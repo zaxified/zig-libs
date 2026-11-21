@@ -78,7 +78,7 @@ properties incl. script extensions, binary properties, age and break properties,
 names, counts to 100,000, its nest limit); `regex::bytes` → `.utf8 = false`; `RegexSet` /
 `RE2::Set` → `RegexSet` (`isMatch`, `matches`); `shortest_match` → `shortestMatch`;
 `size_limit`/RE2 `max_mem` → patterns past `max_insts` compile on the heap, up to `4 * max_insts`
-(what every entry point still matches on the stack; past it `error.PatternTooLarge`);
+(what every entry point still matches on the stack; past it `error.PatternTooLarge`, unless `Options.large_programs` is on: then up to 65,534 instructions, matched with heap scratch from the caller's allocator);
 `find_at`/`captures_at` → `Matcher.find`/`captures` with `from`; RE2's `ANCHOR_START` /
 regex-automata's `Input::anchored` → `Matcher.findAnchored`/`capturesAnchored`; `Regex::new` → `compileOptions`,
 no `RegexBuilder` knobs beyond `Options`. Not here (each with its reason under *What is deliberately not done*): RE2's `ANCHOR_BOTH` (= `fullMatch` of the rest; Rust has none), RE2's Latin-1 mode (bytes
@@ -131,7 +131,17 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   the same parse runs in all three, so the verdict is the last builder's. A program past `max_insts`
   runs on the backtracker, the Pike VM and the set VM only: the DFAs, the one-pass engine and the
   prefilter step aside, and `isMatch`/`fullMatch`/`shortestMatch` keep their scratch on the stack up
-  to `4 * max_insts`. a program past `4 * max_insts` is `error.PatternTooLarge`. Never `b.* = .{}` on a builder or
+  to `4 * max_insts`. A program past `4 * max_insts` is `error.PatternTooLarge` — unless the caller opts in
+  with `Options.large_programs` (Go and Rust compile such programs; the default stays, so that no setting
+  of a consumer can end in a panic or an OOM): a fourth builder of `syntax.huge_capacity` (65,534 instructions, the `u16`
+  limit of a program counter, ~5 MiB of heap scratch, freed) compiles it, `Regex.isLarge()` reports it, and its scans
+  take heap scratch from the caller's allocator — `isMatchAlloc`, `fullMatchAlloc`, `shortestMatchAlloc`,
+  `isMatchReaderAlloc` (one allocation holding the two thread sets and the closure stack, `~8 bytes` per instruction
+  plus a bit set) and, as ever, `Matcher.init` and every `Regex` function taking a `gpa`; a failed allocation is
+  `error.OutOfMemory`. The allocation-free `isMatch`/`fullMatch`/`shortestMatch`/`isMatchReader` have no allocator to
+  ask and panic with a message naming the `Alloc` form on such a `Regex` (the one documented panic: a precondition
+  of the opt-in, found on the first call). `literalPrefix` on one writes nothing (the empty prefix holds). Bytes mode
+  (`max_insts`) and a `RegexSet`'s joined program (`4 * max_insts`) keep their bounds under the option. Never `b.* = .{}` on a builder or
   a VM state set: a default-initialised table is written whole (it cost 85 % of
   `isMatch` and most of a short compile).
 - **Prefilter** (`analyze`, once per program): `anchored` when every path from the start passes
@@ -316,11 +326,12 @@ group depth, are budgeted separately: at most `max_stacked` (64) per pattern, th
 `error.NestingDepth`.
 Residual risks and limits a consumer relies on: a `Regex` whose fields a caller writes by hand (all but
 `longest`) is outside the guarantee; `Span.slice` takes the input the span was found in; a `Matcher` for a
-65,534-instruction program with 64 groups would be ~134 MiB, which is why programs past `4 * max_insts` are
-refused (Backlog); the `!bytes` and `out.len` contracts of a few entry points are asserts; the one-pass/DFA cross
+65,534-instruction program with 64 groups would be ~134 MiB (heap, `Matcher.init` fails with `error.OutOfMemory` when it is not there),
+which is why programs past `4 * max_insts` are refused unless the caller opts in with `Options.large_programs`; the `!bytes` and `out.len` contracts of a few entry points are asserts; the one-pass/DFA cross
 check is a `debug.assert` (silent in ReleaseFast). A `std.Io.Reader` is read through its `stream`, so an
 unbuffered reader or one with a buffer under 4 bytes works (bytes held, never more than three code points past
-a match). Any program that compiles runs through every entry point without a panic and in bounded memory.
+a match). Any program that compiles runs through every entry point without a panic and in bounded memory — except the opt-in
+`Options.large_programs` programs, whose allocation-free scans panic by contract (use the `Alloc` forms) and whose memory is the caller's allocator's.
 
 ## Verification
 
@@ -393,11 +404,6 @@ Consumer build options (CONVENTIONS §4.2), after Rust `regex-syntax`'s `unicode
 
 All open.
 
-- **Programs past `4 * max_insts`** (owner: no consumer setting may end in a panic or an OOM) — Go and Rust compile
-  them; here `error.PatternTooLarge`, because `isMatch` has no allocator and a `Matcher` for 65,534 instructions x 64
-  groups would be ~134 MiB. Taking them back needs matching in bounded memory for any size (a windowed or chunked state
-  set), not an allocating side door. *BOUNCED: an owner decision — no bounded-memory design for any size is known
-  without an allocator; the alternative is an opt-in allocating scratch (Go and Rust are unbounded).*
 - **A full forward table can stop caching two-byte steps** (perf only) — when `FindDfa` holds `limit` states and the next
   state already exists, `intern` does not empty the table, but `midAfter` has no room: every two-byte code point from that
   state is stepped uncached until some new state forces a flush. Not seen in the bench (<= 20 states). Flushing from

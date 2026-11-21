@@ -120,6 +120,11 @@ pub const max_repeat_rust = 100_000;
 /// in stack scratch, so no compiled pattern can make one fail later; the
 /// range and node tables to their `u16` indices.
 pub const large_capacity: Capacity = .{ .insts = 4 * max_insts, .ranges = 65535, .nodes = 65535 };
+/// The capacities of the opt-in builder (`Options.large_programs`, on the
+/// heap): a program of up to `u16` program counters (65,534 instructions, so
+/// `pc + 1` never wraps). Its matching needs heap scratch, which the
+/// `*Alloc` entry points and `Matcher` take from the caller.
+pub const huge_capacity: Capacity = .{ .insts = 65534, .ranges = 65535, .nodes = 65535 };
 /// `emitNode` calls in one compile: far past any program the builders hold
 /// (Go's nested-count rule caps it at ~2M), short of a compile that runs for
 /// seconds on empty repeated bodies (~16M steps, tens of milliseconds).

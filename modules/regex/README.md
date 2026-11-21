@@ -142,14 +142,18 @@ matches an invalid byte; an empty match may fall inside a code point; slices onl
 
 ## Limits
 
-**Whatever compiles can be used through every entry point without a panic, and in bounded
+**Whatever compiles (without `large_programs`) can be used through every entry point without a panic, and in bounded
 memory** — a limit is an error at compile time, safe for patterns an attacker writes. A pattern
 within `max_insts` (1024) instructions, 4096 class ranges and 2048 AST nodes compiles in stack or
 full-`Builder` scratch; up to `4 * max_insts` (4096; bytes mode `max_insts`) it compiles on the
 heap (~2 MiB of scratch, freed), the DFAs and the prefilter stepping aside. Matching never needs
 more: `isMatch`/`fullMatch`/`shortestMatch` take ~6 KiB of stack, ~33 KiB for the largest
 programs; a `Matcher` at most ~8 MiB (4096 instructions × 64 groups). Past that,
-`error.PatternTooLarge` (Go and Rust compile larger programs: the oracles' CAPACITY rows). Always:
+`error.PatternTooLarge` — unless you opt in with `Options.large_programs` (Go and Rust compile larger programs: the
+oracles' CAPACITY rows): then up to 65,534 instructions compile (`Regex.isLarge()` says so), and the scans take heap scratch
+from your allocator (`isMatchAlloc`, `fullMatchAlloc`, `shortestMatchAlloc`, `isMatchReaderAlloc`, `Matcher.init`; a failed
+allocation is `error.OutOfMemory`); the allocation-free `isMatch` and its kin panic on such a `Regex`. Bytes mode and a
+`RegexSet` keep their bounds. Always:
 at most 63 groups; nesting at most `max_depth` (250); a counted
 repetition at most `{1000}` (Rust grammar `{100000}`) and nested counts multiply to at most 1000
 (Go's rule). Past one: `error.NestingDepth` / `error.InvalidRepeatSize` / `error.PatternTooLarge`

@@ -60,6 +60,19 @@ pub const Options = struct {
     /// invalid byte, and an empty match may fall inside a code point. Such a
     /// `Regex` runs on the VMs only, and not through the `Reader` functions.
     utf8: bool = true,
+    /// Allow a program past `4 * max_insts` instructions (up to 65,534, the
+    /// `u16` limit of a program counter; Go and Rust have no such stack
+    /// bound). Off: such a pattern is `error.PatternTooLarge`, as ever. On:
+    /// it compiles, and what the stack cannot hold takes heap scratch from the
+    /// caller's allocator — `Matcher.init`, `isMatchAlloc`, `fullMatchAlloc`,
+    /// `shortestMatchAlloc`, `isMatchReaderAlloc` and the `Regex` functions that
+    /// take a `gpa` — failing with `error.OutOfMemory`, never a panic. The
+    /// allocation-free `isMatch`, `fullMatch`, `shortestMatch` and
+    /// `isMatchReader` have no allocator to ask: on such a `Regex`
+    /// (`isLarge`) they panic with a message that names the `*Alloc` form.
+    /// Bytes mode keeps its `max_insts` bound; a `RegexSet` keeps its joined
+    /// `4 * max_insts` bound.
+    large_programs: bool = false,
 
     fn isLongest(o: Options) bool {
         return o.longest orelse (o.syntax == .posix);
@@ -213,9 +226,24 @@ pub const Regex = struct {
         // the stack. Past that `error.PatternTooLarge`: a pattern that
         // compiles can be matched by every entry point, never a panic or an
         // unbounded `Matcher` later. The DFAs and the prefilter step aside.
-        const big = try gpa.create(syntax.BuilderOf(syntax.large_capacity));
-        defer gpa.destroy(big);
-        return compileWith(gpa, big, pattern, opts);
+        {
+            const big = try gpa.create(syntax.BuilderOf(syntax.large_capacity));
+            defer gpa.destroy(big);
+            if (compileWith(gpa, big, pattern, opts)) |re| return re else |e| if (e != error.PatternTooLarge or !opts.large_programs or !opts.utf8) return e;
+        }
+        // Opt-in (`Options.large_programs`): up to the `u16` limit of a program
+        // counter, ~5 MiB of heap scratch, freed.
+        const huge = try gpa.create(syntax.BuilderOf(syntax.huge_capacity));
+        defer gpa.destroy(huge);
+        return compileWith(gpa, huge, pattern, opts);
+    }
+
+    /// The program is past `4 * max_insts` instructions (compiled with
+    /// `Options.large_programs`): its scans need heap scratch, so
+    /// `isMatch`, `fullMatch`, `shortestMatch` and `isMatchReader` panic
+    /// on it; use their `*Alloc` forms (or a `Matcher`).
+    pub fn isLarge(re: *const Regex) bool {
+        return re.insts.len > 4 * max_insts;
     }
 
     /// `compile` with the caller's `Builder` (~80 KiB of compile scratch, any
@@ -324,7 +352,9 @@ pub const Regex = struct {
     /// true when that text is the whole pattern.
     pub fn literalPrefix(re: *const Regex, w: *std.Io.Writer) std.Io.Writer.Error!bool {
         // Bytes mode: its byte classes are no text. The empty prefix holds.
-        if (re.bytes) return false;
+        // A program past the stack's reach (`isLarge`): no prefix is worked out
+        // (the empty one holds).
+        if (re.bytes or re.isLarge()) return false;
         return replace.literalPrefix(re, w);
     }
 
@@ -627,10 +657,57 @@ pub const Regex = struct {
     /// `runSetEnd` for a program past `max_insts`: up to `4 * max_insts`
     /// (the largest `compile` makes), on the stack.
     noinline fn runSetEndWide(re: *const Regex, text: anytype, full: bool) ?usize {
-        std.debug.assert(re.insts.len <= 4 * max_insts);
+        if (re.isLarge()) @panic("regex: a program past 4 * max_insts has no stack scan; use isMatchAlloc / fullMatchAlloc / shortestMatchAlloc / isMatchReaderAlloc");
         var lists: [2]StateSetOf(4 * max_insts) = undefined;
         var stack: [8 * max_insts]u16 = undefined;
         return re.setLoop(text, full, &lists[0], &lists[1], &stack);
+    }
+
+    /// `runSetEnd` with heap scratch from `gpa` (any program size): the two
+    /// state sets and the closure stack in one allocation.
+    noinline fn runSetEndHeap(re: *const Regex, gpa: std.mem.Allocator, text: anytype, full: bool) std.mem.Allocator.Error!?usize {
+        const n = re.insts.len;
+        const words = (n + 63) / 64;
+        const stack_len = 2 * n + 2;
+        const block = try gpa.alloc(u64, 2 * words + (2 * n + stack_len + 3) / 4);
+        defer gpa.free(block);
+        const tail: [*]u16 = @ptrCast(block[2 * words ..].ptr);
+        var lists: [2]HeapSet = .{
+            .{ .pcs = tail[0..n], .seen = .{ .masks = block[0..words] } },
+            .{ .pcs = tail[n..][0..n], .seen = .{ .masks = block[words..][0..words] } },
+        };
+        const stack = tail[2 * n ..][0..stack_len];
+        return re.setLoop(text, full, &lists[0], &lists[1], stack);
+    }
+
+    /// `isMatch` for a program of any size, its scratch from `gpa` when the
+    /// stack cannot hold it (`isLarge`); allocation-free otherwise.
+    pub fn isMatchAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!bool {
+        if (!re.isLarge()) return re.isMatch(input);
+        return try re.shortestMatchAlloc(gpa, input) != null;
+    }
+
+    /// `fullMatch` for a program of any size (see `isMatchAlloc`).
+    pub fn fullMatchAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!bool {
+        if (!re.isLarge()) return re.fullMatch(input);
+        var t: SliceText = .{ .input = input };
+        return try re.runSetEndHeap(gpa, &t, true) != null;
+    }
+
+    /// `shortestMatch` for a program of any size (see `isMatchAlloc`).
+    pub fn shortestMatchAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!?usize {
+        if (!re.isLarge()) return re.shortestMatch(input);
+        var t: SliceText = .{ .input = input };
+        return re.runSetEndHeap(gpa, &t, false);
+    }
+
+    /// `isMatchReader` for a program of any size (see `isMatchAlloc`).
+    pub fn isMatchReaderAlloc(re: *const Regex, gpa: std.mem.Allocator, r: *std.Io.Reader) (ReaderError || std.mem.Allocator.Error)!bool {
+        if (!re.isLarge()) return re.isMatchReader(r);
+        var t: ReaderText = .init(r);
+        const found = try re.runSetEndHeap(gpa, &t, false) != null;
+        if (t.failed and !found) return error.ReadFailed;
+        return found;
     }
 
     /// The set VM's loop over sets `cur0`/`nxt0` (fixed or heap).
@@ -1512,6 +1589,19 @@ const ByteSet = struct {
 };
 
 const StateSet = StateSetOf(max_insts);
+
+/// `StateSetOf` over slices of a heap block (a program past the stack's
+/// reach, `Regex.runSetEndHeap`).
+const HeapSet = struct {
+    pcs: []u16,
+    n: u16 = 0,
+    seen: SliceBits,
+
+    fn clear(s: *HeapSet, words: usize) void {
+        s.n = 0;
+        @memset(s.seen.masks[0..words], 0);
+    }
+};
 
 fn StateSetOf(comptime cap: usize) type {
     return struct {
@@ -6002,6 +6092,88 @@ test "compile: past max_insts on the heap, past 4 * max_insts refused — never 
     try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, empties, .{ .syntax = .rust }));
     // Bytes mode: its set VM holds `max_insts`.
     try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, "a{1000}b{100}", .{ .syntax = .rust, .utf8 = false }));
+}
+
+test "large_programs: off by default (past 4 * max_insts is PatternTooLarge); on, the program compiles and every Alloc entry point answers as the Matcher does" {
+    const gpa = testing.allocator;
+    const pat = "a{1000}b{1000}c{1000}d{1000}e{1000}";
+    try testing.expectError(error.PatternTooLarge, Regex.compileOptions(gpa, pat, .{}));
+    try testing.expectError(error.PatternTooLarge, Regex.compileOptions(gpa, pat, .{ .large_programs = false }));
+    var re = try Regex.compileOptions(gpa, pat, .{ .large_programs = true });
+    defer re.deinit(gpa);
+    try testing.expect(re.isLarge());
+    try testing.expect(re.insts.len > 4 * max_insts);
+    const text = strRepeat("a", 1000) ++ strRepeat("b", 1000) ++ strRepeat("c", 1000) ++ strRepeat("d", 1000) ++ strRepeat("e", 1000);
+    const inputs = [_][]const u8{ text, "x" ++ text ++ "y", text[1..], text[0 .. text.len - 1], "", strRepeat("a", 1000) ++ text };
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    for (inputs) |in| {
+        const found = m.find(in, 0);
+        try testing.expectEqual(found != null, try re.isMatchAlloc(gpa, in));
+        try testing.expectEqual(if (found) |f| f.end else null, try re.shortestMatchAlloc(gpa, in));
+        try testing.expectEqual(found != null and found.?.start == 0 and found.?.end == in.len, try re.fullMatchAlloc(gpa, in));
+        var r: std.Io.Reader = .fixed(in);
+        try testing.expectEqual(found != null, try re.isMatchReaderAlloc(gpa, &r));
+    }
+    try testing.expectEqual(@as(?Span, .{ .start = 1, .end = 5001 }), m.find("x" ++ text ++ "y", 0));
+    try testing.expect(try re.fullMatchAlloc(gpa, text));
+    // The other gpa entry points ride on the Matcher.
+    const replaced = try re.replaceAll(gpa, "x" ++ text ++ "y", "<>");
+    defer gpa.free(replaced);
+    try testing.expectEqualStrings("x<>y", replaced);
+    try testing.expectEqual(@as(?Span, .{ .start = 1, .end = 5001 }), try re.find(gpa, "x" ++ text ++ "y"));
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    try testing.expect(!(try re.literalPrefix(&w.writer))); // none is worked out past the stack's reach
+    try testing.expectEqual(@as(usize, 0), w.written().len);
+}
+
+test "large_programs: a program that fits the stack gives the same answers through the Alloc forms and allocates nothing; bytes mode and sets keep their bounds" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var re = try Regex.compileOptions(testing.allocator, "a{1000}b{1000}", .{ .large_programs = true });
+    defer re.deinit(testing.allocator);
+    try testing.expect(!re.isLarge());
+    const text = strRepeat("a", 1000) ++ strRepeat("b", 1000);
+    try testing.expect(try re.isMatchAlloc(failing.allocator(), text));
+    try testing.expect(try re.fullMatchAlloc(failing.allocator(), text));
+    try testing.expectEqual(@as(?usize, 2000), try re.shortestMatchAlloc(failing.allocator(), text));
+    var r: std.Io.Reader = .fixed(text);
+    try testing.expect(try re.isMatchReaderAlloc(failing.allocator(), &r));
+    // Bytes mode: its bound is `max_insts`, option or not.
+    try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, "a{1000}b{100}", .{ .syntax = .rust, .utf8 = false, .large_programs = true }));
+    // A set joins up to `4 * max_insts`: a large member is refused.
+    try testing.expectError(error.PatternTooLarge, RegexSet.compile(testing.allocator, &.{"a{1000}b{1000}c{1000}d{1000}e{1000}"}, .{ .large_programs = true }));
+    // The `u16` limit of a program counter is still a limit.
+    try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, "\\w{100000}", .{ .syntax = .rust, .large_programs = true }));
+}
+
+test "large_programs: an allocation that fails is error.OutOfMemory at compile, scan and Matcher, never a panic" {
+    const pat = "a{1000}b{1000}c{1000}d{1000}e{1000}";
+    const text = strRepeat("a", 1000) ++ strRepeat("b", 1000) ++ strRepeat("c", 1000) ++ strRepeat("d", 1000) ++ strRepeat("e", 1000);
+    var compile_failed: usize = 0;
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = index });
+        var re = Regex.compileOptions(fa.allocator(), pat, .{ .large_programs = true }) catch |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            compile_failed += 1;
+            continue;
+        };
+        re.deinit(fa.allocator());
+        break;
+    }
+    try testing.expect(compile_failed > 0);
+    var re = try Regex.compileOptions(testing.allocator, pat, .{ .large_programs = true });
+    defer re.deinit(testing.allocator);
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, re.isMatchAlloc(fa.allocator(), text));
+    try testing.expectError(error.OutOfMemory, re.fullMatchAlloc(fa.allocator(), text));
+    try testing.expectError(error.OutOfMemory, re.shortestMatchAlloc(fa.allocator(), text));
+    var r: std.Io.Reader = .fixed(text);
+    try testing.expectError(error.OutOfMemory, re.isMatchReaderAlloc(fa.allocator(), &r));
+    try testing.expectError(error.OutOfMemory, Matcher.init(fa.allocator(), &re));
+    try testing.expectError(error.OutOfMemory, re.find(fa.allocator(), text));
+    try testing.expectError(error.OutOfMemory, re.replaceAll(fa.allocator(), text, "x"));
 }
 
 test "bytes mode through a reader: same spans and groups as the slice, for every buffer size" {
