@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — ADDED `Poller` (an `epoll` backend with fd registration: `add`/`modify`/`remove`/`wait`, `EVENT` bits, per-registration `u64` token) and `Signals` (signal handles as a `signalfd`: `init`/`read`/`deinit`, `Info`). Tests in `root.zig`.
 - **2026-11-20** — New `Env.overlay`: the `.inherit` snapshot with `NAME=value` entries applied on top (same name replaced, later duplicates win). SOURCE-BREAKING for an exhaustive `switch` over `Env` (one more variant); no existing behaviour changes.
 - **2026-11-13** — Review fixes: reused timer slots start clean; `setWaker` quiesces
   itself; `.inherit` enforces the entry cap and the 1 MiB bound exactly; docs for

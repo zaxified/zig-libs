@@ -8,6 +8,10 @@ blocks that only share the "single owner drives the loop" discipline:
 - **`Loop`** — a thin, allocation-free wrapper over `poll(2)` (`Loop.poll`) plus
   a per-tick **maintenance callback list** (`addTask` / `tick`). The owner
   composes them: poll the fds, service readiness, `tick()` the callbacks.
+- **`Poller`** — an `epoll` instance with fd registration (`add`/`modify`/`remove`,
+  `wait` hands back each ready fd's `u64` token), the O(ready) alternative to
+  `Loop.poll`. **`Signals`** — signal handles as a `signalfd` that either poller
+  can watch.
 - **`JobTable(N, Job)`** — a fixed-size, lock-free `FREE→RUNNING→DONE` slot
   table. The loop `claim()`s a slot, a worker fills it and `finish()`es it, and
   the loop `drain()`s the DONE slots on its next tick. Handoff is per-slot
@@ -113,5 +117,5 @@ try jobs.spawnDetachedEnv(gpa, argv, .inherit, &record);   // snapshot of /proc/
 
 ## Not provided
 
-The curl-specific fetch, epoll / fd registration and signal handles, queueing beyond the fixed slot count and
-Windows / non-Linux support: see SPEC.md *What is deliberately not done* and *Backlog / deferred*.
+The curl-specific fetch, io_uring, queueing beyond the fixed slot count and
+Windows / non-Linux support: see SPEC.md *What is deliberately not done*.

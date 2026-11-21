@@ -746,6 +746,207 @@ pub const Timers = struct {
     }
 };
 
+// ── Poller (epoll) ───────────────────────────────────────────────────────────
+
+/// An `epoll` instance with fd registration (libuv's `uv__io_poll` backend, mio's `Poll`): the
+/// kernel keeps the interest list, so a wait costs O(ready) rather than `Loop.poll`'s O(fds).
+/// Every registration carries a caller-chosen `u64` token that `wait` hands back. Owner-thread
+/// only, allocation-free, raw syscalls. The `Loop` clock and timers drive it unchanged:
+/// `wait(out, loop.timeoutMs(now, caller_ms))`.
+///
+/// Level-triggered by default; `EVENT.ET` / `EVENT.ONESHOT` select edge-triggered / one-shot.
+pub const Poller = struct {
+    fd: i32,
+
+    /// The readiness bits of `add`/`modify` and `Event.events` (`EPOLL*`). `ERR` and `HUP` are
+    /// always reported, registered or not.
+    pub const EVENT = struct {
+        pub const IN: u32 = linux.EPOLL.IN;
+        pub const OUT: u32 = linux.EPOLL.OUT;
+        pub const PRI: u32 = linux.EPOLL.PRI;
+        pub const ERR: u32 = linux.EPOLL.ERR;
+        pub const HUP: u32 = linux.EPOLL.HUP;
+        /// The peer closed its writing half (stream sockets).
+        pub const RDHUP: u32 = linux.EPOLL.RDHUP;
+        pub const ET: u32 = linux.EPOLL.ET;
+        pub const ONESHOT: u32 = linux.EPOLL.ONESHOT;
+    };
+
+    pub const Event = struct {
+        /// The token given at `add`/`modify`.
+        token: u64,
+        /// `EVENT` bits that are ready.
+        events: u32,
+    };
+
+    pub const InitError = error{ PollerFailed, ProcessFdQuotaExceeded, SystemFdQuotaExceeded };
+    pub const CtlError = error{
+        /// `add` of an fd that is registered already.
+        AlreadyRegistered,
+        /// `modify`/`remove` of an fd that is not registered.
+        NotRegistered,
+        /// The fd cannot be polled (a regular file, a directory) or is not a valid descriptor.
+        Unsupported,
+        /// The per-user `max_user_watches` limit is reached.
+        TooManyWatches,
+        SystemResources,
+    };
+    pub const WaitError = error{
+        /// A signal interrupted the wait (EINTR); treat as "nothing ready" and re-check the quit flag.
+        Interrupted,
+        PollFailed,
+    };
+
+    pub fn init() InitError!Poller {
+        const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return .{ .fd = @intCast(rc) },
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            else => return error.PollerFailed,
+        }
+    }
+
+    pub fn deinit(self: *Poller) void {
+        _ = linux.close(self.fd);
+        self.* = undefined;
+    }
+
+    fn ctl(self: *const Poller, op: u32, fd: i32, events: u32, token: u64) CtlError!void {
+        var ev: linux.epoll_event = .{ .events = events, .data = .{ .u64 = token } };
+        switch (linux.errno(linux.epoll_ctl(self.fd, op, fd, &ev))) {
+            .SUCCESS => {},
+            .EXIST => return error.AlreadyRegistered,
+            .NOENT => return error.NotRegistered,
+            .BADF, .PERM, .INVAL => return error.Unsupported,
+            .NOSPC => return error.TooManyWatches,
+            else => return error.SystemResources,
+        }
+    }
+
+    /// Start watching `fd` for `events`; `wait` reports it with `token`.
+    pub fn add(self: *const Poller, fd: i32, events: u32, token: u64) CtlError!void {
+        return self.ctl(linux.EPOLL.CTL_ADD, fd, events, token);
+    }
+
+    /// Replace the interest set and token of a registered fd (also re-arms a `ONESHOT` one).
+    pub fn modify(self: *const Poller, fd: i32, events: u32, token: u64) CtlError!void {
+        return self.ctl(linux.EPOLL.CTL_MOD, fd, events, token);
+    }
+
+    /// Stop watching `fd`. Closing the last descriptor of an open file does it implicitly.
+    pub fn remove(self: *const Poller, fd: i32) CtlError!void {
+        return self.ctl(linux.EPOLL.CTL_DEL, fd, 0, 0);
+    }
+
+    /// Block up to `timeout_ms` (-1 = forever, 0 = poll) for readiness and fill `out` with at
+    /// most `out.len` events; returns how many (0 = timeout). Ready fds beyond `out.len` stay
+    /// ready for the next call (level-triggered) or are reported in a later call.
+    pub fn wait(self: *const Poller, out: []Event, timeout_ms: i32) WaitError!usize {
+        var raw: [64]linux.epoll_event = undefined;
+        const cap: usize = @min(out.len, raw.len);
+        if (cap == 0) return 0;
+        const rc = linux.epoll_wait(self.fd, &raw, @intCast(cap), timeout_ms);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => return error.Interrupted,
+            else => return error.PollFailed,
+        }
+        for (raw[0..rc], out[0..rc]) |r, *o| o.* = .{ .token = r.data.u64, .events = r.events };
+        return rc;
+    }
+};
+
+// ── Signals (signalfd) ───────────────────────────────────────────────────────
+
+/// Signal handles (libuv `uv_signal_t`) as a file descriptor: the named signals are blocked in
+/// the calling thread and delivered as readable records on `fd()`, which any poller can watch
+/// (`Loop.poll` with `POLL.IN`, `Poller` with `EVENT.IN`). No handler runs, nothing is
+/// async-signal-context. Owner-thread only.
+///
+/// **Call it before the process starts other threads:** a thread inherits the blocked set of its
+/// creator, and a process-directed signal (`kill`) goes to any thread that does not block it,
+/// where its default action (usually termination) would run. `SIGKILL` and `SIGSTOP` cannot be
+/// caught (`error.InvalidSignal`). `deinit` closes the fd and unblocks the signals this handle
+/// blocked; signals that were blocked before `init` stay blocked.
+pub const Signals = struct {
+    fd: i32,
+    /// The signals that this handle added to the blocked set (and `deinit` removes again).
+    blocked_by_us: linux.sigset_t,
+
+    pub const InitError = error{ InvalidSignal, SignalsFailed, ProcessFdQuotaExceeded, SystemFdQuotaExceeded };
+
+    /// One delivered signal.
+    pub const Info = struct {
+        signo: u32,
+        /// Sender pid (`kill`, `sigqueue`); 0 for kernel-generated ones.
+        pid: u32,
+        uid: u32,
+        /// `si_code`: e.g. `SI_USER` (0) for `kill`, `SI_TKILL` (-6) for `tgkill`.
+        code: i32,
+        /// `SIGCHLD`: the child's exit status or signal.
+        status: i32,
+    };
+
+    pub fn init(signals: []const linux.SIG) InitError!Signals {
+        if (signals.len == 0) return error.InvalidSignal;
+        var mask = linux.sigemptyset();
+        for (signals) |s| {
+            if (s == .KILL or s == .STOP or @backingInt(s) == 0 or @backingInt(s) >= linux.NSIG) return error.InvalidSignal;
+            linux.sigaddset(&mask, s);
+        }
+        var old: linux.sigset_t = undefined;
+        if (linux.errno(linux.sigprocmask(linux.SIG.BLOCK, &mask, &old)) != .SUCCESS) return error.SignalsFailed;
+        const rc = linux.signalfd(-1, &mask, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
+        const err = linux.errno(rc);
+        if (err != .SUCCESS) {
+            restore(&mask, &old);
+            return switch (err) {
+                .MFILE => error.ProcessFdQuotaExceeded,
+                .NFILE => error.SystemFdQuotaExceeded,
+                else => error.SignalsFailed,
+            };
+        }
+        return .{ .fd = @intCast(rc), .blocked_by_us = newlyBlocked(&mask, &old) };
+    }
+
+    fn newlyBlocked(mask: *const linux.sigset_t, old: *const linux.sigset_t) linux.sigset_t {
+        var out: linux.sigset_t = undefined;
+        for (&out, mask, old) |*o, m, p| o.* = m & ~p;
+        return out;
+    }
+
+    /// Unblock what `mask` blocked on top of `old`.
+    fn restore(mask: *const linux.sigset_t, old: *const linux.sigset_t) void {
+        const ours = newlyBlocked(mask, old);
+        _ = linux.sigprocmask(linux.SIG.UNBLOCK, &ours, null);
+    }
+
+    pub fn deinit(self: *Signals) void {
+        _ = linux.close(self.fd);
+        _ = linux.sigprocmask(linux.SIG.UNBLOCK, &self.blocked_by_us, null);
+        self.* = undefined;
+    }
+
+    /// The next pending signal, or null when none is queued. Standard signals coalesce (one
+    /// record for any number of raises while pending); real-time signals queue.
+    pub fn read(self: *const Signals) error{SignalsFailed}!?Info {
+        var rec: linux.signalfd_siginfo = undefined;
+        while (true) {
+            const rc = linux.read(self.fd, @ptrCast(&rec), @sizeOf(linux.signalfd_siginfo));
+            switch (linux.errno(rc)) {
+                .SUCCESS => {
+                    if (rc != @sizeOf(linux.signalfd_siginfo)) return error.SignalsFailed;
+                    return .{ .signo = rec.signo, .pid = rec.pid, .uid = rec.uid, .code = rec.code, .status = rec.status };
+                },
+                .AGAIN => return null,
+                .INTR => continue,
+                else => return error.SignalsFailed,
+            }
+        }
+    }
+};
+
 // ── Env ──────────────────────────────────────────────────────────────────────
 
 /// The environment a detached child gets (`JobTable.spawnDetachedEnv`). Like
@@ -1939,4 +2140,202 @@ test "JobTable.setWaker waits out a worker still inside finish" {
     try table.setWaker(null); // must block until the fake worker leaves
     try std.testing.expectEqual(@as(u32, 0), table.finishing.load(.acquire));
     th.join();
+}
+
+// ── Poller and Signals tests ────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn testPipe() ![2]i32 {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })) != .SUCCESS) return error.SkipZigTest;
+    return fds;
+}
+
+test "Poller: a readable pipe is reported with its token, level-triggered until drained; remove stops it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var p = Poller.init() catch return error.SkipZigTest;
+    defer p.deinit();
+    const fds = try testPipe();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    try p.add(fds[0], Poller.EVENT.IN, 0xfeed_0000_0007);
+    var out: [4]Poller.Event = undefined;
+    try testing.expectEqual(@as(usize, 0), try p.wait(&out, 0));
+    _ = linux.write(fds[1], "x", 1);
+    try testing.expectEqual(@as(usize, 1), try p.wait(&out, 1000));
+    try testing.expectEqual(@as(u64, 0xfeed_0000_0007), out[0].token);
+    try testing.expect(out[0].events & Poller.EVENT.IN != 0);
+    // Level-triggered: still ready because nothing was read.
+    try testing.expectEqual(@as(usize, 1), try p.wait(&out, 0));
+    var b: [1]u8 = undefined;
+    _ = linux.read(fds[0], &b, 1);
+    try testing.expectEqual(@as(usize, 0), try p.wait(&out, 0));
+    _ = linux.write(fds[1], "x", 1);
+    try p.remove(fds[0]);
+    try testing.expectEqual(@as(usize, 0), try p.wait(&out, 0));
+}
+
+test "Poller: add twice, modify and remove of an unknown fd, a regular file and a bad fd are typed errors" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var p = Poller.init() catch return error.SkipZigTest;
+    defer p.deinit();
+    const fds = try testPipe();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    try testing.expectError(error.NotRegistered, p.modify(fds[0], Poller.EVENT.IN, 1));
+    try testing.expectError(error.NotRegistered, p.remove(fds[0]));
+    try p.add(fds[0], Poller.EVENT.IN, 1);
+    try testing.expectError(error.AlreadyRegistered, p.add(fds[0], Poller.EVENT.IN, 2));
+    try p.modify(fds[0], Poller.EVENT.IN | Poller.EVENT.RDHUP, 3);
+    try testing.expectError(error.Unsupported, p.add(-1, Poller.EVENT.IN, 1));
+    const rc = linux.open("/proc/self/exe", .{}, 0);
+    if (linux.errno(rc) == .SUCCESS) {
+        const reg: i32 = @intCast(rc);
+        defer _ = linux.close(reg);
+        try testing.expectError(error.Unsupported, p.add(reg, Poller.EVENT.IN, 1)); // regular files are not pollable
+    }
+    // wait with an empty buffer does not touch the kernel.
+    var none: [0]Poller.Event = undefined;
+    try testing.expectEqual(@as(usize, 0), try p.wait(&none, 0));
+}
+
+test "Poller: ONESHOT disarms after one event and modify re-arms; ET reports a change once; HUP arrives unasked" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var p = Poller.init() catch return error.SkipZigTest;
+    defer p.deinit();
+    const fds = try testPipe();
+    defer _ = linux.close(fds[0]);
+    var w = fds[1];
+    defer if (w >= 0) {
+        _ = linux.close(w);
+    };
+    var out: [4]Poller.Event = undefined;
+    try p.add(fds[0], Poller.EVENT.IN | Poller.EVENT.ONESHOT, 5);
+    _ = linux.write(w, "ab", 2);
+    try testing.expectEqual(@as(usize, 1), try p.wait(&out, 1000));
+    try testing.expectEqual(@as(usize, 0), try p.wait(&out, 0)); // disarmed though data is left
+    try p.modify(fds[0], Poller.EVENT.IN | Poller.EVENT.ET, 6);
+    try testing.expectEqual(@as(usize, 1), try p.wait(&out, 1000));
+    try testing.expectEqual(@as(u64, 6), out[0].token);
+    try testing.expectEqual(@as(usize, 0), try p.wait(&out, 0)); // edge: not reported again without new data
+    var b: [8]u8 = undefined;
+    _ = linux.read(fds[0], &b, b.len);
+    _ = linux.close(w);
+    w = -1;
+    // The write end closed: HUP is reported although only IN was asked for.
+    try testing.expectEqual(@as(usize, 1), try p.wait(&out, 1000));
+    try testing.expect(out[0].events & Poller.EVENT.HUP != 0);
+}
+
+test "Poller: a Waker's fd wakes a wait from another thread; the Loop timer timeout shortens it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var p = Poller.init() catch return error.SkipZigTest;
+    defer p.deinit();
+    var wk = try Waker.init();
+    defer wk.deinit();
+    try p.add(wk.fd(), Poller.EVENT.IN, 99);
+    var out: [2]Poller.Event = undefined;
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(w: *Waker) void {
+            w.wake();
+        }
+    }.run, .{&wk});
+    try testing.expectEqual(@as(usize, 1), try p.wait(&out, 60_000));
+    t.join();
+    try testing.expectEqual(@as(u64, 99), out[0].token);
+    wk.clear();
+    try testing.expectEqual(@as(usize, 0), try p.wait(&out, 0));
+    // A timer shortens the wait the way it shortens Loop.poll.
+    var loop: Loop = .{};
+    defer loop.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 250), loop.timeoutMs(1000, 250));
+    try testing.expectEqual(@as(usize, 0), try p.wait(&out, 5));
+}
+
+test "Poller: more ready fds than the buffer holds are reported over several waits" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var p = Poller.init() catch return error.SkipZigTest;
+    defer p.deinit();
+    var ws: [3]i32 = undefined;
+    var rs: [3]i32 = undefined;
+    for (&rs, &ws, 0..) |*r, *w, i| {
+        const fds = try testPipe();
+        r.* = fds[0];
+        w.* = fds[1];
+        try p.add(r.*, Poller.EVENT.IN, i);
+        _ = linux.write(w.*, "x", 1);
+    }
+    defer for (rs, ws) |r, w| {
+        _ = linux.close(r);
+        _ = linux.close(w);
+    };
+    var out: [2]Poller.Event = undefined;
+    try testing.expectEqual(@as(usize, 2), try p.wait(&out, 1000));
+    var seen: [3]bool = @splat(false);
+    var total: usize = 0;
+    // Drain everything that is reported until all three tokens were seen.
+    var rounds: usize = 0;
+    while (total < 3 and rounds < 10) : (rounds += 1) {
+        const n = try p.wait(&out, 1000);
+        for (out[0..n]) |e| {
+            if (!seen[e.token]) total += 1;
+            seen[e.token] = true;
+            var b: [1]u8 = undefined;
+            _ = linux.read(rs[e.token], &b, 1);
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), total);
+}
+
+fn blockedNow() linux.sigset_t {
+    var cur: linux.sigset_t = undefined;
+    _ = linux.sigprocmask(linux.SIG.BLOCK, null, &cur);
+    return cur;
+}
+
+fn isBlocked(set: linux.sigset_t, s: linux.SIG) bool {
+    var probe = linux.sigemptyset();
+    linux.sigaddset(&probe, s);
+    for (set, probe) |a, b| if (a & b != 0) return true;
+    return false;
+}
+
+test "Signals: a raised signal arrives as a record on the fd, polled by a Poller; deinit unblocks only what it blocked" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // USR2 was blocked before: it must stay blocked after deinit.
+    var usr2 = linux.sigemptyset();
+    linux.sigaddset(&usr2, .USR2);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &usr2, null);
+    defer _ = linux.sigprocmask(linux.SIG.UNBLOCK, &usr2, null);
+
+    var sg = Signals.init(&.{ .USR1, .USR2 }) catch return error.SkipZigTest;
+    try testing.expect(isBlocked(blockedNow(), .USR1));
+    var p = try Poller.init();
+    defer p.deinit();
+    try p.add(sg.fd, Poller.EVENT.IN, 1);
+    var out: [1]Poller.Event = undefined;
+    try testing.expectEqual(@as(usize, 0), try p.wait(&out, 0));
+    try testing.expectEqual(@as(?Signals.Info, null), try sg.read());
+    // Thread-directed, so no other thread can take it.
+    _ = linux.tgkill(linux.getpid(), linux.gettid(), .USR1);
+    try testing.expectEqual(@as(usize, 1), try p.wait(&out, 1000));
+    const info = (try sg.read()).?;
+    try testing.expectEqual(@as(u32, @backingInt(linux.SIG.USR1)), info.signo);
+    try testing.expectEqual(@as(i32, -6), info.code); // SI_TKILL
+    try testing.expectEqual(@as(u32, @intCast(linux.getpid())), info.pid);
+    try testing.expectEqual(@as(?Signals.Info, null), try sg.read());
+    sg.deinit();
+    const after = blockedNow();
+    try testing.expect(!isBlocked(after, .USR1));
+    try testing.expect(isBlocked(after, .USR2));
+}
+
+test "Signals: SIGKILL, SIGSTOP and an empty list are refused and leave the mask alone" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const before = blockedNow();
+    try testing.expectError(error.InvalidSignal, Signals.init(&.{}));
+    try testing.expectError(error.InvalidSignal, Signals.init(&.{ .USR1, .KILL }));
+    try testing.expectError(error.InvalidSignal, Signals.init(&.{.STOP}));
+    try testing.expectEqualSlices(usize, &before, &blockedNow());
 }
