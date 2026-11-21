@@ -28,10 +28,14 @@ fn checkInfo(info: taproot.SpendInfo) !void {
         defer ta.free(cb);
         try testing.expect(tapscript.controlBlockValid(cb));
         try testing.expect(tapscript.verifyCommitment(&q, cb, leaf.script));
+        // The two independent implementations (this module's consensus one and
+        // `taproot.verifyCommitment`) agree here and on every damaged variant below.
+        try testing.expect(taproot.verifyCommitment(q, cb, leaf.script));
 
         // Parity bit.
         cb[0] ^= 1;
         try testing.expect(!tapscript.verifyCommitment(&q, cb, leaf.script));
+        try testing.expect(!taproot.verifyCommitment(q, cb, leaf.script));
         cb[0] ^= 1;
         // Path bytes (bytes 33.., one flip per node is enough: bit 0 of its
         // first byte) plus one flip in the internal key's last byte, which
@@ -40,10 +44,12 @@ fn checkInfo(info: taproot.SpendInfo) !void {
         while (k < cb.len) : (k += 32) {
             cb[k] ^= 0x01;
             try testing.expect(!tapscript.verifyCommitment(&q, cb, leaf.script));
+            try testing.expect(!taproot.verifyCommitment(q, cb, leaf.script));
             cb[k] ^= 0x01;
         }
         cb[32] ^= 0x01;
         try testing.expect(!tapscript.verifyCommitment(&q, cb, leaf.script));
+        try testing.expect(!taproot.verifyCommitment(q, cb, leaf.script));
         cb[32] ^= 0x01;
         // Still fine after restoring, and a different script is rejected.
         try testing.expect(tapscript.verifyCommitment(&q, cb, leaf.script));

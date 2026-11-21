@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **New public API: `ControlBlock` and `verifyCommitment`.** `ControlBlock.parse` splits a BIP341 control block (`33 + 32m` bytes, `m <= 128`) into leaf version, output parity, internal key and path; `merkleRoot(leaf_hash)` folds the path and `verifyCommitment(output_x, script)` is the script-path commitment check (Core `VerifyTaprootCommitment`, rust-bitcoin `ControlBlock::verify_taproot_commitment`); `taproot.verifyCommitment(output_x, control_block, script)` parses and checks, false for a malformed block. It is a second implementation beside `bitcoinscript`'s consensus one, and the two are cross-checked on every damaged variant.
 - **2026-11-20** — New `nums_internal_x` / `numsInternalKey()`: BIP341's unspendable internal key `H` (test: `x = SHA256(04 || Gx || Gy)`, it lifts, it tweaks). No existing behaviour changes.
 - **2026-11-19** — added `WeightedLeaf`, `huffmanLeaves` and `buildFromWeights`: Huffman tree layout from `(weight, script)` pairs, behaving as rust-bitcoin's `TaprootBuilder::with_huffman_tree` (two lowest weights joined, `u32` saturating sum, ties by larger node hash, empty input `EmptyTree`, depth > 128 `TreeTooDeep`). Additive; no behaviour change to existing functions.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private CompactSize encoder in `tree.zig` is replaced by `bitcointx.encodeCompactSize`; `bitcointx` is now a dependency (it only depends on `bip340`, no cycle).

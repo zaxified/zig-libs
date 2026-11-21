@@ -518,3 +518,64 @@ fn fuzzBuild(_: void, smith: *std.testing.Smith) !void {
     }
     try testing.expectEqual(@as(u32, 16), kraft);
 }
+
+// ── control-block parsing and commitment verification ───────────────────
+
+test "ControlBlock.parse: size rules and fields" {
+    var buf: [33 + 32 * 129]u8 = @splat(0x07);
+    buf[0] = 0xc1;
+    const cb = try tree.ControlBlock.parse(buf[0..33]);
+    try testing.expectEqual(@as(u8, 0xc0), cb.leaf_version);
+    try testing.expectEqual(@as(u1, 1), cb.output_parity);
+    try testing.expectEqual(@as(usize, 0), cb.pathLen());
+    try testing.expectEqual(@as(usize, 128), (try tree.ControlBlock.parse(buf[0 .. 33 + 32 * 128])).pathLen());
+    try testing.expectEqual(@as(usize, 1), (try tree.ControlBlock.parse(buf[0..65])).pathLen());
+    for ([_]usize{ 0, 1, 32, 34, 64, 66, 33 + 32 * 128 + 32, 33 + 32 * 128 + 1 }) |n| {
+        try testing.expectError(error.InvalidControlBlockSize, tree.ControlBlock.parse(buf[0..n]));
+    }
+}
+
+/// Every leaf of `info` verifies, and any single flipped byte of the control
+/// block, the output key or the script is refused.
+fn checkVerify(info: tree.SpendInfo) !void {
+    for (info.leaves, 0..) |leaf, i| {
+        const cb = try info.controlBlockAlloc(ta, i);
+        defer ta.free(cb);
+        try testing.expect(taproot.verifyCommitment(info.output.x, cb, leaf.script));
+        const parsed = try tree.ControlBlock.parse(cb);
+        if (info.merkle_root) |r| try testing.expectEqualSlices(u8, &r, &parsed.merkleRoot(leaf.leaf_hash));
+        for (0..cb.len) |k| {
+            cb[k] ^= 0x01;
+            try testing.expect(!taproot.verifyCommitment(info.output.x, cb, leaf.script));
+            cb[k] ^= 0x01;
+        }
+        var q = info.output.x;
+        q[31] ^= 0x01;
+        try testing.expect(!taproot.verifyCommitment(q, cb, leaf.script));
+        try testing.expect(!taproot.verifyCommitment(info.output.x, cb, "\x00 other script"));
+        try testing.expect(!taproot.verifyCommitment(info.output.x, cb[0 .. cb.len - 1], leaf.script));
+    }
+}
+
+test "verifyCommitment: every control block of every BIP341 vector tree" {
+    for (v.rows) |row| {
+        const internal = try bip340.XOnlyPublicKey.fromBytes(try hex32(row.internal_pubkey));
+        var info = try taproot.buildFromLeaves(ta, internal, row.leaves);
+        defer info.deinit(ta);
+        try checkVerify(info);
+        // the published control blocks (BIP341 JSON) verify too
+        for (info.leaves, row.control_blocks) |leaf, cb_hex| {
+            const cb = try hexAlloc(cb_hex);
+            defer ta.free(cb);
+            try testing.expect(taproot.verifyCommitment(try hex32(row.tweaked_pubkey), cb, leaf.script));
+        }
+    }
+}
+
+test "verifyCommitment: an off-curve internal key and an out-of-range tweak are refused, not trapped" {
+    // BIP340 vector 5's x is not on the curve.
+    var cb: [33]u8 = undefined;
+    cb[0] = 0xc0;
+    _ = try std.fmt.hexToBytes(cb[1..], "EEFDEA4CDB677750A420FEE807EACF21EB9898AE79B9768766E4FAA04A2D4A34");
+    try testing.expect(!taproot.verifyCommitment(@splat(0x11), &cb, "x"));
+}

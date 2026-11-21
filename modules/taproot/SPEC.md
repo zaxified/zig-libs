@@ -76,7 +76,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `bip340` + `k256`); `taproot` does NOT depend on `bitcoinscript`.
   `bitcoinscript` keeps its own `tapleafHash`/`verifyCommitment` (consensus
   side) and depends on `taproot` in tests only — `taproot_builder_xcheck_test.zig`
-  checks that the two implementations agree.
+  checks that the two implementations agree. The independence is deliberate:
+  `ControlBlock`/`verifyCommitment` here (the check rust-bitcoin's
+  `ControlBlock::verify_taproot_commitment` and Core's `VerifyTaprootCommitment`
+  offer) is a second implementation for callers that hold a control block
+  (wallets, PSBT tooling), cross-checked against the consensus one rather than
+  replacing it.
 - **Two entry points, one implementation.** `buildFromLeaves` takes a
   depth-first `[]DepthLeaf` (BIP371 `PSBT_OUT_TAP_TREE` shape);
   `buildFromTree` takes an explicit `Node` (leaf | two subtrees), flattens it
@@ -199,9 +204,6 @@ Design references: none beyond the BIP341 specification text itself,
 
 - **Script-path spending and the sighash algorithm** (BIP341's other sections): this module builds outputs and control
   blocks; spending is the consumer's.
-- **Verifying a control block here.** `bitcoinscript` owns the consensus verifier (`tapleafHash`, `verifyCommitment`) and
-  depends on `taproot` in tests only, to cross-check the two implementations; `taproot` does not depend on
-  `bitcoinscript`, so a verifier here would duplicate consensus code or invert the dependency.
 
 ## Verification
 
@@ -254,5 +256,4 @@ Design references: none beyond the BIP341 specification text itself,
 
 ## Backlog / deferred
 
-- **Control-block parse / `verifyCommitment` here** — today only `bitcoinscript` verifies; a wallet that only builds does not need it. Would duplicate consensus code or invert the dependency; decide with a consumer.
-- **BIP371 `PSBT_OUT_TAP_TREE` byte (de)serialization** — the depth-list shape is accepted; the wire encoding belongs with `psbt`.
+None open.

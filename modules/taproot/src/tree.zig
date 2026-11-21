@@ -166,6 +166,70 @@ pub const SpendInfo = struct {
     }
 };
 
+/// A parsed BIP341 control block: `(leaf_version | output_parity) ‖
+/// internal_key ‖ path`, `33 + 32m` bytes with `0 <= m <= 128`. Borrows the
+/// bytes it was parsed from.
+pub const ControlBlock = struct {
+    /// The leaf version, low bit cleared.
+    leaf_version: u8,
+    /// The output key's y-parity (the low bit of the first byte).
+    output_parity: u1,
+    internal_key: [32]u8,
+    /// `32 * m` bytes of Merkle path, leaf level first.
+    path: []const u8,
+
+    pub const ParseError = error{
+        /// Shorter than 33 bytes, longer than `33 + 32 * 128`, or not `33 + 32m`.
+        InvalidControlBlockSize,
+    };
+
+    pub fn parse(bytes: []const u8) ParseError!ControlBlock {
+        if (bytes.len < control_base_size or bytes.len > control_base_size + control_node_size * max_path_len)
+            return error.InvalidControlBlockSize;
+        if ((bytes.len - control_base_size) % control_node_size != 0) return error.InvalidControlBlockSize;
+        return .{
+            .leaf_version = bytes[0] & 0xfe,
+            .output_parity = @intCast(bytes[0] & 1),
+            .internal_key = bytes[1..33].*,
+            .path = bytes[control_base_size..],
+        };
+    }
+
+    /// Number of path nodes `m`.
+    pub fn pathLen(self: ControlBlock) usize {
+        return self.path.len / control_node_size;
+    }
+
+    /// The Merkle root a leaf with hash `leaf_hash` has under this path
+    /// (Bitcoin Core `ComputeTaprootMerkleRoot`).
+    pub fn merkleRoot(self: ControlBlock, leaf_hash: [32]u8) [32]u8 {
+        var k = leaf_hash;
+        var i: usize = 0;
+        while (i < self.path.len) : (i += control_node_size) k = tapBranchHash(k, self.path[i..][0..32].*);
+        return k;
+    }
+
+    /// BIP341 script-path commitment check (Bitcoin Core
+    /// `VerifyTaprootCommitment`): the output key `output_x` (the 32-byte
+    /// witness program) equals the internal key tweaked by the Merkle root
+    /// this control block gives `script` under `leaf_version`, with this
+    /// block's parity bit. An internal key that is not a curve point, or a
+    /// tweak `>= n`, is `false`.
+    pub fn verifyCommitment(self: ControlBlock, output_x: [32]u8, script: []const u8) bool {
+        const internal = bip340.XOnlyPublicKey.fromBytes(self.internal_key) catch return false;
+        const root_hash = self.merkleRoot(tapLeafHash(self.leaf_version, script));
+        const q = root.tweakPublicKey(internal, root_hash) catch return false;
+        return q.output.parity == self.output_parity and std.mem.eql(u8, &q.output.x, &output_x);
+    }
+};
+
+/// Parse `control_block` and run `ControlBlock.verifyCommitment` (false for a
+/// malformed block).
+pub fn verifyCommitment(output_x: [32]u8, control_block: []const u8, script: []const u8) bool {
+    const cb = ControlBlock.parse(control_block) catch return false;
+    return cb.verifyCommitment(output_x, script);
+}
+
 /// Build from a depth-first leaf list (BIP371 shape). An empty list is a
 /// key-path-only output (`merkle_root == null`). Every failure is a typed
 /// error; nothing is leaked on the error path.
