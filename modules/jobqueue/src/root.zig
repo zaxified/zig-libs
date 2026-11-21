@@ -51,6 +51,11 @@ const clock_lib = @import("clock");
 const Allocator = std.mem.Allocator;
 const kv = @import("kv");
 
+/// Cron expressions for repeating schedules (`Cron.parse`, `Cron.next`); see
+/// `cron.zig`.
+pub const Cron = @import("cron.zig").Cron;
+pub const CronParseError = @import("cron.zig").ParseError;
+
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
@@ -204,6 +209,13 @@ pub const EnqueueOptions = struct {
     /// `error.DuplicateJob` and writes nothing. Durable (stored in the job
     /// record), at most `max_field_len` bytes.
     unique_key: []const u8 = "",
+    /// 0 = the key is held until ack/cancel. Otherwise the key is released
+    /// this many ns of wall time after the enqueue even though the job is
+    /// still live (Asynq `Unique(ttl)`): after that another `enqueue` with the
+    /// same key is accepted, `findUnique` no longer finds the old job, and
+    /// acking or cancelling the old job leaves the new holder's key alone.
+    /// Durable (stored in the job record). Ignored without a `unique_key`.
+    unique_ttl_ns: u64 = 0,
 };
 
 /// `Queue.requeueDead` options.
@@ -230,6 +242,24 @@ pub const DequeueOptions = struct {
     /// O(partitions × excluded) on top of the dequeue; meant for a handful
     /// of keys (e.g. those waiting out a caller-side backoff).
     exclude: []const []const u8 = &.{},
+    /// Weighted dispatch across partitions (Asynq weighted queues, Sidekiq
+    /// weighted queues): when non-empty and no `partition` filter is set, the
+    /// partition to serve is chosen by these weights instead of by global
+    /// priority, in proportion over a run of calls: smooth weighted
+    /// round-robin (the nginx algorithm), deterministic, so a partition of
+    /// weight 3 is served three times for every one of a weight-1 partition
+    /// while both have visible work, and no one starves. A partition not
+    /// listed has weight 1; a listed weight 0 passes the partition over like
+    /// `exclude`. Inside the chosen partition the order is the usual one
+    /// (priority, then FIFO). The credits live in memory with the partition's
+    /// heap and restart when the partition runs dry. Borrowed for the call.
+    weights: []const PartitionWeight = &.{},
+};
+
+/// One entry of `DequeueOptions.weights`.
+pub const PartitionWeight = struct {
+    partition: []const u8,
+    weight: u32,
 };
 
 pub const NackOptions = struct {
@@ -288,11 +318,19 @@ pub const max_field_len: usize = 4096;
 //
 //   [31..35) unique_len    u32 LE
 //   [35..]   job_type ++ partition ++ payload ++ unique_key
+//
+// Version 3 (a job with a `unique_key` and a `unique_ttl_ns`): version 2 plus
+//
+//   [31..35) unique_len    u32 LE
+//   [35..43) unique_until_ns i64 LE (wall ns; > 0)
+//   [43..]   job_type ++ partition ++ payload ++ unique_key
 
 const rec_version: u8 = 1;
 const rec_version_unique: u8 = 2;
+const rec_version_unique_ttl: u8 = 3;
 const rec_fixed = 31;
 const rec_fixed_v2 = 35;
+const rec_fixed_v3 = 43;
 
 const JobState = enum(u8) { ready = 0, dead = 1 };
 
@@ -310,6 +348,8 @@ const Job = struct {
     lease_epoch: u32,
     /// "" = none. Owned; the `unique` index borrows it as its key.
     unique_key: []u8 = &.{},
+    /// Wall ns at which the key lapses; 0 = held until the job is removed.
+    unique_until_ns: i64 = 0,
 };
 
 const meta_key = "m/next_id";
@@ -366,6 +406,9 @@ fn readyBefore(a: ReadyEntry, b: ReadyEntry) bool {
 fn Heap(comptime T: type, comptime before: fn (T, T) bool) type {
     return struct {
         items: std.ArrayListUnmanaged(T) = .empty,
+        /// Smooth-weighted-round-robin credit of a partition heap (only the
+        /// weighted `dequeue` touches it; in memory, gone with the heap).
+        credit: i64 = 0,
 
         const Self = @This();
 
@@ -493,10 +536,9 @@ pub const Queue = struct {
         if (job_type.len > max_field_len or opts.partition.len > max_field_len or opts.unique_key.len > max_field_len)
             return Error.FieldTooLarge;
         std.debug.assert(opts.max_attempts >= 1);
-        if (opts.unique_key.len != 0 and self.unique.contains(opts.unique_key)) return UniqueError.DuplicateJob;
-
         const id = self.next_id;
         const wall = self.wall.now();
+        if (opts.unique_key.len != 0 and self.keyHeld(opts.unique_key, wall)) return UniqueError.DuplicateJob;
         const run_at = opts.run_at orelse addNs(wall, opts.delay_ns);
 
         const job = try self.gpa.create(Job);
@@ -520,6 +562,7 @@ pub const Queue = struct {
         errdefer self.gpa.free(job.partition);
         job.unique_key = try self.gpa.dupe(u8, opts.unique_key);
         errdefer self.gpa.free(job.unique_key);
+        if (opts.unique_key.len != 0 and opts.unique_ttl_ns != 0) job.unique_until_ns = addNs(wall, opts.unique_ttl_ns);
 
         try self.jobs.ensureUnusedCapacity(self.gpa, 1);
         if (job.unique_key.len != 0) try self.unique.ensureUnusedCapacity(self.gpa, 1);
@@ -536,7 +579,12 @@ pub const Queue = struct {
         try self.db.put(meta_key, &nb);
 
         self.jobs.putAssumeCapacity(id, job);
-        if (job.unique_key.len != 0) self.unique.putAssumeCapacity(job.unique_key, id);
+        if (job.unique_key.len != 0) {
+            // A lapsed holder is still in the index (`keyHeld` only looked);
+            // drop it so the map key points into this job, not the old one.
+            _ = self.unique.remove(job.unique_key);
+            self.unique.putAssumeCapacity(job.unique_key, id);
+        }
         self.pending.pushAssumeCapacity(.{ .run_at_ns = run_at, .id = id });
         self.ready_n += 1;
         self.next_id = id + 1;
@@ -579,7 +627,7 @@ pub const Queue = struct {
         try self.migrateDue(wall_now);
 
         const id = id: while (true) {
-            const found = self.bestReady(opts.partition, opts.exclude) orelse return null;
+            const found = self.bestReady(opts.partition, opts.exclude, opts.weights) orelse return null;
             const job = self.jobs.get(found.id) orelse {
                 // Cancelled while visible: its heap entry is a tombstone.
                 self.takeTop(found);
@@ -734,6 +782,7 @@ pub const Queue = struct {
 
     /// The live job holding `unique_key`, or null.
     pub fn findUnique(self: *const Queue, unique_key: []const u8) ?JobId {
+        if (!self.keyHeld(unique_key, self.wall.now())) return null;
         const id = self.unique.get(unique_key) orelse return null;
         return @fromBackingInt(@intCast(id));
     }
@@ -860,13 +909,14 @@ pub const Queue = struct {
 
     /// Best visible job: the partition's heap top under a filter, else the best
     /// top across all partitions (same (priority, id) order as within one).
-    fn bestReady(self: *Queue, filter: ?[]const u8, exclude: []const []const u8) ?Found {
+    fn bestReady(self: *Queue, filter: ?[]const u8, exclude: []const []const u8, weights: []const PartitionWeight) ?Found {
         if (filter) |p| {
             if (excluded(exclude, p)) return null;
             const e = self.parts.getEntry(p) orelse return null;
             const top = e.value_ptr.peek() orelse return null;
             return .{ .key = e.key_ptr.*, .heap = e.value_ptr, .id = top.id };
         }
+        if (weights.len != 0) return self.bestWeighted(exclude, weights);
         var best: ?Found = null;
         var best_entry: ReadyEntry = undefined;
         var it = self.parts.iterator();
@@ -878,6 +928,39 @@ pub const Queue = struct {
                 best = .{ .key = e.key_ptr.*, .heap = e.value_ptr, .id = top.id };
             }
         }
+        return best;
+    }
+
+    /// Smooth weighted round-robin over the partitions that have a top: every
+    /// candidate gains its weight, the richest is served and pays the total.
+    /// Ties go to the older top (`readyBefore`), so equal credits are decided
+    /// the way the unweighted dispatch decides them, not by map order.
+    fn bestWeighted(self: *Queue, exclude: []const []const u8, weights: []const PartitionWeight) ?Found {
+        var best: ?Found = null;
+        var best_entry: ReadyEntry = undefined;
+        var total: i64 = 0;
+        var it = self.parts.iterator();
+        while (it.next()) |e| {
+            if (excluded(exclude, e.key_ptr.*)) continue;
+            const top = e.value_ptr.peek() orelse continue;
+            var w: i64 = 1;
+            for (weights) |pw| {
+                if (std.mem.eql(u8, pw.partition, e.key_ptr.*)) {
+                    w = pw.weight;
+                    break;
+                }
+            }
+            if (w == 0) continue;
+            total += w;
+            e.value_ptr.credit += w;
+            if (best == null or e.value_ptr.credit > best.?.heap.credit or
+                (e.value_ptr.credit == best.?.heap.credit and readyBefore(top, best_entry)))
+            {
+                best_entry = top;
+                best = .{ .key = e.key_ptr.*, .heap = e.value_ptr, .id = top.id };
+            }
+        }
+        if (best) |b| b.heap.credit -= total;
         return best;
     }
 
@@ -978,6 +1061,13 @@ pub const Queue = struct {
         return capped;
     }
 
+    /// True while a live job holds `key` (a TTL'd key lapses at its wall time).
+    fn keyHeld(self: *const Queue, key: []const u8, wall: i64) bool {
+        const id = self.unique.get(key) orelse return false;
+        const holder = self.jobs.get(id) orelse return true;
+        return holder.unique_until_ns == 0 or wall < holder.unique_until_ns;
+    }
+
     fn persistJob(self: *Queue, job: *const Job) !void {
         const buf = try self.encodeJob(job);
         defer self.gpa.free(buf);
@@ -987,11 +1077,12 @@ pub const Queue = struct {
 
     fn encodeJob(self: *Queue, job: *const Job) ![]u8 {
         const v2 = job.unique_key.len != 0;
-        const fixed: usize = if (v2) rec_fixed_v2 else rec_fixed;
+        const v3 = v2 and job.unique_until_ns != 0;
+        const fixed: usize = if (v3) rec_fixed_v3 else if (v2) rec_fixed_v2 else rec_fixed;
         const total = fixed + job.job_type.len + job.partition.len + job.payload.len + job.unique_key.len;
         const buf = try self.gpa.alloc(u8, total);
         errdefer self.gpa.free(buf);
-        buf[0] = if (v2) rec_version_unique else rec_version;
+        buf[0] = if (v3) rec_version_unique_ttl else if (v2) rec_version_unique else rec_version;
         buf[1] = @backingInt(job.state);
         buf[2] = @backingInt(job.priority);
         std.mem.writeInt(u32, buf[3..7], job.attempts, .little);
@@ -1001,6 +1092,7 @@ pub const Queue = struct {
         std.mem.writeInt(u32, buf[23..27], @intCast(job.partition.len), .little);
         std.mem.writeInt(u32, buf[27..31], @intCast(job.payload.len), .little);
         if (v2) std.mem.writeInt(u32, buf[31..35], @intCast(job.unique_key.len), .little);
+        if (v3) std.mem.writeInt(i64, buf[35..43], job.unique_until_ns, .little);
         var o: usize = fixed;
         @memcpy(buf[o..][0..job.job_type.len], job.job_type);
         o += job.job_type.len;
@@ -1017,10 +1109,11 @@ pub const Queue = struct {
         if (buf.len < rec_fixed) return Error.CorruptRecord;
         const v2 = switch (buf[0]) {
             rec_version => false,
-            rec_version_unique => true,
+            rec_version_unique, rec_version_unique_ttl => true,
             else => return Error.CorruptRecord,
         };
-        const fixed: usize = if (v2) rec_fixed_v2 else rec_fixed;
+        const v3 = buf[0] == rec_version_unique_ttl;
+        const fixed: usize = if (v3) rec_fixed_v3 else if (v2) rec_fixed_v2 else rec_fixed;
         if (buf.len < fixed) return Error.CorruptRecord;
         const state_raw = buf[1];
         const pri_raw = buf[2];
@@ -1031,6 +1124,8 @@ pub const Queue = struct {
         const uq_len: u32 = if (v2) std.mem.readInt(u32, buf[31..35], .little) else 0;
         // A version-2 record exists only for a non-empty key.
         if (v2 and uq_len == 0) return Error.CorruptRecord;
+        const until: i64 = if (v3) std.mem.readInt(i64, buf[35..43], .little) else 0;
+        if (v3 and until <= 0) return Error.CorruptRecord;
         // What this module writes: max_attempts ≥ 1 (asserted at enqueue), a
         // ready job below its limit, a dead one at it. Anything else would
         // overflow the attempt arithmetic later, so it is refused here.
@@ -1069,6 +1164,7 @@ pub const Queue = struct {
         job.partition = try self.gpa.dupe(u8, part);
         errdefer self.gpa.free(job.partition);
         job.unique_key = try self.gpa.dupe(u8, uq);
+        job.unique_until_ns = until;
         return job;
     }
 
@@ -1077,6 +1173,7 @@ pub const Queue = struct {
             defer self.gpa.free(v);
             if (v.len == 8) self.next_id = std.mem.readInt(u64, v[0..8], .little);
         }
+        const wall_now = self.wall.now();
         var id: u64 = 1;
         while (id < self.next_id) : (id += 1) {
             var kb: [24]u8 = undefined;
@@ -1087,11 +1184,20 @@ pub const Queue = struct {
             // Reserve every slot first: once `jobs` owns the job, nothing
             // below may fail (an error after the put would free it twice —
             // here and in `open`'s `freeIndex`).
-            if (job.unique_key.len != 0) {
+            // A TTL'd key that has lapsed is not held; it stays off the index.
+            var indexed = job.unique_key.len != 0;
+            if (indexed and job.unique_until_ns != 0 and wall_now >= job.unique_until_ns) indexed = false;
+            if (indexed) {
                 // Two live records with one key cannot be written by this
-                // module (`enqueue` refuses the second): a store that has
-                // them was not written by it.
-                if (self.unique.contains(job.unique_key)) return Error.CorruptRecord;
+                // module (`enqueue` refuses the second) unless the older one's
+                // TTL lapsed (a wall clock that stepped back can leave both
+                // unexpired: the newer wins): a store that has them otherwise
+                // was not written by it.
+                if (self.unique.get(job.unique_key)) |old| {
+                    const holder = self.jobs.get(old).?;
+                    if (holder.unique_until_ns == 0) return Error.CorruptRecord;
+                    _ = self.unique.remove(job.unique_key);
+                }
                 try self.unique.ensureUnusedCapacity(self.gpa, 1);
             }
             try self.jobs.ensureUnusedCapacity(self.gpa, 1);
@@ -1100,7 +1206,7 @@ pub const Queue = struct {
                 .dead => try self.dlq.ensureUnusedCapacity(self.gpa, 1),
             }
             self.jobs.putAssumeCapacity(id, job);
-            if (job.unique_key.len != 0) self.unique.putAssumeCapacity(job.unique_key, id);
+            if (indexed) self.unique.putAssumeCapacity(job.unique_key, id);
             switch (job.state) {
                 // A job leased-but-not-acked at crash time was persisted as
                 // `ready` (the lease was in-memory only) — it comes back ready.
@@ -1112,7 +1218,13 @@ pub const Queue = struct {
 
     fn removeJob(self: *Queue, id: u64) void {
         if (self.jobs.fetchRemove(id)) |kve| {
-            if (kve.value.unique_key.len != 0) _ = self.unique.remove(kve.value.unique_key);
+            // Only the holder releases the key: a lapsed holder's key may
+            // belong to a newer job by now.
+            if (kve.value.unique_key.len != 0) {
+                if (self.unique.get(kve.value.unique_key)) |holder| {
+                    if (holder == id) _ = self.unique.remove(kve.value.unique_key);
+                }
+            }
             self.freeJob(kve.value);
         }
     }
@@ -1151,6 +1263,10 @@ fn freeDeadLetter(gpa: Allocator, dl: DeadLetter) void {
 // ── tests (deterministic: fake clocks + kv.SimStorage, no real time/disk) ────
 
 const testing = std.testing;
+
+test {
+    _ = @import("cron.zig");
+}
 
 /// Controllable wall clock (epoch ns).
 const FakeWall = struct {
@@ -1753,6 +1869,83 @@ test "requeueDead: an operator retry, with and without an attempt reset, durable
     try testing.expectEqual(@as(u32, 2), l.attempt);
     try q.nack(l, .{ .backoff_ns = 0 });
     try testing.expectEqual(@as(?Status, .dead), q.status(id));
+}
+
+test "unique_ttl_ns: the key lapses on the wall clock, durably, and the old job cannot free the new holder's key" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var first: JobId = undefined;
+    {
+        var q = try h.openQueue();
+        defer q.close();
+        first = try q.enqueue("t", "a", .{ .unique_key = "k", .unique_ttl_ns = 10 * one_ms });
+        var kb: [24]u8 = undefined;
+        const raw = (try q.db.get(testing.allocator, jobKey(&kb, 1))).?;
+        defer testing.allocator.free(raw);
+        try testing.expectEqual(@as(u8, 3), raw[0]);
+        h.wall.advance(9 * one_ms);
+        try testing.expectError(UniqueError.DuplicateJob, q.enqueue("t", "b", .{ .unique_key = "k" }));
+        try testing.expectEqual(@as(?JobId, first), q.findUnique("k"));
+        h.wall.advance(one_ms); // lapses at exactly ttl
+        try testing.expectEqual(@as(?JobId, null), q.findUnique("k"));
+    }
+    var q = try h.openQueue(); // a lapsed key stays lapsed across a reopen
+    defer q.close();
+    try testing.expectEqual(@as(?JobId, null), q.findUnique("k"));
+    const second = try q.enqueue("t", "b", .{ .unique_key = "k", .unique_ttl_ns = 5 * one_ms });
+    try testing.expectEqual(@as(?JobId, second), q.findUnique("k"));
+    try testing.expect(try q.cancel(first)); // the old, lapsed holder
+    try testing.expectEqual(@as(?JobId, second), q.findUnique("k")); // untouched
+    try testing.expectError(UniqueError.DuplicateJob, q.enqueue("t", "c", .{ .unique_key = "k" }));
+    try testing.expect(try q.cancel(second));
+    try testing.expectEqual(@as(?JobId, null), q.findUnique("k"));
+    // Without a key the ttl is ignored: still a version-1 record.
+    _ = try q.enqueue("t", "d", .{ .unique_ttl_ns = one_ms });
+    var kb: [24]u8 = undefined;
+    const raw = (try q.db.get(testing.allocator, jobKey(&kb, 3))).?;
+    defer testing.allocator.free(raw);
+    try testing.expectEqual(@as(u8, 1), raw[0]);
+}
+
+test "weighted dispatch: proportional over partitions, priority ignored across them, weight 0 passes over" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+    for (0..8) |_| _ = try q.enqueue("t", "a", .{ .partition = "a" });
+    for (0..8) |_| _ = try q.enqueue("t", "b", .{ .partition = "b", .priority = .critical });
+    const w = [_]PartitionWeight{ .{ .partition = "a", .weight = 3 }, .{ .partition = "b", .weight = 1 } };
+    var na: usize = 0;
+    var seq: [8]u8 = undefined;
+    for (&seq) |*c| {
+        const l = (try q.dequeue(.{ .visibility_timeout_ns = 100 * one_ms, .weights = &w })).?;
+        c.* = l.payload[0];
+        if (l.payload[0] == 'a') na += 1;
+    }
+    // 3:1 over a run of 8 (the unweighted dispatch would have served all of
+    // the critical partition first).
+    try testing.expectEqual(@as(usize, 6), na);
+    try testing.expectEqualStrings("abaaabaa", &seq); // the second pick is a credit tie: the critical top wins
+}
+
+test "weighted dispatch: unlisted partitions weigh 1, weight 0 is passed over" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q2 = try h.openQueue();
+    defer q2.close();
+    for (0..3) |_| _ = try q2.enqueue("t", "x", .{ .partition = "x" });
+    for (0..3) |_| _ = try q2.enqueue("t", "y", .{ .partition = "y" });
+    for (0..3) |_| _ = try q2.enqueue("t", "z", .{ .partition = "z" });
+    const only = [_]PartitionWeight{.{ .partition = "z", .weight = 0 }};
+    var got: [6]u8 = undefined;
+    for (&got) |*c| c.* = (try q2.dequeue(.{ .visibility_timeout_ns = 100 * one_ms, .weights = &only })).?.payload[0];
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, &got, "x"));
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, &got, "y"));
+    try testing.expect(got[0] != got[1] and got[2] != got[3] and got[4] != got[5]);
+    try testing.expectEqual(@as(?Lease, null), try q2.dequeue(.{ .visibility_timeout_ns = one_ms, .weights = &only }));
 }
 
 test "extendLease: a heartbeat keeps a long job from being reaped" {

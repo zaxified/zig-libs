@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — New: `Cron` (`Cron.parse`, `next`, `matches`; `CronParseError`) — five-field Vixie cron expressions (UTC, minute resolution) whose `next` feeds `EnqueueOptions.run_at`. Additive.
+- **2026-11-21** — New: `DequeueOptions.weights` (+ `PartitionWeight`) — smooth weighted round-robin across partitions (Asynq/Sidekiq weighted queues); empty (the default) = the strict-priority dequeue unchanged. Additive.
+- **2026-11-21** — New: `EnqueueOptions.unique_ttl_ns` — a unique key lapses that many wall ns after the enqueue (Asynq `Unique(ttl)`); 0 = held until ack/cancel as before. A TTL'd job is stored as a version-3 record, so a store with TTL'd jobs is not readable by older builds (jobs without a TTL stay v1/v2). Additive otherwise.
 - **2026-11-19** — New: `DequeueOptions.exclude` — partitions a `dequeue` passes over (nothing of theirs is leased or changed; a filtered partition that is excluded gives null). Default empty = the plain dequeue. Additive.
 - **2026-11-19** — New: `Queue.release(lease, .{ .delay_ns })` (+ `ReleaseOptions`) hands a lease back without counting an attempt — the job keeps its attempts and its place in the partition FIFO, never dead-letters and keeps its unique key; a delay is persisted like a `nack` backoff, no delay writes nothing. A released, reaped, acked or forged lease is `error.StaleLease`, as for `ack`/`nack`. Additive; existing calls unchanged.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private OS reads behind `WallClock.system` and `MonoClock.monotonic` (duplicate-code pass) now call `clock.realtimeNs()` / `clock.monotonicNs()`; the clock types are unchanged. New dependency: `clock`.

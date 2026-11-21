@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [taskforcesh/bullmq](https://github.com/taskforcesh/bullmq) | TypeScript | MIT | 9.5k | v6.3.10 (2026-09-29) | Redis queue with delays, priorities, rate limits, repeatable/cron jobs, flows *(inferred)*. |
 | Zig ecosystem | Zig | MIT | 0-17 | 2022-2026 | `zig-gamedev/zjobs` (MIT, 17 stars) is an in-memory thread-pool job queue, not durable; `seemsindie/pidgn_jobs` (MIT, 1 star; "job queues with flexible storage backends, retry strategies, cron scheduling, and telemetry", per README) is the only durable-style peer. Neither has partitions. Zig `std` has no job queue. |
 
-**Where we are ahead:** the only durable, single-file (no server, no Redis, no Postgres) background queue in pure Zig with lease/retry/DLQ, a durable id counter with crash-safe enqueue, per-partition FIFO under a priority override, scheduled visibility and injected wall and monotonic clocks so retries, backoff and lease expiry are testable under `kv.SimStorage`; `enqueue` returns only after fsync. **Where we are behind:** single process only (leases are in memory), no worker runtime (concurrency, graceful shutdown, handler registry) or web UI, no cron/repeating schedules, no weighted queues, no unique-key TTL (a key is held until ack/cancel, Asynq's can expire); each is in *Backlog / deferred*. Also built: job cancel, dead-letter requeue, lease heartbeat (`extendLease`), unique jobs, `status`, lease `release`, `dequeue` partition exclusion.
+**Where we are ahead:** the only durable, single-file (no server, no Redis, no Postgres) background queue in pure Zig with lease/retry/DLQ, a durable id counter with crash-safe enqueue, per-partition FIFO under a priority override, scheduled visibility and injected wall and monotonic clocks so retries, backoff and lease expiry are testable under `kv.SimStorage`; `enqueue` returns only after fsync. **Where we are behind:** single process only (leases are in memory), no worker runtime (concurrency, graceful shutdown, handler registry) or web UI, no scheduler (a cron expression parser is here, the caller enqueues each next run); each is in *Backlog / deferred*. Also built: unique-key TTL (`unique_ttl_ns`, as Asynq's `Unique(ttl)`), weighted dispatch across partitions (`DequeueOptions.weights`, as Asynq's and Sidekiq's weighted queues), a cron expression parser (`Cron`), job cancel, dead-letter requeue, lease heartbeat (`extendLease`), unique jobs, `status`, lease `release`, `dequeue` partition exclusion.
 
 ## Design & invariants
 
@@ -129,6 +129,31 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   writes that). `decodeJob` accepts exactly what `encodeJob` writes: version 1 or 2, a v2 key
   non-empty, `max_attempts ≥ 1`, `attempts ≤ max_attempts`, a ready job below its limit — the
   rest is `CorruptRecord` (a dead record with `max_attempts` 0 would underflow in `requeueDead`).
+- **Unique-key TTL.** `EnqueueOptions.unique_ttl_ns` (Asynq `Unique(ttl)`; 0 = held until ack/cancel, as
+  before) releases the key that many wall ns after the enqueue while the job is still live: the next
+  `enqueue` with the key is accepted and `findUnique` returns null. Lapse is decided lazily at
+  `enqueue`/`findUnique`, never by a timer. A TTL'd job is a **version-3 record** (version 2 plus
+  `unique_until_ns` i64 at 35..43, body from 43; `decodeJob` refuses a v3 record with a non-positive
+  deadline); jobs without a TTL stay v1/v2, so older builds still read such a store. The `unique` index
+  borrows the holder's key bytes, so a lapsed holder is dropped from the index before a new holder is
+  inserted, and `removeJob` frees a key only when the index still names that job (ack/cancel of a
+  lapsed job leaves the new holder alone). `open` does not index a lapsed key; two live records with one
+  key are `CorruptRecord` unless the older one has a TTL (a wall clock that stepped back can leave both
+  unexpired: the newer wins).
+- **Weighted dispatch.** `DequeueOptions.weights` (a `[]PartitionWeight`, no `partition` filter):
+  smooth weighted round-robin (nginx's algorithm) over the partitions that have a visible top, in
+  place of "best global top". Peers: Asynq weighted queues and Sidekiq weighted queues both pick a
+  queue by weight (randomly, in proportion); a deterministic scheme gives the same proportions and is
+  testable. Priority then orders jobs only inside the chosen partition; a partition not listed weighs 1,
+  weight 0 passes it over, ties in credit go to the older top. The credit is one `i64` on the
+  partition's heap (no allocation, gone when the partition runs dry). Strict priority stays the default.
+- **Cron expressions.** `Cron.parse` / `Cron.next(after_ns)` / `Cron.matches` (`src/cron.zig`): the
+  five-field Vixie syntax (lists, ranges, steps, `?`, month and weekday names, weekday 7, the `@hourly`
+  .. `@yearly` aliases), dom/dow ORed when both are restricted. Reference: Vixie cron, which Asynq's
+  scheduler (robfig/cron), Sidekiq-cron and BullMQ's repeat options follow. UTC, minute resolution,
+  null when no date matches. The result is meant for `EnqueueOptions.run_at`; the queue has no scheduler.
+  Not offered: `@every <duration>` and a time-zone argument (robfig has both; compute the offset or
+  use `delay_ns`).
 - **Recovery ownership.** Every slot (`jobs`, unique index, pending/dlq) is reserved before a
   recovered job is indexed, so an allocation failure frees the job once.
 
@@ -147,7 +172,7 @@ Not a security boundary — durability/correctness, not adversarial hardening:
 - **Damaged stored records** are refused with `error.CorruptRecord` (or decode to a job that keeps
   every invariant), never a panic; `open` refuses a store that holds two live jobs with one
   `unique_key`.
-- **Not provided:** cross-process leases and cron-expression schedules (see *Backlog / deferred*),
+- **Not provided:** cross-process leases and a scheduler thread (see *Backlog / deferred*),
   exactly-once and rate-limited dispatch (see *What is deliberately not done*).
 
 ## What is deliberately not done
@@ -155,6 +180,9 @@ Not a security boundary — durability/correctness, not adversarial hardening:
 - **Exactly-once delivery.** The queue is at-least-once; the idempotent consumer is the
   application's job (see *Threat model*).
 - **Rate-limited dispatch inside the queue.** Compose the `ratelimit` module around `dequeue`.
+- **A scheduler that fires cron entries.** `Cron` computes times; persisting a schedule and
+  re-enqueueing from it is the worker runtime's part (Backlog), because it needs a thread and a
+  handler registry. A caller enqueues the next run with `run_at = cron.next(now)` after each run.
 
 ## Verification
 
@@ -187,6 +215,7 @@ deterministic.
   an excluded tombstone stays put), and records: keyless jobs are still version-1, `decodeJob`
   refuses what the module never writes (a keyless v2 record, a dead job with `max_attempts` 0),
   `open` refuses two live jobs with one key.
+- **TTL, weights, cron:** unique-key TTL (lapse at exactly the deadline, across a reopen, an old lapsed holder cancelled without freeing the new holder's key, v3 record only with a key), weighted dispatch (3:1 over a run, priority ignored across partitions, unlisted = 1, weight 0 passed over), and `Cron` (common expressions, the dom/dow OR rule, leap day and impossible dates, lists/ranges/steps, refusals).
 - **Seeded sweeps:** a damaged-record sweep over `decodeJob` (v1 and v2 encodings with length
   fields, version, state/priority, attempt counts, truncation and random bytes damaged: always
   `CorruptRecord` or a job that keeps the invariants, with floors on how many inputs decode and how
@@ -204,17 +233,11 @@ deterministic.
 
 - **Durable, cross-process leases.** Leases live in memory (single-process worker model); several
   worker processes would need a shared queue and a cross-process lock in `kv`. Effort: large.
-- **Cron / repeating schedules.** Only `delay_ns`/`run_at` exist; no `* * * * *` parsing. Needs a
-  cron-expression parser (check for a sibling module first; a caller can enqueue the next run with
-  `run_at`, and a scheduler is a separate module's job). Effort: medium.
-- **Worker runtime** (concurrency, graceful shutdown, handler dispatch by job type): Sidekiq and
-  Asynq ship it; here the caller writes the loop (`workerpool` exists as a sibling). Likely a
-  separate module composing `jobqueue` + `workerpool`. Effort: medium.
-- **A background maintenance thread and compaction-trigger policy.** The visibility sweep
-  (`reapExpiredLeases`) is caller-driven; `kv.compact` is the caller's to schedule.
-- **Fair-share / weighted dispatch across partitions.** Dispatch is strict priority; there is no
-  round-robin or weighting over partitions. Pin a worker to a partition for isolation.
-- **A TTL on unique keys.** A key is held until ack/cancel; Asynq's can expire. No consumer asked.
+- **Worker runtime** (concurrency, graceful shutdown, handler dispatch by job type, a scheduler that
+  fires `Cron` entries, a background lease-sweep / `kv.compact` thread with a trigger policy):
+  Sidekiq and Asynq ship it; here the caller writes the loop and drives `reapExpiredLeases` and
+  `kv.compact` (`workerpool` exists as a sibling). A separate module composing `jobqueue` +
+  `workerpool`. Effort: large.
 
 ## Anchoring
 

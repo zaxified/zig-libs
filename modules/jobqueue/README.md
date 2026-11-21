@@ -124,7 +124,18 @@ _ = try q.dequeue(.{ .visibility_timeout_ns = 30 * std.time.ns_per_s, .exclude =
 // place in its partition (with a delay, newer jobs may go first meanwhile).
 try q.release(lease, .{ .delay_ns = 0 });  // or a delay, persisted like a nack backoff
 
-// At most one live job per key (until acked or cancelled), durable:
+// Weighted dispatch across partitions (smooth weighted round-robin; priority
+// then orders jobs inside the chosen partition only):
+_ = try q.dequeue(.{ .visibility_timeout_ns = 30 * std.time.ns_per_s, .weights = &.{
+    .{ .partition = "paid", .weight = 3 }, .{ .partition = "free", .weight = 1 },
+} });
+
+// A repeating job: compute the next fire time from a cron expression and
+// enqueue it (UTC, five fields, Vixie syntax); do this again after each run:
+const cron = try jobqueue.Cron.parse("*/15 8-18 * * MON-FRI");
+_ = try q.enqueue("report", payload, .{ .run_at = cron.next(now_ns).? });
+
+// At most one live job per key (until acked or cancelled, or for `unique_ttl_ns`), durable:
 _ = q.enqueue("welcome_email", payload, .{ .unique_key = "welcome:42" }) catch |e| switch (e) {
     error.DuplicateJob => {}, // already queued
     else => return e,
@@ -148,8 +159,8 @@ consumer **idempotent**.
 
 ## Not provided
 
-Exactly-once delivery and rate-limited dispatch (compose `ratelimit`) are
-refused (SPEC *What is deliberately not done*). Cross-process leases, cron
-schedules, a worker runtime, a background maintenance thread, fair-share /
-weighted dispatch across partitions and a TTL on unique keys are open work
-(SPEC *Backlog / deferred*); dispatch is strict priority (see above).
+Exactly-once delivery, rate-limited dispatch (compose `ratelimit`) and a
+cron scheduler (`Cron` only computes times) are refused (SPEC *What is
+deliberately not done*). Cross-process leases and a worker runtime (with a
+background maintenance thread) are open work (SPEC *Backlog / deferred*);
+dispatch is strict priority unless `DequeueOptions.weights` is set.
