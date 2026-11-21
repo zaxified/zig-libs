@@ -32,12 +32,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig ecosystem / `std` | Zig | — | — | — | None found. |
 
 **Where we are ahead:** of the Go and Rust libraries, CAKE and `mq` with the full option set,
-the psched rate tables done the way `tc` does (byte-exact goldens diffed against the real `tc`
-6.19), the standalone action table, hexadecimal handles and 64-bit rates; and it is the only
-Zig option. **Where we are behind:** `hfsc` classes (service curves) and `red`'s derived fields
-(`wlog`/`plog`/`scell_log`/`stab` are the caller's), eBPF-object `bpf` filters and
-`pedit`/`tunnel_key`/`connmark` (→ Backlog; all reachable via the `raw` escape hatches). `ingress`/`clsact`
-are typed, and statistics on qdisc/class dumps (`tc -s`) are decoded.
+the psched rate tables and `stab` size tables done the way `tc` does (byte-exact goldens diffed against the
+real `tc` 6.19), the standalone action table, chains, a notification monitor, hexadecimal handles and
+64-bit rates; and it is the only Zig option. **Where we are behind:** `red`'s derived fields
+(`wlog`/`plog`/`scell_log`/`stab` are the caller's), eBPF-object `bpf` (the caller loads the program and
+passes its fd) and `taprio`; the action kinds `tc` has beyond the thirteen typed ones, and every kind
+this module does not model, stay reachable through the `raw` escape hatches.
 
 ## Design & invariants
 
@@ -355,9 +355,9 @@ All are typed with goldens captured from iproute2 6.19.0 (attribute order read o
 - **`matchall` and `bpf` classifiers** (`FilterSpec.matchall` / `.bpf`, `Filter.matchall` / `.bpf`):
   matchall sends CLASSID, ACT, FLAGS (`skip_sw` = 2, `skip_hw` = 1); `bpf` carries an inline classic-BPF
   program (`BpfInsn`, 1..`bpf_max_insns`) and sends CLASSID, ACT, OPS_LEN, OPS, FLAGS_GEN, FLAGS
-  (`direct_action` is the `da` flag), each only when given. The eBPF forms `obj`/`fd`/`pinned` are not
-  modelled: `tc` loads the object through `bpf(2)`, which an unprivileged network namespace refuses, so no
-  golden could be captured (`FilterSpec.raw` covers them).
+  (`direct_action` is the `da` flag), each only when given. The eBPF forms go by file descriptor
+  (`Bpf.fd`, `.name`; `obj` and `pinned` are the caller's `bpf(2)` work): `tc` loads the object through
+  `bpf(2)`, which an unprivileged network namespace refuses, so no golden could be captured for them.
 - **Statistics on qdisc/class dumps** (`tc -s`): `Qdisc.stats` / `Class.stats: ?Stats` (bytes, packets,
   hardware counters, qlen, backlog, drops, requeues, overlimits, rate estimator `bps`/`pps`) from
   `TCA_STATS2` (basic, queue, `RATE_EST64` over `RATE_EST`, `PKT64` over the 32-bit packet count,
@@ -365,6 +365,63 @@ All are typed with goldens captured from iproute2 6.19.0 (attribute order read o
   `Qdisc.fq_codel_xstats` from `TCA_XSTATS` of an `fq_codel` qdisc. A sub-attribute shorter than its struct
   is skipped like other optional attributes (`stats` stays null when nothing valid decoded); a malformed
   nest is a codec error. Layouts are from the local UAPI headers.
+- **Kind statistics** (`Qdisc.xstats` / `Class.xstats: ?Xstats`): the kind's own counters for `htb`
+  (lends, borrows, giants, tokens), `hfsc` classes, `red`, `codel`, `fq_codel` (qdisc and flow) and `cake`
+  (qdisc-wide figures plus a `CakeTinStats` per tin), from the legacy `TCA_XSTATS` or — cake sends nothing
+  else — `TCA_STATS2`'s `TCA_STATS_APP`. cake's attribute numbers have an unused 0 and a 64-bit alignment
+  pad at 1; a live test in a network namespace checks the cake and htb decoders against the figures the
+  kernel itself dumps (`tc -s`). `action.Stats` carries the rate estimator too. Not decoded: fq's
+  `tc_fq_qd_stats` and filter statistics.
+
+### More actions, classifiers, chains, events and qdisc options
+
+Everything here has goldens captured from iproute2 6.19.0 (`tools/verify_goldens.py` re-derives them) unless
+said otherwise. Attribute order is the order `tc` sends them, read off the captures.
+
+- **Action kinds** beyond gact/mirred/police/skbedit/vlan: `connmark`, `csum`, `sample`, `tunnel_key`
+  (IPv4/IPv6, ports, tos/ttl, `nocsum` always sent, `nofrag`, a pre-encoded `enc_opts` for geneve/vxlan/erspan),
+  `mpls`, `nat`, `pedit`, `ct`, `ctinfo`, `gate`, `bpf` (classic bytecode, or an eBPF fd), `ife` and `simple`.
+  Their readbacks are in `Action.ext` (a union), kept apart from the older per-kind fields. Each kind's
+  verdict default is what `tc` sends (`pipe` for connmark, sample, tunnel_key, mpls, ct, ctinfo, gate, bpf, ife,
+  simple; `ok` for csum, nat, pedit). `pedit` keys are 32-bit words — `mask` (set bits are KEPT) and `val` as
+  the numbers read big-endian off the packet — and `peditMunge` splits a byte-range edit into them
+  (`munge ip6 dst set …`, `retain`); `extended = false` sends the legacy `TCA_PEDIT_PARMS`. `ct` always sends
+  `TCA_CT_ACTION` (0 for `ct zone N`); `gate` sends its entries as nested `TCA_GATE_ONE_ENTRY`. `simple`
+  has no golden (`tc` sends uninitialised bytes after the string) and the eBPF `bpf` form none (it needs a
+  loaded program).
+- **Per-action attributes:** every spec struct has `extra: Extra` — `TCA_ACT_HW_STATS` then `TCA_ACT_FLAGS`
+  (`skip_hw`/`skip_sw`/`no_percpu`), sent after the cookie as `tc` does; `Action` reads them back with
+  `used_hw_stats` and `in_hw_count`. `skbedit` also sends `mask` (`mark N/MASK`) and the 64-bit
+  `TCA_SKBEDIT_FLAGS` (`inheritdsfield`); `vlan` sends `push_eth` addresses. `police` takes `avrate`
+  (`TCA_POLICE_AVRATE`, which `tc` sends alone) and `pkt_rate`/`pkt_burst` (`PKTRATE64`, `PKTBURST64` timed
+  like the byte burst); a byte rate together with a packet rate is `error.RateConflict`.
+- **Composite verdicts and chains:** `Verdict.gotoChain(n)` / `.jump(n)` (28-bit operands). A filter lives in
+  a chain through `FilterTarget.chain` (`TCA_CHAIN`, sent before the kind; chain 0 sends none);
+  `message.buildChainAdd` / `Del` / `Get` and `Socket.chainAdd` / `chainDel` / `chains` are `tc chain …`
+  (an add may carry a template filter spec and its protocol). `Filter.chain` reads it back.
+- **Events:** `tc.monitor` joins `RTNLGRP_TC` (group 4, no privilege) and decodes each message of a received
+  datagram into a qdisc, class, filter, chain or action event (`added` false for `RTM_DEL*`).
+- **Classifiers:** `fw` (the mark is the filter's HANDLE; `mask`, `indev`), `route` (`route4Handle` builds
+  the handle `tc` computes from the realms and `fromif`), `basic` and `cgroup` (a flat list of ematches
+  joined by `EM_FLAG.REL_AND|OR`, `INVERT` for `not`; `EmCmp` and `emU32` encode the two common kinds, other
+  kinds pass their data as bytes). u32 gains hash tables (`divisor` alone, `hash`, `link` via `htHandle`),
+  `mark` (round trip only: `tc` sends an uninitialised hit counter), `indev`, `flags` and the selector's
+  variable-offset fields (`sel_flags`). flower gains MAC addresses, VLAN/QinQ, `tcp_flags`, TOS/TTL, ICMP
+  type/code, port ranges, `indev`, conntrack state/zone/mark/labels, ARP, MPLS, `ip_flags` and tunnel keys,
+  each with its mask (`Masked(T)`); a port range or ICMP key needs the matching `ip_proto`
+  (`error.PortWithoutProto`). `ct_label` has no golden: 6.19 sends an empty value for it. The SCTP port keys
+  are attributes 41/42 (27/28 are the tunnel keys).
+- **Qdisc options:** `QdiscTarget.stab` sends `TCA_STAB` after the options. `tc` builds the size table
+  itself, and so does this module: the smallest `cell_log` with `mtu >> cell_log < tsize`; entry `i` is
+  `(i + 1) << cell_log` raised to `mpu` and, for ATM, rounded up to whole 48-byte cells of 53; `size_log`
+  is the smallest shift that keeps the largest entry in 16 bits. No table is sent without ATM or an
+  `mpu` (plain overhead): the sizespec then carries only `overhead` and the link layer (a size table with a zero
+  `mtu` or `tsize` is `error.InvalidStab`). hfsc classes carry `rsc`/`fsc`/`usc` curves (`m1`, `d` in
+  microseconds, `m2`, bytes per second). netem gains `gemodel` and `state` loss models (`one_minus_h_pct` is
+  the command-line argument: `tc` sends `UINT32_MAX - scale(arg)`), `slot`, caller-supplied delay and slot
+  distribution tables, 64-bit `rate` (`RATE64` first, `~0U` in the 32-bit field) with overheads, `ecn` and
+  `seed`; percentages round half to even like `tc` (70% is `0xb3333332`). `pfifo_fast` (kind only),
+  `pfifo_head_drop` and `fq defrate` are typed.
 
 ### Dump filtering
 
@@ -435,6 +492,16 @@ caller-supplied rate/size can panic in ReleaseSafe or wrap in ReleaseFast.
   because `Filter` is a fixed-size value type; `Filter.act_list.total` reports the true count, and
   `Socket.actions()` (the standalone dump) is uncapped.
 - **Pre-4.14 kernels for netem** (no `TCA_NETEM_LATENCY64`/`JITTER64`; see *The netem encoding*).
+- **Options `tc` 6.19 has no keyword for:** `skbedit`'s `TXQ_SKBHASH` flag and `queue_mapping_max`, the
+  `codel` CE-threshold selector and mask, `fq`'s `bands` other than 3 (the kernel fixes three): no
+  reference to follow and no golden to capture. The raw escape hatches carry them.
+- **Typed tunnel option nests** (`geneve_opts`, `vxlan_opts`, `erspan_opts`): `TunnelKey.enc_opts` takes the
+  nest pre-encoded. **`hfsc` `umax`/`dmax`** is a command-line shorthand for `m1`/`d`; give the curve.
+  **Delay distribution tables** are data (`tc` reads them from its `.dist` files); the caller supplies one.
+- **eBPF object loading** (`obj`, `pinned`): `bpf(2)` work; pass the program's fd.
+- **Chain-scoped filter dumps** (`tc filter show chain N`): the dump request carries no `TCA_CHAIN` here;
+  `Socket.chains` lists the chains and `Filter.chain` tells which one a filter is in.
+- **fq's `tc_fq_qd_stats`, filter statistics, and `TCA_STATS_APP` on actions:** not decoded.
 - **Non-Linux, and big-endian hosts.** The goldens assert only on little-endian (they are captured
   bytes); the encoders themselves use host byte order like the kernel does.
 
@@ -455,47 +522,11 @@ Unverified gaps (the code exists, nothing observes it against the real thing):
 
 ## Backlog / deferred
 
-All reachable through the `raw` escape hatches today; each fits CONVENTIONS §2.
-
-- **More action kinds.** `pedit`, `tunnel_key`, `connmark`, `csum`, `sample`, `ct` (header rewrite and
-  tunnel actions used by most SDN-style setups; vishvananda/netlink has them; effort medium each, `pedit`
-  largest), then `bpf`, `ctinfo`, `gate`, `ife`, `mpls`, `nat`, `simple`. `ActionSpec.raw` takes a kind
-  string plus a pre-encoded options payload for all of them.
-- **Action extras.** `TCA_ACT_FLAGS` (`no_percpu`, `skip_hw`/`skip_sw`), `TCA_ACT_HW_STATS`/
-  `USED_HW_STATS`/`IN_HW_COUNT` and `tc actions flush`. `skbedit`'s `mask` decodes but is never emitted
-  (the iproute2 build used for the captures rejected the `mask` keyword, so there is no golden); its
-  `flags`/`queue_mapping_max` and `vlan`'s `push_eth`/`pop_eth` + `PUSH_ETH_DST`/`SRC` are neither emitted
-  nor decoded.
-- **police extras.** `TCA_POLICE_AVRATE` (iproute2 6.19 rejects `avrate` in the position the capture
-  harness could reach, so there is no golden and it is not emitted) and the packet-rate policer
-  `TCA_POLICE_PKTRATE64`/`PKTBURST64`.
-- **Chains and rtnetlink events.** `TC_ACT_GOTO_CHAIN` (the composite verdict decodes, `Verdict` is
-  non-exhaustive, but there is no helper to build one) and the chain machinery (`TCA_CHAIN`,
-  `tc chain add`); multicast rtnetlink events / a monitor, matching `netlink`'s scope (none there yet).
-  Effort: medium.
-- **More statistics.** Per-action rate estimator (`TCA_STATS_RATE_EST*`), `TCA_STATS_APP`, filter
-  statistics, `TCA_XSTATS` of kinds other than `fq_codel` qdiscs (and fq_codel *class* xstats), and CAKE's
-  `TCA_CAKE_STATS`/`TIN_STATS` (tin occupancy, drop/mark counters, capacity estimate; `CakeWire` carries the
-  configuration attributes only).
-- **Other classifiers.** `basic`, `route`, `fw`, `cgroup`, and `bpf` from an eBPF object or fd
-  (`obj`/`fd`/`pinned`; no golden can be captured in an unprivileged namespace, see above); anything not
-  typed needs `FilterSpec.raw`.
-- **u32 hash tables.** `TCA_U32_DIVISOR`/`HASH`/`LINK` (linked hash tables, `ht 800:` bucket routing)
-  and `TCA_U32_MARK`/`FLAGS`/`INDEV`. The selector's variable offset fields (`offshift`/`offmask`/`off`/
-  `offoff`/`hoff`/`hmask`, i.e. `at nexthdr+N`) are exposed on `U32` but have no golden and no helper.
-- **flower beyond L2–L4 basics.** MAC addresses, VLAN/CVLAN, MPLS, tunnel keys, ARP, ICMP type/code, TCP
-  flags, IP TOS/TTL, ct state, port ranges, `TCA_FLOWER_INDEV`.
-- **More qdisc options.** `hfsc` service curves on classes (only the qdisc-level `default_class` is
-  modelled); inside the classic kinds `fq`'s `defrate` (`FLOW_DEFAULT_RATE`, absent from iproute2 6.19's
-  usage) and priomap `bands` other than 3, `codel`'s CE-threshold selector/mask, and `pfifo_fast`/
-  `pfifo_head_drop`; `TCA_STAB` (size tables / per-packet overhead outside the rate table).
 - **RED parameter derivation.** `tc` derives `wlog`, `plog`, `scell_log` and the 256-octet `stab` from
   `burst`/`avpkt`/`probability`/`bandwidth` for `red` and `sfq` RED; the caller supplies them. Reproducing
   it needs either iproute2's source (GPL, not read) or a permissively licensed statement of the formulas;
-  the man page gives the recipe only in words. Effort: small once such a statement is at hand.
-- **netem distributions and GI/GE loss models.** `TCA_NETEM_LOSS`, `TCA_NETEM_DELAY_DIST` (needs the
-  distribution table), `TCA_NETEM_SLOT*`, `TCA_NETEM_RATE64`, `TCA_NETEM_ECN`; matters for realistic
-  impairment. Effort: medium.
+  the man page gives the recipe only in words, and the RED paper (Floyd and Jacobson 1993) gives the weight's
+  inequality but not `tc`'s `plog`, `scell_log` and `stab` conventions. Waits for such a statement.
 
 ## Verification
 
@@ -515,7 +546,7 @@ run with `unshare -rn zig build test-tc`.
   the action batch: gact (drop, pass + index, continue, probabilistic, cookie), mirred (redirect, mirror),
   police (plain, peak, 64-bit), skbedit, vlan push/pop/modify, the two chain goldens that pin the 1-based
   ordinals, flower with actions, and the standalone `tc actions` add/del/get/ls forms that pin the 4-byte
-  `tcamsg`. The class and tbf goldens include the full 1024-byte rate tables, and the police goldens their
+  `tcamsg`. The later additions (the action kinds, flower keys, u32 hash tables, the fw/route/basic/cgroup classifiers, chains, netem models, `stab` tables, hfsc classes) have goldens of their own, 150-odd more in all, listed by command in the comment above each. The class and tbf goldens include the full 1024-byte rate tables, and the police goldens their
   rate (and peak) tables, so the psched arithmetic and `tc_calc_rtable_64` are verified entry by entry.
 - **Re-deriving the goldens.** `modules/tc/tools/verify_goldens.py` re-runs the commands against a stock
   `tc` and diffs the bytes (`capture.sh` and `parse_strace.py` are its parts; see `modules/tc/tools/README.md`).

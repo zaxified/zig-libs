@@ -8,20 +8,27 @@ Zig with no `tc` binary shell-out and no libc.
   option-less multiqueue root whose per-queue child classes the kernel auto-creates), and
   `cake` (the CAKE AQM/shaper: bandwidth, RTT/target, DiffServ/flow modes, NAT, wash,
   ACK-filter, overhead/MPU/ATM, memory, split-GSO, fwmark, ingress), the classic `prio`,
-  `pfifo`/`bfifo`, `sfq`, `codel` and `fq`, plus a `raw`
-  escape hatch that takes a kind string and a pre-encoded `TCA_OPTIONS` payload.
+  `pfifo`/`bfifo`, `sfq`, `codel`, `fq`, `hfsc`, `red`, `pfifo_fast` and `pfifo_head_drop`, size
+  tables (`stab`), and a `raw` escape hatch that takes a kind string and a pre-encoded
+  `TCA_OPTIONS` payload; netem also has loss models, slots, distributions and a 64-bit rate.
 - **classes** (`RTM_NEWTCLASS`/`DELTCLASS`/`GETTCLASS`) — htb rate/ceil token buckets
   including the psched **rate tables** and the 64-bit `TCA_HTB_RATE64`/`CEIL64`
-  attributes for rates above 4.29 GB/s.
+  attributes for rates above 4.29 GB/s; hfsc service curves.
 - **filters** (`RTM_NEWTFILTER`/`DELTFILTER`/`GETTFILTER`) — `u32` (masked 32-bit matches
-  at fixed offsets), `flower` (structured L2–L4 keys: ethertype, ip_proto, IPv4/IPv6
-  prefixes, TCP/UDP/SCTP ports, classid), `matchall` and `bpf` (inline classic-BPF bytecode).
+  at fixed offsets, hash tables, links), `flower` (structured keys: ethertype, ip_proto, IPv4/IPv6
+  prefixes, ports and ranges, MAC, VLAN, ICMP, conntrack, ARP, MPLS, tunnel keys, classid),
+  `matchall`, `bpf` (inline classic-BPF bytecode or an eBPF fd), `fw`, `route`, `basic` and
+  `cgroup`; filters live in chains (`chain N`, `tc chain …`).
 - **actions** (`TCA_U32_ACT`/`TCA_FLOWER_ACT`, and the standalone
   `RTM_NEWACTION`/`DELACTION`/`GETACTION` table) — `gact` (pass/drop/continue/reclassify/
   trap, incl. the probabilistic `tc_gact_p`), `mirred` (egress/ingress × redirect/mirror),
   `police` (rate/burst/mtu/peakrate on the same psched rate tables, incl. `RATE64`),
-  `skbedit` (priority/mark/queue_mapping/ptype), `vlan` (push/pop/modify), plus a `raw`
-  escape hatch. Multi-action lists chain through the `TC_ACT_PIPE` verdict.
+  `skbedit` (priority/mark/queue_mapping/ptype), `vlan` (push/pop/modify), `connmark`, `csum`,
+  `sample`, `tunnel_key`, `mpls`, `nat`, `pedit`, `ct`, `ctinfo`, `gate`, `bpf`, `ife`, `simple`,
+  plus a `raw` escape hatch. Multi-action lists chain through the `TC_ACT_PIPE` verdict.
+- **notifications** — `tc.monitor` (`RTNLGRP_TC`): qdisc, class, filter, chain and action
+  events; **statistics** — `tc -s` counters and the kind's own (`htb`, `hfsc`, `red`, `codel`,
+  `fq_codel`, `cake`).
 - **handles** — a typed `Handle` for `major:minor` with `TC_H_ROOT`/`TC_H_INGRESS`/
   `TC_H_UNSPEC`, hexadecimal `parse`/`format` (`"1:10"` is minor **16**, exactly as `tc`
   reads and prints it).
@@ -137,7 +144,8 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
   like `tc`.
 - `QdiscSpec` = `.netem` | `.htb` | `.tbf` | `.fq_codel` | `.mq` | `.ingress` | `.clsact` | `.cake` | `.prio` | `.pfifo` | `.bfifo` | `.sfq` | `.codel` | `.fq` | `.hfsc` | `.red` | `.raw`;
   `ClassSpec` = `.htb` | `.raw`; `FilterSpec` = `.u32` | `.flower` | `.matchall` | `.bpf` | `.raw`;
-  `ActionSpec` = `.gact` | `.mirred` | `.police` | `.skbedit` | `.vlan` | `.raw`.
+  `ActionSpec` = `.gact` | `.mirred` | `.police` | `.skbedit` | `.vlan` | `.connmark` | `.csum` | `.sample` |
+  `.tunnel_key` | `.mpls` | `.nat` | `.pedit` | `.ct` | `.simple` | `.ctinfo` | `.gate` | `.bpf` | `.ife` | `.raw`.
 - `Verdict` — the `TC_ACT_*` return codes (`.ok`, `.shot`, `.pipe`, `.stolen`,
   `.reclassify`, `.trap`, `.unspec` = `tc`'s `continue`). `.pipe` is the one that
   **chains** into the next action of the list; everything else ends it. Non-exhaustive,
@@ -148,7 +156,7 @@ class's direct children, and `filters(ifi, parent)` matches the attach point exa
   (police's differently-shaped `tc_police` is reassembled into it).
 - `Action` — one decoded action: `order` (its 1-based place in the list), `kind()`,
   `gen`, `cookie()`, an optional per-kind wire struct (`a.gact`/`a.mirred`/`a.police`/
-  `a.skbedit`/`a.vlan`), plus `stats` and `tm` when the kernel sent them.
+  `a.skbedit`/`a.vlan`; the later kinds in `a.ext`), plus `stats` and `tm` when the kernel sent them.
   `Filter.actions()` returns the list attached to a dumped filter.
 - `Netem`, `Htb`, `HtbClass`, `Tbf`, `FqCodel`, `Mq`, `Ingress`, `Clsact`, `Cake` (+ `CakeDiffservMode`/
   `CakeFlowMode`/`CakeAtmMode`/`CakeAckFilter`), `U32` + `U32Key`, `Flower` + `Prefix4`/
