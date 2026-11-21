@@ -50,6 +50,14 @@
 //! the same count. rmcp has no schema validation on this path, so its echo
 //! row validates nothing (see its header). The card's `fastest` figure is
 //! ours / min(Go, rmcp) per workload, worst over the workloads.
+//!
+//! The official Python SDK (`tools/py_bench`, mcp 2.3.0 from the oracle venv of
+//! `tools/sdk_oracle`; `BENCH_PY=0` skips it, as does a missing venv) is timed
+//! the same way as one more row per workload, through `MCPServer` and its stdio
+//! runner over in-memory streams; it is a speed context, not part of the card's
+//! `ref` / `fastest` figures. Its count must agree too. The TypeScript SDK needs
+//! Node, which this host has only inside a browser-test cache (no `npm`, so no
+//! SDK): not measured.
 
 const std = @import("std");
 const bench = @import("benchkit");
@@ -62,6 +70,7 @@ const ref_short = "ref";
 const ref_card = "modelcontextprotocol/go-sdk v1.8.0";
 const fast_rs_manifest = "modules/mcp/tools/rs_field/Cargo.toml";
 const fast_rs_exe = "modules/mcp/tools/rs_field/target/release/mcp_rs_field";
+const py_exe = "modules/mcp/tools/py_bench/run.sh";
 
 const names = [_][]const u8{ "tools_call_echo", "tools_list_20", "resources_read", "prompts_get", "initialize_only" };
 const n_req = 64;
@@ -173,6 +182,10 @@ pub fn main(init: std.process.Init) !u8 {
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
     const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
     if (use_fast) rustBuild(arena, io) catch return 1;
+    const use_py = if (init.environ_map.get("BENCH_PY")) |v| !std.mem.eql(u8, v, "0") else pythonAvailable(io, init.environ_map);
+    var py_banner: []const u8 = "";
+    var worst_py: f64 = 0;
+    var best_py: f64 = std.math.inf(f64);
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
@@ -189,9 +202,11 @@ pub fn main(init: std.process.Init) !u8 {
         var ours: bench.Side = .{};
         var go: bench.Side = .{};
         var rs: bench.Side = .{};
+        var py: bench.Side = .{};
         for (0..rounds) |_| {
             go.add(try bench.foreign(arena, io, bench_name, exe, abs, name, null));
             if (use_fast) rs.add(try bench.foreign(arena, io, bench_name, fast_rs_exe, abs, name, &rs_banner));
+            if (use_py) py.add(try bench.foreign(arena, io, bench_name, py_exe, abs, name, &py_banner));
             ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true));
         }
         const ratio = ours.best_ns / go.best_ns;
@@ -208,8 +223,18 @@ pub fn main(init: std.process.Init) !u8 {
             worst_fast = @max(worst_fast, ours.best_ns / @min(go.best_ns, rs.best_ns));
             try w.print("{s:<18} {s:>12} {d:>12.0} {d:>8.3} {s:>7} {d:>6.1}%  rmcp{s}\n", .{ "", "", rs.best_ns, ours.best_ns / rs.best_ns, "", 100 * rs.spread(false), if (rs_same) "" else " ≠ " ++ ref_short });
         }
+        if (use_py) {
+            const py_same = py.count == go.count;
+            mismatch = mismatch or !py_same;
+            max_spread = @max(max_spread, py.spread(false));
+            const py_ratio = ours.best_ns / py.best_ns;
+            worst_py = @max(worst_py, py_ratio);
+            best_py = @min(best_py, py_ratio);
+            try w.print("{s:<18} {s:>12} {d:>12.0} {d:>8.4} {s:>7} {d:>6.1}%  python-sdk{s}\n", .{ "", "", py.best_ns, py_ratio, "", 100 * py.spread(false), if (py_same) "" else " ≠ " ++ ref_short });
+        }
         try w.flush();
     }
+    if (use_py and py_banner.len > 0) try w.print("python: {s}\n", .{std.mem.trim(u8, py_banner, " \n")});
     if (rs_banner.len > 0) try w.print("field: {s}\n", .{std.mem.trim(u8, rs_banner, " \n")});
     try w.print("rounds: {d}; ratios by wall time; largest spread {d:.1}%{s}\n", .{ rounds, 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
     if (mismatch) {
@@ -219,6 +244,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
     if (use_fast) try w.print("worst ours/fastest = {d:.2}\n", .{worst_fast});
+    if (use_py and worst_py > 0) try w.print("ours/python-sdk = {d:.4}-{d:.4} (not a card figure)\n", .{ best_py, worst_py });
     if (filters.len == 0) {
         if (use_fast)
             try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× rmcp 3.7.0 (Rust) (measured <today>)\n", .{ best, worst, ref_card, worst_fast })
@@ -227,6 +253,20 @@ pub fn main(init: std.process.Init) !u8 {
     }
     try w.flush();
     return 0;
+}
+
+/// The Python side needs the oracle venv's interpreter (`MCP_PYTHON` or the default of
+/// `tools/py_bench/run.sh`).
+fn pythonAvailable(io: std.Io, environ: *const std.process.Environ.Map) bool {
+    if (environ.get("MCP_PYTHON")) |p| {
+        std.Io.Dir.cwd().access(io, p, .{}) catch return false;
+        return true;
+    }
+    const home = environ.get("HOME") orelse return false;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/.local/share/zig-libs/oracle-venvs/mcp/bin/python", .{home}) catch return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
 }
 
 /// `cargo build --release --offline` of tools/rs_field.

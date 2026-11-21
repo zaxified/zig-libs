@@ -468,7 +468,7 @@ that the user who opens it is the user it was minted for) is the application's, 
 
 No diary here: the card's `**Performance:**` line carries the figures. The benchmark is `zig build bench-mcp`
 (`tools/bench.zig`; five stdio sessions of 64 requests each against the Go SDK, `tools/go_bench`, and the Rust SDK,
-`tools/rs_field`); the TypeScript SDK needs Node.
+`tools/rs_field`), plus the official Python SDK 2.3.0 as a speed context (`tools/py_bench`, `MCPServer` over its stdio runner on in-memory streams, EOF withheld until every request is answered as on the Go side; not a card figure). Measured 2026-11-21 under a loaded shared host: ours/python 0.0011-0.0037 (python spread up to 9x between rounds, the effect is two orders of magnitude, so the claim is only "over 100x faster per session"). The TypeScript SDK needs Node.
 
 **MCP Apps (`apps.zig`).** The Python SDK's `mcp.server.apps` and the TypeScript `registerAppTool` / `registerAppResource` over the
 existing `meta_json` and `setCapabilityExtras`: `toolMeta(arena, "ui://…", visibility)` writes `{"ui":{"resourceUri":…,"visibility":[…]}}`,
@@ -522,7 +522,7 @@ shapes of the client declaration. The iframe bridge belongs to the host and the 
   buffer.
 - **`mcp-http` still answers `subscriptions/listen` with an empty filter and closes** (its README); wiring its
   held-open SSE stream to `PushSink` is `mcp-http`'s item, the mechanism here is complete.
-- **Speed against the TypeScript and Python SDKs is not measured** (the card compares with the Go and Rust SDKs only).
+- **Speed against the TypeScript SDK is not measured** (and the TypeScript SDK as a differential peer, above): needs Node plus npm to install the SDK; this host has Node only inside a browser-test cache, no npm, and no network install without root of a full Node. Waits on a Node install.
 
 ## Anchoring
 
