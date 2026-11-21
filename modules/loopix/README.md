@@ -29,7 +29,7 @@ positive controls that must fail, how anonymous a Loopix configuration is:
 - with **providers and mailboxes** (constant-size pulls), **sender-chosen
   delays** as deployed, and **n−1 detection** from loop cover against an
   attacker blocking a mix (`Attack`, `Loopix.alarms`);
-- at what cost (`TrafficStats`: latency, cover overhead, delivery).
+- at what cost (`TrafficStats`: latency, cover overhead in packets and bytes, delivery).
 
 ```zig
 const loopix = @import("loopix");
@@ -45,7 +45,7 @@ const per_mix = try loopix.measure(gpa, mix.transcript(), law);
 const e2e = try loopix.measureEndToEnd(gpa, mix.transcript(), mix.origins(),
     loopix.PROVIDER_CFG.clients, loopix.PROVIDER_CFG.layers - 1, law);
 if (!per_mix.holds(.{}) or !e2e.holds(.{})) return error.AnonymityBroken;
-const cost = mix.stats(); // latency, overhead, delivery
+const cost = mix.stats(); // latency, overhead, delivery, link_bytes, bytes_per_real
 
 // n−1: block a middle-layer mix for a while; clients notice their loops.
 mix.attack = .{ .mix = loopix.PROVIDER_CFG.mixNode(1, 0), .start = 700, .stop = 1400 };
@@ -100,7 +100,7 @@ mix.attack = .{ .mix = loopix.PROVIDER_CFG.mixNode(1, 0), .start = 700, .stop = 
 ## Not provided
 
 No real transport (it is a simulator, not a node), no PKI, no cascade or batch-and-reorder mixing, no
-receiver-side metric: see SPEC.md *What is deliberately not done* and *Backlog / deferred*.
+receiver-side metric: see SPEC.md *What is deliberately not done*, *Backlog / deferred* and *Roadmap*.
 
 Provenance: clean-room from the Loopix paper (Piotrowska et al., USENIX Security
 2017); Sphinx packet reused from this repo's `sphinx` module. No third-party

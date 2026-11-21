@@ -158,6 +158,15 @@ pub const TrafficStats = struct {
     overhead: f64 = 0,
     mean_latency: f64 = 0,
     max_latency: Time = 0,
+    /// Every byte the protocol put on any link: client packets, mix-to-mix
+    /// forwards, provider forwards, mailbox requests and the padded mailbox
+    /// answers. What the network carries, cover and padding included.
+    link_bytes: u64 = 0,
+    /// The bytes of mailbox answers alone (`fetch_batch` slots each, padded).
+    fetch_bytes: u64 = 0,
+    /// `link_bytes` per real packet delivered — the bandwidth cost in bytes of
+    /// one application message, everything included (0 if none delivered).
+    bytes_per_real: f64 = 0,
 };
 
 const Sent = struct { client: u8, at: Time, kind: MsgKind, recipient: NodeId };
@@ -192,6 +201,9 @@ const Relay = struct {
     malformed: u64 = 0,
     /// A packet delivered a second time, or to a client it was not for.
     misdelivered: u64 = 0,
+    /// Bytes put on links (`send`), and of those the mailbox answers'.
+    link_bytes: u64 = 0,
+    fetch_bytes: u64 = 0,
     next_id: u64 = 1,
     real_seq: u64 = 0,
     cover_seq: u64 = 0,
@@ -232,9 +244,18 @@ const Relay = struct {
         self.fetch_lens.clearRetainingCapacity();
         self.malformed = 0;
         self.misdelivered = 0;
+        self.link_bytes = 0;
+        self.fetch_bytes = 0;
         self.next_id = 1;
         self.real_seq = 0;
         self.cover_seq = 0;
+    }
+
+    /// Every send of the protocol goes through here, so the byte count is
+    /// exactly what the links were handed.
+    fn send(self: *Relay, sim: *Sim, from: NodeId, to: NodeId, bytes: []const u8) anyerror!void {
+        self.link_bytes += bytes.len;
+        try sim.send(from, to, bytes);
     }
 
     /// Originate one message from `src_client` toward `dest`, tagged `kind`,
@@ -255,7 +276,7 @@ const Relay = struct {
         var buf: [MixHeader.wire_len]u8 = undefined;
         hdr.encode(&buf);
         const first = if (self.cfg.providers > 0) self.cfg.providerOf(src_client) else hdr.route[0];
-        try sim.send(self.cfg.clientNode(src_client), first, &buf);
+        try self.send(sim, self.cfg.clientNode(src_client), first, &buf);
         try self.origins.append(self.gpa, .{ .id = hdr.id, .client = src_client });
         try self.sent.put(self.gpa, hdr.id, .{ .client = src_client, .at = sim.timeNow(), .kind = kind, .recipient = hdr.recipient });
         return hdr;
@@ -324,7 +345,7 @@ const Relay = struct {
         const next = hdr.route[hdr.hop];
         var buf: [MixHeader.wire_len]u8 = undefined;
         hdr.encode(&buf);
-        try sim.send(node, next, &buf);
+        try self.send(sim, node, next, &buf);
     }
 
     /// The header a MIX may act on: it decodes, and names this node as the
@@ -361,7 +382,8 @@ const Relay = struct {
             mbox.shrinkRetainingCapacity(mbox.items.len - n);
             const len = 2 + @as(usize, cfg.fetch_batch) * MixHeader.wire_len;
             try self.fetch_lens.append(self.gpa, len);
-            try sim.send(node, from, buf[0..len]);
+            self.fetch_bytes += len;
+            try self.send(sim, node, from, buf[0..len]);
             return;
         }
         const hdr = MixHeader.decode(payload) catch {
@@ -371,7 +393,7 @@ const Relay = struct {
         if (hdr.hop == 0 and hdr.n_hops > 0 and cfg.isClient(from) and cfg.providerOf(cfg.clientIndex(from)) == node) {
             var buf: [MixHeader.wire_len]u8 = undefined;
             hdr.encode(&buf);
-            try sim.send(node, hdr.route[0], &buf);
+            try self.send(sim, node, hdr.route[0], &buf);
         } else if (hdr.n_hops > 0 and hdr.hop == hdr.n_hops and hdr.route[hdr.n_hops] == node and
             cfg.layerOf(from) == cfg.layers - 1 and cfg.isClient(hdr.recipient) and
             cfg.providerOf(cfg.clientIndex(hdr.recipient)) == node)
@@ -433,7 +455,7 @@ const Relay = struct {
     }
 
     fn fetch(self: *Relay, sim: *Sim, node: NodeId) anyerror!void {
-        try sim.send(node, self.cfg.providerOf(self.cfg.clientIndex(node)), &.{FETCH_REQ});
+        try self.send(sim, node, self.cfg.providerOf(self.cfg.clientIndex(node)), &.{FETCH_REQ});
         try sim.setTimer(node, self.cfg.fetch_period, FETCH_TIMER);
     }
 
@@ -453,6 +475,9 @@ const Relay = struct {
         }
         if (st.real_delivered > 0) st.mean_latency = sum / @as(f64, @floatFromInt(st.real_delivered));
         if (st.real_sent > 0) st.overhead = @as(f64, @floatFromInt(st.cover_sent)) / @as(f64, @floatFromInt(st.real_sent));
+        st.link_bytes = self.link_bytes;
+        st.fetch_bytes = self.fetch_bytes;
+        if (st.real_delivered > 0) st.bytes_per_real = @as(f64, @floatFromInt(self.link_bytes)) / @as(f64, @floatFromInt(st.real_delivered));
         return st;
     }
 };
@@ -1041,6 +1066,71 @@ test "providers: every packet reaches its recipient through the mailbox, and eve
     try testing.expect(st.mean_latency > 100 and st.mean_latency < 220);
     // Cover dominates the volume, as it must for the sets below.
     try testing.expect(st.overhead > 1.5);
+
+    // Bytes: every packet the transcript shows leaving a mix, every packet a
+    // client sent, and every mailbox answer are on the links, so the total is
+    // at least their sum; the answers are exactly the fetch lengths.
+    const W = MixHeader.wire_len;
+    var fetch_sum: u64 = 0;
+    for (lens) |l| fetch_sum += l;
+    try testing.expectEqual(fetch_sum, st.fetch_bytes);
+    const floor = (mix.transcript().len + st.real_sent + st.cover_sent) * W + fetch_sum;
+    try testing.expect(st.link_bytes >= floor);
+    // ...and at most each sent packet over every leg (client→provider,
+    // provider→layer 0, one per layer, layer→provider) plus the fetch traffic.
+    const fetch_reqs = lens.len + P.clients; // at most one unanswered per client
+    const ceiling = (st.real_sent + st.cover_sent) * W * (2 + @as(usize, P.layers)) + fetch_sum + fetch_reqs;
+    try testing.expect(st.link_bytes <= ceiling);
+    try testing.expectEqual(@as(f64, @floatFromInt(st.link_bytes)) / @as(f64, @floatFromInt(st.real_delivered)), st.bytes_per_real);
+}
+
+/// A larger network than the anonymity sweeps run: 3 layers × 10 mixes,
+/// 120 clients behind 10 providers = 160 nodes.
+pub const LARGE_CFG = LoopixConfig{ .width = 10, .clients = 120, .providers = 10, .sender_chosen_delays = true, .real_period = 120 };
+
+pub fn largeScenario(sim: *Sim) anyerror!void {
+    try buildTopology(sim, LARGE_CFG);
+}
+
+test "scale: 160 nodes deliver every due packet, malformed-free, with per-mix and end-to-end anonymity" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const C = LARGE_CFG;
+    var mix = try Loopix.init(gpa, C, 7);
+    defer mix.deinit(gpa);
+    const until: Time = 1500;
+    // Wider than `COOLDOWN`: with ~10x the packets, the tail of three
+    // exponential holds past 300 ticks is hit near the horizon.
+    const cool: Time = 600;
+    _ = try netsim.replay(gpa, .{ .seed = 7, .scenario = largeScenario, .protocol = mix.protocol(), .until = until }, &.{}, null);
+    try testing.expectEqual(@as(u64, 0), mix.relay.malformed);
+    try testing.expectEqual(@as(u64, 0), mix.relay.misdelivered);
+    const st = mix.stats();
+    try testing.expect(st.real_sent > 800);
+    var due: usize = 0;
+    var it = mix.relay.sent.valueIterator();
+    while (it.next()) |s| {
+        if (s.kind == .real and s.at + cool <= until) due += 1;
+    }
+    var on_time: usize = 0;
+    for (mix.deliveries()) |d| {
+        if (d.kind == .real and d.sent + cool <= until) on_time += 1;
+    }
+    try testing.expectEqual(due, on_time);
+    try testing.expect(st.bytes_per_real > @as(f64, @floatFromInt(MixHeader.wire_len * (2 + @as(usize, C.layers)))));
+    // Per-mix and end-to-end sender anonymity hold at this size too.
+    const exp_model = adversary.DelayModel{ .exponential = @floatFromInt(C.mean_delay) };
+    var windowed = try std.ArrayListUnmanaged(Transit).initCapacity(gpa, mix.transcript().len);
+    defer windowed.deinit(gpa);
+    for (mix.transcript()) |t| {
+        var w = t;
+        if (t.kind == .real and mix.relay.sent.get(t.id).?.at + cool > until) w.kind = .drop_cover;
+        windowed.appendAssumeCapacity(w);
+    }
+    const r = try adversary.measure(gpa, windowed.items, exp_model);
+    try testing.expect(r.holds(types.AnonymityBound{}));
+    const e = try adversary.measureEndToEnd(gpa, windowed.items, mix.origins(), C.clients, C.layers - 1, exp_model);
+    try testing.expect(e.holds(types.SenderBound{}));
 }
 
 test "providers: sender-chosen holds keep the per-mix invariant and stay memoryless" {

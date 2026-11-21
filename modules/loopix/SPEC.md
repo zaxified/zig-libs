@@ -199,7 +199,16 @@ mixing core itself — is where the design's weight lies.
   can know when a loop is due) — which is the reason Loopix puts the delays in
   the packet.
 - **Traffic cost** (`TrafficStats`): real/cover packets sent, delivery,
-  end-to-end latency (mean/max), cover overhead per real packet.
+  end-to-end latency (mean/max), cover overhead per real packet, and the same
+  in bytes: every byte the protocol hands a link (`link_bytes`, counted in the
+  one `Relay.send` every send goes through — client packets, mix and provider
+  forwards, mailbox requests, padded mailbox answers), the answers alone
+  (`fetch_bytes`) and `bytes_per_real`, the network's bytes per delivered
+  application message, cover and padding included. Bytes are those of the
+  modeled `MixHeader` (`wire_len`); a real Sphinx packet is larger by a constant
+  factor per packet, which does not change any ratio.
+- **Scale** (`LARGE_CFG`, `largeScenario`): 3 layers × 10 mixes, 120 clients
+  behind 10 providers, 160 nodes (the `u8` node id caps a network at 255).
 
 ## Known limits
 
@@ -241,6 +250,9 @@ is skipped.
   raises the alarm during the attack, a clean network none, a loop's deadline is exactly its holds plus
   every leg at worst plus one fetch plus the slack; config validation refuses what would overflow the
   header, the casts or the mailboxes; a mix drops a header that does not name it as the current hop.
+- **Scale and bytes:** at 160 nodes every due packet is delivered, nothing is malformed, and the per-mix and
+  end-to-end bounds hold; the byte count lies between what the transcript proves was sent and every leg of
+  every packet, and the mailbox bytes equal the answer lengths.
 - **Codec and fuzz:** `MixHeader` round trip and fail-closed decode. `LOOPIX_FUZZ=<runs>[,<first seed>]`
   runs the deterministic driver (testkit) over the harnesses `loopix-header` (header decode) and
   `loopix-inject` (hostile packets into the relay handlers: never panic, never mis-deliver); each harness
@@ -250,13 +262,15 @@ is skipped.
 
 ## Backlog / deferred
 
-- **A deployable Loopix node/client (real transport):** today the module cannot carry a byte over a network; Nym and Katzenpost can. Needs real transport, a PKI/epoch directory, and the real Sphinx header carrying the sender-chosen delays (the simulator models providers with mailboxes and sender-chosen delays already, with a modeled header). Effort L. Fits §2 (pure Zig) but overlaps `sphinx`/`noise` work; decide whether it is wanted at all before starting.
-- **Nym-compatible Sphinx (Curve25519):** interop with the only large deployed network needs its packet format; the repo's `sphinx` is secp256k1. Effort M-L. Fits §2.
 - **Topologies beyond stratified:** cascade, multi-cascade, free-route — the reference simulates all four. Effort M (routing + scenario builder; the metrics are topology-agnostic once a mix's layer is not assumed). Fits §2.
 - **Batch-and-reorder (threshold/timed pool) mixing:** the reference's second mixing technique; here only as the order-preserving FIFO control. Effort M. Fits §2.
 - **Mix-originated cover (mix loops):** Loopix mixes send their own loops to detect attacks on themselves; here only clients do. Effort S–M. Fits §2.
 - **Sender–receiver third-party unlinkability and receiver anonymity:** the reference's second metric; here only sender anonymity end to end. Effort M. Fits §2.
-- **Overhead in bytes, larger scale:** overhead is counted in packets; runs are tens of nodes. Effort S / M.
+
+## Roadmap
+
+- **A deployable Loopix node/client (real transport):** today the module cannot carry a byte over a network; Nym and Katzenpost can. Needs real transport, a PKI/epoch directory, and the real Sphinx header carrying the sender-chosen delays (the simulator models providers with mailboxes and sender-chosen delays already, with a modeled header). Fits §2 (pure Zig) but overlaps `sphinx`/`noise` work; decide whether it is wanted at all before starting. Project-size: a networked node, a directory service and a wire format.
+- **Nym-compatible Sphinx (Curve25519):** interop with the only large deployed network needs its packet format; the repo's `sphinx` is secp256k1. Fits §2. Project-size: a second Sphinx packet family matched byte-for-byte to Nym's, which needs a live or recorded Nym oracle.
 
 ## Anchoring
 
