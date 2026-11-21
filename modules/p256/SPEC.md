@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [briansmith/ring](https://github.com/briansmith/ring) | Rust/asm | ISC-style + Apache-2.0 parts (LICENSE read) | 4.1k | pushed 2026-07-23 | ECDSA P-256 sign/verify and ECDH agreement with BoringSSL-derived nistz256 *(inferred)*; no point-level API. |
 | Zig `std.crypto.ecc.P256` + `sign.ecdsa` | Zig | MIT | — | Zig 0.16.0 | Portable fiat-crypto field, no asm; full point API, SEC1 codecs, ECDSA over any hash. This module is bit-exact with it and about 10× faster on sign, 3× on verify (README, one host). |
 
-**Where we are ahead:** the fastest pure-Zig P-256 by a wide margin and close to OpenSSL nistz256 on sign, verify and ECDH without C or libc (the card's **Performance:** line); bit-exact with `std` and RFC 6979; ECDH (`ecdh`/`ecdhInto`) and ECDSA over any hash (`Ecdsa(Hash)`) in std's shape, both burned; Wycheproof ECDSA (SHA-256 P1363 + DER, SHA-512 P1363 + DER, SHA3-256 DER) and Wycheproof ECDH vectors, NIST CAVP 186-4 SigVer/SigGen/KeyPair/PKV and the ECC CDH primitive; ctgrind targets with positive controls; drop-in `EcdsaP256Sha256` shape. **Where we are behind:** asm only on amd64+ADX/BMI2, other targets run the portable Solinas path (aarch64 field core → *Backlog / deferred*); no hash-to-curve (RFC 9380 P256_XMD:SHA-256_SSWU_RO_ — RustCrypto has it; → *Backlog / deferred*). Key codecs (PKCS#8/SPKI/PEM) deliberately live with the consumers, see *What is deliberately not done*.
+**Where we are ahead:** the fastest pure-Zig P-256 by a wide margin and close to OpenSSL nistz256 on sign, verify and ECDH without C or libc (the card's **Performance:** line); bit-exact with `std` and RFC 6979; ECDH (`ecdh`/`ecdhInto`) and ECDSA over any hash (`Ecdsa(Hash)`) in std's shape, both burned; Wycheproof ECDSA (SHA-256 P1363 + DER, SHA-512 P1363 + DER, SHA3-256 DER) and Wycheproof ECDH vectors, NIST CAVP 186-4 SigVer/SigGen/KeyPair/PKV and the ECC CDH primitive; ctgrind targets with positive controls; drop-in `EcdsaP256Sha256` shape. **Where we are behind:** asm only on amd64+ADX/BMI2, other targets run the portable Solinas path (aarch64 field core → *Backlog / deferred*); no hash-to-curve point API (RFC 9380 P256_XMD:SHA-256_SSWU_RO_ — RustCrypto has it, OpenSSL does not; `voprf` implements the suite; → *What is deliberately not done*). Key codecs (PKCS#8/SPKI/PEM) deliberately live with the consumers, see *What is deliberately not done*.
 
 ## Dedup — why this module exists although std HAS P-256
 
@@ -344,15 +344,16 @@ formulas in nistz256's operation order, the Jacobian windowed multiply and comb)
 - **GLV.** P-256 admits no efficiently computable endomorphism, so there is no scalar split (see *No GLV*).
 - **A std-gap role.** std already has P-256; this module exists for speed (see *Dedup*), and tracks std byte for byte
   rather than extending its API.
+- **Hash-to-curve (RFC 9380 `P256_XMD:SHA-256_SSWU_RO_`) as a point API here.** The reference, OpenSSL 3.5.5, has none,
+  nor do std and Go's `crypto/ecdh` (RustCrypto's `p256` does, behind a feature); the collection's RFC 9380 hashing to
+  the NIST curves lives with its consumer, `voprf` (`src/h2c.zig`, the P256-SHA256 suite with the RFC's vectors).
+- **A self-hosted-backend compile in the module's checks.** No gate or CI lane uses the self-hosted backend (edit loop
+  only). That backend builds the portable field path: `fast_core.supported` is false under it (its assembler rejects
+  `movabsq` and it runs out of registers in `addRegs`/`subRegs`; see the `self-hosted backend:` comment there), and a
+  regression would show in the edit loop and be fixed there.
 
 ## Backlog / deferred
 
-- **Self-hosted Debug does not compile.** `fast_core.zig` says "No `movabsq` (rejected by the self-hosted assembler)",
-  but `fast_core.zig` and the generated `point_asm.zig` use it; the self-hosted backend also
-  runs out of registers lowering inline asm at `fast_core.zig` (`addRegs`/`subRegs`). Any consumer's `-fno-llvm`
-  Debug build (the edit loop) fails in p256. Plan: the module's own recipe (`movl $imm32` + `shlq`/`orq`), in the generator
-  for `point_asm`; then a self-hosted Debug `modtest` lane (or a `-Dselfhosted` compile) so it cannot regress silently.
-  montint has the same gap.
 - **ECDH lever.** About 1.05× OpenSSL, not re-profiled since the generated point formulas. Candidates: keep the CIOS output
   in r8..r11 so a multiply's result forwards into a following add/sub without moves; fuse the `3·M` and `2·S` add chains;
   nistz256's `mul_by_2`/`mul_by_3` shapes. Measure the doubling's cycles in isolation first. None is needed for P2.
@@ -362,10 +363,6 @@ formulas in nistz256's operation order, the Jacobian windowed multiply and comb)
 - **aarch64 field core and point formulas.** The `MULX/ADX` core and `point_asm` are amd64-only; ARM servers get the
   portable Montgomery path, whose speed relative to std's is unmeasured here. Effort: medium (a `umulh` product with the
   existing reduction). Fits CONVENTIONS §2.
-- **Hash-to-curve (RFC 9380 P256_XMD:SHA-256_SSWU_RO_)**, deferred: no module of the collection asks for it of P-256 today
-  (hash-to-curve exists in `bls12_381` only), and a point-level `hashToCurve` is one more public surface to keep correct.
-  Effort: medium (SSWU map, isogeny-free for P-256, plus the RFC's vectors).
-
 ## Anchoring
 
 **Anchor grade:** class B · oracle EXTERNAL

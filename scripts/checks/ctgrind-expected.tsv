@@ -526,9 +526,9 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 montint	ReleaseFast	dyn	1	2	65b77fe3c4c660f8	94e445ba261b2dab
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity in group.zig per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
-p256	ReleaseFast	comb	1	1	a7818ef37f73632e	e3c458c38b8cf4a8
-p256	ReleaseFast	sign	1	<=12	28f2a4af6098e566	af4baed5c5134f3f
-p256	ReleaseFast	secpt	1	1	a7818ef37f73632e	0202b342b562adc1
+p256	ReleaseFast	comb	1	1	ce264cc565eba31c	e3c458c38b8cf4a8
+p256	ReleaseFast	sign	1	<=12	5962f75d06ae9ec9	af4baed5c5134f3f
+p256	ReleaseFast	secpt	1	1	ce264cc565eba31c	0202b342b562adc1
 # p256 ecdh (2026-11-18) — `p256.ecdh` with the secret scalar tainted, peer 3G public:
 # the variable-base windowed multiply `mulCtWindowed` (recoding, `gatherSigned`,
 # the `started` blend) and the affine conversion of the secret product. Before
@@ -540,7 +540,7 @@ p256	ReleaseFast	secpt	1	1	a7818ef37f73632e	0202b342b562adc1
 # shared secret. Mutation 2026-11-18: dropping `gatherSigned`'s match-mask
 # barrier adds 4 contexts here (group.zig `mulCtWindowed` branches, 2 secret-indexed
 # loads); see the p256 SPEC audit paragraph.
-p256	ReleaseFast	ecdh	1	3	a015020354119889	7746c55c1426e84a
+p256	ReleaseFast	ecdh	1	3	da3a49b9da38a504	7746c55c1426e84a
 # rsa 2026-10-02 — the private path moved onto montint.DynModint (reduce of c
 # mod p/q, Garner, unblinding, F3). crt 213 -> 1: the 212 were std.crypto.ff's
 # reduce (shiftIn, compare-and-subtract) and montgomeryMul over the secret

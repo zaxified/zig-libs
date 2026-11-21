@@ -78,9 +78,9 @@
 //! tied to discarded outputs. AT&T size suffixes throughout (`mulxq`). `MULX`
 //! touches no flag; `movl $imm` / `movq reg,reg` preserve flags where a chain
 //! is live; the flag-clobbering `xorl`/`shlq`/`shrq`/`orq`/`andq` only ever run
-//! where flags are dead. No `movabsq` (rejected by the self-hosted assembler)
-//! and no negative immediates — wide constants are built with
-//! `movl $imm32` + `shlq`/`orq`, and all-ones via `xorl` + `subq $1`.
+//! where flags are dead. Wide constants come from `movabsq` or from
+//! `movl $imm32` + `shlq`/`orq`; all-ones via `xorl` + `subq $1`. (The self-hosted backend does not build
+//! this file's asm at all: see `supported`.)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -89,7 +89,13 @@ const builtin = @import("builtin");
 /// the ADX + BMI2 feature flags that supply `ADCX/ADOX` and `MULX`). On every
 /// other target the dispatch in `field.zig` stays on the portable Solinas path
 /// forever, regardless of the gate flag.
+///
+/// self-hosted backend: false there. Its assembler rejects `movabsq` (used by
+/// `point_asm` and the REDC tails) and it runs out of registers lowering
+/// `addRegs`/`subRegs` (Zig 0.17.1), so that backend — the edit loop only,
+/// never a gate — builds the portable path. The LLVM builds are unchanged.
 pub const supported = builtin.cpu.arch == .x86_64 and
+    builtin.zig_backend != .stage2_x86_64 and
     std.Target.x86.featureSetHas(builtin.cpu.features, .adx) and
     std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2);
 
