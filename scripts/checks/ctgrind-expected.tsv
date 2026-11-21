@@ -1445,9 +1445,9 @@ stun	ReleaseFast	ltkey	1	0	bd4df5e08776eb07	f48e64fbf4283df1
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id
 # bytes through idhex.encode (what Manager.newId runs on its draw); idhash: the
 # session id through SHA-256, the store-key hash under hash_id_in_store.
-sessions	ReleaseFast	csrf	1	0	049bc1d45bd458ed	f2cf7c06791be126
-sessions	ReleaseFast	newid	1	0	f11922fe5a2b5b26	7a197b81f402a7ea
-sessions	ReleaseFast	idhash	1	0	20e4b947fbd47e62	e2cd48972864f904
+sessions	ReleaseFast	csrf	1	0	4466bae23c9e3192	f2cf7c06791be126
+sessions	ReleaseFast	newid	1	0	1cda05e276c25c70	7a197b81f402a7ea
+sessions	ReleaseFast	idhash	1	0	eebde2ce56510493	e2cd48972864f904
 # mqtt (2026-10-09) — CONNECT password + 5.0 authentication data tainted
 # through encodePacket (CONNECT 3.1.1/5.0, AUTH) and, as wire bytes only,
 # through decodePacket. The codec copies/slices them and nothing else.
@@ -1800,14 +1800,14 @@ ctap2	ReleaseFast	token	1	0	e7eb4307746d757a	e927dca40cedb432
 # test (root.zig `decode`, x3; for canonical text the '=' positions are fixed by
 # the public length, so the outcome carries nothing) + the validity verdict
 # taken once at the end (root.zig `decode`, x2).
-base32	ReleaseFast	encode	1	0	88c51cebb8ad777a	123eeef97ba0d81b
+base32	ReleaseFast	encode	1	0	8f9de776f14328be	123eeef97ba0d81b
 # Zig 0.17.0 (2026-10-18): decode 5 -> 8 in-file, no new line and no new class. The three new
 # contexts are the same `c == '='` test in root.zig `decode` (once per decode call, x3), now at a SECOND
 # address: LLVM 22 emits the loop twice (a copy with the skip_whitespace `bt` test and one without),
 # each with its own `cmp $0x3d,%edi` / `je` (objdump 0x1076333 and 0x10764d3). Same per-character
 # padding test the 5 already counted, whose outcome the public length fixes for canonical text;
 # the validity verdict (root.zig `decode`, x2) unchanged.
-base32	ReleaseFast	decode	1	8	88c51cebb8ad777a	4b6a48f852c57125
+base32	ReleaseFast	decode	1	8	8f9de776f14328be	4b6a48f852c57125
 # voprf (2026-10-10, ristretto255-SHA512) — server: skS + proof nonce through
 # blindEvaluate/Verifiable/Poprf, evaluate, evaluatePoprf; client: the
 # private input + blinds through blind/finalize/finalizeVerifiable/
@@ -2100,7 +2100,7 @@ acme	ReleaseFast	anykey	1	15	5338dfdbd665eb9f	7dff1d27c302259e
 # (timing_safe.eql in verifyHmac) yields a tainted verdict that reaches only the
 # harness printer (67 witness); no branch or load of root.zig / encode.zig takes
 # the secret. Needs no declassification: the verdict is public by design.
-jwt	ReleaseFast	hmac	1	0	d76e154c59442cec	82c3cf6208c0b9d8
+jwt	ReleaseFast	hmac	1	0	084b8fa46b9298b0	82c3cf6208c0b9d8
 # ec 10 = ES256 9 + EdDSA 1. Every ES context carries encode.zig `signInput`
 # (signEc) in its stack, so the pattern attributes the DELEGATED signer to jwt,
 # exactly as acme's p256 contexts; none is a branch in jwt's own code and p256 /
@@ -2117,7 +2117,7 @@ jwt	ReleaseFast	hmac	1	0	d76e154c59442cec	82c3cf6208c0b9d8
 #   Left as is (std's basePoint.mul has the same refusal); FINDING for the
 #   coordinator, not fixed here.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-jwt	ReleaseFast	ec	1	9	d76e154c59442cec	6c14c21a4454880c
+jwt	ReleaseFast	ec	1	9	084b8fa46b9298b0	6c14c21a4454880c
 # rsa 2 = RS256 1 + PS256 1: rsa/src/root.zig privateOpCrtPtr, the F3
 # Bellcore fault-check verdict `if (!eql(m^e, c)) return error.FaultDetected`
 # (the rsa module's own `crt` row, 2, documents the same verdict). Delegated to
@@ -2127,7 +2127,7 @@ jwt	ReleaseFast	ec	1	9	d76e154c59442cec	6c14c21a4454880c
 # blinding verdict (root.zig makeBlinding): since CRT-domain blinding the
 # r⁻¹ checks run mod the secret p, q, folded into ONE branch-once verdict that
 # is false only for r ≡ 0 mod p or q (~2^-1023) and only causes a redraw.
-jwt	ReleaseFast	rsa	1	3	d76e154c59442cec	f2bee89c3c58cdaf
+jwt	ReleaseFast	rsa	1	3	084b8fa46b9298b0	f2bee89c3c58cdaf
 # minisign (2026-10-20). Every in-file context is std's, attributed because a
 # minisign frame (root.zig edSignBody / sealSecretKeyBody / openSecretKeyBody)
 # is on its stack; read from --stacks, none is a minisign branch on a secret

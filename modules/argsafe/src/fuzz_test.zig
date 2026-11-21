@@ -100,7 +100,9 @@ test "fuzz: shape harness, arbitrary bytes under testing.fuzz" {
 }
 
 fn fuzzOne(_: void, smith: *std.testing.Smith) !void {
-    try harness(std.testing.Smith, smith, testing.allocator);
+    var script: [1024]u8 = undefined;
+    var src: testkit.fuzz.ScriptSource = .init(script[0..smith.slice(&script)]);
+    try harness(testkit.fuzz.ScriptSource, &src, testing.allocator);
 }
 
 test "fuzz harness (shapes): 4000 seeds in every test run, and they reach every verdict of every predicate" {

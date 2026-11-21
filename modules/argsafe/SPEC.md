@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-19 · mutation 2026-10-04 (40/40) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — argv quoting only (keyword review, 2026-10-07) · panic 2026-10-30 (shapes added 2026-11-02, oversized/hostile sweep in `src/sweep_test.zig`; sweep + blind review: Argv poisoned on OOM, isSafeCidrList separator bounds, empty base64 refused, unparsed Template.fill checked panic; no injection found; delta audit 13/14 + 1 eq)
+**Hardening:** fuzz 2026-11-21 (300,000-run budget clean, ARGSAFE_FUZZ) · ct n/a — argv quoting only (keyword review, 2026-10-07) · panic 2026-10-30 (shapes added 2026-11-02, oversized/hostile sweep in `src/sweep_test.zig`; sweep + blind review: Argv poisoned on OOM, isSafeCidrList separator bounds, empty base64 refused, unparsed Template.fill checked panic; no injection found; delta audit 13/14 + 1 eq)
 
 **Performance:** n/a — every call is a few dozen byte compares on a string of at most a few hundred bytes (an estimate from the code, tens of ns, not measured) guarding a process spawn, itself a syscall path orders of magnitude dearer; the shared-shape reference (go-playground, a regexp) is not what a user chooses this module over for speed, and the same-work comparison would only restate that. Precedent: `probe`, `icmp` ("the CPU per probe is not what a user picks it for"). (2026-11-02)
 
