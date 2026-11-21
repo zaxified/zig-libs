@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [matrix-org/vodozemac](https://github.com/matrix-org/vodozemac) (Olm) | Rust | Apache-2.0 | 404 | 0.11.0 (2026-09-11) | Not Signal: Matrix's own Double-Ratchet variant (Olm, AES-CBC + HMAC). Named because it is the maintained permissive Rust double ratchet; a different wire format. |
 | Zig ecosystem | Zig | — | — | — | Nothing found on GitHub for a Signal or Double Ratchet implementation in Zig (searched `signal double ratchet` language:zig). `std.crypto` has the primitives, including `ml_kem` and X25519, no protocol. |
 
-**Where we are ahead:** the only Zig Signal-protocol core; the three public specs (X3DH, XEdDSA, Double Ratchet) plus PQXDH with FIPS 203 ML-KEM-1024 (the spec text still names Kyber; deployments use ML-KEM), both XEdDSA variants selectable at the call site with libsignal's own vector pinned against each, a transactional fail-closed `decrypt`, bounded skipped-key store, and the ratchet's `KDF_CK` ladders cross-checked byte for byte with libsignal (`KDF_RK`'s `info` is application-defined). **Where we are behind:** everything above the specs that a libsignal user builds on — wire compatibility with Signal (protobuf messages, libsignal's AEAD and `info` strings; SPEC: "not claimed"), sealed sender, sender-key groups, Sesame session management, safety numbers, header encryption, SPQR, and persistence that other implementations can read (→ Backlog).
+**Where we are ahead:** the only Zig Signal-protocol core; the three public specs (X3DH, XEdDSA, Double Ratchet) plus PQXDH with FIPS 203 ML-KEM-1024 (the spec text still names Kyber; deployments use ML-KEM), both XEdDSA variants selectable at the call site with libsignal's own vector pinned against each, a transactional fail-closed `decrypt`, bounded skipped-key store, and the ratchet's `KDF_CK` ladders cross-checked byte for byte with libsignal (`KDF_RK`'s `info` is application-defined). **Where we are behind:** everything above the specs that a libsignal user builds on — wire compatibility with Signal (protobuf messages, libsignal's AEAD and `info` strings; SPEC: "not claimed"), sealed sender, sender-key groups, Sesame session management, safety numbers, header encryption, SPQR, and persistence that other implementations can read (→ Backlog, Roadmap, *What is deliberately not done*).
 
 ## Design
 
@@ -338,9 +338,10 @@ exact bytes and that nonce isn't published).
   libsignal-only fields (identities, registration ids, pending prekey) —
   those belong to the session layer above the ratchet, which this module does
   not have.
-- **Not provided — see Backlog**: header encryption (spec §4 — headers here are
-  cleartext, so the ratchet public key + counters are observable) and
-  interop of the persisted state with other implementations. Under PQXDH the
+- **Not provided**: header encryption (spec §4 — headers here are
+  cleartext, so the ratchet public key + counters are observable; not done,
+  as libsignal) and interop of the persisted state with other implementations
+  (Backlog). Under PQXDH the
   ratchet is seeded from `pqxdh.Agreement.ratchetAssociatedData()` rather than
   the full AD — see below.
 
@@ -479,12 +480,29 @@ its own); `initial_message.seal` / `open` and the codecs, which only run inside 
 burned bodies; a caller's own frames and the heap; registers and the red zone below
 the stack pointer.
 
+## What is deliberately not done
+
+- **Header encryption** (Double Ratchet spec §4): libsignal, the reference, does not use it (its `SignalMessage`
+  carries the ratchet key and counters in the clear), so a Signal-shaped session has no header keys to derive.
+
 ## Backlog / deferred
 
+Bounced — copyleft-only reference: the formats below exist only in libsignal (AGPL-3.0, source off limits here) with no
+published specification or permissively licensed vectors; they wait for one.
+
 - **Signal-compatible wire messages and KDF strings** (`SignalMessage`/`PreKeySignalMessage` protobufs, AES-256-CBC + truncated HMAC-SHA256, libsignal's `info` labels): without this a session cannot talk to Signal servers or clients; the module chose ChaCha20-Poly1305 over a fixed header because the spec leaves the AEAD to the application (`interop_vectors.zig` header). It is a design choice for the spec-shaped core, but a compatibility layer is what a libsignal user expects. Effort: large (protobuf codec, prekey-message flow, version handling). Fits §2 if the protobuf codec is a sibling module.
-- **Sender keys (group messaging), sealed sender, safety numbers/fingerprints, Sesame**: the parts of libsignal that make it a messenger rather than a handshake; none is implemented. Effort: medium each; safety numbers small. Fits §2 (`megolm`/`mls` cover other group designs).
-- **Header encryption** (Double Ratchet spec §4) and **SPQR / triple ratchet**: the SPEC excluded header encryption without giving a reason; SPQR is Signal's current PQ-forward-secrecy layer. Effort: medium / large. Fits §2.
+- **Sender keys (group messaging), sealed sender, safety numbers/fingerprints**: the parts of libsignal that make it a messenger rather than a handshake; none is implemented and none has a public specification. Effort: medium each; safety numbers small. Fits §2 (`megolm`/`mls` cover other group designs).
 - **Interop of the persisted ratchet state** with other implementations: `State.toBytes` is this module's own layout, not libsignal's `SessionStructure`; it belongs with the Signal-compatible wire work above.
+
+## Roadmap
+
+- **Sesame** (session management across devices; signal.org/docs/specifications/sesame): a public spec, but a
+  protocol layer of its own above the ratchet.
+  Size: weeks — per-user/per-device session records, the send/receive algorithms and their retry rules.
+- **SPQR / triple ratchet** (Signal's post-quantum ratchet beside the Double Ratchet; signal.org publishes the
+  ML-KEM Braid and triple-ratchet documents).
+  Size: weeks to months — a second ratchet with its own KEM chunking, state machine and the combination with the
+  Double Ratchet's keys.
 
 ## Anchoring
 
