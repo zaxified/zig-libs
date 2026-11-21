@@ -1261,10 +1261,7 @@ pub const PosixConnector = struct {
         var n: usize = 0;
         while (queue.getOne(io)) |res| switch (res) {
             .address => |addr| {
-                out[n] = switch (addr) {
-                    .ip4 => |a| .{ .v4 = a.bytes },
-                    .ip6 => |a| .{ .v6 = a.bytes },
-                };
+                out[n] = netaddr.Ip.fromStd(addr);
                 n += 1;
                 if (n == max_addresses) return n;
             },

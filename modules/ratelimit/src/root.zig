@@ -1016,10 +1016,7 @@ pub fn clientKeyWith(req: *const http.Server.Request, peer_buf: *[peer_key_len_m
         if (ip.len != 0) return ip;
     };
     if (req.peerAddress()) |peer| {
-        const ip: netaddr.Ip = switch (peer) {
-            .ip4 => |a| .{ .v4 = a.bytes },
-            .ip6 => |a| .{ .v6 = a.bytes },
-        };
+        const ip = netaddr.Ip.fromStd(peer);
         return netaddr.formatIp(ip.unmap(), peer_buf);
     }
     return fallback_key;

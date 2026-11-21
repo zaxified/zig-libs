@@ -125,6 +125,7 @@ dependency of a widely consumed module (`set_build` is already well below Go).
 
 ## What is deliberately not done
 
+- **Longest-prefix match with values.** Go `netip`/`netipx` have none (a set answers membership, not "which entry"), ipnet neither; a prefix → value table is a routing-table type (a trie), not an address-set operation, and no consumer has asked.
 - **Resolving a zone name to an interface** (zones are carried as opaque text by `ZonedIp`/`AddrPort`,
   rejected by the zone-less `parseIp*`, passed through untouched by `parseHostPort`; `AddrPort.toStd`
   maps a numeric zone only and refuses a name with `ZoneNotNumeric`), **DNS resolution** and
@@ -136,11 +137,7 @@ dependency of a widely consumed module (`set_build` is already well below Go).
 
 ## Backlog / deferred
 
-- **Longest-prefix match with values.** netipx has none: a set answers membership, not "which entry".
-  A prefix → value table belongs to a routing-table type; not started, no consumer has asked.
-- **Consumers converting `std.Io.net.IpAddress` by hand** (abuseguard, http/proxy, probe, ratelimit,
-  whois: `rg '\.ip4 => \|a\| \.\{ \.v4 = a\.bytes'`): can switch to `Ip.fromStd` / `AddrPort.fromStd`.
-  Cosmetic; do it when touching those modules.
+None open.
 
 ## Anchoring
 

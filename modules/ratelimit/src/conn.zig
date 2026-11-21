@@ -230,10 +230,7 @@ pub const ConnectionLimiter = struct {
         // was UB in ReleaseFast.
         const cl: *ConnectionLimiter = @ptrCast(@alignCast(ctx orelse
             @panic("ratelimit: onConnect needs Options.on_connect_ctx = &the ConnectionLimiter")));
-        const ip: netaddr.Ip = switch (peer) {
-            .ip4 => |a| .{ .v4 = a.bytes },
-            .ip6 => |a| .{ .v6 = a.bytes },
-        };
+        const ip = netaddr.Ip.fromStd(peer);
         return if (cl.allowPeer(ip).allowed) .accept else .reject;
     }
 

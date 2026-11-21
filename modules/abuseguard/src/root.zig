@@ -1246,10 +1246,7 @@ fn onConnStateHook(ctx: ?*anyopaque, peer: ?net.IpAddress, state: http.Server.Co
 }
 
 fn ipOf(peer: net.IpAddress) netaddr.Ip {
-    return switch (peer) {
-        .ip4 => |a| .{ .v4 = a.bytes },
-        .ip6 => |a| .{ .v6 = a.bytes },
-    };
+    return netaddr.Ip.fromStd(peer);
 }
 
 // ── the middleware ──────────────────────────────────────────────────────────

@@ -911,10 +911,7 @@ fn buildForwardedFor(buf: []u8, req: *Server.Request) ?[]const u8 {
 /// when serving socket-free.
 fn peerText(req: *Server.Request, buf: *[netaddr.max_ip_text_len]u8) ?[]const u8 {
     const peer = req.peerAddress() orelse return null;
-    const ip: netaddr.Ip = switch (peer) {
-        .ip4 => |a| .{ .v4 = a.bytes },
-        .ip6 => |a| .{ .v6 = a.bytes },
-    };
+    const ip = netaddr.Ip.fromStd(peer);
     return netaddr.formatIp(ip.unmap(), buf);
 }
 
