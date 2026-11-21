@@ -2309,8 +2309,8 @@ webhooksig	ReleaseFast	ed25519	1	30	09ef5762426cb579	0ddab6b90956b2fe
 # control >=1 = POSITIVE CONTROL: the same HMAC under the tainted key compared with an
 #   early-exit `std.mem.eql` in the harness; its branch on the key-derived tag must flag,
 #   or the zeros of the other rows would mean "the taint never arrived".
-mcp	ReleaseFast	seal	1	16	c0b41f2f07a08352	e0ed633eec25c1a0
-mcp	ReleaseFast	open	1	4	c0b41f2f07a08352	68a492911d53a84a
+mcp	ReleaseFast	seal	1	16	d1b5705b81f641bd	e0ed633eec25c1a0
+mcp	ReleaseFast	open	1	4	d1b5705b81f641bd	68a492911d53a84a
 mcp	ReleaseFast	control	1	>=1	f58c2a60efeb0f78	77618407a4b8daaf
 # xmlenc, 2026-11-13 (sweep hB): the RSA private key (OAEP, v1.5), the KEK (kw-aes) and
 # through them the CEK, driven through `decryptData` on a real EncryptedData. NO context is
