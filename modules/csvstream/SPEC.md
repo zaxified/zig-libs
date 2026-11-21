@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, CSVSTREAM_FUZZ; dialect harness checks the event-jumping scanner against its bytewise reference — a planted cap mutant fails at seed 48) · ct n/a — CSV parsing (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: capacity sums saturate, scan start clamped, counters saturate, no-cut refills double (O(M log M)), EOF probe ≤ 64 KiB; delta audit 18/20 + 2 eq)
 
-**Performance:** ref 0.43–0.89× Go encoding/csv 1.26.8 (`ReuseRecord`, `LazyQuotes`; `zig build bench-csvstream`: narrow 10×1M, wide 100×100k, every field quoted, multi-line `.span`, in-memory, writer 1M records) · fastest 1.02–2.05× zsv 1.4.3 (measured 2026-11-21)
+**Performance:** ref 0.43–0.89× Go encoding/csv 1.26.8 (`ReuseRecord`, `LazyQuotes`; `zig build bench-csvstream`: narrow 10×1M, wide 100×100k, every field quoted, multi-line `.span`, in-memory, writer 1M records) · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -243,8 +243,8 @@ The bench is `zig build bench-csvstream` against Go `encoding/csv` (`ReuseRecord
 numeric, wide text, every field quoted, multi-line `.span`, in-memory `LineIterator` + `splitFields`, writer. The
 card's Performance line holds the figures (the card is authoritative). The field's fastest is zsv 1.4.3 (liquidaty/zsv, C, MIT,
 SIMD scan engine, default buffers), driven through its public API by `tools/zsv_bench/main.c` over the same files and the same
-checksum (checked before timing); the reader rows put this module at 1.02-2.05x of zsv (quoted rows about even, the narrow and wide
-rows 1.3-1.4x, the multi-line `.span` rows 1.9-2.05x) and, as before, at 0.5-0.8x of Go. rust `csv`/`csv-core` was not added (not attempted: it needs a Rust toolchain and crates fetched from the network); zsv alone answers "fastest" for the card.
+checksum (checked before timing). A first run on a loaded machine (spreads up to 57 %) put the reader at roughly
+1.0-2.1x of zsv; it is not a claim until re-measured on a quiet host (the card keeps `fastest ?`) and, as before, at 0.5-0.8x of Go. rust `csv`/`csv-core` was not added (not attempted: it needs a Rust toolchain and crates fetched from the network); zsv alone answers "fastest" for the card.
 
 ## What is deliberately not done
 
