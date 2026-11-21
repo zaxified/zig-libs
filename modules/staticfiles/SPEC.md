@@ -273,7 +273,7 @@ with no index (301 then 403, where `Handler` answers 403). No directory listing,
 `follow_symlinks`, no SPA `fallback` (each `error.Unsupported` at `open`, never ignored silently). A file created after `open` is a 404; one
 replaced by rename keeps serving the old inode until the next snapshot. `max_files` bounds the
 descriptors and `max_dirs` the directories (both `error.TooManyFiles`, never a partial table),
-`max_depth` the nesting (`error.TooDeep`). The walk reads an entry's kind from the directory entry;
+`max_depth` the nesting (`error.TooDeep`, as is a path longer than `max_path_bytes`, which no request could carry: refused rather than held unreachable, so a deep tree fails closed at `open`). `max_entries` (default 0 = unbounded, as nginx and Go) bounds the directory entries read of every kind, symlinks and sockets included (`error.TooManyFiles`). `TooDeep`/`TooManyFiles` abort the whole rescan, so one new deep directory keeps `Live` on the old generation (reported as `failed`): publishing a partial tree would trade the completeness guarantee for availability. The walk reads an entry's kind from the directory entry;
 on a filesystem that reports DT_UNKNOWN (some XFS, NFS, FUSE) it classifies the entry with one
 no-follow `fstatat` (`Snapshot.realKind`, as `find`/`ftw` do; the directory listing uses it too), a
 failed stat skips the entry, and a symlink stays unserved. A test serves one fixture tree through
@@ -418,6 +418,7 @@ The bench is `zig build bench-staticfiles` (`BENCH_ROUNDS=5`, ReleaseFast); the 
 
 ## What is deliberately not done
 
+- **A check of `Live`'s descriptors against `RLIMIT_NOFILE`.** Up to `(max_retired + 1) × max_files` descriptors can be open at once (documented on `LiveOptions.max_retired`); neither Go nor nginx checks its descriptor budget against the limit, and the caller who raises `max_files` or `max_retired` owns `ulimit -n`.
 - **Multi-range `multipart/byteranges`.** Go and nginx serve it; here a multi-range request answers 200 with the full body, which RFC 7233 §6.1 permits. A known amplification vector; not a backlog item unless a consumer asks.
 - **Content sniffing of unknown extensions.** Go sniffs the first 512 bytes; here an unlisted extension is `application/octet-stream` (the embedded table covers the common web types, `Options.mime_overrides` adds more) and `nosniff` tells the browser not to guess.
 - **A content-hash `ETag` in `Handler`.** It would turn every conditional GET into a full read; `Snapshot`/`Live` hash once per file at `open`.
@@ -426,5 +427,4 @@ The bench is `zig build bench-staticfiles` (`BENCH_ROUNDS=5`, ReleaseFast); the 
 
 ## Backlog / deferred
 
-- **Descriptors of `Live` at the retirement cap, and uncounted entries (LOW).** Up to `(max_retired + 1) × max_files` descriptors can be open at once in `Live`; this is documented on `LiveOptions.max_retired` only, with no check against `RLIMIT_NOFILE`. `Snapshot.walk` counts regular files (`max_files`) and directories (`max_dirs`) but not symlinks, sockets or devices, so a directory of millions of them is read in full (time, no memory growth) before `open` returns.
-- **Decision: deep trees against the 8 KiB request-path limit.** `max_depth * 256` reaches `max_path_bytes`, so a deep tree can be snapshotted but not asked for. The fix is either a clamp of `max_depth` or skipping/refusing over-long paths at `open` (a new error or a silent omission). Related: `TooDeep`/`TooManyFiles` abort the whole rescan, so one new deep directory keeps `Live` on the old generation (reported as `failed`); publishing the partial tree, or skipping the offending subtree, would trade the fail-closed completeness guarantee for availability.
+None open.

@@ -1453,12 +1453,19 @@ pub const SnapshotOptions = struct {
     /// Most regular files held -- one open descriptor each. A larger tree is
     /// `error.TooManyFiles`, never a silently partial snapshot.
     max_files: usize = 4096,
-    /// Deepest directory nesting walked; deeper is `error.TooDeep`.
+    /// Deepest directory nesting walked; deeper is `error.TooDeep`, and so is
+    /// a path longer than `max_path_bytes` (it could never be requested).
     max_depth: usize = 32,
     /// Most directories held (each is a path-table entry, and a rescan reads
     /// each one). More is `error.TooManyFiles`: a tree of millions of empty
     /// directories is bounded like one of millions of files.
     max_dirs: usize = 4096,
+    /// Most directory entries READ in the whole walk, of every kind
+    /// (symlinks, sockets, devices and skipped dotfiles included, which
+    /// `max_files`/`max_dirs` do not count). More is `error.TooManyFiles`.
+    /// 0 (the default) is unbounded, as nginx and Go are: a directory of
+    /// millions of symlinks is then read in full, in time and no memory.
+    max_entries: usize = 0,
     /// Files larger than this keep `Handler`'s size+mtime tag instead of a
     /// content tag, so one huge file cannot make `open` (or every `Live`
     /// rescan that sees it change) read gigabytes. A file is hashed up to the
@@ -1534,6 +1541,8 @@ pub const Snapshot = struct {
     fresh: usize = 0,
     /// Directories entered by this build.
     dirs: usize = 0,
+    /// Directory entries read by this build (see `SnapshotOptions.max_entries`).
+    entries: usize = 0,
 
     const Node = union(enum) { file: u32, dir: ?u32 };
 
@@ -1658,11 +1667,15 @@ pub const Snapshot = struct {
     fn walk(s: *Snapshot, io: Io, root: Dir, dir: Dir, prefix: []const u8, depth: usize, prev: ?*Snapshot) SnapshotError!void {
         var it = dir.iterate();
         while (it.next(io) catch return error.IoError) |entry| {
+            s.entries += 1;
+            if (s.options.max_entries != 0 and s.entries > s.options.max_entries) return error.TooManyFiles;
             if (!s.options.serve.serve_dotfiles and entry.name.len != 0 and entry.name[0] == '.') continue;
             switch (realKind(io, dir, entry.name, entry.kind)) {
                 .file => {
                     if (s.files.items.len == s.options.max_files) return error.TooManyFiles;
                     const rel = try s.join(prefix, entry.name);
+                    // A path no request can carry (`max_path_bytes`) is refused, not held unreachable.
+                    if (rel.len > max_path_bytes) return error.TooDeep;
                     // Unchanged since `prev`: take its descriptor over --
                     // one `fstatat`, no open, no read.
                     if (prev) |p| if (p.paths.get(rel)) |n| switch (n) {
@@ -1704,6 +1717,7 @@ pub const Snapshot = struct {
                     };
                     defer sub.close(io);
                     const rel = try s.join(prefix, entry.name);
+                    if (rel.len > max_path_bytes) return error.TooDeep;
                     try s.paths.put(s.gpa, rel, .{ .dir = null });
                     try s.walk(io, root, sub, rel, depth + 1, prev);
                 },
@@ -4256,6 +4270,37 @@ test "Snapshot.open refuses what it would not serve right: symlink following, li
     try testing.expectError(error.TooDeep, Snapshot.open(gpa, io, root, .{ .max_depth = 1 }));
     var ok = try Snapshot.open(gpa, io, root, .{ .max_files = 2, .max_depth = 2 });
     ok.deinit(io);
+}
+
+test "Snapshot: max_entries counts every entry kind, and a path past max_path_bytes is TooDeep" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "A" });
+    try root.symLink(io, "a.txt", "l1", .{});
+    try root.symLink(io, "a.txt", "l2", .{});
+    const gpa = testing.allocator;
+    var unbounded = try Snapshot.open(gpa, io, root, .{});
+    unbounded.deinit(io);
+    try testing.expectError(error.TooManyFiles, Snapshot.open(gpa, io, root, .{ .max_entries = 2 }));
+    var ok = try Snapshot.open(gpa, io, root, .{ .max_entries = 3 });
+    ok.deinit(io);
+    // 40 nested directories of 255 bytes: 10 KiB of path, built one level at a time (PATH_MAX).
+    const name: [255]u8 = @splat('d');
+    var deep_tmp = testing.tmpDir(.{ .iterate = true });
+    defer deep_tmp.cleanup();
+    var deep = try deep_tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer deep.close(io);
+    var cur = try deep.createDirPathOpen(io, &name, .{ .open_options = .{ .iterate = true } });
+    for (1..40) |_| {
+        const next = try cur.createDirPathOpen(io, &name, .{ .open_options = .{ .iterate = true } });
+        cur.close(io);
+        cur = next;
+    }
+    cur.close(io);
+    try testing.expectError(error.TooDeep, Snapshot.open(gpa, io, deep, .{ .max_depth = 64 }));
 }
 
 test "Snapshot: more directories than max_dirs is TooManyFiles, empty ones included (sweep 2026-10-28 F-2)" {
