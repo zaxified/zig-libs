@@ -54,8 +54,13 @@ field-by-field derivation and the residual bit-order note.
 **Model-after:** IEEE 802.1aq (SPBM) unicast B-MAC FIB + the RFC 6329 §4.4 group
 multicast-DA construction. Clean-room from the public standard.
 
+**Part C — the multicast FDB entry of one node.** `buildMcast` turns a `bumtree` tree (one source, one I-SID)
+into the group-DA entry a node installs: key `groupDa`, the single RPF ingress B-MAC, the pruned set of
+egress B-MACs and whether to deliver locally; `portFor` joins a next-hop B-MAC to the caller's egress
+interface (`PortBinding`). One B-VID, passed through.
+
 **Status:** `any · util · single_owner` · deps: `isis-spf` (which owns the SPF /
-ECT route table this consumes) — canonical metadata is `pub const meta` in
+ECT route table this consumes) and `bumtree` (the multicast trees) — canonical metadata is `pub const meta` in
 `src/root.zig`. This module parses no TLVs and recomputes no SPF: the
 system-id→B-MAC map and each node's SPSourceID are inputs the caller extracts
 from the SPB sub-TLVs (`isis/spb`).

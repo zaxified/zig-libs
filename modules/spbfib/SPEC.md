@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [holo-routing/holo](https://github.com/holo-routing/holo) `holo-isis` | Rust | MIT (LICENSE file) | 541 | v0.9.0 (2026-02-21) | Carries SPBM-SI on the wire only (`MtCapStlvs`); no B-MAC FIB derivation found *(inferred from the source listing)*. |
 | Avaya/Extreme, Alcatel-Lucent Enterprise SPBM | proprietary | proprietary | — | — | The deployed SPBM implementations; behaviour not inspectable (SPEC anchoring note). |
 
-**Where we are ahead:** the only open, maintained, pure-code derivation of the SPBM unicast B-MAC FIB from an IS-IS route table plus the RFC 6329 group multicast DA with its bit-order trap resolved by two RFC worked examples; total, allocation-bounded and deterministic. **Where we are behind:** one FIB — no per-B-VID / multi-ECT set (the 802.1aq ECT-VID tuples the `isis` codec decodes are never used; `rg -i 'vid' spbfib/src/root.zig` shows one doc line about B-VIDs), no multicast FDB entries (the tree is `bumtree`'s, the membership `l2forward`'s — siblings exist, but no glue yet assembles a per-(SPSourceID, I-SID) FDB), no ingress/transit/egress split for I-SID membership, no programming of a bridge. Oracle is EXTERNAL for the RFC 6329 §5 example rows (see Anchoring); the rest is SELF (anchor grade, not scored here).
+**Where we are ahead:** the only open, maintained, pure-code derivation of the SPBM unicast B-MAC FIB from an IS-IS route table plus the RFC 6329 group multicast DA with its bit-order trap resolved by two RFC worked examples; total, allocation-bounded and deterministic. **Where we are behind:** one FIB — no per-B-VID / multi-ECT set (the 802.1aq ECT-VID tuples the `isis` codec decodes are never used; `rg -i 'vid' spbfib/src/root.zig` shows one doc line about B-VIDs), no programming of a bridge. The multicast FDB entry of one node is assembled from a `bumtree` tree (`buildMcast`); which local ports belong to an I-SID stays `l2forward`'s. Oracle is EXTERNAL for the RFC 6329 §5 example rows (see Anchoring); the rest is SELF (anchor grade, not scored here).
 
 ## What it computes
 
@@ -210,6 +210,18 @@ Run: `scripts/modtest spbfib`. Offline only: pure logic, no live-interop surface
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
 
+## Part C — multicast FDB entry and egress ports
+
+`buildMcast(gpa, tree, local, spsourceid, isid, b_vid, bmacs)` turns one `bumtree.BumTree` (one source, one I-SID) into
+the entry `local` installs (RFC 6329 §4.4; IEEE 802.1Q clause 28's group-DA entry per SPSourceID and I-SID): the key
+`groupDa(spsourceid, isid)`, the one legal ingress (`rpf_ingress_bmac`, null at the source), the pruned replication set
+(`egress_bmacs`, ascending by node id as `bumtree` gives it) and `deliver_locally` (a member that is on the tree). A node
+that is off the tree (unreachable from the source) or has nothing to replicate and no local delivery (a pruned branch)
+has no entry (`null`). `NodeBmac` binds `bumtree` node ids to B-MACs (the first binding of a repeated id wins); an
+ingress or egress neighbour without a binding is `error.UnknownBmac`, never a partial entry. The B-VID is passed through
+(one tree is computed; a per-B-VID set is in the Backlog). `PortBinding` / `portFor` join a next-hop B-MAC (of the
+unicast `Entry` or of an `egress_bmacs` element) to the caller's egress interface; no binding is `null`.
+
 ## What is deliberately not done
 
 - **B-MAC / SPSourceID extraction from TLVs** — the caller decodes the SPBM-SI
@@ -225,9 +237,7 @@ Run: `scripts/modtest spbfib`. Offline only: pure logic, no live-interop surface
 
 ## Backlog / deferred
 
-- **Per-B-VID FIB set** (one `Fib` per ECT-VID tuple, each from its own SPF tree) (survey). Why: a real SPBM deployment uses two or more B-VIDs for path diversity; a single FIB covers only the base VID (the one congruent path per destination comes from `isis-spf`'s single deterministic ECT selection). Needs multi-algorithm ECT in `spf-ect` (see its backlog). Effort: ~3 days after that. Fits §2: yes.
-- **Multicast FDB assembly** (`bumtree` tree + I-SID membership → (group DA, B-VID) → egress-port set at this node) (survey). Why: without it SPBM carries unicast only; `groupDa` names the DA but nothing installs it. Effort: ~1 week including `bumtree`/`l2forward` glue. Fits §2: yes.
-- **Link-layer port mapping** (adjacency → egress interface) (survey). Why: the FIB names next-hop B-MAC/system-id; a forwarder needs a port. Effort: ~1 day. Fits §2: yes. Priority low (caller can join).
+- **Per-B-VID FIB set** (one `Fib` per ECT-VID tuple, each from its own SPF tree) (survey). Why: a real SPBM deployment uses two or more B-VIDs for path diversity; a single FIB covers only the base VID (the one congruent path per destination comes from `isis-spf`'s single deterministic ECT selection). Needs multi-algorithm ECT in `spf-ect` (see its backlog). Effort: ~3 days after that. Fits §2: yes. *BOUNCED: blocked on `spf-ect`'s 802.1aq ECT-ALGORITHM selection (its own backlog: the algorithm text is IEEE's, paywalled, and no vector exists), without which a second B-VID's tree would not agree with another vendor's bridge.*
 
 ## Open
 

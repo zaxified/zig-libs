@@ -237,7 +237,7 @@ pub const module_list = [_]Module{
     .{ .name = "l2forward", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "pbb", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "bumtree", .libs = &.{"net"}, .deps = &.{"spf-ect"} },
-    .{ .name = "spbfib", .libs = &.{"net"}, .deps = &.{"isis-spf"} },
+    .{ .name = "spbfib", .libs = &.{"net"}, .deps = &.{ "isis-spf", "bumtree" }, .test_deps = &.{"spf-ect"} },
     .{ .name = "isis", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "isis-adj", .libs = &.{"net"}, .deps = &.{"isis"}, .test_deps = &.{"testkit"} },
     .{ .name = "isis-dis", .libs = &.{"net"}, .deps = &.{"isis"} },

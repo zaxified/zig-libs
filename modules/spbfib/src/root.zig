@@ -46,6 +46,7 @@
 
 const std = @import("std");
 const spf = @import("isis-spf");
+const bumtree = @import("bumtree");
 
 const Allocator = std.mem.Allocator;
 
@@ -62,7 +63,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .single_owner,
     .model_after = "IEEE 802.1aq SPBM unicast B-MAC FIB + group-DA construction (RFC 6329 §4.4)",
-    .deps = .{"isis-spf"},
+    .deps = .{ "isis-spf", "bumtree" },
 };
 
 /// A 6-octet IS-IS system-id — the node identity in the topology. Re-exported
@@ -311,6 +312,102 @@ pub fn parseGroupDa(da: BMac) ?GroupDa {
         .spsourceid = (sp_ms << 16) | (@as(u20, da[1]) << 8) | @as(u20, da[2]),
         .isid = (@as(u24, da[3]) << 16) | (@as(u24, da[4]) << 8) | @as(u24, da[5]),
     };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Part C — the multicast FDB entry of one node, and egress ports
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One `bumtree` node identity bound to its B-MAC (the caller extracts it as for `BmacEntry`; `bumtree`
+/// names nodes by the dense id of its graph, `isis-spf` by system-id).
+pub const NodeBmac = struct {
+    node: bumtree.NodeId,
+    b_mac: BMac,
+};
+
+/// The multicast forwarding entry one node installs for one (source, I-SID) tree (RFC 6329 §4.4,
+/// IEEE 802.1aq 802.1Q clause 28: a group-DA entry per SPSourceID and I-SID): frames with DA `group_da`
+/// that arrive from `rpf_ingress_bmac` (the only legal ingress, the reverse-path check) are copied to
+/// every bridge of `egress_bmacs` and, when `deliver_locally`, to the local service. The B-VID is the
+/// caller's: this module computes one tree, and passes the VID through (`b_vid`, 12 bits).
+pub const McastEntry = struct {
+    /// The FIB key (`groupDa(spsourceid, isid)`).
+    group_da: BMac,
+    spsourceid: u20,
+    isid: u24,
+    b_vid: u12,
+    /// The one neighbour a frame of this tree may arrive from; null at the source itself.
+    rpf_ingress_bmac: ?BMac,
+    /// The neighbours to replicate to, ascending by node id (`bumtree`'s order). Owned.
+    egress_bmacs: []BMac,
+    /// The node is a member of the I-SID and on the tree: deliver a copy locally.
+    deliver_locally: bool,
+
+    pub fn deinit(self: *McastEntry, gpa: Allocator) void {
+        gpa.free(self.egress_bmacs);
+        self.* = undefined;
+    }
+};
+
+pub const McastError = Allocator.Error || error{
+    /// A node the entry needs (`local`'s ingress or an egress neighbour) has no binding in `bmacs`: the
+    /// entry could not be forwarded, and a partial one would silently drop the branch.
+    UnknownBmac,
+};
+
+/// `local`'s multicast entry for the tree `tree` (one source, one I-SID), or null when `local` takes no
+/// part in it: it is not on the tree (unreachable from the source), or it has nothing to replicate to
+/// and does not deliver locally (a pruned branch). `spsourceid` is the source's SPSourceID and `isid`
+/// the service; `bmacs` binds node ids to B-MACs (a repeated node keeps the first binding). The
+/// entry's RPF ingress and every egress neighbour must be bound, else `error.UnknownBmac` (never a
+/// partial entry). Pure; allocates only the egress list.
+pub fn buildMcast(
+    gpa: Allocator,
+    tree: *const bumtree.BumTree,
+    local: bumtree.NodeId,
+    spsourceid: u20,
+    isid: u24,
+    b_vid: u12,
+    bmacs: []const NodeBmac,
+) McastError!?McastEntry {
+    const plan = tree.plan(local) orelse return null;
+    const on_tree = local == tree.source or plan.rpf_ingress != null;
+    if (!on_tree) return null;
+    const deliver = tree.deliversLocally(local);
+    if (plan.replicate_to.len == 0 and !deliver) return null;
+    const rpf: ?BMac = if (plan.rpf_ingress) |n| (lookupNode(bmacs, n) orelse return error.UnknownBmac) else null;
+    const egress = try gpa.alloc(BMac, plan.replicate_to.len);
+    errdefer gpa.free(egress);
+    for (plan.replicate_to, egress) |n, *out| out.* = lookupNode(bmacs, n) orelse return error.UnknownBmac;
+    return .{
+        .group_da = groupDa(spsourceid, isid),
+        .spsourceid = spsourceid,
+        .isid = isid,
+        .b_vid = b_vid,
+        .rpf_ingress_bmac = rpf,
+        .egress_bmacs = egress,
+        .deliver_locally = deliver,
+    };
+}
+
+fn lookupNode(bmacs: []const NodeBmac, node: bumtree.NodeId) ?BMac {
+    for (bmacs) |b| if (b.node == node) return b.b_mac;
+    return null;
+}
+
+/// One egress interface of this node: the adjacent bridge (by B-MAC) the interface leads to.
+pub const PortBinding = struct {
+    next_hop_bmac: BMac,
+    /// The caller's interface identifier (an ifindex, a port number).
+    port: u32,
+};
+
+/// The egress interface toward `next_hop_bmac` (an `Entry.next_hop_bmac` of the unicast FIB or one of a
+/// `McastEntry.egress_bmacs`), or null when no interface is bound to it. The first binding of a repeated
+/// B-MAC wins. A linear scan: a node has few adjacencies.
+pub fn portFor(ports: []const PortBinding, next_hop_bmac: BMac) ?u32 {
+    for (ports) |p| if (std.mem.eql(u8, &p.next_hop_bmac, &next_hop_bmac)) return p.port;
+    return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -740,4 +837,76 @@ test "meta is well-formed" {
     try testing.expectEqual(.any, meta.platform);
     try testing.expectEqual(.util, meta.role);
     try testing.expectEqual(.single_owner, meta.concurrency);
+}
+
+test "buildMcast: root, transit, leaf, pruned and off-tree nodes get the right group-DA entry" {
+    const spf_ect = @import("spf-ect");
+    var g = spf_ect.Graph.init(testing.allocator);
+    defer g.deinit();
+    // 0 - 1 - 3, 0 - 2 - 4; source 0, members {3}: the branch through 2 is pruned. Node 5 is unreachable.
+    try g.addEdge(0, 1, 1);
+    try g.addEdge(1, 3, 1);
+    try g.addEdge(0, 2, 1);
+    try g.addEdge(2, 4, 1);
+    try g.ensureNode(5);
+    var tree = try bumtree.build(testing.allocator, &g, 0, &.{3});
+    defer tree.deinit();
+    const map = [_]NodeBmac{ .{ .node = 0, .b_mac = bmac(0) }, .{ .node = 1, .b_mac = bmac(1) }, .{ .node = 2, .b_mac = bmac(2) }, .{ .node = 3, .b_mac = bmac(3) }, .{ .node = 4, .b_mac = bmac(4) }, .{ .node = 5, .b_mac = bmac(5) } };
+    const da = groupDa(0x04001, 200);
+
+    var root = (try buildMcast(testing.allocator, &tree, 0, 0x04001, 200, 100, &map)).?;
+    defer root.deinit(testing.allocator);
+    try testing.expectEqual(da, root.group_da);
+    try testing.expectEqual(@as(?BMac, null), root.rpf_ingress_bmac);
+    try testing.expectEqual(@as(usize, 1), root.egress_bmacs.len);
+    try testing.expectEqual(bmac(1), root.egress_bmacs[0]);
+    try testing.expect(!root.deliver_locally);
+    try testing.expectEqual(@as(u12, 100), root.b_vid);
+
+    var transit = (try buildMcast(testing.allocator, &tree, 1, 0x04001, 200, 100, &map)).?;
+    defer transit.deinit(testing.allocator);
+    try testing.expectEqual(@as(?BMac, bmac(0)), transit.rpf_ingress_bmac);
+    try testing.expectEqual(bmac(3), transit.egress_bmacs[0]);
+    try testing.expect(!transit.deliver_locally);
+
+    var leaf = (try buildMcast(testing.allocator, &tree, 3, 0x04001, 200, 100, &map)).?;
+    defer leaf.deinit(testing.allocator);
+    try testing.expectEqual(@as(?BMac, bmac(1)), leaf.rpf_ingress_bmac);
+    try testing.expectEqual(@as(usize, 0), leaf.egress_bmacs.len);
+    try testing.expect(leaf.deliver_locally);
+
+    // The pruned branch (2, 4), the unreachable node 5 and an id outside the graph have no entry.
+    for ([_]bumtree.NodeId{ 2, 4, 5, 99 }) |n| try testing.expectEqual(@as(?McastEntry, null), try buildMcast(testing.allocator, &tree, n, 0x04001, 200, 100, &map));
+}
+
+test "buildMcast: an unbound neighbour is error.UnknownBmac, never a partial entry; allocation failure leaks nothing" {
+    const spf_ect = @import("spf-ect");
+    var g = spf_ect.Graph.init(testing.allocator);
+    defer g.deinit();
+    try g.addEdge(0, 1, 1);
+    try g.addEdge(0, 2, 1);
+    var tree = try bumtree.build(testing.allocator, &g, 0, &.{ 1, 2 });
+    defer tree.deinit();
+    const partial = [_]NodeBmac{ .{ .node = 0, .b_mac = bmac(0) }, .{ .node = 1, .b_mac = bmac(1) } };
+    try testing.expectError(error.UnknownBmac, buildMcast(testing.allocator, &tree, 0, 1, 1, 1, &partial));
+    // A leaf whose RPF neighbour is not bound.
+    const only_leaf = [_]NodeBmac{.{ .node = 2, .b_mac = bmac(2) }};
+    try testing.expectError(error.UnknownBmac, buildMcast(testing.allocator, &tree, 2, 1, 1, 1, &only_leaf));
+    const full = [_]NodeBmac{ .{ .node = 0, .b_mac = bmac(0) }, .{ .node = 1, .b_mac = bmac(1) }, .{ .node = 2, .b_mac = bmac(2) } };
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        if (buildMcast(fa.allocator(), &tree, 0, 1, 1, 1, &full)) |maybe| {
+            var e = maybe.?;
+            e.deinit(fa.allocator());
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+}
+
+test "portFor: the egress interface of a next-hop B-MAC; unbound is null; the first binding wins" {
+    const ports = [_]PortBinding{ .{ .next_hop_bmac = bmac(1), .port = 7 }, .{ .next_hop_bmac = bmac(2), .port = 9 }, .{ .next_hop_bmac = bmac(1), .port = 11 } };
+    try testing.expectEqual(@as(?u32, 7), portFor(&ports, bmac(1)));
+    try testing.expectEqual(@as(?u32, 9), portFor(&ports, bmac(2)));
+    try testing.expectEqual(@as(?u32, null), portFor(&ports, bmac(3)));
+    try testing.expectEqual(@as(?u32, null), portFor(&.{}, bmac(1)));
 }
