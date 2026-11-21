@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, CSVSTREAM_FUZZ; dialect harness checks the event-jumping scanner against its bytewise reference — a planted cap mutant fails at seed 48) · ct n/a — CSV parsing (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: capacity sums saturate, scan start clamped, counters saturate, no-cut refills double (O(M log M)), EOF probe ≤ 64 KiB; delta audit 18/20 + 2 eq)
 
-**Performance:** ref 0.43–0.89× Go encoding/csv 1.26.8 (`ReuseRecord`, `LazyQuotes`; `zig build bench-csvstream`: narrow 10×1M, wide 100×100k, every field quoted, multi-line `.span`, in-memory, writer 1M records) · fastest 1.02–2.05× zsv 1.4.3 (C, SIMD; the five reader rows, `bench-csvstream`, 2026-11-21, two runs of 5 and 7 rounds on a loaded machine: the ratios repeat, the spreads were 9-57%)
+**Performance:** ref 0.43–0.89× Go encoding/csv 1.26.8 (`ReuseRecord`, `LazyQuotes`; `zig build bench-csvstream`: narrow 10×1M, wide 100×100k, every field quoted, multi-line `.span`, in-memory, writer 1M records) · fastest 1.02–2.05× zsv 1.4.3 (measured 2026-11-21)
 
 **Known defects:** none recorded
 
