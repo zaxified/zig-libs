@@ -63,6 +63,8 @@ const security = opcua.security;
 
 const transcript_path = "modules/opcua/src/testdata/asyncua_transcript.txt";
 const driver_path = "modules/opcua/tools/asyncua_driver.py";
+/// The second phase (live only, never recorded): the newer policies.
+const policies_driver_path = "modules/opcua/tools/asyncua_policies.py";
 
 // ── the fixture ────────────────────────────────────────────────────────────
 //
@@ -808,7 +810,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .{ session.connections, session.steps, session.rejected },
     );
 
-    if (!capture) return 0;
+    if (!capture) return runPolicies(gpa, io, &fx, &listener, python, repo_root, root);
 
     // Everything the transcript can SHOW but not CHECK goes in as a note.
     rec.raw("\n", .{});
@@ -847,4 +849,195 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try root.writeFile(io, .{ .sub_path = transcript_path, .data = full.written() });
     std.debug.print("wrote {s} ({d} bytes)\n", .{ transcript_path, full.written().len });
     return 0;
+}
+
+// ── phase 2: Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss ───────────────
+//
+// Live only (not part of `--capture`): the same server and listener, its
+// endpoint list swapped for the newer policies at Sign and SignAndEncrypt,
+// driven by `asyncua_policies.py`. Each leg writes and reads back
+// `the.answer` and, at Sign, logs in with a username whose password asyncua
+// encrypts under the leg's policy.
+
+const policy_expectations = [_][]const u8{
+    "ZIGLIBS-POLICY Aes128Sha256RsaOaep Sign ",
+    "ZIGLIBS-POLICY Aes128Sha256RsaOaep SignAndEncrypt ",
+    "ZIGLIBS-POLICY Aes256Sha256RsaPss Sign ",
+    "ZIGLIBS-POLICY Aes256Sha256RsaPss SignAndEncrypt ",
+    "ZIGLIBS-POLICIES-DONE",
+};
+
+fn runPolicies(gpa: std.mem.Allocator, io: std.Io, fx: *Fixture, listener: *std.Io.net.Server, python: []const u8, repo_root: []const u8, root: std.Io.Dir) !u8 {
+    root.access(io, policies_driver_path, .{}) catch {
+        std.debug.print("cannot find {s}\n", .{policies_driver_path});
+        return 2;
+    };
+    const script_path = try gpa.print("{s}/{s}", .{ repo_root, policies_driver_path });
+    const endpoints = [_]services.EndpointDescription{
+        server.noneEndpoint(live_endpoint_url, app),
+        server.secureEndpointFor(.aes128_sha256_rsaoaep, live_endpoint_url, app, .sign, fx.creds.certificate_der, 10),
+        server.secureEndpointFor(.aes128_sha256_rsaoaep, live_endpoint_url, app, .sign_and_encrypt, fx.creds.certificate_der, 20),
+        server.secureEndpointFor(.aes256_sha256_rsapss, live_endpoint_url, app, .sign, fx.creds.certificate_der, 30),
+        server.secureEndpointFor(.aes256_sha256_rsapss, live_endpoint_url, app, .sign_and_encrypt, fx.creds.certificate_der, 40),
+    };
+    fx.srv.config.endpoints = &endpoints;
+
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    var rec: Recorder = .{ .enabled = false, .out = &sink.writer };
+    var peer: Peer = .{
+        .gpa = gpa,
+        .io = io,
+        .child = std.process.spawn(io, .{
+            .argv = &.{ python, script_path, live_endpoint_url },
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .environ_map = child_env,
+        }) catch |err| {
+            std.debug.print("cannot start the policies driver: {t}\n", .{err});
+            return 1;
+        },
+    };
+    const drainer = std.Thread.spawn(.{}, Peer.drain, .{&peer}) catch {
+        std.debug.print("cannot spawn the drain thread\n", .{});
+        return 1;
+    };
+    var session: Session = .{ .fx = fx, .rec = &rec };
+    const serve_result = serve(&session, io, listener, &peer);
+    drainer.join();
+    if (serve_result) |_| {} else |err| {
+        std.debug.print("the policies serve loop failed: {t}\n", .{err});
+        return 1;
+    }
+    var failed = peer.failed != null or peer.exit_code != 0;
+    for (policy_expectations) |needle| {
+        if (std.mem.find(u8, peer.stdout, needle) == null) {
+            std.debug.print("policies driver output missing \"{s}\"\n", .{needle});
+            failed = true;
+        }
+    }
+    if (failed) {
+        std.debug.print("\n--- policies driver stdout ---\n{s}\n--- stderr ---\n{s}\n", .{ peer.stdout, peer.stderr });
+        return 1;
+    }
+    std.debug.print("ok: newer policies, {d} connections, driver exited 0\n", .{session.connections});
+    return runClientPolicies(gpa, io, &fx.csprng, python, repo_root, root);
+}
+
+// ── phase 3: this module's CLIENT against asyncua's server ────────────────
+//
+// `asyncua_server.py` serves only the newer policies (and #None); this
+// client opens a channel at each policy and mode, makes and activates an
+// anonymous session and reads the server's CurrentTime (i=2258) over it.
+
+const server_driver_path = "modules/opcua/tools/asyncua_server.py";
+const client_port: u16 = 4842;
+const client_url = "opc.tcp://127.0.0.1:4842/";
+
+fn runClientPolicies(gpa: std.mem.Allocator, io: std.Io, csprng: *std.Random.DefaultCsprng, python: []const u8, repo_root: []const u8, root: std.Io.Dir) !u8 {
+    root.access(io, server_driver_path, .{}) catch {
+        std.debug.print("cannot find {s}\n", .{server_driver_path});
+        return 2;
+    };
+    const script_path = try gpa.print("{s}/{s}", .{ repo_root, server_driver_path });
+    var child = std.process.spawn(io, .{
+        .argv = &.{ python, script_path, client_url },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .environ_map = child_env,
+    }) catch |err| {
+        std.debug.print("cannot start the asyncua server: {t}\n", .{err});
+        return 1;
+    };
+    defer {
+        // Closing stdin ends the server; then reap it.
+        if (child.stdin) |f| f.close(io);
+        child.stdin = null;
+        _ = child.wait(io) catch {};
+    }
+    var line_buf: [4096]u8 = undefined;
+    var out_reader = child.stdout.?.reader(io, &line_buf);
+    const ready = (out_reader.interface.takeDelimiter('\n') catch null) orelse {
+        std.debug.print("the asyncua server did not come up\n", .{});
+        return 1;
+    };
+    const marker = "ZIGLIBS-SERVER-READY ";
+    if (!std.mem.startsWith(u8, ready, marker)) {
+        std.debug.print("unexpected asyncua server line: {s}\n", .{ready});
+        return 1;
+    }
+    const cert_path = std.mem.trim(u8, ready[marker.len..], " \r\t");
+    const server_cert = try std.Io.Dir.cwd().readFileAlloc(io, cert_path, gpa, .limited(16 * 1024));
+
+    var creds: security.Credentials = undefined;
+    try security.Credentials.generateSelfSigned(gpa, csprng.random(), .{
+        .modulus_bits = 2048,
+        .common_name = "zig-libs opcua interop client",
+        .not_before = "200101000000Z",
+        .not_after = "350101000000Z",
+        .application_uri = "urn:zig-libs:opcua:client",
+    }, &creds);
+    defer creds.deinit(gpa);
+
+    var legs: usize = 0;
+    for ([_]security.SecurityPolicy{ .aes128_sha256_rsaoaep, .aes256_sha256_rsapss }) |policy| {
+        for ([_]security.SecurityMode{ .sign, .sign_and_encrypt }) |mode| {
+            clientLeg(gpa, io, policy, mode, creds, server_cert, csprng.random()) catch |err| {
+                std.debug.print("client leg {t} {t} against asyncua: {t}\n", .{ policy, mode, err });
+                return 1;
+            };
+            legs += 1;
+        }
+    }
+    std.debug.print("ok: this client at the newer policies against asyncua's server, {d} legs\n", .{legs});
+    return 0;
+}
+
+fn clientLeg(gpa: std.mem.Allocator, io: std.Io, policy: security.SecurityPolicy, mode: security.SecurityMode, creds: security.Credentials, server_cert: []const u8, random: std.Random) !void {
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", client_port);
+    var stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var read_buf: [8192]u8 = undefined;
+    var write_buf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &read_buf);
+    var sw = stream.writer(io, &write_buf);
+    var conn = opcua.transport.Connection.init(&sr.interface, &sw.interface);
+    _ = try conn.hello(.{
+        .protocol_version = 0,
+        .receive_buffer_size = 65536,
+        .send_buffer_size = 65536,
+        .max_message_size = 0,
+        .max_chunk_count = 0,
+        .endpoint_url = client_url,
+    });
+    var ch: opcua.SecureChannel = undefined;
+    try opcua.SecureChannel.open(&conn, gpa, .{ .security = .{
+        .policy = policy,
+        .mode = mode,
+        .credentials = creds,
+        .server_certificate = server_cert,
+        .random = random,
+    } }, &ch);
+    defer ch.close() catch {};
+    var session = try opcua.Session.create(&ch, gpa, .{
+        .client_description = .{
+            .application_uri = "urn:zig-libs:opcua:client",
+            .product_uri = "urn:zig-libs:opcua",
+            .application_name = .{ .locale = "en", .text = "zig-libs opcua client" },
+            .application_type = .client,
+            .gateway_server_uri = null,
+            .discovery_profile_uri = null,
+            .discovery_urls = null,
+        },
+        .endpoint_url = client_url,
+    });
+    defer session.deinit();
+    try session.activate(null);
+    defer session.close(false) catch {};
+    const now = try session.readAttribute(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, services.attribute_id.value);
+    defer encoding.freeDataValue(gpa, now);
+    const v = now.value orelse return error.NoCurrentTime;
+    if (v != .scalar or v.scalar != .date_time or v.scalar.date_time <= 0) return error.NoCurrentTime;
 }

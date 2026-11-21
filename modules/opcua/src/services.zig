@@ -3401,6 +3401,7 @@ pub const Channel = struct {
                     const random = sec.random orelse @panic("opcua security: SecurityMode != none requires SecurityContext.random");
                     break :blk try security.sealAsymmetricMessage(
                         ch.allocator,
+                        sec.policy,
                         random,
                         message_type.code(),
                         body,
@@ -3480,7 +3481,7 @@ pub const Channel = struct {
                     .open_secure_channel => blk: {
                         const creds = sec.credentials orelse @panic("opcua security: SecurityMode != none requires ClientCredentials");
                         const server_cert = sec.server_certificate orelse @panic("opcua security: SecurityMode != none requires a pinned server certificate");
-                        break :blk try security.openAsymmetricMessage(ch.allocator, &header_bytes, chunk.body, &creds.private_key, server_cert);
+                        break :blk try security.openAsymmetricMessage(ch.allocator, sec.policy, &header_bytes, chunk.body, &creds.private_key, server_cert);
                     },
                     .message, .close_secure_channel => blk: {
                         const keys: *const security.ChannelKeys = if (sec.keys) |*k| k else @panic("opcua security: SecurityMode != none requires derived ChannelKeys");

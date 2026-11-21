@@ -441,7 +441,7 @@ pub const Session = struct {
             defer allocator.free(signed);
             @memcpy(signed[0..client_cert.len], client_cert);
             @memcpy(signed[client_cert.len..], &session_nonce);
-            security.asymmetricVerify(signed, signature, server_pk) catch return error.InvalidSecureMessage;
+            security.asymmetricVerify(sec.policy, signed, signature, server_pk) catch return error.InvalidSecureMessage;
         }
 
         session.session_id = response.session_id;
@@ -509,9 +509,10 @@ pub const Session = struct {
             defer session.allocator.free(to_sign);
             @memcpy(to_sign[0..server_cert.len], server_cert);
             @memcpy(to_sign[server_cert.len..], server_nonce);
-            signature_bytes = try security.asymmetricSign(session.allocator, to_sign, &sec.credentials.?.private_key);
+            const random = sec.random orelse @panic("opcua security: SecurityMode != none requires SecurityContext.random");
+            signature_bytes = try security.asymmetricSign(session.allocator, sec.policy, to_sign, &sec.credentials.?.private_key, random);
             client_signature = .{
-                .algorithm = security.signature_algorithm_rsa_sha256,
+                .algorithm = sec.policy.asymmetricSignatureAlgorithm(),
                 .signature = signature_bytes,
             };
         }
@@ -2005,6 +2006,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
     });
     const sealed_opn_resp = try security.sealAsymmetricMessage(
         testing.allocator,
+        .basic256sha256,
         random,
         transport.MessageType.open_secure_channel.code(),
         opn_resp_alloc.writer.buffered(),
@@ -2051,6 +2053,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
     try testing.expectEqual(opn_req_wire.len, std.mem.readInt(u32, opn_req_wire[4..8], .little));
     const opn_req_plain = try security.openAsymmetricMessage(
         testing.allocator,
+        .basic256sha256,
         opn_req_wire[0..8],
         opn_req_wire[8..],
         &server_creds.private_key,
@@ -3518,6 +3521,7 @@ test "secure offline scripted: a secured OpenSecureChannel answer with an empty 
     });
     const sealed = try security.sealAsymmetricMessage(
         testing.allocator,
+        .basic256sha256,
         random,
         transport.MessageType.open_secure_channel.code(),
         resp.writer.buffered(),
@@ -3627,6 +3631,7 @@ fn sealedOpnAnswer(
     });
     return security.sealAsymmetricMessage(
         allocator,
+        .basic256sha256,
         random,
         transport.MessageType.open_secure_channel.code(),
         resp.writer.buffered(),

@@ -8,10 +8,10 @@ module), and the Part-4 services on both sides of the wire — a client that
 drives a real server, and a server (device) a real client can drive.
 
 **Status: implemented, both roles, both secured.** Client: codec, transport,
-secure channel (`Basic256Sha256` Sign/SignAndEncrypt, with client-side token renewal), session lifecycle,
+secure channel (`Basic256Sha256`, `Aes128_Sha256_RsaOaep` and `Aes256_Sha256_RsaPss`, Sign/SignAndEncrypt, with client-side token renewal), session lifecycle,
 attribute/method/TranslateBrowsePaths services and subscriptions. Server: the opc.tcp connection
 state machine with explicit chunk limits, **the full server side of
-`Basic256Sha256`** (asymmetric OpenSecureChannel, P-SHA256 key derivation,
+`Basic256Sha256`, `Aes128_Sha256_RsaOaep` and `Aes256_Sha256_RsaPss`** (asymmetric OpenSecureChannel, P-SHA256 key derivation,
 per-chunk sign/encrypt, SecurityToken renewal with an overlap window, the
 CreateSession/ActivateSession signature exchange and RSA-OAEP-encrypted
 username tokens), sessions with anonymous/username identity, a caller-owned
@@ -200,6 +200,8 @@ var srv = opcua.server.Server.init(gpa, &store, .{
         opcua.server.noneEndpointWithEncryptedUserTokens(url, app, creds.certificate_der),
         opcua.server.secureEndpoint(url, app, .sign,             creds.certificate_der, 10),
         opcua.server.secureEndpoint(url, app, .sign_and_encrypt, creds.certificate_der, 20),
+        // the OPC UA 1.05 policies: secureEndpointFor(.aes128_sha256_rsaoaep / .aes256_sha256_rsapss, …)
+        opcua.server.secureEndpointFor(.aes256_sha256_rsapss, url, app, .sign_and_encrypt, creds.certificate_der, 40),
     },
     .security = .{
         .credentials = creds,                          // key pair + application certificate
@@ -212,7 +214,11 @@ var srv = opcua.server.Server.init(gpa, &store, .{
   request is RSA-OAEP-decrypted with the server key and its
   RSA-PKCS1v1.5/SHA-256 signature verified against the certificate the
   (plaintext) `AsymmetricAlgorithmSecurityHeader` carries; the response is
-  signed and encrypted back to that certificate.
+  signed and encrypted back to that certificate. `Aes128_Sha256_RsaOaep`
+  differs only in its AES-128-CBC chunks; `Aes256_Sha256_RsaPss` signs with
+  RSA-PSS/SHA-256 and encrypts with RSA-OAEP/SHA-256 (also the
+  `CreateSession`/`ActivateSession` signatures and an encrypted password,
+  `…/rsa-pss-sha2-256`, `…/rsa-oaep-sha2-256`).
 - **The endpoint list is the authority.** A (SecurityPolicy, SecurityMode)
   pair no endpoint advertises is `BadSecurityModeRejected`, so what a client
   picked out of `GetEndpoints` is exactly what it can use.
@@ -245,8 +251,8 @@ var srv = opcua.server.Server.init(gpa, &store, .{
 
 ## Not provided
 
-Each a `Bad…` status rather than a silent partial answer: security policies other than `#None` and `Basic256Sha256`
-(`Basic128Rsa15`, `Basic256`, `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`), `X509IdentityToken`/`IssuedIdentityToken`,
+Each a `Bad…` status rather than a silent partial answer: the deprecated security policies `Basic128Rsa15` and
+`Basic256`, `X509IdentityToken`/`IssuedIdentityToken`,
 a trust store and certificate revocation (no CRL/OCSP — fold that into your `certificate_policy`),
 `ApplicationUri`-vs-SAN matching, event filters and events, HistoryUpdate and processed history, node management, PubSub, and the full
 standard NodeSet. `IndexRange` is applied on Read, Write and monitored items, and monitored items take a `DataChangeFilter` (trigger, absolute and percent deadband), and `HistoryRead` (raw, at time) goes to a `Config.history` provider. What is deliberately refused
@@ -296,7 +302,10 @@ is in SPEC.md *What is deliberately not done*; what is wanted and open is in *Ba
   toolchain — `live` in `build.zig`'s `module_list` is where it is answered.
 - Live, outside the module (`zig build interop-opcua`, needs a Python with
   `asyncua` + `cryptography`): `tools/asyncua_driver.py` driving this server for
-  real. It is a pre-release check; the replay above is the per-commit one.
+  real; then `tools/asyncua_policies.py` driving it at `Aes128_Sha256_RsaOaep` and
+  `Aes256_Sha256_RsaPss` (Sign with an encrypted username, SignAndEncrypt), and this
+  module's client against `asyncua`'s own server at both (`tools/asyncua_server.py`).
+  It is a pre-release check; the replay above is the per-commit one.
 - Goldens: captured open62541 bytes for the `#None` traffic; **self-derived,
   fully deterministic** goldens for the Basic256Sha256 asymmetric handshake
   and for signed / signed-and-encrypted MSG chunks; and, cut from a real

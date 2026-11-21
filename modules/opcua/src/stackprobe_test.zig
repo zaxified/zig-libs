@@ -64,7 +64,7 @@ fn setup() !void {
     fill(&cbc, "opcua probe plaintext");
     fill(&sym_body, "opcua probe body");
     std.mem.writeInt(u32, sym_body[0..4], 7, .little);
-    token_blob = try security.encryptUserTokenSecret(gpa, &password, &nonce, server.public_key, prng.random());
+    token_blob = try security.encryptUserTokenSecret(gpa, .basic256sha256, &password, &nonce, server.public_key, prng.random());
     sealed = try security.symmetricSealChunk(gpa, "MSG", 'F', &sym_body, .sign_and_encrypt, &keys, .client_to_server);
 
     // A plausible OPN body: ChannelId + real asymmetric header + SequenceHeader + payload.
@@ -81,7 +81,7 @@ fn setup() !void {
     try w.writeInt(u32, 1, .little);
     try w.writeAll("opn-request-payload-bytes");
     opn_len = w.buffered().len;
-    opn_wire = try security.sealAsymmetricMessage(gpa, prng.random(), "OPN", opn_buf[0..opn_len], opn_enc_offset, &client, server.certificate_der);
+    opn_wire = try security.sealAsymmetricMessage(gpa, .basic256sha256, prng.random(), "OPN", opn_buf[0..opn_len], opn_enc_offset, &client, server.certificate_der);
 }
 
 fn keyNeedles() [3][]const u8 {
@@ -102,10 +102,10 @@ test "STACKPROBE: no channel key, RSA key or password residue after any entry po
     _ = try P.run("symmetricDecryptAndVerify", security.symmetricDecryptAndVerify, .{ gpa, sealed[0..8], sealed[8..], .sign_and_encrypt, &keys, .client_to_server }, kb, .{});
 
     const rsa_sk = std.mem.asBytes(&server.private_key);
-    _ = try P.run("encryptUserTokenSecret", security.encryptUserTokenSecret, .{ gpa, &password, &nonce, server.public_key, prng.random() }, &[_][]const u8{&password}, .{});
-    _ = try P.run("decryptUserTokenSecret", security.decryptUserTokenSecret, .{ gpa, token_blob, &server.private_key, &nonce }, &[_][]const u8{ rsa_sk, &password }, .{});
-    _ = try P.run("sealAsymmetricMessage", security.sealAsymmetricMessage, .{ gpa, prng.random(), "OPN", opn_buf[0..opn_len], opn_enc_offset, &client, server.certificate_der }, &[_][]const u8{std.mem.asBytes(&client.private_key)}, .{});
-    _ = try P.run("openAsymmetricMessage", security.openAsymmetricMessage, .{ gpa, opn_wire[0..8], opn_wire[8..], &server.private_key, client.certificate_der }, &[_][]const u8{rsa_sk}, .{});
+    _ = try P.run("encryptUserTokenSecret", security.encryptUserTokenSecret, .{ gpa, .basic256sha256, &password, &nonce, server.public_key, prng.random() }, &[_][]const u8{&password}, .{});
+    _ = try P.run("decryptUserTokenSecret", security.decryptUserTokenSecret, .{ gpa, .basic256sha256, token_blob, &server.private_key, &nonce }, &[_][]const u8{ rsa_sk, &password }, .{});
+    _ = try P.run("sealAsymmetricMessage", security.sealAsymmetricMessage, .{ gpa, .basic256sha256, prng.random(), "OPN", opn_buf[0..opn_len], opn_enc_offset, &client, server.certificate_der }, &[_][]const u8{std.mem.asBytes(&client.private_key)}, .{});
+    _ = try P.run("openAsymmetricMessage", security.openAsymmetricMessage, .{ gpa, .basic256sha256, opn_wire[0..8], opn_wire[8..], &server.private_key, client.certificate_der }, &[_][]const u8{rsa_sk}, .{});
 
     const opts = security.ClientCredentials.GenerateSelfSignedOptions{
         .modulus_bits = 1024,

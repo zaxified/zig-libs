@@ -51,9 +51,13 @@
 //! `services.Channel`'s hook points only call into this file when
 //! `channel.security != null` and `.mode != .none`.
 //!
-//! `Aes256_Sha256_RsaPss` (OPC 10000-7 §6.4.6) remains reserved as an enum
-//! value + `uri()` only (asym encrypt = RSA-OAEP-SHA256, asym sign =
-//! RSA-PSS-SHA256) — no crypto wiring.
+//! The newer policies differ from that table in three places only (OPC
+//! 10000-7 §6.6.163, §6.6.164; `SecurityPolicy` holds the switches):
+//!   - `Aes128_Sha256_RsaOaep`: symmetric encryption AES-128-CBC (a 16-byte
+//!     derived encrypting key); everything else as Basic256Sha256.
+//!   - `Aes256_Sha256_RsaPss`: asymmetric encryption RSA-OAEP / SHA-256,
+//!     asymmetric signature RSA-PSS / SHA-256 (MGF1-SHA256, a 32-byte
+//!     salt); everything else as Basic256Sha256.
 //!
 //! **Both roles use this file.** Nothing in it is client-specific: a client
 //! seals with `.client_to_server` and opens with `.server_to_client`, a
@@ -74,6 +78,7 @@ const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Aes256 = std.crypto.core.aes.Aes256;
+const Aes128 = std.crypto.core.aes.Aes128;
 
 pub const meta = .{
     .platform = .any, // pure computation + RSA (no I/O of its own)
@@ -88,9 +93,11 @@ pub const meta = .{
 pub const SecurityPolicy = enum {
     none,
     basic256sha256,
-    /// Reserved: enum value + `uri()` only (asym encrypt = RSA-OAEP-SHA256,
-    /// asym sign = RSA-PSS-SHA256) — no `SecurityLengths`, no crypto wiring.
+    /// OPC 10000-7 §6.6.164: asymmetric encryption RSA-OAEP / SHA-256,
+    /// asymmetric signature RSA-PSS / SHA-256; symmetric as Basic256Sha256.
     aes256_sha256_rsapss,
+    /// OPC 10000-7 §6.6.163: AES-128-CBC; the rest as Basic256Sha256.
+    aes128_sha256_rsaoaep,
 
     /// The real OPC Foundation SecurityPolicy URI (OPC 10000-7 §6.1/§6.4).
     pub fn uri(self: SecurityPolicy) []const u8 {
@@ -98,18 +105,26 @@ pub const SecurityPolicy = enum {
             .none => "http://opcfoundation.org/UA/SecurityPolicy#None",
             .basic256sha256 => "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
             .aes256_sha256_rsapss => "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss",
+            .aes128_sha256_rsaoaep => "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep",
         };
     }
 
-    /// OPC 10000-7 §6.6.x "MinAsymmetricKeyLength" (bits) of the policy's RSA
-    /// application-certificate key: 2048 for `Basic256Sha256` and
-    /// `Aes256_Sha256_RsaPss` (Aes128_Sha256_RsaOaep has the same row; it is
-    /// not an enum value here). `null` for `.none`. Basic128Rsa15 and
-    /// Basic256 (deprecated, 1024..2048) are not implemented by this module.
+    /// The policy `uri_str` names, or null for one this module does not speak.
+    pub fn fromUri(uri_str: []const u8) ?SecurityPolicy {
+        inline for (comptime std.enums.values(SecurityPolicy)) |p| {
+            if (std.mem.eql(u8, uri_str, p.uri())) return p;
+        }
+        return null;
+    }
+
+    /// OPC 10000-7 "MinAsymmetricKeyLength" (bits) of the policy's RSA
+    /// application-certificate key: 2048 for every secured policy here.
+    /// `null` for `.none`. Basic128Rsa15 and Basic256 (deprecated,
+    /// 1024..2048) are not implemented by this module.
     pub fn minAsymmetricKeyBits(self: SecurityPolicy) ?usize {
         return switch (self) {
             .none => null,
-            .basic256sha256, .aes256_sha256_rsapss => 2048,
+            .basic256sha256, .aes256_sha256_rsapss, .aes128_sha256_rsaoaep => 2048,
         };
     }
 
@@ -118,8 +133,37 @@ pub const SecurityPolicy = enum {
     pub fn maxAsymmetricKeyBits(self: SecurityPolicy) ?usize {
         return switch (self) {
             .none => null,
-            .basic256sha256, .aes256_sha256_rsapss => 4096,
+            .basic256sha256, .aes256_sha256_rsapss, .aes128_sha256_rsaoaep => 4096,
         };
+    }
+
+    /// The `AsymmetricSignatureAlgorithm` URI that goes into a
+    /// `SignatureData.Algorithm` (OPC 10000-7): RSA-PSS-SHA256 for
+    /// `Aes256_Sha256_RsaPss`, RSA-PKCS1v1.5-SHA256 otherwise.
+    pub fn asymmetricSignatureAlgorithm(self: SecurityPolicy) []const u8 {
+        return if (self == .aes256_sha256_rsapss) signature_algorithm_rsa_pss_sha256 else signature_algorithm_rsa_sha256;
+    }
+
+    /// The `AsymmetricEncryptionAlgorithm` URI (an encrypted identity
+    /// token's `EncryptionAlgorithm`): RSA-OAEP-SHA256 for
+    /// `Aes256_Sha256_RsaPss`, RSA-OAEP (SHA-1) otherwise.
+    pub fn asymmetricEncryptionAlgorithm(self: SecurityPolicy) []const u8 {
+        return if (self == .aes256_sha256_rsapss) encryption_algorithm_rsa_oaep_sha256 else encryption_algorithm_rsa_oaep;
+    }
+
+    /// `DerivedEncryptionKeyLength` (bytes): 16 for AES-128-CBC
+    /// (`Aes128_Sha256_RsaOaep`), 32 for AES-256-CBC.
+    pub fn encryptingKeyLen(self: SecurityPolicy) usize {
+        return if (self == .aes128_sha256_rsaoaep) 16 else 32;
+    }
+
+    fn oaepSha256(self: SecurityPolicy) bool {
+        return self == .aes256_sha256_rsapss;
+    }
+
+    /// RSA-OAEP overhead per encrypted block: 2*hLen + 2 (RFC 8017 §7.1.1).
+    fn oaepOverhead(self: SecurityPolicy) usize {
+        return if (self.oaepSha256()) 2 * Sha256.digest_length + 2 else oaep_sha1_overhead;
     }
 
     /// Is an RSA modulus of `bits` within the policy's key-length band?
@@ -160,6 +204,18 @@ pub const signature_algorithm_rsa_sha256_legacy = "http://www.w3.org/2000/09/xml
 /// OPC 10000-7 §6.4.5 "AsymmetricEncryptionAlgorithm": RSA-OAEP/SHA-1).
 pub const encryption_algorithm_rsa_oaep = "http://www.w3.org/2001/04/xmlenc#rsa-oaep";
 
+/// `Aes256_Sha256_RsaPss`'s asymmetric signature algorithm URI (OPC
+/// 10000-7 §6.6.164: RSA-PSS with SHA-256, MGF1-SHA256, a 32-byte salt).
+pub const signature_algorithm_rsa_pss_sha256 = "http://opcfoundation.org/UA/security/rsa-pss-sha2-256";
+
+/// `Aes256_Sha256_RsaPss`'s asymmetric encryption algorithm URI (RSA-OAEP
+/// with SHA-256 and MGF1-SHA256).
+pub const encryption_algorithm_rsa_oaep_sha256 = "http://opcfoundation.org/UA/security/rsa-oaep-sha2-256";
+
+/// The PSS salt length of `Aes256_Sha256_RsaPss` (the SHA-256 output
+/// length, as open62541 and asyncua sign).
+const pss_salt_len = Sha256.digest_length;
+
 /// Per-`SecurityPolicy` algorithm/length constants. Values below are for a
 /// 2048-bit (256-byte) RSA key — the conventional size open62541/node-opcua
 /// default an application certificate to for this profile. The functions in
@@ -194,15 +250,27 @@ pub const SecurityLengths = struct {
         .asymmetric_max_plaintext_len = 256 - 2 * 20 - 2, // = 214
         .asymmetric_signature_len = 256,
     };
+    /// Aes128_Sha256_RsaOaep, 2048-bit RSA: a 16-byte encrypting key.
+    pub const aes128_sha256_rsaoaep: SecurityLengths = .{
+        .asymmetric_max_plaintext_len = 256 - 2 * 20 - 2, // = 214
+        .asymmetric_signature_len = 256,
+        .symmetric_key_len = 16,
+    };
+    /// Aes256_Sha256_RsaPss, 2048-bit RSA: OAEP over SHA-256.
+    pub const aes256_sha256_rsapss: SecurityLengths = .{
+        .asymmetric_max_plaintext_len = 256 - 2 * 32 - 2, // = 190
+        .asymmetric_signature_len = 256,
+    };
 };
 
 /// The length table for `policy`, or `null` for `.none` (no security, no
-/// lengths to speak of) and `.aes256_sha256_rsapss` (reserved — see the
-/// module doc comment; that policy has no `SecurityLengths` yet).
+/// lengths to speak of).
 pub fn lengths(policy: SecurityPolicy) ?SecurityLengths {
     return switch (policy) {
-        .none, .aes256_sha256_rsapss => null,
+        .none => null,
         .basic256sha256 => SecurityLengths.basic256sha256,
+        .aes128_sha256_rsaoaep => SecurityLengths.aes128_sha256_rsaoaep,
+        .aes256_sha256_rsapss => SecurityLengths.aes256_sha256_rsapss,
     };
 }
 
@@ -477,8 +545,9 @@ pub fn certificateValidity(certificate_der: []const u8) CertificatePublicKeyErro
 
 /// The six symmetric keys/IVs `deriveKeys` (P-SHA256) produces from the
 /// client/server nonce pair — one signing key + one encrypting key + one IV
-/// per direction (OPC 10000-6 §6.7.5), sized for Basic256Sha256 (AES-256 =
-/// 32-byte keys, AES block = 16-byte IV).
+/// per direction (OPC 10000-6 §6.7.5): 32-byte signing keys, 16-byte IVs,
+/// encrypting keys of `encrypting_key_len` octets (32 for AES-256-CBC, 16
+/// for `Aes128_Sha256_RsaOaep`'s AES-128-CBC: the first 16 of the field).
 pub const ChannelKeys = struct {
     client_signing_key: [32]u8,
     client_encrypting_key: [32]u8,
@@ -486,6 +555,8 @@ pub const ChannelKeys = struct {
     server_signing_key: [32]u8,
     server_encrypting_key: [32]u8,
     server_iv: [16]u8,
+    /// 32 (AES-256-CBC) or 16 (AES-128-CBC).
+    encrypting_key_len: u8 = 32,
 
     /// Zero all key material (`std.crypto.secureZero`) — call when the
     /// channel closes; the keys are as secret as the nonces they came from.
@@ -503,19 +574,31 @@ const DirectionKeys = struct {
     signing_key: *const [32]u8,
     encrypting_key: *const [32]u8,
     iv: *const [16]u8,
+    aes128: bool,
+
+    fn encrypt(dk: DirectionKeys, data: []u8) void {
+        if (dk.aes128) aes128CbcEncrypt(dk.encrypting_key[0..16], dk.iv, data) else aes256CbcEncrypt(dk.encrypting_key, dk.iv, data);
+    }
+
+    fn decrypt(dk: DirectionKeys, data: []u8) void {
+        if (dk.aes128) aes128CbcDecrypt(dk.encrypting_key[0..16], dk.iv, data) else aes256CbcDecrypt(dk.encrypting_key, dk.iv, data);
+    }
 };
 
 fn directionKeys(keys: *const ChannelKeys, direction: Direction) DirectionKeys {
+    const aes128 = keys.encrypting_key_len == 16;
     return switch (direction) {
         .client_to_server => .{
             .signing_key = &keys.client_signing_key,
             .encrypting_key = &keys.client_encrypting_key,
             .iv = &keys.client_iv,
+            .aes128 = aes128,
         },
         .server_to_client => .{
             .signing_key = &keys.server_signing_key,
             .encrypting_key = &keys.server_encrypting_key,
             .iv = &keys.server_iv,
+            .aes128 = aes128,
         },
     };
 }
@@ -584,38 +667,61 @@ pub fn checkContextKeyLengths(ctx: SecurityContext) (CertificatePublicKeyError |
 
 pub const AsymmetricEncryptError = std.mem.Allocator.Error || rsa.EncryptOaepError;
 
-/// RSA-OAEP/SHA-1 encrypt `plaintext` under the receiver's public key (the
-/// OPN body's asymmetric-encryption algorithm, Basic256Sha256), splitting
-/// into per-RSA-block chunks of at most k - 42 bytes (k = modulus length;
-/// 214 for a 2048-bit key), each encrypted to one k-byte cipher block.
-/// `random` seeds OAEP and MUST be cryptographically secure. Returned
-/// ciphertext is `allocator`-owned.
-pub fn asymmetricEncrypt(allocator: std.mem.Allocator, plaintext: []const u8, receiver_public_key: rsa.PublicKey, random: std.Random) AsymmetricEncryptError![]u8 {
+/// One RSA-OAEP block under `policy`'s hash (SHA-1, or SHA-256 for
+/// `Aes256_Sha256_RsaPss`).
+fn oaepEncrypt(policy: SecurityPolicy, pk: rsa.PublicKey, random: std.Random, msg: []const u8, out: []u8) rsa.EncryptOaepError!void {
+    if (policy.oaepSha256())
+        _ = try rsa.encryptOaep(pk, Sha256, random, msg, "", out)
+    else
+        _ = try rsa.encryptOaep(pk, Sha1, random, msg, "", out);
+}
+
+fn oaepDecrypt(policy: SecurityPolicy, sk: *const rsa.SecretKey, ct: []const u8, out: []u8) rsa.DecryptOaepError![]u8 {
+    return if (policy.oaepSha256()) rsa.decryptOaep(sk, Sha256, ct, "", out) else rsa.decryptOaep(sk, Sha1, ct, "", out);
+}
+
+/// `policy`'s asymmetric signature: RSA-PSS / SHA-256 (salt 32) for
+/// `Aes256_Sha256_RsaPss`, RSA-PKCS1v1.5 / SHA-256 otherwise.
+fn rsaSign(policy: SecurityPolicy, sk: *const rsa.SecretKey, random: std.Random, msg: []const u8, out: []u8) (rsa.SignPkcs1v15Error || rsa.SignPssError)!void {
+    if (policy == .aes256_sha256_rsapss)
+        _ = try rsa.signPss(sk, Sha256, random, msg, pss_salt_len, out)
+    else
+        _ = try rsa.signPkcs1v15(sk, Sha256, msg, out);
+}
+
+/// RSA-OAEP encrypt `plaintext` under the receiver's public key with
+/// `policy`'s hash (the OPN body's asymmetric-encryption algorithm), splitting
+/// into per-RSA-block chunks of at most k - 2*hLen - 2 bytes (k = modulus
+/// length; 214 for a 2048-bit key under SHA-1, 190 under SHA-256), each
+/// encrypted to one k-byte cipher block. `random` seeds OAEP and MUST be
+/// cryptographically secure. Returned ciphertext is `allocator`-owned.
+pub fn asymmetricEncrypt(allocator: std.mem.Allocator, policy: SecurityPolicy, plaintext: []const u8, receiver_public_key: rsa.PublicKey, random: std.Random) AsymmetricEncryptError![]u8 {
     const k = modulusByteLen(receiver_public_key.n.bits());
-    if (k <= oaep_sha1_overhead) return error.MessageTooLong;
-    const plain_block = k - oaep_sha1_overhead;
+    const overhead = policy.oaepOverhead();
+    if (k <= overhead) return error.MessageTooLong;
+    const plain_block = k - overhead;
     const blocks = std.math.divCeil(usize, plaintext.len, plain_block) catch unreachable;
     const out = try allocator.alloc(u8, blocks * k);
     errdefer allocator.free(out);
     var i: usize = 0;
     while (i < blocks) : (i += 1) {
         const chunk = plaintext[i * plain_block .. @min((i + 1) * plain_block, plaintext.len)];
-        _ = try rsa.encryptOaep(receiver_public_key, Sha1, random, chunk, "", out[i * k ..][0..k]);
+        try oaepEncrypt(policy, receiver_public_key, random, chunk, out[i * k ..][0..k]);
     }
     return out;
 }
 
 pub const AsymmetricDecryptError = std.mem.Allocator.Error || rsa.DecryptOaepError;
 
-/// RSA-OAEP/SHA-1 decrypt `ciphertext` (a whole number of k-byte RSA blocks)
-/// with this client's private key (the OPN response body's asymmetric-
-/// decryption algorithm, Basic256Sha256). Returned plaintext is
-/// `allocator`-owned.
-pub fn asymmetricDecrypt(allocator: std.mem.Allocator, ciphertext: []const u8, private_key: *const rsa.SecretKey) AsymmetricDecryptError![]u8 {
+/// RSA-OAEP decrypt `ciphertext` (a whole number of k-byte RSA blocks) with
+/// this application's private key under `policy`'s hash (SHA-1, or SHA-256
+/// for `Aes256_Sha256_RsaPss`). Returned plaintext is `allocator`-owned.
+pub fn asymmetricDecrypt(allocator: std.mem.Allocator, policy: SecurityPolicy, ciphertext: []const u8, private_key: *const rsa.SecretKey) AsymmetricDecryptError![]u8 {
     const k = modulusByteLen(private_key.n.bits());
-    if (k <= oaep_sha1_overhead) return error.DecryptionError;
+    const overhead = policy.oaepOverhead();
+    if (k <= overhead) return error.DecryptionError;
     if (ciphertext.len == 0 or ciphertext.len % k != 0) return error.DecryptionError;
-    const plain_block = k - oaep_sha1_overhead;
+    const plain_block = k - overhead;
     const blocks = ciphertext.len / k;
     const out = try allocator.alloc(u8, blocks * plain_block);
     errdefer {
@@ -625,7 +731,7 @@ pub fn asymmetricDecrypt(allocator: std.mem.Allocator, ciphertext: []const u8, p
     var len: usize = 0;
     var i: usize = 0;
     while (i < blocks) : (i += 1) {
-        const m = rsa.decryptOaep(private_key, Sha1, ciphertext[i * k ..][0..k], "", out[len..][0..plain_block]) catch |err| switch (err) {
+        const m = oaepDecrypt(policy, private_key, ciphertext[i * k ..][0..k], out[len..][0..plain_block]) catch |err| switch (err) {
             error.BufferTooSmall => unreachable, // out chunk is exactly the max message length
             error.DecryptionError => return error.DecryptionError,
         };
@@ -638,25 +744,27 @@ pub fn asymmetricDecrypt(allocator: std.mem.Allocator, ciphertext: []const u8, p
     return shrunk;
 }
 
-pub const AsymmetricSignError = std.mem.Allocator.Error || rsa.SignPkcs1v15Error;
+pub const AsymmetricSignError = std.mem.Allocator.Error || rsa.SignPkcs1v15Error || rsa.SignPssError;
 
-/// RSA-PKCS1v1.5/SHA-256 sign `message` (the whole assembled plaintext OPN
-/// message) with this client's private key (Basic256Sha256's asymmetric-
-/// signature algorithm). Returned signature (modulus-length) is
-/// `allocator`-owned.
-pub fn asymmetricSign(allocator: std.mem.Allocator, message: []const u8, private_key: *const rsa.SecretKey) AsymmetricSignError![]u8 {
+/// Sign `message` with this application's private key under `policy`'s
+/// asymmetric-signature algorithm: RSA-PKCS1v1.5 / SHA-256, or RSA-PSS /
+/// SHA-256 with a 32-byte salt drawn from `random` for
+/// `Aes256_Sha256_RsaPss` (`random` is unused otherwise). Returned
+/// signature (modulus-length) is `allocator`-owned.
+pub fn asymmetricSign(allocator: std.mem.Allocator, policy: SecurityPolicy, message: []const u8, private_key: *const rsa.SecretKey, random: std.Random) AsymmetricSignError![]u8 {
     const k = modulusByteLen(private_key.n.bits());
     const out = try allocator.alloc(u8, k);
     errdefer allocator.free(out);
-    _ = try rsa.signPkcs1v15(private_key, Sha256, message, out);
+    try rsaSign(policy, private_key, random, message, out);
     return out;
 }
 
-/// Verify an RSA-PKCS1v1.5/SHA-256 signature over `message` against the
-/// peer's public key (the OPN response's asymmetric signature). Follows
-/// `rsa.verifyPkcs1v15`'s `!void` convention (an error return means "did not
-/// verify", not a different failure mode) rather than `!bool`.
-pub fn asymmetricVerify(message: []const u8, signature: []const u8, public_key: rsa.PublicKey) rsa.VerifyPkcs1v15Error!void {
+/// Verify `policy`'s asymmetric signature over `message` against the peer's
+/// public key. Follows `rsa.verifyPkcs1v15`'s `!void` convention (an error
+/// return means "did not verify", not a different failure mode) rather than
+/// `!bool`.
+pub fn asymmetricVerify(policy: SecurityPolicy, message: []const u8, signature: []const u8, public_key: rsa.PublicKey) rsa.VerifyPkcs1v15Error!void {
+    if (policy == .aes256_sha256_rsapss) return rsa.verifyPss(public_key, Sha256, message, signature, pss_salt_len);
     return rsa.verifyPkcs1v15(public_key, Sha256, message, signature);
 }
 
@@ -699,20 +807,24 @@ fn pSha256Body(secret: []const u8, seed: []const u8, out: []u8) void {
 /// bytes-in-bytes-out — no allocation, no error. The caller should `wipe`
 /// the returned keys when the channel dies.
 pub fn deriveKeys(client_nonce: []const u8, server_nonce: []const u8, policy: SecurityPolicy) ChannelKeys {
-    std.debug.assert(policy == .basic256sha256); // the only implemented policy
-    var keys: ChannelKeys = undefined;
-    var block: [32 + 32 + 16]u8 = undefined;
-    defer std.crypto.secureZero(u8, &block);
+    std.debug.assert(policy != .none); // no keys without a policy
+    // signingKey(32) ‖ encryptingKey(ek) ‖ IV(16), ek = 32 or 16 (AES-128).
+    const ek = policy.encryptingKeyLen();
+    var keys: ChannelKeys = std.mem.zeroes(ChannelKeys);
+    keys.encrypting_key_len = @intCast(ek);
+    var buf: [32 + 32 + 16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    const block = buf[0 .. 32 + ek + 16];
 
-    pSha256(server_nonce, client_nonce, &block);
+    pSha256(server_nonce, client_nonce, block);
     keys.client_signing_key = block[0..32].*;
-    keys.client_encrypting_key = block[32..64].*;
-    keys.client_iv = block[64..80].*;
+    @memcpy(keys.client_encrypting_key[0..ek], block[32..][0..ek]);
+    keys.client_iv = block[32 + ek ..][0..16].*;
 
-    pSha256(client_nonce, server_nonce, &block);
+    pSha256(client_nonce, server_nonce, block);
     keys.server_signing_key = block[0..32].*;
-    keys.server_encrypting_key = block[32..64].*;
-    keys.server_iv = block[64..80].*;
+    @memcpy(keys.server_encrypting_key[0..ek], block[32..][0..ek]);
+    keys.server_iv = block[32 + ek ..][0..16].*;
 
     return keys;
 }
@@ -743,6 +855,44 @@ fn aes256CbcEncryptBody(key: *const [32]u8, iv: *const [16]u8, data: []u8) void 
 /// In-place AES-256-CBC decryption (mirror of `aes256CbcEncrypt`).
 pub fn aes256CbcDecrypt(key: *const [32]u8, iv: *const [16]u8, data: []u8) void {
     return burn.run(burn.prim_burn, void, aes256CbcDecryptBody, .{ key, iv, data });
+}
+
+/// In-place AES-128-CBC encryption (`Aes128_Sha256_RsaOaep`); as
+/// `aes256CbcEncrypt` with a 16-byte key.
+pub fn aes128CbcEncrypt(key: *const [16]u8, iv: *const [16]u8, data: []u8) void {
+    return burn.run(burn.prim_burn, void, aes128CbcEncryptBody, .{ key, iv, data });
+}
+
+fn aes128CbcEncryptBody(key: *const [16]u8, iv: *const [16]u8, data: []u8) void {
+    std.debug.assert(data.len % aes_block_len == 0);
+    const ctx = Aes128.initEnc(key.*);
+    var prev: [aes_block_len]u8 = iv.*;
+    var i: usize = 0;
+    while (i < data.len) : (i += aes_block_len) {
+        const block = data[i..][0..aes_block_len];
+        for (block, &prev) |*b, p| b.* ^= p;
+        ctx.encrypt(block, block);
+        prev = block.*;
+    }
+}
+
+/// In-place AES-128-CBC decryption (mirror of `aes128CbcEncrypt`).
+pub fn aes128CbcDecrypt(key: *const [16]u8, iv: *const [16]u8, data: []u8) void {
+    return burn.run(burn.prim_burn, void, aes128CbcDecryptBody, .{ key, iv, data });
+}
+
+fn aes128CbcDecryptBody(key: *const [16]u8, iv: *const [16]u8, data: []u8) void {
+    std.debug.assert(data.len % aes_block_len == 0);
+    const ctx = Aes128.initDec(key.*);
+    var prev: [aes_block_len]u8 = iv.*;
+    var i: usize = 0;
+    while (i < data.len) : (i += aes_block_len) {
+        const block = data[i..][0..aes_block_len];
+        const cipher: [aes_block_len]u8 = block.*;
+        ctx.decrypt(block, block);
+        for (block, &prev) |*b, p| b.* ^= p;
+        prev = cipher;
+    }
 }
 
 fn aes256CbcDecryptBody(key: *const [32]u8, iv: *const [16]u8, data: []u8) void {
@@ -839,7 +989,7 @@ fn symmetricSealChunkBody(
     const sig_start = total - sym_signature_len;
     HmacSha256.create(buf[sig_start..][0..sym_signature_len], buf[0..sig_start], dk.signing_key);
     if (mode == .sign_and_encrypt) {
-        aes256CbcEncrypt(dk.encrypting_key, dk.iv, buf[16..]);
+        dk.encrypt(buf[16..]);
     }
     return buf;
 }
@@ -913,7 +1063,7 @@ fn symmetricDecryptAndVerifyBody(
     if (mode == .sign_and_encrypt) {
         const encrypted = plain[8..]; // SequenceHeader.. (message offset 16)
         if (encrypted.len % aes_block_len != 0) return error.InvalidSecureMessage;
-        aes256CbcDecrypt(dk.encrypting_key, dk.iv, encrypted);
+        dk.decrypt(encrypted);
     }
 
     const sig_start = plain.len - sym_signature_len;
@@ -1011,7 +1161,7 @@ pub fn viewAsymmetricHeader(chunk_body: []const u8) ?AsymmetricHeaderView {
     };
 }
 
-pub const SealAsymmetricError = std.mem.Allocator.Error || rsa.EncryptOaepError || rsa.SignPkcs1v15Error || error{InvalidCertificate};
+pub const SealAsymmetricError = std.mem.Allocator.Error || rsa.EncryptOaepError || rsa.SignPkcs1v15Error || rsa.SignPssError || error{InvalidCertificate};
 
 /// Seal an outgoing OPN message (always sign + encrypt when SecurityMode !=
 /// None — OPC 10000-6 §6.7.4, even at SecurityMode=Sign): build the final
@@ -1019,12 +1169,15 @@ pub const SealAsymmetricError = std.mem.Allocator.Error || rsa.EncryptOaepError 
 /// AsymmetricAlgorithmSecurityHeader + SequenceHeader + payload;
 /// `encrypted_region_offset` = where the SequenceHeader starts within it),
 /// append the padding footer sized to the receiver key's OAEP plaintext
-/// blocks, RSA-PKCS1v1.5/SHA-256-sign the whole plaintext message (final
-/// MessageSize already in the header), then RSA-OAEP/SHA-1-encrypt
-/// SequenceHeader..signature per block to the receiver certificate's public
-/// key. Returns the complete `allocator`-owned wire bytes.
+/// blocks, sign the whole plaintext message (final MessageSize already in the
+/// header) and RSA-OAEP-encrypt SequenceHeader..signature per block to the
+/// receiver certificate's public key, both with `policy`'s algorithms
+/// (RSA-PKCS1v1.5 / SHA-256 and OAEP / SHA-1; RSA-PSS and OAEP over SHA-256
+/// for `Aes256_Sha256_RsaPss`). Returns the complete `allocator`-owned wire
+/// bytes.
 pub fn sealAsymmetricMessage(
     allocator: std.mem.Allocator,
+    policy: SecurityPolicy,
     random: std.Random,
     msg_code: *const [3]u8,
     unsecured_body: []const u8,
@@ -1032,11 +1185,12 @@ pub fn sealAsymmetricMessage(
     credentials: *const ClientCredentials,
     receiver_certificate: []const u8,
 ) SealAsymmetricError![]u8 {
-    return burn.run(burn.rsa_burn, SealAsymmetricError![]u8, sealAsymmetricMessageBody, .{ allocator, random, msg_code, unsecured_body, encrypted_region_offset, credentials, receiver_certificate });
+    return burn.run(burn.rsa_burn, SealAsymmetricError![]u8, sealAsymmetricMessageBody, .{ allocator, policy, random, msg_code, unsecured_body, encrypted_region_offset, credentials, receiver_certificate });
 }
 
 fn sealAsymmetricMessageBody(
     allocator: std.mem.Allocator,
+    policy: SecurityPolicy,
     random: std.Random,
     msg_code: *const [3]u8,
     unsecured_body: []const u8,
@@ -1047,8 +1201,9 @@ fn sealAsymmetricMessageBody(
     std.debug.assert(encrypted_region_offset <= unsecured_body.len);
     const peer_pk = try certificatePublicKey(receiver_certificate);
     const k_peer = modulusByteLen(peer_pk.n.bits());
-    if (k_peer <= oaep_sha1_overhead) return error.InvalidCertificate;
-    const plain_block = k_peer - oaep_sha1_overhead;
+    const overhead = policy.oaepOverhead();
+    if (k_peer <= overhead) return error.InvalidCertificate;
+    const plain_block = k_peer - overhead;
     // ExtraPaddingSize byte iff the *encryption* key is > 2048 bits
     // (open62541 `padChunk`; padding can then exceed one byte's range).
     const pad_overhead: usize = if (k_peer > 256) 2 else 1;
@@ -1082,7 +1237,7 @@ fn sealAsymmetricMessageBody(
     }
     const sig_start = plain.len - sig_len;
     std.debug.assert(p == sig_start);
-    _ = try rsa.signPkcs1v15(&credentials.private_key, Sha256, plain[0..sig_start], plain[sig_start..]);
+    try rsaSign(policy, &credentials.private_key, random, plain[0..sig_start], plain[sig_start..]);
 
     // Encrypt SequenceHeader..signature per OAEP block into the wire buffer.
     const out = try allocator.alloc(u8, wire_len);
@@ -1091,7 +1246,7 @@ fn sealAsymmetricMessageBody(
     @memcpy(out[0..clear_len], plain[0..clear_len]);
     var i: usize = 0;
     while (i < blocks) : (i += 1) {
-        _ = try rsa.encryptOaep(peer_pk, Sha1, random, plain[clear_len + i * plain_block ..][0..plain_block], "", out[clear_len + i * k_peer ..][0..k_peer]);
+        try oaepEncrypt(policy, peer_pk, random, plain[clear_len + i * plain_block ..][0..plain_block], out[clear_len + i * k_peer ..][0..k_peer]);
     }
     return out;
 }
@@ -1099,8 +1254,8 @@ fn sealAsymmetricMessageBody(
 pub const OpenAsymmetricError = std.mem.Allocator.Error || rsa.DecryptOaepError || rsa.VerifyPkcs1v15Error || error{ InvalidCertificate, InvalidSecureMessage };
 
 /// Open a received OPN message: locate the encrypted region behind the
-/// `AsymmetricAlgorithmSecurityHeader`, RSA-OAEP/SHA-1-decrypt it with
-/// `private_key`, verify the RSA-PKCS1v1.5/SHA-256 signature over the
+/// `AsymmetricAlgorithmSecurityHeader`, RSA-OAEP-decrypt it with
+/// `private_key`, verify the signature (both per `policy`) over the
 /// reconstructed plaintext message (8-byte wire header — pass it in
 /// `header_bytes`, the transport already consumed it — + clear headers +
 /// decrypted region) against `sender_certificate`'s public key, validate +
@@ -1111,16 +1266,18 @@ pub const OpenAsymmetricError = std.mem.Allocator.Error || rsa.DecryptOaepError 
 /// certificate, not the one inside the (attacker-controlled) message.
 pub fn openAsymmetricMessage(
     allocator: std.mem.Allocator,
+    policy: SecurityPolicy,
     header_bytes: *const [8]u8,
     chunk_body: []const u8,
     private_key: *const rsa.SecretKey,
     sender_certificate: []const u8,
 ) OpenAsymmetricError![]u8 {
-    return burn.run(burn.rsa_burn, OpenAsymmetricError![]u8, openAsymmetricMessageBody, .{ allocator, header_bytes, chunk_body, private_key, sender_certificate });
+    return burn.run(burn.rsa_burn, OpenAsymmetricError![]u8, openAsymmetricMessageBody, .{ allocator, policy, header_bytes, chunk_body, private_key, sender_certificate });
 }
 
 fn openAsymmetricMessageBody(
     allocator: std.mem.Allocator,
+    policy: SecurityPolicy,
     header_bytes: *const [8]u8,
     chunk_body: []const u8,
     private_key: *const rsa.SecretKey,
@@ -1130,11 +1287,12 @@ fn openAsymmetricMessageBody(
     const enc_offset = asymmetricHeaderEnd(chunk_body, 4) orelse return error.InvalidSecureMessage;
 
     const k = modulusByteLen(private_key.n.bits());
-    if (k <= oaep_sha1_overhead) return error.InvalidSecureMessage;
+    const overhead = policy.oaepOverhead();
+    if (k <= overhead) return error.InvalidSecureMessage;
     const enc_len = chunk_body.len - enc_offset;
     if (enc_len == 0 or enc_len % k != 0) return error.InvalidSecureMessage;
     const blocks = enc_len / k;
-    const plain_block = k - oaep_sha1_overhead;
+    const plain_block = k - overhead;
 
     // Reconstruct the plaintext message: wire header + clear headers +
     // per-block decrypted region (blocks may decrypt shorter than
@@ -1149,7 +1307,7 @@ fn openAsymmetricMessageBody(
     var plen: usize = 8 + enc_offset;
     var i: usize = 0;
     while (i < blocks) : (i += 1) {
-        const m = rsa.decryptOaep(private_key, Sha1, chunk_body[enc_offset + i * k ..][0..k], "", plain[plen..][0..plain_block]) catch |err| switch (err) {
+        const m = oaepDecrypt(policy, private_key, chunk_body[enc_offset + i * k ..][0..k], plain[plen..][0..plain_block]) catch |err| switch (err) {
             error.BufferTooSmall => unreachable, // chunk is exactly the max message length
             error.DecryptionError => return error.DecryptionError,
         };
@@ -1161,7 +1319,7 @@ fn openAsymmetricMessageBody(
     const sig_len = modulusByteLen(peer_pk.n.bits());
     const pad_overhead: usize = if (k > 256) 2 else 1; // mirror of sealAsymmetricMessage
     if (plen < 8 + enc_offset + 8 + pad_overhead + sig_len) return error.InvalidSecureMessage;
-    try asymmetricVerify(plain[0 .. plen - sig_len], plain[plen - sig_len .. plen], peer_pk);
+    try asymmetricVerify(policy, plain[0 .. plen - sig_len], plain[plen - sig_len .. plen], peer_pk);
 
     // Strip the padding footer (PaddingSize low byte, padding bytes, then
     // the ExtraPaddingSize high byte just before the signature if present).
@@ -1205,22 +1363,25 @@ pub const UserTokenSecretError = std.mem.Allocator.Error || error{
     MessageTooLong,
 };
 
-/// Build and RSA-OAEP/SHA-1-encrypt the `length ‖ secret ‖ serverNonce` blob
-/// above to `receiver_public_key` (the server's certificate key). The
-/// caller-side half of `decryptUserTokenSecret`; used by the tests and
-/// available to any client this module grows later.
+/// Build and RSA-OAEP-encrypt (`policy`'s hash: SHA-1, or SHA-256 for
+/// `Aes256_Sha256_RsaPss`) the `length ‖ secret ‖ serverNonce` blob above to
+/// `receiver_public_key` (the server's certificate key). The caller-side half
+/// of `decryptUserTokenSecret`; used by the tests and available to any
+/// client this module grows later.
 pub fn encryptUserTokenSecret(
     allocator: std.mem.Allocator,
+    policy: SecurityPolicy,
     secret: []const u8,
     server_nonce: []const u8,
     receiver_public_key: rsa.PublicKey,
     random: std.Random,
 ) UserTokenSecretError![]u8 {
-    return burn.run(burn.rsa_burn, UserTokenSecretError![]u8, encryptUserTokenSecretBody, .{ allocator, secret, server_nonce, receiver_public_key, random });
+    return burn.run(burn.rsa_burn, UserTokenSecretError![]u8, encryptUserTokenSecretBody, .{ allocator, policy, secret, server_nonce, receiver_public_key, random });
 }
 
 fn encryptUserTokenSecretBody(
     allocator: std.mem.Allocator,
+    policy: SecurityPolicy,
     secret: []const u8,
     server_nonce: []const u8,
     receiver_public_key: rsa.PublicKey,
@@ -1235,7 +1396,7 @@ fn encryptUserTokenSecretBody(
     std.mem.writeInt(u32, plain[0..4], declared, .little);
     @memcpy(plain[4..][0..secret.len], secret);
     @memcpy(plain[4 + secret.len ..], server_nonce);
-    return asymmetricEncrypt(allocator, plain, receiver_public_key, random) catch |err| switch (err) {
+    return asymmetricEncrypt(allocator, policy, plain, receiver_public_key, random) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.MessageTooLong, error.BufferTooSmall => error.MessageTooLong,
     };
@@ -1247,20 +1408,22 @@ fn encryptUserTokenSecretBody(
 /// typed error, never a partially-recovered password.
 pub fn decryptUserTokenSecret(
     allocator: std.mem.Allocator,
+    policy: SecurityPolicy,
     ciphertext: []const u8,
     private_key: *const rsa.SecretKey,
     expected_server_nonce: []const u8,
 ) UserTokenSecretError![]u8 {
-    return burn.run(burn.rsa_burn, UserTokenSecretError![]u8, decryptUserTokenSecretBody, .{ allocator, ciphertext, private_key, expected_server_nonce });
+    return burn.run(burn.rsa_burn, UserTokenSecretError![]u8, decryptUserTokenSecretBody, .{ allocator, policy, ciphertext, private_key, expected_server_nonce });
 }
 
 fn decryptUserTokenSecretBody(
     allocator: std.mem.Allocator,
+    policy: SecurityPolicy,
     ciphertext: []const u8,
     private_key: *const rsa.SecretKey,
     expected_server_nonce: []const u8,
 ) UserTokenSecretError![]u8 {
-    const plain = asymmetricDecrypt(allocator, ciphertext, private_key) catch |err| switch (err) {
+    const plain = asymmetricDecrypt(allocator, policy, ciphertext, private_key) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DecryptionError, error.BufferTooSmall => return error.DecryptionError,
     };
@@ -1347,7 +1510,97 @@ test "SecurityLengths.basic256sha256" {
     try testing.expectEqual(@as(usize, 32), l.symmetric_signature_len);
     try testing.expectEqual(@as(usize, 32), l.nonce_len);
     try testing.expect(lengths(.none) == null);
-    try testing.expect(lengths(.aes256_sha256_rsapss) == null);
+    try testing.expectEqual(@as(usize, 16), lengths(.aes128_sha256_rsaoaep).?.symmetric_key_len);
+    try testing.expectEqual(@as(usize, 214), lengths(.aes128_sha256_rsaoaep).?.asymmetric_max_plaintext_len);
+    try testing.expectEqual(@as(usize, 190), lengths(.aes256_sha256_rsapss).?.asymmetric_max_plaintext_len);
+    try testing.expectEqual(@as(usize, 32), lengths(.aes256_sha256_rsapss).?.symmetric_key_len);
+}
+
+test "SecurityPolicy: URIs, fromUri, algorithm URIs and key lengths of the newer policies" {
+    try testing.expectEqualStrings("http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep", SecurityPolicy.aes128_sha256_rsaoaep.uri());
+    for (std.enums.values(SecurityPolicy)) |p| try testing.expectEqual(p, SecurityPolicy.fromUri(p.uri()).?);
+    try testing.expect(SecurityPolicy.fromUri("http://opcfoundation.org/UA/SecurityPolicy#Basic256") == null);
+    try testing.expectEqualStrings(signature_algorithm_rsa_pss_sha256, SecurityPolicy.aes256_sha256_rsapss.asymmetricSignatureAlgorithm());
+    try testing.expectEqualStrings(signature_algorithm_rsa_sha256, SecurityPolicy.aes128_sha256_rsaoaep.asymmetricSignatureAlgorithm());
+    try testing.expectEqualStrings(encryption_algorithm_rsa_oaep_sha256, SecurityPolicy.aes256_sha256_rsapss.asymmetricEncryptionAlgorithm());
+    try testing.expectEqualStrings(encryption_algorithm_rsa_oaep, SecurityPolicy.aes128_sha256_rsaoaep.asymmetricEncryptionAlgorithm());
+    try testing.expectEqual(@as(usize, 16), SecurityPolicy.aes128_sha256_rsaoaep.encryptingKeyLen());
+    try testing.expectEqual(@as(usize, 32), SecurityPolicy.aes256_sha256_rsapss.encryptingKeyLen());
+}
+
+test "deriveKeys: Aes128_Sha256_RsaOaep splits P_SHA256 as 32 ‖ 16 ‖ 16, the others as 32 ‖ 32 ‖ 16" {
+    const cn = "client-nonce-0123456789abcdefghi";
+    const sn = "server-nonce-0123456789abcdefghi";
+    var block: [80]u8 = undefined;
+    pSha256(sn, cn, &block);
+    const k128 = deriveKeys(cn, sn, .aes128_sha256_rsaoaep);
+    try testing.expectEqual(@as(u8, 16), k128.encrypting_key_len);
+    try testing.expectEqualSlices(u8, block[0..32], &k128.client_signing_key);
+    try testing.expectEqualSlices(u8, block[32..48], k128.client_encrypting_key[0..16]);
+    try testing.expectEqualSlices(u8, block[48..64], &k128.client_iv);
+    try testing.expect(std.mem.allEqual(u8, k128.client_encrypting_key[16..], 0));
+    const kpss = deriveKeys(cn, sn, .aes256_sha256_rsapss);
+    const kb = deriveKeys(cn, sn, .basic256sha256);
+    try testing.expectEqual(@as(u8, 32), kpss.encrypting_key_len);
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&kb), std.mem.asBytes(&kpss));
+    try testing.expectEqualSlices(u8, block[32..64], &kb.client_encrypting_key);
+}
+
+test "aes128CbcEncrypt/Decrypt: NIST SP 800-38A F.2.1/F.2.2 (CBC-AES128)" {
+    const key = [16]u8{ 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c };
+    var iv: [16]u8 = undefined;
+    for (&iv, 0..) |*b, i| b.* = @intCast(i);
+    var data = [32]u8{
+        0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+        0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+    };
+    const plain = data;
+    aes128CbcEncrypt(&key, &iv, &data);
+    try testing.expectEqualSlices(u8, &.{
+        0x76, 0x49, 0xab, 0xac, 0x81, 0x19, 0xb2, 0x46, 0xce, 0xe9, 0x8e, 0x9b, 0x12, 0xe9, 0x19, 0x7d,
+        0x50, 0x86, 0xcb, 0x9b, 0x50, 0x72, 0x19, 0xee, 0x95, 0xdb, 0x11, 0x3a, 0x91, 0x76, 0x78, 0xb2,
+    }, &data);
+    aes128CbcDecrypt(&key, &iv, &data);
+    try testing.expectEqualSlices(u8, &plain, &data);
+}
+
+test "Aes256_Sha256_RsaPss: RSA-PSS signatures and OAEP-SHA256 blocks round-trip, and are not the Basic256Sha256 ones" {
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x31)));
+    const random = prng.random();
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, random, 1024, 65537);
+    const msg = "OPN message bytes to be signed";
+    const sig = try asymmetricSign(testing.allocator, .aes256_sha256_rsapss, msg, &kp.secret_key, random);
+    defer testing.allocator.free(sig);
+    try asymmetricVerify(.aes256_sha256_rsapss, msg, sig, kp.public_key);
+    try testing.expectError(error.SignatureVerificationFailed, asymmetricVerify(.basic256sha256, msg, sig, kp.public_key));
+    const pkcs = try asymmetricSign(testing.allocator, .basic256sha256, msg, &kp.secret_key, random);
+    defer testing.allocator.free(pkcs);
+    try testing.expectError(error.SignatureVerificationFailed, asymmetricVerify(.aes256_sha256_rsapss, msg, pkcs, kp.public_key));
+    // OAEP over SHA-256: 128 - 66 = 62 octets per block for a 1024-bit key.
+    var plain: [130]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i * 7);
+    const ct = try asymmetricEncrypt(testing.allocator, .aes256_sha256_rsapss, &plain, kp.public_key, random);
+    defer testing.allocator.free(ct);
+    try testing.expectEqual(@as(usize, 3 * 128), ct.len);
+    const back = try asymmetricDecrypt(testing.allocator, .aes256_sha256_rsapss, ct, &kp.secret_key);
+    defer testing.allocator.free(back);
+    try testing.expectEqualSlices(u8, &plain, back);
+    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, .basic256sha256, ct, &kp.secret_key));
+}
+
+test "Aes128_Sha256_RsaOaep: a symmetric chunk sealed under AES-128-CBC opens, and not under AES-256 keys" {
+    const keys = deriveKeys("client-nonce-0123456789abcdefghi", "server-nonce-0123456789abcdefghi", .aes128_sha256_rsaoaep);
+    var body: [16 + 40]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i);
+    const wire = try symmetricSignAndEncrypt(testing.allocator, "MSG", &body, .sign_and_encrypt, &keys, .client_to_server);
+    defer testing.allocator.free(wire);
+    const back = try symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], .sign_and_encrypt, &keys, .client_to_server);
+    defer testing.allocator.free(back);
+    try testing.expectEqualSlices(u8, &body, back);
+    var wide = keys;
+    wide.encrypting_key_len = 32;
+    try testing.expectError(error.SignatureVerificationFailed, symmetricDecryptAndVerify(testing.allocator, wire[0..8], wire[8..], .sign_and_encrypt, &wide, .client_to_server));
 }
 
 test "AsymmetricAlgorithmSecurityHeader round-trip" {
@@ -1612,12 +1865,12 @@ test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {
     try rsa.generate(&kp, random, 1024, 65537); // k = 128, plain block = 86 -> multi-block fast
 
     const msg = "a message noticeably longer than one 86-byte OAEP block, so that it spans several RSA blocks: this sentence keeps going to pass two";
-    const ct = try asymmetricEncrypt(testing.allocator, msg, kp.public_key, random);
+    const ct = try asymmetricEncrypt(testing.allocator, .basic256sha256, msg, kp.public_key, random);
     defer testing.allocator.free(ct);
     try testing.expectEqual(@as(usize, 0), ct.len % 128);
     try testing.expect(ct.len / 128 == (msg.len + 85) / 86);
 
-    const pt = try asymmetricDecrypt(testing.allocator, ct, &kp.secret_key);
+    const pt = try asymmetricDecrypt(testing.allocator, .basic256sha256, ct, &kp.secret_key);
     defer testing.allocator.free(pt);
     try testing.expectEqualSlices(u8, msg, pt);
 
@@ -1625,9 +1878,9 @@ test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {
     const bad = try testing.allocator.dupe(u8, ct);
     defer testing.allocator.free(bad);
     bad[10] ^= 0x01;
-    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, bad, &kp.secret_key));
+    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, .basic256sha256, bad, &kp.secret_key));
     // Non-whole-block ciphertext is structurally invalid.
-    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, ct[0 .. ct.len - 1], &kp.secret_key));
+    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, .basic256sha256, ct[0 .. ct.len - 1], &kp.secret_key));
 }
 
 test "asymmetricSign -> asymmetricVerify round-trip + tamper" {
@@ -1637,13 +1890,13 @@ test "asymmetricSign -> asymmetricVerify round-trip + tamper" {
     try rsa.generate(&kp, random, 1024, 65537);
 
     const msg = "OPN message bytes to be signed";
-    const sig = try asymmetricSign(testing.allocator, msg, &kp.secret_key);
+    const sig = try asymmetricSign(testing.allocator, .basic256sha256, msg, &kp.secret_key, random);
     defer testing.allocator.free(sig);
     try testing.expectEqual(@as(usize, 128), sig.len);
-    try asymmetricVerify(msg, sig, kp.public_key);
-    try testing.expectError(error.SignatureVerificationFailed, asymmetricVerify("OPN message bytes to be signed!", sig, kp.public_key));
+    try asymmetricVerify(.basic256sha256, msg, sig, kp.public_key);
+    try testing.expectError(error.SignatureVerificationFailed, asymmetricVerify(.basic256sha256, "OPN message bytes to be signed!", sig, kp.public_key));
     sig[0] ^= 0x01;
-    try testing.expectError(error.SignatureVerificationFailed, asymmetricVerify(msg, sig, kp.public_key));
+    try testing.expectError(error.SignatureVerificationFailed, asymmetricVerify(.basic256sha256, msg, sig, kp.public_key));
 }
 
 /// A plausible plaintext MSG chunk body: ChannelId + TokenId +
@@ -1779,7 +2032,7 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
     try body_writer.writer.writeAll("opn-request-payload-bytes");
     const body = body_writer.writer.buffered();
 
-    const wire = try sealAsymmetricMessage(testing.allocator, random, "OPN", body, enc_offset, &client, server.certificate_der);
+    const wire = try sealAsymmetricMessage(testing.allocator, .basic256sha256, random, "OPN", body, enc_offset, &client, server.certificate_der);
     defer testing.allocator.free(wire);
     try testing.expectEqualSlices(u8, "OPN", wire[0..3]);
     try testing.expectEqual(wire.len, std.mem.readInt(u32, wire[4..8], .little));
@@ -1789,7 +2042,7 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
     try testing.expectEqual(@as(usize, 0), (wire.len - 8 - enc_offset) % 160);
 
     // Server side: decrypt with the server key, verify with the client cert.
-    const recovered = try openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], &server.private_key, client.certificate_der);
+    const recovered = try openAsymmetricMessage(testing.allocator, .basic256sha256, wire[0..8], wire[8..], &server.private_key, client.certificate_der);
     defer testing.allocator.free(recovered);
     try testing.expectEqualSlices(u8, body, recovered);
 
@@ -1798,10 +2051,10 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
         const bad = try testing.allocator.dupe(u8, wire);
         defer testing.allocator.free(bad);
         bad[bad.len - 1] ^= 0x01;
-        try testing.expectError(error.DecryptionError, openAsymmetricMessage(testing.allocator, bad[0..8], bad[8..], &server.private_key, client.certificate_der));
+        try testing.expectError(error.DecryptionError, openAsymmetricMessage(testing.allocator, .basic256sha256, bad[0..8], bad[8..], &server.private_key, client.certificate_der));
     }
     // Wrong sender certificate must fail the signature.
-    try testing.expectError(error.SignatureVerificationFailed, openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], &server.private_key, server.certificate_der));
+    try testing.expectError(error.SignatureVerificationFailed, openAsymmetricMessage(testing.allocator, .basic256sha256, wire[0..8], wire[8..], &server.private_key, server.certificate_der));
 }
 
 test "deriveKeys KAT: P-SHA256 over two fixed 32-byte nonces (OPC 10000-6 §6.7.5)" {
@@ -1990,13 +2243,13 @@ test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong k
     const server_nonce = "server-nonce-0123456789abcdefghi"; // 32 bytes
     const password = "correct horse battery staple";
 
-    const blob = try encryptUserTokenSecret(testing.allocator, password, server_nonce, server_kp.public_key, random);
+    const blob = try encryptUserTokenSecret(testing.allocator, .basic256sha256, password, server_nonce, server_kp.public_key, random);
     defer testing.allocator.free(blob);
     // Whole RSA blocks, and nothing recognisable of the password in them.
     try testing.expectEqual(@as(usize, 0), blob.len % 128);
     try testing.expect(std.mem.find(u8, blob, password) == null);
 
-    const recovered = try decryptUserTokenSecret(testing.allocator, blob, &server_kp.secret_key, server_nonce);
+    const recovered = try decryptUserTokenSecret(testing.allocator, .basic256sha256, blob, &server_kp.secret_key, server_nonce);
     defer testing.allocator.free(recovered);
     try testing.expectEqualStrings(password, recovered);
 
@@ -2005,22 +2258,22 @@ test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong k
     // session-bound rather than a reusable bearer secret.
     try testing.expectError(
         error.NonceMismatch,
-        decryptUserTokenSecret(testing.allocator, blob, &server_kp.secret_key, "server-nonce-DIFFERENT-0123456789"[0..32]),
+        decryptUserTokenSecret(testing.allocator, .basic256sha256, blob, &server_kp.secret_key, "server-nonce-DIFFERENT-0123456789"[0..32]),
     );
     // Encrypted to us, decrypted with somebody else's key.
     try testing.expectError(
         error.DecryptionError,
-        decryptUserTokenSecret(testing.allocator, blob, &other_kp.secret_key, server_nonce),
+        decryptUserTokenSecret(testing.allocator, .basic256sha256, blob, &other_kp.secret_key, server_nonce),
     );
     // Structurally broken ciphertext.
     try testing.expectError(
         error.DecryptionError,
-        decryptUserTokenSecret(testing.allocator, blob[0 .. blob.len - 1], &server_kp.secret_key, server_nonce),
+        decryptUserTokenSecret(testing.allocator, .basic256sha256, blob[0 .. blob.len - 1], &server_kp.secret_key, server_nonce),
     );
     // An empty password is legal and must round-trip (some servers allow it).
-    const empty = try encryptUserTokenSecret(testing.allocator, "", server_nonce, server_kp.public_key, random);
+    const empty = try encryptUserTokenSecret(testing.allocator, .basic256sha256, "", server_nonce, server_kp.public_key, random);
     defer testing.allocator.free(empty);
-    const empty_back = try decryptUserTokenSecret(testing.allocator, empty, &server_kp.secret_key, server_nonce);
+    const empty_back = try decryptUserTokenSecret(testing.allocator, .basic256sha256, empty, &server_kp.secret_key, server_nonce);
     defer testing.allocator.free(empty_back);
     try testing.expectEqual(@as(usize, 0), empty_back.len);
 }
@@ -2327,13 +2580,13 @@ const OpnRig = struct {
         std.mem.writeInt(u32, plain[4..8], @intCast(wire_len), .little);
         @memcpy(plain[8..][0..clear_part.len], &clear_part);
         @memcpy(plain[8 + clear_part.len ..], tail);
-        const sig = try asymmetricSign(gpa, plain, &signer.private_key);
+        const sig = try asymmetricSign(gpa, .basic256sha256, plain, &signer.private_key, random);
         defer gpa.free(sig);
         const region = try gpa.alloc(u8, tail.len + sig.len);
         defer gpa.free(region);
         @memcpy(region[0..tail.len], tail);
         @memcpy(region[tail.len..], sig);
-        const enc = try asymmetricEncrypt(gpa, region, peer_pk, random);
+        const enc = try asymmetricEncrypt(gpa, .basic256sha256, region, peer_pk, random);
         defer gpa.free(enc);
         const wire = try gpa.alloc(u8, wire_len);
         @memcpy(wire[0 .. 8 + clear_part.len], plain[0 .. 8 + clear_part.len]);
@@ -2342,7 +2595,7 @@ const OpnRig = struct {
     }
 
     fn open(rig: *OpnRig, wire: []const u8) ![]u8 {
-        return openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], &rig.server.private_key, rig.client.certificate_der);
+        return openAsymmetricMessage(testing.allocator, .basic256sha256, wire[0..8], wire[8..], &rig.server.private_key, rig.client.certificate_der);
     }
 };
 
@@ -2426,7 +2679,7 @@ test "seal/open with a receiver key over 2048 bits uses the two-byte padding foo
         var body: [OpnRig.clear_part.len + 8 + 100]u8 = undefined;
         @memcpy(body[0..OpnRig.clear_part.len], &OpnRig.clear_part);
         @memset(body[OpnRig.clear_part.len..], 0x5a);
-        const wire = try sealAsymmetricMessage(gpa, random, "OPN", &body, OpnRig.clear_part.len, &rig.client, rig.server.certificate_der);
+        const wire = try sealAsymmetricMessage(gpa, .basic256sha256, random, "OPN", &body, OpnRig.clear_part.len, &rig.client, rig.server.certificate_der);
         defer gpa.free(wire);
         const got = try rig.open(wire);
         defer gpa.free(got);
@@ -2438,7 +2691,7 @@ test "asymmetricDecrypt refuses an empty ciphertext; certificatePublicKey refuse
     var rig: OpnRig = undefined;
     try rig.init(1024);
     defer rig.deinit();
-    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, &.{}, &rig.server.private_key));
+    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, .basic256sha256, &.{}, &rig.server.private_key));
     // same certificate, SPKI algorithm OID rsaEncryption (…01 01 01) rewritten to id-RSASSA-PSS (…01 01 0a)
     const needle = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
     const cert = try testing.allocator.dupe(u8, rig.server.certificate_der);
@@ -2464,14 +2717,14 @@ test "decryptUserTokenSecret: length prefix rules on crafted plaintexts" {
         .{ .plain = &[_]u8{ 100, 0, 0, 0, 'a' }, .expect = error.InvalidSecureMessage }, // claims far more than there is
     };
     for (cases) |c| {
-        const blob = try asymmetricEncrypt(gpa, c.plain, kp.public_key, random);
+        const blob = try asymmetricEncrypt(gpa, .basic256sha256, c.plain, kp.public_key, random);
         defer gpa.free(blob);
-        try testing.expectError(c.expect.?, decryptUserTokenSecret(gpa, blob, &kp.secret_key, nonce));
+        try testing.expectError(c.expect.?, decryptUserTokenSecret(gpa, .basic256sha256, blob, &kp.secret_key, nonce));
     }
     // exactly the prefix, empty nonce expected: a legal empty secret
-    const blob = try asymmetricEncrypt(gpa, &[_]u8{ 0, 0, 0, 0 }, kp.public_key, random);
+    const blob = try asymmetricEncrypt(gpa, .basic256sha256, &[_]u8{ 0, 0, 0, 0 }, kp.public_key, random);
     defer gpa.free(blob);
-    const got = try decryptUserTokenSecret(gpa, blob, &kp.secret_key, "");
+    const got = try decryptUserTokenSecret(gpa, .basic256sha256, blob, &kp.secret_key, "");
     defer gpa.free(got);
     try testing.expectEqual(@as(usize, 0), got.len);
 }

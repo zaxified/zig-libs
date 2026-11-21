@@ -375,6 +375,31 @@ pub const encrypted_user_token_policies = [_]services.UserTokenPolicy{
     },
 };
 
+/// `encrypted_user_token_policies` with the username password encrypted under
+/// `Aes128_Sha256_RsaOaep` (RSA-OAEP / SHA-1) or `Aes256_Sha256_RsaPss`
+/// (RSA-OAEP / SHA-256): what `secureEndpointFor` offers at `Sign` for those
+/// policies, the token's policy being the channel's.
+pub const encrypted_user_token_policies_aes128 = [_]services.UserTokenPolicy{
+    encrypted_user_token_policies[0],
+    .{
+        .policy_id = "username-aes128sha256rsaoaep",
+        .token_type = .user_name,
+        .issued_token_type = null,
+        .issuer_endpoint_url = null,
+        .security_policy_uri = "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep",
+    },
+};
+pub const encrypted_user_token_policies_rsapss = [_]services.UserTokenPolicy{
+    encrypted_user_token_policies[0],
+    .{
+        .policy_id = "username-aes256sha256rsapss",
+        .token_type = .user_name,
+        .issued_token_type = null,
+        .issuer_endpoint_url = null,
+        .security_policy_uri = "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss",
+    },
+};
+
 /// The opc.tcp binary transport profile URI every endpoint advertises
 /// (OPC 10000-7 §7.1).
 pub const transport_profile_uri = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
@@ -437,17 +462,34 @@ pub fn secureEndpoint(
     server_certificate: []const u8,
     security_level: u8,
 ) services.EndpointDescription {
+    return secureEndpointFor(.basic256sha256, endpoint_url, app, mode, server_certificate, security_level);
+}
+
+/// `secureEndpoint` for any secured `policy` (`.basic256sha256`,
+/// `.aes128_sha256_rsaoaep`, `.aes256_sha256_rsapss`).
+pub fn secureEndpointFor(
+    policy: security.SecurityPolicy,
+    endpoint_url: []const u8,
+    app: services.ApplicationDescription,
+    mode: services.MessageSecurityMode,
+    server_certificate: []const u8,
+    security_level: u8,
+) services.EndpointDescription {
     std.debug.assert(mode == .sign or mode == .sign_and_encrypt);
+    std.debug.assert(policy != .none);
     return .{
         .endpoint_url = endpoint_url,
         .server = app,
         .server_certificate = server_certificate,
         .security_mode = mode,
-        .security_policy_uri = services.security_policy_basic256sha256_uri,
+        .security_policy_uri = policy.uri(),
         .user_identity_tokens = if (mode == .sign_and_encrypt)
             &default_user_token_policies
-        else
-            &encrypted_user_token_policies,
+        else switch (policy) {
+            .aes128_sha256_rsaoaep => &encrypted_user_token_policies_aes128,
+            .aes256_sha256_rsapss => &encrypted_user_token_policies_rsapss,
+            else => &encrypted_user_token_policies,
+        },
         .transport_profile_uri = transport_profile_uri,
         .security_level = security_level,
     };
@@ -1453,10 +1495,11 @@ pub const Connection = struct {
             c.opn_policy = .none;
             return .plaintext;
         }
-        if (!std.mem.eql(u8, view.security_policy_uri, services.security_policy_basic256sha256_uri)) {
+        // Basic256Sha256, Aes128_Sha256_RsaOaep or Aes256_Sha256_RsaPss.
+        const policy = security.SecurityPolicy.fromUri(view.security_policy_uri) orelse {
             try c.fail(out, status.bad_security_policy_rejected, "unsupported SecurityPolicy");
             return .failed;
-        }
+        };
 
         const sec = c.server.config.security orelse {
             // No key pair configured: say so plainly rather than pretend.
@@ -1466,7 +1509,7 @@ pub const Connection = struct {
         // Our own key must satisfy the policy's band, or this server cannot
         // honestly offer the policy (OPC 10000-7).
         if (!sec.insecure_allow_key_length_outside_policy and
-            !security.SecurityPolicy.basic256sha256.allowsKeyBits(sec.credentials.public_key.bits()))
+            !policy.allowsKeyBits(sec.credentials.public_key.bits()))
         {
             try c.fail(out, status.bad_security_policy_rejected, "own RSA key length is outside the SecurityPolicy's band");
             return .failed;
@@ -1513,6 +1556,7 @@ pub const Connection = struct {
 
         const plain = security.openAsymmetricMessage(
             c.server.allocator,
+            policy,
             header,
             wire_body,
             &sec.credentials.private_key,
@@ -1539,7 +1583,7 @@ pub const Connection = struct {
         if (c.client_certificate == null) {
             c.client_certificate = try c.server.allocator.dupe(u8, client_cert);
         }
-        c.opn_policy = .basic256sha256;
+        c.opn_policy = policy;
         return .{ .opened = plain };
     }
 
@@ -1617,7 +1661,8 @@ pub const Connection = struct {
     /// Structure + validity period + the caller's trust policy, in that
     /// order. Returns `status.good` or the `Bad…` code to answer with.
     fn checkPeerCertificate(c: *Connection, sec: SecurityConfig, certificate_der: []const u8, now_ms: i64) encoding.StatusCode {
-        // OPC 10000-7 key-length band (2048..4096 bits for Basic256Sha256);
+        // OPC 10000-7 key-length band (2048..4096 bits for every secured
+        // policy here: Basic256Sha256, Aes128_Sha256_RsaOaep, Aes256_Sha256_RsaPss);
         // open62541's `rsaNewChannelContext` answers the same status. Checked
         // on the modulus length before the key is parsed, so a key past this
         // build's RSA capacity (profile=small: 4096) gets the same answer.
@@ -1807,6 +1852,7 @@ pub const Connection = struct {
 
         const sealed = security.sealAsymmetricMessage(
             c.server.allocator,
+            c.sec_policy,
             c.server.random,
             transport.MessageType.open_secure_channel.code(),
             body.writer.buffered(),
@@ -2274,7 +2320,8 @@ pub const Connection = struct {
         if (ctx.srv.next_session_id == 0) ctx.srv.next_session_id = 1;
         try ctx.srv.sessions.append(ctx.srv.allocator, session);
 
-        // §5.6.2.2 `ServerSignature`: RSA-PKCS1v1.5/SHA-256 over
+        // §5.6.2.2 `ServerSignature`: the policy's asymmetric signature
+        // (RSA-PKCS1v1.5/SHA-256, RSA-PSS/SHA-256 for Aes256_Sha256_RsaPss) over
         // clientCertificate ‖ clientNonce, proving to the client that the
         // application holding the endpoint's certificate is the one on the
         // other end of *this* session — the mirror of the ClientSignature
@@ -2291,8 +2338,8 @@ pub const Connection = struct {
             @memcpy(to_sign[0..client_cert.len], client_cert);
             @memcpy(to_sign[client_cert.len..], client_nonce);
             server_signature = .{
-                .algorithm = security.signature_algorithm_rsa_sha256,
-                .signature = security.asymmetricSign(ctx.arena, to_sign, &sec.credentials.private_key) catch |err| switch (err) {
+                .algorithm = c.sec_policy.asymmetricSignatureAlgorithm(),
+                .signature = security.asymmetricSign(ctx.arena, c.sec_policy, to_sign, &sec.credentials.private_key, ctx.srv.random) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {
                         try sendFault(ctx, status.bad_internal_error);
@@ -2343,9 +2390,14 @@ pub const Connection = struct {
                 return;
             };
             const algo = request.client_signature.algorithm orelse "";
-            if (!std.mem.eql(u8, algo, security.signature_algorithm_rsa_sha256) and
-                !std.mem.eql(u8, algo, security.signature_algorithm_rsa_sha256_legacy))
-            {
+            // The channel policy's signature algorithm (OPC 10000-4
+            // §5.6.3: the SecurityPolicy's AsymmetricSignatureAlgorithm).
+            const algo_ok = if (c.sec_policy == .aes256_sha256_rsapss)
+                std.mem.eql(u8, algo, security.signature_algorithm_rsa_pss_sha256)
+            else
+                std.mem.eql(u8, algo, security.signature_algorithm_rsa_sha256) or
+                    std.mem.eql(u8, algo, security.signature_algorithm_rsa_sha256_legacy);
+            if (!algo_ok) {
                 try sendFault(ctx, status.bad_application_signature_invalid);
                 return;
             }
@@ -2357,7 +2409,7 @@ pub const Connection = struct {
                 try sendFault(ctx, status.bad_certificate_invalid);
                 return;
             };
-            security.asymmetricVerify(to_verify, sig, client_pk) catch {
+            security.asymmetricVerify(c.sec_policy, to_verify, sig, client_pk) catch {
                 try sendFault(ctx, status.bad_application_signature_invalid);
                 return;
             };
@@ -2437,10 +2489,15 @@ pub const Connection = struct {
                 if (!std.mem.eql(u8, policy_uri, services.security_policy_none_uri)) {
                     return status.bad_identity_token_invalid;
                 }
-            } else if (std.mem.eql(u8, algo, security.encryption_algorithm_rsa_oaep)) {
+            } else if (std.mem.eql(u8, algo, security.encryption_algorithm_rsa_oaep) or
+                std.mem.eql(u8, algo, security.encryption_algorithm_rsa_oaep_sha256))
+            {
                 const sec = cfg.security orelse return status.bad_identity_token_invalid;
+                // RSA-OAEP over SHA-1 or SHA-256, as the token says.
+                const token_policy: security.SecurityPolicy = if (std.mem.eql(u8, algo, security.encryption_algorithm_rsa_oaep_sha256)) .aes256_sha256_rsapss else .basic256sha256;
                 password = security.decryptUserTokenSecret(
                     ctx.arena,
+                    token_policy,
                     password,
                     &sec.credentials.private_key,
                     &session.server_nonce,
@@ -4070,6 +4127,8 @@ const TestRig = struct {
     answer_id: encoding.NodeId = undefined,
     method_id: encoding.NodeId = undefined,
     device_id: encoding.NodeId = undefined,
+    /// The SecurityPolicy `armSecurity` sets up (set after `init`).
+    policy: security.SecurityPolicy = .basic256sha256,
 
     const start_time: encoding.DateTime = 132_223_104_000_000_000;
 
@@ -4351,7 +4410,7 @@ const TestRig = struct {
     /// before `openChannelSecure`.
     fn armSecurity(rig: *TestRig, mode: services.MessageSecurityMode, client: security.Credentials, server_certificate: []const u8) void {
         rig.channel.security = .{
-            .policy = .basic256sha256,
+            .policy = rig.policy,
             .insecure_allow_key_length_outside_policy = true,
             .mode = mode,
             .credentials = client,
@@ -4394,7 +4453,7 @@ const TestRig = struct {
         try testing.expectEqual(@as(usize, 32), server_nonce.len);
         rig.channel.channel_id = response.security_token.channel_id;
         rig.channel.token_id = response.security_token.token_id;
-        rig.channel.security.?.keys = security.deriveKeys(&client_nonce, server_nonce, .basic256sha256);
+        rig.channel.security.?.keys = security.deriveKeys(&client_nonce, server_nonce, rig.channel.security.?.policy);
         return response.security_token;
     }
 
@@ -4466,12 +4525,12 @@ const TestRig = struct {
 
         // The server must publish its certificate and prove it holds the key.
         try testing.expectEqualSlices(u8, server_certificate, response.server_certificate.?);
-        try testing.expectEqualStrings(security.signature_algorithm_rsa_sha256, response.server_signature.algorithm.?);
+        try testing.expectEqualStrings(rig.policy.asymmetricSignatureAlgorithm(), response.server_signature.algorithm.?);
         const signed = try rig.gpa.alloc(u8, client.certificate_der.len + client_nonce.len);
         defer rig.gpa.free(signed);
         @memcpy(signed[0..client.certificate_der.len], client.certificate_der);
         @memcpy(signed[client.certificate_der.len..], &client_nonce);
-        try security.asymmetricVerify(signed, response.server_signature.signature.?, try security.certificatePublicKey(server_certificate));
+        try security.asymmetricVerify(rig.policy, signed, response.server_signature.signature.?, try security.certificatePublicKey(server_certificate));
 
         const token = response.authentication_token.byte_string.id.?;
         @memcpy(&rig.auth_token, token);
@@ -4487,8 +4546,8 @@ const TestRig = struct {
         defer rig.gpa.free(signed);
         @memcpy(signed[0..server_certificate.len], server_certificate);
         @memcpy(signed[server_certificate.len..], nonce);
-        buf.* = try security.asymmetricSign(rig.gpa, signed, &client.private_key);
-        return .{ .algorithm = security.signature_algorithm_rsa_sha256, .signature = buf.* };
+        buf.* = try security.asymmetricSign(rig.gpa, rig.policy, signed, &client.private_key, rig.prng.random());
+        return .{ .algorithm = rig.policy.asymmetricSignatureAlgorithm(), .signature = buf.* };
     }
 
     fn activateSessionSecure(rig: *TestRig, signature: services.SignatureData, identity: encoding.ExtensionObject) !void {
@@ -6749,6 +6808,119 @@ test "secure: Basic256Sha256 end-to-end at Sign and at SignAndEncrypt" {
     }
 }
 
+test "secure: Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss end-to-end at Sign and at SignAndEncrypt" {
+    const gpa = testing.allocator;
+    for ([_]security.SecurityPolicy{ .aes128_sha256_rsaoaep, .aes256_sha256_rsapss }) |policy| {
+        for ([_]services.MessageSecurityMode{ .sign, .sign_and_encrypt }) |mode| {
+            var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x23)));
+            const pki = try TestPki.init(gpa, &prng, .{});
+            defer pki.deinit(gpa);
+            const endpoints = [_]services.EndpointDescription{
+                secureEndpointFor(policy, test_endpoint_url, test_app, .sign, pki.server.certificate_der, 10),
+                secureEndpointFor(policy, test_endpoint_url, test_app, .sign_and_encrypt, pki.server.certificate_der, 20),
+            };
+            try testing.expectEqualStrings(policy.uri(), endpoints[0].security_policy_uri.?);
+
+            var rig: TestRig = undefined;
+            try rig.init(gpa, secureTestConfig(&endpoints, pki));
+            defer rig.deinit();
+            rig.policy = policy;
+            // The server signature (CreateSession) is checked against the
+            // policy's algorithm in `createSessionSecure`, the client's
+            // (ActivateSession) by the server.
+            try rig.connectSecure(mode, pki);
+            try testing.expectEqual(mode, rig.conn.sec_mode);
+            try testing.expectEqual(policy, rig.conn.sec_policy);
+            try testing.expectEqual(@as(u8, @intCast(policy.encryptingKeyLen())), rig.conn.keys.?.encrypting_key_len);
+
+            // Write, then read back: both directions of the symmetric path.
+            const writes = [_]services.WriteValue{.{
+                .node_id = rig.answer_id,
+                .attribute_id = services.attribute_id.value,
+                .index_range = null,
+                .value = .{ .value = .{ .scalar = .{ .int32 = 4343 } }, .status = null, .source_timestamp = null, .server_timestamp = null },
+            }};
+            const wr = try rig.call(
+                .message,
+                services.type_id.write_request,
+                services.WriteRequest,
+                .{ .request_header = rig.header(rig.authToken()), .nodes_to_write = &writes },
+                services.encodeWriteRequest,
+                services.WriteResponse,
+                services.type_id.write_response,
+                services.decodeWriteResponse,
+                services.result_fns.write,
+            );
+            defer services.freeWriteResponse(gpa, wr);
+            try testing.expectEqual(status.good, wr.results.?[0]);
+            const ids = [_]services.ReadValueId{.{
+                .node_id = rig.answer_id,
+                .attribute_id = services.attribute_id.value,
+                .index_range = null,
+                .data_encoding = .{ .namespace_index = 0, .name = null },
+            }};
+            const rd = try rig.call(
+                .message,
+                services.type_id.read_request,
+                services.ReadRequest,
+                .{
+                    .request_header = rig.header(rig.authToken()),
+                    .max_age = 0,
+                    .timestamps_to_return = .both,
+                    .nodes_to_read = &ids,
+                },
+                services.encodeReadRequest,
+                services.ReadResponse,
+                services.type_id.read_response,
+                services.decodeReadResponse,
+                services.result_fns.read,
+            );
+            defer services.freeReadResponse(gpa, rd);
+            try testing.expectEqual(@as(i32, 4343), rd.results.?[0].value.?.scalar.int32);
+        }
+    }
+}
+
+test "secure negatives: a policy no endpoint offers, and a client signature of another policy's algorithm" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x24)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    // Only Aes256_Sha256_RsaPss offered: a Basic256Sha256 or an
+    // Aes128_Sha256_RsaOaep OpenSecureChannel is refused.
+    const endpoints = [_]services.EndpointDescription{
+        secureEndpointFor(.aes256_sha256_rsapss, test_endpoint_url, test_app, .sign_and_encrypt, pki.server.certificate_der, 20),
+    };
+    for ([_]security.SecurityPolicy{ .basic256sha256, .aes128_sha256_rsaoaep }) |policy| {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(&endpoints, pki));
+        defer rig.deinit();
+        rig.policy = policy;
+        try rig.handshake();
+        rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+        var nonce: [32]u8 = @splat(0x5D);
+        try rig.sendOpenSecure(.sign_and_encrypt, .issue, &nonce);
+        try rig.expectTransportError(status.bad_security_mode_rejected);
+    }
+    // On an Aes256_Sha256_RsaPss channel, an ActivateSession signed with
+    // RSA-PKCS1v1.5 (Basic256Sha256's algorithm) is refused.
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(&endpoints, pki));
+    defer rig.deinit();
+    rig.policy = .aes256_sha256_rsapss;
+    try rig.handshake();
+    rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+    _ = try rig.openChannelSecure(.sign_and_encrypt, .issue, 600_000);
+    try rig.createSessionSecure(pki.client, pki.server.certificate_der);
+    rig.policy = .basic256sha256;
+    var sig_buf: []u8 = &.{};
+    const sig = try rig.clientSignature(pki.client, pki.server.certificate_der, &rig.server_nonce, &sig_buf);
+    defer rig.gpa.free(sig_buf);
+    var token_buf: [128]u8 = undefined;
+    try testing.expectError(error.ServiceFault, rig.activateSessionSecure(sig, try rig.anonymousToken(&token_buf)));
+    try testing.expectEqual(status.bad_application_signature_invalid, rig.channel.last_service_result);
+}
+
 test "secure: token renewal keeps the old token alive for the overlap, then stops" {
     const gpa = testing.allocator;
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x33)));
@@ -7628,7 +7800,7 @@ test "secure: encrypted UserNameIdentityToken over a SecurityPolicy#None channel
             out: *std.Io.Writer.Allocating,
         ) !encoding.ExtensionObject {
             const pk = try security.certificatePublicKey(server_certificate);
-            const blob = try security.encryptUserTokenSecret(alloc, password, nonce, pk, random);
+            const blob = try security.encryptUserTokenSecret(alloc, .basic256sha256, password, nonce, pk, random);
             defer alloc.free(blob);
             var e = encoding.Encoder.init(&out.writer);
             try services.encodeUserNameIdentityToken(&e, .{

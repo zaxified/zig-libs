@@ -2236,6 +2236,7 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
     var seal_prng = std.Random.DefaultCsprng.init(golden_seal_seed);
     const produced = try security.sealAsymmetricMessage(
         gpa,
+        .basic256sha256,
         seal_prng.random(),
         "OPN",
         plain_body,
@@ -2265,7 +2266,7 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
     try testing.expectEqualSlices(u8, &thumbprint, view.receiver_certificate_thumbprint.?);
     try testing.expectEqual(encrypted_region_offset, view.encrypted_region_offset);
 
-    const opened = try security.openAsymmetricMessage(gpa, expected[0..8], expected[8..], &srv.private_key, client.certificate_der);
+    const opened = try security.openAsymmetricMessage(gpa, .basic256sha256, expected[0..8], expected[8..], &srv.private_key, client.certificate_der);
     defer gpa.free(opened);
     try testing.expectEqualSlices(u8, plain_body, opened);
 }

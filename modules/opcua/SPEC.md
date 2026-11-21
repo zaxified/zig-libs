@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [open62541/open62541](https://github.com/open62541/open62541) — **reference** | C | MPL-2.0 | 3.2k | v1.5.8 (2026-09-06) | Client and server, "zero errors indicated by the OPC Foundation CTT for the supported features" (its README); features overview in its FEATURES.md *(not read; PubSub, events/alarms, history, full NodeSet, multiple security policies are what a user of it expects — inferred)*. We speak `#None` and `Basic256Sha256` only, no events/history/node management (NumericRange on Read and Write is implemented). |
+| [open62541/open62541](https://github.com/open62541/open62541) — **reference** | C | MPL-2.0 | 3.2k | v1.5.8 (2026-09-06) | Client and server, "zero errors indicated by the OPC Foundation CTT for the supported features" (its README); features overview in its FEATURES.md *(not read; PubSub, events/alarms, history, full NodeSet, multiple security policies are what a user of it expects — inferred)*. We speak `#None`, `Basic256Sha256`, `Aes128_Sha256_RsaOaep` and `Aes256_Sha256_RsaPss`, no events/history/node management (NumericRange on Read and Write is implemented). |
 | [node-opcua/node-opcua](https://github.com/node-opcua/node-opcua) | TypeScript | MIT | 1.7k | v2.186.0 (2026-09-20) | The broadest open client+server toolkit with alarms, history, full NodeSets *(inferred)*. |
 | [gopcua/opcua](https://github.com/gopcua/opcua) | Go | MIT | 1.1k | v0.9.1 (2026-08-09) | Go client (used by Telegraf) with security modes, polling and subscriptions (its README); server is experimental *(inferred)*. |
 | [FreeOpcUa/opcua-asyncio](https://github.com/FreeOpcUa/opcua-asyncio) | Python | LGPL-3.0 | 1.5k | v2.0.1 (2026-06-29) | Python client+server; used here as the black-box interop peer at SignAndEncrypt (source not read). |
 | [locka99/opcua](https://github.com/locka99/opcua) / [FreeOpcUa/async-opcua](https://github.com/FreeOpcUa/async-opcua) | Rust | MPL-2.0 | 575 / 154 | push 2025-04-08 / 2026-09-09 | The Rust options (the first stale, the second its async successor *(inferred)*). Not read. |
 | Zig ecosystem | — | — | — | — | `gh search repos opcua --language=zig` found nothing. |
 
-**Where we are ahead:** the only Zig OPC UA, client and server, allocation-disciplined and I/O-free (byte-in/byte-out server state machine, caller-driven clock) and MIT where the C/Rust references are MPL and the Python one LGPL; secured server (`Basic256Sha256` Sign/SignAndEncrypt) verified against open62541 binaries and asyncua. **Where we are behind:** events/alarms and monitored-item filters, HistoryRead, node management, newer security policies (`Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`), X509/Issued identity tokens, PKI trust store, full standard NodeSet, PubSub (→ Backlog items).
+**Where we are ahead:** the only Zig OPC UA, client and server, allocation-disciplined and I/O-free (byte-in/byte-out server state machine, caller-driven clock) and MIT where the C/Rust references are MPL and the Python one LGPL; secured server (`Basic256Sha256` Sign/SignAndEncrypt verified against open62541 binaries and asyncua; `Aes128_Sha256_RsaOaep` and `Aes256_Sha256_RsaPss` against asyncua, client and server). **Where we are behind:** events/alarms and monitored-item filters, HistoryRead, node management, X509/Issued identity tokens, PKI trust store, full standard NodeSet, PubSub (→ Backlog items).
 
 ## Design & invariants
 
@@ -164,8 +164,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Threat model
 
-**Both halves speak `SecurityPolicy#Basic256Sha256` at Sign and
-SignAndEncrypt** (`security.zig`, over the `rsa` module). The server side is
+**Both halves speak `SecurityPolicy#Basic256Sha256`, `#Aes128_Sha256_RsaOaep` and
+`#Aes256_Sha256_RsaPss` at Sign and SignAndEncrypt** (`security.zig`, over the `rsa` module;
+OPC 10000-7). The three share P-SHA256 key derivation, HMAC-SHA256 chunk signatures, 32-byte nonces
+and the 2048..4096-bit key band; `Aes128_Sha256_RsaOaep` encrypts chunks with AES-128-CBC (a 16-byte
+derived key), `Aes256_Sha256_RsaPss` signs asymmetrically with RSA-PSS/SHA-256 (MGF1-SHA256, a 32-byte
+salt) and encrypts with RSA-OAEP/SHA-256 — the OPN, the CreateSession/ActivateSession signatures
+(`http://opcfoundation.org/UA/security/rsa-pss-sha2-256`) and an encrypted password
+(`…/rsa-oaep-sha2-256`). The policy is read from the OPN's security header (`SecurityPolicy.fromUri`),
+must be advertised by `Config.endpoints` (`server.secureEndpointFor`) and cannot change on a renewal; a
+`ClientSignature` must use the channel policy's algorithm. At Sign, `secureEndpointFor` offers a
+username token encrypted under the channel's policy. The server side is
 opt-in: `Config.security = null` (the default) keeps it `#None`-only, with
 every byte on the wire identical to the pre-security server; setting it to a
 `SecurityConfig` (an RSA key pair + application certificate, plus a trust
@@ -314,8 +323,8 @@ floor); it is an operator setting, not peer input.
 Everything in `encoding` and `services` is a codec; what makes it *driven* is
 whether a state machine in `root` (client) or `server` (server) uses it.
 
-- **Driven, both directions, at `#None` *and* `Basic256Sha256`
-  Sign/SignAndEncrypt:** OpenSecureChannel (issue and renew)/CloseSecureChannel,
+- **Driven, both directions, at `#None` *and* `Basic256Sha256`, `Aes128_Sha256_RsaOaep`,
+  `Aes256_Sha256_RsaPss` Sign/SignAndEncrypt:** OpenSecureChannel (issue and renew)/CloseSecureChannel,
   GetEndpoints, FindServers, CreateSession, ActivateSession, CloseSession,
   Read, Write, Browse, BrowseNext, TranslateBrowsePathsToNodeIds, Call,
   CreateSubscription, ModifySubscription, SetPublishingMode, DeleteSubscriptions,
@@ -328,8 +337,7 @@ whether a state machine in `root` (client) or `server` (server) uses it.
   (always encoded empty), `SignedSoftwareCertificate`, `X509IdentityToken`
   and `IssuedIdentityToken` type ids, `ActivateSessionRequest.
   UserTokenSignature` (decoded, never required — it only matters for the
-  X509/Issued tokens, which are not implemented), and
-  `SecurityPolicy.aes256_sha256_rsapss` (an enum value + `uri()` only).
+  X509/Issued tokens, which are not implemented).
 
 ## Verification
 
@@ -400,7 +408,19 @@ run at once finds the port taken and skips loudly instead of failing.
 - **Live, outside the module** (`zig build interop-opcua`, needs a Python with `asyncua` + `cryptography`; `-- --capture`
   rewrites the transcript): `tools/asyncua_driver.py` driving this server for real. The only half that can find a new
   divergence, and a pre-release check; the replay is the per-commit one. `zig build check-interop` compiles it on every
-  lane so the instrument cannot rot.
+  lane so the instrument cannot rot. Without `--capture` two more phases run, never recorded: `tools/asyncua_policies.py`
+  drives the same server with its endpoints swapped for `Aes128_Sha256_RsaOaep` and `Aes256_Sha256_RsaPss` (each at Sign
+  with a username whose password asyncua encrypts under the policy, and at SignAndEncrypt; write and read back), and this
+  module's client opens a channel and an activated session at both policies and both modes against `asyncua`'s own server
+  (`tools/asyncua_server.py`) and reads its CurrentTime (asyncua 2.0.1, 2026-11-21: all 8 legs pass). The local
+  open62541 image (its `server_ctt` offers Basic128Rsa15, Basic256 and Basic256Sha256 only) cannot judge the newer
+  policies.
+- **The newer policies, offline** (`security.zig`, `server.zig`): the policy table and `fromUri`; P-SHA256 split
+  32 ‖ 16 ‖ 16 for AES-128; AES-128-CBC against NIST SP 800-38A F.2.1; RSA-PSS and OAEP-SHA256 round trips, each refused
+  under Basic256Sha256's algorithm; an AES-128 chunk refused under AES-256 keys; the module's client against its server
+  at both policies and both modes (OPN, CreateSession/ActivateSession signatures, Write + Read); an OPN under a policy
+  no endpoint offers (`BadSecurityModeRejected`), and a PKCS#1 `ClientSignature` on an RSA-PSS channel
+  (`BadApplicationSignatureInvalid`).
 - **Basic256Sha256 goldens** (`server_interop.zig`): *self-derived*, labelled as such — a full asymmetric
   `OpenSecureChannel` message (from a fixed key seed and a fixed OAEP seed, so `rsa.generate`, `rsa.selfSignedCert`,
   RSA-OAEP and RSA-PKCS1v1.5 are pinned byte for byte) and one MSG chunk at each of Sign and SignAndEncrypt, each
@@ -496,6 +516,5 @@ Server side, deliberately out of scope for this part — each is a Bad status, n
 ## Backlog / deferred
 
 - **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. Also `deriveKeys` still returns `ChannelKeys` by value and `services.zig`/`server.zig` copy `SecurityContext`/`ChannelKeys` by value (`ch.security.?`, `c.keys orelse`) inside those burned frames. Next: drive one Basic256Sha256 session over the loopback fixture under the probe, then move the copies to pointers.
-- **Security policies `Aes128Sha256RsaOaep` / `Aes256Sha256RsaPss`** (survey): `Basic256Sha256` is deprecated in OPC UA 1.05 and new servers may offer only the newer policies; medium, fits §2 (sibling `rsa` has PSS/OAEP *(inferred)*).
 - **Events and alarms & conditions** (survey): the `EventFilter` on monitored items, `EventNotificationList`, the event type model and conditions (OPC 10000-9); large, fits §2.
 - **Full standard NodeSet + node management + PubSub (Part 14)** (survey): large, fits §2 for NodeSet (generated data); PubSub is a project of its own.

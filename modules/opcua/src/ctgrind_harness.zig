@@ -70,6 +70,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var body = secretBytes(32, "ctgrind-opcua-body-v1") ++ secretBytes(29, "ctgrind-opcua-body-2-v1");
             if (taint == .yes) {
                 std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&keys));
+                // The key length (16 or 32: which AES) is the policy's, public.
+                std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&keys.encrypting_key_len));
                 std.valgrind.memcheck.makeMemUndefined(&body);
             }
             for ([_]sec.SecurityMode{ .sign, .sign_and_encrypt }) |mode| {

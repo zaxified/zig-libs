@@ -1871,8 +1871,11 @@ iec62351	ReleaseFast	mac	1	0	ff413992e4aa0c2f	760ede68c6c5b472
 # what follows it on the AUTHENTICATED plaintext: the padding-byte checks
 # (834-840) and the dupe/alloc/free of the unpadded body (its length). The
 # padding is checked only after the MAC, so it is no padding oracle.
-opcua	ReleaseFast	kdf	1	0	c525d0fd3655a260	29be2a7621f75ceb
-opcua	ReleaseFast	chunk	1	14	c525d0fd3655a260	17e08703a66ffe0f
+# 2026-11-21 — opcua Aes128_Sha256_RsaOaep / Aes256_Sha256_RsaPss: ChannelKeys gained `encrypting_key_len`, so the
+# kdf harness prints one more octet (output pin moved; counts unchanged). The chunk harness marks that public
+# length defined after tainting the keys (it chooses AES-128 or AES-256); chunk stays 14.
+opcua	ReleaseFast	kdf	1	0	0dd1fbac129468b8	17ce49d4d1054236
+opcua	ReleaseFast	chunk	1	14	0dd1fbac129468b8	17e08703a66ffe0f
 # sha2 (2026-10-10) — hash: the message tainted through hash/update/peek for
 # SHA-224/256/384/512 at 0..1000 bytes; hmac: std Hmac over sha2.Sha256/512
 # with key + message tainted. Both 0.
@@ -2381,7 +2384,7 @@ dnp3	ReleaseFast	keys	1	121	ecc855bd8e8f65c3	d2337903af778cbe	cpu=x86_64 control
 # public after the verdict and declassified in the -fvalgrind build, which this
 # trap build compiles out. Native (AES-NI) trap is 0.
 dnp3	ReleaseFast	keys5	1	121	ecc855bd8e8f65c3	d56cf320bfeb21d5	cpu=x86_64 control=4 trap=61
-opcua	ReleaseFast	chunk	1	134	c525d0fd3655a260	17e08703a66ffe0f	cpu=x86_64 control=2 trap=34
+opcua	ReleaseFast	chunk	1	134	0dd1fbac129468b8	17e08703a66ffe0f	cpu=x86_64 control=2 trap=34
 snmp	ReleaseFast	aes	1	312	f7b2d59406205574	07f7c9867f83b17e	cpu=x86_64 control=12 trap=12
 aes192	ReleaseFast	enc	1	128	91e9bb5ec00b01a9	0c5f76d6ab016242	cpu=x86_64
 aes192	ReleaseFast	dec	1	304	91e9bb5ec00b01a9	68602ef849690825	cpu=x86_64
