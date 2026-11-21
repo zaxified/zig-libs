@@ -42,11 +42,16 @@ if (role.is_df and dfe.allowForward(frame.ingress_segment, segment.id)) deliver(
   independent of DF state.
 - `EdgeSegment` (id, ESI, address-sorted `members`, `tags`; `validate`),
   `Member`, `Tag`, `Algorithm`, `ElectConfig` (`hello_period`, `stale_after`,
-  `df_wait`, `algorithm`).
+  `df_wait`, `algorithm`, `tag_policy`, `prefs`, `ac_events`), `TagPolicy`,
+  `NodePref`, `AcEvent`, `algorithmFor`.
 - `Hello` (origin, seq, segment or `no_segment`, `view` = the members the
-  origin sees; empty = it declares itself isolated) / `BumFrame` (origin,
-  seq, ingress segment, tag) / `no_ingress` — the two 17-octet wire
+  origin sees; empty = it declares itself isolated; plus `pref`, `flags` with
+  Don't Preempt, `ac_down` and `lifetime`, 25 octets) / `BumFrame` (origin,
+  seq, ingress segment, tag; 17 octets) / `no_ingress` — the two wire
   messages; both decoders fail closed.
+- `preferenceDfBy`, `operationalPref`, `Advert` — RFC 9785 preference
+  algorithms 2 and 3 with the Don't Preempt rule; AC-influenced DF (RFC 8584
+  section 4) prunes the candidates of a tag.
 - `DfElect` — the `netsim.Protocol` that runs it all over a Hello flood. A
   member is named DF only when its own view AND every live peer's advertised
   view name it, which makes a one-way failure safe (the member nobody hears
@@ -78,7 +83,7 @@ algorithm in Debug and 400 optimized:
 - duplicates: every one follows a heal / link-up / restart within
   `maxDuplicateWindow` (= 100 with the default config);
 - zero-DF: every stretch without a DF, measured from the last disruptive
-  fault, stays within `maxZeroDfWindow` (= 470 with the default config);
+  fault, stays within `maxZeroDfWindow` (= 420 with the default config);
 - fault-free runs: no duplicate at all, and the roles settle on the RFC
   assignment; explicit failover (DF crash + restart) and partition/heal cases;
 - negative control: `df_wait = 0` duplicates at startup with no fault to

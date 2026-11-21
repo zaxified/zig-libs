@@ -128,9 +128,14 @@ pub fn settledDf(algorithm: types.Algorithm, seg: EdgeSegment, tag: Tag) NodeId 
 
 // ── DfElect: the real protocol ───────────────────────────────────────────
 
+/// Hello flag bit 1: a Don't Preempt member that has not yet frozen its
+/// operational preference; peers leave it out of the candidates.
+const flag_unready: u8 = 2;
+
 const HELLO_TIMER: u64 = 0;
 const BUM_CE_TIMER: u64 = 1;
 const BUM_NET_TIMER: u64 = 2;
+const DFW_TIMER: u64 = 3;
 
 /// Timer ids carry the node's start epoch above the kind, so a timer armed
 /// before a crash that comes due after the restart is recognised as stale
@@ -163,14 +168,33 @@ pub const DfElect = struct {
     /// frame must reach every node; it bounds each origin to fewer than 64
     /// originations per run (asserted in `originateBum`).
     bum_seen: []u64,
-    /// last_seen[node*node_count + member] = `node`'s local time when it last
-    /// accepted a fresh Hello from `member` of its own segment.
+    /// last_seen[node*node_count + member] = the local time until which
+    /// `node` counts `member` of its own segment alive: the arrival time of
+    /// its last fresh Hello plus the lifetime that Hello advertised.
     last_seen: []?Time,
+    /// The preference, flag octet and AC-down mask `member` last advertised
+    /// to `node`, indexed like `last_seen`.
+    last_pref: []u16,
+    last_flags: []u8,
+    last_ac: []u8,
+    /// Per node: its own AC-down mask, whether it has been alive for
+    /// `df_wait` (`ready`: it has heard its peers, so its operational
+    /// preference may be frozen), that frozen advert, and the global time of
+    /// the pending DF-wait timer (null: none armed).
+    own_ac: []u8,
+    ready: []bool,
+    op_pref: []u16,
+    op_dp: []bool,
+    start_at: []Time,
+    dfw_due: []?Time,
+    /// Which `cfg.ac_events` have been applied.
+    ac_applied: []bool,
     /// last_view[node*node_count + member] = the `Hello.view` `member` last
     /// advertised to `node` (meaningful while `last_seen` says alive).
     last_view: []u32,
-    /// last_heard[node] = `node`'s local time when it last accepted a fresh
-    /// Hello from ANY other fabric node; `null` = never since its start.
+    /// last_heard[node] = the local time until which `node` counts the fabric
+    /// as heard: the latest arrival plus lifetime of a fresh Hello from ANY
+    /// other fabric node; `null` = never since its start.
     last_heard: []?Time,
     /// roles[node*MAX_TAGS + i] = `node`'s standing for its segment's
     /// `tags[i]`.
@@ -215,6 +239,26 @@ pub const DfElect = struct {
         errdefer gpa.free(last_view);
         const last_heard = try gpa.alloc(?Time, node_count);
         errdefer gpa.free(last_heard);
+        const last_pref = try gpa.alloc(u16, node_count * node_count);
+        errdefer gpa.free(last_pref);
+        const last_flags = try gpa.alloc(u8, node_count * node_count);
+        errdefer gpa.free(last_flags);
+        const last_ac = try gpa.alloc(u8, node_count * node_count);
+        errdefer gpa.free(last_ac);
+        const own_ac = try gpa.alloc(u8, node_count);
+        errdefer gpa.free(own_ac);
+        const ready = try gpa.alloc(bool, node_count);
+        errdefer gpa.free(ready);
+        const op_pref = try gpa.alloc(u16, node_count);
+        errdefer gpa.free(op_pref);
+        const op_dp = try gpa.alloc(bool, node_count);
+        errdefer gpa.free(op_dp);
+        const start_at = try gpa.alloc(Time, node_count);
+        errdefer gpa.free(start_at);
+        const dfw_due = try gpa.alloc(?Time, node_count);
+        errdefer gpa.free(dfw_due);
+        const ac_applied = try gpa.alloc(bool, cfg.ac_events.len);
+        errdefer gpa.free(ac_applied);
         const roles = try gpa.alloc(election.Role, node_count * MAX_TAGS);
         errdefer gpa.free(roles);
         const hello_seq = try gpa.alloc(u32, node_count);
@@ -233,6 +277,16 @@ pub const DfElect = struct {
             .last_seen = last_seen,
             .last_view = last_view,
             .last_heard = last_heard,
+            .last_pref = last_pref,
+            .last_flags = last_flags,
+            .last_ac = last_ac,
+            .own_ac = own_ac,
+            .ready = ready,
+            .op_pref = op_pref,
+            .op_dp = op_dp,
+            .start_at = start_at,
+            .dfw_due = dfw_due,
+            .ac_applied = ac_applied,
             .roles = roles,
             .hello_seq = hello_seq,
             .bum_seq = bum_seq,
@@ -249,6 +303,16 @@ pub const DfElect = struct {
         gpa.free(self.last_seen);
         gpa.free(self.last_view);
         gpa.free(self.last_heard);
+        gpa.free(self.last_pref);
+        gpa.free(self.last_flags);
+        gpa.free(self.last_ac);
+        gpa.free(self.own_ac);
+        gpa.free(self.ready);
+        gpa.free(self.op_pref);
+        gpa.free(self.op_dp);
+        gpa.free(self.start_at);
+        gpa.free(self.dfw_due);
+        gpa.free(self.ac_applied);
         gpa.free(self.roles);
         gpa.free(self.hello_seq);
         gpa.free(self.bum_seq);
@@ -266,6 +330,16 @@ pub const DfElect = struct {
         @memset(self.last_seen, null);
         @memset(self.last_view, 0);
         @memset(self.last_heard, null);
+        @memset(self.last_pref, 0);
+        @memset(self.last_flags, 0);
+        @memset(self.last_ac, 0);
+        @memset(self.own_ac, 0);
+        @memset(self.ready, false);
+        @memset(self.op_pref, 0);
+        @memset(self.op_dp, false);
+        @memset(self.start_at, 0);
+        @memset(self.dfw_due, null);
+        @memset(self.ac_applied, false);
         @memset(self.roles, .{});
         @memset(self.hello_seq, 0);
         @memset(self.bum_seq, 0);
@@ -306,6 +380,10 @@ pub const DfElect = struct {
         self.epoch[node] += 1;
         const e = self.epoch[node];
         self.last_heard[node] = null;
+        self.own_ac[node] = 0;
+        self.ready[node] = false;
+        self.start_at[node] = localTime(sim, node);
+        self.dfw_due[node] = null;
         try sim.setTimer(node, self.cfg.hello_period, timerId(HELLO_TIMER, e));
         if (segmentIndexOf(node)) |si| {
             const seg = segments[si];
@@ -316,6 +394,9 @@ pub const DfElect = struct {
             }
             @memset(self.last_seen[node * self.node_count ..][0..self.node_count], null);
             @memset(self.last_view[node * self.node_count ..][0..self.node_count], 0);
+            @memset(self.last_pref[node * self.node_count ..][0..self.node_count], 0);
+            @memset(self.last_flags[node * self.node_count ..][0..self.node_count], 0);
+            @memset(self.last_ac[node * self.node_count ..][0..self.node_count], 0);
             if (seg.members[0].node == node) try sim.setTimer(node, self.cfg.bum_period, timerId(BUM_CE_TIMER, e));
         }
         if (node == NETWORK_ORIGIN) try sim.setTimer(node, self.cfg.bum_period, timerId(BUM_NET_TIMER, e));
@@ -328,10 +409,15 @@ pub const DfElect = struct {
         switch (timer_id & 0xff) {
             HELLO_TIMER => {
                 const si = segmentIndexOf(node);
+                if (si) |i| self.tickState(sim, node, i);
                 try self.originateHello(sim, node, si);
                 // Staleness and isolation are only noticed on a tick.
-                if (si) |i| self.refreshRoles(sim, node, i);
+                if (si) |i| try self.refreshRoles(sim, node, i);
                 try sim.setTimer(node, self.cfg.hello_period, timerId(HELLO_TIMER, e));
+            },
+            DFW_TIMER => {
+                self.dfw_due[node] = null;
+                if (segmentIndexOf(node)) |si| try self.refreshRoles(sim, node, si);
             },
             BUM_CE_TIMER => if (segmentIndexOf(node)) |si| {
                 const seg = segments[si];
@@ -381,7 +467,17 @@ pub const DfElect = struct {
         var buf: [types.Hello.wire_len]u8 = undefined;
         const segment = if (si) |i| segments[i].id else types.no_segment;
         const view = if (si) |i| self.viewOf(sim, node, i) else 0;
-        (types.Hello{ .origin = node, .seq = self.hello_seq[node], .segment = segment, .view = view }).encode(&buf);
+        const adv = self.advertOf(node);
+        (types.Hello{
+            .origin = node,
+            .seq = self.hello_seq[node],
+            .segment = segment,
+            .view = view,
+            .pref = adv.pref,
+            .flags = (if (adv.dp) types.Hello.flag_dp else 0) | (if (self.dpMember(node) and !self.ready[node]) flag_unready else 0),
+            .ac_down = self.own_ac[node],
+            .lifetime = @intCast(@min(self.cfg.stale_after, std.math.maxInt(u32))),
+        }).encode(&buf);
         self.hello_last_seq[node * self.node_count + node] = self.hello_seq[node];
         try floodFrom(sim, node, &buf, null);
     }
@@ -412,15 +508,23 @@ pub const DfElect = struct {
         const idx = node * self.node_count + h.origin;
         if (h.seq <= self.hello_last_seq[idx]) return; // stale or duplicate
         self.hello_last_seq[idx] = h.seq;
-        if (h.origin != node) self.last_heard[node] = localTime(sim, node);
+        const now = localTime(sim, node);
+        if (h.origin != node) {
+            const until = now +| h.lifetime;
+            self.last_heard[node] = if (self.last_heard[node]) |old| @max(old, until) else until;
+        }
 
         if (segmentIndexOf(node)) |si| {
             const seg = segments[si];
             if (h.origin != node and h.segment == seg.id and seg.indexOf(h.origin) != null) {
-                self.last_seen[idx] = localTime(sim, node);
+                // Lifetime 0 is a purge: the origin is forgotten at once.
+                self.last_seen[idx] = if (h.lifetime == 0) null else now +| h.lifetime;
                 // Bits past the member list mean nothing; drop them.
                 self.last_view[idx] = h.view & memberMask(seg);
-                self.refreshRoles(sim, node, si);
+                self.last_pref[idx] = h.pref;
+                self.last_flags[idx] = h.flags;
+                self.last_ac[idx] = h.ac_down;
+                try self.refreshRoles(sim, node, si);
             }
         }
         try floodFrom(sim, node, payload, from);
@@ -445,7 +549,7 @@ pub const DfElect = struct {
         if (segmentIndexOf(node)) |si| {
             const seg = segments[si];
             if (seg.tagIndex(f.tag)) |ti| {
-                self.refreshRoles(sim, node, si);
+                try self.refreshRoles(sim, node, si);
                 if (self.roles[node * MAX_TAGS + ti].is_df and election.allowForward(f.ingress_segment, seg.id)) {
                     try self.delivery.recordDelivery(self.gpa, sim.timeNow(), seg.id, f.tag, f.id(), f.ingress_segment);
                 }
@@ -459,8 +563,8 @@ pub const DfElect = struct {
     /// isolated (its own bit set).
     fn sees(self: *const DfElect, now: Time, node: NodeId, member: NodeId, bit: u32) bool {
         const idx = node * self.node_count + member;
-        const seen = self.last_seen[idx] orelse return false;
-        if (now -| seen > self.cfg.stale_after) return false;
+        const until = self.last_seen[idx] orelse return false;
+        if (now > until) return false;
         return self.last_view[idx] & bit != 0;
     }
 
@@ -470,8 +574,8 @@ pub const DfElect = struct {
     /// rule FRRouting applies as EVPN-MH "core isolation" (access ports go
     /// protodown once every uplink is gone).
     fn isolated(self: *const DfElect, now: Time, node: NodeId) bool {
-        const heard = self.last_heard[node] orelse return true;
-        return now -| heard > self.cfg.stale_after;
+        const until = self.last_heard[node] orelse return true;
+        return now > until;
     }
 
     /// `node`'s current view of its segment as a member bitmask (the value
@@ -488,6 +592,91 @@ pub const DfElect = struct {
         return mask;
     }
 
+    /// Per-tick local state: apply due scripted AC events and, once the member
+    /// has been alive for `df_wait`, freeze its operational preference.
+    fn tickState(self: *DfElect, sim: *const Sim, node: NodeId, si: usize) void {
+        _ = si;
+        const now = localTime(sim, node);
+        for (self.cfg.ac_events, 0..) |ev, k| {
+            if (ev.node != node or self.ac_applied[k] or now < ev.time) continue;
+            self.ac_applied[k] = true;
+            const bit = @as(u8, 1) << @intCast(ev.tag_index);
+            if (ev.down) self.own_ac[node] |= bit else self.own_ac[node] &= ~bit;
+        }
+        if (!self.ready[node] and now -| self.start_at[node] >= self.cfg.df_wait) {
+            const seg = segments[segmentIndexOf(node).?];
+            const admin = self.adminOf(node);
+            // The peers' adverts as received: members this node sees and
+            // that are themselves ready.
+            var peers: [types.max_members]Member = undefined;
+            var n: usize = 0;
+            for (seg.members) |m| {
+                if (m.node == node) continue;
+                const idx = node * self.node_count + m.node;
+                const bit = @as(u32, 1) << @intCast(seg.indexOf(m.node).?);
+                if (!self.sees(now, node, m.node, bit) or self.last_flags[idx] & flag_unready != 0) continue;
+                peers[n] = .{ .node = m.node, .addr = m.addr, .pref = self.last_pref[idx], .dp = self.last_flags[idx] & types.Hello.flag_dp != 0 };
+                n += 1;
+            }
+            const op = election.operationalPref(admin, peers[0..n]);
+            self.op_pref[node] = op.pref;
+            self.op_dp[node] = op.dp;
+            self.ready[node] = true;
+        }
+    }
+
+    /// The configured preference of `node`.
+    fn adminOf(self: *const DfElect, node: NodeId) election.Advert {
+        for (self.cfg.prefs) |p| if (p.node == node) return .{ .pref = p.pref, .dp = p.dp };
+        const seg = segments[segmentIndexOf(node).?];
+        const m = seg.members[seg.indexOf(node).?];
+        return .{ .pref = m.pref, .dp = m.dp };
+    }
+
+    /// Does `node` run Don't Preempt?
+    fn dpMember(self: *const DfElect, node: NodeId) bool {
+        if (segmentIndexOf(node) == null) return false;
+        return self.adminOf(node).dp;
+    }
+
+    /// What `node` advertises: its configured value until it is ready, the
+    /// frozen operational one after. A DP member that is not yet ready also
+    /// sets `flag_unready` so that peers leave it out of the candidates.
+    fn advertOf(self: *const DfElect, node: NodeId) election.Advert {
+        if (segmentIndexOf(node) == null) return .{ .pref = 0, .dp = false };
+        if (!self.ready[node]) return self.adminOf(node);
+        return .{ .pref = self.op_pref[node], .dp = self.op_dp[node] };
+    }
+
+    /// The candidate list for `tag` under the member set `view`, as `node`
+    /// knows it: the members in `view`, each with the preference it last
+    /// advertised, less those whose attachment circuit for the tag is down
+    /// (RFC 8584 section 4) and, for DP members, those not yet ready.
+    fn candidatesFor(self: *const DfElect, node: NodeId, seg: EdgeSegment, view: u32, ti: usize, buf: *[types.max_members]Member) []Member {
+        var n: usize = 0;
+        const tag_bit = @as(u8, 1) << @intCast(ti);
+        for (seg.members, 0..) |m, i| {
+            if (view & (@as(u32, 1) << @intCast(i)) == 0) continue;
+            var c = m;
+            if (m.node == node) {
+                if (self.own_ac[node] & tag_bit != 0) continue;
+                if (self.dpMember(node) and !self.ready[node]) continue;
+                const adv = self.advertOf(node);
+                c.pref = adv.pref;
+                c.dp = adv.dp;
+            } else {
+                const idx = node * self.node_count + m.node;
+                if (self.last_ac[idx] & tag_bit != 0) continue;
+                if (self.last_flags[idx] & flag_unready != 0) continue;
+                c.pref = self.last_pref[idx];
+                c.dp = self.last_flags[idx] & types.Hello.flag_dp != 0;
+            }
+            buf[n] = c;
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
     /// Re-run the election for every tag of `node`'s segment.
     ///
     /// `node` is NAMED for a tag when the DF function over its own view picks
@@ -499,19 +688,24 @@ pub const DfElect = struct {
     /// and it yields instead of delivering alongside them. (netsim's
     /// `link_down` is directional, and the fuzzer found exactly this.) EVPN
     /// gets the same property from BGP sessions being two-way.
-    fn refreshRoles(self: *DfElect, sim: *Sim, node: NodeId, si: usize) void {
+    ///
+    /// A role gain that is pending arms one DF-wait timer for the moment its
+    /// wait ends, so the role is taken then and not on the next tick.
+    fn refreshRoles(self: *DfElect, sim: *Sim, node: NodeId, si: usize) anyerror!void {
         const seg = segments[si];
         const now = localTime(sim, node);
         const my_view = self.viewOf(sim, node, si);
-        var mine_buf: [types.max_members]Member = undefined;
-        const mine = membersIn(seg, my_view, &mine_buf);
+        var next_due: ?Time = null; // earliest pending end of a DF wait, local time
         for (seg.tags, 0..) |tag, ti| {
-            var named = election.designatedForwarder(self.cfg.algorithm, seg.esi, mine, tag) == node;
+            const alg = types.algorithmFor(self.cfg, tag);
+            var mine_buf: [types.max_members]Member = undefined;
+            const mine = self.candidatesFor(node, seg, my_view, ti, &mine_buf);
+            var named = election.designatedForwarder(alg, seg.esi, mine, tag) == node;
             if (named) for (seg.members, 0..) |peer, pi| {
                 if (peer.node == node or my_view & (@as(u32, 1) << @intCast(pi)) == 0) continue;
                 var theirs_buf: [types.max_members]Member = undefined;
-                const theirs = membersIn(seg, self.last_view[node * self.node_count + peer.node], &theirs_buf);
-                if (election.designatedForwarder(self.cfg.algorithm, seg.esi, theirs, tag) != node) {
+                const theirs = self.candidatesFor(node, seg, self.last_view[node * self.node_count + peer.node], ti, &theirs_buf);
+                if (election.designatedForwarder(alg, seg.esi, theirs, tag) != node) {
                     named = false;
                     break;
                 }
@@ -520,6 +714,18 @@ pub const DfElect = struct {
             const next = election.stepRole(r.*, named, now, self.cfg.df_wait);
             if (next.is_df != r.is_df) self.logTransition(sim, seg, tag, node, next.is_df);
             r.* = next;
+            if (next.want_since) |since| {
+                const due = since +| self.cfg.df_wait;
+                next_due = if (next_due) |d| @min(d, due) else due;
+            }
+        }
+        if (next_due) |due| {
+            const global_due = sim.timeNow() + @max(1, due -| now);
+            const armed = self.dfw_due[node];
+            if (armed == null or armed.? > global_due) {
+                self.dfw_due[node] = global_due;
+                try sim.setTimer(node, global_due - sim.timeNow(), timerId(DFW_TIMER, self.epoch[node]));
+            }
         }
     }
 
@@ -747,7 +953,7 @@ test "smoke: scenario topology matches the declared segment membership" {
 
 // ── the real DfElect ──────────────────────────────────────────────────────
 
-const algorithms = [_]types.Algorithm{ .modulo, .hrw, .preference };
+const algorithms = [_]types.Algorithm{ .modulo, .hrw, .preference, .preference_lowest };
 
 /// The final role table must be the RFC assignment over all members: one
 /// holder per tag, the one `settledDf` names.
@@ -1162,4 +1368,111 @@ test "the config check refuses df_wait == hello_period, the edge the wait must c
     try testing.expectError(error.InvalidConfig, DfElect.init(gpa, NODE_N, .{ .hello_period = 50, .df_wait = 50 }));
     var ok = try DfElect.init(gpa, NODE_N, .{ .hello_period = 50, .df_wait = 51 });
     ok.deinit(gpa);
+}
+
+// ── RFC 8584 section 4, RFC 9785, lifetime ───────────────────────────────
+
+fn holderOf(df: *const DfElect, seg: EdgeSegment, tag: Tag) !NodeId {
+    var buf: [types.max_members]NodeId = undefined;
+    const h = df.holders(seg, tag, &buf);
+    try testing.expectEqual(@as(usize, 1), h.len);
+    return h[0];
+}
+
+test "AC-influenced DF: a member whose AC for one tag is down drops out of that tag only, and returns when it is up" {
+    const gpa = testing.allocator;
+    // Preference with default values: node 3 (least address) is DF of every tag.
+    // Modulo: tag 10 mod 3 = 1, node 4 is its DF; pruning 4 leaves {3, 5}, 10 mod 2 = 0.
+    const cases = [_]struct { alg: types.Algorithm, victim: NodeId, expect_down: NodeId }{
+        .{ .alg = .preference, .victim = 3, .expect_down = 4 },
+        .{ .alg = .modulo, .victim = 4, .expect_down = 3 },
+        .{ .alg = .hrw, .victim = settledDf(.hrw, SEG_A, 10), .expect_down = 0 },
+    };
+    for (cases) |c| {
+        const events = [_]types.AcEvent{.{ .time = 400, .node = c.victim, .tag_index = 0, .down = true }};
+        var df = try DfElect.init(gpa, NODE_N, .{ .algorithm = c.alg, .ac_events = &events });
+        defer df.deinit(gpa);
+        const case = netsim.Case{ .seed = 3, .scenario = scenario, .protocol = df.protocol(), .until = 1000 };
+        const r = try netsim.replay(gpa, case, &.{}, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+        // Tag 10 (index 0) left the victim; tag 11 did not move.
+        try testing.expect(try holderOf(&df, SEG_A, 10) != c.victim);
+        if (c.expect_down != 0) try testing.expectEqual(c.expect_down, try holderOf(&df, SEG_A, 10));
+        try testing.expectEqual(settledDf(c.alg, SEG_A, 11), try holderOf(&df, SEG_A, 11));
+        try testing.expectEqual(@as(usize, 0), df.delivery.duplicates.items.len);
+    }
+    // Repair: the AC comes back and the RFC assignment returns.
+    const events = [_]types.AcEvent{
+        .{ .time = 400, .node = 3, .tag_index = 0, .down = true },
+        .{ .time = 800, .node = 3, .tag_index = 0, .down = false },
+    };
+    var df = try DfElect.init(gpa, NODE_N, .{ .algorithm = .preference, .ac_events = &events });
+    defer df.deinit(gpa);
+    const case = netsim.Case{ .seed = 3, .scenario = scenario, .protocol = df.protocol(), .until = 1400 };
+    _ = try netsim.replay(gpa, case, &.{}, null);
+    try expectSettled(&df, .preference);
+}
+
+test "Don't Preempt: a returning higher-preference member does not take the role back; without DP it does" {
+    const gpa = testing.allocator;
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 500, .kind = .{ .crash_node = .{ .node = 3 } } },
+        .{ .time = 1100, .kind = .{ .restart_node = .{ .node = 3 } } },
+    };
+    for ([_]bool{ true, false }) |dp| {
+        const prefs = [_]types.NodePref{
+            .{ .node = 3, .pref = 500, .dp = dp },
+            .{ .node = 4, .pref = 100, .dp = dp },
+            .{ .node = 5, .pref = 50, .dp = dp },
+        };
+        for ([_]types.Algorithm{ .preference, .preference_lowest }) |alg| {
+            var df = try DfElect.init(gpa, NODE_N, .{ .algorithm = alg, .prefs = &prefs });
+            defer df.deinit(gpa);
+            const case = netsim.Case{ .seed = 3, .scenario = scenario, .protocol = df.protocol(), .until = 2200 };
+            _ = try netsim.replay(gpa, case, &trace, null);
+            // Highest: 3 first, 4 while 3 is down. Lowest: 5 first (50), and
+            // the crash of 3 changes nothing, so the returning 3 (500) is not
+            // a better choice either way; check the highest direction only.
+            if (alg == .preference) {
+                try testing.expectEqual(if (dp) @as(NodeId, 4) else 3, try holderOf(&df, SEG_A, 10));
+            } else {
+                try testing.expectEqual(@as(NodeId, 5), try holderOf(&df, SEG_A, 10));
+            }
+        }
+    }
+}
+
+test "tag policy: a tag range runs another algorithm than the segment default" {
+    const gpa = testing.allocator;
+    const policy = [_]types.TagPolicy{.{ .first = 12, .last = 13, .algorithm = .preference }};
+    var df = try DfElect.init(gpa, NODE_N, .{ .algorithm = .modulo, .tag_policy = &policy });
+    defer df.deinit(gpa);
+    const case = netsim.Case{ .seed = 3, .scenario = scenario, .protocol = df.protocol(), .until = UNTIL };
+    _ = try netsim.replay(gpa, case, &.{}, null);
+    for (SEG_A.tags) |tag| {
+        const alg = types.algorithmFor(df.cfg, tag);
+        try testing.expectEqual(settledDf(alg, SEG_A, tag), try holderOf(&df, SEG_A, tag));
+    }
+    // 12 mod 3 = 0 is also node 3, so pick the tags where the two differ.
+    try testing.expectEqual(@as(NodeId, 3), try holderOf(&df, SEG_A, 13)); // preference: least address
+    try testing.expect(settledDf(.modulo, SEG_A, 13) != 3);
+}
+
+test "lifetime: a Hello advertising lifetime 0 purges its origin at once; a longer lifetime outlives stale_after" {
+    const gpa = testing.allocator;
+    var df = try DfElect.init(gpa, NODE_N, DEFAULT_CFG);
+    defer df.deinit(gpa);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = netsim.Sim.init(gpa, 0, df.protocol(), &log, UNTIL, 10_000);
+    defer sim.deinit();
+    try scenario(&sim);
+    const p = df.protocol();
+    var buf: [types.Hello.wire_len]u8 = undefined;
+    (types.Hello{ .origin = 4, .seq = 1, .segment = SEG_A.id, .view = 0b111, .lifetime = 1000 }).encode(&buf);
+    try p.onMessageFn(p.ctx, &sim, 3, CORE0, &buf);
+    try testing.expectEqual(@as(?Time, 1000), df.last_seen[3 * NODE_N + 4]);
+    (types.Hello{ .origin = 4, .seq = 2, .segment = SEG_A.id, .view = 0b111, .lifetime = 0 }).encode(&buf);
+    try p.onMessageFn(p.ctx, &sim, 3, CORE0, &buf);
+    try testing.expectEqual(@as(?Time, null), df.last_seen[3 * NODE_N + 4]);
 }

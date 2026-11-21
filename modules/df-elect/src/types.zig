@@ -40,6 +40,10 @@ pub const Member = struct {
     /// "preference-based"; FRRouting's `es-df-pref`). Higher wins. The
     /// default is FRR's (and the preference-based draft's) 32767.
     pref: u16 = 32767,
+    /// RFC 9785 Don't Preempt (DP) bit: this member asks the segment not to
+    /// hand the role back to a returning higher-preference member. Only
+    /// the preference algorithms read it.
+    dp: bool = false,
 };
 
 /// Upper bound on members per segment. The election works on stack buffers of
@@ -97,6 +101,36 @@ pub const Algorithm = enum {
     /// from FRR's observed behaviour (`tools/frr/`), the preference-based
     /// draft itself was not read.
     preference,
+    /// RFC 9785 algorithm 3, lowest-preference: the lowest `Member.pref` is
+    /// DF for every tag; DP-first and lowest-address tie-breaks as above.
+    preference_lowest,
+};
+
+/// A local policy that overrides the algorithm for a range of Ethernet tags
+/// (RFC 9785 section 4.2). It must be identical on every member of a segment,
+/// as the RFC says: members with different policies disagree on the DF.
+pub const TagPolicy = struct {
+    first: Tag,
+    last: Tag,
+    algorithm: Algorithm,
+};
+
+/// A configured preference of one member (RFC 9785 section 3); overrides
+/// `Member.pref` / `Member.dp` for the protocol run.
+pub const NodePref = struct {
+    node: NodeId,
+    pref: u16 = 32767,
+    dp: bool = false,
+};
+
+/// A scripted attachment-circuit change (RFC 8584 section 4): at local time
+/// `time` the AC of `node` for the tag at index `tag_index` of its segment
+/// goes down (`down`) or up. Applied on the member's next Hello tick.
+pub const AcEvent = struct {
+    time: netsim.Time,
+    node: NodeId,
+    tag_index: u8,
+    down: bool,
 };
 
 pub const ElectConfig = struct {
@@ -114,12 +148,28 @@ pub const ElectConfig = struct {
     /// empty (startup, restart) from taking roles before the Hellos arrive.
     df_wait: netsim.Time = 150,
     algorithm: Algorithm = .modulo,
+    /// Per-tag-range overrides of `algorithm`; the first range containing a
+    /// tag wins.
+    tag_policy: []const TagPolicy = &.{},
+    /// Configured preferences per node (default: `Member.pref`/`dp`).
+    prefs: []const NodePref = &.{},
+    /// Scripted AC failures and repairs (RFC 8584 section 4).
+    ac_events: []const AcEvent = &.{},
     /// How often a BUM frame is originated (network-side and per-segment
     /// CE-side), for the scenario/property tests only; kept low enough that
     /// the per-origin sequence number stays inside `bum_seen`'s 64-bit dedup
     /// window (see that field in `protocol.zig`).
     bum_period: netsim.Time = 40,
 };
+
+/// The algorithm that applies to `tag`: the first matching `tag_policy` range,
+/// else `cfg.algorithm`.
+pub fn algorithmFor(cfg: ElectConfig, tag: Tag) Algorithm {
+    for (cfg.tag_policy) |p| {
+        if (tag >= p.first and tag <= p.last) return p.algorithm;
+    }
+    return cfg.algorithm;
+}
 
 /// The two message kinds this module puts on the wire, tagged by the first
 /// payload byte.
@@ -165,8 +215,23 @@ pub const Hello = struct {
     /// declares it isolated (it hears no fabric node): receivers stop
     /// counting it as a member until it advertises itself again.
     view: u32,
+    /// The preference this member advertises: its configured one, or the
+    /// RFC 9785 section 4.3 "in-use" value that keeps a returning member from
+    /// preempting (see `election.operationalPref`).
+    pref: u16 = 32767,
+    /// Bit 0: Don't Preempt (RFC 9785).
+    flags: u8 = 0,
+    /// Bit i: the sender's attachment circuit for `tags[i]` is down, so it is
+    /// not a candidate for that tag (RFC 8584 section 4).
+    ac_down: u8 = 0,
+    /// How many ticks the receiver may count `origin` alive after this
+    /// Hello: the LSP remaining lifetime of an IS-IS style refresh model
+    /// (refreshed every `hello_period`). 0 purges: the receiver forgets the
+    /// origin at once.
+    lifetime: u32 = 170,
 
-    pub const wire_len = 17;
+    pub const wire_len = 25;
+    pub const flag_dp: u8 = 1;
 
     pub fn encode(self: Hello, buf: *[wire_len]u8) void {
         buf[0] = @backingInt(MsgTag.hello);
@@ -174,23 +239,29 @@ pub const Hello = struct {
         std.mem.writeInt(u32, buf[5..9], self.seq, .little);
         std.mem.writeInt(u32, buf[9..13], self.segment, .little);
         std.mem.writeInt(u32, buf[13..17], self.view, .little);
+        std.mem.writeInt(u16, buf[17..19], self.pref, .little);
+        buf[19] = self.flags;
+        buf[20] = self.ac_down;
+        std.mem.writeInt(u32, buf[21..25], self.lifetime, .little);
     }
 
     pub fn decode(payload: []const u8) DecodeError!Hello {
         if (payload.len < wire_len) return error.Truncated;
         // Check the tag here rather than trusting the caller to have called
-        // `tagOf` first. Hello and BumFrame have identical wire lengths and
-        // layouts, so a BUM frame decoded as a Hello is silent type confusion:
-        // its `ingress_segment` — routinely `no_ingress` (0xFFFFFFFF) — would
-        // become a `segment` id. Every dispatch site does check the tag today;
-        // this makes that an invariant of the decoder instead of a convention
-        // a new call site can forget.
+        // `tagOf` first: a BUM frame shares the first 17 octets' layout, so a
+        // BUM frame decoded as a Hello would silently turn its
+        // `ingress_segment` (routinely `no_ingress`, 0xFFFFFFFF) into a
+        // segment id.
         if (payload[0] != @backingInt(MsgTag.hello)) return error.InvalidEncoding;
         return .{
             .origin = std.mem.readInt(u32, payload[1..5], .little),
             .seq = std.mem.readInt(u32, payload[5..9], .little),
             .segment = std.mem.readInt(u32, payload[9..13], .little),
             .view = std.mem.readInt(u32, payload[13..17], .little),
+            .pref = std.mem.readInt(u16, payload[17..19], .little),
+            .flags = payload[19],
+            .ac_down = payload[20],
+            .lifetime = std.mem.readInt(u32, payload[21..25], .little),
         };
     }
 };
@@ -256,6 +327,21 @@ test "Hello round-trips through its wire encoding" {
     try testing.expectEqual(h.seq, h2.seq);
     try testing.expectEqual(h.segment, h2.segment);
     try testing.expectEqual(h.view, h2.view);
+
+    const g = Hello{ .origin = 7, .seq = 900, .segment = 3, .view = 0b101, .pref = 65535, .flags = Hello.flag_dp, .ac_down = 0b1000_0001, .lifetime = 170 };
+    g.encode(&buf);
+    try testing.expectEqual(g, try Hello.decode(&buf));
+}
+
+test "algorithmFor: the first matching tag range overrides the configured algorithm" {
+    const cfg = ElectConfig{ .algorithm = .modulo, .tag_policy = &.{
+        .{ .first = 10, .last = 12, .algorithm = .hrw },
+        .{ .first = 11, .last = 20, .algorithm = .preference },
+    } };
+    try testing.expectEqual(Algorithm.modulo, algorithmFor(cfg, 9));
+    try testing.expectEqual(Algorithm.hrw, algorithmFor(cfg, 11));
+    try testing.expectEqual(Algorithm.preference, algorithmFor(cfg, 13));
+    try testing.expectEqual(Algorithm.modulo, algorithmFor(cfg, 21));
 }
 
 test "BumFrame round-trips through its wire encoding, including the ingress tag" {
@@ -312,7 +398,7 @@ test "tagOf and the frame decoders reject short and undefined input" {
 
     // Every prefix of a valid frame is rejected; the full frame still decodes.
     var buf: [Hello.wire_len]u8 = undefined;
-    (Hello{ .origin = 1, .seq = 1, .segment = 1, .view = 1 }).encode(&buf);
+    (Hello{ .origin = 1, .seq = 1, .segment = 1, .view = 1, .pref = 5, .flags = Hello.flag_dp, .ac_down = 3, .lifetime = 170 }).encode(&buf);
     for (0..buf.len) |n| try testing.expectError(error.Truncated, Hello.decode(buf[0..n]));
     _ = try Hello.decode(&buf);
 
@@ -395,17 +481,17 @@ test "corpus: every tag seed reaches tagOf, and the tags resolved are pinned" {
 }
 
 /// Whole frames, in the format the length draw reads. The buffer is
-/// `Hello.wire_len * 2` = 34 octets and the longest seed here is 34, which is
+/// `Hello.wire_len * 2` = 50 octets and the longest seed here is 50, which is
 /// the point: a seed longer than the buffer is not a large seed, it is the
 /// EMPTY one.
 const frame_seeds = [_][]const u8{
-    seedHex("00070000000100000003000000010000"), // Hello, one octet short of `wire_len` → Truncated
-    seedHex("0007000000010000000300000005000000"), // Hello{ origin = 7, seq = 1, segment = 3, view = 0b101 }
+    seedHex("0007000000010000000300000001000000ff7f01020a0000"), // Hello, one octet short of `wire_len` → Truncated
+    seedHex("0007000000010000000300000005000000ff7f01020a000000"), // Hello{ origin = 7, seq = 1, segment = 3, view = 0b101, pref = 32767, DP, ac_down = 2, lifetime = 10 }
     seedHex("010700000001000000ffffffff0a000000"), // BumFrame{ origin = 7, seq = 1, ingress = no_ingress, tag = 10 }
     seedHex("010700000001000000030000000b000000"), // BumFrame with a real segment id, tag = 11
     seedHex("010700000001000000ffffffff"), // a BUM frame in the old 13-octet layout, no tag → Truncated
-    seedHex("00ffffffffffffffffffffffffffffffff"), // Hello with every field saturated
-    seedHex("00070000000100000003000000010000000007000000020000000300000001000000"), // two Hellos back to back: 34 octets, the buffer exactly
+    seedHex("00ffffffffffffffffffffffffffffffffffffffffffffffff"), // Hello with every field saturated
+    seedHex("0007000000010000000300000001000000ff7f01020a000000" ++ "0007000000010000000300000001000000ff7f01020a000000"), // two Hellos back to back: 50 octets, the buffer exactly
     seedHex("7f0700000001000000030000000a000000"), // a tag that is neither: both decoders must refuse
     seedHex("00"), // a lone tag octet
     seedHex(""), // zero length; the collapsed harness's only input
@@ -447,7 +533,7 @@ test "corpus: every frame seed reaches both decoders, and what decodes is pinned
         } else |_| {}
     }
     // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 decoded, id sum 0.
-    // Seeds re-cut 2026-09-30 for the 17-octet Hello and BumFrame; same counts.
+    // Seeds re-cut for the 25-octet Hello; same counts.
     try testing.expectEqual(frame_seeds.len - 1, nonempty); // the deliberate empty seed
     try testing.expectEqual(@as(usize, 3), hellos);
     try testing.expectEqual(@as(usize, 2), bums);
@@ -455,7 +541,7 @@ test "corpus: every frame seed reaches both decoders, and what decodes is pinned
 }
 
 test "decode refuses the sibling message: identical layouts must not cross-decode" {
-    // Hello and BumFrame are both 17 octets with a u32 quadruple, so the tag
+    // Hello and BumFrame share their first 17 octets' layout (a u32 quadruple), so the tag
     // byte is the ONLY thing separating them. Decoding one as the other used
     // to succeed and silently reinterpret the third field — `no_ingress`
     // (0xFFFFFFFF) arriving as a segment id.
@@ -465,13 +551,16 @@ test "decode refuses the sibling message: identical layouts must not cross-decod
     (BumFrame{ .origin = 7, .seq = 1, .ingress_segment = no_ingress, .tag = 10 }).encode(&bum_buf);
 
     try testing.expectError(error.InvalidEncoding, BumFrame.decode(&hello_buf));
-    try testing.expectError(error.InvalidEncoding, Hello.decode(&bum_buf));
+    var wide: [Hello.wire_len]u8 = @splat(0);
+    @memcpy(wide[0..bum_buf.len], &bum_buf);
+    try testing.expectError(error.InvalidEncoding, Hello.decode(&wide));
 
     // A byte that is neither tag is refused by both, not just by `tagOf`.
     var junk = bum_buf;
     junk[0] = 0x7f;
     try testing.expectError(error.InvalidEncoding, BumFrame.decode(&junk));
-    try testing.expectError(error.InvalidEncoding, Hello.decode(&junk));
+    wide[0] = 0x7f;
+    try testing.expectError(error.InvalidEncoding, Hello.decode(&wide));
 
     // The correct pairing still round-trips.
     try testing.expectEqual(@as(u32, 3), (try Hello.decode(&hello_buf)).segment);

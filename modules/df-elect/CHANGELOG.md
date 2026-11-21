@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — Behaviour change: `Hello` is 25 octets (was 17: new `pref`,
+  `flags`, `ac_down`, `lifetime`), so 17-octet Hellos are refused as Truncated;
+  liveness is the sender-advertised lifetime (default `stale_after`, so default
+  timing is unchanged) and lifetime 0 purges; `maxZeroDfWindow` is
+  `stale_after + df_wait + 2 * hello_period` (was 3), because a pending DF gain
+  now ends on its own timer. Source-breaking: `Algorithm` gains
+  `preference_lowest` (an exhaustive `switch` needs the new prong). Added: RFC
+  9785 Don't Preempt (`Member.dp`, `operationalPref`), algorithm 3, per-tag
+  algorithm ranges (`ElectConfig.tag_policy`), AC-influenced DF
+  (`ElectConfig.ac_events`, `Hello.ac_down`).
+
 - **2026-10-01** — **Core isolation; lost frames are now checked.** Review
   found a black hole the checks could not see: a member whose inbound link
   died heard nobody, so it named itself DF for every tag, and its peers (which

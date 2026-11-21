@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | RFC 7432 §8.5 / RFC 8584 (spec) | — | — | — | — | Ordinal `mod N` DF for N PEs, later preference-based and HRW algorithms. |
 | Zig / Rust ecosystem | — | — | — | — | Nothing found (`gh search repos 'evpn designated forwarder'`: no results). |
 
-**Where we are ahead:** the only reusable, dependency-free DF decision for a fabric without BGP; all three DF algorithms in the RFC 8584 registry that matter (mod N, HRW, preference) behind one function; the failover guarantees are stated as bounds and model-checked under partitions, one-way cuts, crashes, restarts and clock jumps — a restarted member starts blocked and cannot produce the long post-restart dual DF observed in FRR. **Where we are behind:** no BGP (by design — the input is a Hello flood), so a failover waits for Hello staleness plus `df_wait` instead of a route withdrawal; the preference algorithm has no "don't preempt" option and no per-tag preference ranges; no RFC 8584 §4 AC-influenced DF; liveness is an abstract `stale_after` threshold, not a real LSA machinery (→ Backlog).
+**Where we are ahead:** the only reusable, dependency-free DF decision for a fabric without BGP; all three DF algorithms in the RFC 8584 registry that matter (mod N, HRW, preference) behind one function; the failover guarantees are stated as bounds and model-checked under partitions, one-way cuts, crashes, restarts and clock jumps — a restarted member starts blocked and cannot produce the long post-restart dual DF observed in FRR. **Where we are behind:** no BGP (by design — the input is a Hello flood), so a failover waits for Hello staleness plus `df_wait` instead of a route withdrawal; the one-way core failure described under *Known limit* is not closed (→ Backlog). Don't Preempt, the lowest-preference algorithm, per-tag algorithm ranges, AC-influenced DF, a dedicated DF-wait timer and sender-advertised lifetimes are implemented.
 
 ## The problem
 
@@ -73,12 +73,37 @@ in `EdgeSegment.members` order (sorted by address, which `validate` enforces):
   `u32` and masked, exact because every operation commutes with reduction
   mod 2^31. Removing a member that is not the DF never moves a role (the
   property RFC 8584 argues for HRW over mod N).
-- `.preference` — the member with the highest `Member.pref` (default 32767)
-  is DF for every tag of the segment, ties to the numerically least address:
-  DF algorithm type 2 in the RFC 8584 registry, and what FRRouting's EVPN
-  multihoming runs. The rule was taken from FRR's observed behaviour (twelve
-  settled phases, `frr_test.zig`); the preference-based draft was not read,
-  so its "don't preempt" option and per-tag preference ranges are absent.
+- `.preference` / `.preference_lowest` — RFC 9785 algorithms 2 and 3: the member
+  with the highest (lowest) `Member.pref` (default 32767) is DF for every tag of
+  the segment. Ties go to the member advertising Don't Preempt (`Member.dp`),
+  then to the numerically least address (RFC 9785 §4.1). Algorithm 2 is also what
+  FRRouting's EVPN multihoming runs; its choices were observed in twelve settled
+  phases (`frr_test.zig`). FRR was seen to always preempt, and RFC 9785 makes
+  Don't Preempt an opt-in bit (default 0), so the default stays revertive.
+- **Don't Preempt (`election.operationalPref`).** RFC 9785 §4.3: a member that
+  returns with DP set looks at the best and the worst peer; if its preference is
+  at least the best's it advertises the best's preference with DP=0, if at most
+  the worst's the worst's with DP=0, else its own. It then ties with the incumbent
+  (DP=1), which wins the tie, so the role stays. The protocol freezes this value
+  when the member becomes ready (alive for `df_wait`, so it has heard its peers);
+  recomputing it in steady state would make the incumbent lose its own tie. A DP
+  member that is not ready sets a Hello flag and peers leave it out of the
+  candidates, the stand-in for "not a candidate until its ES route is received"
+  (RFC 9785 §4.1). Members that disagree on DP get no non-revertive guarantee, as
+  in the RFC.
+- **Per-tag ranges (`ElectConfig.tag_policy`).** RFC 9785 §4.2: a local policy
+  overrides the algorithm for a range of tags; it must be identical on every
+  member. The first matching range wins (`types.algorithmFor`). RFC 9785 defines no
+  per-EVI preference value, only this override.
+- **AC-influenced DF (RFC 8584 §4).** A member whose attachment circuit for a tag is
+  down is not a candidate for that tag. Each Hello carries a bit per tag of the
+  sender's down circuits (`Hello.ac_down`); every candidate list drops those
+  members, so the pruning applies to every algorithm (modulo ordinals are assigned
+  after pruning, as §4's modified step 3 says). The member's own down circuit makes
+  it yield that tag at once. `ElectConfig.ac_events` scripts failures and repairs;
+  each applies on the member's next Hello tick. One tag's circuit does not touch
+  another tag (the VLAN-aware case of §4.1). A tag whose every circuit is down has
+  no DF, which is the RFC's outcome too.
 
 Pure: two members with the same candidate list name the same DF, so no vote
 is needed. `kat_test.zig` checks both functions against an independent Python
@@ -91,16 +116,23 @@ it, it gives the role up **at once**; when its view names it, it takes the
 role only after the view has done so **continuously for `df_wait`** (RFC 7432
 §8.5 step 2's timer, RFC 8584 §2.1's DF_Wait). `DfElect.init` refuses
 `df_wait <= hello_period`: the wait has to cover the first Hello round, or
-startup races (below).
+startup races (below). A pending gain arms its own timer for the end of the
+wait (`DFW_TIMER`), so the role is taken exactly `df_wait` after the view first
+named the member, not on the next Hello tick; a timer that fires early on a
+member whose clock jumped back re-arms itself.
 
 ### What a member counts as alive, and the view consensus (`protocol.zig`)
 
 Every fabric node floods Hellos, members and non-members alike (a
 non-member's Hello carries `types.no_segment`), as every router of a
-link-state fabric floods its LSPs. A member counts a peer as alive while the
-peer's last Hello is no older than `stale_after`, measured on the member's OWN
+link-state fabric floods its LSPs. A member counts a peer as alive until the arrival of its last Hello plus the
+`lifetime` that Hello advertised (the remaining lifetime of an IS-IS style LSP,
+refreshed every `hello_period`; `ElectConfig.stale_after` is the value a member
+advertises), measured on the member's OWN
 clock (netsim's per-node clock, which the fuzzer jumps), and that Hello does
-not declare the peer isolated (below). Every Hello carries the sender's view —
+not declare the peer isolated (below). A Hello with lifetime 0 is a purge: the peer
+is forgotten at once. The age is not decremented while flooding; hop delays are
+a few ticks and `stale_after` has the slack. Every Hello carries the sender's view —
 a bitmask of the members it currently sees, itself included. A member is
 **named** for a tag only when:
 
@@ -122,7 +154,7 @@ holds only itself and it names itself DF for every tag — while its peers,
 which still hear it, defer to that view. It held every role and received no
 frame: the segment got no traffic at all, for as long as the cut lasted, and
 the zero-DF check (which counts holders) saw nothing wrong. A member that
-has heard no fabric node for `stale_after` (or not yet since it started) is
+has heard no fabric node within a Hello's lifetime (or not yet since it started) is
 **isolated**: its view is empty — without even its own bit — so it is named
 for nothing, and the Hellos it still manages to send tell its peers to stop
 counting it. This is EVPN-MH "core isolation" as FRRouting applies it (access
@@ -190,8 +222,8 @@ local-bias backstop and must hold inside a dual-DF window too.
    fault before it ended (link/partition/crash/restart/clock-jump;
    single-message faults are not disruptions — one lost Hello never flips
    liveness). The bound `maxZeroDfWindow` = `stale_after + df_wait +
-   3·hello_period` (= 470): detection plus the tick that notices it, the
-   peers re-advertising their views, the wait, and the evaluation tick (the
+   2·hello_period` (= 420): detection plus the tick that notices it, the
+   peers re-advertising their views and the wait, which now ends on its own timer (the
    isolation path is the slow one; flood delays fit the slack because
    evaluation also runs on every BUM frame). A schedule that keeps disrupting
    can keep a tag without a DF — true of any failover protocol — so the bound
@@ -213,15 +245,13 @@ Not a security boundary; the adversary is timing and topology (netsim's fault
 fuzzer: partitions and heals, one-way link cuts and repairs, crashes and
 restarts, clock jumps, single-message drop/dup/delay). The flood's CONTENT is
 trusted — a lying Hello (a forged view) is out of scope, as is node
-authentication. Out of scope too: RFC 8584 §4 AC-influenced DF, the
-preference algorithm's "don't preempt" option and per-tag ranges (see
-Backlog), VLAN bundles beyond using the lowest VLAN as the tag, and
+authentication. Out of scope too: VLAN bundles beyond using the lowest VLAN as the tag, and
 multi-segment split-horizon label interactions.
 
 **Malformed frames are NOT trusted, though.** `tagOf` / `Hello.decode` /
 `BumFrame.decode` return `DecodeError!T` (`Truncated` / `InvalidEncoding`) and
-bounds-check before indexing; both messages are 17 octets and the tag byte is
-what separates them, so each decoder checks it. `origin` and `seq` are
+bounds-check before indexing; the first 17 octets of both messages share one layout
+(the Hello continues to 25) and the tag byte is what separates them, so each decoder checks it. `origin` and `seq` are
 untrusted values too: `origin` indexes `node_count*node_count` arrays and
 `seq` is a shift into a u64 bitmask, so both are range-checked in the
 handlers against the live topology; a Hello's `view` bits past the member
@@ -231,8 +261,7 @@ asserted 0 across the sweep, since every frame in the harness is our own).
 **Harness simplifications.** BUM traffic is timer-generated (`bum_period`),
 bounded to < 64 originations per origin so the per-origin dedup is a 64-bit
 bitmask; a real data plane would use a windowed set. Evaluation runs on the
-Hello tick and on every received Hello/BUM frame, not on a dedicated DF-wait
-timer, which is why the bounds carry one Hello period of granularity.
+Hello tick, on every received Hello/BUM frame and on the DF-wait timer.
 Delivery to "the segment" is abstract: a member that receives a frame and
 holds the role for its tag delivers it; there is no CE-side link to fail
 separately from the member (an access-link failure is modelled as the member
@@ -290,17 +319,11 @@ Run with `scripts/modtest df-elect` (`zig build test-df-elect`), offline.
 - **Directed fabric graph.** Let every Hello carry the set of nodes its sender
   hears (an adjacency LSP); each member can then compute which members the
   BUM sources reach and carve among those, replacing the deference heuristic
-  and closing the known limit (a one-way failure deeper in the core).
-- **Preference algorithm, rest of RFC 8584:** the "don't preempt" option (a
-  returning higher-preference member does not take the role back) and per-tag
-  preference ranges (the preference-based draft was not read).
-- A real LSA age/refresh liveness model in place of the abstract `stale_after`
-  threshold, if this graduates from a model-checked jewel into a fabric
-  component (`isis-sim` has one to borrow).
-- A dedicated DF-wait timer instead of evaluating on the Hello tick, which
-  would take one `hello_period` of granularity out of both bounds.
-- RFC 8584 §4 AC-influenced DF (a member whose attachment circuit for a tag is
-  down drops out of that tag's candidate list).
+  and closing the known limit (a one-way failure deeper in the core). Open
+  question: with the sets, the peers behind the intact side can tell that the
+  deaf member is unreachable from them, but the deaf member never hears them,
+  so it keeps claiming every tag; the choice is between a bounded black hole
+  (today) and duplicate delivery for the frames sourced behind the cut.
 
 ## Anchoring
 

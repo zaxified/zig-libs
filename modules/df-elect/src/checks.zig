@@ -162,7 +162,7 @@ pub const DfTransition = struct {
 /// of a few ticks per hop fit the slack: evaluation also runs on every BUM
 /// frame, more often than the Hello tick. Startup fits the same bound.
 pub fn maxZeroDfWindow(cfg: ElectConfig) Time {
-    return cfg.stale_after + cfg.df_wait + 3 * cfg.hello_period;
+    return cfg.stale_after + cfg.df_wait + 2 * cfg.hello_period;
 }
 
 const TagKey = struct { segment: SegmentId, tag: Tag };
@@ -600,9 +600,9 @@ test "firstUnexplainedDuplicate: only a restoring fault within the window explai
 }
 
 test "maxZeroDfWindow / maxDuplicateWindow: functions of the config" {
-    try testing.expectEqual(@as(Time, 170 + 150 + 150), maxZeroDfWindow(.{}));
+    try testing.expectEqual(@as(Time, 170 + 150 + 100), maxZeroDfWindow(.{}));
     try testing.expectEqual(@as(Time, 100), maxDuplicateWindow(.{}));
-    try testing.expectEqual(@as(Time, 30 + 20 + 30), maxZeroDfWindow(.{ .hello_period = 10, .stale_after = 30, .df_wait = 20 }));
+    try testing.expectEqual(@as(Time, 30 + 20 + 20), maxZeroDfWindow(.{ .hello_period = 10, .stale_after = 30, .df_wait = 20 }));
 }
 
 const members_a = [_]types.Member{ .{ .node = 10, .addr = 1 }, .{ .node = 11, .addr = 2 } };

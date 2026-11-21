@@ -117,14 +117,55 @@ pub fn hrwDf(candidates: []const Member, tag: Tag, esi: [10]u8) ?NodeId {
     return if (best) |b| b.node else null;
 }
 
-/// Preference-based DF: highest `pref`, ties to the numerically least
-/// address; the same member for every tag (FRR elects per Ethernet Segment).
+/// Is `a` a better preference-DF candidate than `b`? RFC 9785 section 4.1:
+/// order by preference (highest first, or lowest first for algorithm 3); on
+/// equal preference the member advertising Don't Preempt first; then the
+/// numerically least address.
+fn prefBetter(a: Member, b: Member, lowest: bool) bool {
+    if (a.pref != b.pref) return if (lowest) a.pref < b.pref else a.pref > b.pref;
+    if (a.dp != b.dp) return a.dp;
+    return a.addr < b.addr;
+}
+
+/// Preference-based DF (algorithm 2, or 3 with `lowest`): the same member for
+/// every tag (FRR elects per Ethernet Segment).
 pub fn preferenceDf(candidates: []const Member) ?NodeId {
+    return preferenceDfBy(candidates, false);
+}
+
+pub fn preferenceDfBy(candidates: []const Member, lowest: bool) ?NodeId {
     var best: ?Member = null;
     for (candidates) |m| {
-        if (best == null or m.pref > best.?.pref or (m.pref == best.?.pref and m.addr < best.?.addr)) best = m;
+        if (best == null or prefBetter(m, best.?, lowest)) best = m;
     }
     return if (best) |b| b.node else null;
+}
+
+/// What a member puts in its Hello: a preference and a Don't Preempt bit.
+pub const Advert = struct { pref: u16, dp: bool };
+
+/// RFC 9785 section 4.3: the "in-use" preference a (re)started member
+/// advertises so that it does not preempt the existing DF. `admin` is its
+/// configured value, `peers` are the other members' adverts as received. A
+/// member without DP, or with no peer, advertises `admin`. With DP it looks at
+/// the best and the worst peer (by `prefBetter` in the highest direction): if
+/// its own preference is at least the best's, it advertises the best's
+/// preference with DP=0 (it ties, and the DP=1 incumbent wins the tie); if at
+/// most the worst's, the worst's with DP=0; otherwise `admin`. Computed once
+/// when the member becomes ready and then frozen, as the RFC does for a PE
+/// that returns; recomputing it in the steady state would make the incumbent
+/// lose its own tie.
+pub fn operationalPref(admin: Advert, peers: []const Member) Advert {
+    if (!admin.dp or peers.len == 0) return admin;
+    var hi = peers[0];
+    var lo = peers[0];
+    for (peers[1..]) |m| {
+        if (prefBetter(m, hi, false)) hi = m;
+        if (prefBetter(m, lo, true)) lo = m;
+    }
+    if (admin.pref >= hi.pref) return .{ .pref = hi.pref, .dp = false };
+    if (admin.pref <= lo.pref) return .{ .pref = lo.pref, .dp = false };
+    return admin;
 }
 
 /// The DF for `tag` among `candidates` under `algorithm`, or `null` if there
@@ -135,6 +176,7 @@ pub fn designatedForwarder(algorithm: Algorithm, esi: [10]u8, candidates: []cons
         .modulo => moduloDf(candidates, tag),
         .hrw => hrwDf(candidates, tag, esi),
         .preference => preferenceDf(candidates),
+        .preference_lowest => preferenceDfBy(candidates, true),
     };
 }
 
@@ -279,6 +321,47 @@ test "preferenceDf: highest preference, ties to the least address, one DF for ev
     // Default preferences everywhere: the least address.
     try testing.expectEqual(@as(?NodeId, 3), preferenceDf(&three));
     try testing.expectEqual(@as(?NodeId, null), preferenceDf(&.{}));
+}
+
+test "preference ties: Don't Preempt first, then the least address; algorithm 3 picks the lowest" {
+    const m = [_]Member{
+        .{ .node = 3, .addr = 0x0a00_0001, .pref = 300 },
+        .{ .node = 4, .addr = 0x0a00_0002, .pref = 300, .dp = true },
+        .{ .node = 5, .addr = 0x0a00_0003, .pref = 100 },
+    };
+    try testing.expectEqual(@as(?NodeId, 4), preferenceDf(&m));
+    try testing.expectEqual(@as(?NodeId, 5), designatedForwarder(.preference_lowest, @splat(0), &m, 7));
+    const t = [_]Member{
+        .{ .node = 3, .addr = 0x0a00_0001, .pref = 100 },
+        .{ .node = 4, .addr = 0x0a00_0002, .pref = 100, .dp = true },
+    };
+    try testing.expectEqual(@as(?NodeId, 4), preferenceDfBy(&t, true));
+}
+
+test "operationalPref: a returning DP member ties with the incumbent instead of preempting (RFC 9785 section 4.3)" {
+    const incumbent = [_]Member{
+        .{ .node = 4, .addr = 0x0a00_0004, .pref = 100, .dp = true },
+        .{ .node = 5, .addr = 0x0a00_0005, .pref = 50, .dp = true },
+    };
+    // Higher than every peer: advertises the best peer's preference, DP=0.
+    var a = operationalPref(.{ .pref = 500, .dp = true }, &incumbent);
+    try testing.expectEqual(Advert{ .pref = 100, .dp = false }, a);
+    // ... and the incumbent (DP=1) wins that tie even from a lower address.
+    const with_returning = [_]Member{
+        .{ .node = 3, .addr = 0x0a00_0003, .pref = a.pref, .dp = a.dp },
+        incumbent[0],
+        incumbent[1],
+    };
+    try testing.expectEqual(@as(?NodeId, 4), preferenceDf(&with_returning));
+    // Lower than every peer: the worst peer's preference.
+    a = operationalPref(.{ .pref = 10, .dp = true }, &incumbent);
+    try testing.expectEqual(Advert{ .pref = 50, .dp = false }, a);
+    // Strictly between: unchanged, DP kept.
+    a = operationalPref(.{ .pref = 70, .dp = true }, &incumbent);
+    try testing.expectEqual(Advert{ .pref = 70, .dp = true }, a);
+    // Without DP, or alone: the configured value (revertive).
+    try testing.expectEqual(Advert{ .pref = 500, .dp = false }, operationalPref(.{ .pref = 500, .dp = false }, &incumbent));
+    try testing.expectEqual(Advert{ .pref = 500, .dp = true }, operationalPref(.{ .pref = 500, .dp = true }, &.{}));
 }
 
 test "allowForward: everywhere except back onto the ingress segment" {
