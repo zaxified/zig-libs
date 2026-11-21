@@ -2,10 +2,12 @@
 
 Pure-Zig **DNP3 (IEEE 1815-2012)**: the Data Link Layer, the Transport
 Function, the Application Layer and the object library as pure codecs — plus a
-complete **outstation** built on top of them. The master role is the codecs
-(build request / parse response); the outstation role is a real stateful
-responder with IIN handling, event buffering, select-before-operate and
-fragmentation. Feeds SCADA/utility fleet-simulation now; real RTU
+complete **outstation** and a stateful **master** built on top of them. The
+outstation is a real stateful responder with IIN handling, event buffering,
+select-before-operate and fragmentation; the master (`master`) runs the task queue (startup
+sequence, integrity and class polls, IIN-driven clear-restart / event scans / time sync, direct and
+select-before-operate commands), CONFIRMs responses and unsolicited responses, and times requests
+out, with `master.Session` doing the link and transport framing (SPEC.md *Master session*). Feeds SCADA/utility fleet-simulation now; real RTU
 monitoring/control is a later consumer.
 
 - No mature pure-Zig DNP3 library exists.
@@ -122,9 +124,9 @@ foreign SA master is unproven (no SA peer exists to test against); see SPEC.md.
 
 ## Not provided
 
-No transport I/O (TCP/serial/TLS: `Session` moves byte slices), no unsolicited retry timer, and no
-stateful master session; object groups g0/g70/g85-g88/g110-g111/g34, SAv5/SAv6 asymmetric key change and
-a few link/event details are not built. See SPEC.md *What is deliberately not done* and
+No transport I/O (TCP/serial/TLS: `Session` moves byte slices) and no unsolicited retry timer; object
+groups g0/g70/g85-g88/g110-g111/g34, SAv5/SAv6 asymmetric key change and a few link/event details are not
+built. See SPEC.md *What is deliberately not done* and
 *Backlog / deferred*.
 
 ## Use

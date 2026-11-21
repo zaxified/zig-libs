@@ -50,17 +50,15 @@
 //! encode/decode function here is a pure function over byte slices, used by
 //! whichever side is sending or receiving — the same "both directions are
 //! pure functions, golden-byte tested offline" shape as the `wireguard` and
-//! `modbus` sibling modules. There is no stateful `Master`/`Outstation`
-//! session type in this base pass (no confirm/retry timers, no unsolicited
-//! response state machine) — that belongs to a future pass built on top of
-//! these codecs.
+//! `modbus` sibling modules. The stateful **master** (`master`: task queue,
+//! startup/integrity/class polls, IIN-driven tasks, commands, CONFIRM,
+//! timeouts) and the data-link confirmed-delivery services (`link_session`)
+//! are built on the same codecs.
 //!
-//! Deliberately out of scope for this pass (see README "Scope"): event
-//! object variations (g2/g11/g22/g32/g42 etc.), file transfer, data sets,
-//! unsolicited-response confirmation/retry state machines, and any actual
-//! transport (TCP/serial) I/O — this module is wire codec + pure
-//! segmentation/reassembly only; the caller wires it to whatever transport
-//! it likes.
+//! Not provided (see SPEC.md *What is deliberately not done*): file transfer,
+//! data sets and the other object groups listed there, and any actual
+//! transport (TCP/serial) I/O — the caller wires the byte slices to whatever
+//! transport it likes.
 //!
 //! Provenance: clean-room from IEEE 1815-2012 (DNP3); structure and
 //! behavior cross-referenced against opendnp3 (Apache-2.0) and public DNP3
@@ -113,6 +111,8 @@ pub const records = @import("records.zig");
 /// responder over a caller-owned point database, plus a `Session` that wires
 /// it to the link and transport layers.
 pub const outstation = @import("outstation.zig");
+/// The stateful master session (task queue, polls, commands, CONFIRM, timeouts).
+pub const master = @import("master.zig");
 /// Secure Authentication (SAv5 symmetric) for the outstation: challenge of
 /// critical requests, aggressive mode, session-key change. Opt-in through
 /// `outstation.Outstation.setSecureAuth`.
@@ -132,6 +132,7 @@ test {
     _ = sa;
     _ = records;
     _ = outstation;
+    _ = master;
     _ = secure_auth;
     _ = goldens;
     _ = @import("link_session.zig");

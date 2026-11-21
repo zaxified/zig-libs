@@ -608,6 +608,26 @@ pub const g41 = struct {
             return .{ .value = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)), .status = @fromBackingInt(@intCast(bytes[4])) };
         }
     };
+
+    /// g41v4: IEEE-754 double-precision float(8, LE) + command status(1) -- 9 bytes.
+    pub const V4 = struct {
+        value: f64,
+        status: g12.CommandStatus = .success,
+
+        pub const wire_len = 9;
+
+        pub fn encode(self: V4, out: []u8) error{BufferTooSmall}![]u8 {
+            if (out.len < wire_len) return error.BufferTooSmall;
+            std.mem.writeInt(u64, out[0..8], @bitCast(self.value), .little);
+            out[8] = @backingInt(self.status);
+            return out[0..wire_len];
+        }
+
+        pub fn decode(bytes: []const u8) error{ShortRecord}!V4 {
+            if (bytes.len < wire_len) return error.ShortRecord;
+            return .{ .value = @bitCast(std.mem.readInt(u64, bytes[0..8], .little)), .status = @fromBackingInt(@intCast(bytes[8])) };
+        }
+    };
 };
 
 // ── g50: Time and Date ───────────────────────────────────────────────────────

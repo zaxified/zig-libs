@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [nblair2/go-dnp3](https://github.com/nblair2/go-dnp3) | Go | MPL-2.0 | 1 | push 2026-09-26 | Small Go library (red-team tooling context, *inferred*); not read. |
 | Zig ecosystem | — | — | — | — | `gh search repos dnp3 --language=zig` found nothing besides zig-libs itself. |
 
-**Where we are ahead:** the only permissively licensed (MIT), no-libc, allocation-free DNP3 that runs with no runtime: unlike opendnp3 (EOL) it is maintained, unlike stepfunc it can be used commercially; the only Zig implementation; SAv2 symmetric g120 codecs are present; outstation behaviour (SBO bound to the arming peer, event ring, fragmentation) is tested against opendnp3 demos. **Where we are behind:** no stateful master (poll scheduler, task queue, timeouts), Secure Authentication only symmetric and only in the outstation, no file transfer/data sets/device attributes, no channel handling (TCP/serial/TLS is the caller's, by design, see *What is deliberately not done*; the rest is in *Backlog / deferred*).
+**Where we are ahead:** the only permissively licensed (MIT), no-libc, allocation-free DNP3 that runs with no runtime: unlike opendnp3 (EOL) it is maintained, unlike stepfunc it can be used commercially; the only Zig implementation; SAv2 symmetric g120 codecs are present; outstation behaviour (SBO bound to the arming peer, event ring, fragmentation) is tested against opendnp3 demos. **Where we are behind:** Secure Authentication only symmetric and only in the outstation (no master side), no file transfer/data sets/device attributes, no channel handling (TCP/serial/TLS is the caller's, by design, see *What is deliberately not done*; the rest is in *Backlog / deferred*).
 
 
 ## Design & invariants
@@ -139,6 +139,45 @@ which is a local programming mistake.
   outstation-originated ones. `Session` sends 0. Getting this backwards makes a real master drop
   every reply as "master frame received for master".
 
+## Master session (`master.zig`)
+
+The master is a pure state machine like the outstation: allocation-free, no timer, no I/O; the caller passes
+`now_ms` (milliseconds since the UNIX epoch, the clock the outstation stamps events with), asks `poll` for
+the next request, feeds each received application fragment to `handle`, and sleeps until `nextWakeup`.
+`master.Session` adds the transport and link framing (requests as unconfirmed user data with DIR = 1; the
+receive side ACKs confirmed user data from an outstation that sends it, with the frame-count rule of
+`link_session`). Modelled on opendnp3's master and Step Function I/O's, behaviour only.
+
+- **Tasks and priority** (lowest first): command, clear restart, disable unsolicited, delay measure, write
+  time, integrity poll, enable unsolicited, class 1/2/3 poll. One request is outstanding at a time.
+- **Startup** (the opendnp3 order): DISABLE_UNSOLICITED (g60v2-v4), integrity poll (g60v2, v3, v4, v1), then
+  ENABLE_UNSOLICITED; each part can be switched off in `Config`. `integrity_poll_ms` and `class_poll_ms`
+  repeat the polls.
+- **IIN-driven**: device restart -> WRITE g80v1 index 7 = 0 (`clear_restart_iin`); class 1/2/3 events -> a class
+  poll (`scan_on_event_iin`); NEED_TIME -> `time_sync`: `lan` writes g50v1 with `now_ms`, `non_lan` sends
+  DELAY_MEASURE first and writes `now_ms + delay/2` (g52v2 carries the outstation's turnaround).
+- **Commands**: `queueCommand` (bounded, 8) with a CROB (g12v1) or an analog output block (g41v1-v4) at a 1- or
+  2-octet index; direct operate, or SELECT then OPERATE at the next sequence number once the SELECT echoed
+  success. `Event.command_done` carries the outstation's echo status (`format_error` for a response that does
+  not echo the command, `timeout` when none came). A command is never retried by the master: the
+  outstation may already have acted.
+- **CONFIRM**: every response and unsolicited response with CON gets a CONFIRM carrying its sequence number
+  (UNS set for an unsolicited one); every fragment of a multi-fragment response is confirmed and the next one
+  must carry the next sequence number. A response with a wrong sequence number, FIR missing on the first
+  fragment, or while nothing is outstanding is ignored.
+- **Unsolicited**: delivered as `Data{ .unsolicited = true }`; a repeat with the sequence number of the
+  previous one is confirmed again and not delivered twice (opendnp3 does the same).
+- **Timeouts**: no complete response within `response_timeout_ms` fails the task. A poll or other task is
+  retried after `task_retry_ms`, `max_task_retries` times, then `task_done{ ok = false }`; a periodic task keeps its
+  schedule. IIN bits seen on any response are acted on at once.
+- **Reading the data**: `Data.measurements()` walks the objects: static and event binary, double-bit, binary
+  output, counter, frozen counter, analog input and output, with start-stop ranges and index prefixes,
+  packed bit forms, g51 common times resolving relative-time events. Any other object (and any
+  truncation) stops the walk with `ok = false`; the module never panics on hostile bytes.
+- **Not done**: one outstation per `Master` (a second association is a second `Master`); no
+  Secure Authentication on the master side (SPEC *Backlog*); file transfer, data sets, device attributes, octet
+  strings and the other groups listed under *What is deliberately not done* are not decoded.
+
 ## CRC verification
 
 DNP3's link-layer CRC-16 is the reveng CRC-catalogue "CRC-16/DNP": width=16, poly=0x3D65,
@@ -222,12 +261,12 @@ arithmetic. The structured loops assert they produced those shapes, so a generat
 reaching them fails rather than reading green. `std.testing.fuzz` targets over the same generator
 (`Outstation.handle`, `Session.feedFrame`) hand the shape space to the real fuzzer.
 
-Out of scope: unsolicited *retry* policy (the fragment builder is here, the timer is the caller's),
-file-transfer objects (g70), data-set objects (g85-g88), device attributes (g0), octet strings
-(g110/g111), time-and-interval (g50v4), analog deadbands (g34), Secure Authentication beyond the outstation's symmetric procedures (see its own
-section), a stateful master session type, and any actual transport (TCP/serial) I/O — this module
-hands the caller bytes to send/receive, nothing more. The reasons and the open items
-are in *What is deliberately not done* and *Backlog / deferred*.
+Out of scope: unsolicited *retry* policy of the outstation (the fragment builder is here, the timer is
+the caller's), file-transfer objects (g70), data-set objects (g85-g88), device attributes (g0), octet
+strings (g110/g111), time-and-interval (g50v4), analog deadbands (g34), Secure Authentication beyond the
+outstation's symmetric procedures (see its own section), and any actual transport (TCP/serial) I/O — this
+module hands the caller bytes to send/receive, nothing more. The reasons and the open items are in *What is
+deliberately not done* and *Backlog / deferred*.
 
 ## g120 Secure Authentication — SAv2 symmetric core
 
@@ -513,10 +552,6 @@ foreign SA master computes the same.
 
 ## Backlog / deferred
 
-- **Stateful master session** (integrity/class polls, task queue, response timeout, unsolicited
-  handling). The master role is still the pure codecs. opendnp3 and stepfunc both ship it and most
-  DNP3 users are SCADA masters: this is the top gap. Large (~1-2 weeks); fits the allocation-free,
-  clock-injected, no-I/O shape.
 - **Object groups not built:** file transfer (g70) and device attributes (g0), used by
   commissioning and configuration tools (medium); data sets (g85-g88), octet strings (g110/g111),
   time-and-interval (g50v4), analog deadbands (g34), time-sync with delay compensation (g50v2/g51).
