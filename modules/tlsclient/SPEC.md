@@ -252,11 +252,20 @@ marked `zig-libs tlsclient` in `Client.zig`:
   socket `output` first failed at the first application record).
 - **A KeyUpdate must end its record** (RFC 8446 §5.1): anything after it in
   the same record is `TlsUnexpectedMessage`, before the key changes.
+- **Handshake messages split across records** are joined in the cleartext
+  buffer (a message that ends one record goes on in the next, as many
+  servers' `max_fragment` settings make them; OpenSSL `s_server -max_send_frag
+  512` in the interop tests), up to one record's plaintext
+  (`tls.max_ciphertext_inner_record_len`) for the joined message
+  (`TlsRecordOverflow` past it). The next record must continue it: another
+  content type between the parts or a key change inside a message is
+  `TlsUnexpectedMessage` (RFC 8446 §5.1, RFC 5246 §6.2.1; Go: "handshake
+  message spans a key change").
 - **`realtime_now`** outside i64 milliseconds is `error.RealtimeInvalid`.
-- **Stack:** `init` needs about 400 KiB free (302 KiB deep, the TLS 1.2 resumption's +6 KiB estimated from its locals, then the 384 KiB
-  dead-stack burn); documented on `init`, not checked at run time.
-- **Stack-residue coverage:** the probe drives TLS 1.3 handshakes (every group and suite, a full flight);
-  a TLS 1.2 key schedule, a TLS 1.2 resumed handshake, an RSA server key and `.ca = .bundle`
+- **Stack:** `init` needs about 400 KiB free (302 KiB deep, then the 384 KiB dead-stack burn, which a
+  TLS 1.2 resumed handshake stays within too); documented on `init`, not checked at run time.
+- **Stack-residue coverage:** the probes drive TLS 1.3 handshakes (every group and suite, a full flight)
+  and a TLS 1.2 resumed handshake; a full TLS 1.2 key schedule, an RSA server key and `.ca = .bundle`
   verification are covered by the burn's depth only, unmeasured, and the 12-byte IVs are shorter than a
   probe needle window.
 - **Fail-closed or informational findings, left as they are:** ServerHello extensions are not checked
@@ -424,10 +433,6 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
 - **ECH (Encrypted Client Hello)**: deferred by the owner ("deliberately not now"). Go's client has it
   (`EncryptedClientHelloConfigList`, configs from DNS HTTPS records); it would pull `hpke` (grade 3) into
   this module's closure, which then has to reach grade 2.
-- **Handshake messages split across records** (inherited from std): in TLS 1.3 the cleartext buffer flips
-  after the Certificate message while the fragment indices carry over, and TLS 1.2 drops a first fragment; a
-  server that splits a message there fails the handshake (bounds stay safe). Real servers seen so far do not;
-  fix with one reassembly buffer when the record layer moves off std's unions.
 - **Stack requirement checked at run time**: `init` documents about 400 KiB; a caller on a small fibre stack
   overflows. A check needs the thread's stack bounds (no std API); revisit if a consumer runs clients on
   small stacks.

@@ -996,3 +996,46 @@ test "STACKPROBE: no master secret or key block on the dead stack after a TLS 1.
     _ = try P.run("Client.init TLS 1.2 resumption", probeResume, .{}, &.{ &master, &kb }, .{});
     try testing.expectEqual(@as(?anyerror, null), probe_err);
 }
+
+/// `server` with its first record (the ServerHello) cut into two records
+/// after `at` octets of its body, and `between` (whole records) in the gap.
+fn splitFirst(out: []u8, server: []const u8, at: usize, between: []const u8) []const u8 {
+    const len = std.mem.readInt(u16, server[3..5], .big);
+    var w = Writer.fixed(out);
+    putPlainRecord(&w, .handshake, server[5..][0..at]);
+    w.writeAll(between) catch unreachable;
+    putPlainRecord(&w, .handshake, server[5 + at ..][0 .. len - at]);
+    w.writeAll(server[5 + len ..]) catch unreachable;
+    return w.buffered();
+}
+
+test "a ServerHello split across two records is joined (std lost the first part); a record of another type between them is unexpected_message" {
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, .{}, .{ .cache = null });
+    var th: Sha256 = undefined;
+    const server = buildServer(&srv_buf, ch, .{}, &th);
+    var split_buf: [4200]u8 = undefined;
+    for ([_]usize{ 1, 3, 4, 10, 40 }) |at| {
+        errdefer std.debug.print("split at {d}\n", .{at});
+        var storage: [2]Client.ClientSession = undefined;
+        var cache = newCache(&storage);
+        defer cache.deinit();
+        _ = prime(&cache, .{});
+        const r = run(splitFirst(&split_buf, server, at, ""), .{ .cache = &cache, .now_s = 1234 });
+        try testing.expect(r.err == null);
+        try expectClientFinished(r.out, ch.len, &th);
+        try testing.expect(sink.did_resume);
+    }
+    // A ChangeCipherSpec or an alert between the parts (RFC 8446 §5.1, RFC
+    // 5246 §6.2.1: handshake messages are not interleaved with other types).
+    const ccs = [_]u8{ 20, 3, 3, 0, 1, 1 };
+    const alert = [_]u8{ 21, 3, 3, 0, 2, 1, 0 };
+    for ([_][]const u8{ &ccs, &alert }) |between| {
+        var storage: [2]Client.ClientSession = undefined;
+        var cache = newCache(&storage);
+        defer cache.deinit();
+        _ = prime(&cache, .{});
+        const r = run(splitFirst(&split_buf, server, 10, between), .{ .cache = &cache, .now_s = 1234 });
+        try testing.expectEqual(error.TlsUnexpectedMessage, r.err.?);
+    }
+}

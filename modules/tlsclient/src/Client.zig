@@ -988,11 +988,20 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
     var cleartext_fragment_start: usize = 0;
     var cleartext_fragment_end: usize = 0;
     var cleartext_bufs: [2][tls.max_ciphertext_inner_record_len]u8 = undefined;
+    // zig-libs tlsclient: a handshake message split across records is joined
+    // in `cleartext_bufs[frag_buf][cleartext_fragment_start..end]` (std lost
+    // a cleartext first fragment, and read a protected one from the wrong
+    // buffer once the Certificate had flipped them). `frag_cipher`: the
+    // cipher state of the records it came in; a message may not span a key
+    // change (RFC 8446 §5.1).
+    var frag_buf: usize = 0;
+    var frag_cipher: CipherState = .cleartext;
     // zig-libs tlsclient: consecutive records that neither carry handshake
     // bytes nor change the cipher state (a TLS 1.3 CCS, an empty record).
     var useless_records: usize = 0;
     fragment: while (true) {
         const fragment_end_before = cleartext_fragment_end;
+        const record_cipher = cipher_state;
         // Ensure the input buffer pointer is stable in this scope.
         input.rebase(tls.max_ciphertext_record_len) catch |err| switch (err) {
             error.EndOfStream => {}, // We have assurance the remainder of stream can be buffered.
@@ -1011,8 +1020,38 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
             error.ReadFailed => return error.ReadFailed,
         };
         var record_decoder: tls.Decoder = .fromTheirSlice(record_buffer);
+        // zig-libs tlsclient: a partial handshake message waits for the rest
+        // in the next record: of the same content type and cipher state
+        // (RFC 8446 §5.1: no interleaving, no spanning a key change). A
+        // Certificate flipped the buffers meanwhile: move it over.
+        if (cleartext_fragment_end > cleartext_fragment_start) {
+            const continues = cipher_state == frag_cipher and switch (cipher_state) {
+                .cleartext => record_ct == .handshake,
+                .handshake => record_ct == .application_data,
+                .application => record_ct == .handshake,
+            };
+            if (!continues) return error.TlsUnexpectedMessage;
+        }
+        {
+            const cur = cert_buf_index % 2;
+            if (frag_buf != cur) {
+                const n = cleartext_fragment_end - cleartext_fragment_start;
+                @memcpy(cleartext_bufs[cur][0..n], cleartext_bufs[frag_buf][cleartext_fragment_start..cleartext_fragment_end]);
+                cleartext_fragment_start = 0;
+                cleartext_fragment_end = n;
+                frag_buf = cur;
+            }
+        }
         var ctd, const ct = content: switch (cipher_state) {
-            .cleartext => .{ record_decoder, record_ct },
+            .cleartext => {
+                if (cleartext_fragment_end == 0) break :content .{ record_decoder, record_ct };
+                // zig-libs tlsclient: the rest of a split message.
+                const cleartext_buf = &cleartext_bufs[frag_buf];
+                if (record_len > cleartext_buf.len - cleartext_fragment_end) return error.TlsRecordOverflow;
+                @memcpy(cleartext_buf[cleartext_fragment_end..][0..record_len], record_buffer);
+                cleartext_fragment_end += record_len;
+                break :content .{ joined(cleartext_buf[0..cleartext_fragment_end], cleartext_fragment_start), record_ct };
+            },
             .handshake => {
                 assert(tls_version == .tls_1_3);
                 // zig-libs tlsclient: the middlebox-compatibility CCS stays
@@ -1063,7 +1102,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                     break :content .{ tls.Decoder.fromTheirSlice(@constCast(a)), ct };
                 }
                 if (ct != .handshake) return error.TlsUnexpectedMessage;
-                break :content .{ tls.Decoder.fromTheirSlice(@constCast(cleartext_buf[cleartext_fragment_start..cleartext_fragment_end])), ct };
+                break :content .{ joined(cleartext_buf[0..cleartext_fragment_end], cleartext_fragment_start), ct };
             },
             .application => {
                 assert(tls_version == .tls_1_2);
@@ -1098,7 +1137,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                     },
                 }
                 read_seq += 1;
-                break :content .{ tls.Decoder.fromTheirSlice(cleartext_buf[cleartext_fragment_start..cleartext_fragment_end]), record_ct };
+                break :content .{ joined(cleartext_buf[0..cleartext_fragment_end], cleartext_fragment_start), record_ct };
             },
         };
         // zig-libs tlsclient: handshake budget, as Go's `crypto/tls`
@@ -1140,10 +1179,19 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                 cipher_state = pending_cipher_state;
             },
             .handshake => while (true) {
-                ctd.ensure(4) catch continue :fragment;
+                const msg_at = ctd.idx;
+                ctd.ensure(4) catch {
+                    try keepPartial(&cleartext_bufs, cert_buf_index % 2, ctd.buf[msg_at..ctd.their_end], &cleartext_fragment_start, &cleartext_fragment_end, &frag_buf);
+                    frag_cipher = record_cipher;
+                    continue :fragment;
+                };
                 const handshake_type = ctd.decode(tls.HandshakeType);
                 const handshake_len = ctd.decode(u24);
-                var hsd = ctd.sub(handshake_len) catch continue :fragment;
+                var hsd = ctd.sub(handshake_len) catch {
+                    try keepPartial(&cleartext_bufs, cert_buf_index % 2, ctd.buf[msg_at..ctd.their_end], &cleartext_fragment_start, &cleartext_fragment_end, &frag_buf);
+                    frag_cipher = record_cipher;
+                    continue :fragment;
+                };
                 const wrapped_handshake = ctd.buf[ctd.idx - handshake_len - 4 .. ctd.idx];
                 // zig-libs tlsclient: TLS 1.2 handshake messages are cleartext
                 // up to the server's Finished; TLS 1.3 never reads these hashes.
@@ -2202,6 +2250,45 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
         cleartext_fragment_start = 0;
         cleartext_fragment_end = 0;
     }
+}
+
+// ── zig-libs tlsclient: handshake message reassembly ───────────────────────
+
+/// A decoder over `buf` (a cleartext buffer, from its start) reading from
+/// `start`, so that its `idx` is an offset into the buffer.
+fn joined(buf: []u8, start: usize) tls.Decoder {
+    var d: tls.Decoder = .fromTheirSlice(buf);
+    d.idx = start;
+    d.our_end = start;
+    return d;
+}
+
+/// Keep `partial` (a handshake message's first part, at the end of the
+/// record) for the next record to complete: where it already lies when it
+/// is in a cleartext buffer, else (a cleartext record, read in place) copied
+/// to the start of buffer `cur`.
+fn keepPartial(
+    bufs: *[2][tls.max_ciphertext_inner_record_len]u8,
+    cur: usize,
+    partial: []const u8,
+    frag_start: *usize,
+    frag_end: *usize,
+    frag_buf: *usize,
+) error{TlsRecordOverflow}!void {
+    for (bufs, 0..) |*b, i| {
+        const lo = @intFromPtr(b);
+        if (@intFromPtr(partial.ptr) >= lo and @intFromPtr(partial.ptr) <= lo + b.len) {
+            frag_start.* = @intFromPtr(partial.ptr) - lo;
+            frag_end.* = frag_start.* + partial.len;
+            frag_buf.* = i;
+            return;
+        }
+    }
+    if (partial.len > bufs[cur].len) return error.TlsRecordOverflow;
+    @memcpy(bufs[cur][0..partial.len], partial);
+    frag_start.* = 0;
+    frag_end.* = partial.len;
+    frag_buf.* = cur;
 }
 
 // ── zig-libs tlsclient: ClientHello helpers ──────────────────────────────

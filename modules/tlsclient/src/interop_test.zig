@@ -1430,3 +1430,17 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "interop: handshake messages split across records (s_server -max_send_frag 512), TLS 1.3 and TLS 1.2" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    inline for (.{ "-tls1_3", "-tls1_2" }) |proto| {
+        var srv = try Server.startProto(io, tmp.dir, proto, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-max_send_frag", "512", "-rev" });
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{});
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+    }
+}
