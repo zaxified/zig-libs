@@ -682,7 +682,7 @@ from source on the same payloads; the reference decode is the preallocated-buffe
 
 ## Backlog / deferred
 
-- **R18 Parallel compression on a quiet host:** `parallel.compress`'s wall time with 1–8 workers on 5–8 MB
+- *BOUNCED (quiet-host):* **R18 Parallel compression on a quiet host:** `parallel.compress`'s wall time with 1–8 workers on 5–8 MB
   inputs, measured only under load (1.3–2.4× one pass with 8 workers). Expected near the job count, less
   the cuts' 0–9 % CPU. Needs an idle machine; the host is shared.
 - **R19 Speed rows outside the bench** (owner: S2 = feature parity + the bench within 1.1×; these rows are

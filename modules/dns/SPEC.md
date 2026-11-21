@@ -442,7 +442,12 @@ Consumer build options (CONVENTIONS §4.2), for a consumer that wants hop names 
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - **DoQ / DoH3**: need a QUIC stack the collection does not have.
+  Size: weeks to months: a new transport (QUIC stack, then DoQ/DoH3 on top), needs a QUIC module the collection does not have.
 
 ## Anchoring
 

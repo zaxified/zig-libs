@@ -89,9 +89,14 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - **Commitment / HTLC transaction construction**: the non-crypto serialization (to_local/to_remote/HTLC outputs,
   scripts, feerate math). Not a Fable pocket. Missing and it matters (most of what LDK `chan_utils` offers); effort
   large; fits CONVENTIONS §2, builds on `bitcointx`/`bitcoinscript`.
+  Size: weeks: a transaction-construction layer (to_local/to_remote/HTLC scripts, feerate math) on top of bitcointx/bitcoinscript, with BOLT#3 vectors.
 
 ## Anchoring
 

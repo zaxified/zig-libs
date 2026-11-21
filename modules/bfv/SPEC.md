@@ -334,7 +334,7 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 Open items only. All are additive; none is a defect of what exists.
 
 - **Fast RNS step for the multiply's input lift:** Halevi–Polyakov base conversion replacing `rns.Basis.convertExact` for the `[0,q)` CRT lift of the multiply's inputs. `mulBehz` itself needs no exact tensor and no big-integer division; that input lift is the only wide arithmetic left on the multiply path.
-- **Rescale loop: restore vectorisation under the CT barrier (vector-select form):** since `csub`/`subMod` launder their mask, the `rescale/coeff` BEHZ-RNS micro-row of the opt-in bench reads 59.1 -> 131.9 ns at log2 q=36 and 1.25-1.33x slower at q=120..300 (`BFV_BENCH=1`, ReleaseFast, measured on a shared, noisy host; end-to-end HomMul not slower). Not done: one primitive, always constant-time; a vector-select form would let LLVM vectorise again without a branch. Re-measure on a quiet host first.
+- *BOUNCED (quiet-host):* **Rescale loop: restore vectorisation under the CT barrier (vector-select form):** since `csub`/`subMod` launder their mask, the `rescale/coeff` BEHZ-RNS micro-row of the opt-in bench reads 59.1 -> 131.9 ns at log2 q=36 and 1.25-1.33x slower at q=120..300 (`BFV_BENCH=1`, ReleaseFast, measured on a shared, noisy host; end-to-end HomMul not slower). Not done: one primitive, always constant-time; a vector-select form would let LLVM vectorise again without a branch. Re-measure on a quiet host first.
 
 ## Roadmap
 

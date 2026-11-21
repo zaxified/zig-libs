@@ -348,7 +348,7 @@ Go source) and reused here.
 
 ## Backlog / deferred
 
-- **A genuine `bls-unchained-on-g1` beacon** — none is in the repository, so
+- *BOUNCED (waits-external):* **A genuine `bls-unchained-on-g1` beacon** — none is in the repository, so
   that scheme's tests are self-consistency only; add a real vector when one is
   available.
 

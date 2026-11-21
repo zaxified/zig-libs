@@ -186,7 +186,7 @@ in constant time instead of attempting an astronomical allocation. Round-trippin
 
 ## Backlog / deferred
 
-- **`normalize` division is schoolbook:** 50,000 zeros take 15 ms in Debug and 4x zeros costs about 11x; a divide-and-conquer or Hensel exact division would make it linear. BOUNCED to the quiet-host phase: it is a timing claim (the A/B needs a quiet machine) and needs a sub-quadratic division that `std.math.big.int` does not have.
+- *BOUNCED (quiet-host):* **`normalize` division is schoolbook:** 50,000 zeros take 15 ms in Debug and 4x zeros costs about 11x; a divide-and-conquer or Hensel exact division would make it linear. It is a timing claim (the A/B needs a quiet machine) and needs a sub-quadratic division that `std.math.big.int` does not have.
 
 ## Roadmap
 

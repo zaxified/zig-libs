@@ -316,7 +316,7 @@ Run with `scripts/modtest df-elect` (`zig build test-df-elect`), offline.
 
 ## Backlog / deferred
 
-- **Directed fabric graph.** Let every Hello carry the set of nodes its sender
+- *BOUNCED (owner):* **Directed fabric graph.** Let every Hello carry the set of nodes its sender
   hears (an adjacency LSP); each member can then compute which members the
   BUM sources reach and carve among those, replacing the deference heuristic
   and closing the known limit (a one-way failure deeper in the core). Open

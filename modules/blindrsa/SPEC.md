@@ -345,7 +345,7 @@ is montint.
 
 ## Backlog / deferred
 
-- **Partially blind RSA (draft-irtf-cfrg-partially-blind-rsa)** *(survey 2026-09-30)*.
+- *BOUNCED (waits-external):* **Partially blind RSA (draft-irtf-cfrg-partially-blind-rsa)** *(survey 2026-09-30)*.
   Public metadata bound into the signature — the feature that lets a token issuer
   put an expiry or a policy tag into blind tokens. jedisct1's Zig library and CIRCL
   ship it; it is a draft, so the module's RFC-only scope is still parity. Large:

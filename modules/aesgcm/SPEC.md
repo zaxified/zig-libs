@@ -361,11 +361,11 @@ byte-array to wider-lane vector `@bitCast` byte by byte.
 ## Backlog / deferred
 
 - **Generic backend's GCTR on Zig 0.17**: `Generic.gctr` (`src/root.zig`, the non-AES-NI path) runs std's `crypto.core.modes.ctr`, whose per-block `mem.writeInt(u128, …, .big)` 0.17 lowers byte by byte (#36256) — measured on `aes192`'s bench: 2.32× OpenSSL at 16 KiB, against 0.96× for `Aes192EncryptCtx.ctr`'s two-`u64`, vector-byte-swap counter. Port that counter (inc32 only: the low 32 bits) when the generic path is next measured; the stitched AES-NI kernel is unaffected.
-- **Performance P2 → P1: measure the fastest in the field**: ours is about 1.0× OpenSSL 3.5.5 at 16 KiB and
+- *BOUNCED (tool):* **Performance P2 → P1: measure the fastest in the field**: ours is about 1.0× OpenSSL 3.5.5 at 16 KiB and
   faster below; P1 needs `fastest ≤ 1.25×`, and no other implementation is measured. Candidates: aws-lc / BoringSSL (same CRYPTOGAMS kernel
   family as OpenSSL, plus VAES paths), Go `crypto/cipher`. Add them as an `alt` side in
   `tools/bench.zig` when one is installable on the host.
-- **arm64 stitched AESE/PMULL kernel and run-time HWCAP dispatch**: on arm64 servers a consumer gets `std`'s two-pass speed, not the 1.6–2.2× the README advertises. Listed above under "What is deliberately not done" for want of arm64 hardware to measure on; recorded here as the gap a user of OpenSSL/Go on ARM will notice. Effort: large. Fits §2.
+- *BOUNCED (hardware):* **arm64 stitched AESE/PMULL kernel and run-time HWCAP dispatch**: on arm64 servers a consumer gets `std`'s two-pass speed, not the 1.6–2.2× the README advertises. Listed above under "What is deliberately not done" for want of arm64 hardware to measure on; recorded here as the gap a user of OpenSSL/Go on ARM will notice. Effort: large. Fits §2.
 
 ## Open
 

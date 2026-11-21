@@ -946,7 +946,7 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   `Config.tickets`, `resumption`, `early_data` or staple, so a `DTLS_FUZZ` run does not reach the ticket open, the
   binder check, the early-record path or the stapled `CertificateEntry` decoder. Extend the harness (a ticket from a
   first handshake, then mutated resumption flights), then a `DTLS_FUZZ` verdict run on the ReleaseSafe binary.
-- **AEAD record protection is the stateless per-record call** of the `aesgcm` module: every record re-runs the
+- *BOUNCED (quiet-host):* **AEAD record protection is the stateless per-record call** of the `aesgcm` module: every record re-runs the
   AES key expansion and the GHASH key setup. `zig build bench-dtls` (`tools/bench.zig`) measures it against a cached
   `aesgcm` `Context` (first run, 2026-11-21, ReleaseFast, 3 rounds on a loaded machine, spread up to 40 %): cached /
   per-record 0.20–0.23 at 64-byte records, 0.31–0.35 at 256, 0.52–0.58 at 1024, 0.61–0.65 at 1400 (AES-128 and
@@ -957,7 +957,7 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   `cert-client-keyupdate-ours`, `cert-client-keyupdate-theirs`) pass against wolfSSL 5.9.1 but are not yet in
   `src/testdata/wolfssl_transcript.txt`: `zig build interop-dtls -- --capture --version 13`, then
   `wolfssl_replay.zig`'s `recorded_cases_floor` 22 → 26 and `fuzz_corpus.zig`'s pinned frame counts.
-- **A second independent stack.** wolfSSL agreeing with us rules out the wire defects listed under *What it found*, but a
+- *BOUNCED (owner):* **A second independent stack.** wolfSSL agreeing with us rules out the wire defects listed under *What it found*, but a
   bug the two happen to share would still pass. OpenSSL 3.5 now covers 1.2 plain PSK (it has no DTLS 1.3). The next
   one is Mbed TLS 3.6 (DTLS 1.2, RFC 9146 connection ID — the 1.2 CID's missing live peer, since Debian's wolfSSL
   5.9.1 fails it): its `ssl_server2` / `ssl_client2` from the sha256-pinned release tarball, built outside `modules/`

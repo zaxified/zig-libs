@@ -422,7 +422,7 @@ computed from those inputs, not code or text of either project.
 
 Missing and it matters, most-hit first:
 
-1. **snarkjs's circuit hash and contribution proof:** needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b) — hit by a ceremony that mixes snarkjs and this module, not by proving. Black-box only; 29 340 hash constructions tried, so possibly infeasible without reading GPL source. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks. Blocked: the only reference is snarkjs's GPL-3.0 source, which is not read.
+1. *BOUNCED (other):* **snarkjs's circuit hash and contribution proof:** needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b) — hit by a ceremony that mixes snarkjs and this module, not by proving. Black-box only; 29 340 hash constructions tried, so possibly infeasible without reading GPL source. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks. Blocked: the only reference is snarkjs's GPL-3.0 source, which is not read.
 
 ## Roadmap
 

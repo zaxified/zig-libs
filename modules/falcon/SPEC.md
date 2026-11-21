@@ -289,15 +289,15 @@ publishes only hashes of its padded KAT responses.
 
 ## Backlog / deferred
 
-- **Rebase onto FN-DSA (FIPS 206) once a draft is published.** The main way
+- *BOUNCED (waits-external):* **Rebase onto FN-DSA (FIPS 206) once a draft is published.** The main way
   this module goes stale: expect a header-byte / domain-separation / pre-hash
-  revision, not an NTT/math revision. Moderate, pure Zig. Bounced (wait): no
+  revision, not an NTT/math revision. Moderate, pure Zig. No
   Initial Public Draft as of 2026-11-21.
-- **Expanded (precomputed-tree) signing key.** The reference offers it for
+- *BOUNCED (quiet-host):* **Expanded (precomputed-tree) signing key.** The reference offers it for
   repeated signing under one key; here every signature rebuilds the Gram matrix
   and LDL tree, and the integer-emulated FP is already about 5x slower than
   native. Moderate, pure Zig; worth it only for a signing-heavy consumer.
-  Bounced (quiet phase): a performance item, to be measured A/B on a quiet host.
+  A performance item, to be measured A/B on a quiet host.
 - **Dead-stack probe below the top NTRUSolve level.** The probe sees the entry
   points and the top-level RNS limbs of f and g; the intermediate big-integer
   limbs of the F/G recursion levels (depth > 0) have no independent model short

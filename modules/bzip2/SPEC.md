@@ -218,9 +218,9 @@ intact file and shows a flipped bit costing exactly one block.
 
 ## Backlog / deferred
 
-- **Decoder speed:** the Huffman walk is a 20-bit window with a per-length loop; a lookup table
+- *BOUNCED (quiet-host):* **Decoder speed:** the Huffman walk is a 20-bit window with a per-length loop; a lookup table
   on the first 8-10 bits would take the common symbols in one step (the card's Performance line has the
-  decoder's current ratio). BOUNCED to the quiet-host phase: a speed claim needs an A/B of several interleaved
+  decoder's current ratio). A speed claim needs an A/B of several interleaved
   runs on an idle machine (the decoder rows are noisy even there).
 
 ## Open

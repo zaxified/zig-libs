@@ -308,8 +308,8 @@ and its offline replay inside the lane (see *Anchoring*); `zig build interop-acm
 
 - **OCSP stapling in the manager** *(owner: backlog)*: certmagic staples and replaces revoked certificates; Let's
   Encrypt switched its OCSP responders off in 2025, ZeroSSL/GTS still serve OCSP. Sibling `ocsp`. Effort: medium.
-- **dns-persist-01** *(owner: backlog)*: draft-ietf-acme-dns-persist, lego only; wait for Pebble / a production CA.
-- **A scheduled run against Let's Encrypt STAGING itself** (Boulder, a public name, port 80): out of scope for a
+- *BOUNCED (waits-external):* **dns-persist-01** *(owner: backlog)*: draft-ietf-acme-dns-persist, lego only; wait for Pebble / a production CA.
+- *BOUNCED (other):* **A scheduled run against Let's Encrypt STAGING itself** (Boulder, a public name, port 80): out of scope for a
   loopback lane; Pebble is the only CA the module has run against.
 
 ## Anchoring

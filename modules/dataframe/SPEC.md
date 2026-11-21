@@ -1241,4 +1241,4 @@ the end cell with 0).
 
 Open items only; everything here is LOW unless marked, and none is a known wrong answer without a refusal or a note in the sections above.
 
-- **Time zones:** `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until it is made a zoned column before 1970 shows the zone's state at the epoch.
+- *BOUNCED (owner):* **Time zones:** `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until it is made a zoned column before 1970 shows the zone's state at the epoch.

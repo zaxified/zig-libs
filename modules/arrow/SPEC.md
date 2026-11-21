@@ -423,7 +423,7 @@ reads one batch on its own.
   the writer. Not here until `dataframe` has one.
 - **Interval (YEAR_MONTH, DAY_TIME, MONTH_DAY_NANO).** No `dataframe` column; reading as an int or a struct would lose
   the type. Needs a column kind first.
-- **Incremental IO over `std.Io.Reader` / `std.Io.Writer`** (a batch-at-a-time reader, a `StreamWriter` that takes
+- *BOUNCED (owner):* **Incremental IO over `std.Io.Reader` / `std.Io.Writer`** (a batch-at-a-time reader, a `StreamWriter` that takes
   frames as they are produced; Arrow C++, arrow-rs and Go all have one). Not a mechanical split of what is here: the
   writer decides types from the whole frame (a Decimal128's precision is the widest value's, Large offsets start where
   a frame's text reaches 2^31 bytes, a dictionary is the frame's), so a streaming writer needs the types declared up

@@ -431,16 +431,16 @@ survey's value to an operator or fleet agent; all fit CONVENTIONS §2 (pure Zig,
 
 | deferred | why |
 |---|---|
-| **flash update** (`devlink dev flash`, the `FLASH_UPDATE_STATUS` progress stream on the `config` group) | The main reason an operator uses devlink on a NIC. Needs a firmware file on disk and emits an asynchronous progress stream; the write half is dangerous to expose without a way to exercise it. Effort medium (request plus stream decoding). |
+| **flash update** (`devlink dev flash`, the `FLASH_UPDATE_STATUS` progress stream on the `config` group) | *BOUNCED (hardware):* The main reason an operator uses devlink on a NIC. Needs a firmware file on disk and emits an asynchronous progress stream; the write half is dangerous to expose without a way to exercise it. Effort medium (request plus stream decoding). |
 | **port functions** (`PORT_FUNCTION` nest) and **`PORT_NEW`/`PORT_DEL`** | SF/VF provisioning, the clearest standalone value for an SR-IOV/SF fleet agent (vishvananda/netlink has it). Hardware address, admin state, capability bitfield and max-IO-EQs; subfunction lifecycle pairs with it. The port decoder reports the nest's *presence* (`Port.has_function`) but does not decode it. Effort medium. |
-| **rate objects** (`RATE_GET`/`SET`/`NEW`/`DEL`) | VF/SF rate limiting; a full model needs the leaf/node tree and the TC bandwidth nest. Only meaningful on an eswitch with rate limiting, unverifiable without hardware. Effort medium-large. |
+| **rate objects** (`RATE_GET`/`SET`/`NEW`/`DEL`) | *BOUNCED (hardware):* VF/SF rate limiting; a full model needs the leaf/node tree and the TC bandwidth nest. Only meaningful on an eswitch with rate limiting, unverifiable without hardware. Effort medium-large. |
 | **health diagnose / dump** (`HEALTH_REPORTER_DIAGNOSE`, `DUMP_GET`, `DUMP_CLEAR`, `TEST`) and `HEALTH_REPORTER_SET` | Their payload is the `DEVLINK_ATTR_FMSG` nest, a self-describing, recursively typed object/array format that is its own decoder; an FMSG decoder unlocks the group in one step. Effort medium. |
-| **`DEV_STATS` / `RELOAD_STATS`** | Per-action, per-limit reload counters. `Device.has_reload_stats` reports the nest's presence only. The nesting of the counters is not in the UAPI header and cannot be captured without a driver that supports reload (netdevsim needs root); decoding it from memory would be guessing. |
-| **traps, trap groups, trap policers** | Three related object families with their own statistics nests; mlxsw-specific in practice. Large. |
-| **DPIPE** (`DPIPE_TABLE_GET`, `ENTRIES_GET`, `HEADERS_GET`) | A whole pipeline-introspection schema nested five deep, bigger than the rest of devlink combined, and only mlxsw implements it. Large. |
-| **shared buffers** (`SB_*`, 20 commands) | Pool/port-pool/TC-bind matrix plus occupancy snapshots; coherent as a unit, untestable without a switch ASIC. Large. |
-| **selftests** | `SELFTESTS_GET`/`RUN`; running one takes the device down. |
-| **linecards** | Modular-chassis only; carries a `NESTED_DEVLINK` handle whose semantics deserve their own treatment. |
+| **`DEV_STATS` / `RELOAD_STATS`** | *BOUNCED (hardware):* Per-action, per-limit reload counters. `Device.has_reload_stats` reports the nest's presence only. The nesting of the counters is not in the UAPI header and cannot be captured without a driver that supports reload (netdevsim needs root); decoding it from memory would be guessing. |
+| **traps, trap groups, trap policers** | *BOUNCED (hardware):* Three related object families with their own statistics nests; mlxsw-specific in practice. Large. |
+| **DPIPE** (`DPIPE_TABLE_GET`, `ENTRIES_GET`, `HEADERS_GET`) | *BOUNCED (hardware):* A whole pipeline-introspection schema nested five deep, bigger than the rest of devlink combined, and only mlxsw implements it. Large. |
+| **shared buffers** (`SB_*`, 20 commands) | *BOUNCED (hardware):* Pool/port-pool/TC-bind matrix plus occupancy snapshots; coherent as a unit, untestable without a switch ASIC. Large. |
+| **selftests** | *BOUNCED (hardware):* `SELFTESTS_GET`/`RUN`; running one takes the device down. |
+| **linecards** | *BOUNCED (hardware):* Modular-chassis only; carries a `NESTED_DEVLINK` handle whose semantics deserve their own treatment. |
 | **`NOTIFY_FILTER_SET`** | Narrows what a multicast subscriber receives; useful only once there is something to receive. |
 | **`PORT_PARAM_GET`/`SET`** | Per-port parameters. The decoders already handle a `PORT_INDEX` on a parameter; only the commands are missing. |
 

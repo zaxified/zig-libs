@@ -388,7 +388,7 @@ forced-inline `mulI`/`squareI`) are in *Design*.
 
 ## Backlog / deferred
 
-- **Speed leftovers** (verify at 1.03–1.07× OpenSSL). Bounced (quiet phase): perf, to be measured A/B on a quiet
+- *BOUNCED (quiet-host):* **Speed leftovers** (verify at 1.03–1.07× OpenSSL). Perf, to be measured A/B on a quiet
   host. Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
 
 ## Anchoring

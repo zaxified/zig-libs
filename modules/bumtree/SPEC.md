@@ -169,7 +169,7 @@ Offline only — pure logic, no live-interop surface; the RFC 6329 example (Anch
 
 ## Backlog / deferred
 
-- **802.1aq ECT-mask tie-break in `spf-ect` (or a variant hook in `bumtree.build`)** (survey 2026-09-30): two SPB bridges only agree on the tree if they run the same ECT algorithm; a network with a non-Zig bridge needs the standard's, not ours. Effort M (needs the standard's algorithm text; no public vectors, see Anchoring). Fits CONVENTIONS §2 (pure Zig).
+- *BOUNCED (paywalled):* **802.1aq ECT-mask tie-break in `spf-ect` (or a variant hook in `bumtree.build`)** (survey 2026-09-30): two SPB bridges only agree on the tree if they run the same ECT algorithm; a network with a non-Zig bridge needs the standard's, not ours. Effort M (needs the standard's algorithm text; no public vectors, see Anchoring). Fits CONVENTIONS §2 (pure Zig).
 
 ## Anchoring
 

@@ -587,4 +587,9 @@ its clause citations live in this file and in the module's doc comments.
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - (survey 2026-09-30) **MS/TP (clause 9)**: bacnet-stack has it. The RS-485 master-slave/token-passing data link has completely different framing (preamble, CRC, token rotation) with a real-time token timer, and needs a serial port to verify; it would be its own module — a question whether this is "never in this module" or "sibling module later".
+  Size: months: a new data-link module (RS-485 MS/TP framing, token-rotation timer, serial-port verification rig).
