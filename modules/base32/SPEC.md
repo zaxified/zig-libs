@@ -35,13 +35,14 @@ No foreign source was read; feature claims are from public documentation as reme
 **Where we are ahead:** strict-by-default decoding (exact padding count, canonical trailing bits,
 typed errors per fault — accepted text maps injectively to bytes), opt-in leniency exactly
 where authenticator secrets need it, caller buffers with no allocation, Python-anchored KATs.
-**Where we are behind:** no streaming encoder/decoder, no custom or Crockford alphabet, no
+**Where we are behind:** no custom or Crockford alphabet, no
 `map01`.
 
 ## What this module is, and what it is not
 
-A one-shot RFC 4648 §6/§7 codec over caller buffers. Not provided: a streaming
-(incremental) encoder/decoder, base32 variants other than the two RFC alphabets
+A one-shot RFC 4648 §6/§7 codec over caller buffers, plus an incremental `Encoder` and `Decoder` (Go's
+`NewEncoder`/`NewDecoder`: pieces of any size in, caller buffers out, no allocation; the text or the bytes and the
+error of any split equal the one-shot's; `decode` is the `Decoder` run once). Not provided: base32 variants other than the two RFC alphabets
 (Crockford, z-base-32, Geohash).
 
 ## Wire format / algorithm
@@ -94,7 +95,7 @@ caller's buffer: callers own `dest` and should clear it after use (its own tempo
 ## Verification
 
 Run: `scripts/modtest base32`; the deterministic fuzz driver: `BASE32_FUZZ=<runs>[,<first seed>]` (harnesses
-`base32-decode`, `base32-roundtrip`); constant time: `scripts/checks/ctgrind.sh base32`.
+`base32-decode`, `base32-roundtrip`, `base32-stream`: random splits through `Encoder`/`Decoder` equal the one-shot); constant time: `scripts/checks/ctgrind.sh base32`.
 
 - RFC 4648 §10 vectors in both alphabets (encode and strict decode).
 - `src/kat_vectors.zig`: inputs of lengths 0..41, all-zero, all-one and the 256 byte values with Python-stdlib encodings
@@ -123,7 +124,7 @@ module is the two RFC 4648 alphabets (see *What this module is, and what it is n
 
 ## Backlog / deferred
 
-- Streaming encoder/decoder (for secrets read in pieces): none needed yet.
+None open.
 
 ## Anchoring
 

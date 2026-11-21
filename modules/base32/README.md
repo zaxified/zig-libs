@@ -34,6 +34,7 @@ const n = try base32.decode(&raw, "jbsw y3dp ehpk 3pxp", .{
 | `encodedLen(n, pad)`, `decodedLenUpperBound(text_len)` | buffer sizing |
 | `encode(dest, src, opts)`, `decode(dest, text, opts) !usize` | caller-buffer codec |
 | `encodeAlloc`, `decodeAlloc` | owning wrappers |
+| `Encoder`, `Decoder` | incremental codec: `write(dest, piece)` then `finish`; any split gives the one-shot result (`Encoder.writeLenUpperBound`, `finish_len_max`) |
 | `EncodeError` | `BufferTooSmall` |
 | `DecodeError` | `InvalidCharacter`, `InvalidPadding`, `InvalidLength`, `NonCanonical`, `BufferTooSmall` |
 

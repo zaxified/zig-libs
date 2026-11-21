@@ -166,3 +166,95 @@ fn roundtripSmith(_: void, smith: *std.testing.Smith) !void {
 test "fuzz: roundtrip, exploration" {
     try testing.fuzz({}, roundtripSmith, .{});
 }
+
+// ── streaming equals one-shot ────────────────────────────────────────────
+
+const StreamMark = Marker(enum { enc_split, dec_ok, dec_err, dec_split_err });
+
+/// `Encoder` fed in random pieces gives `encode`'s text; `Decoder` fed a
+/// (genuine or damaged) text in random pieces gives `decode`'s bytes, or its
+/// error.
+fn fuzzStream(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var raw: [80]u8 = undefined;
+    const n = src.index(raw.len + 1);
+    src.bytes(raw[0..n]);
+    const eo: b32.EncodeOptions = .{
+        .alphabet = if (src.value(bool)) .std else .hex,
+        .pad = src.value(bool),
+        .lowercase = src.value(bool),
+    };
+    var want: [b32.encodedLen(80, true)]u8 = undefined;
+    const text = try b32.encode(&want, raw[0..n], eo);
+
+    var got: [b32.encodedLen(80, true) + 16]u8 = undefined;
+    var o: usize = 0;
+    var e = b32.Encoder.init(eo);
+    var at: usize = 0;
+    while (at < n) {
+        const take = @min(n - at, src.index(9));
+        o += try e.write(got[o..], raw[at..][0..take]);
+        at += take;
+    }
+    o += try e.finish(got[o..]);
+    if (!std.mem.eql(u8, got[0..o], text)) return error.EncoderDiffers;
+    StreamMark.mark(.enc_split);
+
+    // The text to decode: genuine, or with up to three bytes damaged / truncated.
+    var dtext: [b32.encodedLen(80, true)]u8 = undefined;
+    var dl = text.len;
+    @memcpy(dtext[0..dl], text);
+    if (src.index(3) != 0) {
+        for (0..src.index(4)) |_| {
+            if (dl == 0) break;
+            dtext[src.index(dl)] = "A2z=7 \x00\xff1"[src.index(9)];
+        }
+        if (src.index(3) == 0) dl = src.index(dl + 1);
+    }
+    const dopts: b32.DecodeOptions = .{
+        .alphabet = eo.alphabet,
+        .padding = switch (src.index(3)) {
+            0 => .required,
+            1 => .optional,
+            else => .forbidden,
+        },
+        .case = if (src.value(bool)) .insensitive else .upper_only,
+        .skip_whitespace = src.value(bool),
+    };
+    var one: [80]u8 = undefined;
+    const one_res = b32.decode(&one, dtext[0..dl], dopts);
+
+    var d = b32.Decoder.init(dopts);
+    var out: [90]u8 = undefined;
+    var m: usize = 0;
+    var failure: ?b32.DecodeError = null;
+    var pos: usize = 0;
+    var pieces: usize = 0;
+    while (pos < dl and failure == null) {
+        const take = @min(dl - pos, src.index(11));
+        if (d.write(out[m..], dtext[pos..][0..take])) |k| m += k else |err| failure = err;
+        pos += take;
+        pieces += 1;
+    }
+    if (failure == null) d.finish() catch |err| {
+        failure = err;
+    };
+    if (one_res) |k| {
+        if (failure != null) return error.StreamRefusedWhatOneShotAccepted;
+        if (!std.mem.eql(u8, out[0..m], one[0..k])) return error.StreamBytesDiffer;
+        StreamMark.mark(.dec_ok);
+    } else |err| {
+        if (failure == null) return error.StreamAcceptedWhatOneShotRefused;
+        if (failure.? != err) return error.StreamErrorDiffers;
+        StreamMark.mark(.dec_err);
+        if (pieces > 1) StreamMark.mark(.dec_split_err);
+    }
+}
+
+test "fuzz driver: BASE32_FUZZ (streaming equals one-shot)" {
+    try fuzz_driver.run(fuzzStream, .{ .prefix = "BASE32_FUZZ", .name = "base32-stream" });
+}
+
+test "fuzz harness: streaming, 600 seeds, reaches every outcome" {
+    try StreamMark.reach(fuzzStream, "base32-stream", 600);
+}

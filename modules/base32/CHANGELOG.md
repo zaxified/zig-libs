@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **NEW (additive API):** `Encoder` and `Decoder`, the incremental codec (Go's `NewEncoder`/`NewDecoder`): `write(dest, piece)` then `finish`, caller buffers, no allocation; the text, bytes and error of any split are those of `encode`/`decode`. `decode` now runs a `Decoder` once (same results; the ctgrind rows are unchanged in counts, source digests re-pinned).
 
 - **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat` branch quota scaled with length.
 - **2026-10-18** — Docs: the module doc comment and `SPEC.md` (scope line, "what it is not", Constant-time contract, Backlog) still said "Not constant-time" / "table lookup"; they now describe the 2026-10-10 arithmetic implementation. No code change.

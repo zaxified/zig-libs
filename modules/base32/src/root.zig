@@ -14,7 +14,8 @@
 //! lowercase, unpadded and grouped by spaces).
 //!
 //! No allocation in the core (`encode`/`decode` write into a caller buffer);
-//! `encodeAlloc`/`decodeAlloc` are thin owning wrappers.
+//! `encodeAlloc`/`decodeAlloc` are thin owning wrappers. `Encoder`/`Decoder` are
+//! the incremental form (pieces of any size, same result as the one-shot).
 //!
 //! **Constant-time over the data** (since 2026-10-10): neither direction
 //! indexes a table or branches on the value of a symbol -- each symbol is
@@ -242,70 +243,174 @@ fn isSkippable(c: u8) bool {
 /// misplaced padding is reported where it is met, left to right; then
 /// `InvalidLength`, `InvalidPadding` (count), `NonCanonical`.
 pub fn decode(dest: []u8, text: []const u8, opts: DecodeOptions) DecodeError!usize {
-    var acc: u32 = 0; // holds `nbits` (< 8) pending bits between symbols
-    var nbits: u5 = 0;
-    var nsym: usize = 0;
-    var npad: usize = 0;
-    var out: usize = 0;
-    // The validity of every character is accumulated as a mask and reported
-    // once, after the loop, with the position of the first invalid one (picked
-    // arithmetically). The faults that depend only on public things -- padding
-    // where forbidden, data after padding, a full buffer -- are recorded with
-    // their position, and the earliest fault wins, which is the left-to-right
-    // precedence the loop used to get by returning where it met each.
-    var bad: u8 = 0;
-    var bad_pos: usize = 0;
-    var early: ?struct { pos: usize, err: DecodeError } = null;
-    for (text, 0..) |c, i| {
-        if (opts.skip_whitespace and isSkippable(c)) continue;
-        if (c == '=') {
-            if (opts.padding == .forbidden) {
+    var d: Decoder = .init(opts);
+    const n = try d.write(dest, text);
+    try d.finish();
+    return n;
+}
+
+/// An incremental encoder (Go's `NewEncoder`): feed the input in pieces of any
+/// size, collect the text in caller buffers. No allocation. The text of any
+/// split is byte-identical to `encode` of the whole input.
+pub const Encoder = struct {
+    opts: EncodeOptions,
+    pending: [5]u8 = @splat(0),
+    npending: usize = 0,
+
+    pub fn init(opts: EncodeOptions) Encoder {
+        return .{ .opts = opts };
+    }
+
+    /// The most text `write` of `n` more bytes can produce.
+    pub fn writeLenUpperBound(e: *const Encoder, n: usize) usize {
+        return (e.npending + n) / 5 * 8;
+    }
+
+    /// The most text `finish` can produce (the padded tail group).
+    pub const finish_len_max = 8;
+
+    /// Encode the whole 5-byte groups now available into the front of `dest`
+    /// (`writeLenUpperBound(src.len)` bytes always suffice) and keep the rest
+    /// for the next call; returns the number of text bytes written. On
+    /// `error.BufferTooSmall` nothing was consumed.
+    pub fn write(e: *Encoder, dest: []u8, src: []const u8) EncodeError!usize {
+        if (dest.len < e.writeLenUpperBound(src.len)) return error.BufferTooSmall;
+        var o: usize = 0;
+        var i: usize = 0;
+        if (e.npending > 0 and e.npending + src.len >= 5) {
+            const need = 5 - e.npending;
+            @memcpy(e.pending[e.npending..5], src[0..need]);
+            o += (encode(dest[o..], &e.pending, .{ .alphabet = e.opts.alphabet, .pad = false, .lowercase = e.opts.lowercase }) catch unreachable).len;
+            e.npending = 0;
+            i = need;
+        }
+        const whole = (src.len - i) / 5 * 5;
+        if (whole > 0) {
+            o += (encode(dest[o..], src[i..][0..whole], .{ .alphabet = e.opts.alphabet, .pad = false, .lowercase = e.opts.lowercase }) catch unreachable).len;
+            i += whole;
+        }
+        const rest = src[i..];
+        @memcpy(e.pending[e.npending..][0..rest.len], rest);
+        e.npending += rest.len;
+        return o;
+    }
+
+    /// Encode the buffered tail (with `=` padding when `opts.pad`) into the
+    /// front of `dest` (`finish_len_max` bytes always suffice); returns the
+    /// number of text bytes written. The encoder is empty afterwards and can
+    /// start a new text. On `error.BufferTooSmall` nothing changed.
+    pub fn finish(e: *Encoder, dest: []u8) EncodeError!usize {
+        const n = (try encode(dest, e.pending[0..e.npending], e.opts)).len;
+        std.crypto.secureZero(u8, &e.pending);
+        e.npending = 0;
+        return n;
+    }
+};
+
+/// An incremental decoder (Go's `NewDecoder`) with exactly the strictness of
+/// `decode`: feed the text in pieces of any size, then `finish`. The bytes and
+/// the error of any split are those of `decode` of the whole text, and the
+/// symbol mapping stays constant-time. A fault found by `write` is sticky:
+/// every later call answers the same error. A bad character is reported at
+/// the end of the `write` that contained it (the verdict is taken once per
+/// call, as `decode` takes it once per text).
+pub const Decoder = struct {
+    opts: DecodeOptions,
+    acc: u32 = 0, // holds `nbits` (< 8) pending bits between symbols
+    nbits: u5 = 0,
+    nsym: usize = 0,
+    npad: usize = 0,
+    /// Position (in text bytes consumed so far) of the next byte.
+    pos: usize = 0,
+    bad: u8 = 0,
+    bad_pos: usize = 0,
+    failed: ?DecodeError = null,
+
+    pub fn init(opts: DecodeOptions) Decoder {
+        return .{ .opts = opts };
+    }
+
+    /// Decode `text` into the front of `dest`; returns the number of bytes
+    /// written. `decodedLenUpperBound(text.len) + 1` always suffices.
+    /// Padding is accepted here and checked by `finish`.
+    pub fn write(d: *Decoder, dest: []u8, text: []const u8) DecodeError!usize {
+        if (d.failed) |f| return f;
+        const opts = d.opts;
+        // The validity of every character is accumulated as a mask and reported
+        // once per call, with the position of the first invalid one (picked
+        // arithmetically). The faults that depend only on public things --
+        // padding where forbidden, data after padding, a full buffer -- are
+        // recorded with their position, and the earliest fault wins, which is
+        // the left-to-right precedence a loop returning where it met each gets.
+        var early: ?struct { pos: usize, err: DecodeError } = null;
+        var out: usize = 0;
+        for (text, 0..) |c, k| {
+            const i = d.pos + k;
+            if (opts.skip_whitespace and isSkippable(c)) continue;
+            if (c == '=') {
+                if (opts.padding == .forbidden) {
+                    early = .{ .pos = i, .err = error.InvalidPadding };
+                    break;
+                }
+                d.npad += 1;
+                continue;
+            }
+            const sv = symbolValue(opts.alphabet, opts.case, c);
+            d.bad_pos = pick(~sv[1] & ~d.bad, i, d.bad_pos);
+            d.bad |= ~sv[1];
+            if (d.npad != 0) { // data after padding
                 early = .{ .pos = i, .err = error.InvalidPadding };
                 break;
             }
-            npad += 1;
-            continue;
-        }
-        const sv = symbolValue(opts.alphabet, opts.case, c);
-        bad_pos = pick(~sv[1] & ~bad, i, bad_pos);
-        bad |= ~sv[1];
-        if (npad != 0) { // data after padding
-            early = .{ .pos = i, .err = error.InvalidPadding };
-            break;
-        }
-        nsym += 1;
-        acc = (acc << 5) | sv[0];
-        nbits += 5;
-        if (nbits >= 8) {
-            nbits -= 8;
-            if (out >= dest.len) {
-                early = .{ .pos = i, .err = error.BufferTooSmall };
-                break;
+            d.nsym += 1;
+            d.acc = (d.acc << 5) | sv[0];
+            d.nbits += 5;
+            if (d.nbits >= 8) {
+                d.nbits -= 8;
+                if (out >= dest.len) {
+                    early = .{ .pos = i, .err = error.BufferTooSmall };
+                    break;
+                }
+                dest[out] = @truncate(d.acc >> d.nbits);
+                out += 1;
+                d.acc &= (@as(u32, 1) << d.nbits) - 1;
             }
-            dest[out] = @truncate(acc >> nbits);
-            out += 1;
-            acc &= (@as(u32, 1) << nbits) - 1;
         }
+        d.pos += text.len;
+        if (d.bad != 0) {
+            if (early) |e| if (e.pos < d.bad_pos) {
+                d.failed = e.err;
+                return e.err;
+            };
+            d.failed = error.InvalidCharacter;
+            return error.InvalidCharacter;
+        }
+        if (early) |e| {
+            d.failed = e.err;
+            return e.err;
+        }
+        return out;
     }
-    if (bad != 0) {
-        if (early) |e| if (e.pos < bad_pos) return e.err;
-        return error.InvalidCharacter;
+
+    /// The end of the text: the symbol count, the padding count and the
+    /// trailing bits are checked here (`InvalidLength`, `InvalidPadding`,
+    /// `NonCanonical`), as the end of `decode` checks them.
+    pub fn finish(d: *Decoder) DecodeError!void {
+        if (d.failed) |f| return f;
+        const rem = d.nsym % 8;
+        switch (rem) {
+            0, 2, 4, 5, 7 => {},
+            else => return error.InvalidLength,
+        }
+        const want_pad: usize = (8 - rem) % 8;
+        switch (d.opts.padding) {
+            .required => if (d.npad != want_pad) return error.InvalidPadding,
+            .optional => if (d.npad != 0 and d.npad != want_pad) return error.InvalidPadding,
+            .forbidden => {},
+        }
+        if (d.acc != 0) return error.NonCanonical;
     }
-    if (early) |e| return e.err;
-    const rem = nsym % 8;
-    switch (rem) {
-        0, 2, 4, 5, 7 => {},
-        else => return error.InvalidLength,
-    }
-    const want_pad: usize = (8 - rem) % 8;
-    switch (opts.padding) {
-        .required => if (npad != want_pad) return error.InvalidPadding,
-        .optional => if (npad != 0 and npad != want_pad) return error.InvalidPadding,
-        .forbidden => {},
-    }
-    if (acc != 0) return error.NonCanonical;
-    return out;
-}
+};
 
 /// Owning variant of `decode`; the caller frees the result. The temporary
 /// buffer is wiped before it is freed (TOTP secrets pass through it); the
@@ -323,6 +428,65 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, text: []const u8, opts: DecodeO
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "Encoder and Decoder: the RFC 4648 §10 vectors, byte by byte" {
+    const cases = [_]struct { plain: []const u8, text: []const u8 }{
+        .{ .plain = "", .text = "" },
+        .{ .plain = "f", .text = "MY======" },
+        .{ .plain = "fo", .text = "MZXQ====" },
+        .{ .plain = "foo", .text = "MZXW6===" },
+        .{ .plain = "foob", .text = "MZXW6YQ=" },
+        .{ .plain = "fooba", .text = "MZXW6YTB" },
+        .{ .plain = "foobar", .text = "MZXW6YTBOI======" },
+    };
+    for (cases) |c| {
+        var e: Encoder = .init(.{});
+        var buf: [32]u8 = undefined;
+        var o: usize = 0;
+        for (c.plain) |b| o += try e.write(buf[o..], &.{b});
+        o += try e.finish(buf[o..]);
+        try testing.expectEqualStrings(c.text, buf[0..o]);
+        var d: Decoder = .init(.{});
+        var out: [16]u8 = undefined;
+        var m: usize = 0;
+        for (c.text) |b| m += try d.write(out[m..], &.{b});
+        try d.finish();
+        try testing.expectEqualStrings(c.plain, out[0..m]);
+    }
+}
+
+test "Encoder: a too small buffer consumes nothing; finish empties the encoder" {
+    var e: Encoder = .init(.{});
+    var small: [7]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, e.write(&small, "fooba"));
+    try testing.expectEqual(@as(usize, 0), e.npending);
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try e.write(&buf, "foo"));
+    try testing.expectEqual(@as(usize, 8), e.writeLenUpperBound(2));
+    try testing.expectEqual(@as(usize, 8), try e.finish(&buf));
+    try testing.expectEqual(@as(usize, 0), e.npending);
+    try testing.expectEqual(@as(usize, 0), try e.finish(&buf));
+}
+
+test "Decoder: faults of the streaming path are those of decode, and sticky" {
+    var d: Decoder = .init(.{});
+    var out: [16]u8 = undefined;
+    _ = try d.write(&out, "MZXW6===");
+    try testing.expectError(error.InvalidPadding, d.write(&out, "M")); // data after padding
+    try testing.expectError(error.InvalidPadding, d.write(&out, "")); // sticky
+    try testing.expectError(error.InvalidPadding, d.finish());
+    var e: Decoder = .init(.{});
+    try testing.expectError(error.InvalidCharacter, e.write(&out, "MZ!W"));
+    var f: Decoder = .init(.{});
+    _ = try f.write(&out, "MZX");
+    try testing.expectError(error.InvalidLength, f.finish());
+    var g: Decoder = .init(.{ .padding = .optional });
+    _ = try g.write(&out, "MZ");
+    try testing.expectError(error.NonCanonical, g.finish()); // 'Z' leaves non-zero trailing bits
+    var h: Decoder = .init(.{ .padding = .optional });
+    var tiny: [1]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, h.write(&tiny, "MZXW6YTB"));
+}
 
 test "decodeAlloc: the temporary buffer is wiped before it goes back to the allocator" {
     // ReleaseFast only (CONVENTIONS §2.1): `Allocator.free` scrubs a freed
