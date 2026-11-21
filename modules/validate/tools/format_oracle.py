@@ -375,7 +375,7 @@ def dt_offset(s):
 
 def dt_norm(s):
     """What the module's profile reads `s` as, in Go's RFC 3339 spelling: `T`/`Z`
-    upper-cased, a leap second as :59, a missing offset as `Z`."""
+    upper-cased, a leap second as :59 (a missing offset stays missing: RFC 3339 requires it)."""
     if len(s) < 19:
         return s
     b = bytearray(s)
@@ -385,9 +385,7 @@ def dt_norm(s):
         b[17:19] = b"59"
     s = bytes(b)
     off = dt_offset(s)
-    if off == b"":
-        s += b"Z"
-    elif off == b"z":
+    if off == b"z":
         s = s[:-1] + b"Z"
     return s
 
@@ -660,7 +658,7 @@ CLASSES = [
     ("DT_OFFSET_24", "GO DEFECT: go's datetime (time.Parse RFC 3339) takes a +24:00 offset; RFC 3339 5.6 time-numoffset hour is 00-23",
      lambda f, s, go: f == "date_time" and go and (dt_offset(s) or b"")[:1] in (b"+", b"-") and (dt_offset(s) or b"")[1:3] >= b"24",
      lambda f, s, go: False),
-    ("DT_PROFILE", "profile: date_time also takes lower-case t/z (RFC 3339 5.6 NOTE), a leap second at any time of day and an offset-less local time (SPEC Format; review M4, owner's call); go's time.Parse takes none of them",
+    ("DT_PROFILE", "profile: date_time also takes lower-case t/z (RFC 3339 5.6 NOTE), and a leap second (go takes none; this one takes 23:59:60 UTC, RFC 3339 5.7) (SPEC Format); go's time.Parse takes none of them (an offset-less time is `local_date_time`, not `date_time`: RFC 3339)",
      lambda f, s, go: f == "date_time" and not go and dt_norm(s) != s and AUX.get(("datetime=2006-01-02T15:04:05Z07:00", dt_norm(s)), False),
      lambda f, s, go: True),
     ("CIDR_MAPPED", "GO DEFECT: go's cidrv4 takes the IPv6 text ::ffff:a.b.c.d/n (net.IP.To4) and its cidrv6 refuses it; RFC 4291 2.5.5.2 makes it an IPv6 prefix",

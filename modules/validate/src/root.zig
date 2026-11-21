@@ -181,10 +181,11 @@ pub const Matcher = struct {
 ///   label ends, ≤ 253 total, no empty labels.
 /// - `date` / `time` / `date_time` — RFC 3339 profile with real range
 ///   checks (month 1–12, day per month incl. leap years, hour ≤ 23,
-///   minute ≤ 59, second ≤ 60 — `23:59:60` is accepted since RFC 3339
-///   permits leap seconds). The UTC offset (`Z` / `±HH:MM`) is validated
-///   strictly when present but is **optional** (offset-less local times
-///   are accepted — ISO 8601 profile, slightly laxer than RFC 3339).
+///   minute ≤ 59, second ≤ 60 — `:60` only at 23:59 UTC, RFC 3339 5.7
+///   permits leap seconds). The UTC offset (`Z` / `±HH:MM`) is **required**
+///   (RFC 3339 `full-time`, which JSON Schema's `time` / `date-time` cite)
+///   and validated strictly; `local_time` / `local_date_time` are the ISO
+///   8601 local forms, the offset optional.
 /// - `duration` — the RFC 3339 appendix-A ISO 8601 grammar (`P…` with
 ///   ordered Y/M/D and T-separated H/M/S components, or the week form).
 /// - `json_pointer` — RFC 6901: "" or `/`-prefixed, `~` only as `~0`/`~1`.
@@ -390,6 +391,11 @@ pub const Format = enum {
     cron,
     /// Contains an HTML tag (go-playground `html`): see `isHtml`.
     html,
+    /// `time` without the offset requirement: ISO 8601 local time (`23:59:59`),
+    /// an offset allowed (`Z` / `±HH:MM`, validated strictly when present).
+    local_time,
+    /// `date_time` without the offset requirement: ISO 8601 local date-time.
+    local_date_time,
 };
 
 /// Caller-supplied predicate, run after all built-in checks pass the type
@@ -1310,7 +1316,7 @@ fn fractionOrder(a: []const u8, b: []const u8) std.math.Order {
 /// other two strings by byte length (go-playground's `len`).
 fn scalarOrder(x: Value, y: Value, instants: bool) ?std.math.Order {
     if (x == .string and y == .string) {
-        if (instants and isDateTime(x.string) and isDateTime(y.string)) {
+        if (instants and isDateTime(x.string, false) and isDateTime(y.string, false)) {
             const ix = instantOf(x.string);
             const iy = instantOf(y.string);
             const o = std.math.order(ix.secs, iy.secs);
@@ -1338,7 +1344,7 @@ fn scalarsEqual(x: Value, y: Value, instants: bool) bool {
     switch (x) {
         .string => |s| {
             if (y != .string) return false;
-            if (instants and isDateTime(s) and isDateTime(y.string)) return scalarOrder(x, y, true).? == .eq;
+            if (instants and isDateTime(s, false) and isDateTime(y.string, false)) return scalarOrder(x, y, true).? == .eq;
             return std.mem.eql(u8, s, y.string);
         },
         .bool => |p| return y == .bool and y.bool == p,
@@ -2175,8 +2181,10 @@ pub fn validateFormat(format: Format, s: []const u8) bool {
         .ipv6 => if (netaddr.parseIp(s)) |ip| ip == .v6 else false,
         .hostname => isHostname(s),
         .date => isDate(s),
-        .time => isTime(s),
-        .date_time => isDateTime(s),
+        .time => isTime(s, true),
+        .date_time => isDateTime(s, true),
+        .local_time => isTime(s, false),
+        .local_date_time => isDateTime(s, false),
         .duration => isDuration(s),
         .json_pointer => isJsonPointer(s),
         .uuid3 => isUuidVersion(s, '3', false, true),
@@ -2280,6 +2288,8 @@ fn formatMessage(format: Format) []const u8 {
         .date => "Input should be a valid date",
         .time => "Input should be a valid time",
         .date_time => "Input should be a valid date-time",
+        .local_time => "Input should be a valid local time",
+        .local_date_time => "Input should be a valid local date-time",
         .duration => "Input should be a valid duration",
         .json_pointer => "Input should be a valid JSON Pointer",
         .uuid3 => "Input should be a valid version 3 UUID",
@@ -2539,16 +2549,22 @@ fn isDate(s: []const u8) bool {
 }
 
 /// `HH:MM:SS[.frac][Z|±HH:MM]` with ranges: hour ≤ 23, minute ≤ 59,
-/// second ≤ 60 (60 = leap second, which RFC 3339 permits — accepted at any
-/// time of day since the grammar cannot know the leap-second table). The
-/// offset is validated strictly when present but is optional (ISO 8601
-/// local-time profile; RFC 3339 proper would require it).
-fn isTime(s: []const u8) bool {
+/// second ≤ 60 (60 = leap second, RFC 3339 5.7: only at 23:59 UTC, which the
+/// clock and the offset must give; the calendar day is not checked). The
+/// offset is required (RFC 3339 `full-time`; JSON Schema's `time` cites it)
+/// unless `require_offset` is false (the `local_*` formats: ISO 8601 local
+/// time), and validated strictly when present.
+fn isTime(s: []const u8, require_offset: bool) bool {
     if (s.len < 8 or s[2] != ':' or s[5] != ':') return false;
     const h = parseDigits(s[0..2]) orelse return false;
     const m = parseDigits(s[3..5]) orelse return false;
     const sec = parseDigits(s[6..8]) orelse return false;
     if (h > 23 or m > 59 or sec > 60) return false;
+    // RFC 3339 5.7: a leap second (`:60`) is the last second of a UTC minute
+    // 23:59 — the clock and the offset must say so (JSON-Schema-Test-Suite,
+    // ajv, python-jsonschema). The calendar day is not checked (the leap-second
+    // table is not ours).
+    var leap_ok = sec != 60;
     var i: usize = 8;
     if (i < s.len and s[i] == '.') {
         i += 1;
@@ -2556,8 +2572,22 @@ fn isTime(s: []const u8) bool {
         while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
         if (i == start) return false; // '.' needs at least one digit
     }
-    if (i == s.len) return true; // offset-less local time
-    return isUtcOffset(s[i..]);
+    if (i == s.len) { // offset-less local time
+        if (sec == 60) leap_ok = h == 23 and m == 59;
+        return !require_offset and leap_ok;
+    }
+    if (!isUtcOffset(s[i..])) return false;
+    if (sec == 60) {
+        var off: i32 = 0; // minutes east of UTC
+        const o = s[i..];
+        if (o.len == 6) {
+            off = @intCast((parseDigits(o[1..3]) orelse 0) * 60 + (parseDigits(o[4..6]) orelse 0));
+            if (o[0] == '-') off = -off;
+        }
+        const utc = @mod(@as(i32, @intCast(h * 60 + m)) - off, 1440);
+        leap_ok = utc == 23 * 60 + 59;
+    }
+    return leap_ok;
 }
 
 /// `Z`/`z` or `±HH:MM` (hour ≤ 23, minute ≤ 59).
@@ -2570,11 +2600,11 @@ fn isUtcOffset(s: []const u8) bool {
 }
 
 /// RFC 3339 date-time: `full-date "T" time` (`T` case-insensitive; a space
-/// separator is rejected). Offset optionality follows `isTime`.
-fn isDateTime(s: []const u8) bool {
+/// separator is rejected). Offset requirement as for `isTime`.
+fn isDateTime(s: []const u8, require_offset: bool) bool {
     if (s.len < 12) return false;
     if (s[10] != 'T' and s[10] != 't') return false;
-    return isDate(s[0..10]) and isTime(s[11..]);
+    return isDate(s[0..10]) and isTime(s[11..], require_offset);
 }
 
 /// ISO 8601 duration per the RFC 3339 appendix-A grammar (what JSON Schema
@@ -6246,6 +6276,8 @@ fn formatName(f: Format) []const u8 {
         .date => "date",
         .time => "time",
         .date_time => "date-time",
+        .local_time => "local-time",
+        .local_date_time => "local-date-time",
         .duration => "duration",
         .json_pointer => "json-pointer",
         .uuid3 => "uuid3",
@@ -6353,6 +6385,9 @@ pub const Body = struct {
     max_body_bytes: usize = 1 << 20,
     /// Structural JSON caps enforced (fail-fast) before the body is parsed.
     limits: Limits = .{},
+    /// Answer failures as RFC 9457 problem details (see `respondInvalid`): the
+    /// template's `type`/`title`/`detail`/`instance`; status is always 400.
+    problem: ?http.problem.Problem = null,
 
     pub fn middleware(v: *const Body) router.Middleware {
         // state is a mutable pointer by type only — run() never writes.
@@ -6366,21 +6401,21 @@ pub const Body = struct {
 
         // Structural DoS caps, enforced before the value tree is built.
         if (try jsonLimitError(v.gpa, raw, v.limits)) |e|
-            return respondInvalid(ctx.res, &.{e}); // no next
+            return respondInvalid(ctx.res, &.{e}, v.problem); // no next
 
         var parsed = std.json.parseFromSlice(Value, v.gpa, raw, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 var report = try jsonInvalidReport(v.gpa, err);
                 defer report.deinit();
-                return respondInvalid(ctx.res, report.errors);
+                return respondInvalid(ctx.res, report.errors, v.problem);
             },
         };
         defer parsed.deinit();
 
         var report = try validateValue(v.gpa, parsed.value, v.schema);
         defer report.deinit();
-        if (!report.ok()) return respondInvalid(ctx.res, report.errors); // no next
+        if (!report.ok()) return respondInvalid(ctx.res, report.errors, v.problem); // no next
 
         var validated: ValidatedBody = .{ .value = parsed.value, .raw = raw };
         var slot: Slot = .{ .kind = .body, .payload = &validated, .prev = ctx.data };
@@ -6415,6 +6450,8 @@ pub fn TypedBody(comptime T: type) type {
         max_body_bytes: usize = 1 << 20,
         /// See `Body.limits`.
         limits: Limits = .{},
+        /// See `Body.problem`.
+        problem: ?http.problem.Problem = null,
 
         const Self = @This();
 
@@ -6437,7 +6474,7 @@ pub fn TypedBody(comptime T: type) type {
             var result = try parseIntoLimited(T, v.gpa, raw, v.limits);
             defer result.deinit();
             switch (result) {
-                .invalid => |report| return respondInvalid(ctx.res, report.errors), // no next
+                .invalid => |report| return respondInvalid(ctx.res, report.errors, v.problem), // no next
                 .ok => |parsed| {
                     var slot: Slot = .{
                         .kind = .typed,
@@ -6460,6 +6497,8 @@ pub fn TypedBody(comptime T: type) type {
 pub const Query = struct {
     gpa: Allocator,
     schema: []const Rule,
+    /// See `Body.problem`.
+    problem: ?http.problem.Problem = null,
 
     pub fn middleware(v: *const Query) router.Middleware {
         return .{ .state = @constCast(v), .run = runQuery };
@@ -6469,7 +6508,7 @@ pub const Query = struct {
         const v: *const Query = @ptrCast(@alignCast(state.?));
         var report = try validateQuery(v.gpa, ctx.req.query, v.schema);
         defer report.deinit();
-        if (!report.ok()) return respondInvalid(ctx.res, report.errors); // no next
+        if (!report.ok()) return respondInvalid(ctx.res, report.errors, v.problem); // no next
 
         var arena = std.heap.ArenaAllocator.init(v.gpa);
         defer arena.deinit();
@@ -6521,6 +6560,8 @@ fn decodePairs(a: Allocator, query: []const u8) Allocator.Error![]const Validate
 pub const PathParams = struct {
     gpa: Allocator,
     schema: []const Rule,
+    /// See `Body.problem`.
+    problem: ?http.problem.Problem = null,
 
     pub fn middleware(v: *const PathParams) router.Middleware {
         return .{ .state = @constCast(v), .run = runParams };
@@ -6533,7 +6574,7 @@ pub const PathParams = struct {
         // take `&Params`, now it would take `*const *const Params`).
         var report = try validateParams(v.gpa, ctx.params, v.schema);
         defer report.deinit();
-        if (!report.ok()) return respondInvalid(ctx.res, report.errors); // no next
+        if (!report.ok()) return respondInvalid(ctx.res, report.errors, v.problem); // no next
         try next.run(ctx);
     }
 };
@@ -6556,7 +6597,15 @@ fn readBody(ctx: *router.Ctx, gpa: Allocator, max: usize) anyerror!?[]u8 {
 }
 
 /// The 400 short-circuit: status + JSON error body, handler never runs.
-fn respondInvalid(res: *http.Server.ResponseWriter, errors: []const Error) anyerror!void {
+fn respondInvalid(res: *http.Server.ResponseWriter, errors: []const Error, problem: ?http.problem.Problem) anyerror!void {
+    if (problem) |template| {
+        var p = template;
+        p.status = 400; // the status of this answer, whatever the template said
+        if (p.title == null) p.title = "Request validation failed";
+        res.setStatus(400);
+        try res.setHeader("Content-Type", http.problem.content_type);
+        return writeErrorsProblem(errors, p, res.writer());
+    }
     res.setStatus(400);
     try res.setHeader("Content-Type", "application/json");
     try writeErrorsJson(errors, res.writer());
@@ -7074,21 +7123,27 @@ test "format truth table: date (calendar-correct, incl. leap years)" {
     });
 }
 
-test "format truth table: time (leap second 23:59:60 ACCEPTED per RFC 3339)" {
+test "format truth table: time (a leap second only at 23:59 UTC, RFC 3339 5.7)" {
     try expectFormat(.time, &.{
-        "00:00:00",
-        "23:59:59",
-        "23:59:60", // leap second — documented accept
-        "12:30:45.123",
+        "00:00:00Z",
+        "23:59:59Z",
+        "23:59:60Z", // leap second, 23:59 UTC
+        "01:29:60+01:30", // idem, 23:59:60Z
+        "07:59:60-16:00",
+        "12:30:45.123Z",
         "12:30:45Z",
         "12:30:45z",
         "12:30:45.5+02:00",
         "12:30:45-23:59",
     }, &.{
         "",
+        "23:59:59", // no offset: RFC 3339 requires it (`local_time` takes it)
+        "12:30:45.123", // idem
         "24:00:00", // hour 24
         "12:60:00", // minute 60
         "12:00:61", // second 61
+        "12:00:60Z", // leap second off 23:59 UTC
+        "23:59:60+01:00", // 22:59:60Z
         "12:00:00.", // empty fraction
         "12:00:00+2:00", // unpadded offset hour
         "12:00:00+24:00", // offset hour out of range
@@ -7105,9 +7160,9 @@ test "format truth table: date_time (combined form; T required)" {
         "2024-01-02t03:04:05z", // lowercase t/z (RFC 3339 case-insensitive)
         "2024-02-29T23:59:60Z", // leap day + leap second
         "2024-01-02T03:04:05.123-07:00",
-        "2024-01-02T03:04:05", // offset-less accepted (documented ISO profile)
     }, &.{
         "",
+        "2024-01-02T03:04:05", // no offset: RFC 3339 requires it (`local_date_time` takes it)
         "2024-01-02 03:04:05Z", // space instead of T
         "2024-01-0203:04:05Z", // missing separator entirely
         "2023-02-29T00:00:00Z", // invalid date part
@@ -9296,6 +9351,46 @@ test "stacked Query + Body middleware: both getters work via the slot chain" {
     try testing.expect(!probe.invoked);
 }
 
+test "middleware `problem`: a failed Query/PathParams/Body answers RFC 9457 problem+json, the default stays application/json" {
+    var probe: Probe = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &probe;
+    const plain: Query = .{ .gpa = testing.allocator, .schema = &search_schema };
+    const prob: Query = .{ .gpa = testing.allocator, .schema = &search_schema, .problem = .{ .type = "https://example.test/problems/invalid", .title = "Bad search" } };
+    const g1 = try r.group("/plain");
+    try g1.use(plain.middleware());
+    try g1.get("/run", hSearch);
+    const g2 = try r.group("/prob");
+    try g2.use(prob.middleware());
+    try g2.get("/run", hSearch);
+    const body_prob: Body = .{ .gpa = testing.allocator, .schema = &.{.{ .field = "name", .kind = .string, .required = true }}, .problem = .{} };
+    const g3 = try r.group("/body");
+    try g3.use(body_prob.middleware());
+    try g3.post("/run", hSearch);
+
+    var buf: [2048]u8 = undefined;
+    const a = runWire(&r, getWire("/plain/run?q=zig&limit=0"), &buf);
+    try expectStatus(a, "400");
+    try testing.expect(std.mem.find(u8, a, "Content-Type: application/json\r\n") != null);
+    try testing.expect(std.mem.startsWith(u8, bodyOf(a), "{\"errors\":["));
+
+    const b = runWire(&r, getWire("/prob/run?q=zig&limit=0"), &buf);
+    try expectStatus(b, "400");
+    try testing.expect(std.mem.find(u8, b, "Content-Type: application/problem+json\r\n") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(b), "\"type\":\"https://example.test/problems/invalid\"") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(b), "\"status\":400") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(b), "\"title\":\"Bad search\"") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(b), "\"errors\":[{\"path\":\"limit\"") != null);
+
+    var buf2: [2048]u8 = undefined;
+    const c = runWire(&r, postWire("/body/run", "{}"), &buf2);
+    try expectStatus(c, "400");
+    try testing.expect(std.mem.find(u8, c, "application/problem+json") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(c), "\"title\":\"Request validation failed\"") != null);
+    try testing.expect(!probe.invoked);
+}
+
 test "getters return null when no validate middleware ran" {
     var req: http.Server.Request = undefined;
     var res: http.Server.ResponseWriter = undefined;
@@ -9598,6 +9693,8 @@ const format_seeds = [_][]const u8{
     fuzzseed.seed("\x5e\x00" ++ "12-3456789"), // ein
     fuzzseed.seed("\x5f\x00" ++ "*/5 * * * *"), // cron
     fuzzseed.seed("\x60\x00" ++ "a <b>bold</b> text"), // html
+    fuzzseed.seed("\x61\x00" ++ "23:59:59"), // local_time
+    fuzzseed.seed("\x62\x00" ++ "2026-09-07T12:00:00"), // local_date_time
     fuzzseed.seed(""), // the empty seed: `.email` and the empty string, which is what this target ran
 };
 
@@ -9833,7 +9930,7 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
     // selects. All of them, and the accepted count beside it so a corpus of
     // refusals only would be visible.
     const formats = std.enums.values(Format);
-    var seen = @as([97]bool, @splat(false));
+    var seen = @as([99]bool, @splat(false));
     var nonempty: usize = 0;
     var accepted: usize = 0;
     for (format_seeds) |sd| {
@@ -9846,14 +9943,14 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
         if (case[1].len != 0) nonempty += 1;
         if (validateFormat(case[0], case[1])) accepted += 1;
     }
-    try testing.expectEqual(@as(usize, 97), formats.len);
+    try testing.expectEqual(@as(usize, 99), formats.len);
     for (seen) |v| try testing.expect(v);
     // Measured (21 / 12; before: 1 format, 0 non-empty strings, 0
     // accepted).: +24 seeds for the go-playground formats, 21 of
     // them valid by hand-check (uuid4-as-v1, https_url-on-http and the
     // one-character base64_raw_url are the refusals).
-    try testing.expectEqual(@as(usize, 108), nonempty);
-    try testing.expectEqual(@as(usize, 96), accepted);
+    try testing.expectEqual(@as(usize, 110), nonempty);
+    try testing.expectEqual(@as(usize, 98), accepted);
 }
 
 // ── external anchor: json-schema-org/JSON-Schema-Test-Suite (format) ───────
@@ -10093,24 +10190,30 @@ test "the error cap bounds the WORK, not just the list" {
     }
 }
 
-test "the offset-optional date-time profile is a CHOICE, and this is where it is written down" {
-    // `date_time`/`time` accept a local time with no UTC offset, which RFC
-    // 3339 proper forbids and the `Format` doc calls a deliberate ISO 8601
-    // profile. Nothing pinned it: the vendored corpus has no date-time case
-    // at all and reaches the `time` one only through a documented skip, so
-    // the choice could have been reversed by accident in either direction. If a future change makes the offset mandatory, this
-    // test is the conversation, not a surprise.
-    try testing.expect(validateFormat(.date_time, "1998-12-31T23:59:59"));
+test "the offset is required by date_time/time (RFC 3339) and optional only in the local_* formats" {
+    // The default formats follow RFC 3339 (JSON Schema's `time` / `date-time`
+    // cite it; ajv, python-jsonschema and the suite refuse an offset-less
+    // value). The ISO 8601 local forms are their own formats.
+    try testing.expect(!validateFormat(.date_time, "1998-12-31T23:59:59"));
     try testing.expect(validateFormat(.date_time, "1998-12-31T23:59:59Z"));
     try testing.expect(validateFormat(.date_time, "1998-12-31T23:59:59+01:00"));
-    try testing.expect(validateFormat(.time, "23:59:59"));
+    try testing.expect(!validateFormat(.time, "23:59:59"));
     try testing.expect(validateFormat(.time, "23:59:59Z"));
+    try testing.expect(validateFormat(.local_date_time, "1998-12-31T23:59:59"));
+    try testing.expect(validateFormat(.local_date_time, "1998-12-31T23:59:59.5"));
+    try testing.expect(validateFormat(.local_date_time, "1998-12-31T23:59:59+01:00"));
+    try testing.expect(validateFormat(.local_time, "23:59:59"));
+    try testing.expect(validateFormat(.local_time, "23:59:59Z"));
 
     // What is NOT lax: the offset is still validated when it is there, and
-    // the calendar/clock ranges are real.
-    try testing.expect(!validateFormat(.date_time, "1998-12-31T23:59:59+99:00"));
-    try testing.expect(!validateFormat(.date_time, "1998-13-31T23:59:59Z"));
-    try testing.expect(!validateFormat(.time, "24:00:00"));
+    // the calendar/clock ranges are real, in every one of them.
+    for ([_]Format{ .date_time, .local_date_time }) |f| {
+        try testing.expect(!validateFormat(f, "1998-12-31T23:59:59+99:00"));
+        try testing.expect(!validateFormat(f, "1998-13-31T23:59:59Z"));
+    }
+    for ([_]Format{ .time, .local_time }) |f| try testing.expect(!validateFormat(f, "24:00:00Z"));
+    try testing.expect(!validateFormat(.local_time, "24:00:00"));
+    try testing.expect(!validateFormat(.local_date_time, "1998-12-31 23:59:59"));
 }
 
 // ── tests: cross-field rules ───────────────────────────────────
@@ -13254,6 +13357,8 @@ const format_name_table = [_]struct { Format, []const u8 }{
     .{ .ein, "ein" },
     .{ .cron, "cron" },
     .{ .html, "html" },
+    .{ .local_time, "local-time" },
+    .{ .local_date_time, "local-date-time" },
 };
 
 test "a1 mutation: JSON Schema `format` name of every Format (the go-playground tag, or the JSON Schema name)" {

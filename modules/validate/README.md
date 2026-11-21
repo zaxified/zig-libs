@@ -12,9 +12,10 @@ keyword semantics: `1.0` is an integer, inclusive `minimum`/`maximum`,
 additional properties allowed, `enum`, `properties`/`items` nesting) and
 go-playground/validator (MIT — struct-tag-style ergonomics, mirrored here as
 comptime reflection; behavior only). The string `format` vocabulary follows
-RFC 5321/3986/1123/3339/6901 (`date`/`time`/`date_time` follow an ISO 8601
-profile that is slightly laxer than RFC 3339 in one named place: the UTC offset
-is optional — see `Format`). No source copied. The reproduced JSON-Schema
+RFC 5321/3986/1123/3339/6901 (`date`/`time`/`date_time` are RFC 3339, the
+UTC offset required and a leap second only at 23:59 UTC; `local_time` and
+`local_date_time` are the ISO 8601 local forms with the offset optional — see
+`Format`). No source copied. The reproduced JSON-Schema
 conformance fixtures are a separate matter and are answered in
 [`NOTICE`](NOTICE) beside this file. DATA: `src/schema_oracle_vectors.zig` holds
 python-jsonschema's (MIT) and ajv's (MIT) verdicts, both run as black boxes, on

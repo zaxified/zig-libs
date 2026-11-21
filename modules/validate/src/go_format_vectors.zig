@@ -885,9 +885,9 @@ pub const cases = [_]Case{
     .{ .format = "date_time", .s = "2024-01-01T00:00:00Z", .go = true, .want = true, .class = "" },
     .{ .format = "date_time", .s = "2024-01-01T00:00:00+01:00", .go = true, .want = true, .class = "" },
     .{ .format = "date_time", .s = "2024-01-01t00:00:00z", .go = false, .want = true, .class = "DT_PROFILE" },
-    .{ .format = "date_time", .s = "2024-01-01T00:00:00", .go = false, .want = true, .class = "DT_PROFILE" },
+    .{ .format = "date_time", .s = "2024-01-01T00:00:00", .go = false, .want = false, .class = "" },
     .{ .format = "date_time", .s = "2024-01-01T23:59:60Z", .go = false, .want = true, .class = "DT_PROFILE" },
-    .{ .format = "date_time", .s = "2024-01-01T12:00:60Z", .go = false, .want = true, .class = "DT_PROFILE" },
+    .{ .format = "date_time", .s = "2024-01-01T12:00:60Z", .go = false, .want = false, .class = "" },
     .{ .format = "date_time", .s = "2024-01-01T00:00:00.123456789Z", .go = true, .want = true, .class = "" },
     .{ .format = "date_time", .s = "2024-01-01 00:00:00Z", .go = false, .want = false, .class = "" },
     .{ .format = "date_time", .s = "2024-01-01T24:00:00Z", .go = false, .want = false, .class = "" },
@@ -980,7 +980,7 @@ pub const cases = [_]Case{
     .{ .format = "date_time", .s = "2024-01-01T24:00:00Z\x7f", .go = false, .want = false, .class = "" },
     .{ .format = "date_time", .s = "22000:00-00:00", .go = false, .want = false, .class = "" },
     .{ .format = "date_time", .s = "2024-01-01ZT00:00:00Z", .go = false, .want = false, .class = "" },
-    .{ .format = "date_time", .s = "2024-01-01t00:00:00", .go = false, .want = true, .class = "DT_PROFILE" },
+    .{ .format = "date_time", .s = "2024-01-01t00:00:00", .go = false, .want = false, .class = "" },
     .{ .format = "date_time", .s = "%024-01-01T00:00:00", .go = false, .want = false, .class = "" },
     .{ .format = "date_time", .s = "2024-1T00:00:00Z", .go = false, .want = false, .class = "" },
     .{ .format = "date_time", .s = "2023-02-29T000:00:00Z", .go = false, .want = false, .class = "" },
@@ -10854,7 +10854,7 @@ pub const classes = [_][]const u8{
     "UUID_RFC4122_STRICT", // profile: uuid_rfc4122 checks the RFC 9562 version (1-8) and variant (10xx) nibbles, or nil/max; go's checks shape only
     "CIDR_PREFIX_ZEROS", // profile: no leading zero in the prefix length (Go's own net/netip.ParsePrefix refuses it too; net.ParseCIDR, which go-playground uses, takes it)
     "DT_OFFSET_24", // GO DEFECT: go's datetime (time.Parse RFC 3339) takes a +24:00 offset; RFC 3339 5.6 time-numoffset hour is 00-23
-    "DT_PROFILE", // profile: date_time also takes lower-case t/z (RFC 3339 5.6 NOTE), a leap second at any time of day and an offset-less local time (SPEC Format; review M4, owner's call); go's time.Parse takes none of them
+    "DT_PROFILE", // profile: date_time also takes lower-case t/z (RFC 3339 5.6 NOTE), and a leap second (go takes none; this one takes 23:59:60 UTC, RFC 3339 5.7) (SPEC Format); go's time.Parse takes none of them (an offset-less time is `local_date_time`, not `date_time`: RFC 3339)
     "CIDR_MAPPED", // GO DEFECT: go's cidrv4 takes the IPv6 text ::ffff:a.b.c.d/n (net.IP.To4) and its cidrv6 refuses it; RFC 4291 2.5.5.2 makes it an IPv6 prefix
     "SOCK6_MAPPED", // GO DEFECT: go's tcp6_addr/tcp_addr/udp6_addr/udp_addr refuse [::ffff:a.b.c.d]:port (net.IP.To4); RFC 4291 2.5.5.2 makes it an IPv6 address
     "ADDR_PORT_NUMERIC", // profile: syntax only, so the port is 1+ decimal digits, 0-65535; go also resolves an empty port (host:) and a service name (host:http) through the system resolver

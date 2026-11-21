@@ -86,84 +86,6 @@ const case_skips = [_]CaseSkip{
         .reason = "domain address-literal (`[IPv6:::1]`) -- see above.",
     },
     .{
-        .path = "date-time.json",
-        .case = "an invalid date-time with leap second on a wrong hour, UTC",
-        .reason = "leap-second-anywhere -- isTime's doc comment states seconds " ++
-            "\"= 60 (leap second) ... accepted at any time of day since the " ++
-            "grammar cannot know the leap-second table\", a pre-existing " ++
-            "documented design choice, not an oversight.",
-    },
-    .{
-        .path = "date-time.json",
-        .case = "an invalid date-time with leap second on a wrong minute, UTC",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "invalid leap second, Zulu (wrong hour)",
-        .reason = "leap-second-anywhere -- see the date-time.json entries above; " ++
-            "same documented isTime design choice.",
-    },
-    .{
-        .path = "time.json",
-        .case = "invalid leap second, Zulu (wrong minute)",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "invalid leap second, zero time-offset (wrong hour)",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "invalid leap second, zero time-offset (wrong minute)",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "invalid leap second, positive time-offset (wrong hour)",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "invalid leap second, positive time-offset (wrong minute)",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "invalid leap second, negative time-offset (wrong hour)",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "invalid leap second, negative time-offset (wrong minute)",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "an invalid time string with invalid leap second (wrong hour)",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "an invalid time string with invalid leap second (wrong minute)",
-        .reason = "leap-second-anywhere -- see above.",
-    },
-    .{
-        .path = "time.json",
-        .case = "no time offset",
-        .reason = "offset-optional -- isTime's doc comment states the UTC offset " ++
-            "\"is optional (offset-less local times are accepted -- ISO 8601 " ++
-            "profile, slightly laxer than RFC 3339)\", a pre-existing documented " ++
-            "design choice: this format implements an ISO 8601 local-time " ++
-            "profile, not RFC 3339 proper (which mandates an offset).",
-    },
-    .{
-        .path = "time.json",
-        .case = "no time offset with second fraction",
-        .reason = "offset-optional -- see above.",
-    },
-    .{
         .path = "uri.json",
         .case = "invalid userinfo",
         .reason = "authority-shape (userinfo) validation -- isUri's doc comment " ++
@@ -259,8 +181,8 @@ test "json-schema-test-suite format corpus: total/skip counts match expectation 
     // different commit, or a file/group/case count moved) -- investigate and
     // update these numbers deliberately, don't silently accept a new shape.
     try testing.expectEqual(@as(usize, 485), tally.total);
-    try testing.expectEqual(@as(usize, 59), tally.skipped);
-    try testing.expectEqual(@as(usize, 426), tally.executed);
+    try testing.expectEqual(@as(usize, 45), tally.skipped);
+    try testing.expectEqual(@as(usize, 440), tally.executed);
 }
 
 test "json-schema-test-suite format corpus: every in-scope case agrees with validateFormat" {
