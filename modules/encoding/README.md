@@ -75,6 +75,7 @@ fn decodeUtf32(alloc, bytes, endian: Utf32Endian) ![]u8;         // malformed un
 fn encodeUtf32(alloc, utf8, endian: Utf32Endian, bom: bool) ![]u8;
 fn detect(bytes, more_follows: bool) Detection;                    // .utf8_bom/.utf16le_bom/.utf16be_bom/.ascii/.utf8/.unknown (never guesses legacy pages)
 fn sniffBom32(bytes) ?Bom;                                       // + .utf32le (ff fe 00 00) / .utf32be (00 00 fe ff)
+fn detect(bytes, more_follows: bool) Detection;                    // .utf8_bom/.utf16le_bom/.utf16be_bom/.ascii/.utf8/.unknown (never guesses legacy pages)
 fn decode32(alloc, bytes, fallback: Encoding) !Decoded;          // `decode` that honours a UTF-32 BOM too
 // Decoder/Encoder .init(.{ .utf32 = .le }, .{ .bom = true })
 fn utf8ValidUpTo(s) usize;  fn isAscii(s) bool;  fn asciiValidUpTo(s) usize;   // vector
