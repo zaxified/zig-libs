@@ -160,6 +160,25 @@ var secret: [32]u8 = undefined;
 try context.exportSecret(&suite_id, "my exporter label", &secret);
 ```
 
+**Runtime-agile suites** (`hpke.agile`, the suite chosen by id at run time, as Go's
+`crypto/hpke`):
+
+```zig
+const s = try hpke.agile.Suite.init(kem_id, kdf_id, aead_id); // error.UnsupportedSuite
+var kp: hpke.agile.KeyPair = undefined;
+try hpke.agile.generateKeyPair(&kp, s.kem, io);
+const pk = kp.publicKey(); // or hpke.agile.publicKeyFromBytes(s.kem, bytes)
+
+var st: hpke.agile.Setup = undefined;
+try hpke.agile.setupS(&st, s, .base, &pk, null, io, info, "", "");
+var rc: hpke.agile.Context = undefined;
+try hpke.agile.setupR(&rc, s, .base, st.encSlice(), &kp, null, info, "", "");
+try st.context.seal(aad, pt, ct_buf[0 .. pt.len + s.tagLength()]);
+
+// only the suites a program accepts, nothing else linked:
+const A = hpke.agile.Agile(.{ .kems = &.{.dhkem_x25519_hkdf_sha256}, .kdfs = &.{.hkdf_sha256}, .aeads = &.{.chacha20poly1305} });
+```
+
 ## Verify
 
 ```sh
@@ -194,8 +213,7 @@ binary because `testing/cryptotest` is the only way to pin Go's randomness.
 
 ## Not provided
 
-No runtime-agile suite selection (suites are comptime types), no
-`auth`/`auth_psk` mode for the pq KEMs, and no `validatePublicKey` for X25519: `SPEC.md`
+No `auth`/`auth_psk` mode for the pq KEMs, and no `validatePublicKey` for X25519: `SPEC.md`
 *What is deliberately not done* and *Backlog / deferred* give the reasons and what is open.
 
 ## Provenance

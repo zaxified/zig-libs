@@ -980,3 +980,79 @@ test "STACKPROBE: no key or DH residue on the dead stack after DHKEM(X448)" {
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
+
+// ── hpke.agile: the run-time dispatch around the same KEM / key schedule ────
+
+var ag_r: hpke.agile.KeyPair = undefined;
+var ag_ctx: hpke.agile.Context = undefined;
+var ag_setup_sink: hpke.agile.Setup = undefined;
+var ag_ctx_sink: hpke.agile.Context = undefined;
+var ag_suite: hpke.agile.Suite = undefined;
+var ag_pk: hpke.agile.PublicKey = undefined;
+var ag_ikm_e: [32]u8 = undefined;
+
+noinline fn callAgileSetupS() void {
+    hpke.agile.setupSDeterministic(&ag_setup_sink, ag_suite, .base, &ag_pk, null, &ag_ikm_e, info, "", "") catch unreachable;
+}
+noinline fn callAgileSetupR() void {
+    hpke.agile.setupR(&ag_ctx_sink, ag_suite, .base, &x_enc, &ag_r, null, info, "", "") catch unreachable;
+}
+noinline fn callAgileSeal() void {
+    ag_ctx.msg.aes128gcm.seq = 0;
+    ag_ctx.seal(aad, pt, ct_sink[0 .. pt.len + Aes.tag_length]) catch unreachable;
+}
+noinline fn callAgileExport() void {
+    ag_ctx.exportSecret("probe export", &exp_sink) catch unreachable;
+}
+
+test "STACKPROBE: no key or key-schedule residue on the dead stack after hpke.agile setupS/setupR, seal, export" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    for (0..n_cases) |ci| {
+        try setUp(@intCast(ci));
+        ag_suite = try hpke.agile.Suite.init(X.kem_id, 0x0001, 0x0001);
+        try hpke.agile.keyPairFromSecret(&ag_r, .dhkem_x25519_hkdf_sha256, &x_r.secret_key);
+        ag_pk = ag_r.publicKey();
+        ag_ikm_e = caseKey(@as(u8, @intCast(ci)) + 10); // x_eph's ikm
+        try hpke.agile.setupR(&ag_ctx, ag_suite, .base, &x_enc, &ag_r, null, info, "", "");
+
+        const x_dh = try std.crypto.dh.X25519.scalarmult(x_r.secret_key, x_enc);
+        var x_ss: [X.Nsecret]u8 = undefined;
+        try X.decap(&x_ss, x_enc, &x_r);
+        var n: Needles = .{};
+        n.addBytes("skE", &x_eph.secret_key);
+        n.addBytes("ikmE", &ag_ikm_e);
+        n.addBytes("dh", &x_dh);
+        addKem(&n, HkdfSha256, X.kem_id, &x_dh, &x_ss);
+        addSchedule(&n, X, Aes, .aes128gcm, &x_ss);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("agile setupSDeterministic (X25519, AES-128-GCM)", callAgileSetupS, &n);
+
+        n = .{};
+        n.addBytes("skR", &x_r.secret_key);
+        n.addBytes("dh", &x_dh);
+        addKem(&n, HkdfSha256, X.kem_id, &x_dh, &x_ss);
+        addSchedule(&n, X, Aes, .aes128gcm, &x_ss);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("agile setupR (X25519, AES-128-GCM)", callAgileSetupR, &n);
+
+        n = .{};
+        addAeadKey(&n, Aes, aes_ctx.key);
+        n.addBytes("exporter_secret", &aes_ctx.exporter_secret);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("agile Context.seal (AES-128-GCM)", callAgileSeal, &n);
+
+        n = .{};
+        n.addBytes("exporter_secret", &aes_ctx.exporter_secret);
+        var exp: [32]u8 = undefined;
+        try aes_ctx.exportSecret(&suiteId(X, .aes128gcm), "probe export", &exp);
+        n.addBytes("exported", &exp);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("agile Context.exportSecret", callAgileExport, &n);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}

@@ -33,9 +33,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jedisct1/zig-hpke](https://github.com/jedisct1/zig-hpke) | Zig | MIT | 18 | pushed 2026-05-19 | The Zig peer. Its README: X25519, P-256, P-384, ML-KEM-512/768/1024, MLKEM768-X25519, -P256, MLKEM1024-P384, HKDF and SHAKE/TurboSHAKE KDFs, AES-GCM/ChaCha. No P-521 or X448. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No HPKE, but ships the parts for the PQ suites: `kem.ml_kem` and `kem.hybrid` (`MlKem768X25519`, `MlKem768P256`, `MlKem1024P384`; checked in `lib/std/crypto/`). No P-521. |
 
-**Gaps closed since the survey:** ML-KEM-512/768/1024, MLKEM768-P256, MLKEM1024-P384 and X-Wing (`pq.zig`), the SHAKE128/256 and TurboSHAKE128/256 one-stage KDFs (`kdf.zig`) and the export-only AEAD (`ExportOnly`): every KEM, KDF and AEAD Go 1.26 offers, anchored byte-exact to all of Go's `testdata` vectors (`rfc9180.json` + `hpke-pq.json`) through the public setup/seal/open/export entry points. DHKEM(X448, HKDF-SHA512) followed on 2026-11-21 (`X448Kem`, over the sibling `ed448`'s `x448`), anchored to Go's X448 vector. Remaining difference: no runtime-agile `NewKEM(id)` (suites are comptime types here, as in rust-hpke).
+**Gaps closed since the survey:** ML-KEM-512/768/1024, MLKEM768-P256, MLKEM1024-P384 and X-Wing (`pq.zig`), the SHAKE128/256 and TurboSHAKE128/256 one-stage KDFs (`kdf.zig`) and the export-only AEAD (`ExportOnly`): every KEM, KDF and AEAD Go 1.26 offers, anchored byte-exact to all of Go's `testdata` vectors (`rfc9180.json` + `hpke-pq.json`) through the public setup/seal/open/export entry points. DHKEM(X448, HKDF-SHA512) followed on 2026-11-21 (`X448Kem`, over the sibling `ed448`'s `x448`), anchored to Go's X448 vector. The runtime-agile `NewKEM`/`NewKDF`/`NewAEAD` selection followed on 2026-11-21 (`hpke.agile`, *Runtime-agile suites*); the comptime API stays the primary one, as in rust-hpke.
 
-**Where we are ahead:** all four modes (base, psk, auth, auth_psk) anchored to RFC 9180 Appendix A byte for byte including `AuthEncap`/`AuthDecap`, four DHKEMs (P-521 anchored to RFC 9180 A.6 in all four modes), the §5.1 setup layer and exporter that `mls` uses, HKDF-SHA256/384/512 key-schedule dispatch, and the RFC's §5.1.2 PSK-length floor (32 bytes) enforced, which its pseudocode omits. Five DHKEMs, X448 included, which neither rust-hpke nor zig-hpke has. **Where we are behind:** no runtime-agile suite selection (*What is deliberately not done*).
+**Where we are ahead:** all four modes (base, psk, auth, auth_psk) anchored to RFC 9180 Appendix A byte for byte including `AuthEncap`/`AuthDecap`, four DHKEMs (P-521 anchored to RFC 9180 A.6 in all four modes), the §5.1 setup layer and exporter that `mls` uses, HKDF-SHA256/384/512 key-schedule dispatch, and the RFC's §5.1.2 PSK-length floor (32 bytes) enforced, which its pseudocode omits. Five DHKEMs, X448 included, which neither rust-hpke nor zig-hpke has. Runtime-agile suites (`hpke.agile`) with a compile-time subset, so a program links only the suites it accepts.
 
 ## What this is, in one paragraph
 
@@ -416,6 +416,51 @@ curve (y off the curve, `0x02`/`0x00`/`0x06` prefixes, all zeros, x ≥ p,
 y ≥ p), each refused by both `validatePublicKey` and `encapDeterministic`, and
 a real key accepted by both.
 
+## Runtime-agile suites (`hpke.agile`)
+
+The suite as a run-time value, for a protocol that negotiates it (ECH, MLS, OHTTP
+key configs): `agile.Suite.init(kem_id, kdf_id, aead_id)` (`error.UnsupportedSuite`
+for an id the module does not implement), keys as `agile.PublicKey` (KEM-tagged
+bytes) and `agile.KeyPair` (a union over the eleven KEMs), then `setupS`/`setupR`
+in any of the four modes (auth modes for the DHKEMs only, as the comptime API),
+`Context.seal`/`open`/`exportSecret`, and single-shot `sealBase`/`openBase` that
+write and read `enc ‖ ct`. Behaviour as the reference: Go 1.26 `crypto/hpke`
+(`NewKEM`/`NewKDF`/`NewAEAD` by id, `KEM.GenerateKey`/`NewPublicKey`/
+`NewPrivateKey`/`DeriveKeyPair`, `NewSender`/`NewRecipient`, `Seal`/`Open` over
+`enc ‖ ct`); BoringSSL's `EVP_HPKE_*` and hpke-js select the suite at run time too.
+Go's public API is base mode only; the other three modes are here because the
+comptime API has them. Every cryptographic step is a comptime entry point
+selected by an `inline for` over the supported ids: the KEM step (11 KEMs), the
+key schedule (one `schedule.keySchedule` per KDF × AEAD pair), `seal`/`open` (one
+comptime `Context` per AEAD), `exportSecret` (one per KDF) — additive, never
+KEM × KDF × AEAD. Misuse a typed API catches at compile time is an error here:
+a key of another KEM (`KemMismatch`), an auth mode without the sender key, with
+one in a non-auth mode, or over a pq KEM (`UnsupportedMode`), a wrong-length
+`enc`/`ikmE`/key (`InvalidLength`), `seal`/`open` on export-only (`ExportOnly`).
+The entry points run under `kem_burn` like the comptime setup layer;
+`stackprobe_test.zig` probes `setupSDeterministic`, `setupR`, `seal` and
+`exportSecret` (X25519, AES-128-GCM).
+
+**Size.** Nothing of it is compiled unless referenced. The top-level functions
+dispatch over everything; `agile.Agile(.{ .kems = …, .kdfs = …, .aeads = … })` is
+the same API over a subset (other ids `UnsupportedSuite`). ReleaseSmall, x86_64,
+stripped, a program that generates a key pair and does one `sealBase` + `openBase`
+(2026-11-21, Zig 0.17.1):
+
+| program | bytes |
+|---|---:|
+| comptime API, X25519 + HKDF-SHA256 + ChaCha20-Poly1305 | 274 984 |
+| `hpke.agile` (all 11 KEMs, 7 KDFs, 4 AEADs), suite read from argv | 1 182 416 |
+| `hpke.agile.Agile` restricted to X25519 + HKDF-SHA256 + ChaCha20-Poly1305 | 277 992 |
+
+Anchors (`agile_test.zig`): all 37 Go 1.26 `crypto/hpke` vectors driven through a
+run-time `Suite` (enc, 1000-round seal/open digest or the encryption list, export
+digest or list); all four modes over P-256/HKDF-SHA384/AES-256-GCM equal to the
+comptime entry points byte for byte (enc, ciphertext, export) and tampered
+ciphertext refused; every KEM × KDF round trip through `sealBase`/`openBase` with
+a generated key; `keyPairFromSecret` from `KeyPair.secretBytes`; the misuse errors;
+a restricted instance equal to the full set on its suite and refusing the rest.
+
 ## Threat model
 
 - **Nonce reuse under `Context.seal`.** RFC 9180 §5.2 derives each
@@ -598,12 +643,9 @@ is the authoritative figure set.
   fails closed at `maxInt(u64)` (`MessageLimitReached`): a conservative sub-range.
 - **No internal locking of a `Context`**, per the repo's no-hidden-locking convention.
 - **`ExportOnly` has no `seal`/`open`** (a compile error), as RFC 9180 §7.3 defines it.
-- **No runtime-agile `NewKEM`/`NewKDF`/`NewAEAD`**: suites are comptime types; see
-  *Backlog / deferred* for what a consumer that negotiates a suite does.
 
 ## Backlog / deferred
 
-- **Runtime-agile suite selection** (Go `NewKEM`/`NewKDF`/`NewAEAD` by id): suites are comptime types here. A protocol that negotiates the suite (ECH, MLS) switches over the ids it supports itself (`tlsserver/src/ech.zig` does). Small; only if a consumer asks.
 - *BOUNCED (waits-external):* **One-stage psk mode has no published vector:** the draft's vectors and Go's are base mode only; psk over a one-stage KDF follows draft-ietf-hpke-hpke §5.1 `CombineSecrets_OneStage` text and is pinned by round trips only (`kat_go_test.zig`). Re-anchor when a psk vector is published.
 
 ## Anchoring

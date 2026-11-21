@@ -64,6 +64,9 @@ pub const schedule = @import("schedule.zig");
 /// integer 32/48/64 for the HKDFs as before.
 pub const kdf = @import("kdf.zig");
 pub const pq = @import("pq.zig");
+/// Runtime-agile suites: the KEM/KDF/AEAD chosen at run time by id (Go
+/// `crypto/hpke`'s `NewKEM`/`NewKDF`/`NewAEAD`); compiled only when referenced.
+pub const agile = @import("agile.zig");
 
 pub const KemId = suite.KemId;
 pub const KdfId = suite.KdfId;
@@ -197,6 +200,9 @@ test {
     _ = @import("kat_go_test.zig");
     _ = @import("go_oracle_test.zig");
     _ = @import("mutation_test.zig");
+    _ = agile;
+    _ = @import("agile_set.zig");
+    _ = @import("agile_test.zig");
 }
 
 test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm, p384, ct25519, mlkem, ed448} (the P-256 group + the ChaCha AEAD + the fail-closed key draw + the P-521 group + the AES-GCM AEAD + the P-384 group + X25519 + ML-KEM + X448; else std only)" {
