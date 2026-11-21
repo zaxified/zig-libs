@@ -574,10 +574,10 @@ test "corpus: every record seed reaches its decoder, and the counts are pinned" 
         if (d.hdr.length != null) with_length += 1;
     }
     try testing.expectEqual(unified.len, nonempty);
-    try testing.expectEqual(@as(usize, 131), decoded);
-    try testing.expectEqual(@as(usize, 611), consumed);
+    try testing.expectEqual(@as(usize, 166), decoded);
+    try testing.expectEqual(@as(usize, 775), consumed);
     try testing.expectEqual(@as(usize, 4), with_cid);
-    try testing.expectEqual(@as(usize, 129), with_length);
+    try testing.expectEqual(@as(usize, 164), with_length);
 
     var p_nonempty: usize = 0;
     var p_decoded: usize = 0;
@@ -594,9 +594,9 @@ test "corpus: every record seed reaches its decoder, and the counts are pinned" 
         declared += h.length;
     }
     try testing.expectEqual(corpus.plaintext.n, p_nonempty);
-    try testing.expectEqual(@as(usize, 28), p_decoded);
-    try testing.expectEqual(@as(usize, 28), handshake_records);
-    try testing.expectEqual(@as(usize, 12000), declared);
+    try testing.expectEqual(@as(usize, 33), p_decoded);
+    try testing.expectEqual(@as(usize, 33), handshake_records);
+    try testing.expectEqual(@as(usize, 12941), declared);
 
     // Nothing was dropped for capacity: a dropped frame is a corpus entry that
     // silently does not exist.

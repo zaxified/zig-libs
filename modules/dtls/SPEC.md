@@ -740,7 +740,7 @@ against **wolfSSL 5.9.1**, in both roles and in both PSK and certificate mode,
 each followed by an application-data round trip — thirty-one cases in all (including ALPN in both roles and in
 certificate mode, a KeyUpdate from each side in PSK and in certificate mode and a wolfSSL client's KeyUpdate against
 our server, the four AES-256-GCM-SHA384 PSK cases, the two CID cases, resumption both ways and OCSP stapling). The
-committed transcript holds twenty-two of them (Backlog: re-capture; the resumption and stapling cases are live-only).
+committed transcript holds twenty-six of them (the resumption and stapling cases are live-only).
 
 **It is a PROGRAM, not a test, and that is the design.** A
 zig-libs module is standalone Zig with no external dependency; an anchor against
@@ -940,7 +940,7 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** a committed transcript of live interop vs a real wolfSSL 5.9.1 peer (both roles, both key exchanges, twenty-two flows), replayed byte-for-byte by `src/wolfssl_replay.zig` with no wolfSSL present, and a second one of seventeen DTLS 1.2 flows (fifteen against `wolfDTLSv1_2_*_method`, two plain-PSK ones against OpenSSL 3.5, `src/wolfssl12_replay.zig`); the live exchanges themselves are `tools/interop.zig` (`zig build interop-dtls`)
+**What the tests actually contain.** a committed transcript of live interop vs a real wolfSSL 5.9.1 peer (both roles, both key exchanges, twenty-six flows), replayed byte-for-byte by `src/wolfssl_replay.zig` with no wolfSSL present, and a second one of seventeen DTLS 1.2 flows (fifteen against `wolfDTLSv1_2_*_method`, two plain-PSK ones against OpenSSL 3.5, `src/wolfssl12_replay.zig`); the live exchanges themselves are `tools/interop.zig` (`zig build interop-dtls`)
 
 ## Backlog / deferred
 
@@ -951,10 +951,6 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   AES-256, seal and open); a whole `send` + `recv` of 64 bytes on AES-128-GCM is ~1.2 µs, of which ~0.6 µs is the two
   per-record AEAD calls. The rewrite (per-epoch `Context` storage behind `Protection(Aead)`, which ChaCha20 shares
   without needing it) waits for a quiet-machine A/B with the spread below the effect.
-- **Re-capture of the 1.3 transcript.** Four live 1.3 cases (`psk-server-keyupdate-theirs`, `cert-client-alpn`,
-  `cert-client-keyupdate-ours`, `cert-client-keyupdate-theirs`) pass against wolfSSL 5.9.1 but are not yet in
-  `src/testdata/wolfssl_transcript.txt`: `zig build interop-dtls -- --capture --version 13`, then
-  `wolfssl_replay.zig`'s `recorded_cases_floor` 22 → 26 and `fuzz_corpus.zig`'s pinned frame counts.
 - *BOUNCED (owner):* **A second independent stack.** wolfSSL agreeing with us rules out the wire defects listed under *What it found*, but a
   bug the two happen to share would still pass. OpenSSL 3.5 now covers 1.2 plain PSK (it has no DTLS 1.3). The next
   one is Mbed TLS 3.6 (DTLS 1.2, RFC 9146 connection ID — the 1.2 CID's missing live peer, since Debian's wolfSSL

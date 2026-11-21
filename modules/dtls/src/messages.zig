@@ -2223,7 +2223,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         var it = CipherSuiteIter{ .raw = dec.cipher_suites_raw };
         while (it.next()) |_| r.walked += 1;
     }
-    try expectReach(r, .{ .entries = 26, .accepted = 21, .walked = 152, .mutated = 3 });
+    try expectReach(r, .{ .entries = 30, .accepted = 25, .walked = 185, .mutated = 3 });
     try testing.expectEqual(@as(usize, 0), ch.dropped);
 
     // ── ServerHello: extensions parsed.
@@ -2241,7 +2241,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         r.accepted += 1;
         r.walked += dec.extensions.len;
     }
-    try expectReach(r, .{ .entries = 35, .accepted = 32, .walked = 63, .mutated = 3 });
+    try expectReach(r, .{ .entries = 40, .accepted = 37, .walked = 75, .mutated = 3 });
     try testing.expectEqual(@as(usize, 0), sh.dropped);
 
     // ── Certificate: DER octets handed back as `cert_data`. 1161 is three
@@ -2278,7 +2278,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         r.accepted += 1;
         r.walked += got.len;
     }
-    try expectReach(r, .{ .entries = 45, .accepted = 41, .walked = 173 });
+    try expectReach(r, .{ .entries = 54, .accepted = 50, .walked = 214 });
     try testing.expectEqual(@as(usize, 0), ext.dropped);
 
     // ── cookie: cookie octets returned.
@@ -2330,7 +2330,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         r.accepted += 1;
         r.walked += got.identities.len;
     }
-    try expectReach(r, .{ .entries = 18, .accepted = 14, .walked = 13 });
+    try expectReach(r, .{ .entries = 21, .accepted = 17, .walked = 16 });
     try testing.expectEqual(@as(usize, 0), op.dropped);
 
     // ── supported_groups / signature_algorithms: u16 values decoded.
@@ -2383,7 +2383,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         r.accepted += 1;
         r.walked += got.key_exchange.len;
     }
-    try expectReach(r, .{ .entries = 16, .accepted = 11, .walked = 3682 });
+    try expectReach(r, .{ .entries = 19, .accepted = 14, .walked = 3778 });
     try testing.expectEqual(@as(usize, 0), kss.dropped);
 
     // ── CertificateVerify: signature octets. 135 = the 71-octet ECDSA P-256

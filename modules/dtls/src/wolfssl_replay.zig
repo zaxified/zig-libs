@@ -95,7 +95,7 @@ const transcript = @embedFile("testdata/wolfssl_transcript.txt");
 /// the anchor got smaller — which a replay over "whatever is in the file"
 /// would report as a pass. Raise it when cases are added; a drop needs a
 /// sentence in CHANGELOG.md saying which anchor was given up.
-const recorded_cases_floor = 22;
+const recorded_cases_floor = 26;
 
 // ── a tiny line format, parsed here ───────────────────────────────────────
 //

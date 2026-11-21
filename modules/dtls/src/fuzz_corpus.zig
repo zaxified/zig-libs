@@ -272,7 +272,7 @@ test "every recorded datagram fits the buffer this file hands its callers" {
         largest = @max(largest, d.len);
     }
     try testing.expectEqual(@as(usize, 0), it.too_large);
-    try testing.expectEqual(@as(usize, 186), count);
+    try testing.expectEqual(@as(usize, 242), count);
     try testing.expect(largest > 1500); // a recording that lost its big flights
 }
 
@@ -284,12 +284,12 @@ test "the transcript still yields the frames the corpora are built from" {
     var ch: Store(16384, 64) = .{};
     collectHandshakeBodies(&ch, 1, null);
     try testing.expectEqual(@as(usize, 0), ch.dropped);
-    try testing.expectEqual(@as(usize, 20), ch.n);
+    try testing.expectEqual(@as(usize, 24), ch.n);
 
-    var sh: Store(8192, 32) = .{};
+    var sh: Store(16384, 64) = .{};
     collectHandshakeBodies(&sh, 2, null);
     try testing.expectEqual(@as(usize, 0), sh.dropped);
-    try testing.expectEqual(@as(usize, 29), sh.n);
+    try testing.expectEqual(@as(usize, 34), sh.n);
 
     // The one that matters most: the hybrid key_share, which is bigger than
     // every fuzz buffer this module had before the corpora were written.
