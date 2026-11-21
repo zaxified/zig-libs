@@ -91,27 +91,6 @@
 const std = @import("std");
 const atomic = @import("atomic.zig");
 
-/// After a lost claim CAS: spin `2^step` pause hints, `step` growing to
-/// `cap_step` — not `Backoff.spin`'s 6. Every lost CAS still moved the line
-/// to the loser, so contenders that retry soon keep the line in flight;
-/// spreading them further lets a winner claim several positions while the
-/// line stays in its cache. Measured (i7-7920HQ, 4 Mi items,
-/// median of 15 runs, ms) for caps 6 / 8 / 10: 4×4 155 / 135 / 94, 8×8
-/// 230 / 184 / 131, 1×4 146 / 80 / 84, 4×1 81 / 74 / 74, 1×1 and 2×2 flat.
-/// A pop pays the long spins only after ten straight losses, i.e. only
-/// when other pops are winning.
-const CasBackoff = struct {
-    step: u6 = 0,
-    const cap_step: u6 = 10;
-
-    fn spin(b: *CasBackoff) void {
-        var i: usize = 0;
-        const limit = @as(usize, 1) << b.step;
-        while (i < limit) : (i += 1) std.atomic.spinLoopHint();
-        if (b.step < cap_step) b.step += 1;
-    }
-};
-
 /// Waiting on another thread that has claimed and has a short, bounded
 /// tail of work left (an install, a hand-off, an item write): poll with one
 /// pause hint, so the wait ends within a pause of the store, and yield the
@@ -343,7 +322,7 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
             defer if (next_block) |nb| self.recycle(nb);
 
             var waiter: Waiter = .{};
-            var lost: CasBackoff = .{};
+            var lost: atomic.CasBackoff = .{};
             while (true) {
                 const pos = self.tail.value.index.load(.seq_cst);
                 const off = pos % lap;
@@ -384,7 +363,7 @@ fn Impl(comptime T: type, comptime opts: Options, comptime fault: Fault) type {
         /// empty.
         pub fn pop(self: *Self) ?T {
             var waiter: Waiter = .{};
-            var lost: CasBackoff = .{};
+            var lost: atomic.CasBackoff = .{};
             while (true) {
                 const pos = self.head.value.index.load(.seq_cst);
                 const off = pos % lap;

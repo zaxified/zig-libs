@@ -232,7 +232,7 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
         /// called.
         pub fn pushWith(q: *Self, source: anytype, comptime fill: fn (@TypeOf(source), *T) void) bool {
             var pos = q.tail.load(.monotonic);
-            var backoff: atomic.Backoff = .{};
+            var backoff: atomic.CasBackoff = .{};
             while (true) {
                 const slot = q.slotAt(pos);
                 // Acquire: pairs with the consumer's release store that freed
@@ -284,7 +284,7 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
             comptime if (opts.consumers != .multi)
                 @compileError("forcePush needs .consumers = .multi: it takes the oldest item as a second consumer would");
             var pos = q.tail.load(.monotonic);
-            var backoff: atomic.Backoff = .{};
+            var backoff: atomic.CasBackoff = .{};
             while (true) {
                 const slot = q.slotAt(pos);
                 const seq = slot.seq.load(.acquire);
@@ -332,7 +332,7 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
                 return item;
             }
             var pos = q.head.load(.monotonic);
-            var backoff: atomic.Backoff = .{};
+            var backoff: atomic.CasBackoff = .{};
             while (true) {
                 const slot = q.slotAt(pos);
                 // Acquire: pairs with the producer's publish, so the item

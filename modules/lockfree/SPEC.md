@@ -349,6 +349,15 @@ hash of the thread's stack address (`refusedCount` sums them,
 `src/bounded.zig`): one shared counter made producers
 spinning on a full ring fight over a single line.
 
+**Lost-CAS backoff.** A producer or consumer that loses the `tail`/`head` CAS spins `2^step` pause hints, `step`
+growing to 10 (`atomic.CasBackoff`, shared with `SegQueue`, §4d), not `Backoff.spin`'s 2^6. Measured as `SegQueue`'s
+was (ReleaseFast, 8 cores shared with other jobs, interleaved A/B, best of 15 per sample): `bounded_4x4` median
+ratio new/old 0.81 / 0.76 / 0.82 over three runs of 4, 6 and 8 samples (spread of a side 17–40 %, so the size of the gain
+is not claimed, only its direction, which each run shows); `bounded_4x1` 0.88 / 0.98 and `bounded_1x1` 1.01
+(flat within spread). `Queue(T)` (MS + EBR) was tried too (unpin, then the same spin, instead of `Backoff.pause`):
+`unbounded_4x4` 1.06 and `unbounded_1x1` 0.95 with 8 % spread, no gain, so it keeps `pause`. The card's ratio is not
+re-measured.
+
 **Capacity.** A power of two (`pos mod capacity` is a mask, and positions wrap
 at the integer width without breaking the mapping) and at least 2: with one
 slot, "free for the next lap" (`pos + capacity`) equals "holds the item"
@@ -527,7 +536,7 @@ when they catch up. The 1×1 case went from slower than crossbeam to faster with
 **Waits and backoff, both measured.** Waiting on a thread that has claimed
 (installer, hand-off, item write) polls with one pause hint and yields only after
 4096 polls; `Backoff.pause`'s doubling overshot the ~300 ns hand-off by
-microseconds. A lost claim CAS spins `2^step` hints up to `2^10` (not
+microseconds. A lost claim CAS spins `2^step` hints up to `2^10` (`atomic.CasBackoff`, not
 `Backoff.spin`'s `2^6`), a large win under 4×4/8×8 contention with the other
 shapes flat. The long spins only follow ten straight losses, i.e. only while other pops are winning.
 
@@ -988,9 +997,6 @@ bench did not change it.
 - **A litmus pair for `SegQueue`'s retire/scan shape** — the consumer's `read`
   store → the scanner's acquire load is message passing, already shape 2; the
   pending stack is a Treiber push plus swap-all. Effort: small-medium.
-- **Lost-CAS backoff in `BoundedQueue` / `Queue(T)`** — `SegQueue` measured `2^10`
-  against `Backoff.spin`'s `2^6` as a large win under 4×4/8×8 contention (§4d); the
-  other CAS loops were not re-measured. Effort: small.
 - **Dynamic weak-memory stress on real ARM/RISC-V hardware** (§7).
 - **Per-worker deques with stealing in `workerpool`** — the pool still shares one
   queue; this is its own change there.

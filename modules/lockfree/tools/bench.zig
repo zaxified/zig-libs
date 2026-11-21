@@ -328,13 +328,21 @@ pub fn main(init: std.process.Init) !u8 {
     const filters = if (args.len > 1) args[1..] else &[_][:0]const u8{};
     const rounds: usize = if (init.environ_map.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
 
-    try rustBuild(arena, io);
+    // `BENCH_OURS_ONLY=1`: time our side alone (no cargo, no crossbeam), to
+    // compare two builds of this module with each other; no ratio, no verdict.
+    const ours_only = init.environ_map.get("BENCH_OURS_ONLY") != null;
+    if (!ours_only) try rustBuild(arena, io);
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    try w.print("{s:<14} {s:>13} {s:>13} {s:>8} {s:>7} {s:>7}  count / sum\n", .{ "row", "ours ns", ref_short ++ " ns", "ratio", "spr us", "spr ref" });
-    try w.flush();
+    if (ours_only) {
+        try w.print("{s:<14} {s:>13} {s:>7}\n", .{ "row", "ours ns", "spr us" });
+        try w.flush();
+    } else {
+        try w.print("{s:<14} {s:>13} {s:>13} {s:>8} {s:>7} {s:>7}  count / sum\n", .{ "row", "ours ns", ref_short ++ " ns", "ratio", "spr us", "spr ref" });
+        try w.flush();
+    }
 
     var worst: f64 = 0;
     var best: f64 = std.math.inf(f64);
@@ -349,8 +357,13 @@ pub fn main(init: std.process.Init) !u8 {
         var ours: Side = .{};
         var ref: Side = .{};
         for (0..rounds) |_| {
-            ref.add(try rustRun(arena, io, name));
+            if (!ours_only) ref.add(try rustRun(arena, io, name));
             ours.add(try timeIt(gpa, io, wi));
+        }
+        if (ours_only) {
+            try w.print("{s:<14} {d:>13.0} {d:>6.1}%\n", .{ name, ours.best_ns, 100 * ours.spread() });
+            try w.flush();
+            continue;
         }
         const ratio = ours.best_ns / ref.best_ns;
         if (!infoOnly(name)) {
@@ -369,6 +382,7 @@ pub fn main(init: std.process.Init) !u8 {
         });
         try w.flush();
     }
+    if (ours_only) return 0;
     try w.print("rounds: {d}; ratios by wall time; largest spread {d:.1}%{s}\n", .{ rounds, 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
     if (mismatch) {
         try w.writeAll(bench_name ++ ": FAILED -- a result differs from the reference's; the timing means nothing until it agrees\n");

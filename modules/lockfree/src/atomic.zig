@@ -86,6 +86,28 @@ pub const Backoff = struct {
     }
 };
 
+/// After a lost claim CAS: spin `2^step` pause hints, `step` growing to
+/// `cap_step` (10) — not `Backoff.spin`'s 6. Every lost CAS still moved the
+/// line to the loser, so contenders that retry soon keep the line in flight;
+/// spreading them further lets a winner claim several positions while the
+/// line stays in its cache. `SegQueue` measured it first (i7-7920HQ, 4 Mi
+/// items, median of 15 runs, ms) for caps 6 / 8 / 10: 4×4 155 / 135 / 94, 8×8
+/// 230 / 184 / 131, 1×4 146 / 80 / 84, 4×1 81 / 74 / 74, 1×1 and 2×2 flat;
+/// `BoundedQueue` took it after (SPEC §4b). A caller pays the long spins only
+/// after ten straight losses, i.e. only when other threads are winning.
+/// Never yields: a lost CAS means another thread made progress.
+pub const CasBackoff = struct {
+    step: u6 = 0,
+    const cap_step: u6 = 10;
+
+    pub fn spin(b: *CasBackoff) void {
+        var i: usize = 0;
+        const limit = @as(usize, 1) << b.step;
+        while (i < limit) : (i += 1) std.atomic.spinLoopHint();
+        if (b.step < cap_step) b.step += 1;
+    }
+};
+
 /// Test-and-test-and-set spinlock. **Test-only** mutual exclusion for the
 /// harness reference oracle; NOT a lock-free primitive and never used on a
 /// lock-free path. Built on `std.atomic` because 0.16 removed
@@ -329,4 +351,10 @@ test "Backoff.spin widens up to the spin ceiling and never goes past it" {
     try std.testing.expectEqual(Backoff.spin_ceiling + 1, b.step);
     b.spin(); // saturated: still spins 2^spin_ceiling, step stays put
     try std.testing.expectEqual(Backoff.spin_ceiling + 1, b.step);
+}
+
+test "CasBackoff doubles its spin up to the cap and stays there" {
+    var b: CasBackoff = .{};
+    for (0..CasBackoff.cap_step + 5) |_| b.spin();
+    try testing.expect(b.step == CasBackoff.cap_step);
 }
