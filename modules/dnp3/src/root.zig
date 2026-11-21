@@ -95,6 +95,8 @@ pub const meta = .{
 pub const link = @import("link.zig");
 /// The Transport Function (§8): segmentation + reassembly.
 pub const transport = @import("transport.zig");
+/// The data-link layer's confirmed-delivery services (frame-count bit, stop-and-wait).
+pub const link_session = @import("link_session.zig");
 /// The Application Layer (§4/§5): header, function codes, IIN.
 pub const application = @import("application.zig");
 /// Object-header framing + the core static object library.
@@ -132,6 +134,7 @@ test {
     _ = outstation;
     _ = secure_auth;
     _ = goldens;
+    _ = @import("link_session.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }

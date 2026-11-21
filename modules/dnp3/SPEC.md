@@ -117,6 +117,17 @@ which is a local programming mistake.
   closed, and `TIMEOUT` would tell a foreign station that somebody else holds an arm. The
   wrong-peer case is also the one refusal that does **not** consume the arm, so it cannot be used
   to cancel another station's select.
+- **Link-layer confirmed delivery (`link_session.zig`).** Receive side, always on: RESET_LINK_STATES
+  is ACKed and sets the expected frame-count bit to 1; CONFIRMED_USER_DATA with FCV set and the expected
+  FCB is delivered, ACKed and flips the expectation; the other FCB is a repeat of a delivered frame (its
+  ACK was lost) and is ACKed without being delivered or executed again; a confirmed frame before a reset,
+  or without FCV, or a TEST_LINK_STATES out of count, is NACKed (IEC 60870-5-2 two-state scheme, 1815-2012
+  §9.2.6). A broadcast is never confirmed (delivered as unconfirmed, no reply). Send side, opt-in
+  (`Config.link_confirms`, default off like opendnp3 and Step Function I/O): the response goes out as
+  RESET_LINK_STATES, then one CONFIRMED_USER_DATA frame per link ACK with alternating FCB (`link_session.Primary`),
+  retransmitted unchanged after `link_response_timeout_ms` (default 1000) up to `link_retries` (3) times
+  (`Session.pollLink` / `nextLinkDeadline`); a NACK or the last timeout drops the fragment and un-resets the link.
+  The same pair serves the master (`dir = true`).
 - **Link direction.** §9.2.4.1.2's DIR bit is 1 for master-originated frames and 0 for
   outstation-originated ones. `Session` sends 0. Getting this backwards makes a real master drop
   every reply as "master frame received for master".
@@ -206,9 +217,7 @@ reaching them fails rather than reading green. `std.testing.fuzz` targets over t
 
 Out of scope: unsolicited *retry* policy (the fragment builder is here, the timer is the caller's),
 file-transfer objects (g70), data-set objects (g85-g88), device attributes (g0), octet strings
-(g110/g111), time-and-interval (g50v4), analog deadbands (g34), data-link *confirmed* user data on
-the send path (the outstation always sends unconfirmed user data; the FCB/FCV toggle is decoded but
-not enforced), Secure Authentication beyond the outstation's symmetric procedures (see its own
+(g110/g111), time-and-interval (g50v4), analog deadbands (g34), Secure Authentication beyond the outstation's symmetric procedures (see its own
 section), a stateful master session type, and any actual transport (TCP/serial) I/O — this module
 hands the caller bytes to send/receive, nothing more. The reasons and the open items
 are in *What is deliberately not done* and *Backlog / deferred*.
@@ -516,9 +525,6 @@ foreign SA master computes the same.
   monitoring key, only in the confirmation); (c) the exact default critical-function table;
   (d) whether a reply may carry a sequence number other than the challenged request's; (e) the
   aggressive-mode MAC input (here: last challenge message || request up to g120v9).
-- **Data-link confirmed user data on the send path.** The outstation answers RESET_LINK_STATES,
-  TEST_LINK_STATES and REQUEST_LINK_STATUS and accepts both confirmed and unconfirmed user data,
-  but always *sends* unconfirmed user data; the FCB/FCV toggle is decoded, not enforced.
 - **Relative-time event variations (g2v3, g4v3)** are encodable by `records` but the outstation
   never selects them; it always emits absolute time.
 - **Portable ctgrind trap counts for `keys5`** include std soft-AES pad-lane definedness

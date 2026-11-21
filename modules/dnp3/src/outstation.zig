@@ -71,6 +71,7 @@ const objects = @import("objects.zig");
 const records = @import("records.zig");
 const link = @import("link.zig");
 const transport = @import("transport.zig");
+const link_session = @import("link_session.zig");
 const secure_auth = @import("secure_auth.zig");
 
 pub const Iin = application.Iin;
@@ -475,6 +476,18 @@ pub const Config = struct {
 
     /// Set IIN1.NEED_TIME at start-up and after every restart.
     need_time_at_start: bool = true,
+
+    /// Send response and unsolicited fragments as CONFIRMED_USER_DATA with the
+    /// link-layer stop-and-wait (`link_session.Primary`): RESET_LINK_STATES
+    /// first, one frame at a time, retransmitted on timeout. Off by default:
+    /// DNP3 over TCP and most serial deployments use unconfirmed user data, and
+    /// opendnp3 and Step Function I/O default to it. Receiving confirmed user data
+    /// is always supported (the frame-count bit is enforced, see `Session`).
+    link_confirms: bool = false,
+    /// `link_confirms`: how long to wait for the link ACK before retransmitting.
+    link_response_timeout_ms: u32 = 1000,
+    /// `link_confirms`: retransmissions before the frame is given up.
+    link_retries: u8 = 3,
 
     /// Honour COLD_RESTART / WARM_RESTART. Off by default: a simulator that
     /// silently accepts a restart teaches its operator the wrong lesson.
@@ -1985,6 +1998,15 @@ pub const Session = struct {
     /// starts at. It advances across fragments, which is what a master's
     /// reassembler expects.
     tx_seq: u6 = 0,
+    /// Receive-side frame-count state (RESET_LINK_STATES / FCB), always on.
+    rx_link: link_session.Secondary = .{},
+    /// `Config.link_confirms`: the send-side stop-and-wait, the segments of the
+    /// fragment being delivered and the one in flight.
+    tx_link: link_session.Primary = link_session.Primary.init(false, .{}),
+    tx_seg: transport.Segmenter = transport.Segmenter.init(&.{}),
+    tx_seg_active: bool = false,
+    tx_cur: [1 + transport.max_segment_payload]u8 = undefined,
+    tx_cur_len: usize = 0,
 
     pub const SessionError = Error || link.EncodeError || link.DecodeError ||
         transport.ReassembleError;
@@ -2000,6 +2022,10 @@ pub const Session = struct {
             .rx = transport.Reassembler.init(rx_buf),
             .scratch = scratch,
             .tx_fragment = tx_fragment,
+            .tx_link = link_session.Primary.init(false, .{
+                .response_timeout_ms = outstation.config.link_response_timeout_ms,
+                .retries = outstation.config.link_retries,
+            }),
         };
     }
 
@@ -2032,23 +2058,45 @@ pub const Session = struct {
         // answer to a broadcast, which would turn one broadcast into a reply
         // from every station on the bus at once.
         if (control.prm) {
-            switch (control.primaryFunction()) {
-                .reset_link_states, .test_link_states => {
-                    if (broadcast) return null;
-                    return try self.linkReply(.ack, decoded.src, out);
+            if (control.primaryFunction() == .request_link_status) {
+                if (broadcast) return null;
+                return try self.linkReply(.link_status, decoded.src, out);
+            }
+            // A broadcast is never confirmed (no frame-count state, no ACK):
+            // user data in one is delivered like unconfirmed data.
+            const verdict: link_session.Verdict = if (broadcast) switch (control.primaryFunction()) {
+                .confirmed_user_data, .unconfirmed_user_data => .deliver,
+                else => .none,
+            } else self.rx_link.onPrimary(control);
+            switch (verdict) {
+                .none => return null,
+                .nack => return try self.linkReply(.nack, decoded.src, out),
+                .ack_discard => return try self.linkReply(.ack, decoded.src, out),
+                .deliver => return try self.deliverFragment(decoded, broadcast, now_ms, out),
+                .ack_deliver => {
+                    const ack = try self.linkReply(.ack, decoded.src, out);
+                    const rest = try self.deliverFragment(decoded, broadcast, now_ms, out[ack.len..]);
+                    return out[0 .. ack.len + (if (rest) |r| r.len else 0)];
                 },
-                .request_link_status => {
-                    if (broadcast) return null;
-                    return try self.linkReply(.link_status, decoded.src, out);
-                },
-                .confirmed_user_data, .unconfirmed_user_data => {},
-                _ => return null,
             }
         } else {
-            // A secondary (response) frame from the master: nothing to do.
-            return null;
+            // A secondary (response) frame from the master: the ACK/NACK of
+            // our confirmed frame, if we send confirmed ones.
+            if (!self.outstation.config.link_confirms) return null;
+            return switch (self.tx_link.onSecondary(control, now_ms)) {
+                .send_data, .retransmit_data => try self.emitLinkFrame(.data, decoded.src, out),
+                .acked => try self.startNextSegment(now_ms, out),
+                .failed => blk: {
+                    self.tx_seg_active = false;
+                    break :blk null;
+                },
+                else => null,
+            };
         }
+    }
 
+    /// The transport + application half of a received user-data frame.
+    fn deliverFragment(self: *Session, decoded: link.DecodedFrame, broadcast: bool, now_ms: u64, out: []u8) SessionError!?[]u8 {
         const fragment = (try self.rx.feed(self.scratch[0..decoded.user_data_len])) orelse return null;
         // The peer goes with the fragment: `Session` is the only layer that
         // knows it, and the select-before-operate arm is bound to it.
@@ -2067,13 +2115,13 @@ pub const Session = struct {
             if (self.outstation.cursor != null) return try self.nextFrames(now_ms, out);
             return null;
         };
-        return try self.sendFragment(reply.fragment, out);
+        return try self.sendFragment(reply.fragment, now_ms, out);
     }
 
     /// Emits the next fragment of a multi-fragment response as link frames.
     pub fn nextFrames(self: *Session, now_ms: u64, out: []u8) SessionError!?[]u8 {
         const reply = (try self.outstation.next(now_ms, self.tx_fragment)) orelse return null;
-        return try self.sendFragment(reply.fragment, out);
+        return try self.sendFragment(reply.fragment, now_ms, out);
     }
 
     /// Emits a pending **unsolicited** response as link frames, or `null` when
@@ -2091,10 +2139,37 @@ pub const Session = struct {
     /// (`Outstation.confirmTimedOut` puts the events back).
     pub fn unsolicitedFrames(self: *Session, now_ms: u64, out: []u8) SessionError!?[]u8 {
         const reply = (try self.outstation.unsolicited(now_ms, self.tx_fragment)) orelse return null;
-        return try self.sendFragment(reply.fragment, out);
+        return try self.sendFragment(reply.fragment, now_ms, out);
     }
 
-    fn sendFragment(self: *Session, fragment: []const u8, out: []u8) SessionError![]u8 {
+    /// With `Config.link_confirms`: the retransmission (or give-up) the link
+    /// layer owes at `now_ms`, as link frames, or `null`. Call it when
+    /// `nextLinkDeadline` passes; with confirms off it is always `null`.
+    pub fn pollLink(self: *Session, now_ms: u64, out: []u8) SessionError!?[]u8 {
+        if (!self.outstation.config.link_confirms) return null;
+        return switch (self.tx_link.poll(now_ms)) {
+            .retransmit_reset => try self.emitLinkFrame(.reset, self.outstation.config.master_address, out),
+            .retransmit_data => try self.emitLinkFrame(.data, self.outstation.config.master_address, out),
+            .failed => blk: {
+                self.tx_seg_active = false;
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    /// When `pollLink` next has something to do (`null` when nothing is outstanding).
+    pub fn nextLinkDeadline(self: *const Session) ?u64 {
+        return self.tx_link.nextDeadline();
+    }
+
+    fn sendFragment(self: *Session, fragment: []const u8, now_ms: u64, out: []u8) SessionError![]u8 {
+        if (self.outstation.config.link_confirms) {
+            self.tx_seg = transport.Segmenter.init(fragment);
+            self.tx_seg.seq = self.tx_seq;
+            self.tx_seg_active = true;
+            return (try self.startNextSegment(now_ms, out)) orelse out[0..0];
+        }
         const control = link.Control{
             // §9.2.4.1.2: DIR is 1 for frames sent *by the master*, 0 for
             // frames sent by the outstation. Getting this backwards makes a
@@ -2121,6 +2196,32 @@ pub const Session = struct {
         }
         self.tx_seq = seg.seq;
         return out[0..pos];
+    }
+
+    /// `Config.link_confirms`: take the next transport segment of the fragment
+    /// being delivered and start its link-layer delivery.
+    fn startNextSegment(self: *Session, now_ms: u64, out: []u8) SessionError!?[]u8 {
+        if (!self.tx_seg_active) return null;
+        const segment = self.tx_seg.next(&self.tx_cur) orelse {
+            self.tx_seg_active = false;
+            return null;
+        };
+        self.tx_cur_len = segment.len;
+        self.tx_seq = self.tx_seg.seq;
+        const dest = self.outstation.config.master_address;
+        return switch (self.tx_link.start(now_ms)) {
+            .send_reset => try self.emitLinkFrame(.reset, dest, out),
+            else => try self.emitLinkFrame(.data, dest, out),
+        };
+    }
+
+    const LinkFrameKind = enum { reset, data };
+
+    fn emitLinkFrame(self: *Session, kind: LinkFrameKind, dest: u16, out: []u8) SessionError![]u8 {
+        return switch (kind) {
+            .reset => try link.encodeFrame(self.tx_link.resetControl(), dest, self.outstation.config.address, &.{}, out),
+            .data => try link.encodeFrame(self.tx_link.dataControl(), dest, self.outstation.config.address, self.tx_cur[0..self.tx_cur_len], out),
+        };
     }
 
     fn linkReply(self: *Session, function: link.SecondaryFunction, dest: u16, out: []u8) SessionError![]u8 {
@@ -3449,6 +3550,140 @@ fn frameFor(dest: u16, src: u16, fragment: []const u8, out: []u8) ![]u8 {
         user[0 .. 1 + fragment.len],
         out,
     );
+}
+
+/// `frameFor` as CONFIRMED_USER_DATA with the given frame-count bit.
+fn confirmedFrameFor(dest: u16, src: u16, fcb: bool, fragment: []const u8, out: []u8) ![]u8 {
+    var user: [link.max_user_data_len]u8 = undefined;
+    user[0] = 0xC0;
+    @memcpy(user[1..][0..fragment.len], fragment);
+    return try link.encodeFrame(
+        .{ .dir = true, .prm = true, .fcb = fcb, .fcv_or_dfc = true, .function = @backingInt(link.PrimaryFunction.confirmed_user_data) },
+        dest,
+        src,
+        user[0 .. 1 + fragment.len],
+        out,
+    );
+}
+
+fn masterAck(dest: u16, src: u16, function: link.SecondaryFunction, out: []u8) ![]u8 {
+    return try link.encodeFrame(.{ .dir = true, .prm = false, .function = @backingInt(function) }, dest, src, &.{}, out);
+}
+
+test "Session: confirmed user data is ACKed and delivered once; a repeated frame-count bit is ACKed and not executed again" {
+    var req: [64]u8 = undefined;
+    const command = try buildCrob(&req, 1, .direct_operate, 2, .latch_on);
+    var fix = Fixture{};
+    var station = fix.station(.{ .address = 10, .master_address = 1 });
+    var rx: [512]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var tx: [512]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    var frame_buf: [128]u8 = undefined;
+    var session = Session.init(&station, &rx, &scratch, &tx);
+
+    // Confirmed data before a reset: NACK, nothing executed.
+    const early = (try session.feedFrame(try confirmedFrameFor(10, 1, true, command, &frame_buf), 100, &out)).?;
+    try testing.expectEqual(link.SecondaryFunction.nack, (try link.decodeFrame(early, &scratch)).control.secondaryFunction());
+    try testing.expect(!fix.bouts[2].value);
+
+    const reset = try link.encodeFrame(
+        .{ .dir = true, .prm = true, .function = @backingInt(link.PrimaryFunction.reset_link_states) },
+        10,
+        1,
+        &.{},
+        &frame_buf,
+    );
+    _ = (try session.feedFrame(reset, 110, &out)).?;
+
+    // FCB=1: link ACK first, then the application response, in one buffer.
+    const first = (try session.feedFrame(try confirmedFrameFor(10, 1, true, command, &frame_buf), 120, &out)).?;
+    const ack_frame_len = link.header_frame_len;
+    try testing.expect(first.len > ack_frame_len);
+    try testing.expectEqual(link.SecondaryFunction.ack, (try link.decodeFrame(first[0..ack_frame_len], &scratch)).control.secondaryFunction());
+    try testing.expect(fix.bouts[2].value);
+    fix.bouts[2].value = false;
+
+    // The ACK was lost and the master repeats FCB=1: ACK only, no second execution.
+    const dup = (try session.feedFrame(try confirmedFrameFor(10, 1, true, command, &frame_buf), 130, &out)).?;
+    try testing.expectEqual(ack_frame_len, dup.len);
+    try testing.expectEqual(link.SecondaryFunction.ack, (try link.decodeFrame(dup, &scratch)).control.secondaryFunction());
+    try testing.expect(!fix.bouts[2].value);
+
+    // FCB=0 is the next new frame.
+    _ = (try session.feedFrame(try confirmedFrameFor(10, 1, false, command, &frame_buf), 140, &out)).?;
+    try testing.expect(fix.bouts[2].value);
+}
+
+test "Session: with link_confirms the response goes out as RESET then CONFIRMED frames, one per ACK, and retransmits on timeout" {
+    var req: [64]u8 = undefined;
+    const command = try buildCrob(&req, 1, .direct_operate, 2, .latch_on);
+    var fix = Fixture{};
+    var station = fix.station(.{ .address = 10, .master_address = 1, .link_confirms = true, .link_response_timeout_ms = 100, .link_retries = 1 });
+    var rx: [512]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var tx: [512]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    var frame_buf: [128]u8 = undefined;
+    var session = Session.init(&station, &rx, &scratch, &tx);
+
+    // The response begins with RESET_LINK_STATES (outstation -> master).
+    const f1 = (try session.feedFrame(try frameFor(10, 1, command, &frame_buf), 1000, &out)).?;
+    const d1 = try link.decodeFrame(f1, &scratch);
+    try testing.expect(d1.control.prm and !d1.control.dir);
+    try testing.expectEqual(link.PrimaryFunction.reset_link_states, d1.control.primaryFunction());
+    try testing.expectEqual(@as(u16, 1), d1.dest);
+    try testing.expectEqual(@as(?u64, 1100), session.nextLinkDeadline());
+
+    // ACK of the reset releases the data frame with FCB=1, FCV=1.
+    const f2 = (try session.feedFrame(try masterAck(10, 1, .ack, &frame_buf), 1010, &out)).?;
+    const d2 = try link.decodeFrame(f2, &scratch);
+    try testing.expectEqual(link.PrimaryFunction.confirmed_user_data, d2.control.primaryFunction());
+    try testing.expect(d2.control.fcb and d2.control.fcv_or_dfc);
+    const response_len = d2.user_data_len;
+    try testing.expect(response_len > 1);
+
+    // No ACK: the same frame again at the deadline, then the link gives up.
+    const f3 = (try session.pollLink(1110, &out)).?;
+    const d3 = try link.decodeFrame(f3, &scratch);
+    try testing.expect(d3.control.fcb);
+    try testing.expectEqual(response_len, d3.user_data_len);
+    try testing.expectEqual(@as(?[]u8, null), try session.pollLink(1210, &out));
+    try testing.expectEqual(@as(?u64, null), session.nextLinkDeadline());
+
+    // An ACK with nothing outstanding is ignored.
+    try testing.expectEqual(@as(?[]u8, null), try session.feedFrame(try masterAck(10, 1, .ack, &frame_buf), 1300, &out));
+}
+
+test "Session: link_confirms delivers a multi-segment response one frame per ACK" {
+    var fix = Fixture{};
+    var station = fix.station(.{ .address = 10, .master_address = 1, .link_confirms = true, .max_tx_fragment = 2048 });
+    var rx: [512]u8 = undefined;
+    var scratch: [256]u8 = undefined;
+    var tx: [2048]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    var frame_buf: [128]u8 = undefined;
+    var session = Session.init(&station, &rx, &scratch, &tx);
+    // A fragment longer than one transport segment, handed straight to the sender.
+    var big: [600]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @truncate(i);
+    var f = (try session.sendFragment(&big, 0, &out));
+    try testing.expectEqual(link.PrimaryFunction.reset_link_states, (try link.decodeFrame(f, &scratch)).control.primaryFunction());
+    var seen: usize = 0;
+    var fcb_expected = true;
+    var n_frames: usize = 0;
+    while (true) {
+        const next = (try session.feedFrame(try masterAck(10, 1, .ack, &frame_buf), 1, &out)) orelse break;
+        const d = try link.decodeFrame(next, &scratch);
+        try testing.expectEqual(link.PrimaryFunction.confirmed_user_data, d.control.primaryFunction());
+        try testing.expectEqual(fcb_expected, d.control.fcb);
+        fcb_expected = !fcb_expected;
+        seen += d.user_data_len - 1; // minus the transport octet
+        n_frames += 1;
+        f = next;
+    }
+    try testing.expectEqual(big.len, seen);
+    try testing.expectEqual(@as(usize, 3), n_frames); // 249 + 249 + 102
 }
 
 test "Session: a frame addressed to another outstation is dropped, not executed" {
