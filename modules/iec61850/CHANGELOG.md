@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Additive:** server-side MMS file services over a caller-supplied `FileStore` (`Model.files`; read-only `FileDirectory`, `FileOpen`, `FileRead`, `FileClose`, the services advertised only with a store; `mms.decodeFileOpenRequest`, `decodeFileDirectoryRequest`, `decodeFrsmId`, `encodeFileOpenResponse`, `encodeFileReadResponse`, `encodeFileCloseResponse`, `DirectoryResponseBuilder`). Without a store the services are answered with a service error as before. `Model` gained a field with a default.
 - **2026-11-21** — **Behaviour change (source-breaking for code naming the type):** `TcpTransport` bounds its reads with `io.operateTimeout` through its own `std.Io.Reader` instead of `poll(2)` on the raw descriptor, so a simulated `std.Io` (a deterministic simulation, a test `Io`) sees the wait and a cancel ends it at once. Under `std.Io.Threaded` the results are the same. The public field `reader` is now a private `TimedReader` instead of `std.Io.net.Stream.Reader`.
 
 

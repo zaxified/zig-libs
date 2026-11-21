@@ -447,9 +447,21 @@ Where the module is deliberately partial, with the boundary stated.
 
 **What the tests actually contain.** 82+15 goldens captured from libiec61850, live peer both directions (SPEC.md)
 
+## File services (server)
+
+`Model.files` (a `FileStore`: size, read-at-offset and listing callbacks over storage the caller owns) switches on the
+read-only MMS file services of ISO 9506-2 §14: `FileDirectory` (root only, `continueAfter` and `moreFollows`, at most 24
+entries a response), `FileOpen` (with `initialPosition`), `FileRead` (one TPDU's worth per call, at most 4096 octets,
+`moreFollows` false at the end) and `FileClose`. Open files belong to the association that opened them
+(`releaseAssociationOf` closes them), eight at once. Errors are `confirmed-ErrorPDU`s of class `file`: file-problem for an
+unknown `frsmID`, file-busy when every slot is taken, position-invalid, file-non-existent. No write services
+(`ObtainFile`, `FileRename`, `FileDelete`): COMTRADE fault-record retrieval and CID download are reads. The service bits
+are advertised only with a store. libiec61850's file services are the reference (documentation only; its source is GPL
+and was not read); the encodings follow ISO 9506-2 and the captured client requests in `goldens.zig`, and the responses
+are checked against this module's own client decoders, not against a third-party peer.
+
 ## Backlog / deferred
 
-- **Server-side MMS file services** (FileDirectory/Open/Read/Close over a caller-supplied file store): libiec61850 offers them and COMTRADE fault-record retrieval needs them; the codec exists, the server responder does not; medium, fits §2 (caller supplies the file store).
 - **R-GOOSE / R-SMV (IEC 61850-90-5, UDP)**: libiec61850's R-Session; growing use in wide-area protection; medium, fits §2.
 - **SCL `Substation` section, `Services`, `Inputs`/`ExtRef`, `SampledValueControl` parsing** (and `Private`/`Text`): engineering tools notice the round-trip loss, and these account for the files whose generated model differs from the original's; medium, fits §2.
 - **GOOSE subscriber-side redundancy (PRP/HSR duplicate discard) and GSSE** (the pre-2003 `0x88B9` framing).

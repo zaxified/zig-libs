@@ -84,8 +84,46 @@ pub const LogControl = logging.ControlBlock;
 /// The setting-group control block — see `settinggroups.zig`.
 pub const SettingGroups = settinggroups.ControlBlock;
 
+/// The files a server offers through the MMS file services (`FileDirectory`,
+/// `FileOpen`, `FileRead`, `FileClose`; read-only, as COMTRADE fault-record
+/// retrieval and CID download need). The caller owns the storage; the server
+/// only asks. File names are one graphic string, with no directory tree.
+pub const FileStore = struct {
+    ctx: ?*anyopaque = null,
+    /// The size of the file called `name`, or null when there is none.
+    sizeFn: *const fn (ctx: ?*anyopaque, name: []const u8) ?u32,
+    /// Copies up to `buf.len` octets of the file from `offset` and returns how
+    /// many (0 at or past the end).
+    readFn: *const fn (ctx: ?*anyopaque, name: []const u8, offset: u32, buf: []u8) usize,
+    /// The `index`-th file of the listing, in a stable order: its name copied
+    /// into `name_buf` and its size, or null past the last.
+    entryFn: *const fn (ctx: ?*anyopaque, index: usize, name_buf: []u8) ?Entry,
+
+    pub const Entry = struct { name_len: usize, size: u32 };
+};
+
+/// Files open at once across every association.
+pub const max_open_files = 8;
+/// Longest file name a `FileOpen` accepts.
+pub const max_file_name_len = 64;
+/// Entries one `FileDirectory` response carries; `moreFollows` says there are
+/// others and `continueAfter` asks for them.
+pub const max_directory_entries = 24;
+
+const OpenFile = struct {
+    used: bool = false,
+    peer: u32 = 0,
+    name: [max_file_name_len]u8 = undefined,
+    name_len: usize = 0,
+    size: u32 = 0,
+    pos: u32 = 0,
+};
+
 pub const Model = struct {
     variables: []Variable,
+    /// The file services' store; null: they are not offered and are answered with
+    /// a `confirmed-ErrorPDU`, as before.
+    files: ?FileStore = null,
     data_sets: []const DataSet = &.{},
     /// Control objects, addressed by the `LN$CO$DO` prefix their `Oper`, `SBO`,
     /// `SBOw` and `Cancel` hang off. Empty by default, which is exactly the
@@ -167,6 +205,7 @@ pub const Server = struct {
     associated_peers: [max_associations]u32 = @splat(0),
     associated_count: usize = 0,
     transport_up: bool = false,
+    open_files: [max_open_files]OpenFile = @splat(.{}),
     /// W2-A8/iec61850-F6: COTP class-0 reassembly for an inbound *segmented*
     /// request — mirrors `client.zig`'s identical `reasm`/`reasm_len` pair.
     /// Before this existed, `handle` discarded the `eot` bit and fed every
@@ -399,6 +438,7 @@ pub const Server = struct {
             else => return error.Unsupported,
         };
 
+        const supported = self.servicesSupported();
         const init_resp = mms.Initiate{
             .local_detail = self.config.local_detail,
             .max_serv_outstanding_calling = @min(init_req.max_serv_outstanding_calling, self.config.max_serv_outstanding),
@@ -406,7 +446,7 @@ pub const Server = struct {
             .data_structure_nesting_level = init_req.data_structure_nesting_level,
             .version_number = 1,
             .parameter_cbb = init_req.parameter_cbb,
-            .services_supported = try ber.BitString.parse(&server_services_supported),
+            .services_supported = try ber.BitString.parse(&supported),
         };
         var mms_buf: [512]u8 = undefined;
         const mms_pdu = try init_resp.encode(false, &mms_buf);
@@ -471,8 +511,118 @@ pub const Server = struct {
             .write => self.write(req, body),
             .get_variable_access_attributes => self.variableAccessAttributes(req, body),
             .get_named_variable_list_attributes => self.dataSetAttributes(req, body),
+            .file_open => self.fileOpen(req, body),
+            .file_read => self.fileRead(req, body),
+            .file_close => self.fileClose(req, body),
+            .file_directory => self.fileDirectory(req, body),
             else => mms.encodeConfirmedError(req.invoke_id, .service, 0, body),
         };
+    }
+
+    // ── the file services (ISO 9506-2 §14), read-only ─────────────────────────
+    // ErrorClass `file` codes: file-problem 0, file-busy 2, position-invalid 5,
+    // file-non-existent 7, other 10.
+
+    /// `server_services_supported`, plus the file services when a fstore is set.
+    fn servicesSupported(self: *const Server) [12]u8 {
+        var bits = server_services_supported;
+        if (self.model.files != null) {
+            for ([_]usize{
+                mms.Initiate.service_bit.file_open,
+                mms.Initiate.service_bit.file_read,
+                mms.Initiate.service_bit.file_close,
+                mms.Initiate.service_bit.file_directory,
+            }) |b| bits[1 + b / 8] |= @as(u8, 0x80) >> @intCast(b % 8);
+        }
+        return bits;
+    }
+
+    fn fileError(req: mms.ConfirmedRequest, code: i32, body: []u8) Error![]const u8 {
+        return mms.encodeConfirmedError(req.invoke_id, .file, code, body);
+    }
+
+    fn fileOpen(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        const fstore = self.model.files orelse return mms.encodeConfirmedError(req.invoke_id, .service, 0, body);
+        const r = mms.decodeFileOpenRequest(req.body) catch return fileError(req, 10, body);
+        if (r.name.len == 0 or r.name.len > max_file_name_len) return fileError(req, 7, body);
+        const size = fstore.sizeFn(fstore.ctx, r.name) orelse return fileError(req, 7, body);
+        if (r.initial_position > size) return fileError(req, 5, body);
+        for (&self.open_files, 0..) |*f, i| {
+            if (f.used) continue;
+            f.* = .{ .used = true, .peer = self.peer, .name_len = r.name.len, .size = size, .pos = r.initial_position };
+            @memcpy(f.name[0..r.name.len], r.name);
+            return mms.encodeFileOpenResponse(req.invoke_id, @intCast(i + 1), size, body);
+        }
+        return fileError(req, 2, body); // every slot is busy
+    }
+
+    /// The open file `frsm` names for this association, or null.
+    fn openFile(self: *Server, frsm: i32) ?*OpenFile {
+        if (frsm < 1 or frsm > max_open_files) return null;
+        const f = &self.open_files[@intCast(frsm - 1)];
+        if (!f.used or f.peer != self.peer) return null;
+        return f;
+    }
+
+    fn fileRead(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        const fstore = self.model.files orelse return mms.encodeConfirmedError(req.invoke_id, .service, 0, body);
+        const frsm = mms.decodeFrsmId(req.body) catch return fileError(req, 0, body);
+        const f = self.openFile(frsm) orelse return fileError(req, 0, body);
+        // One TPDU carries the whole response (this server does not segment): leave
+        // room for the TPKT/COTP/session/presentation/MMS framing around the data.
+        const ceiling = @min(
+            if (self.negotiated_pdu_len != 0) self.negotiated_pdu_len else 1024,
+            if (self.negotiated_tpdu_len != 0) self.negotiated_tpdu_len else 1024,
+        );
+        const chunk = std.math.clamp(ceiling -| 160, 64, 4096);
+        var data: [4096]u8 = undefined;
+        const n = fstore.readFn(fstore.ctx, f.name[0..f.name_len], f.pos, data[0..chunk]);
+        f.pos +|= @intCast(n);
+        return mms.encodeFileReadResponse(req.invoke_id, data[0..n], n != 0 and f.pos < f.size, body);
+    }
+
+    fn fileClose(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        if (self.model.files == null) return mms.encodeConfirmedError(req.invoke_id, .service, 0, body);
+        const frsm = mms.decodeFrsmId(req.body) catch return fileError(req, 0, body);
+        const f = self.openFile(frsm) orelse return fileError(req, 0, body);
+        f.used = false;
+        return mms.encodeFileCloseResponse(req.invoke_id, body);
+    }
+
+    fn fileDirectory(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
+        const fstore = self.model.files orelse return mms.encodeConfirmedError(req.invoke_id, .service, 0, body);
+        const r = mms.decodeFileDirectoryRequest(req.body) catch return fileError(req, 10, body);
+        // Only the root exists: a named directory is not there.
+        if (r.path) |p| if (p.len != 0 and !std.mem.eql(u8, p, "/")) return fileError(req, 7, body);
+        var names: [max_directory_entries][max_file_name_len]u8 = undefined;
+        var entries: [max_directory_entries]FileStore.Entry = undefined;
+        var count: usize = 0;
+        var index: usize = 0;
+        var skipping = r.continue_after != null;
+        var more = false;
+        var scratch: [max_file_name_len]u8 = undefined;
+        while (fstore.entryFn(fstore.ctx, index, &scratch)) |e| : (index += 1) {
+            if (skipping) {
+                if (std.mem.eql(u8, scratch[0..e.name_len], r.continue_after.?)) skipping = false;
+                continue;
+            }
+            if (count == max_directory_entries) {
+                more = true;
+                break;
+            }
+            @memcpy(names[count][0..e.name_len], scratch[0..e.name_len]);
+            entries[count] = e;
+            count += 1;
+        }
+        // A `continueAfter` that names no file is not a place to continue from.
+        if (skipping) return fileError(req, 7, body);
+        var b = try mms.DirectoryResponseBuilder.init(body, more);
+        var i = count;
+        while (i > 0) {
+            i -= 1;
+            try b.addFront(names[i][0..entries[i].name_len], entries[i].size);
+        }
+        return b.finish(req.invoke_id);
     }
 
     fn getNameList(self: *Server, req: mms.ConfirmedRequest, body: []u8) Error![]const u8 {
@@ -1117,6 +1267,9 @@ pub const Server = struct {
         // The dropped connection's half-sent frame goes with it, or the next
         // peer to reach the `.dt` arm inherits its octets.
         if (self.reasm_peer == peer) self.reasm_len = 0;
+        for (&self.open_files) |*f| if (f.used and f.peer == peer) {
+            f.used = false;
+        };
         self.clearAssociated(peer);
     }
 
@@ -1842,6 +1995,147 @@ test "the advertised service bit string really names what is implemented" {
     // Not implemented, and not claimed.
     try testing.expect(!bs.bit(mms.Initiate.service_bit.define_named_variable_list));
     try testing.expect(!bs.bit(mms.Initiate.service_bit.file_open));
+}
+
+// ── the file services ───────────────────────────────────────────────────────
+
+const big_file: [10_000]u8 = @splat('x');
+const test_files = [_]struct { name: []const u8, data: []const u8 }{
+    .{ .name = "IEDMODEL.CID", .data = "<SCL>the model</SCL>" },
+    .{ .name = "FAULT1.CFG", .data = &big_file },
+    .{ .name = "FAULT1.DAT", .data = "yz" },
+};
+
+fn testSize(_: ?*anyopaque, name: []const u8) ?u32 {
+    for (test_files) |f| if (std.mem.eql(u8, f.name, name)) return @intCast(f.data.len);
+    return null;
+}
+
+fn testRead(_: ?*anyopaque, name: []const u8, offset: u32, buf: []u8) usize {
+    for (test_files) |f| if (std.mem.eql(u8, f.name, name)) {
+        if (offset >= f.data.len) return 0;
+        const n = @min(buf.len, f.data.len - offset);
+        @memcpy(buf[0..n], f.data[offset..][0..n]);
+        return n;
+    };
+    return 0;
+}
+
+fn testEntry(_: ?*anyopaque, index: usize, name_buf: []u8) ?FileStore.Entry {
+    if (index >= test_files.len) return null;
+    const f = test_files[index];
+    @memcpy(name_buf[0..f.name.len], f.name);
+    return .{ .name_len = f.name.len, .size = @intCast(f.data.len) };
+}
+
+fn fileServer(vars: []Variable) Server {
+    return Server.init(.{}, .{
+        .variables = vars,
+        .domains = &.{},
+        .files = .{ .sizeFn = testSize, .readFn = testRead, .entryFn = testEntry },
+    });
+}
+
+fn expectFileError(pdu: mms.Pdu, code: i32) !void {
+    const e = pdu.confirmed_error;
+    try testing.expectEqual(mms.ErrorClass.file, e.error_class);
+    try testing.expectEqual(code, e.code);
+}
+
+test "file services: list, open, read to the end in chunks, close" {
+    var vars = [_]Variable{};
+    var srv = fileServer(&vars);
+    var req: [256]u8 = undefined;
+    var body: [16384]u8 = undefined;
+
+    // Directory: all three, in the store's order, no continuation.
+    const dir = (try askService(&srv, try mms.encodeFileDirectory(1, null, null, &req), &body)).confirmed_response;
+    const dr = try mms.decodeFileDirectoryResponse(dir.body);
+    try testing.expect(!dr.more_follows);
+    var it = dr.entries;
+    var n: usize = 0;
+    while (try it.next()) |e| : (n += 1) {
+        try testing.expectEqualStrings(test_files[n].name, e.name);
+        try testing.expectEqual(@as(u32, @intCast(test_files[n].data.len)), e.size);
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+
+    // Directory continuing after the first entry.
+    const cont = (try askService(&srv, try mms.encodeFileDirectory(2, null, "IEDMODEL.CID", &req), &body)).confirmed_response;
+    var cit = (try mms.decodeFileDirectoryResponse(cont.body)).entries;
+    try testing.expectEqualStrings("FAULT1.CFG", (try cit.next()).?.name);
+
+    // Open, read the 10 000 octets in chunks, close.
+    const open = (try askService(&srv, try mms.encodeFileOpen(3, "FAULT1.CFG", 0, &req), &body)).confirmed_response;
+    const o = try mms.decodeFileOpenResponse(open.body);
+    try testing.expectEqual(@as(u32, 10_000), o.size);
+    var got: usize = 0;
+    var reads: usize = 0;
+    while (true) : (reads += 1) {
+        const rd = (try askService(&srv, try mms.encodeFileRead(4, o.frsm_id, &req), &body)).confirmed_response;
+        const r = try mms.decodeFileReadResponse(rd.body);
+        try testing.expect(r.data.len > 0 and r.data.len <= 4096);
+        for (r.data) |c| try testing.expectEqual(@as(u8, 'x'), c);
+        got += r.data.len;
+        if (!r.more_follows) break;
+        try testing.expect(reads < 20);
+    }
+    try testing.expectEqual(@as(usize, 10_000), got);
+    try testing.expect(reads >= 2);
+    const closed = (try askService(&srv, try mms.encodeFileClose(5, o.frsm_id, &req), &body)).confirmed_response;
+    try testing.expectEqual(mms.Service.file_close, closed.service);
+    // Closed: the id is gone.
+    try expectFileError(try askService(&srv, try mms.encodeFileRead(6, o.frsm_id, &req), &body), 0);
+}
+
+test "file services: errors, the position, the association boundary and the slots" {
+    var vars = [_]Variable{};
+    var srv = fileServer(&vars);
+    var req: [256]u8 = undefined;
+    var body: [16384]u8 = undefined;
+    try expectFileError(try askService(&srv, try mms.encodeFileOpen(1, "NOPE.TXT", 0, &req), &body), 7);
+    try expectFileError(try askService(&srv, try mms.encodeFileOpen(1, "FAULT1.DAT", 3, &req), &body), 5);
+    try expectFileError(try askService(&srv, try mms.encodeFileDirectory(1, "/sub", null, &req), &body), 7);
+    try expectFileError(try askService(&srv, try mms.encodeFileDirectory(1, null, "GONE", &req), &body), 7);
+    try expectFileError(try askService(&srv, try mms.encodeFileRead(1, 3, &req), &body), 0);
+    try expectFileError(try askService(&srv, try mms.encodeFileClose(1, 0, &req), &body), 0);
+
+    // An initial position inside the file starts reading there.
+    const open = (try askService(&srv, try mms.encodeFileOpen(2, "FAULT1.DAT", 1, &req), &body)).confirmed_response;
+    const o = try mms.decodeFileOpenResponse(open.body);
+    const rd = (try askService(&srv, try mms.encodeFileRead(3, o.frsm_id, &req), &body)).confirmed_response;
+    const r = try mms.decodeFileReadResponse(rd.body);
+    try testing.expectEqualStrings("z", r.data);
+    try testing.expect(!r.more_follows);
+
+    // Another association cannot use the id, and losing the association closes the file.
+    srv.peer = 2;
+    try expectFileError(try askService(&srv, try mms.encodeFileRead(4, o.frsm_id, &req), &body), 0);
+    srv.peer = 1;
+    srv.releaseAssociationOf(1);
+    try expectFileError(try askService(&srv, try mms.encodeFileRead(5, o.frsm_id, &req), &body), 0);
+
+    // Every slot busy.
+    for (0..max_open_files) |i| _ = try askService(&srv, try mms.encodeFileOpen(@intCast(10 + i), "IEDMODEL.CID", 0, &req), &body);
+    try expectFileError(try askService(&srv, try mms.encodeFileOpen(99, "IEDMODEL.CID", 0, &req), &body), 2);
+}
+
+test "file services: a server without a store answers a service error, and advertises them only with one" {
+    var vars = [_]Variable{};
+    var plain = Server.init(.{}, .{ .variables = &vars, .domains = &.{} });
+    var req: [256]u8 = undefined;
+    var body: [1024]u8 = undefined;
+    const e = (try askService(&plain, try mms.encodeFileOpen(1, "A", 0, &req), &body)).confirmed_error;
+    try testing.expectEqual(mms.ErrorClass.service, e.error_class);
+    const without = plain.servicesSupported();
+    const bs0 = try ber.BitString.parse(&without);
+    try testing.expect(!bs0.bit(mms.Initiate.service_bit.file_open));
+    var withfiles = fileServer(&vars);
+    const with = withfiles.servicesSupported();
+    const bs1 = try ber.BitString.parse(&with);
+    inline for (.{ "file_open", "file_read", "file_close", "file_directory" }) |name| {
+        try testing.expect(bs1.bit(@field(mms.Initiate.service_bit, name)));
+    }
 }
 
 // ── the control model, client against server ────────────────────────────────

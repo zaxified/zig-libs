@@ -1372,6 +1372,120 @@ pub fn decodeFileDirectoryResponse(body: []const u8) Error!FileDirectoryResponse
     return .{ .entries = entries orelse return error.MissingField, .more_follows = more };
 }
 
+// ── the responder's side of the file services (ISO 9506-2 §14) ─────────────
+
+pub const FileOpenRequest = struct {
+    /// The first (only) graphic string of the file name; a path with several
+    /// components is refused by the responder, which has no directory tree.
+    name: []const u8,
+    initial_position: u32 = 0,
+};
+
+/// `FileOpen-Request ::= SEQUENCE { fileName [0] FileName, initialPosition [1] Unsigned32 }`.
+pub fn decodeFileOpenRequest(body: []const u8) Error!FileOpenRequest {
+    var it = ber.Iterator.init(body);
+    var name: ?[]const u8 = null;
+    var pos: u32 = 0;
+    while (try it.next()) |e| {
+        if (e.tag.eql(ber.Tag.ctxc(0))) {
+            name = (try ber.decode(e.content)).content;
+        } else if (e.tag.eql(ber.Tag.ctx(1))) {
+            pos = try ber.decodeUint(u32, e.content);
+        }
+    }
+    return .{ .name = name orelse return error.MissingField, .initial_position = pos };
+}
+
+/// The bare `Integer32` of a `FileRead`/`FileClose` request.
+pub fn decodeFrsmId(body: []const u8) Error!i32 {
+    return ber.decodeInt(i32, body);
+}
+
+pub const FileDirectoryRequest = struct {
+    path: ?[]const u8 = null,
+    continue_after: ?[]const u8 = null,
+};
+
+pub fn decodeFileDirectoryRequest(body: []const u8) Error!FileDirectoryRequest {
+    var it = ber.Iterator.init(body);
+    var r: FileDirectoryRequest = .{};
+    while (try it.next()) |e| {
+        if (e.tag.eql(ber.Tag.ctxc(0))) {
+            r.path = (try ber.decode(e.content)).content;
+        } else if (e.tag.eql(ber.Tag.ctxc(1))) {
+            r.continue_after = (try ber.decode(e.content)).content;
+        }
+    }
+    return r;
+}
+
+/// `FileOpen-Response ::= SEQUENCE { frsmID [0] Integer32, fileAttributes [1] FileAttributes }`.
+pub fn encodeFileOpenResponse(invoke_id: u32, frsm_id: i32, size: u32, out: []u8) Error![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    const a = w.mark();
+    try w.unsigned(ber.Tag.ctx(0), size);
+    try w.header(ber.Tag.ctxc(1), a);
+    try w.integer(ber.Tag.ctx(0), frsm_id);
+    try closeConfirmedResponse(&w, m, .file_open, invoke_id);
+    return w.done();
+}
+
+/// `FileRead-Response ::= SEQUENCE { fileData [0] OCTET STRING, moreFollows [1] BOOLEAN DEFAULT TRUE }`.
+pub fn encodeFileReadResponse(invoke_id: u32, data: []const u8, more_follows: bool, out: []u8) Error![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    if (!more_follows) try w.boolean(ber.Tag.ctx(1), false);
+    try w.primitive(ber.Tag.ctx(0), data);
+    try closeConfirmedResponse(&w, m, .file_read, invoke_id);
+    return w.done();
+}
+
+/// `FileClose-Response ::= NULL`, a primitive `[74]` with no content.
+pub fn encodeFileCloseResponse(invoke_id: u32, out: []u8) Error![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    try w.header(ber.Tag.ctx(@backingInt(Service.file_close)), m);
+    try w.unsigned(ber.Tag.uni(ber.Universal.integer), invoke_id);
+    try w.header(PduKind.confirmed_response.tag(), m);
+    return w.done();
+}
+
+/// Builds a `FileDirectory-Response` entry by entry, the way the `Writer`
+/// builds everything: front to back reversed, so the caller adds the LAST entry
+/// first. `finish` closes the list and the response.
+pub const DirectoryResponseBuilder = struct {
+    w: ber.Writer,
+    outer: usize,
+    list: usize,
+
+    pub fn init(out: []u8, more_follows: bool) Error!DirectoryResponseBuilder {
+        var w = ber.Writer.init(out);
+        const outer = w.mark();
+        if (more_follows) try w.boolean(ber.Tag.ctx(1), true);
+        const list = w.mark();
+        return .{ .w = w, .outer = outer, .list = list };
+    }
+
+    /// Prepends one entry; call for the last entry of the listing first.
+    pub fn addFront(self: *DirectoryResponseBuilder, name: []const u8, size: u32) Error!void {
+        const e = self.w.mark();
+        const a = self.w.mark();
+        try self.w.unsigned(ber.Tag.ctx(0), size);
+        try self.w.header(ber.Tag.ctxc(1), a);
+        const f = self.w.mark();
+        try self.w.primitive(ber.Tag.uni(ber.Universal.graphic_string), name);
+        try self.w.header(ber.Tag.ctxc(0), f);
+        try self.w.header(ber.Tag.sequence, e);
+    }
+
+    pub fn finish(self: *DirectoryResponseBuilder, invoke_id: u32) Error![]const u8 {
+        try self.w.header(ber.Tag.ctxc(0), self.list);
+        try closeConfirmedResponse(&self.w, self.outer, .file_directory, invoke_id);
+        return self.w.done();
+    }
+};
+
 // A `[N] IMPLICIT Integer32` service body is primitive, not constructed.
 fn closeConfirmedRequestPrimitive(w: *ber.Writer, mark: usize, service: Service, invoke_id: u32) Error!void {
     try w.header(ber.Tag.ctx(@backingInt(service)), mark);

@@ -65,7 +65,7 @@ for the ride.
   `GetVariableAccessAttributes` with a depth-bounded type tree,
   `GetNamedVariableListAttributes`, `DefineNamedVariableList`/
   `DeleteNamedVariableList`, `InformationReport`, and `FileOpen`/`FileRead`/
-  `FileClose`/`FileDirectory`.
+  `FileClose`/`FileDirectory` (the client side, and the server's read-only side over a caller's `FileStore`).
 - **`acsi`** — the object-reference syntax in **both** forms:
   `LDName/LNName.DOName.DAName` and the `$`-separated MMS form
   `GGIO1$MX$AnIn1$mag$f`, with the functional constraint injected between the
@@ -193,7 +193,7 @@ all typed errors.
 ## Not provided
 
 No IEC 62351 security (TLS on 102, GOOSE/SV signing: the sibling `iec62351`), no R-GOOSE/R-SMV
-(IEC 61850-90-5), no server-side MMS file services, no SCL `Substation` section, no SV timing and no
+(IEC 61850-90-5), no SCL `Substation` section, no SV timing and no
 PRP/HSR. Reasons and the planned items: SPEC.md *What is deliberately not done* and
 *Backlog / deferred*.
 
