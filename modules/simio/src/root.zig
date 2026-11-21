@@ -83,4 +83,5 @@ test {
     _ = @import("pilots/timeouts.zig");
     _ = @import("pilots/staticfiles.zig");
     _ = @import("pilots/iec104.zig");
+    _ = @import("pilots/iec61850.zig");
 }

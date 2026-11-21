@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Behaviour change (source-breaking for code naming the type):** `TcpTransport` bounds its reads with `io.operateTimeout` through its own `std.Io.Reader` instead of `poll(2)` on the raw descriptor, so a simulated `std.Io` (a deterministic simulation, a test `Io`) sees the wait and a cancel ends it at once. Under `std.Io.Threaded` the results are the same. The public field `reader` is now a private `TimedReader` instead of `std.Io.net.Stream.Reader`.
 
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
