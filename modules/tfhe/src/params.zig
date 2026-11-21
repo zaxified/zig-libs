@@ -196,6 +196,21 @@ pub const tfhers_default = Params{
     .glwe_noise = .{ .gaussian = 9.315272083503367e-10 },
 };
 
+/// tfhe-rs 1.8.1 `boolean::parameters::DEFAULT_PARAMETERS_KS_PBS` — fresh
+/// ciphertexts under the big key, gates key-switch before they bootstrap
+/// (`EncryptionKeyChoice::Big`, `boolean.KsPbsServerKey`).
+pub const tfhers_default_ks_pbs = Params{
+    .n = 739,
+    .k = 3,
+    .N = 512,
+    .bg_bits = 10,
+    .ell = 2,
+    .bks_bits = 3,
+    .ell_ks = 4,
+    .lwe_noise = .{ .gaussian = 1.8304520733507305e-05 },
+    .glwe_noise = .{ .gaussian = 9.315272083503367e-10 },
+};
+
 /// tfhe-rs 1.8.1 `boolean::parameters::TFHE_LIB_PARAMETERS` — the original
 /// TFHE library's gate-bootstrapping set (`k = 1`, `N = 1024`).
 pub const tfhers_tfhe_lib = Params{
@@ -236,7 +251,7 @@ test "toy validates and has the documented shape" {
 }
 
 test "the tfhe-rs sets validate and keep the prepared product exact" {
-    inline for (.{ tfhers_default, tfhers_tfhe_lib, tfhers_2m165 }) |s| try s.validate();
+    inline for (.{ tfhers_default, tfhers_default_ks_pbs, tfhers_tfhe_lib, tfhers_2m165 }) |s| try s.validate();
     // DEFAULT: 8 rows · 512 coefficients · 2^9 · 2^32 = 2^53.
     try testing.expectEqual(@as(u32, 53), tfhers_default.preparedBoundLog2());
     try testing.expectEqual(@as(usize, 3 * 512), tfhers_default.bigDim());

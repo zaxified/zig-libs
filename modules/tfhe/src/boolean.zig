@@ -36,6 +36,7 @@
 //! client keeps `ClientKey` (the two secret keys).
 
 const std = @import("std");
+const entropy = @import("entropy");
 const torus = @import("torus.zig");
 
 const T = torus.Torus;
@@ -78,10 +79,94 @@ pub fn ClientKey(comptime F: type) type {
             return decode(F.lwePhase(F.lwe_dim, &self.lwe, ct));
         }
 
+        /// Encrypt a bit under the BIG key (the GLWE key read as an LWE key of
+        /// dimension `k·N`) — tfhe-rs's `EncryptionKeyChoice::Big`, the input
+        /// of `KsPbsServerKey`'s gates.
+        pub fn encryptBig(self: *const Self, b: bool, io: std.Io) F.LweBig {
+            var big = F.extractGlweKey(&self.glwe);
+            defer big.deinit();
+            return F.lweEncrypt(F.big_lwe_dim, &big, encode(b), io);
+        }
+
+        pub fn decryptBig(self: *const Self, ct: *const F.LweBig) bool {
+            var big = F.extractGlweKey(&self.glwe);
+            defer big.deinit();
+            return decode(F.lwePhase(F.big_lwe_dim, &big, ct));
+        }
+
         /// Wipe both keys.
         pub fn deinit(self: *Self) void {
             self.lwe.deinit();
             self.glwe.deinit();
+        }
+    };
+}
+
+/// Which secret key fresh ciphertexts are encrypted under — tfhe-rs's
+/// `EncryptionKeyChoice`. `small`: the LWE key, gates bootstrap then key-switch
+/// (`ServerKey`, PBS-KS). `big`: the GLWE key read as an LWE key, gates
+/// key-switch then bootstrap (`KsPbsServerKey`, KS-PBS).
+pub const EncryptionKeyChoice = enum { small, big };
+
+/// tfhe-rs's boolean `PublicKey`: `(dim + 1)·32 + 128` LWE encryptions of
+/// zero under the chosen key (`dim` = `n` for `small`, `k·N` for `big`), so a
+/// party without the client key can encrypt. Encryption sums a uniformly random
+/// binary subset of them and adds the encoded bit to the body; the noise grows
+/// by `√(count/2)` over a fresh encryption, which the gate bootstrap removes.
+/// The count is tfhe-rs's `(n+1)·log2 q + 128` (leftover-hash bound for the
+/// random subset sum, `q = 2^32`). Public data: nothing in it is secret.
+pub fn PublicKey(comptime F: type, comptime choice: EncryptionKeyChoice) type {
+    return struct {
+        const Self = @This();
+        pub const dim: usize = switch (choice) {
+            .small => F.lwe_dim,
+            .big => F.big_lwe_dim,
+        };
+        pub const Ciphertext = F.Lwe(dim);
+        pub const zero_encryption_count: usize = (dim + 1) * 32 + 128;
+
+        zeros: []Ciphertext,
+
+        /// The zero encryptions under `client`'s key, from `io`'s CSPRNG.
+        pub fn generate(allocator: Allocator, client: *const ClientKey(F), io: std.Io) Allocator.Error!Self {
+            const zeros = try allocator.alloc(Ciphertext, zero_encryption_count);
+            switch (choice) {
+                .small => for (zeros) |*z| {
+                    z.* = F.lweEncrypt(dim, &client.lwe, 0, io);
+                },
+                .big => {
+                    var big = F.extractGlweKey(&client.glwe);
+                    defer big.deinit();
+                    for (zeros) |*z| z.* = F.lweEncrypt(dim, &big, 0, io);
+                },
+            }
+            return .{ .zeros = zeros };
+        }
+
+        pub fn deinit(self: *Self, allocator: Allocator) void {
+            allocator.free(self.zeros);
+            self.* = undefined;
+        }
+
+        /// Encrypt a bit with the public key: the subset is drawn from `io`'s
+        /// CSPRNG (it is this encryption's randomness) and selected with a
+        /// mask, never a branch.
+        pub fn encrypt(self: *const Self, b: bool, io: std.Io) Ciphertext {
+            var src: entropy.SecureSource = .{ .io = io };
+            return self.encryptWith(b, src.interface());
+        }
+
+        fn encryptWith(self: *const Self, b: bool, random: std.Random) Ciphertext {
+            var ct = F.lweTrivial(dim, encode(b));
+            var word: u64 = 0;
+            for (self.zeros, 0..) |*z, i| {
+                if (i % 64 == 0) word = random.int(u64);
+                const m: T = 0 -% @as(T, @truncate(word & 1));
+                word >>= 1;
+                for (&ct.a, z.a) |*o, x| o.* +%= x & m;
+                ct.b +%= z.b & m;
+            }
+            return ct;
         }
     };
 }
@@ -179,6 +264,79 @@ pub fn ServerKey(comptime F: type) type {
             const u2_ = self.bsk.bootstrapBig(&sign_lut, &rhs);
             const big = F.lweAddConstant(F.big_lwe_dim, &F.lweAdd(F.big_lwe_dim, &u1_, &u2_), 1 << 29);
             return F.keySwitch(&self.ksk, &big);
+        }
+    };
+}
+
+/// The same evaluation key, for ciphertexts under the BIG key (tfhe-rs's
+/// `EncryptionKeyChoice::Big`, e.g. `params.tfhers_default_ks_pbs`): each gate
+/// forms the same linear combination on the big ciphertexts, key-switches it to
+/// the small key, and bootstraps WITHOUT a key switch after, so its output is a
+/// fresh big ciphertext again (KS-PBS). The keys are `ServerKey`'s: the
+/// bootstrap key (small → GLWE) and the key-switch key (big → small) serve both
+/// orders. `mux` bootstraps `c AND a` and `¬c AND b` and adds `+q/8`.
+pub fn KsPbsServerKey(comptime F: type) type {
+    return struct {
+        const Self = @This();
+        const B = F.big_lwe_dim;
+        keys: ServerKey(F),
+
+        pub fn generate(allocator: Allocator, client: *const ClientKey(F), io: std.Io) Allocator.Error!Self {
+            return .{ .keys = try ServerKey(F).generate(allocator, client, io) };
+        }
+
+        /// Takes ownership of `keys`.
+        pub fn fromServerKey(keys: ServerKey(F)) Self {
+            return .{ .keys = keys };
+        }
+
+        pub fn deinit(self: *Self, allocator: Allocator) void {
+            self.keys.deinit(allocator);
+        }
+
+        pub fn trivial(b: bool) F.LweBig {
+            return F.lweTrivial(B, encode(b));
+        }
+
+        /// Key switch, then bootstrap the sign to a fresh big `±q/8`.
+        fn sign(self: *const Self, ct: *const F.LweBig) F.LweBig {
+            const small = F.keySwitch(&self.keys.ksk, ct);
+            return self.keys.bsk.bootstrapBig(&ServerKey(F).sign_lut, &small);
+        }
+
+        fn lin(c: T, k: T, x: *const F.LweBig, y: *const F.LweBig) F.LweBig {
+            const s = F.lweScalarMul(B, &F.lweAdd(B, x, y), k);
+            return F.lweAddConstant(B, &s, c);
+        }
+
+        pub fn @"and"(self: *const Self, a: *const F.LweBig, b: *const F.LweBig) F.LweBig {
+            return self.sign(&lin(false_value, 1, a, b));
+        }
+        pub fn nand(self: *const Self, a: *const F.LweBig, b: *const F.LweBig) F.LweBig {
+            return self.sign(&lin(true_value, 0 -% @as(T, 1), a, b));
+        }
+        pub fn @"or"(self: *const Self, a: *const F.LweBig, b: *const F.LweBig) F.LweBig {
+            return self.sign(&lin(true_value, 1, a, b));
+        }
+        pub fn nor(self: *const Self, a: *const F.LweBig, b: *const F.LweBig) F.LweBig {
+            return self.sign(&lin(false_value, 0 -% @as(T, 1), a, b));
+        }
+        pub fn xor(self: *const Self, a: *const F.LweBig, b: *const F.LweBig) F.LweBig {
+            return self.sign(&lin(1 << 30, 2, a, b));
+        }
+        pub fn xnor(self: *const Self, a: *const F.LweBig, b: *const F.LweBig) F.LweBig {
+            return self.sign(&lin(0xC000_0000, 0 -% @as(T, 2), a, b));
+        }
+        pub fn not(a: *const F.LweBig) F.LweBig {
+            return F.lweNeg(B, a);
+        }
+        pub fn mux(self: *const Self, c: *const F.LweBig, a: *const F.LweBig, b: *const F.LweBig) F.LweBig {
+            const lhs = lin(false_value, 1, c, a); // c AND a
+            const nc = F.lweNeg(B, c);
+            const rhs = lin(false_value, 1, &nc, b); // ¬c AND b
+            const u1_ = self.sign(&lhs);
+            const u2_ = self.sign(&rhs);
+            return F.lweAddConstant(B, &F.lweAdd(B, &u1_, &u2_), true_value);
         }
     };
 }
@@ -324,4 +482,112 @@ test "mutation: ServerKey.generate and fromKeys free everything when an allocati
     const ksk = try Small.keySwitchKeyGen(testing.allocator, &ck.glwe, &ck.lwe, io);
     var fb = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(error.OutOfMemory, Small.ServerKey.fromKeys(fb.allocator(), &bsk, ksk));
+}
+
+test "public key: encryptions decrypt and feed the gates (small and big key)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ck = Small.ClientKey.generate(io);
+    defer ck.deinit();
+    var sk = try Small.ServerKey.generate(testing.allocator, &ck, io);
+    defer sk.deinit(testing.allocator);
+    const PK = PublicKey(Small, .small);
+    try testing.expectEqual(@as(usize, 17 * 32 + 128), PK.zero_encryption_count);
+    var pk = try PK.generate(testing.allocator, &ck, io);
+    defer pk.deinit(testing.allocator);
+    for (0..4) |it| {
+        const a = it & 1 == 1;
+        const b = it & 2 == 2;
+        const ca = pk.encrypt(a, io);
+        const cb = pk.encrypt(b, io);
+        try testing.expectEqual(a, ck.decrypt(&ca));
+        try testing.expectEqual(a != b, ck.decrypt(&sk.xor(&ca, &cb)));
+        try testing.expectEqual(a and b, ck.decrypt(&sk.@"and"(&ca, &cb)));
+    }
+    // Two encryptions of the same bit differ (the subset is random).
+    const x = pk.encrypt(true, io);
+    const y = pk.encrypt(true, io);
+    try testing.expect(!std.mem.eql(T, &x.a, &y.a));
+
+    const PKB = PublicKey(Small, .big);
+    try testing.expectEqual(@as(usize, (2 * 64 + 1) * 32 + 128), PKB.zero_encryption_count);
+    var pkb = try PKB.generate(testing.allocator, &ck, io);
+    defer pkb.deinit(testing.allocator);
+    for ([_]bool{ false, true }) |bit| try testing.expectEqual(bit, ck.decryptBig(&pkb.encrypt(bit, io)));
+}
+
+test "KS-PBS (EncryptionKeyChoice::Big): every gate's truth table on big-key ciphertexts" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ck = Small.ClientKey.generate(io);
+    defer ck.deinit();
+    const K = KsPbsServerKey(Small);
+    var sk = try K.generate(testing.allocator, &ck, io);
+    defer sk.deinit(testing.allocator);
+    for (0..2) |round| {
+        for (0..4) |it| {
+            const a = it & 1 == 1;
+            const b = it & 2 == 2;
+            const ca = if (round == 0) ck.encryptBig(a, io) else K.trivial(a);
+            const cb = if (round == 0) ck.encryptBig(b, io) else K.trivial(b);
+            try testing.expectEqual(a, ck.decryptBig(&ca));
+            try testing.expectEqual(a and b, ck.decryptBig(&sk.@"and"(&ca, &cb)));
+            try testing.expectEqual(!(a and b), ck.decryptBig(&sk.nand(&ca, &cb)));
+            try testing.expectEqual(a or b, ck.decryptBig(&sk.@"or"(&ca, &cb)));
+            try testing.expectEqual(!(a or b), ck.decryptBig(&sk.nor(&ca, &cb)));
+            try testing.expectEqual(a != b, ck.decryptBig(&sk.xor(&ca, &cb)));
+            try testing.expectEqual(a == b, ck.decryptBig(&sk.xnor(&ca, &cb)));
+            try testing.expectEqual(!a, ck.decryptBig(&K.not(&ca)));
+            for ([_]bool{ false, true }) |c| {
+                const cc = ck.encryptBig(c, io);
+                try testing.expectEqual(if (c) a else b, ck.decryptBig(&sk.mux(&cc, &ca, &cb)));
+            }
+        }
+    }
+    // Gates compose: (a XOR b) AND c, three levels deep through fresh outputs.
+    const t = sk.xor(&ck.encryptBig(true, io), &ck.encryptBig(false, io));
+    const u = sk.@"and"(&t, &ck.encryptBig(true, io));
+    try testing.expect(ck.decryptBig(&sk.@"or"(&u, &K.trivial(false))));
+}
+
+test "at tfhe-rs's sets: KS-PBS gates under DEFAULT_PARAMETERS_KS_PBS, public-key inputs under DEFAULT_PARAMETERS" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        const F = tfhe.Tfhe(params.tfhers_default_ks_pbs);
+        var ck = F.ClientKey.generate(io);
+        defer ck.deinit();
+        var sk = try F.KsPbsServerKey.generate(testing.allocator, &ck, io);
+        defer sk.deinit(testing.allocator);
+        for (0..4) |it| {
+            const a = it & 1 == 1;
+            const b = it & 2 == 2;
+            const ca = ck.encryptBig(a, io);
+            const cb = ck.encryptBig(b, io);
+            const x = sk.xor(&ca, &cb);
+            try testing.expectEqual(a != b, ck.decryptBig(&x));
+            try testing.expectEqual(!(a != b) or a, ck.decryptBig(&sk.@"or"(&F.KsPbsServerKey.not(&x), &ca)));
+        }
+    }
+    {
+        const F = tfhe.Tfhe(params.tfhers_default);
+        var ck = F.ClientKey.generate(io);
+        defer ck.deinit();
+        var sk = try F.ServerKey.generate(testing.allocator, &ck, io);
+        defer sk.deinit(testing.allocator);
+        var pk = try F.PublicKey.generate(testing.allocator, &ck, io);
+        defer pk.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 806 * 32 + 128), F.PublicKey.zero_encryption_count);
+        for (0..4) |it| {
+            const a = it & 1 == 1;
+            const b = it & 2 == 2;
+            const ca = pk.encrypt(a, io);
+            const cb = pk.encrypt(b, io);
+            try testing.expectEqual(a, ck.decrypt(&ca));
+            try testing.expectEqual(a and b, ck.decrypt(&sk.@"and"(&ca, &cb)));
+        }
+    }
 }

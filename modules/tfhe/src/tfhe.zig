@@ -398,6 +398,12 @@ pub fn Tfhe(comptime P: params.Params) type {
         pub const ClientKey = boolean.ClientKey(Self);
         /// The evaluation key and the binary gates (`boolean.zig`).
         pub const ServerKey = boolean.ServerKey(Self);
+        /// tfhe-rs's boolean public key, under the small key (`boolean.zig`).
+        pub const PublicKey = boolean.PublicKey(Self, .small);
+        /// The public key under the big key (`EncryptionKeyChoice::Big`).
+        pub const PublicKeyBig = boolean.PublicKey(Self, .big);
+        /// The gates for big-key ciphertexts, key switch before bootstrap.
+        pub const KsPbsServerKey = boolean.KsPbsServerKey(Self);
         /// Byte encodings of keys and ciphertexts (`codec.zig`).
         pub const Codec = codec.Codec(Self);
 

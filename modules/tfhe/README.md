@@ -48,6 +48,15 @@ const result = client.decrypt(&d);
 
 // Bytes: F.Codec.writeServerKey / readServerKey, writeLwe / readLwe, … — the
 // payload is tfhe-rs's container order; the header refuses other parameters.
+
+// A third party encrypts with the public key (no client secret needed).
+var pk = try F.PublicKey.generate(gpa, &client, io);
+defer pk.deinit(gpa);
+const e = pk.encrypt(true, io);
+
+// tfhe-rs's EncryptionKeyChoice::Big (key switch before bootstrap):
+// G = tfhe.Tfhe(tfhe.params.tfhers_default_ks_pbs); G.KsPbsServerKey's gates take
+// client.encryptBig(...) ciphertexts and return big ones (client.decryptBig).
 ```
 
 `example/main.zig` runs a three-input policy circuit end to end with the key

@@ -35,7 +35,7 @@ First surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`. **Re-surveyed 2026-10-05** a
 
 **Yardstick.** This module describes itself as TFHE *gate bootstrapping*, so Scope is judged against tfhe-rs's `boolean` API and TFHE-lib — the gate-level libraries — not against tfhe-rs as a whole. A user who wants encrypted integers (`FheUint32 + FheUint32`) wants tfhe-rs's `integer`/high-level layer; against that yardstick this module is a building block (programmable bootstrapping is public, `testPolynomial` takes multi-bit LUTs, but there is no shortint/integer arithmetic) and would rate below mvp. That layer is filed under Backlog as a scope extension, not counted as a gap in this module's main use case.
 
-**Where we are ahead:** the only implementation here that is **byte-compatible with tfhe-rs** in both directions — tfhe-rs decrypts this module's ciphertexts and runs its own `ServerKey` on this module's bootstrap and key-switch keys, and the bootstrap and key switch are byte-identical to tfhe-rs's on the same inputs (`interop_test.zig`, `tools/tfhers`) — so a Zig client can talk to a tfhe-rs server. Exact integer NTT instead of a floating-point FFT (no rounding error in the evaluation path, deterministic output); constant time measured under ctgrind (every in-file count 0) rather than asserted; a fail-closed typed entropy seam; pure Zig with no C — zig-tfhe, the only other Zig TFHE, needs a C compiler and states no interop, anchor or constant-time property. **Where we are even:** the whole of the tfhe-rs `boolean` user flow as its docs describe it — key generation with tfhe-rs's three boolean parameter sets (128-bit, `2^-64`/`2^-165` failure), client-side encrypt/decrypt, trivial ciphertexts, NOT/AND/NAND/OR/NOR/XOR/XNOR/MUX with unbounded depth, user-defined parameters (`Params` is an open struct), and keys/ciphertexts to and from bytes — and TFHE-lib's gate set. **Where we are behind (→ Backlog):** speed — ≈ 0.25 s per gate, expected well behind tfhe-rs (not measured here) and ≈ 6× zig-tfhe's own claimed figure on different hardware, with no multi-threaded batch evaluation; no public-key encryption (tfhe-rs `boolean::PublicKey`, zig-tfhe); our byte format is not tfhe-rs's bincode/versioned serialisation (same container order, different envelope); no compressed (seeded) server key; only `EncryptionKeyChoice::Small`. None of these blocks the client/server gate flow; the speed gap is the one a user will feel first.
+**Where we are ahead:** the only implementation here that is **byte-compatible with tfhe-rs** in both directions — tfhe-rs decrypts this module's ciphertexts and runs its own `ServerKey` on this module's bootstrap and key-switch keys, and the bootstrap and key switch are byte-identical to tfhe-rs's on the same inputs (`interop_test.zig`, `tools/tfhers`) — so a Zig client can talk to a tfhe-rs server. Exact integer NTT instead of a floating-point FFT (no rounding error in the evaluation path, deterministic output); constant time measured under ctgrind (every in-file count 0) rather than asserted; a fail-closed typed entropy seam; pure Zig with no C — zig-tfhe, the only other Zig TFHE, needs a C compiler and states no interop, anchor or constant-time property. **Where we are even:** the whole of the tfhe-rs `boolean` user flow as its docs describe it — key generation with tfhe-rs's three boolean parameter sets (128-bit, `2^-64`/`2^-165` failure), client-side encrypt/decrypt, trivial ciphertexts, NOT/AND/NAND/OR/NOR/XOR/XNOR/MUX with unbounded depth, user-defined parameters (`Params` is an open struct), and keys/ciphertexts to and from bytes — and TFHE-lib's gate set. **Where we are behind (→ Backlog):** speed — ≈ 0.25 s per gate, expected well behind tfhe-rs (not measured here) and ≈ 6× zig-tfhe's own claimed figure on different hardware, with no multi-threaded batch evaluation; our byte format is not tfhe-rs's bincode/versioned serialisation (same container order, different envelope); no compressed (seeded) server key. Public-key encryption (`PublicKey`, `PublicKeyBig`) and `EncryptionKeyChoice::Big` (`KsPbsServerKey`, `params.tfhers_default_ks_pbs`) follow tfhe-rs's construction and constants but have no tfhe-rs interop vectors yet. None of these blocks the client/server gate flow; the speed gap is the one a user will feel first.
 
 ## What this module is
 
@@ -114,6 +114,27 @@ well ahead per gate, but that gap is not measured in this repo; closing it is ba
 samplers read entropy a polynomial at a time (one `fillFn` call per polynomial, the same bytes as the per-sample
 form), because through `entropy.SecureSource` every `fillFn` call is a `getrandom(2)`.
 
+## Public key and the key choice
+
+- **Public key** (`boolean.PublicKey(F, choice)`, `F.PublicKey`/`F.PublicKeyBig`):
+  tfhe-rs's boolean `PublicKey` construction — `(dim + 1)·32 + 128` LWE
+  encryptions of zero under the chosen key (`dim = n` or `k·N`; tfhe-rs's
+  `(n+1)·log2 q + 128` with `q = 2^32`, the count that makes the random binary
+  subset sum statistically close to uniform). `encrypt` draws one bit per zero
+  encryption from the CSPRNG, adds the selected ones with a mask (no branch on
+  the bit) and adds the encoded message to the body. The noise is the sum of
+  about `count/2` fresh errors, `√(count/2)` times a fresh one (≈ 114× at
+  `tfhers_default`: still under `q/8` by two orders of magnitude, and every
+  gate bootstraps it away). At `tfhers_default` the key is ~83 MB.
+- **`EncryptionKeyChoice::Big`** (`boolean.EncryptionKeyChoice`,
+  `KsPbsServerKey`, `ClientKey.encryptBig`/`decryptBig`): fresh ciphertexts
+  under the GLWE key read as an LWE key of dimension `k·N` (GLWE noise); each
+  gate forms the same linear combination, key-switches to the small key, then
+  bootstraps without a key switch after (KS-PBS), so outputs are big again.
+  `mux` bootstraps both halves and adds `+q/8`. The keys are `ServerKey`'s.
+  `params.tfhers_default_ks_pbs` is tfhe-rs 1.8.1's
+  `DEFAULT_PARAMETERS_KS_PBS` (constants from its documentation).
+
 ## Error sampling
 
 `toy` keeps the uniform error (bounded, `σ = bound/√3`). The tfhe-rs sets use
@@ -174,6 +195,10 @@ ledger is in `params.zig` (`erfc ≈ 48`, correctness only, no security).
 
 GPU/HPU backends, ZK proofs of encryption and C/WASM bindings: CONVENTIONS.md §2 (pure Zig, no C).
 
+A parameter-selection helper driven by a lattice estimate: tfhe-rs (the reference) ships fixed, pre-estimated
+sets and no chooser, and a lattice estimator is a research tool (Sage/Python) of its own; `Params` stays an open
+struct for user-defined sets, as tfhe-rs's `BooleanParameters`.
+
 ## Verification
 
 - **Run:** `scripts/modtest tfhe` (the module is `heavy`); `TFHE_BENCH=1` additionally runs the benchmarks in a
@@ -184,6 +209,9 @@ GPU/HPU backends, ZK proofs of encryption and C/WASM bindings: CONVENTIONS.md §
   core.
 - **Differential tests**: prepared vs reference external product and bootstrap (bit for bit, arbitrary GLWE inputs);
   bulk vs per-sample samplers.
+- **Public key and KS-PBS**: public-key encryptions decrypt and feed the gates (small and big key), two encryptions
+  of one bit differ; every KS-PBS gate's truth table on big-key ciphertexts; at tfhe-rs's sets, KS-PBS gates under
+  `tfhers_default_ks_pbs` and public-key inputs to the gates under `tfhers_default`.
 - **Homomorphic properties**: every gate's truth table on encrypted and trivial inputs, a 4-bit ripple-carry adder
   40 gates deep (`src/boolean.zig`), an unlimited-depth bootstrap chain, a corrupted-bootstrap-key control, the
   noise budget.
@@ -213,16 +241,14 @@ GPU/HPU backends, ZK proofs of encryption and C/WASM bindings: CONVENTIONS.md §
 
 Against the tfhe-rs `boolean` yardstick, missing and it matters:
 
-1. **Speed**: ≈ 0.25 s per gate, ~20× behind tfhe-rs and behind zig-tfhe's claimed ≈ 40 ms. Candidates: a vectorised NTT, a 32-bit-friendly NTT prime pair, keeping the accumulator in the transform domain across CMux steps, and multi-threaded evaluation of independent gates (through `std.Io`). Medium–large. The gap a user notices first.
-2. **Public-key encryption** (tfhe-rs `boolean::PublicKey`, also in zig-tfhe): lets a third party encrypt inputs without the client key — an LWE public key of encryptions of zero, plus the security bookkeeping for its size. Small–medium.
-3. **tfhe-rs's own serialisation** (bincode + `tfhe-versionable`), so files, not only raw containers, can be exchanged with a tfhe-rs program. Today a bridge must re-wrap `codec.zig` payloads. Medium.
-4. **Seeded (compressed) keys**: tfhe-rs ships keys whose masks are a CSPRNG seed, ~`(k+1)×` smaller (this module's `tfhers_default` server key is ~78 MB). Needs tfhe-rs's CSPRNG reproduced. Medium.
-5. **`EncryptionKeyChoice::Big`** (ciphertexts under the big key, key switch before PBS: tfhe-rs's `DEFAULT_PARAMETERS_KS_PBS`). Small.
+1. **Speed**: ≈ 0.25 s per gate, ~20× behind tfhe-rs and behind zig-tfhe's claimed ≈ 40 ms. Candidates: a vectorised NTT, a 32-bit-friendly NTT prime pair, keeping the accumulator in the transform domain across CMux steps, and multi-threaded evaluation of independent gates (through `std.Io`). Medium–large. The gap a user notices first. Needs A/B numbers on a quiet host.
+2. **tfhe-rs's own serialisation** (bincode + `tfhe-versionable`), so files, not only raw containers, can be exchanged with a tfhe-rs program. Today a bridge must re-wrap `codec.zig` payloads. Medium.
+3. **Seeded (compressed) keys**: tfhe-rs ships keys whose masks are a CSPRNG seed, ~`(k+1)×` smaller (this module's `tfhers_default` server key is ~78 MB). Needs tfhe-rs's CSPRNG reproduced. Medium.
+4. **tfhe-rs interop vectors for the public key and KS-PBS**: `tools/tfhers` does not yet emit `PublicKey` encryptions or `DEFAULT_PARAMETERS_KS_PBS` keys/gates; both are checked here only for self-consistency. Small.
 
-Scope extension, not a gap in this module's main use case:
+## Roadmap
 
-- **Integer arithmetic** on top of programmable bootstrapping (tfhe-rs `shortint`/`integer`: multi-bit messages with carry space, radix/CRT decomposition, carry propagation, comparison) and multi-value / larger-precision LUTs — what most tfhe-rs users call. Large; would be judged against tfhe-rs's `integer` API, against which this module is currently below mvp.
-- **A parameter-selection helper** driven by a lattice estimate, for sets tfhe-rs does not ship. Medium.
+- **Integer arithmetic** on top of programmable bootstrapping (tfhe-rs `shortint`/`integer`: multi-bit messages with carry space, radix/CRT decomposition, carry propagation, comparison) and multi-value / larger-precision LUTs — what most tfhe-rs users call. Would be judged against tfhe-rs's `integer` API, against which this module is currently below mvp. Project-size: a new layer (message/carry encoding, LUT library, radix arithmetic) with its own interop vectors.
 
 ## Anchoring
 

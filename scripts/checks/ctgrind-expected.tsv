@@ -1171,11 +1171,11 @@ fss	ReleaseFast	eval	1	0	04a4f7caf30f2695	da79011b1ab46d96
 bfv	ReleaseFast	keygen	1	<=29	b5e0aaa8f81c3991	85d334608120f4fc
 bfv	ReleaseFast	encrypt	1	<=17	b5e0aaa8f81c3991	e4cdbb1aa2e9c9dc
 bfv	ReleaseFast	decrypt	1	<=6	b5e0aaa8f81c3991	51de1d1011ed3c4c
-tfhe	ReleaseFast	keygen	1	0	52995b82893a8a80	69d480284dbfd7e8
-tfhe	ReleaseFast	encrypt	1	0	52995b82893a8a80	01f895b45b944863
-tfhe	ReleaseFast	decrypt	1	0	f5995c509b5d9a4a	3d8c08984d3541f6
-tfhe	ReleaseFast	bootstrap	1	0	2afa12ddb03ebe64	88cf61492d6e15bc
-tfhe	ReleaseFast	noise	1	0	670ec10adfaeb9ff	57f844d8aeb1660a
+tfhe	ReleaseFast	keygen	1	0	8c530e4dfed31d2e	69d480284dbfd7e8
+tfhe	ReleaseFast	encrypt	1	0	8c530e4dfed31d2e	01f895b45b944863
+tfhe	ReleaseFast	decrypt	1	0	8606c3d979962240	3d8c08984d3541f6
+tfhe	ReleaseFast	bootstrap	1	0	34dd87f02fc527de	88cf61492d6e15bc
+tfhe	ReleaseFast	noise	1	0	bf2fd88be74b1e41	57f844d8aeb1660a
 # dkg -- the module makes no constant-time claim (see its ctgrind_harness.zig);
 # these rows are measurements, kept so a change in them is seen. Re-measured
 # 2026-10-02 after the participant layer and GJKR step 4 (ba92d6fc, a528d9fa):
