@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** a pilot for `probe` (`LiveConnector` + `IoSleeper` against simulated targets) joins the pilots; `probe` is a new test dependency.
 - **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** a pilot for `opcua` (server `Connection` driven by the pilot's own loop, client `SecureChannel` and `Session`, under loss, duplication and partitions) joins the pilots; `opcua` is a new test dependency.
 - **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** a pilot for `s7comm` (client and responder under loss, duplication and partitions) joins the pilots; `s7comm` is a new test dependency.
 - **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** a pilot for `iec61850` (MMS client and server under loss, duplication and partitions) joins the pilots; `iec61850` is a new test dependency.

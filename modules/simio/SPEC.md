@@ -226,11 +226,17 @@ Run `scripts/modtest simio` (loopback-dependent tests skip where binding is unav
   fingerprint and `Case.digest`; a failing root task is a violation naming its host.
 - **Differential oracle** (`src/oracle_tests.zig`): see *Anchoring*.
 - **Pilots** (`src/pilots/`): real modules run on simio, each with a deliberately broken variant that must
-  trip: `sntp`, `dns`, `mqtt`, `ssh`, `kv`, `http` (client and server), `icmp`, `staticfiles`, and
+  trip: `sntp`, `dns`, `mqtt`, `ssh`, `kv`, `http` (client and server), `icmp`, `staticfiles`, `iec104`,
+  `iec61850`, `s7comm` and `opcua` (a client or master that must converge on the process after an outage, and
+  the one that never reconnects), `probe` (classification, round trip and the budget of `LiveConnector`), and
   `timeouts` (when the timeouts of `modbus`, `whois`, `stun`, `ocspcache` and `llmclient` fire, in virtual
   time). A pilot is a `test_dep` consumer here, not a test in the piloted module: most piloted modules
   also target 32-bit Linux, where `std.Io.fiber` does not exist. The piloted modules keep their own
-  loopback tests (the real-kernel half); what moved is the timing those cannot assert.
+  loopback tests (the real-kernel half); what moved is the timing those cannot assert. `opcua`'s own test
+  driver (`server_interop.zig`) is such a real-kernel half: it polls the kernel for the live third-party
+  clients, while the library underneath (`Connection`, `SecureChannel`, `Session`) has no raw syscall and runs
+  in the pilot under a loop of the pilot's own. `probe`'s `probeMany` fans out over OS threads, so a pilot
+  drives `probeTarget` from a simulated host instead.
 - **Mutation:** schemata over `sched.zig`, `net.zig`, `fs.zig` and `search.zig`; the card's `**Audit:**`
   line is the current score.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
@@ -248,11 +254,7 @@ Run `scripts/modtest simio` (loopback-dependent tests skip where binding is unav
 
 ## Backlog / deferred
 
-- **Six modules out of simio's reach:** `fleetsim`, `probe`, `iec104`, `iec61850`, `s7comm` and `opcua`
-  poll or sleep with raw syscalls (`poll`, `clock_gettime`, `nanosleep`) instead of `std.Io`, so their timing
-  cannot be simulated. Each needs its socket waits and clocks moved behind the `Io` it is given — the same
-  change `sntp`, `mqtt` and the `http` Server got for their pilots — and then a pilot in `src/pilots/`. Their
-  loopback tests stay as the real-kernel half.
+None open.
 
 
 ## Anchoring

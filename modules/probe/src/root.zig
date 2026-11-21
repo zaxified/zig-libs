@@ -545,6 +545,11 @@ fn monoNs() u64 {
     return clock_lib.monotonicNs();
 }
 
+/// The monotonic clock of `io`: a simulated `Io` has its own virtual time.
+fn ioNs(io: std.Io) u64 {
+    return @intCast(@max(std.Io.Timestamp.now(io, .awake).nanoseconds, 0));
+}
+
 /// Classify a *successful* connect against the caller's budget. Shared by
 /// both live connectors, for two different reasons.
 ///
@@ -586,6 +591,13 @@ fn overBudget(rtt: u64, timeout_ns: u64) ConnectOutcome {
 /// still needed by both connectors.
 pub const LiveConnector = struct {
     io: std.Io,
+    /// Pass the attempt's budget to the connect itself (`ConnectOptions.timeout`),
+    /// so a connect that gets no answer ends at the budget as `.timeout`. Only for
+    /// an `Io` that implements connect timeouts -- a simulated one does;
+    /// `std.Io.Threaded` panics on any timeout (see above), which is why this is
+    /// off by default. The round trip is read from `io`'s own monotonic clock
+    /// either way.
+    bounded: bool = false,
 
     pub fn connector(self: *LiveConnector) Connector {
         return .{ .ctx = self, .connectFn = connectImpl };
@@ -594,9 +606,13 @@ pub const LiveConnector = struct {
     fn connectImpl(ctx: *anyopaque, target: Target, timeout_ns: u64) ConnectOutcome {
         const self: *LiveConnector = @ptrCast(@alignCast(ctx));
         const io = self.io;
-        const copts: net.IpAddress.ConnectOptions = .{ .mode = .stream };
+        var copts: net.IpAddress.ConnectOptions = .{ .mode = .stream };
+        if (self.bounded and timeout_ns != 0) copts.timeout = .{ .duration = .{
+            .raw = .fromNanoseconds(timeout_ns),
+            .clock = .awake,
+        } };
 
-        const start = monoNs();
+        const start = ioNs(io);
         const literal = netaddr.parseIp(target.host);
         var stream: net.Stream = blk: {
             if (literal != null) {
@@ -612,7 +628,7 @@ pub const LiveConnector = struct {
                 return .{ .status = .@"error" };
             break :blk host_name.connect(io, target.port, copts) catch |e| return classifyErr(e);
         };
-        const rtt: u64 = monoNs() -| start;
+        const rtt: u64 = ioNs(io) -| start;
         stream.close(io);
         var out = overBudget(rtt, timeout_ns);
         if (out.status == .up) out.addr = literal;

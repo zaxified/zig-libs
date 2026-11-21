@@ -201,7 +201,7 @@ lookup that alone exceeds the budget returns `.timeout` without connecting — w
 mode. `LiveConnector` on `timeout_ns`: **advisory** for a different reason — `std.Io.Threaded`
 panics if a connect timeout is passed, so the attempt blocks for the OS default (measured 134 367 ms
 for a 200 ms budget) and only the result respects the budget. That is a property of that backend,
-not a reason for `probe` to be unbounded; `PosixConnector` is the answer. Out of scope: UDP/ICMP
+not a reason for `probe` to be unbounded; `PosixConnector` is the answer. `LiveConnector.bounded = true` hands the budget to the connect for an `Io` that implements connect timeouts (a simulated one does), which makes the wall clock exact there; it is off by default because `std.Io.Threaded` panics on a timeout. Out of scope: UDP/ICMP
 probing, banner grabbing, TLS/protocol handshakes, port-range sweeping, IPv6 zone/scope ids (see
 *What is deliberately not done*). There is no total-time cap across `LiveConnector`'s OS connect timeout,
 `Options.interval` and `timeout_ms`: they are documented knobs, bounded individually.
