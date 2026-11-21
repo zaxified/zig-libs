@@ -37,7 +37,7 @@ comparators, which are built from the Go module cache and never vendored.
 | `CircuitBreaker` | `closed → open → half_open` on **consecutive** failures, fast-fail, probes (k of n), `forceOpen`/`disable`/`reset`, state listener, `counts()` | an injected `Clock` |
 | `RateCircuitBreaker(n)` | the same machine tripping on the failure **rate** / slow-call rate over the last `n` calls or `n` time buckets | an injected `Clock` |
 | `Bulkhead` | ≤ `max_concurrent` calls in flight; full = `error.BulkheadFull` (or a bounded wait) | injected `Clock`/`Delay` only for the bounded wait |
-| `Retry` | pure backoff math: `nextDelay(attempt, random)` (or `nextDelayFrom(attempt, bits)`), full / equal / proportional jitter, a total time budget | a seeded `std.Random` (or random bits) for jitter |
+| `Retry` | pure backoff math: `nextDelay(attempt, random)` (or `nextDelayFrom(attempt, bits)`), exponential / linear / custom `interval` schedule, full / equal / proportional jitter, a total time budget | a seeded `std.Random` (or random bits) for jitter |
 | `Deadline` | cooperative time budget (`expired()`/`remainingMs()`) | an injected `Clock` |
 | `run(op, policy)` | one-call composition: bulkhead → breaker → retry → timeout; error classification, retry on a result, `Retry-After`, an `on_retry` listener | all of the above, injected |
 

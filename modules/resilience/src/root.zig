@@ -1029,6 +1029,15 @@ pub const Jitter = enum {
     proportional,
 };
 
+/// The growth shape of the un-jittered retry delay (Polly's `DelayBackoffType`
+/// constant / linear / exponential; constant is `.exponential` with `factor = 1`).
+pub const Backoff = enum {
+    /// `base × factor^(attempt-1)` (the default).
+    exponential,
+    /// `base × attempt` (Polly linear); `factor` is ignored.
+    linear,
+};
+
 /// Retry policy — a pure value: `nextDelay` computes, the caller (or `run`)
 /// waits. Semantics follow resilience4j's `IntervalFunction` family
 /// (exponential backoff, cap, randomization) with the jitter flavors named
@@ -1042,6 +1051,13 @@ pub const Retry = struct {
     /// Exponential growth per attempt. Must be ≥ 1.0 and finite; anything
     /// else (NaN, negative, infinite) is a checked panic in every build mode.
     factor: f64 = 2.0,
+    /// Shape of the un-jittered schedule; `.exponential` by default.
+    backoff: Backoff = .exponential,
+    /// A caller-supplied schedule (resilience4j `IntervalFunction`, backon's
+    /// custom strategies): the delay in ms before jitter after failed attempt
+    /// `attempt` (1-based). When set it replaces `base_delay_ms` / `factor` /
+    /// `backoff`; the result is still capped at `max_delay_ms` and jittered.
+    interval: ?*const fn (attempt: u32) u64 = null,
     /// Upper bound on any single delay (applied before jitter, so it also
     /// bounds every jittered delay).
     max_delay_ms: u64 = 30_000,
@@ -1067,8 +1083,9 @@ pub const Retry = struct {
     retryable: *const fn (anyerror) bool = &retryAllErrors,
 
     /// Delay in ms to wait after failed attempt `attempt` (1-based: pass 1
-    /// after the first call failed). Exponential: `base × factor^(attempt-1)`,
-    /// capped at `max_delay_ms`, then jittered. Pure — same inputs, same
+    /// after the first call failed). Exponential by default: `base × factor^(attempt-1)`
+    /// (`.linear`: `base × attempt`; or the `interval` function), capped at
+    /// `max_delay_ms`, then jittered. Pure — same inputs, same
     /// output (for `.none`; jittered flavors draw from `random`).
     /// `random` may be null only with `.none` jitter — with a jittered
     /// flavor and no rng the delay deterministically falls back to the
@@ -1124,6 +1141,8 @@ pub const Retry = struct {
     /// The un-jittered exponential schedule (overflow-safe: anything that
     /// leaves f64's exact range lands on `max_delay_ms`).
     fn expDelayMs(r: Retry, attempt: u32) u64 {
+        if (r.interval) |f| return @min(f(attempt), r.max_delay_ms);
+        if (r.backoff == .linear) return @min(r.base_delay_ms *| attempt, r.max_delay_ms);
         // factor 2 (the default) in integers: `base << k` is exactly what
         // the f64 product below gives while it is under the cap, and no
         // `pow` (~2/3 of a delay's cost, bench 2026-10-16).
@@ -1970,6 +1989,27 @@ test "Retry.nextDelay: exponential progression capped at max_delay_ms (no jitter
     const constant: Retry = .{ .base_delay_ms = 250, .factor = 1.0, .max_delay_ms = 1000 };
     try testing.expectEqual(250, constant.nextDelay(1, null));
     try testing.expectEqual(250, constant.nextDelay(7, null));
+}
+
+fn testInterval(attempt: u32) u64 {
+    return 7 * attempt + 1;
+}
+
+test "Retry.nextDelay: linear backoff, a custom interval function and the cap (no jitter)" {
+    const lin: Retry = .{ .backoff = .linear, .base_delay_ms = 100, .max_delay_ms = 350, .jitter = .none };
+    try testing.expectEqual(@as(u64, 100), lin.nextDelay(1, null));
+    try testing.expectEqual(@as(u64, 200), lin.nextDelay(2, null));
+    try testing.expectEqual(@as(u64, 300), lin.nextDelay(3, null));
+    try testing.expectEqual(@as(u64, 350), lin.nextDelay(4, null));
+    try testing.expectEqual(@as(u64, 350), lin.nextDelay(std.math.maxInt(u32), null));
+    const cus: Retry = .{ .interval = &testInterval, .max_delay_ms = 20, .jitter = .none };
+    try testing.expectEqual(@as(u64, 8), cus.nextDelay(1, null));
+    try testing.expectEqual(@as(u64, 15), cus.nextDelay(2, null));
+    try testing.expectEqual(@as(u64, 20), cus.nextDelay(3, null));
+    // jitter still applies on top of a custom schedule
+    var prng = std.Random.DefaultPrng.init(1);
+    const j: Retry = .{ .interval = &testInterval, .jitter = .full };
+    for (0..50) |_| try testing.expect(j.nextDelay(2, prng.random()) <= 15);
 }
 
 test "Retry.nextDelay: jitter bounds and seeded determinism" {

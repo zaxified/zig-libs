@@ -47,7 +47,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `ignore` outcome, slow calls, a listener called outside the lock, `counts()`, and a
   type-erased `handle()` for `Policy.breaker`. `Bulkhead` (semaphore-style, ≤ `max_concurrent`
   in flight, `error.BulkheadFull` or a bounded poll-wait), `Retry` (pure `nextDelay` math —
-  exponential + cap + jitter, no I/O; `nextDelayFrom` takes the random bits directly),
+  exponential, linear or a caller function + cap + jitter, no I/O; `nextDelayFrom` takes the random bits directly),
   `Deadline` (cooperative `expired()`/`remainingMs()`). `run(op, policy)` composes
   `bulkhead → breaker → retry → timeout`, with `classify`, `on_retry`, `max_elapsed_ms` and the
   operation hooks `retryOnResult` / `retryAfterMs`. Clean-room; design references
@@ -145,17 +145,18 @@ card's Performance line carries the figures and is authoritative.
   thread; `state()` stays lazy.
 - **Registries** — global state; each upstream owns its `CircuitBreaker` / `Bulkhead` (see `upstream`).
 - **Thread-pool bulkhead** — lives in `workerpool`.
+- **Retry budgets and decorrelated jitter** — failsafe-go only / Polly only (resilience4j, the reference, has neither;
+  decorrelated jitter also needs the previous delay, so `nextDelay` would stop being pure).
+- **A delay computed from the result** (failsafe-go) — `retryAfterMs` on the operation already sees the last
+  result and replaces the schedule.
 
 ## Backlog / deferred
 
-- **Hedging / preemptive time limiter on top of `Io.Group`** — a later, separate layer once cancellation is
-  available; the module stays `Io`-free until then.
-- **Open delay from the result** (failsafe-go), **custom / linear interval functions**, **retry budgets**
-  (failsafe-go only), **decorrelated jitter** (stateful) — niche, nobody else ships all of them; no consumer asks.
 - **Whole-module mutation run over the current code** — the card's mutation entry is the run over the 2026-10-04
   code (34 mutants) with `src` not recorded; the code has since gained the rate breaker, the listener and the
   sweep fixes, which only the model harnesses (8 planted mutants) and a 13-mutant delta cover. A schemata run
   over the whole module is due.
+- **Hedging / preemptive time limiter on top of `Io.Group`** — BOUNCED, waits on `Io` cancellation; the module stays `Io`-free until then (see *What is deliberately not done*).
 
 ## Anchoring
 
