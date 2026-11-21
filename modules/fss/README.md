@@ -93,6 +93,13 @@ try D.Key.fromBytesTagged(&reloaded, &stored); // error.UnsupportedKeyFormat
 // SHA-256 instantiation (slower, constant-time on every target, and what the
 // recorded KAT vectors are stated over) stays available:
 const S = fss.DpfWith(fss.prg.Sha256Prg, 8, 4);
+
+// Distributed comparison: shares of beta·[x < alpha] (same seed contract).
+const C = fss.Dcf(16, 8);
+var ck: [2]C.Key = undefined;
+C.genWithSeeds(&alpha16, &beta64, &seed0, &seed1, &ck);
+const share = C.eval(0, &ck[0], x); // + C.eval(1, &ck[1], x) == beta·[x < alpha]
+// An interval [a, b): eval of Dcf(b)'s keys minus eval of Dcf(a)'s keys.
 ```
 
 ### Multi-point (`k` points at once)
@@ -188,8 +195,7 @@ the `firstMismatch` checker) are core-independent and prove the harness has teet
 
 ## Not provided
 
-Distributed comparison and interval functions, incremental (hierarchical) DPFs and non-`Z_{2^{8L}}` output groups are
-open (SPEC *Backlog / deferred*); sublinear (cuckoo) multi-point FSS and byte-exact interoperability with other DPF
+Incremental (hierarchical) DPFs and non-`Z_{2^{8L}}` output groups are open (SPEC *Backlog / deferred*); sublinear (cuckoo) multi-point FSS and byte-exact interoperability with other DPF
 libraries are refused (SPEC *What is deliberately not done*).
 
 Provenance: clean-room from the BGI16 paper (ACM CCS 2016); no third-party

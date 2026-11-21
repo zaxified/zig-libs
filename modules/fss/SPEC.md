@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [weikengchen/libdpf](https://github.com/weikengchen/libdpf) | C / Rust | none detected by the API (not verified) | 14 | push 2026-03-20 | "A template for 2-server 1-bit DPF" with hardware AES for x86_64 and ARM64. |
 | Zig ecosystem | Zig | — | — | — | No FSS or DPF in `std`; none found on GitHub (search 2026-09-30). Sibling `pir` builds two-server PIR on this module; there is no sibling for Prio / VDAF. |
 
-**Where we are ahead:** the only FSS/DPF found for Zig, and maintained where libfss (2018) and dpf-go (2021) are not; beyond point functions it has multi-point FSS (`Mpf`), tree-reuse prefix and range evaluation (`evalFull`, `evalRangeWith`, interleaved `evalEachFullWith`), two PRGs (fixed-key AES by default, SHA-256 kept as the anchor) with a tagged key format, KATs from an independent re-derivation, and a ctgrind-measured branch-free evaluator. **Where we are behind:** no distributed comparison or interval functions (Google's tree has `dcf/`, libfss offers comparison), no incremental/hierarchical DPF (the reference's headline feature), only the additive `Z_{2^{8L}}` output group, and no byte-exact interoperability with Google's keys (→ Backlog; the last is under *What is deliberately not done*).
+**Where we are ahead:** the only FSS/DPF found for Zig, and maintained where libfss (2018) and dpf-go (2021) are not; beyond point functions it has multi-point FSS (`Mpf`), tree-reuse prefix and range evaluation (`evalFull`, `evalRangeWith`, interleaved `evalEachFullWith`), two PRGs (fixed-key AES by default, SHA-256 kept as the anchor) with a tagged key format, KATs from an independent re-derivation, and a ctgrind-measured branch-free evaluator. It also has the distributed comparison function (`Dcf`, BCGIKRS21; intervals as the difference of two), which Google's tree (`dcf/`) and libfss offer. **Where we are behind:** no incremental/hierarchical DPF (the reference's headline feature), only the additive `Z_{2^{8L}}` output group, and no byte-exact interoperability with Google's keys (→ Backlog; the last is under *What is deliberately not done*).
 
 ## What this module is
 
@@ -205,6 +205,10 @@ a skip is never a pass.
    long-hand `H_2 ‖ H_3`; `convert(L)` is the low `L` bytes of `convert(32)` for every `L`; distinct format tags and
    tagged round trip (`dpf.zig`ff).
 
+7. **DCF** (`dcf.zig`): every point of every `α` of a 4-bit domain under both PRGs reconstructs `β·[x < α]`, plus
+   1-bit and 32-byte-group corners, random `(α, β)` over 10 bits, `β = 0`, an interval as the difference of two
+   DCFs, a single key's shares not collapsing to `0/1`, and the key codec round trip.
+
 - **Fuzz:** testkit's deterministic driver, `FSS_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`), harnesses
   `fss-dpf` and `fss-mpf`: generated key pairs reconstruct the point function through the byte codec, a wrong format
   tag is refused, a repeated `Mpf` seed is refused, and on arbitrary or damaged key bytes the tree-reuse walk equals
@@ -218,6 +222,22 @@ a skip is never a pass.
 - **Bench:** `FSS_BENCH=1 zig build test-fss -Doptimize=ReleaseFast` (`src/bench.zig`).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
+
+## Distributed comparison (`dcf.zig`)
+
+`Dcf(n, L)` shares `f^<_{α,β}(x) = β·[x < α]` over `{0,1}^n` into `Z_{2^{8L}}`: Boyle, Chandran, Gilboa,
+Gupta, Ishai, Kumar, Rathee, Eurocrypt 2021, Fig. 1, on the same GGM tree and PRG as `Dpf`. Each level adds a
+value correction word `V_cw`; the evaluator sums `(-1)^b·(v_x + t·V_cw)` down the path to `x` plus the DPF-style
+leaf term, and the corrections make the two sums differ by `β` exactly where the path to `x` turns left off the
+path to `α` (`x_i = 0 < α_i = 1`). The per-child values `v^L`, `v^R` come from a second expansion of the parent
+seed with its last byte XORed with `0x5a`, each child seed converted into the group — an input domain disjoint
+from the seed's own `expand` and from the leaf `convert`, so `v` is independent of the seeds the walk continues
+with (converting the child seed itself would equal the leaf's `Convert(s)` whenever the last control bit is 0).
+Keys are `seed || n·(s_cw ‖ V_cw ‖ t_cw_l ‖ t_cw_r) || cw_final`, `16 + n·(18 + L) + L` bytes, header-free like
+`Dpf`'s wire form. An interval `[a, b)` is `Dcf(b) − Dcf(a)` (the paper's §3.2). Every use of `α`, `β`, a seed
+or a control bit is a masked select (the `dpf.secretMask` barrier); the DCF has no ctgrind row yet. Not
+provided: Google's packed value-correction layout and its `DistributedComparisonFunction` key format (as for
+`Dpf`, see *What is deliberately not done*), and the DCF-based decision-tree functions.
 
 ## Multi-point FSS (`mpf.zig`)
 
@@ -530,10 +550,6 @@ does not observe `α` itself; for `α` the guarantee is by construction.
   codec (`dpf.zig`), per tree node in `convert`. Measure first (cycles + instructions 0.16 vs 0.17, or the
   share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative`
   (identical bytes, 8 instructions).
-- **Distributed comparison function (DCF) and interval functions** *(survey)*: the module doc names `dcf.zig` as the
-  reason it is called `fss` and not `dpf`. Google's tree has `dcf/`, libfss offers comparison; private analytics
-  (thresholds, histograms), secure ReLU/comparison in MPC ML, and range queries need it. Medium (BCGIKRS21, one bit of
-  extra state per level, reuses `prg` and `group`); general interval and decision-tree functions would follow.
 - **Incremental / hierarchical DPF (IDPF)** *(survey)*: the headline feature of the reference library; private heavy
   hitters (Poplar, the VDAF `Poplar1` in DAP) is the main deployed use of DPFs. `evalFull` already walks prefixes
   internally but there is no per-level output/CW. Medium.

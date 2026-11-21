@@ -43,10 +43,11 @@
 //!     recorded KAT vectors are stated over — see SPEC.md §"PRG choice".
 //!   - `prg` / `group` — the mechanical building blocks (both usable alone).
 //!
-//! Room to grow (OUT of Phase 1, see SPEC.md): a `dcf.zig` Distributed
-//! Comparison Function. The 2-server PIR layer landed as its own module
-//! (`pir`), multi-point FSS — listed there as "General FSS" — is `mpf.zig`,
-//! and the fixed-key-AES PRG + the constant-time review are both done.
+//!   - `Dcf` (`dcf.zig`) — the Distributed Comparison Function
+//!     `β·[x < α]` (BCGIKRS21), the reason the module is `fss` and not `dpf`;
+//!     an interval is the difference of two.
+//!
+//! The 2-server PIR layer is its own module (`pir`).
 
 const std = @import("std");
 
@@ -90,6 +91,10 @@ pub const MpfWith = mpf.MpfWith;
 /// The one way `Mpf.genWithSeeds` can fail (`error.SeedReuse`). See `mpf.zig`.
 pub const GenError = mpf.GenError;
 
+const dcf = @import("dcf.zig");
+pub const Dcf = dcf.Dcf;
+pub const DcfWith = dcf.DcfWith;
+
 pub const kat_vectors = @import("kat_vectors.zig");
 
 // Pull every submodule's tests into the test binary (CONVENTIONS.md §6
@@ -100,6 +105,7 @@ test {
     _ = group;
     _ = dpf;
     _ = mpf;
+    _ = dcf;
     _ = kat_vectors;
     _ = @import("kat_test.zig");
     _ = @import("mpf_test.zig");
