@@ -196,6 +196,10 @@ const timer_age: u64 = 2;
 /// "Run this node's adjacency timers" (`Options.adjacency`): hold-timer
 /// expiry and the periodic hellos.
 const timer_hello: u64 = 3;
+/// "Retire this node gracefully now" (`Fabric.shutdown`).
+const timer_shutdown: u64 = 4;
+/// Ticks between a graceful shutdown's purges and its links going down.
+pub const shutdown_grace: Time = 10;
 /// Failure-reaction timer ids start here (distinct from `timer_poll`); the
 /// failure index is added on.
 const fail_timer_base: u64 = 1 << 32;
@@ -523,6 +527,19 @@ pub const Fabric = struct {
     /// the only thing that can remove the dead node's LSP from the fabric is
     /// aging: this is what makes the MaxAge purge path observable.
     crash: ?struct { node: NodeId, time: Time } = null,
+    /// The crashed node comes back at this time (netsim `restart_node`) with its
+    /// whole control-plane state lost: empty database, adjacencies down, its own
+    /// LSP originated at sequence 1 and raised above the copy its neighbours still
+    /// hold when they challenge it (ISO 10589 §7.3.16.1). SPEC §15.
+    restart_crashed: ?Time = null,
+    /// A graceful shutdown: at `time` the node purges its own LSP (and its
+    /// pseudonode LSPs), floods the purges and stops originating; `shutdown_grace`
+    /// ticks later its links go down. SPEC §15.
+    shutdown: ?struct { node: NodeId, time: Time } = null,
+    /// Per node: it has been gracefully retired (originates nothing), or was
+    /// restarted after a crash.
+    retired: []bool = &.{},
+    rebooted: []bool = &.{},
 
     /// Counters of the last run (see `Stats`); zeroed at the top of every drive.
     stats: Stats = .{},
@@ -734,6 +751,11 @@ pub const Fabric = struct {
         @memset(seen_pn_seq, 0);
         const seen_pn_purge = try gpa.alloc(bool, pn_slots);
         @memset(seen_pn_purge, false);
+        const retired = try gpa.alloc(bool, topo.node_count);
+        errdefer gpa.free(retired);
+        @memset(retired, false);
+        const rebooted = try gpa.alloc(bool, topo.node_count);
+        @memset(rebooted, false);
 
         return .{
             .gpa = gpa,
@@ -747,6 +769,8 @@ pub const Fabric = struct {
             .count_bound = topo.node_count + total_members,
             .seen_pn_seq = seen_pn_seq,
             .seen_pn_purge = seen_pn_purge,
+            .retired = retired,
+            .rebooted = rebooted,
         };
     }
 
@@ -763,6 +787,8 @@ pub const Fabric = struct {
         self.gpa.free(self.seen_purge);
         self.gpa.free(self.seen_pn_seq);
         self.gpa.free(self.seen_pn_purge);
+        self.gpa.free(self.retired);
+        self.gpa.free(self.rebooted);
         self.gpa.free(self.lans);
         self.lan_events.deinit(self.gpa);
         self.lan_run.deinit(self.gpa);
@@ -846,6 +872,14 @@ pub const Fabric = struct {
     /// Register a link failure to inject partway through the next
     /// `runToConvergence`, at a default time comfortably after initial
     /// convergence.
+    /// Retire `node` gracefully at `time`: it purges its LSPs and floods the
+    /// purges, and `shutdown_grace` ticks later its links go down, which its
+    /// neighbours react to like any link failure (SPEC §15).
+    pub fn shutdownAt(self: *Fabric, node: NodeId, time: Time) Allocator.Error!void {
+        self.shutdown = .{ .node = node, .time = time };
+        for (self.nodes[node].neighbours) |nb| try self.failLinkAt(node, nb.node, time + shutdown_grace);
+    }
+
     pub fn failLink(self: *Fabric, a: NodeId, b: NodeId) Allocator.Error!void {
         try self.failLinkAt(a, b, 5_000);
     }
@@ -903,6 +937,8 @@ pub const Fabric = struct {
         @memset(self.seen_pn_seq, 0);
         @memset(self.seen_pn_purge, false);
         self.violation = null;
+        @memset(self.retired, false);
+        @memset(self.rebooted, false);
         self.wipe_done = false;
         self.stats = .{};
     }
@@ -925,6 +961,16 @@ pub const Fabric = struct {
     fn onStart(ctx: *anyopaque, sim: *netsim.Sim, node: NodeId) anyerror!void {
         const self = cast(ctx);
         const now = sim.timeNow();
+        // netsim starts a restarted node again: a crashed node that comes back has
+        // lost its control-plane state (SPEC §15).
+        const is_reboot = if (self.crash) |c| c.node == node and now > c.time else false;
+        if (is_reboot) {
+            self.wipeState(node);
+            resetAdjacencies(&self.nodes[node], self.opts);
+            self.nodes[node].poll_due = null;
+            self.rebooted[node] = true;
+            for (self.nodes[node].lan_circuits) |*c| self.resetLanCircuit(c);
+        }
         // Initial DIS election on every LAN circuit (and the pseudonode LSP of
         // the ones this node wins), before the node's own LSP names the DIS.
         for (self.nodes[node].lan_circuits) |*c| {
@@ -952,6 +998,10 @@ pub const Fabric = struct {
         if (self.opts.aging) |a| {
             if (a.tick_interval <= self.horizon) try sim.setTimer(node, a.tick_interval, timer_age);
         }
+        if (self.shutdown) |sd| {
+            if (sd.node == node and !is_reboot and sd.time <= self.horizon) try sim.setTimer(node, sd.time, timer_shutdown);
+        }
+        if (is_reboot) return try self.setPoll(sim, node, poll_delay);
         // Pre-arm the failure-reaction timers for links this node terminates.
         for (self.failures.items, 0..) |f, k| {
             // With adjacencies the hold timer notices the severed link itself.
@@ -966,16 +1016,8 @@ pub const Fabric = struct {
         }
     }
 
-    /// A cold restart of `node`: its link-state database and its whole flooding
-    /// state (SRM/SSN, the last-sent pacing map, the CSNP cadence) are gone, and
-    /// it re-originates its own LSP at a bumped sequence number — ISO/IEC 10589
-    /// §7.3.16.1 forbids it from adopting the copy its neighbours still hold.
-    ///
-    /// Its neighbours are unaffected and, crucially, hold **no SRM** toward it:
-    /// they were acked before the restart. So nothing they do on their own will
-    /// re-send it anything, and the LSPs it lost come back only if a database
-    /// summary discovers the divergence.
-    fn coldRestart(self: *Fabric, node: NodeId, now: Time) anyerror!void {
+    /// Drop a node's database, flooding state and invariant high-water marks.
+    fn wipeState(self: *Fabric, node: NodeId) void {
         const ns = &self.nodes[node];
         const n = self.nodes.len;
         ns.lsdb.deinit();
@@ -991,10 +1033,23 @@ pub const Fabric = struct {
         const lc = self.lans.len;
         @memset(self.seen_pn_seq[node * lc * n ..][0 .. lc * n], 0);
         @memset(self.seen_pn_purge[node * lc * n ..][0 .. lc * n], false);
+    }
+
+    /// A cold restart of `node`: its link-state database and its whole flooding
+    /// state (SRM/SSN, the last-sent pacing map, the CSNP cadence) are gone, and
+    /// it re-originates its own LSP at a bumped sequence number — ISO/IEC 10589
+    /// §7.3.16.1 forbids it from adopting the copy its neighbours still hold.
+    ///
+    /// Its neighbours are unaffected and, crucially, hold **no SRM** toward it:
+    /// they were acked before the restart. So nothing they do on their own will
+    /// re-send it anything, and the LSPs it lost come back only if a database
+    /// summary discovers the divergence.
+    fn coldRestart(self: *Fabric, node: NodeId, now: Time) anyerror!void {
+        self.wipeState(node);
         try self.originate(node, now);
         // A DIS re-asserts its pseudonode LSP too (the sequence number lives in
         // the circuit state, which the restart does not clear — SPEC §12).
-        for (ns.lan_circuits) |*c| {
+        for (self.nodes[node].lan_circuits) |*c| {
             if (c.pn_live) try self.originatePseudonode(node, c, now);
         }
     }
@@ -1038,13 +1093,11 @@ pub const Fabric = struct {
                 // A challenge to a pseudonode LSP this node originates (§7.3.16.1).
                 if (r.self_challenge) |ch| {
                     if (r.lsp_id[6] != 0) {
-                        if (self.opts.aging) |a| {
-                            if (a.refresh) {
-                                for (ns.lan_circuits) |*c| {
-                                    if (c.pn_live and r.lsp_id[6] == c.lan + 1) {
-                                        c.pn_seq = @max(c.pn_seq, ch);
-                                        try self.originatePseudonode(node, c, now);
-                                    }
+                        if (self.challengeEnabled(node)) {
+                            for (ns.lan_circuits) |*c| {
+                                if (c.pn_live and r.lsp_id[6] == c.lan + 1) {
+                                    c.pn_seq = @max(c.pn_seq, ch);
+                                    try self.originatePseudonode(node, c, now);
                                 }
                             }
                         }
@@ -1055,11 +1108,9 @@ pub const Fabric = struct {
                 // purge for) OUR LSP. It was refused and flagged; the owner
                 // re-originates above the challenger so the fabric re-learns it.
                 if (r.self_challenge) |ch| {
-                    if (self.opts.aging) |a| {
-                        if (a.refresh) {
-                            ns.seq = @max(ns.seq, ch);
-                            try self.originate(node, now);
-                        }
+                    if (self.challengeEnabled(node)) {
+                        ns.seq = @max(ns.seq, ch);
+                        try self.originate(node, now);
                     }
                 }
             },
@@ -1155,6 +1206,16 @@ pub const Fabric = struct {
         try sim.setTimer(node, delay, timer_poll);
     }
 
+    /// Does `node` answer a neighbour's newer copy of its own LSP by
+    /// re-originating above it? With aging on that is `Aging.refresh`; a node
+    /// that restarted after a crash (SPEC §15) always does, it is how it learns
+    /// the sequence number it must exceed.
+    fn challengeEnabled(self: *const Fabric, node: NodeId) bool {
+        if (self.rebooted[node]) return true;
+        const a = self.opts.aging orelse return false;
+        return a.refresh;
+    }
+
     fn armPoll(self: *Fabric, sim: *netsim.Sim, node: NodeId) anyerror!void {
         // Positive control: skipping this arm leaves SRM/SSN undrained forever.
         if (self.broken_no_drain) return;
@@ -1164,7 +1225,25 @@ pub const Fabric = struct {
     fn onTimer(ctx: *anyopaque, sim: *netsim.Sim, node: NodeId, timer_id: u64) anyerror!void {
         const self = cast(ctx);
         const now = sim.timeNow();
-        if (timer_id == timer_poll) self.nodes[node].poll_due = null;
+        if (timer_id == timer_poll) {
+            // Only the poll `setPoll` armed runs; a stale one (armed before a
+            // restart, or a duplicate at the same time) must not start a chain.
+            const due = self.nodes[node].poll_due orelse return;
+            if (due != now) return;
+            self.nodes[node].poll_due = null;
+        }
+        if (timer_id == timer_shutdown) {
+            self.retired[node] = true;
+            const ns = &self.nodes[node];
+            var scratch: [isis_lsdb.generate.min_buffer_size]u8 = undefined;
+            _ = try isis_lsdb.generate.purgeFragments(&ns.lsdb, 0, false, 0, now, &scratch);
+            for (ns.lan_circuits) |*c| {
+                if (!c.pn_live) continue;
+                c.pn_live = false;
+                try self.purgePseudonode(node, c, now);
+            }
+            self.stats.last_change = now;
+        }
 
         if (timer_id >= lan_timer_base) {
             try self.onLanEvent(node, self.lan_run.items[@intCast(timer_id - lan_timer_base)], now);
@@ -1296,6 +1375,7 @@ pub const Fabric = struct {
     /// (Re-)originate the pseudonode LSP of `c`'s LAN: every member this node
     /// believes alive (itself included) at metric 0, ISO 10589 §7.2.5.
     fn originatePseudonode(self: *Fabric, node: NodeId, c: *LanCircuit, now: Time) anyerror!void {
+        if (self.retired[node]) return;
         const ns = &self.nodes[node];
         const ls = &self.lans[c.lan];
         self.stats.last_change = now;
@@ -1402,6 +1482,7 @@ pub const Fabric = struct {
     /// currently-up neighbour, at a freshly bumped sequence number, inserted
     /// self-originated (floods out every circuit).
     fn originate(self: *Fabric, node: NodeId, now: Time) anyerror!void {
+        if (self.retired[node]) return;
         const ns = &self.nodes[node];
         self.stats.last_change = now;
         // The neighbours as `isis-lsdb`'s generator takes them: one Extended IS
@@ -1560,6 +1641,7 @@ pub const Fabric = struct {
         try trace.appendSlice(self.gpa, self.extra_faults.items);
         if (self.crash) |c| {
             try trace.append(self.gpa, .{ .time = c.time, .kind = .{ .crash_node = .{ .node = c.node } } });
+            if (self.restart_crashed) |r| try trace.append(self.gpa, .{ .time = r, .kind = .{ .restart_node = .{ .node = c.node } } });
         }
 
         const case = netsim.Case{
@@ -1622,6 +1704,7 @@ pub const Fabric = struct {
     /// Whether `node` has been crashed by `Fabric.crash` by the end of the run.
     fn isDead(self: *const Fabric, node: NodeId) bool {
         const c = self.crash orelse return false;
+        if (self.restart_crashed) |r| if (r <= self.horizon) return false;
         return c.node == node and c.time <= self.horizon;
     }
 
@@ -3779,4 +3862,54 @@ test "adjacency: LSPs from a circuit whose adjacency is not Up are ignored" {
     const wire = b.finishStamped();
     try Fabric.onMessage(&fab, &d.sim, 0, 1, wire);
     try testing.expect(!fab.holds(0, 1));
+}
+
+// ── node lifecycle: graceful shutdown, crash and restart, sequence exhaustion ─
+
+const square = [_]Edge{ .{ .a = 0, .b = 1 }, .{ .a = 1, .b = 2 }, .{ .a = 2, .b = 3 }, .{ .a = 3, .b = 0 } };
+
+test "lifecycle: a gracefully shut down node purges its LSP everywhere and drops out of SPF" {
+    for ([_]Options{ .{}, adj_opts }) |opts| {
+        var edges: [3]Edge = undefined;
+        var fab = try Fabric.initWithOptions(testing.allocator, lineTopology(&edges), 12, opts);
+        defer fab.deinit();
+        try fab.shutdownAt(3, 2_000);
+        try testing.expectEqual(Outcome.converged, try fab.runToConvergence(4_000));
+        var n: NodeId = 0;
+        while (n < 4) : (n += 1) try testing.expect(fab.holdsPurge(n, 3));
+        // The retired node's links are down: it no longer hears the survivors.
+        try testing.expectEqual(fab.storedSequence(0, 2), fab.storedSequence(1, 2));
+        try testing.expectEqual(fab.storedSequence(0, 2), fab.storedSequence(2, 2));
+        try testing.expect((try fab.reaches(testing.allocator, 0, 3)) == null);
+        try testing.expect((try fab.reaches(testing.allocator, 0, 2)) != null);
+        // The retired node never re-originated after the purge.
+        try testing.expectEqual(fab.storedSequence(0, 3), fab.storedSequence(3, 3));
+    }
+}
+
+test "lifecycle: NEGATIVE CONTROL — a crash (no purge) leaves the stale LSP live where a shutdown purges it" {
+    var edges: [3]Edge = undefined;
+    var fab = try Fabric.init(testing.allocator, lineTopology(&edges), 12);
+    defer fab.deinit();
+    fab.crash = .{ .node = 3, .time = 2_000 };
+    _ = try fab.runToConvergence(4_000);
+    try testing.expect(fab.holds(0, 3) and !fab.holdsPurge(0, 3));
+}
+
+test "lifecycle: a crashed node that restarts has lost its state, is challenged by its neighbours' newer copy and re-originates above it" {
+    var fab = try Fabric.initWithOptions(testing.allocator, .{ .node_count = 4, .edges = &square }, 21, .{ .adjacency = .{}, .retransmit_interval = 40, .csnp_interval = 20 });
+    defer fab.deinit();
+    // Node 2 re-originates once (its link to 3 fails), so its neighbours hold a
+    // copy newer than the sequence 1 a restarted node starts from.
+    try fab.failLinkAt(2, 3, 500);
+    fab.crash = .{ .node = 2, .time = 1_500 };
+    fab.restart_crashed = 3_500;
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(8_000));
+    try testing.expect(fab.lsdbsAgree());
+    try testing.expect(fab.nodes[2].adjs[0].currentState() == .up);
+    try testing.expect(fab.selfSequence(2) >= 3);
+    try testing.expect((try fab.reaches(testing.allocator, 0, 2)) != null);
+    // The severed 2-3 link is still unused: 2 reaches 3 around the ring.
+    try testing.expectEqual(systemIdForNode(1), (try fab.reaches(testing.allocator, 2, 3)).?);
+    try testing.expect(fab.rebooted[2]);
 }
