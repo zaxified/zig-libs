@@ -74,6 +74,40 @@ pub const Error = h2c.Error || status_mod.StatusError || metadata.DecodeError ||
     ReservedMetadata,
 };
 
+/// What an `on_start` hook may add to a request.
+pub const Outgoing = struct {
+    arena: Allocator,
+    entries: *std.ArrayList(metadata.Entry),
+
+    /// Add a request metadata entry (`-bin` keys take the raw value, as in
+    /// `CallOptions.metadata`). Both strings are copied; a reserved name
+    /// (`grpc-timeout`, `content-type`, ...) fails the call with
+    /// `error.ReservedMetadata`.
+    pub fn add(o: *Outgoing, entry: metadata.Entry) Error!void {
+        if (metadata.isReserved(entry.name)) return error.ReservedMetadata;
+        try o.entries.append(o.arena, .{
+            .name = try o.arena.dupe(u8, entry.name),
+            .value = try o.arena.dupe(u8, entry.value),
+        });
+    }
+};
+
+/// Call-level hooks of a `Channel` (`Options.interceptors`): credentials,
+/// tracing ids, logging and metrics without wrapping every call by hand.
+pub const Interceptor = struct {
+    ctx: ?*anyopaque = null,
+    /// Runs in `Channel.start` in the order of `Options.interceptors`, after
+    /// the call's own metadata is staged and before the request goes out; it
+    /// may add metadata (`Outgoing.add`). An error ends `start` with that
+    /// error and nothing is sent (`on_finish` does not run for it).
+    on_start: ?*const fn (ctx: ?*anyopaque, path: []const u8, out: *Outgoing) Error!void = null,
+    /// Runs once when the call is released (`Call.deinit`), in the reverse
+    /// order of `Options.interceptors`, with the status the call ended with:
+    /// the server's, a local one (`failLocal`), or `.cancelled` when it was
+    /// released before a status arrived.
+    on_finish: ?*const fn (ctx: ?*anyopaque, path: []const u8, status: Status, message: []const u8) void = null,
+};
+
 /// Channel-wide policy. The receive limit is the security-critical one — see
 /// `frame.zig`.
 pub const Options = struct {
@@ -95,6 +129,8 @@ pub const Options = struct {
     /// `grpc-encoding`. `.identity` (the default, as in grpc-go and tonic):
     /// never. A server that does not understand it answers UNIMPLEMENTED.
     request_encoding: compress.Encoding = .identity,
+    /// Hooks around every call, outermost first (see `Interceptor`).
+    interceptors: []const Interceptor = &.{},
     /// `:scheme` — "https" when the session runs over TLS.
     scheme: []const u8 = "http",
     /// Size of the buffer each call reads HTTP/2 body bytes into before
@@ -267,6 +303,17 @@ pub const Channel = struct {
             const buf = try arena.alloc(u8, metadata.encodedValueLen(e));
             try fields.append(arena, .{ .name = e.name, .value = metadata.encodeValue(e, buf) });
         }
+        if (ch.options.interceptors.len != 0) {
+            var added: std.ArrayList(metadata.Entry) = .empty;
+            var out: Outgoing = .{ .arena = arena, .entries = &added };
+            for (ch.options.interceptors) |ic| {
+                if (ic.on_start) |f| try f(ic.ctx, path, &out);
+            }
+            for (added.items) |e| {
+                const buf = try arena.alloc(u8, metadata.encodedValueLen(e));
+                try fields.append(arena, .{ .name = e.name, .value = metadata.encodeValue(e, buf) });
+            }
+        }
 
         const sid = try ch.session.openStream(.post, path, .{
             .scheme = ch.options.scheme,
@@ -277,9 +324,13 @@ pub const Channel = struct {
 
         const read_buf = try ch.gpa.alloc(u8, ch.options.read_chunk);
         errdefer ch.gpa.free(read_buf);
+        // `on_finish` needs the path after `start` returns, and the caller's
+        // slice may not live that long.
+        const path_owned: ?[]u8 = if (ch.options.interceptors.len != 0) try ch.gpa.dupe(u8, path) else null;
         return .{
             .ch = ch,
             .sid = sid,
+            .path_owned = path_owned,
             .read_buf = read_buf,
             .de = .{ .max_recv_message_size = ch.options.max_recv_message_size },
             .failure_out = opts.failure,
@@ -292,6 +343,8 @@ pub const Channel = struct {
 pub const Call = struct {
     ch: *Channel,
     sid: u31,
+    /// The request path, kept only when the channel has interceptors.
+    path_owned: ?[]u8 = null,
     read_buf: []u8,
     de: frame.Deframer,
     failure_out: ?*Failure,
@@ -319,6 +372,15 @@ pub const Call = struct {
     /// natural order to do it in.
     pub fn deinit(c: *Call) void {
         const gpa = c.ch.gpa;
+        if (c.path_owned) |path| {
+            var k = c.ch.options.interceptors.len;
+            while (k > 0) {
+                k -= 1;
+                const ic = c.ch.options.interceptors[k];
+                if (ic.on_finish) |f| f(ic.ctx, path, c.status orelse .cancelled, c.status_message);
+            }
+            gpa.free(path);
+        }
         if (c.status_message_owned) gpa.free(@constCast(c.status_message));
         if (c.inflated) |b| gpa.free(b);
         c.de.deinit(gpa);

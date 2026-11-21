@@ -146,6 +146,9 @@ pub const Channel = call_mod.Channel;
 /// The untyped call: messages are opaque byte slices. Use it for a codec
 /// other than protobuf, or when the schema is not known at compile time.
 pub const Call = call_mod.Call;
+/// Call-level hooks of a `Channel` (credentials, tracing, metrics).
+pub const ClientInterceptor = call_mod.Interceptor;
+pub const ClientOutgoing = call_mod.Outgoing;
 /// Build `/{Service}/{Method}`.
 pub const methodPath = call_mod.methodPath;
 
@@ -277,6 +280,8 @@ pub const server = server_mod;
 /// `Router.h2ServerOptions`). See `server.zig` for why registration is a
 /// data table rather than comptime reflection over a struct's decls.
 pub const Router = server_mod.Router;
+/// Call-level hooks around every handler (`Router.interceptors`).
+pub const Interceptor = server_mod.Interceptor;
 /// One service: the `{Service}` half of `/{Service}/{Method}`.
 pub const Service = server_mod.Service;
 /// One method. Build these with `Methods(Req, Rep)`, or `Method.raw` for a

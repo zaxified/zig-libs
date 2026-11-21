@@ -830,6 +830,115 @@ test "server: a request compressed with an encoding that is not enabled is UNIMP
     try testing.expectEqualStrings("gzip,deflate,identity", r.header("grpc-accept-encoding").?);
 }
 
+// ── interceptors ────────────────────────────────────────────────────────────
+
+var ic_log: [16]u8 = undefined;
+var ic_len: usize = 0;
+var ic_status: status_mod.Status = .ok;
+var ic_method_buf: [32]u8 = undefined;
+var ic_method: []const u8 = "";
+var ic_sent: usize = 0;
+
+fn icNote(ch: u8) void {
+    ic_log[ic_len] = ch;
+    ic_len += 1;
+}
+
+fn icBeforeA(_: ?*anyopaque, _: *server.Call) anyerror!void {
+    icNote('a');
+}
+
+fn icAuth(_: ?*anyopaque, c: *server.Call) anyerror!void {
+    icNote('b');
+    const token = c.metadataValue("authorization") orelse return c.fail(.unauthenticated, "no token");
+    if (!std.mem.eql(u8, token, "Bearer ok")) return error.PermissionDenied;
+}
+
+fn icBeforeC(_: ?*anyopaque, _: *server.Call) anyerror!void {
+    icNote('c');
+}
+
+fn icAfterA(_: ?*anyopaque, c: *server.Call) void {
+    icNote('A');
+    ic_status = c.status;
+    @memcpy(ic_method_buf[0..c.method.len], c.method);
+    ic_method = ic_method_buf[0..c.method.len];
+    ic_sent = c.messages_sent;
+}
+
+fn icAfterC(_: ?*anyopaque, _: *server.Call) void {
+    icNote('C');
+}
+
+fn icCall(token: ?[]const u8, path: []const u8) !struct { peer: TestPeer, sid: u31 } {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa);
+    errdefer peer.deinit();
+    const ics = [_]server.Interceptor{
+        .{ .before = icBeforeA, .after = icAfterA },
+        .{ .before = icAuth },
+        .{ .before = icBeforeC, .after = icAfterC },
+    };
+    var router: server.Router = .{ .gpa = gpa, .services = &.{echo_service}, .interceptors = &ics };
+    try peer.conn.sendPreface(&peer.wire);
+    const base = grpcFields(path);
+    var fields: [7]hpack.Field = undefined;
+    @memcpy(fields[0..6], &base);
+    var n: usize = 6;
+    if (token) |t| {
+        fields[n] = .{ .name = "authorization", .value = t };
+        n += 1;
+    }
+    const sid = try peer.conn.startStream(&peer.wire, fields[0..n], false);
+    const req = try encodeReq(gpa, .{ .text = "x" });
+    defer gpa.free(req);
+    const framed = try frame.encodeAlloc(gpa, req);
+    defer gpa.free(framed);
+    try peer.conn.sendData(&peer.wire, sid, framed, true);
+    ic_len = 0;
+    try runOffline(&peer, &router);
+    return .{ .peer = peer, .sid = sid };
+}
+
+test "interceptors: before runs in order and can reject; after runs in reverse for every call" {
+    // Accepted: a b c, handler, then C A.
+    {
+        var r = try icCall("Bearer ok", "/echo.Echo/Unary");
+        defer r.peer.deinit();
+        try testing.expectEqualStrings("abcCA", ic_log[0..ic_len]);
+        try testing.expectEqualStrings("0", r.peer.resp(r.sid).trailer("grpc-status").?);
+        try testing.expectEqual(status_mod.Status.ok, ic_status);
+        try testing.expectEqualStrings("Unary", ic_method);
+        try testing.expectEqual(@as(usize, 1), ic_sent);
+    }
+    // No token: the second hook fails the call with its own message; c never
+    // runs and neither does the handler; both after hooks still see it.
+    {
+        var r = try icCall(null, "/echo.Echo/Unary");
+        defer r.peer.deinit();
+        try testing.expectEqualStrings("abCA", ic_log[0..ic_len]);
+        const resp = r.peer.resp(r.sid);
+        try testing.expect(resp.isTrailersOnly());
+        try testing.expectEqualStrings("16", resp.header("grpc-status").?);
+        try testing.expectEqualStrings("no token", resp.header("grpc-message").?);
+        try testing.expectEqual(status_mod.Status.unauthenticated, ic_status);
+        try testing.expectEqual(@as(usize, 0), ic_sent);
+    }
+    // A plain StatusError maps to its status.
+    {
+        var r = try icCall("Bearer wrong", "/echo.Echo/Unary");
+        defer r.peer.deinit();
+        try testing.expectEqualStrings("7", r.peer.resp(r.sid).header("grpc-status").?);
+    }
+    // An unknown method never reaches `before`, but is still reported.
+    {
+        var r = try icCall("Bearer ok", "/echo.Echo/Nope");
+        defer r.peer.deinit();
+        try testing.expectEqualStrings("CA", ic_log[0..ic_len]);
+        try testing.expectEqualStrings("12", r.peer.resp(r.sid).header("grpc-status").?);
+    }
+}
+
 // ── concurrent handlers ─────────────────────────────────────────────────────
 
 var pool_gate: std.atomic.Value(bool) = .init(false);

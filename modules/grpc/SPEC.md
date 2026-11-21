@@ -36,7 +36,7 @@ Zig `std` has no gRPC.
 against Python `grpcio` (recorded replay plus live oracle); offline frame-level tests for the
 Trailers-Only vs Trailers distinction; a decoded-size bound on every message (declared length
 never sizes an allocation), pure Zig with no C core, typed struct messages with no codegen step.
-**Where we are behind:** no retries, name resolution/load balancing, interceptors,
+**Where we are behind:** no retries, name resolution/load balancing, per-message (stream-wrapping) interceptors,
 keepalive, `grpc-status-details-bin`, gRPC-Web, and no reflection service (the standard
 `grpc.health.v1` health service is provided, `src/health.zig`); the server is sequential per connection unless the application sets `Router.pool` (a `HandlerPool`) or installs the `http` dispatcher itself.
 
@@ -93,6 +93,20 @@ copying and the ones `finish` sets (the status digits, the percent-encoded messa
 live in the per-call arena. The loop's `end()` runs after the handler, i.e. after the arena is
 gone; it serialized freed memory. `end` is idempotent, so calling it first makes the loop's call
 a no-op.
+
+### Interceptors
+
+`Router.interceptors` (`Interceptor{ before, after }`) and `Channel` `Options.interceptors`
+(`Interceptor{ on_start, on_finish }`) are call-level hooks, the shape of tonic's interceptors
+(a function that sees the request metadata and may reject) plus the call-end hook that grpc-go's
+stats handlers and interceptors use for logging and metrics. `before` hooks run in order after
+routing and the deadline check and stop at the first error (a `StatusError` is the status sent,
+`c.fail` adds a message, other errors map as a handler's); `after` hooks run for every call that
+reached dispatch, in reverse order, before the status is written, and see it. Client `on_start`
+adds metadata through `Outgoing.add` (reserved names refused) and `on_finish` runs in
+`Call.deinit` with the call's status, `.cancelled` if none arrived. A wrapper around each
+message of a stream (grpc-go's `StreamInterceptor` that replaces `RecvMsg`/`SendMsg`) is not
+provided: a hook per message would be a second dispatch layer over the same `Call`.
 
 ### What the server does not do
 
@@ -424,5 +438,4 @@ Each item is refused with its reason here; the ones that are open work are also 
 
 Reasons for each are under *What is deliberately not done*; the first four are what a typical grpc-go/tonic user hits in ordinary use.
 
-- **Interceptors / middleware hooks** (auth, logging, metrics on client and server) — a grpc-go/tonic staple; absent, every caller wraps calls by hand. Effort: medium (needs an API decision). Fits §2: yes.
 - **Retries/hedging, name resolution and load balancing, keepalive, `grpc-status-details-bin`, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.

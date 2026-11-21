@@ -170,6 +170,16 @@ const b = (try call.metadataValueDecoded("x-echo-bin")).?; // decoded; b.deinit(
 Header names this layer owns (`grpc-timeout`, `content-type`, `te`, the pseudo-headers, …) are
 refused with `error.ReservedMetadata` rather than duplicated onto the wire.
 
+### Interceptors
+
+Call-level hooks, so credentials, logging and metrics are written once. On a channel,
+`Options.interceptors` takes `grpc.ClientInterceptor`s: `on_start(ctx, path, out)` adds request
+metadata (`out.add`) or fails the call, `on_finish(ctx, path, status, message)` runs once when the
+call is released. On a server, `Router.interceptors` takes `grpc.Interceptor`s: `before(ctx, call)`
+runs ahead of the handler and may reject (`return call.fail(.unauthenticated, "...")`, or
+`error.PermissionDenied`), `after(ctx, call)` runs for every call, rejected ones included, with
+the final status. They are call-level (tonic's interceptor shape), not per-message wrappers.
+
 ## Untyped calls
 
 `grpc.Call` is the same engine with opaque byte messages — for a codec other than protobuf

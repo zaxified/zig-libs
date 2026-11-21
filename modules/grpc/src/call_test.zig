@@ -819,6 +819,99 @@ test "request: request_encoding compresses every message and says so" {
     try testing.expectEqualStrings("compress compress compress compress", plain);
 }
 
+// ── interceptors ────────────────────────────────────────────────────────────
+
+var cic_log: [16]u8 = undefined;
+var cic_len: usize = 0;
+var cic_status: grpc.Status = .ok;
+var cic_path: [32]u8 = undefined;
+var cic_path_len: usize = 0;
+
+fn cicNote(ch: u8) void {
+    cic_log[cic_len] = ch;
+    cic_len += 1;
+}
+
+fn cicStartA(_: ?*anyopaque, _: []const u8, out: *grpc.ClientOutgoing) grpc.Error!void {
+    cicNote('a');
+    try out.add(.{ .name = "authorization", .value = "Bearer tok" });
+}
+
+fn cicStartB(_: ?*anyopaque, path: []const u8, out: *grpc.ClientOutgoing) grpc.Error!void {
+    cicNote('b');
+    try out.add(.{ .name = "x-path", .value = path });
+}
+
+fn cicStartBad(_: ?*anyopaque, _: []const u8, out: *grpc.ClientOutgoing) grpc.Error!void {
+    try out.add(.{ .name = "grpc-timeout", .value = "1S" });
+}
+
+fn cicFinishA(_: ?*anyopaque, _: []const u8, _: grpc.Status, _: []const u8) void {
+    cicNote('A');
+}
+
+fn cicFinishB(_: ?*anyopaque, path: []const u8, status: grpc.Status, _: []const u8) void {
+    cicNote('B');
+    cic_status = status;
+    @memcpy(cic_path[0..path.len], path);
+    cic_path_len = path.len;
+}
+
+test "client interceptors: on_start adds metadata in order, on_finish runs once in reverse with the status" {
+    const gpa = testing.allocator;
+    const ics = [_]grpc.ClientInterceptor{
+        .{ .on_start = cicStartA, .on_finish = cicFinishA },
+        .{ .on_start = cicStartB, .on_finish = cicFinishB },
+    };
+    cic_len = 0;
+    const fx = try Fx.init(gpa, .{ .interceptors = &ics });
+    defer fx.deinit();
+    {
+        var path_buf = "/pkg.Svc/Method".*;
+        var call = try fx.ch.start(&path_buf, .{});
+        // The channel kept its own copy of the path.
+        @memset(&path_buf, 'x');
+        try call.sendMessage("", true);
+        var peer = try Peer.init(fx.clientBytes());
+        defer peer.deinit();
+        const hl = peer.requestHeaders(1).?;
+        var auth: ?[]const u8 = null;
+        var xpath: ?[]const u8 = null;
+        for (hl.fields) |f| {
+            if (std.mem.eql(u8, f.name, "authorization")) auth = f.value;
+            if (std.mem.eql(u8, f.name, "x-path")) xpath = f.value;
+        }
+        try testing.expectEqualStrings("Bearer tok", auth.?);
+        try testing.expectEqualStrings("/pkg.Svc/Method", xpath.?);
+        try testing.expectEqualStrings("ab", cic_log[0..cic_len]);
+        try peer.okHeaders(1, false);
+        try peer.okTrailers(1);
+        fx.reply(peer.wire.items);
+        try call.finish();
+        try testing.expectEqualStrings("ab", cic_log[0..cic_len]); // not yet: released in deinit
+        call.deinit();
+    }
+    try testing.expectEqualStrings("abBA", cic_log[0..cic_len]);
+    try testing.expectEqual(grpc.Status.ok, cic_status);
+    try testing.expectEqualStrings("/pkg.Svc/Method", cic_path[0..cic_path_len]);
+}
+
+test "client interceptors: a call released before its status is reported as cancelled; a reserved name fails start" {
+    const gpa = testing.allocator;
+    const ics = [_]grpc.ClientInterceptor{.{ .on_finish = cicFinishB }};
+    cic_len = 0;
+    const fx = try Fx.init(gpa, .{ .interceptors = &ics });
+    defer fx.deinit();
+    var call = try fx.ch.start("/s/m", .{});
+    call.deinit();
+    try testing.expectEqual(grpc.Status.cancelled, cic_status);
+
+    const bad = [_]grpc.ClientInterceptor{.{ .on_start = cicStartBad }};
+    const fx2 = try Fx.init(gpa, .{ .interceptors = &bad });
+    defer fx2.deinit();
+    try testing.expectError(error.ReservedMetadata, fx2.ch.start("/s/m", .{}));
+}
+
 // ── the unary contract ─────────────────────────────────────────────────────
 
 fn scriptNoMessage(p: *Peer) anyerror!void {

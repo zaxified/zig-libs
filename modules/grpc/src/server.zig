@@ -198,6 +198,29 @@ pub const Service = struct {
     methods: []const Method,
 };
 
+/// Call-level hooks around every handler (`Router.interceptors`): the place
+/// for authentication, logging and metrics that would otherwise be repeated in
+/// each handler. Both hooks are optional.
+pub const Interceptor = struct {
+    ctx: ?*anyopaque = null,
+    /// Runs after the call is routed and its deadline checked, before the
+    /// handler, in the order of `Router.interceptors`. Return an error to stop
+    /// the call there: a `StatusError` (`error.Unauthenticated`,
+    /// `error.PermissionDenied`, ...) is the status the client gets, `c.fail`
+    /// sets a message to go with it, and any other error maps as a handler's
+    /// would. The handler and the later `before` hooks do not run. May read the
+    /// request metadata (`c.metadataValue`) and stage response metadata.
+    before: ?*const fn (ctx: ?*anyopaque, c: *Call) anyerror!void = null,
+    /// Runs once for every call that reached dispatch, rejected or not (a call
+    /// to an unknown method too: `c.method` is then empty), in the reverse
+    /// order of `Router.interceptors`, after the handler returned and before the
+    /// status is written. `c.status`, `c.status_message`, `c.service`,
+    /// `c.method`, `c.messages_received` and `c.messages_sent` are final; it
+    /// cannot change the status (that is `before`'s job). A hook that blocks
+    /// holds the connection's task, as a handler does.
+    after: ?*const fn (ctx: ?*anyopaque, c: *Call) void = null,
+};
+
 /// The gRPC server: a table of services plus policy, wired into
 /// `http.Server` (or `http.h2_server`) with `httpOptions`/`h2ServerOptions`.
 ///
@@ -241,6 +264,8 @@ pub const Router = struct {
     /// it as the HTTP/2 dispatcher (unless `base` already has one). Null: the
     /// historical sequential behaviour. The pool must outlive the server.
     pool: ?*pool_mod.HandlerPool = null,
+    /// Hooks around every handler, outermost first (see `Interceptor`).
+    interceptors: []const Interceptor = &.{},
 
     /// `http.Server.Options` wired for gRPC: the handler, the context and
     /// the streaming predicate all have to agree about which router they
@@ -365,6 +390,12 @@ pub fn serve(
     defer call.deinit();
 
     dispatch(r, &call) catch |err| call.adoptError(err);
+    var k = r.interceptors.len;
+    while (k > 0) {
+        k -= 1;
+        const ic = r.interceptors[k];
+        if (ic.after) |f| f(ic.ctx, &call);
+    }
     call.finish();
     // No `ResponseWriter.end` here. It used to run ahead of the serving
     // loop's, purely so it beat `arena_state.deinit()` (the `defer` above) to
@@ -427,6 +458,9 @@ fn dispatch(r: *const Router, c: *Call) anyerror!void {
     // Already past the deadline before a byte of work: answer rather than
     // run the handler and discard its result.
     try c.checkDeadline();
+    for (r.interceptors) |ic| {
+        if (ic.before) |f| try f(ic.ctx, c);
+    }
     return m.run(c);
 }
 
