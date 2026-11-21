@@ -12,6 +12,7 @@
 const std = @import("std");
 const bn254 = @import("bn254");
 const field = @import("field.zig");
+const burn = @import("burn.zig");
 const Fr = field.Fr;
 
 const G1 = bn254.G1;
@@ -21,6 +22,11 @@ const G2 = bn254.G2;
 /// Returns the identity for empty input.
 pub fn msmG1(bases: []const G1.Affine, scalars: []const Fr) G1.Jacobian {
     std.debug.assert(bases.len == scalars.len);
+    // The scalars are the witness: one frame down, then a stack wipe.
+    return burn.run(burn.helper_burn, G1.Jacobian, msmG1Body, .{ bases, scalars });
+}
+
+fn msmG1Body(bases: []const G1.Affine, scalars: []const Fr) G1.Jacobian {
     var acc = G1.Jacobian.identity;
     for (bases, scalars) |base, s| {
         acc = acc.add(G1.Jacobian.fromAffine(base).scalarMul(s));
@@ -31,6 +37,11 @@ pub fn msmG1(bases: []const G1.Affine, scalars: []const Fr) G1.Jacobian {
 /// `Σ scalarsᵢ · basesᵢ` in `G2`. `scalars.len` must equal `bases.len`.
 pub fn msmG2(bases: []const G2.Affine, scalars: []const Fr) G2.Jacobian {
     std.debug.assert(bases.len == scalars.len);
+    // The scalars are the witness: one frame down, then a stack wipe.
+    return burn.run(burn.helper_burn, G2.Jacobian, msmG2Body, .{ bases, scalars });
+}
+
+fn msmG2Body(bases: []const G2.Affine, scalars: []const Fr) G2.Jacobian {
     var acc = G2.Jacobian.identity;
     for (bases, scalars) |base, s| {
         acc = acc.add(G2.Jacobian.fromAffine(base).scalarMul(s));

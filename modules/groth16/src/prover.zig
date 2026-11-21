@@ -384,7 +384,7 @@ fn proveBody(
     defer std.crypto.secureZero(u8, std.mem.asBytes(&c_ev));
     for (0..n) |j| {
         if (j < sys.constraints.len) {
-            const e = sys.evalConstraint(j, witness);
+            const e = sys.evalUnburned(j, witness);
             a_ev[j] = e.a;
             b_ev[j] = e.b;
             c_ev[j] = e.c;

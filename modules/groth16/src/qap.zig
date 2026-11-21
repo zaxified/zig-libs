@@ -20,6 +20,7 @@ const field = @import("field.zig");
 const poly = @import("poly.zig");
 const fft = @import("fft.zig");
 const r1cs = @import("r1cs.zig");
+const burn = @import("burn.zig");
 const Fr = field.Fr;
 
 /// Interpolates the QAP polynomials for `sys`+`witness` over `Domain(n)`
@@ -33,6 +34,12 @@ const Fr = field.Fr;
 pub const DivisibilityError = error{DomainTooSmall} || poly.DivError;
 
 pub fn checkDivisible(comptime n: usize, sys: r1cs.System, witness: []const Fr) DivisibilityError!bool {
+    // The witness and every array below are secret: the body runs one frame
+    // down and the stack it dirtied (its 3n-element arrays included) is zeroed.
+    return burn.run(burn.helper_burn + n * burn.per_point_burn, DivisibilityError!bool, checkDivisibleBody, .{ n, sys, witness });
+}
+
+fn checkDivisibleBody(comptime n: usize, sys: r1cs.System, witness: []const Fr) DivisibilityError!bool {
     // ⛔ NOT an assert — see `prover.setup` for the measurement. A `false` here
     // would be the wrong answer as well as an unsafe one: the honest answer to
     // "does this witness satisfy a circuit that does not fit the domain" is
@@ -45,7 +52,7 @@ pub fn checkDivisible(comptime n: usize, sys: r1cs.System, witness: []const Fr) 
     var c_evals: [n]Fr = undefined;
     for (0..n) |i| {
         if (i < sys.constraints.len) {
-            const e = sys.evalConstraint(i, witness);
+            const e = sys.evalUnburned(i, witness);
             a_evals[i] = e.a;
             b_evals[i] = e.b;
             c_evals[i] = e.c;

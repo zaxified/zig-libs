@@ -3,7 +3,8 @@
 //! Dead-stack burn for the prover's secret entry points: `prover.setup` (toxic
 //! waste), `prover.prove` and `zkprove.prove` (witness, randomizers `r`/`s`,
 //! the quotient), `phase2.contribute` (the contribution secrets `x`/`s`) and
-//! `circom.parseWitness` (the witness decoded from a `.wtns`). Each runs its
+//! `circom.parseWitness` (the witness decoded from a `.wtns`); and the helpers
+//! that take a witness slice (`helper_burn`). Each runs its
 //! body one frame down (`run`, a `never_inline` call), then zeroes the bytes
 //! that body dirtied at that depth. The body is a separate frame on purpose:
 //! inlined into the entry point, the burn would land above the body's locals.
@@ -59,3 +60,9 @@ pub const contribute_burn = 24 * 1024;
 
 /// `circom.parseWitness`: dirtied 1.3 KiB.
 pub const witness_burn = 4 * 1024;
+
+/// The witness helpers that run in the caller's frames: `r1cs.System.isSatisfied`
+/// / `evalConstraint`, `qap.checkDivisible` (plus `per_point_burn` per domain
+/// point), `msm.msmG1`/`msmG2`, `circom.writeWitness`. Dirtied at most 9.2 KiB
+/// (`msmG2`; `checkDivisible` 4.3 KiB at n = 4, the others under 1 KiB).
+pub const helper_burn = 20 * 1024;

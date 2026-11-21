@@ -309,10 +309,12 @@ and bucket scratch before freeing it. `Randomizers.randomInto(out, io)` (`prover
 and quotient and the `r·δ`/`s·δ`/`r·s·δ` points as needles, plus the `Randomizers.randomInto` draw — 0 residues, with
 a negative and a positive control in the same binary. Residual risks: the caller's own copies (the `Randomizers` and
 `ToxicWaste` variables, the witness vector) are the caller's to wipe (`circom.freeWitness` does it for the
-`parseWitness` result); the `.wtns` and `.zkey` file bytes the caller read in are out of reach; and the helpers that
-take a witness slice and run in the caller's frames — `r1cs.System.isSatisfied`/`evalConstraint`,
-`qap.checkDivisible`, `msm.msmG1/G2`, `circom.writeWitness` — are not burned (a consumer calling them on a real
-witness does its own `burn.run`-style wrapper; Backlog item 0).
+`parseWitness` result), and so is what a helper returns (`evalConstraint`'s dot products, an MSM's point,
+`writeWitness`'s output buffer); the `.wtns` and `.zkey` file bytes the caller read in are out of reach. The helpers
+that take a witness slice — `r1cs.System.isSatisfied`/`evalConstraint`, `qap.checkDivisible`, `msm.msmG1/G2`,
+`circom.writeWitness` — burn the same way (`burn.helper_burn`); `r1cs.System.evalUnburned` is the per-row form for a
+body that already runs under a burn. The probe pins them with the witness, its dot products, their interpolations
+and the quotient as needles (0 residues; with the burn cut to 16 bytes every one of the six leaves residue).
 
 ## Verification
 
@@ -400,10 +402,6 @@ computed from those inputs, not code or text of either project.
 
 
 ## Backlog / deferred
-
-0. **Secret hygiene beyond the entry points:** the helpers that take a witness slice and run in the caller's frames —
-   `r1cs.System.isSatisfied`/`evalConstraint`, `qap.checkDivisible`, `msm.msmG1/G2`, `circom.writeWitness` — are not
-   burned (§ 5b item 8). `phase2.newZkey` handles public data only.
 
 Missing and it matters, most-hit first:
 

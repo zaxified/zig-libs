@@ -60,6 +60,12 @@ fn parseWitnessBody(allocator: Allocator, bytes: []const u8) Error![]Fr {
 /// Writes a witness vector as a `.wtns` (what circom's witness generator
 /// writes), so a witness computed here can be handed to snarkjs.
 pub fn writeWitness(w: *std.Io.Writer, witness: []const Fr) std.Io.Writer.Error!void {
+    // The encoded values pass through this frame: one frame down, then a stack
+    // wipe. What lands in `w`'s buffer and sink is the caller's.
+    return burn.run(burn.helper_burn, std.Io.Writer.Error!void, writeWitnessBody, .{ w, witness });
+}
+
+fn writeWitnessBody(w: *std.Io.Writer, witness: []const Fr) std.Io.Writer.Error!void {
     try bin.writeHeader(w, "wtns", 2, 2);
     try bin.writeSectionHeader(w, 1, 40);
     try bin.writePrime(w, &bin.r_le);

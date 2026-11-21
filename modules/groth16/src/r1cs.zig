@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const field = @import("field.zig");
+const burn = @import("burn.zig");
 const Fr = field.Fr;
 
 /// One nonzero entry of a constraint's linear combination: `coeff · w[index]`.
@@ -46,7 +47,20 @@ pub const System = struct {
 
     /// The three dot products `(Aᵢ·w, Bᵢ·w, Cᵢ·w)` for constraint `i` — the
     /// per-constraint evaluations QAP interpolation samples over the domain.
-    pub fn evalConstraint(self: System, i: usize, witness: []const Fr) struct { a: Fr, b: Fr, c: Fr } {
+    /// The witness is secret: the products are computed one frame down and the
+    /// stack they dirtied is zeroed (`burn.helper_burn`); the returned values
+    /// are the caller's to wipe.
+    pub fn evalConstraint(self: System, i: usize, witness: []const Fr) Eval {
+        return burn.run(burn.helper_burn, Eval, evalUnburned, .{ self, i, witness });
+    }
+
+    /// `(Aᵢ·w, Bᵢ·w, Cᵢ·w)`, the result of `evalConstraint`.
+    pub const Eval = struct { a: Fr, b: Fr, c: Fr };
+
+    /// `evalConstraint` without its own burn: for a body that already runs
+    /// under one (`isSatisfied`, `qap.checkDivisible`, the provers), where a
+    /// burn per constraint would cost a stack wipe per row.
+    pub fn evalUnburned(self: System, i: usize, witness: []const Fr) Eval {
         const con = self.constraints[i];
         return .{
             .a = dot(con.a, witness),
@@ -56,11 +70,16 @@ pub const System = struct {
     }
 
     /// Returns `true` iff `witness` satisfies EVERY constraint. `witness.len`
-    /// must equal `num_vars`.
+    /// must equal `num_vars`. Runs one frame down and zeroes the stack it
+    /// dirtied (the witness and its dot products are secret).
     pub fn isSatisfied(self: System, witness: []const Fr) bool {
         std.debug.assert(witness.len == self.num_vars);
+        return burn.run(burn.helper_burn, bool, isSatisfiedBody, .{ self, witness });
+    }
+
+    fn isSatisfiedBody(self: System, witness: []const Fr) bool {
         for (self.constraints, 0..) |_, i| {
-            const e = self.evalConstraint(i, witness);
+            const e = self.evalUnburned(i, witness);
             if (!e.a.mul(e.b).eql(e.c)) return false;
         }
         return true;

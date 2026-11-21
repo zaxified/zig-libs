@@ -4,7 +4,9 @@
 //! secret: `prover.setup` (the five toxic-waste scalars), `prover.prove` and
 //! `zkprove.prove` (witness, randomizers `r`/`s`, the QAP quotient),
 //! `phase2.contribute` (`x`, `s`), `circom.parseWitness` (witness decoded
-//! from a `.wtns`) and `Randomizers.randomInto` (which draws through
+//! from a `.wtns`), the witness helpers that run in the caller's frames
+//! (`r1cs.System.isSatisfied`/`evalConstraint`, `qap.checkDivisible`,
+//! `msm.msmG1`/`msmG2`, `circom.writeWitness`) and `Randomizers.randomInto` (which draws through
 //! `bn254.Fr.randomInto`; a fake `Io` replays known bytes so the draw is a
 //! needle). Kept in the module per `CONVENTIONS.md` §9.
 //!
@@ -36,6 +38,8 @@ const prover = @import("prover.zig");
 const zkprove = @import("zkprove.zig");
 const phase2 = @import("phase2.zig");
 const circom = @import("circom.zig");
+const qap = @import("qap.zig");
+const msm = @import("msm.zig");
 const zkey = @import("zkey.zig");
 const r1cs = @import("r1cs.zig");
 const fft = @import("fft.zig");
@@ -459,8 +463,14 @@ fn randomizerNeedles(n: *Needles, rand: prover.Randomizers, delta1: G1.Affine, d
 }
 
 fn proveNeedles(n: *Needles, w: []const Fr, rand: prover.Randomizers, pk: prover.ProvingKey, sys: r1cs.System) void {
-    addAll(n, "witness", w);
     randomizerNeedles(n, rand, pk.delta_g1, pk.delta_g2);
+    witnessNeedles(n, w, sys);
+}
+
+/// The witness, its per-constraint dot products, their interpolations and the
+/// quotient: what `prove` and the witness helpers compute from `w` alone.
+fn witnessNeedles(n: *Needles, w: []const Fr, sys: r1cs.System) void {
+    addAll(n, "witness", w);
     var a_ev = @as([nt_domain]Fr, @splat(Fr.zero));
     var b_ev = @as([nt_domain]Fr, @splat(Fr.zero));
     var c_ev = @as([nt_domain]Fr, @splat(Fr.zero));
@@ -719,3 +729,65 @@ test "STACKPROBE: no prover-secret residue on the dead stack after setup, prove,
 }
 
 const t1_zkey = @embedFile("testdata/snarkjs/t1.zkey");
+
+// ── the witness helpers (they take a witness slice in the caller's frames) ──
+
+var cur_g1: [nt_num_vars]G1.Affine = undefined;
+var cur_g2: [nt_num_vars]G2.Affine = undefined;
+var wtns_sink: [512]u8 = undefined;
+
+noinline fn callIsSatisfied() void {
+    const ok = cur_sys.isSatisfied(&cur_wit);
+    std.mem.doNotOptimizeAway(ok);
+}
+noinline fn callEvalConstraint() void {
+    // The result is the caller's; only what the call left below it counts.
+    var e = cur_sys.evalConstraint(1, &cur_wit);
+    std.mem.doNotOptimizeAway(&e);
+    std.crypto.secureZero(u8, std.mem.asBytes(&e));
+}
+noinline fn callCheckDivisible() void {
+    const ok = qap.checkDivisible(nt_domain, cur_sys, &cur_wit) catch unreachable;
+    std.mem.doNotOptimizeAway(ok);
+}
+noinline fn callMsmG1() void {
+    const r = msm.msmG1(&cur_g1, &cur_wit);
+    std.mem.doNotOptimizeAway(&r);
+}
+noinline fn callMsmG2() void {
+    const r = msm.msmG2(&cur_g2, &cur_wit);
+    std.mem.doNotOptimizeAway(&r);
+}
+noinline fn callWriteWitness() void {
+    var w: std.Io.Writer = .fixed(&wtns_sink);
+    circom.writeWitness(&w, &cur_wit) catch unreachable;
+    std.mem.doNotOptimizeAway(&wtns_sink);
+}
+
+test "STACKPROBE: no witness residue on the dead stack after isSatisfied, evalConstraint, checkDivisible, msmG1/G2 and writeWitness" {
+    try skipUnlessOptimized();
+    cur_cons = ntConstraints();
+    cur_sys = .{ .num_vars = nt_num_vars, .constraints = &cur_cons };
+    for (&cur_g1, &cur_g2, 0..) |*a, *b, i| {
+        const k = @import("field.zig").frFromU64(@intCast(i + 2));
+        a.* = G1.Jacobian.fromAffine(G1.Affine.generator).scalarMul(k).toAffine();
+        b.* = G2.Jacobian.fromAffine(G2.Affine.generator).scalarMul(k).toAffine();
+    }
+    var bad: usize = 0;
+    for (0..2) |ci| {
+        const c: u8 = @intCast(ci);
+        cur_wit = ntWitness(bigFr(20, c), bigFr(21, c));
+        try std.testing.expect(cur_sys.isSatisfied(&cur_wit));
+        nd.reset();
+        witnessNeedles(&nd, &cur_wit, cur_sys);
+        nd.sort();
+        leak_src = cur_wit[4].toBytes();
+        bad += try runProbe("r1cs.System.isSatisfied", callIsSatisfied, &nd);
+        bad += try runProbe("r1cs.System.evalConstraint", callEvalConstraint, &nd);
+        bad += try runProbe("qap.checkDivisible", callCheckDivisible, &nd);
+        bad += try runProbe("msm.msmG1", callMsmG1, &nd);
+        bad += try runProbe("msm.msmG2", callMsmG2, &nd);
+        bad += try runProbe("circom.writeWitness", callWriteWitness, &nd);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
