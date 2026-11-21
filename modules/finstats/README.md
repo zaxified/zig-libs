@@ -241,10 +241,9 @@ See the doc comments in `src/slice.zig` (every function and result struct),
 
 Portfolio weights, GARCH, cointegration and Fama-French regression are a later
 module; plotting, HTML reports, data download and pandas-index helpers are not
-statistics. Annualisation-frequency presets and confidence intervals / standard
-errors on the statistics (beyond the probabilistic ratios) are open items, and
-`montecarloSharpe` does not reproduce quantstats' spread. The reasons and the open
-items are in `SPEC.md`, *What is deliberately not done* and *Backlog / deferred*.
+statistics. Confidence intervals / standard errors on the statistics (beyond the
+probabilistic ratios) and O(n) rolling reducers are not provided; the reasons are in
+`SPEC.md`, *What is deliberately not done*.
 
 ## Verify
 

@@ -720,14 +720,50 @@ pub fn montecarloDrawdown(a: std.mem.Allocator, xs: []const f64, sims: usize, se
     return resampleStat(a, xs, sims, seed, .permute, {}, ddEval);
 }
 
+/// Distribution of the annualised Sharpe ratio over `sims` permutations of `xs`,
+/// computed as quantstats `montecarlo_sharpe` does (Apache-2.0 source read):
+/// path 0 is `xs` itself, the others permutations; each path is turned into a
+/// cumulative curve and back with `pct_change().dropna()`, which DROPS THE FIRST
+/// return of the path, so a path's Sharpe is that of its last `xs.len - 1`
+/// returns, `(mean - rf / ppy) / std * sqrt(ppy)` (`rf` divided, not compounded;
+/// `std` with ddof 1). A permutation of the whole series cannot move a Sharpe
+/// ratio, so the spread this reports is the spread of leaving one return out:
+/// about `1/sqrt(n)` of a bootstrap's. A path with no spread is skipped, as
+/// there; if none is left (or `xs` has fewer than three returns) every field is
+/// NaN. Our PRNG is xoshiro256, not numpy's: only the distribution matches, and
+/// exactly so at `sims = 1` (the original path). `montecarloSharpeBootstrap`
+/// is the statistically meaningful spread.
+pub fn montecarloSharpe(a: std.mem.Allocator, xs: []const f64, sims: usize, seed: u64, rf: f64, ppy: f64) Error!Dist {
+    if (badPpy(ppy) or !std.math.isFinite(rf)) return filled(nan);
+    try checkResample(xs.len, sims);
+    if (xs.len == 0 or sims == 0) return filled(0);
+    if (!finiteAll(xs)) return filled(nan);
+    const vals = try a.alloc(f64, sims);
+    defer a.free(vals);
+    const buf = try a.dupe(f64, xs);
+    defer a.free(buf);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    var n: usize = 0;
+    for (0..sims) |k| {
+        if (k != 0) drawPath(rnd, xs, buf, .permute);
+        const w = buf[1..];
+        if (w.len < 2) continue;
+        const sd = core.stdSample(w);
+        if (!(sd > 0)) continue;
+        vals[n] = (core.mean(w) - rf / ppy) / sd * @sqrt(ppy);
+        n += 1;
+    }
+    if (n == 0) return filled(nan);
+    return distOf(a, vals[0..n]);
+}
+
 /// Distribution of the annualised Sharpe ratio (`slice.sharpeRatio(path, rf,
 /// ppy)`) over `sims` BOOTSTRAP paths: `xs.len` returns drawn WITH replacement,
-/// since a permutation cannot change a Sharpe ratio (mean and std are order
-/// free). quantstats `montecarlo_sharpe` centres on the same value but reports
-/// a spread about 11 times narrower than a bootstrap of this size has; how it
-/// resamples could not be established as a black box, so its spread is NOT
-/// reproduced (the mean is, up to sampling error).
-pub fn montecarloSharpe(a: std.mem.Allocator, xs: []const f64, sims: usize, seed: u64, rf: f64, ppy: f64) Error!Dist {
+/// the spread a Sharpe ratio estimated from `xs.len` returns really has
+/// (quantstats' permutations cannot give one, see `montecarloSharpe`). `rf` is
+/// compounded to a period, as `slice.sharpeRatio` does.
+pub fn montecarloSharpeBootstrap(a: std.mem.Allocator, xs: []const f64, sims: usize, seed: u64, rf: f64, ppy: f64) Error!Dist {
     if (badPpy(ppy) or !std.math.isFinite(rf)) return filled(nan);
     return resampleStat(a, xs, sims, seed, .bootstrap, RfCtx{ .rf = rf, .ppy = ppy }, sharpeEval);
 }

@@ -29,6 +29,28 @@ const Cashflow = core.Cashflow;
 /// `error.TooLarge`). A histogram with more than 65 536 buckets is not a
 /// histogram anyone reads, and the bin count comes straight from a spec: at
 /// `bins = 1e9` the count buffer alone is 8 GB.
+/// How often the returns of a series are sampled: the presets of empyrical's
+/// `annualization_factor` (`DAILY` 252, `WEEKLY` 52, `MONTHLY` 12, `QUARTERLY` 4,
+/// `YEARLY` 1), for the `periods_per_year` argument of every annualising function.
+pub const Frequency = enum {
+    daily,
+    weekly,
+    monthly,
+    quarterly,
+    yearly,
+
+    /// The `periods_per_year` this frequency stands for.
+    pub fn periodsPerYear(f: Frequency) f64 {
+        return switch (f) {
+            .daily => 252,
+            .weekly => 52,
+            .monthly => 12,
+            .quarterly => 4,
+            .yearly => 1,
+        };
+    }
+};
+
 pub const max_histogram_bins: usize = 65_536;
 
 /// Most simulated values (`paths` x (months + 1)) `monteCarlo` will hold and
@@ -1585,6 +1607,7 @@ pub const montecarlo = calendar.montecarlo;
 pub const montecarloCagr = calendar.montecarloCagr;
 pub const montecarloDrawdown = calendar.montecarloDrawdown;
 pub const montecarloSharpe = calendar.montecarloSharpe;
+pub const montecarloSharpeBootstrap = calendar.montecarloSharpeBootstrap;
 pub const AlphaBeta = calendar.AlphaBeta;
 pub const alphaBeta = calendar.alphaBeta;
 pub const jensenAlpha = calendar.jensenAlpha;

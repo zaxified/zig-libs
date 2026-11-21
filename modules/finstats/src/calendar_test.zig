@@ -424,22 +424,45 @@ test "montecarlo percentiles agree between two large seeded runs" {
     try testing.expect(@abs(x.std - y.std) < 3e-3);
 }
 
-test "montecarloSharpe: bootstrap, centred on the sample Sharpe" {
+test "montecarloSharpeBootstrap: bootstrap, centred on the sample Sharpe" {
     const a = testing.allocator;
     const xs = try sampleReturns(a, 120, 44);
     defer a.free(xs);
     const sample = slice.sharpeRatio(xs, 0, 252);
-    const d = try cal.montecarloSharpe(a, xs, 4000, 8, 0, 252);
+    const d = try cal.montecarloSharpeBootstrap(a, xs, 4000, 8, 0, 252);
     // the bootstrap sd of an annualised Sharpe on 120 days is about 1.5
     try testing.expect(@abs(d.mean - sample) < 0.25);
     try testing.expect(d.std > 0.5 and d.std < 3.0);
     try testing.expect(d.min < sample and d.max > sample);
-    const rf = try cal.montecarloSharpe(a, xs, 4000, 8, 0.05, 252);
+    const rf = try cal.montecarloSharpeBootstrap(a, xs, 4000, 8, 0.05, 252);
     try testing.expect(rf.mean < d.mean); // same draws, a higher hurdle
     // a constant series has no spread: Sharpe 0 for every path
-    const c = try cal.montecarloSharpe(a, &.{ 0.01, 0.01, 0.01 }, 50, 1, 0, 252);
+    const c = try cal.montecarloSharpeBootstrap(a, &.{ 0.01, 0.01, 0.01 }, 50, 1, 0, 252);
     try testing.expectEqual(@as(f64, 0), c.max);
     try testing.expectEqual(@as(f64, 0), c.min);
+}
+
+test "montecarloSharpe: quantstats' permutation form: the first return of every path is dropped, pinned at sims = 1" {
+    const a = testing.allocator;
+    // quantstats 0.0.86 `montecarlo_sharpe(returns, sims=1, rf=..)` on these ten returns
+    const xs = [_]f64{ 0.012, -0.004, 0.007, 0.001, -0.011, 0.009, 0.003, -0.002, 0.006, 0.0 };
+    const d0 = try cal.montecarloSharpe(a, &xs, 1, 1, 0.0, 252);
+    try near(2.558408596267137, d0.mean, 1e-9);
+    try near(2.558408596267137, d0.min, 1e-9);
+    const d4 = try cal.montecarloSharpe(a, &xs, 1, 1, 0.04, 252); // rf / ppy, not compounded
+    try near(2.152311993685022, d4.mean, 1e-9);
+    // many permutations: centred near the Sharpe of the series, a spread far below a bootstrap's
+    const ys = try sampleReturns(a, 400, 9);
+    defer a.free(ys);
+    const p = try cal.montecarloSharpe(a, ys, 2000, 5, 0, 252);
+    const b = try cal.montecarloSharpeBootstrap(a, ys, 2000, 5, 0, 252);
+    try testing.expect(p.std > 0 and p.std < b.std / 5);
+    try testing.expect(@abs(p.mean - slice.sharpeRatio(ys, 0, 252)) < 0.2);
+    // no spread in any path, or too few returns: NaN
+    const c = try cal.montecarloSharpe(a, &.{ 0.01, 0.01, 0.01, 0.01 }, 20, 1, 0, 252);
+    try testing.expect(std.math.isNan(c.mean));
+    const two = try cal.montecarloSharpe(a, &.{ 0.01, 0.02 }, 20, 1, 0, 252);
+    try testing.expect(std.math.isNan(two.mean));
 }
 
 test "montecarlo caps, empty and non-finite inputs" {

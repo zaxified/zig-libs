@@ -59,7 +59,7 @@ Lists read from the installed packages by AST (ffn 1.3.0, empyrical-reloaded 0.5
 | Ratios: `serenity_index`, `common_sense_ratio`, `cpc_index`, `profit_ratio`, `win_loss_ratio`, `rar`, `exposure`, `outliers`, `remove_outliers`, `outlier_win_ratio`, `outlier_loss_ratio`, `pct_rank`, bias-corrected `skew` and `kurtosis` | **new**; `skewSample`, `kurtosisSample` beside the population `skewness`, `excessKurtosis` |
 | Against a benchmark: `information_ratio`, `treynor_ratio`, `greeks`, `rolling_greeks`, `alpha`, `capture`, `up_capture`, `down_capture`, `up_down_capture`, `roll_alpha_beta`, `roll_up_down_capture`, `roll_up_capture`, `roll_down_capture`, `up_alpha_beta`, `down_alpha_beta`, `excess_sharpe`, `batting_average`, `beta_fragility_heuristic` | **new** |
 | Tails: `gpd_risk_estimates`, CDaR, EWMA volatility, Hurst, Gaussian EVaR | **new**; the GPD fit is the exact constrained optimum, empyrical's `fmin` stops up to 6.7e-3 short (measured, on `gpdRiskEstimates`) |
-| Resampling: `montecarlo`, `montecarlo_cagr`, `montecarlo_drawdown`, `montecarlo_sharpe`, `resample_returns` | **new**; distribution facts pinned, our PRNG differs. `montecarloSharpe`'s spread does NOT reproduce quantstats', see *Backlog / deferred* |
+| Resampling: `montecarlo`, `montecarlo_cagr`, `montecarlo_drawdown`, `montecarlo_sharpe`, `resample_returns` | **new**; distribution facts pinned, our PRNG differs. `montecarloSharpe` is quantstats' form (permutations, the first return of each path dropped: its spread is a leave-one-out spread), `montecarloSharpeBootstrap` the with-replacement spread |
 | Converters: `simple_returns`, `to_returns`, `to_log_returns`, `to_price_index`, `rebase`, `deannualize`, `to_excess_returns`, `winsorize`, `rescale`, `year_frac` | **new** |
 | Rolling: `rolling_sortino`, `rolling_cagr`, `rolling_max_drawdown`, `rolling_win_rate`, rf in the rolling Sharpe | **new**; `rollingApplyCtx` for a reducer with parameters |
 | Factor attribution: `compute_exposures`, `perf_attrib` | **new** in `factor.zig` on flat arrays |
@@ -198,12 +198,11 @@ Newton budget is clamped by `max_newton_iter_cap` and by the work cap.
 
 Known limits a caller relies on:
 
-- `periods_per_year` is a free 252-defaulted knob: there are no annualisation presets and no bounds check beyond
-  rejecting a non-positive or non-finite value with NaN.
+- `periods_per_year` is a free 252-defaulted knob; `Frequency` (daily 252, weekly 52, monthly 12, quarterly 4, yearly 1: empyrical's `annualization_factor` presets) names the usual values, and a non-positive or non-finite value is rejected with NaN (empyrical and quantstats check no more).
 - There are no confidence intervals or standard errors on the statistics (beyond the probabilistic ratios).
 - `rollingApply` and `rollingBetaAlpha` cost O(rows x window), capped by `max_rolling_work`; `correlationMatrix` costs
   keys^2 x overlap, capped by `max_corr_keys` and `max_corr_work`.
-- `montecarloSharpe` is a plain bootstrap; its spread does not reproduce quantstats' (*Backlog / deferred*).
+- `montecarloSharpe` reproduces quantstats' permutation form, whose spread is the spread of leaving the first return of a path out (about `1/sqrt(n)` of a bootstrap's); `montecarloSharpeBootstrap` is the bootstrap.
 
 ## Verification
 
@@ -258,25 +257,23 @@ authoritative). The newer functions have no bench row; see *Backlog / deferred*.
   the pinned inputs, so it is not offered; `rf` is compounded to a period and subtracted (*Conventions*, label R).
 - **Sterling and Burke ratios:** no surveyed rival exports them (R PerformanceAnalytics does); open if that library joins
   the checklist.
+- **Confidence intervals / standard errors on the statistics.** None of the surveyed libraries (ffn, empyrical,
+  quantstats, Rust `quantstats`, `quant-metrics`) attaches one to a ratio or return statistic; the probabilistic
+  ratios and `montecarloSharpeBootstrap` are what they offer.
+- **O(n) rolling reducers.** `rollingApply` / `rollingBetaAlpha` recompute each window as the rivals' rolling
+  functions do (empyrical applies its function per window); a running-sum or monotonic-deque version would
+  change the numerics the oracles pin at 1e-11, so it would be a second function with its own tolerance, and
+  `max_rolling_work` already bounds the cost.
 - **Rival conventions not followed**, each on purpose and stated on its function: see the end of *Verdicts per
   function group* (`exposure`, weekly aggregation, `rar`, `probBacktestOverfitting`, `riskOfRuin`).
 
 ## Backlog / deferred
 
-- **`montecarloSharpe`'s spread:** quantstats centres on the sample Sharpe too, but reports a spread about 11 times
-  narrower than a bootstrap of this size, which falls like 1/n and does not depend on input order. How it resamples
-  could not be established as a black box. Ours is a plain bootstrap and says so.
 - **Speed of the newer functions:** `tools/bench.zig` measures the period functions and `riskMetrics`; the newer
   functions have no row, and the card's `fastest ?` stands. Rust `quantstats` and `quant-metrics` are the candidates to
   measure.
-- **Independent review of `slice.zig` before its "errors, dates" section:** the independent read-only review of the
-  slice surface did not cover it, so the card's review date stays.
 - **No mutants yet:** the `xirrPrecise` 1e-14 derivative guard and bracket exits, `gpdFit`'s grid bounds and
   golden-section constants, `distOf`'s percentile positions, the `tradeStats` and `periodStats` wrappers.
-- **O(n) rolling reducers:** `rollingApply` / `rollingBetaAlpha` are O(rows x window); running-sum or monotonic-deque
-  versions would change the numerics of the shipped reducers, so they would be new functions.
-- **Annualisation presets and bounds checking** beyond the free `periods_per_year` knob; **confidence intervals /
-  standard errors** on the statistics.
 
 ## Anchoring
 

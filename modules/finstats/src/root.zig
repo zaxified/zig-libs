@@ -35,6 +35,7 @@ pub const meta = .{
 /// is `finstats.X`.
 pub const slice = @import("slice.zig");
 
+pub const Frequency = slice.Frequency;
 pub const max_histogram_bins = slice.max_histogram_bins;
 pub const max_monte_carlo_cells = slice.max_monte_carlo_cells;
 pub const max_monte_carlo_months = slice.max_monte_carlo_months;
@@ -221,6 +222,7 @@ pub const montecarlo = slice.montecarlo;
 pub const montecarloCagr = slice.montecarloCagr;
 pub const montecarloDrawdown = slice.montecarloDrawdown;
 pub const montecarloSharpe = slice.montecarloSharpe;
+pub const montecarloSharpeBootstrap = slice.montecarloSharpeBootstrap;
 pub const AlphaBeta = slice.AlphaBeta;
 pub const alphaBeta = slice.alphaBeta;
 pub const jensenAlpha = slice.jensenAlpha;

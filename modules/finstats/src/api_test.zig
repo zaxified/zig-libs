@@ -53,6 +53,16 @@ fn xp(a: std.mem.Allocator, dates: []const []const u8, flows: []const f64, value
     return fs.xirrPrecise(a, dates, flows, values, opening, .{});
 }
 
+test "Frequency: empyrical's annualisation presets feed periods_per_year" {
+    try testing.expectEqual(@as(f64, 252), fs.Frequency.daily.periodsPerYear());
+    try testing.expectEqual(@as(f64, 52), fs.Frequency.weekly.periodsPerYear());
+    try testing.expectEqual(@as(f64, 12), fs.Frequency.monthly.periodsPerYear());
+    try testing.expectEqual(@as(f64, 4), fs.Frequency.quarterly.periodsPerYear());
+    try testing.expectEqual(@as(f64, 1), fs.Frequency.yearly.periodsPerYear());
+    const xs = [_]f64{ 0.01, -0.02, 0.015, 0.0, 0.02, -0.01 };
+    try testing.expectEqual(fs.cagrPeriods(&xs, 12), fs.cagrPeriods(&xs, fs.Frequency.monthly.periodsPerYear()));
+}
+
 test "scratch allocations are released: EVERY allocating public fn, on std.testing.allocator" {
     // Every other test here runs on an arena, which bulk-frees, so a function that
     // never released its scratch looked identical to one that did. The list is every
