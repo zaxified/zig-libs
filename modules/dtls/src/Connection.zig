@@ -60,6 +60,7 @@ const suitehash = @import("suitehash.zig");
 const Secret = suitehash.Secret;
 const certverify = @import("tls13").certverify;
 const certauth = @import("certauth.zig");
+const x509 = @import("x509");
 const suite12 = @import("suite12.zig");
 const messages12 = @import("messages12.zig");
 pub const ProtocolVersion = suite12.ProtocolVersion;
@@ -374,15 +375,36 @@ pub const PeerVerify = union(enum) {
     /// propagated (it becomes `error.CertificateRejected`) — log inside the
     /// hook if the caller needs the specific reason.
     verify_fn: *const fn (leaf_cert_der: []const u8) anyerror!void,
+    /// RFC 5280 §6 certification-path validation (`ChainVerify`): the peer's
+    /// whole Certificate message, built into a path to one of the anchors
+    /// by the `x509` module (multi-hop, out-of-order and cross-signed
+    /// chains, name constraints, `basicConstraints` / `keyUsage`,
+    /// path length, optional EKU and CRL revocation). `Config.now_sec` and
+    /// `Config.expected_peer_name` (checked against the leaf's
+    /// subjectAltName) apply. Checked when the Certificate message arrives,
+    /// before its CertificateVerify.
+    chain: ChainVerify,
 
     /// "No trust decision is made." Kept as a method rather than an `==`
     /// comparison because `PeerVerify` carries payloads.
     pub fn isNone(self: PeerVerify) bool {
         return switch (self) {
             .none => true,
-            .trust_anchor, .verify_fn => false,
+            .trust_anchor, .verify_fn, .chain => false,
         };
     }
+};
+
+/// `PeerVerify.chain`'s policy.
+pub const ChainVerify = struct {
+    /// Trusted roots (DER). A path must end at one of them.
+    trust_anchors: []const []const u8,
+    /// When set, the leaf's extKeyUsage (if present) must allow it — e.g.
+    /// `.server_auth` on a client, `.client_auth` on a server.
+    required_eku: ?x509.extensions.Purpose = null,
+    /// CRL checking of every certificate on the path (`x509.chain.Revocation`);
+    /// null checks nothing.
+    revocation: ?x509.chain.Revocation = null,
 };
 
 pub const Config = struct {
@@ -3702,6 +3724,8 @@ pub const Connection = struct {
                 self.config.expected_peer_name,
             ) catch return error.CertificateRejected,
             .verify_fn => |f| f(leaf_der) catch return error.CertificateRejected,
+            // Verified over the whole chain when the Certificate arrived.
+            .chain => {},
         }
     }
 
@@ -3848,8 +3872,17 @@ pub const Connection = struct {
                 self.transcript.append(parsed.msg_type, parsed.body);
             } else if (parsed.msg_type == @backingInt(messages.HandshakeType.certificate)) {
                 if (result.saw_cert) return error.UnexpectedMessage;
-                var entries_buf: [4]messages.CertificateEntry = undefined;
+                var entries_buf: [certauth.max_chain_certs]messages.CertificateEntry = undefined;
                 const dec = messages.decodeCertificate(parsed.body, &entries_buf) catch return error.Malformed;
+                if (dec.entries.len > 0) {
+                    if (self.config.peer_verify == .chain) {
+                        var ders: [certauth.max_chain_certs][]const u8 = undefined;
+                        for (dec.entries, 0..) |e, i| ders[i] = e.cert_data;
+                        const cv = self.config.peer_verify.chain;
+                        certauth.verifyPeerChain(ders[0..dec.entries.len], cv.trust_anchors, self.config.now_sec, self.config.expected_peer_name, cv.required_eku, cv.revocation) catch
+                            return error.CertificateRejected;
+                    }
+                }
                 self.transcript.append(parsed.msg_type, parsed.body);
                 result.saw_cert = true;
                 if (dec.entries.len > 0) {
@@ -10916,4 +10949,67 @@ test "use_srtp (1.3): the client refuses an answer it cannot accept" {
     try testing.expectError(error.InvalidSrtpProfiles, (Config{ .role = .client, .psk_identity = "id", .psk = "k", .srtp_profiles = &.{0} }).validate());
     const many: [max_srtp_profiles + 1]u16 = @splat(1);
     try testing.expectError(error.InvalidSrtpProfiles, (Config{ .role = .client, .psk_identity = "id", .psk = "k", .srtp_profiles = &many }).validate());
+}
+
+// ── PeerVerify.chain: RFC 5280 path building through x509 ──────────────────
+
+fn chainServerConfig(chain: []const []const u8, sk: *const std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey) Config {
+    var c = certDheServerConfig();
+    c.cert = .{ .chain = chain, .private_key = .{ .ecdsa_p256 = sk } };
+    return c;
+}
+
+fn chainHandshake(sc: Config, cc: Config) anyerror!void {
+    var client = try Connection.clientInit(cc);
+    defer client.deinit();
+    var server = try Connection.serverInit(sc);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x83)));
+    const rnd = seededForTest(&csprng);
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    const f2 = try server.handleFlight(ch, rnd, 0, &b2);
+    const cf = try client.handleFlight(f2.out, rnd, 0, &b1);
+    if (!cf.done) return error.WrongState;
+    const sf = try server.handleFlight(cf.out, rnd, 0, &b2);
+    if (!sf.done) return error.WrongState;
+}
+
+test "PeerVerify.chain: a leaf behind an intermediate verifies to the root; missing intermediate, wrong name, wrong EKU, wrong root fail" {
+    const sk = try std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.chain_leaf_secret_key_bytes);
+    const full = [_][]const u8{ &cert_kat.chain_leaf_cert_der, &cert_kat.chain_inter_cert_der };
+    const leaf_only = [_][]const u8{&cert_kat.chain_leaf_cert_der};
+    const roots = [_][]const u8{ &cert_kat.anchor_cert_der, &cert_kat.chain_root_cert_der };
+    var cc = certDheClientConfig();
+    cc.peer_verify = .{ .chain = .{ .trust_anchors = &roots, .required_eku = .server_auth } };
+    cc.expected_peer_name = "dtls-chain.test";
+    try chainHandshake(chainServerConfig(&full, &sk), cc);
+
+    try testing.expectError(error.CertificateRejected, chainHandshake(chainServerConfig(&leaf_only, &sk), cc));
+    var wrong_name = cc;
+    wrong_name.expected_peer_name = "other.test";
+    try testing.expectError(error.CertificateRejected, chainHandshake(chainServerConfig(&full, &sk), wrong_name));
+    var wrong_eku = cc;
+    wrong_eku.peer_verify = .{ .chain = .{ .trust_anchors = &roots, .required_eku = .client_auth } };
+    try testing.expectError(error.CertificateRejected, chainHandshake(chainServerConfig(&full, &sk), wrong_eku));
+    var wrong_root = cc;
+    wrong_root.peer_verify = .{ .chain = .{ .trust_anchors = &.{&cert_kat.anchor_cert_der} } };
+    try testing.expectError(error.CertificateRejected, chainHandshake(chainServerConfig(&full, &sk), wrong_root));
+    // The one-hop `.trust_anchor` cannot follow the intermediate.
+    var one_hop = cc;
+    one_hop.peer_verify = .{ .trust_anchor = &cert_kat.chain_root_cert_der };
+    try testing.expectError(error.CertificateRejected, chainHandshake(chainServerConfig(&full, &sk), one_hop));
+    // The intermediate offered as an anchor ends the path there.
+    var inter_anchor = cc;
+    inter_anchor.peer_verify = .{ .chain = .{ .trust_anchors = &.{&cert_kat.chain_inter_cert_der} } };
+    try chainHandshake(chainServerConfig(&full, &sk), inter_anchor);
+}
+
+test "PeerVerify.chain: the existing one-hop fixtures verify the same way" {
+    var cc = certDheClientConfig();
+    cc.peer_verify = .{ .chain = .{ .trust_anchors = &.{&cert_kat.anchor_cert_der} } };
+    try chainHandshake(certDheServerConfig(), cc);
+    cc.peer_verify = .{ .chain = .{ .trust_anchors = &.{&cert_kat.evil_anchor_cert_der} } };
+    try testing.expectError(error.CertificateRejected, chainHandshake(certDheServerConfig(), cc));
 }

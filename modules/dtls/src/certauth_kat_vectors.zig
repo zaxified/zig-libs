@@ -49,6 +49,16 @@ pub const server_cert_der = der("testdata/certs/server-cert.der");
 /// `server_cert_der`'s raw 32-byte ECDSA P-256 private scalar.
 pub const server_secret_key_bytes = der("testdata/certs/server-key.bin");
 
+/// A three-level chain for `PeerVerify.chain` (`tools/gen-chain-certs.sh`,
+/// OpenSSL 3.5.5, `openssl verify` OK): root CA (pathlen 1) → intermediate
+/// CA (pathlen 0) → leaf CN=dtls-chain-leaf, SAN dtls-chain.test, EKU
+/// serverAuth; same validity window as the others.
+pub const chain_root_cert_der = der("testdata/certs/chain-root-cert.der");
+pub const chain_inter_cert_der = der("testdata/certs/chain-inter-cert.der");
+pub const chain_leaf_cert_der = der("testdata/certs/chain-leaf-cert.der");
+/// `chain_leaf_cert_der`'s raw 32-byte ECDSA P-256 private scalar.
+pub const chain_leaf_secret_key_bytes = der("testdata/certs/chain-leaf-key.bin");
+
 /// Client leaf: ECDSA P-256, CN=dtls-test-client, issued by the SAME anchor.
 pub const client_cert_der = der("testdata/certs/client-cert.der");
 /// `client_cert_der`'s raw 32-byte ECDSA P-256 private scalar.

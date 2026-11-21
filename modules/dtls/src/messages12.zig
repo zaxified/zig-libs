@@ -260,6 +260,24 @@ pub fn encodeCertificate(chain: []const []const u8, out: []u8) Error![]u8 {
 
 /// Validates the whole `certificate_list` framing and returns the leaf (or
 /// null for an empty list — a client's "no certificate", RFC 5246 §7.4.6).
+/// Every certificate of a Certificate body, in order, into `out`;
+/// `error.Malformed` for a bad shape or more than `out.len` certificates.
+pub fn decodeCertificateList(buf: []const u8, out: [][]const u8) Error![]const []const u8 {
+    if (buf.len < 3) return error.Malformed;
+    const total: usize = std.mem.readInt(u24, buf[0..3], .big);
+    if (total != buf.len - 3) return error.Malformed;
+    var i: usize = 3;
+    var n: usize = 0;
+    while (i < buf.len) : (n += 1) {
+        if (buf.len - i < 3 or n == out.len) return error.Malformed;
+        const len: usize = std.mem.readInt(u24, buf[i..][0..3], .big);
+        if (len == 0 or len > buf.len - i - 3) return error.Malformed;
+        out[n] = buf[i + 3 ..][0..len];
+        i += 3 + len;
+    }
+    return out[0..n];
+}
+
 pub fn decodeCertificateLeaf(buf: []const u8) Error!?[]const u8 {
     if (buf.len < 3) return error.Malformed;
     const total: usize = std.mem.readInt(u24, buf[0..3], .big);

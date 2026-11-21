@@ -135,6 +135,39 @@ pub fn parseLeafPublicKey(cert_der: []const u8) Error!certverify.PublicKey {
 /// authenticates as any other — device impersonation, and on a client, a
 /// server-impersonation MITM. That is the whole reason this parameter is not
 /// optional-by-omission but an explicit `?[]const u8` the caller must decide.
+/// The most certificates `verifyPeerChain` takes from a peer's Certificate
+/// message: the leaf and `x509.Options.max_intermediates`' default of 8.
+pub const max_chain_certs = 9;
+
+/// RFC 5280 §6 certification-path validation of a peer's chain (leaf first,
+/// as sent) against `trust_anchors`, through `x509.verifyChain`: path
+/// building over every presented certificate (out of order, cross-signed,
+/// at most 8 intermediates), validity of each certificate at `now_sec`,
+/// `basicConstraints` / `keyUsage` on every CA, path-length and name
+/// constraints, an optional `required_eku` on the leaf, `expected_name`
+/// against the leaf's subjectAltName, and CRL revocation when `revocation`
+/// is set. Allocation-free from the caller's view: x509's working memory
+/// comes from a fixed stack buffer, and running out of it fails the chain.
+pub fn verifyPeerChain(
+    chain: []const []const u8,
+    trust_anchors: []const []const u8,
+    now_sec: i64,
+    expected_name: ?[]const u8,
+    required_eku: ?x509.extensions.Purpose,
+    revocation: ?x509.chain.Revocation,
+) (Error || error{ChainRejected})!void {
+    if (chain.len == 0 or chain.len > max_chain_certs) return error.ChainRejected;
+    var mem: [32 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    const gpa = fba.allocator();
+    _ = x509.verifyChain(gpa, chain, trust_anchors, .{
+        .now_sec = now_sec,
+        .expected_host = expected_name,
+        .required_eku = required_eku,
+        .revocation = revocation,
+    }) catch return error.ChainRejected;
+}
+
 pub fn verifyLeafAgainstAnchor(
     leaf_der: []const u8,
     anchor_der: []const u8,

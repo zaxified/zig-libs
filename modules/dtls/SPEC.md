@@ -131,7 +131,8 @@ bridge), layered on top of the unchanged PSK key exchange — see `root.zig`'s m
   `Config.require_peer_cert`; peer-chain trust via `Config.peer_verify`
   (`.none` / `.trust_anchor` — a real one-hop `std.crypto.Certificate
   .Parsed.verify` check via `certauth.verifyLeafAgainstAnchor` — /
-  `.verify_fn` escape hatch); real ECDSA-P256/P384, RSA-PSS, Ed25519
+  `.chain` — RFC 5280 §6 path validation through the `x509` module,
+  `certauth.verifyPeerChain` — / `.verify_fn` escape hatch); real ECDSA-P256/P384, RSA-PSS, Ed25519
   signatures over the LIVE running transcript (not a fixed KAT string) via
   `certverify.sign`/`.verify`, unmodified. Proven by a real client↔server
   self-interop suite in `Connection.zig` (server-cert-only, mutual auth,
@@ -552,9 +553,18 @@ Deliberately not implemented in 1.2: see *What is deliberately not done*. Not ye
   `error.DecryptionFailed` on any tag mismatch, never panic, never leak
   timing differences between "bad tag" and "bad padding"/other failure
   modes — attacker-controlled ciphertext must never reach a panic path.
-- **Certificate paths and entries:** `.trust_anchor` is a minimal one-hop check (no multi-hop chains, name
-  constraints, `basicConstraints`/`keyUsage` policy, revocation); `CertificateEntry` extensions (OCSP
-  stapling/SCT) are framed empty on send and length-validated-but-discarded on receive (Backlog).
+- **Certificate paths and entries:** `.trust_anchor` stays a minimal one-hop check. `PeerVerify.chain`
+  (`ChainVerify`: trust anchors, optional `required_eku`, optional CRL `revocation`) runs `x509.verifyChain` over
+  every certificate of the peer's Certificate message (leaf + at most 8 intermediates, `certauth.max_chain_certs`):
+  path building (out-of-order and cross-signed chains), validity at `Config.now_sec`, `basicConstraints` /
+  `keyUsage` on each CA, path length and name constraints, `Config.expected_peer_name` against the leaf's SAN —
+  Go `crypto/x509` / OpenSSL semantics, as the `x509` module documents. x509's working memory is a 32 KiB stack
+  buffer (`FixedBufferAllocator`), so the module stays allocation-free; running out fails the chain. Both engines;
+  checked when the Certificate arrives, before CertificateVerify. Anchored by a three-level chain from OpenSSL
+  (`tools/gen-chain-certs.sh`, `openssl verify` OK): verified to the root, the intermediate as anchor; refused with
+  the intermediate missing, a wrong name, a wrong EKU, a wrong root. The received Certificate message is still bounded
+  by `max_cert_message_body` (1200 bytes). `CertificateEntry` extensions (OCSP stapling/SCT) are framed empty on send
+  and length-validated-but-discarded on receive (Backlog).
 - **The cookie exchange is not stateless against a FRAGMENTED ClientHello.**
   `serverProcessClientHello` fully reassembles the ClientHello (`takeHandshakeMessage`) before the cookie
   check ever runs — the cookie lives inside the ClientHello body, so it cannot be read from a partial one.
@@ -813,8 +823,9 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.
 - **Connection ID (RFC 9146).** Only the framing exists (`record.zig`'s unified header carries and decodes a CID, with
   `negotiated_cid_len` passed in); there is no negotiation and no CID in the engines.
-- **Certification-path building** (RFC 5280 §6: multi-hop chains, name constraints, `basicConstraints`/`keyUsage`
-  policy, revocation) and **`CertificateEntry` extensions** (OCSP stapling/SCT); `.trust_anchor` is a minimal one-hop check.
+- **`CertificateEntry` extensions** (OCSP stapling `status_request`, SCT): wolfSSL and OpenSSL offer stapling.
+  Framed empty on send, length-validated-but-discarded on receive. Needs an OCSP response verifier (the `x509`
+  module checks CRLs). Effort: medium.
 - **A second independent stack.** wolfSSL agreeing with us rules out the wire defects listed under *What it found*, but a
   bug the two happen to share would still pass; mbedTLS or picotls would be the natural cross-check.
 - **Dead-stack hygiene, what the sweep does not cover yet.** The full-handshake probe drives `poll`'s handshake

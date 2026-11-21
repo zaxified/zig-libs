@@ -1211,3 +1211,22 @@ test "dtls12: use_srtp (RFC 5764) in the hellos, server preference, same SRTP ke
     try server.exportKeyingMaterial("EXTRACTOR-dtls_srtp", null, &ks);
     try testing.expectEqualSlices(u8, &kc, &ks);
 }
+
+test "dtls12: PeerVerify.chain builds the path through the intermediate (and refuses without it)" {
+    const sk = try std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.chain_leaf_secret_key_bytes);
+    const roots = [_][]const u8{&cert_kat.chain_root_cert_der};
+    var c = ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    c.peer_verify = .{ .chain = .{ .trust_anchors = &roots, .required_eku = .server_auth } };
+    c.expected_peer_name = "dtls-chain.test";
+    var s = ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    s.cert = .{ .chain = &.{ &cert_kat.chain_leaf_cert_der, &cert_kat.chain_inter_cert_der }, .private_key = .{ .ecdsa_p256 = &sk } };
+    try roundTrip(c, s, .ecdhe_ecdsa_with_aes_128_gcm_sha256);
+    s.cert = .{ .chain = &.{&cert_kat.chain_leaf_cert_der}, .private_key = .{ .ecdsa_p256 = &sk } };
+    var client = try Connection12.clientInit(c);
+    defer client.deinit();
+    var server = try Connection12.serverInit(s);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x84)));
+    var bufs: Bufs = undefined;
+    try testing.expectError(error.CertificateRejected, drive(&client, &server, seeded(&csprng), &bufs));
+}

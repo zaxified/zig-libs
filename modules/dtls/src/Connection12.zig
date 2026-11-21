@@ -1034,7 +1034,7 @@ pub const Connection12 = struct {
     fn clientCertificate(self: *Connection12, body: []const u8, transcript_before: usize) HandshakeError!void {
         if (!self.kx.usesCertificate()) return error.UnexpectedMessage;
         const leaf = (m12.decodeCertificateLeaf(body) catch return error.Malformed) orelse return error.PeerCertificateRequired;
-        try self.checkTrust(leaf);
+        try self.checkTrust(leaf, body);
         self.peer_leaf_off = transcript_before + handshake.header_len + (@intFromPtr(leaf.ptr) - @intFromPtr(body.ptr));
         self.peer_leaf_len = leaf.len;
         self.got_certificate = true;
@@ -1372,7 +1372,7 @@ pub const Connection12 = struct {
             if (self.config.require_peer_cert) return error.PeerCertificateRequired;
             return;
         };
-        try self.checkTrust(leaf);
+        try self.checkTrust(leaf, body);
         self.peer_leaf_off = transcript_before + handshake.header_len + (@intFromPtr(leaf.ptr) - @intFromPtr(body.ptr));
         self.peer_leaf_len = leaf.len;
         self.client_cert_presented = true;
@@ -1525,12 +1525,20 @@ pub const Connection12 = struct {
         return null;
     }
 
-    fn checkTrust(self: *const Connection12, leaf: []const u8) HandshakeError!void {
+    /// `body` is the whole Certificate message (`.chain` reads every
+    /// certificate of it).
+    fn checkTrust(self: *const Connection12, leaf: []const u8, body: []const u8) HandshakeError!void {
         _ = certauth.parseLeafPublicKey(leaf) catch return error.CertificateRejected;
         switch (self.config.peer_verify) {
             .none => {},
             .trust_anchor => |anchor| certauth.verifyLeafAgainstAnchor(leaf, anchor, self.config.now_sec, self.config.expected_peer_name) catch return error.CertificateRejected,
             .verify_fn => |f| f(leaf) catch return error.CertificateRejected,
+            .chain => |cv| {
+                var ders: [certauth.max_chain_certs][]const u8 = undefined;
+                const certs = m12.decodeCertificateList(body, &ders) catch return error.CertificateRejected;
+                certauth.verifyPeerChain(certs, cv.trust_anchors, self.config.now_sec, self.config.expected_peer_name, cv.required_eku, cv.revocation) catch
+                    return error.CertificateRejected;
+            },
         }
     }
 

@@ -201,8 +201,8 @@ the middle of an incomplete one — see `handleFlight`'s "KNOWN LIMIT".
 ## Not provided
 
 Resumption and tickets, 0-RTT, connection ID
-negotiation, full RFC 5280 §6 path building (`.trust_anchor` is a one-hop check) and
-`CertificateEntry` extensions are not built; DTLS 1.2 CBC suites, static-RSA key exchange,
+negotiation and `CertificateEntry` extensions (OCSP stapling) are not built (RFC 5280 path building is
+`PeerVerify.chain`; `.trust_anchor` stays one-hop); DTLS 1.2 CBC suites, static-RSA key exchange,
 compression, renegotiation and DTLS 1.0 are refused on purpose. See [SPEC.md](SPEC.md) *Backlog /
 deferred* and *What is deliberately not done*.
 

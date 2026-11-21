@@ -348,6 +348,9 @@ pub const certauth = @import("certauth.zig");
 pub const Connection = connection.Connection;
 pub const Config = connection.Config;
 pub const Role = connection.Role;
+/// `Config.peer_verify`'s policy, and `.chain`'s RFC 5280 path-validation settings.
+pub const PeerVerify = connection.PeerVerify;
+pub const ChainVerify = connection.ChainVerify;
 pub const CipherSuite = connection.CipherSuite;
 /// A suite's hash (`CipherSuite.hash`, `Config.psk_hash`): SHA-256, or
 /// SHA-384 for `aes_256_gcm_sha384`.
