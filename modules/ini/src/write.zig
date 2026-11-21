@@ -100,11 +100,67 @@ pub fn appendValue(gpa: Allocator, out: *std.ArrayList(u8), value: []const u8, i
     }
 }
 
+/// A byte-class shortcut for the common entry: one line, a plain key and a
+/// plain value. It accepts an entry only when the classifier provably would
+/// (so it never replaces the proof, only skips copying the line and reading it
+/// back); anything else, and every bare key under a dialect that refuses them,
+/// goes the long way through `verifyEntry`. `write_fast_test` below holds it to
+/// "accepts implies the classifier accepts" over generated entries.
+pub const Plain = struct {
+    ok: bool,
+    /// Not allowed anywhere in a key: a separator, a comment character, a
+    /// bracket, a line end.
+    key_bad: [256]bool = @splat(false),
+    /// Not allowed anywhere in a value: a line end and, when inline comments are
+    /// on, a comment character.
+    val_bad: [256]bool = @splat(false),
+
+    pub fn init(opts: *const Options, separator: []const u8) Plain {
+        var p: Plain = .{ .ok = !opts.locale_keys };
+        // The separator must be blanks around one of `separators`, which is no
+        // comment character: the first separator on the line is then ours.
+        const mid = std.mem.trim(u8, separator, " \t");
+        if (mid.len != 1 or std.mem.findScalar(u8, opts.separators, mid[0]) == null or
+            std.mem.findScalar(u8, opts.comment_chars, mid[0]) != null) p.ok = false;
+        for (separator) |c| if (c != ' ' and c != '\t' and c != mid[0]) {
+            p.ok = false;
+        };
+        for (opts.separators) |c| p.key_bad[c] = true;
+        for (opts.comment_chars) |c| {
+            p.key_bad[c] = true;
+            if (opts.inline_comments) p.val_bad[c] = true;
+        }
+        for ("[]\r\n") |c| p.key_bad[c] = true;
+        p.val_bad['\r'] = true;
+        p.val_bad['\n'] = true;
+        return p;
+    }
+
+    /// True: the line `key` + separator + `value` (or `key` alone when not
+    /// `has_value`) reads as exactly this entry under the options given to `init`.
+    pub fn entry(self: *const Plain, opts: *const Options, key: []const u8, value: []const u8, has_value: bool) bool {
+        if (!self.ok or key.len == 0) return false;
+        if (!has_value and !opts.no_value_keys) return false;
+        if (isBlank(key[0]) or isBlank(key[key.len - 1])) return false;
+        for (key) |c| if (self.key_bad[c]) return false;
+        if (!has_value) return true;
+        if (value.len == 0) return true;
+        if (isBlank(value[0]) or isBlank(value[value.len - 1])) return false;
+        for (value) |c| if (self.val_bad[c]) return false;
+        return true;
+    }
+
+    fn isBlank(c: u8) bool {
+        return c == ' ' or c == '\t';
+    }
+};
+
 const Scratch = struct {
     gpa: Allocator,
     w: *std.Io.Writer,
     o: *const WriteOptions,
     separator: []const u8,
+    plain: Plain,
     line: std.ArrayList(u8) = .empty,
 
     fn header(self: *Scratch, name: []const u8) WriteError!void {
@@ -123,6 +179,14 @@ const Scratch = struct {
     }
 
     fn entry(self: *Scratch, key: []const u8, value: []const u8, has_value: bool) WriteError!void {
+        if (self.plain.entry(&self.o.options, key, value, has_value)) {
+            try self.w.writeAll(key);
+            if (has_value) {
+                try self.w.writeAll(self.separator);
+                try self.w.writeAll(value);
+            }
+            return self.w.writeAll(self.o.eol);
+        }
         self.line.clearRetainingCapacity();
         try self.line.appendSlice(self.gpa, key);
         if (has_value) {
@@ -138,11 +202,13 @@ const Scratch = struct {
 pub fn writeDocument(doc: *const root.Document, gpa: Allocator, w: *std.Io.Writer, o: WriteOptions) WriteError!void {
     if (!std.mem.eql(u8, o.eol, "\n") and !std.mem.eql(u8, o.eol, "\r\n")) return error.NotRepresentable;
     var sep_buf: [3]u8 = undefined;
+    const separator = o.separator orelse try defaultSeparator(&o.options, &sep_buf);
     var s: Scratch = .{
         .gpa = gpa,
         .w = w,
         .o = &o,
-        .separator = o.separator orelse try defaultSeparator(&o.options, &sep_buf),
+        .separator = separator,
+        .plain = .init(&o.options, separator),
     };
     defer s.line.deinit(gpa);
 
@@ -177,4 +243,52 @@ fn writeMergedSection(doc: *const root.Document, s: *Scratch, name: []const u8) 
         try s.entry(e.key, e.value, e.has_value);
     }
     if (s.o.blank_after_section) try s.w.writeAll(s.o.eol);
+}
+
+test "Plain accepts only entries the classifier accepts" {
+    const testing = std.testing;
+    const optsets = [_]Options{
+        .{},
+        .python,
+        .{ .separators = "=:", .comment_chars = "#;", .inline_comments = true },
+        .{ .trim_values = false, .no_value_keys = true },
+        .{ .separators = ":", .comment_chars = "#", .inline_comments = true, .no_value_keys = true },
+        .{ .separators = "=", .comment_chars = "=", .inline_comments = true },
+        .{ .locale_keys = true },
+        .{ .header_trailing_text = true, .continuation_lines = true, .no_value_keys = true },
+    };
+    const alphabet = "ab =:;#[]\t\r\n.";
+    var prng: std.Random.DefaultPrng = .init(0x1417);
+    const rnd = prng.random();
+    var kbuf: [8]u8 = undefined;
+    var vbuf: [8]u8 = undefined;
+    var accepted: usize = 0;
+    for (optsets) |opts| {
+        var sepb: [3]u8 = undefined;
+        const sep = defaultSeparator(&opts, &sepb) catch continue;
+        const plain = Plain.init(&opts, sep);
+        var i: usize = 0;
+        while (i < 40000) : (i += 1) {
+            const kl = rnd.uintLessThan(usize, kbuf.len + 1);
+            const vl = rnd.uintLessThan(usize, vbuf.len + 1);
+            for (kbuf[0..kl]) |*c| c.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+            for (vbuf[0..vl]) |*c| c.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+            const has_value = rnd.boolean();
+            if (!plain.entry(&opts, kbuf[0..kl], vbuf[0..vl], has_value)) continue;
+            accepted += 1;
+            var line: [32]u8 = undefined;
+            var n: usize = 0;
+            @memcpy(line[0..kl], kbuf[0..kl]);
+            n = kl;
+            if (has_value) {
+                @memcpy(line[n..][0..sep.len], sep);
+                n += sep.len;
+                @memcpy(line[n..][0..vl], vbuf[0..vl]);
+                n += vl;
+            }
+            try testing.expect(verifyEntry(line[0..n], kbuf[0..kl], if (has_value) vbuf[0..vl] else "", has_value, &opts));
+        }
+    }
+    // The shortcut is not vacuous.
+    try testing.expect(accepted > 5000);
 }

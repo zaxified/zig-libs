@@ -689,6 +689,7 @@ test {
     _ = @import("editor.zig");
     _ = @import("oracle_ext_test.zig");
     _ = @import("value.zig");
+    _ = @import("write.zig");
 }
 
 test "an mc skin: sections, later lines win, `;` inside values" {
