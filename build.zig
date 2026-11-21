@@ -615,6 +615,11 @@ pub fn build(b: *std.Build) void {
         "ct25519-base-comb",
         "ct25519: fixed-base comb table for mulBase/X25519 keygen (default true; profile=small false, ~3x slower keygen, -43 KB table)",
     ));
+    zl_options.addOption(?bool, "ed448_base_comb", b.option(
+        bool,
+        "ed448-base-comb",
+        "ed448: fixed-base comb table for key generation and signing (default true; profile=small false, slower keygen/sign, -344 KB table)",
+    ));
     zl_options.addOption(?bool, "p521_base_table", b.option(
         bool,
         "p521-base-table",

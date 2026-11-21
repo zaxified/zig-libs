@@ -70,6 +70,17 @@ fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
 /// "complete" without the twisted/extended-coordinates trick 25519 needs
 /// for its `a = -1` curve — RFC 8032 §5.2.4 gives the plain 3-coordinate
 /// formulas directly for exactly this reason).
+/// Whether `Point.baseComb` (112 × 16 projective points, 344 064 bytes of
+/// `.rodata`) is linked: `-Ded448-base-comb=false`, or `-Dprofile=small`, leaves
+/// it out. `mulBasePoint` (key generation, signing) then runs the variable-base
+/// constant-time `mul` on `basePoint` — the same points, the same constant-time
+/// shape, slower. The default keeps the table: the grade is measured on it.
+pub const use_base_comb: bool = zl_options.ed448_base_comb orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
+const zl_options = @import("zl_options");
+
 pub const Point = struct {
     x: Fe,
     y: Fe,
@@ -284,6 +295,7 @@ pub const Point = struct {
     }
 
     noinline fn mulBasePointUnburned(s: *const scalar.CompressedScalar) Point {
+        if (comptime !use_base_comb) return mulUnburned(basePoint, s);
         var acc = identityElement;
         inline for (0..112) |w| {
             const shift = w * 4;

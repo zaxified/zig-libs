@@ -290,7 +290,25 @@ it. The expander is this module's own (`decaf448`, which depends on this module,
 for all five messages of each suite (an RFC model in Python reproduced them first); parts equal the
 concatenation; the oversize-DST reduction; the exceptional inputs `u ∈ {0, ±1}` land on the curve.
 
+## Build options
+
+`-Ded448-base-comb=false` (and `-Dprofile=small`, which picks it) leaves the fixed-base comb (`Point.baseComb`,
+112 × 16 projective points, 344 064 bytes of `.rodata`) out of the binary. `mulBasePoint` (key generation, the
+signing nonce `[r]B`) then runs `Point.mul(basePoint, s)` — the variable-base constant-time ladder `decaf448`'s
+`scalarmul` ctgrind row already covers — the same points (the RFC 8032 KATs pass under `-Dprofile=small`), slower.
+Measured: `tools/sizeprobe.zig` (a seeded key pair and one signature) at ReleaseSmall shrinks 410 416 → 74 544 B
+(gain 335 872 B, `scripts/checks/small-sizes.sh --measure`). The default keeps the comb: the card's performance is
+measured on it.
+
 ## What is deliberately not done
+
+- **A `blackBox` on `scalar.zig`'s `condSubL` mask.** `Fe`'s selects launder their mask; the scalar's
+  conditional subtraction does not. Measured 2026-11-21 (`ctgrind.sh --stacks ed448`, ReleaseFast): target
+  `full` runs `sign`, whose `reduceWide` takes the secret nonce digest through `condSubL` 912 times, and
+  reports no context in `scalar.zig` (its 3 are `Fe.invert`'s public-length entry and the harness's prints), so
+  the select is branch-free as compiled; a compiler that branched there would move the pinned count. Laundering
+  it anyway moved `decaf448`'s `scalar.invert` dead-stack probe (the scalar found 167–199 B below the region top)
+  and would need a deeper burn there.
 
 - **A cofactorless `verifyStrict`** (RFC 8032 §5.2.7's `[S]B = R + [k]A'`): `verify`/`verifyPh` are
   cofactored only, as `std.crypto.sign.Ed25519.verify` is (see *Threat model*).
@@ -370,13 +388,8 @@ forced-inline `mulI`/`squareI`) are in *Design*.
 
 ## Backlog / deferred
 
-- **Build option: fixed-base comb size** (mechanism and checklist in CONVENTIONS §4.2; measure first —
-  HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of
-  roughly ≥ 100 KB or a consumer request). `baseComb: [112][16]Point` ≈ 1792 points ×
-  ~224 B ≈ 400 KB of table (estimate). `.small` → a smaller comb (fewer teeth or w=4 windowed) — slower keygen/sign, same constant-time
-  guarantees (table lookups stay masked; re-run ctgrind). Unmeasured.
-- **`scalar.zig` `condSubL` mask not laundered**: `Fe`'s selects use `field.blackBox`; the same change on the scalar's conditional subtraction made `decaf448`'s `scalar.invert` stack probe find the scalar (30 hits, 167–199 B below the region top), so it was reverted. It needs a ctgrind look at whether that select lowers to a branch at all, and a burn depth that covers the new frame. Effort S.
-- **Speed leftovers** (verify at 1.03–1.07× OpenSSL). Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
+- **Speed leftovers** (verify at 1.03–1.07× OpenSSL). Bounced (quiet phase): perf, to be measured A/B on a quiet
+  host. Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
 
 ## Anchoring
 
