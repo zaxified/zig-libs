@@ -22,13 +22,14 @@ const s7 = @import("s7.zig");
 const items = @import("items.zig");
 const vars = @import("vars.zig");
 const userdata = @import("userdata.zig");
+const bt = @import("blocktransfer.zig");
 
 pub const Error = error{
     /// The request is not something this responder implements.
     Unsupported,
     /// The caller's output buffer is too small for the reply.
     BufferTooSmall,
-} || tpkt.Error || cotp.Error || s7.Error || items.Error || vars.Error || userdata.Error;
+} || bt.Error || tpkt.Error || cotp.Error || s7.Error || items.Error || vars.Error || userdata.Error;
 
 /// One addressable memory area backed by caller-owned storage.
 pub const AreaBinding = struct {
@@ -76,6 +77,24 @@ pub const Config = struct {
     /// follow-up requests. Zero: whatever the negotiated PDU length leaves
     /// (480 octets: 454). A small value forces fragmentation in tests.
     max_userdata_payload: u16 = 0,
+    /// Block images served to an upload (functions 0x1D-0x1F), as the CPU keeps
+    /// them. A block not listed here is "object does not exist".
+    block_images: []const BlockImage = &.{},
+    /// A download (functions 0x1A-0x1C, then `_INSE`) WRITES a program into
+    /// the simulated CPU; refused unless this is set, like the PLC control
+    /// requests. Off by default.
+    allow_block_download: bool = false,
+    /// Where a download's image is assembled. A download longer than this is
+    /// refused ("no resources"). After the `_INSE` the image stays here until
+    /// the next download starts (`Responder.insertedImage`).
+    download_buffer: []u8 = &.{},
+};
+
+/// One block image served by the upload services.
+pub const BlockImage = struct {
+    block_type: userdata.BlockType,
+    number: u16,
+    image: []const u8,
 };
 
 /// A caller-supplied clock for the time-of-day services.
@@ -112,6 +131,25 @@ pub const Responder = struct {
     /// request continues. Cleared by a COTP connect or disconnect and by any
     /// request that is not the follow-up.
     cont: ?Continuation = null,
+    /// An upload in progress (start-upload answered, end-upload not yet seen).
+    up: ?Upload = null,
+    /// A download in progress.
+    dl: ?Download = null,
+    /// The block the last successful `_INSE` activated.
+    inserted: ?userdata.BlockRef = null,
+    inserted_len: usize = 0,
+
+    const Upload = struct { image: []const u8, offset: usize = 0 };
+    const Download = struct {
+        const Stage = enum { pulling, received, ended };
+        name: bt.FileName,
+        expected: usize,
+        received: usize = 0,
+        job_ref: u16,
+        stage: Stage = .pulling,
+    };
+    /// Upload and download id the responder hands out.
+    const transfer_id: u32 = 1;
 
     const Continuation = struct {
         const Kind = enum { szl, list };
@@ -148,6 +186,8 @@ pub const Responder = struct {
                 // A legitimation belongs to one connection.
                 self.legitimated = false;
                 self.cont = null;
+                self.up = null;
+                self.dl = null;
                 var body: [64]u8 = undefined;
                 // Echo the client's parameters back, which is what a real CPU
                 // does and what makes the rack/slot round trip visible.
@@ -166,6 +206,8 @@ pub const Responder = struct {
                 self.connected = false;
                 self.legitimated = false;
                 self.cont = null;
+                self.up = null;
+                self.dl = null;
                 return null;
             },
             .dt => |dt| {
@@ -190,6 +232,7 @@ pub const Responder = struct {
         return switch (pdu.header.rosctr) {
             .job => try self.handleJob(pdu, out),
             .userdata => try self.handleUserdata(pdu, out),
+            .ack_data => try self.handleAck(pdu, out),
             else => error.Unsupported,
         };
     }
@@ -202,7 +245,18 @@ pub const Responder = struct {
             .read_var => try self.doRead(pdu, out),
             .write_var => try self.doWrite(pdu, out),
             .plc_stop => try self.doControl(pdu, out, true),
-            .pi_service => try self.doControl(pdu, out, false),
+            .pi_service => if (bt.piServiceName(pdu.parameters)) |svc|
+                (if (std.mem.eql(u8, svc, bt.insert_service))
+                    try self.doInsert(pdu, out)
+                else
+                    try self.doControl(pdu, out, false))
+            else
+                try self.doControl(pdu, out, false),
+            .start_upload => try self.doStartUpload(pdu, out),
+            .upload => try self.doUpload(pdu, out),
+            .end_upload => try self.doEndUpload(pdu, out),
+            .request_download => try self.doRequestDownload(pdu, out),
+            .download_ended => try self.doDownloadEnded(pdu, out),
             else => try errorReply(pdu, .error_on_service_processing, 0x04, out),
         };
     }
@@ -329,6 +383,157 @@ pub const Responder = struct {
         if (value.payload.len < want) return .data_type_inconsistent;
         @memcpy(store[start..][0..want], value.payload[0..want]);
         return .success;
+    }
+
+    // ── block upload and download ──────────────────────────────────────────
+
+    /// The image `Config.block_images` holds for a block, or null.
+    fn imageOf(self: *const Responder, t: userdata.BlockType, number: u16) ?[]const u8 {
+        for (self.config.block_images) |b| {
+            if (b.block_type == t and b.number == number) return b.image;
+        }
+        return null;
+    }
+
+    /// The image the last successful `_INSE` activated, or null.
+    pub fn insertedImage(self: *const Responder) ?[]const u8 {
+        if (self.inserted == null) return null;
+        return self.config.download_buffer[0..self.inserted_len];
+    }
+
+    fn refuse(pdu: s7.Pdu, out: []u8) Error![]u8 {
+        return errorReply(pdu, .error_on_service_processing, 0x04, out);
+    }
+
+    fn doStartUpload(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
+        self.up = null;
+        const name = bt.decodeStartUpload(pdu.parameters) catch return refuse(pdu, out);
+        const image = self.imageOf(name.block_type, name.number) orelse
+            return errorReply(pdu, .object_definition, 0x00, out);
+        var params: [bt.start_upload_reply_len]u8 = undefined;
+        if (image.len > bt.max_upload_len) return refuse(pdu, out);
+        const p = try bt.encodeStartUploadReply(transfer_id, @intCast(image.len), &params);
+        self.up = .{ .image = image };
+        return self.reply(pdu.header.pdu_reference, p, &.{}, out);
+    }
+
+    /// Chunk payload room of one Ack-Data under the negotiated PDU length.
+    fn chunkRoom(self: *const Responder) usize {
+        const pdu_len: usize = if (self.pdu_length == 0) 480 else self.pdu_length;
+        const overhead = s7.Rosctr.ack_data.headerLen() + 2 + bt.chunk_header_len;
+        return @min(if (pdu_len > overhead) pdu_len - overhead else 0, 1024);
+    }
+
+    fn doUpload(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
+        const up = &(self.up orelse return refuse(pdu, out));
+        const id = bt.decodeIdJob(pdu.parameters, bt.fn_upload) catch return refuse(pdu, out);
+        if (id != transfer_id) return refuse(pdu, out);
+        const room = self.chunkRoom();
+        if (room == 0) return refuse(pdu, out);
+        const n = @min(room, up.image.len - up.offset);
+        const more = up.offset + n < up.image.len;
+        var cp: [2]u8 = undefined;
+        var data: [1024 + bt.chunk_header_len]u8 = undefined;
+        const d = try bt.encodeChunk(up.image[up.offset..][0..n], &data);
+        const p = try bt.encodeChunkParams(bt.fn_upload, more, &cp);
+        up.offset += n;
+        return self.reply(pdu.header.pdu_reference, p, d, out);
+    }
+
+    fn doEndUpload(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
+        if (self.up == null) return refuse(pdu, out);
+        _ = bt.decodeIdJob(pdu.parameters, bt.fn_end_upload) catch return refuse(pdu, out);
+        self.up = null;
+        return self.reply(pdu.header.pdu_reference, pdu.parameters[0..1], &.{}, out);
+    }
+
+    /// The CPU's pull: the next "download block" job.
+    fn downloadJob(self: *Responder, out: []u8) Error![]u8 {
+        const dl = &self.dl.?;
+        var jp: [bt.block_job_len]u8 = undefined;
+        const p = try bt.encodeBlockJob(bt.fn_download_block, transfer_id, dl.name, &jp);
+        return self.frame(.job, dl.job_ref, p, &.{}, out, false);
+    }
+
+    fn doRequestDownload(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
+        self.dl = null;
+        if (!self.config.allow_block_download) return refuse(pdu, out);
+        const rd = bt.decodeRequestDownload(pdu.parameters) catch return refuse(pdu, out);
+        if (rd.load_len > self.config.download_buffer.len) {
+            return errorReply(pdu, .no_resources_available, 0x00, out);
+        }
+        self.inserted = null;
+        self.dl = .{
+            .name = rd.name,
+            .expected = rd.load_len,
+            .job_ref = pdu.header.pdu_reference +% 1,
+        };
+        // Two packets in one answer: the ack, then the CPU's first pull.
+        const ack = try self.reply(pdu.header.pdu_reference, pdu.parameters[0..1], &.{}, out);
+        const job = try self.downloadJob(out[ack.len..]);
+        return out[0 .. ack.len + job.len];
+    }
+
+    /// The client's Ack-Data to a download-block job: one chunk of the image.
+    /// Anything that does not fit a running download is dropped.
+    fn handleAck(self: *Responder, pdu: s7.Pdu, out: []u8) Error!?[]u8 {
+        const dl = &(self.dl orelse return null);
+        if (dl.stage != .pulling or pdu.header.pdu_reference != dl.job_ref) return null;
+        if (pdu.header.isError()) {
+            self.dl = null;
+            return null;
+        }
+        const more = bt.decodeChunkParams(pdu.parameters, bt.fn_download_block) catch {
+            self.dl = null;
+            return null;
+        };
+        const chunk = bt.decodeChunk(pdu.data) catch {
+            self.dl = null;
+            return null;
+        };
+        if (chunk.len > dl.expected - dl.received) {
+            self.dl = null;
+            return null;
+        }
+        @memcpy(self.config.download_buffer[dl.received..][0..chunk.len], chunk);
+        dl.received += chunk.len;
+        if (!more) {
+            dl.stage = .received;
+            return null;
+        }
+        dl.job_ref +%= 1;
+        return try self.downloadJob(out);
+    }
+
+    fn sameBlock(a: bt.FileName, b: bt.FileName) bool {
+        return a.block_type == b.block_type and a.number == b.number;
+    }
+
+    fn doDownloadEnded(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
+        const dl = &(self.dl orelse return refuse(pdu, out));
+        const job = bt.decodeBlockJob(pdu.parameters, bt.fn_download_ended) catch {
+            self.dl = null;
+            return refuse(pdu, out);
+        };
+        if (dl.stage != .received or dl.received != dl.expected or !sameBlock(job.name, dl.name)) {
+            self.dl = null;
+            return refuse(pdu, out);
+        }
+        dl.stage = .ended;
+        return self.reply(pdu.header.pdu_reference, pdu.parameters[0..1], &.{}, out);
+    }
+
+    fn doInsert(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
+        const dl = &(self.dl orelse return refuse(pdu, out));
+        const name = bt.decodeInsert(pdu.parameters) catch return refuse(pdu, out);
+        if (dl.stage != .ended or !sameBlock(name, dl.name)) {
+            self.dl = null;
+            return refuse(pdu, out);
+        }
+        self.inserted = .{ .block_type = dl.name.block_type, .number = dl.name.number };
+        self.inserted_len = dl.expected;
+        self.dl = null;
+        return self.reply(pdu.header.pdu_reference, pdu.parameters[0..1], &.{}, out);
     }
 
     fn doControl(self: *Responder, pdu: s7.Pdu, out: []u8, is_stop: bool) Error![]u8 {
@@ -484,8 +689,8 @@ pub const Responder = struct {
                 if (self.followUp(p, db, .list)) |c| {
                     offset = c.offset;
                     t = c.block_type;
-                } else if (userdata.decodeListOfTypeRequest(db.payload)) |bt| {
-                    t = bt;
+                } else if (userdata.decodeListOfTypeRequest(db.payload)) |lt| {
+                    t = lt;
                 } else |_| {
                     rc = .data_type_inconsistent;
                     t = .db;

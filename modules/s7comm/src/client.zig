@@ -24,6 +24,7 @@ const s7 = @import("s7.zig");
 const items = @import("items.zig");
 const vars = @import("vars.zig");
 const userdata = @import("userdata.zig");
+const bt = @import("blocktransfer.zig");
 const address = @import("address.zig");
 const transport = @import("transport.zig");
 
@@ -63,7 +64,9 @@ pub const Error = error{
     CotpReferenceMismatch,
     /// A multi-PDU answer kept announcing more PDUs past `max_fragments`.
     TooManyFragments,
-} || transport.TransportError || tpkt.Error || cotp.Error || s7.Error ||
+    /// `downloadBlock` was called without `DownloadOptions.allow_program_replacement`.
+    DownloadNotConfirmed,
+} || bt.Error || transport.TransportError || tpkt.Error || cotp.Error || s7.Error ||
     items.Error || vars.Error || userdata.Error || address.Error;
 
 /// Octets of framing in front of every S7 PDU: TPKT (4) + COTP DT (3).
@@ -234,8 +237,8 @@ pub const Client = struct {
         }
     }
 
-    /// Builds `TPKT | COTP DT | S7`, writes it, reads the reply and decodes it.
-    fn exchange(self: *Client, rosctr: s7.Rosctr, params: []const u8, data_parts: []const []const u8) Error!s7.Pdu {
+    /// Builds `TPKT | COTP DT | S7` and writes it, under the given PDU reference.
+    fn sendPdu(self: *Client, rosctr: s7.Rosctr, pdu_ref: u16, params: []const u8, data_parts: []const []const u8) Error!void {
         var data_len: usize = 0;
         for (data_parts) |p| data_len += p.len;
         const hl = rosctr.headerLen();
@@ -246,7 +249,6 @@ pub const Client = struct {
         const total = frame_overhead + pdu_len;
         if (total > self.tx.len) return error.BufferTooSmall;
 
-        self.pdu_ref +%= 1;
         const th = try tpkt.header(total - tpkt.header_len);
         const dh = cotp.dataHeader(0, true);
         @memcpy(self.tx[0..tpkt.header_len], &th);
@@ -256,8 +258,8 @@ pub const Client = struct {
         body[1] = @backingInt(rosctr);
         body[2] = 0;
         body[3] = 0;
-        body[4] = @intCast(self.pdu_ref >> 8);
-        body[5] = @intCast(self.pdu_ref & 0xFF);
+        body[4] = @intCast(pdu_ref >> 8);
+        body[5] = @intCast(pdu_ref & 0xFF);
         body[6] = @intCast(params.len >> 8);
         body[7] = @intCast(params.len & 0xFF);
         body[8] = @intCast(data_len >> 8);
@@ -273,6 +275,12 @@ pub const Client = struct {
             pos += p.len;
         }
         try self.tr.write(self.tx[0..total]);
+    }
+
+    /// Builds `TPKT | COTP DT | S7`, writes it, reads the reply and decodes it.
+    fn exchange(self: *Client, rosctr: s7.Rosctr, params: []const u8, data_parts: []const []const u8) Error!s7.Pdu {
+        self.pdu_ref +%= 1;
+        try self.sendPdu(rosctr, self.pdu_ref, params, data_parts);
 
         const payload = try self.readPacket();
         const dt = switch (try cotp.decode(payload)) {
@@ -777,6 +785,135 @@ pub const Client = struct {
     pub fn readProtection(self: *Client) Error!userdata.Protection {
         const r = try self.readSzl(userdata.SzlId.protection_status, userdata.Protection.szl_index);
         return userdata.protectionFrom(r.response) orelse error.ShortReply;
+    }
+
+    // ── Block upload and download (functions 0x1A-0x1F) ───────────────────
+
+    /// Reads one block out of the CPU as the image the CPU keeps (block header,
+    /// code, footer; this module does not interpret it). The image is
+    /// collected over as many PDUs as the CPU needs into `out`; `error.BufferTooSmall`
+    /// when it does not fit (the CPU announces the length first, so nothing
+    /// is transferred in that case). Uploading only reads, but it hands out
+    /// the machine's program: do it on equipment you own.
+    pub fn uploadBlock(self: *Client, t: userdata.BlockType, number: u16, out: []u8) Error![]u8 {
+        if (!self.connected) return error.NotConnected;
+        var pb: [bt.start_upload_request_len]u8 = undefined;
+        const name = bt.FileName{ .block_type = t, .number = number, .destination = 'A' };
+        var pdu = try self.exchange(.job, try bt.encodeStartUpload(name, &pb), &.{});
+        if (pdu.header.rosctr != .ack_data) return error.UnexpectedReply;
+        const started = try bt.decodeStartUploadReply(pdu.parameters);
+        if (started.length > out.len) return error.BufferTooSmall;
+        errdefer self.endUpload(started.id);
+
+        var n: usize = 0;
+        var empty: usize = 0;
+        while (true) {
+            pdu = try self.exchange(.job, try bt.encodeIdJob(bt.fn_upload, started.id, &pb), &.{});
+            if (pdu.header.rosctr != .ack_data) return error.UnexpectedReply;
+            const more = try bt.decodeChunkParams(pdu.parameters, bt.fn_upload);
+            const chunk = try bt.decodeChunk(pdu.data);
+            if (chunk.len > out.len - n) return error.BufferTooSmall;
+            @memcpy(out[n..][0..chunk.len], chunk);
+            n += chunk.len;
+            if (!more) break;
+            if (chunk.len == 0) {
+                empty += 1;
+                if (empty > max_fragments) return error.TooManyFragments;
+            }
+        }
+        try self.endUploadChecked(started.id);
+        return out[0..n];
+    }
+
+    fn endUpload(self: *Client, id: u32) void {
+        self.endUploadChecked(id) catch {};
+    }
+
+    fn endUploadChecked(self: *Client, id: u32) Error!void {
+        var pb: [bt.id_job_len]u8 = undefined;
+        const pdu = try self.exchange(.job, try bt.encodeIdJob(bt.fn_end_upload, id, &pb), &.{});
+        try expectControlAck(pdu, bt.fn_end_upload);
+    }
+
+    pub const DownloadOptions = struct {
+        /// Must be set explicitly: a download REPLACES a block of the program
+        /// the machine is running. Without it `downloadBlock` sends nothing and
+        /// returns `error.DownloadNotConfirmed`. Never the default.
+        allow_program_replacement: bool = false,
+        /// The block's MC7 code length (from its header, or the `mc7_size` of
+        /// `getBlockInfo`); sent in the request, the CPU checks it.
+        mc7_length: u32,
+        /// Activate the block after the transfer (`_INSE`). Without it the
+        /// block is transferred but not inserted into the program.
+        insert: bool = true,
+    };
+
+    /// **Writes a block into the CPU's program** (`image` as `uploadBlock`
+    /// returns it): request download, the CPU's pull of the chunks, download
+    /// ended and, unless `opts.insert` is off, the `_INSE` activation. A
+    /// wrong or hostile image can make the machine misbehave or stop; S7comm
+    /// has no authentication in front of this (see SPEC "Threat model").
+    /// Refused with `error.DownloadNotConfirmed` unless
+    /// `opts.allow_program_replacement` is set. Never called implicitly.
+    pub fn downloadBlock(self: *Client, t: userdata.BlockType, number: u16, image: []const u8, opts: DownloadOptions) Error!void {
+        if (!opts.allow_program_replacement) return error.DownloadNotConfirmed;
+        if (!self.connected) return error.NotConnected;
+        if (image.len > bt.max_download_len) return error.BlockTooLong;
+        const overhead = s7.Rosctr.ack_data.headerLen() + 2 + bt.chunk_header_len;
+        if (self.negotiated_pdu_length <= overhead) return error.PduTooSmall;
+        const chunk_max: usize = self.negotiated_pdu_length - overhead;
+        const name = bt.FileName{ .block_type = t, .number = number, .destination = 'P' };
+
+        var pb: [bt.request_download_len]u8 = undefined;
+        var pdu = try self.exchange(.job, try bt.encodeRequestDownload(name, @intCast(image.len), opts.mc7_length, &pb), &.{});
+        try expectControlAck(pdu, bt.fn_request_download);
+
+        // The CPU asks for the data, one job per chunk; the client answers each.
+        var sent: usize = 0;
+        var id: u32 = 0;
+        while (true) {
+            const job = try self.readJob();
+            if (job.header.rosctr != .job) return error.UnexpectedReply;
+            const bj = try bt.decodeBlockJob(job.parameters, bt.fn_download_block);
+            if (bj.name.block_type != t or bj.name.number != number) return error.UnexpectedReply;
+            id = bj.id;
+            const n = @min(chunk_max, image.len - sent);
+            const more = sent + n < image.len;
+            var cp: [2]u8 = undefined;
+            const ch = bt.chunkHeader(@intCast(n));
+            try self.sendPdu(
+                .ack_data,
+                job.header.pdu_reference,
+                try bt.encodeChunkParams(bt.fn_download_block, more, &cp),
+                &[_][]const u8{ &ch, image[sent..][0..n] },
+            );
+            sent += n;
+            if (!more) break;
+        }
+
+        var jb: [bt.block_job_len]u8 = undefined;
+        pdu = try self.exchange(.job, try bt.encodeBlockJob(bt.fn_download_ended, id, name, &jb), &.{});
+        try expectControlAck(pdu, bt.fn_download_ended);
+        if (opts.insert) {
+            var ib: [bt.insert_request_len]u8 = undefined;
+            pdu = try self.exchange(.job, try bt.encodeInsert(name, &ib), &.{});
+            try expectControlAck(pdu, bt.fn_pi_service);
+        }
+    }
+
+    /// Reads one PDU the peer initiated (the CPU's download-block job).
+    fn readJob(self: *Client) Error!s7.Pdu {
+        const payload = try self.readPacket();
+        const dt = switch (try cotp.decode(payload)) {
+            .dt => |d| d,
+            .dr, .dc => return error.EndOfStream,
+            else => return error.UnexpectedReply,
+        };
+        const pdu = try s7.decode(dt.payload);
+        if (self.negotiated_pdu_length != 0 and
+            pdu.header.len() + pdu.parameters.len + pdu.data.len > self.negotiated_pdu_length)
+            return error.ReplyExceedsNegotiatedPdu;
+        return pdu;
     }
 
     // ── PLC control — DANGEROUS ────────────────────────────────────────────

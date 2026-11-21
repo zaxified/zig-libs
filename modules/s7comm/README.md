@@ -202,7 +202,7 @@ not, and this matters:
 
 See SPEC.md, "S7CommPlus", for the field-by-field breakdown; what is missing
 (encryption, the newest-firmware integrity cryptography, subscriptions, symbolic
-sub-path resolution, block up/download) is under "Not provided" below.
+sub-path resolution, block transfer) is under "Not provided" below.
 
 ## Block services and long SZL lists
 
@@ -213,12 +213,21 @@ sub-path resolution, block up/download) is under "Not provided" below.
 block calls from `ResponderConfig.blocks` and its bound DB areas. See SPEC.md,
 "Block services (function group 3) and multi-PDU answers".
 
+## Block upload and download
+
+`Client.uploadBlock(.db, 1, &out)` returns the block's image as the CPU keeps it.
+`Client.downloadBlock(.fb, 3, image, .{ .allow_program_replacement = true, .mc7_length = n })`
+writes a block into the CPU's program; it sends nothing unless
+`allow_program_replacement` is set, and the responder refuses it unless
+`ResponderConfig.allow_block_download` is set. Images are opaque (no MC7
+model). See SPEC.md, "Block upload and download (functions 0x1A-0x1F)".
+
 ## Not provided
 
-Block upload and download, cyclic subscriptions, symbolic (`0xB2`) addressing over classic S7comm (use
+Cyclic subscriptions, a block-format (MC7) model, symbolic (`0xB2`) addressing over classic S7comm (use
 `s7plus`), retry/reconnect/keepalive, concurrent outstanding requests, and
 S7CommPlus encryption are not implemented. SPEC.md "What is deliberately not
-done" gives the reasons, "Backlog / deferred" what may still come.
+done" gives the reasons.
 
 ## Verify
 

@@ -90,6 +90,8 @@ pub const items = @import("items.zig");
 pub const vars = @import("vars.zig");
 /// Userdata (ROSCTR 7): the sub-header and `Read SZL`.
 pub const userdata = @import("userdata.zig");
+/// Block upload and download (function codes 0x1A-0x1F) and `_INSE`.
+pub const blocktransfer = @import("blocktransfer.zig");
 /// The STEP 7 address notation parser.
 pub const address = @import("address.zig");
 /// The byte-stream seam and its adapters.
@@ -176,6 +178,7 @@ test {
     _ = items;
     _ = vars;
     _ = userdata;
+    _ = blocktransfer;
     _ = address;
     _ = transport;
     _ = client;
@@ -995,4 +998,164 @@ test "round trip: a fragmented SZL list is assembled by readSzlAll" {
     const one = try c2.readSzlAll(userdata.SzlId.cpu_status, 0, &out);
     try testing.expectEqual(CpuStatus.run, userdata.cpuStatusFrom(one).?);
     try testing.expectEqual(@as(usize, 0), paired.failures);
+}
+
+// ── block upload and download ───────────────────────────────────────────────
+
+fn patternImage(buf: []u8) []u8 {
+    for (buf, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    return buf;
+}
+
+test "block upload: the image arrives whole over several PDUs, at two PDU sizes" {
+    var img_buf: [1000]u8 = undefined;
+    const image = patternImage(&img_buf);
+    const images = [_]server.BlockImage{
+        .{ .block_type = .fc, .number = 5, .image = image },
+        .{ .block_type = .db, .number = 9, .image = &.{} },
+    };
+    for ([_]u16{ 480, 240 }) |max_pdu| {
+        var r = Responder.init(.{ .block_images = &images, .max_pdu_length = max_pdu }, &.{});
+        var paired = PairedTransport{ .responder = &r };
+        var buf: [1024]u8 = undefined;
+        var c = try Client.init(paired.seam(), &buf, .{});
+        try c.connect();
+        var out: [1000]u8 = undefined;
+        const got = try c.uploadBlock(.fc, 5, &out);
+        try testing.expectEqualSlices(u8, image, got);
+        try testing.expect(r.up == null); // end upload was sent
+        // A zero-length image is one empty chunk.
+        try testing.expectEqual(@as(usize, 0), (try c.uploadBlock(.db, 9, &out)).len);
+        // The caller's buffer too small: refused before any chunk is pulled.
+        try testing.expectError(error.BufferTooSmall, c.uploadBlock(.fc, 5, out[0..999]));
+        // An unknown block is the CPU's error.
+        try testing.expectError(error.PlcError, c.uploadBlock(.fc, 6, &out));
+    }
+}
+
+test "block download: refused unless confirmed on both sides, then pulled, ended and inserted" {
+    var img_buf: [700]u8 = undefined;
+    const image = patternImage(&img_buf);
+    var store: [1024]u8 = undefined;
+
+    // The client refuses without the explicit option: nothing is sent.
+    {
+        var r = Responder.init(.{ .allow_block_download = true, .download_buffer = &store }, &.{});
+        var paired = PairedTransport{ .responder = &r };
+        var buf: [1024]u8 = undefined;
+        var c = try Client.init(paired.seam(), &buf, .{});
+        try c.connect();
+        const before = paired.last_req_len;
+        try testing.expectError(error.DownloadNotConfirmed, c.downloadBlock(.fb, 3, image, .{ .mc7_length = 600 }));
+        try testing.expectEqual(before, paired.last_req_len);
+        try testing.expect(r.dl == null);
+    }
+    // The responder refuses by default, and a block that does not fit its buffer.
+    {
+        var r = Responder.init(.{ .download_buffer = &store }, &.{});
+        var paired = PairedTransport{ .responder = &r };
+        var buf: [1024]u8 = undefined;
+        var c = try Client.init(paired.seam(), &buf, .{});
+        try c.connect();
+        const opts: Client.DownloadOptions = .{ .allow_program_replacement = true, .mc7_length = 600 };
+        try testing.expectError(error.PlcError, c.downloadBlock(.fb, 3, image, opts));
+        try testing.expect(r.insertedImage() == null);
+    }
+    for ([_]u16{ 480, 240 }) |max_pdu| {
+        var r = Responder.init(.{ .allow_block_download = true, .download_buffer = &store, .max_pdu_length = max_pdu }, &.{});
+        var paired = PairedTransport{ .responder = &r };
+        var buf: [1024]u8 = undefined;
+        var c = try Client.init(paired.seam(), &buf, .{});
+        try c.connect();
+        const opts: Client.DownloadOptions = .{ .allow_program_replacement = true, .mc7_length = 600 };
+        try c.downloadBlock(.fb, 3, image, opts);
+        try testing.expectEqual(@as(usize, 0), paired.failures);
+        try testing.expectEqualSlices(u8, image, r.insertedImage().?);
+        try testing.expectEqual(userdata.BlockType.fb, r.inserted.?.block_type);
+        try testing.expectEqual(@as(u16, 3), r.inserted.?.number);
+        // Transferred but not activated.
+        try c.downloadBlock(.fc, 4, image[0..10], .{ .allow_program_replacement = true, .mc7_length = 1, .insert = false });
+        try testing.expect(r.insertedImage() == null);
+        try testing.expect(r.dl != null and r.dl.?.stage == .ended);
+        // Too big for the responder's buffer.
+        var big: [1100]u8 = @splat(1);
+        try testing.expectError(error.PlcError, c.downloadBlock(.fc, 4, &big, opts));
+    }
+}
+
+test "block transfer on the responder: out-of-sequence and damaged requests are refused, not trusted" {
+    var store: [64]u8 = undefined;
+    const images = [_]server.BlockImage{.{ .block_type = .db, .number = 1, .image = "abcd" }};
+    var r = Responder.init(.{ .allow_block_download = true, .download_buffer = &store, .block_images = &images }, &.{});
+    var out: [600]u8 = undefined;
+    var pb: [64]u8 = undefined;
+    const jobs = [_][]const u8{
+        // upload and end-upload with no start-upload
+        try blocktransfer.encodeIdJob(blocktransfer.fn_upload, 1, &pb),
+    };
+    for (jobs) |p| {
+        var pdu_buf: [128]u8 = undefined;
+        const pdu = try s7.encode(.{ .rosctr = .job, .pdu_reference = 1 }, p, &.{}, &pdu_buf);
+        var frame: [160]u8 = undefined;
+        const reply = (try r.handle(try wrapForTest(pdu, &frame), &out)).?;
+        try testing.expect((try s7.decode(reply[7..])).header.isError());
+    }
+    // A download-ended / insert without a running download.
+    var nb: [32]u8 = undefined;
+    const name = blocktransfer.FileName{ .block_type = .db, .number = 1 };
+    const stray = [_][]const u8{
+        try blocktransfer.encodeBlockJob(blocktransfer.fn_download_ended, 1, name, &nb),
+    };
+    for (stray) |p| {
+        var pdu_buf: [128]u8 = undefined;
+        const pdu = try s7.encode(.{ .rosctr = .job, .pdu_reference = 2 }, p, &.{}, &pdu_buf);
+        var frame: [160]u8 = undefined;
+        const reply = (try r.handle(try wrapForTest(pdu, &frame), &out)).?;
+        try testing.expect((try s7.decode(reply[7..])).header.isError());
+    }
+    var ib: [32]u8 = undefined;
+    {
+        var pdu_buf: [128]u8 = undefined;
+        const pdu = try s7.encode(.{ .rosctr = .job, .pdu_reference = 3 }, try blocktransfer.encodeInsert(name, &ib), &.{}, &pdu_buf);
+        var frame: [160]u8 = undefined;
+        const reply = (try r.handle(try wrapForTest(pdu, &frame), &out)).?;
+        try testing.expect((try s7.decode(reply[7..])).header.isError());
+        try testing.expect(r.inserted == null);
+    }
+    // A stray Ack-Data with no download running gets no answer.
+    {
+        var pdu_buf: [128]u8 = undefined;
+        const pdu = try s7.encode(.{ .rosctr = .ack_data, .pdu_reference = 4 }, &[_]u8{ 0x1B, 0x00 }, &blocktransfer.chunkHeader(0), &pdu_buf);
+        var frame: [160]u8 = undefined;
+        try testing.expect((try r.handle(try wrapForTest(pdu, &frame), &out)) == null);
+    }
+    // A chunk longer than the announced length aborts the download.
+    {
+        var rb: [bt_len]u8 = undefined;
+        const req = try blocktransfer.encodeRequestDownload(name, 2, 2, &rb);
+        var pdu_buf: [128]u8 = undefined;
+        const pdu = try s7.encode(.{ .rosctr = .job, .pdu_reference = 5 }, req, &.{}, &pdu_buf);
+        var frame: [160]u8 = undefined;
+        const two = (try r.handle(try wrapForTest(pdu, &frame), &out)).?;
+        try testing.expect(two.len > 7 + 12); // the ack and the first pull
+        try testing.expect(r.dl != null);
+        var chunk: [8]u8 = undefined;
+        const data = try blocktransfer.encodeChunk("xyz", &chunk);
+        var pdu2: [128]u8 = undefined;
+        const ack = try s7.encode(.{ .rosctr = .ack_data, .pdu_reference = 6 }, &[_]u8{ 0x1B, 0x00 }, data, &pdu2);
+        var frame2: [160]u8 = undefined;
+        try testing.expect((try r.handle(try wrapForTest(ack, &frame2), &out)) == null);
+        try testing.expect(r.dl == null);
+    }
+}
+
+const bt_len = blocktransfer.request_download_len;
+
+fn wrapForTest(pdu: []const u8, out: []u8) ![]const u8 {
+    var tp: [4]u8 = undefined;
+    tp = try tpkt.header(3 + pdu.len);
+    @memcpy(out[0..4], &tp);
+    @memcpy(out[4..7], &cotp.dataHeader(0, true));
+    @memcpy(out[7..][0..pdu.len], pdu);
+    return out[0 .. 7 + pdu.len];
 }
