@@ -475,6 +475,10 @@ Both are 1.1 parsers so most divergence is expected-and-bucketed, not a module d
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - **Comment-preserving round trip.** eemeli/yaml, goccy/go-yaml and go-yaml keep comments for edit-in-place tools. Needs
   comment tokens through scanner, parser and `Value`, plus an emitter: a large change for tools no consumer has. Effort:
-  large. Low priority.
+  large. Low priority. Size: weeks (a comment token through scanner, parser, `Value` and a style-keeping emitter).
