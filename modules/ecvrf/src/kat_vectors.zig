@@ -123,3 +123,73 @@ test "hex field lengths match RFC 9381 §5.5's stated widths" {
         try std.testing.expectEqual(@as(usize, 128), vec.beta.len);
     }
 }
+
+/// RFC 9381 Appendix B.4, ECVRF-EDWARDS25519-SHA512-ELL2 (Examples 19, 20,
+/// 21; the same RFC 8032 keys and messages as B.3). Extracted from
+/// `https://www.rfc-editor.org/rfc/rfc9381.txt` by a line-joining pass over
+/// the wrapped hex, every field's length checked against §5.5's widths.
+/// `uniform_bytes` is the 48-byte `expand_message_xmd` output the RFC
+/// prints for the Elligator2 step.
+pub const Ell2Vector = struct {
+    example: u8,
+    sk: []const u8,
+    pk: []const u8,
+    alpha: []const u8,
+    x: []const u8,
+    uniform_bytes: []const u8,
+    h: []const u8,
+    k_string: []const u8,
+    k: []const u8,
+    u: []const u8,
+    v: []const u8,
+    pi: []const u8,
+    beta: []const u8,
+};
+
+pub const ell2_vectors = [_]Ell2Vector{
+    .{
+        .example = 19,
+        .sk = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+        .pk = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        .alpha = "",
+        .x = "307c83864f2833cb427a2ef1c00a013cfdff2768d980c0a3a520f006904de94f",
+        .uniform_bytes = "d620782a206d9de584b74e23ae5ee1db5ca5298b3fc527c4867f049dee6dd419b3674967bd614890f621c128d72269ae",
+        .h = "b8066ebbb706c72b64390324e4a3276f129569eab100c26b9f05011200c1bad9",
+        .k_string = "b5682049fee54fe2d519c9afff73bbfad724e69a82d5051496a42458f817bed7a386f96b1a78e5736756192aeb1818a20efb336a205ffede351cfe88dab8d41c",
+        .k = "55cbb247af9b8372259a97b2cfec656d78868deb33b203d51b9961c364522400",
+        .u = "762f5c178b68f0cddcc1157918edf45ec334ac8e8286601a3256c3bbf858edd9",
+        .v = "4652eba1c4612e6fce762977a59420b451e12964adbe4fbecd58a7aeff5860af",
+        .pi = "7d9c633ffeee27349264cf5c667579fc583b4bda63ab71d001f89c10003ab46f14adf9a3cd8b8412d9038531e865c341cafa73589b023d14311c331a9ad15ff2fb37831e00f0acaa6d73bc9997b06501",
+        .beta = "9d574bf9b8302ec0fc1e21c3ec5368269527b87b462ce36dab2d14ccf80c53cccf6758f058c5b1c856b116388152bbe509ee3b9ecfe63d93c3b4346c1fbc6c54",
+    },
+    .{
+        .example = 20,
+        .sk = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+        .pk = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        .alpha = "72",
+        .x = "68bd9ed75882d52815a97585caf4790a7f6c6b3b7f821c5e259a24b02e502e51",
+        .uniform_bytes = "04ae20a9ad2a2330fb33318e376a2448bd77bb99e81d126f47952b156590444a9225b84128b66a2f15b41294fa2f2f6d",
+        .h = "76ac3ccb86158a9104dff819b1ca293426d305fd76b39b13c9356d9b58c08e57",
+        .k_string = "88bf479281fd29a6cbdffd67e2c5ec0024d92f14eaed58f43f22f37c4c37f1d41e65c036fbf01f9fba11d554c07494d0c02e7e5c9d64be88ef78cab7544e444d",
+        .k = "9565956daeedf376cad61b829b2a4d21ba1b52e9b3e2457477a64630a9711003",
+        .u = "8ec26e77b8cb3114dd2265fe1564a4efb40d109aa3312536d93dfe3d8d80a061",
+        .v = "fe799eb5770b4e3a5a27d22518bb631db183c8316bb552155f442c62a47d1c8b",
+        .pi = "47b327393ff2dd81336f8a2ef10339112401253b3c714eeda879f12c509072ef055b48372bb82efbdce8e10c8cb9a2f9d60e93908f93df1623ad78a86a028d6bc064dbfc75a6a57379ef855dc6733801",
+        .beta = "38561d6b77b71d30eb97a062168ae12b667ce5c28caccdf76bc88e093e4635987cd96814ce55b4689b3dd2947f80e59aac7b7675f8083865b46c89b2ce9cc735",
+    },
+    .{
+        .example = 21,
+        .sk = "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+        .pk = "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+        .alpha = "af82",
+        .x = "909a8b755ed902849023a55b15c23d11ba4d7f4ec5c2f51b1325a181991ea95c",
+        .uniform_bytes = "be0aed556e36cdfddf8f1eeddbb7356a24fad64cf95a922a098038f215588b216beabbfe6acf20256188e883292b7a3a",
+        .h = "13d2a8b5ca32db7e98094a61f656a08c6c964344e058879a386a947a4e189ed1",
+        .k_string = "a7ddd74a3a7d165d511b02fa268710ddbb3b939282d276fa2efcfa5aaf79cf576087299ca9234aacd7cd674d912deba00f4e291733ef189a51e36c861b3d683b",
+        .k = "1fda4077f737098b3f361c33a36cccafd7e9e9b720e1f84011254e25f37eed02",
+        .u = "a012f35433df219a88ab0f9481f4e0065d00422c3285f3d34a8b0202f20bac60",
+        .v = "fb613986d171b3e98319c7ca4dc44c5dd8314a6e5616c1a4f16ce72bd7a0c25a",
+        .pi = "926e895d308f5e328e7aa159c06eddbe56d06846abf5d98c2512235eaa57fdce35b46edfc655bc828d44ad09d1150f31374e7ef73027e14760d42e77341fe05467bb286cc2c9d7fde29120a0b2320d04",
+        .beta = "121b7f9b9aaaa29099fc04a94ba52784d44eac976dd1a3cca458733be5cd090a7b5fbd148444f17f8daf1fb55cb04b1ae85a626e30a54b4b0f8abf4a43314a58",
+    },
+};

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! ecvrf — ECVRF-EDWARDS25519-SHA512-TAI, the elliptic-curve Verifiable
+//! ecvrf — ECVRF-EDWARDS25519-SHA512-TAI (and -ELL2), the elliptic-curve Verifiable
 //! Random Function ciphersuite from RFC 9381 ("Verifiable Random
 //! Functions (VRFs)", IRTF CFRG, August 2023) built on
 //! `std.crypto.ecc.Edwards25519` + `std.crypto.hash.sha2.Sha512`. A VRF
@@ -41,14 +41,12 @@
 //! new field/curve arithmetic (contrast `ed448`/`decaf448`/`bls12_381`,
 //! which had to build a curve family std lacks).
 //!
-//! Deferred (out of scope for this module): **ECVRF-P256-SHA256-TAI**
-//! and **ECVRF-EDWARDS25519-SHA512-ELL2** (RFC 9381 §5.5's other two
-//! ciphersuites — P-256 would need `std.crypto.ecc`'s P256 support plus
-//! SEC1 point encoding; ELL2 would need RFC 9380's Elligator2
-//! hash-to-curve, `Edwards25519.fromUniform`/`elligator2`, both already
-//! in std and a plausible low-effort follow-up); the **RSA-FDH-VRF**
-//! family (RFC 9381 Appendix A, an entirely different non-elliptic-curve
-//! construction).
+//! The sibling ciphersuite **ECVRF-EDWARDS25519-SHA512-ELL2**
+//! (`suite_string = 0x04`, RFC 9380 Elligator2 hash-to-curve, no
+//! data-dependent loop over `alpha`) is the `ell2` namespace, anchored on
+//! RFC 9381 Appendix B.4. Not here: **ECVRF-P256-SHA256-TAI/-SSWU** (P-256
+//! with SEC1 point encoding) and the **RSA-FDH-VRF** family (RFC 9381
+//! Appendix A, a different, non-elliptic-curve construction).
 //!
 //! Provenance: clean-room from RFC 9381 (a public IETF/IRTF spec — no
 //! third-party source ported). See `NOTICE`.
@@ -68,7 +66,7 @@ pub const meta = .{
     .role = .util, // pure computation over caller-supplied keys/bytes — no owned socket/transport
     .concurrency = .reentrant, // no globals; every function here is a plain caller-owned value
     .model_after = "RFC 9381 §5 (Elliptic Curve VRF) + §5.5's ECVRF-EDWARDS25519-SHA512-TAI ciphersuite fixing, referencing RFC 8032 §5.1.2/§5.1.5 for point/scalar encoding and secret-key derivation; std.crypto.ecc.Edwards25519 (+ its scalar submodule) and std.crypto.hash.sha2.Sha512 supply every primitive",
-    .deps = .{"ct25519"}, // constant-time secret-scalar multiply (see ecvrf.zig's module doc comment)
+    .deps = .{ "ct25519", "sha2" }, // ct25519: constant-time secret-scalar multiply (see ecvrf.zig's module doc comment); sha2: expand_message_xmd of the ELL2 suite
 };
 
 pub const ecvrf = @import("ecvrf.zig");
@@ -100,6 +98,8 @@ pub const KeyPair = ecvrf.KeyPair;
 pub const prove = ecvrf.prove;
 pub const proofToHash = ecvrf.proofToHash;
 pub const verify = ecvrf.verify;
+/// ECVRF-EDWARDS25519-SHA512-ELL2 (`suite_string = 0x04`).
+pub const ell2 = ecvrf.ell2;
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
 //
@@ -115,9 +115,10 @@ test {
     _ = @import("stackprobe2_test.zig");
 }
 
-test "meta.deps is exactly {ct25519} (the constant-time secret-scalar ladder)" {
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta.deps is exactly {ct25519, sha2} (the constant-time secret-scalar ladder, ELL2's expand_message_xmd)" {
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("ct25519", meta.deps[0]);
+    try std.testing.expectEqualStrings("sha2", meta.deps[1]);
 }
 
 test "suite_string is 0x03 (ECVRF-EDWARDS25519-SHA512-TAI), not the sibling ELL2 ciphersuite's 0x04" {

@@ -88,16 +88,18 @@ mismatched challenge) returns `error.InvalidPublicKey` or
 
 ## Ciphersuite
 
-Only **ECVRF-EDWARDS25519-SHA512-TAI** (RFC 9381 §5.5, `suite_string =
-0x03`) is implemented. `0x04` is the sibling ELL2 suite (same curve and
-hash, RFC 9380 Elligator2 instead of try-and-increment) and is easy to
-conflate with it; the two are not interchangeable.
+**ECVRF-EDWARDS25519-SHA512-TAI** (RFC 9381 §5.5, `suite_string = 0x03`)
+is the top-level API. **ECVRF-EDWARDS25519-SHA512-ELL2** (`suite_string =
+0x04`, same curve and hash, RFC 9380 Elligator2 instead of
+try-and-increment) is `ecvrf.ell2.prove` / `ell2.proveKeyPair` /
+`ell2.verify` / `ell2.proofToHash`; use it when `alpha` is secret (TAI's
+loop over `alpha` is data-dependent). The two are not interchangeable: a
+proof of one never verifies under the other.
 
 ## Not provided
 
 The other ciphersuites of RFC 9381: **ECVRF-P256-SHA256-TAI / -SSWU**
-(NIST P-256) and **ECVRF-EDWARDS25519-SHA512-ELL2** are open work (SPEC
-*Backlog / deferred*); the non-elliptic-curve **RSA-FDH-VRF** family
+(NIST P-256) are open work (SPEC *Backlog / deferred*); the non-elliptic-curve **RSA-FDH-VRF** family
 (Appendix A) and batch verification are refused (SPEC *What is
 deliberately not done*).
 

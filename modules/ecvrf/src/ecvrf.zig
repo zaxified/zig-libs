@@ -15,11 +15,13 @@
 //! instead of try-and-increment), with `suite_string = 0x04` — the two
 //! are easy to conflate since both mine edwards25519/SHA-512, but they
 //! are NOT interchangeable (different `encode_to_curve`, different
-//! `suite_string` byte feeding every hash in the scheme). This module
-//! implements ONLY the TAI (try-and-increment) ciphersuite, `suite_string
-//! = 0x03` — ELL2 is out of scope (would need RFC 9380's Elligator2 map,
-//! `std.crypto.ecc.Edwards25519.fromUniform`/`elligator2` — a real
-//! candidate for a follow-up module, not attempted here).
+//! `suite_string` byte feeding every hash in the scheme). The top-level
+//! functions are the TAI ciphersuite, `suite_string = 0x03`; the ELL2
+//! ciphersuite is the `ell2` namespace (`ell2.prove`, `ell2.verify`,
+//! `ell2.proofToHash`, `ell2.encodeToCurve`), identical except for the
+//! suite byte and `encode_to_curve` (RFC 9381 §5.4.1.2: RFC 9380
+//! `edwards25519_XMD:SHA-512_ELL2_NU_`, no data-dependent loop over
+//! `alpha`, so suitable for a secret input).
 //!
 //! Algorithm map (RFC 9381 section -> this file):
 //!   - §5.1 `ECVRF_prove`                    -> `prove`
@@ -85,6 +87,7 @@ const burn = @import("burn.zig");
 const Edwards25519 = std.crypto.ecc.Edwards25519;
 const scalar = Edwards25519.scalar;
 const Sha512 = std.crypto.hash.sha2.Sha512;
+const sha2 = @import("sha2");
 
 // ── constant-time scalar multiplication on a SECRET scalar ──────────────
 //
@@ -133,6 +136,85 @@ const Sha512 = std.crypto.hash.sha2.Sha512;
 /// ECVRF-EDWARDS25519-SHA512-TAI. NOT 0x04 (that is the sibling ELL2
 /// ciphersuite, §5.5's very next paragraph) — see the module doc comment.
 pub const suite_string: u8 = 0x03;
+
+/// The two RFC 9381 edwards25519 ciphersuites; they differ only in the suite
+/// byte and `encode_to_curve`.
+const Suite = enum {
+    tai,
+    ell2,
+
+    fn byte(comptime suite: Suite) u8 {
+        return switch (suite) {
+            .tai => 0x03,
+            .ell2 => 0x04,
+        };
+    }
+
+    fn encode(comptime suite: Suite, pk_string: PublicKey, alpha_string: []const u8) PublicKey {
+        return switch (suite) {
+            .tai => encodeToCurve(pk_string, alpha_string),
+            .ell2 => ell2.encodeToCurve(pk_string, alpha_string),
+        };
+    }
+};
+
+/// ECVRF-EDWARDS25519-SHA512-ELL2 (RFC 9381 §5.5, `suite_string = 0x04`):
+/// the TAI ciphersuite with RFC 9380's Elligator2 `encode_to_curve` in
+/// place of try-and-increment. Same keys, proof and output sizes; a proof of
+/// one suite never verifies under the other (the suite byte is hashed into
+/// every step). Known-answer vectors: RFC 9381 Appendix B.4.
+pub const ell2 = struct {
+    pub const suite_string: u8 = 0x04;
+
+    /// `h2c_suite_ID_string` (RFC 9381 §5.5).
+    pub const h2c_suite_id = "edwards25519_XMD:SHA-512_ELL2_NU_";
+    /// `DST = "ECVRF_" || h2c_suite_ID_string || suite_string` (§5.4.1.2).
+    pub const dst = "ECVRF_" ++ h2c_suite_id ++ [_]u8{0x04};
+
+    /// RFC 9381 §5.4.1.2 `ECVRF_encode_to_curve_h2c_suite`:
+    /// `encode(encode_to_curve_salt || alpha_string)` with RFC 9380
+    /// `edwards25519_XMD:SHA-512_ELL2_NU_` (§6.8.2 / §8.5): one
+    /// `expand_message_xmd` of 48 bytes, Elligator2, the rational map to
+    /// edwards25519, cofactor clearing. Constant time in `alpha_string`'s
+    /// content (its length is public).
+    pub fn encodeToCurve(pk_string: PublicKey, alpha_string: []const u8) PublicKey {
+        const uniform = sha2.expandMessageXmd(Sha512, 48, &.{ &pk_string, alpha_string }, dst);
+        // `Edwards25519.fromHash` reduces a 64-byte big-endian value mod p:
+        // the 48 bytes left-padded with zeros are OS2IP(uniform) mod p
+        // (RFC 9380 hash_to_field, L = 48), then Elligator2 + the map to
+        // edwards25519 + clear_cofactor.
+        var wide: [64]u8 = @splat(0);
+        wide[16..].* = uniform;
+        return Edwards25519.fromHash(wide).toBytes();
+    }
+
+    /// `ECVRF_prove` under ELL2. Burned like the TAI `prove`.
+    pub fn prove(sk: *const SecretKey, alpha_string: []const u8) Proof {
+        const r = proveUnburned(.ell2, sk, alpha_string);
+        burn.stack(burn.prove_burn);
+        return r;
+    }
+
+    /// `ECVRF_prove` under ELL2 with a `KeyPair` (no `Y` recomputation).
+    pub fn proveKeyPair(kp: *const KeyPair, alpha_string: []const u8) Proof {
+        const r = keyPairProveUnburned(.ell2, kp, alpha_string);
+        burn.stack(burn.prove_burn);
+        return r;
+    }
+
+    /// `ECVRF_proof_to_hash` under ELL2 (the same caveat as the TAI
+    /// `proofToHash`: only on a proof `verify` accepted or `prove` made).
+    pub fn proofToHash(pi: Proof) Error!Output {
+        const d = try decodeProof(pi);
+        const gamma_point = Edwards25519.fromBytes(d.gamma) catch unreachable;
+        return hashOutputFromGamma(.ell2, gamma_point);
+    }
+
+    /// `ECVRF_verify` under ELL2, `validate_key` TRUE.
+    pub fn verify(pk_string: PublicKey, alpha_string: []const u8, pi: Proof) Error!Output {
+        return verifyWith(.ell2, pk_string, alpha_string, pi);
+    }
+};
 
 /// RFC 9381 §5.5: challenge length in octets (`cLen`).
 pub const c_len: usize = 16;
@@ -329,9 +411,9 @@ noinline fn nonceGenerationUnburned(out: *[32]u8, sk: *const SecretKey, h_string
 /// || 0x00`, truncate to the first `cLen` (16) octets. Every caller in
 /// this module supplies `P1 = Y` (see the module doc comment on why `Y`
 /// must not be dropped from this hash).
-fn challengeGeneration(p1: PublicKey, p2: PublicKey, p3: PublicKey, p4: PublicKey, p5: PublicKey) [c_len]u8 {
+fn challengeGeneration(comptime suite: Suite, p1: PublicKey, p2: PublicKey, p3: PublicKey, p4: PublicKey, p5: PublicKey) [c_len]u8 {
     var st = Sha512.init(.{});
-    st.update(&[_]u8{suite_string});
+    st.update(&[_]u8{suite.byte()});
     st.update(&[_]u8{0x02}); // challenge_generation_domain_separator_front
     st.update(&p1);
     st.update(&p2);
@@ -409,12 +491,12 @@ pub fn validateKey(pk_string: PublicKey) Error!Edwards25519 {
 /// the seed on the dead stack in the callees' frames
 /// — `k` beside the proof's `s` and `c` is the secret scalar.
 pub fn prove(sk: *const SecretKey, alpha_string: []const u8) Proof {
-    const r = proveUnburned(sk, alpha_string);
+    const r = proveUnburned(.tai, sk, alpha_string);
     burn.stack(burn.prove_burn);
     return r;
 }
 
-noinline fn proveUnburned(sk_ptr: *const SecretKey, alpha_string: []const u8) Proof {
+noinline fn proveUnburned(comptime suite: Suite, sk_ptr: *const SecretKey, alpha_string: []const u8) Proof {
     const sk = sk_ptr;
     var exp = expandSecretKey(sk.*);
     defer std.crypto.secureZero(u8, &exp.x);
@@ -422,7 +504,7 @@ noinline fn proveUnburned(sk_ptr: *const SecretKey, alpha_string: []const u8) Pr
     // Step 1: x, Y = x*B. `ct25519.mulBase` (constant-time, no error union)
     // — `x` is the VRF secret scalar; see the module doc comment for why
     // std's `mul` is not usable on a secret here.
-    return proveExpanded(sk, &exp, ct25519.mulBase(exp.x).toBytes(), alpha_string);
+    return proveExpanded(suite, sk, &exp, ct25519.mulBase(exp.x).toBytes(), alpha_string);
 }
 
 /// A secret key with its public key derived once (A1 E10). `prove` spends
@@ -449,24 +531,24 @@ pub const KeyPair = struct {
     ///
     /// Burned like the free `prove`.
     pub fn prove(kp: *const KeyPair, alpha_string: []const u8) Proof {
-        const r = keyPairProveUnburned(kp, alpha_string);
+        const r = keyPairProveUnburned(.tai, kp, alpha_string);
         burn.stack(burn.prove_burn);
         return r;
     }
-
-    noinline fn keyPairProveUnburned(kp: *const KeyPair, alpha_string: []const u8) Proof {
-        var exp = expandSecretKey(kp.secret_key);
-        defer std.crypto.secureZero(u8, &exp.x);
-        return proveExpanded(&kp.secret_key, &exp, kp.public_key, alpha_string);
-    }
 };
+
+noinline fn keyPairProveUnburned(comptime suite: Suite, kp: *const KeyPair, alpha_string: []const u8) Proof {
+    var exp = expandSecretKey(kp.secret_key);
+    defer std.crypto.secureZero(u8, &exp.x);
+    return proveExpanded(suite, &kp.secret_key, &exp, kp.public_key, alpha_string);
+}
 
 /// `ECVRF_prove` steps 2-8, given step 1's `x` and `PK_string`. `sk` and
 /// `exp` come by pointer: passed by value, `sk` left one more copy of the
 /// seed on the dead stack (measured by a dead-stack probe, A1 E4).
-fn proveExpanded(sk: *const SecretKey, exp: *const ExpandedSecretKey, y_string: PublicKey, alpha_string: []const u8) Proof {
+fn proveExpanded(comptime suite: Suite, sk: *const SecretKey, exp: *const ExpandedSecretKey, y_string: PublicKey, alpha_string: []const u8) Proof {
     // Step 2-3: H = encode_to_curve(PK_string, alpha), h_string = point_to_string(H).
-    const h_string = encodeToCurve(y_string, alpha_string);
+    const h_string = suite.encode(y_string, alpha_string);
     // encode_to_curve always returns a canonical toBytes() encoding of a
     // real (cofactor-cleared, non-identity) point — decoding it back can
     // never fail.
@@ -499,7 +581,7 @@ fn proveExpanded(sk: *const SecretKey, exp: *const ExpandedSecretKey, y_string: 
     // identically.
     const u_point = ct25519.mulBase(k);
     const v_point = ct25519.mul(h_point, k);
-    const c = challengeGeneration(y_string, h_string, gamma_string, u_point.toBytes(), v_point.toBytes());
+    const c = challengeGeneration(suite, y_string, h_string, gamma_string, u_point.toBytes(), v_point.toBytes());
 
     // Step 7: s = (k + c*x) mod q.
     const s = scalar.mulAdd(padChallenge(c), exp.x, k);
@@ -528,7 +610,7 @@ fn proveExpanded(sk: *const SecretKey, exp: *const ExpandedSecretKey, y_string: 
 pub fn proofToHash(pi: Proof) Error!Output {
     const d = try decodeProof(pi);
     const gamma_point = Edwards25519.fromBytes(d.gamma) catch unreachable; // decodeProof already validated
-    return hashOutputFromGamma(gamma_point);
+    return hashOutputFromGamma(.tai, gamma_point);
 }
 
 /// The tail of `ECVRF_proof_to_hash` (RFC 9381 §5.2), given an already
@@ -537,11 +619,11 @@ pub fn proofToHash(pi: Proof) Error!Output {
 /// `Gamma` a second time just to reach this hash (A1 E10 point 3: measured
 /// ~9.2us of `verify`'s ~180us, 5.1%, was exactly that repeat of work
 /// `verify` already has the result of).
-fn hashOutputFromGamma(gamma_point: Edwards25519) Output {
+fn hashOutputFromGamma(comptime suite: Suite, gamma_point: Edwards25519) Output {
     const cofactor_gamma = gamma_point.clearCofactor();
 
     var st = Sha512.init(.{});
-    st.update(&[_]u8{suite_string});
+    st.update(&[_]u8{suite.byte()});
     st.update(&[_]u8{0x03}); // proof_to_hash_domain_separator_front
     st.update(&cofactor_gamma.toBytes());
     st.update(&[_]u8{0x00}); // proof_to_hash_domain_separator_back
@@ -559,6 +641,10 @@ fn hashOutputFromGamma(gamma_point: Edwards25519) Output {
 /// "INVALID" — every RFC "output INVALID and stop" step maps to one of
 /// these two `return error...` points, never a panic on attacker input.
 pub fn verify(pk_string: PublicKey, alpha_string: []const u8, pi: Proof) Error!Output {
+    return verifyWith(.tai, pk_string, alpha_string, pi);
+}
+
+fn verifyWith(comptime suite: Suite, pk_string: PublicKey, alpha_string: []const u8, pi: Proof) Error!Output {
     // Steps 1-3: Y = string_to_point(PK_string); validate_key.
     const y_point = try validateKey(pk_string);
     const y_string = y_point.toBytes(); // canonical PK_string (see module doc comment)
@@ -568,7 +654,7 @@ pub fn verify(pk_string: PublicKey, alpha_string: []const u8, pi: Proof) Error!O
     const gamma_point = Edwards25519.fromBytes(d.gamma) catch unreachable; // decodeProof already validated
 
     // Step 7: H = encode_to_curve(PK_string, alpha_string).
-    const h_string = encodeToCurve(y_string, alpha_string);
+    const h_string = suite.encode(y_string, alpha_string);
     const h_point = Edwards25519.fromBytes(h_string) catch unreachable; // see prove()'s identical argument
 
     // Steps 8-9: U = s*B - c*Y; V = s*H - c*Gamma (variable-time,
@@ -583,7 +669,7 @@ pub fn verify(pk_string: PublicKey, alpha_string: []const u8, pi: Proof) Error!O
     // Step 10: c' = challenge_generation(Y, H, Gamma, U, V), with
     // point_to_string(Gamma) as the RFC writes it (A1 E14). Since
     // `decodeProof` decodes strictly, this is byte-for-byte `d.gamma`.
-    const c_prime = challengeGeneration(y_string, h_string, gamma_point.toBytes(), u_point.toBytes(), v_point.toBytes());
+    const c_prime = challengeGeneration(suite, y_string, h_string, gamma_point.toBytes(), u_point.toBytes(), v_point.toBytes());
 
     // Step 11: accept iff c == c'.
     if (!std.crypto.timing_safe.eql([c_len]u8, c_prime, d.c)) return error.InvalidProof;
@@ -593,7 +679,7 @@ pub fn verify(pk_string: PublicKey, alpha_string: []const u8, pi: Proof) Error!O
     // `gamma_point`) purely to reach the same hash tail. `gamma_point` here
     // is bit-for-bit `Edwards25519.fromBytes(d.gamma)` on the SAME `pi`, so
     // this is the identical output, not an approximation of it.
-    return hashOutputFromGamma(gamma_point);
+    return hashOutputFromGamma(suite, gamma_point);
 }
 
 test "wire-shape constants match RFC 9381 §5.5 (ECVRF-EDWARDS25519-SHA512-TAI)" {

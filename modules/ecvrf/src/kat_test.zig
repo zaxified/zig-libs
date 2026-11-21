@@ -466,3 +466,58 @@ test "negative: a low-order Gamma (order 1, 2, 4 or 8) makes verify answer Inval
         try std.testing.expectError(error.InvalidProof, ecvrf.verify(pk, "", pi));
     }
 }
+
+// ── ECVRF-EDWARDS25519-SHA512-ELL2 (RFC 9381 Appendix B.4) ─────────────────
+
+test "KAT ELL2: expand_message_xmd, encodeToCurve, nonce, prove, proofToHash and verify match RFC 9381 Appendix B.4" {
+    const gpa = std.testing.allocator;
+    const sha2 = @import("sha2");
+    for (v.ell2_vectors) |vec| {
+        const sk = try hex32(vec.sk);
+        const alpha = try hexAlloc(gpa, vec.alpha);
+        defer gpa.free(alpha);
+        const pk = try hex32(vec.pk);
+        try std.testing.expectEqualSlices(u8, &pk, &ecvrf.publicKey(&sk));
+
+        var want_ub: [48]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&want_ub, vec.uniform_bytes);
+        const got_ub = sha2.expandMessageXmd(std.crypto.hash.sha2.Sha512, 48, &.{ &pk, alpha }, ecvrf.ell2.dst);
+        try std.testing.expectEqualSlices(u8, &want_ub, &got_ub);
+
+        const h = ecvrf.ell2.encodeToCurve(pk, alpha);
+        try std.testing.expectEqualSlices(u8, &(try hex32(vec.h)), &h);
+
+        var k_string: [64]u8 = undefined;
+        ecvrf.nonceGenerationString(&k_string, &sk, h);
+        try std.testing.expectEqualSlices(u8, &(try hex64(vec.k_string)), &k_string);
+
+        const want_pi = try hex80(vec.pi);
+        try std.testing.expectEqualSlices(u8, &want_pi, &ecvrf.ell2.prove(&sk, alpha));
+        var kp: ecvrf.KeyPair = undefined;
+        ecvrf.KeyPair.fromSecretKey(&kp, &sk);
+        try std.testing.expectEqualSlices(u8, &want_pi, &ecvrf.ell2.proveKeyPair(&kp, alpha));
+
+        const want_beta = try hex64(vec.beta);
+        try std.testing.expectEqualSlices(u8, &want_beta, &(try ecvrf.ell2.proofToHash(want_pi)));
+        try std.testing.expectEqualSlices(u8, &want_beta, &(try ecvrf.ell2.verify(pk, alpha, want_pi)));
+
+        // The suite byte separates the two ciphersuites both ways.
+        try std.testing.expectError(error.InvalidProof, ecvrf.verify(pk, alpha, want_pi));
+        try std.testing.expectError(error.InvalidProof, ecvrf.ell2.verify(pk, alpha, ecvrf.prove(&sk, alpha)));
+    }
+}
+
+test "negative ELL2: a tampered Gamma, c or s, a wrong alpha and a small-order key are refused" {
+    const vec = v.ell2_vectors[1];
+    const pk = try hex32(vec.pk);
+    const pi = try hex80(vec.pi);
+    for ([_]usize{ 5, 40, 60 }) |pos| {
+        var bad = pi;
+        bad[pos] ^= 0x01;
+        if (ecvrf.ell2.verify(pk, &.{0x72}, bad)) |_| return error.TamperAccepted else |_| {}
+    }
+    try std.testing.expectError(error.InvalidProof, ecvrf.ell2.verify(pk, &.{0x73}, pi));
+    var identity: [32]u8 = @splat(0);
+    identity[0] = 1;
+    try std.testing.expectError(error.InvalidPublicKey, ecvrf.ell2.verify(identity, &.{0x72}, pi));
+}
