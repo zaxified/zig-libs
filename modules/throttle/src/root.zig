@@ -38,9 +38,9 @@
 //!   per-waiter queue memory). Go's waiter set is also unbounded; ours is
 //!   capped (`max_waiters`) per the SEDA rule above.
 //! - **SEDA / Netflix concurrency-limits:** static limit + bounded queue +
-//!   fast rejection. TODO: the adaptive variant (Netflix Gradient-style
-//!   AIMD on observed latency, discovering the limit instead of a static
-//!   number) — the static `max_in_flight` is the required primary.
+//!   fast rejection. The static `max_in_flight` is the required primary; the
+//!   opt-in `Options.adaptive` discovers the limit below it from observed
+//!   latency (Netflix `Gradient2Limit`, or `AIMDLimit`), see `Adaptive`.
 //!
 //! Thread-safety: pure atomics — no mutex, no hidden globals, no allocation;
 //! every call may race from any thread (the middleware runs on
@@ -114,8 +114,72 @@ pub const Options = struct {
     /// uses. Ignored otherwise.
     io: ?std.Io = null,
     /// Time source for the wait deadline — inject a fake for deterministic
-    /// tests. Never consulted when `max_wait_ms = 0`.
+    /// tests. Never consulted when `max_wait_ms = 0` and `adaptive` is null.
     clock: Clock = .monotonic,
+    /// Opt-in adaptive limit discovery: `max_in_flight` becomes the ceiling and
+    /// the admitted limit moves below it with the observed latency of the
+    /// requests that report it (`acquirePermit` / `releasePermit`, or the
+    /// middleware). null (default) = the static limit, nothing changes.
+    adaptive: ?Adaptive = null,
+};
+
+/// Adaptive limit discovery, modelled on Netflix concurrency-limits'
+/// `Gradient2Limit` and `AIMDLimit` (defaults are theirs: initial and minimum
+/// limit 20, smoothing 0.2, RTT tolerance 1.5, long window 600 samples, queue
+/// size 4, back-off 0.9, timeout 5 s). The limit stays in
+/// `[min_limit, Options.max_in_flight]`; both bounds are clamped to the
+/// ceiling, so a ceiling below 20 simply pins the limit there.
+///
+/// Samples are applied under a try-lock: a sample that finds another being
+/// applied is skipped (a statistical estimator loses nothing, and the hot path
+/// never blocks).
+pub const Adaptive = struct {
+    pub const Algorithm = enum {
+        /// Latency gradient: the limit shrinks when the current RTT rises
+        /// above the long-term RTT (a queue is building) and grows by
+        /// `queue_size` per sample otherwise.
+        gradient2,
+        /// Additive increase while at least half the limit is in use,
+        /// multiplicative decrease by `backoff_ratio` on a drop or an RTT past
+        /// `timeout_ms`.
+        aimd,
+    };
+    algorithm: Algorithm = .gradient2,
+    /// First limit; null = `min(20, max_in_flight)`.
+    initial_limit: ?u32 = null,
+    min_limit: u32 = 20,
+    /// `gradient2`: blend of the new estimate (0 < smoothing <= 1).
+    smoothing: f64 = 0.2,
+    /// `gradient2`: how much the RTT may exceed the long-term RTT before the
+    /// limit shrinks (>= 1).
+    rtt_tolerance: f64 = 1.5,
+    /// `gradient2`: the long-term RTT is a mean over the first 10 samples,
+    /// then an exponential average over about this many samples.
+    long_window: u32 = 600,
+    /// `gradient2`: slots the limit may grow by per sample (a constant).
+    queue_size: u32 = 4,
+    /// `aimd`: factor applied on a drop or timeout (0.5 <= ratio < 1).
+    backoff_ratio: f64 = 0.9,
+    /// `aimd`: an RTT past this counts as a drop.
+    timeout_ms: u32 = 5_000,
+};
+
+/// How a request that held a `Permit` ended, for `releasePermit`.
+pub const Outcome = enum {
+    /// Completed: its latency is a sample.
+    success,
+    /// Shed or timed out by something downstream: `aimd` backs off (as the
+    /// reference does; `gradient2` ignores drops, also as the reference does).
+    dropped,
+    /// Says nothing about capacity (a client error, a cancel): no sample.
+    ignore,
+};
+
+/// A held slot plus what the adaptive limit needs to judge the request.
+pub const Permit = struct {
+    start_ns: u64,
+    /// Requests in flight when this one was admitted (itself included).
+    in_flight: u32,
 };
 
 // ── the semaphore ───────────────────────────────────────────────────────────
@@ -135,9 +199,24 @@ pub const Throttle = struct {
     /// waiters exist, so a parked `acquire` re-contends. Wraparound is fine —
     /// the futex only compares for equality.
     release_gen: std.atomic.Value(u32) = .init(0),
+    /// The admitted limit; 0 = not set yet (`limit()` then reads
+    /// `Options.max_in_flight`, or the adaptive initial limit).
+    limit_now: std.atomic.Value(u32) = .init(0),
+    /// Try-lock over the adaptive estimator below.
+    adapt_busy: std.atomic.Value(bool) = .init(false),
+    /// Estimator state (guarded by `adapt_busy`): the unrounded limit and the
+    /// long-term RTT, 0 = not set yet.
+    est_limit: f64 = 0,
+    long_rtt_ns: f64 = 0,
+    long_n: u32 = 0,
 
     pub fn init(options: Options) Throttle {
         std.debug.assert(options.max_in_flight >= 1);
+        if (options.adaptive) |a| {
+            std.debug.assert(a.min_limit >= 1 and a.rtt_tolerance >= 1.0);
+            std.debug.assert(a.smoothing > 0 and a.smoothing <= 1.0);
+            std.debug.assert(a.backoff_ratio >= 0.5 and a.backoff_ratio < 1.0);
+        }
         // Bounded wait blocks on the Io futex — there is no io-less wait in
         // Zig 0.16 std (std.Thread.Condition/Futex are gone).
         if (options.max_wait_ms != 0) std.debug.assert(options.io != null);
@@ -158,7 +237,7 @@ pub const Throttle = struct {
     pub fn tryAcquire(t: *Throttle) bool {
         var cur = t.in_flight_count.load(.seq_cst);
         while (true) {
-            if (cur >= t.options.max_in_flight) return false;
+            if (cur >= t.limit()) return false;
             cur = t.in_flight_count.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) orelse
                 return true;
         }
@@ -237,6 +316,81 @@ pub const Throttle = struct {
         }
     }
 
+    // ── adaptive limit ──────────────────────────────────────────────────
+
+    /// The limit in force now: `max_in_flight` for a static throttle, the
+    /// discovered value (in `[min_limit, max_in_flight]`) for an adaptive one.
+    pub fn limit(t: *const Throttle) u32 {
+        const l = t.limit_now.load(.seq_cst);
+        if (l != 0) return l;
+        const a = t.options.adaptive orelse return t.options.max_in_flight;
+        return @min(a.initial_limit orelse 20, t.options.max_in_flight);
+    }
+
+    /// `acquire`, plus the start time and load that `releasePermit` needs to
+    /// turn the request into a sample. null = shed. Without `Options.adaptive`
+    /// the clock is not read.
+    pub fn acquirePermit(t: *Throttle) ?Permit {
+        if (!t.acquire()) return null;
+        if (t.options.adaptive == null) return .{ .start_ns = 0, .in_flight = 0 };
+        return .{ .start_ns = t.options.clock.now(), .in_flight = t.in_flight_count.load(.seq_cst) };
+    }
+
+    /// Return the slot of `acquirePermit` and, with `Options.adaptive`, feed
+    /// the request's latency to the limit (see `Outcome`).
+    pub fn releasePermit(t: *Throttle, p: Permit, outcome: Outcome) void {
+        if (t.options.adaptive != null and outcome != .ignore)
+            t.sample(t.options.clock.since(p.start_ns), p.in_flight, outcome == .dropped);
+        t.release();
+    }
+
+    /// Apply one sample to the limit (`Adaptive` has the rules).
+    fn sample(t: *Throttle, rtt_ns: u64, in_flight: u32, dropped: bool) void {
+        const a = t.options.adaptive orelse return;
+        if (t.adapt_busy.swap(true, .acquire)) return; // another sample is being applied: skip
+        defer t.adapt_busy.store(false, .release);
+        const ceiling = t.options.max_in_flight;
+        const floor_limit = @min(a.min_limit, ceiling);
+        const cur: u32 = t.limit();
+        var next: f64 = @floatFromInt(cur);
+        switch (a.algorithm) {
+            .aimd => {
+                if (dropped or rtt_ns > @as(u64, a.timeout_ms) * std.time.ns_per_ms) {
+                    next = @floatFromInt(@as(u32, @intFromFloat(next * a.backoff_ratio)));
+                } else if (@as(u64, in_flight) * 2 >= cur) {
+                    next += 1;
+                }
+            },
+            .gradient2 => {
+                if (dropped) return; // the reference ignores drops here
+                if (t.est_limit == 0) t.est_limit = next;
+                const short: f64 = @floatFromInt(@max(rtt_ns, 1));
+                // Long-term RTT: a mean over the first 10 samples, then an
+                // exponential average with alpha = 2 / (window + 1).
+                const warmup = 10;
+                if (t.long_n < warmup) {
+                    t.long_rtt_ns = (t.long_rtt_ns * @as(f64, @floatFromInt(t.long_n)) + short) / @as(f64, @floatFromInt(t.long_n + 1));
+                    t.long_n += 1;
+                } else {
+                    const alpha = 2.0 / (@as(f64, @floatFromInt(a.long_window)) + 1.0);
+                    t.long_rtt_ns = t.long_rtt_ns * (1.0 - alpha) + short * alpha;
+                }
+                const long = t.long_rtt_ns;
+                // Drift: a long-term RTT far above the current one is pulled down.
+                if (long / short > 2.0) t.long_rtt_ns *= 0.95;
+                // Do not grow while the application, not the limit, is the bound.
+                if (@as(f64, @floatFromInt(in_flight)) < t.est_limit / 2.0) return;
+                const gradient = @max(0.5, @min(1.0, a.rtt_tolerance * long / short));
+                const raw = t.est_limit * gradient + @as(f64, @floatFromInt(a.queue_size));
+                next = t.est_limit * (1.0 - a.smoothing) + raw * a.smoothing;
+                next = @max(@as(f64, @floatFromInt(floor_limit)), @min(@as(f64, @floatFromInt(ceiling)), next));
+                t.est_limit = next;
+            },
+        }
+        next = @max(@as(f64, @floatFromInt(floor_limit)), @min(@as(f64, @floatFromInt(ceiling)), next));
+        t.limit_now.store(@max(1, @as(u32, @intFromFloat(next))), .seq_cst);
+    }
+
     // ── observability ───────────────────────────────────────────────────
 
     /// Slots currently held. A point-in-time snapshot — pair with
@@ -251,7 +405,8 @@ pub const Throttle = struct {
         return t.waiting_count.load(.seq_cst);
     }
 
-    /// The configured hard cap (denominator for utilization metrics).
+    /// The configured hard cap (denominator for utilization metrics); with
+    /// `Options.adaptive` the ceiling, see `limit` for the value in force.
     pub fn maxInFlight(t: *const Throttle) u32 {
         return t.options.max_in_flight;
     }
@@ -278,9 +433,19 @@ pub const Throttle = struct {
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const t: *Throttle = @ptrCast(@alignCast(state.?));
-    if (!t.acquire()) return shed(t, ctx);
-    defer t.release();
-    return next.run(ctx);
+    if (t.options.adaptive == null) {
+        if (!t.acquire()) return shed(t, ctx);
+        defer t.release();
+        return next.run(ctx);
+    }
+    // Adaptive: the request's latency is a sample; a handler error says
+    // nothing about capacity (a client mistake looks the same), so it is not.
+    const p = t.acquirePermit() orelse return shed(t, ctx);
+    next.run(ctx) catch |e| {
+        t.releasePermit(p, .ignore);
+        return e;
+    };
+    t.releasePermit(p, .success);
 }
 
 /// The 503 path, mirroring ratelimit's 429: the `Retry-After` value is
@@ -1545,4 +1710,131 @@ test "Partitioned: 8 threads never lose accounting and guaranteed share holds" {
     try testing.expectEqual(@as(usize, 0), p.inFlight());
     try testing.expectEqual(@as(usize, 0), p.inFlightIn(0));
     try testing.expectEqual(@as(usize, 0), p.inFlightIn(1));
+}
+
+// ── adaptive limit ──────────────────────────────────────────────────────────
+
+test "adaptive: off by default, limit() is max_in_flight and tryAcquire is unchanged" {
+    var th: Throttle = .init(.{ .max_in_flight = 3 });
+    try testing.expectEqual(@as(u32, 3), th.limit());
+    const p = th.acquirePermit().?; // no clock read, no sample
+    try testing.expectEqual(@as(u64, 0), p.start_ns);
+    th.releasePermit(p, .success);
+    try testing.expectEqual(@as(u32, 3), th.limit());
+    th.deinit();
+}
+
+test "adaptive aimd: +1 while half the limit is in use, x0.9 (floored) on a drop or a timeout, clamped" {
+    var th: Throttle = .init(.{ .max_in_flight = 30, .adaptive = .{ .algorithm = .aimd, .initial_limit = 20, .min_limit = 10 } });
+    try testing.expectEqual(@as(u32, 20), th.limit());
+    th.sample(1_000, 5, false); // 5 * 2 < 20: under-used, no growth
+    try testing.expectEqual(@as(u32, 20), th.limit());
+    th.sample(1_000, 10, false); // 10 * 2 >= 20
+    try testing.expectEqual(@as(u32, 21), th.limit());
+    th.sample(1_000, 21, true); // drop: floor(21 * 0.9) = 18
+    try testing.expectEqual(@as(u32, 18), th.limit());
+    th.sample(6 * std.time.ns_per_s, 1, false); // past the 5 s timeout: floor(18 * 0.9) = 16
+    try testing.expectEqual(@as(u32, 16), th.limit());
+    for (0..40) |_| th.sample(1_000, 100, true); // never below min_limit
+    try testing.expectEqual(@as(u32, 10), th.limit());
+    for (0..100) |_| th.sample(1_000, 100, false); // never above the ceiling
+    try testing.expectEqual(@as(u32, 30), th.limit());
+    th.deinit();
+}
+
+test "adaptive gradient2: grows while latency is flat, shrinks when it rises, ignores drops and an idle app" {
+    var th: Throttle = .init(.{ .max_in_flight = 200, .adaptive = .{ .initial_limit = 50, .min_limit = 5 } });
+    const ms = std.time.ns_per_ms;
+    // Flat 10 ms: gradient 1, the limit grows by about queue_size * smoothing = 0.8 a sample.
+    for (0..60) |_| th.sample(10 * ms, th.limit(), false);
+    const grown = th.limit();
+    try testing.expect(grown > 90 and grown <= 200);
+    // An idle application (in flight < limit / 2) neither grows nor shrinks it.
+    th.sample(10 * ms, 1, false);
+    th.sample(500 * ms, 1, false);
+    try testing.expectEqual(grown, th.limit());
+    // A drop is not a gradient2 signal.
+    th.sample(10 * ms, grown, true);
+    try testing.expectEqual(grown, th.limit());
+    // The RTT jumps to 5x the long-term value: gradient 0.5, est * 0.9 + 0.8 a sample, towards min_limit.
+    for (0..80) |_| th.sample(50 * ms, th.limit(), false);
+    try testing.expect(th.limit() < grown / 2);
+    try testing.expect(th.limit() >= 5);
+    th.deinit();
+}
+
+test "adaptive: tryAcquire admits at most the discovered limit, never above the ceiling" {
+    var th: Throttle = .init(.{ .max_in_flight = 4, .adaptive = .{ .algorithm = .aimd, .initial_limit = 2, .min_limit = 1 } });
+    try testing.expect(th.tryAcquire());
+    try testing.expect(th.tryAcquire());
+    try testing.expect(!th.tryAcquire()); // limit 2, ceiling 4
+    th.sample(1_000, 2, false); // grows to 3
+    try testing.expect(th.tryAcquire());
+    try testing.expect(!th.tryAcquire());
+    for (0..5) |_| th.sample(1_000, 3, false);
+    try testing.expectEqual(@as(u32, 4), th.limit());
+    try testing.expect(th.tryAcquire());
+    try testing.expect(!th.tryAcquire());
+    for (0..4) |_| th.release();
+    th.deinit();
+}
+
+test "adaptive: a permit measures with the injected clock, an ignored outcome is no sample" {
+    var mc = clock_lib.ManualClock.init(1_000);
+    var th: Throttle = .init(.{
+        .max_in_flight = 30,
+        .clock = mc.clock(),
+        .adaptive = .{ .algorithm = .aimd, .initial_limit = 20, .min_limit = 10, .timeout_ms = 100 },
+    });
+    const slow = th.acquirePermit().?;
+    try testing.expectEqual(@as(u32, 1), slow.in_flight);
+    mc.advance(200 * std.time.ns_per_ms); // past the 100 ms timeout
+    th.releasePermit(slow, .success);
+    try testing.expectEqual(@as(u32, 18), th.limit());
+    const skipped = th.acquirePermit().?;
+    mc.advance(200 * std.time.ns_per_ms);
+    th.releasePermit(skipped, .ignore);
+    try testing.expectEqual(@as(u32, 18), th.limit());
+    try testing.expectEqual(@as(usize, 0), th.inFlight());
+    th.deinit();
+}
+
+test "adaptive: a ceiling below the default minimum pins the limit there" {
+    var th: Throttle = .init(.{ .max_in_flight = 5, .adaptive = .{} });
+    try testing.expectEqual(@as(u32, 5), th.limit());
+    for (0..20) |_| th.sample(1_000, 5, false);
+    th.sample(5 * std.time.ns_per_s, 5, false);
+    try testing.expectEqual(@as(u32, 5), th.limit());
+    th.deinit();
+}
+
+test "adaptive middleware: a served request is a sample, a handler error is not, the 503 path is unchanged" {
+    var mc = clock_lib.ManualClock.init(1_000);
+    var th: Throttle = .init(.{
+        .max_in_flight = 10,
+        .clock = mc.clock(),
+        .adaptive = .{ .algorithm = .aimd, .initial_limit = 2, .min_limit = 1 },
+    });
+    defer th.deinit();
+    var hits: u32 = 0;
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &hits;
+    try r.use(th.middleware());
+    try r.get("/t", hCount);
+    try r.get("/boom", hBoom);
+
+    var buf: [1024]u8 = undefined;
+    // One request alone: in flight 1, 1 * 2 >= 2, so the limit grows to 3.
+    try expectStatus(runWire(&r, wire("/t"), &buf), "200");
+    try testing.expectEqual(@as(u32, 3), th.limit());
+    try testing.expectEqual(0, th.inFlight());
+    // An erroring handler (the server's 500) is not a sample: the limit stays.
+    try expectStatus(runWire(&r, wire("/boom"), &buf), "500");
+    try testing.expectEqual(@as(u32, 3), th.limit());
+    try testing.expectEqual(0, th.inFlight());
+    // At the discovered limit the request is shed with the usual 503.
+    for (0..3) |_| try testing.expect(th.tryAcquire());
+    try expectStatus(runWire(&r, wire("/t"), &buf), "503");
+    for (0..3) |_| th.release();
 }

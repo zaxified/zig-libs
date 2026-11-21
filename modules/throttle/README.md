@@ -126,8 +126,10 @@ connection task; that *is* the backpressure, bounded by
 - Unlike `ratelimit`'s 429, no exact retry time is computable (it depends on
   in-flight handler durations) — `Retry-After` is the configured
   `retry_after_ms` hint.
-- Adaptive limit discovery (Netflix Gradient-style AIMD on observed latency)
-  is not implemented: `max_in_flight` is static (SPEC.md, Backlog).
+- Adaptive limit discovery is opt-in: `Options.adaptive` (`.gradient2` or `.aimd`, Netflix
+  concurrency-limits' rules) lets the limit move below `max_in_flight` with the observed
+  latency (`acquirePermit` / `releasePermit`, or the middleware). Without it `max_in_flight`
+  is static.
 
 ## Verification
 
