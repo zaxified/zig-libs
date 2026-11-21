@@ -659,6 +659,36 @@ fn reconnectTcp() u8 {
     return 0;
 }
 
+/// Exit 0: a `.host` target is resolved and the first address that answers is
+/// used (`localhost` may list `::1` first, where nothing listens), and a name
+/// that does not resolve is `UnknownHostName`.
+fn hostTarget() u8 {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
+    const io = threaded.io();
+    var addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = addr.listen(io, .{ .kernel_backlog = 8 }) catch return 9;
+    var e = transport.ReconnectingEmitter.init(io, .{ .host = .{ .name = "localhost", .port = server.socket.address.getPort() } }, .{});
+    e.send(&.{ .msg = "one" }) catch return 1;
+    const c1 = server.accept(io) catch return 2;
+    var buf: [64]u8 = undefined;
+    const want = "21 <13>1 - - - - - - one";
+    var got: usize = 0;
+    while (got < want.len) {
+        const n = linux.read(c1.socket.handle, buf[got..].ptr, buf.len - got);
+        if (linux.errno(n) != .SUCCESS or n == 0) return 3;
+        got += n;
+    }
+    if (!std.mem.eql(u8, buf[0..got], want)) return 4;
+    e.close();
+    var bad = transport.ReconnectingEmitter.init(io, .{ .host = .{ .name = "no-such-host.invalid", .port = 514 } }, .{});
+    bad.send(&.{ .msg = "x" }) catch |err| return if (err == error.UnknownHostName) 0 else 5;
+    return 6;
+}
+
+test "ReconnectingEmitter (host name target): resolved per connect, the answering address wins" {
+    try testing.expectEqual(@as(u32, 0), try runChild(hostTarget));
+}
+
 test "ReconnectingEmitter (TCP loopback): the record after a peer restart arrives" {
     try testing.expectEqual(@as(u32, 0), try runChild(reconnectTcp));
 }

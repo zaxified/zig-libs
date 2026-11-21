@@ -232,6 +232,8 @@ pub const TcpEmitter = struct {
         HostUnreachable,
         SocketFailed,
         ConnectFailed,
+        /// `ReconnectingEmitter.Target.host`: the name did not resolve to any address.
+        UnknownHostName,
         /// `connectUnix`: the path (plus its NUL) does not fit `sockaddr_un`.
         PathTooLong,
     };
@@ -502,7 +504,15 @@ pub const ReconnectingEmitter = struct {
         tcp: std.Io.net.IpAddress,
         /// A unix stream socket path; it must outlive the emitter.
         unix: []const u8,
+        /// A host name, resolved again on every connect, so that a collector
+        /// behind a DNS change is followed. Every address the lookup returns is
+        /// tried in order; the lookup itself is not bounded by
+        /// `Config.connect_timeout_ms` (it takes what `std.Io.net.HostName.lookup`
+        /// takes). The name must outlive the emitter.
+        host: Host,
     };
+
+    pub const Host = struct { name: []const u8, port: u16 };
 
     pub const Config = struct {
         connect_timeout_ms: u32 = default_connect_timeout_ms,
@@ -576,7 +586,7 @@ pub const ReconnectingEmitter = struct {
     /// The framing in use: `Config.framing` or the target's default.
     pub fn framing(e: *const ReconnectingEmitter) Framing {
         return e.config.framing orelse switch (e.target) {
-            .tcp => .octet_counting,
+            .tcp, .host => .octet_counting,
             .unix => .nul,
         };
     }
@@ -595,6 +605,7 @@ pub const ReconnectingEmitter = struct {
         const conn = switch (e.target) {
             .tcp => |a| TcpEmitter.connectTimeout(e.io, a, e.config.connect_timeout_ms),
             .unix => |p| TcpEmitter.connectUnix(e.io, p, e.config.connect_timeout_ms),
+            .host => |h| connectHost(e.io, h, e.config.connect_timeout_ms),
         } catch |err| {
             // From the failure, not the attempt: a connect that took its whole
             // deadline must still leave `backoff_ms` of quiet after it (review).
@@ -610,6 +621,30 @@ pub const ReconnectingEmitter = struct {
         return c;
     }
 };
+
+/// Resolve `host` and connect to the first of its addresses that answers; the
+/// error of the last attempt when none does. Each address gets the full deadline.
+fn connectHost(io: std.Io, host: ReconnectingEmitter.Host, connect_timeout_ms: u32) (TcpEmitter.ConnectError || error{Canceled})!TcpEmitter {
+    const HostName = std.Io.net.HostName;
+    const hn = HostName.init(host.name) catch return error.UnknownHostName;
+    var qbuf: [16]HostName.LookupResult = undefined;
+    var q: std.Io.Queue(HostName.LookupResult) = .init(&qbuf);
+    hn.lookup(io, &q, .{ .port = host.port }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return error.UnknownHostName,
+    };
+    var last: TcpEmitter.ConnectError = error.UnknownHostName;
+    while (q.getOne(io)) |r| switch (r) {
+        .address => |a| {
+            if (TcpEmitter.connectTimeout(io, a, connect_timeout_ms)) |c| return c else |err| last = err;
+        },
+        .canonical_name => {},
+    } else |err| switch (err) {
+        error.Closed => {},
+        error.Canceled => return error.Canceled,
+    }
+    return last;
+}
 
 /// Did the peer close (or reset) this stream? `recv(MSG_PEEK)` answers without a
 /// byte taken: 0 is an orderly close, an error other than "nothing to read" a

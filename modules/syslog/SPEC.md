@@ -223,9 +223,6 @@ Run `scripts/modtest syslog`; the interop oracles are `zig build interop-syslog`
 
 ## Backlog / deferred
 
-- **A host name in `ReconnectingEmitter.Target`, re-resolved per connect:** a collector behind a DNS change is
-  not followed, since the target is an address. Effort small, once `std.Io.net.HostName` is taken as a dependency
-  on `Io` semantics.
 - **A mutation run over `parse.zig`, `logger.zig`, `ReconnectingEmitter` and `sendThroughMemfd`:** the card's
   mutation score predates this surface (swept, fuzzed and blind-reviewed, not mutation-tested).
 

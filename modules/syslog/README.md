@@ -212,7 +212,7 @@ sharing a thread must not suspend in a sink.
 
 ```zig
 // Survives a collector restart; `init` does no I/O.
-var e = syslog.ReconnectingEmitter.init(io, .{ .tcp = addr }, .{});   // or .{ .unix = "/dev/log" }
+var e = syslog.ReconnectingEmitter.init(io, .{ .tcp = addr }, .{});   // or .{ .unix = "/dev/log" } or .{ .host = .{ .name = "logs.example", .port = 514 } }
 defer e.close();
 try e.send(&msg);
 ```
