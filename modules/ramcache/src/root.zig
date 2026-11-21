@@ -581,6 +581,9 @@ pub const Cache = struct {
     /// zipf_mixed 145 → 131 ns (`bench-ramcache`, 2026-10-25), for ~7 bytes
     /// more per entry (a slot is a pointer plus a metadata byte).
     map: std.HashMapUnmanaged(*Node, void, NodeContext, 50) = .empty,
+    /// Bumped whenever the index relocates its slots (a grow, a rebuild):
+    /// `scan` restarts a walk whose cursor predates it.
+    map_epoch: u32 = 0,
     bytes: usize = 0,
     options: Options,
     stats: Stats = .{},
@@ -853,7 +856,7 @@ pub const Cache = struct {
         const reserved = blk: {
             if (self.deadlineFor(now_ns, ttl_ns, now_ns) != null)
                 self.exp.ensureUnusedCapacity(self.alloc, 1) catch break :blk false;
-            self.map.ensureUnusedCapacity(self.alloc, 1) catch break :blk false;
+            self.reserveMapSlot() catch break :blk false;
             break :blk true;
         };
         if (!reserved) {
@@ -1166,7 +1169,7 @@ pub const Cache = struct {
         // ceiling path makes the same distinction the other way round: it
         // drops with `.evicted`, because nothing takes the entry's place.)
         self.doomed.ensureTotalCapacity(self.alloc, self.pinned_entries + 1) catch return null;
-        self.map.ensureUnusedCapacity(self.alloc, 1) catch return null;
+        self.reserveMapSlot() catch return null;
         const vbuf = self.alloc.alloc(u8, len) catch return null;
         const node = self.createNode(k) orelse {
             self.alloc.free(vbuf);
@@ -1402,7 +1405,69 @@ pub const Cache = struct {
         }
     }
 
+    /// Where a `scan` walk stands: start one with `.{}`, hand it back
+    /// to every call of the same walk. Plain data (copy it, keep it between
+    /// calls; it holds no pointer into the cache).
+    pub const ScanCursor = struct {
+        slot: u32 = 0,
+        epoch: u32 = 0,
+        started: bool = false,
+    };
+
+    /// Called by `scan` for each live entry, with the cache's own `key` and
+    /// `value` bytes (valid only during the call).
+    pub const ScanFn = *const fn (ctx: ?*anyopaque, key: []const u8, value: []const u8) void;
+
+    /// Visit up to `max` live entries (a value that `get(key, now_ns, cur_gen)`
+    /// would return: filled, not expired, not stale for `cur_gen`) through
+    /// `cb`, continuing from `cursor`; returns true when the walk has reached
+    /// the end of the table. A caller walks a big cache a page at a time and
+    /// does its slow work between pages, with no lock held:
+    /// `var c: ScanCursor = .{}; while (!cache.scan(&c, now, gen, 256, cb, ctx)) {}`.
+    ///
+    /// Weakly consistent, as Caffeine's `asMap()` views and otter's `Range`: an
+    /// entry present for the whole walk is visited at least once, exactly once
+    /// unless the index was rebuilt between two calls (a grow, a tombstone
+    /// shed), in which case the walk starts again from the beginning and
+    /// may show entries twice; an entry inserted or removed during the walk may
+    /// or may not be seen. A `scan` neither counts as an access (no hit, no
+    /// frequency, no idle refresh, no promotion) nor removes an expired entry.
+    /// `cb` runs inside this call: it must not call into the cache (same
+    /// rule as `drainDirty`).
+    pub fn scan(self: *Cache, cursor: *ScanCursor, now_ns: i64, cur_gen: u64, max: usize, cb: ScanFn, ctx: ?*anyopaque) bool {
+        if (!cursor.started or cursor.epoch != self.map_epoch) {
+            cursor.* = .{ .slot = 0, .epoch = self.map_epoch, .started = true };
+        }
+        const prev = self.in_hook;
+        self.in_hook = true;
+        defer self.in_hook = prev;
+        var it = self.map.iterator();
+        it.index = @min(cursor.slot, self.map.capacity());
+        var seen: usize = 0;
+        while (seen < max) {
+            const e = it.next() orelse {
+                cursor.slot = it.index;
+                return true;
+            };
+            const n = e.key_ptr.*;
+            if (!n.filled) continue;
+            if (self.timeExpired(&n.entry, now_ns)) continue;
+            if (n.entry.gen != 0 and n.entry.gen != cur_gen) continue;
+            cb(ctx, n.key, n.entry.value);
+            seen += 1;
+        }
+        cursor.slot = it.index;
+        return false;
+    }
+
     // ── internals ───────────────────────────────────────────────────────────
+
+    /// `map.ensureUnusedCapacity(1)`, noting a relocation of the slots.
+    fn reserveMapSlot(self: *Cache) std.mem.Allocator.Error!void {
+        const before = self.map.capacity();
+        try self.map.ensureUnusedCapacity(self.alloc, 1);
+        if (self.map.capacity() != before) self.map_epoch +%= 1;
+    }
 
     /// The entry for `key` if it holds a value -- a reservation that has not
     /// been `commit`ted yet does not (see `reserve`), and reads as a miss.
@@ -1934,6 +1999,7 @@ pub const Cache = struct {
         if (cap == 0) return;
         if (self.removals < @max(32, cap / 4)) return;
         self.map.rehash(NodeContext{});
+        self.map_epoch +%= 1;
         self.removals = 0;
         self.stats.rehashes += 1;
     }
@@ -3691,6 +3757,124 @@ test "markCleanIf acks only the value that was flushed" {
     try testing.expect(c.markCleanIf("k", "v2"));
     try testing.expect(!c.isDirty("k"));
     try testing.expect(!c.markCleanIf("nope", "v2")); // absent → false
+}
+
+const ScanCollector = struct {
+    keys: std.ArrayList([]const u8) = .empty,
+    fn hook(ctx: ?*anyopaque, key: []const u8, value: []const u8) void {
+        const self: *ScanCollector = @ptrCast(@alignCast(ctx.?));
+        std.debug.assert(std.mem.eql(u8, key, value)); // the tests store key == value
+        self.keys.append(testing.allocator, testing.allocator.dupe(u8, key) catch @panic("oom")) catch @panic("oom");
+    }
+    fn deinit(self: *ScanCollector) void {
+        for (self.keys.items) |k| testing.allocator.free(k);
+        self.keys.deinit(testing.allocator);
+    }
+    fn count(self: *const ScanCollector, key: []const u8) usize {
+        var n: usize = 0;
+        for (self.keys.items) |k| n += @intFromBool(std.mem.eql(u8, k, key));
+        return n;
+    }
+};
+
+test "scan: pages of a stable cache show every live entry exactly once" {
+    var c = testCache(1 << 20, 4096);
+    defer c.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..1000) |i| {
+        const k = std.fmt.bufPrint(&buf, "k{d}", .{i}) catch unreachable;
+        c.put(k, k, 0, 0, 0);
+    }
+    var col: ScanCollector = .{};
+    defer col.deinit();
+    var cur: Cache.ScanCursor = .{};
+    var pages: usize = 0;
+    while (!c.scan(&cur, 0, 0, 37, ScanCollector.hook, &col)) pages += 1;
+    try testing.expect(pages >= 1000 / 37 - 1);
+    try testing.expectEqual(@as(usize, 1000), col.keys.items.len);
+    for (0..1000) |i| {
+        const k = std.fmt.bufPrint(&buf, "k{d}", .{i}) catch unreachable;
+        try testing.expectEqual(@as(usize, 1), col.count(k));
+    }
+    // A scan is not an access.
+    const before = c.stats;
+    var cur2: Cache.ScanCursor = .{};
+    var col2: ScanCollector = .{};
+    defer col2.deinit();
+    while (!c.scan(&cur2, 0, 0, 100, ScanCollector.hook, &col2)) {}
+    try testing.expectEqual(before.hits, c.stats.hits);
+    try testing.expectEqual(before.misses, c.stats.misses);
+}
+
+test "scan: skips expired and generation-stale entries, and a reservation; removals between pages are not shown" {
+    var c = testCache(1 << 20, 64);
+    defer c.deinit();
+    c.put("live", "live", 0, 0, 0);
+    c.put("ttl", "ttl", 0, 10, 0);
+    c.put("gen1", "gen1", 0, 0, 1);
+    c.put("gen2", "gen2", 0, 0, 2);
+    const fill = c.reserve("pending", 3, 0, 0, 0).?;
+    var col: ScanCollector = .{};
+    defer col.deinit();
+    var cur: Cache.ScanCursor = .{};
+    while (!c.scan(&cur, 100, 2, 100, ScanCollector.hook, &col)) {}
+    try testing.expectEqual(@as(usize, 1), col.count("live"));
+    try testing.expectEqual(@as(usize, 1), col.count("gen2"));
+    try testing.expectEqual(@as(usize, 0), col.count("ttl"));
+    try testing.expectEqual(@as(usize, 0), col.count("gen1"));
+    try testing.expectEqual(@as(usize, 0), col.count("pending"));
+    c.discard(fill);
+
+    // Removal between two pages: the entry is not shown if not yet reached.
+    var c2 = testCache(1 << 20, 64);
+    defer c2.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }) |k| c2.put(k, k, 0, 0, 0);
+    var col2: ScanCollector = .{};
+    defer col2.deinit();
+    var cur2: Cache.ScanCursor = .{};
+    try testing.expect(!c2.scan(&cur2, 0, 0, 2, ScanCollector.hook, &col2));
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }) |k| {
+        if (col2.count(k) == 0) _ = c2.remove(k); // drop one not yet shown
+    }
+    while (!c2.scan(&cur2, 0, 0, 2, ScanCollector.hook, &col2)) {}
+    try testing.expect(col2.keys.items.len >= 2 and col2.keys.items.len <= 6);
+}
+
+test "scan: a grow between pages restarts the walk and misses nothing present throughout" {
+    var c = testCache(1 << 24, 100_000);
+    defer c.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..40) |i| {
+        const k = std.fmt.bufPrint(&buf, "s{d}", .{i}) catch unreachable;
+        c.put(k, k, 0, 0, 0);
+    }
+    var col: ScanCollector = .{};
+    defer col.deinit();
+    var cur: Cache.ScanCursor = .{};
+    try testing.expect(!c.scan(&cur, 0, 0, 7, ScanCollector.hook, &col));
+    const epoch = c.map_epoch;
+    for (0..5000) |i| { // force the index to grow
+        const k = std.fmt.bufPrint(&buf, "g{d}", .{i}) catch unreachable;
+        c.put(k, k, 0, 0, 0);
+    }
+    try testing.expect(c.map_epoch != epoch);
+    while (!c.scan(&cur, 0, 0, 1000, ScanCollector.hook, &col)) {}
+    for (0..40) |i| {
+        const k = std.fmt.bufPrint(&buf, "s{d}", .{i}) catch unreachable;
+        try testing.expect(col.count(k) >= 1);
+    }
+}
+
+test "scan: an empty cache is done at once" {
+    var c = testCache(1 << 20, 8);
+    defer c.deinit();
+    var col: ScanCollector = .{};
+    defer col.deinit();
+    var cur: Cache.ScanCursor = .{};
+    try testing.expect(c.scan(&cur, 0, 0, 10, ScanCollector.hook, &col));
+    try testing.expectEqual(@as(usize, 0), col.keys.items.len);
+    c.put("x", "x", 0, 0, 0);
+    try testing.expect(c.scan(&cur, 0, 0, 10, ScanCollector.hook, &col)); // the cursor was done: a new call continues at the end
 }
 
 test "drainDirty visits exactly the dirty entries, skipping clean ones" {

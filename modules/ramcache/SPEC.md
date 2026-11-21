@@ -59,7 +59,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Write-behind seam (opt-in), for a caller-driven persistence layer built on top:** every entry
   carries a *dirty* bit — `put` always sets it (a write not yet known to be durable); `markClean(key)`
   clears it; `isDirty(key)` reads it — none of the three touch stats, SLRU promotion, or the
-  frequency sketch. `drainDirty(cb, ctx)` sweeps every currently-dirty entry once
+  frequency sketch. `scan(&cursor, now, gen, max, cb, ctx)` walks the live entries a page at a time (weakly consistent, like Caffeine's `asMap()` views and otter's `Range`; not an access; an index grow restarts a walk); `drainDirty(cb, ctx)` sweeps every currently-dirty entry once
   (`*const fn(ctx, key, value) void`, no removal, no allocation) for a periodic flusher.
   `Options.on_evict` (`*const fn(ctx, key, value, dirty, EvictReason) void` + `on_evict_ctx`, the
   same fn-pointer + `*anyopaque` pattern as `aaa-gate.AuditFn`/`coap.observe.AdmitFn`) fires
