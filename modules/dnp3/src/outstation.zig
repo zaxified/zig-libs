@@ -1398,6 +1398,10 @@ pub const Outstation = struct {
         var seen: usize = 0;
         var written: usize = 0;
         var i: usize = 0;
+        // The common time of occurrence (g51) the relative-time events being
+        // written count from; one per call, restarted when an event is before
+        // it or more than 16 bits of milliseconds after it.
+        var cto: ?u48 = null;
         while (i < self.events.len) : (i += 1) {
             const ev = self.events.at(i);
             if (!classes[@as(usize, @backingInt(ev.class)) - 1]) continue;
@@ -1417,7 +1421,23 @@ pub const Outstation = struct {
             const wide = ev.index > 0xFF;
             const header_len: usize = if (wide) 6 else 4; // g/v/qual + count + prefix
             const each = layout.wireLen().? + @as(usize, if (wide) 2 else 1);
-            if (pos.* + header_len + each > out.len) break;
+            const relative = layout.time == .rel16;
+            const need_cto = relative and (cto == null or ev.time_ms < cto.? or ev.time_ms - cto.? > 0xFFFF);
+            const cto_len: usize = if (need_cto) 4 + objects.g51.wire_len else 0;
+            if (pos.* + cto_len + header_len + each > out.len) break;
+            if (need_cto) {
+                const cto_header = objects.ObjectHeader{
+                    .group = 51,
+                    .variation = if (self.need_time) 2 else 1,
+                    .qualifier = .{ .prefix_code = .none, .range_code = .count_1b },
+                    .range = .{ .count = 1 },
+                };
+                const ch = objects.encodeObjectHeader(cto_header, out[pos.*..]) catch break;
+                pos.* += ch.len;
+                const tb = (objects.g51.V1{ .ms_since_epoch = ev.time_ms }).encode(out[pos.*..]) catch break;
+                pos.* += tb.len;
+                cto = ev.time_ms;
+            }
 
             const header = objects.ObjectHeader{
                 .group = group,
@@ -1437,7 +1457,8 @@ pub const Outstation = struct {
                 out[pos.*] = @intCast(ev.index);
                 pos.* += 1;
             }
-            const bytes = records.encode(layout, ev.flags, ev.value, ev.time_ms, 0, out[pos.*..]) catch break;
+            const rel_ms: u16 = if (relative) @intCast(ev.time_ms - cto.?) else 0;
+            const bytes = records.encode(layout, ev.flags, ev.value, ev.time_ms, rel_ms, out[pos.*..]) catch break;
             pos.* += bytes.len;
             written += 1;
         }
@@ -2642,6 +2663,53 @@ test "events: reported oldest-first with the right group, retired only on CONFIR
     const confirm = [_]u8{ 0xC5, 0x00 };
     try testing.expectEqual(@as(?Reply, null), try station.handle(&confirm, 3100, &out));
     try testing.expect(station.events.isEmpty());
+}
+
+test "events: relative-time variations (g2v3) follow a g51 common time of occurrence, restarted past 16 bits" {
+    var fix = Fixture{};
+    var station = fix.station(.{ .need_time_at_start = false });
+    for (&fix.binaries) |*b| b.event_variation = 3;
+    var out: [512]u8 = undefined;
+    var req: [64]u8 = undefined;
+    // Relative to the first event (t=1000): +0, +500; the third is 99000 ms later
+    // and does not fit 16 bits, so a new g51 starts at it.
+    station.update(.binary_input, 2, .{ .binary = false }, 1000);
+    station.update(.binary_input, 4, .{ .binary = false }, 1500);
+    station.update(.binary_input, 2, .{ .binary = true }, 100_000);
+    const read = try buildRead(&req, 5, &.{objects.g60.readClassHeader(.class1)});
+    const reply = (try station.handle(read, 200_000, &out)).?;
+    const body = (try application.decodeResponseHeader(reply.fragment)).rest;
+    var pos: usize = 0;
+    // g51v1 (clock synchronised), count 1, then the time 1000 ms.
+    try testing.expectEqualSlices(u8, &.{ 51, 1, 0x07, 1, 0xE8, 0x03, 0, 0, 0, 0 }, body[pos..][0..10]);
+    pos += 10;
+    // g2v3, 1-octet index prefix, count 1: index 2, flags, offset 0.
+    try testing.expectEqualSlices(u8, &.{ 2, 3, 0x17, 1, 2 }, body[pos..][0..5]);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, body[pos + 6 ..][0..2], .little));
+    pos += 5 + 1 + 2;
+    try testing.expectEqualSlices(u8, &.{ 2, 3, 0x17, 1, 4 }, body[pos..][0..5]);
+    try testing.expectEqual(@as(u16, 500), std.mem.readInt(u16, body[pos + 6 ..][0..2], .little));
+    pos += 5 + 1 + 2;
+    // New g51 at t = 100000 = 0x0186A0, then offset 0 and the value bit set in the flags.
+    try testing.expectEqualSlices(u8, &.{ 51, 1, 0x07, 1, 0xA0, 0x86, 0x01, 0, 0, 0 }, body[pos..][0..10]);
+    pos += 10;
+    try testing.expectEqualSlices(u8, &.{ 2, 3, 0x17, 1, 2 }, body[pos..][0..5]);
+    try testing.expect(body[pos + 5] & 0x80 != 0);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, body[pos + 6 ..][0..2], .little));
+    try testing.expectEqual(pos + 8, body.len);
+}
+
+test "events: an unsynchronised clock (NEED_TIME) precedes relative events with g51v2" {
+    var fix = Fixture{};
+    var station = fix.station(.{});
+    for (&fix.binaries) |*b| b.event_variation = 3;
+    var out: [512]u8 = undefined;
+    var req: [64]u8 = undefined;
+    station.update(.binary_input, 2, .{ .binary = false }, 1000);
+    const read = try buildRead(&req, 5, &.{objects.g60.readClassHeader(.class1)});
+    const reply = (try station.handle(read, 3000, &out)).?;
+    const body = (try application.decodeResponseHeader(reply.fragment)).rest;
+    try testing.expectEqualSlices(u8, &.{ 51, 2, 0x07, 1 }, body[0..4]);
 }
 
 test "events: a confirm that never arrives puts them back on the queue" {

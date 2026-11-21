@@ -634,6 +634,19 @@ pub const g50 = struct {
     };
 };
 
+// ── g51: Time and Date Common Time-of-Occurrence ────────────────────────────
+
+/// A g51 object precedes event objects that carry a relative time (g2v3,
+/// g4v3, g11v... with `TimeShape.rel16`): their 16-bit millisecond offsets
+/// count from this time (IEEE 1815-2012 Part 4 §4.2.2). v1 is the time of an
+/// outstation whose clock is synchronised, v2 of one that is not (IIN1.4
+/// NEED_TIME set). Same 6-octet little-endian millisecond layout as g50v1.
+pub const g51 = struct {
+    pub const V1 = g50.V1;
+    pub const V2 = g50.V1;
+    pub const wire_len = g50.V1.wire_len;
+};
+
 // ── g60: Class Data (request-only markers, no object payload) ──────────────
 
 pub const g60 = struct {

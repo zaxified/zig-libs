@@ -117,6 +117,13 @@ which is a local programming mistake.
   closed, and `TIMEOUT` would tell a foreign station that somebody else holds an arm. The
   wrong-peer case is also the one refusal that does **not** consume the arm, so it cannot be used
   to cancel another station's select.
+- **Relative-time events (g2v3, g4v3 and the other `rel16` variations).** A point whose
+  `event_variation` selects a relative-time variation is reported with a 16-bit millisecond offset from a
+  g51 common time-of-occurrence object that precedes it in the fragment (IEEE 1815-2012 Part 4 §4.2.2):
+  g51v1 while the clock is synchronised, g51v2 while IIN1.4 NEED_TIME is set. The first such event of an
+  emit call sets the CTO to its own time; a later event earlier than the CTO or more than 65535 ms after it
+  starts a new g51. (Before, a relative variation was written with offset 0 and no g51, which no master
+  can place in time.)
 - **Link-layer confirmed delivery (`link_session.zig`).** Receive side, always on: RESET_LINK_STATES
   is ACKed and sets the expected frame-count bit to 1; CONFIRMED_USER_DATA with FCV set and the expected
   FCB is delivered, ACKed and flips the expectation; the other FCB is a repeat of a delivered frame (its
@@ -525,8 +532,6 @@ foreign SA master computes the same.
   monitoring key, only in the confirmation); (c) the exact default critical-function table;
   (d) whether a reply may carry a sequence number other than the challenged request's; (e) the
   aggressive-mode MAC input (here: last challenge message || request up to g120v9).
-- **Relative-time event variations (g2v3, g4v3)** are encodable by `records` but the outstation
-  never selects them; it always emits absolute time.
 - **Portable ctgrind trap counts for `keys5`** include std soft-AES pad-lane definedness
   reaching post-verdict public plaintext (`sa.zig` unwrap); revisit if std stops padding with
   undefined.
