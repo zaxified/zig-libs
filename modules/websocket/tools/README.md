@@ -31,7 +31,7 @@ scripts/lib/capped zig build-exe --cache-dir <scratch>/zc \
   -femit-bin=<scratch>/verify_response_probe \
   --dep websocket --dep http -Mmain=modules/websocket/tools/verify_response_probe.zig \
   --dep http -Mwebsocket=modules/websocket/src/root.zig \
-  --dep netaddr --dep datefmt --dep tlsclient --dep crc32 --dep b64ct -Mhttp=modules/http/src/root.zig \
+  --dep netaddr --dep datefmt --dep tlsclient --dep crc32 --dep b64ct --dep proxyproto --dep tlsserver -Mhttp=modules/http/src/root.zig \
   -Mb64ct=modules/b64ct/src/root.zig \
   -Mcrc32=modules/crc32/src/root.zig \
   --dep x509 --dep p256 --dep p384 --dep p521 --dep rsa --dep tlsresume --dep ct25519 --dep mlkem -Mtlsclient=modules/tlsclient/src/root.zig \
@@ -51,7 +51,13 @@ scripts/lib/capped zig build-exe --cache-dir <scratch>/zc \
   --dep rsa --dep slhdsa --dep p521 --dep p256 --dep netaddr -Mx509=modules/x509/src/root.zig \
   -Mnetaddr=modules/netaddr/src/root.zig \
   -Mslhdsa=modules/slhdsa/src/root.zig \
-  -Mdatefmt=modules/datefmt/src/root.zig
+  -Mdatefmt=modules/datefmt/src/root.zig \
+  -Mchachapoly=modules/chachapoly/src/root.zig \
+  -Mcrc32c=modules/crc32c/src/root.zig \
+  --dep p256 --dep chachapoly --dep entropy --dep p521 --dep aesgcm --dep p384 --dep ct25519 --dep mlkem -Mhpke=modules/hpke/src/root.zig \
+  --dep netaddr --dep crc32c -Mproxyproto=modules/proxyproto/src/root.zig \
+  --dep rsa --dep ct25519 --dep p256 --dep p384 --dep p521 --dep mlkem --dep montint -Mtls13=modules/tls13/src/root.zig \
+  --dep tls13 --dep aesgcm --dep chachapoly --dep netaddr --dep x509 --dep rsa --dep keycodec --dep tlsresume --dep p521 --dep hpke -Mtlsserver=modules/tlsserver/src/root.zig
 modules/websocket/tools/oracle_handshake.py <scratch>/verify_response_probe
 ```
 
