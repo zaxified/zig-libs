@@ -594,26 +594,34 @@ const scratch_bytes = 8192;
 /// Bump inside the buffer, the arena past it. Nothing is freed one by one.
 const Scratch = struct {
     fba: std.heap.FixedBufferAllocator,
-    next: std.mem.Allocator,
+    /// Where an allocation goes once the buffer is full; null: it fails (`compileInto`).
+    next: ?std.mem.Allocator,
 
     fn allocator(s: *Scratch) std.mem.Allocator {
         return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
     fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
         const s: *Scratch = @ptrCast(@alignCast(ctx));
-        return s.fba.allocator().rawAlloc(len, al, ra) orelse s.next.rawAlloc(len, al, ra);
+        if (s.fba.allocator().rawAlloc(len, al, ra)) |p| return p;
+        const n = s.next orelse return null;
+        return n.rawAlloc(len, al, ra);
     }
     fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
         const s: *Scratch = @ptrCast(@alignCast(ctx));
-        return if (s.fba.ownsSlice(m)) s.fba.allocator().rawResize(m, al, n, ra) else s.next.rawResize(m, al, n, ra);
+        if (s.fba.ownsSlice(m)) return s.fba.allocator().rawResize(m, al, n, ra);
+        const nx = s.next orelse return false;
+        return nx.rawResize(m, al, n, ra);
     }
     fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
         const s: *Scratch = @ptrCast(@alignCast(ctx));
-        return if (s.fba.ownsSlice(m)) s.fba.allocator().rawRemap(m, al, n, ra) else s.next.rawRemap(m, al, n, ra);
+        if (s.fba.ownsSlice(m)) return s.fba.allocator().rawRemap(m, al, n, ra);
+        const nx = s.next orelse return null;
+        return nx.rawRemap(m, al, n, ra);
     }
     fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
         const s: *Scratch = @ptrCast(@alignCast(ctx));
-        if (!s.fba.ownsSlice(m)) s.next.rawFree(m, al, ra);
+        if (s.fba.ownsSlice(m)) return;
+        if (s.next) |nx| nx.rawFree(m, al, ra);
     }
 };
 
@@ -623,6 +631,21 @@ pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) Comp
     defer arena.deinit();
     var scratch_buf: [scratch_bytes]u8 = undefined;
     var scratch: Scratch = .{ .fba = .init(&scratch_buf), .next = arena.allocator() };
+    return compileCore(gpa, &.{}, &scratch, &arena, expr, opts);
+}
+
+/// `compile` with no allocator: the working memory is the caller's `scratch` and the
+/// program is written to `out`; the result is the used prefix of `out`. Nothing else
+/// is touched, so a loop of compiles cannot grow any allocator. `error.OutOfMemory`
+/// when `scratch` or `out` is too small; `out.len == max_insns` never
+/// is. `scratch_bytes` (8 KiB, what `compile` keeps on its stack) takes a typical filter; the
+/// bump buffer frees nothing, so a long one needs more. The program is the one `compileOpts` returns.
+pub fn compileInto(out: []BpfInsn, scratch: []u8, expr: []const u8, opts: Options) CompileError![]BpfInsn {
+    var sc: Scratch = .{ .fba = .init(scratch), .next = null };
+    return compileCore(null, out, &sc, null, expr, opts);
+}
+
+fn compileCore(gpa: ?std.mem.Allocator, out_buf: []BpfInsn, scratch: *Scratch, arena: ?*std.heap.ArenaAllocator, expr: []const u8, opts: Options) CompileError![]BpfInsn {
     const scratch_a = scratch.allocator();
     var p: Parser = .{ .a = scratch_a, .lex = .{ .src = expr }, .opts = opts, .shift = @as(i32, @intCast(opts.link.headerLen())) - 14 };
     var ast = try p.parseExpr();
@@ -635,10 +658,12 @@ pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) Comp
     if (p.alone_only and p.leaves != p.alone_leaves) return error.UnsupportedExpression;
     var live = false;
     if (p.saw_vlan and opts.vlan_ancillary) {
-        arena.deinit();
-        arena = std.heap.ArenaAllocator.init(gpa);
         scratch.fba.reset();
-        scratch.next = arena.allocator();
+        if (arena) |ar| {
+            ar.deinit();
+            ar.* = std.heap.ArenaAllocator.init(gpa.?);
+            scratch.next = ar.allocator();
+        }
         p = .{ .a = scratch_a, .lex = .{ .src = expr }, .opts = opts, .shift = 0, .live = true };
         ast = try p.parseExpr();
         if (try p.lex.peek() != null) return error.Syntax;
@@ -664,7 +689,7 @@ pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) Comp
     try g.emit(.{ .insn = .{ .code = op.ret | op.k, .jt = 0, .jf = 0, .k = accept_len } });
     try g.place(f_label);
     try g.emit(.{ .insn = .{ .code = op.ret | op.k, .jt = 0, .jf = 0, .k = 0 } });
-    return g.finish(gpa);
+    return g.finish(gpa, out_buf);
 }
 
 const Gen = struct {
@@ -843,7 +868,7 @@ const Gen = struct {
     /// `[cond jt=0 jf=1][ja T][ja F]` when both sides are long. Widening one
     /// jump moves others, so layout repeats until no new jump needs it (flags
     /// only ever turn on, so it ends).
-    fn finish(g: *Gen, gpa: std.mem.Allocator) CompileError![]BpfInsn {
+    fn finish(g: *Gen, gpa: ?std.mem.Allocator, out_buf: []BpfInsn) CompileError![]BpfInsn {
         const n = g.code.items.len;
         const long_t = try g.a.alloc(bool, n);
         const long_f = try g.a.alloc(bool, n);
@@ -871,8 +896,8 @@ const Gen = struct {
             if (!changed) break;
         }
         if (pos[n] > max_insns) return error.FilterTooComplex;
-        const out = try gpa.alloc(BpfInsn, pos[n]);
-        errdefer gpa.free(out);
+        const out = if (gpa) |ga| try ga.alloc(BpfInsn, pos[n]) else if (out_buf.len >= pos[n]) out_buf[0..pos[n]] else return error.OutOfMemory;
+        errdefer if (gpa) |ga| ga.free(out);
         for (g.code.items, 0..) |p, i| {
             const at = pos[i];
             out[at] = p.insn;
@@ -3788,4 +3813,29 @@ test "run: scratch slots 16 and up drop the frame, stx stores, a load at the las
     try testing.expectEqual(@as(u32, 7), run(&.{ mk(op.ld | op.b | op.abs, 7), mk(op.ret | op.a, 0) }, frame));
     // 0x55: (0x55 & 0x0f) * 4 = 20; a wider mask would give 84.
     try testing.expectEqual(@as(u32, 20), run(&.{ mk(op.ldx | op.b | op.msh, 0), mk(op.misc | op.txa, 0), mk(op.ret | op.a, 0) }, frame));
+}
+
+test "compileInto: the same program as compile, no allocator; too little scratch or out is OutOfMemory" {
+    const exprs = [_][]const u8{
+        "ip and tcp port 80",
+        "not (ether host 00:11:22:33:44:55 or arp)",
+        "vlan 5 and tcp port 80",
+        "ip6 and udp portrange 1000-2000",
+    };
+    var scratch: [scratch_bytes]u8 = undefined;
+    var out: [max_insns]BpfInsn = undefined;
+    for (exprs) |e| {
+        for ([_]bool{ false, true }) |anc| {
+            const o: Options = .{ .vlan_ancillary = anc };
+            const want = try compileOpts(testing.allocator, e, o);
+            defer testing.allocator.free(want);
+            const got = try compileInto(&out, &scratch, e, o);
+            try testing.expectEqualSlices(BpfInsn, want, got);
+        }
+    }
+    // Errors are the same as compile's.
+    try testing.expectError(error.UnsupportedExpression, compileInto(&out, &scratch, "ip and and", .{}));
+    // Too little scratch / output.
+    try testing.expectError(error.OutOfMemory, compileInto(&out, scratch[0..64], "ip and tcp port 80", .{}));
+    try testing.expectError(error.OutOfMemory, compileInto(out[0..2], &scratch, "ip and tcp port 80", .{}));
 }

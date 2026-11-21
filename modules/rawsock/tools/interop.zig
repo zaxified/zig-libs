@@ -24,6 +24,7 @@ const mac_a = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0xaa, 0x01 };
 const mac_b = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0xaa, 0x02 };
 const ip_a = [4]u8{ 10, 88, 0, 1 };
 const ip_b = [4]u8{ 10, 88, 0, 2 };
+const validate_cases = 20000;
 
 fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
     const r = try std.process.run(gpa, io, .{ .argv = argv });
@@ -216,6 +217,52 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return 1;
     }
     std.debug.print("interop-rawsock: combined `vlan 5 and ether proto 0x88b5` passes the kernel-tagged frame; `vlan 5 and ip` passes an IPv4 frame on the same device and not the 0x88b5 one\n", .{});
+
+    // `filter.validate` against the kernel's own attach-time verifier: seeded random
+    // programs (valid and not) through `Socket.setFilter` (SO_ATTACH_FILTER) on an
+    // AF_PACKET socket; the two must agree on every one. The committed replay
+    // (`src/testdata/validate_kernel.zig`) holds 211; this draws `validate_cases` more
+    // from a fixed seed each run, so a new kernel can be checked in one command.
+    {
+        var vsock = try rawsock.Socket.open(rawsock.eth_p.all, .{ .iface = "rsa", .recv_timeout_ms = 100 });
+        defer vsock.close();
+        var prng = std.Random.DefaultPrng.init(0x72_61_77_73);
+        const rnd = prng.random();
+        const codes = [_]u16{ 0x00, 0x01, 0x20, 0x28, 0x30, 0x40, 0x48, 0x50, 0x60, 0x61, 0x80, 0x81, 0xb1, 0x02, 0x03, 0x07, 0x87, 0x04, 0x0c, 0x14, 0x24, 0x34, 0x3c, 0x44, 0x54, 0x64, 0x6c, 0x74, 0x84, 0x94, 0xa4, 0x05, 0x15, 0x1d, 0x25, 0x35, 0x45, 0x06, 0x16, 0x0e, 0x99 };
+        const ks = [_]u32{ 0, 1, 2, 3, 15, 16, 31, 32, 0xfffff000, 0xfffffffe, 0xffffffff, 0xfffff034, 0xfffff038 };
+        var accepted: usize = 0;
+        var disagree: usize = 0;
+        var i: usize = 0;
+        while (i < validate_cases) : (i += 1) {
+            var prog: [12]rawsock.BpfInsn = undefined;
+            const n = rnd.intRangeAtMost(usize, 1, prog.len - 1);
+            for (prog[0..n]) |*ins| {
+                ins.* = .{
+                    .code = codes[rnd.uintLessThan(usize, codes.len)],
+                    .jt = rnd.uintLessThan(u8, 3),
+                    .jf = rnd.uintLessThan(u8, 3),
+                    .k = if (rnd.boolean()) ks[rnd.uintLessThan(usize, ks.len)] else rnd.uintLessThan(u32, 20),
+                };
+            }
+            var len = n;
+            if (rnd.uintLessThan(u8, 10) < 8) {
+                prog[len] = .{ .code = if (rnd.boolean()) 0x06 else 0x16, .jt = 0, .jf = 0, .k = 0 };
+                len += 1;
+            }
+            const mine = if (rawsock.filter.validate(prog[0..len])) |_| true else |_| false;
+            const kernel = if (vsock.setFilter(prog[0..len])) |_| true else |_| false;
+            if (kernel) accepted += 1;
+            if (mine != kernel) {
+                disagree += 1;
+                if (disagree <= 5) std.debug.print("interop-rawsock: validate says {} but the kernel says {} for program {x}\n", .{ mine, kernel, std.mem.sliceAsBytes(prog[0..len]) });
+            }
+        }
+        if (disagree != 0) {
+            std.debug.print("interop-rawsock: validate disagrees with the kernel on {d} of {d} random programs\n", .{ disagree, validate_cases });
+            return 1;
+        }
+        std.debug.print("interop-rawsock: validate agrees with the kernel on {d} random programs ({d} accepted)\n", .{ validate_cases, accepted });
+    }
 
     if (capture) {
         var out: std.ArrayList(u8) = .empty;

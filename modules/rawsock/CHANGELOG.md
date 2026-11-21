@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **CONSUMER-VISIBLE (additive):** `filter.compileInto(out, scratch, expr, opts)`: a compile with no allocator (caller-owned working buffer and output slice; `error.OutOfMemory` when either is too small), the same program as `compileOpts`. `compile`/`compileOpts` unchanged (internal `Scratch` buffer's overflow arena is now optional).
+
 - **2026-11-20** — **Behaviour change:** a filter with more than `max_insns` comparisons that is also malformed is now `error.Syntax` (it used to be `FilterTooComplex` the moment the cap was passed, before the parser reached the error); a well-formed over-long filter is still `FilterTooComplex`. The parser keeps reading past the cap without building more nodes.
 - **2026-11-20** — Behaviour change (source-breaking): `pcap.writeRecord` takes the file header's `snaplen` as a new third argument (after `precision`) and returns `error.InvalidRecord` for a record longer than `max(snaplen, default_snaplen)`; before, such a record was written and `pcap.Reader` then refused the file with `RecordTooLong`. Pass the `snaplen` given to `writeHeader` (`default_snaplen` for the default header).
 - **2026-11-04** — **behaviour:** `Block.nextPacket` after `BadBlock` is null; before, a chain error let the next calls hand out a packet of that block, a header error repeated for ever. Dead first-pass branch in `vlan` deleted, stale comments fixed, `pcapng.Record.orig_len` and `Reader.order` documented, stack margin on the card.
