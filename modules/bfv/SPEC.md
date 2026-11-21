@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-09 · mutation 2026-11-18 (227/240, 13 eq) · src ad5b3b26dd3de721
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct 2026-09-09 (ctgrind)
+**Hardening:** fuzz 2026-11-21 (200,000-run budget per harness clean, BFV_FUZZ) · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
 
@@ -315,7 +315,7 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   - `ops_test.zig`: plaintext operands, batch-encoded row rotations / row swap / slot-wise product, modulus switching, codec round-trips and every decoder refusal, all decrypted and compared against the plaintext-space result; `batch.zig` checks each slot against direct evaluation `m(ζ^e)`; an end-to-end multiply + relinearize + rotate at `params.secure(4096, 65537, .tc128)`; every `defaultPrimes` chain re-validated;
   - parameter and modulus refusals (`init` running `validate`, `Ntt.init` on a composite `q`, the `2^62` bounds, auxiliary primes equal to a main prime skipped).
 - **Stack probe:** `src/stackprobe_test.zig` (`testkit.stackprobe`) checks that `keyGen`, `genRelinKey`, `genGaloisKey` (at `bfv_toy`), `decrypt` and `noiseBudget` leave no secret-key residue on the dead stack, at `bfv_toy` and at the security-grade set (ReleaseFast).
-- **Fuzz:** none (the card's Hardening line records the fuzz obligation as n/a).
+- **Fuzz:** `BFV_FUZZ=<runs>[,<first seed>]` (testkit driver, `src/fuzz_test.zig`, harness `bfv-codec`): damaged encodings of every codec kind and raw bytes; whatever decodes re-encodes to the same bytes; an in-suite reach test requires both outcomes.
 - **ctgrind:** `src/ctgrind_harness.zig`, targets `keygen`, `encrypt`, `decrypt` (ReleaseFast; rows in `scripts/checks/ctgrind-expected.tsv`, run by `scripts/checks/ctgrind.sh`); the baseline-CPU variant is `CTGRIND_CPU=x86_64`. Source-level CT only, see *Threats / caveats*.
 - **Mutation:** the whole-module run covers every non-test file (`modarith`, `ntt`, `rns`, `ring`, `encode`, `params`, `bfv`); comptime sizing, `gate.zig`, `bench.zig`, the ctgrind harness and the KAT data are not mutated. Three kinds of mutant: functional (one ReleaseSafe schemata build), burn-site (one `burn.run` per secret entry point, read by the stack probe, `DeadStackResidue`) and constant-time (judged by ctgrind only: `csub`'s and `subMod`'s `blackBox` removed, the `sampleTernary` trit select written as `if`/`else`; no functional test can see them).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
