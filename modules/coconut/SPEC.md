@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [nymtech/nym](https://github.com/nymtech/nym) | Rust | mixed (`LICENSES/` directory; not read) | 2.0k | nym-binaries-v2026.18 (2026-09) | Production home of Coconut-derived credentials; the current `common/` tree lists `nym_offline_compact_ecash`, i.e. the project appears to have moved to compact e-cash *(inferred from directory names)*. |
 | Zig ecosystem (GitHub search "coconut credential", "bls12-381 pairing", language Zig, 2026-09-30) | Zig | — | — | — | No Coconut repository found. |
 
-**Where we are ahead:** the only Coconut implementation found that is not dormant (*inferred*: the four above were last pushed 2019-2023 or have moved on), and the only one in Zig; BLS12-381 (the curve production stacks now use) with RFC 9380 hash-to-curve; pure Zig on the in-repo `bls12_381`; a Fiat-Shamir transcript that is documented field by field, with the two commitments that are load-bearing named and owner-verified by dropping them (SPEC §1a); a ctgrind harness; the PS signature core and threshold aggregation are cross-checked against `coconut-crypto` (see Anchoring). Blind issuance (paper §4.3, as the reference implements it: ElGamal-encrypted private attributes, the formation proof `π_s`, `blindSign`, `unblind`; §1b), so the authorities need not see the private attributes. **Where we are behind:** keygen is trusted-dealer only, although the sibling `dkg` is GJKR over secp256k1 and does not serve BLS12-381; no wire-compatibility of the show proof with any other implementation (none publishes vectors, SPEC §3).
+**Where we are ahead:** the only Coconut implementation found that is not dormant (*inferred*: the four above were last pushed 2019-2023 or have moved on), and the only one in Zig; BLS12-381 (the curve production stacks now use) with RFC 9380 hash-to-curve; pure Zig on the in-repo `bls12_381`; a Fiat-Shamir transcript that is documented field by field, with the two commitments that are load-bearing named and owner-verified by dropping them (SPEC §1a); a ctgrind harness; the PS signature core and threshold aggregation are cross-checked against `coconut-crypto` (see Anchoring). Blind issuance (paper §4.3, as the reference implements it: ElGamal-encrypted private attributes, the formation proof `π_s`, `blindSign`, `unblind`; §1b), so the authorities need not see the private attributes. Dealer-free key generation (`dkg.zig`, §1c), as Nym runs a DKG for its authorities. **Where we are behind:** no wire-compatibility of the show proof with any other implementation (none publishes vectors, SPEC §3).
 
 ## 1. Construction (Coconut, NDSS 2019, §4)
 
@@ -46,7 +46,7 @@ attributes, `t`-of-`n` authorities.
   base** is `h = hashToCurveG1(cm)` — deterministic, so every authority signs
   under the SAME `h` (this is what makes the partials Lagrange-aggregatable).
 
-- **KeyGen (§4.4 `TTPKeyGen`, trusted dealer)** — master secret
+- **KeyGen (§4.4 `TTPKeyGen`, trusted dealer; dealer-free: §1c)** — master secret
   `sk = (x, y₁…y_q) ∈ Fr^{q+1}`; each component is Shamir-shared with an
   independent degree-`t−1` polynomial, evaluated at authority indices `1..n`.
   Verification key `vk = (α, β₁…β_q) = (g2^x, g2^{yᵢ}) ∈ G2^{q+1}`; each
@@ -138,6 +138,35 @@ The reference's `prepare_blind_sign` / `blind_sign` / `unblind`, attribute order
   zeroed on every path; `stackprobe_test.zig` has needles for each of `elgamalKeyGen`, `prepareBlindSign`,
   `blindSign`, `unblind`.
 
+## 1c. Dealer-free key generation (`dkg.zig`)
+
+The two-round Pedersen DKG of the FROST paper (Komlo–Goldberg 2020, Figure 1) in frost-core's
+`part1`/`part2`/`part3` shape — the sibling `frost.dkg` follows the same reference over secp256k1 — run
+once per key component `c ∈ 0..q` (`x`, then `y_1..y_q`). Participants are the Shamir indices `1..n`.
+
+- **`part1(i, n, t, q)`**: draws (fail-closed `io`) `q + 1` polynomials `a_ic0..a_ic(t−1)` and proof nonces
+  `k_ic` (a zero draw is redrawn), broadcasts the Feldman commitments `φ_ick = [a_ick] g2`
+  (component-major, `commitment[c·t + k]`) and per component a Schnorr proof of knowledge of `a_ic0`:
+  `R_ic = [k_ic] g2`, `c_ic = Fr.reduceWide(SHA-512("COCONUT-BLS12381G2_XMD:SHA-512_DKG-V01_POK_" ‖ i ‖ c ‖
+  φ_ic0 ‖ R_ic))` (`i`, `c` u64 big-endian, points compressed), `μ_ic = k_ic + a_ic0·c_ic`. frost-core hashes
+  `i ‖ φ_0 ‖ R`; the component number separates one participant's `q + 1` proofs.
+- **`part2`**: frost-core's order — exactly `n − 1` packages, every sender in `1..n`, not the own index, no
+  sender twice, every shape right, all before any proof; then per sender every commitment point in G2, `φ_ℓc0`
+  and `R_ℓc` not the identity, and `R_ℓc == [μ_ℓc] g2 − [c_ℓc] φ_ℓc0` (`error.InvalidProofOfKnowledge`, the
+  first failing sender in `culprit`). Returns `f_ic(ℓ)` per component for each `ℓ`.
+- **`part3`**: the same sender checks, then `[f_ℓc(i)] g2 == Σ_k [i^k] φ_ℓck` for every received share
+  (`error.InvalidSecretShare`, culprit named), `x(i) = Σ_ℓ f_ℓ0(i)`, `y_c(i) = Σ_ℓ f_ℓc(i)` into a
+  `SecretKeyShare`, and the `PublicKeyPackage`: group key `α = Σ_ℓ φ_ℓ00`, `β_c = Σ_ℓ φ_ℓc0`, and every
+  authority's `VerificationKeyShare` `(Σ_k [j^k] Σ_ℓ φ_ℓck)_c`, identical at every participant.
+
+The commitments are in G2 because the verification key is: the summed constant terms ARE `(α, β_1..β_q)`
+and the summed commitment evaluated at `j` IS authority `j`'s vk share, so the output feeds `signPartial`,
+`blindSign`, `aggregateVerificationKeys` and `aggregateCredential` unchanged. Packages are plain values
+(as in `frost.dkg`); the transport — authenticated broadcast for round 1, confidential authenticated
+point-to-point for round 2 — is the caller's. Pedersen's DKG lets a rushing adversary bias the group key's
+distribution (Gennaro et al. 1999); frost-core accepts that for Schnorr-type keys, and so does this
+module (the `dkg` module's GJKR is the unbiased variant, over secp256k1).
+
 ## 2. Reuse map
 
 | Need | Source | How |
@@ -145,10 +174,10 @@ The reference's `prepare_blind_sign` / `blind_sign` / `unblind`, attribute order
 | `Fr` scalar field, `G1`/`G2` groups, pairing, hash-to-curve | `bls12_381` (imported) | all field/group/pairing/H2C math — this module adds none |
 | Lagrange coefficient at 0, Shamir eval | `frost`/`bls12_381.threshold` (**pattern, not import**) | those are over secp256k1 / min-pk BLS; reimplemented over `Fr` in `lagrange.zig` (`coefficientAtZero`) + `keys.zig` (`evalPoly`) |
 | selective-disclosure Fiat-Shamir NIZK shape | `bbs` (**design reference**) | `bbs.proofGen/proofVerify`'s transcript/challenge discipline is the closest sibling; Coconut's show proof is the analogous NIZK over PS instead of BBS |
-| threshold DKG (dealer-free) | `dkg` (**deferred**) | keygen is trusted-dealer in Phase 1; the `dkg`-style dealer-free wiring is a later increment |
+| threshold DKG (dealer-free) | `frost.dkg` (**pattern, not import**) | frost-core's `part1`/`part2`/`part3` over secp256k1; re-done per key component over `Fr`, commitments in G2 (`dkg.zig`) |
 
 Only `bls12_381` is an actual build dependency; `frost`/`dkg`/`bbs` are sibling
-modules in this repo reused as *pattern* references (different curve / deferred),
+modules in this repo reused as *pattern* references (different curve),
 not third-party source. Clean-room from the NDSS 2019 paper — no third-party
 source ported or studied as a design reference, so no `NOTICE` entry (CONVENTIONS
 §5, same as `bbs`/`frost`/`dkg`). `asonnino/coconut` + `nymtech/coconut` were
@@ -235,9 +264,20 @@ Run: `scripts/modtest coconut` (heavy: pairing arithmetic; ReleaseSafe is the us
   `coconut-crypto` run as a black box (see Anchoring).
 - **Fuzz:** the deterministic driver, `COCONUT_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver), over
   `coconut-credential-decode`, `coconut-partial-decode`, `coconut-showproof-decode` and `coconut-protocol`.
-- **ctgrind:** `src/ctgrind_harness.zig` (authority signing, user issue, user show); rows in
-  `scripts/checks/ctgrind-expected.tsv`.
-- **Dead-stack probe:** `src/stackprobe_test.zig` for `keygen`, the key-share derivations, `psSignWithSecret`,
+- **ctgrind:** `src/ctgrind_harness.zig` (authority signing, user issue, user show, and blind issuance:
+  `blind_prepare` — private attributes and every random draw of `prepareBlindSign`, `blind_sign` — the key share in
+  `blindSign`, `unblind` — the ElGamal secret `d`); rows in `scripts/checks/ctgrind-expected.tsv`, each context
+  classified in the row's comment (identity and canonicality verdicts, hash-to-curve and point encoding of the
+  published `cm`, no branch on a private attribute, `o`, `k_i`, a witness, the share or `d`). The DKG has no
+  ctgrind target.
+- **DKG:** `src/dkg.zig` tests — 2-of-3 (q = 1), 3-of-4 and 3-of-5 (q = 2) runs: every participant derives the
+  same public package, its own vk share is the listed one, any `t` vk shares aggregate to the group key, the
+  group `x` is the sum of the constant terms and `t` key shares Lagrange-reconstruct it, partials from two
+  different `t`-subsets aggregate to the same credential that verifies (and shows) under the group key, `t − 1`
+  do not; blind issuance under DKG shares; a wrong proof response, a swapped constant-term commitment, a
+  commitment point outside G2 and a wrong share are refused with the culprit named; sender, count and shape
+  errors.
+- **Dead-stack probe:** `src/stackprobe_test.zig` for `keygen`, `dkg.part1`/`part2`/`part3`, the key-share derivations, `psSignWithSecret`,
   `signPartial` and `proveCredential` (the `Entropy.io` arm is not probed; it differs from the seeded arm only
   in `Fr.random`, swept in `bls12_381`).
 - **Mutation:** whole module, 145 mutants over `credential.zig` (codecs, signing exponent, `psVerifyPlain`, every item of the
@@ -291,9 +331,5 @@ them. Do not use either outside a test.
 
 ## Backlog / deferred
 
-- **ctgrind rows for blind issuance:** `prepareBlindSign`, `blindSign` and `unblind` are stack-probed but have no
-  ctgrind target yet (the existing rows cover `signPartial`, the local commitment and `proveCredential`). Small.
-- **Dealer-free key generation for BLS12-381** (survey 2026-09-30): `keygen` is a trusted dealer; `dkg` targets
-  secp256k1 only. A Pedersen/Feldman DKG over `Fr` of `bls12_381` (the shape `dkg` already has) would remove the
-  dealer. Effort: medium; fits §2.
+None open.
 

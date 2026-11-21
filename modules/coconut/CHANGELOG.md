@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — Added: dealer-free key generation, `coconut.dkg` (`part1`/`part2`/`part3`, frost-core's two-round Pedersen DKG per key component, Feldman commitments in G2): the output `SecretKeyShare` and `PublicKeyPackage` (group `VerificationKey`, every `VerificationKeyShare`) feed `signPartial`, `blindSign` and the aggregations unchanged; a bad proof of knowledge or share names the sender in `culprit`. Bodies burned and stack-probed.
 - **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind harness targets for blind issuance (`blind_prepare`, `blind_sign`, `unblind`) in `src/ctgrind_harness.zig`; no library code moved.
 - **2026-11-21** — Added: wire forms for blind issuance, `BlindSignRequest.toBytes`/`fromBytes` and `BlindSignature.toBytes`/`fromBytes` (exact length, G1 subgroup checks and canonical scalars on decode).
 - **2026-11-21** — Added: blind issuance (paper §4.3, `blind.zig`): `ElGamalKeyPair`/`elgamalKeyGen`, `prepareBlindSign` (commitment, ElGamal ciphertexts of the private attributes, formation proof `π_s`), `verifyBlindSignRequest`, `blindSign` (refuses a failed proof with `error.InvalidProof` and any point outside G1), `unblind`; `BlindError`. Secret-touching bodies are burned and stack-probed.

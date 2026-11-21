@@ -18,10 +18,6 @@ shows are unlinkable).
 > are implemented behind `gate.fable_core_implemented` (`true`). See `SPEC.md` for the construction, the full
 > Fiat-Shamir transcript, the tier finding and the backlog.
 
-## Not provided
-
-Dealer-free key generation (`keygen` is a trusted dealer). `SPEC.md`, *Backlog / deferred*, has the plan.
-
 ## API
 
 ```zig
@@ -58,6 +54,19 @@ defer req.deinit(allocator);
 // each authority j (checks the proof, error.InvalidProof otherwise):
 const bs = try coconut.blindSign(allocator, &keys.sk_shares[j], p, eg.gamma, &req, &public_attrs);
 const partial_j = coconut.unblind(&eg, &bs); // -> aggregateCredential as above; attributes = private ++ public
+
+// Dealer-free key generation instead of `keygen` (frost-core's part1/2/3 shape,
+// participants 1..n). Round-1 packages go over an authenticated broadcast
+// channel, round-2 shares over confidential authenticated point-to-point ones.
+var s1: coconut.dkg.Round1SecretPackage = undefined;
+var r1 = try coconut.dkg.part1(allocator, io, &s1, my_index, n, t, q); // broadcast r1
+var s2: coconut.dkg.Round2SecretPackage = undefined;
+var culprit: u64 = 0; // the first sender whose package fails a check
+const shares_out = try coconut.dkg.part2(allocator, &s2, &s1, received_round1, &culprit);
+// send shares_out[k] to shares_out[k].recipient; free with dkg.freeRound2Packages
+var my_share: coconut.SecretKeyShare = undefined; // -> signPartial / blindSign
+var pub_pkg = try coconut.dkg.part3(allocator, &my_share, &s2, received_round1, received_round2, &culprit);
+// pub_pkg.vk = the group key, pub_pkg.vk_shares = every authority's vk share
 ```
 
 A show proof is bound to `context`: issue a fresh nonce per show and refuse a
@@ -66,7 +75,7 @@ binds nothing.
 
 ## Randomness
 
-`keygen` and `proveCredential` take `io: std.Io` and draw every secret scalar
+`keygen`, `dkg.part1` and `proveCredential` take `io: std.Io` and draw every secret scalar
 through `Entropy.scalar` (`keys.zig`), which calls `bls12_381`'s
 `Fr.random(io)`. That function is fail-closed: it draws through `entropy`'s
 `fill`, i.e. `std.Io.randomSecure` or an abort, never `std.Io.random` (whose

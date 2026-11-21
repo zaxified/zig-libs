@@ -25,9 +25,8 @@
 //! construction, the full Fiat-Shamir transcript element list, the
 //! Fable-vs-mechanical split, the tier finding (no external byte-exact
 //! vector exists → genuine Fable, weight concentrated in the
-//! selective-disclosure NIZK), and the deferred increments (blind
-//! issuance ElGamal + NIZK π_s; distributed-authority DKG wiring; SHAKE
-//! ciphersuite).
+//! selective-disclosure NIZK). Blind issuance (`blind.zig`) and
+//! dealer-free key generation (`dkg.zig`) are implemented too.
 //!
 //! ## Randomness
 //!
@@ -75,6 +74,9 @@
 //! - `keys.zig` — REAL. Threshold keygen, `vk` derivation, Lagrange-in-
 //!   exponent `vk` aggregation.
 //! - `lagrange.zig` — REAL. Lagrange coefficient at `x = 0` over `Fr`.
+//! - `dkg.zig` — dealer-free key generation: a Pedersen DKG (frost-core's
+//!   `part1`/`part2`/`part3`) per key component, Feldman commitments in G2.
+//! - `blind.zig` — blind issuance (paper §4.3).
 //! - `credential.zig` — `Credential`/`PartialCredential`/`ShowProof` +
 //!   codecs + the `psSignWithSecret`/`psVerifyPlain` oracles (REAL); the
 //!   four **FABLE CORE** functions (implemented; the show-proof NIZK's
@@ -91,6 +93,7 @@ pub const lagrange = @import("lagrange.zig");
 pub const keys = @import("keys.zig");
 pub const credential = @import("credential.zig");
 pub const blind = @import("blind.zig");
+pub const dkg = @import("dkg.zig");
 
 // Convenience re-exports.
 pub const Parameters = params.Parameters;
@@ -151,6 +154,7 @@ test {
     _ = keys;
     _ = credential;
     _ = blind;
+    _ = dkg;
     _ = @import("harness_test.zig");
     _ = @import("interop_test.zig");
     _ = @import("stackprobe_test.zig");

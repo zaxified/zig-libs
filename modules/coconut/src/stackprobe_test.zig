@@ -27,6 +27,10 @@
 //! and every proof witness), `blindSign` (the share and its exponent over the
 //! public attributes) and `unblind` (`d`, `−d`).
 //!
+//! Dealer-free key generation: `dkg.part1` (every polynomial coefficient and
+//! proof nonce), `dkg.part2` (the coefficients and the shares they evaluate
+//! to) and `dkg.part3` (the received shares and the summed key share).
+//!
 //! Not probed: the `Entropy.io`
 //! arm (it differs from the seeded arm only in `Fr.random`,
 //! which `bls12_381` already swept).
@@ -41,6 +45,7 @@ const bls = @import("bls12_381");
 const keys = @import("keys.zig");
 const cred = @import("credential.zig");
 const blind = @import("blind.zig");
+const dkg = @import("dkg.zig");
 const params_mod = @import("params.zig");
 
 const g1 = bls.g1;
@@ -590,6 +595,114 @@ test "STACKPROBE: no key, share, attribute or witness residue on the dead stack 
         nd.sort();
         leak_src = cur_eg.d.toBytes();
         bad += try runProbe("unblind", callUnblind, &nd);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+// ── dealer-free key generation (`dkg.zig`) ──────────────────────────────────
+
+var dkg_s1: [N]dkg.Round1SecretPackage = undefined;
+var dkg_r1: [N]dkg.Round1Package = undefined;
+var dkg_rec1: [N - 1]dkg.Round1Received = undefined;
+var dkg_rec2: [N - 1]dkg.Round2Received = undefined;
+var dkg_s2: dkg.Round2SecretPackage = undefined;
+var dkg_s1_sink: dkg.Round1SecretPackage = undefined;
+var dkg_r1_sink: dkg.Round1Package = undefined;
+var dkg_s2_sink: dkg.Round2SecretPackage = undefined;
+var dkg_share_sink: keys.SecretKeyShare = undefined;
+var dkg_pub_sink: dkg.PublicKeyPackage = undefined;
+
+noinline fn callDkgPart1() void {
+    const a = freshHeap();
+    call_prng = .init(cur_seed + 6000);
+    dkg_r1_sink = dkg.part1SeededForTest(a, call_prng.random(), &dkg_s1_sink, 1, N, T, Q) catch unreachable;
+    dkg_r1_sink.deinit(a);
+    dkg_s1_sink.deinit(a);
+}
+noinline fn callDkgPart2() void {
+    const a = freshHeap();
+    const sent = dkg.part2(a, &dkg_s2_sink, &dkg_s1[0], &dkg_rec1, null) catch unreachable;
+    dkg.freeRound2Packages(a, sent);
+    dkg_s2_sink.deinit(a);
+}
+noinline fn callDkgPart3() void {
+    const a = freshHeap();
+    dkg_pub_sink = dkg.part3(a, &dkg_share_sink, &dkg_s2, &dkg_rec1, &dkg_rec2, null) catch unreachable;
+    dkg_pub_sink.deinit(a);
+    dkg_share_sink.deinit(a);
+}
+
+test "STACKPROBE: no polynomial, share or nonce residue on the dead stack or heap after the DKG" {
+    try skipUnlessOptimized();
+    const gpa = std.testing.allocator;
+    var bad: usize = 0;
+    for (0..2) |ci| {
+        cur_seed = 0xD1C0_0000 + ci;
+        for (&dkg_s1, &dkg_r1, 0..) |*s, *r, i| {
+            var pr = std.Random.DefaultPrng.init(cur_seed + i);
+            r.* = try dkg.part1SeededForTest(gpa, pr.random(), s, @intCast(i + 1), N, T, Q);
+        }
+        defer for (&dkg_s1, &dkg_r1) |*s, *r| {
+            s.deinit(gpa);
+            r.deinit(gpa);
+        };
+        for (&dkg_rec1, 1..) |*rc, j| rc.* = .{ .sender = @intCast(j + 1), .package = dkg_r1[j] };
+
+        // part1: every coefficient and nonce it draws.
+        nd.reset();
+        replay(&nd, "dkg coefficient", cur_seed + 6000, (Q + 1) * T + (Q + 1));
+        nd.sort();
+        {
+            var pr = std.Random.DefaultPrng.init(cur_seed + 6000);
+            leak_src = apiScalar(pr.random()).toBytes();
+        }
+        heap_view = &heap_buf;
+        bad += try runProbe("dkg.part1", callDkgPart1, &nd);
+
+        // part2: participant 1's coefficients and the shares they evaluate to.
+        var sent_ref: [N - 1][]dkg.Round2Package = undefined;
+        var s2_ref: [N]dkg.Round2SecretPackage = undefined;
+        for (0..N) |i| {
+            var rec: [N - 1]dkg.Round1Received = undefined;
+            var k: usize = 0;
+            for (0..N) |j| if (j != i) {
+                rec[k] = .{ .sender = @intCast(j + 1), .package = dkg_r1[j] };
+                k += 1;
+            };
+            const sent = try dkg.part2(gpa, &s2_ref[i], &dkg_s1[i], &rec, null);
+            if (i == 0) dkg.freeRound2Packages(gpa, sent) else sent_ref[i - 1] = sent;
+        }
+        defer for (&s2_ref) |*s| s.deinit(gpa);
+        defer for (sent_ref) |s| dkg.freeRound2Packages(gpa, s);
+        nd.reset();
+        for (dkg_s1[0].coefficients) |c| nd.addFr("dkg coefficient", c);
+        for (s2_ref[0].own_values) |v| nd.addFr("dkg own share", v);
+        nd.sort();
+        leak_src = dkg_s1[0].coefficients[0].toBytes();
+        heap_view = &heap_buf;
+        bad += try runProbe("dkg.part2", callDkgPart2, &nd);
+
+        // part3: the shares participant 1 received, its own, and their sums.
+        for (&dkg_rec2, sent_ref, 2..) |*rc, sent, j| {
+            const to1 = for (sent) |pk| {
+                if (pk.recipient == 1) break pk;
+            } else unreachable;
+            rc.* = .{ .sender = @intCast(j), .values = to1.values };
+        }
+        dkg_s2 = s2_ref[0];
+        var ref_share: keys.SecretKeyShare = undefined;
+        var ref_pub = try dkg.part3(gpa, &ref_share, &dkg_s2, &dkg_rec1, &dkg_rec2, null);
+        defer ref_pub.deinit(gpa);
+        defer ref_share.deinit(gpa);
+        nd.reset();
+        for (dkg_rec2) |rc| for (rc.values) |v| nd.addFr("dkg received", v);
+        for (dkg_s2.own_values) |v| nd.addFr("dkg own share", v);
+        nd.addFr("dkg share x", ref_share.x);
+        for (ref_share.ys) |y| nd.addFr("dkg share y", y);
+        nd.sort();
+        leak_src = ref_share.x.toBytes();
+        heap_view = &heap_buf;
+        bad += try runProbe("dkg.part3", callDkgPart3, &nd);
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
