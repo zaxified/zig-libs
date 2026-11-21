@@ -181,6 +181,48 @@ test "dtls12: ECDHE_RSA with a peer that offers only PKCS#1 v1.5 (rsa_pkcs1_sha2
     try roundTrip(ccfg, rsaServerConfig(&.{.ecdhe_rsa_with_aes_128_gcm_sha256}), .ecdhe_rsa_with_aes_128_gcm_sha256);
 }
 
+test "CertConfig.rsa_blinding: the per-key cache serves every RSA signature (1.2 PSS and PKCS#1 v1.5 ServerKeyExchange, 1.3 CertificateVerify)" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5b)));
+    var cache = rsa.BlindingCache.init(csprng.random());
+    defer cache.deinit();
+
+    // 1.2, RSA-PSS ServerKeyExchange: one op drawn from the cache.
+    var scfg = rsaServerConfig(&.{.ecdhe_rsa_with_aes_128_gcm_sha256});
+    scfg.cert.?.rsa_blinding = &cache;
+    try roundTrip(rsaClientConfig(&.{.ecdhe_rsa_with_aes_128_gcm_sha256}), scfg, .ecdhe_rsa_with_aes_128_gcm_sha256);
+    try testing.expectEqual(rsa.BlindingCache.refresh_every - 1, cache.left);
+
+    // 1.2, PKCS#1 v1.5 (a client offering no PSS): the same pair, squared.
+    var ccfg = rsaClientConfig(&.{.ecdhe_rsa_with_aes_128_gcm_sha256});
+    ccfg.signature_algorithms = &.{.ecdsa_secp256r1_sha256};
+    try roundTrip(ccfg, scfg, .ecdhe_rsa_with_aes_128_gcm_sha256);
+    try testing.expectEqual(rsa.BlindingCache.refresh_every - 2, cache.left);
+
+    // 1.3 CertificateVerify (RSA-PSS).
+    const v13 = [_]conn13.ProtocolVersion{.dtls13};
+    var s13 = scfg;
+    s13.versions = &v13;
+    var c13 = rsaClientConfig(scfg.cipher_suites12);
+    c13.versions = &v13;
+    var client = try conn13.Connection.clientInit(c13);
+    defer client.deinit();
+    var server = try conn13.Connection.serverInit(s13);
+    defer server.deinit();
+    var hs_csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5c)));
+    const rnd = seeded(&hs_csprng);
+    var bufs: Bufs = .{};
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    const f2 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    const fin = try client.handleFlight(f2.out, rnd, 0, &bufs.a);
+    try testing.expect(fin.done);
+    try testing.expect((try server.handleFlight(fin.out, rnd, 0, &bufs.b)).done);
+    try testing.expectEqual(rsa.BlindingCache.refresh_every - 3, cache.left);
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    const rec = try client.send("rsa over 1.3", &b1);
+    try testing.expectEqualStrings("rsa over 1.3", try server.recv(rec, &b2));
+}
+
 test "dtls12: PSK (RFC 4279/5487) and ECDHE_PSK (RFC 5489/7905) self-interop, with and without a hint" {
     try roundTrip(pskConfig(.client, &.{.psk_with_aes_128_gcm_sha256}), pskConfig(.server, &.{.psk_with_aes_128_gcm_sha256}), .psk_with_aes_128_gcm_sha256);
     try roundTrip(pskConfig(.client, &.{.ecdhe_psk_with_chacha20_poly1305_sha256}), pskConfig(.server, &.{.ecdhe_psk_with_chacha20_poly1305_sha256}), .ecdhe_psk_with_chacha20_poly1305_sha256);

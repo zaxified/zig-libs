@@ -59,6 +59,7 @@ const engine = @import("engine.zig");
 const suitehash = @import("suitehash.zig");
 const Secret = suitehash.Secret;
 const certverify = @import("tls13").certverify;
+const rsa = @import("rsa");
 const certauth = @import("certauth.zig");
 const x509 = @import("x509");
 const suite12 = @import("suite12.zig");
@@ -339,6 +340,15 @@ pub const CertConfig = struct {
     /// permits. `error.NoSignatureSchemeOverlap` if none exists — never a
     /// silent fallback to a hardcoded scheme.
     private_key: certverify.SecretKey,
+    /// An RSA key's base-blinding cache (`rsa.BlindingCache`, OpenSSL's
+    /// per-key `BN_BLINDING`, as `tlsserver`'s `CertifiedKey.rsa_blinding`):
+    /// every RSA CertificateVerify (both engines) and 1.2 ServerKeyExchange
+    /// signature, PSS or PKCS#1 v1.5, reuses its pair instead of drawing a
+    /// fresh `r`, its inverse and `r^e`. BORROWED, mutable, secret and not
+    /// thread-safe: every connection whose `Config` points at it mutates it,
+    /// so give each thread its own (or none). Null: fresh blinding per
+    /// signature. Ignored for a non-RSA key.
+    rsa_blinding: ?*rsa.BlindingCache = null,
 };
 
 /// Trust policy for a peer's presented certificate chain (RFC 8446 §4.4.2).
@@ -3761,7 +3771,7 @@ pub const Connection = struct {
         // `certverify.sign` carries its own requirement in its type (`?std.Random`,
         // fail-closed with `error.RandomRequired` for RSA-PSS), so this is where
         // the arm is erased: the choice was already made at the entry point.
-        const sig = try certverify.sign(scheme, cc.private_key, side, th, entropy.source(), &sig_buf);
+        const sig = try certverify.signWith(scheme, cc.private_key, side, th, entropy.source(), .{ .rsa_blinding = cc.rsa_blinding }, &sig_buf);
 
         var cv_body_buf: [max_certverify_body]u8 = undefined;
         const cv_body = messages.encodeCertificateVerify(.{ .algorithm = @backingInt(scheme), .signature = sig }, &cv_body_buf) catch return error.BufferTooShort;

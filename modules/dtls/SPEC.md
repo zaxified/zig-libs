@@ -154,6 +154,11 @@ bridge), layered on top of the unchanged PSK key exchange — see `root.zig`'s m
   scheme THIS side never put in its own `signature_algorithms` — a downgrade
   guard, checked before the signature itself. `CertConfig` carries no
   fixed `signature_scheme` field.
+- **RSA base-blinding cache:** `CertConfig.rsa_blinding` (an `rsa.BlindingCache`, OpenSSL's per-key
+  `BN_BLINDING`, as `tlsserver`'s `CertifiedKey.rsa_blinding`) is handed to every RSA signature this side
+  makes — the 1.3 CertificateVerify (`certverify.signWith`), the 1.2 CertificateVerify and ServerKeyExchange,
+  PSS and PKCS#1 v1.5 (`sig12.sign`). Null (default) draws a fresh blinding per signature. Not thread-safe:
+  one cache per thread. Test: `conn12_test.zig` "CertConfig.rsa_blinding".
 
 - **Untrusted DER.** `std.crypto.Certificate.parse` (Zig 0.16; the reader is unchanged in 0.17.0)
   is not panic-safe against malformed or adversarial DER — fuzzing crashed it with trivial

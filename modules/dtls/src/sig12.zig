@@ -40,26 +40,29 @@ pub fn canSign(sk: certverify.SecretKey, scheme: u16) bool {
     return certverify.canSign(sk, @fromBackingInt(scheme));
 }
 
-/// Signs `content` under `scheme`. PKCS#1 v1.5 runs the private operation
-/// with base blinding from `random` (the signature does not depend on it).
+/// Signs `content` under `scheme`. An RSA private operation (PKCS#1 v1.5 or
+/// PSS) runs with base blinding from `blinding` when given (the per-key
+/// cache, `CertConfig.rsa_blinding`), else a fresh one from `random`; the
+/// signature does not depend on it.
 // secret-api-ok: `SecretKey` is a tagged union of pointers to the key; the signers run under their own burns.
-pub fn sign(scheme: u16, sk: certverify.SecretKey, content: []const u8, random: std.Random, out: []u8) SignError![]u8 {
+pub fn sign(scheme: u16, sk: certverify.SecretKey, blinding: ?*rsa.BlindingCache, content: []const u8, random: std.Random, out: []u8) SignError![]u8 {
     if (isPkcs1(scheme)) {
         const k = switch (sk) {
             .rsa => |k| k,
             else => return error.KeyMismatch,
         };
+        const b: rsa.Blinding = if (blinding) |c| .{ .cached = c } else .{ .csprng = random };
         const r = if (scheme == rsa_pkcs1_sha256)
-            rsa.signPkcs1v15Blinded(k, std.crypto.hash.sha2.Sha256, .{ .csprng = random }, content, out)
+            rsa.signPkcs1v15Blinded(k, std.crypto.hash.sha2.Sha256, b, content, out)
         else
-            rsa.signPkcs1v15Blinded(k, std.crypto.hash.sha2.Sha384, .{ .csprng = random }, content, out);
+            rsa.signPkcs1v15Blinded(k, std.crypto.hash.sha2.Sha384, b, content, out);
         return r catch |err| switch (err) {
             error.FaultDetected => error.FaultDetected,
             error.EntropyFailure => error.EntropyFailure,
             else => error.BufferTooSmall,
         };
     }
-    return certverify.signContent(@fromBackingInt(scheme), sk, content, random, out);
+    return certverify.signContentWith(@fromBackingInt(scheme), sk, content, random, .{ .rsa_blinding = blinding }, out);
 }
 
 /// Verifies a peer's signature over `content`. Every failure — unknown

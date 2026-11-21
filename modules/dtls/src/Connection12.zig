@@ -1126,7 +1126,7 @@ pub const Connection12 = struct {
             const cert = self.config.cert.?;
             const scheme = self.selectScheme(self.peer_schemes[0..self.peer_schemes_len], null) orelse return error.NoSignatureSchemeOverlap;
             var sig: [600]u8 = undefined;
-            const s = try sig12.sign(scheme, cert.private_key, self.transcript[0..self.transcript_len], source(entropy), &sig);
+            const s = try sig12.sign(scheme, cert.private_key, cert.rsa_blinding, self.transcript[0..self.transcript_len], source(entropy), &sig);
             const cv = m12.encodeSigned(scheme, s, &buf) catch return error.BufferTooShort;
             try self.sendMessage(.handshake_epoch0, m12.HandshakeType.certificate_verify, cv);
         }
@@ -1346,7 +1346,7 @@ pub const Connection12 = struct {
                 @memcpy(content[32..64], &self.server_random);
                 @memcpy(content[64..][0..params.len], params);
                 var sig: [600]u8 = undefined;
-                const s = try sig12.sign(scheme, self.config.cert.?.private_key, content[0 .. 64 + params.len], source(entropy), &sig);
+                const s = try sig12.sign(scheme, self.config.cert.?.private_key, self.config.cert.?.rsa_blinding, content[0 .. 64 + params.len], source(entropy), &sig);
                 const signed = m12.encodeSigned(scheme, s, buf[ske_len + params.len ..]) catch return error.BufferTooShort;
                 ske_len += params.len + signed.len;
             } else ske_len += params.len;
@@ -1724,7 +1724,7 @@ test "audit: verifyPeerSignature checks the scheme was advertised and fits the s
     const content = "server key exchange params";
     var csprng = std.Random.DefaultCsprng.init(@splat(5));
     var sig_buf: [128]u8 = undefined;
-    const sig = try sig12.sign(0x0403, .{ .ecdsa_p256 = &sk }, content, csprng.random(), &sig_buf);
+    const sig = try sig12.sign(0x0403, .{ .ecdsa_p256 = &sk }, null, content, csprng.random(), &sig_buf);
     // Genuine: accepted for an ECDHE_ECDSA suite.
     try c.verifyPeerSignature(.{ .scheme = 0x0403, .signature = sig }, content, .ecdhe_ecdsa);
     // The same valid signature for an ECDHE_RSA suite: the family is wrong.
