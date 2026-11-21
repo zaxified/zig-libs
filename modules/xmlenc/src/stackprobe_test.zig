@@ -164,3 +164,80 @@ test "STACKPROBE: no RSA private-key residue after any decryption entry point" {
     _ = try P.run("decryptData kw-aes256", root.decryptData, .{ a, doc_kw.root, sk, .{ .kek = &kek } }, &[_][]const u8{ &kek, &cek_kw }, .{});
     _ = try P.run("decryptData kw-aes256 decoy", root.decryptData, .{ a, doc_decoy.root, sk, .{ .kek = &kek } }, &[_][]const u8{ &kek, &decoy_digest }, .{});
 }
+
+// ── ECDH-ES arm ─────────────────────────────────────────────────────────────
+
+const jwe = @import("jwe");
+const P256 = std.crypto.ecc.P256;
+
+/// The encrypt side's random draws, in the order `encryptData` makes them for a GCM content and an ECDH-ES key:
+/// the content key, the IV, the ephemeral scalar. Fixed, so the probe knows every secret in advance; the counter
+/// wraps, so each of the probe's repeated calls draws the same three.
+const FixedDraws = struct {
+    var n: usize = 0;
+    const cek: [32]u8 = fillBytes(32, 0x4D);
+    const iv: [12]u8 = fillBytes(12, 0x19);
+    const eph: [32]u8 = fillBytes(32, 0x07); // top byte 0x07 < the group order's, so canonical
+    fn fill(_: *anyopaque, buf: []u8) void {
+        const src: []const u8 = switch (n % 3) {
+            0 => &cek,
+            1 => &iv,
+            else => &eph,
+        };
+        std.debug.assert(src.len == buf.len);
+        @memcpy(buf, src);
+        n += 1;
+    }
+    fn random() std.Random {
+        return .{ .ptr = undefined, .fillFn = fill };
+    }
+};
+
+const ecdh_kdf_id = "probe-kdf-id";
+const ecdh_party_u = "PU-probe";
+const ecdh_party_v = "PV-probe";
+
+var ec_recipient: jwe.ecdhes.EphemeralKeyPair = undefined;
+var ec_doc: xml.Document = undefined;
+var ec_z: [jwe.ecdhes.max_z_len]u8 = undefined;
+var ec_kek: [32]u8 = undefined;
+
+test "STACKPROBE: no ECDH-ES residue (static and ephemeral scalar, shared secret, derived KEK, CEK) after decryptData and encryptData" {
+    try sp.skipUnlessOptimized();
+    const a = std.heap.page_allocator;
+
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x6E)));
+    jwe.ecdhes.generateEphemeral(&ec_recipient, .p256, .{ .fixed_for_test = prng.random() });
+    const params: root.EcdhEs = .{
+        .recipient = ec_recipient.public,
+        .wrap_bits = 256,
+        .algorithm_id = ecdh_kdf_id,
+        .party_u_info = ecdh_party_u,
+        .party_v_info = ecdh_party_v,
+    };
+
+    // What the module must not leave behind, recomputed from the fixed draws: Z = the ephemeral scalar times the
+    // recipient's public key, KEK = SHA-256(counter || Z || OtherInfo) (ConcatKDF, one round for 32 bytes).
+    const eph_priv: jwe.ecdhes.PrivateKey = .{ .p256 = FixedDraws.eph };
+    const z = try jwe.ecdhes.deriveZ(&eph_priv, ec_recipient.public, &ec_z);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(&.{ 0, 0, 0, 1 });
+    h.update(z);
+    h.update(ecdh_kdf_id ++ ecdh_party_u ++ ecdh_party_v);
+    h.final(&ec_kek);
+
+    FixedDraws.n = 0;
+    const src = try root.encryptData(a, assertion, .{ .ecdh_es = params }, FixedDraws.random(), .{});
+    ec_doc = try xml.parse(a, src, .{});
+
+    const needles = &[_][]const u8{ &FixedDraws.eph, z, &ec_kek, &FixedDraws.cek, &ec_recipient.private.p256 };
+
+    // Decryption: one-shot, burned (`burn.decrypt_burn`); the burn must cover the ECDH arm too.
+    const ec_sk: root.EcPrivateKey = ec_recipient.private;
+    const rec = try P.run("decryptData ecdh-es", root.decryptData, .{ a, ec_doc.root, undefined, .{ .ec_private_key = &ec_sk } }, needles, .{});
+    _ = rec;
+
+    // Encryption has no burn of its own; its dead stack is only checked for the three ECDH secrets and the CEK.
+    FixedDraws.n = 0;
+    _ = try P.run("encryptData ecdh-es", root.encryptData, .{ a, assertion, .{ .ecdh_es = params }, FixedDraws.random(), .{} }, needles, .{ .burn = false, .residue = false });
+}
