@@ -138,6 +138,7 @@ test {
     _ = @import("snarkjs_kat_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("audit_test.zig");
+    _ = @import("bench.zig"); // opt-in via GROTH16_BENCH; SKIPs otherwise
 }
 
 test "meta names the Groth16 construction and the bn254 dep" {

@@ -276,7 +276,11 @@ control) must read at least 10 (`scripts/checks/ctgrind-expected.tsv`). It costs
 constraints, one core, ReleaseFast (`tools/snarkjs/g16 prove-ct`; snarkjs
 verified that proof). `zkprove.prove` stays Pippenger, the default every
 other prover has. The toy `prove` uses the constant-time naive MSM.
-`contribute`'s secret goes through `bn254`'s constant-time `scalarMul` only.
+`contribute`'s secret goes through constant-time multiplies only: `bn254`'s `scalarMul` for δ and the record, and
+`phase2.scaleAll` for C and H (4-bit fixed window, every table entry read per window, complete adds; one shared
+inversion per 256 points, the Jacobian scratch wiped). The C/H rescaling measures 1.83-2.29x faster than one
+`scalarMul` + inversion per point (2 048 G1 points, five alternating rounds, ReleaseFast, shared host;
+`GROTH16_BENCH=1`, `src/bench.zig`).
 **5. A `.zkey` is trusted by the prover; `phase2.verify` is how it earns that.**
 `zkey.parse` checks that every point is on its curve and every index is in
 range, so a hostile file cannot crash the prover or make it read out of
@@ -322,7 +326,9 @@ and the quotient as needles (0 residues; with the burn cut to 16 bytes every one
 ## Verification
 
 Run: `scripts/modtest groth16` (add `-Doptimize=ReleaseFast` for the stack probe and the heap-wipe tests, which only
-run in an optimised build). Test classes:
+run in an optimised build). Opt-in benchmark of `contribute`'s rescaling (plain vs windowed path in one binary):
+`GROTH16_BENCH=1 scripts/modtest groth16 -Doptimize=ReleaseFast -Dtest-filter=bench` (it prints, so the run step reports
+stderr). Test classes:
 
 - **Sub-anchors** (`fft.zig`, `msm.zig`, `qap.zig`, `prover.zig`, `domain.zig`): NTT round-trip identity;
   `fft.mulViaFFT == poly.mulSchoolbook`; `msm` single-term/linearity `==` `G.scalarMul`; `domain` root-of-unity
@@ -412,7 +418,6 @@ Missing and it matters, most-hit first:
 2. **Solidity verifier and calldata export**: snarkjs, gnark and ark-circom write a verifier contract for a key, and snarkjs the `verifyProof(...)` calldata for a proof. Today a user deploying on-chain runs snarkjs on the same `.zkey`/`proof.json`, which works *(inferred: same key, same equation; not run here)*. Effort: small-medium (a template over `VerifyingKey` plus the EVM's G2 coordinate order); needs a black-box oracle run (solc / an EVM) to anchor. Fits §2.
 3. **snarkjs's circuit hash and contribution proof:** needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b) — hit by a ceremony that mixes snarkjs and this module, not by proving. Black-box only; 29 340 hash constructions tried, so possibly infeasible without reading GPL source. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks.
 5. **Positional file source:** readers take bytes in memory. Proving needs only the `.zkey` (hundreds of MB at 10⁶ constraints *(inferred)*), and phase 2 needs a `.ptau` cut to the circuit's power; the full 2²⁸ ceremony file (~150 GB) does not fit. A `readAt` source over `std.Io.File` reading only the levels a circuit needs. Effort: medium.
-6. **Faster `contribute`:** 12 s at 10 000 constraints, one constant-time `scalarMul` + inversion per C/H point; a fixed-window constant-time multiply and batch normalisation should take most of it.
 7. **Domain-size boundary fixture:** `phase2.newZkey`'s rule for a circuit whose row count is exactly a power of two (the `log_n` loop at the top of `newZkey`) is learnable black-box but no committed fixture pins it against snarkjs; a circom circuit landing on the boundary, run through `gen.sh`, would. The 10 000-constraint run is also manual (`gen.sh big`), not committed. `src/audit_test.zig` pins this module's own rule, but against itself.
 8. **Phase-1 (`.ptau`) contribution and verification**: reading only; users take a published ceremony (§ 5b item 5).
 9. **Circuit-building API (constraint-synthesis trait or gadget helpers):** arkworks (`ark-relations`), bellman and gnark all let users write circuits; here R1CS is assembled by hand or comes from circom. Effort: medium-large. Fits §2.

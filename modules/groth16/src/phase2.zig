@@ -307,6 +307,12 @@ fn contributeBody(allocator: Allocator, z: *ZKey, x_ptr: *const Fr, s_ptr: *cons
     params[1] = @intCast(name.len);
     @memcpy(params[2..], name);
     const list = try allocator.alloc(zkey_mod.Contribution, z.contributions.len + 1);
+    errdefer allocator.free(list);
+    const scratch = try allocator.create(ScaleScratch);
+    defer {
+        std.crypto.secureZero(u8, std.mem.asBytes(scratch));
+        allocator.destroy(scratch);
+    }
     // Nothing below can fail: `z` is updated completely or not at all.
     @memcpy(list[0..z.contributions.len], z.contributions);
 
@@ -314,8 +320,10 @@ fn contributeBody(allocator: Allocator, z: *ZKey, x_ptr: *const Fr, s_ptr: *cons
     const prev_transcript: [64]u8 = if (z.contributions.len == 0) z.circuit_hash else z.contributions[z.contributions.len - 1].transcript;
     z.delta_g1 = G1.Jacobian.fromAffine(z.delta_g1).scalarMul(x).toAffine();
     z.delta_g2 = G2.Jacobian.fromAffine(z.delta_g2).scalarMul(x).toAffine();
-    for (z.c) |*p| p.* = G1.Jacobian.fromAffine(p.*).scalarMul(x_inv).toAffine();
-    for (z.h) |*p| p.* = G1.Jacobian.fromAffine(p.*).scalarMul(x_inv).toAffine();
+    var k_be = x_inv.toBytes();
+    defer std.crypto.secureZero(u8, &k_be);
+    scaleAll(scratch, z.c, &k_be);
+    scaleAll(scratch, z.h, &k_be);
 
     var rec: zkey_mod.Contribution = .{
         .delta_after = z.delta_g1,
@@ -411,6 +419,94 @@ pub fn hashToG2(msg: []const u8) G2.Affine {
         if (p.isIdentity()) continue;
         return p.toAffine();
     }
+}
+
+// ── rescaling C and H by 1/x ────────────────────────────────────────────────
+//
+// Every C/H point is multiplied by the same secret `1/x`, so the scalar's
+// digits are read once and each point gets a 4-bit fixed window (16-entry
+// table of public multiples of P, a constant-time scan to pick the entry, a
+// complete add per window: 256 doublings + 64 adds instead of 256 + 256), then
+// `scale_batch` results share one field inversion (Montgomery's trick) on the
+// way back to affine. The Jacobian results and prefix products are wiped
+// with the scratch (projective coordinates can leak about the scalar).
+
+/// Points per shared inversion.
+pub const scale_batch = 256;
+
+/// Heap scratch for `scaleAll` (32 KiB: kept off the burned stack).
+pub const ScaleScratch = struct {
+    jac: [scale_batch]G1.Jacobian,
+    pre: [scale_batch]bn254.Fp,
+};
+
+/// `pts[i] ← [k]·pts[i]` for the big-endian scalar `k_be`, constant-time in
+/// `k_be` (the timing depends on `pts.len` and on which inputs are the point
+/// at infinity, both public).
+pub fn scaleAll(scratch: *ScaleScratch, pts: []G1.Affine, k_be: *const [32]u8) void {
+    var i: usize = 0;
+    while (i < pts.len) {
+        const n = @min(scale_batch, pts.len - i);
+        for (pts[i..][0..n], scratch.jac[0..n]) |pt, *j| j.* = mulWindowed(G1.Jacobian.fromAffine(pt), k_be);
+        normalizeBatch(scratch, pts[i..][0..n]);
+        i += n;
+    }
+}
+
+fn ctSelectJ(cond: bool, a: G1.Jacobian, b: G1.Jacobian) G1.Jacobian {
+    const Fp = bn254.Fp;
+    return .{ .x = Fp.ctSelect(cond, a.x, b.x), .y = Fp.ctSelect(cond, a.y, b.y), .z = Fp.ctSelect(cond, a.z, b.z) };
+}
+
+/// `[k]P`, 4-bit fixed window, every table entry read on every window.
+fn mulWindowed(p: G1.Jacobian, k_be: *const [32]u8) G1.Jacobian {
+    var table: [16]G1.Jacobian = undefined;
+    table[0] = G1.Jacobian.identity;
+    table[1] = p;
+    for (2..16) |t| table[t] = table[t - 1].add(p);
+    var acc = G1.Jacobian.identity;
+    for (k_be) |byte| {
+        inline for (.{ 4, 0 }) |shift| {
+            acc = acc.double().double().double().double();
+            const digit: u8 = (byte >> shift) & 0xf;
+            var sel = table[0];
+            for (table[1..], 1..) |e, t| sel = ctSelectJ(t == digit, e, sel);
+            acc = acc.add(sel);
+        }
+    }
+    return acc;
+}
+
+/// `scratch.jac[0..out.len]` to affine with one inversion.
+fn normalizeBatch(scratch: *ScaleScratch, out: []G1.Affine) void {
+    const Fp = bn254.Fp;
+    var acc = Fp.one;
+    for (scratch.jac[0..out.len], scratch.pre[0..out.len]) |j, *pre| {
+        pre.* = acc;
+        if (!j.z.isZero()) acc = acc.mul(j.z);
+    }
+    var inv = acc.inv() catch unreachable; // a product of nonzero z
+    var i = out.len;
+    while (i > 0) {
+        i -= 1;
+        const j = scratch.jac[i];
+        if (j.z.isZero()) {
+            out[i] = G1.Affine.identity;
+            continue;
+        }
+        const zi = inv.mul(scratch.pre[i]);
+        inv = inv.mul(j.z);
+        const zi2 = zi.square();
+        out[i] = .{ .x = j.x.mul(zi2), .y = j.y.mul(zi2).mul(zi) };
+    }
+    std.crypto.secureZero(u8, std.mem.asBytes(&inv));
+}
+
+/// The plain form `scaleAll` replaced: one double-and-add-always `scalarMul`
+/// and one inversion per point. Kept as the reference the tests and the
+/// opt-in bench (`src/bench.zig`) compare against.
+pub fn scaleAllRef(pts: []G1.Affine, k: Fr) void {
+    for (pts) |*p| p.* = G1.Jacobian.fromAffine(p.*).scalarMul(k).toAffine();
 }
 
 /// `e(a1, b2) == e(a2, b1)`: the G1 pair and the G2 pair have the same ratio.
@@ -657,4 +753,38 @@ test "a contribution record's g2_sp is the hashed point, not [h]₂ (the old, kn
     try testing.expect(!sp.x.eql(old.x));
     const h = hashToG2(&t);
     try testing.expect(sp.x.eql(h.x) and sp.y.eql(h.y));
+}
+
+test "scaleAll equals scalarMul per point, across batch edges, with points at infinity" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const n = scale_batch + 37;
+    const a = try gpa.alloc(G1.Affine, n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(G1.Affine, n);
+    defer gpa.free(b);
+    var acc = G1.Jacobian.fromAffine(G1.Affine.generator);
+    const step = G1.Jacobian.fromAffine(G1.Affine.generator).scalarMul(Fr.reduceWide(&@as([64]u8, @splat(0x5a))));
+    for (a, 0..) |*p, i| {
+        p.* = if (i % 97 == 3) G1.Affine.identity else acc.toAffine();
+        acc = acc.add(step);
+    }
+    const scratch = try gpa.create(ScaleScratch);
+    defer gpa.destroy(scratch);
+    var wide: [64]u8 = undefined;
+    for (0..3) |round| {
+        for (&wide, 0..) |*w, i| w.* = @truncate(i * 31 + round * 101 + 7);
+        var k = Fr.reduceWide(&wide);
+        if (round == 2) k = Fr.one.neg(); // r - 1, the largest scalar
+        @memcpy(b, a);
+        scaleAllRef(b, k);
+        const got = try gpa.dupe(G1.Affine, a);
+        defer gpa.free(got);
+        const k_be = k.toBytes();
+        scaleAll(scratch, got, &k_be);
+        for (got, b) |g, w| {
+            try testing.expectEqual(w.infinity, g.infinity);
+            if (!w.infinity) try testing.expect(g.x.eql(w.x) and g.y.eql(w.y));
+        }
+    }
 }
