@@ -547,9 +547,9 @@ pub const LookupOptions = struct {
     /// every hop.
     per_server_syntax: bool = true,
     /// Convert a Unicode domain query to its A-label form first (`idnQuery`), as the reference
-    /// `whois` client does. Null (the default) sends the query as given: raw UTF-8, which most
-    /// port-43 servers reject. `.{}` is the WHATWG defaults of `unitext.idna.Options`.
-    idna: ?unitext.idna.Options = null,
+    /// `whois` client does. The default `.{}` is the WHATWG defaults of `unitext.idna.Options`;
+    /// null opts out and sends the query as given: raw UTF-8, which most port-43 servers reject.
+    idna: ?unitext.idna.Options = .{},
 };
 
 /// Hop-aware query formatting used by `lookup`. Known registries get their
@@ -2334,7 +2334,7 @@ test "idnQuery: a Unicode domain becomes its A-label form, everything else passe
     try testing.expectError(error.QueryTooLong, idnQuery(&tiny, "b\xc3\xbccher.example", .{}));
 }
 
-test "lookup with LookupOptions.idna sends the A-label form to every hop; without it the bytes go as given" {
+test "lookup converts a Unicode query to the A-label form by default; idna = null sends the bytes as given" {
     const Rec = struct {
         var seen: [64]u8 = undefined;
         var len: usize = 0;
@@ -2349,9 +2349,10 @@ test "lookup with LookupOptions.idna sends the A-label form to every hop; withou
     var dummy: u8 = 0;
     const t: Transport = .{ .ctx = &dummy, .exchangeFn = Rec.exchange };
     var resp: [256]u8 = undefined;
-    _ = try lookup(t, "b\xc3\xbccher.example", .{ .root = "whois.example", .idna = .{} }, &resp);
-    try testing.expectEqualStrings("xn--bcher-kva.example\r\n", Rec.seen[0..Rec.len]);
     _ = try lookup(t, "b\xc3\xbccher.example", .{ .root = "whois.example" }, &resp);
+    try testing.expectEqualStrings("xn--bcher-kva.example\r\n", Rec.seen[0..Rec.len]);
+    _ = try lookup(t, "b\xc3\xbccher.example", .{ .root = "whois.example", .idna = null }, &resp);
     try testing.expectEqualStrings("b\xc3\xbccher.example\r\n", Rec.seen[0..Rec.len]);
-    try testing.expectError(error.InvalidQuery, lookup(t, "bad\xff.example", .{ .root = "whois.example", .idna = .{} }, &resp));
+    try testing.expectError(error.InvalidQuery, lookup(t, "bad\xff.example", .{ .root = "whois.example" }, &resp));
+    _ = try lookup(t, "bad\xff.example", .{ .root = "whois.example", .idna = null }, &resp);
 }
