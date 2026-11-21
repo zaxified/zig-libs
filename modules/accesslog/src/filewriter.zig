@@ -144,6 +144,7 @@ pub const RotatingFile = struct {
         const f = self.file orelse return error.Closed;
         f.writePositionalAll(self.io, bytes, self.size) catch |e| {
             self.last_write_error = e;
+            self.dropPartial(f, self.size, e);
             return e;
         };
         self.size += bytes.len;
@@ -179,9 +180,21 @@ pub const RotatingFile = struct {
         return consumed;
     }
 
+    /// Cut a fragment of a failed write off the file (best effort: the
+    /// truncation can fail for the same reason the write did).
+    /// Only for the errors a short write ends in; any other failure left nothing behind (and truncating a read-only descriptor would be a std bug trap).
+    fn dropPartial(self: *RotatingFile, f: File, off: u64, e: anyerror) void {
+        switch (e) {
+            error.NoSpaceLeft, error.FileTooBig, error.DiskQuota, error.InputOutput => {},
+            else => return,
+        }
+        f.setLength(self.io, off) catch {};
+    }
+
     fn failWrite(self: *RotatingFile, e: anyerror, off: u64) std.Io.Writer.Error {
         self.last_write_error = e;
         self.size = off; // bytes before the failing slice did reach the file
+        if (self.file) |f| self.dropPartial(f, off, e);
         return error.WriteFailed;
     }
 
@@ -761,6 +774,10 @@ test "RotatingFile: a failing slice keeps the size of the slices that did reach 
     try testing.expectError(error.WriteFailed, rf.interface().writeVecAll(&vec));
     try testing.expect(rf.last_write_error != null);
     try testing.expectEqual(@as(u64, 60), rf.size);
+    // The 40 bytes of the failed slice that reached the file are cut off again.
+    try posix.setrlimit(.FSIZE, old);
+    const st = try (rf.file orelse return error.TestUnexpectedResult).stat(testing.io);
+    try testing.expectEqual(@as(u64, 60), st.size);
 }
 
 test "RotatingFile: the Writer after close is WriteFailed, never a panic, even when it would rotate (audit H F1)" {

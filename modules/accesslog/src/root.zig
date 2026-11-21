@@ -228,6 +228,49 @@ fn extraRenderable(extra: []const Field, i: usize) bool {
     return true;
 }
 
+/// A fixed-size Bloom filter over the case-folded keys of the fields seen so
+/// far, so the duplicate check of a record with many extras stays linear: a
+/// key whose bit is clear cannot repeat an earlier one; only a set bit pays
+/// the scan of `extraRenderable`. Below `bloom_threshold` fields the filter is
+/// not consulted (the scan is cheaper than hashing).
+const ExtraSeen = struct {
+    const bloom_threshold = 16;
+    bits: [64]u64,
+
+    fn bit(key: []const u8) u12 {
+        var h = std.hash.Wyhash.init(0);
+        var chunk: [max_extra_key_len]u8 = undefined;
+        const n = @min(key.len, chunk.len);
+        for (key[0..n], chunk[0..n]) |c, *o| o.* = std.ascii.toLower(c);
+        h.update(chunk[0..n]);
+        return @truncate(h.final());
+    }
+
+    /// `extraRenderable(extra, i)` and record field `i`; call with `i` ascending from 0.
+    fn renderable(self: *ExtraSeen, extra: []const Field, i: usize) bool {
+        if (i < bloom_threshold) return extraRenderable(extra, i);
+        const key = extra[i].key;
+        const b = bit(key);
+        const word = &self.bits[b >> 6];
+        const mask = @as(u64, 1) << @truncate(b);
+        const maybe_dup = word.* & mask != 0;
+        word.* |= mask;
+        if (!isValidExtraKey(key)) return false;
+        for (fixed_keys) |fk| if (std.ascii.eqlIgnoreCase(key, fk)) return false;
+        if (maybe_dup) for (extra[0..i]) |earlier| if (std.ascii.eqlIgnoreCase(key, earlier.key)) return false;
+        return true;
+    }
+
+    /// Record the keys of the first `bloom_threshold` fields (the scan path does not).
+    fn prime(self: *ExtraSeen, extra: []const Field) void {
+        self.bits = @splat(0);
+        for (extra[0..@min(extra.len, bloom_threshold)]) |f| {
+            const b = bit(f.key);
+            self.bits[b >> 6] |= @as(u64, 1) << @truncate(b);
+        }
+    }
+};
+
 /// First field of `extra` with exactly this key (the one `LogFormat`'s
 /// `%{key}x` prints).
 pub fn extraValue(extra: []const Field, key: []const u8) ?[]const u8 {
@@ -320,8 +363,10 @@ pub fn writeJsonLines(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void 
     try writeJsonOptString(w, entry.trace_id);
     try w.writeAll(",\"span_id\":");
     try writeJsonOptString(w, entry.span_id);
+    var seen: ExtraSeen = undefined; // only read once `extra` has more than `bloom_threshold` fields
+    if (entry.extra.len > ExtraSeen.bloom_threshold) seen.prime(entry.extra);
     for (entry.extra, 0..) |f, i| {
-        if (!extraRenderable(entry.extra, i)) continue;
+        if (!seen.renderable(entry.extra, i)) continue;
         try w.print(",\"{s}\":", .{f.key});
         try writeJsonString(w, f.value);
     }
@@ -418,8 +463,10 @@ pub fn writeLogfmt(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll(" span_id=");
         try writeLogfmtValue(w, v, .{});
     }
+    var seen: ExtraSeen = undefined; // only read once `extra` has more than `bloom_threshold` fields
+    if (entry.extra.len > ExtraSeen.bloom_threshold) seen.prime(entry.extra);
     for (entry.extra, 0..) |f, i| {
-        if (!extraRenderable(entry.extra, i)) continue;
+        if (!seen.renderable(entry.extra, i)) continue;
         try w.print(" {s}=", .{f.key});
         try writeLogfmtValue(w, f.value, .{});
     }
@@ -2420,6 +2467,33 @@ test "extra: byte-exact goldens, appended after the fixed fields in JSON Lines a
     try writeCombined(e, &c1);
     try writeCombined(sampleEntry(), &c2);
     try testing.expectEqualStrings(c2.buffered(), c1.buffered());
+}
+
+test "extra: the many-fields path agrees with the plain scan on repeats, case folds and fixed keys" {
+    var keys: [300][]const u8 = undefined;
+    var store: [300][12]u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        // Repeats at several distances, some differing only in case, some fixed keys, some invalid.
+        const n: usize = switch (i % 5) {
+            0 => i / 5, // each repeated later by case 1
+            1 => (i - 1) / 5,
+            2 => i + 1000,
+            3 => 7,
+            else => i,
+        };
+        var text = std.mem.print(&store[i], "k{d}", .{n}) catch unreachable;
+        if (i % 5 == 1) text[0] = 'K';
+        k.* = switch (i) {
+            40 => "STATUS",
+            41 => "bad key",
+            else => text,
+        };
+    }
+    var extra: [300]Field = undefined;
+    for (&extra, keys) |*f, k| f.* = .{ .key = k, .value = "v" };
+    var seen: ExtraSeen = undefined;
+    seen.prime(&extra);
+    for (0..extra.len) |i| try testing.expectEqual(extraRenderable(&extra, i), seen.renderable(&extra, i));
 }
 
 test "extra: empty, and a list of only unusable keys, change no output byte" {
