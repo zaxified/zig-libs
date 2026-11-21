@@ -10,7 +10,7 @@
 
 **Audit:** review 2026-11-01 · mutation 2026-11-17 (33/37, 4 eq) · src 4fa834ae30a81390
 
-**Hardening:** fuzz 2026-10-31 (pq KEMs and one-stage KDFs: `hpke-pq-kem`/`hpke-pq-kdf`, 8 × 100,000 runs clean, every reach label hit, 8 planted mutants caught; RFC 9180 harnesses 2026-10-10, 200,000-run budget, HPKE_FUZZ) · ct 2026-10-31 (ctgrind: pq decap per family + one-stage schedule added, P-384 rows 0 contexts on the `p384` module; every nonzero context attributed; 2026-11-21 X448 decap / authDecap rows added, 2 / 4 contexts not yet itemized) · panic 2026-10-31 (sweep + blind review: export length past 255·Nh → `LabelTooLong`, `out` zeroed on every error path, i2osp/os2ip checked panics; delta audit 27/27; pq/kdf/schedule blind review 2026-10-31: 2 MED fixed — stale or garbage expanded AES key — and an over-long plaintext refused instead of the AEAD's panic)
+**Hardening:** fuzz 2026-10-31 (pq KEMs and one-stage KDFs: `hpke-pq-kem`/`hpke-pq-kdf`, 8 × 100,000 runs clean, every reach label hit, 8 planted mutants caught; RFC 9180 harnesses 2026-10-10, 200,000-run budget, HPKE_FUZZ) · ct 2026-10-31 (ctgrind: pq decap per family + one-stage schedule added, P-384 rows 0 contexts on the `p384` module; every nonzero context attributed; 2026-11-21 X448 decap / authDecap rows added, every context itemized) · panic 2026-10-31 (sweep + blind review: export length past 255·Nh → `LabelTooLong`, `out` zeroed on every error path, i2osp/os2ip checked panics; delta audit 27/27; pq/kdf/schedule blind review 2026-10-31: 2 MED fixed — stale or garbage expanded AES key — and an over-long plaintext refused instead of the AEAD's panic)
 
 **Performance:** ref 0.20–0.99× Go crypto/hpke (Go 1.26.8; 50 rows over 11 suites incl. the pq KEMs; worst p256_keygen 0.99×) · fastest 1.34× AWS-LC (aws-lc-sys 0.44.0 `EVP_HPKE`, `bench-hpke -- --vs=awslc`; it has only DHKEM(X25519): worst x25519_keygen 1.34×, setupS 1.29×, setupR 1.27× — ct25519's X25519 against AWS-LC's s2n-bignum asm, was 2.93× on std's ladder; seal/open/export 0.60–1.13×) · OpenSSL 3.5.5 `OSSL_HPKE` worst 1.15× over its 29 classic rows; rozbb/rust-hpke not measured (RustCrypto, no asm) (measured 2026-11-01)
 
@@ -560,8 +560,10 @@ fuzz drivers and the stack probe run inside it), `zig build interop-hpke`
 - **Constant time.** `src/ctgrind_harness.zig`: decap and authDecap of every DHKEM,
   `open` (the AEAD context), every pq decap and the one-stage schedule, ReleaseFast;
   pinned in `scripts/checks/ctgrind-expected.tsv` (the file attributes every nonzero
-  context to a sibling module's code, except the `x448_decap` / `x448_authdecap` rows: two
-  contexts per X448 DH in `ed448`'s `x448`, to be itemized with `--stacks`). The seal/open
+  context to a sibling module's code; the `x448_decap` / `x448_authdecap` rows, read with
+  `--stacks`, are per X448 DH `ed448`'s `Fe.invert` zero test on the ladder's z_2 and this
+  module's RFC 9180 §7.1.4 all-zero verdict, and in decap the harness's own error branch —
+  verdicts and a public small-order case, no branch on a scalar bit). The seal/open
   fuzz harness draws X448 (HKDF-SHA512, ChaCha20-Poly1305) as its fourth KEM.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
   the last whole-module mutation run and the delta runs after it.
