@@ -492,10 +492,13 @@ static int run_cert_server(int port, struct cert_server_opts o) {
     socklen_t peer_len = sizeof(peer);
     if (round > 0) {
         // The next connection comes from a new client socket: drop the
-        // association and anything the old peer still sends.
+        // association (until then the kernel drops datagrams from any other
+        // address, so the next client waits for `NEXT`).
         struct sockaddr unspec = {0};
         unspec.sa_family = AF_UNSPEC;
         connect(fd, &unspec, sizeof(unspec));
+        printf("NEXT\n");
+        fflush(stdout);
     }
     if (recvfrom(fd, probe, sizeof(probe), MSG_PEEK, (struct sockaddr *)&peer,
                  &peer_len) < 0) {
@@ -872,15 +875,31 @@ static int run12(int port, struct opts12 o) {
         }
     }
 
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((unsigned short)port);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (o.server) {
         if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { perror("bind"); return 1; }
         printf("READY\n");
         fflush(stdout);
+    }
+    // `g_resume`: a second connection resumes the first one's RFC 5077
+    // ticket (the client asks with `UseSessionTicket`).
+    WOLFSSL_SESSION *saved = NULL;
+    for (int round = 0; round < (g_resume ? 2 : 1); round++) {
+    if (o.server) {
+        if (round > 0) {
+            struct sockaddr unspec = {0};
+            unspec.sa_family = AF_UNSPEC;
+            connect(fd, &unspec, sizeof(unspec));
+            // Until here the socket was connected to the first client and
+            // the kernel dropped datagrams from any other address: the next
+            // client waits for this line before it sends.
+            printf("NEXT\n");
+            fflush(stdout);
+        }
         char probe[1];
         struct sockaddr_in peer = {0};
         socklen_t peer_len = sizeof(peer);
@@ -889,13 +908,20 @@ static int run12(int port, struct opts12 o) {
             return 1;
         }
         if (connect(fd, (struct sockaddr *)&peer, peer_len) != 0) { perror("connect"); return 1; }
-    } else if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        perror("connect");
-        return 1;
+    } else {
+        if (round > 0) fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            perror("connect");
+            return 1;
+        }
     }
 
     WOLFSSL *ssl = wolfSSL_new(ctx);
     wolfSSL_set_fd(ssl, fd);
+    if (g_resume && !o.server) {
+        if (wolfSSL_UseSessionTicket(ssl) != WOLFSSL_SUCCESS) { fprintf(stderr, "UseSessionTicket failed\n"); return 1; }
+        if (saved && wolfSSL_set_session(ssl, saved) != WOLFSSL_SUCCESS) { fprintf(stderr, "set_session failed\n"); return 1; }
+    }
     if (o.mtu > 0 && wolfSSL_dtls_set_mtu(ssl, (unsigned short)o.mtu) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "dtls_set_mtu(%d) failed\n", o.mtu);
         return 1;
@@ -912,7 +938,16 @@ static int run12(int port, struct opts12 o) {
     printf("HANDSHAKE %s %s\n", wolfSSL_get_version(ssl), wolfSSL_get_cipher(ssl));
     fflush(stdout);
     if (check_cid(ssl)) return 1;
-    if (verify) {
+    if (g_resume) {
+        int reused = wolfSSL_session_reused(ssl);
+        printf("RESUMED %d\n", reused);
+        fflush(stdout);
+        if (reused != round) {
+            fprintf(stderr, "connection %d: session_reused %d\n", round + 1, reused);
+            return 1;
+        }
+    }
+    if (verify && round == 0) {
         if (!o.server) {
             long vr = wolfSSL_get_verify_result(ssl);
             if (vr != WOLFSSL_X509_V_OK) { fprintf(stderr, "peer chain not verified: %ld\n", vr); return 1; }
@@ -944,10 +979,17 @@ static int run12(int port, struct opts12 o) {
         if (strcmp(msg, hello) != 0) { fprintf(stderr, "echo differs\n"); return 1; }
     }
 
+    if (g_resume && !o.server && round == 0) {
+        saved = wolfSSL_get1_session(ssl);
+        if (!saved) { fprintf(stderr, "no session to resume\n"); return 1; }
+    }
     wolfSSL_shutdown(ssl);
     wolfSSL_free(ssl);
+    if (!o.server) close(fd);
+    }
+    if (saved) wolfSSL_SESSION_free(saved);
     wolfSSL_CTX_free(ctx);
-    close(fd);
+    if (o.server) close(fd);
     return 0;
 }
 
@@ -975,6 +1017,8 @@ static int run12_mode(const char *mode, int port, int mtu) {
     } else if (strcmp(mode, "ecdsa-cid") == 0) {
         g_cid = 1;
     } else if (strcmp(mode, "ecdsa") == 0) {
+    } else if (strcmp(mode, "ecdsa-resume") == 0) {
+        g_resume = 1;
     } else if (strcmp(mode, "ecdsa-aes256") == 0) {
         o.suite = "ECDHE-ECDSA-AES256-GCM-SHA384";
     } else if (strcmp(mode, "ecdsa-chacha") == 0) {

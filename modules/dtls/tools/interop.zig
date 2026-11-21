@@ -1219,6 +1219,7 @@ fn resumeClient(io: std.Io, case: Case, fx: *const Fixtures, server_addr: *const
     defer conn.deinit();
     var out: [4096]u8 = undefined;
     var rx: [2048]u8 = undefined;
+    try waitPeerLine(peer_out, "NEXT");
     try sock.send(io, server_addr, try conn.startHandshake(rnd, 0, &out));
     var steps: usize = 0;
     while (conn.state != .connected) : (steps += 1) {
@@ -1231,12 +1232,7 @@ fn resumeClient(io: std.Io, case: Case, fx: *const Fixtures, server_addr: *const
     try sock.send(io, server_addr, try conn.send(case.app_send, &out));
     var plain: [2048]u8 = undefined;
     try expectBytes("echo on the resumed connection", case.app_expect, try recvApplicationData(io, sock, &conn, &rx, &plain, &off, null));
-    var lines: usize = 0;
-    while (lines < 8) : (lines += 1) {
-        const line = peerLine(peer_out) catch break;
-        if (std.mem.eql(u8, line, "RESUMED 1")) return;
-    }
-    return error.PeerDidNotResume;
+    try waitPeerLine(peer_out, "RESUMED 1");
 }
 
 /// What a KeyUpdate case needs to answer a peer's KeyUpdate: where to send, a
@@ -1676,6 +1672,9 @@ const Case12 = struct {
     /// no live wolfSSL peer (`12-*-cid` peer modes kept for a fixed build).
     cid: bool = false,
     expect_peer_cert_subject: ?[]const u8 = null,
+    /// RFC 5077: a second connection resumes the first one's ticket with an
+    /// abbreviated handshake. Live-only, not recorded.
+    resumption: bool = false,
     app_send: []const u8 = "hello from zig-libs over dtls 1.2",
     app_expect: []const u8 = "hello from zig-libs over dtls 1.2",
     why: []const u8,
@@ -1872,6 +1871,28 @@ const cases12 = [_]Case12{
         .expect_group = 0,
         .app_expect = openssl12_client_hello,
         .why = "an OpenSSL s_client offering only PSK-AES128-GCM-SHA256 completes against OUR server: the identity hint in ServerKeyExchange, its identity in ClientKeyExchange, the plain-PSK premaster",
+    },
+    .{
+        .name = "dtls12-ecdsa-client-resume",
+        .flow = .client,
+        .peer_mode = "12-server-ecdsa-resume",
+        .seed = 0x7a,
+        .kind = .ecdsa,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .expect_hvr = true,
+        .resumption = true,
+        .why = "RFC 5077 against a live wolfSSL 1.2 server: our client asks for a ticket, keeps its NewSessionTicket, and a second connection resumes it with an abbreviated handshake (wolfSSL session_reused 1)",
+    },
+    .{
+        .name = "dtls12-ecdsa-server-resume",
+        .flow = .server,
+        .peer_mode = "12-client-ecdsa-resume",
+        .seed = 0x7b,
+        .kind = .ecdsa,
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .app_expect = wolfssl12_client_hello,
+        .resumption = true,
+        .why = "OUR RFC 5077 ticket against a live wolfSSL 1.2 client: it stores the ticket, offers it on a second connection, and OUR server resumes with an abbreviated handshake (the peer exits 0 only on session_reused 1)",
     },
 };
 
@@ -2102,6 +2123,10 @@ fn config12(case: Case12, role: dtls.Role, fx: *const Fixtures, binding: ?[]cons
     }
     if (binding) |b| c.hello_retry = .{ .cookie_secret = cookie_secret, .peer_binding = b };
     if (case.cid) c.connection_id = zig_cid;
+    if (case.resumption) switch (role) {
+        .client => c.session_tickets12 = true,
+        .server => c.tickets = .{ .ticketer = InteropTicketer.ticketer() },
+    };
     return c;
 }
 
@@ -2297,6 +2322,68 @@ fn runClientFlow12(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, case: C
     try expectBytes("echoed application data", case.app_expect, echoed);
 
     if (case.expect_peer_cert_subject) |want| try checkPeerCertLine(&stdout_reader.interface, want, rec);
+    if (case.resumption) try resumeClient12(io, case, fx, &server_addr, &conn, rnd, &stdout_reader.interface);
+}
+
+/// The second connection of a 1.2 client resumption case: the ticket the
+/// first one kept, an abbreviated handshake, the echo, and the peer's
+/// `RESUMED 1`.
+fn resumeClient12(io: std.Io, case: Case12, fx: *const Fixtures, server_addr: *const net.IpAddress, first: *const Connection12, rnd: Entropy, peer_out: *std.Io.Reader) !void {
+    var ticket = (first.sessionTicket() orelse return error.NoTicketFromPeer).*;
+    defer ticket.wipe();
+    var off: Recorder = .{ .enabled = false, .out = undefined };
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    var cfg = config12(case, .client, fx, null);
+    cfg.resumption12 = &ticket;
+    var conn = try Connection12.clientInit(cfg);
+    defer conn.deinit();
+    var out: [8192]u8 = undefined;
+    var rx: [4096]u8 = undefined;
+    try waitPeerLine(peer_out, "NEXT");
+    try clientHandshake12(io, sock, server_addr, &conn, rnd, case, &out, &rx, &off);
+    if (!conn.resumed()) return error.TicketNotResumed;
+    try sock.send(io, server_addr, try conn.send(case.app_send, &out));
+    var plain: [2048]u8 = undefined;
+    try expectBytes("echo on the resumed connection", case.app_expect, try recvApplicationData12(io, sock, &conn, &rx, &plain, &off));
+    try waitPeerLine(peer_out, "RESUMED 1");
+}
+
+/// Reads the peer's stdout up to the line `want` (at most 12 lines).
+fn waitPeerLine(peer_out: *std.Io.Reader, want: []const u8) !void {
+    var lines: usize = 0;
+    while (lines < 12) : (lines += 1) {
+        const line = peerLine(peer_out) catch break;
+        if (std.mem.eql(u8, line, want)) return;
+    }
+    std.debug.print("  peer never printed \"{s}\"\n", .{want});
+    return error.PeerDidNotResume;
+}
+
+/// The second connection of a 1.2 server resumption case (datagrams still
+/// arriving from the first client address are dropped).
+fn resumeServer12(io: std.Io, case: Case12, fx: *const Fixtures, sock: net.Socket, old_peer: net.IpAddress, rnd: Entropy) !void {
+    var off: Recorder = .{ .enabled = false, .out = undefined };
+    var conn = try Connection12.serverInit(config12(case, .server, fx, null));
+    defer conn.deinit();
+    var out: [8192]u8 = undefined;
+    var rx: [4096]u8 = undefined;
+    var peer: net.IpAddress = undefined;
+    var steps: usize = 0;
+    while (!conn.isConnected()) : (steps += 1) {
+        if (steps > 40) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        if (incoming.from.eql(&old_peer)) continue;
+        peer = incoming.from;
+        const result = try conn.handleFlight(incoming.data, rnd, 0, &out);
+        if (result.out.len > 0) _ = try sendDatagrams(io, sock, &peer, result.out, case.max_datagram);
+    }
+    if (!conn.resumed()) return error.TicketNotResumed;
+    var plain: [2048]u8 = undefined;
+    const received = try recvApplicationData12(io, sock, &conn, &rx, &plain, &off);
+    try expectBytes("received on the resumed connection", case.app_expect, received);
+    try sock.send(io, &peer, try conn.send(received, &out));
 }
 
 fn runServerFlow12(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, case: Case12, fx: *const Fixtures, rec: *Recorder) !void {
@@ -2393,6 +2480,7 @@ fn runServerFlow12(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, case: C
     rec.hexArg("out", echo);
     rec.end();
     try sock.send(io, &peer_addr, echo);
+    if (case.resumption) try resumeServer12(io, case, fx, sock, peer_addr, rnd);
 
     const term = try child.wait(io);
     switch (term) {
@@ -2656,6 +2744,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             if (!isSelected(selected[0..selected_len], case.name)) continue;
             std.debug.print("{s} ... ", .{case.name});
             const mark = t12.written().len;
+            rec.enabled = capture and !case.resumption; // live-only, see `Case12.resumption`
             rec.raw("case {s}\n", .{case.name});
             rec.raw("why {s}\n", .{case.why});
             const result = switch (case.peer) {
