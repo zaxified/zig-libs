@@ -175,6 +175,9 @@ const Case = struct {
     /// (with `Config.tickets`) takes back the one it issued. Live-only: the
     /// second connection is not recorded.
     resumption: bool = false,
+    /// Our server presents the `ocsp-*` leaf and staples its OCSP response;
+    /// the peer client requires and verifies the staple. Live-only.
+    ocsp: bool = false,
     /// One line of prose, copied into the transcript, saying what THIS case
     /// proves that no other one does.
     why: []const u8,
@@ -499,6 +502,16 @@ const cases = [_]Case{
         .app_expect = "hello from wolfssl cert client",
         .why = "OUR NewSessionTicket against a live client: wolfSSL stores it, offers it on a second connection, and OUR server resumes it (wolfSSL_session_reused 1)",
     },
+    .{
+        .name = "cert-server-ocsp",
+        .flow = .server,
+        .peer_mode = "client-cert-ocsp",
+        .seed = 0x4e,
+        .cert_mode = true,
+        .ocsp = true,
+        .app_expect = "hello from wolfssl cert client",
+        .why = "OCSP stapling (RFC 8446 4.4.2.1) against a live client: wolfSSL asks with status_request, REQUIRES a staple (must-staple) and verifies the response OUR server put in the leaf's CertificateEntry against the CA",
+    },
 };
 
 // ── the recorder ──────────────────────────────────────────────────────────
@@ -563,6 +576,12 @@ const Fixtures = struct {
     client_secret_key_bytes: []u8,
     rsa12_cert_der: []u8,
     rsa12_key_der: []u8,
+    /// The stapling case's leaf, its key, CA and OCSP response
+    /// (`tools/gen-ocsp-certs.sh`).
+    ocsp_leaf_cert_der: []u8,
+    ocsp_leaf_key_bytes: []u8,
+    ocsp_ca_cert_der: []u8,
+    ocsp_response_der: []u8,
     /// The one-element chains `Config.cert.chain` points AT.
     ///
     /// They are fields, and `Fixtures` is passed by pointer, because
@@ -578,6 +597,7 @@ const Fixtures = struct {
     server_chain: [1][]const u8 = undefined,
     client_chain: [1][]const u8 = undefined,
     rsa12_chain: [1][]const u8 = undefined,
+    ocsp_chain: [1][]const u8 = undefined,
 
     fn load(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir) !Fixtures {
         var fx: Fixtures = .{
@@ -588,7 +608,12 @@ const Fixtures = struct {
             .client_secret_key_bytes = try read(gpa, io, root, "client-key.bin"),
             .rsa12_cert_der = try read(gpa, io, root, "rsa12-cert.der"),
             .rsa12_key_der = try read(gpa, io, root, "rsa12-key.der"),
+            .ocsp_leaf_cert_der = try read(gpa, io, root, "ocsp-leaf-cert.der"),
+            .ocsp_leaf_key_bytes = try read(gpa, io, root, "ocsp-leaf-key.bin"),
+            .ocsp_ca_cert_der = try read(gpa, io, root, "ocsp-ca-cert.der"),
+            .ocsp_response_der = try read(gpa, io, root, "ocsp-response.der"),
         };
+        fx.ocsp_chain = .{fx.ocsp_leaf_cert_der};
         fx.server_chain = .{fx.server_cert_der};
         fx.client_chain = .{fx.client_cert_der};
         fx.rsa12_chain = .{fx.rsa12_cert_der};
@@ -619,6 +644,14 @@ const Fixtures = struct {
         const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
         client_sk = P256.SecretKey.fromBytes(scalar32(self.client_secret_key_bytes)) catch unreachable;
         return .{ .ecdsa_p256 = &client_sk };
+    }
+
+    var ocsp_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+
+    fn ocspKey(self: *const Fixtures) certverify.SecretKey {
+        const P256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+        ocsp_sk = P256.SecretKey.fromBytes(scalar32(self.ocsp_leaf_key_bytes)) catch unreachable;
+        return .{ .ecdsa_p256 = &ocsp_sk };
     }
 
     fn serverKey(self: *const Fixtures) certverify.SecretKey {
@@ -689,6 +722,7 @@ const Fixtures = struct {
         try dir.writeFile(io, .{ .sub_path = "client-key.der", .data = &ckey });
         try dir.writeFile(io, .{ .sub_path = "rsa12-cert.der", .data = self.rsa12_cert_der });
         try dir.writeFile(io, .{ .sub_path = "rsa12-key.der", .data = self.rsa12_key_der });
+        try dir.writeFile(io, .{ .sub_path = "ocsp-ca-cert.der", .data = self.ocsp_ca_cert_der });
     }
 };
 
@@ -959,7 +993,12 @@ fn serverConfigBase(case: Case, fx: *const Fixtures, binding: ?[]const u8) dtls.
         .role = .server,
         .key_exchange = .cert_dhe,
         .cipher_suites = &.{.aes_128_gcm_sha256},
-        .cert = .{
+        // The stapling case presents the `ocsp-*` leaf with its response.
+        .cert = if (case.ocsp) .{
+            .chain = &fx.ocsp_chain,
+            .private_key = fx.ocspKey(),
+            .ocsp_response = fx.ocsp_response_der,
+        } else .{
             .chain = &fx.server_chain,
             .private_key = fx.serverKey(),
         },
@@ -2714,7 +2753,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             const mark = t13.written().len;
             // A resumption case spans two connections and a ticket key the
             // replay has no line for: live-only, never in the transcript.
-            rec.enabled = capture and !case.resumption;
+            rec.enabled = capture and !case.resumption and !case.ocsp;
             rec.raw("case {s}\n", .{case.name});
             rec.raw("why {s}\n", .{case.why});
             const result = switch (case.flow) {

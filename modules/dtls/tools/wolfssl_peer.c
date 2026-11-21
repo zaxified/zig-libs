@@ -163,6 +163,12 @@ static int g_cid = 0;                    // RFC 9146 / RFC 9147 section 9 connec
 // The server prints `RESUMED <0|1>` per connection and fails unless the second
 // one resumed; the client fails unless `wolfSSL_session_reused` says so.
 static int g_resume = 0;
+// The `*-ocsp` modes: the client trusts `ocsp-ca-cert.der` (the CA of the
+// stapled leaf), asks for an OCSP staple and REQUIRES one (must-staple), so
+// the handshake succeeds only if wolfSSL verified the response our server
+// stapled (DTLS 1.3: in the leaf's CertificateEntry; 1.2: CertificateStatus).
+static int g_ocsp = 0;
+static int load_anchor_file(WOLFSSL_CTX *ctx, const char *path);
 
 // The connection IDs of the `*-cid` modes: wolfSSL asks for `kWolfCid`, and
 // the Zig side for `kZigCid` (duplicated in `tools/interop.zig`).
@@ -594,7 +600,14 @@ static int run_cert_client(int port, int group) {
         fprintf(stderr, "set_groups failed\n");
         return 1;
     }
-    if (!load_anchor(ctx)) return 1;
+    if (g_ocsp) {
+        if (!load_anchor_file(ctx, "ocsp-ca-cert.der")) return 1;
+        if (wolfSSL_CTX_EnableOCSPStapling(ctx) != WOLFSSL_SUCCESS ||
+            wolfSSL_CTX_EnableOCSPMustStaple(ctx) != WOLFSSL_SUCCESS) {
+            fprintf(stderr, "EnableOCSPStapling failed\n");
+            return 1;
+        }
+    } else if (!load_anchor(ctx)) return 1;
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
 
     WOLFSSL_SESSION *saved = NULL;
@@ -633,6 +646,10 @@ static int run_cert_client(int port, int group) {
     }
     if (saved && wolfSSL_set_session(ssl, saved) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "set_session failed\n");
+        return 1;
+    }
+    if (g_ocsp && wolfSSL_UseOCSPStapling(ssl, WOLFSSL_CSR_OCSP, 0) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "UseOCSPStapling failed\n");
         return 1;
     }
     int rc = wolfSSL_connect(ssl);
@@ -1156,6 +1173,9 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "server-cert-resume") == 0) {
         g_resume = 1;
         rc = run_cert_server(port, cert);
+    } else if (strcmp(argv[1], "client-cert-ocsp") == 0) {
+        g_ocsp = 1;
+        rc = run_cert_client(port, WOLFSSL_ECC_X25519);
     } else if (strcmp(argv[1], "client-cert-resume") == 0) {
         g_resume = 1;
         rc = run_cert_client(port, WOLFSSL_ECC_X25519);
