@@ -170,7 +170,8 @@ capability that announces it; for those, construct the `Client` with
 | `.sessionId()` / `.serverCapabilities()` / `.dialect()` / `.state` | what the exchange produced |
 | `.pumpOnce() !usize` | **the one blocking call** — one `Transport.read`, fed to the framer |
 | `.receive() ![]const u8` | next complete message (loops `pumpOnce`) |
-| `.send(Rpc) !u64` / `.receiveReply(id) !Reply` | pipelining seam; returns/consumes the `message-id` |
+| `.send(Rpc) !u64` / `.receiveReply(id) !Reply` | pipelining seam; returns/consumes the `message-id`; replies for other ids are buffered |
+| `.receiveAnyReply() !Completed` / `.outstandingCount()` | the reply dispatcher: the next reply of any outstanding request, in arrival order, with its `message-id` |
 | `.call(Rpc) !Reply` | send + correlated receive |
 | `.callOk(Rpc, ?*?Reply) !void` | `call` + `expectOk`, handing the failed reply back |
 | `.get` `.getConfig` `.editConfig` `.copyConfig` `.deleteConfig` `.lock` `.unlock` `.commit` `.cancelCommit` `.discardChanges` `.validate` `.killSession` `.createSubscription` `.raw` | one wrapper per RFC 6241 §7/§8 operation |
@@ -230,9 +231,8 @@ and which goldens come from which RFC section.
 
 ## Not provided
 
-No server side, no TLS transport or Call Home, no YANG model or XPath evaluation, no out-of-order reply
-dispatcher, no typed builders for `:partial-lock` or NMDA (reachable through `Rpc.raw`): SPEC *What is
-deliberately not done* gives the reasons and *Backlog / deferred* the open items.
+No server side, no TLS transport or Call Home, no YANG model or XPath evaluation, no typed builders for `:partial-lock` or NMDA (reachable through `Rpc.raw`): SPEC *What is
+deliberately not done* gives the reasons and *Roadmap* the TLS / Call Home item.
 
 Provenance: clean-room from RFC 6241 / RFC 6242 / RFC 5277. No third-party source was
 ported or studied, so there is no `/NOTICE` entry — the RFC citations live in SPEC.md.

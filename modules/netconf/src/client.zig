@@ -459,28 +459,7 @@ pub const Client = struct {
         while (true) {
             const msg = try self.receive();
             switch (reply_mod.classify(msg)) {
-                .notification => {
-                    // `classify` only sniffs the root element's LOCAL NAME
-                    // (it does not resolve namespaces at all), while
-                    // `reply_mod.parseNotification` requires the RFC 5277 §4
-                    // namespace too. A `<notification>` in a foreign or
-                    // absent namespace used to queue here regardless, taking
-                    // up queue slots and memory, only to fail with
-                    // `error.NotANotification` much later -- at whatever
-                    // unrelated `nextNotification`/`awaitNotification` call
-                    // happened to dequeue it (audit,
-                    // A1 audit N10). Validating before queueing makes
-                    // this fail at the point the bad message actually
-                    // arrived, the same way `.hello`/`.rpc`/`.unknown` below
-                    // already do.
-                    var probe = try reply_mod.parseNotification(self.gpa, msg);
-                    probe.deinit();
-                    if (self.notifications.items.len >= self.opts.max_queued_notifications)
-                        return error.NotificationQueueFull;
-                    const copy = try self.gpa.dupe(u8, msg);
-                    errdefer self.gpa.free(copy);
-                    try self.notifications.append(self.gpa, copy);
-                },
+                .notification => try self.queueNotification(msg),
                 .rpc_reply => {
                     var r = try reply_mod.parseReply(self.gpa, msg);
                     errdefer r.deinit();
@@ -506,6 +485,30 @@ pub const Client = struct {
         }
     }
 
+    /// Validate a `<notification>` the moment it arrives and queue a copy.
+    fn queueNotification(self: *Client, msg: []const u8) SessionError!void {
+        // `classify` only sniffs the root element's LOCAL NAME
+        // (it does not resolve namespaces at all), while
+        // `reply_mod.parseNotification` requires the RFC 5277 §4
+        // namespace too. A `<notification>` in a foreign or
+        // absent namespace used to queue here regardless, taking
+        // up queue slots and memory, only to fail with
+        // `error.NotANotification` much later -- at whatever
+        // unrelated `nextNotification`/`awaitNotification` call
+        // happened to dequeue it (audit,
+        // A1 audit N10). Validating before queueing makes
+        // this fail at the point the bad message actually
+        // arrived, the same way `.hello`/`.rpc`/`.unknown` below
+        // already do.
+        var probe = try reply_mod.parseNotification(self.gpa, msg);
+        probe.deinit();
+        if (self.notifications.items.len >= self.opts.max_queued_notifications)
+            return error.NotificationQueueFull;
+        const copy = try self.gpa.dupe(u8, msg);
+        errdefer self.gpa.free(copy);
+        try self.notifications.append(self.gpa, copy);
+    }
+
     fn matchesId(r: *const reply_mod.Reply, id: u64) bool {
         r.expectMessageId(id) catch return false;
         return true;
@@ -526,6 +529,55 @@ pub const Client = struct {
                 return;
             }
         }
+    }
+
+    /// One reply taken in arrival order by `receiveAnyReply`.
+    pub const Completed = struct {
+        /// The `message-id` `send` returned for the request this answers.
+        id: u64,
+        reply: reply_mod.Reply,
+    };
+
+    /// How many requests `send` has issued whose reply the caller has not yet received:
+    /// replies still on the wire plus replies buffered by an earlier `receiveReply`.
+    pub fn outstandingCount(self: *const Client) usize {
+        return self.outstanding_ids.items.len + self.pending_replies.items.len;
+    }
+
+    /// The reply dispatcher for a caller that pipelines many requests: return the next reply
+    /// of ANY outstanding request, in the order the server answered, together with the id
+    /// `send` gave it. A reply that an earlier `receiveReply(other_id)` buffered is returned
+    /// first (oldest first). Notifications that arrive meanwhile are queued as in
+    /// `receiveReply`. `error.InvalidState` when nothing is outstanding (it would wait for a
+    /// reply nobody asked for); a reply that carries an id nobody sent is
+    /// `error.MessageIdMismatch`, as in `receiveReply`. The reply is owned by the caller and may
+    /// carry `<rpc-error>`.
+    pub fn receiveAnyReply(self: *Client) SessionError!Completed {
+        if (self.state != .established) return error.InvalidState;
+        if (self.pending_replies.items.len != 0) {
+            const r = self.pending_replies.orderedRemove(0);
+            return .{ .id = idOf(&r) orelse unreachable, .reply = r }; // buffered only after matching an outstanding id
+        }
+        if (self.outstanding_ids.items.len == 0) return error.InvalidState;
+        while (true) {
+            const msg = try self.receive();
+            switch (reply_mod.classify(msg)) {
+                .notification => try self.queueNotification(msg),
+                .rpc_reply => {
+                    var r = try reply_mod.parseReply(self.gpa, msg);
+                    errdefer r.deinit();
+                    const oid = self.findOutstanding(&r) orelse return error.MessageIdMismatch;
+                    self.removeOutstanding(oid);
+                    return .{ .id = oid, .reply = r };
+                },
+                .hello, .rpc, .unknown => return error.UnexpectedMessage,
+            }
+        }
+    }
+
+    /// The `message-id` of a buffered reply as the number `send` returned.
+    fn idOf(r: *const reply_mod.Reply) ?u64 {
+        return std.fmt.parseInt(u64, r.message_id orelse return null, 10) catch null;
     }
 
     /// `send` + `receiveReply`: the ordinary synchronous request.
@@ -1073,6 +1125,56 @@ test "receiveReply survives a pipelined reply arriving out of order" {
     defer r_b.deinit();
     try r_b.expectOk();
     try testing.expectEqualStrings("2", r_b.message_id.?);
+}
+
+test "receiveAnyReply returns replies in arrival order with their ids, buffered ones first" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+    try testing.expectError(error.InvalidState, h.client.receiveAnyReply());
+
+    h.peer.hold_next_reply = true;
+    const id_a = try h.client.send(.discard_changes);
+    const id_b = try h.client.send(.discard_changes);
+    const id_c = try h.client.send(.discard_changes);
+    try testing.expectEqual(@as(usize, 3), h.client.outstandingCount());
+    try h.peer.releaseHeld(); // the wire now carries b, c, a
+
+    var first = try h.client.receiveAnyReply();
+    defer first.reply.deinit();
+    try testing.expectEqual(id_b, first.id);
+    try first.reply.expectOk();
+    // Asking for c by id buffers nothing it does not have to: a is still on the wire behind it.
+    var c = try h.client.receiveReply(id_c);
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 1), h.client.outstandingCount());
+    var last = try h.client.receiveAnyReply();
+    defer last.reply.deinit();
+    try testing.expectEqual(id_a, last.id);
+    try testing.expectEqual(@as(usize, 0), h.client.outstandingCount());
+    try testing.expectError(error.InvalidState, h.client.receiveAnyReply());
+}
+
+test "receiveAnyReply drains a reply an earlier receiveReply buffered, and a forged id fails loudly" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+    h.peer.hold_next_reply = true;
+    const id_a = try h.client.send(.discard_changes);
+    const id_b = try h.client.send(.discard_changes);
+    try h.peer.releaseHeld(); // b, a
+    var a = try h.client.receiveReply(id_a); // buffers b
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 1), h.client.outstandingCount());
+    var b = try h.client.receiveAnyReply();
+    defer b.reply.deinit();
+    try testing.expectEqual(id_b, b.id);
+
+    h.peer.forge_message_id = 9999;
+    _ = try h.client.send(.discard_changes);
+    try testing.expectError(error.MessageIdMismatch, h.client.receiveAnyReply());
 }
 
 test "one byte at a time: the whole session works with a 1-byte transport" {

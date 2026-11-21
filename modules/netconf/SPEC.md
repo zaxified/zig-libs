@@ -374,9 +374,6 @@ What this module does **not** do, with the reason:
 * **Notification replay bookkeeping.** `create-subscription` (incl. `startTime`/`stopTime`)
   is built and `<notification>` is parsed and queued, but nothing tracks subscription
   state, `<replayComplete>`/`<notificationComplete>`, or the `:interleave` rules.
-* **Pipelining depth.** `send`/`receiveReply` allow more than one outstanding request, but
-  `receiveReply` waits for one specific id and treats any other reply as a mismatch, so
-  true out-of-order pipelining needs a small dispatcher on top.
 * **Chunk-size tuning on send.** `writeMessage(.chunked, …)` emits one chunk;
   `writeChunked(w, payload, n)` splits at `n` but nothing in the client picks a smaller
   `n`. A peer with a modest input buffer might want that.
@@ -396,5 +393,8 @@ What this module does **not** do, with the reason:
 
 Open survey findings; *What is deliberately not done* is the prose list of what is not done.
 
-- **NETCONF over TLS (RFC 7589) and Call Home (RFC 8071)** *(survey 2026-09-30)*. Provided by libnetconf2; used by devices managed by a controller that accepts inbound sessions. The `Transport` seam already takes any byte stream; the missing piece is TLS client-cert wiring from the `tlsclient` sibling and the reverse-connect listener. Effort: medium. Fits §2 (TLS is a sibling module, not a dependency of this one).
-- **Reply dispatcher for true pipelining** *(survey 2026-09-30)*. Listed under *What is deliberately not done*; a controller polling many RPCs on one session wants it. Effort: small-medium. Fits §2.
+None open.
+
+## Roadmap
+
+- **NETCONF over TLS (RFC 7589) and Call Home (RFC 8071)** *(survey 2026-09-30)*. Provided by libnetconf2; used by devices managed by a controller that accepts inbound sessions. The `Transport` seam already takes any byte stream; the missing piece is TLS client-cert wiring from the `tlsclient` sibling and the reverse-connect listener. Effort: medium. Fits §2 (TLS is a sibling module, not a dependency of this one). Size: a new transport (TLS client-cert session over `tlsclient`, plus a listener for Call Home), weeks; needs `tlsclient`/`tlsserver` wiring and a TLS peer to test against.
