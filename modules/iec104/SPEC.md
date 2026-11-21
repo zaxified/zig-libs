@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [mzaniolo/iec104](https://github.com/mzaniolo/iec104) | Rust | MIT | 14 | push 2026-08-16 | Small Rust crate; no traction; not read *(features inferred unknown)*. |
 | Zig ecosystem | — | — | — | — | `gh search repos iec104 --language=zig` found nothing. |
 
-**Where we are ahead:** the only Zig implementation, and permissively licensed (MIT) where the C/C#/Java references are GPL; the k/w/t0..t3 machine is pure and time-injected (testable with a fake clock); interop-checked against a live lib60870-C peer and captured traffic (`tools/`); a spec-following outstation (broadcast restricted to the four defined type ids). **Where we are behind:** IEC 101 serial link layer, redundancy groups, file transfer (type ids 120-127) and typed parameter loading (QPM/QPA qualifiers are raw octets); TLS is BYO (→ Backlog and *What is deliberately not done*).
+**Where we are ahead:** the only Zig implementation, and permissively licensed (MIT) where the C/C#/Java references are GPL; the k/w/t0..t3 machine is pure and time-injected (testable with a fake clock); interop-checked against a live lib60870-C peer and captured traffic (`tools/`); a spec-following outstation (broadcast restricted to the four defined type ids). **Where we are behind:** IEC 101 serial link layer, redundancy groups, typed parameter loading (QPM/QPA qualifiers are raw octets); TLS is BYO (→ Backlog and *What is deliberately not done*).
 
 ## Design & invariants
 
@@ -301,13 +301,46 @@ sockets and timers are for 104; the ASDU inside a variable frame is the one `asd
 (`asdu.Params`). Its vectors are derived from the checksum rule and the standard's frame layout, not captured from a
 101 peer: no serial 101 stack was available (see *Open*).
 
+## File transfer (type ids 120-127)
+
+`asdu.zig` models the eight type ids (`F_FR_NA_1` file ready, `F_SR_NA_1` section ready, `F_SC_NA_1`
+call/select, `F_LS_NA_1` last segment/section, `F_AF_NA_1` acknowledge, `F_SG_NA_1` segment, `F_DR_TA_1`
+directory, `F_SC_NB_1` query log) with the qualifiers of IEC 60870-5-101 §7.2.6 typed in `info.zig` (SCQ,
+LSQ, AFQ, FRQ, SRQ, SOF; the error codes of the upper nibble). Lengths of a file or a section are three
+octets, little-endian like every multi-octet field of the protocol. `F_SG_NA_1` is the one variable-length element: an ASDU
+holds exactly one segment (SQ = 0), the fourth element octet counts its data octets, the decoder requires the body to
+match it exactly, the encoder refuses more than 240 (`asdu.max_segment_len`; `asdu.maxSegmentLen` gives 236 under
+the 104 field widths, which is what the engines send).
+
+`file.zig` holds two sans-I/O state machines, `Sender` and `Receiver`, driven by `onAsdu` and `next` (see the
+file header for the exchange): select file, file ready, call file, section ready, call section, segments, last
+segment with the section checksum (sum of the data octets modulo 256), acknowledgement; after the last section the
+file's checksum and the file acknowledgement. They work in either direction of the link. `Outstation` serves
+`Options.files` (a `file.Source`: a directory and a read function) and accepts files into `Options.file_sink`
+(a `file.Sink`); `Client.requestDirectory`, `queryLog`, `fetchFile` and `sendFile` start the master's side and `poll`
+drives the rest, the engine's output held back while the send window is full. The directory is one `F_DR_TA_1` per file
+(cause 5), the last flagged LFD; a query log answers the same way for the files whose time lies in the range. Section
+lengths are configurable (`Options.file_section_len`), and a file needing more than 255 sections gets longer ones.
+Transfers end with a `file.Result` (`completed`, `refused`, `peer_aborted`, `local_abort` and the error code); a
+failed source, sink, checksum, length or an out-of-sequence message aborts both sides with a negative `F_AF_NA_1`
+carrying the error code of the standard (memory, checksum, unexpected service/file/section).
+
+* **Sources and oracle.** The layouts and qualifier values are those of IEC 60870-5-101 §7.2.6 / §7.3.4 as
+  documented by lib60870's user guide and its .NET API reference (the type table, the SCQ, LSQ, AFQ and
+  file-error enumerations; documentation only, no source read: lib60870 is GPL). `c104` (lib60870-C) decodes the
+  envelope of the pinned ASDUs (type id, cause, common address, object address) and names the types
+  (`tools/file_transfer_explain.py`); it does not decode the file elements, and no peer that serves or collects
+  files was available, so the element octets and the exchange are anchored to the standard's text, not to a live
+  third party. Interop with a lib60870 file client or server is the open check.
+* **Choices where the documents are silent.** An empty directory is answered with one entry with NOF 0 flagged
+  last; a file is offered with `F_FR_NA_1` positive and refused with the negative FRQ; "with deactivation" last
+  section/file qualifiers (LSQ 2 and 4) are treated like 1 and 3; a deactivation (SCQ 3, 7) ends the transfer with
+  no answer; the call of a file without a select before it is accepted.
+
 ## Known limits
 
 What a full IEC 60870-5-104 implementation has and this one does not (planned items are under *Backlog / deferred*):
 
-- **File transfer** (type ids 120–127, `F_FR_NA_1`/`F_SR_NA_1`/`F_SC_NA_1`/`F_LS_NA_1`/`F_AF_NA_1`/`F_SG_NA_1`/`F_DR_TA_1`/
-  `F_SC_NB_1`) is not modelled at all. Their elements are variable-length, so the fixed (base, tag) shape table cannot
-  express them; they decode as `error.UnsupportedTypeId`.
 - **Parameter loading** (110–113) is recognised with the right element width, but the QPM/QPA qualifier semantics are passed
   through as raw octets rather than typed, and the outstation has no parameter store: a request of those types is answered
   like any type the outstation does not handle, with cause 44 and the negative bit (`outstation.zig`).
@@ -316,6 +349,9 @@ What a full IEC 60870-5-104 implementation has and this one does not (planned it
   is a name only, never generated by the outstation.
 - **Protection-equipment events** are decoded and built, never generated by the outstation on its own (see *Design &
   invariants*).
+- **File transfer limits:** one transfer per engine at a time; no delete-file (SCQ 4), no subdirectories, no
+  section-level retry (a bad section aborts the file) and no timeouts (the caller drops a stalled transfer with
+  `abortFiles` / `Sender.abort`).
 - **Timer policy is the caller's.** The module tells the caller *when* something is due (`nextDeadline`) and *what* to do
   (`tick`), but it does not sleep, and the `TcpTransport` demo adapter waits with a timed read through `std.Io` (`io.operateTimeout`, so a simulated `Io` sees it too) with a caller-set timeout. A
   production deployment wires the seam into its own event loop.
@@ -341,9 +377,7 @@ What a full IEC 60870-5-104 implementation has and this one does not (planned it
 
 ## Backlog / deferred
 
-- **File transfer (type ids 120-127)** *(survey)*: lib60870 has the file service; needs variable-length elements outside
-  the shape table (the segment of `F_SG_NA_1` carries 1..240 data octets) and a section/segment state machine on both
-  roles; medium-large, fits §2. Not started: the codec and the two state machines are one piece of work.
+None open.
 
 ## Anchoring
 

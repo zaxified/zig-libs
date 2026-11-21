@@ -85,6 +85,8 @@ pub const apci = @import("apci.zig");
 pub const info = @import("info.zig");
 /// ASDU codec (§7.2): data unit identifier plus information objects.
 pub const asdu = @import("asdu.zig");
+/// File transfer (type ids 120-127): the sender and receiver state machines.
+pub const file = @import("file.zig");
 /// The k/w + t0..t3 flow-control state machine (§5.4–§5.6, §9.6).
 pub const state = @import("state.zig");
 /// The byte-stream seam and its adapters.
@@ -145,6 +147,7 @@ test {
     _ = apci;
     _ = info;
     _ = asdu;
+    _ = file;
     _ = state;
     _ = transport;
     _ = client;
@@ -607,4 +610,157 @@ test "a frame split across TCP segments survives a frame_buf at the documented m
     loop.deliver(full); // a second frame coalesced behind the tail
     // The point is that this returns rather than erroring out of the framer.
     _ = try c.poll(0);
+}
+
+// ── file transfer across the whole stack ────────────────────────────────────
+
+const RigFiles = struct {
+    data: [4000]u8 = undefined,
+    sink_buf: [4000]u8 = undefined,
+    sink_len: usize = 0,
+    sink_ended: ?bool = null,
+
+    fn fill(self: *RigFiles) void {
+        for (&self.data, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    }
+
+    fn source(self: *RigFiles) file.Source {
+        return .{ .ctx = self, .entryFn = entryFn, .readFn = readFn };
+    }
+
+    fn entryFn(ctx: ?*anyopaque, i: usize) ?file.DirEntry {
+        const self: *RigFiles = @ptrCast(@alignCast(ctx));
+        return switch (i) {
+            0 => .{ .nof = 3, .length = @intCast(self.data.len), .time = .{ .year = 26, .month = 11, .day = 20 } },
+            1 => .{ .nof = 4, .length = 0 },
+            else => null,
+        };
+    }
+
+    fn readFn(ctx: ?*anyopaque, nof: u16, offset: u32, out: []u8) usize {
+        const self: *RigFiles = @ptrCast(@alignCast(ctx));
+        if (nof != 3 or offset >= self.data.len) return 0;
+        const n = @min(out.len, self.data.len - offset);
+        @memcpy(out[0..n], self.data[offset..][0..n]);
+        return n;
+    }
+
+    fn sink(self: *RigFiles) file.Sink {
+        return .{ .ctx = self, .beginFn = beginFn, .writeFn = writeFn, .endFn = endFn };
+    }
+
+    fn beginFn(ctx: ?*anyopaque, _: u16, length: u32) bool {
+        const self: *RigFiles = @ptrCast(@alignCast(ctx));
+        self.sink_len = 0;
+        self.sink_ended = null;
+        return length <= self.sink_buf.len;
+    }
+
+    fn writeFn(ctx: ?*anyopaque, _: u16, offset: u32, data: []const u8) bool {
+        const self: *RigFiles = @ptrCast(@alignCast(ctx));
+        if (offset != self.sink_len) return false;
+        @memcpy(self.sink_buf[self.sink_len..][0..data.len], data);
+        self.sink_len += data.len;
+        return true;
+    }
+
+    fn endFn(ctx: ?*anyopaque, _: u16, ok: bool) void {
+        const self: *RigFiles = @ptrCast(@alignCast(ctx));
+        self.sink_ended = ok;
+    }
+};
+
+test "round trip: a master lists and reads a file from the outstation through a small k window" {
+    const gpa = testing.allocator;
+    var wire = Wire{};
+    var m_end = MasterEnd{ .wire = &wire };
+    var r_end = RtuEnd{ .wire = &wire };
+    var rtu_files = RigFiles{};
+    rtu_files.fill();
+    var master_files = RigFiles{};
+
+    var points = [_]Point{.{ .ioa = 101, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = true } } }};
+    var m_frames: [apci.max_apdu_len * 2]u8 = undefined;
+    var r_frames: [apci.max_apdu_len * 2]u8 = undefined;
+    var r_queue: [16384]u8 = undefined;
+    const cfg = Config{ .k = 3, .w = 2, .t0_ms = 100_000, .t1_ms = 50_000, .t2_ms = 1_000, .t3_ms = 100_000 };
+    var master = try Client.init(m_end.transportSeam(), &m_frames, .{ .config = cfg });
+    var rtu = try OutstationServer.init(.{
+        .common_address = 47,
+        .files = rtu_files.source(),
+        .file_section_len = 1500,
+    }, &points, r_end.transportSeam(), &r_frames, &r_queue, cfg);
+    var rig = Rig{ .master = &master, .rtu = &rtu };
+    defer rig.deinit(gpa);
+
+    master.beginConnect(0);
+    master.onConnected(0);
+    rtu.onConnected(0);
+    try master.startDataTransfer(0);
+    try rig.settle(gpa);
+
+    // The directory: one F_DR_TA_1 per file.
+    try master.requestDirectory(47, rig.now);
+    try rig.settle(gpa);
+    try testing.expectEqualSlices(TypeId, &.{ .f_dr_ta_1, .f_dr_ta_1 }, rig.seen.items);
+
+    // The file: 4000 octets, 3 sections of 1500/1500/1000, 17+... segments.
+    try master.fetchFile(47, 3, master_files.sink(), rig.now);
+    try rig.settle(gpa);
+    try testing.expectEqual(file.Result.Kind.completed, master.takeFileResult().?.kind);
+    try testing.expectEqual(@as(?bool, true), master_files.sink_ended);
+    try testing.expectEqualSlices(u8, &rtu_files.data, master_files.sink_buf[0..master_files.sink_len]);
+    try testing.expect(rtu.outstation.takeFileResult().?.kind == .completed);
+    try testing.expect(master.conn.recv_seq > cfg.k);
+
+    // A file the station does not have is refused, and the master is free again.
+    try master.fetchFile(47, 99, master_files.sink(), rig.now);
+    try rig.settle(gpa);
+    try testing.expectEqual(file.Result.Kind.refused, master.takeFileResult().?.kind);
+    try testing.expect(master.takeFileResult() == null);
+    try master.fetchFile(47, 3, master_files.sink(), rig.now);
+}
+
+test "round trip: a master sends a file to the outstation's sink; without a sink the offer is refused" {
+    const gpa = testing.allocator;
+    var master_files = RigFiles{};
+    master_files.fill();
+    var rtu_files = RigFiles{};
+    var points = [_]Point{.{ .ioa = 101, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = true } } }};
+
+    inline for ([_]bool{ true, false }) |with_sink| {
+        var wire = Wire{};
+        var m_end = MasterEnd{ .wire = &wire };
+        var r_end = RtuEnd{ .wire = &wire };
+        var m_frames: [apci.max_apdu_len * 2]u8 = undefined;
+        var r_frames: [apci.max_apdu_len * 2]u8 = undefined;
+        var r_queue: [4096]u8 = undefined;
+        var master = try Client.init(m_end.transportSeam(), &m_frames, .{});
+        var rtu = try OutstationServer.init(.{
+            .common_address = 47,
+            .file_sink = if (with_sink) rtu_files.sink() else null,
+        }, &points, r_end.transportSeam(), &r_frames, &r_queue, .{});
+        var rig = Rig{ .master = &master, .rtu = &rtu };
+        defer rig.deinit(gpa);
+        master.beginConnect(0);
+        master.onConnected(0);
+        rtu.onConnected(0);
+        try master.startDataTransfer(0);
+        try rig.settle(gpa);
+        try master.sendFile(47, 3, master_files.source(), 1500, rig.now);
+        try testing.expectError(error.FileTransferBusy, master.sendFile(47, 3, master_files.source(), 1500, rig.now));
+        try rig.settle(gpa);
+        if (with_sink) {
+            try testing.expectEqual(file.Result.Kind.completed, master.takeFileResult().?.kind);
+            try testing.expectEqual(file.Result.Kind.completed, rtu.outstation.takeFileResult().?.kind);
+            try testing.expectEqual(@as(?bool, true), rtu_files.sink_ended);
+            try testing.expectEqualSlices(u8, &master_files.data, rtu_files.sink_buf[0..rtu_files.sink_len]);
+        } else {
+            // No file service: the type id is answered with cause 44, negative.
+            try testing.expect(rig.saw_negative);
+            try testing.expectEqualSlices(TypeId, &.{.f_fr_na_1}, rig.seen.items);
+            master.abortFiles();
+            try testing.expectError(error.FileNotFound, master.sendFile(47, 99, master_files.source(), 1500, rig.now));
+        }
+    }
 }

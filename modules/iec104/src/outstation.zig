@@ -22,6 +22,7 @@ const apci = @import("apci.zig");
 const asdu_mod = @import("asdu.zig");
 const info = @import("info.zig");
 const state = @import("state.zig");
+const file = @import("file.zig");
 const transport_mod = @import("transport.zig");
 
 pub const Transport = transport_mod.Transport;
@@ -88,6 +89,17 @@ pub const Options = struct {
     /// Emit an `ACTIVATION TERMINATION` after a successfully executed
     /// command, as §7.2.3 prescribes for commands that take time.
     command_termination: bool = true,
+    /// The files this station serves (type ids 120-127, `file.zig`): a
+    /// controlling station lists, selects and reads them. Null: no file
+    /// service, every file ASDU is answered with cause 44 as before.
+    files: ?file.Source = null,
+    /// Where a file a controlling station sends to this station goes. Null:
+    /// no file is accepted (the sender gets the negative acknowledgement).
+    file_sink: ?file.Sink = null,
+    /// Target length of one section of a served file.
+    file_section_len: u32 = 1920,
+    /// The information object address the file service answers with.
+    file_ioa: u32 = 0,
 };
 
 pub const Error = SinkError || asdu_mod.Error;
@@ -117,6 +129,9 @@ pub const Outstation = struct {
     hook: ?CommandHook = null,
     /// Scratch for one reply ASDU.
     scratch: [apci.max_asdu_len]u8 = undefined,
+    /// The file service engines, present when `Options.files` / `file_sink` are.
+    sender: ?file.Sender = null,
+    receiver: ?file.Receiver = null,
 
     pub fn init(opts: Options, points: []Point) Error!Outstation {
         try opts.params.validate();
@@ -131,7 +146,62 @@ pub const Outstation = struct {
         // (W2 re-audit, `iec104` F4).
         if (opts.common_address == opts.params.broadcastCa()) return error.AddressOutOfRange;
         if (opts.common_address > opts.params.maxCa()) return error.AddressOutOfRange;
-        return .{ .opts = opts, .points = points };
+        const fcfg = file.Config{
+            .params = opts.params,
+            .common_address = opts.common_address,
+            .ioa = opts.file_ioa,
+        };
+        var o: Outstation = .{ .opts = opts, .points = points };
+        if (opts.files) |src| {
+            o.sender = file.Sender.init(fcfg, src);
+            o.sender.?.section_len = opts.file_section_len;
+        }
+        if (opts.file_sink) |sk| o.receiver = file.Receiver.init(fcfg, sk);
+        return o;
+    }
+
+    /// Drops file transfers in progress (the link went away). A receiving
+    /// sink hears `end(false)`.
+    pub fn abortFiles(self: *Outstation) void {
+        if (self.sender) |*s| s.abort();
+        if (self.receiver) |*r| r.abort();
+    }
+
+    /// How the last file transfer ended, once; null while none has.
+    pub fn takeFileResult(self: *Outstation) ?file.Result {
+        if (self.sender) |*s| if (s.result) |r| {
+            s.result = null;
+            return r;
+        };
+        if (self.receiver) |*r| if (r.result) |x| {
+            r.result = null;
+            return x;
+        };
+        return null;
+    }
+
+    fn onFile(self: *Outstation, a: asdu_mod.Asdu, request: []const u8, sink: Sink) Error!void {
+        const t = a.header.type_id;
+        // An acknowledgement belongs to the engine that is mid-transfer.
+        const to_receiver = switch (t) {
+            .f_fr_na_1, .f_sr_na_1, .f_ls_na_1, .f_sg_na_1 => true,
+            .f_af_na_1 => if (self.receiver) |r| r.busy() else false,
+            else => false,
+        };
+        if (to_receiver) {
+            if (self.receiver) |*r| {
+                try r.onAsdu(a);
+                while (try r.next(&self.scratch)) |b| try sink.send(b);
+                return;
+            }
+        } else if (t == .f_sc_na_1 or t == .f_af_na_1 or t == .f_sc_nb_1) {
+            if (self.sender) |*s| {
+                try s.onAsdu(a);
+                while (try s.next(&self.scratch)) |b| try sink.send(b);
+                return;
+            }
+        }
+        try self.echoRaw(request, a.header, .unknown_type_id, true, sink);
     }
 
     /// Looks up a point by address (and, when `type_id` is given, by type).
@@ -198,6 +268,7 @@ pub const Outstation = struct {
                 try self.echoDecoded(a, .activation_con, false, sink);
             },
             .c_rd_na_1 => try self.onRead(a, request, sink),
+            .f_fr_na_1, .f_sr_na_1, .f_sc_na_1, .f_ls_na_1, .f_af_na_1, .f_sg_na_1, .f_sc_nb_1 => try self.onFile(a, request, sink),
             else => {
                 if (header.type_id.isCommand()) {
                     try self.onCommand(a, request, sink);
@@ -544,6 +615,7 @@ pub const Server = struct {
         self.framer.pos = 0;
         self.queue_used = 0;
         self.queue_read = 0;
+        self.outstation.abortFiles();
     }
 
     pub fn isStarted(self: *const Server) bool {

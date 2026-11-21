@@ -166,6 +166,16 @@ pub const TypeId = enum(u8) {
     p_me_nc_1 = 112,
     p_ac_na_1 = 113,
 
+    // file transfer (IEC 60870-5-101 §7.3.4; the elements live in `file.zig`'s state machines)
+    f_fr_na_1 = 120, // file ready
+    f_sr_na_1 = 121, // section ready
+    f_sc_na_1 = 122, // call directory, select file, call file, call section
+    f_ls_na_1 = 123, // last section, last segment
+    f_af_na_1 = 124, // acknowledge file, acknowledge section
+    f_sg_na_1 = 125, // segment (the one variable-length element)
+    f_dr_ta_1 = 126, // directory, with CP56Time2a
+    f_sc_nb_1 = 127, // query log: request archive file
+
     _,
 
     /// True for the monitor-direction process-information types (1..40).
@@ -182,6 +192,12 @@ pub const TypeId = enum(u8) {
             .m_ep_ta_1, .m_ep_tb_1, .m_ep_tc_1, .m_ep_td_1, .m_ep_te_1, .m_ep_tf_1 => true,
             else => false,
         };
+    }
+
+    /// True for the file-transfer types (120..127).
+    pub fn isFileTransfer(self: TypeId) bool {
+        const v = @backingInt(self);
+        return v >= 120 and v <= 127;
     }
 
     /// True for the control-direction process-information types (45..69).
@@ -341,6 +357,24 @@ pub const ElementKind = enum {
     protection_start,
     /// OCI(1) + QDP(1) + CP16Time2a relay operating time(2): M_EP_TC_1 / M_EP_TF_1.
     protection_output,
+    /// NOF(2) + LOF(3) + FRQ(1): F_FR_NA_1.
+    file_ready,
+    /// NOF(2) + NOS(1) + LOS(3) + SRQ(1): F_SR_NA_1.
+    section_ready,
+    /// NOF(2) + NOS(1) + SCQ(1): F_SC_NA_1.
+    file_call,
+    /// NOF(2) + NOS(1) + LSQ(1) + CHS(1): F_LS_NA_1.
+    file_last,
+    /// NOF(2) + NOS(1) + AFQ(1): F_AF_NA_1.
+    file_ack,
+    /// NOF(2) + NOS(1) + LOS(1) + LOS data octets: F_SG_NA_1. The only
+    /// variable-length element: `Shape.size` is its minimum (4), the data
+    /// length is in the fourth octet.
+    file_segment,
+    /// NOF(2) + LOF(3) + SOF(1), the CP56Time2a is the time tag: F_DR_TA_1.
+    file_directory,
+    /// NOF(2) + range start CP56Time2a(7) + range stop CP56Time2a(7): F_SC_NB_1.
+    query_log,
 };
 
 /// Which time tag, if any, a type appends to its base element.
@@ -377,13 +411,19 @@ pub const Shape = struct {
             .parameter => 3,
             .protection_event => 3,
             .protection_start, .protection_output => 4,
+            .file_ready => 6,
+            .section_ready => 7,
+            .file_call, .file_ack, .file_segment => 4,
+            .file_last => 5,
+            .file_directory => 6,
+            .query_log => 2 + 2 * info.CP56Time2a.wire_len,
         };
         return base + self.time.size();
     }
 };
 
-/// The wire shape of `t`, or null when this module does not model it (file
-/// transfer, unknown/private type ids). Callers turn null into
+/// The wire shape of `t`, or null when this module does not model it (unknown
+/// and private type ids). Callers turn null into
 /// `error.UnsupportedTypeId`.
 pub fn shapeOf(t: TypeId) ?Shape {
     return switch (t) {
@@ -447,6 +487,14 @@ pub fn shapeOf(t: TypeId) ?Shape {
         .p_me_na_1, .p_me_nb_1 => .{ .base = .parameter, .time = .none },
         .p_me_nc_1 => .{ .base = .parameter_float, .time = .none },
         .p_ac_na_1 => .{ .base = .qrp, .time = .none }, // QPA, same width
+        .f_fr_na_1 => .{ .base = .file_ready, .time = .none },
+        .f_sr_na_1 => .{ .base = .section_ready, .time = .none },
+        .f_sc_na_1 => .{ .base = .file_call, .time = .none },
+        .f_ls_na_1 => .{ .base = .file_last, .time = .none },
+        .f_af_na_1 => .{ .base = .file_ack, .time = .none },
+        .f_sg_na_1 => .{ .base = .file_segment, .time = .none },
+        .f_dr_ta_1 => .{ .base = .file_directory, .time = .cp56 },
+        .f_sc_nb_1 => .{ .base = .query_log, .time = .none },
         else => null,
     };
 }
@@ -490,6 +538,15 @@ pub const Element = union(ElementKind) {
     protection_event: struct { event: info.Sep, elapsed: info.CP16Time2a },
     protection_start: struct { start: info.Spe, qdp: info.Qdp, duration: info.CP16Time2a },
     protection_output: struct { output: info.Oci, qdp: info.Qdp, operating: info.CP16Time2a },
+    file_ready: struct { nof: u16, length: u32, frq: info.Frq },
+    section_ready: struct { nof: u16, nos: u8, length: u32, srq: info.Srq },
+    file_call: struct { nof: u16, nos: u8, scq: info.Scq },
+    file_last: struct { nof: u16, nos: u8, lsq: info.Lsq, checksum: u8 },
+    file_ack: struct { nof: u16, nos: u8, afq: info.Afq },
+    /// `data` aliases the decoded ASDU's octets.
+    file_segment: struct { nof: u16, nos: u8, data: []const u8 },
+    file_directory: struct { nof: u16, length: u32, sof: info.Sof },
+    query_log: struct { nof: u16, range_start: info.CP56Time2a, range_stop: info.CP56Time2a },
 
     /// The select/execute bit, for the command elements that carry one.
     /// Null for anything that is not a command.
@@ -549,6 +606,10 @@ pub const Error = error{
     TooManyObjects,
     /// With SQ = 1 the addresses must run consecutively from the first one.
     NonSequentialAddress,
+    /// A file segment of more than 240 data octets (the standard's maximum).
+    SegmentTooLong,
+    /// A file or section length that does not fit the three octets of LOF/LOS.
+    FileLengthOutOfRange,
 } || ParamsError || info.TimeError;
 
 // ── data unit identifier ────────────────────────────────────────────────────
@@ -642,7 +703,11 @@ pub const ObjectIterator = struct {
 
         var ioa: u32 = undefined;
         var elem: []const u8 = undefined;
-        if (self.asdu.header.vsq.sq) {
+        if (self.asdu.shape.base == .file_segment) {
+            // `decode` proved: one object, SQ = 0, the element runs to the end.
+            ioa = readAddress(self.asdu.body[0..isz]);
+            elem = self.asdu.body[isz..];
+        } else if (self.asdu.header.vsq.sq) {
             const base = readAddress(self.asdu.body[0..isz]);
             ioa = base + @as(u32, @intCast(i));
             const off = isz + i * esz;
@@ -672,6 +737,13 @@ pub fn decode(bytes: []const u8, params: Params) Error!Asdu {
     const esz = shape.size();
     const isz: usize = params.ioa_size;
     const n: usize = header.vsq.count;
+    if (shape.base == .file_segment) {
+        // The one variable-length element: one object, SQ = 0, the fourth
+        // element octet counts the data octets that follow it.
+        if (header.vsq.sq or n != 1) return error.ObjectCountMismatch;
+        if (body.len < isz + esz or body.len != isz + esz + body[isz + 3]) return error.ObjectCountMismatch;
+        return .{ .header = header, .params = params, .shape = shape, .body = body };
+    }
     const expected = if (header.vsq.sq) isz + n * esz else n * (isz + esz);
     if (body.len != expected) return error.ObjectCountMismatch;
 
@@ -716,6 +788,7 @@ fn writeAddress(out: []u8, value: u32) void {
 pub fn decodeElement(kind: ElementKind, bytes: []const u8) Error!Element {
     const need = (Shape{ .base = kind, .time = .none }).size();
     if (bytes.len < need) return error.ObjectCountMismatch;
+    if (kind == .file_segment and bytes.len != need + bytes[3]) return error.ObjectCountMismatch;
     return switch (kind) {
         .empty => .{ .empty = {} },
         .siq => .{ .siq = info.Siq.fromByte(bytes[0]) },
@@ -760,12 +833,54 @@ pub fn decodeElement(kind: ElementKind, bytes: []const u8) Error!Element {
             .qdp = info.Qdp.fromByte(bytes[1]),
             .operating = try info.CP16Time2a.decode(bytes[2..4]),
         } },
+        .file_ready => .{ .file_ready = .{
+            .nof = info.readU16(bytes[0..2]),
+            .length = info.readU24(bytes[2..5]),
+            .frq = info.Frq.fromByte(bytes[5]),
+        } },
+        .section_ready => .{ .section_ready = .{
+            .nof = info.readU16(bytes[0..2]),
+            .nos = bytes[2],
+            .length = info.readU24(bytes[3..6]),
+            .srq = info.Srq.fromByte(bytes[6]),
+        } },
+        .file_call => .{ .file_call = .{
+            .nof = info.readU16(bytes[0..2]),
+            .nos = bytes[2],
+            .scq = info.Scq.fromByte(bytes[3]),
+        } },
+        .file_last => .{ .file_last = .{
+            .nof = info.readU16(bytes[0..2]),
+            .nos = bytes[2],
+            .lsq = @fromBackingInt(@intCast(bytes[3])),
+            .checksum = bytes[4],
+        } },
+        .file_ack => .{ .file_ack = .{
+            .nof = info.readU16(bytes[0..2]),
+            .nos = bytes[2],
+            .afq = info.Afq.fromByte(bytes[3]),
+        } },
+        .file_segment => .{ .file_segment = .{
+            .nof = info.readU16(bytes[0..2]),
+            .nos = bytes[2],
+            .data = bytes[4..],
+        } },
+        .file_directory => .{ .file_directory = .{
+            .nof = info.readU16(bytes[0..2]),
+            .length = info.readU24(bytes[2..5]),
+            .sof = info.Sof.fromByte(bytes[5]),
+        } },
+        .query_log => .{ .query_log = .{
+            .nof = info.readU16(bytes[0..2]),
+            .range_start = try info.CP56Time2a.decode(bytes[2..9]),
+            .range_stop = try info.CP56Time2a.decode(bytes[9..16]),
+        } },
     };
 }
 
 /// Encodes one base element into the front of `out`, returning its length.
 pub fn encodeElement(element: Element, out: []u8) Error!usize {
-    const need = (Shape{ .base = @as(ElementKind, element), .time = .none }).size();
+    const need = baseSize(element);
     if (out.len < need) return error.BufferTooSmall;
     switch (element) {
         .empty => {},
@@ -842,8 +957,77 @@ pub fn encodeElement(element: Element, out: []u8) Error!usize {
             out[1] = v.qdp.toByte();
             _ = try v.operating.encode(out[2..4]);
         },
+        .file_ready => |v| {
+            if (v.length > 0xFF_FFFF) return error.FileLengthOutOfRange;
+            info.writeU16(out[0..2], v.nof);
+            info.writeU24(out[2..5], v.length);
+            out[5] = v.frq.toByte();
+        },
+        .section_ready => |v| {
+            if (v.length > 0xFF_FFFF) return error.FileLengthOutOfRange;
+            info.writeU16(out[0..2], v.nof);
+            out[2] = v.nos;
+            info.writeU24(out[3..6], v.length);
+            out[6] = v.srq.toByte();
+        },
+        .file_call => |v| {
+            info.writeU16(out[0..2], v.nof);
+            out[2] = v.nos;
+            out[3] = v.scq.toByte();
+        },
+        .file_last => |v| {
+            info.writeU16(out[0..2], v.nof);
+            out[2] = v.nos;
+            out[3] = @backingInt(v.lsq);
+            out[4] = v.checksum;
+        },
+        .file_ack => |v| {
+            info.writeU16(out[0..2], v.nof);
+            out[2] = v.nos;
+            out[3] = v.afq.toByte();
+        },
+        .file_segment => |v| {
+            if (v.data.len > max_segment_len) return error.SegmentTooLong;
+            info.writeU16(out[0..2], v.nof);
+            out[2] = v.nos;
+            out[3] = @intCast(v.data.len);
+            @memcpy(out[4..][0..v.data.len], v.data);
+        },
+        .file_directory => |v| {
+            if (v.length > 0xFF_FFFF) return error.FileLengthOutOfRange;
+            info.writeU16(out[0..2], v.nof);
+            info.writeU24(out[2..5], v.length);
+            out[5] = v.sof.toByte();
+        },
+        .query_log => |v| {
+            info.writeU16(out[0..2], v.nof);
+            _ = try v.range_start.encode(out[2..9]);
+            _ = try v.range_stop.encode(out[9..16]);
+        },
     }
     return need;
+}
+
+/// The largest data field of one `F_SG_NA_1` segment, whatever the field
+/// widths (IEC 60870-5-101 §7.3.4.4).
+pub const max_segment_len: usize = 240;
+
+/// The data octets of one segment that still fit the 249-octet ASDU of an
+/// IEC 60870-5-104 APDU under `params`: 236 with the 104 field widths, 240
+/// (the standard's ceiling) when the widths are small enough.
+pub fn maxSegmentLen(params: Params) usize {
+    const room = 249 - params.headerLen() - @as(usize, params.ioa_size) - 4;
+    return @min(max_segment_len, room);
+}
+
+/// Octets of the base element `element` occupies on the wire; differs from
+/// `Shape.size` only for a file segment, whose data octets follow its four fixed ones.
+fn baseSize(element: Element) usize {
+    const fixed = (Shape{ .base = @as(ElementKind, element), .time = .none }).size();
+    return switch (element) {
+        .file_segment => |v| fixed + v.data.len,
+        else => fixed,
+    };
 }
 
 fn decodeTime(kind: TimeKind, bytes: []const u8) Error!TimeTag {
@@ -917,6 +1101,9 @@ pub const Builder = struct {
         if (self.count == std.math.maxInt(u7)) return error.TooManyObjects;
         if (ioa > self.params.maxIoa()) return error.AddressOutOfRange;
         if (@as(ElementKind, element) != self.shape.base) return error.UnsupportedTypeId;
+        if (element == .file_segment and element.file_segment.data.len > max_segment_len) return error.SegmentTooLong;
+        // A file segment is alone in its ASDU, never in the sequence layout.
+        if (self.shape.base == .file_segment and (self.count != 0 or self.sq)) return error.TooManyObjects;
         if (@as(TimeKind, time) != self.shape.time) return error.UnsupportedTypeId;
 
         const isz: usize = self.params.ioa_size;
@@ -935,7 +1122,7 @@ pub const Builder = struct {
             self.len += isz;
         }
 
-        const esz = self.shape.size();
+        const esz = baseSize(element) + self.shape.time.size();
         if (self.len + esz > self.buf.len) return error.BufferTooSmall;
         const base_len = try encodeElement(element, self.buf[self.len..]);
         _ = try encodeTime(time, self.buf[self.len + base_len ..]);
@@ -1156,7 +1343,8 @@ test "decode rejects a short ASDU and an unmodelled type id" {
     // Type 200 has no element layout here.
     try testing.expectError(error.UnsupportedTypeId, decode(&[_]u8{ 200, 0x01, 0x06, 0x00, 0x2F, 0x00, 0, 0, 0, 0 }, default_params));
     try testing.expect(shapeOf(@fromBackingInt(@intCast(200))) == null);
-    try testing.expect(elementSize(@fromBackingInt(@intCast(126))) == null); // F_SC_NB_1, file transfer
+    try testing.expect(elementSize(@fromBackingInt(@intCast(128))) == null); // beyond the file-transfer ids
+    try testing.expectEqual(@as(?usize, 13), elementSize(.f_dr_ta_1));
 }
 
 test "element sizes match the standard for every modelled type" {

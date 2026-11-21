@@ -649,6 +649,156 @@ pub const Coi = struct {
     }
 };
 
+// ── file transfer (type ids 120-127) ───────────────────────────────────────
+
+/// Error code in the upper nibble of SCQ and AFQ (IEC 60870-5-101 §7.2.6.38,
+/// §7.2.6.40). Non-exhaustive.
+pub const FileError = enum(u4) {
+    default = 0,
+    memory_not_available = 1,
+    checksum_failed = 2,
+    unexpected_service = 3,
+    unexpected_file_name = 4,
+    unexpected_section_name = 5,
+    _,
+};
+
+/// What an SCQ asks for (lower nibble, §7.2.6.38).
+pub const ScqAction = enum(u4) {
+    default = 0,
+    select_file = 1,
+    request_file = 2,
+    deactivate_file = 3,
+    delete_file = 4,
+    select_section = 5,
+    request_section = 6,
+    deactivate_section = 7,
+    _,
+};
+
+/// SCQ — select and call qualifier of `F_SC_NA_1`.
+pub const Scq = struct {
+    action: ScqAction = .default,
+    err: FileError = .default,
+
+    pub fn toByte(self: Scq) u8 {
+        return @as(u8, @backingInt(self.action)) | (@as(u8, @backingInt(self.err)) << 4);
+    }
+
+    pub fn fromByte(b: u8) Scq {
+        return .{
+            .action = @fromBackingInt(@intCast(@as(u4, @truncate(b)))),
+            .err = @fromBackingInt(@intCast(@as(u4, @truncate(b >> 4)))),
+        };
+    }
+};
+
+/// LSQ — last section or segment qualifier of `F_LS_NA_1` (§7.2.6.37).
+pub const Lsq = enum(u8) {
+    unused = 0,
+    file_transfer_without_deactivation = 1,
+    file_transfer_with_deactivation = 2,
+    section_transfer_without_deactivation = 3,
+    section_transfer_with_deactivation = 4,
+    _,
+};
+
+/// What an AFQ acknowledges (lower nibble, §7.2.6.39).
+pub const AfqAction = enum(u4) {
+    unused = 0,
+    positive_file = 1,
+    negative_file = 2,
+    positive_section = 3,
+    negative_section = 4,
+    _,
+};
+
+/// AFQ — acknowledge file or section qualifier of `F_AF_NA_1`.
+pub const Afq = struct {
+    action: AfqAction = .unused,
+    err: FileError = .default,
+
+    pub fn toByte(self: Afq) u8 {
+        return @as(u8, @backingInt(self.action)) | (@as(u8, @backingInt(self.err)) << 4);
+    }
+
+    pub fn fromByte(b: u8) Afq {
+        return .{
+            .action = @fromBackingInt(@intCast(@as(u4, @truncate(b)))),
+            .err = @fromBackingInt(@intCast(@as(u4, @truncate(b >> 4)))),
+        };
+    }
+};
+
+/// FRQ — file ready qualifier (§7.2.6.34): a seven-bit qualifier (0 = default)
+/// and the CON bit, set for a negative confirmation of select/request.
+pub const Frq = struct {
+    qualifier: u7 = 0,
+    negative: bool = false,
+
+    pub fn toByte(self: Frq) u8 {
+        return @as(u8, self.qualifier) | (if (self.negative) @as(u8, 0x80) else 0);
+    }
+
+    pub fn fromByte(b: u8) Frq {
+        return .{ .qualifier = @truncate(b), .negative = b & 0x80 != 0 };
+    }
+};
+
+/// SRQ — section ready qualifier (§7.2.6.35): a seven-bit qualifier (0 =
+/// default) and the not-ready bit.
+pub const Srq = struct {
+    qualifier: u7 = 0,
+    not_ready: bool = false,
+
+    pub fn toByte(self: Srq) u8 {
+        return @as(u8, self.qualifier) | (if (self.not_ready) @as(u8, 0x80) else 0);
+    }
+
+    pub fn fromByte(b: u8) Srq {
+        return .{ .qualifier = @truncate(b), .not_ready = b & 0x80 != 0 };
+    }
+};
+
+/// SOF — status of file (§7.2.6.38), the status octet of a directory entry.
+pub const Sof = struct {
+    /// Five-bit status, 0 = default.
+    status: u5 = 0,
+    /// LFD — this is the last file of the directory.
+    last_file: bool = false,
+    /// FOR — the name denotes a subdirectory, not a file.
+    is_directory: bool = false,
+    /// FA — the file's transfer is active (0: it waits for transfer).
+    active: bool = false,
+
+    pub fn toByte(self: Sof) u8 {
+        return @as(u8, self.status) |
+            (if (self.last_file) @as(u8, 0x20) else 0) |
+            (if (self.is_directory) @as(u8, 0x40) else 0) |
+            (if (self.active) @as(u8, 0x80) else 0);
+    }
+
+    pub fn fromByte(b: u8) Sof {
+        return .{
+            .status = @truncate(b),
+            .last_file = b & 0x20 != 0,
+            .is_directory = b & 0x40 != 0,
+            .active = b & 0x80 != 0,
+        };
+    }
+};
+
+/// Reads a three-octet little-endian length (LOF, LOS of a section).
+pub fn readU24(bytes: []const u8) u32 {
+    return @as(u32, bytes[0]) | (@as(u32, bytes[1]) << 8) | (@as(u32, bytes[2]) << 16);
+}
+
+pub fn writeU24(out: []u8, v: u32) void {
+    out[0] = @truncate(v);
+    out[1] = @truncate(v >> 8);
+    out[2] = @truncate(v >> 16);
+}
+
 // ── little-endian scalar helpers ────────────────────────────────────────────
 
 /// Reads an IEEE-754 short float (§7.2.6.8) — four little-endian octets.
@@ -698,6 +848,26 @@ pub fn writeU16(out: []u8, v: u16) void {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "file transfer qualifiers: bit layout and round trip" {
+    try testing.expectEqual(@as(u8, 0x12), (Scq{ .action = .request_file, .err = @fromBackingInt(1) }).toByte());
+    try testing.expectEqual(ScqAction.request_section, Scq.fromByte(0x06).action);
+    try testing.expectEqual(@as(u8, 0x23), (Afq{ .action = .positive_section, .err = .checksum_failed }).toByte());
+    try testing.expectEqual(FileError.unexpected_section_name, Afq.fromByte(0x54).err);
+    try testing.expectEqual(AfqAction.negative_section, Afq.fromByte(0x54).action);
+    try testing.expectEqual(@as(u8, 0x80), (Frq{ .negative = true }).toByte());
+    try testing.expectEqual(@as(u8, 0x85), (Srq{ .qualifier = 5, .not_ready = true }).toByte());
+    try testing.expect(Frq.fromByte(0x81).negative);
+    try testing.expect(Srq.fromByte(0x80).not_ready);
+    const sof = Sof{ .status = 3, .last_file = true, .active = true };
+    try testing.expectEqual(@as(u8, 0xA3), sof.toByte());
+    try testing.expectEqual(sof, Sof.fromByte(0xA3));
+    try testing.expect(Sof.fromByte(0x40).is_directory);
+    var b: [3]u8 = undefined;
+    writeU24(&b, 0x010203);
+    try testing.expectEqualSlices(u8, &[_]u8{ 3, 2, 1 }, &b);
+    try testing.expectEqual(@as(u32, 0x010203), readU24(&b));
+}
 const fz = @import("fuzz_test.zig");
 
 test "quality descriptor bit positions and round-trip" {

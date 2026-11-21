@@ -364,6 +364,14 @@ test "asdu: the shape table matches the standard, type by type" {
         .{ .id = 111, .base = .parameter, .time = .none, .size = 3 },
         .{ .id = 112, .base = .parameter_float, .time = .none, .size = 5 },
         .{ .id = 113, .base = .qrp, .time = .none, .size = 1 },
+        .{ .id = 120, .base = .file_ready, .time = .none, .size = 6 },
+        .{ .id = 121, .base = .section_ready, .time = .none, .size = 7 },
+        .{ .id = 122, .base = .file_call, .time = .none, .size = 4 },
+        .{ .id = 123, .base = .file_last, .time = .none, .size = 5 },
+        .{ .id = 124, .base = .file_ack, .time = .none, .size = 4 },
+        .{ .id = 125, .base = .file_segment, .time = .none, .size = 4 },
+        .{ .id = 126, .base = .file_directory, .time = .cp56, .size = 13 },
+        .{ .id = 127, .base = .query_log, .time = .none, .size = 16 },
     };
     for (rows) |r| {
         const t: asdu.TypeId = @fromBackingInt(r.id);
@@ -373,8 +381,8 @@ test "asdu: the shape table matches the standard, type by type" {
         try testing.expectEqual(r.size, sh.size());
         try testing.expectEqual(@as(?usize, r.size), asdu.elementSize(t));
     }
-    // Not modelled: file transfer, the unused ids.
-    for ([_]u8{ 0, 22, 29, 41, 120, 127, 200 }) |id| {
+    // Not modelled: the unused ids.
+    for ([_]u8{ 0, 22, 29, 41, 128, 200 }) |id| {
         try testing.expectEqual(@as(?asdu.Shape, null), asdu.shapeOf(@fromBackingInt(id)));
     }
 }

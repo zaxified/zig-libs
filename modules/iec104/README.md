@@ -156,9 +156,16 @@ what is third-party-validated versus self-derived.
 recent `STARTDT` wins; groups by client address); `ft12` frames and splits IEC 60870-5-101 serial link frames (FT1.2).
 See SPEC *Redundancy groups and the serial link layer*.
 
+## File transfer
+
+`Client.requestDirectory`, `queryLog`, `fetchFile(ca, nof, sink, now)` and `sendFile(ca, nof, source, section_len, now)`
+start a transfer, `poll` drives it and `takeFileResult` reports how it ended; `Outstation` serves `Options.files`
+and accepts into `Options.file_sink`. The engines (`file.Sender`, `file.Receiver`) are usable without either. See SPEC
+*File transfer (type ids 120-127)*.
+
 ## Not provided
 
-File transfer (type ids 120–127) is open (SPEC *Backlog / deferred*); typed parameter loading (the
+Typed parameter loading (the
 QPM/QPA qualifiers are raw octets, the outstation has no parameter store),
 `C_CD_NA_1` on the outstation and automatic background scan are limits (SPEC
 *Known limits*); TLS is bring-your-own and a few third-party quirks are

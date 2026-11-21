@@ -22,6 +22,7 @@ const apci = @import("apci.zig");
 const asdu_mod = @import("asdu.zig");
 const info = @import("info.zig");
 const state = @import("state.zig");
+const file = @import("file.zig");
 const transport_mod = @import("transport.zig");
 
 // Skip diagnostics are opt-in: `zig build test` must be silent on
@@ -51,7 +52,12 @@ pub const Options = struct {
     test_mode: bool = false,
 };
 
-pub const Error = TransportError || state.Error || asdu_mod.Error || apci.FramerError || apci.EncodeError;
+pub const Error = error{
+    /// `fetchFile` / `sendFile` while a transfer of that kind is running.
+    FileTransferBusy,
+    /// `sendFile`: the source has no such file.
+    FileNotFound,
+} || TransportError || state.Error || asdu_mod.Error || apci.FramerError || apci.EncodeError;
 
 /// What one `poll` produced.
 pub const Incoming = union(enum) {
@@ -85,6 +91,12 @@ pub const Client = struct {
     tx_asdu: [apci.max_asdu_len]u8 = undefined,
     /// Scratch for one stream read.
     rx_chunk: [apci.max_apdu_len]u8 = undefined,
+    /// File transfer engines (`fetchFile`, `sendFile`) and the one ASDU they
+    /// have built that the send window has not yet taken.
+    file_rx: ?file.Receiver = null,
+    file_tx: ?file.Sender = null,
+    file_out: [apci.max_asdu_len]u8 = undefined,
+    file_out_len: usize = 0,
 
     /// `frame_buf` must hold at least `apci.max_apdu_len` octets; twice that
     /// lets a single read carry more than one frame without a compaction.
@@ -232,6 +244,112 @@ pub const Client = struct {
         try self.send(type_id, .activation, common_address, ioa, element, time, now);
     }
 
+    // ── file transfer (type ids 120-127) ────────────────────────────────────
+
+    /// Asks the station `common_address` for its directory (`F_SC_NA_1`,
+    /// NOF 0). The answer is one `F_DR_TA_1` ASDU per file, each arriving
+    /// as `Incoming.asdu`; the last has `sof.last_file` set.
+    pub fn requestDirectory(self: *Client, common_address: u16, now: u64) Error!void {
+        var buf: [apci.max_asdu_len]u8 = undefined;
+        try self.sendAsdu(try file.buildDirectoryRequest(self.fileConfig(common_address), &buf), now);
+    }
+
+    /// Asks for the files of one time range (`F_SC_NB_1`, "query log").
+    pub fn queryLog(self: *Client, common_address: u16, nof: u16, start: info.CP56Time2a, stop: info.CP56Time2a, now: u64) Error!void {
+        var buf: [apci.max_asdu_len]u8 = undefined;
+        try self.sendAsdu(try file.buildQueryLog(self.fileConfig(common_address), nof, start, stop, &buf), now);
+    }
+
+    /// Starts reading file `nof` from the station `common_address` into
+    /// `sink`: sends the select, then every further step is driven by what
+    /// `poll` receives. `error.FileTransferBusy` while another read runs.
+    /// `takeFileResult` reports how it ended.
+    pub fn fetchFile(self: *Client, common_address: u16, nof: u16, sink: file.Sink, now: u64) Error!void {
+        if (self.file_rx) |r| if (r.busy()) return error.FileTransferBusy;
+        var r = file.Receiver.init(self.fileConfig(common_address), sink);
+        _ = r.fetch(nof);
+        self.file_rx = r;
+        try self.pumpFiles(now);
+    }
+
+    /// Offers file `nof` of `source` to the station `common_address` (`F_FR_NA_1`);
+    /// the station calls it section by section as `poll` runs. The station
+    /// decides whether it takes the file. `error.FileTransferBusy` while
+    /// another send runs, `error.FileNotFound` when `source` has no such file.
+    pub fn sendFile(self: *Client, common_address: u16, nof: u16, source: file.Source, section_len: u32, now: u64) Error!void {
+        if (self.file_tx) |s| if (s.busy()) return error.FileTransferBusy;
+        var s = file.Sender.init(self.fileConfig(common_address), source);
+        s.section_len = section_len;
+        if (!s.offer(nof)) return error.FileNotFound;
+        self.file_tx = s;
+        try self.pumpFiles(now);
+    }
+
+    /// How the last file transfer ended, once; null while none has.
+    pub fn takeFileResult(self: *Client) ?file.Result {
+        if (self.file_rx) |*r| if (r.result) |x| {
+            r.result = null;
+            return x;
+        };
+        if (self.file_tx) |*s| if (s.result) |x| {
+            s.result = null;
+            return x;
+        };
+        return null;
+    }
+
+    /// Drops the file transfers in progress (a timeout of the caller's).
+    pub fn abortFiles(self: *Client) void {
+        if (self.file_rx) |*r| r.abort();
+        if (self.file_tx) |*s| s.abort();
+        self.file_out_len = 0;
+    }
+
+    fn fileConfig(self: *const Client, common_address: u16) file.Config {
+        return .{ .params = self.opts.params, .common_address = common_address, .originator = self.opts.originator };
+    }
+
+    /// Sends what the engines want to say, as far as the send window allows;
+    /// the rest waits for the next `poll`.
+    fn pumpFiles(self: *Client, now: u64) Error!void {
+        while (true) {
+            if (self.file_out_len == 0) {
+                const b = try self.nextFileAsdu() orelse return;
+                self.file_out_len = b.len;
+            }
+            self.sendAsdu(self.file_out[0..self.file_out_len], now) catch |e| switch (e) {
+                error.SendWindowFull => return,
+                else => return e,
+            };
+            self.file_out_len = 0;
+        }
+    }
+
+    fn nextFileAsdu(self: *Client) Error!?[]u8 {
+        if (self.file_rx) |*r| if (try r.next(&self.file_out)) |b| return b;
+        if (self.file_tx) |*s| if (try s.next(&self.file_out)) |b| return b;
+        return null;
+    }
+
+    fn onFileAsdu(self: *Client, a: asdu_mod.Asdu, now: u64) Error!void {
+        const t = a.header.type_id;
+        const rx_for_us = if (self.file_rx) |r| r.cfg.common_address == a.header.common_address else false;
+        const tx_for_us = if (self.file_tx) |s| s.cfg.common_address == a.header.common_address else false;
+        switch (t) {
+            .f_fr_na_1, .f_sr_na_1, .f_ls_na_1, .f_sg_na_1 => if (rx_for_us) try self.file_rx.?.onAsdu(a),
+            .f_sc_na_1, .f_sc_nb_1 => if (tx_for_us) try self.file_tx.?.onAsdu(a),
+            .f_af_na_1 => {
+                if (tx_for_us and self.file_tx.?.busy()) {
+                    try self.file_tx.?.onAsdu(a);
+                } else if (rx_for_us and self.file_rx.?.busy()) {
+                    try self.file_rx.?.onAsdu(a);
+                }
+            },
+            else => {},
+        }
+        try self.pumpFiles(now);
+    }
+
     // ── receiving ───────────────────────────────────────────────────────────
 
     /// Advances the connection by one step: performs any timer-driven writes,
@@ -251,6 +369,9 @@ pub const Client = struct {
                 .send_u => |f| try self.writeU(f),
             }
         }
+
+        // 1b. A file ASDU the send window could not take earlier.
+        if (self.file_out_len != 0) try self.pumpFiles(now);
 
         // 2. Anything already framed?
         if (try self.framer.next()) |apdu| return try self.dispatch(apdu, now);
@@ -287,7 +408,9 @@ pub const Client = struct {
                 if (asdu_mod.shapeOf(header.type_id) == null) {
                     break :blk .{ .unsupported_asdu = header };
                 }
-                break :blk .{ .asdu = try asdu_mod.decode(body, self.opts.params) };
+                const a = try asdu_mod.decode(body, self.opts.params);
+                if (header.type_id.isFileTransfer()) try self.onFileAsdu(a, now);
+                break :blk .{ .asdu = a };
             },
         };
     }
