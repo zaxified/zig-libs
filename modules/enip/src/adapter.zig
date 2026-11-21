@@ -18,6 +18,8 @@
 //!   wrapper it unwraps and re-dispatches;
 //! * `SendUnitData` on a connection opened by `Forward_Open` /
 //!   `Large_Forward_Open`, with the sequence count echoed;
+//! * **implicit I/O** (transport class 0/1 `Forward_Open` over `Config.assemblies`,
+//!   `ioReceive` / `ioPoll`, over the `implicit` engine);
 //! * on the Message Router: `Get_Attributes_All` and `Get_Attribute_Single`
 //!   on the Identity object, `Multiple_Service_Packet`, and the Logix tag
 //!   services `Read Tag`, `Write Tag`, `Read Tag Fragmented` and
@@ -74,6 +76,7 @@ const epath = @import("epath.zig");
 const connmgr = @import("connmgr.zig");
 const types = @import("types.zig");
 const stdobj = @import("stdobj.zig");
+const implicit = @import("implicit.zig");
 
 pub const Error = error{
     /// The request could not be parsed far enough to answer it at all.
@@ -230,6 +233,36 @@ pub const Config = struct {
     max_reply: usize = 4000,
     /// `Reset` reboots a real device. Refused unless this is set.
     allow_reset: bool = false,
+    /// The group addresses given to a `Forward_Open` whose target-to-originator
+    /// connection is **multicast** (the TCP/IP Interface object's
+    /// `Num_Mcast` / `Mcast_Start_Addr`), handed out round-robin.
+    io_multicast: implicit.MulticastPool = .{},
+};
+
+/// One datagram `ioPoll` has for the network.
+pub const IoDatagram = struct {
+    /// Where to send it. `null`: to the originator's host (the peer of the
+    /// TCP session that opened the connection, which only the caller knows),
+    /// UDP port 2222.
+    to: ?encap.SocketAddress,
+    /// Sent to a multicast group (`to` is that group).
+    multicast: bool,
+    bytes: []const u8,
+};
+
+/// What `ioReceive` did with a datagram.
+pub const IoReceived = union(enum) {
+    /// Not for any open I/O connection (or not an I/O datagram).
+    unknown_connection,
+    /// New data was written into the consuming assembly.
+    applied: struct { connection_id: u32, missed: u32 },
+    /// New data under an **Idle** header: the assembly was left alone.
+    idle: struct { connection_id: u32 },
+    /// The same data again; the watchdog was restarted.
+    heartbeat: struct { connection_id: u32 },
+    /// Refused by the connection (stale, malformed, closed) or by the size
+    /// check (`wrong_size`).
+    dropped: struct { connection_id: u32, reason: enum { stale, malformed, closed, wrong_size } },
 };
 
 /// An open Class 3 connection.
@@ -240,6 +273,19 @@ const OpenConnection = struct {
     serial: u16 = 0,
     vendor: u16 = 0,
     originator_serial: u32 = 0,
+    /// The implicit (Class 0/1) engine, when this connection carries I/O.
+    io: ?implicit.Connection = null,
+    /// The assemblies the I/O connection consumes (O→T) and produces (T→O).
+    consume_asm: ?u16 = null,
+    produce_asm: ?u16 = null,
+    /// An Idle header, or the size, is checked against these.
+    consume_len: usize = 0,
+    produce_len: usize = 0,
+    /// The T→O destination the originator asked for, or the multicast group.
+    dest: ?encap.SocketAddress = null,
+    multicast: bool = false,
+    /// A hash of the last data produced, for change-of-state triggers.
+    last_hash: u64 = 0,
 };
 
 pub const Adapter = struct {
@@ -259,9 +305,24 @@ pub const Adapter = struct {
     reset_requested: bool = false,
     /// What `Set_Attribute_Single` changed on the TCP/IP Interface object.
     tcpip_state: stdobj.TcpIpState = .{},
+    /// Implicit I/O counters: datagrams consumed and produced, connections
+    /// closed by their watchdog.
+    io_consumed: u64 = 0,
+    io_produced: u64 = 0,
+    io_timeouts: u64 = 0,
+    io_multicast: implicit.MulticastPool,
+    /// The Sockaddr Info (T→O) item of the `SendRRData` being served, and the
+    /// one its reply must carry.
+    rr_t_to_o: ?encap.SocketAddress = null,
+    rr_reply_sockaddr: ?encap.SocketAddress = null,
+    /// The time the engines were last told, so that a connection opened by
+    /// `Forward_Open` starts its watchdog and its first production from it.
+    /// `ioReceive` and `ioPoll` keep it current; before the first call it is
+    /// 0, which is only right when the caller's clock starts there.
+    io_now_us: u64 = 0,
 
     pub fn init(cfg: Config, tags: []const TagBinding) Adapter {
-        return .{ .cfg = cfg, .tags = tags };
+        return .{ .cfg = cfg, .tags = tags, .io_multicast = cfg.io_multicast };
     }
 
     fn identity(self: *const Adapter) encap.Identity {
@@ -392,7 +453,8 @@ pub const Adapter = struct {
         if (command == .send_unit_data) {
             const id = cpf.connectionId(addr) catch return error.Malformed;
             const conn = self.findConnection(id) orelse return error.Malformed;
-            _ = conn;
+            // An I/O connection speaks UDP 2222, not SendUnitData.
+            if (conn.io != null) return error.Malformed;
             const cd = cpf.ConnectedData.decode(data_item) catch return error.Malformed;
             const reply = try self.messageRouter(cd.payload, &scratch);
             var body_buf: [4096]u8 = undefined;
@@ -405,9 +467,19 @@ pub const Adapter = struct {
                 error.BufferTooSmall;
         }
 
+        self.rr_t_to_o = null;
+        if (env.list.find(.sockaddr_info_t_to_o)) |it| self.rr_t_to_o = cpf.socketAddress(it) catch null;
+        self.rr_reply_sockaddr = null;
         const reply = try self.messageRouter(data_item.data, &scratch);
-        const items = cpf.unconnectedItems(reply);
-        return cpf.encodeEnvelope(cpf.cip_interface_handle, env.timeout, &items, out) catch
+        const base = cpf.unconnectedItems(reply);
+        if (self.rr_reply_sockaddr) |sa| {
+            var sa_buf: [encap.SocketAddress.encoded_len]u8 = undefined;
+            const sa_bytes = sa.encode(&sa_buf) catch return error.BufferTooSmall;
+            const items = [_]cpf.Item{ base[0], base[1], .{ .type_id = .sockaddr_info_t_to_o, .data = sa_bytes } };
+            return cpf.encodeEnvelope(cpf.cip_interface_handle, env.timeout, &items, out) catch
+                error.BufferTooSmall;
+        }
+        return cpf.encodeEnvelope(cpf.cip_interface_handle, env.timeout, &base, out) catch
             error.BufferTooSmall;
     }
 
@@ -517,6 +589,8 @@ pub const Adapter = struct {
                 // Room for the reply is checked before a slot is taken, so a
                 // reply that cannot be built leaves no connection behind.
                 if (out.len < 4 + connmgr.ForwardOpenReply.fixed_len) return error.BufferTooSmall;
+                // Transport class 0 and 1 carry implicit I/O over UDP.
+                if (fo.transport_class.class <= 1) return self.openIo(req.service, fo, out);
                 const slot = self.freeConnection() orelse
                     return extendedErrorReply(
                         req.service,
@@ -568,6 +642,7 @@ pub const Adapter = struct {
                         c.originator_serial == fc.originator_serial)
                     {
                         c.in_use = false;
+                        c.io = null;
                         found = true;
                     }
                 }
@@ -595,6 +670,244 @@ pub const Adapter = struct {
             },
             else => return errorReply(req.service, .service_not_supported, out),
         }
+    }
+
+    // ── implicit (Class 0/1) I/O ───────────────────────────────────────────
+
+    fn ioRefusal(service: u8, status: connmgr.ExtendedStatus, out: []u8) Error![]const u8 {
+        return extendedErrorReply(service, .connection_failure, @backingInt(status), out);
+    }
+
+    /// The octets a consumed or produced packet carries around an assembly's
+    /// data for a connection of this class: the 16-bit count of Class 1 and,
+    /// when `header`, the 32-bit Run/Idle header.
+    fn ioOverhead(class: implicit.TransportClass, header: bool) usize {
+        return (if (class == .class1) @as(usize, 2) else 0) + (if (header) @as(usize, 4) else 0);
+    }
+
+    /// A `Forward_Open` of transport class 0 or 1 (clause 3-5 of Vol 1): the
+    /// connection path names a configuration assembly and the connection
+    /// points this end consumes (the first) and produces (the second); a
+    /// single connection point serves the one direction the parameters leave
+    /// non-null. The sizes must be an assembly's size plus the count and the
+    /// optional header, and say whether the header is there.
+    fn openIo(self: *Adapter, svc: u8, fo: connmgr.ForwardOpen, out: []u8) Error![]const u8 {
+        const tc = fo.transport_class;
+        if (tc.class > 1 or tc.trigger > 2) return ioRefusal(svc, .transport_class_trigger_not_supported, out);
+        const class: implicit.TransportClass = if (tc.class == 1) .class1 else .class0;
+        const trigger: implicit.Trigger = @fromBackingInt(tc.trigger);
+        if (fo.o_to_t_rpi == 0 or fo.t_to_o_rpi == 0) return ioRefusal(svc, .rpi_not_supported, out);
+        const o_null = fo.o_to_t_params.connection_type == .null_connection;
+        const t_null = fo.t_to_o_params.connection_type == .null_connection;
+        if (o_null and t_null) return ioRefusal(svc, .invalid_connection_type, out);
+        if (fo.o_to_t_params.connection_type == .reserved or fo.t_to_o_params.connection_type == .reserved)
+            return ioRefusal(svc, .invalid_connection_type, out);
+
+        // The path: class 0x04, then instance (configuration) and the
+        // connection points, in order.
+        var points: [2]u32 = undefined;
+        var npoints: usize = 0;
+        var saw_class = false;
+        var it = epath.Iterator.init(fo.connection_path);
+        while (it.next() catch return ioRefusal(svc, .invalid_segment_in_connection_path, out)) |seg| switch (seg) {
+            .logical => |l| switch (l.what) {
+                .class => saw_class = l.value == @backingInt(cip.ClassCode.assembly),
+                .connection_point => {
+                    if (npoints == points.len) return ioRefusal(svc, .invalid_produced_or_consumed_path, out);
+                    points[npoints] = l.value;
+                    npoints += 1;
+                },
+                else => {},
+            },
+            else => {},
+        };
+        if (!saw_class or npoints == 0) return ioRefusal(svc, .invalid_produced_or_consumed_path, out);
+        var consume: ?u16 = null;
+        var produce: ?u16 = null;
+        if (npoints == 2) {
+            if (!o_null) consume = @intCast(@min(points[0], 0xFFFF));
+            if (!t_null) produce = @intCast(@min(points[1], 0xFFFF));
+        } else if (o_null) {
+            produce = @intCast(@min(points[0], 0xFFFF));
+        } else if (t_null) {
+            consume = @intCast(@min(points[0], 0xFFFF));
+        } else {
+            return ioRefusal(svc, .invalid_produced_or_consumed_path, out);
+        }
+        var consume_len: usize = 0;
+        var produce_len: usize = 0;
+        var consume_header = false;
+        var produce_header = false;
+        if (consume) |id| {
+            const a = stdobj.assemblyFind(self.cfg.assemblies, id) orelse
+                return ioRefusal(svc, .invalid_produced_or_consumed_path, out);
+            if (!a.writable) return ioRefusal(svc, .invalid_produced_or_consumed_path, out);
+            consume_len = a.data.len;
+            const size: usize = fo.o_to_t_params.size;
+            if (size == consume_len + ioOverhead(class, false)) {
+                consume_header = false;
+            } else if (size == consume_len + ioOverhead(class, true)) {
+                consume_header = true;
+            } else {
+                return ioRefusal(svc, .invalid_connection_size, out);
+            }
+        }
+        if (produce) |id| {
+            const a = stdobj.assemblyFind(self.cfg.assemblies, id) orelse
+                return ioRefusal(svc, .invalid_produced_or_consumed_path, out);
+            produce_len = a.data.len;
+            const size: usize = fo.t_to_o_params.size;
+            if (size == produce_len + ioOverhead(class, false)) {
+                produce_header = false;
+            } else if (size == produce_len + ioOverhead(class, true)) {
+                produce_header = true;
+            } else {
+                return ioRefusal(svc, .invalid_connection_size, out);
+            }
+        }
+        const slot = self.freeConnection() orelse return ioRefusal(svc, .connection_limit_reached, out);
+
+        const o_t = self.next_connection_id;
+        self.next_connection_id +%= 1;
+        var t_o = self.next_connection_id;
+        self.next_connection_id +%= 1;
+        const multicast = fo.t_to_o_params.connection_type == .multicast;
+        var dest: ?encap.SocketAddress = null;
+        if (multicast) {
+            const group = self.io_multicast.take() orelse return ioRefusal(svc, .no_available_link_consumer, out);
+            dest = .{ .port = encap.io_udp_port, .addr = group };
+            self.rr_reply_sockaddr = dest;
+        } else {
+            // Point to point: the originator names the T→O connection id,
+            // and may name the address it wants the data sent to.
+            if (fo.t_to_o_connection_id != 0) t_o = fo.t_to_o_connection_id;
+            dest = self.rr_t_to_o;
+        }
+        slot.* = .{
+            .in_use = true,
+            .o_to_t_id = o_t,
+            .t_to_o_id = t_o,
+            .serial = fo.connection_serial,
+            .vendor = fo.originator_vendor_id,
+            .originator_serial = fo.originator_serial,
+            .io = implicit.Connection.init(.{
+                .class = class,
+                .trigger = trigger,
+                .produce_id = t_o,
+                .consume_id = o_t,
+                .produce_rpi_us = fo.t_to_o_rpi,
+                .consume_rpi_us = fo.o_to_t_rpi,
+                .timeout_multiplier = fo.connection_timeout_multiplier,
+                .produce_header = produce_header,
+                .consume_header = consume_header,
+                .consume_len = if (consume != null) consume_len else null,
+            }, self.io_now_us),
+            .consume_asm = consume,
+            .produce_asm = produce,
+            .consume_len = consume_len,
+            .produce_len = produce_len,
+            .dest = dest,
+            .multicast = multicast,
+        };
+        var body: [64]u8 = undefined;
+        const encoded = (connmgr.ForwardOpenReply{
+            .o_to_t_connection_id = o_t,
+            .t_to_o_connection_id = t_o,
+            .connection_serial = fo.connection_serial,
+            .originator_vendor_id = fo.originator_vendor_id,
+            .originator_serial = fo.originator_serial,
+            .o_to_t_api = fo.o_to_t_rpi,
+            .t_to_o_api = fo.t_to_o_rpi,
+            .application_reply = &.{},
+        }).encode(&body) catch return error.BufferTooSmall;
+        return (cip.Reply{
+            .service = svc,
+            .general_status = .success,
+            .additional_status = &.{},
+            .data = encoded,
+        }).encode(out) catch error.BufferTooSmall;
+    }
+
+    fn findIo(self: *Adapter, connection_id: u32) ?*OpenConnection {
+        for (&self.connections) |*c| {
+            if (c.in_use and c.io != null and c.io.?.cfg.consume_id == connection_id) return c;
+        }
+        return null;
+    }
+
+    /// Takes one datagram that arrived on UDP 2222 (or on a multicast group
+    /// the caller joined) at `now_us`. New data is written into the
+    /// connection's consuming assembly and its `after_set` hook runs; data
+    /// under an Idle header is not applied.
+    pub fn ioReceive(self: *Adapter, now_us: u64, datagram: []const u8) IoReceived {
+        self.io_now_us = now_us;
+        var storage: [4]cpf.Item = undefined;
+        const list = cpf.decode(datagram, &storage) catch return .unknown_connection;
+        const addr = cpf.SequencedAddress.decode(list.addressItem() orelse return .unknown_connection) catch
+            return .unknown_connection;
+        const c = self.findIo(addr.connection_id) orelse return .unknown_connection;
+        const id = addr.connection_id;
+        switch (c.io.?.receive(now_us, datagram)) {
+            .dropped => |why| return .{ .dropped = .{ .connection_id = id, .reason = switch (why) {
+                .closed => .closed,
+                .stale => .stale,
+                .wrong_size => .wrong_size,
+                else => .malformed,
+            } } },
+            .heartbeat => return .{ .heartbeat = .{ .connection_id = id } },
+            .data => |d| {
+                const a = stdobj.assemblyFind(self.cfg.assemblies, c.consume_asm orelse return .unknown_connection) orelse
+                    return .unknown_connection;
+                if (!d.run) return .{ .idle = .{ .connection_id = id } };
+                @memcpy(a.data, d.payload);
+                if (a.after_set) |hook| _ = hook(a.ctx, a.data);
+                self.io_consumed += 1;
+                return .{ .applied = .{ .connection_id = id, .missed = d.missed } };
+            },
+        }
+    }
+
+    /// The next datagram an I/O connection has due, built into `out`; call it
+    /// until it returns `null`. It also retires every connection whose
+    /// watchdog ran out (`io_timeouts`), so call it on a timer as well as
+    /// after receiving; `ioNextDueUs` says when.
+    pub fn ioPoll(self: *Adapter, now_us: u64, out: []u8) ?IoDatagram {
+        self.io_now_us = now_us;
+        for (&self.connections) |*c| {
+            if (!c.in_use) continue;
+            const io = &(c.io orelse continue);
+            if (io.check(now_us) != null) {
+                c.in_use = false;
+                c.io = null;
+                self.io_timeouts += 1;
+                continue;
+            }
+            const pid = c.produce_asm orelse continue;
+            const a = stdobj.assemblyFind(self.cfg.assemblies, pid) orelse continue;
+            if (a.before_get) |hook| hook(a.ctx, a.data);
+            const h = std.hash.Wyhash.hash(0, a.data);
+            const changed = h != c.last_hash;
+            const bytes = io.produce(now_us, a.data, changed, true, out) catch continue;
+            if (bytes) |b| {
+                c.last_hash = h;
+                self.io_produced += 1;
+                return .{ .to = c.dest, .multicast = c.multicast, .bytes = b };
+            }
+        }
+        return null;
+    }
+
+    /// The earliest time `ioPoll` has something to do, or `null` when no I/O
+    /// connection is open.
+    pub fn ioNextDueUs(self: *const Adapter) ?u64 {
+        var best: ?u64 = null;
+        for (self.connections) |c| {
+            if (!c.in_use) continue;
+            const io = c.io orelse continue;
+            const t = io.nextDueUs() orelse continue;
+            if (best == null or t < best.?) best = t;
+        }
+        return best;
     }
 
     fn freeConnection(self: *Adapter) ?*OpenConnection {

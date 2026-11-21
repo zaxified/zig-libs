@@ -3540,3 +3540,225 @@ test "template object: a definition too big for one reply continues through part
     try testing.expect(rounds > 0 and rounds < 10);
     try testing.expectEqualStrings("Pump;n", std.mem.sliceTo(all[24..got], 0));
 }
+
+// ── implicit (Class 0/1) I/O on the adapter ────────────────────────────────
+
+const IoRig = struct {
+    out_data: [4]u8 = @splat(0),
+    in_data: [6]u8 = .{ 1, 2, 3, 4, 5, 6 },
+    asms: [2]stdobj.Assembly = undefined,
+    after: usize = 0,
+    before: usize = 0,
+
+    fn afterSet(ctx: ?*anyopaque, _: []const u8) bool {
+        const self: *IoRig = @ptrCast(@alignCast(ctx.?));
+        self.after += 1;
+        return true;
+    }
+
+    fn beforeGet(ctx: ?*anyopaque, _: []u8) void {
+        const self: *IoRig = @ptrCast(@alignCast(ctx.?));
+        self.before += 1;
+    }
+
+    /// Instance 100 is the output assembly the scanner writes, 101 the input assembly it reads.
+    fn config(self: *IoRig) AdapterConfig {
+        self.asms = .{
+            .{ .instance = 100, .data = &self.out_data, .writable = true, .ctx = self, .after_set = afterSet },
+            .{ .instance = 101, .data = &self.in_data, .ctx = self, .before_get = beforeGet },
+        };
+        return .{ .assemblies = &self.asms };
+    }
+};
+
+fn ioForwardOpen(trigger: u3, class: u4, o_size: u16, t_size: u16, rpi: u32, mult: u8, t_type: connmgr.ConnectionType, path: []const u8, out: []u8) []const u8 {
+    return (connmgr.ForwardOpen{
+        .o_to_t_connection_id = 0,
+        .t_to_o_connection_id = 0x7700,
+        .connection_serial = 5,
+        .originator_vendor_id = 0x1234,
+        .originator_serial = 0xABCD,
+        .connection_timeout_multiplier = mult,
+        .o_to_t_rpi = rpi,
+        .o_to_t_params = .{ .size = o_size, .variable = false, .connection_type = .point_to_point },
+        .t_to_o_rpi = rpi,
+        .t_to_o_params = .{ .size = t_size, .variable = false, .connection_type = t_type },
+        .transport_class = .{ .server = true, .trigger = trigger, .class = class },
+        .connection_path = path,
+    }).wrap(out) catch unreachable;
+}
+
+const io_path = [_]u8{ 0x20, 0x04, 0x24, 0x01, 0x2C, 100, 0x2C, 101 };
+
+fn extendedOf(reply: []const u8) !u16 {
+    const r = try cip.Reply.decode(reply);
+    try testing.expectEqual(cip.GeneralStatus.connection_failure, r.general_status);
+    return std.mem.readInt(u16, r.additional_status[0..2], .little);
+}
+
+test "implicit I/O: a Class 1 connection moves an assembly each way, honours Idle, notices a gap, dies of silence" {
+    var rig: IoRig = .{};
+    var target = Adapter.init(rig.config(), &.{});
+    var rq: [256]u8 = undefined;
+    var out: [128]u8 = undefined;
+    // O→T: 4 octets + count + Run/Idle header = 10; T→O: 6 octets + count = 8.
+    const reply = try target.messageRouter(ioForwardOpen(0, 1, 10, 8, 10_000, 0, .point_to_point, &io_path, &rq), &out);
+    const fr = try connmgr.ForwardOpenReply.decode((try cip.Reply.decode(reply)).data);
+    try testing.expectEqual(@as(u32, 0x01000001), fr.o_to_t_connection_id);
+    // Point to point: the originator's own T→O connection id is kept.
+    try testing.expectEqual(@as(u32, 0x7700), fr.t_to_o_connection_id);
+    try testing.expect(target.connections[0].io != null);
+
+    // The originator's end of the same connection.
+    const cfg: implicit.Config = .{
+        .produce_id = fr.o_to_t_connection_id,
+        .consume_id = fr.t_to_o_connection_id,
+        .produce_rpi_us = 10_000,
+        .consume_rpi_us = 10_000,
+        .produce_header = true,
+    };
+    var orig = implicit.Connection.init(cfg, 0);
+    var dg: [64]u8 = undefined;
+
+    // The target produces at once: the input assembly, no header.
+    const first = target.ioPoll(0, &dg).?;
+    try testing.expectEqual(@as(?encap.SocketAddress, null), first.to);
+    try testing.expect(!first.multicast);
+    const got = orig.receive(0, first.bytes).data;
+    try testing.expectEqualSlices(u8, &rig.in_data, got.payload);
+    try testing.expectEqual(@as(usize, 1), rig.before);
+    // Nothing more before the next RPI; then the changed input still goes out on schedule.
+    try testing.expectEqual(@as(?adapter.IoDatagram, null), target.ioPoll(5_000, &dg));
+    rig.in_data[0] = 99;
+    try testing.expectEqualSlices(u8, &.{ 99, 2, 3, 4, 5, 6 }, orig.receive(10_000, target.ioPoll(10_000, &dg).?.bytes).data.payload);
+    try testing.expectEqual(@as(u64, 2), target.io_produced);
+
+    // Outputs: a Run datagram is applied and the after-set hook runs.
+    var o: [64]u8 = undefined;
+    var ev = target.ioReceive(11_000, (try orig.produce(0, &.{ 9, 8, 7, 6 }, false, true, &o)).?);
+    try testing.expectEqual(@as(u32, 0), ev.applied.missed);
+    try testing.expectEqualSlices(u8, &.{ 9, 8, 7, 6 }, &rig.out_data);
+    try testing.expectEqual(@as(usize, 1), rig.after);
+    // Idle: delivered, not applied.
+    ev = target.ioReceive(12_000, (try orig.produce(10_000, &.{ 1, 1, 1, 1 }, false, false, &o)).?);
+    try testing.expectEqual(fr.o_to_t_connection_id, ev.idle.connection_id);
+    try testing.expectEqualSlices(u8, &.{ 9, 8, 7, 6 }, &rig.out_data);
+    // A lost datagram is reported as missed.
+    _ = (try orig.produce(20_000, &.{ 0, 0, 0, 0 }, false, true, &o)).?;
+    ev = target.ioReceive(22_000, (try orig.produce(30_000, &.{ 5, 5, 5, 5 }, false, true, &o)).?);
+    try testing.expectEqual(@as(u32, 1), ev.applied.missed);
+    try testing.expectEqual(@as(u64, 2), target.io_consumed);
+    // A datagram of the wrong size is dropped and applies nothing.
+    var small = implicit.Connection.init(cfg, 0);
+    small.tx_seq = 100;
+    small.tx_count = 100;
+    ev = target.ioReceive(23_000, (try small.produce(0, &.{ 1, 2 }, false, true, &o)).?);
+    try testing.expectEqual(@as(@TypeOf(ev.dropped.reason), .wrong_size), ev.dropped.reason);
+    try testing.expectEqualSlices(u8, &.{ 5, 5, 5, 5 }, &rig.out_data);
+    // Another connection's, and garbage, are not ours.
+    try testing.expect(target.ioReceive(24_000, &.{ 1, 2, 3 }) == .unknown_connection);
+    var stranger = implicit.Connection.init(.{ .produce_id = 0xDEAD, .consume_id = 1, .produce_rpi_us = 1, .consume_rpi_us = 1 }, 0);
+    try testing.expect(target.ioReceive(24_000, (try stranger.produce(0, &.{ 1, 2, 3, 4 }, false, true, &o)).?) == .unknown_connection);
+
+    // The watchdog: 10 ms x 4 after the last valid datagram (22 ms) is 62 ms.
+    try testing.expectEqual(@as(u64, 20_000), target.ioNextDueUs().?);
+    _ = target.ioPoll(20_000, &dg);
+    _ = target.ioPoll(61_999, &dg);
+    try testing.expectEqual(@as(u64, 0), target.io_timeouts);
+    try testing.expectEqual(@as(?adapter.IoDatagram, null), target.ioPoll(62_000, &dg));
+    try testing.expectEqual(@as(u64, 1), target.io_timeouts);
+    try testing.expect(!target.connections[0].in_use);
+    try testing.expectEqual(@as(?u64, null), target.ioNextDueUs());
+    // The slot is free again for a new connection.
+    try testing.expect((try cip.Reply.decode(try target.messageRouter(ioForwardOpen(0, 1, 10, 8, 10_000, 0, .point_to_point, &io_path, &rq), &out))).general_status.isSuccess());
+}
+
+test "implicit I/O: Forward_Open refusals name the reason, and refuse before taking a slot" {
+    var rig: IoRig = .{};
+    var target = Adapter.init(rig.config(), &.{});
+    var rq: [256]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const ES = connmgr.ExtendedStatus;
+    // A size that is neither the assembly nor the assembly plus the header.
+    try testing.expectEqual(@backingInt(ES.invalid_connection_size), try extendedOf(try target.messageRouter(ioForwardOpen(0, 1, 11, 8, 10_000, 0, .point_to_point, &io_path, &rq), &out)));
+    try testing.expectEqual(@backingInt(ES.invalid_connection_size), try extendedOf(try target.messageRouter(ioForwardOpen(0, 1, 10, 9, 10_000, 0, .point_to_point, &io_path, &rq), &out)));
+    // An assembly that is not served, or the read-only one named as the consumed one.
+    const unknown = [_]u8{ 0x20, 0x04, 0x24, 0x01, 0x2C, 100, 0x2C, 77 };
+    try testing.expectEqual(@backingInt(ES.invalid_produced_or_consumed_path), try extendedOf(try target.messageRouter(ioForwardOpen(0, 1, 10, 8, 10_000, 0, .point_to_point, &unknown, &rq), &out)));
+    const swapped = [_]u8{ 0x20, 0x04, 0x24, 0x01, 0x2C, 101, 0x2C, 100 };
+    try testing.expectEqual(@backingInt(ES.invalid_produced_or_consumed_path), try extendedOf(try target.messageRouter(ioForwardOpen(0, 1, 8, 10, 10_000, 0, .point_to_point, &swapped, &rq), &out)));
+    // A path that does not name the Assembly class, and one that names no connection point.
+    const wrong_class = [_]u8{ 0x20, 0x02, 0x24, 0x01, 0x2C, 100, 0x2C, 101 };
+    try testing.expectEqual(@backingInt(ES.invalid_produced_or_consumed_path), try extendedOf(try target.messageRouter(ioForwardOpen(0, 1, 10, 8, 10_000, 0, .point_to_point, &wrong_class, &rq), &out)));
+    try testing.expectEqual(@backingInt(ES.invalid_produced_or_consumed_path), try extendedOf(try target.messageRouter(ioForwardOpen(0, 1, 10, 8, 10_000, 0, .point_to_point, &.{ 0x20, 0x04, 0x24, 0x01 }, &rq), &out)));
+    // A trigger that does not exist, and an RPI of nothing.
+    try testing.expectEqual(@backingInt(ES.transport_class_trigger_not_supported), try extendedOf(try target.messageRouter(ioForwardOpen(5, 1, 10, 8, 10_000, 0, .point_to_point, &io_path, &rq), &out)));
+    try testing.expectEqual(@backingInt(ES.rpi_not_supported), try extendedOf(try target.messageRouter(ioForwardOpen(0, 1, 10, 8, 0, 0, .point_to_point, &io_path, &rq), &out)));
+    for (target.connections) |c| try testing.expect(!c.in_use);
+    // Class 0 has no count: 4 and 6 octets, and the header makes it 8 and 10.
+    try testing.expect((try cip.Reply.decode(try target.messageRouter(ioForwardOpen(0, 0, 4, 6, 10_000, 0, .point_to_point, &io_path, &rq), &out))).general_status.isSuccess());
+    try testing.expect(!target.connections[0].io.?.cfg.consume_header);
+    try testing.expect((try cip.Reply.decode(try target.messageRouter(ioForwardOpen(0, 0, 8, 10, 10_000, 0, .point_to_point, &io_path, &rq), &out))).general_status.isSuccess());
+    try testing.expect(target.connections[1].io.?.cfg.consume_header and target.connections[1].io.?.cfg.produce_header);
+    // A Class 1 connection is not reachable through SendUnitData.
+    target.session_handle = 1;
+    var env: [64]u8 = undefined;
+    const id_le: [4]u8 = .{ 1, 0, 0, 1 };
+    const body = try cpf.ConnectedData.encode(1, &.{ 0x0E, 0x02, 0x20, 0x01, 0x24, 0x01 }, &env);
+    const items = cpf.connectedItems(&id_le, body);
+    var envb: [128]u8 = undefined;
+    const e = try cpf.encodeEnvelope(0, 0, &items, &envb);
+    var fb: [256]u8 = undefined;
+    const resp = (try target.handle(tapFrame(.send_unit_data, 1, e, &fb), &out)).?;
+    try testing.expectEqual(encap.Status.incorrect_data, (try encap.decode(resp)).status);
+}
+
+test "implicit I/O: change of state sends on change and heartbeats; multicast gets a group from the pool and the reply says which" {
+    var rig: IoRig = .{};
+    var cfg = rig.config();
+    cfg.io_multicast = .{ .start = .{ 239, 192, 1, 10 }, .count = 2 };
+    var target = Adapter.init(cfg, &.{});
+    target.session_handle = 1;
+    var rq: [256]u8 = undefined;
+    var fb: [512]u8 = undefined;
+    var out: [512]u8 = undefined;
+    // A multicast T→O connection, change-of-state, through SendRRData so the Sockaddr Info item can come back.
+    const fo = ioForwardOpen(1, 1, 10, 8, 20_000, 1, .multicast, &io_path, &rq);
+    const items = cpf.unconnectedItems(fo);
+    var envb: [512]u8 = undefined;
+    const resp = (try target.handle(tapFrame(.send_rr_data, 1, try cpf.encodeEnvelope(0, 0, &items, &envb), &fb), &out)).?;
+    var storage: [4]cpf.Item = undefined;
+    const env = try cpf.decodeEnvelope((try encap.decode(resp)).data, &storage);
+    const sa = try cpf.socketAddress(env.list.find(.sockaddr_info_t_to_o).?);
+    try testing.expectEqual([4]u8{ 239, 192, 1, 10 }, sa.addr);
+    try testing.expectEqual(@as(u16, 2222), sa.port);
+    const cr = try cip.Reply.decode(env.list.dataItem().?.data);
+    const fr = try connmgr.ForwardOpenReply.decode(cr.data);
+    // Multicast: the target names the connection id, not the originator's 0x7700.
+    try testing.expectEqual(@as(u32, 0x01000002), fr.t_to_o_connection_id);
+    // The second multicast connection gets the next group, the third wraps.
+    for ([_][4]u8{ .{ 239, 192, 1, 11 }, .{ 239, 192, 1, 10 } }, 0..) |want, i| {
+        var r2: [256]u8 = undefined;
+        const f2 = ioForwardOpen(1, 1, 10, 8, 20_000, 1, .multicast, &io_path, &r2);
+        const it2 = cpf.unconnectedItems(f2);
+        var e2: [512]u8 = undefined;
+        // Free the earlier ones' serials by varying nothing: slots are what limit, not serials.
+        const rs = (try target.handle(tapFrame(.send_rr_data, 1, try cpf.encodeEnvelope(0, 0, &it2, &e2), &fb), &out)).?;
+        var st: [4]cpf.Item = undefined;
+        const en = try cpf.decodeEnvelope((try encap.decode(rs)).data, &st);
+        try testing.expectEqual(want, (try cpf.socketAddress(en.list.find(.sockaddr_info_t_to_o).?)).addr);
+        _ = i;
+    }
+
+    // Change of state: the first datagram is the initial heartbeat, a change goes out at once, silence is repeated at the RPI.
+    var dg: [64]u8 = undefined;
+    const c0 = target.ioPoll(0, &dg).?;
+    try testing.expect(c0.multicast);
+    try testing.expectEqual([4]u8{ 239, 192, 1, 10 }, c0.to.?.addr);
+    _ = target.ioPoll(0, &dg); // the other two connections' first datagrams
+    _ = target.ioPoll(0, &dg);
+    try testing.expectEqual(@as(?adapter.IoDatagram, null), target.ioPoll(1_000, &dg));
+    rig.in_data[5] = 0xEE;
+    const changed = target.ioPoll(1_000 + 1, &dg);
+    try testing.expect(changed != null);
+}

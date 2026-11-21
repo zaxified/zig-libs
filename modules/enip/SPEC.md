@@ -26,8 +26,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [ottowayi/pycomm3](https://github.com/ottowayi/pycomm3) — **reference** (client) | Python | MIT | 520 | push 2025-12-22 | The tool Logix users reach for: tag read/write by name, and structures/UDTs returned with named members *(inferred from its docs; not re-read this run)*. Here a structure read returns handle + raw octets. |
-| [EIPStackGroup/OpENer](https://github.com/EIPStackGroup/OpENer) — **reference** (adapter) | C | "OpENer" BSD-style custom licence, API: NOASSERTION; source not read | 863 | v2.3 (2019-03-25), push 2026-09-04 | Adapter stack for I/O devices with implicit (Class 1) messaging and the standard object set; this module serves explicit messaging only and the Identity, Program Name, Symbol, TCP/IP Interface and Ethernet Link objects, plus the Assembly object when configured. |
-| [nimbuscontrols/EIPScanner](https://github.com/nimbuscontrols/EIPScanner) | C++ | MIT | 319 | 1.3.0 (2021-06-25), push 2024-11-26 | Scanner: explicit + point-to-point implicit messaging, discovery, File/Parameter/Identity objects (its README). Implicit I/O is what we lack. |
+| [EIPStackGroup/OpENer](https://github.com/EIPStackGroup/OpENer) — **reference** (adapter) | C | "OpENer" BSD-style custom licence, API: NOASSERTION; source not read | 863 | v2.3 (2019-03-25), push 2026-09-04 | Adapter stack for I/O devices with implicit (Class 1) messaging and the standard object set; this module serves explicit messaging and Class 0/1 implicit I/O over its assemblies (`implicit`), and the Identity, Program Name, Symbol, TCP/IP Interface and Ethernet Link objects, plus the Assembly object when configured. |
+| [nimbuscontrols/EIPScanner](https://github.com/nimbuscontrols/EIPScanner) | C++ | MIT | 319 | 1.3.0 (2021-06-25), push 2024-11-26 | Scanner: explicit + point-to-point implicit messaging, discovery, File/Parameter/Identity objects (its README). Its implicit messaging is originator-side; ours is the target-side engine and the adapter's I/O connections. |
 | [danomagnum/gologix](https://github.com/danomagnum/gologix) | Go | MIT | 73 | v0.42.0-beta (2026-09-17) | Go Logix client, beta. Not read. |
 | [pjkundert/cpppo](https://github.com/pjkundert/cpppo) | Python | NOASSERTION per API (dual GPL/commercial, *inferred*) | 391 | push 2025-07-08 | Protocol/simulator toolkit; not read. |
 | Zig ecosystem | — | — | — | — | `gh search repos ethernet/ip --language=zig` found no library. |
@@ -304,9 +304,8 @@ layout never depends on Zig's bitfield-packing rules.
   served (the first entry for an id wins). Deviation: OpENer has no per-instance
   writable flag (every instance is settable); the flag is this module's, so an
   input assembly can be read-only, answering `0x0E` as OpENer does for a
-  non-settable attribute. The object is explicit messaging only: no implicit
-  (Class 1) I/O engine, so assemblies are read and written on request only,
-  not exchanged cyclically.
+  non-settable attribute. Assemblies are read and written on request, and exchanged
+  cyclically by an implicit I/O connection (*Implicit I/O* below).
 
 
   It also answers enough for a browsing tool to **discover** its tags rather
@@ -433,7 +432,7 @@ client sends.
   (1.2.16) reads structures of the simulator, with their templates, through `tools/udt_serve.zig` + `tools/udt_oracle.py`
   (nested types, arrays, handle; external, live, not a capture). The member layout and the template name's `;n` suffix
   are what pycomm3's parser accepts; they are not checked against a controller's own bytes.
-- **Sequenced Address items and the sockaddr-info items.** Codecs only; implicit I/O was never exercised.
+- **Sequenced Address items, the sockaddr-info items and the implicit I/O engine.** Self-anchored on the clauses' layouts; no foreign scanner or adapter was driven (no implicit-capable stack was available).
 - **CIP data types beyond INT, DINT, REAL and SHORT_STRING.** Round-trip tested against their documented codes and widths.
 - **`Get_Attribute_List` / `Set_Attribute_List`.** Encoders and a reply iterator built from the specification.
 - **The oracle target is a simulator, not real hardware.** No ControlLogix, CompactLogix, MicroLogix, PowerFlex or
@@ -552,27 +551,22 @@ containment, not confidentiality or integrity against an active attacker:
   behaviour for 0 to follow. Kept for predictability: a caller that wants a deadline gets one at or above what it asked
   for, a zero request gets `null` instead of a silently different value, and the raw pair stays available through the
   struct fields. Pinned by the test `timeouts: the exponent is the low four bits and every encoding edge is found`.
+- **CIP Sync / time synchronisation (Volume 2 ch. 7, IEEE 1588).** Not implemented: the module's references (pycomm3, OpENer) were surveyed from their documentation and neither documents it, and the clause is not available to this project to implement from, so there is no citable behaviour to follow.
+- **More adapter objects.** The adapter serves the Identity, Program Name (`0x64`), Symbol (`0x6B`), Template (`0x6C`), TCP/IP Interface (`0xF5`), Ethernet Link (`0xF6`) and, when `Config.assemblies` is non-empty, Assembly (`0x04`) objects, and answers the Connection Manager. The Message Router object's attributes, the Connection object, the Port object (`0xF4`) and the Connection Configuration object are named in `ClassCode` but not served on the target side (a client can still address any of them with the generic attribute services). Not done: no reference or consumer needs their attributes to be present, and the values (object lists, connection tables) would be invented by a simulator.
 
 ## Backlog / deferred
 
-- **Implicit I/O connection engine (Class 0/1, UDP 2222).** The Sequenced Address item (`0x8002`) and the Sockaddr Info
-  items (`0x8000`/`0x8001`) encode and decode and `Forward_Open` carries the parameters an I/O connection needs, but
-  there is no cyclic producer, no RPI timer, no connection watchdog, no sequence-number gap detection, no multicast group
-  management and no Run/Idle header handling. Large (a cyclic scheduler with an injected clock); fits CONVENTIONS §2 if
-  kept clock-agnostic. The single largest thing missing.
-- **Connection watchdogs and timeout supervision.** `connection_timeout_multiplier` is carried on the wire and honoured by
-  neither side; there is no timer anywhere in the module and a connection is closed only by a `Forward_Close` or a dead
-  transport. Part of the implicit engine above.
-- **CIP Sync / time synchronisation (Volume 2 ch. 7, IEEE 1588).** Not implemented.
 - **PCCC encapsulation (`Execute PCCC`, 0x4B)** for legacy SLC/PLC-5 targets. Named, not implemented.
-- **Adapter object coverage.** The adapter serves the Identity, Program Name (`0x64`), Symbol (`0x6B`), TCP/IP Interface
-  (`0xF5`), Ethernet Link (`0xF6`) and, when `Config.assemblies` is non-empty, Assembly (`0x04`) objects and no other
-  class. The Message Router, Connection, Port (`0xF4`) and Connection Configuration objects are named in `ClassCode` and
-  not implemented on the target side (a client can address any of them with the generic attribute services).
 
 ## Template Object and user-defined types
 
 `Config.udts` (`adapter.Udt`: template instance `id` 1..4095, `name`, structure `handle`, `size`, `members`) makes the adapter serve the **Template Object** (class 0x6C, one instance per type): `Get_Attribute_List` (0x03) answers attributes 1 (structure handle, UINT), 2 (member count, UINT), 4 (definition size in 32-bit words, UDINT) and 5 (structure size in octets, UDINT) as count, then per attribute id + status + value (0x14 and no value for one not served); `Read Template` (0x4C on this class, where it is Read Tag on a symbol) returns the definition from `offset` for `count` octets, as `partial_transfer` when the reply cannot hold them. The definition is one 8-octet descriptor per member (`UINT info` = array length, `UINT type` = the symbol type word, `UDINT offset`; an array sets bit 13, a nested type is `0x8000 | template id`), then the template name with the `;n` suffix and the member names, each NUL-terminated, padded with NULs so that `length + 23` is a whole number of words (a driver reads `4 * words - 23` octets). `TagBinding.udt` marks a structure tag: the Symbol Object lists it with the symbol type word `0x8000 | id`, and Read Tag answers `0x02A0` + the handle + the octets. Members are atomic types, arrays of them and nested types; strings and BOOL bit members are not modelled (give the host `SINT`/`DINT`). Checked live against `pycomm3` 1.2.16 (`tools/udt_oracle.py` against `tools/udt_serve.zig`).
+
+## Implicit I/O (Class 0/1)
+
+`implicit` is the connection engine and nothing else: the caller supplies `now_us` (microseconds, monotonic) and the octets that arrived and takes back the octets to send; there is no socket, no thread and no clock inside. One datagram is a bare CPF item list: a Sequenced Address item (connection id, 32-bit sequence number) and a Connected Data item holding, in order, the 16-bit data sequence count (Class 1), the optional 32-bit Run/Idle header (bit 0 = Run) and the data. **Producing:** a cyclic connection sends every RPI (the cadence is kept; a late caller gets one datagram, not a burst); a change-of-state or application-triggered one sends when the caller says the data changed, not sooner than `inhibit_us` after the previous data production, and as a heartbeat every RPI (any production restarts that timer); the sequence number grows with every datagram, the count with every new production and a heartbeat repeats it. **Consuming:** another connection id is not ours; a sequence number not ahead of the last (modulo 2^32) or a count behind the last (modulo 2^16) is stale and dropped without touching the watchdog; a jump is a gap, reported as the number of datagrams missed; a repeated count is a heartbeat (no new data, watchdog restarted); with `consume_len` set, other data lengths are refused before any state changes (an Idle datagram without data is accepted). **Watchdog:** `consume RPI x 4 x 2^multiplier` since the last valid datagram (`Forward_Open`'s timeout multiplier; the reserved values above 7 are taken as 7), reported once by `check`, after which the connection neither sends nor receives. `MulticastPool` gives out `Num_Mcast` consecutive group addresses from `Mcast_Start_Addr` (default 239.192.1.0, 32) round-robin.
+
+`Adapter` opens an I/O connection for a `Forward_Open` of transport class 0 or 1 (triggers cyclic, change of state, application). The connection path names the Assembly class, a configuration instance and the connection points: with two, the first is the assembly consumed (O to T, must be `writable`) and the second the one produced (T to O); with one, the direction the parameters leave non-null. A connection size must be the assembly's size plus the 2-octet count (Class 1) plus, when present, the 4-octet Run/Idle header, which is how the header's presence is told; anything else is refused with `invalid_connection_size`, an unserved assembly with `invalid_produced_or_consumed_path`, an unknown trigger with `transport_class_trigger_not_supported`, an RPI of 0 with `rpi_not_supported`, all before a slot is taken. The O to T connection id is always the target's; the T to O one is the originator's unless the T to O connection is multicast, when the target names it, takes a group from `Config.io_multicast` and returns it, with port 2222, in a Sockaddr Info (T to O) item after the reply's data item; a point-to-point T to O Sockaddr Info in the request is kept as the destination. `ioReceive` takes a datagram, writes new data into the consuming assembly (and runs its `after_set` hook; data under an Idle header is delivered but not applied), `ioPoll` yields the due datagrams (refreshing the producing assembly through `before_get`; change of state compares a hash of the data) and retires connections whose watchdog ran out (`io_timeouts`), `ioNextDueUs` says when to call it again. `IoDatagram.to` is null for "the originator's host, port 2222", which only the caller's TCP session knows. Not modelled: listen-only and redundant-owner connections, the production inhibit segment of the connection path, ownership conflicts (a second `Forward_Open` for the same assembly), the Sockaddr Info O to T item (the target listens where the caller binds). Reference: OpENer's documented scope (Class 1 messaging over assemblies, multicast); the sequence-number, heartbeat and watchdog rules are the clauses' as this module reads them, self-anchored with a fake clock (an originator end and a target end run against each other) and no foreign scanner.
 
 ## Anchoring
 

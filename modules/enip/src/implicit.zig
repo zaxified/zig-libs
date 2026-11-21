@@ -80,6 +80,10 @@ pub const Config = struct {
     consume_header: bool = false,
     /// Least time between two data-change productions, microseconds.
     inhibit_us: u32 = 0,
+    /// When set, a datagram whose data is not exactly this long is refused
+    /// (`wrong_size`) without touching the watchdog or the sequence state;
+    /// the one exception is an Idle datagram with no data at all.
+    consume_len: ?usize = null,
 };
 
 pub const State = enum { established, timed_out };
@@ -105,6 +109,8 @@ pub const Dropped = enum {
     wrong_connection,
     /// A sequence number or data count behind the last one.
     stale,
+    /// The data is not `Config.consume_len` long.
+    wrong_size,
 };
 
 /// Why `check` says the connection is dead.
@@ -219,6 +225,11 @@ pub const Connection = struct {
             if (d.len < 4) return .{ .dropped = .malformed };
             run = std.mem.readInt(u32, d[0..4], .little) & run_bit != 0;
             d = d[4..];
+        }
+
+        if (self.cfg.consume_len) |n| {
+            const idle_empty = self.cfg.consume_header and !run and d.len == 0;
+            if (d.len != n and !idle_empty) return .{ .dropped = .wrong_size };
         }
 
         var missed: u32 = 0;
@@ -462,6 +473,21 @@ test "watchdog: RPI x 4 x 2^multiplier, restarted by valid data only, reported o
     try testing.expectEqual(@as(?u64, null), rx.nextDueUs());
 }
 
+test "consume_len: a datagram of another size is refused and does not restart the watchdog; an empty Idle is fine" {
+    var cfg = cfgFor(.cyclic);
+    cfg.consume_header = true;
+    cfg.consume_len = 2;
+    var rx = Connection.init(cfg, 0);
+    var tx = Connection.init(mirror(cfg), 0);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(Dropped.wrong_size, rx.receive(30_000, (try tx.produce(0, &.{ 1, 2, 3 }, false, true, &buf)).?).dropped);
+    try testing.expectEqual(@as(u64, 40_000), rx.deadline_us);
+    try testing.expectEqual(@as(?u32, null), rx.rx_seq);
+    try testing.expect(rx.receive(30_000, (try tx.produce(10_000, &.{ 1, 2 }, false, true, &buf)).?) == .data);
+    const idle = rx.receive(31_000, (try tx.produce(20_000, &.{}, false, false, &buf)).?).data;
+    try testing.expect(!idle.run and idle.payload.len == 0);
+}
+
 test "class 0 has no data count: every datagram is new" {
     var cfg = cfgFor(.cyclic);
     cfg.class = .class0;
@@ -496,4 +522,68 @@ test "the multicast pool hands out its range round-robin" {
     try testing.expectEqual([4]u8{ 239, 192, 1, 254 }, pool.take().?);
     var none: MulticastPool = .{ .count = 0 };
     try testing.expectEqual(@as(?[4]u8, null), none.take());
+}
+
+// ── fuzzing: arbitrary datagrams into a connection ─────────────────────────
+
+const testkit = @import("testkit");
+const fuzzSeed = testkit.fuzz.seedHex;
+const fz = @import("fuzz_test.zig");
+
+const implicit_seeds = [_][]const u8{
+    fuzzSeed("0200028008000100222202000000" ++ "b100" ++ "0800" ++ "0100" ++ "01000000" ++ "aabb"), // Class 1 with a Run header
+    fuzzSeed("0200028008000100222201000000" ++ "b100" ++ "0600" ++ "0100" ++ "010000"), // truncated header
+    fuzzSeed("0200028008000100222203000000" ++ "b100" ++ "0200" ++ "0100"), // count only
+    fuzzSeed("0200028008000900222201000000" ++ "b100" ++ "0200" ++ "0100"), // another connection id
+    fuzzSeed("0100028008000100222201000000"), // one item
+    fuzzSeed("020002800800010022220100000" ++ "0"), // odd length
+};
+
+test "fuzz: an I/O connection never crashes on arbitrary datagrams" {
+    try std.testing.fuzz({}, fuzzImplicitSmith, .{ .corpus = &implicit_seeds });
+}
+
+const fuzzImplicitMark = fz.Marker(enum { ran, nonempty, data, heartbeat, dropped });
+
+fn fuzzImplicitSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzImplicit(std.testing.Smith, smith, std.testing.allocator);
+}
+
+fn fuzzImplicit(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [128]u8 = undefined;
+    const len: usize = fz.drawInput(S, src, &buf, &implicit_seeds);
+    fuzzImplicitMark.mark(.ran);
+    if (len != 0) fuzzImplicitMark.mark(.nonempty);
+    var c = Connection.init(.{
+        .produce_id = 1,
+        .consume_id = 0x2222_0001,
+        .produce_rpi_us = 1000,
+        .consume_rpi_us = 1000,
+        .consume_header = true,
+        .consume_len = if (src.value(bool)) @as(?usize, 2) else null,
+    }, 0);
+    var now: u64 = 0;
+    // The datagram, then again with the next sequence number (a heartbeat if
+    // the count is the same), then late: the stale and watchdog paths.
+    for (0..3) |i| {
+        if (i == 1 and len >= 14) buf[10] +%= 1;
+        now += if (i == 2) 100_000 else 10;
+        switch (c.receive(now, buf[0..len])) {
+            .data => fuzzImplicitMark.mark(.data),
+            .heartbeat => fuzzImplicitMark.mark(.heartbeat),
+            .dropped => fuzzImplicitMark.mark(.dropped),
+        }
+        _ = c.check(now);
+        var out: [64]u8 = undefined;
+        _ = c.produce(now, buf[0..@min(len, 8)], src.value(bool), true, &out) catch {};
+    }
+}
+
+test "fuzz driver: ENIP_FUZZ (fuzzImplicit)" {
+    try fz.fuzz_driver.run(fuzzImplicit, .{ .prefix = "ENIP_FUZZ", .name = "enip-implicit-implicit" });
+}
+
+test "fuzz harness: fuzzImplicit, 600 seeds, reaches every outcome" {
+    try fuzzImplicitMark.reach(fuzzImplicit, "enip-implicit-implicit", 600);
 }

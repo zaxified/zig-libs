@@ -119,7 +119,7 @@ fleet-simulation target.
 
 ## Not provided
 
-No implicit (Class 0/1) I/O engine, no UDT member decoding on the client side, no CIP Safety, Sync or Security, no
+No scanner-side (originator) implicit I/O (the target-side engine and the adapter's I/O connections exist), no UDT member decoding on the client side, no CIP Safety, Sync or Security, no
 PCCC. See SPEC.md, *What is deliberately not done* and *Backlog / deferred*.
 
 ## Use
