@@ -946,6 +946,10 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
 
 ## Backlog / deferred
 
+- **Fuzz reach for resumption, 0-RTT and stapling.** `fuzz_test.zig`'s handshake harness configures no
+  `Config.tickets`, `resumption`, `early_data` or staple, so a `DTLS_FUZZ` run does not reach the ticket open, the
+  binder check, the early-record path or the stapled `CertificateEntry` decoder. Extend the harness (a ticket from a
+  first handshake, then mutated resumption flights), then a `DTLS_FUZZ` verdict run on the ReleaseSafe binary.
 - **AEAD record protection is the stateless per-record call** of the `aesgcm` module: every record re-runs the
   AES key expansion and the GHASH key setup. `zig build bench-dtls` (`tools/bench.zig`) measures it against a cached
   `aesgcm` `Context` (first run, 2026-11-21, ReleaseFast, 3 rounds on a loaded machine, spread up to 40 %): cached /
