@@ -387,26 +387,29 @@ the figures and is authoritative.
   the returned `TokenRequest` itself (one `base64(client_id:client_secret)` line), not worth a
   builder-side seam for a single header.
 - **HashML-DSA:** no `Alg` name, so `UnsupportedAlg` (RFC 9964 specifies pure ML-DSA).
+- **`VerifiedCache` behind `Provider`/`Guard`/`ResourceServer`:** not wired. `Provider.verify` returns an owned
+  `ParsedToken`, which a hit cannot produce without allocating, and its TTL refresh must run before a lookup (else
+  a hit would outlive a dropped key). The compared libraries have no such cache, so there is no reference shape; a caller that wants one
+  composes `VerifiedCache.verifyJwks` over its own key set.
+- **Dead-stack residue that cannot be burned from here:** `kty:"oct"` secrets in `parseJwks` leave none on the dead stack
+  (stack probe `parseJwks` oct, ReleaseFast); `VerifiedCache`'s SipHash `mac_key` (zeroed by `defer`, but the SipHash state it
+  keys is not burned, and `init` returns the cache by value, so the stack probe pins one copy of the key as the known
+  residue; the key is not a bearer credential, only a cache-poisoning one); ML-DSA/Ed25519 *key generation* in the
+  caller's frame (std); ES384 key generation burns inside p384, but the returned `KeyPair` still lands in the caller's
+  frame. `buildTokenRequest`'s `client_secret` is a borrowed slice and only copied into the request body.
 
 ## Backlog / deferred
+
+None open.
+
+## Roadmap
 
 - **DPoP (RFC 9449).** Proof-of-possession access tokens need client-held key management (generate and
   persist a signing key per client) and a per-request DPoP proof JWT (bound to the HTTP method, URL and
   access-token hash, with replay-window `jti`/`iat` tracking on the resource server): a materially bigger,
   separable feature than the authorization-code + PKCE flow. `ResourceServer`'s Bearer-only enforcement
-  is unaffected; a DPoP variant would be added alongside it. golang-jwt does not offer it either.
-- **`VerifiedCache` behind `Provider`/`Guard`/`ResourceServer`** is not wired. `Provider.verify`
-  returns an owned `ParsedToken`, which a hit cannot produce without allocating, and its TTL
-  refresh must run before a lookup (else a hit would outlive a dropped key). The fit is a
-  `derive`-style entry point on `Provider` that refreshes first and then calls
-  `VerifiedCache.verifyJwks` with its current set. Add it when a consumer of those types asks.
-- **Dead-stack residue not yet probed or burned:** the `kty:"oct"` secret in `parseJwks` (`jwkMaterial`
-  decodes `k` through arena/stack buffers before it becomes `Key.hmac`); `VerifiedCache`'s SipHash
-  `mac_key` (zeroed by `defer`, but the SipHash state it keys is not burned, and `init` returns the cache by
-  value, so the stack probe measures one copy of the key on the dead stack, pinned as the known residue; the
-  key is not a bearer credential, only a cache-poisoning one); ML-DSA/Ed25519 *key generation* in the caller's frame (std);
-  ES384 key generation burns inside p384, but the returned `KeyPair` still lands in the caller's frame.
-  `buildTokenRequest`'s `client_secret` is a borrowed slice and only copied into the request body.
+  is unaffected; a DPoP variant would be added alongside it. golang-jwt does not offer it either. Size: a new
+  scheme with its own state (key management, proof builder and verifier, replay tracking), weeks.
 
 ## Anchoring
 

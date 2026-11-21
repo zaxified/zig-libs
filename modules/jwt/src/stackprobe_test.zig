@@ -767,6 +767,35 @@ test "STACKPROBE: no key residue on the dead stack after PrivateKey.fromPem" {
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
 
+// ── `parseJwks` with a `kty:"oct"` secret ──────────────────────────────────
+
+var oct_secret: [32]u8 = undefined;
+var oct_json_buf: [128]u8 = undefined;
+var oct_json: []const u8 = "";
+
+noinline fn callParseOct() void {
+    var set = root.parseJwks(std.heap.page_allocator, oct_json) catch unreachable; // global-alloc-ok: a stack-probe target takes no arguments; the set is freed here
+    set.deinit();
+}
+
+test "STACKPROBE: no `oct` key residue on the dead stack after parseJwks" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    for (0..2) |i| {
+        Sha256.hash(&[_]u8{ 'o', 'c', 't', @intCast(i) }, &oct_secret, .{});
+        var b64: [43]u8 = undefined;
+        _ = std.base64.url_safe_no_pad.Encoder.encode(&b64, &oct_secret);
+        oct_json = try std.fmt.bufPrint(&oct_json_buf, "{{\"keys\":[{{\"kty\":\"oct\",\"kid\":\"h\",\"k\":\"{s}\"}}]}}", .{b64});
+        Sha256.hash(&[_]u8{ 'l', 'e', 'a', 'k', @intCast(i) }, &leak_src, .{});
+        callParseOct();
+        const n = fresh();
+        n.addImage("oct k", &oct_secret);
+        n.sort();
+        bad += try runProbe("parseJwks oct", callParseOct, n);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
 const ProbeCache = root.VerifiedCache(u8);
 var cache_out: ProbeCache = undefined;
 
