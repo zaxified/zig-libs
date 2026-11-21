@@ -291,6 +291,19 @@ pub const Options = struct {
     /// cannot be made from inside the handler, because by the time a
     /// handler runs the choice has already been acted on.
     stream_request: ?StreamRequestFn = null,
+    /// Hand `CONNECT` (RFC 9113 §8.5) to the handler instead of answering
+    /// 501: the stream is the tunnel. The handler sees `method == .connect`,
+    /// `target` = the `:authority` (Go's `RequestURI` for a CONNECT), an empty
+    /// `path`, and the request body as the incremental surface (the handler
+    /// runs at HEADERS, whatever `stream_request` says): `req.reader()` yields
+    /// the client's DATA as it arrives and ends at the client's END_STREAM
+    /// (its half-close). The handler answers by setting the status (a 2xx
+    /// opens the tunnel; anything else refuses it) and flushing, then writes
+    /// and flushes the tunnel's other direction; returning ends the stream
+    /// (RFC 8441's extended CONNECT is not offered). Full duplex is the
+    /// handler's to run: with no `dispatcher` it owns the connection's task
+    /// while the tunnel lives, so serve CONNECT from a dispatcher.
+    allow_connect: bool = false,
     /// Run handlers on a caller-supplied bounded worker pool instead of on
     /// the connection's own task. Null (the default) is the historical
     /// sequential behavior, byte-for-byte — the locking below is compiled
@@ -495,6 +508,15 @@ pub const Dispatcher = struct {
 /// Predicate selecting the incremental request-body surface for one stream
 /// (`Options.stream_request`). Gets `Options.context`.
 pub const StreamRequestFn = *const fn (?*anyopaque, RequestPreview) bool;
+
+/// A decoded HEADERS block that asks for `CONNECT`.
+fn isConnectFields(fields: []const hpack.Field) bool {
+    for (fields) |f| {
+        if (std.mem.eql(u8, f.name, ":method")) return std.mem.eql(u8, f.value, "CONNECT");
+        if (f.name.len == 0 or f.name[0] != ':') return false;
+    }
+    return false;
+}
 
 /// What `Options.stream_request` sees: the decoded HEADERS block, exactly
 /// as it came off the wire, before any body octet has arrived.
@@ -1452,10 +1474,10 @@ const Session = struct {
         // The incremental-request opt-in is decided HERE and only here —
         // the one moment at which "buffer the body first" and "run the
         // handler now" are still both possible.
-        const streaming = if (s.opts.stream_request) |pred|
+        const streaming = (if (s.opts.stream_request) |pred|
             pred(s.opts.context, .{ .fields = hd.headers.fields })
         else
-            false;
+            false) or (s.opts.allow_connect and isConnectFields(hd.headers.fields));
         s.jobs.put(s.gpa, hd.stream_id, .{
             .id = hd.stream_id,
             .headers = hd.headers, // ownership moves into the job
@@ -1957,7 +1979,12 @@ const Session = struct {
         // on h2 (RFC 9113 §8.5) turns the stream into a tunnel this server
         // does not provide.
         const method = http.Method.fromToken(method_tok.?);
-        if (method == .connect) return s.respondError(id, 501);
+        const is_connect = method == .connect;
+        if (is_connect) {
+            if (!s.opts.allow_connect) return s.respondError(id, 501);
+            // §8.5: :scheme and :path MUST be omitted, :authority is the target.
+            if (scheme != null or path_full != null or authority == null) return s.protocolError(id);
+        } else
         // §8.3.1: GET-family requests need :scheme and a non-empty :path.
         if (scheme == null or path_full == null or path_full.?.len == 0)
             return s.protocolError(id);
@@ -1971,24 +1998,24 @@ const Session = struct {
 
         // `:path` is origin-form or "*" (§8.3.1); anything else is malformed.
         // "*" belongs to OPTIONS alone (RFC 9112 §3.2.4 — h1 parity).
-        const target = path_full.?;
-        if (target[0] != '/' and !std.mem.eql(u8, target, "*"))
+        const target = if (is_connect) authority.? else path_full.?;
+        if (!is_connect and target[0] != '/' and !std.mem.eql(u8, target, "*"))
             return s.protocolError(id);
-        if (std.mem.eql(u8, target, "*") and method != .options)
+        if (!is_connect and std.mem.eql(u8, target, "*") and method != .options)
             return s.respondError(id, 400);
-        var path: []const u8 = target;
+        var path: []const u8 = if (is_connect) "" else target;
         var query: []const u8 = "";
-        if (std.mem.findScalar(u8, target, '?')) |i| {
+        if (!is_connect) if (std.mem.findScalar(u8, target, '?')) |i| {
             path = target[0..i];
             query = target[i + 1 ..];
-        }
+        };
         // The h1 path guard and normalization, verbatim (`Server.
         // checkOriginPath` / `normalizePathInto`): 414 over the length
         // cap, 400 on NUL/`%00`, and `.`/`..` segments collapsed so a `..`
         // cannot walk a route prefix. The h1 loop does this on its serving
         // frame; here the copy is one arena allocation, taken only when a
         // dot-segment is actually present.
-        if (path[0] == '/') {
+        if (path.len != 0 and path[0] == '/') {
             Server.checkOriginPath(path) catch |err| return s.respondError(id, switch (err) {
                 error.PathTooLong => 414,
                 error.PathForbidden => 400,
@@ -3768,6 +3795,56 @@ test "h2c serve: handler error → 500; 404 and HEAD framing (offline)" {
     try testing.expectEqualStrings("5", head.header("content-length").?);
     try testing.expectEqual(@as(usize, 0), head.body.items.len);
     try testing.expectEqual(@as(u32, 0), head.data_frames);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+fn connectEchoHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    if (req.method != .connect) {
+        rw.setStatus(404);
+        return;
+    }
+    // The tunnel opens with the 2xx head, then each chunk goes back upper-cased.
+    rw.setStatus(200);
+    try rw.flush();
+    var buf: [4]u8 = undefined;
+    while (true) {
+        const n = req.reader().readSliceShort(&buf) catch return;
+        if (n == 0) break;
+        for (buf[0..n]) |*b| b.* = std.ascii.toUpper(b.*);
+        try rw.writeAll(buf[0..n]);
+        try rw.flush();
+    }
+    try rw.writeAll("!"); // after the client's half-close, our side is still ours
+}
+
+test "h2 CONNECT (allow_connect): the stream is a tunnel, the target is the authority" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "backend.example:443" },
+    }, false);
+    try peer.conn.sendData(&peer.wire, sid, "ping", false);
+    try peer.conn.sendData(&peer.wire, sid, "pong", true); // half-close
+    // §8.5: :scheme and :path on a CONNECT are malformed.
+    const bad = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "x:1" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+    }, true);
+    // A CONNECT with no authority is too.
+    const bad2 = try peer.conn.startStream(&peer.wire, &.{.{ .name = ":method", .value = "CONNECT" }}, true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = connectEchoHandler, .allow_connect = true }, &out_buf);
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqualStrings("PINGPONG!", c.body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(bad).rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(bad2).rst);
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
 

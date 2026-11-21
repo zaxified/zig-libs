@@ -827,6 +827,9 @@ pub const Options = struct {
     ///
     /// See `h2_server.Options.stream_request`.
     h2_stream_request: ?H2StreamRequestFn = null,
+    /// Hand HTTP/2 `CONNECT` to the handler (the stream is the tunnel) instead
+    /// of answering 501: see `h2_server.Options.allow_connect`.
+    h2_allow_connect: bool = false,
     /// Run HTTP/2 handlers on a caller-supplied bounded worker pool instead
     /// of on the connection's own task (only meaningful with `enable_h2c`,
     /// or via `h2_server.serveStream`). Null (the default) keeps the
@@ -1762,6 +1765,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 // is documented as h1-only for that reason.
                 .limits = o.h2_limits,
                 .stream_request = o.h2_stream_request,
+                .allow_connect = o.h2_allow_connect,
                 .dispatcher = o.h2_dispatcher,
             }, app_in, app_out);
             reportTimeout(o, stream, &tr, &tw, true);
