@@ -1611,7 +1611,7 @@ Gaps that are unverified rather than unbuilt:
 
 ## Backlog / deferred
 
-- **The per-message fixed cost of a small `PrivateMessage`** is about 1.3×
+- *BOUNCED (quiet-host):* **The per-message fixed cost of a small `PrivateMessage`** is about 1.3×
   OpenMLS's (`bench-mls`, *Performance*): profile it (std Ed25519 sign/verify
   against ed25519-dalek, the 96 KiB `group_burn` per call, the
-  `groupContextAlloc` per message) and close it to the P2 bar (≤ 1.1×).
+  `groupContextAlloc` per message) and close it to the P2 bar (≤ 1.1×). Profile 2026-11-22 (read, not timed): the two Ed25519 operations (std's `sign` and `verify`, 2 of the 3 costs the item names) are the lever, and `ct25519.verifyEd25519Strict` is the faster verifier in the collection, but it checks stricter than std's `verify` (a behaviour decision) and the 20-40 % gap needs an interleaved A/B with a spread below the effect, which three agents sharing the host do not allow; `group_burn` (96 KiB per call) is a measured security bound (`src/burn.zig`) and is not shortened for speed.

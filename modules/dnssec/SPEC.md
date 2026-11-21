@@ -198,10 +198,10 @@ Run: `scripts/modtest dnssec` (offline); `DNSSEC_FUZZ=<runs>` for the fuzz drive
 
 ## Backlog / deferred
 
-- **RFC 5011 oracle:** `rollover.zig` (the add / remove hold-down state machine over `(algorithm, public key)`) is
+- *BOUNCED (tool):* **RFC 5011 oracle:** `rollover.zig` (the add / remove hold-down state machine over `(algorithm, public key)`) is
   tested against the RFC's rules with hand-built timelines only; Unbound's and Hickory's behaviour was not compared. The
   caller owns the DNSKEY fetch, the validation of the RRset against `Tracker.isTrusted` keys, the `self_signed`
-  determination and persistence.
+  determination and persistence. Unbound is not installed and its autotrust (the reference implementation) takes its clock from the process, so a hold-down timeline can only be replayed in real time (30 days) or by patching the daemon; Hickory has no RFC 5011 tracker to compare against *(inferred)*. A comparison needs an Unbound build with an injectable clock.
 
 ## Open
 

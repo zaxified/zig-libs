@@ -340,11 +340,11 @@ current figures, with their date, are the card's `**Performance:**` line; they a
 
 ## Backlog / deferred
 
-- **Performance leftovers** (every counted row of the card's Performance line is <= 0.86x CIRCL):
+- *BOUNCED (quiet-host):* **Performance leftovers** (every counted row of the card's Performance line is <= 0.86x CIRCL):
   `powC1` in `sqrt_ratio` is a plain square-and-multiply (an addition chain
   would cut it), and the composite sums use one `mulPublic` per term instead
   of a multi-scalar multiply. "fastest" is unmeasured: facebook/voprf (Rust)
-  would be the second implementation.
+  would be the second implementation. Both are micro-optimisations (an addition chain for `powC1`, a multi-scalar multiply for the composite sums) whose effect on a row already at 0.18-0.86x the reference needs a quiet-machine A/B; the "fastest" figure needs facebook/voprf's API driven through a Rust harness with the same interop pre-checks as `tools/bench.zig`.
 
 ## Anchoring
 

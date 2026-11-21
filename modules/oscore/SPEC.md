@@ -406,11 +406,11 @@ material.
 - **Glue to the sibling `coap` message type** (extracting Class E options, building the outer message): left to
   the caller by design, as libOSCORE leaves it to a CoAP-library adapter; see *Threat model / limits* and the
   README. A `coap` + `oscore` integration example would be the natural place.
+- **Other AEAD algorithms** (ChaCha20-Poly1305, COSE 24; AES-GCM): the reference, liboscore, is "RFC 8613 only" (*Compared with*), and RFC 8613 makes only AES-CCM-16-64-128 mandatory; no consumer asks for another. `Algorithm` keeps its one member, so the AEAD nonce, the ID width and the 8-byte tag stay constants of the module.
 
 ## Backlog / deferred
 
 - *BOUNCED (waits-external):* **Group OSCORE** (draft-ietf-core-oscore-groupcomm): multicast use; needs signature countersignatures. Large; fits §2. Moving draft, not an RFC yet as far as checked *(inferred)*; defer.
-- **Other AEAD algorithms** (AES-CCM-16-64-128 only today; `Algorithm` has one member): RFC 8613 makes only AES-CCM-16-64-128 mandatory; ChaCha20-Poly1305 (COSE 24) and AES-GCM are the usual additions on hardware without CCM offload. Small (nonce length and ID width become algorithm-dependent); fits §2. Candidate for "deliberately not doing" if the maintainer wants MTI only.
 
 ## Roadmap
 

@@ -265,7 +265,7 @@ never `zig build --fuzz`); constant time: `scripts/checks/ctgrind.sh quic-crypto
 
 ## Backlog / deferred
 
-- **AES-GCM bulk path not re-measured** since AES-GCM moved to the `aesgcm` module (Zig 0.17 #36256).
+- *BOUNCED (quiet-host):* **AES-GCM bulk path not re-measured** since AES-GCM moved to the `aesgcm` module (Zig 0.17 #36256). The module has no bench, and `Protection(Aead)` calls the stateless `encrypt`/`decrypt` of the AEAD type per packet, so every packet re-runs the key expansion (`dtls`'s `tools/bench.zig` measured cached/per-record at 0.20-0.65 for 64-1400 byte records); caching an `aesgcm.Context` per key needs an AEAD interface that carries one, and a quiet-machine A/B.
 
 ## Anchoring
 

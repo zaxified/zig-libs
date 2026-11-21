@@ -170,4 +170,4 @@ input. `decaps` cannot fail (implicit rejection).
 ## Backlog / deferred
 
 - A faster scalar Keccak (H(ek) and J(z ‖ c) are 12 serial permutations for ML-KEM-1024 and
-  the largest single cost); std's is used.
+  the largest single cost); std's is used. H(ek) and J(z ‖ c) are sponge absorptions (serial by construction; `keccak4` cannot batch them), so the lever is a faster single-state Keccak-f[1600] than std's, to be shown by an interleaved A/B on a quiet machine.
