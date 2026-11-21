@@ -107,6 +107,16 @@ bytes `age.encrypt` would, and `age.decryptStream(gpa, w, r, round_signature, op
 reads them back. Every chunk is authenticated before it is written, but a
 tampered or truncated file is detected at its bad chunk or at its end, after
 the earlier plaintext has reached `w`; see SPEC.md "Streaming encrypt/decrypt".
+Armored files stream through `age.ArmorWriter` / `age.ArmorReader` (age's
+`armor.NewWriter` / `armor.NewReader`):
+
+```zig
+var aw = age.ArmorWriter.init(out, &buf);           // out: *std.Io.Writer
+try age.encryptStream(gpa, &aw.writer, r, p_pub, round, chain_hash, &rnd);
+try aw.finish();                                    // last line + END line
+var ar = age.ArmorReader.init(in, &buf2);           // in: *std.Io.Reader (buffer >= 72)
+try age.decryptStream(gpa, w, &ar.reader, round_signature, .{});
+```
 
 Decryption order is header syntax → chain hash (if given) → the stanza
 (`error.FoCheckFailed` on a wrong signature) → the header MAC

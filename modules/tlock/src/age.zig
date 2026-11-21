@@ -44,7 +44,7 @@
 //!   stanza is `error.NoTlockStanza`. Other stanzas (an X25519 recipient
 //!   alongside) are parsed, MAC-covered and skipped; two `tlock` stanzas are
 //!   refused (`tle` never writes that).
-//! - Armor is whole-buffer only. The binary file also streams over
+//! - Armor streams through `ArmorWriter`/`ArmorReader`. The binary file also streams over
 //!   `std.Io.Reader`/`Writer` (`encryptStream`, `decryptStream`); the
 //!   whole-buffer functions have exact sizes up front (`encryptedLen`,
 //!   `decryptedLen`, `armoredLen`).
@@ -634,7 +634,14 @@ pub fn inspectAlloc(gpa: std.mem.Allocator, file: []const u8) (HeaderError || Ar
 // binary age file, one 64 KiB STREAM chunk at a time, so memory is bounded
 // (one allocation of about 128 KiB) however large the file is. Armor is not
 // streamed (`encryptAlloc`/`decryptAlloc` keep it): `tle` armors through a
-// separate writer in front of this one.
+// separate writer in front of this one; `ArmorWriter` / `ArmorReader` are
+// that writer and its reader.
+
+/// Streaming armor (`armor_stream.zig`): a `std.Io.Writer` that armors and a
+/// `std.Io.Reader` that de-armors, to compose with `encryptStream` /
+/// `decryptStream` (age's `armor.NewWriter` / `armor.NewReader`).
+pub const ArmorWriter = @import("armor_stream.zig").ArmorWriter;
+pub const ArmorReader = @import("armor_stream.zig").ArmorReader;
 
 /// Errors of `encryptStream`: the reader or the writer failed, or the one
 /// chunk buffer could not be allocated.
@@ -1022,6 +1029,33 @@ fn streamDecrypt(gpa: std.mem.Allocator, file: []const u8, sig: g1.Affine, opts:
     errdefer sink.deinit();
     try decryptStream(gpa, &sink.writer, &slow.interface, sig, opts);
     return sink.toOwnedSlice();
+}
+
+test "age: encryptStream through ArmorWriter is encryptAlloc's armored file; decryptStream through ArmorReader reads it back" {
+    const gpa = testing.allocator;
+    for ([_]usize{ 0, 1, 100, chunk_bytes + 1 }) |len| {
+        const pt = try gpa.alloc(u8, len);
+        defer gpa.free(pt);
+        streamPlain(pt);
+        const want = try encryptAlloc(gpa, pt, pub1000(), 1000, quicknet_chain, &fixed_rnd, .{ .armor = true });
+        defer gpa.free(want);
+        var src: std.Io.Reader = .fixed(pt);
+        var sink: std.Io.Writer.Allocating = .init(gpa);
+        defer sink.deinit();
+        var abuf: [64]u8 = undefined;
+        var aw = ArmorWriter.init(&sink.writer, &abuf);
+        try encryptStream(gpa, &aw.writer, &src, pub1000(), 1000, quicknet_chain, &fixed_rnd);
+        try aw.finish();
+        try testing.expectEqualStrings(want, sink.written());
+
+        var in: std.Io.Reader = .fixed(sink.written());
+        var rbuf: [128]u8 = undefined;
+        var ar = ArmorReader.init(&in, &rbuf);
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try decryptStream(gpa, &out.writer, &ar.reader, sig1000(), .{});
+        try testing.expectEqualSlices(u8, pt, out.written());
+    }
 }
 
 test "age: encryptStream writes exactly what encrypt writes, and decryptStream reads it back, across the chunk boundaries" {

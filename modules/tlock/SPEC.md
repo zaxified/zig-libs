@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [drand/kyber](https://github.com/drand/kyber) `encrypt/ibe` | Go | MPL-2.0 (`LICENSE` header; source NOT read) | 12 | v1.3.2 (2025-12-15) | The BF-IBE library `drand/tlock` uses. Its `LICENSE` file is the MPL-2.0 text (the module NOTICE calls it Apache-2.0/MIT dual: see the survey report); this module is validated byte-exact against a genuine `tle` ciphertext. |
 | Zig ecosystem | Zig | — | — | — | No Zig timelock/drand-encryption repository found by GitHub search (2026-09-30). |
 
-**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `Fp12.pow` measured with ctgrind. **Where we are behind:** only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254; armor is whole-buffer only (the age layer, arbitrary-length payloads and streaming encrypt/decrypt of the binary file exist; see *The age layer* and *Streaming encrypt/decrypt*).
+**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `Fp12.pow` measured with ctgrind. **Where we are behind:** only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254; (the age layer, arbitrary-length payloads, streaming encrypt/decrypt and streaming armor exist; see *The age layer* and *Streaming encrypt/decrypt*).
 
 ## Scheme variant pinned: quicknet / `SigsOnG1ID`
 
@@ -247,7 +247,7 @@ age-encryption.org/v1
   whole plaintext is.
 - **Armor** (`tle -a`): standard padded base64 of the whole binary file in 64-column
   lines between `-----BEGIN AGE ENCRYPTED FILE-----` and `-----END AGE ENCRYPTED
-  FILE-----`. Whole-buffer only.
+  FILE-----`. Whole-buffer (`armor`/`dearmor`) or streaming (`ArmorWriter`/`ArmorReader`).
 - **Randomness** is explicit: `age.Randomness` holds the file key, `sigma` and the
   nonce, so a fixed set reproduces a file byte-exactly; `Randomness.draw` takes all
   three from `entropy.fill` (fail-closed) and `wipe` zeroes the secrets.
@@ -271,7 +271,18 @@ age-encryption.org/v1
 - **Byte equality.** `encryptStream` writes exactly the bytes `encrypt` writes for the same input and `Randomness`; `decryptStream` of that file returns the input. Tested at 0, 1, one chunk minus 1, one chunk, +1, two chunks, +1 bytes through readers that hand out 7 (and 13) bytes at a time, and against the Go-`tle`-produced fixture of `kat_test.zig` (de-armored).
 - **Chunk lookahead.** A chunk is sealed or opened once one more byte (or the end) shows whether it is the last; the extra byte is carried to the next chunk. No `peek`, no `takeByte`: the functions work on an unbuffered reader.
 - **What a stream cannot keep from `decrypt`.** The header is read up to its MAC line (at most `max_header_bytes`) before it is parsed, so a bad header reports `HeaderTooLarge`/`MalformedHeader` where `decrypt` names the first bad line (a bad FIRST line is `NotAgeFile` at once). The payload length is unknown until the end, so a payload that is too short is `MalformedPayload` after the FO check and the MAC. Every chunk is authenticated before it is written, but chunks written are written: a tampered or truncated file fails at its bad chunk or at its end and the plaintext before that point has reached `w` (the age reference reader behaves the same); a caller that must not act on unverified output buffers it until the call returns. `w` is not flushed, `r` is not closed.
-- **Not streamed.** Armor (`encryptAlloc`/`decryptAlloc` keep it).
+- **Armor streams too.** `age.ArmorWriter` (a `std.Io.Writer` that armors into another
+  writer; `finish` writes the last line and the END line) and `age.ArmorReader` (a
+  `std.Io.Reader` of the binary bytes of an armored stream; malformed armor is
+  `ReadFailed` with `err = error.MalformedArmor`), the shape of age's
+  `armor.NewWriter`/`armor.NewReader` that `tle` puts in front of the binary stream.
+  Byte for byte `armor`'s output and as strict as `dearmor` (64-column lines, padding only
+  on the last line, canonical base64, CRLF and surrounding whitespace accepted, only
+  whitespace after END). Tested: `ArmorWriter` equals `armor` at 1..300 bytes for write
+  sizes 1, 5, 48, 1000; `ArmorReader` equals `dearmor` (CRLF and whitespace too) and
+  refuses the same malformed inputs; `encryptStream` through `ArmorWriter` is
+  `encryptAlloc(.armor = true)`'s file; the armored Go-`tle` fixture decrypts through
+  `ArmorReader` (`kat_test.zig`).
 
 ## What is deliberately not done
 
@@ -302,7 +313,6 @@ age-encryption.org/v1
 ## Backlog / deferred
 
 - **G2-signature scheme (`bls-unchained` testnet variant).** Supported by `drand/tlock` and `tlock_age`; mainnet uses G1 only, so low priority. Effort: medium (swap group roles); fits CONVENTIONS section 2.
-- **Streaming armor.** Armor is whole-buffer (`encryptAlloc`/`decryptAlloc` keep it); `tle` itself armors through a separate writer.
 
 ## Anchoring
 

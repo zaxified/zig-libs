@@ -464,6 +464,18 @@ test "drand interop: decryptStream reads the Go-tle file (de-armored) to the sam
     try std.testing.expectError(error.PayloadAuthenticationFailed, tlock.age.decryptStream(gpa, &sink.writer, &src, interopRoundSignature(), .{}));
 }
 
+test "drand interop: decryptStream through ArmorReader reads the armored Go-tle file directly" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var src: std.Io.Reader = .fixed(interop_tle_file);
+    var rbuf: [96]u8 = undefined;
+    var ar = tlock.age.ArmorReader.init(&src, &rbuf);
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try tlock.age.decryptStream(gpa, &sink.writer, &ar.reader, interopRoundSignature(), .{ .chain_hash = hexBytes(32, interop_chain_hash_hex) });
+    try std.testing.expectEqualSlices(u8, interop_tle_plaintext, sink.written());
+}
+
 test "drand interop: the fixture rejects under a mismatched round signature (FO check, cross-beacon)" {
     if (!gate.core_implemented) return error.SkipZigTest;
 

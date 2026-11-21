@@ -136,6 +136,7 @@ test {
     _ = gate;
     _ = tlock_mod;
     _ = age;
+    _ = @import("armor_stream.zig");
     _ = kat_test;
     _ = @import("stackprobe_test.zig");
 }
