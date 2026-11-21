@@ -503,9 +503,9 @@ k256	ReleaseFast	ecdsablind	1	10	d60698c0789b29fb	cdc0d7699f169fcf
 # `portable` moved from Modint(1024) to Modint(512) (L=8) because L=16 left the
 # portable bodies, so its output pin was re-taken (different modulus, different
 # printed result); the L=16 kernel is measured by `dyn` (2 in-file, unchanged).
-montint	ReleaseFast	small	1	0	41fdecba95b35f2f	4e9f8c0b1ac8efe3
-montint	ReleaseFast	portable	1	0	41fdecba95b35f2f	a65d399a02be7ebb
-montint	ReleaseFast	asmcore	1	0	41fdecba95b35f2f	51c0595ca47bd7cc
+montint	ReleaseFast	small	1	0	140bb2c3bf973fd2	4e9f8c0b1ac8efe3
+montint	ReleaseFast	portable	1	0	140bb2c3bf973fd2	a65d399a02be7ebb
+montint	ReleaseFast	asmcore	1	0	140bb2c3bf973fd2	51c0595ca47bd7cc
 # `field` (2026-10-02): `Field(r)` for the bls12_381 scalar order — the backend of
 # both pairing modules' `Fr`. Operands, exponent and a 64-byte reduce input
 # tainted; the one in-file context is `inv`'s zero check (`NotInvertible`).
@@ -514,7 +514,7 @@ montint	ReleaseFast	asmcore	1	0	41fdecba95b35f2f	51c0595ca47bd7cc
 # extra-reduction select, the pow window select, toBytes). If it reads zero,
 # std fixed ff or the instrument went blind; `field`'s 1 means nothing until
 # that is understood.
-montint	ReleaseFast	field	1	1	1b4c91eb57cc6e92	efbe5c72b7a484c2
+montint	ReleaseFast	field	1	1	dfe07b209652b178	efbe5c72b7a484c2
 # Zig 0.17.0 (2026-10-18): ffcontrol 27 -> 28, still the positive control (>=1). 0.17 std
 # rewrote ff pow's window select: the old `eql` contexts in montgomeryMul/pow (15) became 16 in
 # `cmov` (ff.zig, `ct.select` per table entry, unswitched into a jump) under
@@ -529,7 +529,7 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # against a secret EVEN value, both widths, operands coprime to the modulus so
 # the success path runs (results = Python pow(x, -1, m)); still 2 in-file —
 # the divsteps and the Hensel step add no context, their verdicts are witness.
-montint	ReleaseFast	dyn	1	2	65b77fe3c4c660f8	94e445ba261b2dab
+montint	ReleaseFast	dyn	1	2	d7efcc8a3def5808	94e445ba261b2dab
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity in group.zig per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
 p256	ReleaseFast	comb	1	1	ce264cc565eba31c	e3c458c38b8cf4a8
