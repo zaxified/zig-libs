@@ -166,11 +166,11 @@ NOT covered, honestly:
   binding.
 - **X448 by default (Curve448 DH)** — std has none; the `ed448` sibling's X448 plugs in through `noise_name` as an
   adapter type in the caller, so `noise` takes no dependency on it.
+- **The `fallback` modifier** (Noise Pipes, §10.2 — a role switch mid-session): the reference, snow v0.10.0, omits it
+  (as do flynn/noise and WireGuard), and no consumer asks; refused as `UnsupportedModifier`.
 
 ## Backlog / deferred
 
-- **The `fallback` modifier** (Noise Pipes, §10.2 — a role switch mid-session): deferred, no consumer; snow omits it
-  too. It is refused today as `UnsupportedModifier`.
 - **AES-GCM bulk path not re-measured** since the cipher moved to the `aesgcm` module (Zig 0.17 #36256).
 
 ## Anchoring
