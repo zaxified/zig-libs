@@ -39,6 +39,10 @@ Translated (source, restructured into Zig):
                   code lengths 1..20, run-length bound, origin pointer, symbol limits)
                   and the T^-1 construction and run-length decoding of bzlib.c's
                   unRLE_obuf_to_output_FAST                            -> src/decoder.zig
+  bzip2recover.c  the block search (the two 48-bit magics at any bit offset, the region
+                  rules: not before the first magic, at least 130 bits, the block limit) and
+                  the stream written around each block (header, block bits, end magic and
+                  CRC)                                                 -> src/recover.zig
 
 Reproduced (data):
 
@@ -46,7 +50,7 @@ Reproduced (data):
                   randomisation                                        -> src/randtable.zig
 
 Not copied: crctable.c (the table is generated at compile time from the polynomial
-0x04c11db7 in src/crc.zig), the bzip2 command line program, bzip2recover, the build
+0x04c11db7 in src/crc.zig), the bzip2 command line program, bzip2recover's file naming and I/O, the build
 system, the test files and the manual. libbzip2 is also run as a black box for the
 differential tests and the benchmark (tools/), compiled from a clone that is never part of
 this repository.
