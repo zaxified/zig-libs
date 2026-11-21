@@ -1068,10 +1068,14 @@ fn orientSkipping(f: []Finder, skip: []const [3]u8, picked: *[3]u8) ?Corners {
     // Centre-to-centre spans (dimension - 7) modules.
     const span = @sqrt(dist2(tl, tr));
     const dim_f = span / module + 7.0;
-    var dimension: u32 = @intFromFloat(@round(dim_f));
-    // Snap to a legal symbol size; a fraction of a module of error otherwise
-    // lands between two versions.
-    dimension = dimension -% ((dimension -% 17) % 4);
+    // Snap to the NEAREST legal symbol size (17 + 4 * version); a fraction of a
+    // module of error otherwise lands between two versions. (Rounded down, a
+    // measurement of 40.2 modules became 37 although 41 is the nearer size: a
+    // tilt about the horizontal axis foreshortens the span a little and the
+    // symbol then read one version too small.)
+    if (!(dim_f >= 19.0 and dim_f <= @as(f32, @floatFromInt(qr.max_size)) + 2.0)) return null;
+    const version_steps = @round((dim_f - 17.0) / 4.0);
+    const dimension: u32 = 17 + 4 * @as(u32, @intFromFloat(@max(version_steps, 1.0)));
     if (dimension < 21 or dimension > qr.max_size) return null;
 
     return .{ .tl = tl, .tr = tr, .bl = bl, .dimension = dimension, .module = module };
@@ -3680,4 +3684,26 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "orient snaps the measured size to the nearest symbol size, not the next one down" {
+    // A tilt about the horizontal axis foreshortens the span between finder
+    // centres a little: 40.2 modules measured for a 41-module symbol. Rounded
+    // down to a size it became 37.
+    var pixels: [900 * 900]u8 = undefined;
+    var scratch: [scratchSize(900, 900)]u8 = undefined;
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, "https://example.com/a-longer-url-that-needs-a-bigger-symbol/12345", .{ .ecc = .quartile });
+    try std.testing.expectEqual(@as(u16, 41), m.size);
+    for ([_]bool{ true, false }) |vertical_axis| {
+        for ([_]f32{ 10, 13, 16 }) |deg| {
+            var side: u32 = 0;
+            const img = renderProjective(&m, 6, deg, vertical_axis, &pixels, &side);
+            var ws = Workspace.carve(img, &scratch);
+            binarize(img, &ws.bits, ws.means);
+            var finders: [max_candidates]Finder = undefined;
+            const c = orient(locateFinders(&ws.bits, &finders, true, ws.runs)).?;
+            try std.testing.expectEqual(@as(u32, 41), c.dimension);
+        }
+    }
 }

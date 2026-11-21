@@ -369,7 +369,12 @@ tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
   about the vertical axis in the differential, 10–25° in the in-repo sweep), since it stops assuming the whole symbol is
   one plane. The landmarks are already collected; what is missing is the lattice and the extrapolation for the margins
   outside it. Effort: large.
-- **Tilt about the horizontal axis lags the vertical one** — 15° against 25° at version 6. Unexplained. The scan that
-  finds the finders runs along rows, so the two axes are not the same thing to it, but that is a hypothesis.
+- **Tilt about the horizontal axis lags the vertical one** — 15° against 25° at version 6. Partly explained
+  (2026-11-21, a version 6 text at 6 px per module, finders found on both axes up to 34°): the size estimate
+  snapped *down* to a symbol size, so a 40.2-module span read as 37 where 41 is nearer (fixed: nearest size);
+  the remaining gap is the grid fit, not the finders or the size: at the right size and from 19° the timing
+  score of the best sampled grid is 0.55–0.57 about the horizontal axis, where about the vertical axis it is 1.0
+  to 25°. The refinement (alignment patterns, `refine`) is the suspect: it takes one module size for both
+  directions, and a tilt about the horizontal axis changes the vertical one.
 - **Small symbols at three pixels per module.** A version 1 reads at about 79 % of angles there, against 100 % at four
   pixels. The fix has to happen in binarisation (see *What is deliberately not done* for the sampling idea that failed).
