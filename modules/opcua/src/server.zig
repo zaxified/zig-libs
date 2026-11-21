@@ -184,7 +184,61 @@ pub const SecurityConfig = struct {
     insecure_allow_key_length_outside_policy: bool = false,
 };
 
+/// What a historian answers a raw read with (`HistoryProvider.read_raw`).
+pub const HistoryPage = struct {
+    /// In the order the request asks for (start before end: oldest first;
+    /// end before start: newest first), at most `HistoryRawQuery.max_values`.
+    values: []const encoding.DataValue = &.{},
+    /// Opaque, provider-defined: more values wait. The server hands it to the
+    /// client as the ContinuationPoint, and passes it back in
+    /// `HistoryRawQuery.continuation` on the client's next call (or to
+    /// `HistoryProvider.release_continuation`). Allocated from the `arena`
+    /// the call was given.
+    continuation: ?[]const u8 = null,
+    /// `Good`, or the Bad status of this node (e.g. `BadNodeIdUnknown`,
+    /// `BadContinuationPointInvalid`). Empty `values` with `Good` is
+    /// answered `BadNoData`.
+    status: encoding.StatusCode = 0,
+};
+
+/// A raw read of one node (OPC 10000-11 §6.4.3, `isReadModified` false).
+pub const HistoryRawQuery = struct {
+    /// 0 = unspecified. The server has refused the cases the specification
+    /// forbids (both unspecified; one unspecified with no value count).
+    start_time: encoding.DateTime,
+    end_time: encoding.DateTime,
+    /// The client's `NumValuesPerNode`, held to `Config.max_history_values_per_node`
+    /// (0 from the client = that cap): never 0 here.
+    max_values: u32,
+    return_bounds: bool,
+    /// The ContinuationPoint of the previous answer, or null for a new read.
+    continuation: ?[]const u8,
+};
+
+/// The seam to a historian (`Config.history`): the store keeps no history
+/// (OPC UA servers keep it in a database of their own: open62541's
+/// `UA_HistoryDatabase` and node-opcua's history hooks are the same shape).
+/// Callbacks run on the server's thread, must be quick, and allocate their
+/// answers from `arena` (freed with the request).
+pub const HistoryProvider = struct {
+    ctx: ?*anyopaque = null,
+    read_raw: *const fn (ctx: ?*anyopaque, arena: std.mem.Allocator, node_id: encoding.NodeId, query: HistoryRawQuery) std.mem.Allocator.Error!HistoryPage,
+    /// `ReadAtTimeDetails` (OPC 10000-11 §6.4.5): one value per requested
+    /// time, in the order given; a time with no value takes the provider's
+    /// interpolation (or the previous sample with `use_simple_bounds`, or a
+    /// `BadNoData` value). Null: the server answers `BadHistoryOperationUnsupported`.
+    read_at_time: ?*const fn (ctx: ?*anyopaque, arena: std.mem.Allocator, node_id: encoding.NodeId, req_times: []const encoding.DateTime, use_simple_bounds: bool) std.mem.Allocator.Error![]const encoding.DataValue = null,
+    /// A client released (or the server drops) a ContinuationPoint.
+    release_continuation: ?*const fn (ctx: ?*anyopaque, continuation: []const u8) void = null,
+};
+
 pub const Config = struct {
+    /// The historian behind `HistoryRead`; null = `HistoryRead` answers every
+    /// node `BadHistoryOperationUnsupported`.
+    history: ?HistoryProvider = null,
+    /// Most values one node's `HistoryRead` answer carries (a client asking
+    /// for more, or for "all" with 0, gets this many and a ContinuationPoint).
+    max_history_values_per_node: u32 = 1000,
     application_uri: []const u8 = "urn:zig-libs:opcua:server",
     product_uri: []const u8 = "urn:zig-libs:opcua",
     application_name: encoding.LocalizedText = .{ .locale = "en", .text = "zig-libs opcua server" },
@@ -558,9 +612,12 @@ fn itemChanged(item: *const MonitoredItem, last: encoding.DataValue, dv: encodin
 
 /// Parses the filter of a monitored item. `no_body` or empty: the default
 /// (StatusValue, no deadband). Anything that is not a DataChangeFilter (an
-/// EventFilter, an AggregateFilter) is unsupported. Percent deadbands need the
-/// node's EURange, which the store does not model: unsupported too.
-fn parseDataChangeFilter(f: encoding.ExtensionObject, attribute_id: u32, current: encoding.DataValue) FilterParse {
+/// EventFilter, an AggregateFilter) is unsupported. A percent deadband
+/// (OPC 10000-8 §6.4.2) is `percent / 100 * (high - low)` of the variable's
+/// `EURange` and applies only to an analog variable: one without a range is
+/// refused with `BadFilterNotAllowed`, a percent outside 0..100 with
+/// `BadDeadbandFilterInvalid`.
+fn parseDataChangeFilter(f: encoding.ExtensionObject, attribute_id: u32, current: encoding.DataValue, eu: ?nodestore.EuRange) FilterParse {
     if (f.encoding == .no_body or f.body.len == 0) return .{ .ok = .{ .trigger = .status_value, .deadband = null } };
     if (!services.nodeIdEql(f.type_id, services.type_id.data_change_filter) or f.encoding != .byte_string) {
         return .{ .bad = status.bad_monitored_item_filter_unsupported };
@@ -581,7 +638,15 @@ fn parseDataChangeFilter(f: encoding.ExtensionObject, attribute_id: u32, current
             if (!numeric) return .{ .bad = status.bad_filter_not_allowed };
             return .{ .ok = .{ .trigger = trigger, .deadband = db_value } };
         },
-        2 => return .{ .bad = status.bad_monitored_item_filter_unsupported },
+        2 => {
+            if (!std.math.isFinite(db_value) or db_value < 0 or db_value > 100) return .{ .bad = status.bad_deadband_filter_invalid };
+            const numeric = attribute_id == services.attribute_id.value and
+                if (current.value) |v| isNumericVariant(v) else false;
+            const r = eu orelse return .{ .bad = status.bad_filter_not_allowed };
+            const span = r.high - r.low;
+            if (!numeric or !std.math.isFinite(span) or !(span > 0)) return .{ .bad = status.bad_filter_not_allowed };
+            return .{ .ok = .{ .trigger = trigger, .deadband = db_value / 100.0 * span } };
+        },
         else => return .{ .bad = status.bad_deadband_filter_invalid },
     }
 }
@@ -1872,6 +1937,7 @@ pub const Connection = struct {
             t.browse_next_request.numeric.id => c.handleBrowseNext(ctx, &d),
             t.translate_browse_paths_to_node_ids_request.numeric.id => c.handleTranslateBrowsePaths(ctx, &d),
             t.call_request.numeric.id => c.handleCall(ctx, &d),
+            t.history_read_request.numeric.id => c.handleHistoryRead(ctx, &d),
             t.create_subscription_request.numeric.id => c.handleCreateSubscription(ctx, &d),
             t.modify_subscription_request.numeric.id => c.handleModifySubscription(ctx, &d),
             t.set_publishing_mode_request.numeric.id => c.handleSetPublishingMode(ctx, &d),
@@ -2843,6 +2909,123 @@ pub const Connection = struct {
 
     // ── §5.11: Call ─────────────────────────────────────────────────────────
 
+    fn handleHistoryRead(c: *Connection, ctx: *Ctx, d: *encoding.Decoder) HandlerError!void {
+        _ = c;
+        const request = try services.decodeHistoryReadRequest(d);
+        ctx.request_handle = request.request_header.request_handle;
+        _ = try sessionOrFault(ctx, request.request_header, true) orelse return;
+        if (request.timestamps_to_return == .invalid) {
+            try sendFault(ctx, status.bad_timestamps_to_return_invalid);
+            return;
+        }
+        const nodes = request.nodes_to_read orelse &.{};
+        if (nodes.len == 0) {
+            try sendFault(ctx, status.bad_nothing_to_do);
+            return;
+        }
+        if (nodes.len > ctx.srv.config.max_operations_per_request) {
+            try sendFault(ctx, status.bad_too_many_operations);
+            return;
+        }
+        const results = try ctx.arena.alloc(services.HistoryReadResult, nodes.len);
+        for (nodes, results) |n, *res| res.* = try historyReadOne(ctx, request, n);
+        try sendResponse(ctx, services.type_id.history_read_response, services.HistoryReadResponse, .{
+            .response_header = ctx.responseHeader(status.good),
+            .results = results,
+            .diagnostic_infos = null,
+        }, services.encodeHistoryReadResponse);
+    }
+
+    /// One node of a HistoryRead (OPC 10000-4 §5.10.3): the node and its
+    /// `AccessLevel` are checked here, the data come from `Config.history`.
+    fn historyReadOne(ctx: *Ctx, request: services.HistoryReadRequest, n: services.HistoryReadValueId) ServerError!services.HistoryReadResult {
+        const no_data: encoding.ExtensionObject = .{ .type_id = nodestore.n0(0), .encoding = .no_body };
+        const failed = struct {
+            fn of(sc: encoding.StatusCode) services.HistoryReadResult {
+                return .{ .status_code = sc, .continuation_point = null, .history_data = .{ .type_id = nodestore.n0(0), .encoding = .no_body } };
+            }
+        }.of;
+        const provider = ctx.srv.config.history orelse return failed(status.bad_history_operation_unsupported);
+        if (request.release_continuation_points) {
+            if (n.continuation_point) |cp| if (provider.release_continuation) |f| f(provider.ctx, cp);
+            return .{ .status_code = status.good, .continuation_point = null, .history_data = no_data };
+        }
+        const node = ctx.srv.store.getNode(n.node_id) orelse return failed(status.bad_node_id_unknown);
+        const v = switch (node.attributes) {
+            .variable => |v| v,
+            else => return failed(status.bad_history_operation_invalid),
+        };
+        if (v.user_access_level & nodestore.access_level.history_read == 0) return failed(status.bad_user_access_denied);
+        if (n.data_encoding.name) |name| {
+            if (name.len != 0 and !std.mem.eql(u8, name, "Default Binary")) return failed(status.bad_data_encoding_invalid);
+        }
+        const details = request.history_read_details;
+        if (details.encoding != .byte_string) return failed(status.bad_history_operation_invalid);
+        const cap = @max(ctx.srv.config.max_history_values_per_node, 1);
+        var values: []const encoding.DataValue = &.{};
+        var continuation: ?[]const u8 = null;
+        var sc: encoding.StatusCode = status.good;
+        if (services.nodeIdEql(details.type_id, services.type_id.read_raw_modified_details)) {
+            const raw = services.ReadRawModifiedDetails.decode(details.body) orelse return failed(status.bad_history_operation_invalid);
+            // No store of modifications: only the plain history exists.
+            if (raw.is_read_modified) return failed(status.bad_history_operation_unsupported);
+            if ((raw.start_time == 0 or raw.end_time == 0) and raw.num_values_per_node == 0) return failed(status.bad_history_operation_invalid);
+            const max_values = if (raw.num_values_per_node == 0) cap else @min(raw.num_values_per_node, cap);
+            const page = try provider.read_raw(provider.ctx, ctx.arena, n.node_id, .{
+                .start_time = raw.start_time,
+                .end_time = raw.end_time,
+                .max_values = max_values,
+                .return_bounds = raw.return_bounds,
+                .continuation = n.continuation_point,
+            });
+            sc = page.status;
+            values = page.values[0..@min(page.values.len, max_values)];
+            continuation = page.continuation;
+            if (sc == status.good and values.len == 0) sc = status.bad_no_data;
+        } else if (services.nodeIdEql(details.type_id, services.type_id.read_at_time_details)) {
+            const f = provider.read_at_time orelse return failed(status.bad_history_operation_unsupported);
+            const at = services.ReadAtTimeDetails.decode(details.body) orelse return failed(status.bad_history_operation_invalid);
+            if (at.count == 0 or at.count > cap) return failed(status.bad_history_operation_invalid);
+            const times = try ctx.arena.alloc(encoding.DateTime, at.count);
+            for (times, 0..) |*t, i| t.* = at.reqTime(i);
+            const got = try f(provider.ctx, ctx.arena, n.node_id, times, at.use_simple_bounds);
+            values = got[0..@min(got.len, at.count)];
+        } else return failed(status.bad_history_operation_unsupported);
+        if (sc & 0x8000_0000 != 0) return failed(sc);
+
+        // Historical samples keep the timestamps they were stored with; the
+        // request's TimestampsToReturn selects which of them go out.
+        const shaped = try ctx.arena.alloc(encoding.DataValue, values.len);
+        for (values, shaped) |src, *dst| {
+            dst.* = src;
+            switch (request.timestamps_to_return) {
+                .source => {
+                    dst.server_timestamp = null;
+                    dst.server_pico_seconds = null;
+                },
+                .server => {
+                    dst.source_timestamp = null;
+                    dst.source_pico_seconds = null;
+                },
+                .both => {},
+                .neither, .invalid => {
+                    dst.source_timestamp = null;
+                    dst.source_pico_seconds = null;
+                    dst.server_timestamp = null;
+                    dst.server_pico_seconds = null;
+                },
+            }
+        }
+        var body = std.Io.Writer.Allocating.init(ctx.arena);
+        var e = encoding.Encoder.init(&body.writer);
+        try services.encodeHistoryData(&e, shaped);
+        return .{
+            .status_code = sc,
+            .continuation_point = continuation,
+            .history_data = .{ .type_id = services.type_id.history_data, .encoding = .byte_string, .body = body.writer.buffered() },
+        };
+    }
+
     fn handleCall(c: *Connection, ctx: *Ctx, d: *encoding.Decoder) HandlerError!void {
         _ = c;
         const request = try services.decodeCallRequest(d);
@@ -3148,7 +3331,7 @@ pub const Connection = struct {
         // A DataChangeFilter (trigger, absolute deadband) is applied; any other
         // filter is rejected rather than silently ignored (which would hand the
         // client values it did not ask for).
-        const parsed = switch (parseDataChangeFilter(spec.requested_parameters.filter, target.attribute_id, probe)) {
+        const parsed = switch (parseDataChangeFilter(spec.requested_parameters.filter, target.attribute_id, probe, ctx.srv.store.euRange(target.node_id))) {
             .ok => |ok| ok,
             .bad => |sc| {
                 result.status_code = sc;
@@ -3252,7 +3435,7 @@ pub const Connection = struct {
             };
             // A new filter replaces the old one (an absent one resets to the default).
             const probe = ctx.srv.store.readAttribute(item.node_id, item.attribute_id);
-            const parsed = switch (parseDataChangeFilter(mod.requested_parameters.filter, item.attribute_id, probe)) {
+            const parsed = switch (parseDataChangeFilter(mod.requested_parameters.filter, item.attribute_id, probe, ctx.srv.store.euRange(item.node_id))) {
                 .ok => |ok| ok,
                 .bad => |sc| {
                     results[i] = .{
@@ -11705,6 +11888,243 @@ fn dcFilter(trigger: u32, db_type: u32, db: f64, body: *[16]u8) encoding.Extensi
     return .{ .type_id = services.type_id.data_change_filter, .encoding = .byte_string, .body = body };
 }
 
+/// A historian over fixed samples 10, 20, ... 100 at t = 10 .. 100 (ticks).
+const test_history = struct {
+    var released: u32 = 0;
+
+    fn sample(i: usize) encoding.DataValue {
+        return .{
+            .value = .{ .scalar = .{ .int32 = @intCast(i * 10) } },
+            .status = 0,
+            .source_timestamp = @intCast(i * 10),
+            .server_timestamp = @intCast(i * 10 + 1),
+        };
+    }
+
+    fn readRaw(_: ?*anyopaque, arena: std.mem.Allocator, _: encoding.NodeId, q: HistoryRawQuery) std.mem.Allocator.Error!HistoryPage {
+        // Oldest first from the continuation (an index in text), within [start, end].
+        var from: usize = 1;
+        if (q.continuation) |c| from = std.fmt.parseInt(usize, c, 10) catch return .{ .status = services.status.bad_continuation_point_invalid };
+        var out: std.ArrayList(encoding.DataValue) = .empty;
+        var i = from;
+        while (i <= 10) : (i += 1) {
+            const t: encoding.DateTime = @intCast(i * 10);
+            if (q.start_time != 0 and t < q.start_time) continue;
+            if (q.end_time != 0 and t > q.end_time) break;
+            if (out.items.len == q.max_values) {
+                return .{ .values = out.items, .continuation = try std.fmt.allocPrint(arena, "{d}", .{i}) };
+            }
+            try out.append(arena, sample(i));
+        }
+        return .{ .values = out.items };
+    }
+
+    fn readAtTime(_: ?*anyopaque, arena: std.mem.Allocator, _: encoding.NodeId, times: []const encoding.DateTime, _: bool) std.mem.Allocator.Error![]const encoding.DataValue {
+        const out = try arena.alloc(encoding.DataValue, times.len);
+        for (times, out) |t, *o| o.* = if (t >= 10 and t <= 100 and @mod(t, 10) == 0) sample(@intCast(@divExact(t, 10))) else .{ .status = services.status.bad_no_data };
+        return out;
+    }
+
+    fn release(_: ?*anyopaque, _: []const u8) void {
+        released += 1;
+    }
+};
+
+fn historyCall(rig: *TestRig, details: encoding.ExtensionObject, ttr: services.TimestampsToReturn, release: bool, nodes: []const services.HistoryReadValueId) !services.HistoryReadResponse {
+    var h = rig.header(rig.authToken());
+    h.request_handle = 1;
+    return rig.call(.message, services.type_id.history_read_request, services.HistoryReadRequest, .{
+        .request_header = h,
+        .history_read_details = details,
+        .timestamps_to_return = ttr,
+        .release_continuation_points = release,
+        .nodes_to_read = nodes,
+    }, services.encodeHistoryReadRequest, services.HistoryReadResponse, services.type_id.history_read_response, services.decodeHistoryReadResponse, services.result_fns.history_read);
+}
+
+fn historyValues(gpa: std.mem.Allocator, r: services.HistoryReadResult) ![]const encoding.DataValue {
+    try testing.expect(services.nodeIdEql(r.history_data.type_id, services.type_id.history_data));
+    var rd: std.Io.Reader = .fixed(r.history_data.body);
+    var d = encoding.Decoder.init(&rd, gpa);
+    return (try services.decodeHistoryData(&d)) orelse &.{};
+}
+
+fn freeHistoryValues(gpa: std.mem.Allocator, v: []const encoding.DataValue) void {
+    for (v) |dv| encoding.freeDataValue(gpa, dv);
+    gpa.free(v);
+}
+
+test "HistoryRead: raw and at-time reads through a provider, continuation points, refusals (OPC 10000-4 §5.10.3)" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    var cfg = TestRig.defaultConfig();
+    cfg.history = .{ .read_raw = test_history.readRaw, .read_at_time = test_history.readAtTime, .release_continuation = test_history.release };
+    cfg.max_history_values_per_node = 4;
+    try rig.init(gpa, cfg);
+    defer rig.deinit();
+    try rig.connect();
+    const ns = rig.answer_id.string.namespace;
+    const hist_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "hist.var" } };
+    try rig.store.addVariable(.{
+        .node_id = hist_id,
+        .parent_id = rig.device_id,
+        .browse_name = .{ .namespace_index = ns, .name = "hist.var" },
+        .value = .{ .scalar = .{ .int32 = 0 } },
+        .data_type = nodestore.n0(nodestore.id.int32),
+        .access_level = nodestore.access_level.current_read | nodestore.access_level.history_read,
+    });
+    const hv = struct {
+        fn id(n: encoding.NodeId, cp: ?[]const u8) services.HistoryReadValueId {
+            return .{ .node_id = n, .index_range = null, .data_encoding = .{ .namespace_index = 0, .name = null }, .continuation_point = cp };
+        }
+    }.id;
+    var raw_body: [services.ReadRawModifiedDetails.wire_len]u8 = undefined;
+    const rawDetails = struct {
+        fn of(buf: *[services.ReadRawModifiedDetails.wire_len]u8, d: services.ReadRawModifiedDetails) encoding.ExtensionObject {
+            d.encode(buf);
+            return .{ .type_id = services.type_id.read_raw_modified_details, .encoding = .byte_string, .body = buf };
+        }
+    }.of;
+
+    // 1: [20, 80], no count: 7 samples, cut at the server's 4 with a continuation point.
+    {
+        const r = try historyCall(&rig, rawDetails(&raw_body, .{ .is_read_modified = false, .start_time = 20, .end_time = 80, .num_values_per_node = 0, .return_bounds = false }), .both, false, &.{ hv(hist_id, null), hv(rig.answer_id, null), hv(rig.device_id, null) });
+        defer services.freeHistoryReadResponse(gpa, r);
+        const res = r.results.?;
+        try testing.expectEqual(status.good, res[0].status_code);
+        const first = try historyValues(gpa, res[0]);
+        defer freeHistoryValues(gpa, first);
+        try testing.expectEqual(@as(usize, 4), first.len);
+        try testing.expectEqual(@as(i32, 20), first[0].value.?.scalar.int32);
+        try testing.expectEqual(@as(?encoding.DateTime, 20), first[0].source_timestamp);
+        try testing.expectEqual(@as(?encoding.DateTime, 21), first[0].server_timestamp);
+        try testing.expectEqualStrings("6", res[0].continuation_point.?);
+        // The answer variable has no HistoryRead access; a folder is no variable.
+        try testing.expectEqual(status.bad_user_access_denied, res[1].status_code);
+        try testing.expectEqual(status.bad_history_operation_invalid, res[2].status_code);
+
+        // 2: the continuation point carries on: 60, 70, 80 and no more.
+        const r2 = try historyCall(&rig, rawDetails(&raw_body, .{ .is_read_modified = false, .start_time = 20, .end_time = 80, .num_values_per_node = 0, .return_bounds = false }), .source, false, &.{hv(hist_id, res[0].continuation_point)});
+        defer services.freeHistoryReadResponse(gpa, r2);
+        const rest = try historyValues(gpa, r2.results.?[0]);
+        defer freeHistoryValues(gpa, rest);
+        try testing.expectEqual(@as(usize, 3), rest.len);
+        try testing.expectEqual(@as(i32, 80), rest[2].value.?.scalar.int32);
+        try testing.expectEqual(@as(?encoding.DateTime, null), rest[0].server_timestamp); // .source
+        try testing.expect(r2.results.?[0].continuation_point == null);
+    }
+    // 3: a client count below the cap is honoured; a bad continuation point is the node's status.
+    {
+        const r = try historyCall(&rig, rawDetails(&raw_body, .{ .is_read_modified = false, .start_time = 10, .end_time = 100, .num_values_per_node = 2, .return_bounds = false }), .neither, false, &.{ hv(hist_id, null), hv(hist_id, "zz") });
+        defer services.freeHistoryReadResponse(gpa, r);
+        const v = try historyValues(gpa, r.results.?[0]);
+        defer freeHistoryValues(gpa, v);
+        try testing.expectEqual(@as(usize, 2), v.len);
+        try testing.expectEqual(@as(?encoding.DateTime, null), v[0].source_timestamp);
+        try testing.expectEqual(status.bad_continuation_point_invalid, r.results.?[1].status_code);
+    }
+    // 4: nothing in the range; the unspecified-bounds rules; modified data.
+    {
+        const r = try historyCall(&rig, rawDetails(&raw_body, .{ .is_read_modified = false, .start_time = 200, .end_time = 300, .num_values_per_node = 0, .return_bounds = false }), .both, false, &.{hv(hist_id, null)});
+        defer services.freeHistoryReadResponse(gpa, r);
+        try testing.expectEqual(status.bad_no_data, r.results.?[0].status_code);
+        const r2 = try historyCall(&rig, rawDetails(&raw_body, .{ .is_read_modified = false, .start_time = 0, .end_time = 300, .num_values_per_node = 0, .return_bounds = false }), .both, false, &.{hv(hist_id, null)});
+        defer services.freeHistoryReadResponse(gpa, r2);
+        try testing.expectEqual(status.bad_history_operation_invalid, r2.results.?[0].status_code);
+        const r3 = try historyCall(&rig, rawDetails(&raw_body, .{ .is_read_modified = true, .start_time = 10, .end_time = 100, .num_values_per_node = 0, .return_bounds = false }), .both, false, &.{hv(hist_id, null)});
+        defer services.freeHistoryReadResponse(gpa, r3);
+        try testing.expectEqual(status.bad_history_operation_unsupported, r3.results.?[0].status_code);
+    }
+    // 5: at time: 30 exists, 35 does not.
+    {
+        var body: [4 + 16 + 1]u8 = undefined;
+        std.mem.writeInt(i32, body[0..4], 2, .little);
+        std.mem.writeInt(i64, body[4..12], 30, .little);
+        std.mem.writeInt(i64, body[12..20], 35, .little);
+        body[20] = 1;
+        const r = try historyCall(&rig, .{ .type_id = services.type_id.read_at_time_details, .encoding = .byte_string, .body = &body }, .both, false, &.{hv(hist_id, null)});
+        defer services.freeHistoryReadResponse(gpa, r);
+        const v = try historyValues(gpa, r.results.?[0]);
+        defer freeHistoryValues(gpa, v);
+        try testing.expectEqual(@as(usize, 2), v.len);
+        try testing.expectEqual(@as(i32, 30), v[0].value.?.scalar.int32);
+        try testing.expectEqual(status.bad_no_data, v[1].status.?);
+    }
+    // 6: releasing a continuation point reaches the provider.
+    {
+        const before = test_history.released;
+        const r = try historyCall(&rig, rawDetails(&raw_body, .{ .is_read_modified = false, .start_time = 10, .end_time = 100, .num_values_per_node = 0, .return_bounds = false }), .both, true, &.{hv(hist_id, "6")});
+        defer services.freeHistoryReadResponse(gpa, r);
+        try testing.expectEqual(status.good, r.results.?[0].status_code);
+        try testing.expectEqual(before + 1, test_history.released);
+    }
+}
+
+test "HistoryRead without a provider: every node is BadHistoryOperationUnsupported" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    var body: [services.ReadRawModifiedDetails.wire_len]u8 = undefined;
+    (services.ReadRawModifiedDetails{ .is_read_modified = false, .start_time = 1, .end_time = 2, .num_values_per_node = 0, .return_bounds = false }).encode(&body);
+    const r = try historyCall(&rig, .{ .type_id = services.type_id.read_raw_modified_details, .encoding = .byte_string, .body = &body }, .both, false, &.{.{ .node_id = rig.answer_id, .index_range = null, .data_encoding = .{ .namespace_index = 0, .name = null }, .continuation_point = null }});
+    defer services.freeHistoryReadResponse(gpa, r);
+    try testing.expectEqual(status.bad_history_operation_unsupported, r.results.?[0].status_code);
+}
+
+test "DataChangeFilter: percent deadband of the EURange (OPC 10000-8 §6.4.2)" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const ns = rig.answer_id.string.namespace;
+    const an_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "db.analog" } };
+    const pr_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "db.analog.EURange" } };
+    try rig.store.addVariable(.{
+        .node_id = an_id,
+        .parent_id = rig.device_id,
+        .browse_name = .{ .namespace_index = ns, .name = "db.analog" },
+        .value = .{ .scalar = .{ .double = 100 } },
+        .data_type = nodestore.n0(nodestore.id.double),
+        .access_level = nodestore.access_level.read_write,
+        .eu_range = .{ .low = 0, .high = 200 },
+        .eu_range_node_id = pr_id,
+    });
+    // The property node is there: HasProperty, a Range extension object.
+    const prop = rig.store.readAttribute(pr_id, services.attribute_id.value);
+    try testing.expect(prop.value.? == .scalar and prop.value.?.scalar == .extension_object);
+    try testing.expectEqual(@as(usize, 16), prop.value.?.scalar.extension_object.body.len);
+    try testing.expectEqual(@as(?nodestore.EuRange, .{ .low = 0, .high = 200 }), rig.store.euRange(an_id));
+    try testing.expectEqual(@as(?nodestore.EuRange, null), rig.store.euRange(rig.answer_id));
+
+    const created = try newSub(&rig, 100, 3, 30, 0, true);
+    defer services.freeCreateSubscriptionResponse(gpa, created);
+    const val = services.attribute_id.value;
+    var bodies: [4][16]u8 = undefined;
+    var items = [_]services.MonitoredItemCreateRequest{
+        mkItem(an_id, val, 1, .reporting, -1, 20, true), // [0] 5 % of 200 = 10
+        mkItem(an_id, val, 2, .reporting, -1, 20, true), // [1] 100.5 %
+        mkItem(an_id, val, 3, .reporting, -1, 20, true), // [2] NaN
+        mkItem(an_id, val, 4, .reporting, -1, 20, true), // [3] 0 %: any change
+    };
+    items[0].requested_parameters.filter = dcFilter(1, 2, 5.0, &bodies[0]);
+    items[1].requested_parameters.filter = dcFilter(1, 2, 100.5, &bodies[1]);
+    items[2].requested_parameters.filter = dcFilter(1, 2, std.math.nan(f64), &bodies[2]);
+    items[3].requested_parameters.filter = dcFilter(1, 2, 0.0, &bodies[3]);
+    const r = try callCreateItems(&rig, 1, created.subscription_id, .neither, &items);
+    defer services.freeCreateMonitoredItemsResponse(gpa, r);
+    const res = r.results.?;
+    try testing.expectEqual(status.good, res[0].status_code);
+    try testing.expectEqual(status.bad_deadband_filter_invalid, res[1].status_code);
+    try testing.expectEqual(status.bad_deadband_filter_invalid, res[2].status_code);
+    try testing.expectEqual(status.good, res[3].status_code);
+    const sub = mutSub(&rig, 0);
+    const pct = &sub.monitored_items.items[0];
+    try testing.expectEqual(@as(?f64, 10.0), pct.deadband);
+}
+
 test "DataChangeFilter: absolute deadband, trigger, refusals (OPC 10000-4 §7.22.2)" {
     const gpa = testing.allocator;
     var rig: TestRig = undefined;
@@ -11728,7 +12148,7 @@ test "DataChangeFilter: absolute deadband, trigger, refusals (OPC 10000-4 §7.22
     var items = [_]services.MonitoredItemCreateRequest{
         mkItem(rig.answer_id, val, 1, .reporting, -1, 20, true), // [0] absolute 5, StatusValue
         mkItem(arr_id, val, 2, .reporting, -1, 20, true), // [1] array, absolute 0.5
-        mkItem(rig.answer_id, val, 3, .reporting, -1, 20, true), // [2] percent: unsupported
+        mkItem(rig.answer_id, val, 3, .reporting, -1, 20, true), // [2] percent, no EURange
         mkItem(rig.answer_id, val, 4, .reporting, -1, 20, true), // [3] negative deadband
         mkItem(rig.answer_id, services.attribute_id.browse_name, 5, .reporting, -1, 20, true), // [4] not numeric
         mkItem(rig.answer_id, val, 6, .reporting, -1, 20, true), // [5] trigger 7
@@ -11748,7 +12168,7 @@ test "DataChangeFilter: absolute deadband, trigger, refusals (OPC 10000-4 §7.22
     const res = r.results.?;
     try testing.expectEqual(status.good, res[0].status_code);
     try testing.expectEqual(status.good, res[1].status_code);
-    try testing.expectEqual(status.bad_monitored_item_filter_unsupported, res[2].status_code);
+    try testing.expectEqual(status.bad_filter_not_allowed, res[2].status_code);
     try testing.expectEqual(status.bad_deadband_filter_invalid, res[3].status_code);
     try testing.expectEqual(status.bad_filter_not_allowed, res[4].status_code);
     try testing.expectEqual(status.bad_monitored_item_filter_invalid, res[5].status_code);

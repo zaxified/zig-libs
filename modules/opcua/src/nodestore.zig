@@ -80,6 +80,9 @@ pub const id = struct {
     pub const base_variable_type: u32 = 62;
     pub const base_data_variable_type: u32 = 63;
     pub const property_type: u32 = 68;
+    /// DataType Range (OPC 10000-5) and its Default Binary encoding node.
+    pub const range: u32 = 884;
+    pub const range_binary_encoding: u32 = 886;
     pub const server_type: u32 = 2004;
     pub const server_status_type: u32 = 2138;
 
@@ -409,7 +412,14 @@ pub const MethodFn = *const fn (
     outputs: *std.ArrayList(encoding.Variant),
 ) StoreError!encoding.StatusCode;
 
+/// The `EURange` of an analog variable (OPC 10000-8 §5.3.2): the typical
+/// value range. Percent deadbands of a DataChangeFilter are a share of
+/// `high - low`.
+pub const EuRange = struct { low: f64, high: f64 };
+
 pub const VariableAttributes = struct {
+    /// Set: the variable is analog, and a percent deadband applies to it.
+    eu_range: ?EuRange = null,
     value: encoding.DataValue = .{},
     data_type: encoding.NodeId = n0(id.base_data_type),
     value_rank: i32 = value_rank.scalar,
@@ -652,6 +662,7 @@ pub const NodeStore = struct {
                     .user_access_level = v.user_access_level,
                     .minimum_sampling_interval = v.minimum_sampling_interval,
                     .historizing = v.historizing,
+                    .eu_range = v.eu_range,
                 } };
             },
             .variable_type => |v| blk: {
@@ -1146,6 +1157,12 @@ pub const NodeStore = struct {
         /// current user.
         user_access_level: ?u8 = null,
         timestamp: ?encoding.DateTime = null,
+        /// Makes the variable analog: percent deadbands apply (`EuRange`).
+        eu_range: ?EuRange = null,
+        /// With `eu_range`: the NodeId of the `EURange` property node
+        /// (`HasProperty`, DataType Range, `i=884`) that shows the range to
+        /// clients. Null: the range is kept for deadbands only.
+        eu_range_node_id: ?encoding.NodeId = null,
     }) StoreError!void {
         try s.addNode(.{
             .node_id = opts.node_id,
@@ -1153,6 +1170,7 @@ pub const NodeStore = struct {
             .display_name = if (opts.display_name.text == null) .{ .text = opts.browse_name.name } else opts.display_name,
             .description = opts.description,
             .attributes = .{ .variable = .{
+                .eu_range = opts.eu_range,
                 .value = .{
                     .value = opts.value,
                     .status = 0,
@@ -1167,6 +1185,30 @@ pub const NodeStore = struct {
         });
         try s.addReference(opts.parent_id, opts.reference_type_id, opts.node_id);
         try s.addReference(opts.node_id, n0(id.has_type_definition), opts.type_definition);
+        if (opts.eu_range) |r| if (opts.eu_range_node_id) |pid| {
+            var body: [16]u8 = undefined; // Range, binary: Low, High (Double, little-endian)
+            std.mem.writeInt(u64, body[0..8], @bitCast(r.low), .little);
+            std.mem.writeInt(u64, body[8..16], @bitCast(r.high), .little);
+            try s.addVariable(.{
+                .node_id = pid,
+                .parent_id = opts.node_id,
+                .reference_type_id = n0(id.has_property),
+                .type_definition = n0(id.property_type),
+                .browse_name = .{ .namespace_index = 0, .name = "EURange" },
+                .value = .{ .scalar = .{ .extension_object = .{ .type_id = n0(id.range_binary_encoding), .encoding = .byte_string, .body = &body } } },
+                .data_type = n0(id.range),
+                .timestamp = opts.timestamp,
+            });
+        };
+    }
+
+    /// The `EURange` of a variable, if it has one.
+    pub fn euRange(s: *NodeStore, node_id: encoding.NodeId) ?EuRange {
+        const node = s.nodes.getPtr(node_id) orelse return null;
+        return switch (node.attributes) {
+            .variable => |v| v.eu_range,
+            else => null,
+        };
     }
 
     /// Add a Method node under `parent` (`HasComponent`, per OPC 10000-3

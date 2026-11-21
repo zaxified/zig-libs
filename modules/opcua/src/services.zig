@@ -137,6 +137,12 @@ pub const type_id = struct {
     pub const browse_next_response = n0(536);
     pub const call_request = n0(712);
     pub const call_response = n0(715);
+    // HistoryRead (OPC 10000-4 §5.10.3, details in OPC 10000-11; Schema/NodeIds.csv).
+    pub const history_read_request = n0(664);
+    pub const history_read_response = n0(667);
+    pub const read_raw_modified_details = n0(649);
+    pub const read_at_time_details = n0(655);
+    pub const history_data = n0(658);
 
     // ── Part 5: subscriptions / monitored items / Publish (OPC 10000-4 §5.12/
     // §5.13) — same source as the block above, fetched directly from the OPC
@@ -235,6 +241,9 @@ pub const status = struct {
     pub const bad_filter_not_allowed: encoding.StatusCode = 0x8045_0000;
     pub const bad_deadband_filter_invalid: encoding.StatusCode = 0x808E_0000;
     pub const bad_continuation_point_invalid: encoding.StatusCode = 0x804A_0000;
+    pub const bad_history_operation_invalid: encoding.StatusCode = 0x8071_0000;
+    pub const bad_history_operation_unsupported: encoding.StatusCode = 0x8072_0000;
+    pub const bad_no_data: encoding.StatusCode = 0x809B_0000;
     pub const bad_no_continuation_points: encoding.StatusCode = 0x804B_0000;
     pub const bad_reference_type_id_invalid: encoding.StatusCode = 0x804C_0000;
     pub const bad_browse_direction_invalid: encoding.StatusCode = 0x804D_0000;
@@ -1717,6 +1726,210 @@ pub fn decodeCallResponse(d: *encoding.Decoder) encoding.DecodeError!CallRespons
 pub fn freeCallResponse(a: std.mem.Allocator, v: CallResponse) void {
     freeResponseHeader(a, v.response_header);
     freeCallMethodResultArray(a, v.results);
+    freeDiagnosticInfoArray(a, v.diagnostic_infos);
+}
+
+// ── HistoryRead (OPC 10000-4 §5.10.3) ───────────────────────────────────────
+
+pub const HistoryReadValueId = struct {
+    node_id: encoding.NodeId,
+    index_range: ?[]const u8,
+    data_encoding: encoding.QualifiedName,
+    continuation_point: ?[]const u8,
+};
+
+pub fn encodeHistoryReadValueId(e: *encoding.Encoder, v: HistoryReadValueId) encoding.EncodeError!void {
+    try e.encodeNodeId(v.node_id);
+    try e.encodeString(v.index_range);
+    try e.encodeQualifiedName(v.data_encoding);
+    try e.encodeByteString(v.continuation_point);
+}
+
+pub fn decodeHistoryReadValueId(d: *encoding.Decoder) encoding.DecodeError!HistoryReadValueId {
+    const node_id = try d.decodeNodeId();
+    errdefer encoding.freeNodeId(d.allocator, node_id);
+    const index_range = try d.decodeString();
+    errdefer freeOptStr(d.allocator, index_range);
+    const data_encoding = try d.decodeQualifiedName();
+    errdefer encoding.freeQualifiedName(d.allocator, data_encoding);
+    return .{
+        .node_id = node_id,
+        .index_range = index_range,
+        .data_encoding = data_encoding,
+        .continuation_point = try d.decodeByteString(),
+    };
+}
+
+pub fn freeHistoryReadValueId(a: std.mem.Allocator, v: HistoryReadValueId) void {
+    encoding.freeNodeId(a, v.node_id);
+    freeOptStr(a, v.index_range);
+    encoding.freeQualifiedName(a, v.data_encoding);
+    freeOptStr(a, v.continuation_point);
+}
+
+pub const HistoryReadRequest = struct {
+    request_header: RequestHeader,
+    /// An ExtensionObject: `ReadRawModifiedDetails` or `ReadAtTimeDetails`
+    /// here (`type_id.read_raw_modified_details` / `read_at_time_details`).
+    history_read_details: encoding.ExtensionObject,
+    timestamps_to_return: TimestampsToReturn,
+    release_continuation_points: bool,
+    nodes_to_read: ?[]const HistoryReadValueId,
+};
+
+pub fn encodeHistoryReadRequest(e: *encoding.Encoder, v: HistoryReadRequest) encoding.EncodeError!void {
+    try encodeRequestHeader(e, v.request_header);
+    try e.encodeExtensionObject(v.history_read_details);
+    try encodeEnum(e, TimestampsToReturn, v.timestamps_to_return);
+    try e.encodeBoolean(v.release_continuation_points);
+    try encodeArray(e, HistoryReadValueId, v.nodes_to_read, encodeHistoryReadValueId);
+}
+
+pub fn decodeHistoryReadRequest(d: *encoding.Decoder) encoding.DecodeError!HistoryReadRequest {
+    const header = try decodeRequestHeader(d);
+    errdefer freeRequestHeader(d.allocator, header);
+    const details = try d.decodeExtensionObject();
+    errdefer encoding.freeExtensionObject(d.allocator, details);
+    const ttr = try decodeEnum(d, TimestampsToReturn);
+    const release = try d.decodeBoolean();
+    return .{
+        .request_header = header,
+        .history_read_details = details,
+        .timestamps_to_return = ttr,
+        .release_continuation_points = release,
+        .nodes_to_read = try decodeArray(d, HistoryReadValueId, decodeHistoryReadValueId, freeHistoryReadValueId),
+    };
+}
+
+pub fn freeHistoryReadRequest(a: std.mem.Allocator, v: HistoryReadRequest) void {
+    freeRequestHeader(a, v.request_header);
+    encoding.freeExtensionObject(a, v.history_read_details);
+    if (v.nodes_to_read) |items| {
+        for (items) |it| freeHistoryReadValueId(a, it);
+        a.free(items);
+    }
+}
+
+/// `ReadRawModifiedDetails` (OPC 10000-11 §6.4.3), the body of the details
+/// ExtensionObject. A zero `start_time` or `end_time` is "unspecified".
+pub const ReadRawModifiedDetails = struct {
+    is_read_modified: bool,
+    start_time: encoding.DateTime,
+    end_time: encoding.DateTime,
+    num_values_per_node: u32,
+    return_bounds: bool,
+
+    pub const wire_len = 1 + 8 + 8 + 4 + 1;
+
+    pub fn encode(v: ReadRawModifiedDetails, out: *[wire_len]u8) void {
+        out[0] = @intFromBool(v.is_read_modified);
+        std.mem.writeInt(i64, out[1..9], v.start_time, .little);
+        std.mem.writeInt(i64, out[9..17], v.end_time, .little);
+        std.mem.writeInt(u32, out[17..21], v.num_values_per_node, .little);
+        out[21] = @intFromBool(v.return_bounds);
+    }
+
+    /// Null: the body is not exactly one such structure.
+    pub fn decode(body: []const u8) ?ReadRawModifiedDetails {
+        if (body.len != wire_len or body[0] > 1 or body[21] > 1) return null;
+        return .{
+            .is_read_modified = body[0] == 1,
+            .start_time = std.mem.readInt(i64, body[1..9], .little),
+            .end_time = std.mem.readInt(i64, body[9..17], .little),
+            .num_values_per_node = std.mem.readInt(u32, body[17..21], .little),
+            .return_bounds = body[21] == 1,
+        };
+    }
+};
+
+/// `ReadAtTimeDetails` (OPC 10000-11 §6.4.5): the `req_times` array is
+/// borrowed from `body` (read through `reqTime`).
+pub const ReadAtTimeDetails = struct {
+    count: usize,
+    body: []const u8,
+    use_simple_bounds: bool,
+
+    pub fn decode(body: []const u8) ?ReadAtTimeDetails {
+        if (body.len < 5) return null;
+        const n = std.mem.readInt(i32, body[0..4], .little);
+        if (n < 0) return null; // null array: nothing to read, and not a valid request
+        const count: usize = @intCast(n);
+        if (count > (body.len - 5) / 8 or body.len != 4 + count * 8 + 1 or body[body.len - 1] > 1) return null;
+        return .{ .count = count, .body = body, .use_simple_bounds = body[body.len - 1] == 1 };
+    }
+
+    pub fn reqTime(v: ReadAtTimeDetails, i: usize) encoding.DateTime {
+        return std.mem.readInt(i64, v.body[4 + i * 8 ..][0..8], .little);
+    }
+};
+
+pub const HistoryReadResult = struct {
+    status_code: encoding.StatusCode,
+    continuation_point: ?[]const u8,
+    /// `type_id.history_data` with a `HistoryData` body, or no body.
+    history_data: encoding.ExtensionObject,
+};
+
+pub fn encodeHistoryReadResult(e: *encoding.Encoder, v: HistoryReadResult) encoding.EncodeError!void {
+    try e.encodeStatusCode(v.status_code);
+    try e.encodeByteString(v.continuation_point);
+    try e.encodeExtensionObject(v.history_data);
+}
+
+pub fn decodeHistoryReadResult(d: *encoding.Decoder) encoding.DecodeError!HistoryReadResult {
+    const sc = try d.decodeStatusCode();
+    const cp = try d.decodeByteString();
+    errdefer freeOptStr(d.allocator, cp);
+    return .{ .status_code = sc, .continuation_point = cp, .history_data = try d.decodeExtensionObject() };
+}
+
+pub fn freeHistoryReadResult(a: std.mem.Allocator, v: HistoryReadResult) void {
+    freeOptStr(a, v.continuation_point);
+    encoding.freeExtensionObject(a, v.history_data);
+}
+
+/// `HistoryData`: the body of a result's `history_data`.
+pub fn encodeHistoryData(e: *encoding.Encoder, values: []const encoding.DataValue) encoding.EncodeError!void {
+    try encodeArray(e, encoding.DataValue, values, encoding.Encoder.encodeDataValue);
+}
+
+pub fn decodeHistoryData(d: *encoding.Decoder) encoding.DecodeError!?[]const encoding.DataValue {
+    return try decodeArray(d, encoding.DataValue, encoding.Decoder.decodeDataValue, encoding.freeDataValue);
+}
+
+pub const HistoryReadResponse = struct {
+    response_header: ResponseHeader,
+    results: ?[]const HistoryReadResult,
+    diagnostic_infos: ?[]const encoding.DiagnosticInfo,
+};
+
+pub fn encodeHistoryReadResponse(e: *encoding.Encoder, v: HistoryReadResponse) encoding.EncodeError!void {
+    try encodeResponseHeader(e, v.response_header);
+    try encodeArray(e, HistoryReadResult, v.results, encodeHistoryReadResult);
+    try encodeArray(e, encoding.DiagnosticInfo, v.diagnostic_infos, encoding.Encoder.encodeDiagnosticInfo);
+}
+
+pub fn decodeHistoryReadResponse(d: *encoding.Decoder) encoding.DecodeError!HistoryReadResponse {
+    const header = try decodeResponseHeader(d);
+    errdefer freeResponseHeader(d.allocator, header);
+    const results = try decodeArray(d, HistoryReadResult, decodeHistoryReadResult, freeHistoryReadResult);
+    errdefer if (results) |items| {
+        for (items) |it| freeHistoryReadResult(d.allocator, it);
+        d.allocator.free(items);
+    };
+    return .{
+        .response_header = header,
+        .results = results,
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
+    };
+}
+
+pub fn freeHistoryReadResponse(a: std.mem.Allocator, v: HistoryReadResponse) void {
+    freeResponseHeader(a, v.response_header);
+    if (v.results) |items| {
+        for (items) |it| freeHistoryReadResult(a, it);
+        a.free(items);
+    }
     freeDiagnosticInfoArray(a, v.diagnostic_infos);
 }
 
@@ -3383,6 +3596,9 @@ fn activateSessionResult(r: ActivateSessionResponse) encoding.StatusCode {
 fn closeSessionResult(r: CloseSessionResponse) encoding.StatusCode {
     return r.response_header.service_result;
 }
+fn historyReadResult(r: HistoryReadResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
 fn readResult(r: ReadResponse) encoding.StatusCode {
     return r.response_header.service_result;
 }
@@ -3444,6 +3660,7 @@ pub const result_fns = struct {
     pub const activate_session = activateSessionResult;
     pub const close_session = closeSessionResult;
     pub const read = readResult;
+    pub const history_read = historyReadResult;
     pub const write = writeResult;
     pub const browse = browseResponseResult;
     pub const browse_next = browseNextResult;

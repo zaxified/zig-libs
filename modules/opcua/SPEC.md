@@ -452,11 +452,25 @@ Server side, deliberately out of scope for this part — each is a Bad status, n
   *more* than the deadband away from the **last reported** value (a NaN difference counts; any element of an array; a length change),
   the first value is always reported. Refusals per item: a deadband on a non-numeric Value or another attribute `BadFilterNotAllowed`, a
   negative or non-finite deadband or an unknown DeadbandType `BadDeadbandFilterInvalid`, an unknown Trigger or a body that is not 16 octets
-  `BadMonitoredItemFilterInvalid`, a **percent** deadband `BadMonitoredItemFilterUnsupported` (it needs the node's EURange property, which
-  the store does not model). open62541 and node-opcua offer the same trigger/absolute/percent set.
+  `BadMonitoredItemFilterInvalid`. A **percent** deadband (OPC 10000-8 §6.4.2) is `percent / 100 * (high - low)` of the variable's
+  EURange and applies to analog variables only: the store models the range (`VariableAttributes.eu_range`, set by `addVariable`'s
+  `eu_range`, which with `eu_range_node_id` also adds the `EURange` HasProperty node, DataType Range `i=884`, for clients); a variable
+  without one is refused `BadFilterNotAllowed` (Part 8: it "applies only to AnalogItems with an EURange"; the specification names no
+  code for a missing range, this one is the one used for a filter the node cannot take), a percent outside 0..100 `BadDeadbandFilterInvalid`.
+  The absolute width is fixed when the item is created or modified (a later change of the range is not followed).
+  open62541 and node-opcua offer the same trigger/absolute/percent set.
+- **HistoryRead** (OPC 10000-4 §5.10.3): the store keeps no history; `Config.history` is the seam to a historian
+  (`HistoryProvider`: `read_raw`, optional `read_at_time`, `release_continuation`; open62541's `UA_HistoryDatabase` has the same shape).
+  The server decodes `ReadRawModifiedDetails` and `ReadAtTimeDetails`, checks per node that it is a Variable with the `HistoryRead`
+  user access bit, the data encoding and the details (both bounds unspecified, or one unspecified without a value count, is
+  `BadHistoryOperationInvalid`; `isReadModified` is `BadHistoryOperationUnsupported`: no store of modifications), asks the provider and
+  answers `HistoryData`; empty is `BadNoData`, and `Config.max_history_values_per_node` (1000) caps one answer, the rest waiting behind
+  the provider's opaque ContinuationPoint, which `releaseContinuationPoints` hands back to it. `TimestampsToReturn` selects among the
+  stored timestamps. Without a provider every node answers `BadHistoryOperationUnsupported`. Not built: processed (aggregate) reads,
+  event history, `HistoryUpdate`.
 - **Node management:** no AddNodes/AddReferences/DeleteNodes/DeleteReferences (`BadServiceUnsupported`) — the address
   space is built by the host program, not over the wire (Backlog).
-- **Other service sets:** no Query, no HistoryRead/HistoryUpdate (Backlog), no RegisterNodes/UnregisterNodes, no
+- **Other service sets:** no Query, no HistoryUpdate, no processed or event history, no RegisterNodes/UnregisterNodes, no
   RegisterServer, no session transfer between channels, no `TransferSubscriptions`, no Views (a non-null ViewId is
   `BadViewIdUnknown`), no `DataEncoding` other than Default Binary, no reverse-connect, no discovery server
   registration, no multi-server namespaces (`ExpandedNodeId.server_index` is decoded, never resolved).
@@ -483,6 +497,5 @@ Server side, deliberately out of scope for this part — each is a Bad status, n
 
 - **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. Also `deriveKeys` still returns `ChannelKeys` by value and `services.zig`/`server.zig` copy `SecurityContext`/`ChannelKeys` by value (`ch.security.?`, `c.keys orelse`) inside those burned frames. Next: drive one Basic256Sha256 session over the loopback fixture under the probe, then move the copies to pointers.
 - **Security policies `Aes128Sha256RsaOaep` / `Aes256Sha256RsaPss`** (survey): `Basic256Sha256` is deprecated in OPC UA 1.05 and new servers may offer only the newer policies; medium, fits §2 (sibling `rsa` has PSS/OAEP *(inferred)*).
-- **Events and alarms & conditions** (survey): the `EventFilter` on monitored items, `EventNotificationList`, the event type model and conditions (OPC 10000-9); large, fits §2. Also the percent deadband, which needs the EURange property of the node (small once the store models it).
-- **HistoryRead** (survey): needed for historian access; medium, fits §2 (the store is caller-supplied).
+- **Events and alarms & conditions** (survey): the `EventFilter` on monitored items, `EventNotificationList`, the event type model and conditions (OPC 10000-9); large, fits §2.
 - **Full standard NodeSet + node management + PubSub (Part 14)** (survey): large, fits §2 for NodeSet (generated data); PubSub is a project of its own.
