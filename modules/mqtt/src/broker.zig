@@ -74,8 +74,8 @@
 //!
 //! Deliberately deferred (documented, not built): a store written by the broker itself (sessions and
 //! retained messages live in memory; the server keeps them through
-//! `sessionStatesWith`/`retainedMessages`), and TLS (terminate it in front and hand `TcpServer` the
-//! plaintext, or drive the socket-free core over a TLS stream yourself). ⭐ Will / LWT was on this list
+//! `sessionStatesWith`/`retainedMessages`), and a TLS engine (`TcpServer.secure` is the seam for one;
+//! or terminate it in front, or drive the socket-free core over a TLS stream yourself). ⭐ Will / LWT was on this list
 //! and is now built (3.1.2.5, 3.14.4), as is `publish` — a message the server itself
 //! originates — and, persistent sessions.
 //!
@@ -5432,6 +5432,10 @@ pub const TcpServer = struct {
     /// on the monotonic clock, so it is accurate to about half this value
     /// (at most one second). A per-connection bounded outbox is SPEC backlog.
     write_timeout_ms: u32 = 10_000,
+    /// A TLS layer for this listener (see `Secure`); null = plaintext. One
+    /// `TcpServer` is one listener: run one per port against the same broker,
+    /// as Mosquitto's `listener 1883` and `listener 8883`.
+    secure: ?Secure = null,
 
     /// Standard MQTT port (1883; 8883 is MQTT over TLS).
     pub const default_port = 1883;
@@ -5518,23 +5522,29 @@ pub const TcpServer = struct {
         // Declared before the connection so it outlives `remove`, which
         // drains the fan-out writes that report to it.
         var watch: Watchdog = .{ .io = s.io, .stream = stream, .config = s.broker.config, .write_timeout_ms = s.write_timeout_ms, .start_ms = monoMs(s.io) };
-        var sock = SocketTransport{ .io = s.io, .stream = stream, .watch = &watch };
-        const conn = s.broker.accept(sock.transport()) catch return;
-        // `remove` drains in-flight fan-out references before returning, so
-        // `sock` (this stack frame) outlives every concurrent writer to it.
-        defer s.broker.remove(conn);
-
-        // Timeouts (CONNECT never sent, keep-alive lapsed) are enforced by a
-        // watchdog task that shuts the stream down, which wakes the read
-        // below. The read itself is a plain `std.Io` read: a cancellation
-        // point under any `Io`, with no `poll(2)` on the raw handle and no
-        // clock read outside `Io` — so the server also runs under a
-        // simulated `Io` (simio's mqtt pilot). It used to poll the socket
-        // with a timeout and read the wall clock through `clock_gettime`.
+        // Timeouts (CONNECT never sent, keep-alive lapsed, a TLS handshake
+        // that never finishes) are enforced by a watchdog task that shuts the
+        // stream down, which wakes the read below. The read itself is a plain
+        // `std.Io` read: a cancellation point under any `Io`, with no
+        // `poll(2)` on the raw handle and no clock read outside `Io` — so the
+        // server also runs under a simulated `Io` (simio's mqtt pilot).
         // No unit of concurrency for the watchdog: refuse the connection
         // rather than serve it without its timeouts (same rule as `serve`).
         var watch_task = s.io.concurrent(Watchdog.run, .{&watch}) catch return;
         defer watch_task.cancel(s.io) catch {};
+
+        // The secure stream (if any) is closed after `remove` below has
+        // drained every writer: close_notify is the last thing it sends.
+        var secure: SecureStream = undefined;
+        const is_secure = s.secure != null;
+        if (s.secure) |sec| secure = sec.openFn(sec.ctx, s.io, stream) catch return;
+        defer if (is_secure) secure.closeFn(secure.ctx);
+
+        var sock = SocketTransport{ .io = s.io, .stream = stream, .watch = &watch, .secure = if (is_secure) &secure else null };
+        const conn = s.broker.accept(sock.transport()) catch return;
+        // `remove` drains in-flight fan-out references before returning, so
+        // `sock` (this stack frame) outlives every concurrent writer to it.
+        defer s.broker.remove(conn);
 
         var read_buf: [4096]u8 = undefined;
         while (true) {
@@ -5542,9 +5552,15 @@ pub const TcpServer = struct {
             // watchdog shuts this socket down; the read then returns
             // EndOfStream/ReadFailed and we reap promptly. A cancel (server
             // shutdown) ends the read the same way.
-            var sr = stream.reader(s.io, &read_buf);
-            sr.interface.fillMore() catch return;
-            const n = sr.interface.bufferedLen();
+            var n: usize = undefined;
+            if (is_secure) {
+                n = secure.readFn(secure.ctx, &read_buf) catch return;
+                if (n == 0) return; // close_notify
+            } else {
+                var sr = stream.reader(s.io, &read_buf);
+                sr.interface.fillMore() catch return;
+                n = sr.interface.bufferedLen();
+            }
             const now = nowMs(s.io);
             // In pieces the receive buffer takes: a partial packet plus a
             // whole read can exceed it, and a legitimate pipelining client
@@ -5564,6 +5580,38 @@ pub const TcpServer = struct {
             // check here would drop every connection on a forward clock step.
         }
     }
+};
+
+/// A TLS (or any other) layer between the accepted socket and the broker:
+/// the listener side of Mosquitto's `listener 8883` with a certificate. The
+/// module has no TLS engine of its own and keeps no dependency on one (it
+/// builds for 32-bit targets, which the collection's `tlsserver` does not);
+/// `openFn` is where the caller plugs one in. `README.md` shows the
+/// `tlsserver` glue, tested in `src/tls_recipe_test.zig`.
+pub const Secure = struct {
+    ctx: *anyopaque,
+    /// Called on the connection's own task for every accepted socket, after
+    /// the watchdog started (so `connect_timeout_ms` bounds the handshake):
+    /// run the handshake over `stream` and return the secure stream, or fail
+    /// (the socket is then closed). It owns the buffers it needs.
+    openFn: *const fn (ctx: *anyopaque, io: std.Io, stream: std.Io.net.Stream) TransportError!SecureStream,
+};
+
+/// One connection's secure stream (`Secure.openFn`'s result). `readFn` is
+/// called by the connection's task only; `writeFn` by whichever thread
+/// delivers to the client, never two at once (the broker holds the
+/// connection's `tx_lock` across it) but concurrently with `readFn`: the
+/// implementation guards what the two share (for `tlsserver`, its
+/// `Connection.Guard`).
+pub const SecureStream = struct {
+    ctx: *anyopaque,
+    /// Plaintext into `buf`; 0 = the peer closed cleanly (close_notify).
+    readFn: *const fn (ctx: *anyopaque, buf: []u8) TransportError!usize,
+    /// All of `bytes`, or an error.
+    writeFn: *const fn (ctx: *anyopaque, bytes: []const u8) TransportError!void,
+    /// Called once after the connection was removed from the broker (no
+    /// writer left): send close_notify, best effort, and free the state.
+    closeFn: *const fn (ctx: *anyopaque) void,
 };
 
 /// Wall-clock milliseconds through `io` — the clock `Broker.process` and
@@ -5676,6 +5724,8 @@ const SocketTransport = struct {
     stream: std.Io.net.Stream,
     /// Told when a write starts and ends (`TcpServer.write_timeout_ms`).
     watch: ?*Watchdog = null,
+    /// Set: writes go through it, not straight to `stream` (`TcpServer.secure`).
+    secure: ?*SecureStream = null,
 
     fn transport(t: *SocketTransport) Transport {
         return .{ .ctx = t, .writeFn = writeFn, .closeFn = closeFn, .io = t.io };
@@ -5685,6 +5735,7 @@ const SocketTransport = struct {
         const t: *SocketTransport = @ptrCast(@alignCast(ctx));
         if (t.watch) |w| w.beginWrite();
         defer if (t.watch) |w| w.endWrite();
+        if (t.secure) |sec| return sec.writeFn(sec.ctx, bytes);
         var wbuf: [512]u8 = undefined;
         var sw = t.stream.writer(t.io, &wbuf);
         sw.interface.writeAll(bytes) catch return writeFailure(&sw);

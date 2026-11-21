@@ -157,8 +157,10 @@ properties hold:
 
 Residual scope (documented, not bugs): the broker writes no store itself (the seam
 hands sessions and retained messages to the server). TLS is a transport the caller supplies: the
-client side is a tested recipe over `tlsclient` (`interop-mqtt -- --tls`); `TcpServer` has no TLS
-listener (terminate in front; see *Backlog / deferred*). A clean-session subscriber
+client side is a tested recipe over `tlsclient` (`interop-mqtt -- --tls`); `TcpServer.secure` is the
+listener side (Mosquitto's `listener 8883` with `certfile`/`keyfile`): a seam (`Secure`, `SecureStream`) the
+caller fills with a TLS engine, the `tlsserver` glue being a tested recipe (`src/tls_recipe_test.zig`), so the
+module keeps no dependency on a 64-bit-only engine and builds for 32-bit targets. A clean-session subscriber
 whose window is full does not lose QoS 1/2 messages: they wait in a per-connection
 queue under the same caps as a session's. The concurrency hardening
 targets the thread-per-connection `TcpServer`; the offline core remains single-owner per connection
@@ -486,7 +488,6 @@ The bench is `zig build bench-mqtt` (`BENCH_ROUNDS=5`, ReleaseFast): one raw dri
 
 ## Backlog / deferred
 
-- **A TLS listener in `TcpServer`.** The accept loop takes plaintext; terminate TLS in front. The collection has a `tlsserver` module; `TcpServer` does not use it.
 - **Differential oracle against karlseguin's library (idea, not scheduled).** `karlseguin/mqttz` is a client only (MIT, Zig 0.16): drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so the broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9).
 - **Global byte caps, if a consumer needs them:** queued bytes across all sessions and connections (`(max_sessions + max_connections) * max_queued_bytes`), subscription filter bytes (`max_subscriptions_total * max_packet_size`), and an examined-entries envelope for the retained walk at SUBSCRIBE (documented in `Config`; Mosquitto has no such caps either).
 - **Sweep-review items, each with the review's trigger:**

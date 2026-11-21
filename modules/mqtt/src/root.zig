@@ -114,6 +114,9 @@ pub const BrokerTransport = broker.Transport;
 pub const InlineSubscriber = broker.InlineSubscriber;
 pub const BrokerTransportError = broker.TransportError;
 pub const TcpServer = broker.TcpServer;
+/// A TLS layer between `TcpServer`'s socket and the broker (`TcpServer.secure`).
+pub const Secure = broker.Secure;
+pub const SecureStream = broker.SecureStream;
 
 // Optional authentication / ACL seam for the broker (default allow-all).
 pub const AuthDecision = broker.AuthDecision;
@@ -148,6 +151,7 @@ test {
     _ = @import("reconnect_test.zig");
     _ = acl;
     _ = @import("ws_recipe_test.zig");
+    _ = @import("tls_recipe_test.zig");
     _ = bridge;
     _ = @import("bridge_test.zig");
     _ = @import("fuzz_session_test.zig");

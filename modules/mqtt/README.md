@@ -183,9 +183,9 @@ transport-agnostic client and a broker, all fully offline-testable.
     bodies, operator limits, Payload Format checks and Reason Strings, a
     per-connection queue for clean-session subscribers, `acl` (Mosquitto
     acl/password files), `bridge`, and in the client `reconnect` + an outbox
-    that resumes in-flight QoS 1/2 messages. TLS stays a transport the caller
-    supplies: a tested recipe over `tlsclient` (client) and the `websocket`
-    module (WebSocket); a TLS listener in `TcpServer` is Backlog.
+    that resumes in-flight QoS 1/2 messages. TLS is a seam, not a dependency: a
+    tested recipe over `tlsclient` (client), `TcpServer.secure` with a
+    `tlsserver` recipe (listener) and the `websocket` module (WebSocket).
 
 ```zig
 const mqtt = @import("mqtt");
@@ -272,8 +272,7 @@ spec-permitted divergence (overlapping subscriptions get one copy here).
 
 ## Not provided
 
-No TLS listener in `TcpServer` (the caller supplies the transport; TLS and WebSocket are tested recipes), no MQTT 3.1
-(`MQIsdp`), no store written by the broker (a persistence seam instead), no configuration-file daemon, dynamic-security
+No TLS engine in the module (`TcpServer.secure` is the seam, the `tlsserver` glue a tested recipe; WebSocket is a recipe too), no store written by the broker (a persistence seam instead), no configuration-file daemon, dynamic-security
 plugin, clustering or rule engine. See SPEC.md *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from the OASIS MQTT Version 3.1.1 and Version 5.0
