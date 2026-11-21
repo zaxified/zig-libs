@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-11-19 (123/130, 7 eq) · src 788c1cc257dc0d63
 
-**Hardening:** fuzz 2026-11-02 (checksum-file parser: 3,000,000 runs clean in ReleaseSafe, `HASHDIGEST_FUZZ`, every reach label hit) · ct n/a — digests; `blake3Keyed`'s key goes only into std's BLAKE3 and is wiped after (not ctgrind-checked) · burn 2026-11-02 (stackprobe of `blake3Keyed`/`blake3DeriveKey` clean at 16 KiB; red at 8 KiB for derive and with the burn removed) · panic 2026-11-02 (sweep HD-3: new inputs; the 2026-10-30 sweep predates the new code and the vectorised BLAKE2b)
+**Hardening:** fuzz 2026-11-02 (checksum-file parser: 3,000,000 runs clean in ReleaseSafe, `HASHDIGEST_FUZZ`, every reach label hit) · ct 2026-11-21 (ctgrind: `blake3Keyed` under a tainted key, `blake3DeriveKey` with tainted material and `blake2bVar` under a tainted key, 0 in-file each, std's BLAKE3 and our BLAKE2b in the pattern; digests, XOFs and `verifyEntry` handle public data) · burn 2026-11-02 (stackprobe of `blake3Keyed`/`blake3DeriveKey` clean at 16 KiB; red at 8 KiB for derive and with the burn removed) · panic 2026-11-02 (sweep HD-3: new inputs; the 2026-10-30 sweep predates the new code and the vectorised BLAKE2b)
 
 **Performance:** ref 0.79–0.99× Go 1.26.8 crypto + encoding/hex (BLAKE2b: x/crypto v0.57.0) · fastest 1.07× OpenSSL 3.5.5 / libsodium 1.0.18 (measured 2026-11-03 on a quiet host, largest spread 28.6 % on a 64 B row of the alternative, 10.3 % elsewhere, x86-64 with AVX2, engines `sha2` + vectorised BLAKE2b; baseline x86-64 and MIPS32/ARM32 numbers in Performance)
 
@@ -171,9 +171,8 @@ Run: `scripts/modtest hashdigest`; fuzz: `HASHDIGEST_FUZZ=<runs>[,<seed>] script
 
 ## Backlog / deferred
 
-- **`verifyEntry` stat-then-open race:** a name swapped for a FIFO between the stat and the open can still hang the call. The checksum's directory has to be one the attacker cannot write to; `std.Io.Dir` offers no non-blocking open or fd-based stat to close it here (waits on `std`).
-- **`blake3Keyed` ctgrind harness:** the key goes only into std's BLAKE3 and is wiped after; the stack burn is probe-checked, but there is no `ctgrind_harness.zig` (and expected-table rows) that runs the keyed path under memcheck.
-- **SHA-2 SHA-NI/AVX2 parity on arm64:** `sha2` has no NEON path of its own; hashdigest inherits that. Not measured (x86-64 host only; correctness under qemu aarch64 is covered).
+- **`verifyEntry` stat-then-open race:** a name swapped for a FIFO between the stat and the open can still hang the call. The checksum's directory has to be one the attacker cannot write to; `std.Io.Dir` offers no non-blocking open or fd-based stat to close it here (*BOUNCED: waits on `std`*).
+- **SHA-2 SHA-NI/AVX2 parity on arm64:** `sha2` has no NEON path of its own; hashdigest inherits that. Not measured (x86-64 host only; correctness under qemu aarch64 is covered). *BOUNCED: needs an arm64 machine.*
 
 ## Anchoring
 

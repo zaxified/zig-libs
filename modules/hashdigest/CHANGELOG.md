@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** a ctgrind harness (`src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh hashdigest`) for `blake3Keyed`, `blake3DeriveKey` and keyed `blake2bVar` (0 secret-dependent branches in-file); no library code changed.
 - **2026-11-21** — ADDED `blake2bVar(out, data, params)` with `Blake2bParams` and `Blake2bError`: BLAKE2b with a key (up to 64 bytes), a salt and a personalisation string (up to 16 bytes, zero-padded) and any output size 1..64 bytes, on std's engine, checked against OpenSSL's BLAKE2b; tests: all 35 input lengths of the official BLAKE3 vectors and XOF prefix agreement, the stack-burn probe on aarch64, arm, mips, mipsel, riscv64 and x86-32 under qemu-user.
 
 - **2026-11-19** — Additive: bounded file hashing. `hashFileMax`, `hashFileInMax`, `sha256FileMax` take an optional `max_bytes` and return `error.FileTooLarge` past it; `checksum.Options.max_file_bytes` adds `Status.too_large` and `Summary.too_large` (a new enum member: an exhaustive `switch` over `Status` needs the arm; `Summary.allOk` counts it). Defaults stay unlimited, existing signatures unchanged.

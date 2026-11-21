@@ -327,6 +327,8 @@ declare -A TARGETS=(
     [smtp]="auth"
     # ── 2026-10-10: ct-wave: MCP session id ──
     [mcp-http]="sid"
+    # ── 2026-11-21: hashdigest BLAKE3 keyed / derive and BLAKE2b keyed ──
+    [hashdigest]="keyed derive blake2b"
     # ── 2026-10-10: ct-wave: DNP3 SA session/update keys ──
     [dnp3]="mac keys keys5"
     # ── 2026-10-10: ct-wave: SNMPv3 USM password, auth + priv keys ──
@@ -441,6 +443,7 @@ declare -A MODES=(
     [opcua]="ReleaseFast"
     [smtp]="ReleaseFast"
     [mcp-http]="ReleaseFast"
+    [hashdigest]="ReleaseFast"
     [dnp3]="ReleaseFast"
     [snmp]="ReleaseFast"
     [aes192]="ReleaseFast"
@@ -861,6 +864,9 @@ declare -A PATTERN=(
     [opcua/chunk]='security[.]zig|burn[.]zig'
     [smtp/auth]='auth[.]zig|b64ct[.]zig'
     [mcp-http/sid]='sidhex[.]zig|root[.]zig'
+    [hashdigest/keyed]='root[.]zig|blake2b[.]zig|blake3[.]zig'
+    [hashdigest/derive]='root[.]zig|blake2b[.]zig|blake3[.]zig'
+    [hashdigest/blake2b]='root[.]zig|blake2b[.]zig|blake3[.]zig'
     [dnp3/mac]='sa[.]zig|burn[.]zig'
     [dnp3/keys]='sa[.]zig|burn[.]zig'
     [dnp3/keys5]='sa[.]zig|burn[.]zig'
@@ -1269,6 +1275,9 @@ declare -A LABEL=(
     [opcua/chunk]='opcua sign/encrypt + decrypt/verify (keys+body tainted)'
     [smtp/auth]='smtp AUTH PLAIN/LOGIN responses (password tainted)'
     [mcp-http/sid]='mcp-http session-id hex (id tainted)'
+    [hashdigest/keyed]='hashdigest blake3Keyed (key tainted)'
+    [hashdigest/derive]='hashdigest blake3DeriveKey (key material tainted)'
+    [hashdigest/blake2b]='hashdigest blake2bVar keyed (key tainted)'
     [dnp3/mac]='dnp3 SA MAC compute/verify + reply MAC (session key tainted)'
     [dnp3/keys]='dnp3 SA session key wrap/unwrap (update+session keys tainted)'
     [dnp3/keys5]='dnp3 SAv5 key wrap/unwrap bound to the key-status message (update+session keys tainted)'
