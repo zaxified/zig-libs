@@ -130,6 +130,8 @@ pub const goose = @import("goose.zig");
 pub const publisher = @import("publisher.zig");
 /// The GOOSE subscriber state machine.
 pub const subscriber = @import("subscriber.zig");
+/// PRP / HSR duplicate discard in front of the GOOSE or SV decoder.
+pub const redundancy = @import("redundancy.zig");
 /// Sampled values (IEC 61850-9-2).
 pub const sv = @import("sv.zig");
 /// The byte-stream and layer-2 seams, and their adapters.
@@ -247,6 +249,7 @@ test {
     _ = goose;
     _ = publisher;
     _ = subscriber;
+    _ = redundancy;
     _ = sv;
     _ = transport;
     _ = client;

@@ -193,8 +193,7 @@ all typed errors.
 ## Not provided
 
 No IEC 62351 security (TLS on 102, GOOSE/SV signing: the sibling `iec62351`), no R-GOOSE/R-SMV
-(IEC 61850-90-5), no SV timing and no
-PRP/HSR. Reasons and the planned items: SPEC.md *What is deliberately not done* and
+(IEC 61850-90-5), no GSSE and no SV timing. Reasons and the planned items: SPEC.md *What is deliberately not done* and
 *Backlog / deferred*.
 
 ## Use

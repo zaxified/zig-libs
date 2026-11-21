@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [robidev/iec61850_open_server](https://github.com/robidev/iec61850_open_server) | Python | Apache-2.0 | 134 | push 2026-03-17 | Simulator server built on libiec61850 bindings *(inferred)*. |
 | Zig ecosystem | — | — | — | — | `gh search repos iec61850 --language=zig` found nothing. |
 
-**Where we are ahead:** the only Zig IEC 61850 and the only MIT-licensed (libiec61850 is GPL, the Rust/Go options are toy-sized) implementation covering MMS + GOOSE + SV + reporting + logging + setting groups + control model + SCL read *and write* with pure time-injected state machines; wire behaviour dissected with Wireshark's engine and checked against two third-party stacks. **Where we are behind:** IEC 62351 TLS/GOOSE signing (BYO, see `iec62351`), R-GOOSE/R-SMV (IEC 61850-90-5), GSSE, SV timing, PRP/HSR duplicate discard (→ *Backlog / deferred* and *What is deliberately not done*).
+**Where we are ahead:** the only Zig IEC 61850 and the only MIT-licensed (libiec61850 is GPL, the Rust/Go options are toy-sized) implementation covering MMS + GOOSE + SV + reporting + logging + setting groups + control model + SCL read *and write* with pure time-injected state machines; wire behaviour dissected with Wireshark's engine and checked against two third-party stacks. **Where we are behind:** IEC 62351 TLS/GOOSE signing (BYO, see `iec62351`), R-GOOSE/R-SMV (IEC 61850-90-5), GSSE, SV timing (→ *Backlog / deferred* and *What is deliberately not done*).
 
 ## Design & invariants
 
@@ -340,6 +340,21 @@ shape and say so.
   that trusts the captured frame length reads padding as BER. The optional 802.1Q tag shifts
   everything by four octets, and a subscriber that assumes the EtherType is at offset 12 misparses
   every tagged publisher — which in a real substation is all of them.
+- **On a PRP or HSR bus every frame arrives twice, and `redundancy.Filter` goes in front of the
+  decoder.** The second copy carries the same `sqNum`, so a `Subscriber` fed both sees a refresh that
+  never was or an out-of-order frame for every GOOSE. PRP (IEC 62439-3) appends a six-octet trailer
+  (`SeqNr`, `LanId | LSDUsize`, suffix `0x88FB`) that `Frame.decode` already ignores as padding; HSR
+  inserts a tag (`0x892F`, `Path | LSDUsize`, `SeqNr`) that is stripped into a caller buffer. The
+  window is kept **per source MAC** (the counter belongs to the node, shared by all its streams) as a
+  64-bit sliding bitmap, so a reordered copy inside the window is new once and a duplicate after; a
+  number further back than the window is taken for a restarted publisher and starts the window over,
+  and an entry is forgotten after `forget_ms` (400, PRP's `EntryForgetTime`). The table is bounded
+  (64 sources, least recently used evicted). A frame with neither trailer nor tag (a non-redundant
+  node on the bus) passes through, counted. The trailer is validated (suffix, LAN id A or B, size
+  between the trailer and the payload) so that a frame that merely ends in `0x88FB` is not taken
+  for one; the HSR size field is parsed but not checked, because no third-party HSR peer was
+  available to confirm what it counts. The layouts are self-derived from IEC 62439-3 as the
+  specification is not redistributable; checked only against this module's own encoders.
 - **`numDatSetEntries` must agree with `allData`.** GOOSE has no integrity protection whatsoever, so
   the redundant count is the only consistency signal there is; the encoder derives it from the
   values it is given and never from a caller field, so the two cannot disagree on the wire.
@@ -474,6 +489,7 @@ Where the module is deliberately partial, with the boundary stated.
 - **MMS services outside the IEC 61850 profile:** domain download/upload, program invocations, semaphores, event conditions/actions/enrollments, scattered access, named types, `Status`, `Cancel`. Their tags are named in `mms.Service` and nothing more.
 - **Validating an emitted SCL document against the IEC 61850-6 XSD:** the schema is not redistributable and is not present here; validation is `xmllint` well-formedness plus acceptance by a third-party model generator, a weaker claim that is stated as such.
 - **Multi-client `1-of-n` control across several objects:** a group of objects of which only one may be selected at a time has no representation in SCL (nothing says which objects form the group), and no implementation surveyed offers it (libiec61850: README only, no source read; not verified further), so it is left to the application, which can refuse a second select by keeping its own table.
+- **GSSE** (the pre-2003 `0x88B9` framing): the reference's README lists GOOSE only, and the framing is not described anywhere that was available to read (the specification is not redistributable), so an encoder would be a guess no peer could check. SCL already names GSSE control blocks in the resolved name space.
 - **Raw sockets for GOOSE:** the module opens no `AF_PACKET` socket; the `Link` seam takes whole Ethernet frames (README).
 
 ## Anchoring
@@ -501,4 +517,3 @@ are checked against this module's own client decoders, not against a third-party
 ## Backlog / deferred
 
 - **R-GOOSE / R-SMV (IEC 61850-90-5, UDP)**: libiec61850's R-Session; growing use in wide-area protection; medium, fits §2.
-- **GOOSE subscriber-side redundancy (PRP/HSR duplicate discard) and GSSE** (the pre-2003 `0x88B9` framing).
