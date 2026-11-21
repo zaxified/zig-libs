@@ -43,20 +43,23 @@ pub const Footer = struct {
     dst: ?Dst,
 };
 
-/// Parse `s`; null when it is not a footer this module can evaluate
-/// (empty, malformed, or DST named without rules). The abbreviations are
-/// slices of `s`.
+/// Parse `s`; null when it is not a footer this module can evaluate: empty,
+/// malformed, DST named without rules, a name shorter than three letters (or
+/// an empty or unclosed `<...>`), an `Mm.w.d` rule outside month 1-12, week
+/// 1-5, day 0-6, or anything after the end rule. That is what tzcode, glibc,
+/// Go and Python's zoneinfo agree on (RFC 9636 §3.3.1, tzset(3)). The
+/// abbreviations are slices of `s`.
 pub fn parse(s: []const u8) ?Footer {
     if (s.len == 0) return null;
     var i: usize = 0;
 
-    const std_abbr = readAbbrev(s, &i);
+    const std_abbr = readAbbrev(s, &i) orelse return null;
     const std_written = parseOffsetSeconds(s, &i) orelse return null;
     const utc_std: i32 = -std_written; // POSIX offset is add-to-local-for-UTC
 
     if (i >= s.len) return .{ .std_abbr = std_abbr, .utc_std = utc_std, .dst = null }; // no DST → constant
 
-    const dst_abbr = readAbbrev(s, &i);
+    const dst_abbr = readAbbrev(s, &i) orelse return null;
     // Optional explicit DST offset; default is one hour east of standard.
     var utc_dst: i32 = utc_std +| 3600;
     if (i < s.len and s[i] != ',') {
@@ -72,6 +75,7 @@ pub fn parse(s: []const u8) ?Footer {
     i += 1;
     const end = parseRule(s, &i) orelse return null;
     const end_time = parseRuleTime(s, &i);
+    if (i != s.len) return null;
     return .{ .std_abbr = std_abbr, .utc_std = utc_std, .dst = .{
         .abbr = dst_abbr,
         .utc_dst = utc_dst,
@@ -82,18 +86,21 @@ pub fn parse(s: []const u8) ?Footer {
     } };
 }
 
-/// The abbreviation at `i` (alphabetic run, or `<...>`), advancing past it
-/// (and past the closing `>`); the result excludes the brackets.
-fn readAbbrev(s: []const u8, i: *usize) []const u8 {
+/// The abbreviation at `i` (three or more letters, or a non-empty `<...>`),
+/// advancing past it (and past the closing `>`); the result excludes the
+/// brackets. Null when there is none, or the bracket is not closed.
+fn readAbbrev(s: []const u8, i: *usize) ?[]const u8 {
     if (i.* < s.len and s[i.*] == '<') {
         const start = i.* + 1;
         var j = start;
         while (j < s.len and s[j] != '>') j += 1;
-        i.* = if (j < s.len) j + 1 else j; // consume '>'
+        if (j >= s.len or j == start) return null;
+        i.* = j + 1;
         return s[start..j];
     }
     const start = i.*;
     while (i.* < s.len and std.ascii.isAlphabetic(s[i.*])) i.* += 1;
+    if (i.* - start < 3) return null;
     return s[start..i.*];
 }
 
@@ -138,6 +145,7 @@ fn parseRule(s: []const u8, i: *usize) ?Rule {
         if (i.* >= s.len or s[i.*] != '.') return null;
         i.* += 1;
         const d = readInt(s, i) orelse return null;
+        if (m < 1 or m > 12 or w < 1 or w > 5 or d > 6) return null;
         return .{ .mwd = .{ .month = m, .week = w, .day = d } };
     }
     if (s[i.*] == 'J') {
@@ -184,5 +192,29 @@ test "parse: the shapes the footer grammar allows" {
     try std.testing.expect(parse("") == null);
     try std.testing.expect(parse("AAA") == null);
     try std.testing.expect(parse("EST5EDT") == null); // DST named, no rules
-    try std.testing.expect(parse("A99999999") == null); // overflowing hours: null, not a panic
+    try std.testing.expect(parse("AAA99999999") == null); // overflowing hours: null, not a panic
+}
+
+test "parse: what the reference parsers refuse is null" {
+    // trailing bytes after the end rule or after a constant zone
+    try std.testing.expect(parse("CET-1CEST,M3.5.0,M10.5.0/3x") == null);
+    try std.testing.expect(parse("CET-1CEST,M3.5.0,M10.5.0,") == null);
+    try std.testing.expect(parse("UTC0 ") == null);
+    // names: three letters at least, brackets non-empty and closed
+    try std.testing.expect(parse("A1") == null);
+    try std.testing.expect(parse("AB1") == null);
+    try std.testing.expect(parse("-1") == null);
+    try std.testing.expect(parse("<>1") == null);
+    try std.testing.expect(parse("<+01-1") == null);
+    try std.testing.expect(parse("CET-1CE,M3.5.0,M10.5.0") == null);
+    try std.testing.expect(parse("CET-1<>,M3.5.0,M10.5.0") == null);
+    try std.testing.expect(parse("ABC1").?.dst == null);
+    // M rules: month 1-12, week 1-5, day 0-6, each edge in and just out
+    try std.testing.expect(parse("CET-1CEST,M13.5.0,M10.5.0") == null);
+    try std.testing.expect(parse("CET-1CEST,M0.5.0,M10.5.0") == null);
+    try std.testing.expect(parse("CET-1CEST,M3.6.0,M10.5.0") == null);
+    try std.testing.expect(parse("CET-1CEST,M3.0.0,M10.5.0") == null);
+    try std.testing.expect(parse("CET-1CEST,M3.5.7,M10.5.0") == null);
+    try std.testing.expect(parse("CET-1CEST,M3.5.0,M13.9.9") == null);
+    try std.testing.expect(parse("CET-1CEST,M1.1.0,M12.5.6") != null);
 }

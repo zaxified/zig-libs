@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Behaviour change:** `posix.parse` (the footer grammar behind `offsetAt` for a zone without a stored footer) now returns null for a name of fewer than three letters or an empty or unclosed `<...>`, an `Mm.w.d` outside month 1-12, week 1-5, day 0-6, and bytes after the end rule (all of which it accepted), as tzcode, glibc, Go and Python's zoneinfo do; a hand-built zone whose `posix` is such a string now falls back to its table state. No shipped footer is affected. Fix: `resolveLocal` on a hand-built zone with more than 32 change points in its +-2-day window is exact (it dropped the excess before). Feature: `tz.parseFooter(posix)` for a hand-built zone's `Zone.footer`.
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GN): `nextTransition`/`prevTransition`/`resolveLocal` panicked on i32 year overflow at instants near the i64 ends; a hand-built zone with an abbreviation index past the table, or a `Rule.julian` of `minInt(i32)`, panicked — now an empty abbreviation and i64 arithmetic.
 
 - **2026-10-20** — R9 (loading the system's TZif files) rejected by the owner: zone data come only from the

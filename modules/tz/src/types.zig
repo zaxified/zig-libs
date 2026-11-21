@@ -30,7 +30,8 @@ pub const Zone = struct {
     /// The POSIX-TZ footer rule, applied past the last explicit transition.
     posix: []const u8,
     /// `posix` parsed at generation time. Null for a zone built by hand (a
-    /// test, a caller's own footer): `offsetAt` then parses `posix` per call.
+    /// test, a caller's own footer): `offsetAt` then parses `posix` per call;
+    /// set it from `tz.parseFooter(posix)` to parse once.
     footer: ?*const Footer = null,
     /// For a link (an alias such as `US/Eastern`) the name of the zone it
     /// points to (`America/New_York`); null for a canonical zone.

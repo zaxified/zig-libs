@@ -82,8 +82,13 @@ Python's `fold=0` behave as `compatible`. The policy is a required argument.
 - **`formatOffset`** writes `.colon` (`+01:00`), `.basic` (`+0100`) or `.short` (`+01`, minutes kept when non-zero);
   a non-zero seconds part is kept; `max_offset_len` always fits.
 - **Footer parsed once**: the generator stores each footer parsed (`Zone.footer`), so `offsetAt` never re-parses a
-  shipped zone. A zone built by hand leaves `footer` null and `offsetAt` parses `posix` per call. A test holds the
-  stored footer to the per-call parse for every shipped zone.
+  shipped zone. A zone built by hand leaves `footer` null and `offsetAt` parses `posix` per call, unless the caller
+  stores `&tz.parseFooter(posix).?` there. A test holds the stored footer to the per-call parse for every shipped
+  zone and for a hand-built one.
+- **Footer grammar strictness**: `posix.parse` (also the generator's) refuses what tzcode, glibc, Go and Python's
+  zoneinfo refuse (RFC 9636 §3.3.1): a name of fewer than three letters or an empty or unclosed `<...>`, an `Mm.w.d`
+  outside month 1-12 / week 1-5 / day 0-6, and any byte after the end rule or after a constant zone. A refused
+  footer makes the zone fall back to its last table state, as before.
 - **POSIX rule forms**: the footer parser evaluates `Mm.w.d`, `Jn` (1..365, Feb 29 never counted, so day 60 is always
   March 1) and plain `n` (0..365, zero-based, Feb 29 counted in leap years), all through `ruleDateUnix` /
   `posixOffset`. No tzdata release ships a footer with `Jn` or `n` (all 598 use `Mm.w.d`), so they are forward cover,
@@ -92,8 +97,9 @@ Python's `fold=0` behave as `compatible`. The policy is a required argument.
   otherwise.
 - **No silent fallback in the generator**: it asserts that every zone has a footer, every footer parses, every link
   target exists, and no 4-day window holds more than 12 explicit transitions. `resolveLocal`'s candidate buffer
-  (`Changes`) holds 32 instants; for a hand-built zone with more in a window the excess is dropped and `truncated`
-  is set (no shipped zone truncates; a test pins that).
+  (`Changes`) holds 32 instants; a hand-built zone with more in a window is answered by `resolveExact` (one pass over
+  the change points, no buffer, so none is dropped; no shipped zone needs it, a test pins that, and another holds it to
+  a scan of every instant).
 - **Data provenance and regeneration**: `scripts/gen/tz-gen/` (outside `modules/` and outside `build.zig.zon`'s
   `.paths`, so a consumer fetches only the generated tables; it reads a compiled zoneinfo tree and is the sole
   user of `std.Tz`, which the module's no-filesystem model rules out) re-derives the tables. "Re-derived" means from
@@ -162,13 +168,6 @@ approximation, not a crash).
   binary) and add a knob only for a measured gain of roughly >= 100 KB or a consumer request. `.small` options: a
   zone allow-list (`tz-zones=Europe/*,UTC`) or system zoneinfo only — a capability cut, so an unknown zone must
   return an error, never fall back to UTC silently. Unmeasured.
-- **No-panic sweep leftovers (not crashes).** (1) `posix.parse` is lenient: it accepts trailing garbage after the end
-  rule, empty abbreviations and out-of-range `M` rules (`M13.9.9`; harmless, `nthWeekdayOfMonth` returns null and the
-  zone falls back to its table state). A stricter parser would turn some accepted strings into null. (2) `Changes.add`
-  sets `truncated` for a hand-built zone with more than 32 changes in a window, but nothing reads it, so
-  `resolveLocal` is silently incomplete for such a zone; surface it (an error or a documented bound) if a consumer
-  builds zones by hand. (3) A hand-built zone without `footer` re-parses `posix` on every call (O(len) per
-  `offsetAt`).
 
 ## Anchoring
 

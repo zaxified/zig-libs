@@ -38,6 +38,14 @@ pub const Zone = tz_data.Zone;
 /// answer with a `Change`, which carries the abbreviation as text.
 pub const Transition = tz_data.Transition;
 pub const Footer = posix.Footer;
+
+/// Parse a POSIX-TZ footer (`CET-1CEST,M3.5.0,M10.5.0/3`) for a zone built by
+/// hand: store the result as `Zone.footer` (`&footer`, kept alive as long as
+/// the zone) and `offsetAt` and the rest never parse `Zone.posix` again. Null
+/// for a string the grammar refuses (no rules for a named DST, a name shorter
+/// than three letters, an `Mm.w.d` out of range, trailing bytes). The names
+/// are slices of `s`.
+pub const parseFooter = posix.parse;
 pub const zones = tz_data.zones;
 
 pub const Offset = struct {
@@ -433,6 +441,7 @@ pub fn resolveLocal(zone: *const tz_data.Zone, local: i64) LocalTime {
     // instant it implies, `local - o`, carries `o` itself.
     var cands: Changes = .{};
     cands.collect(zone, local -| local_window, local +| local_window);
+    if (cands.truncated) return resolveExact(zone, local);
 
     var found: [max_changes + 1]i64 = undefined;
     var n: usize = 0;
@@ -478,8 +487,9 @@ pub fn resolveLocal(zone: *const tz_data.Zone, local: i64) LocalTime {
 /// are months apart in every real zone (the generator fails on a table with
 /// more than 12 in a 4-day window; the real maximum is 1), and the POSIX rule
 /// adds at most 4 inside the window. A hand-built zone may exceed it: the
-/// excess is dropped and `truncated` is set (never silently — the test
-/// "no shipped zone truncates a window" holds it at false for every zone).
+/// excess is dropped and `truncated` is set, and `resolveLocal` answers from
+/// `resolveExact` instead (the test "no shipped zone truncates a window" holds
+/// it at false for every zone, so the fast path serves them all).
 const max_changes = 32;
 
 /// The instants in `[lo, hi]` at which `zone`'s offset may change: its
@@ -498,6 +508,15 @@ const Changes = struct {
     }
 
     fn collect(c: *Changes, zone: *const tz_data.Zone, lo: i64, hi: i64) void {
+        walkChanges(zone, lo, hi, c);
+    }
+};
+
+/// Call `sink.add(t)` for every instant `t` in `[lo, hi]` at which `zone`'s
+/// offset may change: its explicit transitions ascending, then the
+/// POSIX-footer changes of the years around.
+fn walkChanges(zone: *const tz_data.Zone, lo: i64, hi: i64, sink: anytype) void {
+    {
         const tr = zone.trans;
         // First transition with ts >= lo.
         var a: usize = 0;
@@ -506,7 +525,7 @@ const Changes = struct {
             const mid = a + (b - a) / 2;
             if (tr[mid].ts < lo) a = mid + 1 else b = mid;
         }
-        while (a < tr.len and tr[a].ts <= hi) : (a += 1) c.add(tr[a].ts);
+        while (a < tr.len and tr[a].ts <= hi) : (a += 1) sink.add(tr[a].ts);
         var storage: Footer = undefined;
         const f = footerOf(zone, &storage) orelse return;
         if (f.dst == null) return;
@@ -516,10 +535,50 @@ const Changes = struct {
         var y = y_lo - 1;
         while (y <= y_hi + 1) : (y += 1) {
             const t = footerTransitionsIn(f, yearClamp(y)) orelse continue;
-            for (t) |x| if (x >= lo and x <= hi) c.add(x);
+            for (t) |x| if (x >= lo and x <= hi) sink.add(x);
         }
     }
-};
+}
+
+/// `resolveLocal` for a zone with more change points near `local` than
+/// `Changes` holds (only a hand-built one can): the same classification, one
+/// pass over the change points with no buffer, so no change is ever dropped.
+/// Slower (every candidate offset is probed), so the buffered path stays the
+/// first choice.
+fn resolveExact(zone: *const tz_data.Zone, local: i64) LocalTime {
+    const Exact = struct {
+        zone: *const tz_data.Zone,
+        local: i64,
+        n: usize = 0,
+        first: i64 = 0,
+        last: i64 = 0,
+        gap: ?LocalTime = null,
+
+        fn candidate(e: *@This(), o: i32) void {
+            const u = e.local -| @as(i64, o);
+            if (offsetAt(e.zone, u).off != o) return;
+            if (e.n == 0 or u < e.first) e.first = u;
+            if (e.n == 0 or u > e.last) e.last = u;
+            e.n += 1;
+        }
+
+        fn add(e: *@This(), t: i64) void {
+            const before = offsetAt(e.zone, t -| 1).off;
+            const after = offsetAt(e.zone, t).off;
+            e.candidate(after);
+            if (e.gap == null and after > before and t +| @as(i64, before) <= e.local and e.local < t +| @as(i64, after))
+                e.gap = .{ .nonexistent = .{ .earlier = e.local -| @as(i64, after), .later = e.local -| @as(i64, before) } };
+        }
+    };
+    var e: Exact = .{ .zone = zone, .local = local };
+    e.candidate(offsetAt(zone, local -| local_window).off);
+    walkChanges(zone, local -| local_window, local +| local_window, &e);
+    if (e.n == 1 or (e.n >= 2 and e.first == e.last)) return .{ .unique = e.first };
+    if (e.n >= 2) return .{ .ambiguous = .{ .earlier = e.first, .later = e.last } };
+    if (e.gap) |g| return g;
+    const o = offsetAt(zone, local).off;
+    return .{ .unique = local -| @as(i64, o) };
+}
 
 /// Local pseudo-Unix (as if the wall-clock were UTC) for a POSIX rule in
 /// `year` at `time_secs` past midnight. Null if the date doesn't exist
@@ -751,6 +810,57 @@ test "no shipped zone truncates a resolveLocal window" {
     c.collect(&z, 0, 5000);
     try testing.expect(c.truncated);
     try testing.expectEqual(@as(usize, max_changes), c.len);
+}
+
+test "resolveLocal: a hand-built zone with more changes than the buffer holds is still exact" {
+    // 40 alternating changes 60 s apart inside one window: the buffered path
+    // truncates, `resolveExact` answers. The oracle scans every instant an offset of 0 or 3600 could name.
+    var many: [40]Transition = undefined;
+    for (&many, 0..) |*t, i| t.* = .{ .ts = 100_000 + @as(i64, @intCast(i)) * 60, .off = @intCast(i % 2 * 3600), .dst = i % 2 == 1 };
+    const z = Zone{ .name = "Test/many", .init_off = 0, .init_dst = false, .trans = &many, .posix = "" };
+    var c: Changes = .{};
+    c.collect(&z, 0, 200_000);
+    try testing.expect(c.truncated);
+    var local: i64 = 98_000;
+    while (local <= 106_000) : (local += 37) {
+        var lo: i64 = std.math.maxInt(i64);
+        var hi: i64 = std.math.minInt(i64);
+        var u = local - 3600; // offsets here are 0 or 3600
+        while (u <= local) : (u += 1) {
+            if (u + offsetAt(&z, u).off != local) continue;
+            lo = @min(lo, u);
+            hi = @max(hi, u);
+        }
+        switch (resolveLocal(&z, local)) {
+            .unique => |x| {
+                try testing.expectEqual(lo, hi);
+                try testing.expectEqual(lo, x);
+            },
+            .ambiguous => |a| {
+                try testing.expect(lo < hi);
+                try testing.expectEqual(lo, a.earlier);
+                try testing.expectEqual(hi, a.later);
+            },
+            .nonexistent => |g| {
+                try testing.expectEqual(std.math.maxInt(i64), lo); // nothing shows it
+                try testing.expect(g.earlier < g.later);
+            },
+        }
+    }
+}
+
+test "parseFooter: a stored footer answers as the per-call parse does" {
+    const text = "CET-1CEST,M3.5.0,M10.5.0/3";
+    const f = parseFooter(text).?;
+    const stored = Zone{ .name = "Test/stored", .init_off = 3600, .init_dst = false, .trans = &.{}, .posix = text, .footer = &f };
+    const parsed = Zone{ .name = "Test/parsed", .init_off = 3600, .init_dst = false, .trans = &.{}, .posix = text };
+    var t: i64 = 1_600_000_000;
+    while (t < 1_700_000_000) : (t += 86_399) {
+        try testing.expectEqual(offsetAt(&parsed, t), offsetAt(&stored, t));
+        try testing.expectEqualStrings(abbrevAt(&parsed, t), abbrevAt(&stored, t));
+    }
+    try testing.expect(parseFooter("CET-1CEST") == null);
+    try testing.expect(parseFooter("CET-1CEST,M13.5.0,M10.5.0") == null);
 }
 
 test "canonical: links point at their zone, canonical zones at nothing" {
