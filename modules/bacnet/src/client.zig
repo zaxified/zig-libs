@@ -55,6 +55,11 @@ pub const Error = tag.Error || apdu.Error || service.Error || bvll.Error ||
     TooManyTransactions,
     /// The peer offered a segmented message this client will not reassemble.
     SegmentationNotSupported,
+    /// The request is larger than the peer's max APDU (learned from its I-Am
+    /// or `learnPeer`) and cannot be segmented: the peer does not receive
+    /// segmented messages, `Config.request_buffer` is null or too small, or
+    /// another segmented request is still in flight.
+    RequestTooLarge,
 };
 
 pub const Config = struct {
@@ -84,7 +89,50 @@ pub const Config = struct {
     /// up (clause 5.4.5.2's `Tseg`, doubled in the standard's default
     /// `APDU_Segment_Timeout` of 2000 ms for a retry; here one wait).
     segment_timeout_ms: u32 = 5000,
+    /// Room to **segment a request** (clause 5.4.4), owned by the caller: a
+    /// request larger than a known peer's max APDU is held here while its
+    /// segments go out, `segment_window` at a time, each window acknowledged
+    /// by a `SegmentACK`. The same buffer is where `writeProperty`,
+    /// `readPropertyMultiple` and `writePropertyMultiple` encode a request
+    /// longer than their own small scratch. A window is resent after
+    /// `segment_timeout_ms` of silence, `retries` times, then the request is
+    /// reported as `.timeout`. One segmented request is in flight at a time.
+    /// A peer is "known" once its I-Am was seen (or `learnPeer` was called);
+    /// a request to an unknown peer is never segmented. `null` (the default)
+    /// segments nothing, and a request too large for a known peer fails with
+    /// `error.RequestTooLarge`.
+    request_buffer: ?[]u8 = null,
 };
+
+/// What this client knows about one device: its max APDU and whether it
+/// receives segmented messages.
+pub const PeerCaps = struct {
+    addr: BipAddress,
+    /// The largest APDU the peer accepts, octets (50..1476).
+    max_apdu: u16,
+    segmentation: types.Segmentation,
+};
+
+/// A segmented request being sent (clause 5.4.4, requester side).
+const SegReq = struct {
+    active: bool = false,
+    peer: BipAddress = .{ .ip = @splat(0) },
+    invoke_id: u8 = 0,
+    svc: types.ConfirmedService = .read_property,
+    len: usize = 0,
+    seg_size: usize = 1,
+    total: u16 = 0,
+    /// The next segment to send, and the first one not yet acknowledged.
+    next: u16 = 0,
+    base: u16 = 0,
+    window: u8 = 1,
+    deadline_ms: u64 = 0,
+    retries_left: u8 = 0,
+    /// Every segment was acknowledged: waiting for the answer.
+    awaiting: bool = false,
+};
+
+const max_peers = 16;
 
 /// One outstanding confirmed request.
 pub const Pending = struct {
@@ -110,6 +158,8 @@ pub const Pending = struct {
     datagram: [transport.max_datagram]u8 = undefined,
     datagram_len: usize = 0,
     active: bool = false,
+    /// A segmented request: `SegReq` drives it, `datagram` is unused.
+    segmented: bool = false,
 };
 
 /// What `poll` reports. Slice-carrying variants borrow from the client's own
@@ -231,9 +281,48 @@ pub fn Client(comptime max_pending: usize) type {
         tx: [transport.max_datagram]u8 = undefined,
         /// The segmented response being reassembled, if any (one at a time).
         rs: Reassembly = .{},
+        /// The segmented request being sent, if any (one at a time).
+        sq: SegReq = .{},
+        peers: [max_peers]?PeerCaps = @splat(null),
+        next_peer: u8 = 0,
 
         pub fn init(tp: Transport, config: Config) Self {
             return .{ .tp = tp, .config = config };
+        }
+
+        /// Records a device's max APDU and segmentation support, as an I-Am
+        /// would (which the client does by itself when it sees one). Sixteen
+        /// peers are remembered; a new one replaces the oldest.
+        pub fn learnPeer(self: *Self, addr: BipAddress, max_apdu_accepted: u32, segmentation: types.Segmentation) void {
+            const caps: PeerCaps = .{
+                .addr = addr,
+                .max_apdu = @intCast(std.math.clamp(max_apdu_accepted, 50, 1476)),
+                .segmentation = segmentation,
+            };
+            for (&self.peers) |*e| {
+                if (e.*) |old| if (old.addr.eql(addr)) {
+                    e.* = caps;
+                    return;
+                };
+            }
+            self.peers[self.next_peer] = caps;
+            self.next_peer = (self.next_peer + 1) % max_peers;
+        }
+
+        fn peerCaps(self: *const Self, addr: BipAddress) ?PeerCaps {
+            for (self.peers) |e| {
+                if (e) |c| if (c.addr.eql(addr)) return c;
+            }
+            return null;
+        }
+
+        /// Where a request body is encoded: the caller's `request_buffer`
+        /// when it is larger than the method's own scratch, else the scratch.
+        fn bodyBuf(self: *Self, scratch: []u8) Error![]u8 {
+            const rb = self.config.request_buffer orelse return scratch;
+            if (rb.len <= scratch.len) return scratch;
+            if (self.sq.active) return error.TooManyTransactions;
+            return rb;
         }
 
         // ── unconfirmed requests (fire and forget) ─────────────────────────
@@ -330,8 +419,8 @@ pub fn Client(comptime max_pending: usize) type {
             priority: ?u8,
             now_ms: u64,
         ) Error!u8 {
-            var body: [200]u8 = undefined;
-            var w = tag.Writer.init(&body);
+            var scratch: [200]u8 = undefined;
+            var w = tag.Writer.init(try self.bodyBuf(&scratch));
             try (service.WriteProperty{
                 .object = object,
                 .property = property,
@@ -365,8 +454,8 @@ pub fn Client(comptime max_pending: usize) type {
             specs: []const RpmSpec,
             now_ms: u64,
         ) Error!u8 {
-            var body: [400]u8 = undefined;
-            var w = tag.Writer.init(&body);
+            var scratch: [400]u8 = undefined;
+            var w = tag.Writer.init(try self.bodyBuf(&scratch));
             var b = service.RpmRequestBuilder.init(&w);
             for (specs) |s| {
                 try b.object(s.object);
@@ -385,8 +474,8 @@ pub fn Client(comptime max_pending: usize) type {
             specs: []const WpmSpec,
             now_ms: u64,
         ) Error!u8 {
-            var body: [1000]u8 = undefined;
-            var w = tag.Writer.init(&body);
+            var scratch: [1000]u8 = undefined;
+            var w = tag.Writer.init(try self.bodyBuf(&scratch));
             var b = service.WpmRequestBuilder.init(&w);
             for (specs) |s| {
                 try b.object(s.object);
@@ -637,6 +726,7 @@ pub fn Client(comptime max_pending: usize) type {
             }
             for (&self.pending) |*p| {
                 if (!p.active or now_ms < p.deadline_ms) continue;
+                if (p.segmented) return self.segmentedExpire(p, now_ms);
                 if (p.attempts_left == 0) {
                     p.active = false;
                     return .{ .timeout = .{
@@ -653,6 +743,80 @@ pub fn Client(comptime max_pending: usize) type {
                 return null;
             }
             return null;
+        }
+
+        /// A window of a segmented request went unacknowledged: resend it, or
+        /// give the request up when the retries are spent (or when every
+        /// segment was acknowledged and the answer never came).
+        fn segmentedExpire(self: *Self, p: *Pending, now_ms: u64) Error!?Event {
+            const q = &self.sq;
+            if (!q.active or q.invoke_id != p.invoke_id) {
+                p.active = false;
+                return null;
+            }
+            if (q.awaiting or q.retries_left == 0) {
+                q.active = false;
+                p.active = false;
+                return .{ .timeout = .{ .peer = p.peer, .invoke_id = p.invoke_id, .svc = p.svc } };
+            }
+            q.retries_left -= 1;
+            q.next = q.base;
+            try self.sendRequestWindow(now_ms);
+            return null;
+        }
+
+        /// Sends the segments of the request from `next` up to the end of the
+        /// window and restarts the acknowledgement timer.
+        fn sendRequestWindow(self: *Self, now_ms: u64) Error!void {
+            const q = &self.sq;
+            const buf = self.config.request_buffer.?;
+            while (q.next < q.total and q.next < q.base + q.window) : (q.next += 1) {
+                const off = @as(usize, q.next) * q.seg_size;
+                const chunk = buf[off..@min(off + q.seg_size, q.len)];
+                try self.sendRequestApdu(q.peer, .{ .confirmed_request = .{
+                    .invoke_id = q.invoke_id,
+                    .service = q.svc,
+                    .max_apdu = self.config.max_apdu,
+                    .max_segments = maxSegmentsFor(self.config),
+                    .segmented_response_accepted = self.config.reassembly != null,
+                    .segment = .{
+                        .sequence_number = @truncate(q.next),
+                        .window_size = @max(1, @min(self.config.segment_window, 127)),
+                        .more_follows = q.next + 1 < q.total,
+                    },
+                    .data = chunk,
+                } });
+            }
+            self.armSegmentTimer(now_ms + self.config.segment_timeout_ms);
+        }
+
+        fn armSegmentTimer(self: *Self, deadline_ms: u64) void {
+            self.sq.deadline_ms = deadline_ms;
+            for (&self.pending) |*p| {
+                if (p.active and p.segmented and p.invoke_id == self.sq.invoke_id) p.deadline_ms = deadline_ms;
+            }
+        }
+
+        /// A `SegmentACK` from the server for the request in flight (clause
+        /// 5.4.4): a positive one opens the next window, a negative one makes
+        /// the sender go back to the segment after the one it names. One that
+        /// names a segment already acknowledged, or one never sent, is stale
+        /// or forged and changes nothing.
+        fn handleRequestAck(self: *Self, sa: apdu.SegmentAck, now_ms: u64) Error!Event {
+            const q = &self.sq;
+            const next_base = @as(u16, sa.sequence_number) + 1;
+            if (q.awaiting or next_base < q.base or next_base > q.next) return .none;
+            q.base = next_base;
+            if (sa.negative) q.next = next_base;
+            q.retries_left = self.config.retries;
+            if (q.base >= q.total) {
+                q.awaiting = true;
+                self.armSegmentTimer(now_ms + self.config.apdu_timeout_ms);
+                return .none;
+            }
+            q.window = @max(1, @min(sa.actual_window_size, self.config.segment_window));
+            try self.sendRequestWindow(now_ms);
+            return .none;
         }
 
         fn handle(self: *Self, from: BipAddress, dgram: []u8, now_ms: u64) Error!Event {
@@ -760,10 +924,12 @@ pub fn Client(comptime max_pending: usize) type {
                     } });
                     return .{ .unhandled = .{ .from = origin, .pdu_type = .confirmed_request } };
                 },
-                .segment_ack => return .{ .unhandled = .{
-                    .from = origin,
-                    .pdu_type = .segment_ack,
-                } },
+                .segment_ack => |sa| {
+                    const q = &self.sq;
+                    if (!(sa.server and q.active and q.invoke_id == sa.invoke_id and q.peer.eql(origin)))
+                        return unclaimed(origin, .segment_ack);
+                    return self.handleRequestAck(sa, now_ms);
+                },
             }
         }
 
@@ -772,12 +938,12 @@ pub fn Client(comptime max_pending: usize) type {
             origin: BipAddress,
             u: apdu.UnconfirmedRequest,
         ) Error!Event {
-            _ = self;
             switch (u.service) {
-                .i_am => return .{ .i_am = .{
-                    .from = origin,
-                    .info = try service.IAm.decode(u.data),
-                } },
+                .i_am => {
+                    const info = try service.IAm.decode(u.data);
+                    self.learnPeer(origin, info.max_apdu_accepted, info.segmentation);
+                    return .{ .i_am = .{ .from = origin, .info = info } };
+                },
                 .i_have => return .{ .i_have = .{
                     .from = origin,
                     .info = try service.IHave.decode(u.data),
@@ -820,6 +986,7 @@ pub fn Client(comptime max_pending: usize) type {
                 if (p.active and p.invoke_id == invoke_id and p.peer.eql(origin)) {
                     p.active = false;
                     retired = true;
+                    if (self.sq.active and self.sq.invoke_id == invoke_id) self.sq.active = false;
                 }
             }
             return retired;
@@ -880,6 +1047,66 @@ pub fn Client(comptime max_pending: usize) type {
             try self.tp.send(to, d);
         }
 
+        /// An APDU of a confirmed request that expects an answer.
+        fn sendRequestApdu(self: *Self, to: BipAddress, a: apdu.Apdu) Error!void {
+            var a_buf: [transport.max_datagram]u8 = undefined;
+            const a_bytes = try apdu.encode(a, &a_buf);
+            var n_buf: [transport.max_datagram]u8 = undefined;
+            const n = try npdu.encode(.{ .expecting_reply = true }, a_bytes, &n_buf);
+            const d = try bvll.wrap(.original_unicast_npdu, n, &self.tx);
+            try self.tp.send(to, d);
+        }
+
+        /// Starts a request larger than the peer's max APDU as segments
+        /// (clause 5.4.4): the whole body is in `request_buffer`, the first
+        /// window goes out now.
+        fn startSegmentedRequest(
+            self: *Self,
+            p: *Pending,
+            to: BipAddress,
+            svc: types.ConfirmedService,
+            body: []const u8,
+            caps: PeerCaps,
+            now_ms: u64,
+        ) Error!u8 {
+            const rb = self.config.request_buffer orelse return error.RequestTooLarge;
+            if (self.sq.active or caps.segmentation == .none or caps.segmentation == .transmit) return error.RequestTooLarge;
+            // Segment header: type, max, invoke id, sequence, window, service.
+            const seg_size = @as(usize, caps.max_apdu) - 6;
+            const total = (body.len + seg_size - 1) / seg_size;
+            const in_buf = @intFromPtr(body.ptr) >= @intFromPtr(rb.ptr) and
+                @intFromPtr(body.ptr) + body.len <= @intFromPtr(rb.ptr) + rb.len;
+            if (total > 255 or (!in_buf and body.len > rb.len)) return error.RequestTooLarge;
+            const id = try self.nextInvokeId();
+            if (!in_buf) @memcpy(rb[0..body.len], body);
+            self.sq = .{
+                .active = true,
+                .peer = to,
+                .invoke_id = id,
+                .svc = svc,
+                .len = body.len,
+                .seg_size = seg_size,
+                .total = @intCast(total),
+                .window = @max(1, @min(self.config.segment_window, 127)),
+                .retries_left = self.config.retries,
+            };
+            p.* = .{
+                .invoke_id = id,
+                .peer = to,
+                .svc = svc,
+                .deadline_ms = now_ms + self.config.segment_timeout_ms,
+                .attempts_left = 0,
+                .active = true,
+                .segmented = true,
+            };
+            self.sendRequestWindow(now_ms) catch |e| {
+                p.active = false;
+                self.sq.active = false;
+                return e;
+            };
+            return id;
+        }
+
         fn sendConfirmed(
             self: *Self,
             to: BipAddress,
@@ -888,6 +1115,10 @@ pub fn Client(comptime max_pending: usize) type {
             now_ms: u64,
         ) Error!u8 {
             const p = self.slot() orelse return error.TooManyTransactions;
+            // Confirmed-Request header: type, max, invoke id, service.
+            if (self.peerCaps(to)) |caps| {
+                if (4 + body.len > caps.max_apdu) return self.startSegmentedRequest(p, to, svc, body, caps, now_ms);
+            }
             const id = try self.nextInvokeId();
 
             var a_buf: [transport.max_datagram]u8 = undefined;

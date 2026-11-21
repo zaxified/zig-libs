@@ -75,7 +75,8 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
   timeout and retry ladder are testable with a fake clock. Invoke ids are
   never reused while outstanding; a segmented response is reassembled into a caller-owned buffer
   (`Config.reassembly`), or without one answered with `Abort(segmentation_not_supported)` and
-  reported, never mis-parsed.
+  reported, never mis-parsed; a request larger than a known peer's max APDU is segmented from
+  `Config.request_buffer`.
 - **`device`** — a small object database that answers Who-Is, Who-Has,
   ReadProperty, ReadPropertyMultiple (including the wildcards), WriteProperty,
   WritePropertyMultiple, DeviceCommunicationControl (password, timed `disable` and
@@ -127,7 +128,7 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
 
 ## Not provided
 
-No segmented *requests* (segmented PDUs are parsed and refused with `Abort`; responses segment and reassemble), no TLS (a seam, never verified), no
+No TLS (a seam, never verified), no
 MS/TP or IPv6, no alarms/events, backup/restore, file services, no
 a priority array only on properties the caller marks commandable; see `SPEC.md` (*What is deliberately not done*, *Backlog / deferred*).
 

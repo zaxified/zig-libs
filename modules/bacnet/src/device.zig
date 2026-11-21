@@ -18,8 +18,10 @@
 //!   overflow the peer's `max-APDU-length-accepted` gets
 //!   `Abort(buffer_overflow)`, which is what clause 5.4 prescribes: it fails
 //!   cleanly rather than silently truncating. With it, such an answer goes out
-//!   as a segmented ComplexACK to a requester that accepts them. It never
-//!   *receives* a segmented request.
+//!   as a segmented ComplexACK to a requester that accepts them.
+//! * **It reassembles a segmented request only with a buffer**
+//!   (`Config.reassembly`); without one it answers
+//!   `Abort(segmentation_not_supported)`.
 //! * **It has no persistence and no allocator.** The object table is the
 //!   caller's slice; property values live in it.
 
@@ -202,6 +204,16 @@ pub const Config = struct {
     /// Resends of a window before the transfer is abandoned with
     /// `Abort(tsm_timeout)`.
     segment_retries: u8 = 3,
+    /// Room to reassemble a **segmented request** (clause 5.4.5), owned by
+    /// the caller. With a buffer the device takes the segments of one request
+    /// at a time (a `SegmentACK` per `segment_window` segments and for the
+    /// last), serves the whole request, and says `receive` (or `both`) in its
+    /// I-Am. A request larger than the buffer is aborted with
+    /// `buffer_overflow`; a second one while one is in progress with
+    /// `out_of_resources`; silence for `segment_timeout_ms` drops the
+    /// transfer. With `null` (the default) a segmented request is answered
+    /// with `Abort(segmentation_not_supported)`.
+    reassembly: ?[]u8 = null,
 };
 
 /// The largest reply a segmented transfer can carry.
@@ -260,6 +272,22 @@ const SegTx = struct {
     retries_left: u8 = 0,
 };
 
+/// A segmented request being received (clause 5.4.5).
+const SegRx = struct {
+    active: bool = false,
+    peer: BipAddress = .{ .ip = @splat(0) },
+    invoke_id: u8 = 0,
+    svc: types.ConfirmedService = .read_property,
+    /// The sequence number the next segment must carry.
+    expected: u8 = 0,
+    len: usize = 0,
+    /// The window agreed (the sender's proposal capped by ours), and how many
+    /// segments came since the last acknowledgement.
+    window: u8 = 1,
+    since_ack: u8 = 0,
+    last_ms: u64 = 0,
+};
+
 pub fn Device(comptime max_subscriptions: usize) type {
     return struct {
         const Self = @This();
@@ -279,6 +307,8 @@ pub fn Device(comptime max_subscriptions: usize) type {
         comm_until_ms: ?u64 = null,
         /// The segmented reply in flight (clause 5.4.4), if any.
         seg: SegTx = .{},
+        /// The segmented request being received (clause 5.4.5), if any.
+        rx_seg: SegRx = .{},
 
         pub fn init(tp: Transport, config: Config, objects: []Object) Self {
             return .{ .tp = tp, .config = config, .objects = objects };
@@ -356,6 +386,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
         pub fn poll(self: *Self, now_ms: u64) Error!Event {
             self.expireSubscriptions(now_ms);
             try self.segmentTimer(now_ms);
+            if (self.rx_seg.active and now_ms >= self.rx_seg.last_ms +| self.config.segment_timeout_ms) self.rx_seg.active = false;
             if (self.comm_until_ms) |t| if (now_ms >= t) {
                 self.comm = .enable;
                 self.comm_until_ms = null;
@@ -396,9 +427,11 @@ pub fn Device(comptime max_subscriptions: usize) type {
             try (service.IAm{
                 .device = self.deviceId(),
                 .max_apdu_accepted = try self.config.max_apdu.octets(),
-                // This device does not reassemble and does not segment; saying
-                // so up front is what keeps a peer from ever trying.
-                .segmentation = if (self.config.segmented_responses) .transmit else .none,
+                // Saying what this device cannot do up front is what keeps a
+                // peer from ever trying.
+                .segmentation = if (self.config.segmented_responses)
+                    (if (self.config.reassembly != null) types.Segmentation.both else .transmit)
+                else if (self.config.reassembly != null) .receive else .none,
                 .vendor_id = self.config.vendor_id,
             }).encode(w);
         }
@@ -450,27 +483,15 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 },
                 .confirmed_request => |r| {
                     if (r.segment != null) {
-                        // Refuse rather than buffer: this device does not
-                        // reassemble, and it said so in its I-Am.
-                        try self.sendApdu(origin, apdu.segmentationNotSupported(r.invoke_id, true));
-                        return .unhandled;
+                        if (self.config.reassembly == null) {
+                            // Refuse rather than buffer: this device was not
+                            // given room to reassemble, and said so in its I-Am.
+                            try self.sendApdu(origin, apdu.segmentationNotSupported(r.invoke_id, true));
+                            return .unhandled;
+                        }
+                        return self.handleRequestSegment(origin, r, now_ms);
                     }
-                    return switch (r.service) {
-                        .read_property => self.handleReadProperty(origin, r, now_ms),
-                        .read_property_multiple => self.handleRpm(origin, r, now_ms),
-                        .write_property => self.handleWriteProperty(origin, r),
-                        .write_property_multiple => self.handleWpm(origin, r),
-                        .device_communication_control => self.handleDcc(origin, r, now_ms),
-                        .reinitialize_device => self.handleReinitialize(origin, r),
-                        .subscribe_cov => self.handleSubscribeCov(origin, r, now_ms),
-                        else => blk: {
-                            try self.sendApdu(origin, .{ .reject = .{
-                                .invoke_id = r.invoke_id,
-                                .reason = .unrecognized_service,
-                            } });
-                            break :blk .unhandled;
-                        },
-                    };
+                    return self.serveConfirmed(origin, r, now_ms);
                 },
                 .segment_ack => |sa| return self.handleSegmentAck(origin, sa, now_ms),
                 .simple_ack => |s| {
@@ -483,6 +504,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 },
                 .abort, .reject, .err => {
                     if (self.seg.active and self.seg.invoke_id == a.invokeId() and self.seg.peer.eql(origin)) self.seg.active = false;
+                    if (self.rx_seg.active and self.rx_seg.invoke_id == a.invokeId() and self.rx_seg.peer.eql(origin)) self.rx_seg.active = false;
                     for (&self.subs) |*sub| {
                         if (sub.active and sub.outstanding == a.invokeId()) sub.outstanding = null;
                     }
@@ -490,6 +512,94 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 },
                 else => return .unhandled,
             }
+        }
+
+        fn serveConfirmed(self: *Self, origin: BipAddress, r: apdu.ConfirmedRequest, now_ms: u64) Error!Event {
+            return switch (r.service) {
+                .read_property => self.handleReadProperty(origin, r, now_ms),
+                .read_property_multiple => self.handleRpm(origin, r, now_ms),
+                .write_property => self.handleWriteProperty(origin, r),
+                .write_property_multiple => self.handleWpm(origin, r),
+                .device_communication_control => self.handleDcc(origin, r, now_ms),
+                .reinitialize_device => self.handleReinitialize(origin, r),
+                .subscribe_cov => self.handleSubscribeCov(origin, r, now_ms),
+                else => blk: {
+                    try self.sendApdu(origin, .{ .reject = .{
+                        .invoke_id = r.invoke_id,
+                        .reason = .unrecognized_service,
+                    } });
+                    break :blk .unhandled;
+                },
+            };
+        }
+
+        /// One segment of a segmented request (clause 5.4.5): in order, it is
+        /// appended and acknowledged when the window is full or the last one
+        /// arrived (and then the whole request is served); out of order or
+        /// duplicate, it is answered with a negative `SegmentACK` naming the
+        /// last in-order segment, which makes the sender go back to the one
+        /// after it.
+        fn handleRequestSegment(self: *Self, origin: BipAddress, r: apdu.ConfirmedRequest, now_ms: u64) Error!Event {
+            const buf = self.config.reassembly.?;
+            const seg = r.segment.?;
+            const rs = &self.rx_seg;
+            const mine = rs.active and rs.invoke_id == r.invoke_id and rs.peer.eql(origin);
+            if (!mine) {
+                if (seg.sequence_number != 0) {
+                    // The middle of something never started (or given up).
+                    try self.sendApdu(origin, .{ .abort = .{ .server = true, .invoke_id = r.invoke_id, .reason = .invalid_apdu_in_this_state } });
+                    return .unhandled;
+                }
+                if (rs.active) {
+                    try self.sendApdu(origin, .{ .abort = .{ .server = true, .invoke_id = r.invoke_id, .reason = .out_of_resources } });
+                    return .{ .refused = .{ .class = .resources, .code = .abort_other } };
+                }
+                rs.* = .{
+                    .active = true,
+                    .invoke_id = r.invoke_id,
+                    .peer = origin,
+                    .svc = r.service,
+                    .window = @max(1, @min(seg.window_size, self.config.segment_window)),
+                    .last_ms = now_ms,
+                };
+            }
+            if (seg.sequence_number != rs.expected or r.service != rs.svc) {
+                try self.sendRequestSegmentAck(origin, r.invoke_id, true, rs.expected -% 1, rs.window);
+                return .none;
+            }
+            if (r.data.len > buf.len - rs.len) {
+                rs.active = false;
+                try self.sendApdu(origin, .{ .abort = .{ .server = true, .invoke_id = r.invoke_id, .reason = .buffer_overflow } });
+                return .{ .refused = .{ .class = .services, .code = .abort_buffer_overflow } };
+            }
+            @memcpy(buf[rs.len..][0..r.data.len], r.data);
+            rs.len += r.data.len;
+            rs.expected +%= 1;
+            rs.since_ack += 1;
+            rs.last_ms = now_ms;
+            if (!seg.more_follows) {
+                try self.sendRequestSegmentAck(origin, r.invoke_id, false, seg.sequence_number, rs.window);
+                rs.active = false;
+                var whole = r;
+                whole.segment = null;
+                whole.data = buf[0..rs.len];
+                return self.serveConfirmed(origin, whole, now_ms);
+            }
+            if (rs.since_ack >= rs.window) {
+                try self.sendRequestSegmentAck(origin, r.invoke_id, false, seg.sequence_number, rs.window);
+                rs.since_ack = 0;
+            }
+            return .none;
+        }
+
+        fn sendRequestSegmentAck(self: *Self, to: BipAddress, invoke_id: u8, negative: bool, seq: u8, window: u8) Error!void {
+            try self.sendApdu(to, .{ .segment_ack = .{
+                .negative = negative,
+                .server = true,
+                .invoke_id = invoke_id,
+                .sequence_number = seq,
+                .actual_window_size = window,
+            } });
         }
 
         fn handleWhoHas(
@@ -2196,6 +2306,160 @@ test "the device refuses a segmented request rather than buffering it" {
     try testing.expectEqual(types.AbortReason.segmentation_not_supported, back.abort.reason);
     try testing.expectEqual(@as(u8, 3), back.abort.invoke_id);
     try testing.expectEqual(true, back.abort.server);
+}
+
+/// A WritePropertyMultiple of `n` writes of 30.0 to the Db's analog value:
+/// about 11 octets each, so far more than one 480-octet APDU for a large `n`.
+fn bigWpm(c: anytype, to: BipAddress, n: usize, now: u64) !u8 {
+    var rb: [8]u8 = undefined;
+    var rw = tag.Writer.init(&rb);
+    try rw.appReal(30.0);
+    var writes: [200]service.PropertyWrite = undefined;
+    for (writes[0..n]) |*pw| pw.* = .{ .property = .present_value, .value = rw.written(), .priority = 8 };
+    return c.writePropertyMultiple(to, &.{.{ .object = .{ .type = .analog_value, .instance = 1 }, .writes = writes[0..n] }}, now);
+}
+
+/// Announces the device and lets the client learn it from the I-Am.
+fn learnDevice(dev: anytype, c: anytype, rig: *Rig) !service.IAm {
+    _ = rig;
+    try dev.announce();
+    const ev = try c.poll(0);
+    return ev.i_am.info;
+}
+
+test "segmented request: a WritePropertyMultiple larger than the device's max APDU is segmented and reassembled" {
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var dbuf: [2048]u8 = undefined;
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .max_apdu = .up_to_480, .reassembly = &dbuf }, db.wire());
+    var cbuf: [2048]u8 = undefined;
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{ .request_buffer = &cbuf });
+
+    // The I-Am says the device receives segmented messages.
+    const iam = try learnDevice(&dev, &c, &rig);
+    try testing.expectEqual(types.Segmentation.receive, iam.segmentation);
+    try testing.expectEqual(@as(u32, 480), iam.max_apdu_accepted);
+
+    _ = try bigWpm(&c, rig.device_ep.address, 150, 1);
+    var wrote: usize = 0;
+    var acked = false;
+    for (0..60) |i| {
+        const ev = try dev.poll(2 + i);
+        if (ev == .wrote_multiple) wrote = ev.wrote_multiple.count;
+        const cev = try c.poll(2 + i);
+        if (cev == .simple_ack) acked = true;
+        if (acked) break;
+    }
+    try testing.expect(acked);
+    try testing.expectEqual(@as(usize, 150), wrote);
+    try testing.expectEqual(@as(f32, 30.0), db.av[2].value.real);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expect(!c.sq.active and !dev.rx_seg.active);
+}
+
+test "segmented request: a lost segment is answered with a negative SegmentACK and resent" {
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var dbuf: [2048]u8 = undefined;
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .max_apdu = .up_to_480, .reassembly = &dbuf }, db.wire());
+    var cbuf: [2048]u8 = undefined;
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{ .request_buffer = &cbuf, .segment_window = 4 });
+    _ = try learnDevice(&dev, &c, &rig);
+
+    _ = try bigWpm(&c, rig.device_ep.address, 150, 1); // four segments of 474 octets go out
+    var datagrams: [4][transport.max_datagram]u8 = undefined;
+    var lens: [4]usize = undefined;
+    for (0..4) |i| lens[i] = (try rig.device_ep.transport().recv(&datagrams[i])).?.bytes.len;
+    // Segment 1 is lost.
+    for ([_]usize{ 0, 2, 3 }) |i| rig.device_ep.inject(rig.client_ep.address, datagrams[i][0..lens[i]]);
+    for (0..3) |_| _ = try dev.poll(2);
+    try testing.expectEqual(@as(u8, 1), dev.rx_seg.expected);
+    var wrote: usize = 0;
+    var acked = false;
+    for (0..60) |i| {
+        const cev = try c.poll(3 + i);
+        if (cev == .simple_ack) acked = true;
+        const ev = try dev.poll(3 + i);
+        if (ev == .wrote_multiple) wrote = ev.wrote_multiple.count;
+        if (acked) break;
+    }
+    try testing.expect(acked);
+    try testing.expectEqual(@as(usize, 150), wrote);
+}
+
+test "segmented request: refused locally for a peer that cannot receive segments, aborted by one with a small buffer" {
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var cbuf: [2048]u8 = undefined;
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{ .request_buffer = &cbuf });
+
+    // A device without a reassembly buffer says `none`: nothing is sent.
+    var plain = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .max_apdu = .up_to_480 }, db.wire());
+    const iam = try learnDevice(&plain, &c, &rig);
+    try testing.expectEqual(types.Segmentation.none, iam.segmentation);
+    try testing.expectError(error.RequestTooLarge, bigWpm(&c, rig.device_ep.address, 150, 1));
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    // A request that fits goes out whole.
+    _ = try bigWpm(&c, rig.device_ep.address, 20, 1);
+    try testing.expectEqual(@as(usize, 20), (try plain.poll(1)).wrote_multiple.count);
+    try testing.expectEqual(types.ConfirmedService.write_property_multiple, (try c.poll(1)).simple_ack.svc);
+
+    // A device that receives, but into a buffer too small for the request.
+    var small: [600]u8 = undefined;
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .max_apdu = .up_to_480, .reassembly = &small }, db.wire());
+    _ = try learnDevice(&dev, &c, &rig);
+    _ = try bigWpm(&c, rig.device_ep.address, 150, 2);
+    var got: ?client.Event = null;
+    for (0..30) |i| {
+        _ = try dev.poll(3 + i);
+        const ev = try c.poll(3 + i);
+        if (ev == .abort) {
+            got = ev;
+            break;
+        }
+    }
+    try testing.expectEqual(types.AbortReason.buffer_overflow, got.?.abort.reason);
+    try testing.expect(!dev.rx_seg.active and !c.sq.active);
+}
+
+test "segmented request: a silent sender's transfer is dropped, a stray middle segment is aborted" {
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var dbuf: [2048]u8 = undefined;
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .max_apdu = .up_to_480, .reassembly = &dbuf, .segment_timeout_ms = 100 }, db.wire());
+    var cbuf: [2048]u8 = undefined;
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{ .request_buffer = &cbuf, .segment_window = 1 });
+    _ = try learnDevice(&dev, &c, &rig);
+
+    _ = try bigWpm(&c, rig.device_ep.address, 150, 1); // window of one: only segment 0 goes out
+    _ = try dev.poll(1);
+    try testing.expect(dev.rx_seg.active);
+    _ = try dev.poll(200); // silence for longer than the timeout
+    try testing.expect(!dev.rx_seg.active);
+
+    // A segment 1 of a transfer the device no longer has.
+    var a_buf: [64]u8 = undefined;
+    const a = try apdu.encode(.{ .confirmed_request = .{
+        .invoke_id = c.sq.invoke_id,
+        .service = .write_property_multiple,
+        .segment = .{ .sequence_number = 1, .window_size = 1, .more_follows = false },
+        .data = &.{0x00},
+    } }, &a_buf);
+    var n_buf: [96]u8 = undefined;
+    const n = try npdu.encode(.{ .expecting_reply = true }, a, &n_buf);
+    var d_buf: [128]u8 = undefined;
+    const d = try bvll.wrap(.original_unicast_npdu, n, &d_buf);
+    var drain: [transport.max_datagram]u8 = undefined;
+    while ((try rig.client_ep.transport().recv(&drain)) != null) {}
+    rig.device_ep.inject(rig.client_ep.address, d);
+    _ = try dev.poll(201);
+    const got = (try rig.client_ep.transport().recv(&drain)).?;
+    const back = try apdu.decode((try npdu.decode((try bvll.decode(got.bytes)).npdu().?)).payload.apdu);
+    try testing.expectEqual(types.AbortReason.invalid_apdu_in_this_state, back.abort.reason);
 }
 
 test "an unsupported confirmed service is Rejected" {

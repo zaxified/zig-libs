@@ -14,11 +14,11 @@
 //! returned as a **typed segment** the caller must deal with, never silently
 //! flattened into an unsegmented one.
 //!
-//! This module does not *reassemble* segments (see SPEC.md's deferred list).
-//! What it does instead is make refusing them correct and easy:
-//! `Client`/`Device` advertise `max_segments = .unspecified` and answer an
-//! offered segmented request with `Abort(segmentation_not_supported)`, which
-//! is exactly what clause 5.4 prescribes for a device that cannot reassemble.
+//! This module does not *reassemble* segments; `Client` and `Device` do, into
+//! a caller-owned buffer (`Config.reassembly`). Without one they advertise
+//! `max_segments = .unspecified` and answer an offered segmented message with
+//! `Abort(segmentation_not_supported)`, which is exactly what clause 5.4
+//! prescribes for a peer that cannot reassemble.
 //!
 //! Nothing here allocates; service data is a slice of the caller's buffer.
 
