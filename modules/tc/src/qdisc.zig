@@ -260,6 +260,8 @@ pub const kind_codel = "codel";
 pub const kind_fq = "fq";
 pub const kind_hfsc = "hfsc";
 pub const kind_red = "red";
+pub const kind_pfifo_fast = "pfifo_fast";
+pub const kind_pfifo_head_drop = "pfifo_head_drop";
 
 /// `sizeof(struct tc_netem_qopt)`.
 pub const tc_netem_qopt_len = 24;
@@ -297,6 +299,9 @@ pub const EncodeError = std.mem.Allocator.Error || error{
     InvalidCellLog,
     /// A `prio` qdisc with `bands` outside `[2, 16]` or a priomap entry `>= bands`.
     InvalidPrioBands,
+    /// A size table (`stab`) with a zero `mtu` or `tsize`, or a `tsize` whose
+    /// table does not fit one netlink attribute.
+    InvalidStab,
 };
 
 // ── netem ───────────────────────────────────────────────────────────────────
@@ -1565,6 +1570,9 @@ pub const Fq = struct {
     initial_quantum: ?u32 = null,
     /// `pacing` / `nopacing` (`TCA_FQ_RATE_ENABLE`).
     pacing: ?bool = null,
+    /// `defrate`, bytes per second: the pacing rate of a flow that has none
+    /// (`TCA_FQ_FLOW_DEFAULT_RATE`).
+    defrate: ?u32 = null,
     /// `maxrate`, bytes per second.
     maxrate: ?u32 = null,
     /// log2 of `buckets` (`buckets 2048` is 11); sent first.
@@ -1597,6 +1605,7 @@ pub const FqWire = struct {
     quantum: ?u32 = null,
     initial_quantum: ?u32 = null,
     pacing: ?u32 = null,
+    defrate: ?u32 = null,
     maxrate: ?u32 = null,
     buckets_log: ?u32 = null,
     refill_delay_us: ?u32 = null,
@@ -1622,6 +1631,7 @@ fn appendFqOptions(f: Fq, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) Enco
     if (f.quantum) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.QUANTUM, v);
     if (f.initial_quantum) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.INITIAL_QUANTUM, v);
     if (f.pacing) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.RATE_ENABLE, @intFromBool(v));
+    if (f.defrate) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.FLOW_DEFAULT_RATE, v);
     if (f.maxrate) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.FLOW_MAX_RATE, v);
     if (f.low_rate_threshold) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.LOW_RATE_THRESHOLD, v);
     if (f.refill_delay_us) |v| try codec.appendAttrU32(gpa, list, TCA_FQ.FLOW_REFILL_DELAY, v);
@@ -1656,6 +1666,7 @@ pub fn parseFqOptions(data: []const u8) codec.Error!FqWire {
                 TCA_FQ.QUANTUM => w.quantum = v,
                 TCA_FQ.INITIAL_QUANTUM => w.initial_quantum = v,
                 TCA_FQ.RATE_ENABLE => w.pacing = v,
+                TCA_FQ.FLOW_DEFAULT_RATE => w.defrate = v,
                 TCA_FQ.FLOW_MAX_RATE => w.maxrate = v,
                 TCA_FQ.BUCKETS_LOG => w.buckets_log = v,
                 TCA_FQ.FLOW_REFILL_DELAY => w.refill_delay_us = v,
@@ -1837,6 +1848,8 @@ pub const QdiscSpec = union(enum) {
     fq: Fq,
     hfsc: Hfsc,
     red: Red,
+    pfifo_fast: PfifoFast,
+    pfifo_head_drop: Fifo,
     raw: Raw,
 
     pub fn kind(self: QdiscSpec) []const u8 {
@@ -1857,6 +1870,8 @@ pub const QdiscSpec = union(enum) {
             .fq => kind_fq,
             .hfsc => kind_hfsc,
             .red => kind_red,
+            .pfifo_fast => kind_pfifo_fast,
+            .pfifo_head_drop => kind_pfifo_head_drop,
             .raw => |r| r.kind,
         };
     }
@@ -1870,7 +1885,9 @@ pub const QdiscSpec = union(enum) {
         return switch (self) {
             .mq, .ingress, .clsact => false,
             // `tc pfifo`/`bfifo`/`sfq` with no argument send no options at all.
-            .pfifo, .bfifo => |f| f.limit != null,
+            .pfifo, .bfifo, .pfifo_head_drop => |f| f.limit != null,
+            // `pfifo_fast` is a kind name only: the kernel sets its bands.
+            .pfifo_fast => false,
             .sfq => |q| sfqAnySet(q),
             else => true,
         };
@@ -1893,7 +1910,8 @@ pub const QdiscSpec = union(enum) {
             .mq, .ingress, .clsact => {}, // no options; carriesOptions() gates the nest away
             .cake => |c| try appendCakeOptions(c, gpa, list),
             .prio => |p| try appendPrioOptions(p, gpa, list),
-            .pfifo, .bfifo => |f| try appendFifoOptions(f, gpa, list),
+            .pfifo, .bfifo, .pfifo_head_drop => |f| try appendFifoOptions(f, gpa, list),
+            .pfifo_fast => {}, // no options; carriesOptions() gates the nest away
             .sfq => |q| try appendSfqOptions(q, gpa, list),
             .codel => |c| try appendCodelOptions(c, gpa, list),
             .fq => |f| try appendFqOptions(f, gpa, list),
@@ -1908,14 +1926,220 @@ pub const QdiscSpec = union(enum) {
     }
 };
 
+/// `pfifo_fast` — the default root qdisc: a kind name only, the kernel sets
+/// its three bands and the TOS priomap (`tc qdisc add … pfifo_fast`).
+pub const PfifoFast = struct {};
+
+// ── hfsc classes ────────────────────────────────────────────────────────────
+
+/// `TCA_HFSC_*` — the class-level attributes.
+pub const TCA_HFSC = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const RSC: u16 = 1;
+    pub const FSC: u16 = 2;
+    pub const USC: u16 = 3;
+};
+
+/// `sizeof(struct tc_service_curve)`.
+pub const tc_service_curve_len = 12;
+
+/// `struct tc_service_curve`: slope `m1` bytes/s for the first `d_us`
+/// microseconds, then `m2` bytes/s (`tc … rt m1 2mbit d 10ms m2 1mbit`; a
+/// plain `rate R` is `m2 = R` with the rest 0).
+pub const ServiceCurve = struct {
+    m1: u32 = 0,
+    d_us: u32 = 0,
+    m2: u32 = 0,
+};
+
+/// An hfsc class: its real-time (`rt`), link-sharing (`ls`) and upper-limit
+/// (`ul`) curves. `tc … sc …` sets the real-time and link-sharing curves
+/// at once. Sent in the order `rsc`, `fsc`, `usc`.
+pub const HfscClass = struct {
+    rsc: ?ServiceCurve = null,
+    fsc: ?ServiceCurve = null,
+    usc: ?ServiceCurve = null,
+};
+
+pub const HfscClassWire = struct {
+    rsc: ?ServiceCurve = null,
+    fsc: ?ServiceCurve = null,
+    usc: ?ServiceCurve = null,
+};
+
+fn encodeCurve(c: ServiceCurve) [tc_service_curve_len]u8 {
+    var raw: [tc_service_curve_len]u8 = undefined;
+    std.mem.writeInt(u32, raw[0..4], c.m1, native_endian);
+    std.mem.writeInt(u32, raw[4..8], c.d_us, native_endian);
+    std.mem.writeInt(u32, raw[8..12], c.m2, native_endian);
+    return raw;
+}
+
+fn decodeCurve(data: []const u8) ?ServiceCurve {
+    if (data.len < tc_service_curve_len) return null;
+    return .{
+        .m1 = std.mem.readInt(u32, data[0..4], native_endian),
+        .d_us = std.mem.readInt(u32, data[4..8], native_endian),
+        .m2 = std.mem.readInt(u32, data[8..12], native_endian),
+    };
+}
+
+fn appendHfscClassOptions(c: HfscClass, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    if (c.rsc) |v| try appendAttr(gpa, list, TCA_HFSC.RSC, &encodeCurve(v));
+    if (c.fsc) |v| try appendAttr(gpa, list, TCA_HFSC.FSC, &encodeCurve(v));
+    if (c.usc) |v| try appendAttr(gpa, list, TCA_HFSC.USC, &encodeCurve(v));
+}
+
+pub fn parseHfscClassOptions(data: []const u8) codec.Error!HfscClassWire {
+    var w: HfscClassWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_HFSC.RSC => w.rsc = decodeCurve(a.data),
+        TCA_HFSC.FSC => w.fsc = decodeCurve(a.data),
+        TCA_HFSC.USC => w.usc = decodeCurve(a.data),
+        else => {},
+    };
+    return w;
+}
+
+// ── stab (size tables) ──────────────────────────────────────────────────────
+
+/// `TCA_STAB_*`, nested in `TCA_STAB`.
+pub const TCA_STAB = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const BASE: u16 = 1;
+    pub const DATA: u16 = 2;
+};
+
+/// `sizeof(struct tc_sizespec)`.
+pub const tc_sizespec_len = 24;
+
+/// `tc_sizespec.linklayer` as `tc stab` sends it: 0 when none is named.
+pub const StabLinkLayer = enum(u32) {
+    unspec = 0,
+    ethernet = 1,
+    atm = 2,
+    _,
+};
+
+/// A packet-size table attached to a qdisc (`tc qdisc add … stab overhead 24
+/// linklayer atm mtu 1500 tsize 128 mpu 64 …`): the kernel adds `overhead`
+/// to every packet's length and looks the result up in a table, so the
+/// qdisc accounts for ATM cells or link framing.
+pub const Stab = struct {
+    /// Per-packet overhead in bytes (may be negative).
+    overhead: i32 = 0,
+    linklayer: StabLinkLayer = .unspec,
+    /// Minimum packet unit: shorter packets count as this long.
+    mpu: u32 = 0,
+    /// The largest packet size the table covers.
+    mtu: u32 = 2047,
+    /// How many table entries.
+    tsize: u32 = 512,
+};
+
+/// Wire readback of `TCA_STAB`.
+pub const StabWire = struct {
+    cell_log: u8 = 0,
+    size_log: u8 = 0,
+    cell_align: i16 = 0,
+    overhead: i32 = 0,
+    linklayer: u32 = 0,
+    mpu: u32 = 0,
+    mtu: u32 = 0,
+    tsize: u32 = 0,
+    /// How many 16-bit entries `TCA_STAB_DATA` carried (0: none).
+    table_len: u16 = 0,
+};
+
+/// The table is only sent when sizes need adjusting: for an ATM link layer or
+/// a minimum packet unit; plain ethernet framing is the overhead alone.
+fn stabNeedsTable(s: Stab) bool {
+    return s.linklayer == .atm or s.mpu != 0;
+}
+
+/// The size a packet of `size` bytes counts as in the table.
+fn stabAdjust(s: Stab, size: u64) u64 {
+    var v = size;
+    if (v < s.mpu) v = s.mpu;
+    if (s.linklayer == .atm) v = (v + 47) / 48 * 53; // whole 53-byte ATM cells
+    return v;
+}
+
+fn appendStab(gpa: std.mem.Allocator, list: *std.ArrayList(u8), s: Stab) EncodeError!void {
+    const table = stabNeedsTable(s);
+    if (table and (s.mtu == 0 or s.tsize == 0 or s.tsize > (std.math.maxInt(u16) - 64) / 2)) return error.InvalidStab;
+    var base: [tc_sizespec_len]u8 = @splat(0);
+    var cell_log: u6 = 0;
+    var size_log: u6 = 0;
+    if (table) {
+        // The smallest cell shift that lets `tsize` entries cover `mtu`.
+        while (cell_log < 31 and (@as(u64, s.mtu) >> cell_log) >= s.tsize) cell_log += 1;
+        // The smallest entry shift that keeps the largest entry in 16 bits.
+        const biggest = stabAdjust(s, @as(u64, s.tsize) << cell_log);
+        while ((biggest >> size_log) > std.math.maxInt(u16)) size_log += 1;
+        base[0] = cell_log;
+        base[1] = size_log;
+        std.mem.writeInt(i16, base[2..4], -1, native_endian);
+        std.mem.writeInt(u32, base[16..20], s.mtu, native_endian);
+        std.mem.writeInt(u32, base[20..24], s.tsize, native_endian);
+        std.mem.writeInt(u32, base[12..16], s.mpu, native_endian);
+    }
+    std.mem.writeInt(i32, base[4..8], s.overhead, native_endian);
+    std.mem.writeInt(u32, base[8..12], @backingInt(s.linklayer), native_endian);
+    if (!table) {
+        // `mpu`, `mtu` and `tsize` stay 0 without a table.
+    }
+    const nest = try codec.nestBegin(gpa, list, TCA.STAB);
+    try appendAttr(gpa, list, TCA_STAB.BASE, &base);
+    if (table) {
+        const raw = try gpa.alloc(u8, s.tsize * 2);
+        defer gpa.free(raw);
+        var i: u32 = 0;
+        while (i < s.tsize) : (i += 1) {
+            const entry = stabAdjust(s, (@as(u64, i) + 1) << cell_log) >> size_log;
+            std.mem.writeInt(u16, raw[i * 2 ..][0..2], @intCast(entry), native_endian);
+        }
+        try appendAttr(gpa, list, TCA_STAB.DATA, raw);
+    }
+    codec.nestEnd(list, nest) catch return error.OptionsTooLong;
+}
+
+/// Append `TCA_STAB` for `message.buildQdiscSet` (after `TCA_OPTIONS`).
+pub fn appendStabAttr(gpa: std.mem.Allocator, list: *std.ArrayList(u8), s: Stab) EncodeError!void {
+    return appendStab(gpa, list, s);
+}
+
+pub fn parseStab(data: []const u8) codec.Error!StabWire {
+    var w: StabWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_STAB.BASE => if (a.data.len >= tc_sizespec_len) {
+            w.cell_log = a.data[0];
+            w.size_log = a.data[1];
+            w.cell_align = std.mem.readInt(i16, a.data[2..4], native_endian);
+            w.overhead = std.mem.readInt(i32, a.data[4..8], native_endian);
+            w.linklayer = std.mem.readInt(u32, a.data[8..12], native_endian);
+            w.mpu = std.mem.readInt(u32, a.data[12..16], native_endian);
+            w.mtu = std.mem.readInt(u32, a.data[16..20], native_endian);
+            w.tsize = std.mem.readInt(u32, a.data[20..24], native_endian);
+        },
+        TCA_STAB.DATA => w.table_len = @intCast(@min(a.data.len / 2, std.math.maxInt(u16))),
+        else => {},
+    };
+    return w;
+}
+
 /// What to attach as a **class** (`RTM_NEWTCLASS`).
 pub const ClassSpec = union(enum) {
     htb: HtbClass,
+    hfsc: HfscClass,
     raw: Raw,
 
     pub fn kind(self: ClassSpec) []const u8 {
         return switch (self) {
             .htb => kind_htb,
+            .hfsc => kind_hfsc,
             .raw => |r| r.kind,
         };
     }
@@ -1928,6 +2152,7 @@ pub const ClassSpec = union(enum) {
     ) EncodeError!void {
         switch (self) {
             .htb => |c| try appendHtbClassOptions(c, gpa, list, ps),
+            .hfsc => |c| try appendHfscClassOptions(c, gpa, list),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
                 try list.appendSlice(gpa, r.options);
@@ -2099,6 +2324,8 @@ pub const Qdisc = struct {
     fq: ?FqWire = null,
     hfsc: ?HfscWire = null,
     red: ?RedWire = null,
+    /// `TCA_STAB`, when the qdisc has a size table.
+    stab: ?StabWire = null,
     /// Counters (`tc -s`); null when the kernel sent none (API addition).
     stats: ?Stats = null,
     /// `TCA_XSTATS` of an `fq_codel` qdisc. Other kinds' private statistics
@@ -2119,6 +2346,8 @@ pub const Class = struct {
     kind_buf: [kind_max]u8 = @splat(0),
     kind_len: u8 = 0,
     htb: ?HtbClassWire = null,
+    /// Service curves, when `kind() == "hfsc"`.
+    hfsc: ?HfscClassWire = null,
     /// Counters (`tc -s`); null when the kernel sent none (API addition).
     stats: ?Stats = null,
 
@@ -2156,6 +2385,7 @@ pub fn parseQdisc(payload: []const u8) codec.Error!Qdisc {
         TCA.STATS2 => stats2 = a.data,
         TCA.STATS => legacy = a.data,
         TCA.XSTATS => xstats = a.data,
+        TCA.STAB => q.stab = try parseStab(a.data),
         else => {},
     };
     q.stats = try pickStats(stats2, legacy);
@@ -2176,8 +2406,13 @@ pub fn parseQdisc(payload: []const u8) codec.Error!Qdisc {
             q.cake = try parseCakeOptions(opt);
         } else if (std.mem.eql(u8, k, kind_prio)) {
             q.prio = parsePrioOptions(opt);
-        } else if (std.mem.eql(u8, k, kind_pfifo) or std.mem.eql(u8, k, kind_bfifo)) {
+        } else if (std.mem.eql(u8, k, kind_pfifo) or std.mem.eql(u8, k, kind_bfifo) or
+            std.mem.eql(u8, k, kind_pfifo_head_drop))
+        {
             q.fifo = parseFifoOptions(opt);
+        } else if (std.mem.eql(u8, k, kind_pfifo_fast)) {
+            // The kernel dumps pfifo_fast's bands and priomap as a prio qopt.
+            q.prio = parsePrioOptions(opt);
         } else if (std.mem.eql(u8, k, kind_sfq)) {
             q.sfq = parseSfqOptions(opt);
         } else if (std.mem.eql(u8, k, kind_codel)) {
@@ -2216,6 +2451,8 @@ pub fn parseClass(payload: []const u8) codec.Error!Class {
     if (options_data) |opt| {
         if (std.mem.eql(u8, c.kind(), kind_htb)) {
             c.htb = try parseHtbClassOptions(opt);
+        } else if (std.mem.eql(u8, c.kind(), kind_hfsc)) {
+            c.hfsc = try parseHfscClassOptions(opt);
         }
     }
     return c;

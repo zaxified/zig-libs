@@ -83,6 +83,9 @@ pub const QdiscTarget = struct {
     /// Where to attach — `Handle.root`, `Handle.ingress`, or a class handle
     /// for a leaf qdisc under an htb class.
     parent: Handle = Handle.root,
+    /// `stab …` — a packet-size table for the qdisc, sent as `TCA_STAB` after
+    /// the options.
+    stab: ?qdisc.Stab = null,
 };
 
 /// Which class a request addresses.
@@ -201,6 +204,7 @@ pub fn buildQdiscSet(
         // A payload that is not a multiple of 4 (hfsc's `u16`) is padded OUTSIDE the attribute's length.
         try list.appendNTimes(gpa, 0, codec.alignUp(list.items.len) - list.items.len);
     }
+    if (target.stab) |s| try qdisc.appendStabAttr(gpa, &list, s);
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }
