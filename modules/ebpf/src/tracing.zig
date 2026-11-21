@@ -413,6 +413,9 @@ pub const LoadOptions = struct {
     prog_btf_fd: ?linux.fd_t = null,
     func_info: []const btfext.FuncInfo = &.{},
     line_info: []const btfext.LineInfo = &.{},
+    /// BTF object fds the program's kfunc calls refer to by index (`off` of a
+    /// `BPF_PSEUDO_KFUNC_CALL`; index 0 is vmlinux and never read).
+    fd_array: []const i32 = &.{},
     prog_flags: u32 = 0,
     kern_version: u32 = 0,
     /// Verifier log buffer. Level 0 with a buffer means "level 1".
@@ -471,6 +474,7 @@ pub fn buildProgLoadAttr(
         if (n.len > attr.prog_name.len - 1) return error.InvalidArgumentLocal;
         @memcpy(attr.prog_name[0..n.len], n);
     }
+    if (opts.fd_array.len != 0) attr.fd_array = @intFromPtr(opts.fd_array.ptr);
     if (opts.func_info.len != 0) {
         attr.func_info = @intFromPtr(opts.func_info.ptr);
         attr.func_info_cnt = @intCast(opts.func_info.len);

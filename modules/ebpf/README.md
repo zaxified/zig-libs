@@ -415,11 +415,16 @@ grown from `log_true_size` so it is never truncated.
 
 What it refuses with a typed error naming the symbol, rather than emitting a
 silently broken program: `error.ExternSymbolUnsupported` (kfuncs,
-extern kconfig/ksym).
+extern symbols the BTF does not describe).
 
 Map-in-map (`ARRAY_OF_MAPS`/`HASH_OF_MAPS` with an inner definition) and
 `PROG_ARRAY` initializers (`.values = { &inner, [1] = &prog }`) are created and
 filled by `load`.
+
+`extern` declarations load: `__kconfig` values (`kconfig.zig`: the running
+kernel's `.config`, typed by the declaration), `__ksym` kernel variables and
+kfuncs (resolved against the kernel's and modules' BTF, `BPF_PSEUDO_KFUNC_CALL` /
+`BPF_PSEUDO_BTF_ID`).
 
 `struct_ops` maps (`.struct_ops`, `.struct_ops.link`) are planned against the
 kernel's BTF, created, and registered with `Object.attachStructOps`.

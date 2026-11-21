@@ -262,6 +262,8 @@ pub const skeleton = @import("skeleton.zig");
 /// `Skeleton` wrapper) for an opened `Object`.
 pub const generateSkeleton = skeleton.generate;
 
+pub const kconfig = @import("kconfig.zig");
+
 pub const btf = @import("btf.zig");
 /// A parsed BTF blob (kernel or program-side) — see `btf.zig`.
 pub const Btf = btf.Btf;

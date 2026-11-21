@@ -192,6 +192,24 @@ pub fn objInfo(fd: linux.fd_t, out: []u8) Error!void {
     };
 }
 
+/// What `btfNameInfo` learned about a BTF object.
+pub const BtfName = struct {
+    /// A kernel BTF (vmlinux or a module's) rather than a user-loaded one.
+    kernel_btf: bool,
+    name: []const u8,
+};
+
+/// The name (`"vmlinux"`, a module's) and kernel-ness of the BTF object behind
+/// `btf_fd`; `name` points into `name_buf`.
+pub fn btfNameInfo(btf_fd: linux.fd_t, name_buf: []u8) Error!BtfName {
+    var info: BtfInfo = std.mem.zeroes(BtfInfo);
+    info.name = @intFromPtr(name_buf.ptr);
+    info.name_len = @intCast(name_buf.len);
+    try objInfo(btf_fd, std.mem.asBytes(&info));
+    const n = @min(std.mem.findScalar(u8, name_buf, 0) orelse name_buf.len, name_buf.len);
+    return .{ .kernel_btf = info.kernel_btf != 0, .name = name_buf[0..n] };
+}
+
 /// Ceiling on a BTF blob read back from the kernel (vmlinux BTF is ~7 MiB).
 pub const max_btf_bytes: usize = btf.max_blob_bytes;
 

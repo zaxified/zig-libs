@@ -404,3 +404,16 @@ test "writeType: the BTF kinds the skeleton mirrors, and the ones it makes opaqu
         } else try testing.expect(got == null);
     }
 }
+
+test "skeleton: the .kconfig map is the externs' fields at the loader's offsets" {
+    const gpa = testing.allocator;
+    const src = try generated(gpa, @embedFile("testdata/externs.bpf.o"));
+    defer gpa.free(src);
+    try parsesClean(gpa, src);
+    try testing.expect(std.mem.find(u8, src, "pub const Kconfig = extern struct {") != null);
+    try testing.expect(std.mem.find(u8, src, "    LINUX_KERNEL_VERSION: u32,\n") != null);
+    try testing.expect(std.mem.find(u8, src, "    CONFIG_BPF: bool,\n") != null);
+    try testing.expect(std.mem.find(u8, src, "    CONFIG_DEFAULT_HOSTNAME: [16]i8,\n") != null);
+    try testing.expect(std.mem.find(u8, src, "@offsetOf(Kconfig, \"CONFIG_ZL_NOT_THERE\") == 32") != null);
+    try testing.expect(std.mem.find(u8, src, "@sizeOf(Kconfig) == 40") != null);
+}

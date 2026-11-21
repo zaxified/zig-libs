@@ -754,6 +754,40 @@ that path whatever `pinning` says. Internal data maps are never auto-pinned, a `
 removing it is `unlink`). The path policy is therefore the caller's: the root directory is an option, never a guess, and
 nothing is pinned unless the object asks for it or the caller does.
 
+### Externs: `__kconfig`, `__ksym` and kfuncs
+
+An `extern` the object declares sits in the BTF `.kconfig` or `.ksyms` DATASEC (a `VAR` / `FUNC` with `extern` linkage;
+`__weak` is the ELF symbol's binding). `open` collects them (`Object.externs`) and gives the `__kconfig` ones a private
+layout (declaration order, natural alignment) in a synthesized `.kconfig` internal map (`RDONLY_PROG`, frozen after seeding),
+which the programs' `LD_IMM64` relocations read as `BPF_PSEUDO_MAP_VALUE`. An `SHN_UNDEF` symbol the BTF does not describe
+stays `error.ExternSymbolUnsupported`; a `__kconfig` of a type that cannot hold a value is `error.UnsupportedExternType`.
+
+`load` fills and resolves them before anything is created:
+
+- **`__kconfig`** (`kconfig.zig`): `CONFIG_*` values from the running kernel's `/proc/config.gz`, else
+  `/boot/config-<release>` (or `LoadOptions.kconfig`, the text of a `.config`), typed by the declaration: `_Bool`
+  (`y`/`n`), `enum libbpf_tristate` (`y`/`n`/`m`), `char`, `char[N]` (a string that fits with its NUL), 1/2/4/8-byte
+  integers (decimal or `0x`, width and sign enforced); a value of another kind or out of range is `error.ExternTypeMismatch`,
+  never truncated. `# CONFIG_X is not set` is a comment, so an option that is off is absent: 0 for a `__weak` extern,
+  `error.ExternNotFound` for a strong one (libbpf's behaviour). `LINUX_KERNEL_VERSION` is the running release as
+  `(major << 16) + (minor << 8) + patch` (patch clamped to 255; `LoadOptions.kernel_version` overrides). Libbpf's probed
+  virtual externs (`LINUX_HAS_BPF_COOKIE`, `LINUX_HAS_SYSCALL_WRAPPER`) are not provided: strong is `ExternNotFound`.
+- **`__ksym` variables and kfuncs**: looked up by name and kind (`VAR` / `FUNC`) in the kernel's BTF, then, for what vmlinux
+  lacks and `LoadOptions.search_modules` allows, in the loaded modules' BTF (`BPF_BTF_GET_NEXT_ID` ...; the fds used are kept
+  in `Object.module_btf_fds` and passed as the programs' `fd_array`, index 0 being vmlinux). The declared type must be
+  libbpf-compatible with the kernel's (`btfext.typesAreCompat`: variable types, function prototypes), else
+  `error.ExternTypeMismatch`. A kfunc call becomes `BPF_PSEUDO_KFUNC_CALL` (`imm` the BTF id, `off` the `fd_array` index),
+  a typed ksym load `BPF_PSEUDO_BTF_ID`, a typeless one (`extern const void x __ksym`) the address `/proc/kallsyms` gives (an
+  unprivileged reader sees 0: unresolved). An absent `__weak` extern is a constant 0 for a load and, for a call, a
+  helper-style call to the poison id `2002000000 + index` (the compiler marks extern calls `BPF_PSEUDO_CALL`, which the
+  verifier would resolve as a sub-program even in dead code): the verifier only reports it where it is reachable.
+
+The kernel's BTF verifier refuses `extern` linkage and the extern DATASECs, so the object's BTF is rewritten before
+`BPF_BTF_LOAD` (`btfsanitize.neutralizeExterns`): extern `VAR` to a 1-byte `INT`, extern `FUNC` to a `TYPEDEF`, an extern
+DATASEC to a `STRUCT` of placeholder members, ids unchanged. Verified here: collection, layout, value filling, resolution
+against this machine's vmlinux and the instruction patching; not verified: loading such a program into a kernel, and the
+module search (both need privilege).
+
 ### `struct_ops`
 
 Each variable of `.struct_ops` and `.struct_ops.link` is a `struct <kernel ops>` initializer (`struct tcp_congestion_ops
@@ -868,8 +902,8 @@ big the log would have been. `Object.verifier_log` and
 ### Refused, not half-done
 
 Every one is a typed error naming the symbol or section:
-`error.ExternSymbolUnsupported` (any
-`SHN_UNDEF` symbol: kfunc, extern kconfig, weak extern),
+`error.ExternSymbolUnsupported` (an
+`SHN_UNDEF` symbol the BTF does not describe as a `.kconfig` / `.ksyms` extern),
 `error.PinningUnsupported` (a mode other than none/by-name), `error.UnknownMapMember`,
 `error.UnknownProgramSection` (an executable section matching no prefix —
 `load` refuses unless `ignore_unknown_sections`).
@@ -1084,9 +1118,6 @@ guards, and bitfield-of-array members clang never emits. The privileged lane (th
 The object loader's gaps (CO-RE kinds, sub-program calls, externs, map-in-map, pinning) are typed errors naming the
 symbol, never a mis-load; the attach and API gaps are simply absent.
 
-- **kfuncs / externs / ksyms.** An `SHN_UNDEF` symbol is `error.ExternSymbolUnsupported`. Real support needs
-  `BPF_PSEUDO_KFUNC_CALL` with the kfunc's BTF id resolved out of vmlinux (and out of module BTF, which the split-BTF
-  parser can already read) plus an `fd_array` of module BTF fds, and, for extern variables, a synthesized `.kconfig` map.
 
 ### Priority order
 

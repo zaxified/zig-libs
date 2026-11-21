@@ -225,6 +225,105 @@ pub fn sanitize(gpa: std.mem.Allocator, blob: []const u8, features: Features) Er
     return out;
 }
 
+// ── extern declarations ─────────────────────────────────────────────────────
+
+fn isExternRecord(b: *const btf.Btf, id: u32) bool {
+    const t = b.byId(id) catch return false;
+    return switch (t.kind) {
+        .@"var" => (b.varLinkage(t) catch return false) == .global_extern,
+        .func => t.vlen == @backingInt(btf.FuncLinkage.external),
+        else => false,
+    };
+}
+
+/// A BPF object's `.kconfig` / `.ksyms` DATASECs describe `extern` variables
+/// and functions (`VAR` / `FUNC` with linkage `extern`), which only the loader
+/// can give a meaning; the kernel's BTF verifier rejects both linkages and a
+/// DATASEC that holds them. This rewrites them into harmless types with the
+/// ids unchanged: an extern `VAR` becomes a 1-byte `INT`, an extern `FUNC` a
+/// `TYPEDEF` of its prototype, and a DATASEC holding externs a `STRUCT` of one
+/// placeholder-`INT` member per entry (appended as the last type). `null` when
+/// the blob has no extern.
+pub fn neutralizeExterns(gpa: std.mem.Allocator, blob: []const u8) Error!?[]u8 {
+    var b = try btf.parse(gpa, blob, .{});
+    defer b.deinit();
+    const count = b.typeCount();
+
+    var any = false;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (isExternRecord(&b, b.start_id + i)) any = true;
+    }
+    if (!any) return null;
+
+    var types: std.ArrayList(u8) = .empty;
+    defer types.deinit(gpa);
+    types.appendSlice(gpa, b.types) catch return error.OutOfMemory;
+    var strings: std.ArrayList(u8) = .empty;
+    defer strings.deinit(gpa);
+    strings.appendSlice(gpa, b.strings) catch return error.OutOfMemory;
+    const ph_name: u32 = @intCast(strings.items.len);
+    strings.appendSlice(gpa, "extern_placeholder\x00") catch return error.OutOfMemory;
+    const ph_id: u32 = b.start_id + count;
+
+    i = 0;
+    while (i < count) : (i += 1) {
+        const id = b.start_id + i;
+        const t = b.byId(id) catch return error.MalformedBtf;
+        const at: usize = b.offsets[i];
+        switch (t.kind) {
+            .@"var" => if (isExternRecord(&b, id)) {
+                wr(types.items, at + 4, info(K_INT, 0, false));
+                wr(types.items, at + 8, 1);
+                wr(types.items, at + 12, 8);
+            },
+            .func => if (isExternRecord(&b, id)) {
+                wr(types.items, at + 4, info(K_TYPEDEF, 0, false));
+            },
+            .datasec => {
+                var has_extern = false;
+                var j: u32 = 0;
+                while (j < t.vlen) : (j += 1) {
+                    if (isExternRecord(&b, rd(b.types, at + 12 + j * 12))) has_extern = true;
+                }
+                if (!has_extern) continue;
+                j = 0;
+                while (j < t.vlen) : (j += 1) {
+                    const e = at + 12 + j * 12;
+                    const entry = b.byId(rd(b.types, e)) catch return error.MalformedBtf;
+                    wr(types.items, e, entry.name_off); // member name
+                    wr(types.items, e + 4, ph_id); // member type
+                    wr(types.items, e + 8, j * 8); // bit offset: one byte each
+                }
+                wr(types.items, at + 4, info(K_STRUCT, t.vlen, false));
+                wr(types.items, at + 8, t.vlen); // size
+            },
+            else => {},
+        }
+    }
+
+    var rec: [16]u8 = undefined;
+    wr(&rec, 0, ph_name);
+    wr(&rec, 4, info(K_INT, 0, false));
+    wr(&rec, 8, 1);
+    wr(&rec, 12, 8);
+    types.appendSlice(gpa, &rec) catch return error.OutOfMemory;
+
+    const hdr = btf.header_size;
+    const out = gpa.alloc(u8, hdr + types.items.len + strings.items.len) catch return error.OutOfMemory;
+    @memset(out[0..hdr], 0);
+    std.mem.writeInt(u16, out[0..2], btf.magic, native_endian);
+    out[2] = btf.version;
+    wr(out, 4, @intCast(hdr));
+    wr(out, 8, 0);
+    wr(out, 12, @intCast(types.items.len));
+    wr(out, 16, @intCast(types.items.len));
+    wr(out, 20, @intCast(strings.items.len));
+    @memcpy(out[hdr..][0..types.items.len], types.items);
+    @memcpy(out[hdr + types.items.len ..][0..strings.items.len], strings.items);
+    return out;
+}
+
 // ── probing the kernel ──────────────────────────────────────────────────────
 
 const Probe = enum { func, func_global, datasec, float, decl_tag, type_tag, enum64 };
@@ -457,4 +556,46 @@ test "unprivileged: probing the kernel is an error, not a crash" {
     if (probeFeatures()) |f| {
         _ = f; // privileged: any answer is a real one
     } else |e| try testing.expect(e == error.PermissionDenied or e == error.Unexpected or e == error.SystemResources);
+}
+
+test "neutralizeExterns: extern VARs, FUNCs and their DATASEC become kinds the kernel accepts" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_a = try r.str(gpa, "CONFIG_A");
+    const n_f = try r.str(gpa, "bpf_kfunc");
+    const n_sec = try r.str(gpa, ".ksyms");
+    const n_g = try r.str(gpa, "global_var");
+    const n_gs = try r.str(gpa, ".data");
+    const int1 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32}); // 1
+    const v_ext = try r.rec(gpa, n_a, btf.K_VAR, 0, false, int1, &.{2}); // 2: extern
+    const proto = try r.rec(gpa, 0, btf.K_FUNC_PROTO, 0, false, 0, &.{}); // 3
+    const f_ext = try r.rec(gpa, n_f, btf.K_FUNC, 2, false, proto, &.{}); // 4: extern
+    const sec = try r.rec(gpa, n_sec, btf.K_DATASEC, 2, false, 0, &.{ v_ext, 0, 4, f_ext, 0, 0 }); // 5
+    const v_glob = try r.rec(gpa, n_g, btf.K_VAR, 0, false, int1, &.{1}); // 6: a real global
+    const sec2 = try r.rec(gpa, n_gs, btf.K_DATASEC, 1, false, 4, &.{ v_glob, 0, 4 }); // 7: untouched
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    const out = (try neutralizeExterns(gpa, blob)).?;
+    defer gpa.free(out);
+    var b = try btf.parse(gpa, out, .{});
+    defer b.deinit();
+    try b.validateReferences(null);
+    try testing.expectEqual(@as(u32, 8), b.typeCount()); // + the placeholder
+    try testing.expectEqual(btf.Kind.int, (try b.byId(v_ext)).kind);
+    try testing.expectEqual(btf.Kind.typedef, (try b.byId(f_ext)).kind);
+    try testing.expectEqual(btf.Kind.func_proto, (try b.byId(proto)).kind);
+    const st = try b.byId(sec);
+    try testing.expectEqual(btf.Kind.@"struct", st.kind);
+    try testing.expectEqual(@as(u32, 2), st.size_type);
+    try testing.expectEqual(@as(u16, 2), st.vlen);
+    const m1 = try b.member(st, 1);
+    try testing.expectEqual(@as(u32, 8), m1.bit_offset);
+    try testing.expectEqual(@as(u32, 8), m1.type_id);
+    try testing.expectEqualStrings("bpf_kfunc", b.str(m1.name_off).?);
+    // a real global and its section are left alone
+    try testing.expectEqual(btf.Kind.@"var", (try b.byId(v_glob)).kind);
+    try testing.expectEqual(btf.Kind.datasec, (try b.byId(sec2)).kind);
+    // nothing to do without externs
+    try testing.expect((try neutralizeExterns(gpa, out)) == null);
 }

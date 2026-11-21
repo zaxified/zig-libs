@@ -958,8 +958,11 @@ fn typesCompat(l: *const Btf, lid: u32, t: *const Btf, tid: u32, depth: u32) Cor
     switch (lt.kind) {
         .@"struct", .@"union", .@"enum", .enum64, .fwd, .float => return true,
         .int => return (try intIsPlain(l, lt)) and (try intIsPlain(t, tt)),
-        .ptr => return typesCompat(l, lt.size_type, t, tt.size_type, depth - 1),
-        .array => return typesCompat(l, (try l.arrayInfo(lt)).elem_type, t, (try t.arrayInfo(tt)).elem_type, depth - 1),
+        // Pointers and arrays are looked through at the same depth (as libbpf's
+        // `goto recur`); only a function prototype's parameters and return type
+        // count a level.
+        .ptr => return typesCompat(l, lt.size_type, t, tt.size_type, depth),
+        .array => return typesCompat(l, (try l.arrayInfo(lt)).elem_type, t, (try t.arrayInfo(tt)).elem_type, depth),
         .func_proto => {
             if (lt.vlen != tt.vlen) return false;
             var i: u16 = 0;
@@ -972,6 +975,13 @@ fn typesCompat(l: *const Btf, lid: u32, t: *const Btf, tid: u32, depth: u32) Cor
         },
         else => return false,
     }
+}
+
+/// libbpf's "compatible" test between a type of `l` and one of `t` (see
+/// `computeRelo`): what an `extern` declaration is checked against the kernel's
+/// variable or function prototype with.
+pub fn typesAreCompat(l: *const Btf, lid: u32, t: *const Btf, tid: u32) CoreError!bool {
+    return typesCompat(l, lid, t, tid, max_compat_depth);
 }
 
 /// `bpf_core_types_match` (`BPF_CORE_TYPE_MATCHES`): a structural comparison.

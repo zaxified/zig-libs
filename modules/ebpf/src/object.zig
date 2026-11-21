@@ -110,6 +110,7 @@ const tracing = @import("tracing.zig");
 const bpfsys = @import("bpfsys.zig");
 const bpflink = @import("bpflink.zig");
 const btfsanitize = @import("btfsanitize.zig");
+const kconfig_mod = @import("kconfig.zig");
 
 pub const Insn = BPF.Insn;
 pub const Btf = btf_mod.Btf;
@@ -155,6 +156,7 @@ const ET_REL: u16 = 1;
 // Taken from std rather than re-declared: `STT_FUNC` is **2**, and writing 4
 // (which is `STT_FILE`) makes every function symbol invisible — a bug that
 // degrades silently into "one program per section, named after the section".
+const STB_WEAK: u4 = 2;
 const STT_FUNC: u4 = @backingInt(std.elf.STT.FUNC);
 const STT_OBJECT: u4 = @backingInt(std.elf.STT.OBJECT);
 const STT_SECTION: u4 = @backingInt(std.elf.STT.SECTION);
@@ -511,6 +513,58 @@ pub const CallSite = struct {
 /// linked in (the kernel's own limit for a privileged load is 1M).
 pub const max_program_insns: usize = 1 << 20;
 
+/// What an `extern ... __kconfig` / `__ksym` declaration is.
+pub const ExternKind = enum {
+    /// A kernel configuration value (`CONFIG_*`, `LINUX_KERNEL_VERSION`): a
+    /// field of the synthesized `.kconfig` map.
+    kconfig,
+    /// A kernel variable (`extern const struct rq runqueues __ksym`).
+    ksym_var,
+    /// A kernel function: a kfunc call, or its address.
+    ksym_func,
+};
+
+/// One `extern` of the object, from the BTF `.kconfig` / `.ksyms` DATASECs.
+pub const Extern = struct {
+    name: []const u8,
+    kind: ExternKind,
+    /// `__weak`: absent from the kernel is a value of 0 (a dead call), not an
+    /// error.
+    weak: bool,
+    /// The VAR or FUNC record in the object's BTF.
+    btf_id: u32,
+    /// The variable's type, or the function's prototype.
+    type_id: u32,
+    /// A `ksym_var` of type `void` (`extern const void x __ksym`): resolved
+    /// to an address through `/proc/kallsyms`, not a BTF id.
+    typeless: bool = false,
+    /// `kconfig`: offset and size in the `.kconfig` map value.
+    value_off: u32 = 0,
+    size: u32 = 0,
+    // ── set by `load` ──
+    resolved: bool = false,
+    /// The id in the kernel BTF (or the module's, see `fd_index`).
+    kernel_btf_id: u32 = 0,
+    /// 0 = vmlinux; otherwise the index of the module's BTF fd in the
+    /// program's `fd_array` (the `off` of a kfunc call).
+    fd_index: u16 = 0,
+    /// A typeless ksym's address.
+    addr: u64 = 0,
+};
+
+/// An instruction that refers to an `Extern`.
+pub const ExternRef = struct {
+    insn_idx: u32,
+    extern_idx: usize,
+    /// A `call` (kfunc) rather than an `LD_IMM64`.
+    call: bool,
+};
+
+/// The `imm` an unresolved weak kfunc call carries: far outside any BTF id,
+/// so a verifier that still reaches it reports the call, and one that proves
+/// it dead removes it (libbpf's `POISON_CALL_KFUNC_BASE`).
+pub const poison_call_kfunc_base: i32 = 2002000000;
+
 /// A slot of a map-in-map or `PROG_ARRAY` initializer.
 pub const InitSlot = struct {
     /// The array index: the map key the fd is stored under.
@@ -548,6 +602,9 @@ pub const ProgramSpec = struct {
     func_info: []btfext.FuncInfo,
     line_info: []btfext.LineInfo,
     core_relos: []btfext.CoreRelo,
+    /// Extern references (kfunc calls, ksym loads) still to be resolved by
+    /// `load`; carried along when a sub-program is linked in.
+    extern_refs: []ExternRef = &.{},
     /// BTF id of the attach target (`struct_ops`: the kernel struct), set by
     /// `load`; 0 for a program with none.
     attach_btf_id: u32 = 0,
@@ -581,8 +638,13 @@ pub const ParseError = error{
     /// A program that, with its sub-programs linked in, exceeds
     /// `max_program_insns`.
     ProgramTooLarge,
-    /// An `SHN_UNDEF` symbol — kfunc, extern kconfig, or weak extern.
+    /// An `SHN_UNDEF` symbol the object's BTF does not describe as a
+    /// `.kconfig` / `.ksyms` extern (a hand-written object, or a producer
+    /// that left the BTF out).
     ExternSymbolUnsupported,
+    /// A `__kconfig` extern whose BTF type cannot hold a configuration value
+    /// (not bool, tristate, char, char array or a 1/2/4/8-byte integer).
+    UnsupportedExternType,
     /// The object has no `.symtab`, so nothing can be relocated.
     NoSymbolTable,
     /// `.maps` exists but the object has no `.BTF` to describe it.
@@ -657,6 +719,14 @@ pub const LoadError = error{
     /// `BPF_OBJ_PIN` of a freshly created map failed (no bpffs there, a
     /// missing directory, the path exists as something else).
     PinFailed,
+    /// A `strong` extern (`__kconfig`, `__ksym`) the kernel does not have: no
+    /// such configuration option, kernel variable or kfunc (a `__weak` one is
+    /// 0 instead).
+    ExternNotFound,
+    /// An extern whose declared type does not fit what the kernel has: a
+    /// configuration value of another kind or out of range for the variable,
+    /// or a kernel variable / kfunc prototype of an incompatible type.
+    ExternTypeMismatch,
     /// The running kernel's BTF has no `struct <name>` / `bpf_struct_ops_<name>`
     /// for a `.struct_ops` variable (vmlinux only; a module's is not read).
     StructOpsTypeNotFound,
@@ -705,12 +775,21 @@ pub const Object = struct {
 
     maps: []MapSpec,
     programs: []ProgramSpec,
+    /// `extern` declarations (`.kconfig`, `.ksyms`) the programs use.
+    externs: []Extern = &.{},
+    /// BTF fds of the kernel modules whose kfuncs/ksyms the programs call,
+    /// opened by `load`; `fd_array[i + 1]` of every program (index 0 is
+    /// vmlinux).
+    module_btf_fds: []linux.fd_t = &.{},
     /// Executable sections whose names match no known prefix. `load` refuses
     /// unless `LoadOptions.ignore_unknown_sections`.
     unknown_sections: [][]const u8,
 
     /// `BPF_BTF_LOAD`'s fd, once `load` has run with `load_btf`.
     btf_fd: linux.fd_t = -1,
+    /// `fd_array` handed to every program: index 0 unused (vmlinux), then the
+    /// modules' BTF fds (`module_btf_fds`).
+    fd_array: []i32 = &.{},
     /// False when `load` had to downgrade the BTF for a kernel without `FUNC`
     /// support: the programs' `func_info` then names functions that are
     /// typedefs, so it is not passed.
@@ -790,6 +869,18 @@ pub const Object = struct {
     /// object has no BTF or no such section. The slice is arena-owned.
     pub fn dataVariables(self: *Object, sec_name: []const u8) ParseError![]const Variable {
         const b = &(self.btf orelse return &.{});
+        // `.kconfig` is the loader's: its variables are the `__kconfig` externs
+        // at the offsets the loader gave them, `.ksyms` has no storage
+        if (std.mem.eql(u8, sec_name, ".ksyms")) return &.{};
+        if (std.mem.eql(u8, sec_name, ".kconfig")) {
+            const a = self.arena.allocator();
+            var list: std.ArrayList(Variable) = .empty;
+            for (self.externs) |e| {
+                if (e.kind != .kconfig) continue;
+                list.append(a, .{ .name = e.name, .offset = e.value_off, .size = e.size, .type_id = e.type_id }) catch return error.OutOfMemory;
+            }
+            return list.toOwnedSlice(a) catch return error.OutOfMemory;
+        }
         try fixupDatasecs(self);
         const id = b.findByNameKind(sec_name, .datasec) orelse return &.{};
         const ds = b.byId(id) catch return error.MalformedBtf;
@@ -1172,6 +1263,9 @@ fn parseImage(
     }
     obj.maps = maps.toOwnedSlice(a) catch return error.OutOfMemory;
 
+    // ── pass 3b: externs (`.kconfig`, `.ksyms`) and the `.kconfig` map ──
+    try collectExterns(&obj, a);
+
     // ── pass 4: programs ──
     var progs: std.ArrayList(ProgramSpec) = .empty;
     for (prog_secs.items) |i| try splitProgramSection(&obj, a, i, classifySection(obj.image.sectionName(i)).?, &progs);
@@ -1542,6 +1636,7 @@ fn collectRelocations(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) Pa
     // name, so `kprobe/x`'s relocations live in `.relkprobe/x`.
     var relos: std.ArrayList(Relo) = .empty;
     var calls: std.ArrayList(CallSite) = .empty;
+    var externs: std.ArrayList(ExternRef) = .empty;
     const lo = prog.sec_byte_off;
     const hi = lo + prog.insns.len * 8;
 
@@ -1567,10 +1662,32 @@ fn collectRelocations(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) Pa
 
         if (rel.type != R_BPF_64_64 and rel.type != R_BPF_64_32) return error.UnsupportedRelocation;
 
-        // An undefined symbol is an extern: kfunc, kconfig, or ksym.
-        if (!sym.hasSection()) return error.ExternSymbolUnsupported;
-
         const insn = prog.insns[insn_idx];
+
+        // An undefined symbol is an extern: kfunc, kconfig, or ksym.
+        if (!sym.hasSection()) {
+            const ei = findExternIdx(obj, sym_name) orelse return error.ExternSymbolUnsupported;
+            const ext = obj.externs[ei];
+            if (rel.type == R_BPF_64_32) {
+                if (insn.code != CALL_CODE or ext.kind != .ksym_func) return error.UnsupportedRelocation;
+                externs.append(a, .{ .insn_idx = insn_idx, .extern_idx = ei, .call = true }) catch return error.OutOfMemory;
+                continue;
+            }
+            if (insn.code != LD_IMM64_CODE) return error.UnsupportedRelocation;
+            if (insn_idx + 1 >= prog.insns.len) return error.RelocationOutOfRange;
+            switch (ext.kind) {
+                // a `.kconfig` field is a read of the synthesized map's value
+                .kconfig => relos.append(a, .{
+                    .kind = .map_value,
+                    .insn_idx = insn_idx,
+                    .map_idx = findMapIdx(obj, ".kconfig") orelse return error.UnresolvedRelocation,
+                    .value_off = ext.value_off,
+                    .sym_name = ext.name,
+                }) catch return error.OutOfMemory,
+                .ksym_var, .ksym_func => externs.append(a, .{ .insn_idx = insn_idx, .extern_idx = ei, .call = false }) catch return error.OutOfMemory,
+            }
+            continue;
+        }
 
         // A call to a sub-program. For a global function the symbol is the
         // function and the call's `imm` is -1; for a static one the symbol is
@@ -1659,6 +1776,113 @@ fn collectRelocations(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) Pa
     }
     prog.relos = relos.toOwnedSlice(a) catch return error.OutOfMemory;
     prog.call_sites = calls.toOwnedSlice(a) catch return error.OutOfMemory;
+    prog.extern_refs = externs.toOwnedSlice(a) catch return error.OutOfMemory;
+}
+
+/// The `extern` declarations of the object: the VARs and FUNCs of the
+/// `.kconfig` and `.ksyms` DATASECs that BTF marks `extern`. The `__kconfig`
+/// ones get a private layout (declaration order, natural alignment) in a
+/// synthesized `.kconfig` map, which `load` fills from the kernel configuration.
+fn collectExterns(obj: *Object, a: std.mem.Allocator) ParseError!void {
+    const b = &(obj.btf orelse return);
+    var list: std.ArrayList(Extern) = .empty;
+    var kcfg_off: u32 = 0;
+    var kcfg_max_align: u32 = 1;
+    for ([_][]const u8{ ".kconfig", ".ksyms" }) |sec_name| {
+        const id = b.findByNameKind(sec_name, .datasec) orelse continue;
+        const ds = b.byId(id) catch return error.MalformedBtf;
+        var i: u16 = 0;
+        while (i < ds.vlen) : (i += 1) {
+            const vsi = b.varSecInfo(ds, i) catch return error.MalformedBtf;
+            const t = b.byId(vsi.type_id) catch return error.MalformedBtf;
+            const name = b.typeName(vsi.type_id) orelse continue;
+            var ext: Extern = undefined;
+            switch (t.kind) {
+                .@"var" => {
+                    const link = b.varLinkage(t) catch return error.MalformedBtf;
+                    if (link != .global_extern) continue;
+                    const ty = t.refType() orelse return error.MalformedBtf;
+                    ext = .{ .name = name, .kind = .kconfig, .weak = false, .btf_id = vsi.type_id, .type_id = ty };
+                    if (std.mem.eql(u8, sec_name, ".ksyms")) {
+                        ext.kind = .ksym_var;
+                        // `void` (after any qualifiers): resolved by address
+                        const strip = skipQualifiers(b, ty) catch return error.MalformedBtf;
+                        ext.typeless = strip == 0;
+                    } else {
+                        const sa = kconfig_mod.sizeAlign(b, ty) catch return error.UnsupportedExternType;
+                        kcfg_off = std.mem.alignForward(u32, kcfg_off, sa.align_);
+                        ext.value_off = kcfg_off;
+                        ext.size = sa.size;
+                        kcfg_off = std.math.add(u32, kcfg_off, sa.size) catch return error.UnsupportedExternType;
+                        kcfg_max_align = @max(kcfg_max_align, sa.align_);
+                    }
+                },
+                .func => {
+                    if (t.funcLinkage() != .external) continue;
+                    ext = .{ .name = name, .kind = .ksym_func, .weak = false, .btf_id = vsi.type_id, .type_id = t.refType() orelse return error.MalformedBtf };
+                },
+                else => continue,
+            }
+            // `__weak` is a property of the ELF symbol, not of the BTF
+            ext.weak = externIsWeak(obj, name);
+            list.append(a, ext) catch return error.OutOfMemory;
+        }
+    }
+    if (list.items.len == 0) return;
+    obj.externs = list.toOwnedSlice(a) catch return error.OutOfMemory;
+
+    if (kcfg_off != 0) {
+        var maps: std.ArrayList(MapSpec) = .empty;
+        maps.appendSlice(a, obj.maps) catch return error.OutOfMemory;
+        const data = a.alloc(u8, kcfg_off) catch return error.OutOfMemory;
+        @memset(data, 0);
+        maps.append(a, .{
+            .name = ".kconfig",
+            .map_type = .array,
+            .key_size = 4,
+            .value_size = kcfg_off,
+            .max_entries = 1,
+            .map_flags = BPF_F_RDONLY_PROG,
+            .origin = .internal,
+            .sec_idx = obj.image.findSection(".kconfig") orelse 0,
+            .initial_data = data,
+            .freeze = true,
+        }) catch return error.OutOfMemory;
+        for (maps.items[0 .. maps.items.len - 1]) |m| {
+            if (std.mem.eql(u8, m.name, ".kconfig")) return error.DuplicateMap;
+        }
+        obj.maps = maps.toOwnedSlice(a) catch return error.OutOfMemory;
+    }
+}
+
+fn skipQualifiers(b: *const Btf, id: u32) btf_mod.TypeError!u32 {
+    var cur = id;
+    var n: u32 = 0;
+    while (cur != 0 and n < btf_mod.max_resolve_depth) : (n += 1) {
+        const t = try b.byId(cur);
+        if (!t.isModifier()) return cur;
+        cur = t.size_type;
+    }
+    return cur;
+}
+
+fn externIsWeak(obj: *Object, name: []const u8) bool {
+    const n = obj.image.symbolCount(obj.symtab_idx) catch return false;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const sym = obj.image.symbol(obj.symtab_idx, i) catch continue;
+        if (sym.hasSection()) continue;
+        if (!std.mem.eql(u8, obj.image.symbolName(obj.symtab_idx, sym), name)) continue;
+        return sym.bind() == STB_WEAK;
+    }
+    return false;
+}
+
+fn findExternIdx(obj: *const Object, name: []const u8) ?usize {
+    for (obj.externs, 0..) |e, i| {
+        if (std.mem.eql(u8, e.name, name)) return i;
+    }
+    return null;
 }
 
 /// `.struct_ops` / `.struct_ops.link`: each `VAR` of the `DATASEC` is a
@@ -1966,6 +2190,7 @@ fn linkSubprograms(a: std.mem.Allocator, progs: []ProgramSpec, subs: []const Pro
         var finfo: std.ArrayList(btfext.FuncInfo) = .empty;
         var linfo: std.ArrayList(btfext.LineInfo) = .empty;
         var cores: std.ArrayList(btfext.CoreRelo) = .empty;
+        var exts: std.ArrayList(ExternRef) = .empty;
         const Placed = struct { idx: u32, base: u32 };
         var queue: std.ArrayList(Placed) = .empty;
         var placed: std.AutoHashMapUnmanaged(u32, u32) = .empty;
@@ -1980,8 +2205,14 @@ fn linkSubprograms(a: std.mem.Allocator, progs: []ProgramSpec, subs: []const Pro
                 fi: *std.ArrayList(btfext.FuncInfo),
                 li: *std.ArrayList(btfext.LineInfo),
                 cr: *std.ArrayList(btfext.CoreRelo),
+                ex: *std.ArrayList(ExternRef),
             ) ParseError!void {
                 i.appendSlice(al, f.insns) catch return error.OutOfMemory;
+                for (f.extern_refs) |x| {
+                    var y = x;
+                    y.insn_idx += base;
+                    ex.append(al, y) catch return error.OutOfMemory;
+                }
                 for (f.relos) |x| {
                     var y = x;
                     y.insn_idx += base;
@@ -2004,7 +2235,7 @@ fn linkSubprograms(a: std.mem.Allocator, progs: []ProgramSpec, subs: []const Pro
                 }
             }
         };
-        try Local.append(a, snap[pi], 0, &insns, &relos, &finfo, &linfo, &cores);
+        try Local.append(a, snap[pi], 0, &insns, &relos, &finfo, &linfo, &cores, &exts);
         placed.put(a, @intCast(pi), 0) catch return error.OutOfMemory;
         queue.append(a, .{ .idx = @intCast(pi), .base = 0 }) catch return error.OutOfMemory;
 
@@ -2018,7 +2249,7 @@ fn linkSubprograms(a: std.mem.Allocator, progs: []ProgramSpec, subs: []const Pro
                     const f = snap[callee];
                     if (insns.items.len + f.insns.len > max_program_insns) return error.ProgramTooLarge;
                     const b: u32 = @intCast(insns.items.len);
-                    try Local.append(a, f, b, &insns, &relos, &finfo, &linfo, &cores);
+                    try Local.append(a, f, b, &insns, &relos, &finfo, &linfo, &cores, &exts);
                     placed.put(a, callee, b) catch return error.OutOfMemory;
                     queue.append(a, .{ .idx = callee, .base = b }) catch return error.OutOfMemory;
                     break :blk b;
@@ -2043,6 +2274,7 @@ fn linkSubprograms(a: std.mem.Allocator, progs: []ProgramSpec, subs: []const Pro
         p.func_info = finfo.items;
         p.line_info = linfo.items;
         p.core_relos = cores.items;
+        p.extern_refs = exts.items;
         p.call_sites = &.{};
     }
     // Sub-programs that nothing links (and entry points with no calls) keep
@@ -2340,6 +2572,15 @@ pub const LoadOptions = struct {
     /// kernel older than 5.5 refuses the flag; `load` then retries without it
     /// and `MapSpec.mmapable` stays false.
     mmap_data: bool = true,
+    /// The kernel configuration `__kconfig` externs read, as the text of a
+    /// `.config`; `null` reads the running kernel's (`/proc/config.gz`, then
+    /// `/boot/config-<release>`).
+    kconfig: ?[]const u8 = null,
+    /// The value of `LINUX_KERNEL_VERSION`; `null` is the running kernel's.
+    kernel_version: ?u32 = null,
+    /// Look for a kfunc or ksym the vmlinux BTF lacks in the loaded kernel
+    /// modules' BTF (needs privilege: `BPF_BTF_GET_NEXT_ID`).
+    search_modules: bool = true,
     /// Where `pinning = LIBBPF_PIN_BY_NAME` maps live: `<pin_root>/<map name>`.
     /// The directory must exist on a bpffs.
     pin_root: []const u8 = "/sys/fs/bpf",
@@ -2397,6 +2638,9 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
         }
     }
 
+    // ── externs: fill the `.kconfig` map, resolve kernel variables / kfuncs ──
+    if (obj.externs.len != 0) try prepareExterns(obj, opts, &kernel_owned);
+
     // ── maps ──
     for (obj.maps) |*m| {
         if (m.origin == .struct_ops) {
@@ -2448,9 +2692,14 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
     // ── the object's own BTF ──
     if (opts.load_btf and obj.btf_bytes != null) {
         try fixupDatasecs(obj);
-        obj.btf_fd = btf_mod.loadIntoKernel(obj.btf_bytes.?, null) catch |e| switch (e) {
+        // `extern` VARs/FUNCs and the `.kconfig`/`.ksyms` DATASECs are the
+        // loader's business; the kernel's BTF verifier refuses them.
+        const neutral = btfsanitize.neutralizeExterns(obj.gpa, obj.btf_bytes.?) catch return error.BtfLoadFailed;
+        defer if (neutral) |n| obj.gpa.free(n);
+        const blob = neutral orelse obj.btf_bytes.?;
+        obj.btf_fd = btf_mod.loadIntoKernel(blob, null) catch |e| switch (e) {
             error.PermissionDenied => return error.PermissionDenied,
-            error.InvalidBtf => if (opts.sanitize_btf) try loadSanitizedBtf(obj) else return error.BtfLoadFailed,
+            error.InvalidBtf => if (opts.sanitize_btf) try loadSanitizedBtf(obj, blob) else return error.BtfLoadFailed,
             else => return error.BtfLoadFailed,
         };
     }
@@ -2462,6 +2711,7 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
         // (libbpf skips it as well).
         if (p.prog_type == .struct_ops and p.attach_btf_id == 0) continue;
         try relocateProgram(p, obj.maps);
+        try patchExterns(p, obj.externs);
         p.fd = try loadOneProgram(obj, p, license, opts);
     }
     try fillInitSlots(obj);
@@ -2495,12 +2745,12 @@ pub fn pinnedMapMatches(m: *const MapSpec, info: bpfsys.MapInfo) bool {
 
 /// The kernel refused the BTF as written: ask it which kinds it knows, rewrite
 /// the rest into ones it does (`btfsanitize.sanitize`) and load that.
-fn loadSanitizedBtf(obj: *Object) LoadError!linux.fd_t {
+fn loadSanitizedBtf(obj: *Object, blob: []const u8) LoadError!linux.fd_t {
     const feats = btfsanitize.probeFeatures() catch |e| return switch (e) {
         error.PermissionDenied => error.PermissionDenied,
         else => error.BtfLoadFailed,
     };
-    const rewritten = (btfsanitize.sanitize(obj.gpa, obj.btf_bytes.?, feats) catch return error.BtfLoadFailed) orelse
+    const rewritten = (btfsanitize.sanitize(obj.gpa, blob, feats) catch return error.BtfLoadFailed) orelse
         return error.BtfLoadFailed; // nothing the kernel lacks: it refused for another reason
     defer obj.gpa.free(rewritten);
     const fd = btf_mod.loadIntoKernel(rewritten, null) catch |e| return switch (e) {
@@ -2520,6 +2770,245 @@ fn needsEntries(t: BPF.MapType) bool {
         .struct_ops, .sk_storage => false,
         else => true,
     };
+}
+
+/// Give every `extern` a value or a kernel id before anything is loaded.
+fn prepareExterns(obj: *Object, opts: LoadOptions, kernel_owned: *?Btf) LoadError!void {
+    // `__kconfig`: the configuration is only read when a CONFIG_ option is asked for
+    var needs_cfg = false;
+    var has_ksym = false;
+    for (obj.externs) |e| {
+        if (e.kind == .kconfig and !std.mem.eql(u8, e.name, "LINUX_KERNEL_VERSION")) needs_cfg = true;
+        if (e.kind != .kconfig) has_ksym = true;
+    }
+    var cfg: ?kconfig_mod.Config = null;
+    defer if (cfg) |*c| c.deinit();
+    if (needs_cfg) {
+        cfg = if (opts.kconfig) |text|
+            kconfig_mod.parse(obj.gpa, text) catch return error.ExternTypeMismatch
+        else
+            kconfig_mod.readKernelConfig(obj.gpa) catch null;
+    }
+    try fillKconfig(obj, if (cfg) |*c| c else null, opts.kernel_version orelse kconfig_mod.runningKernelVersion());
+    if (has_ksym) {
+        const kernel = try kernelBtf(obj, opts, kernel_owned);
+        try resolveKernelExterns(obj, kernel, opts);
+    }
+}
+
+/// Write each `__kconfig` extern's value into the `.kconfig` map's seed.
+/// `LINUX_KERNEL_VERSION` comes from `version`, everything else from `cfg`; an
+/// option absent from `cfg` (`# CONFIG_X is not set` is absent) is 0 for a
+/// `__weak` extern and `error.ExternNotFound` otherwise.
+pub fn fillKconfig(obj: *Object, cfg: ?*const kconfig_mod.Config, version: ?u32) LoadError!void {
+    const mi = findMapIdx(obj, ".kconfig") orelse return;
+    const b = &(obj.btf orelse return);
+    // the seed is memory this object allocated for itself (`collectExterns`)
+    const data: []u8 = @constCast(obj.maps[mi].initial_data);
+    for (obj.externs) |e| {
+        if (e.kind != .kconfig) continue;
+        const out = data[e.value_off..][0..e.size];
+        const value: kconfig_mod.Value = if (std.mem.eql(u8, e.name, "LINUX_KERNEL_VERSION")) blk: {
+            const v = version orelse {
+                if (e.weak) continue;
+                return error.ExternNotFound;
+            };
+            break :blk .{ .int = .{ .negative = false, .magnitude = v } };
+        } else blk: {
+            const c = cfg orelse {
+                if (e.weak) continue;
+                return error.ExternNotFound;
+            };
+            break :blk c.get(e.name) orelse {
+                if (e.weak) continue;
+                return error.ExternNotFound;
+            };
+        };
+        kconfig_mod.fill(b, e.type_id, value, out) catch return error.ExternTypeMismatch;
+    }
+}
+
+/// Resolve every `__ksym` extern against the kernel's BTF (variables and
+/// functions by name and kind, checked for type compatibility), a typeless
+/// one against `/proc/kallsyms`, and, for what vmlinux lacks, the loaded
+/// modules' BTF. An absent `__weak` extern stays unresolved (it reads 0).
+pub fn resolveKernelExterns(obj: *Object, kernel: *const Btf, opts: LoadOptions) LoadError!void {
+    const local = &(obj.btf orelse return);
+    var mods: ?ModuleBtfs = null;
+    defer if (mods) |*m| m.deinit(obj);
+    var kallsyms: ?[]u8 = null;
+    defer if (kallsyms) |k| obj.gpa.free(k);
+
+    for (obj.externs) |*e| {
+        switch (e.kind) {
+            .kconfig => continue,
+            .ksym_var => if (e.typeless) {
+                if (kallsyms == null) kallsyms = kconfig_mod.readStreaming(obj.gpa, "/proc/kallsyms", 64 << 20) catch null;
+                const addr = if (kallsyms) |k| kconfig_mod.kallsymsAddress(k, e.name) else null;
+                if (addr) |ad| {
+                    e.addr = ad;
+                    e.resolved = true;
+                } else if (!e.weak) return error.ExternNotFound;
+                continue;
+            },
+            .ksym_func => {},
+        }
+        const want: btf_mod.Kind = if (e.kind == .ksym_var) .@"var" else .func;
+        var found: ?struct { btf: *const Btf, id: u32, fd_index: u16 } = null;
+        if (kernel.findByNameKind(e.name, want)) |id| found = .{ .btf = kernel, .id = id, .fd_index = 0 };
+        if (found == null and opts.search_modules) {
+            if (mods == null) mods = ModuleBtfs.load(obj, kernel);
+            if (mods) |*m| {
+                if (m.find(e.name, want)) |f| found = .{ .btf = f.btf, .id = f.id, .fd_index = f.fd_index };
+            }
+        }
+        const f = found orelse {
+            if (e.weak) continue;
+            return error.ExternNotFound;
+        };
+        // the declared type must be compatible with the kernel's
+        const kt = f.btf.byId(f.id) catch return error.ExternTypeMismatch;
+        const kernel_type = kt.refType() orelse return error.ExternTypeMismatch;
+        const compat = btfext.typesAreCompat(local, e.type_id, f.btf, kernel_type) catch return error.ExternTypeMismatch;
+        if (!compat) return error.ExternTypeMismatch;
+        e.kernel_btf_id = f.id;
+        e.fd_index = f.fd_index;
+        e.resolved = true;
+    }
+    if (mods) |*m| try m.commit(obj);
+}
+
+/// The loaded kernel modules' BTF, read lazily for a kfunc / ksym that
+/// vmlinux does not have. Each module's fd is what a program's `fd_array`
+/// carries; `commit` moves the ones that were used into the `Object`.
+const ModuleBtfs = struct {
+    const Entry = struct { fd: linux.fd_t, btf: Btf, used: bool = false };
+    entries: std.ArrayList(Entry) = .empty,
+
+    fn load(obj: *Object, base: *const Btf) ?ModuleBtfs {
+        var self: ModuleBtfs = .{};
+        var id: u32 = 0;
+        while (bpfsys.btfNextId(id) catch return null) |next| {
+            id = next;
+            const fd = bpfsys.btfFdById(next) catch continue;
+            var name_buf: [64]u8 = undefined;
+            const info = bpfsys.btfNameInfo(fd, &name_buf) catch {
+                _ = linux.close(fd);
+                continue;
+            };
+            if (!info.kernel_btf or std.mem.eql(u8, info.name, "vmlinux")) {
+                _ = linux.close(fd);
+                continue;
+            }
+            const blob = bpfsys.btfBlob(obj.gpa, fd) catch {
+                _ = linux.close(fd);
+                continue;
+            };
+            const parsed = btf_mod.parse(obj.gpa, blob, .{ .base = base, .own_bytes = true }) catch {
+                obj.gpa.free(blob);
+                _ = linux.close(fd);
+                continue;
+            };
+            self.entries.append(obj.gpa, .{ .fd = fd, .btf = parsed }) catch {
+                var p = parsed;
+                p.deinit();
+                _ = linux.close(fd);
+                continue;
+            };
+        }
+        return self;
+    }
+
+    const Found = struct { btf: *const Btf, id: u32, fd_index: u16 };
+
+    fn find(self: *ModuleBtfs, name: []const u8, kind: btf_mod.Kind) ?Found {
+        for (self.entries.items, 0..) |*e, i| {
+            // a split BTF's own types only: vmlinux's were searched already
+            var k: u32 = 0;
+            while (k < e.btf.typeCount()) : (k += 1) {
+                const id = e.btf.start_id + k;
+                const t = e.btf.byId(id) catch continue;
+                if (t.kind != kind) continue;
+                const n = e.btf.str(t.name_off) orelse continue;
+                if (!std.mem.eql(u8, n, name)) continue;
+                e.used = true;
+                return .{ .btf = &e.btf, .id = id, .fd_index = @intCast(i + 1) };
+            }
+        }
+        return null;
+    }
+
+    /// Keep the fds the externs refer to (as `fd_array[index]`); close the rest.
+    fn commit(self: *ModuleBtfs, obj: *Object) LoadError!void {
+        const a = obj.arena.allocator();
+        const arr = a.alloc(i32, self.entries.items.len + 1) catch return error.OutOfMemory;
+        @memset(arr, 0);
+        var used_any = false;
+        var kept: std.ArrayList(linux.fd_t) = .empty;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.used) {
+                arr[i + 1] = e.fd;
+                kept.append(a, e.fd) catch return error.OutOfMemory;
+                e.fd = -1;
+                used_any = true;
+            }
+        }
+        if (used_any) {
+            obj.fd_array = arr;
+            obj.module_btf_fds = kept.toOwnedSlice(a) catch return error.OutOfMemory;
+        }
+    }
+
+    fn deinit(self: *ModuleBtfs, obj: *Object) void {
+        for (self.entries.items) |*e| {
+            if (e.fd >= 0) _ = linux.close(e.fd);
+            e.btf.deinit();
+        }
+        self.entries.deinit(obj.gpa);
+    }
+};
+
+/// Patch a program's extern references with what `load` resolved: a kfunc call
+/// becomes `BPF_PSEUDO_KFUNC_CALL` (`imm` the BTF id, `off` the module's
+/// `fd_array` index), a typed ksym load `BPF_PSEUDO_BTF_ID`, a typeless one a
+/// plain 64-bit address, and anything unresolved (a `__weak` the kernel lacks)
+/// a 0 / a poisoned call the verifier reports only if it is reachable.
+pub fn patchExterns(prog: *ProgramSpec, externs: []const Extern) RelocateError!void {
+    for (prog.extern_refs) |r| {
+        if (r.insn_idx >= prog.insns.len or r.extern_idx >= externs.len) return error.RelocationOutOfRange;
+        const ext = externs[r.extern_idx];
+        const insn = &prog.insns[r.insn_idx];
+        if (r.call) {
+            if (insn.code != CALL_CODE) return error.NotAnImmediateLoad;
+            if (ext.resolved) {
+                insn.src = BPF_PSEUDO_KFUNC_CALL;
+                insn.imm = @intCast(ext.kernel_btf_id);
+                insn.off = @intCast(ext.fd_index);
+            } else {
+                // a helper-style call (src 0) to an id no helper has: the
+                // compiler marked the call `BPF_PSEUDO_CALL`, which the verifier
+                // would resolve as a sub-program call even in dead code
+                insn.src = 0;
+                insn.imm = poison_call_kfunc_base +% @as(i32, @intCast(@min(r.extern_idx, 1 << 20)));
+            }
+            continue;
+        }
+        if (insn.code != LD_IMM64_CODE) return error.NotAnImmediateLoad;
+        if (r.insn_idx + 1 >= prog.insns.len) return error.RelocationOutOfRange;
+        if (ext.resolved and !ext.typeless) {
+            insn.src = BPF_PSEUDO_BTF_ID;
+            insn.imm = @intCast(ext.kernel_btf_id);
+            prog.insns[r.insn_idx + 1].imm = @intCast(ext.fd_index);
+        } else {
+            // a plain 64-bit constant: whatever pseudo marker the compiler left
+            // on the load must go, or the kernel would read the immediate as a
+            // map fd / BTF id
+            const addr: u64 = if (ext.resolved) ext.addr else 0;
+            insn.src = 0;
+            insn.imm = @bitCast(@as(u32, @truncate(addr)));
+            prog.insns[r.insn_idx + 1].imm = @bitCast(@as(u32, @truncate(addr >> 32)));
+        }
+    }
 }
 
 /// The kernel's BTF for CO-RE and struct_ops: the caller's `target_btf`, or
@@ -2680,6 +3169,7 @@ fn loadOneProgram(obj: *Object, p: *ProgramSpec, license: []const u8, opts: Load
             .attach_btf_id = p.attach_btf_id,
             .prog_flags = if (p.sleepable) BPF_F_SLEEPABLE else 0,
             .kern_version = obj.kern_version,
+            .fd_array = obj.fd_array,
         };
         if (obj.btf_fd >= 0) {
             lo.prog_btf_fd = obj.btf_fd;
@@ -5805,4 +6295,145 @@ test "struct_ops: planning against THIS machine's vmlinux BTF (skipped where it 
         const nm = kern.str(km.name_off).?;
         try testing.expect(std.mem.eql(u8, nm, "ssthresh") or std.mem.eql(u8, nm, "undo_cwnd") or std.mem.eql(u8, nm, "cong_avoid"));
     }
+}
+
+const fx_externs = @embedFile("testdata/externs.bpf.o");
+
+test "externs: a clang object's kconfig, ksym and kfunc declarations and the .kconfig map layout" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_externs, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 10), o.externs.len);
+    const find = struct {
+        fn f(obj: *Object, name: []const u8) Extern {
+            return obj.externs[findExternIdx(obj, name).?];
+        }
+    }.f;
+    // `.kconfig`: declaration order, natural alignment
+    const expect = [_]struct { n: []const u8, off: u32, size: u32, weak: bool }{
+        .{ .n = "LINUX_KERNEL_VERSION", .off = 0, .size = 4, .weak = false },
+        .{ .n = "CONFIG_HZ", .off = 4, .size = 4, .weak = false },
+        .{ .n = "CONFIG_BPF", .off = 8, .size = 1, .weak = false },
+        .{ .n = "CONFIG_TUN", .off = 12, .size = 4, .weak = false },
+        .{ .n = "CONFIG_DEFAULT_HOSTNAME", .off = 16, .size = 16, .weak = false },
+        .{ .n = "CONFIG_ZL_NOT_THERE", .off = 32, .size = 8, .weak = true },
+    };
+    for (expect) |e| {
+        const x = find(&o, e.n);
+        try testing.expectEqual(ExternKind.kconfig, x.kind);
+        try testing.expectEqual(e.off, x.value_off);
+        try testing.expectEqual(e.size, x.size);
+        try testing.expectEqual(e.weak, x.weak);
+    }
+    const km = o.findMap(".kconfig").?;
+    try testing.expectEqual(@as(u32, 40), km.value_size);
+    try testing.expect(km.freeze);
+    try testing.expectEqual(BPF_F_RDONLY_PROG, km.map_flags);
+    // `.ksyms`
+    try testing.expectEqual(ExternKind.ksym_var, find(&o, "bpf_prog_active").kind);
+    try testing.expect(!find(&o, "bpf_prog_active").typeless);
+    try testing.expect(find(&o, "bpf_untyped_sym").typeless);
+    try testing.expect(find(&o, "bpf_untyped_sym").weak);
+    try testing.expectEqual(ExternKind.ksym_func, find(&o, "bpf_rcu_read_lock").kind);
+    try testing.expect(!find(&o, "bpf_rcu_read_lock").weak);
+    try testing.expect(find(&o, "bpf_zl_missing_kfunc").weak);
+
+    // the program: kconfig reads are map_value relocations into `.kconfig`, the rest are extern refs
+    const p = o.findProgram("probe").?;
+    var kcfg: usize = 0;
+    for (p.relos) |r| {
+        try testing.expectEqual(ReloKind.map_value, r.kind);
+        try testing.expectEqualStrings(".kconfig", o.maps[r.map_idx].name);
+        kcfg += 1;
+    }
+    try testing.expectEqual(@as(usize, 6), kcfg);
+    var calls: usize = 0;
+    var loads: usize = 0;
+    for (p.extern_refs) |r| {
+        if (r.call) calls += 1 else loads += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), calls); // bpf_rcu_read_lock, bpf_zl_missing_kfunc
+    try testing.expectEqual(@as(usize, 3), loads); // bpf_prog_active, the weak kfunc's address, bpf_untyped_sym
+}
+
+test "fillKconfig: values come from the configuration and the version, typed by the declaration" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_externs, .{});
+    defer o.deinit();
+    var cfg = try kconfig_mod.parse(gpa,
+        \\CONFIG_HZ=250
+        \\CONFIG_BPF=y
+        \\CONFIG_TUN=m
+        \\CONFIG_DEFAULT_HOSTNAME="zlhost"
+        \\
+    );
+    defer cfg.deinit();
+    try fillKconfig(&o, &cfg, (6 << 16) + (8 << 8) + 1);
+    const d = o.findMap(".kconfig").?.initial_data;
+    try testing.expectEqual(@as(u32, (6 << 16) + (8 << 8) + 1), std.mem.readInt(u32, d[0..4], .little));
+    try testing.expectEqual(@as(i32, 250), std.mem.readInt(i32, d[4..8], .little));
+    try testing.expectEqual(@as(u8, 1), d[8]);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, d[12..16], .little)); // tristate m
+    try testing.expectEqualStrings("zlhost", std.mem.sliceTo(d[16..32], 0));
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, d[32..40], .little)); // the weak one that is absent
+
+    // a strong option the configuration lacks
+    var no_bpf = try kconfig_mod.parse(gpa, "CONFIG_HZ=250\nCONFIG_TUN=y\nCONFIG_DEFAULT_HOSTNAME=\"x\"\n");
+    defer no_bpf.deinit();
+    try testing.expectError(error.ExternNotFound, fillKconfig(&o, &no_bpf, 1));
+    // no configuration at all, and no version
+    try testing.expectError(error.ExternNotFound, fillKconfig(&o, null, 1));
+    try testing.expectError(error.ExternNotFound, fillKconfig(&o, &cfg, null));
+    // a value of the wrong kind for the declared type
+    var bad = try kconfig_mod.parse(gpa, "CONFIG_HZ=\"fast\"\nCONFIG_BPF=y\nCONFIG_TUN=y\nCONFIG_DEFAULT_HOSTNAME=\"x\"\n");
+    defer bad.deinit();
+    try testing.expectError(error.ExternTypeMismatch, fillKconfig(&o, &bad, 1));
+    var big = try kconfig_mod.parse(gpa, "CONFIG_HZ=4294967296\nCONFIG_BPF=y\nCONFIG_TUN=y\nCONFIG_DEFAULT_HOSTNAME=\"x\"\n");
+    defer big.deinit();
+    try testing.expectError(error.ExternTypeMismatch, fillKconfig(&o, &big, 1));
+}
+
+test "externs: resolved against THIS machine's vmlinux BTF and patched into the instructions" {
+    const gpa = testing.allocator;
+    var kern = btf_mod.loadKernel(gpa) catch return error.SkipZigTest;
+    defer kern.deinit();
+    if (kern.findByNameKind("bpf_rcu_read_lock", .func) == null or kern.findByNameKind("bpf_prog_active", .@"var") == null)
+        return error.SkipZigTest;
+    var o = try open(gpa, fx_externs, .{});
+    defer o.deinit();
+    try resolveKernelExterns(&o, &kern, .{ .search_modules = false });
+    const rcu = o.externs[findExternIdx(&o, "bpf_rcu_read_lock").?];
+    try testing.expect(rcu.resolved);
+    try testing.expectEqual(kern.findByNameKind("bpf_rcu_read_lock", .func).?, rcu.kernel_btf_id);
+    const act = o.externs[findExternIdx(&o, "bpf_prog_active").?];
+    try testing.expect(act.resolved and !act.typeless);
+    try testing.expectEqual(kern.findByNameKind("bpf_prog_active", .@"var").?, act.kernel_btf_id);
+    // a weak kfunc the kernel lacks stays unresolved
+    try testing.expect(!o.externs[findExternIdx(&o, "bpf_zl_missing_kfunc").?].resolved);
+
+    const p = o.findProgram("probe").?;
+    try patchExterns(p, o.externs);
+    for (p.extern_refs) |r| {
+        const ins = p.insns[r.insn_idx];
+        const ext = o.externs[r.extern_idx];
+        if (r.call and ext.resolved) {
+            try testing.expectEqual(@as(u4, BPF_PSEUDO_KFUNC_CALL), ins.src);
+            try testing.expectEqual(@as(i32, @intCast(ext.kernel_btf_id)), ins.imm);
+            try testing.expectEqual(@as(i16, 0), ins.off); // vmlinux
+        } else if (r.call) {
+            try testing.expectEqual(@as(u4, 0), ins.src);
+            try testing.expect(ins.imm >= poison_call_kfunc_base); // reported only if reachable
+        } else if (ext.resolved and !ext.typeless) {
+            try testing.expectEqual(@as(u4, BPF_PSEUDO_BTF_ID), ins.src);
+            try testing.expectEqual(@as(i32, @intCast(ext.kernel_btf_id)), ins.imm);
+            try testing.expectEqual(@as(i32, 0), p.insns[r.insn_idx + 1].imm);
+        } else {
+            // unresolved weak: a constant 0
+            try testing.expectEqual(@as(u4, 0), ins.src);
+            try testing.expectEqual(@as(i32, 0), ins.imm);
+        }
+    }
+    // a strong extern the kernel lacks is an error
+    o.externs[findExternIdx(&o, "bpf_zl_missing_kfunc").?].weak = false;
+    try testing.expectError(error.ExternNotFound, resolveKernelExterns(&o, &kern, .{ .search_modules = false }));
 }
