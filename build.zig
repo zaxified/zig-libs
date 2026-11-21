@@ -314,7 +314,7 @@ pub const module_list = [_]Module{
     .{ .name = "aes192", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "p521", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .test_deps = &.{"testkit"} },
     .{ .name = "p384", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .test_deps = &.{"testkit"} },
-    .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "aescbc", "aeskw", "aes192", "aesgcm" }, .test_deps = &.{"testkit"} },
+    .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "p384", "p521", "aescbc", "aeskw", "aes192", "aesgcm" }, .test_deps = &.{"testkit"} },
     .{ .name = "rdap", .libs = &.{"net"}, .deps = &.{ "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "blobstore", .libs = &.{"storage"}, .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },

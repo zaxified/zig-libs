@@ -492,8 +492,8 @@ pub fn encryptCompact(
             epk_params = .{
                 .kty = curve.jwkKty(),
                 .crv = curve.jwkCrv(),
-                .x = epk_coords.x[0..],
-                .y = if (epk_coords.y) |*y| y[0..] else null,
+                .x = epk_coords.xSlice(),
+                .y = epk_coords.ySlice(),
             };
             break :blk ek;
         },
@@ -1024,6 +1024,39 @@ test "ECDH-ES direct + A128GCM real round-trip (P-256, apu/apv, empty encrypted_
     });
     defer std.testing.allocator.free(plaintext);
     try std.testing.expectEqualStrings("meet at the old bridge", plaintext);
+}
+
+test "ECDH-ES over P-384 and P-521 round-trips, direct and with key wrap; epk is a full-width JWK" {
+    inline for ([_]ecdhes.Curve{ .p384, .p521 }) |crv| {
+        const width: usize = if (crv == .p384) 48 else 66;
+        var recipient: ecdhes.EphemeralKeyPair = undefined;
+        ecdhes.generateEphemeral(&recipient, crv, seededForTest());
+        for ([_]Alg{ .@"ECDH-ES", .@"ECDH-ES+A128KW", .@"ECDH-ES+A256KW" }) |key_alg| {
+            const token = try encryptCompact(std.testing.allocator, key_alg, .A256GCM, .{ .ec_public = recipient.public }, "curves of the NIST family", "", seededForTest(), .{});
+            defer std.testing.allocator.free(token);
+            var it = std.mem.splitScalar(u8, token, '.');
+            var hdr_buf: [512]u8 = undefined;
+            const hdr_b64 = it.next().?;
+            const hdr = hdr_buf[0..try std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(hdr_b64)];
+            try std.base64.url_safe_no_pad.Decoder.decode(hdr, hdr_b64);
+            const want = if (crv == .p384) "\"crv\":\"P-384\"" else "\"crv\":\"P-521\"";
+            try std.testing.expect(std.mem.find(u8, hdr, want) != null);
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const parsed = try header.parse(arena.allocator(), hdr);
+            try std.testing.expectEqual(width, parsed.epk.?.x.len);
+            try std.testing.expectEqual(width, parsed.epk.?.y.?.len);
+            const plaintext = try decryptCompact(std.testing.allocator, .{ .ec_private = &recipient.private }, token, .{ .expect_alg = key_alg });
+            defer std.testing.allocator.free(plaintext);
+            try std.testing.expectEqualStrings("curves of the NIST family", plaintext);
+        }
+        // A key of another curve is refused before any point arithmetic.
+        var other: ecdhes.EphemeralKeyPair = undefined;
+        ecdhes.generateEphemeral(&other, .p256, seededForTest());
+        const t2 = try encryptCompact(std.testing.allocator, .@"ECDH-ES", .A128GCM, .{ .ec_public = recipient.public }, "x", "", seededForTest(), .{});
+        defer std.testing.allocator.free(t2);
+        try std.testing.expectError(error.CurveMismatch, decryptCompact(std.testing.allocator, .{ .ec_private = &other.private }, t2, .{}));
+    }
 }
 
 test "ECDH-ES+A256KW over X25519 real round-trip" {

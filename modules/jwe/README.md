@@ -22,8 +22,8 @@ below. AES-192 (every `A192*`) runs on the `aes192` block cipher and
   RFC 3394 (AES Key Wrap).
 - **Platform:** any. **Role:** codec (pure wire format + crypto dispatch, no
   I/O). **Concurrency:** reentrant — no shared/global state.
-- **Deps:** `rsa` (RSA-OAEP / RSA-OAEP-256 key wrap), `p256` (ECDH-ES's
-  P-256 curve — X25519 stays on `std`), `aescbc` + `aeskw` (the shared
+- **Deps:** `rsa` (RSA-OAEP / RSA-OAEP-256 key wrap), `p256` / `p384` / `p521` (ECDH-ES's
+  NIST curves — X25519 stays on `std`), `aescbc` + `aeskw` (the shared
   CBC content-encryption and RFC 3394 key-wrap cores), `aes192` + `aesgcm`
   (AES-192 block cipher and `Aes192Gcm` for every `A192*`).
 
@@ -36,7 +36,7 @@ below. AES-192 (every `A192*`) runs on the `aes192` block cipher and
 | `A128GCMKW` / `A256GCMKW` (key management) | **REAL** (`aesgcm`) |
 | `A128KW` / `A256KW` (key management) | **REAL** (RFC 3394 AES Key Wrap; §4.1 + RFC 7516 A.3 KATs) |
 | `PBES2-HS256+A128KW` / `PBES2-HS512+A256KW` | **REAL** (PBKDF2 KDF feeding the AES Key Wrap above) |
-| `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (key management) | **REAL** (ephemeral-static ECDH on P-256 or X25519 + Concat KDF; RFC 7518 Appendix C KAT) |
+| `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (key management) | **REAL** (ephemeral-static ECDH on P-256, P-384, P-521 or X25519 + Concat KDF; RFC 7518 Appendix C KAT) |
 | `A128GCM` / `A256GCM` (content encryption) | **REAL** (`aesgcm`) |
 | `A128CBC-HS256` / `A256CBC-HS512` (content encryption) | **REAL** (AES-CBC + HMAC encrypt-then-MAC; RFC 7518 B.1/B.3 KATs) |
 | `A192GCM` / `A192GCMKW` / `A192KW` / `A192CBC-HS384` / `PBES2-HS384+A192KW` / `ECDH-ES+A192KW` | **REAL** (AES-192 from the `aes192` module, GCM from `aesgcm`; RFC 7518 B.2, RFC 3394 §4.2/§4.4 and McGrew–Viega 7–10 KATs, full-token round trips — RFC 7520 has no AES-192 examples) |
@@ -112,7 +112,7 @@ honest fit here.
 ## Not provided
 
 JSON serialization (flattened/general) and multiple recipients, `RSA1_5`, `zip` (DEFLATE; refused
-outright) and ECDH-ES on P-384/P-521. See `SPEC.md` § What is deliberately not done and
+outright). See `SPEC.md` § What is deliberately not done and
 § Backlog / deferred.
 
 ## Provenance

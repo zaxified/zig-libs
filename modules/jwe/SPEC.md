@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 verify-before-decrypt CBC-HMAC with a single error for tag or padding failure; refuses `zip`
 outright (a deliberate anti-zip-bomb stance that go-jose, which implements DEF, does not take)
 and caps PBES2 iterations (`default_max_p2c`). **Where we are behind:** JSON
-serialization and multiple recipients (deliberate for v1, see *Design*), RSA1_5 (refused, see *What is deliberately not done*), ECDH-ES on P-384/P-521 (→ Backlog).
+serialization and multiple recipients (deliberate for v1, see *Design*), RSA1_5 (refused, see *What is deliberately not done*). ECDH-ES on P-256, P-384, P-521 and X25519 is implemented.
 
 Design + threat notes for auditors. Usage: see ./README.md.
 Attribution/provenance: see ./NOTICE (module-local — see its own note on
@@ -169,7 +169,7 @@ placement).
 - **Out of scope for v1:** General/Flattened JSON serialization (multiple
   recipients — see Design above), and any `enc`/`alg` this file doesn't
   list. `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (RFC 7518 §4.6,
-  elliptic-curve key agreement on P-256 or X25519 + the Concat KDF) ARE in
+  elliptic-curve key agreement on P-256, P-384, P-521 or X25519 + the Concat KDF; P-384 and P-521 are checked against std's P-384 and the `p384`/`p521` modules' own ECDH, no foreign KAT) ARE in
   scope and implemented — see `ecdhes.zig`, byte-exact against RFC 7518
   Appendix C. `ECDH-ES+A192KW` included (its KEK goes to `aeskw`'s AES-192
   arm).
@@ -274,11 +274,8 @@ Run: `scripts/modtest jwe`. Tests sit beside the code (`src/root.zig`, `enc.zig`
 
 ## Backlog / deferred
 
-- **ECDH-ES on P-384 / P-521** — `ecdhes.Curve` is `p256`/`x25519` only; go-jose and panva/jose accept the
-  NIST curves and IdPs commonly publish P-384 keys. Effort: medium (needs a P-384 primitive;
-  `std.crypto.ecc.P384` is the likely base *(inferred, not checked)*). Fits §2: yes.
 - **JWE JSON serialization (flattened/general) and multiple recipients** — go-jose and panva/jose both
   ship it; deliberately out of scope for v1 (see *Design & invariants*), listed because it is an API
   addition, not a framing change. Effort: medium. Fits §2: yes.
 - **Performance not measured** — the AES-GCM bulk path runs in `aesgcm` (see its Performance); jwe has no
-  bench of its own.
+  bench of its own. BOUNCED: needs a quiet host for numbers (quiet phase).

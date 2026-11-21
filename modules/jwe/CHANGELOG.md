@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — ADDED ECDH-ES on P-384 and P-521: `ecdhes.Curve.p384` / `.p521` (JWK `crv` "P-384" / "P-521", full-width coordinates of 48 / 66 bytes), `PublicKey` / `PrivateKey` variants, `Curve.coordinateLen`. **Source-breaking:** `ecdhes.Coordinates` is now `{x, y, len}` over 66-byte arrays (use `xSlice()` / `ySlice()`), `ecdhes.max_z_len` is 66, and an exhaustive `switch` over `Curve`, `PublicKey` or `PrivateKey` needs the new arms. New dependencies on `p384` and `p521`.
 - **2026-11-19** — **Behaviour change (via `rsa`):** an RSA public key under 1024 bits is refused (`rsa.PublicKey.fromBytes`). Test fixture modulus widened to 1024 bits.
 - **2026-11-13** — **Fix (no-panic sweep):** `header.encode` (and so `encryptCompact` with an `apu`/`apv` over `header.max_member_len` = 128 bytes) overran its base64 scratch buffer — now `BufferTooSmall` / `HeaderTooLarge`; `ecdhes.concatKdfSha256` accepts an empty output (it asserted) and panics with a checked message instead of an `@intCast` on a 2^29-byte output or 2^32-byte input; `enc.encrypt` of a GCM message past 2^36 - 32 bytes is `BufferTooSmall` instead of an `aesgcm` panic. Tests in `src/sweep_test.zig` ("sweep JWE-1..3").
 - **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the `p2c` header narrowing is `std.math.cast(u32, i)` again; the i64 → u64 → u32 detour was the Zig 0.17.0 `trunc nsw` workaround (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).

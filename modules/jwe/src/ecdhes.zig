@@ -31,6 +31,8 @@ pub const Entropy = @import("entropy.zig").Entropy;
 // P-256 curve group from the asm-accelerated `p256` module (byte-exact to
 // `std.crypto.ecc.P256`); X25519 stays on std (p256 covers only P-256).
 const P256 = @import("p256").P256;
+const P384 = @import("p384").P384;
+const P521 = @import("p521").P521;
 const burn = @import("burn.zig");
 const X25519 = std.crypto.dh.X25519;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -49,12 +51,25 @@ pub const Error = error{
 /// `PublicKey`/`PrivateKey`; the JOSE wire names come from `jwkCrv`.
 pub const Curve = enum {
     p256,
+    p384,
+    p521,
     x25519,
+
+    /// Bytes of one coordinate / private scalar / `Z` (RFC 7518 §6.2.1.2: the full field width, so 66 for P-521).
+    pub fn coordinateLen(self: Curve) usize {
+        return switch (self) {
+            .p256, .x25519 => 32,
+            .p384 => 48,
+            .p521 => 66,
+        };
+    }
 
     /// JWK `crv` value (RFC 7518 §6.2.1.1 / RFC 8037 §3.2).
     pub fn jwkCrv(self: Curve) []const u8 {
         return switch (self) {
             .p256 => "P-256",
+            .p384 => "P-384",
+            .p521 => "P-521",
             .x25519 => "X25519",
         };
     }
@@ -63,13 +78,15 @@ pub const Curve = enum {
     /// X25519.
     pub fn jwkKty(self: Curve) []const u8 {
         return switch (self) {
-            .p256 => "EC",
+            .p256, .p384, .p521 => "EC",
             .x25519 => "OKP",
         };
     }
 
     pub fn fromJwkCrv(s: []const u8) ?Curve {
         if (std.mem.eql(u8, s, "P-256")) return .p256;
+        if (std.mem.eql(u8, s, "P-384")) return .p384;
+        if (std.mem.eql(u8, s, "P-521")) return .p521;
         if (std.mem.eql(u8, s, "X25519")) return .x25519;
         return null;
     }
@@ -78,13 +95,17 @@ pub const Curve = enum {
 /// Coordinate width for every supported curve (32 bytes) — also the width
 /// of `Z` (SEC1: the shared X coordinate at field-element width).
 pub const coordinate_len: usize = 32;
-pub const max_z_len: usize = coordinate_len;
+/// The widest coordinate of any curve here (P-521).
+pub const max_coordinate_len: usize = 66;
+pub const max_z_len: usize = max_coordinate_len;
 
 /// A recipient/ephemeral public key. For P-256 the point is validated
 /// on-curve at construction (`fromCoordinates`); an identity/low-order peer
 /// is additionally rejected inside `deriveZ` by std's scalar mult.
 pub const PublicKey = union(Curve) {
     p256: P256,
+    p384: P384,
+    p521: P521,
     x25519: [coordinate_len]u8,
 
     /// Build from raw (base64url-decoded) JWK coordinates. P-256 requires
@@ -102,6 +123,18 @@ pub const PublicKey = union(Curve) {
                 ) catch return error.InvalidKey;
                 return .{ .p256 = point };
             },
+            .p384 => {
+                const yy = y orelse return error.InvalidKey;
+                if (x.len != 48 or yy.len != 48) return error.InvalidKey;
+                const point = P384.fromSerializedAffineCoordinates(x[0..48].*, yy[0..48].*, .big) catch return error.InvalidKey;
+                return .{ .p384 = point };
+            },
+            .p521 => {
+                const yy = y orelse return error.InvalidKey;
+                if (x.len != 66 or yy.len != 66) return error.InvalidKey;
+                const point = P521.fromSerializedAffineCoordinates(x[0..66].*, yy[0..66].*, .big) catch return error.InvalidKey;
+                return .{ .p521 = point };
+            },
             .x25519 => {
                 if (x.len != coordinate_len or y != null) return error.InvalidKey;
                 return .{ .x25519 = x[0..coordinate_len].* };
@@ -114,17 +147,49 @@ pub const PublicKey = union(Curve) {
         switch (self) {
             .p256 => |point| {
                 const aff = point.affineCoordinates();
-                return .{ .x = aff.x.toBytes(.big), .y = aff.y.toBytes(.big) };
+                var c: Coordinates = .{ .x = @splat(0), .y = @splat(0), .len = 32 };
+                c.x[0..32].* = aff.x.toBytes(.big);
+                c.y.?[0..32].* = aff.y.toBytes(.big);
+                return c;
             },
-            .x25519 => |x| return .{ .x = x, .y = null },
+            .p384 => |point| {
+                const aff = point.affineCoordinates();
+                var c: Coordinates = .{ .x = @splat(0), .y = @splat(0), .len = 48 };
+                c.x[0..48].* = aff.x.toBytes(.big);
+                c.y.?[0..48].* = aff.y.toBytes(.big);
+                return c;
+            },
+            .p521 => |point| {
+                const aff = point.affineCoordinates();
+                var c: Coordinates = .{ .x = @splat(0), .y = @splat(0), .len = 66 };
+                c.x[0..66].* = aff.x.toBytes(.big);
+                c.y.?[0..66].* = aff.y.toBytes(.big);
+                return c;
+            },
+            .x25519 => |x| {
+                var c: Coordinates = .{ .x = @splat(0), .y = null, .len = 32 };
+                c.x[0..32].* = x;
+                return c;
+            },
         }
     }
 };
 
 pub const Coordinates = struct {
-    x: [coordinate_len]u8,
+    /// `[0..len]` is the big-endian coordinate, the rest is zero.
+    x: [max_coordinate_len]u8,
     /// null for X25519 (OKP keys have no `y`).
-    y: ?[coordinate_len]u8,
+    y: ?[max_coordinate_len]u8,
+    /// The curve's `coordinateLen`.
+    len: u8,
+
+    pub fn xSlice(self: *const Coordinates) []const u8 {
+        return self.x[0..self.len];
+    }
+
+    pub fn ySlice(self: *const Coordinates) ?[]const u8 {
+        return if (self.y) |*y| y[0..self.len] else null;
+    }
 };
 
 /// A recipient-static or ephemeral private key. P-256: the SEC1 scalar,
@@ -132,6 +197,8 @@ pub const Coordinates = struct {
 /// X25519: the 32-byte secret (clamped by std at use).
 pub const PrivateKey = union(Curve) {
     p256: [coordinate_len]u8,
+    p384: [48]u8,
+    p521: [66]u8,
     x25519: [coordinate_len]u8,
 
     /// Best-effort scrub of the scalar bytes (the tag survives).
@@ -182,6 +249,29 @@ noinline fn generateEphemeralUnburned(out: *EphemeralKeyPair, curve: Curve, entr
                 return;
             }
         },
+        .p384 => {
+            while (true) {
+                out.private = .{ .p384 = undefined };
+                random.bytes(&out.private.p384);
+                _ = P384.scalar.Scalar.fromBytes(out.private.p384, .big) catch continue;
+                var point: P384 = undefined;
+                P384.mulInto(&point, P384.basePoint, &out.private.p384, .big) catch continue;
+                out.public = .{ .p384 = point };
+                return;
+            }
+        },
+        .p521 => {
+            while (true) {
+                out.private = .{ .p521 = undefined };
+                random.bytes(&out.private.p521);
+                out.private.p521[0] &= 0x01; // n < 2^521: only the low bit of the top byte is in range
+                _ = P521.scalar.Scalar.fromBytes(out.private.p521, .big) catch continue;
+                var point: P521 = undefined;
+                P521.mulInto(&point, P521.basePoint, &out.private.p521, .big) catch continue;
+                out.public = .{ .p521 = point };
+                return;
+            }
+        },
         .x25519 => {
             while (true) {
                 out.private = .{ .x25519 = undefined };
@@ -224,15 +314,31 @@ noinline fn deriveZUnburned(private: *const PrivateKey, peer: PublicKey, out: *[
             var shared: P256 = undefined;
             defer std.crypto.secureZero(u8, std.mem.asBytes(&shared));
             peer.p256.mulInto(&shared, d, .big) catch return error.InvalidKey;
-            out.* = shared.affineCoordinates().x.toBytes(.big);
+            out[0..32].* = shared.affineCoordinates().x.toBytes(.big);
             return out[0..coordinate_len];
         },
         .x25519 => |*sk| {
             // std rejects the identity/all-zero output — RFC 7748's
             // low-order-point check. std takes the scalar by value; that copy
             // lives in this (burned) frame.
-            out.* = X25519.scalarmult(sk.*, peer.x25519) catch return error.InvalidKey;
+            out[0..32].* = X25519.scalarmult(sk.*, peer.x25519) catch return error.InvalidKey;
             return out[0..coordinate_len];
+        },
+        .p384 => |*d| {
+            _ = P384.scalar.Scalar.fromBytes(d.*, .big) catch return error.InvalidKey;
+            var shared: P384 = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&shared));
+            P384.mulInto(&shared, peer.p384, d, .big) catch return error.InvalidKey;
+            out[0..48].* = shared.affineCoordinates().x.toBytes(.big);
+            return out[0..48];
+        },
+        .p521 => |*d| {
+            _ = P521.scalar.Scalar.fromBytes(d.*, .big) catch return error.InvalidKey;
+            var shared: P521 = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&shared));
+            P521.mulInto(&shared, peer.p521, d, .big) catch return error.InvalidKey;
+            out[0..66].* = shared.affineCoordinates().x.toBytes(.big);
+            return out[0..66];
         },
     }
 }
@@ -363,6 +469,47 @@ test "RFC 7518 Appendix C KAT — Concat KDF derived key, byte-exact (VqqN6vgjbS
     try testing.expectEqualStrings("VqqN6vgjbSBcIijNcacQGg", enc);
 }
 
+test "P-384 / P-521 ECDH: both sides agree; Z equals std's P-384 and the curve modules' own ecdh" {
+    var rng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x17)));
+    const ent: Entropy = .{ .fixed_for_test = rng.random() };
+    var a: EphemeralKeyPair = undefined;
+    var b: EphemeralKeyPair = undefined;
+    inline for ([_]Curve{ .p384, .p521 }) |crv| {
+        generateEphemeral(&a, crv, ent);
+        generateEphemeral(&b, crv, ent);
+        var za: [max_z_len]u8 = undefined;
+        var zb: [max_z_len]u8 = undefined;
+        const z1 = try deriveZ(&a.private, b.public, &za);
+        const z2 = try deriveZ(&b.private, a.public, &zb);
+        try testing.expectEqual(crv.coordinateLen(), z1.len);
+        try testing.expectEqualSlices(u8, z1, z2);
+        // The sibling curve module's own ECDH over the same SEC1 point.
+        if (crv == .p384) {
+            const p384m = @import("p384");
+            const sec1 = b.public.p384.toUncompressedSec1();
+            const want = try p384m.ecdh(a.private.p384, &sec1);
+            try testing.expectEqualSlices(u8, &want, z1);
+            // std's P-384 as an independent implementation.
+            const sp = try std.crypto.ecc.P384.fromSec1(&sec1);
+            const shared = try sp.mul(a.private.p384, .big);
+            try testing.expectEqualSlices(u8, &shared.affineCoordinates().x.toBytes(.big), z1);
+        } else {
+            const p521m = @import("p521");
+            const sec1 = b.public.p521.toUncompressedSec1();
+            const want = try p521m.ecdh(a.private.p521, &sec1);
+            try testing.expectEqualSlices(u8, &want, z1);
+        }
+        // Coordinates round-trip through fromCoordinates; an off-curve point and a wrong width are refused.
+        const c = a.public.coordinates();
+        const back = try PublicKey.fromCoordinates(crv, c.xSlice(), c.ySlice());
+        try testing.expect(std.meta.eql(back.coordinates(), c));
+        var bad_y = c.y.?;
+        bad_y[crv.coordinateLen() - 1] ^= 1;
+        try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(crv, c.xSlice(), bad_y[0..c.len]));
+        try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(crv, c.xSlice()[1..], c.ySlice()));
+    }
+}
+
 test "Concat KDF std-only sanity oracle — single SHA-256 over the RFC's literal round-1 input" {
     // The RFC prints the exact round-1 hash input octets: counter=1 ‖ Z ‖
     // OtherInfo. Recompute with a raw std Sha256 (no KDF code involved) and
@@ -423,7 +570,7 @@ test "ephemeral generation + agreement — both curves, both directions agree" {
 
         // Public coordinates round-trip through the JWK wire form.
         const coords = a.public.coordinates();
-        const back = try PublicKey.fromCoordinates(curve, &coords.x, if (coords.y) |*y| y else null);
+        const back = try PublicKey.fromCoordinates(curve, coords.xSlice(), coords.ySlice());
         var zc_buf: [max_z_len]u8 = undefined;
         const zc = try deriveZ(&b.private, back, &zc_buf);
         try testing.expectEqualSlices(u8, za, zc);
