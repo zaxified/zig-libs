@@ -305,7 +305,11 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
         // U+FFFD, as Go writes it.
         var buf: [4]u8 = undefined;
         const cp = if (single.? >= 0xd800 and single.? <= 0xdfff) 0xfffd else single.?;
-        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+        // Bytes mode: a raw byte past ASCII is kept at `byte_base + b`.
+        const n = if (cp >= syntax.byte_base) blk: {
+            buf[0] = @intCast(cp - syntax.byte_base);
+            break :blk 1;
+        } else std.unicode.utf8Encode(cp, &buf) catch unreachable;
         if (!try sink.put(buf[0..n])) return false;
         nxt = .empty;
         var it3 = cur.iterator(.{});

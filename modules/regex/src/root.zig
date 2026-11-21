@@ -118,6 +118,8 @@ const Probe = enum {
     dec_two,
     before_two,
     rune_wide,
+    byte_dfa_skip,
+    pike_bytes_skip,
 };
 threadlocal var probe_counts: std.EnumArray(Probe, usize) = .initFill(0);
 
@@ -245,12 +247,12 @@ pub const Regex = struct {
         }
         const source = try gpa.dupe(u8, pattern);
         errdefer gpa.free(source);
-        // Bytes mode: no prefilter (its sets are of code points' bytes); a
-        // program past `max_insts`: none either (the analysis's scratch is
-        // sized for that).
-        const plain = !bytes and insts.len <= max_insts;
-        var pf: Prefilter = if (plain) analyze(insts, ranges) else .{};
-        if (plain) if (buildTeddy(&pf, insts, ranges)) |t| {
+        // A program past `max_insts`: no prefilter (the analysis's scratch
+        // is sized for that). Bytes mode: first bytes and the literal prefix
+        // over raw bytes (`analyze`), no Teddy and no end analysis.
+        const plain = insts.len <= max_insts;
+        var pf: Prefilter = if (plain) analyze(insts, ranges, bytes) else .{};
+        if (plain and !bytes) if (buildTeddy(&pf, insts, ranges)) |t| {
             const tp = try gpa.create(teddy.Teddy);
             tp.* = t;
             pf.teddy = tp;
@@ -833,7 +835,23 @@ pub const Regex = struct {
         first[0][0] = 1;
         var s = d.add(first, .ofIf(re.asserts, null));
         var pos: usize = 0;
+        // Unanchored with a first-byte set: while no thread is alive, jump
+        // to the next byte that can start a match (none can be empty).
+        const skip = restart and re.prefilter.first != null and !re.prefilter.anchored;
         while (true) {
+            if (skip and isEmptyKey(d.keys[s]) and pos < input.len) {
+                const p = re.prefilter.next(input, pos) orelse return false;
+                if (p != pos) {
+                    probe(.byte_dfa_skip);
+                    pos = p;
+                    const ctx: Dfa.Ctx = .ofIf(re.asserts, if (input[p - 1] < 0x80) input[p - 1] else 0xfffd);
+                    const empty: ByteDfa.Key = @splat(.{ 0, 0 });
+                    s = d.find(empty, ctx) orelse blk: {
+                        if (d.n == ByteDfa.max_states) d.n = 0;
+                        break :blk d.add(empty, ctx);
+                    };
+                }
+            }
             if (pos == input.len) return re.byteDfaAccepts(d.keys[s][0], d.ctxs[s], restart);
             const c = input[pos];
             if (re.ascii_dfa and c >= 0x80) return null;
@@ -1392,7 +1410,7 @@ pub fn comptimeCompileOptions(comptime pattern: []const u8, comptime opts: Optio
         var names: [b.ngroups][]const u8 = undefined;
         for (&names, b.names[0..b.ngroups]) |*slot, n| slot.* = n;
         const final_names = names;
-        var pf: Prefilter = if (bytes) .{} else analyze(&insts, &ranges);
+        var pf: Prefilter = analyze(&insts, &ranges, bytes);
         if (!bytes) if (buildTeddy(&pf, &insts, &ranges)) |t| {
             const final_teddy = t;
             pf.teddy = &final_teddy;
@@ -2824,7 +2842,13 @@ fn findLiteral(input: []const u8, pos: usize, lit: []const u8) ?usize {
 /// would decode differently: a lead or ASCII byte always starts one, and a set
 /// that could need a continuation byte (U+FFFD, what an invalid byte reads
 /// as) is given up.
-fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
+///
+/// Bytes mode (`bytes`): every byte position may start a match, a byte class
+/// takes its raw bytes (`syntax.byte_base`) and a Unicode class only a valid
+/// sequence, so `first` is the raw bytes plus the lead bytes, U+FFFD needs no
+/// care (an invalid byte never matches it), and the literal prefix is raw
+/// bytes. No end analysis: `isMatch` in bytes mode has its own engine.
+fn analyze(insts: []const Inst, ranges: []const Range, bytes: bool) Prefilter {
     var pf: Prefilter = .{};
     var seen: std.StaticBitSet(max_insts) = .empty;
     var stack: [2 * max_insts]u16 = undefined;
@@ -2867,6 +2891,14 @@ fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
                 .rune => |r| if (wall) {
                     unanchored = true;
                 } else for (ranges[r.start..][0..r.len]) |rg| {
+                    if (bytes) {
+                        if (rg.lo >= syntax.byte_base) {
+                            // Raw bytes past ASCII.
+                            var c: u32 = rg.lo - syntax.byte_base;
+                            while (c <= rg.hi - syntax.byte_base) : (c += 1) set[c >> 6] |= @as(u64, 1) << @truncate(c);
+                        } else addLeadBytes(&set, rg);
+                        continue;
+                    }
                     if (rg.lo <= 0xfffd and 0xfffd <= rg.hi) any_first = true;
                     addLeadBytes(&set, rg);
                 },
@@ -2874,7 +2906,7 @@ fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
         }
     }
     pf.anchored = !unanchored;
-    pf.end_anchored = !pf.anchored and endAnchored(insts);
+    pf.end_anchored = !bytes and !pf.anchored and endAnchored(insts);
     if (pf.end_anchored) {
         pf.last = lastBytes(insts, ranges);
         if (pf.last != null) pf.tail_len = tailBytes(insts, ranges, &pf.tail);
@@ -3514,7 +3546,15 @@ pub const Matcher = struct {
         cur.clear();
         var matched = false;
         var pos = from;
+        const pf = &re.prefilter;
         while (true) {
+            if (cur.n == 0 and !matched and !full and !m.anchor and pf.first != null and @hasField(@TypeOf(text.*), "input")) {
+                // No thread alive: a match can only start where the prefilter
+                // allows (it cannot be empty, or `first` would be null).
+                const p = pf.next(text.input, pos) orelse return false;
+                if (p != pos) probe(.pike_bytes_skip);
+                pos = p;
+            }
             probe(.pike_bytes_step);
             const at_end = text.atEnd(pos);
             if (!matched and ((!full and !m.anchor) or pos == from)) {
@@ -6728,45 +6768,45 @@ fn goldenRow(gpa: std.mem.Allocator, case: GoldenCase) ![1 + std.EnumArray(Probe
 }
 
 const golden_want = [_][1 + std.EnumArray(Probe, usize).len]u64{
-    .{ 15164632721457695747, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 132, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 144, 0, 0, 0 },
-    .{ 10048191757018527131, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 0, 404, 1260, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 2, 88, 326, 0, 0 },
-    .{ 16040365197490733272, 2, 5, 2, 0, 0, 0, 0, 8, 8, 0, 0, 0, 0, 0, 0, 96, 1371, 96, 756, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 5, 77, 0, 0, 0 },
-    .{ 12384312014502880017, 2, 5, 2, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 120, 480, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 24, 129, 0, 0, 0 },
-    .{ 15115527827644834550, 2, 5, 2, 0, 0, 0, 0, 43, 43, 0, 0, 0, 0, 0, 0, 174, 0, 27, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 36, 0, 0, 0 },
-    .{ 8638340579144201148, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 192, 0, 39, 360, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 28, 21, 0, 0 },
-    .{ 17510967732706982897, 2, 9, 6, 0, 0, 0, 0, 61, 61, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 288, 3, 0, 0, 0, 0, 59, 47, 0, 0, 0 },
-    .{ 1697275548591039429, 2, 13, 10, 0, 0, 0, 0, 36, 36, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 216, 3, 0, 0, 0, 0, 23, 53, 0, 0, 0 },
-    .{ 6803076195450018575, 2, 13, 10, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 189, 6, 96, 3, 0, 0, 0, 0, 12, 43, 0, 0, 0 },
-    .{ 7308186787397403972, 2, 5, 2, 0, 0, 0, 0, 45, 45, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 45, 18, 0, 0, 0 },
-    .{ 12216273954606837675, 2, 1, 0, 0, 0, 0, 0, 869, 869, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 560, 1, 0, 0, 0 },
-    .{ 16661322863164733733, 2, 9, 6, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 22, 32, 0, 0, 0 },
-    .{ 8957657828776279370, 4, 12, 9, 0, 0, 0, 0, 11, 11, 0, 0, 0, 0, 0, 0, 96, 0, 557, 420, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 99, 480, 3, 3 },
-    .{ 3698356145194735362, 1226, 96, 95, 0, 0, 0, 0, 2161, 2161, 0, 0, 0, 0, 0, 0, 0, 0, 135, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2151, 0, 0, 0 },
-    .{ 10115942991274251655, 2, 1264, 1262, 34, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 3222, 0, 0, 4, 217, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 10, 4502, 0, 0, 0 },
-    .{ 15643903801131319530, 0, 1248, 1248, 34, 0, 0, 0, 3002, 3002, 0, 0, 0, 0, 0, 6, 0, 0, 7690, 0, 0, 12, 439, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 1500, 11937, 0, 0, 0 },
-    .{ 16512095191518823459, 0, 4, 3, 0, 4, 0, 4, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0 },
-    .{ 16692255664732926537, 0, 1, 0, 0, 6, 0, 6, 1441, 1441, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 1200, 517, 0, 0, 0 },
-    .{ 12216273954606837675, 0, 1, 0, 0, 0, 0, 0, 1201, 1201, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 126, 7, 0, 3, 0, 0, 0, 0, 1200, 1, 0, 0, 0 },
-    .{ 9928401522073452516, 0, 12, 9, 0, 0, 0, 0, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 6, 32, 0, 0, 0 },
-    .{ 8817487514071533497, 0, 3, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 3, 8, 0, 0, 0 },
-    .{ 255220893118731787, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 1296, 78, 324, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 55, 0, 0, 0 },
-    .{ 9535395973114509801, 0, 18, 15, 0, 0, 0, 0, 4, 4, 0, 15, 24, 0, 6, 0, 0, 1482, 87, 216, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 100, 0, 0, 0 },
-    .{ 7977390198355055948, 2, 21, 18, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 330, 0, 0, 0, 33, 0, 0, 0, 0, 0, 168, 3, 0, 0, 0, 0, 5, 229, 136, 0, 0 },
-    .{ 6979640180260109447, 0, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 3, 0, 6, 0, 0, 2430, 144, 4746, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 432, 0, 1, 96, 0, 0, 0 },
-    .{ 9195713229761359493, 0, 5, 2, 0, 0, 0, 0, 2, 2, 0, 0, 6, 0, 6, 0, 0, 0, 24, 0, 4944, 3, 3, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 3, 31, 0, 0, 0 },
-    .{ 18108727944704394641, 24, 29, 26, 0, 0, 0, 0, 95, 95, 0, 0, 0, 0, 0, 0, 0, 0, 132, 288, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 70, 215, 0, 0, 0 },
-    .{ 5569908290217341108, 20, 54, 51, 0, 0, 0, 0, 72, 72, 0, 0, 36, 0, 12, 0, 96, 0, 349, 0, 168, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 271, 194, 30, 24 },
-    .{ 1304118577475789381, 0, 76, 73, 0, 0, 0, 0, 40, 40, 0, 0, 0, 0, 0, 0, 0, 0, 216, 96, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 22, 332, 0, 0, 0 },
-    .{ 2510107502798244048, 2, 14, 11, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 3, 0, 0, 0, 0, 0, 0, 678, 3, 0, 0, 0, 0, 9, 49, 0, 0, 0 },
-    .{ 12771596290932658175, 2, 5, 2, 0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 141, 0, 144, 3, 0, 0, 0, 0, 1, 7, 14, 0, 0 },
-    .{ 12524798475987748091, 2, 9, 6, 0, 0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 144, 0, 30, 144, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 25, 20, 0, 0 },
-    .{ 16695608249434358507, 0, 51, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6588, 6918, 0, 0, 3717, 0, 0, 0 },
-    .{ 7222689674609703483, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 150, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 160, 0, 0, 0 },
-    .{ 16025140877391608600, 0, 4, 3, 0, 6, 0, 8, 3002, 3002, 0, 0, 12, 0, 12, 6, 0, 0, 84, 0, 6, 6, 3, 0, 0, 0, 0, 0, 774, 3, 0, 0, 0, 0, 1500, 3087, 0, 0, 0 },
-    .{ 17791598714729744375, 2, 5, 2, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 114, 105, 18, 216, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 11, 20, 0, 0, 0 },
-    .{ 16512095191518823459, 0, 4, 3, 0, 0, 0, 0, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0 },
-    .{ 12216273954606837675, 0, 1, 0, 0, 6, 0, 6, 1501, 1501, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1500, 1, 0, 0, 0 },
-    .{ 12216273954606837675, 0, 1, 0, 0, 418, 0, 12, 865, 865, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 612, 702, 0, 0, 378 },
+    .{ 15164632721457695747, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 132, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 144, 0, 0, 0, 0, 0 },
+    .{ 10048191757018527131, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 0, 404, 1260, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 2, 88, 326, 0, 0, 0, 0 },
+    .{ 16040365197490733272, 2, 5, 2, 0, 0, 0, 0, 8, 8, 0, 0, 0, 0, 0, 0, 96, 1371, 96, 756, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 5, 77, 0, 0, 0, 0, 0 },
+    .{ 12384312014502880017, 2, 5, 2, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 120, 480, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 24, 129, 0, 0, 0, 0, 0 },
+    .{ 15115527827644834550, 2, 5, 2, 0, 0, 0, 0, 43, 43, 0, 0, 0, 0, 0, 0, 174, 0, 27, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 36, 0, 0, 0, 0, 0 },
+    .{ 8638340579144201148, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 192, 0, 39, 360, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 28, 21, 0, 0, 0, 0 },
+    .{ 17510967732706982897, 2, 9, 6, 0, 0, 0, 0, 61, 61, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 288, 3, 0, 0, 0, 0, 59, 47, 0, 0, 0, 0, 0 },
+    .{ 1697275548591039429, 2, 13, 10, 0, 0, 0, 0, 36, 36, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 216, 3, 0, 0, 0, 0, 23, 53, 0, 0, 0, 0, 0 },
+    .{ 6803076195450018575, 2, 13, 10, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 189, 6, 96, 3, 0, 0, 0, 0, 12, 43, 0, 0, 0, 0, 0 },
+    .{ 7308186787397403972, 2, 5, 2, 0, 0, 0, 0, 45, 45, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 45, 18, 0, 0, 0, 0, 0 },
+    .{ 12216273954606837675, 2, 1, 0, 0, 0, 0, 0, 869, 869, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 560, 1, 0, 0, 0, 0, 0 },
+    .{ 16661322863164733733, 2, 9, 6, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 22, 32, 0, 0, 0, 0, 0 },
+    .{ 8957657828776279370, 4, 12, 9, 0, 0, 0, 0, 11, 11, 0, 0, 0, 0, 0, 0, 96, 0, 557, 420, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 99, 480, 3, 3, 0, 0 },
+    .{ 3698356145194735362, 1226, 96, 95, 0, 0, 0, 0, 2161, 2161, 0, 0, 0, 0, 0, 0, 0, 0, 135, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2151, 0, 0, 0, 0, 0 },
+    .{ 10115942991274251655, 2, 1264, 1262, 34, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 3222, 0, 0, 4, 217, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 10, 4502, 0, 0, 0, 0, 0 },
+    .{ 15643903801131319530, 0, 1248, 1248, 34, 0, 0, 0, 3002, 3002, 0, 0, 0, 0, 0, 6, 0, 0, 7690, 0, 0, 12, 439, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 1500, 11937, 0, 0, 0, 0, 0 },
+    .{ 16512095191518823459, 0, 4, 3, 0, 4, 0, 4, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0, 0, 0 },
+    .{ 16692255664732926537, 0, 1, 0, 0, 6, 0, 6, 1441, 1441, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 1200, 517, 0, 0, 0, 0, 0 },
+    .{ 12216273954606837675, 0, 1, 0, 0, 0, 0, 0, 1201, 1201, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 126, 7, 0, 3, 0, 0, 0, 0, 1200, 1, 0, 0, 0, 0, 0 },
+    .{ 9928401522073452516, 0, 12, 9, 0, 0, 0, 0, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 6, 32, 0, 0, 0, 0, 0 },
+    .{ 8817487514071533497, 0, 3, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 3, 8, 0, 0, 0, 0, 0 },
+    .{ 255220893118731787, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 1296, 78, 324, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 55, 0, 0, 0, 0, 0 },
+    .{ 9535395973114509801, 0, 18, 15, 0, 0, 0, 0, 4, 4, 0, 15, 24, 0, 6, 0, 0, 1482, 87, 216, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 100, 0, 0, 0, 0, 0 },
+    .{ 7977390198355055948, 2, 21, 18, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 330, 0, 0, 0, 33, 0, 0, 0, 0, 0, 168, 3, 0, 0, 0, 0, 5, 229, 136, 0, 0, 0, 0 },
+    .{ 6979640180260109447, 0, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 3, 0, 6, 0, 0, 2430, 144, 4746, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 432, 0, 1, 96, 0, 0, 0, 0, 0 },
+    .{ 9195713229761359493, 0, 5, 2, 0, 0, 0, 0, 2, 2, 0, 0, 6, 0, 6, 0, 0, 0, 24, 0, 4944, 3, 3, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 3, 31, 0, 0, 0, 0, 0 },
+    .{ 18108727944704394641, 24, 29, 26, 0, 0, 0, 0, 95, 95, 0, 0, 0, 0, 0, 0, 0, 0, 132, 288, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 70, 215, 0, 0, 0, 0, 0 },
+    .{ 5569908290217341108, 20, 54, 51, 0, 0, 0, 0, 72, 72, 0, 0, 36, 0, 12, 0, 96, 0, 349, 0, 168, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 271, 194, 30, 24, 0, 0 },
+    .{ 1304118577475789381, 0, 76, 73, 0, 0, 0, 0, 40, 40, 0, 0, 0, 0, 0, 0, 0, 0, 216, 96, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 22, 332, 0, 0, 0, 0, 0 },
+    .{ 2510107502798244048, 2, 14, 11, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 3, 0, 0, 0, 0, 0, 0, 678, 3, 0, 0, 0, 0, 9, 49, 0, 0, 0, 0, 0 },
+    .{ 12771596290932658175, 2, 5, 2, 0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 141, 0, 144, 3, 0, 0, 0, 0, 1, 7, 14, 0, 0, 0, 0 },
+    .{ 12524798475987748091, 2, 9, 6, 0, 0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 144, 0, 30, 144, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 25, 20, 0, 0, 0, 0 },
+    .{ 16695608249434358507, 0, 7, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 324, 324, 0, 0, 249, 0, 0, 0, 2, 0 },
+    .{ 7222689674609703483, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 150, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 160, 0, 0, 0, 0, 0 },
+    .{ 16025140877391608600, 0, 4, 3, 0, 6, 0, 8, 3002, 3002, 0, 0, 12, 0, 12, 6, 0, 0, 84, 0, 6, 6, 3, 0, 0, 0, 0, 0, 774, 3, 0, 0, 0, 0, 1500, 3087, 0, 0, 0, 0, 0 },
+    .{ 17791598714729744375, 2, 5, 2, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 114, 105, 18, 216, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 11, 20, 0, 0, 0, 0, 0 },
+    .{ 16512095191518823459, 0, 4, 3, 0, 0, 0, 0, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0, 0, 0 },
+    .{ 12216273954606837675, 0, 1, 0, 0, 6, 0, 6, 1501, 1501, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1500, 1, 0, 0, 0, 0, 0 },
+    .{ 12216273954606837675, 0, 1, 0, 0, 418, 0, 12, 865, 865, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 612, 702, 0, 0, 378, 0, 0 },
 };
 
 test "golden work table: the engines' caches, limits and skips do the work they did" {
@@ -7469,8 +7509,9 @@ test "bytes mode: isMatch/fullMatch's byte DFA gives the set VM's answers" {
         }
     }
     // ASCII and continuation bytes are cached; a valid lead byte is
-    // stepped each time; a Unicode word assertion gives up past ASCII.
-    var re = try Regex.compileOptions(gpa, "(?-u:\\xff)z", .{ .syntax = .rust, .utf8 = false });
+    // stepped each time (C3 can start a match here, so the prefilter lands
+    // on every one); a Unicode word assertion gives up past ASCII.
+    var re = try Regex.compileOptions(gpa, "(?-u:[\\xc3\\xff])z", .{ .syntax = .rust, .utf8 = false });
     defer re.deinit(gpa);
     probe_counts = .initFill(0);
     try testing.expect(!re.isMatch("abababababababababab\x80\x80\x80\x80"));
@@ -7637,4 +7678,78 @@ test "Rust-grammar assertions run isMatch's lazy DFAs: same answers as the VM, o
     probe_counts = .initFill(0);
     try testing.expect(half.isMatch("é ab"));
     try testing.expect(probe_counts.get(.dfa_step) > 0);
+}
+
+test "bytes mode: the prefilter (raw first bytes, raw literal prefix) skips only what cannot start a match" {
+    const gpa = testing.allocator;
+    const patterns = [_][]const u8{
+        "abc",                    "(?-u:\\xff)ab",      "(?-u:[\\x80-\\x9f])+x", "\u{00e9}+",
+        "[a-c]+\\d",              "(?-u:\\xc3)\\x{a9}", "\\bfoo\\b",             "x$",
+        "\\Aab",                  "(a|ab)(c|bcd)",      "(?i)k",                 "(?-u:\\xe2\\x82)",
+        "(?-u:[\\xf0-\\xff])\\w", "\\d+(?-u:\\xff)?",   "[\u{4e00}-\u{9fff}]+",  "a*",
+    };
+    const inputs = [_][]const u8{
+        "xxfoo yy abc",  "\xff\xffab \xffab",             "\x80\x85\x9fx \x9fx",   "\u{00e9} \u{00e9}\xc3",
+        "zzb7 cc9",      "\xc3\xa9 \xc3",                 "\xe2\x82\xac \xe2\x82", "x\xff\xf0a\xf0\xff",
+        "ab abc abcbcd", "\u{65e5}\u{672c} k K \u{212a}", "",                      "foo\xffbar 12\xff",
+    };
+    var skipped: usize = 0;
+    for (patterns) |pat| {
+        var re = try Regex.compileOptions(gpa, pat, .{ .syntax = .rust, .utf8 = false });
+        defer re.deinit(gpa);
+        // The same program with no prefilter at all: what bytes mode ran before.
+        var bare = re;
+        bare.prefilter = .{};
+        bare.owned = false;
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        var pm = try Matcher.init(gpa, &re);
+        defer pm.deinit();
+        pm.pike_only = true;
+        var bm = try Matcher.init(gpa, &bare);
+        defer bm.deinit();
+        bm.pike_only = true;
+        var want: [3]?Span = undefined;
+        var got: [3]?Span = undefined;
+        const ng = @min(want.len, re.groupCount() + 1);
+        for (inputs) |input| {
+            probe_counts = .initFill(0);
+            try testing.expectEqual(bare.isMatch(input), re.isMatch(input));
+            try testing.expectEqual(bare.fullMatch(input), re.fullMatch(input));
+            for (0..input.len + 1) |from| {
+                @memset(&want, null);
+                const found = bm.captures(input, from, want[0..ng]);
+                for ([_]*Matcher{ &m, &pm }) |mm| {
+                    @memset(&got, null);
+                    try testing.expectEqual(found, mm.captures(input, from, got[0..ng]));
+                    if (found) for (want[0..ng], got[0..ng]) |w, g| try testing.expectEqual(w, g);
+                    const sp = mm.find(input, from);
+                    try testing.expectEqual(found, sp != null);
+                    if (sp) |x| try testing.expectEqual(want[0].?, x);
+                }
+            }
+            skipped += probe_counts.get(.byte_dfa_skip) + probe_counts.get(.pike_bytes_skip);
+        }
+    }
+    try testing.expect(skipped > 50);
+
+    // What the analysis gives over raw bytes.
+    var a = try Regex.compileOptions(gpa, "(?-u:\\xff)ab", .{ .syntax = .rust, .utf8 = false });
+    defer a.deinit(gpa);
+    try testing.expectEqualStrings("\xffab", a.prefilter.lit[0..a.prefilter.lit_len]);
+    try testing.expectEqual(@as(?u8, 0xff), a.prefilter.single);
+    var b = try Regex.compileOptions(gpa, "(?-u:[\\x80-\\x9f])|\u{00e9}|z", .{ .syntax = .rust, .utf8 = false });
+    defer b.deinit(gpa);
+    const set = b.prefilter.first.?;
+    for (0..256) |c| {
+        const in = set[c >> 6] & (@as(u64, 1) << @intCast(c & 63)) != 0;
+        try testing.expectEqual((c >= 0x80 and c <= 0x9f) or c == 0xc3 or c == 'z', in);
+    }
+    var e = try Regex.compileOptions(gpa, "\\Aab", .{ .syntax = .rust, .utf8 = false });
+    defer e.deinit(gpa);
+    try testing.expect(e.prefilter.anchored and !e.prefilter.end_anchored);
+    // A match that may be empty: no first-byte set.
+    var f = try Regex.compileOptions(gpa, "a*", .{ .syntax = .rust, .utf8 = false });
+    defer f.deinit(gpa);
+    try testing.expectEqual(@as(?[4]u64, null), f.prefilter.first);
 }
