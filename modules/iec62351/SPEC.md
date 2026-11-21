@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Commercial stacks (e.g. MZ Automation add-ons, vendor IEDs) | — | proprietary | — | — | The only place -6/-9/RBAC are deployed; not inspectable *(inferred)*. |
 | Rust / Go / Zig | — | — | — | — | `gh search repos 62351` returns only toy repositories (an OpenSSL wrapper from 2016, a FreeRADIUS script from 2021); nothing in Rust, Go or Zig. |
 
-**Where we are ahead:** the only open implementation of IEC 62351-6 (GOOSE/SV authentication: HMAC-SHA-256-128, AES-GMAC, replay protection) and of a checkable 62351-3 profile, in any language found; pure Zig, MIT. **Where we are behind:** no actual TLS transport (out of scope by layering), no 62351-9 key management, no AES-GCM confidentiality or R-GOOSE session PDUs, no 62351-8 RBAC tokens, and no interop against another 62351-6 stack (none exists publicly, see *What is deliberately not done*) (→ *Backlog / deferred*).
+**Where we are ahead:** the only open implementation of IEC 62351-6 (GOOSE/SV authentication: HMAC-SHA-256-128, AES-GMAC, replay protection) and of a checkable 62351-3 profile, in any language found; pure Zig, MIT. **Where we are behind:** no actual TLS transport (out of scope by layering), no 62351-9 key management, no AES-GCM confidentiality or R-GOOSE session PDUs, no 62351-8 RBAC tokens, and no interop against another 62351-6 stack (none exists publicly), see *What is deliberately not done* and *Roadmap*.
 
 ## Design & invariants
 
@@ -358,7 +358,7 @@ comparison isolated in one function.
   TLS session, so a token captured on one connection is usable on another
   within the freshness window by an attacker who can intercept it. Channel
   binding would need an exporter value from the TLS layer this module does not
-  own (see *Backlog / deferred*).
+  own (see *What is deliberately not done*).
 
 ### IEC 62351-3 specifics
 
@@ -523,15 +523,18 @@ Measured once with a throwaway test in ReleaseFast on an x86-64 desktop (best of
 - **CRL/OCSP inside the 62351-3 policy.** By design `revocation_checked` is the caller's assertion and `ocsp`/`ocspcache` do the work; likewise `chain_validated` and `x509.verifyChain`.
 - **SNTP security (IEC 62351-6 clause 7) and the SCL extensions (clause 9).** Out of scope: the first is a different protocol, the second is configuration schema rather than a security mechanism.
 - **A TLS transport.** Out of scope by layering; the module judges the 62351-3 profile of a session negotiated elsewhere.
+- **IEC 62351-8 role-based access control tokens.** No open implementation offers them (libiec61850 has TLS only; the RBAC deployments are commercial, see *Compared with*), the standard is paywalled and there is no oracle, so the owner policy (the reference does not have it) keeps them out. Reopen when an open stack ships them.
+- **Channel binding for `acse.SignedToken`.** No implementation found binds the 62351-4 token to the TLS session (the token's encoding is this module's own, flagged in its doc comment); an exporter value would come from the TLS layer, which this module does not own.
 - **Interoperability against another 62351-6 stack.** No public oracle exists, so the wire format is verified for self-consistency, structural agreement with an independent ASN.1 decoder and primitive-level agreement with OpenSSL, but **not** against another 62351 implementation. A negative survey (2026-08-08) closed every route: `libiec61850`'s open build has no 62351-6 support (its README claims 62351-3/4 TLS only, and a code search finds no security-extension fields); the academic `61850security` framework (GoSV / S-GoSV) repositories hold a README and no code, and `R-GoSV`'s README documents six programs of which the tree contains two, both unsecured; `pygoose` and the scapy GOOSE tooling do not implement 62351-6; all 493 real GOOSE frames across the five vendored `.pcap` files carry `Reserved 1` = `Reserved 2` = `0x0000`, i.e. no security extension is present in any publicly available capture. So the `0x85` tag, the field order inside the authentication value and the BER framing of the `Extension` SEQUENCE rest on public secondary descriptions of the standard, the honest ceiling for a clean-room implementation of a paywalled standard. **Do not re-run this survey.** It unblocks only by an event outside this repository (an open stack shipping 62351-6, or a capture from an IED with the security profile switched on); then the frozen frame in `vectors_test.zig` is what to run through it.
 
 ## Backlog / deferred
 
-- **IEC 62351-9 key management (GDOI/RFC 8052 group-key distribution, rollover).** No key derivation, distribution, rollover or revocation; the key-schedule fields are carried and surfaced, nothing more. Without it the 62351-6 keys must be provisioned by hand. Large; fits §2 only as a codec/state machine.
-- **R-GOOSE/R-SV session PDU and AES-GCM confidentiality (61850-90-5 / 62351-6:2020).** The routed WAN profile has its own session header (SPDU number, TimeOfCurrentKey, security algorithms octet, Key ID), a larger wire format than the L2 extension; 62351-6:2020 covers AES-GCM over L2 GOOSE/SV and 61850-90-5 defines AES-128/256-GCM for R-GOOSE/R-SV. Only authentication is implemented; the MAC registry is numbered compatibly with 90-5 as groundwork. Medium; fits §2; pairs with the R-GOOSE item in `iec61850`.
-- **IEC 62351-8 role-based access control tokens.** Not covered. Medium; fits §2. Confirm with the owner that this is not "deliberately not done".
-- **Channel binding for `acse.SignedToken`.** The token is not bound to the TLS session it travels over; binding needs an exporter value from the TLS layer, which this module does not own.
-- **Run the frozen frame through a 62351-6 stack** when one exists (see *What is deliberately not done*, interoperability).
+None open.
+
+## Roadmap
+
+- **IEC 62351-9 key management (GDOI/RFC 8052 group-key distribution, rollover).** No key derivation, distribution, rollover or revocation; the key-schedule fields are carried and surfaced, nothing more. Without it the 62351-6 keys must be provisioned by hand. Size: project (a codec plus a rollover/revocation state machine, weeks); needs the paywalled -9 text and a GDOI/RFC 8052 peer to test against.
+- **R-GOOSE/R-SV session PDU and AES-GCM confidentiality (61850-90-5 / 62351-6:2020).** The routed WAN profile has its own session header (SPDU number, TimeOfCurrentKey, security algorithms octet, Key ID), a larger wire format than the L2 extension; 62351-6:2020 covers AES-GCM over L2 GOOSE/SV and 61850-90-5 defines AES-128/256-GCM for R-GOOSE/R-SV. Only authentication is implemented; the MAC registry is numbered compatibly with 90-5 as groundwork. Size: project (a new wire-format family; weeks); needs the paywalled 90-5 and 62351-6:2020 texts (a clean-room layout without them would be guessed) and pairs with the R-GOOSE item in `iec61850`.
 
 ## Anchoring
 

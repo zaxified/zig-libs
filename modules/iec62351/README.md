@@ -334,8 +334,7 @@ authentic, and the decoder should never see unauthenticated bytes.
 No AES-GCM confidentiality or R-GOOSE/R-SV session PDUs, no 62351-9 key
 management, no 62351-8 role-based access tokens, no TLS transport, no
 HMAC-SHA-3 profiles (use `RawSealer`/`RawVerifier`), no CRL/OCSP inside the
-62351-3 policy. See `SPEC.md` *What is deliberately not done* and *Backlog /
-deferred*.
+62351-3 policy. See `SPEC.md` *What is deliberately not done* and *Roadmap*.
 
 ## What this does not protect against
 
