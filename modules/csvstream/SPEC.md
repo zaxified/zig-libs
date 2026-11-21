@@ -154,8 +154,8 @@ fields are opt-in, not the default; the vector search covers event finding only,
   with a 32-byte vector search (`line.zig`, scalar tail). `ChunkReader` in lazy mode remembers how many leading
   buffer bytes are known `\n`-free (`clean`: the residual after a cut, and any buffer a search found no newline in),
   so a refill searches only the new bytes and every byte is searched once; a refill that finds no record end doubles
-  the next read, so one growing record costs O(M log M). `.span` mode still rescans its residual (*Backlog /
-  deferred*).
+  the next read, so one growing record costs O(M log M). `.span` mode still rescans its residual (*What is
+  deliberately not done*).
 - **Seek (R11, rust-csv `Reader::seek`).** `StreamReader.seekTo(byte_offset)` repositions at a record start the caller
   saved from `LineSlice.byte_offset` (or 0, which re-strips a BOM). Reads are positional, so it only resets the buffer;
   line and record counters restart at the seek point (the caller may set `lines.line`/`lines.record`), a learned field
@@ -262,18 +262,24 @@ Ids are those of the scope survey; the card's Scope line cites them.
 - **A full SIMD tokenizer (R17).** Only event finding is vectorised (see *Design & invariants*); the zsv and csv-zero
   style tokenizers are not. None of the references does it (Go `encoding/csv`, rust-csv and csv-core, Python `csv` tokenize
   bytewise), so it is a speed row and not a parity one; the vector event search already keeps this module at 0.43-0.89x of Go.
+- **A resumable `.span` scanner.** `.span` mode rescans the unfinished record from its first byte after a refill: the scanner
+  returns `.incomplete` without a position inside a quoted field, the pending stray-quote look-ahead or a field check, and
+  resuming would need that state snapshotted and re-validated against later bytes (a closing quote or newline arriving after the
+  look-ahead gave up changes the verdict of bytes already scanned). It does not pay: a refill that finds no record end doubles
+  the next read (O(M log M) for one growing record, `sweep_test.zig`), and what a refill rescans is the unfinished record only,
+  at most one record per chunk boundary, so a record has to be over the 10 MiB default chunk to be scanned twice at all. No reference resumes either (Go reads a whole record, csv-core
+  keeps a DFA that never looks ahead, which is what this module's bounded stray-quote rule cannot do).
+- **A cheaper stray-quote look-ahead for a huge `max_quoted_lines`.** With the default 64 the look-ahead per stray quote is at
+  most 64 lines; a caller who sets `max_quoted_lines` and `max_record_len` both huge asks for per-line rescans up to the record cap
+  (*Threat model / Limits*). The references have no bound at all (Go and csv-core swallow the rest of the file at an unbalanced
+  quote), so this module's bound is already the stricter one; remembering "no closer before X" per chunk would add state to every
+  scan for a setting nobody needs.
 - **`QuoteStyle.NonNumeric`** (rust-csv, Python `QUOTE_NONNUMERIC`): it needs a caller-supplied "is number" hint, so
   `quote_style` ships `.necessary`, `.always` and `.never`.
 
 ## Backlog / deferred
 
-- **`.span` mode rescans its residual from the first byte after every refill.** The scanner is not resumable
-  mid-record: `scan` returns `.incomplete` without its position inside a quoted field, the pending stray-quote
-  look-ahead (`max_quoted_lines`) or a field check, and a resume would have to snapshot and validate that state
-  against bytes appended later (a closing quote or newline arriving after the look-ahead gave up changes the verdict of
-  bytes already scanned). That is a new scanner API, not a local change.
-- **A smarter stray-quote look-ahead for a huge `max_quoted_lines`.** A fix would remember "no closer before X" per
-  chunk, so the per-line rescan stops at the first known-open point (see *Threat model / Limits*).
+None open.
 
 ## Anchoring
 
