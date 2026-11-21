@@ -118,6 +118,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   applied by `expandMessageXof`); output is at most 65535 bytes (`error.OutputTooLong`).
   `error.DstTooLong` stays in `HashError` so an exhaustive switch compiles, but is never returned.
   The reduction is covered by self-consistency tests only: RFC 9380 has no decaf448 oversize vector.
+  `hashToElement`/`hashToScalar` expand through the sibling `ed448.h2c.expandMessageXof` (comptime length, the
+  same SHAKE256 expander and oversize-DST rule); `hash.expandMessageXof` stays as the runtime-length public form.
 
 ## The four Fable cores
 

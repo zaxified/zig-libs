@@ -21,9 +21,12 @@
 //! (`error.DstEmpty`). A longer one is reduced as §5.3.3 requires for
 //! `expand_message_xof`: `DST = SHAKE256("H2C-OVERSIZE-DST-" || DST,
 //! ceil(2k/8))` with decaf448's security level `k = 224` (RFC 9496 §5,
-//! RFC 9497 §4.2), i.e. 56 bytes (`reduceOversizeDst`).
+//! RFC 9497 §4.2), i.e. 56 bytes (`reduceOversizeDst`). `hashToElement` and
+//! `hashToScalar` expand through `ed448.h2c.expandMessageXof`, the sibling's
+//! SHAKE256 expander; `expandMessageXof` here is the runtime-length form.
 
 const std = @import("std");
+const ed448 = @import("ed448");
 const element = @import("element.zig");
 const scalar = @import("scalar.zig");
 
@@ -71,7 +74,10 @@ pub fn reduceOversizeDst(dst: []const u8) [oversize_dst_length]u8 {
 /// ```
 ///
 /// `msg` may be any length, including empty. `out` may be empty (the
-/// RFC sets no lower bound for the XOF variant).
+/// RFC sets no lower bound for the XOF variant). This is the runtime-length
+/// form; the fixed lengths this module hashes to go through `ed448`'s
+/// comptime-length `h2c.expandMessageXof` (the same SHAKE256 expander,
+/// `k = 224`, oversize DST reduced the same way).
 pub fn expandMessageXof(out: []u8, msg: []const u8, dst: []const u8) HashError!void {
     if (dst.len == 0) return error.DstEmpty;
     if (dst.len > max_dst_length) {
@@ -94,9 +100,8 @@ pub fn expandMessageXof(out: []u8, msg: []const u8, dst: []const u8) HashError!v
 /// (`element.oneWayMap`). This is RFC 9497's decaf448-SHAKE256
 /// `HashToGroup` when `dst` is `"HashToGroup-" || contextString`.
 pub fn hashToElement(msg: []const u8, dst: []const u8) HashError!Element {
-    var uniform: [112]u8 = undefined;
-    try expandMessageXof(&uniform, msg, dst);
-    return element.oneWayMap(uniform);
+    if (dst.len == 0) return error.DstEmpty;
+    return element.oneWayMap(ed448.h2c.expandMessageXof(112, &.{msg}, dst));
 }
 
 /// RFC 9497 §4.2 decaf448-SHAKE256 `HashToScalar`: 64 bytes from
@@ -106,9 +111,8 @@ pub fn hashToElement(msg: []const u8, dst: []const u8) HashError!Element {
 /// `DeriveKeyPair`. The 512-bit input is 66 bits wider than `l`, so the
 /// output is within `2^-66` of uniform.
 pub fn hashToScalar(msg: []const u8, dst: []const u8) HashError!scalar.CompressedScalar {
-    var uniform: [64]u8 = undefined;
-    try expandMessageXof(&uniform, msg, dst);
-    return scalar.reduce(64, uniform);
+    if (dst.len == 0) return error.DstEmpty;
+    return scalar.reduce(64, ed448.h2c.expandMessageXof(64, &.{msg}, dst));
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
