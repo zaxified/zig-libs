@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Behaviour change:** a token `xmlns` in an exclusive-C14N `InclusiveNamespaces` `PrefixList` is ignored (the prefix is reserved and has no namespace node); it used to be rendered as `xmlns:xmlns="..."`.
+- **2026-11-21** — ADDED the algorithm URI constants as public declarations (`alg_*`, `dig_*`, `sig_*`: canonicalization, enveloped transform, digest and signature method URIs) so callers need not copy them. No behaviour change.
 - **2026-11-20** — **SOURCE-BREAKING (error set):** `VerifyError.DigestMismatch` and `VerifyError.SignatureMismatch` are removed. `verify` never returned them: a digest or signature mismatch is `Result.valid = false` (with `RefResult.digest_valid` per reference), as xmlsec reports it in the context status. Code that names either error (e.g. a `switch` arm) must drop it; behaviour is unchanged.
 - **2026-11-20** — **NO CONSUMER-VISIBLE CHANGE:** tests and test fixtures only (a flexible RSA fixture for per-decision verify tests, c14n escaping/namespace/`xml:*` cases), from the whole-module mutation run (153/157 killed, 4 equivalent); no production code moved.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the private `WipingAllocator` is replaced by the shared `wipealloc` module (same code; new dependency `wipealloc`). The moved code has its own whole-module mutation run (8/8 killed).

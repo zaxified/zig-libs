@@ -378,6 +378,9 @@ const Writer = struct {
         if (self.stats) |st| st.prefix_considered += 1;
         if (prefix.len == 0) return; // default handled separately
         if (std.mem.eql(u8, prefix, "xml")) return; // reserved, never declared
+        // `xmlns` is reserved too and has no namespace node: a listed `xmlns` token names nothing to render
+        // (it used to come out as `xmlns:xmlns="..."`, an ill-formed declaration).
+        if (std.mem.eql(u8, prefix, "xmlns")) return;
         const uri = el.resolveNs(prefix) orelse return;
         if (self.rendered.lookup(prefix)) |prev| {
             if (std.mem.eql(u8, prev, uri)) return; // already rendered, same value
@@ -1020,4 +1023,8 @@ test "canonicalize: CDATA line endings are normalised to LF" {
     const got = try canonicalize(testing.allocator, doc.root, .{ .mode = .inclusive });
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("<a>x\ny\nz\n</a>", got);
+}
+
+test "canonicalize: a PrefixList token `xmlns` renders nothing" {
+    try expectC14n("<a xmlns:p=\"urn:p\"><b/></a>", "b", .{ .mode = .exclusive, .inclusive_prefixes = &.{ "xmlns", "p" } }, "<b xmlns:p=\"urn:p\"></b>");
 }

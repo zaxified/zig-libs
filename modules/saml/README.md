@@ -185,7 +185,7 @@ The same field is on `LogoutRequestConfig`, `LogoutResponseConfig` and
 ## Not provided
 
 The IdP side (issuing Responses, building `ArtifactResponse`), performing the Artifact back-channel HTTP call,
-verifying metadata signatures, and ECDSA for the SP's own signatures; see SPEC "What is deliberately not done" and
+and verifying metadata signatures; see SPEC "What is deliberately not done" and
 "Backlog / deferred". Single Logout, the Artifact binding's message layer and `parseIdpMetadata` /
 `parseIdpMetadataFor` are described in SPEC.
 

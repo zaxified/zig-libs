@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — ADDED ECDSA-P256-SHA256 for the SP's own signatures: `SigningKey.ecdsa_p256` / `EcdsaP256Signer{key_pair, noise}` (deterministic when `noise` is null), used by every builder that signs and by `buildSignedRedirectQuery`. **Source-breaking:** `SigningKey` has a new variant (an exhaustive `switch` over it needs it); the module now depends on `p256`. ADDED `IdpMetadata.entity_attributes` (`EntityAttribute`) and `IdpMetadata.encryption_methods`, read by `parseIdpMetadata` / `parseIdpMetadataFor`. The XML-DSig algorithm URIs are now `xmldsig`'s public constants.
 - **2026-11-16** — `buildSignedAuthnRequest(alloc, opts, key)`: an AuthnRequest with an enveloped RSA-SHA256 signature
   after `<Issuer>` for the HTTP-POST binding (`AuthnRequestsSigned`). `buildAuthnRequest` is unchanged (same bytes, same
   error set); both share one builder.

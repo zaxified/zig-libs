@@ -75,32 +75,32 @@ pub const ds_ns = "http://www.w3.org/2000/09/xmldsig#";
 pub const exc_c14n_ns = "http://www.w3.org/2001/10/xml-exc-c14n#";
 
 // Canonicalization / transform algorithm URIs.
-const alg_exc_c14n = "http://www.w3.org/2001/10/xml-exc-c14n#";
-const alg_exc_c14n_wc = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
-const alg_c14n = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
-const alg_c14n_wc = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
-const alg_enveloped = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+pub const alg_exc_c14n = "http://www.w3.org/2001/10/xml-exc-c14n#";
+pub const alg_exc_c14n_wc = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
+pub const alg_c14n = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+pub const alg_c14n_wc = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
+pub const alg_enveloped = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
 
 // Digest algorithm URIs.
-const dig_sha1 = "http://www.w3.org/2000/09/xmldsig#sha1";
-const dig_sha256 = "http://www.w3.org/2001/04/xmlenc#sha256";
-const dig_sha384 = "http://www.w3.org/2001/04/xmldsig-more#sha384";
-const dig_sha512 = "http://www.w3.org/2001/04/xmlenc#sha512";
+pub const dig_sha1 = "http://www.w3.org/2000/09/xmldsig#sha1";
+pub const dig_sha256 = "http://www.w3.org/2001/04/xmlenc#sha256";
+pub const dig_sha384 = "http://www.w3.org/2001/04/xmldsig-more#sha384";
+pub const dig_sha512 = "http://www.w3.org/2001/04/xmlenc#sha512";
 
 // Signature algorithm URIs.
-const sig_rsa_sha1 = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
-const sig_rsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
-const sig_rsa_sha384 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
-const sig_rsa_sha512 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
-const sig_ecdsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256";
-const sig_ecdsa_sha384 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384";
-const sig_ecdsa_sha512 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512";
+pub const sig_rsa_sha1 = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
+pub const sig_rsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+pub const sig_rsa_sha384 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
+pub const sig_rsa_sha512 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
+pub const sig_ecdsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256";
+pub const sig_ecdsa_sha384 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384";
+pub const sig_ecdsa_sha512 = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512";
 // RFC 9231 §2.1.1: RSASSA-PSS with a fixed profile (MGF1 over the same hash,
 // salt length = digest length, trailer 0xBC), no parameter elements.
-const sig_rsa_pss_sha256 = "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1";
-const sig_rsa_pss_sha384 = "http://www.w3.org/2007/05/xmldsig-more#sha384-rsa-MGF1";
-const sig_rsa_pss_sha512 = "http://www.w3.org/2007/05/xmldsig-more#sha512-rsa-MGF1";
-const sig_hmac_sha256 = "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256";
+pub const sig_rsa_pss_sha256 = "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1";
+pub const sig_rsa_pss_sha384 = "http://www.w3.org/2007/05/xmldsig-more#sha384-rsa-MGF1";
+pub const sig_rsa_pss_sha512 = "http://www.w3.org/2007/05/xmldsig-more#sha512-rsa-MGF1";
+pub const sig_hmac_sha256 = "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256";
 
 // ── public types ────────────────────────────────────────────────────────────
 

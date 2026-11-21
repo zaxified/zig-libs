@@ -21,6 +21,7 @@ const testing = std.testing;
 const saml = @import("root.zig");
 const xmldsig = @import("xmldsig");
 const rsa = @import("rsa");
+const p256 = @import("p256");
 const enc = @import("test_encutil.zig");
 
 const idp_entity_id = "https://idp.example.org/saml";
@@ -103,6 +104,52 @@ test "LogoutRequest: signed build -> POST-field consume round-trips (CONSTRUCTED
     try testing.expectEqual(@as(usize, 1), res.session_indexes.len);
     try testing.expectEqualStrings("sess-42", res.session_indexes[0]);
     try testing.expectEqual(@as(i64, 1717243200), res.issue_instant);
+}
+
+test "LogoutRequest: ECDSA-P256-signed build verifies under xmldsig, deterministic and hedged, and tampering fails" {
+    const alloc = testing.allocator;
+    const kp = try p256.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x5a)));
+    const pub_sec1 = kp.public_key.toUncompressedSec1();
+    const hedge: [32]u8 = @splat(0x77);
+    var first: ?[]u8 = null;
+    defer if (first) |f| alloc.free(f);
+    for ([_]?[32]u8{ null, null, hedge }, 0..) |noise, i| {
+        const req = try saml.buildLogoutRequest(alloc, .{
+            .id = "_lr_ecdsa",
+            .issue_instant = issue_instant,
+            .issuer = idp_entity_id,
+            .destination = "https://sp.example.org/slo",
+            .name_id = "alice@example.org",
+            .sign_with = .{ .ecdsa_p256 = .{ .key_pair = &kp, .noise = noise } },
+        });
+        defer if (i != 0) alloc.free(req);
+        try testing.expect(std.mem.find(u8, req, "xmldsig-more#ecdsa-sha256") != null);
+        var res = try saml.consumeLogoutRequestXml(alloc, req, .embedded, baseRequestConfig(.{ .ecdsa_p256_sec1 = &pub_sec1 }));
+        res.deinit();
+        if (i == 0) first = req else if (i == 1) try testing.expectEqualStrings(first.?, req) else try testing.expect(!std.mem.eql(u8, first.?, req));
+        // Flip the signed content: the signature no longer verifies.
+        const bad = try alloc.dupe(u8, req);
+        defer alloc.free(bad);
+        const at = std.mem.find(u8, bad, "alice@") orelse return error.TestUnexpectedResult;
+        bad[at] = 'm';
+        try testing.expect(std.meta.isError(saml.consumeLogoutRequestXml(alloc, bad, .embedded, baseRequestConfig(.{ .ecdsa_p256_sec1 = &pub_sec1 }))));
+    }
+}
+
+test "Redirect binding: ECDSA-P256 signed query carries the ecdsa-sha256 SigAlg and a 64-byte signature" {
+    const alloc = testing.allocator;
+    const kp = try p256.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x5b)));
+    const q = try saml.buildSignedRedirectQuery(alloc, .{
+        .kind = .request,
+        .message_field = "fZJNa8MwDIb%2FivG9cdItXY2bQrdSKOxQlm6H3Yyj",
+        .relay_state = "rs",
+        .key = .{ .ecdsa_p256 = .{ .key_pair = &kp } },
+    });
+    defer alloc.free(q);
+    try testing.expect(std.mem.find(u8, q, "SigAlg=http%3A%2F%2Fwww.w3.org%2F2001%2F04%2Fxmldsig-more%23ecdsa-sha256") != null);
+    const sig_at = std.mem.find(u8, q, "&Signature=") orelse return error.TestUnexpectedResult;
+    // 64 bytes -> 88 base64 characters (with padding), percent-encoded where needed.
+    try testing.expect(q.len - (sig_at + "&Signature=".len) >= 88);
 }
 
 test "LogoutRequest: Issuer mismatch rejected" {

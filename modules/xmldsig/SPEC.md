@@ -346,5 +346,4 @@ data or production keys appear.
 
 ## Backlog / deferred
 
-- **PrefixList token `xmlns`.** A token `xmlns` in an `InclusiveNamespaces` `PrefixList` resolves to the reserved
-  xmlns namespace and is rendered as `xmlns:xmlns=...`; invalid input, not a crash, left as it is.
+None open.

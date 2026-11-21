@@ -41,7 +41,7 @@ ContactPerson, optionally signed), IdP certificate rollover (`additional_idp_key
 verifying config), and the AuthnRequest options `ForceAuthn`, `IsPassive`,
 `RequestedAuthnContext`, `AttributeConsumingServiceIndex`, `ProtocolBinding`, and an embedded
 signature on a POST-binding AuthnRequest (`buildSignedAuthnRequest`).
-**Where we are behind:** ECDSA for the SP's own signatures (→ *Backlog / deferred*), no IdP side
+**Where we are behind:** no IdP side
 (→ *What is deliberately not done*).
 
 Layer 3 (top) of the SAML cluster: **`xml`** (hardened, namespace-aware,
@@ -67,7 +67,7 @@ returns a trusted `AuthnResult`, or a typed error.
   signatures, are whatever `xmldsig` allows: RSA-SHA256/384/512 and
   ECDSA-P256-SHA256 (SHA-1 only behind `allow_weak_sha1`), Exclusive/Canonical
   C14N, enveloped-signature transform. For the SP's OWN outgoing signatures
-  (SLO, Artifact) it is RSA-SHA256/exclusive-C14N only — see "SP-side signing"
+  (SLO, Artifact, metadata, AuthnRequest) it is RSA-SHA256 or ECDSA-P256-SHA256 with exclusive C14N — see "SP-side signing"
   below.
 
 ## Trust model
@@ -429,7 +429,7 @@ Documents read: `saml-core-2.0-os` and `saml-profiles-2.0-os` (OASIS Standard,
 - **`buildSpMetadata`** — see "SP metadata" below.
 - **`parseIdpMetadata`**: `<md:EntityDescriptor>` → entityID, SSO endpoints, and
   `<md:KeyDescriptor use="signing">` certificate **DER** (raw bytes only, for the
-  caller to parse/pin), plus `mdui:UIInfo` display data (`IdpMetadata.ui_info`: `DisplayName`,
+  caller to parse/pin), plus `mdattr:EntityAttributes` (`IdpMetadata.entity_attributes`: `Name`, `NameFormat`, values; at most `max_metadata_attributes` of each), the `md:EncryptionMethod` algorithm URIs of the encryption `KeyDescriptor`s (`IdpMetadata.encryption_methods`, document order, deduplicated; no preference applied), plus `mdui:UIInfo` display data (`IdpMetadata.ui_info`: `DisplayName`,
   `Description`, `Logo` with `xml:lang`; at most `max_ui_entries` (64) per list, the rest ignored).
 - **`parseIdpMetadataFor(alloc, xml, entity_id, AggregateOptions)`**: the same for one entity of an
   `<md:EntitiesDescriptor>` aggregate (a federation's metadata file), through nested groups; a plain
@@ -485,12 +485,11 @@ Artifact binding, signed SP metadata and a POST-binding AuthnRequest all require
 OUTGOING message (a `LogoutRequest`/`LogoutResponse` it sends, the `ArtifactResolve`
 back-channel call, `buildSpMetadata` with `sign_with`, `buildSignedAuthnRequest`), so a small signing primitive exists for exactly that:
 
-- **RSA-SHA256 / exclusive C14N only.** This is already the primary algorithm
-  everywhere else in this module. ECDSA-P256 signing is deliberately **not**
-  implemented for the SP's own signatures: XML-DSig ECDSA needs a fresh
-  per-signature nonce, and this module's standing rule is "no RNG, no clock"
-  (the caller supplies IDs and timestamps — see `AuthnRequestOptions`, unchanged).
-  A safe nonce-supplying API is separate work from the two gaps this closes.
+- **RSA-SHA256 or ECDSA-P256-SHA256, exclusive C14N.** `SigningKey.rsa` is the primary algorithm
+  everywhere else in this module; `SigningKey.ecdsa_p256` (`EcdsaP256Signer`) signs with ECDSA-SHA256, the
+  value as raw `r || s` (XML-DSig / SAML Bindings). XML-DSig ECDSA needs a per-signature nonce and this module's
+  standing rule is "no RNG, no clock": `EcdsaP256Signer.noise` is supplied by the caller (null: a deterministic
+  signature, std's construction; 32 random bytes per signature add the fault-attack hedge).
   **Verifying** the IdP's own signatures is entirely unaffected and still
   accepts RSA-SHA256/384/512 and ECDSA-P256 via `xmldsig.verify`.
 - `signProtocolMessage` (private) is the shared two-pass signer
@@ -547,7 +546,8 @@ Redirect bindings.
   `A-Za-z0-9-_.~` pass through, everything else `%XX` uppercase) — applied
   identically when signing and when reconstructing the SigningInput to verify,
   so it is deterministic regardless of how a peer implementation happened to
-  percent-encode the same bytes. RSA-SHA256 only, matching `SigningKey`; a
+  percent-encode the same bytes. `buildSignedRedirectQuery` signs with RSA-SHA256 or, for `SigningKey.ecdsa_p256`, ECDSA-SHA256 (raw `r || s`);
+  `verifyRedirectQuery` accepts the RSA-SHA256 URI only, a
   `sig_alg` naming anything else is `error.UnsupportedAlgorithm` (an IdP
   configured for ECDSA-P256 here is out of scope — the POST binding, an
   embedded XML signature via `xmldsig.verify`, is unaffected and already
@@ -814,10 +814,4 @@ integer-equality path. All RSA keys in these tests are test material only.
 
 ## Backlog / deferred
 
-- **ECDSA for the SP's own signatures** (`SigningKey` is RSA-SHA256 only; small) — XML-DSig ECDSA needs a fresh per-signature nonce
-  and the module's rule is no RNG, no clock, so it needs a safe nonce-supplying API (see "SP-side signing"). Verifying an IdP's
-  ECDSA-P256 signatures is unaffected.
-- **Metadata extensions: entity attributes and `md:EncryptionMethod`** (under the encryption `KeyDescriptor`) in
-  `parseIdpMetadata` — not trivial: they need a `saml:Attribute` reader and a policy for the algorithm list.
-- **Share `xmldsig`'s signature-algorithm URI constants** — `sig_alg_rsa_sha256`, `dig_alg_sha256`, `alg_enveloped_sig` are copies in
-  `root.zig`; if `xmldsig` exports its own, `signProtocolMessage` and the Redirect-signing code should switch to them.
+None open.

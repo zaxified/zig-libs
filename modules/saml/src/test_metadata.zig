@@ -419,3 +419,36 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "parseIdpMetadata: entity attributes and EncryptionMethod algorithms are read, deduplicated and bounded" {
+    const alloc = std.testing.allocator;
+    const doc =
+        "<md:EntityDescriptor xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" " ++
+        "xmlns:mdattr=\"urn:oasis:names:tc:SAML:metadata:attribute\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" entityID=\"https://idp.example.org\">" ++
+        "<md:Extensions><mdattr:EntityAttributes>" ++
+        "<saml:Attribute Name=\"http://macedir.org/entity-category\" NameFormat=\"urn:oasis:names:tc:SAML:2.0:attrname-format:uri\">" ++
+        "<saml:AttributeValue>cat-one</saml:AttributeValue><saml:AttributeValue> cat-two </saml:AttributeValue></saml:Attribute>" ++
+        "<saml:Attribute Name=\"assurance\"><saml:AttributeValue>x</saml:AttributeValue></saml:Attribute>" ++
+        "</mdattr:EntityAttributes></md:Extensions>" ++
+        "<md:IDPSSODescriptor protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\">" ++
+        "<md:KeyDescriptor use=\"encryption\"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>AAAA</ds:X509Certificate></ds:X509Data></ds:KeyInfo>" ++
+        "<md:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/>" ++
+        "<md:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\"/></md:KeyDescriptor>" ++
+        "<md:KeyDescriptor><ds:KeyInfo><ds:X509Data><ds:X509Certificate>AAAA</ds:X509Certificate></ds:X509Data></ds:KeyInfo>" ++
+        "<md:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/></md:KeyDescriptor>" ++
+        "<md:SingleSignOnService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\" Location=\"https://idp.example.org/sso\"/>" ++
+        "</md:IDPSSODescriptor></md:EntityDescriptor>";
+    var md = try saml.parseIdpMetadata(alloc, doc);
+    defer md.deinit();
+    try std.testing.expectEqual(@as(usize, 2), md.entity_attributes.len);
+    try std.testing.expectEqualStrings("http://macedir.org/entity-category", md.entity_attributes[0].name);
+    try std.testing.expectEqualStrings("urn:oasis:names:tc:SAML:2.0:attrname-format:uri", md.entity_attributes[0].name_format);
+    try std.testing.expectEqual(@as(usize, 2), md.entity_attributes[0].values.len);
+    try std.testing.expectEqualStrings("cat-two", md.entity_attributes[0].values[1]);
+    try std.testing.expectEqualStrings("", md.entity_attributes[1].name_format);
+    try std.testing.expectEqual(@as(usize, 2), md.encryption_methods.len);
+    try std.testing.expectEqualStrings("http://www.w3.org/2009/xmlenc11#aes128-gcm", md.encryption_methods[0]);
+    try std.testing.expectEqualStrings("http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p", md.encryption_methods[1]);
+    // The signing certificate list is untouched by the encryption descriptor (use="encryption" is skipped).
+    try std.testing.expectEqual(@as(usize, 1), md.signing_certs_der.len);
+}

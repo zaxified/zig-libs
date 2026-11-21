@@ -121,6 +121,7 @@ const std = @import("std");
 const testkit = @import("testkit");
 const xml = @import("xml");
 const xmldsig = @import("xmldsig");
+const p256 = @import("p256");
 const xmlenc = @import("xmlenc");
 const rsa = @import("rsa");
 const x509 = @import("x509");
@@ -176,14 +177,11 @@ const named_curve_p256 = "urn:oid:1.2.840.10045.3.1.7";
 // The SOAP 1.1 envelope namespace (Artifact binding back-channel).
 const soap_ns = "http://schemas.xmlsoap.org/soap/envelope/";
 
-// The one signing algorithm this module's OWN outgoing signatures use (see
-// `SigningKey`). These mirror `xmldsig`'s private algorithm-URI consts
-// (duplicated here for the same reason `xsd:dateTime` parsing is: `saml`
-// depends on `xmldsig` but the URI strings are not part of its public API —
-// see SPEC.md "DRY / hazard follow-ups").
-const sig_alg_rsa_sha256 = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
-const dig_alg_sha256 = "http://www.w3.org/2001/04/xmlenc#sha256";
-const alg_enveloped_sig = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+// The one signing algorithm this module's OWN outgoing signatures use: the algorithm URIs are
+// `xmldsig`'s public constants.
+const sig_alg_rsa_sha256 = xmldsig.sig_rsa_sha256;
+const dig_alg_sha256 = xmldsig.dig_sha256;
+const alg_enveloped_sig = xmldsig.alg_enveloped;
 // A placeholder swapped for the real base64 digest between the two signing
 // passes (see `signProtocolMessage`); distinct from any real base64 output.
 const digest_placeholder_slo = "__SLO_DIGEST_PLACEHOLDER__";
@@ -2155,6 +2153,14 @@ pub const IdpMetadata = struct {
     /// (empty when the descriptor carries none). **UNTRUSTED text** — it is
     /// what a login page would show, never an input to any trust decision.
     ui_info: UiInfo = .{},
+    /// `mdattr:EntityAttributes` from `<md:EntityDescriptor><md:Extensions>` (the entity-category / assurance
+    /// labels federations attach, SAML Metadata Extensions for Entity Attributes). **UNTRUSTED** unless the
+    /// metadata itself was verified; never an input to any trust decision here.
+    entity_attributes: []const EntityAttribute = &.{},
+    /// `Algorithm` URI of every `<md:EncryptionMethod>` listed in the IdP's `<md:KeyDescriptor use="encryption">`
+    /// (or use-less) descriptors, in document order, deduplicated. What the entity says it can decrypt; the
+    /// caller picks from it, this module applies no preference. **UNTRUSTED text.**
+    encryption_methods: []const []const u8 = &.{},
 
     pub fn deinit(self: *IdpMetadata) void {
         self.arena.deinit();
@@ -2196,6 +2202,20 @@ pub const UiInfo = struct {
     display_names: []const UiString = &.{},
     descriptions: []const UiString = &.{},
     logos: []const UiLogo = &.{},
+};
+
+/// `urn:oasis:names:tc:SAML:metadata:attribute` (`mdattr`).
+pub const mdattr_ns = "urn:oasis:names:tc:SAML:metadata:attribute";
+
+/// At most this many `EntityAttribute`s, values per attribute and `EncryptionMethod`s are kept.
+pub const max_metadata_attributes = 64;
+
+/// One `<saml:Attribute>` of `<mdattr:EntityAttributes>`: its `Name`, `NameFormat` (`""` when absent) and
+/// the text of each `<saml:AttributeValue>` child.
+pub const EntityAttribute = struct {
+    name: []const u8,
+    name_format: []const u8,
+    values: []const []const u8,
 };
 
 pub const MetadataError = error{
@@ -2325,6 +2345,7 @@ fn idpFromEntityDescriptor(alloc: std.mem.Allocator, ed: *const xml.Element) Met
     var endpoints: std.ArrayList(SsoEndpoint) = .empty;
     var certs: std.ArrayList([]const u8) = .empty;
     var ui: UiAcc = .{};
+    var enc_methods: std.ArrayList([]const u8) = .empty;
     for (idp.children) |c| switch (c.content) {
         .element => |el| {
             if (isEl(el, md_ns, "SingleSignOnService")) {
@@ -2336,8 +2357,12 @@ fn idpFromEntityDescriptor(alloc: std.mem.Allocator, ed: *const xml.Element) Met
                 });
             } else if (isEl(el, md_ns, "KeyDescriptor")) {
                 if (el.attr("", "use")) |use| {
+                    if (std.mem.eql(u8, use, "encryption")) {
+                        try collectEncryptionMethods(a, el, &enc_methods);
+                        continue;
+                    }
                     if (!std.mem.eql(u8, use, "signing")) continue;
-                }
+                } else try collectEncryptionMethods(a, el, &enc_methods);
                 if (findX509(el)) |cert_el| {
                     const text = textAlloc(a, cert_el) catch continue;
                     const der = decodeBase64(a, text) catch continue;
@@ -2350,9 +2375,14 @@ fn idpFromEntityDescriptor(alloc: std.mem.Allocator, ed: *const xml.Element) Met
         else => {},
     };
 
+    var attrs: std.ArrayList(EntityAttribute) = .empty;
+    if (childEl(ed, md_ns, "Extensions")) |ext| try collectEntityAttributes(a, ext, &attrs);
+
     return .{
         .arena = arena,
         .entity_id = entity_id,
+        .entity_attributes = try attrs.toOwnedSlice(a),
+        .encryption_methods = try enc_methods.toOwnedSlice(a),
         .sso_endpoints = try endpoints.toOwnedSlice(a),
         .signing_certs_der = try certs.toOwnedSlice(a),
         .ui_info = .{
@@ -2360,6 +2390,53 @@ fn idpFromEntityDescriptor(alloc: std.mem.Allocator, ed: *const xml.Element) Met
             .descriptions = try ui.descs.toOwnedSlice(a),
             .logos = try ui.logos.toOwnedSlice(a),
         },
+    };
+}
+
+/// Append the `Algorithm` of each `<md:EncryptionMethod>` child of a `KeyDescriptor`, skipping duplicates.
+fn collectEncryptionMethods(a: std.mem.Allocator, key_descriptor: *const xml.Element, out: *std.ArrayList([]const u8)) std.mem.Allocator.Error!void {
+    for (key_descriptor.children) |c| switch (c.content) {
+        .element => |em| {
+            if (!isEl(em, md_ns, "EncryptionMethod")) continue;
+            const algo = em.attr("", "Algorithm") orelse continue;
+            if (out.items.len >= max_metadata_attributes) return;
+            var seen = false;
+            for (out.items) |have| seen = seen or std.mem.eql(u8, have, algo);
+            if (!seen) try out.append(a, try a.dupe(u8, algo));
+        },
+        else => {},
+    };
+}
+
+/// Read every `<saml:Attribute>` of each `<mdattr:EntityAttributes>` under an `<md:Extensions>` element.
+fn collectEntityAttributes(a: std.mem.Allocator, extensions: *const xml.Element, out: *std.ArrayList(EntityAttribute)) std.mem.Allocator.Error!void {
+    for (extensions.children) |c| switch (c.content) {
+        .element => |ea| {
+            if (!isEl(ea, mdattr_ns, "EntityAttributes")) continue;
+            for (ea.children) |cc| switch (cc.content) {
+                .element => |attr| {
+                    if (!isEl(attr, saml_ns, "Attribute")) continue;
+                    if (out.items.len >= max_metadata_attributes) return;
+                    const name = attr.attr("", "Name") orelse continue;
+                    var values: std.ArrayList([]const u8) = .empty;
+                    for (attr.children) |vc| switch (vc.content) {
+                        .element => |v| {
+                            if (!isEl(v, saml_ns, "AttributeValue")) continue;
+                            if (values.items.len >= max_metadata_attributes) break;
+                            try values.append(a, try uiText(a, v));
+                        },
+                        else => {},
+                    };
+                    try out.append(a, .{
+                        .name = try a.dupe(u8, name),
+                        .name_format = try a.dupe(u8, attr.attr("", "NameFormat") orelse ""),
+                        .values = try values.toOwnedSlice(a),
+                    });
+                },
+                else => {},
+            };
+        },
+        else => {},
     };
 }
 
@@ -2427,23 +2504,28 @@ fn findX509(el: *const xml.Element) ?*xml.Element {
 // so this module now also contains a small, deliberately narrow signing
 // primitive for that.
 //
-// RSA-SHA256 / exclusive C14N only — the primary algorithm this module (and
-// `xmldsig`) already defaults to everywhere else. ECDSA-P256 signing is
-// deliberately NOT implemented: XML-DSig ECDSA needs a fresh per-signature
-// nonce, and this module's standing design rule is "no RNG, no clock" (the
-// caller supplies IDs and timestamps — see `AuthnRequestOptions`); a safe
-// nonce-supplying signing API is a separate piece of work from the two eIDAS
-// gaps this closes. Verifying the IdP's OWN signatures is entirely unaffected
-// and still accepts RSA-SHA256/384/512 and ECDSA-P256 via `xmldsig.verify`,
-// exactly as before this file.
+// RSA-SHA256 or ECDSA-P256-SHA256, exclusive C14N. XML-DSig ECDSA needs a per-signature nonce
+// and this module draws no randomness (no RNG, no clock), so `EcdsaP256Signer` takes the noise
+// from the caller (null: deterministic). Verifying the IdP's OWN signatures is a separate path and
+// accepts RSA-SHA256/384/512 and ECDSA-P256 via `xmldsig.verify`.
 ///
 /// The key is held by pointer: an `rsa.SecretKey` is 11.8 KiB of `p`, `q`,
 /// `d` and the CRT values, and as a by-value field every options struct that
 /// carries a `SigningKey` copied all of it into the caller's frame and every
 /// frame it was passed through, where nothing wiped it. The key must outlive the call it is passed to.
 pub const SigningKey = union(enum) {
-    /// The SP's own RSA private key, used to sign an outgoing protocol message.
+    /// The SP's own RSA private key, used to sign an outgoing protocol message (RSA-SHA256).
     rsa: *const rsa.SecretKey,
+    /// The SP's own ECDSA P-256 key pair (ECDSA-SHA256, `<ds:SignatureValue>` / `Signature` as raw `r || s`).
+    ecdsa_p256: EcdsaP256Signer,
+};
+
+/// An ECDSA P-256 signing key plus the caller-supplied signature noise. This module draws no randomness
+/// itself: `noise` null gives a deterministic signature (std's construction, fixed per key and message); 32
+/// fresh random bytes per signature from the caller's CSPRNG add the usual hedge against fault attacks.
+pub const EcdsaP256Signer = struct {
+    key_pair: *const p256.EcdsaP256Sha256.KeyPair,
+    noise: ?[32]u8 = null,
 };
 
 /// Every typed failure `signProtocolMessage` (and everything built on it) can
@@ -2466,7 +2548,23 @@ pub const ProtocolMessageBuildError = error{
     SigningFailed,
 } || std.mem.Allocator.Error;
 
-/// Assemble and RSA-SHA256/exclusive-C14N-sign one protocol message.
+/// Sign `input` with `key`: RSASSA-PKCS1-v1_5 / SHA-256 (the modulus-length signature) or ECDSA P-256 / SHA-256
+/// (raw `r || s`, 64 bytes), the two encodings XML-DSig and the SAML Redirect binding carry.
+fn signBytes(key: SigningKey, input: []const u8, buf: *[rsa.max_modulus_len]u8) error{SigningFailed}![]const u8 {
+    switch (key) {
+        .rsa => |sk| return rsa.signPkcs1v15(sk, Sha256, input, buf) catch |e| switch (e) {
+            error.EncodedMessageTooShort, error.BufferTooSmall, error.FaultDetected, error.EntropyFailure => return error.SigningFailed,
+        },
+        .ecdsa_p256 => |s| {
+            const sig = s.key_pair.sign(input, s.noise) catch return error.SigningFailed;
+            const raw = sig.toBytes();
+            @memcpy(buf[0..raw.len], &raw);
+            return buf[0..raw.len];
+        },
+    }
+}
+
+/// Assemble and RSA-SHA256 or ECDSA-SHA256 / exclusive-C14N-sign one protocol message.
 /// `root_open` is the already-complete opening tag (carrying `ID="id"` and
 /// namespace declarations), `issuer_xml` the serialized `<saml:Issuer>` (or ""
 /// if the message carries none), `rest_xml` everything else, `root_close` the
@@ -2490,8 +2588,9 @@ fn signProtocolMessage(
     id: []const u8,
     key: SigningKey,
 ) ProtocolMessageBuildError![]u8 {
-    const sk = switch (key) {
-        .rsa => |s| s,
+    const sig_alg = switch (key) {
+        .rsa => sig_alg_rsa_sha256,
+        .ecdsa_p256 => xmldsig.sig_ecdsa_sha256,
     };
 
     const assembled = try alloc.print("{s}{s}<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++
@@ -2505,7 +2604,7 @@ fn signProtocolMessage(
         "</ds:SignedInfo><ds:SignatureValue></ds:SignatureValue></ds:Signature>{s}{s}", .{
         root_open, issuer_xml, xmldsig.ds_ns,
         xmldsig.exc_c14n_ns, // CanonicalizationMethod
-        sig_alg_rsa_sha256, // SignatureMethod
+        sig_alg, // SignatureMethod
         id, // Reference URI
         alg_enveloped_sig, // Transform 1 (enveloped)
         xmldsig.exc_c14n_ns, // Transform 2 (exclusive C14N)
@@ -2556,9 +2655,7 @@ fn signProtocolMessage(
     defer alloc.free(si_canon);
 
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig = rsa.signPkcs1v15(sk, Sha256, si_canon, &sig_buf) catch |e| switch (e) {
-        error.EncodedMessageTooShort, error.BufferTooSmall, error.FaultDetected, error.EntropyFailure => return error.SigningFailed,
-    };
+    const sig = try signBytes(key, si_canon, &sig_buf);
     const sig_b64 = try base64EncodeAlloc(alloc, sig);
     defer alloc.free(sig_b64);
 
@@ -3025,18 +3122,16 @@ pub const BuildSignedRedirectQueryOptions = struct {
 /// resulting RSA-SHA256 signature is base64'd and appended as a final,
 /// also-percent-encoded `Signature` parameter.
 pub fn buildSignedRedirectQuery(alloc: std.mem.Allocator, opts: BuildSignedRedirectQueryOptions) RedirectSignError![]u8 {
-    const sk = switch (opts.key) {
-        .rsa => |s| s,
-    };
-
     var q: std.ArrayList(u8) = .empty;
     errdefer q.deinit(alloc);
-    try appendRedirectSigningInput(alloc, &q, opts.kind, opts.message_field, opts.relay_state, sig_alg_rsa_sha256);
+    const sig_alg = switch (opts.key) {
+        .rsa => sig_alg_rsa_sha256,
+        .ecdsa_p256 => xmldsig.sig_ecdsa_sha256,
+    };
+    try appendRedirectSigningInput(alloc, &q, opts.kind, opts.message_field, opts.relay_state, sig_alg);
 
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
-    const sig = rsa.signPkcs1v15(sk, Sha256, q.items, &sig_buf) catch |e| switch (e) {
-        error.EncodedMessageTooShort, error.BufferTooSmall, error.FaultDetected, error.EntropyFailure => return error.SigningFailed,
-    };
+    const sig = try signBytes(opts.key, q.items, &sig_buf);
     const sig_b64 = try base64EncodeAlloc(alloc, sig);
     defer alloc.free(sig_b64);
 
