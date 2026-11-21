@@ -5,6 +5,7 @@
 //! "(mut <id>)"; each id is a mutant of `s3-mut-m3`, killed by its test.
 
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const lf = @import("listfn.zig");
@@ -810,6 +811,7 @@ test "field: only a struct column that declares fields can name a wrong one (mut
 const tcol: Expr = col("t");
 
 test "split_regex: limit 0 is BadExpr and a limit stops splitting (mut 20415, 20418, 20428)" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -823,6 +825,7 @@ test "split_regex: limit 0 is BadExpr and a limit stops splitting (mut 20415, 20
 }
 
 test "extract_all: a group that took no part is a null element (mut 20427)" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -835,6 +838,7 @@ test "extract_all: a group that took no part is a null element (mut 20427)" {
 }
 
 test "extract_groups: a row with no match has null fields, never the last row's spans (mut 20429)" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

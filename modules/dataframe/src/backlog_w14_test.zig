@@ -2,6 +2,7 @@
 //! Items of SPEC § Backlog closed in wave 14: each test names the review bullet it pins.
 
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const Value = df.Value;
@@ -81,6 +82,7 @@ test "escape_regex output compiles and matches the text it escaped (exprfn d)" {
 }
 
 test "match_regex: a verbose pattern ending in a comment still compiles (expr a)" {
+    try knob_skip.needRegex();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();

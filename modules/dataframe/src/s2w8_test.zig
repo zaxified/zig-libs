@@ -4,6 +4,7 @@
 //! verbs and the selectors. The engines' answers are replayed in `s2w8_oracle_test.zig`;
 //! these cover what they cannot: exact small cases, the invalid-UTF-8 policy and the cap.
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
@@ -23,6 +24,7 @@ fn expectText(want: []const u8, got: []const u8) !void {
 }
 
 test "w8 case: Czech, German, Greek, Turkish, ligatures" {
+    try knob_skip.needUnicode();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
@@ -79,6 +81,7 @@ test "w8 invalid UTF-8 is treated as bytes: ASCII letters change, the rest is ke
 }
 
 test "w8 classes: Arabic-Indic digits, superscripts, fractions, full-width, spaces" {
+    try knob_skip.needUnicode();
     // Arabic-Indic digits: decimal, digit, numeric, not alpha.
     try testing.expect(fnx.isClass("٣٤٥", .decimal));
     try testing.expect(fnx.isClass("٣٤٥", .digit));
@@ -126,6 +129,7 @@ test "w8 classes: Arabic-Indic digits, superscripts, fractions, full-width, spac
 }
 
 test "w8 normalize and unaccent" {
+    try knob_skip.needUnicode();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
@@ -153,6 +157,7 @@ fn textFrame(a: std.mem.Allocator, texts: []const ?[]const u8) !Frame {
 }
 
 test "w8 Expr arms: Unary ops and normalize over a column, null stays null" {
+    try knob_skip.needUnicode();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
@@ -182,6 +187,7 @@ test "w8 Expr arms: Unary ops and normalize over a column, null stays null" {
 }
 
 test "w8 a cell that grows past max_text_result is error.TooLarge, not an allocation" {
+    try knob_skip.needUnicode();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
@@ -194,6 +200,7 @@ test "w8 a cell that grows past max_text_result is error.TooLarge, not an alloca
 }
 
 test "w8 names: rename lower/upper by the Unicode mapping, selectors by Unicode class" {
+    try knob_skip.needUnicode();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
@@ -223,6 +230,7 @@ test "w8 names: rename lower/upper by the Unicode mapping, selectors by Unicode 
 }
 
 test "w8 strip: Unicode whitespace around valid text, Python str.strip() (U4)" {
+    try knob_skip.needUnicode();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
@@ -270,6 +278,7 @@ test "w8 strip: a cell that is not valid UTF-8 is bytes, ASCII whitespace only (
 }
 
 test "w8 names: alpha / alphanumeric selectors use the Alphabetic property, combining vowel signs count (U3)" {
+    try knob_skip.needUnicode();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();

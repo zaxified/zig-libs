@@ -3,6 +3,7 @@
 //! empty frames, invalid UTF-8, caps, error paths). What the engines answer is in
 //! `s2w10_oracle_test.zig`.
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const vm = @import("value.zig");
@@ -50,6 +51,7 @@ fn expectCell(want: Value, got: Value) !void {
 const X: Expr = .{ .col = "x" };
 
 test "w10 find_regex: byte offsets, nulls, non-text, invalid UTF-8, literal, bad pattern" {
+    try knob_skip.needRegex();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -162,6 +164,7 @@ test "w10 unstack: errors, fill casts, caps, names" {
 }
 
 test "w10 wideToLong: pattern, uniqueness, types and the existing j" {
+    try knob_skip.needRegex();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

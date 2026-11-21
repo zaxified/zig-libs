@@ -12,3 +12,4 @@ regex	56000	2026-11-21: 415264 -> 301960 B (gain 113304), knob regex-unicode (Un
 zstd	250000	2026-11-21: 1051816 -> 546072 B (gain 505744), knob zstd-all-strategies; native x86_64
 tz	110000	2026-11-21: 378264 -> 157072 B (gain 221192), knob tz-zones=Europe/Prague,America/New_York,UTC (explicit; passed by small-sizes.sh); native x86_64
 p521	90000	2026-11-21: 275248 -> 95024 B (gain 180224), knob p521-base-table; native ADX/BMI2 x86_64
+dataframe	220000	2026-11-21: 1269968 -> 821344 B (gain 448624), knobs dataframe-regex and dataframe-unicode (both explicit, passed by small-sizes.sh); native x86_64

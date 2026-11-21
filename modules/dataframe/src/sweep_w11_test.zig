@@ -6,6 +6,7 @@
 //! pinned in tests named "(sweep W11-N)".
 
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const fm = @import("frame.zig");
@@ -1176,6 +1177,7 @@ test "frame arithmetic on a Float32 column divides to Float32 as Expr does (swee
 }
 
 test "wideToLong holds a UInt64 above Int64's top in a Float64 stub as a float (sweep W11-9 M5)" {
+    try knob_skip.needRegex();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

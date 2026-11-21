@@ -3,6 +3,7 @@
 //! answers are replayed in `s2w4_oracle_test.zig`; these cover what they cannot: errors,
 //! caps, hostile input, and the behaviours where this module deliberately differs.
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
@@ -140,6 +141,7 @@ test "slice_replace, encode and decode: pandas and polars corners" {
 }
 
 test "match_regex anchors the whole pattern; an invalid one is BadPattern" {
+    try knob_skip.needRegex();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
@@ -211,6 +213,7 @@ test "wrap: one huge word at width 1 is linear (not n^2 per line)" {
 }
 
 test "splitColumns: a cell with too many pieces is TooLarge before they are all built" {
+    try knob_skip.needRegex();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
@@ -422,6 +425,7 @@ test "to_datetime: infer needs a column, an unreadable first cell is BadExpr, IS
 }
 
 test "small cell functions: affixes, replace n, is_ascii, replace_regex n" {
+    try knob_skip.needRegex();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();

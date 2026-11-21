@@ -5,6 +5,7 @@
 //! (`tools/oracle2b.py` asked the engines; no line of this module is consulted there).
 //! The expected values are the engines' alone, so a failure is a difference from them.
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
@@ -312,6 +313,7 @@ fn runFrame(a: std.mem.Allocator, c: J) !void {
 }
 
 test "oracle2b: replay the engines' answers" {
+    try knob_skip.needBoth();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

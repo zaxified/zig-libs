@@ -30,7 +30,7 @@ measure=0
 
 # Knobs a probe sets itself because `-Dprofile=small` leaves them alone (an explicit-only
 # knob; every module that does not read it ignores the argument).
-SMALL_EXTRA=(-Dtz-zones=Europe/Prague,America/New_York,UTC)
+SMALL_EXTRA=(-Dtz-zones=Europe/Prague,America/New_York,UTC -Ddataframe-regex=false -Ddataframe-unicode=false)
 
 for p in default small; do
     extra=()

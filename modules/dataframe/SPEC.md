@@ -706,7 +706,7 @@ group 1); a result past `max_text_result` is `error.TooLarge`, and the cells of 
 `max_eval_bytes`. `Selector.matches` picks columns by a pattern over their names (row 47: polars `cs.matches`, pandas
 `filter(regex=)`), each pattern compiled once per `selectColumns` call and freed after it. `extract_all`, `split_regex` and `extract_groups` (list and record results) are in the paragraph on
 list and struct namespaces; `find_regex` is in the W10 notes (§ Input and output). `regex` brings its
-Unicode tables into any binary that calls `mutate`/`where` (the instruction is dispatched at run time).
+Unicode tables into any binary that calls `mutate`/`where` (the instruction is dispatched at run time) unless `-Ddataframe-regex=false` (§ Build options).
 
 **Unicode text (wave W8; tests `src/s2w8_test.zig`, engine answers `tools/oracle2f.py` to
 `src/oracle2f_vectors.json`, replayed by `src/s2w8_oracle_test.zig`).** `dataframe` depends on `unitext`. `lower`, `upper`,
@@ -1120,6 +1120,36 @@ block of 2 MiB or more (`src/frame.zig`).
 - **ctgrind:** none, the module holds table data and no secret.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
+## Build options
+
+Consumer build options (CONVENTIONS §4.2). Both are explicit-only: `-Dprofile=small` leaves them alone, so the
+`small` lane's test run stays on the full build (a consumer that wants the small binary passes the two flags).
+
+| option | values | default | `-Dprofile=small` |
+|---|---|---|---|
+| `dataframe-regex` | `true` / `false` | `true` (graded) | unchanged |
+| `dataframe-unicode` | `true` / `false` | `true` (graded) | unchanged |
+
+- **`dataframe-regex=false`:** the `regex` module is not imported (`src/knobs.zig` holds a stand-in with the surface the module
+  uses, which cannot compile a pattern), so none of its engine or Unicode tables is in the binary. Every function that takes a
+  pattern fails loudly: `error.BadPattern` from `Expr` (`contains_regex`, `extract`, `count_regex`, `replace_regex`,
+  `find_regex`, `match_regex`, `split_regex`, `extract_all`, `extract_groups`), `Selector.matches` and `renameReplace`,
+  `error.BadArgument` from `splitColumns(.regex = true)` and `wideToLong`'s pattern path. Everything that needs no pattern is
+  unchanged (literal `contains`, `replace`, `split`, the other string functions).
+- **`dataframe-unicode=false`:** the `unitext` module is not imported. Case mapping (`lower`, `upper`, `casefold`, `capitalize`,
+  `title`, `swapcase`, `renameLower`/`renameUpper`) and the `is_*` classes are ASCII: non-ASCII bytes are kept as they are and
+  count as no letter or digit (the module's behaviour before the Unicode wave, and what a cell that is not valid UTF-8 gets
+  anyway); `strip` with no `chars` strips ASCII whitespace; the `alpha`/`alphanumeric`/`digit` selectors by name are ASCII.
+  `normalize` and `unaccent` of a text with a non-ASCII character are `error.UnicodeNotBuilt` (ASCII text is returned as it is;
+  the capability cut is an error, never a silent no-op).
+- **Gain** (read-only probe `tools/sizeprobe.zig`: a one-cell frame through `mutate` with a regex test, `lower` and
+  `unaccent`; ReleaseSmall, native x86_64): 1,269,968 B on the default build; 979,800 B with `dataframe-regex=false` (-290,168);
+  997,056 B with `dataframe-unicode=false` (-272,912); 821,344 B with both (-448,624). The floor row in
+  `scripts/checks/small-size-expected.tsv` holds the both-off gain (`scripts/checks/small-sizes.sh` passes both flags).
+- **Tests:** `scripts/modtest dataframe -Ddataframe-regex=false -Ddataframe-unicode=false` runs the off paths (`src/knobs_test.zig`);
+  a test that needs the regex module or the Unicode tables starts with `knob_skip.needRegex()` / `needUnicode()` / `needBoth()`
+  and is skipped there (38 of 885; 844 run).
+
 ## What is deliberately not done
 
 The refused families (index and MultiIndex, the lazy engine and SQL, chunked storage, Python-language mechanics, plotting,
@@ -1211,5 +1241,4 @@ the end cell with 0).
 
 Open items only; everything here is LOW unless marked, and none is a known wrong answer without a refusal or a note in the sections above.
 
-- **Build size knobs (CONVENTIONS §4.2; owner decision):** `regex` brings its Unicode tables and `unitext` adds 158,056 B (+15%) to a ReleaseSmall binary that calls `mutate` with one `add`; a `dataframe-regex` and a `dataframe-unicode` option (default on, off = the former ASCII behaviour) would remove them: measure with a size probe, the owner decides.
 - **Time zones:** `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until it is made a zoned column before 1970 shows the zone's state at the epoch.

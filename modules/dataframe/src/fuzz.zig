@@ -24,6 +24,7 @@
 //! show, a leak of the harness's own, `DebugAllocator` still does.
 
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const csvio = @import("csvio.zig");
@@ -2741,6 +2742,7 @@ test "fuzz driver: DATAFRAME_FUZZ" {
 }
 
 test "fuzz harness: 300 seeds in every test run, and every verb gets called" {
+    try knob_skip.needBoth();
     resetReach();
     driver.resetReach();
     for (0..300) |seed| {

@@ -5,6 +5,7 @@
 //! `sweep` runs every public verb of the files of part B over one frame that holds all eight
 //! width columns, an Int64, a text and a null-only column.
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const vm = @import("value.zig");
@@ -787,6 +788,7 @@ fn sweepIoAndKeyHelpers(a: std.mem.Allocator) !void {
 // aggregates, `concat(.vertical)`/`.diagonal`, the arithmetic of a UInt64 column) are checked
 // after the merge: the places are marked in the functions.
 test "W11B sweep: every public verb of part B on a frame with all eight widths" {
+    try knob_skip.needBoth();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -5,6 +5,7 @@
 //! `str.replace`/`replace_all`), which share the Rust `regex` grammar used here.
 
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const st = @import("structure_test.zig");
@@ -31,6 +32,7 @@ fn txt(t: []const u8) Value {
 }
 
 test "contains_regex: Rust grammar, Unicode classes, anchors; null and non-text give null" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -44,6 +46,7 @@ test "contains_regex: Rust grammar, Unicode classes, anchors; null and non-text 
 }
 
 test "extract: a group of the first match, group 0, a group that took no part, no match" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -57,6 +60,7 @@ test "extract: a group of the first match, group 0, a group that took no part, n
 }
 
 test "count_regex: non-overlapping, empty matches count once per position" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -67,6 +71,7 @@ test "count_regex: non-overlapping, empty matches count once per position" {
 }
 
 test "replace_regex: first or all, templates with groups, literal replacement" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -78,6 +83,7 @@ test "replace_regex: first or all, templates with groups, literal replacement" {
 }
 
 test "regex functions: a bad pattern is error.BadPattern, a huge repetition too; where filters by a pattern" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -95,6 +101,7 @@ test "regex functions: a bad pattern is error.BadPattern, a huge repetition too;
 }
 
 test "replace_regex: a template that multiplies the text past max_text_result is error.TooLarge" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -106,6 +113,7 @@ test "replace_regex: a template that multiplies the text past max_text_result is
 }
 
 test "Selector.matches: names by pattern, compiled once, freed; a bad pattern is BadPattern" {
+    try knob_skip.needRegex();
     const a = testing.allocator; // not an arena: the compiled patterns must be released
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

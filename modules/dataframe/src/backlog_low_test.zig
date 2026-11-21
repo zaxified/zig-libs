@@ -3,6 +3,7 @@
 //! sweep bullets): each test names its bullet as "(<file> <letter>)".
 
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const Value = df.Value;
@@ -74,6 +75,7 @@ test "CSV of a zoned column keeps the seconds of an offset (textio g)" {
 }
 
 test "wideToLong: a suffix pattern with an alternation does not slice a short name past its end (review W10R-1)" {
+    try knob_skip.needRegex();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

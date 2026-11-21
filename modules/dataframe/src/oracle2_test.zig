@@ -7,6 +7,7 @@
 //! the vector carries a `label` and the engine followed (`engine`); the other engine's
 //! answer is kept in `other`, and a mismatch that equals it is reported as such.
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
@@ -731,6 +732,7 @@ test "oracle2: the comparison sees a wrong cell, a wrong count and a wrong width
 }
 
 test "oracle2: pandas and polars vectors for the D2 verbs" {
+    try knob_skip.needBoth();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -4,6 +4,7 @@
 //! answers are replayed in `s2w3_oracle_test.zig`; these cover what they cannot: caps,
 //! errors, hostile input, and the pieces the oracle script could not generate.
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
@@ -259,6 +260,7 @@ test "dtfn helpers: businessDayCount closed form, makeDatetime ranges" {
 }
 
 test "review fixes: repeatValue bytes and declared type, hist overflowing range, renameReplace frees its regex" {
+    try knob_skip.needRegex();
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();

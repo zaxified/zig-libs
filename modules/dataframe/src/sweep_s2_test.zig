@@ -3,6 +3,7 @@
 //! dtfn seriesfn`: each finding's trigger, pinned. Names end "(sweep <ID>)".
 
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const csvio = @import("csvio.zig");
@@ -382,6 +383,7 @@ fn runAssign(a: std.mem.Allocator, f: Frame, e: df.Expr) !void {
 }
 
 test "every unary and binary operator over extreme cells never traps (sweep clean probe)" {
+    try knob_skip.needBoth();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

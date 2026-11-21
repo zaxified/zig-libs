@@ -4,6 +4,7 @@
 //! the `is*` classes, the `alpha`/`alphanumeric`/`digit` selectors and the name case verbs
 //! (`tools/oracle2f.py` asked the engines; no line of this module is consulted there).
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
@@ -127,6 +128,7 @@ fn runRename(a: std.mem.Allocator, c: J) !void {
 }
 
 test "oracle2f: replay the engines' answers" {
+    try knob_skip.needUnicode();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -148,6 +150,7 @@ test "oracle2f: replay the engines' answers" {
 }
 
 test "oracle2f: unaccent against the pandas NFKD recipe" {
+    try knob_skip.needUnicode();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

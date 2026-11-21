@@ -4,6 +4,7 @@
 //! `bin_*` expressions and `dt.offset_by` on a zoned column (`tools/oracle2i.py` asked the
 //! engines; no line of this module is consulted there).
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const vm = @import("value.zig");
@@ -321,6 +322,7 @@ fn runOffset(a: std.mem.Allocator, c: J) !void {
 }
 
 test "oracle2i: replay the engines' answers" {
+    try knob_skip.needBoth();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

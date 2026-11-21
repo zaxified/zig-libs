@@ -10,7 +10,7 @@
 //! zig-libs authors (MIT); the engines' and Python's documentation was read, no source.
 
 const std = @import("std");
-const regex = @import("regex");
+const regex = @import("knobs.zig").regex;
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
 const sp = @import("spec.zig");

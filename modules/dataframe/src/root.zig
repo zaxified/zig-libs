@@ -697,5 +697,6 @@ test {
     _ = @import("s2w7_test.zig");
     _ = @import("s2w7_oracle_test.zig");
     _ = @import("backlog_low_test.zig");
+    _ = @import("knobs_test.zig");
     _ = @import("backlog_w14_test.zig");
 }

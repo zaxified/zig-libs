@@ -7,6 +7,7 @@
 //! `get` out of range is null) the test says so.
 
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const df = @import("root.zig");
 const Frame = df.Frame;
@@ -243,6 +244,7 @@ test "struct: field, struct_of, concat_list" {
 }
 
 test "text: split, split_regex, extract_all, extract_groups" {
+    try knob_skip.needRegex();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -433,6 +435,7 @@ test "implode: each group's cells as one list; explode inverts it" {
 }
 
 test "list and nested verbs: every allocation failure is an error, never a panic" {
+    try knob_skip.needBoth();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const f = try load(arena.allocator());

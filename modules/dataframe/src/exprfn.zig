@@ -15,7 +15,8 @@
 const std = @import("std");
 const vm = @import("value.zig");
 const keys = @import("keys.zig");
-const ut = @import("unitext");
+const knobs = @import("knobs.zig");
+const ut = knobs.ut;
 const Value = vm.Value;
 const isMissing = keys.isMissing;
 
@@ -577,8 +578,9 @@ pub fn casefold(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarg
 /// `normalize` in `str` (its `unicode-normalization` feature is in `polars-plan` as
 /// `str.normalize` only from some versions; the pandas answer is the reference). Not valid
 /// UTF-8: the cell is returned unchanged.
-pub fn normalize(a: std.mem.Allocator, t: []const u8, form: ut.Form) error{ OutOfMemory, TooLarge }![]const u8 {
+pub fn normalize(a: std.mem.Allocator, t: []const u8, form: ut.Form) error{ OutOfMemory, TooLarge, UnicodeNotBuilt }![]const u8 {
     if (isAsciiText(t) or !validUtf8(t)) return t;
+    if (!knobs.unicode_enabled) return error.UnicodeNotBuilt;
     return ut.normalize(a, t, form, ut_opts) catch |e| switch (e) {
         error.InvalidUtf8 => t,
         else => |x| return x,
@@ -590,8 +592,9 @@ pub fn normalize(a: std.mem.Allocator, t: []const u8, form: ut.Form) error{ OutO
 /// pandas recipe is `str.normalize("NFKD")` then dropping the combining marks (scikit-learn's
 /// `strip_accents_unicode`), which leaves `ł`, `ß` and `æ` alone and also folds
 /// compatibility forms (`ﬁ`, `²`), so the two differ there. Not valid UTF-8: unchanged.
-pub fn unaccent(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge }![]const u8 {
+pub fn unaccent(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge, UnicodeNotBuilt }![]const u8 {
     if (isAsciiText(t) or !validUtf8(t)) return t;
+    if (!knobs.unicode_enabled) return error.UnicodeNotBuilt;
     return ut.unaccent(a, t, .{ .max_output = max_text_result }) catch |e| switch (e) {
         error.InvalidUtf8 => t,
         else => |x| return x,

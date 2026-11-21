@@ -4,6 +4,7 @@
 //! the engines; no line of this module is consulted there). The expected values are the
 //! engines' alone, so a failure is a difference from them.
 const std = @import("std");
+const knob_skip = @import("knobs_skip.zig");
 const testing = std.testing;
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
@@ -280,6 +281,7 @@ fn runJson(a: std.mem.Allocator, c: J) !void {
 }
 
 test "oracle2c: replay the engines' answers" {
+    try knob_skip.needBoth();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -33,7 +33,7 @@ const verbs = @import("verbs.zig");
 const fnx = @import("exprfn.zig");
 const dtf = @import("dtfn.zig");
 const jsonio = @import("jsonio.zig");
-const regex = @import("regex");
+const regex = @import("knobs.zig").regex;
 const tz = @import("tz");
 const lf = @import("listfn.zig");
 const sf = @import("strfn.zig");
@@ -76,8 +76,10 @@ pub const ExprError = error{
     /// selection whose text does not fit the address space.
     TooLarge,
     /// A regex function's pattern that `regex` (Rust syntax) refuses, or one past its
-    /// compile limits.
+    /// compile limits; with `-Ddataframe-regex=false`, every pattern.
     BadPattern,
+    /// `normalize` or `unaccent` of a non-ASCII text under `-Ddataframe-unicode=false`.
+    UnicodeNotBuilt,
 };
 
 /// Deepest tree `compile` accepts: it recurses, and an `Expr` is caller data.

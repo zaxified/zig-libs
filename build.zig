@@ -660,6 +660,16 @@ pub fn build(b: *std.Build) void {
         "zstd-all-strategies",
         "zstd: compress with every strategy, levels 1..22 (default true; profile=small false = fast and dfast only, a level resolving to a higher strategy is refused with LevelUnsupported, about 7 MB less code)",
     ));
+    zl_options.addOption(?bool, "dataframe_regex", b.option(
+        bool,
+        "dataframe-regex",
+        "dataframe: the regex functions (contains_regex, extract, replace_regex, split_regex, ..., selectors by regex) over the regex module (default true; false = none of regex in the binary, every pattern is error.BadPattern; the explicit knob only, profile=small leaves it alone)",
+    ));
+    zl_options.addOption(?bool, "dataframe_unicode", b.option(
+        bool,
+        "dataframe-unicode",
+        "dataframe: Unicode text functions over the unitext module (default true; false = no unitext tables in the binary, case mapping and the is* classes are ASCII, normalize and unaccent of non-ASCII text are error.UnicodeNotBuilt; the explicit knob only, profile=small leaves it alone)",
+    ));
     zl_options.addOption(?[]const u8, "tz_zones", b.option(
         []const u8,
         "tz-zones",
