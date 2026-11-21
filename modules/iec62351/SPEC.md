@@ -512,6 +512,10 @@ Corpus-seeded `std.testing.fuzz` targets sit beside the code they test:
 - `tlsprofile.zig` — certificate inspection over arbitrary DER, and over a real certificate with one fuzzer-chosen octet corrupted.
 - `replay.zig` — a GOOSE guard never accepts a strictly older (stNum, sqNum) pair.
 
+## Speed
+
+Measured once with a throwaway test in ReleaseFast on an x86-64 desktop (best of nine rounds of 400,000 calls, the machine shared, so read the ratios, not the nanoseconds): `goose.computeMac` of an AES-128-GMAC over 64 / 256 / 1,500 octets takes 253 / 281 / 436 ns against 168 / 198 / 344 ns for the raw `aesgcm` call it wraps (a fixed 85-90 ns for the zeroising wrapper, 3.4 GB/s on a full frame); HMAC-SHA-256 (128-bit tag) 1,378 / 2,039 / 6,870 ns against 1,288 / 1,993 / 6,750 ns for `std`'s `HmacSha256` alone. After the GMAC code moved to `aesgcm` the bulk path is therefore the primitive's own speed (which is why it was moved, Zig 0.17 #36256); the module adds a constant, not a per-octet cost. There is no comparative bench and the card says "not measured": a grade needs a reference implementation's number (libiec61850's own MAC path or OpenSSL) driven from `tools/`, and none is wired.
+
 ## What is deliberately not done
 
 - **HMAC-SHA-3 profiles.** No grounded registry numbers appear in the -6 algorithm table this module was built from, and inventing them would be worse than not shipping them; use `RawSealer`/`RawVerifier`.
@@ -527,7 +531,6 @@ Corpus-seeded `std.testing.fuzz` targets sit beside the code they test:
 - **R-GOOSE/R-SV session PDU and AES-GCM confidentiality (61850-90-5 / 62351-6:2020).** The routed WAN profile has its own session header (SPDU number, TimeOfCurrentKey, security algorithms octet, Key ID), a larger wire format than the L2 extension; 62351-6:2020 covers AES-GCM over L2 GOOSE/SV and 61850-90-5 defines AES-128/256-GCM for R-GOOSE/R-SV. Only authentication is implemented; the MAC registry is numbered compatibly with 90-5 as groundwork. Medium; fits §2; pairs with the R-GOOSE item in `iec61850`.
 - **IEC 62351-8 role-based access control tokens.** Not covered. Medium; fits §2. Confirm with the owner that this is not "deliberately not done".
 - **Channel binding for `acse.SignedToken`.** The token is not bound to the TLS session it travels over; binding needs an exporter value from the TLS layer, which this module does not own.
-- **Bulk GMAC path not re-measured** since the GMAC code moved to `aesgcm` (Zig 0.17 #36256); the card's `**Performance:**` line is "not measured", and there is no bench.
 - **Run the frozen frame through a 62351-6 stack** when one exists (see *What is deliberately not done*, interoperability).
 
 ## Anchoring
