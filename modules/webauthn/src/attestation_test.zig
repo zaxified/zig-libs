@@ -262,6 +262,115 @@ test "verifyAttestation: fmt=tpm, the AIK certificate requirements of §8.3.1 (S
     }
 }
 
+/// Length of the DER element whose header starts `der`.
+fn derElementLen(der: []const u8) usize {
+    if (der[1] < 0x80) return 2 + der[1];
+    const n = der[1] & 0x7f;
+    var len: usize = 0;
+    for (der[2..][0..n]) |b| len = len << 8 | b;
+    return 2 + n + len;
+}
+
+fn derHeader(a: std.mem.Allocator, tag: u8, content_len: usize) ![]u8 {
+    if (content_len < 0x80) return a.dupe(u8, &.{ tag, @intCast(content_len) });
+    if (content_len < 0x100) return a.dupe(u8, &.{ tag, 0x81, @intCast(content_len) });
+    return a.dupe(u8, &.{ tag, 0x82, @intCast(content_len >> 8), @intCast(content_len & 0xff) });
+}
+
+/// Replace the whole sibling elements `der[at..][0..old_len]` by `new` and re-encode every enclosing length.
+fn derReplace(a: std.mem.Allocator, der: []const u8, at: usize, old_len: usize, new: []const u8) ![]u8 {
+    if (at == 0 and old_len == der.len) return a.dupe(u8, new);
+    const total = derElementLen(der);
+    const hdr: usize = if (der[1] < 0x80) 2 else 2 + (der[1] & 0x7f);
+    var content: std.ArrayList(u8) = .empty;
+    var pos = hdr;
+    var replaced = false;
+    while (pos < total) {
+        const child_len = derElementLen(der[pos..]);
+        if (!replaced and at >= pos and at < pos + child_len) {
+            if (at == pos and old_len >= child_len) {
+                try content.appendSlice(a, new);
+                var skipped: usize = 0;
+                while (skipped < old_len) {
+                    const l = derElementLen(der[pos..]);
+                    skipped += l;
+                    pos += l;
+                }
+                replaced = true;
+                continue;
+            }
+            try content.appendSlice(a, try derReplace(a, der[pos..][0..child_len], at - pos, old_len, new));
+            replaced = true;
+        } else try content.appendSlice(a, der[pos..][0..child_len]);
+        pos += child_len;
+    }
+    std.debug.assert(replaced);
+    const h = try derHeader(a, der[0], content.items.len);
+    return std.mem.concat(a, u8, &.{ h, content.items });
+}
+
+fn tpmAikWithCert(a: std.mem.Allocator, base: []const u8, cert: []const u8) ![]u8 {
+    const arr = try a.alloc(cbor.Value, 1);
+    arr[0] = .{ .bytes = cert };
+    return withStmt(a, base, "x5c", .{ .array = arr });
+}
+
+test "verifyAttestation: fmt=tpm, AIK certificate rules that need a re-encoded certificate (version, subject, CA flag, AAGUID)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = &vectors.tpm_es256_attestation_object;
+    const hash = clientDataHash(&vectors.tpm_es256_client_data_json);
+    const decoded = try cbor.decode(a, base, .{});
+    var cert: []const u8 = &.{};
+    for (decoded.map) |e| {
+        if (e.key != .text or !std.mem.eql(u8, e.key.text, "attStmt")) continue;
+        for (e.value.map) |se| {
+            if (se.key == .text and std.mem.eql(u8, se.key.text, "x5c")) cert = se.value.array[0].bytes;
+        }
+    }
+    const ver_v3 = [_]u8{ 0xa0, 0x03, 0x02, 0x01, 0x02 };
+    const empty_subject_tail = [_]u8{ 0x5a, 0x30, 0x00, 0x30, 0x59 }; // end of notAfter, subject, start of SPKI
+    const bc_ext = [_]u8{ 0x30, 0x0c, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff, 0x04, 0x02, 0x30, 0x00 };
+
+    // The re-encoder is neutral: an identity edit still verifies.
+    const bc_at = std.mem.indexOf(u8, cert, &bc_ext) orelse return error.EditNotFound;
+    const same = try derReplace(a, cert, bc_at, bc_ext.len, &bc_ext);
+    try testing.expectEqualSlices(u8, cert, same);
+    _ = try webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, same), hash);
+
+    // version: v1 instead of v3.
+    {
+        const at = std.mem.indexOf(u8, cert, &ver_v3) orelse return error.EditNotFound;
+        const m = try a.dupe(u8, cert);
+        m[at + 4] = 0x00;
+        try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), hash));
+    }
+    // subject: a non-empty Name (CN=AA).
+    {
+        const at = (std.mem.indexOf(u8, cert, &empty_subject_tail) orelse return error.EditNotFound) + 1;
+        const subject = [_]u8{ 0x30, 0x0d, 0x31, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x02, 0x41, 0x41 };
+        const m = try derReplace(a, cert, at, 2, &subject);
+        try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), hash));
+    }
+    // basicConstraints: CA true.
+    {
+        const ca_true = [_]u8{ 0x30, 0x0f, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff, 0x04, 0x05, 0x30, 0x03, 0x01, 0x01, 0xff };
+        const m = try derReplace(a, cert, bc_at, bc_ext.len, &ca_true);
+        try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), hash));
+    }
+    // id-fido-gen-ce-aaguid, if present, must equal the AAGUID of authData (here 4b92a377fc5f6107c4c85c190adbfd99).
+    {
+        const aaguid = [_]u8{ 0x4b, 0x92, 0xa3, 0x77, 0xfc, 0x5f, 0x61, 0x07, 0xc4, 0xc8, 0x5c, 0x19, 0x0a, 0xdb, 0xfd, 0x99 };
+        var ext = [_]u8{ 0x30, 0x21, 0x06, 0x0b, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0xe5, 0x1c, 0x01, 0x01, 0x04, 0x04, 0x12, 0x04, 0x10 } ++ aaguid;
+        const good = try derReplace(a, cert, bc_at, bc_ext.len, &(bc_ext ++ ext));
+        _ = try webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, good), hash);
+        ext[ext.len - 1] ^= 1;
+        const bad = try derReplace(a, cert, bc_at, bc_ext.len, &(bc_ext ++ ext));
+        try testing.expectError(error.AaguidExtensionMismatch, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, bad), hash));
+    }
+}
+
 test "verifyAttestation: fmt=tpm, each rule of §8.3 has a variant that breaks only it" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
