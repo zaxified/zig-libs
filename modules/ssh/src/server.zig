@@ -49,7 +49,7 @@ const EcdsaP521 = @import("p521").EcdsaP521Sha512;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const X25519 = std.crypto.dh.X25519;
-const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
+const MLKem768 = @import("mlkem").MLKem768;
 
 // ── small wire/hash helpers (mirror transport.zig privates) ─────────────────
 
@@ -3313,7 +3313,7 @@ test "mlkem768x25519 server: an init under another message number, or C one byte
     var hk: HostKey = undefined;
     try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
     const gpa = std.testing.allocator;
-    const kem = try MLKem768.KeyPair.generateDeterministic(@splat(7));
+    const kem = MLKem768.KeyPair.generateDeterministic(@splat(7));
     var c: [transport.mlkem_cinit_len + 1]u8 = undefined;
     @memcpy(c[0 .. transport.mlkem_cinit_len - 32], &kem.public_key.toBytes());
     @memset(c[transport.mlkem_cinit_len - 32 ..], 0);

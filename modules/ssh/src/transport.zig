@@ -46,7 +46,7 @@ const Aes192 = @import("aes192").Aes192;
 const Aes256 = std.crypto.core.aes.Aes256;
 const Aes256Gcm = @import("aesgcm").Aes256Gcm; // zig-libs aesgcm (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 const Aes128Gcm = @import("aesgcm").Aes128Gcm;
-const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
+const MLKem768 = @import("mlkem").MLKem768;
 const ChaCha = std.crypto.stream.chacha.ChaCha20With64BitNonce;
 const Poly1305 = std.crypto.onetimeauth.Poly1305;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -2573,7 +2573,7 @@ fn mlkem768x25519KexBody(
     var kem_seed: [MLKem768.seed_length]u8 = undefined;
     entropy.fill(&kem_seed);
     defer std.crypto.secureZero(u8, &kem_seed);
-    const kem_kp = MLKem768.KeyPair.generateDeterministic(kem_seed) catch return error.KexFailed;
+    const kem_kp = MLKem768.KeyPair.generateDeterministic(kem_seed);
     const kem_pub = kem_kp.public_key.toBytes();
 
     // C = ML-KEM_encapsulation_key(1184) || X25519_pub(32).
@@ -2601,7 +2601,7 @@ fn mlkem768x25519KexBody(
     // Decapsulate ML-KEM, scalarmult X25519.
     var ct: [mlkem_ct_len]u8 = undefined;
     @memcpy(&ct, s_reply[0..mlkem_ct_len]);
-    var kem_shared = kem_kp.secret_key.decaps(&ct) catch return error.KexFailed;
+    var kem_shared = kem_kp.secret_key.decaps(&ct);
     defer std.crypto.secureZero(u8, &kem_shared);
     var x_srv: [32]u8 = undefined;
     @memcpy(&x_srv, s_reply[mlkem_ct_len..mlkem_sreply_len]);
@@ -4987,11 +4987,11 @@ test "ML-KEM-768 raw encaps/decaps round-trip + wire lengths" {
     try t.expectEqual(@as(usize, 1088), mlkem_ct_len);
     var seed: [MLKem768.seed_length]u8 = undefined;
     for (&seed, 0..) |*b, i| b.* = @intCast(i);
-    const kp = try MLKem768.KeyPair.generateDeterministic(seed);
+    const kp = MLKem768.KeyPair.generateDeterministic(seed);
     var es: [MLKem768.encaps_seed_length]u8 = undefined;
     for (&es, 0..) |*b, i| b.* = @intCast(i + 7);
     const enc = kp.public_key.encapsDeterministic(&es);
-    const dec = try kp.secret_key.decaps(&enc.ciphertext);
+    const dec = kp.secret_key.decaps(&enc.ciphertext);
     try t.expectEqualSlices(u8, &enc.shared_secret, &dec);
 }
 

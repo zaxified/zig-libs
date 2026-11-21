@@ -238,7 +238,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   compiles to a conditional jump in ReleaseFast, which leaked the exponent's windows. Group exchange
   (`gexPow`) uses the same kernel on `GexMod`.
 - **Secrets do not stay on the stack.** The per-method KEX entry points take `out: *KexResult` and burn
-  their bodies (std's X25519, ML-KEM and modexp frames included); the KEX rounds, `installCipher`,
+  their bodies (std's X25519, the `mlkem` module's ML-KEM and the modexp frames included); the KEX rounds, `installCipher`,
   `deriveKeys` and `writePacket`/`readPacket` burn theirs (`burn.zig`). `stackprobe_test.zig` and
   `stackprobe2_test.zig` probe each method and role and a whole handshake per role for residue.
 - **Public keys and `known_hosts` (`keys.zig`, `knownhosts.zig`).** `PublicKey.parse`/`verify`/`eql`,

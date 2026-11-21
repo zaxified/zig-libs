@@ -48,8 +48,8 @@ private key (d ‖ z, 64 bytes) and the expanded FIPS 203 form, and an optional 
 consistency test. Pure Zig; allocation-free.
 
 Not here: Kyber round 3 / draft00 (refused — superseded; std still has `d00` if anyone needs it);
-hybrid combiners and X-Wing (they live in `hpke` and `tls13`, which depend on this module, not the
-other way round); ASN.1 / PKCS#8 / SPKI encodings of ML-KEM keys (the `keycodec` module, type-agnostic: it hands over the seed or the expanded key, which go to `KeyPair.generateDeterministic` / `SecretKey.fromBytes`; `keycodec/src/mlkem_test.zig` loads every OpenSSL 3.5.5 ML-KEM key into this module and writes it back byte for byte). This module's only dependency is `entropy`.
+hybrid combiners and X-Wing (they live in `hpke`, `tls13` and `ssh` (`mlkem768x25519-sha256`), which depend
+on this module, not the other way round); ASN.1 / PKCS#8 / SPKI encodings of ML-KEM keys (the `keycodec` module, type-agnostic: it hands over the seed or the expanded key, which go to `KeyPair.generateDeterministic` / `SecretKey.fromBytes`; `keycodec/src/mlkem_test.zig` loads every OpenSSL 3.5.5 ML-KEM key into this module and writes it back byte for byte). This module's only dependency is `entropy`.
 
 ## Algorithm
 
@@ -171,5 +171,3 @@ input. `decaps` cannot fail (implicit rejection).
 
 - A faster scalar Keccak (H(ek) and J(z ‖ c) are 12 serial permutations for ML-KEM-1024 and
   the largest single cost); std's is used.
-- Consumers still on std `ml_kem`: `ssh` (`src/server.zig`, `mlkem768x25519-sha256`) should switch to
-  this module (needs its own delta audit afterwards).

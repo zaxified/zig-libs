@@ -651,7 +651,7 @@ test "STACKPROBE: no key, nonce or CRT residue on the dead stack after host-key 
 
 const transport = @import("transport.zig");
 const X25519 = std.crypto.dh.X25519;
-const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
+const MLKem768 = @import("mlkem").MLKem768;
 const KexResult = transport.KexResult;
 
 /// Entropy that is a fixed stream and remembers every draw of 32 bytes or more
@@ -886,7 +886,7 @@ fn kexNeedles(n: *Needles, k: Kex, role: Role, me: *const Recorder, peer: *const
             const kem_seed = c.draw(1)[0..MLKem768.seed_length].*;
             const enc_seed = s.draw(0)[0..MLKem768.encaps_seed_length].*;
             const sx = s.draw(1)[0..32].*;
-            const kp = try MLKem768.KeyPair.generateDeterministic(kem_seed);
+            const kp = MLKem768.KeyPair.generateDeterministic(kem_seed);
             const enc = kp.public_key.encapsDeterministic(&enc_seed);
             const xk = try X25519.scalarmult(cx, X25519.recoverPublicKey(sx));
             if (role == .client) {
