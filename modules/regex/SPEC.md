@@ -316,8 +316,6 @@ All open.
 - **Unicode tables cost every consumer 94 KB** — the grammar is chosen at run time, so `unicode_tables.zig` (every property
   the Rust grammar names) is linked even into a program that only ever compiles `.perl` patterns (the Go-generated tables were
   11 KB). A build option or a comptime-known grammar could leave the Rust-only properties out.
-- **Readers in bytes mode** — `isMatchReader`/`findReader`/`capturesReader` return `error.BytesMode` for a bytes-mode
-  `Regex`; a byte-stepping reader front end would lift it (Rust has no reader API at all).
 - **Programs past `4 * max_insts`** (owner: no consumer setting may end in a panic or an OOM) — Go and Rust compile
   them; here `error.PatternTooLarge`, because `isMatch` has no allocator and a `Matcher` for 65,534 instructions x 64
   groups would be ~134 MiB. Taking them back needs matching in bounded memory for any size (a windowed or chunked state

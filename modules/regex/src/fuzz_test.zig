@@ -762,15 +762,11 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
     }
 
     // The reader front end, through a 4-byte buffer (peeked sequences) and a
-    // 1-byte one (held bytes); bytes mode: refused with an error.
+    // 1-byte one (held bytes); bytes mode reads through its own window.
     for ([_]usize{ 4, 1 }) |bl| {
         var rbuf: [4]u8 = undefined;
         var tr: std.testing.Reader = .init(rbuf[0..bl], &.{.{ .buffer = input }});
         tr.artificial_limit = .limited(1);
-        if (re.bytes) {
-            if (m.capturesReader(&tr.interface, g1[0..ng])) |_| return error.BytesReaderAccepted else |e| if (e != error.BytesMode) return e;
-            break;
-        }
         const rf = try m.capturesReader(&tr.interface, g1[0..ng]);
         if (rf != (found != null)) return error.ReaderDisagrees;
         if (rf and (g1[0].?.start != found.?.start or g1[0].?.end != found.?.end)) return error.ReaderDisagreesOnSpan;

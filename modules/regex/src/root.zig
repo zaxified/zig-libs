@@ -125,9 +125,9 @@ inline fn probe(comptime e: Probe) void {
     if (@import("builtin").is_test) probe_counts.getPtr(e).* += 1;
 }
 
-/// The reader front end's errors: the reader failed before the answer was
-/// settled, or the `Regex` is in bytes mode (slices only).
-pub const ReaderError = error{ ReadFailed, BytesMode };
+/// The reader front end's error: the reader failed before the answer was
+/// settled.
+pub const ReaderError = error{ReadFailed};
 
 /// A match: `input[start..end]`.
 pub const Span = struct {
@@ -386,10 +386,18 @@ pub const Regex = struct {
     /// Go's `MatchReader`: does the pattern match anywhere in what `r`
     /// yields? Reads code point by code point, no further than it must (at
     /// most three code points past the end of a match); no allocator,
-    /// constant memory, any buffer size. A bytes-mode `Regex` has no reader
-    /// front end: `error.BytesMode`.
+    /// constant memory, any buffer size. A bytes-mode `Regex` reads byte by
+    /// byte through a window of the last and next four bytes.
     pub fn isMatchReader(re: *const Regex, r: *std.Io.Reader) ReaderError!bool {
-        if (re.bytes) return error.BytesMode;
+        if (re.bytes) {
+            var bt: BytesReader = .init(r);
+            var storage: ByteSet.Fixed = undefined;
+            var sets = storage.sets();
+            var stack: [2 * max_insts]u16 = undefined;
+            const found = re.bytesLoop(&bt, false, &sets[0], &sets[1], &stack) != null;
+            if (bt.failed and !found) return error.ReadFailed;
+            return found;
+        }
         var t: ReaderText = .init(r);
         const found = re.runSetOn(&t, false);
         // A failure after the answer was settled does not change it.
@@ -796,32 +804,34 @@ pub const Regex = struct {
         var storage: ByteSet.Fixed = undefined;
         var sets = storage.sets();
         var stack: [2 * max_insts]u16 = undefined;
-        return re.bytesLoop(input, full, &sets[0], &sets[1], &stack);
+        var text: BytesSlice = .{ .input = input };
+        return re.bytesLoop(&text, full, &sets[0], &sets[1], &stack);
     }
 
-    fn bytesLoop(re: *const Regex, input: []const u8, full: bool, cur0: *ByteSet, nxt0: *ByteSet, stack: []u16) ?usize {
+    /// The bytes-mode set loop over `text` (a `BytesSlice` or `BytesReader`).
+    fn bytesLoop(re: *const Regex, text: anytype, full: bool, cur0: *ByteSet, nxt0: *ByteSet, stack: []u16) ?usize {
         var cur = cur0;
         var nxt = nxt0;
         cur.clear();
         var pos: usize = 0;
         while (true) {
             probe(.bytes_step);
-            const at_end = pos >= input.len;
-            if (!full or pos == 0) re.closureSet(cur, 0, bytesBefore(input, pos), bytesAt(input, pos), stack);
+            const at_end = text.atEnd(pos);
+            if (!full or pos == 0) re.closureSet(cur, 0, text.before(pos), text.at(pos), stack);
             if (cur.n == 0 and (full or at_end)) return null;
             nxt.clear();
             const q = pos + 1;
             for (cur.pcs[0..cur.n], cur.rem[0..cur.n]) |pc, rem| {
                 if (rem != 0) {
-                    if (rem == 1) re.closureSet(nxt, pc, bytesBefore(input, q), bytesAt(input, q), stack) else nxt.pending(pc, rem - 1);
+                    if (rem == 1) re.closureSet(nxt, pc, text.before(q), text.at(q), stack) else nxt.pending(pc, rem - 1);
                     continue;
                 }
                 if (re.insts[pc] == .match) {
                     if (!full or at_end) return pos;
                     continue;
                 }
-                const w = re.consumeBytes(pc, input, pos) orelse continue;
-                if (w == 1) re.closureSet(nxt, pc + 1, bytesBefore(input, q), bytesAt(input, q), stack) else nxt.pending(pc + 1, @intCast(w - 1));
+                const w = text.consume(re, pc, pos) orelse continue;
+                if (w == 1) re.closureSet(nxt, pc + 1, text.before(q), text.at(q), stack) else nxt.pending(pc + 1, @intCast(w - 1));
             }
             if (at_end) return null;
             pos = q;
@@ -3075,6 +3085,12 @@ pub const Matcher = struct {
     /// (`List.rem`) before its closure — the states inside a UTF-8
     /// automaton, so priorities stay as Rust's byte NFA has them.
     fn runOnBytes(m: *Matcher, input: []const u8, from: usize, full: bool) bool {
+        var text: BytesSlice = .{ .input = input };
+        return m.runOnBytesText(&text, from, full);
+    }
+
+    /// `runOnBytes` over `text` (a `BytesSlice` or `BytesReader`).
+    fn runOnBytesText(m: *Matcher, text: anytype, from: usize, full: bool) bool {
         const re = m.re;
         var cur = &m.lists[0];
         var nxt = &m.lists[1];
@@ -3083,10 +3099,10 @@ pub const Matcher = struct {
         var pos = from;
         while (true) {
             probe(.pike_bytes_step);
-            const at_end = pos >= input.len;
+            const at_end = text.atEnd(pos);
             if (!matched and ((!full and !m.anchor) or pos == from)) {
                 @memset(m.tmp, nil);
-                m.addThread(cur, 0, pos, bytesBefore(input, pos), bytesAt(input, pos));
+                m.addThread(cur, 0, pos, text.before(pos), text.at(pos));
             }
             if (cur.n == 0 and (matched or at_end or full or m.anchor)) break;
             nxt.clear();
@@ -3099,7 +3115,7 @@ pub const Matcher = struct {
                 if (re.longest and matched and caps[0] > m.best[0]) continue; // started later
                 if (rem != 0) {
                     @memcpy(m.tmp, caps);
-                    if (rem == 1) m.addThread(nxt, pc, q, bytesBefore(input, q), bytesAt(input, q)) else m.addPending(nxt, pc, rem - 1);
+                    if (rem == 1) m.addThread(nxt, pc, q, text.before(q), text.at(q)) else m.addPending(nxt, pc, rem - 1);
                     continue;
                 }
                 if (re.insts[pc] == .match) {
@@ -3110,9 +3126,9 @@ pub const Matcher = struct {
                     if (re.longest) continue;
                     break; // cut the lower-priority threads
                 }
-                const w = re.consumeBytes(pc, input, pos) orelse continue;
+                const w = text.consume(re, pc, pos) orelse continue;
                 @memcpy(m.tmp, caps);
-                if (w == 1) m.addThread(nxt, pc + 1, q, bytesBefore(input, q), bytesAt(input, q)) else m.addPending(nxt, pc + 1, @intCast(w - 1));
+                if (w == 1) m.addThread(nxt, pc + 1, q, text.before(q), text.at(q)) else m.addPending(nxt, pc + 1, @intCast(w - 1));
             }
             if (at_end) break;
             pos = q;
@@ -3281,9 +3297,15 @@ pub const Matcher = struct {
     /// Go's `FindReaderIndex`: the leftmost match in what `r` yields, as byte
     /// offsets from where `r` stood. Reads no further than it must (at most
     /// three code points past the match's end); constant memory, any buffer
-    /// size. A bytes-mode `Regex`: `error.BytesMode`.
+    /// size. A bytes-mode `Regex` reads byte by byte, as `isMatchReader`.
     pub fn findReader(m: *Matcher, r: *std.Io.Reader) ReaderError!?Span {
-        if (m.re.bytes) return error.BytesMode;
+        if (m.re.bytes) {
+            var bt: BytesReader = .init(r);
+            const found = m.runOnBytesText(&bt, 0, false);
+            if (bt.failed and !found) return error.ReadFailed;
+            if (!found) return null;
+            return .{ .start = m.best[0], .end = m.best[1] };
+        }
         var t: ReaderText = .init(r);
         const found = m.runOn(&t, 0, false);
         if (t.failed and !found) return error.ReadFailed;
@@ -3294,7 +3316,14 @@ pub const Matcher = struct {
     /// Go's `FindReaderSubmatchIndex`: `findReader` that also fills `out` as
     /// `captures` does.
     pub fn capturesReader(m: *Matcher, r: *std.Io.Reader, out: []?Span) ReaderError!bool {
-        if (m.re.bytes) return error.BytesMode;
+        if (m.re.bytes) {
+            var bt: BytesReader = .init(r);
+            const found = m.runOnBytesText(&bt, 0, false);
+            if (bt.failed and !found) return error.ReadFailed;
+            if (!found) return false;
+            m.fillCaptures(out);
+            return true;
+        }
         var t: ReaderText = .init(r);
         const found = m.runOn(&t, 0, false);
         if (t.failed and !found) return error.ReadFailed;
@@ -3658,6 +3687,104 @@ fn bytesAt(input: []const u8, i: usize) ?u21 {
     const cp = d.cp orelse return null;
     return if (d.w == 1 and input[i] >= 0x80) invalid else cp;
 }
+
+/// A slice as the text of the bytes-mode engine.
+const BytesSlice = struct {
+    input: []const u8,
+
+    fn atEnd(t: *const BytesSlice, pos: usize) bool {
+        return pos >= t.input.len;
+    }
+
+    fn before(t: *const BytesSlice, pos: usize) ?u21 {
+        return bytesBefore(t.input, pos);
+    }
+
+    fn at(t: *const BytesSlice, pos: usize) ?u21 {
+        return bytesAt(t.input, pos);
+    }
+
+    fn consume(t: *const BytesSlice, re: *const Regex, pc: u16, pos: usize) ?usize {
+        return re.consumeBytes(pc, t.input, pos);
+    }
+};
+
+/// A reader as the text of the bytes-mode engine: a window of the last
+/// `back` and the next `ahead` bytes — what `bytesBefore` and the sequence
+/// decoder look at — so memory is constant and any buffer size works.
+const BytesReader = struct {
+    r: *std.Io.Reader,
+    win: [back + ahead]u8 = undefined,
+    /// The position of `win[0]`, and how many bytes of `win` are valid.
+    lo: usize = 0,
+    n: usize = 0,
+    eof: bool = false,
+    /// The reader failed; the engine saw the end of the text there.
+    failed: bool = false,
+
+    const back = 4;
+    const ahead = 4;
+
+    fn init(r: *std.Io.Reader) BytesReader {
+        return .{ .r = r };
+    }
+
+    /// Make `pos - back` through `pos + ahead` available (as far as the
+    /// reader has them), dropping what is older.
+    fn ensure(t: *BytesReader, pos: usize) void {
+        if (pos > t.lo + back) {
+            const drop = @min(pos - back - t.lo, t.n);
+            std.mem.copyForwards(u8, t.win[0 .. t.n - drop], t.win[drop..t.n]);
+            t.lo += drop;
+            t.n -= drop;
+        }
+        while (!t.eof and t.lo + t.n < pos + ahead) {
+            const c = t.next() orelse {
+                t.eof = true;
+                break;
+            };
+            t.win[t.n] = c;
+            t.n += 1;
+        }
+    }
+
+    fn next(t: *BytesReader) ?u8 {
+        if (t.r.buffer.len == 0) {
+            // An unbuffered reader: `stream` is the one operation every reader has.
+            var one: [1]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&one);
+            t.r.streamExact(&w, 1) catch |e| {
+                if (e == error.ReadFailed) t.failed = true;
+                return null;
+            };
+            return one[0];
+        }
+        return t.r.takeByte() catch |e| {
+            if (e == error.ReadFailed) t.failed = true;
+            return null;
+        };
+    }
+
+    fn atEnd(t: *BytesReader, pos: usize) bool {
+        t.ensure(pos);
+        return t.lo + t.n <= pos;
+    }
+
+    fn before(t: *BytesReader, pos: usize) ?u21 {
+        t.ensure(pos);
+        return bytesBefore(t.win[0..t.n], pos - t.lo);
+    }
+
+    fn at(t: *BytesReader, pos: usize) ?u21 {
+        t.ensure(pos);
+        return bytesAt(t.win[0..t.n], pos - t.lo);
+    }
+
+    fn consume(t: *BytesReader, re: *const Regex, pc: u16, pos: usize) ?usize {
+        t.ensure(pos);
+        return re.consumeBytes(pc, t.win[0..t.n], pos - t.lo);
+    }
+};
 
 /// An invalid byte next to a position (bytes mode): no word character, and
 /// Rust's `\B` and half boundaries do not hold beside it.
@@ -5158,18 +5285,70 @@ test "compile: past max_insts on the heap, past 4 * max_insts refused — never 
     try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, "a{1000}b{100}", .{ .syntax = .rust, .utf8 = false }));
 }
 
-test "no misuse panics: a bytes Regex through a reader, a short or long RegexSet out, a 1-byte reader buffer" {
+test "bytes mode through a reader: same spans and groups as the slice, for every buffer size" {
     const gpa = testing.allocator;
-    var br = try Regex.compileOptions(gpa, "a", .{ .syntax = .rust, .utf8 = false });
-    defer br.deinit(gpa);
+    const patterns = [_][]const u8{
+        "a",           "\\bfoo\\b",     "(?-u:\\xff)+",  "\u{00e9}+",
+        "(?-u:.)",     "\\B",           "\\w+\\s",       "x$",
+        "^abc",        "(a|ab)(c|bcd)", "[^a]b",         "(?-u:[\\x80-\\xff])\\w",
+        "\\b{start}f", "o\\b{end}",     "(\\w+) (\\w+)", "",
+    };
+    const inputs = [_][]const u8{
+        "xxfoo yy", "\xff\xff", "\u{00e9} \u{00e9}",                "abcd",
+        "a\x80b",   "ab\xc3",   "\u{65e5}\u{672c}\u{8a9e} foo bar", "x",
+        "",         "abcbcd",   "foo\xffbar",                       "\xf0\x9f\x98\x80 smile x",
+    };
+    for (patterns) |pat| {
+        var re = Regex.compileOptions(gpa, pat, .{ .syntax = .rust, .utf8 = false }) catch continue;
+        defer re.deinit(gpa);
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        var want: [4]?Span = undefined;
+        var got: [4]?Span = undefined;
+        const ng = @min(want.len, re.groupCount() + 1);
+        for (inputs) |input| {
+            @memset(&want, null);
+            const found = m.captures(input, 0, want[0..ng]);
+            for ([_]usize{ 0, 1, 2, 3, 4, 9 }) |bl| {
+                var rbuf: [9]u8 = undefined;
+                var tr: std.testing.Reader = .init(rbuf[0..bl], &.{.{ .buffer = input }});
+                tr.artificial_limit = .limited(1);
+                try testing.expectEqual(found, try re.isMatchReader(&tr.interface));
+                var tr2: std.testing.Reader = .init(rbuf[0..bl], &.{.{ .buffer = input }});
+                tr2.artificial_limit = .limited(1);
+                const span = try m.findReader(&tr2.interface);
+                try testing.expectEqual(found, span != null);
+                if (span) |sp| {
+                    try testing.expectEqual(want[0].?.start, sp.start);
+                    try testing.expectEqual(want[0].?.end, sp.end);
+                }
+                var tr3: std.testing.Reader = .init(rbuf[0..bl], &.{.{ .buffer = input }});
+                tr3.artificial_limit = .limited(1);
+                @memset(&got, null);
+                try testing.expectEqual(found, try m.capturesReader(&tr3.interface, got[0..ng]));
+                if (found) for (want[0..ng], got[0..ng]) |w, g| {
+                    try testing.expectEqual(w == null, g == null);
+                    if (w) |ws| {
+                        try testing.expectEqual(ws.start, g.?.start);
+                        try testing.expectEqual(ws.end, g.?.end);
+                    }
+                };
+            }
+        }
+    }
+}
+
+test "bytes mode through a reader: a failing reader after the answer is settled does not matter" {
+    const gpa = testing.allocator;
+    var re = try Regex.compileOptions(gpa, "ab", .{ .syntax = .rust, .utf8 = false });
+    defer re.deinit(gpa);
+    var failing: std.Io.Reader = .failing;
+    try testing.expectError(error.ReadFailed, re.isMatchReader(&failing));
+}
+
+test "no misuse panics: a short or long RegexSet out, a 1-byte reader buffer" {
+    const gpa = testing.allocator;
     var buf: [8]u8 = undefined;
-    var r: std.Io.Reader = .fixed("a");
-    try testing.expectError(error.BytesMode, br.isMatchReader(&r));
-    var bm = try Matcher.init(gpa, &br);
-    defer bm.deinit();
-    try testing.expectError(error.BytesMode, bm.findReader(&r));
-    var g: [1]?Span = undefined;
-    try testing.expectError(error.BytesMode, bm.capturesReader(&r, &g));
 
     var set = try RegexSet.compile(gpa, &.{ "a", "b", "c" }, .{});
     defer set.deinit(gpa);

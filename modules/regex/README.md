@@ -149,8 +149,8 @@ repetition at most `{1000}` (Rust grammar `{100000}`) and nested counts multiply
 (Go's rule). Past one: `error.NestingDepth` / `error.InvalidRepeatSize` / `error.PatternTooLarge`
 at compile time — never a truncated program, never a compile that runs away. A `RegexSet` joins up
 to `4 * max_insts` instructions and 65,535 class ranges; `matches` fills as many slots as it is
-given. The reader functions work with any buffer size; on a bytes-mode `Regex` they return
-`error.BytesMode`. Compiling the deepest accepted pattern
+given. The reader functions work with any buffer size, in bytes mode too (a window of the last and
+next four bytes). Compiling the deepest accepted pattern
 fits a 512 KiB thread stack in Debug. A `Matcher` keeps a
 pointer to its `Regex`: do not move the `Regex` while a `Matcher` uses it.
 
