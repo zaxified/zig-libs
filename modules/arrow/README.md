@@ -6,7 +6,7 @@ Apache Arrow IPC — the stream and file (Feather v2) formats — for `dataframe
 compression both ways (`WriteOptions.compression = .zstd` / `.lz4`), schema / field / footer key/value metadata both
 ways (`ReadOptions.metadata`, `WriteOptions.*_metadata`), column projection on read (`ReadOptions.columns`),
 `ReadOptions.lossy` for values `dataframe` cannot hold; anchored on the apache/arrow-testing golden files; fuzz driver
-(`ARROW_FUZZ`). The no-panic sweep is not recorded yet; against pyarrow the writer is read back by it (`zig build interop-arrow`) and this module is 9-13x slower on a 1 M-row table (`zig build bench-arrow`).
+(`ARROW_FUZZ`). The IPC reader and writer had a no-panic sweep and an independent second review (the card's Hardening line); against pyarrow the writer is read back by it (`zig build interop-arrow`) and this module is 9-13x slower on a 1 M-row table (`zig build bench-arrow`).
 
 ## Not provided
 
