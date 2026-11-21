@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [weikengchen/libdpf](https://github.com/weikengchen/libdpf) | C / Rust | none detected by the API (not verified) | 14 | push 2026-03-20 | "A template for 2-server 1-bit DPF" with hardware AES for x86_64 and ARM64. |
 | Zig ecosystem | Zig | — | — | — | No FSS or DPF in `std`; none found on GitHub (search 2026-09-30). Sibling `pir` builds two-server PIR on this module; there is no sibling for Prio / VDAF. |
 
-**Where we are ahead:** the only FSS/DPF found for Zig, and maintained where libfss (2018) and dpf-go (2021) are not; beyond point functions it has multi-point FSS (`Mpf`), tree-reuse prefix and range evaluation (`evalFull`, `evalRangeWith`, interleaved `evalEachFullWith`), two PRGs (fixed-key AES by default, SHA-256 kept as the anchor) with a tagged key format, KATs from an independent re-derivation, and a ctgrind-measured branch-free evaluator. It also has the distributed comparison function (`Dcf`, BCGIKRS21; intervals as the difference of two), which Google's tree (`dcf/`) and libfss offer. **Where we are behind:** no incremental/hierarchical DPF (the reference's headline feature), only the additive `Z_{2^{8L}}` output group, and no byte-exact interoperability with Google's keys (→ Backlog; the last is under *What is deliberately not done*).
+**Where we are ahead:** the only FSS/DPF found for Zig, and maintained where libfss (2018) and dpf-go (2021) are not; beyond point functions it has multi-point FSS (`Mpf`), tree-reuse prefix and range evaluation (`evalFull`, `evalRangeWith`, interleaved `evalEachFullWith`), two PRGs (fixed-key AES by default, SHA-256 kept as the anchor) with a tagged key format, KATs from an independent re-derivation, and a ctgrind-measured branch-free evaluator. It also has the distributed comparison function (`Dcf`, BCGIKRS21; intervals as the difference of two), which Google's tree (`dcf/`) and libfss offer. It has the reference's headline feature too, the incremental DPF (`Idpf`, per-level outputs for private heavy hitters), and XOR and `Z_N` output groups (`DpfGroup`). **Where we are behind:** no tuple/vector output groups, and no byte-exact interoperability with Google's keys (→ Backlog; the last is under *What is deliberately not done*).
 
 ## What this module is
 
@@ -214,7 +214,9 @@ a skip is never a pass.
 7. **Output groups** (`group.zig`, `dpf.zig`): `Xor` and `ZMod` group laws, `ZMod.fromPrg` against the 192-bit `%`,
    and `DpfGroupWith` over `Xor(8)`, `ZMod(Goldilocks)`, `ZMod(97)` under both PRGs: full-domain reconstruction,
    `evalFull` equal to `evalAll`, the key codec round trip.
-8. **DCF** (`dcf.zig`): every point of every `α` of a 4-bit domain under both PRGs reconstructs `β·[x < α]`, plus
+8. **IDPF** (`idpf.zig`): every prefix at every level of a 6-bit domain under both PRGs, random `α`/`β_ℓ`; the
+   last level equal to `Dpf` share for share; key codec round trip.
+9. **DCF** (`dcf.zig`): every point of every `α` of a 4-bit domain under both PRGs reconstructs `β·[x < α]`, plus
    1-bit and 32-byte-group corners, random `(α, β)` over 10 bits, `β = 0`, an interval as the difference of two
    DCFs, a single key's shares not collapsing to `0/1`, and the key codec round trip.
 
@@ -247,6 +249,18 @@ Keys are `seed || n·(s_cw ‖ V_cw ‖ t_cw_l ‖ t_cw_r) || cw_final`, `16 + n
 or a control bit is a masked select (the `dpf.secretMask` barrier); the DCF has no ctgrind row yet. Not
 provided: Google's packed value-correction layout and its `DistributedComparisonFunction` key format (as for
 `Dpf`, see *What is deliberately not done*), and the DCF-based decision-tree functions.
+
+## Incremental DPF (`idpf.zig`)
+
+`Idpf(n, L)` shares, from one key pair, the point function on every prefix length: level `ℓ` reconstructs
+`β_ℓ` at `α`'s `ℓ`-bit prefix and `0` at every other `ℓ`-bit prefix (Boneh, Boyle, Corrigan-Gibbs, Gilboa, Ishai,
+IEEE S&P 2021, §4 — Poplar's IDPF). It is the DPF tree with the leaf rule applied at every level: an output
+correction word `ocw[ℓ] = (-1)^{t1}·(β_ℓ − Convert(s0) + Convert(s1))` on the α path node, and a party's share of
+prefix `p` is `(-1)^b·(Convert(s_p) + t_p·ocw[ℓ])`. `Convert` (the PRG's `convert`) and `expand` read disjoint
+inputs, so a node's value is independent of the seeds below it. Level `n` is exactly `DpfWith(P, n, L)` with the
+same seeds (a test pins it). `evalPrefix(b, key, ℓ, p)` walks `ℓ` levels. Keys: `seed || n·(s_cw ‖ t_cw_l ‖
+t_cw_r ‖ ocw)`. Not provided: Poplar's sketching/verification of the client's key (the VDAF layer) and per-level
+output groups that differ (Poplar1 uses a smaller field for inner levels); no ctgrind row yet.
 
 ## Multi-point FSS (`mpf.zig`)
 
@@ -557,9 +571,6 @@ does not observe `α` itself; for `α` the guarantee is by construction.
   codec (`dpf.zig`), per tree node in `convert`. Measure first (cycles + instructions 0.16 vs 0.17, or the
   share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative`
   (identical bytes, 8 instructions).
-- **Incremental / hierarchical DPF (IDPF)** *(survey)*: the headline feature of the reference library; private heavy
-  hitters (Poplar, the VDAF `Poplar1` in DAP) is the main deployed use of DPFs. `evalFull` already walks prefixes
-  internally but there is no per-level output/CW. Medium.
 - **Tuple/vector output groups** *(survey, inferred from Google's API)*: `Z_{2^{8L}}`, `Xor(L)` and `ZMod(N)` exist
   (`DpfGroup`); a tuple of elements (one correction word per component, as Google's `Tuple<...>` value types) does
   not, nor `ZMod` for `N > 2^64`. Small-medium.

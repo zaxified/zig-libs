@@ -98,6 +98,12 @@ const S = fss.DpfWith(fss.prg.Sha256Prg, 8, 4);
 const X = fss.DpfGroup(16, fss.group.Xor(32));
 const F = fss.DpfGroup(16, fss.group.ZMod(0xffff_ffff_0000_0001));
 
+// Incremental DPF: per-level outputs (private heavy hitters / Poplar).
+const I = fss.Idpf(16, 8);
+var ik: [2]I.Key = undefined;
+I.genWithSeeds(&alpha16, &betas16, &seed0, &seed1, &ik); // betas16: [16]u64
+const lvl_share = I.evalPrefix(0, &ik[0], 4, prefix4); // level 4, a 4-bit prefix
+
 // Distributed comparison: shares of beta·[x < alpha] (same seed contract).
 const C = fss.Dcf(16, 8);
 var ck: [2]C.Key = undefined;
@@ -199,7 +205,7 @@ the `firstMismatch` checker) are core-independent and prove the harness has teet
 
 ## Not provided
 
-Incremental (hierarchical) DPFs and tuple/vector output groups are open (SPEC *Backlog / deferred*); sublinear (cuckoo) multi-point FSS and byte-exact interoperability with other DPF
+Tuple/vector output groups are open (SPEC *Backlog / deferred*); sublinear (cuckoo) multi-point FSS and byte-exact interoperability with other DPF
 libraries are refused (SPEC *What is deliberately not done*).
 
 Provenance: clean-room from the BGI16 paper (ACM CCS 2016); no third-party

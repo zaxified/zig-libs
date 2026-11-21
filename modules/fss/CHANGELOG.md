@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — Added: the incremental DPF `Idpf`/`IdpfWith` (`idpf.zig`, Boneh et al. S&P 2021 §4): one key pair, an output correction word per level, `evalPrefix` at any prefix length; its last level is `Dpf` share for share.
 - **2026-11-21** — Added: output groups other than `Z_{2^{8L}}` — `DpfGroup`/`DpfGroupWith` over `group.Xor(L)` (XOR shares) and `group.ZMod(N)` (`N ≤ 2^64`, constant-time reduction of the PRG output); `group.Z2k` gains `Elem` and `fromPrg`. `DpfWith(P, n, L)` is now `DpfGroupWith(P, n, group.Z2k(L))`, byte-identical keys and outputs.
 - **2026-11-21** — Added: the distributed comparison function `Dcf`/`DcfWith` (`dcf.zig`, BCGIKRS21 Fig. 1): shares of `β·[x < α]`, `genWithSeeds`/`eval`/`evalAll`, a key codec; intervals as the difference of two.
 - **2026-11-18** — **API change (security triage):** `Dpf.genWithSeeds` and `Mpf.genWithSeeds` take `alpha`/`beta` (`alphas`/`betas`) by `*const` instead of by value, so no copy of the secret point sits in the entry frame above the burn. Callers pass `&alpha, &beta`; a caller's own temporaries are its to wipe. Delta mutation of the new dereferences: 4 mutants, 4 killed (card cumulative 43/44, 1 eq). ctgrind source digests of the fss `gen`/`eval` rows re-pinned (counts unchanged).

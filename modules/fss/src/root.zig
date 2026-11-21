@@ -97,6 +97,10 @@ const dcf = @import("dcf.zig");
 pub const Dcf = dcf.Dcf;
 pub const DcfWith = dcf.DcfWith;
 
+const idpf = @import("idpf.zig");
+pub const Idpf = idpf.Idpf;
+pub const IdpfWith = idpf.IdpfWith;
+
 pub const kat_vectors = @import("kat_vectors.zig");
 
 // Pull every submodule's tests into the test binary (CONVENTIONS.md §6
@@ -108,6 +112,7 @@ test {
     _ = dpf;
     _ = mpf;
     _ = dcf;
+    _ = idpf;
     _ = kat_vectors;
     _ = @import("kat_test.zig");
     _ = @import("mpf_test.zig");
