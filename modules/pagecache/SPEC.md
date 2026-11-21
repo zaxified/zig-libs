@@ -332,13 +332,14 @@ Only the copying `pread` path prefetches: a `preadRef` miss records the access b
 - **Cross-thread sharing and a shared/multi-process pool** (PostgreSQL `shared_buffers`). The module inherits `single_owner` from `ramcache` and `kvtree`; a shared deployment wraps the owner in its own lock.
 - **A silent fall-back from `preadRef` to a copying read.** `null` / `canLend() == false` is the answer for a backend that holds no bytes, for an access that is not exactly one aligned page and for a page not fully present, so "did the fast path engage?" stays answerable.
 - **Caching non-page-shaped accesses.** Only page-aligned, exactly-`page_size` accesses are cached; anything else passes through.
+- **A per-file index of resident pages for whole-file invalidation.** The last close, a truncating open, `rename` and `delete` sweep the resident set by key prefix (`ramcache.removeMatching`), bounded by `max_pages`; an index would add an allocation that can fail (a page whose tracking failed would survive a close, see *Invalidation*) to save a scan the reference designs also pay (SQLite's pcache walks its page list on `sqlite3PcacheTruncate`/`Clear`).
+- **An index of the open files.** `findByPath` / `findById` are linear in the open files, and a handle table of two (kvtree holds a log and a data file) makes a map slower than the scan.
+- **Detecting a double `releasePage`, or one after `deinit`.** `ramcache` already ignores a second release while the entry is alive; after the entry is freed only a table of outstanding borrows could tell, one allocation per `preadRef` on the path whose point is to allocate nothing. SQLite's `sqlite3PcacheRelease` and PostgreSQL's `ReleaseBuffer` do not detect it either; it stays the caller's rule (documented on `preadRef`).
 - **A `rename` that cannot allocate the new name** orphans the file (pages dropped, the old name no longer resolves to it): the one place the several-handles guarantee gives way to the out-of-memory path.
 
 ## Backlog / deferred
 
-- **A whole-file invalidation scans the resident map** (last close, truncating open, `rename`, `delete` run `ramcache.removeMatching`) — LOW, bounded by `max_pages`. (R-pagecache-2)
-- **`findByPath`/`findById` are linear in the open files** — LOW, kvtree holds two. (R-pagecache-4)
-- **A double `releasePage`, or one after `deinit`, is undetected** (a `ramcache` assert; documented on `preadRef`); a generation token would close it. (R-pagecache-5)
+None open.
 
 ## Anchoring
 
