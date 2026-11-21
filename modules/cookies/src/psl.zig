@@ -17,6 +17,7 @@
 //! interop-cookies`.
 
 const std = @import("std");
+const unitext = @import("unitext");
 
 pub const PublicSuffixList = struct {
     arena: std.heap.ArenaAllocator,
@@ -129,125 +130,19 @@ pub const PublicSuffixList = struct {
 };
 
 /// A name in the form rules are stored in: lowercase ASCII, each non-ASCII
-/// label punycoded (`公司.cn` → `xn--55qx5d.cn`). NOT full IDNA: no UTS #46
-/// mapping or validation -- right for the list's own (already normalized)
-/// rules, which is what it is for.
+/// label punycoded (`公司.cn` → `xn--55qx5d.cn`), by UTS #46 processing
+/// (`unitext.idna.toAscii`, which maps and validates). A rule it refuses
+/// (invalid UTF-8, an invalid label) is `error.Unencodable`.
 pub fn toAscii(a: std.mem.Allocator, rule: []const u8) error{ OutOfMemory, Unencodable }![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var labels = std.mem.splitScalar(u8, rule, '.');
-    var first = true;
-    while (labels.next()) |label| {
-        if (!first) try out.append(a, '.');
-        first = false;
-        const ascii = for (label) |c| {
-            if (c >= 0x80) break false;
-        } else true;
-        if (ascii) {
-            for (label) |c| try out.append(a, std.ascii.toLower(c));
-        } else {
-            try out.appendSlice(a, "xn--");
-            try punycodeEncode(a, &out, label);
-        }
-    }
-    return out.items;
-}
-
-// ── punycode (RFC 3492 §6.3), encoding only ─────────────────────────────────
-
-const base = 36;
-const tmin = 1;
-const tmax = 26;
-const skew = 38;
-const damp = 700;
-
-fn adapt(delta_in: u32, numpoints: u32, first: bool) u32 {
-    var delta = if (first) delta_in / damp else delta_in / 2;
-    delta += delta / numpoints;
-    var k: u32 = 0;
-    while (delta > ((base - tmin) * tmax) / 2) : (k += base) delta /= base - tmin;
-    return k + (base - tmin + 1) * delta / (delta + skew);
-}
-
-fn digit(d: u32) u8 {
-    return @intCast(if (d < 26) 'a' + d else '0' + (d - 26));
-}
-
-/// Append the punycode of the UTF-8 `label` (no `xn--`). Code points are
-/// lowercased only when ASCII; the list's own labels are already
-/// normalized.
-fn punycodeEncode(a: std.mem.Allocator, out: *std.ArrayList(u8), label: []const u8) error{ OutOfMemory, Unencodable }!void {
-    var cps_buf: [64]u21 = undefined;
-    var n_cps: usize = 0;
-    var it = (std.unicode.Utf8View.init(label) catch return error.Unencodable).iterator();
-    while (it.nextCodepoint()) |cp| {
-        if (n_cps == cps_buf.len) return error.Unencodable;
-        cps_buf[n_cps] = if (cp < 0x80) std.ascii.toLower(@intCast(cp)) else cp;
-        n_cps += 1;
-    }
-    const cps = cps_buf[0..n_cps];
-
-    var basic: u32 = 0;
-    for (cps) |cp| if (cp < 0x80) {
-        try out.append(a, @intCast(cp));
-        basic += 1;
+    return unitext.idna.toAscii(a, rule, .{}) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidUtf8, error.TooLarge, error.InvalidDomain => error.Unencodable,
     };
-    if (basic > 0) try out.append(a, '-');
-
-    var n: u32 = 128;
-    var delta: u32 = 0;
-    var bias: u32 = 72;
-    var h = basic;
-    while (h < cps.len) {
-        var m: u32 = std.math.maxInt(u32);
-        for (cps) |cp| if (cp >= n and cp < m) {
-            m = cp;
-        };
-        delta = std.math.add(u32, delta, std.math.mul(u32, m - n, h + 1) catch return error.Unencodable) catch return error.Unencodable;
-        n = m;
-        for (cps) |cp| {
-            if (cp < n) delta = std.math.add(u32, delta, 1) catch return error.Unencodable;
-            if (cp == n) {
-                var q = delta;
-                var k: u32 = base;
-                while (true) : (k += base) {
-                    const t: u32 = if (k <= bias) tmin else if (k >= bias + tmax) tmax else k - bias;
-                    if (q < t) break;
-                    try out.append(a, digit(t + (q - t) % (base - t)));
-                    q = (q - t) / (base - t);
-                }
-                try out.append(a, digit(q));
-                bias = adapt(delta, h + 1, h == basic);
-                delta = 0;
-                h += 1;
-            }
-        }
-        delta += 1;
-        n += 1;
-    }
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-test "punycode: RFC 3492 §7.1 samples and the IDN TLD forms the list uses" {
-    const cases = [_][2][]const u8{
-        // RFC 3492 §7.1 (A) Arabic (Egyptian), (B) Chinese (simplified).
-        .{ "ليهمابتكلموشعربي؟", "egbpdaj6bu4bxfgehfvwxn" },
-        .{ "他们为什么不说中文", "ihqwcrb4cv8a8dqg056pqjye" },
-        // (L) mixed ASCII and non-ASCII, lowercased.
-        .{ "3年b組金八先生", "3b-ww4c5e180e575a65lsy2b" },
-        .{ "公司", "55qx5d" },
-        .{ "рф", "p1ai" },
-        .{ "bücher", "bcher-kva" },
-    };
-    for (cases) |c| {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(testing.allocator);
-        try punycodeEncode(testing.allocator, &out, c[0]);
-        try testing.expectEqualStrings(c[1], out.items);
-    }
-}
 
 const sample =
     \\// comment
@@ -308,28 +203,6 @@ test "parse: an empty list is the implicit * rule alone" {
     try testing.expectEqualStrings("co.uk", list.registrableDomain("a.co.uk").?);
 }
 
-test "punycode: reference vectors that exercise the bias adaptation, digit 'z', DEL and U+0080, uppercase ASCII" {
-    // Every expectation is Python's `str.encode('punycode')` (an independent
-    // RFC 3492 implementation); the inputs were picked because a one-off in
-    // `adapt`'s damp, its loop bound, `digit`'s alphabet split or the
-    // `q < t` test changes the output.
-    const cases = [_][2][]const u8{
-        .{ "\u{542e}8d\u{379}0f", "8d0f-1dd7705j" }, // digit 'z' (value 25)
-        .{ "\u{4d5}\u{442}", "r1a70a" }, // q == t
-        .{ "\u{5e4}\u{62c}\u{5df}\u{6654}\u{6ae}-\u{3c7}", "--8mb02nta47a5z6703c" }, // adapt loop bound
-        .{ "4qb\u{9779}\u{81b9}", "4qb-191i611g" }, // damp
-        .{ "a\u{80}", "a-ba" }, // U+0080 is not a basic code point
-        .{ "a\x7f\u{fc}", "a\x7f-yka" }, // DEL is
-        .{ "B\u{fc}cher", "bcher-kva" }, // ASCII lowercased inside a non-ASCII label
-    };
-    for (cases) |c| {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(testing.allocator);
-        try punycodeEncode(testing.allocator, &out, c[0]);
-        try testing.expectEqualStrings(c[1], out.items);
-    }
-}
-
 test "parse: CRLF lists, a tab ends a rule, one name as normal and wildcard, single-label exception" {
     var crlf = try PublicSuffixList.parse(testing.allocator, "uk\r\nco.uk\r\n");
     defer crlf.deinit();
@@ -352,7 +225,7 @@ test "parse: CRLF lists, a tab ends a rule, one name as normal and wildcard, sin
     try testing.expectEqualStrings("example", exc.publicSuffix("a.example"));
 }
 
-test "parse: a rule that cannot be encoded is skipped, never fatal and never guessed; 64 code points fit, 65 do not" {
+test "parse: a rule that cannot be encoded is skipped, never fatal and never guessed; a long label is kept" {
     var long64: [128]u8 = undefined;
     var long65: [130]u8 = undefined;
     for (0..65) |i| {
@@ -366,31 +239,14 @@ test "parse: a rule that cannot be encoded is skipped, never fatal and never gue
     // The invalid-UTF-8 rule is not in the list: `x.\x80.uk` is under `uk`.
     try testing.expectEqualStrings("uk", list.publicSuffix("x.\x80.uk"));
     try testing.expectEqualStrings("com", list.publicSuffix("a.com"));
-    // 64 u-umlauts are `xn--tdaaa...` and their rule is there; the 65-cp rule is not.
+    // 64 and 65 u-umlauts are `xn--tdaaa...` and both rules are there.
     const enc64 = "xn--tdaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     var host: [96]u8 = undefined;
     const h = try std.fmt.bufPrint(&host, "x.{s}.uk", .{enc64});
     try testing.expectEqualStrings(h[2..], list.publicSuffix(h));
     const enc65 = "xn--tdaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const h65 = try std.fmt.bufPrint(&host, "x.{s}.uk", .{enc65});
-    try testing.expectEqualStrings("uk", list.publicSuffix(h65));
-}
-
-test "punycode: vectors that separate damp 700 from 699, the adapt loop bound by one, and tmax by one" {
-    // Expectations are Python's `str.encode('punycode')`; each input changes
-    // its output when `adapt` divides by 699 instead of 700, loops while
-    // `delta > 456` instead of `> 455`, or `t` takes tmax one position early.
-    const cases = [_][2][]const u8{
-        .{ "\u{25d8}\u{1913}", "0ef156d" },
-        .{ "\u{b37}\u{1ebb}\u{a06}", "x8b32di24b" },
-        .{ "\u{198f}\u{2859}", "kif000e" },
-    };
-    for (cases) |c| {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(testing.allocator);
-        try punycodeEncode(testing.allocator, &out, c[0]);
-        try testing.expectEqualStrings(c[1], out.items);
-    }
+    try testing.expectEqualStrings(h65[2..], list.publicSuffix(h65));
 }
 
 test "toAscii: DEL is an ASCII byte (lowercased in place), not a reason for an xn-- form" {

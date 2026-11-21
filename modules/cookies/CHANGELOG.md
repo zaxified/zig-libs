@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — `psl.toAscii` (and so `PublicSuffixList.parse`) now punycodes the list's Unicode rules through `unitext.idna.toAscii` (UTS #46: mapping and validation) instead of a private RFC 3492 encoder; new dependency `unitext`. Behaviour change: a rule label of more than 64 code points, which the private encoder refused, is now kept (it can never match a host); a rule UTS #46 rejects is skipped as before.
+
 - **2026-11-21** — **Behaviour change:** `Jar.writeCookiesAt` (and with it `cookieJar().write_cookies`) no longer holds the jar's lock while it calls the caller's writer: the header is rendered first (stack buffer, heap copy past 2 KiB) and written after unlocking, so a slow socket no longer stalls other threads; the cookies' `used` time is now stamped when the header is rendered, not as each is written. Only if the heap copy cannot be allocated does the writer still run under the lock, as before.
 
 - **2026-11-21** — **Added:** `Jar.saveNetscapeAt`/`saveNetscape`, `Jar.loadNetscapeAt`/`loadNetscape` and `Jar.netscape_header`: persistence of the non-session cookies in the Netscape `cookies.txt` format (curl, wget, Python `MozillaCookieJar`; `#HttpOnly_` lines). A loaded line is stored through the same checks as a `Set-Cookie` from its host. Additive.

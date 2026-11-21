@@ -27,7 +27,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .threadsafe, // `Jar` locks itself; the parser and builder have no state
     .model_after = "RFC 6265 (HTTP State Management Mechanism)",
-    .deps = .{ "http", "aesgcm", "datefmt" }, // datefmt: the civil calendar under cookie-date
+    .deps = .{ "http", "aesgcm", "datefmt", "unitext" }, // datefmt: the civil calendar under cookie-date; unitext: IDNA for the list's Unicode rules
 };
 
 /// The Public Suffix List algorithm, over a list the caller loads (`psl.zig`).

@@ -200,7 +200,7 @@ pub const module_list = [_]Module{
     .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "requestid", .libs = &.{"web"}, .deps = &.{ "router", "http", "clock" } },
     .{ .name = "linkheader", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
-    .{ .name = "cookies", .libs = &.{"format"}, .deps = &.{ "http", "aesgcm", "datefmt" }, .test_deps = &.{"testkit"} },
+    .{ .name = "cookies", .libs = &.{"format"}, .deps = &.{ "http", "aesgcm", "datefmt", "unitext" }, .test_deps = &.{"testkit"} },
     .{ .name = "idempotency", .libs = &.{"web"}, .deps = &.{ "router", "http", "ramcache", "kv", "clock" } },
     .{ .name = "webhooksig", .libs = &.{"web"}, .deps = &.{ "router", "http", "b64ct" }, .test_deps = &.{"testkit"} },
     .{ .name = "tracecontext", .libs = &.{"web"}, .deps = &.{ "router", "http", "clock" }, .test_deps = &.{"testkit"} },

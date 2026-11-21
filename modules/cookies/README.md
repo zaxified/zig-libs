@@ -106,12 +106,12 @@ var client = http.Client.init(io, gpa, .{ .cookie_jar = jar.cookieJar() });
 ## Not provided
 
 No server-side jar with delta tracking, no `Set-Cookie2`, no `SameSite`
-enforcement or partitioned storage in the client jar, no jar persistence, no
-bundled Public Suffix List, no IDNA mapping. See SPEC *What is deliberately not
+enforcement or partitioned storage in the client jar, no
+bundled Public Suffix List. See SPEC *What is deliberately not
 done* and *Backlog / deferred*.
 
 - **Role:** codec. **Platform:** any. **Deps:** `http`
-  (the `get`/`set` helpers), `aesgcm` (`private` values), `datefmt` (the civil calendar under cookie-date); the parser + builder are std-only logic.
+  (the `get`/`set` helpers), `aesgcm` (`private` values), `datefmt` (the civil calendar under cookie-date), `unitext` (IDNA for the list's Unicode rules); the parser + builder are std-only logic.
   **Concurrency:** threadsafe — `Jar` locks itself; the parser and the
   builder have no state and borrow their input.
 
