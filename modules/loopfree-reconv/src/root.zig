@@ -67,6 +67,20 @@ pub const naiveBadOrder = fib_mod.naiveBadOrder;
 pub const computeUpdateOrder = fib_mod.computeUpdateOrder;
 pub const changedNodes = fib_mod.changedNodes;
 
+const schedule = @import("schedule.zig");
+/// Per-node ranks (a node derives its own delay from the old and new trees).
+pub const RankTable = schedule.RankTable;
+pub const Rank = schedule.Rank;
+/// ECMP next-hop sets and their ordering.
+pub const Ecmp = schedule.Ecmp;
+pub const changedNodesEcmp = schedule.changedNodesEcmp;
+pub const computeUpdateOrderEcmp = schedule.computeUpdateOrderEcmp;
+/// Several destinations merged into one rank-sorted timeline.
+pub const TreePair = schedule.TreePair;
+pub const DestUpdate = schedule.DestUpdate;
+pub const BatchError = schedule.BatchError;
+pub const computeBatch = schedule.computeBatch;
+
 const fabric_mod = @import("fabric.zig");
 pub const Fabric = fabric_mod.Fabric;
 pub const Mode = fabric_mod.Mode;
@@ -191,6 +205,7 @@ test {
     _ = netsim;
     _ = spf;
     _ = @import("fib.zig");
+    _ = @import("schedule.zig");
     _ = @import("fabric.zig");
     _ = @import("harness.zig");
 }

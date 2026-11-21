@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — Per-node ranks (`RankTable`, `delayOf` = rank * max_fib, RFC 6976
+  section 4 timer form), ECMP next-hop sets (`Ecmp`, `computeUpdateOrderEcmp`) and
+  multi-destination batching (`computeBatch`, `DestUpdate`, `TreePair`). Additive;
+  `fib.UpdateOrderCtx` is now `pub` (not re-exported).
+
 - **2026-10-05** — Mutation run: 28 of 32 killed, 4 equivalent; 3 tests added and one
   extended (equal-distance shift is class B and intra-class ties ascend by id; a moved
   distance with an unmoved next hop is not changed; frame-slot reuse, short payload,

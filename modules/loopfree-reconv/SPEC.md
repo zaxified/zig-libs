@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [holo-routing/holo](https://github.com/holo-routing/holo) `holo-isis` | Rust | MIT (LICENSE file) | 541 | v0.9.0 (2026-02-21) | No oFIB found *(inferred from the README RFC list, which does not mention RFC 6976/5715)*. |
 | RFC 5715 (framework for loop-free convergence) / RFC 7490 (remote LFA) | spec | n/a | — | RFC 5715 (2010), RFC 7490 (2015) | Alternative families (SPF-based ordering vs repair paths); no open-source library implements them as a reusable component *(inferred)*. |
 
-**Where we are ahead:** the only reusable, tested implementation of an ordered-FIB schedule found: `computeUpdateOrder` takes any (old, new) tree pair (not only single-failure deltas), returns a proven-loop-free permutation, and is verified data-plane-side by real frames in `netsim` across 5000 fuzzed seeds with a positive control and a shrinker. **Where we are behind:** the output is a *global* ordering computed by an omniscient conductor; the RFC's point is that each router derives its own delay locally — `rg -i 'delay|timer' loopfree-reconv/src/fib.zig` is empty, so there is no per-node delay derivation; one destination per call and one topology change at a time (multi-destination and per-prefix interaction out of scope); no ECMP; the control-plane propagation model is a scaffold; RPF-acceptance variant absent (SPEC Backlog).
+**Where we are ahead:** the only reusable, tested implementation of an ordered-FIB schedule found: `computeUpdateOrder` takes any (old, new) tree pair (not only single-failure deltas), returns a proven-loop-free permutation, and is verified data-plane-side by real frames in `netsim` across 5000 fuzzed seeds with a positive control and a shrinker. **Where we are behind:** the control-plane propagation model is a scaffold (topology changes reach the conductor instantly); one topology change at a time per destination; the RPF-acceptance variant is absent (see *Threat model / out of scope*). Per-node delay derivation, ECMP sets and multi-destination batching are implemented (*Per-node rank*, *ECMP*, *Multi-destination batching*). RFC 6976 section 4 derives the rank as a hop depth in the reverse SPT of the failed link for single events; this module derives it from distances for arbitrary tree pairs, which is the form the proof covers.
 
 ## The problem
 
@@ -121,6 +121,33 @@ individually prefix-safe transitions stays loop-free no matter how tightly the
 events bunch. (Minimal case: seed 464, `link_down 0-1 @ t=894` superseded 46
 ticks later by `link_up 0-1 @ t=940`, which a non-serializing conductor loops.)
 
+**Per-node rank (`schedule.zig` `RankTable`).** The global order needs no conductor
+once every node can compute it: a node that holds the old and the new LSDB runs both
+SPFs and builds the same `RankTable`. The rank is the order's dense level: class A
+ranks `0..a-1` by distinct ascending new distance, class B ranks `a..` by distinct
+descending old distance; nodes whose key is equal share a rank (the proof allows any
+order inside a tie). A node reprograms at `hold-down + rank * max_fib` (`delayOf`), the
+RFC 6976 section 4 timer form (`T0 + H + rank * MAX_FIB`). A node whose forwarding did
+not change has no rank. Sorting by (rank, id) reproduces `computeUpdateOrder`, and the
+brute-force test also checks the order reversed inside every rank.
+
+**ECMP (`Ecmp`, `computeUpdateOrderEcmp`).** Forwarding is a next-hop SET per node: every
+neighbour `u` with `dist[u] + w(u, v) == dist[v]`. A node is changed when its set
+differs. The cycle argument of `computeUpdateOrder` uses only that each forwarding edge
+strictly decreases the distance of its own tree (weights >= 1), which every member of
+an ECMP set does, and that a run switches between old and new edges only at a changed
+node; so the same classes and keys order set changes, and the forwarding graph (the
+union of old sets for unswitched nodes and new sets for switched ones) is acyclic at
+every prefix. RFC 6976 section 4.1 takes the maximum depth over the ECMP path set for the
+rank; the distance rank is a level of the whole set and needs no such maximum.
+
+**Multi-destination batching (`computeBatch`).** A FIB entry is per destination and
+installed independently, so the unit of a batch is a (destination, node) update. The
+per-destination ranks merge into one timeline sorted by (rank, destination, node): each
+destination's subsequence is its own `computeUpdateOrder`, hence loop-free at every
+prefix, and the batch takes the largest per-destination round count instead of their
+sum. RFC 6976 defines no per-destination ordering beyond the common root of one event.
+
 **Scaffold simplifications (deliberate, orthogonal to the ordering).** Topology
 changes are made instantly and consistently visible to the conductor via a
 pre-generated fault schedule (`harness.zig` + `Fabric.setSchedule`) rather than
@@ -135,12 +162,13 @@ positive control exercises.
 Not a security boundary; the "adversary" is timing. Guarantees no transient
 forwarding loop for a single destination across a sequence of link up/down
 events on a fixed-topology ring, under the modeling assumptions above. Out of
-scope: multi-destination / per-prefix scheduling interactions, the LSA-flood /
-hold-timer control-plane propagation model, node crash and network partition
+scope: the LSA-flood / hold-timer control-plane propagation model (RFC 6976 itself
+is signalling-free: the per-node rank and timers above replace it), node crash and network partition
 faults (spf-ect's `Graph` has no partition concept), weighted-ECMP load
 distribution during transition, and the RPF-acceptance dual (the module returns
 an apply *ordering*, not an epoch-tagged acceptance predicate, though the two
-are equivalent — see `fib.zig`).
+are equivalent — see `fib.zig`). The RPF variant is not in RFC 6976, the
+reference, and no surveyed open implementation has it, so it stays out.
 
 ## Verification
 
@@ -158,6 +186,11 @@ are equivalent — see `fib.zig`).
   plus the serializing conductor, finds no forwarding loop.
 - unit tests for `changedNodes`, `naiveBadOrder`, `buildGraph`/`applyInitialFib`,
   and `applyTopologyChange` scheduling.
+- **rank and ECMP** — brute force over 400 random graph pairs (mixed classes, many
+  ties): every prefix of the single-hop, ECMP and rank-reshuffled orders has no cycle
+  in the forwarding graph; `Ecmp` contains the tree's predecessor.
+- **batch** — each destination's subsequence equals its `computeUpdateOrder`; the batch
+  has the maximum round count; mismatched roots are refused.
 - **Mutation tests** pin: an equal-distance shift is class B; ties break by ascending
   id in both classes; a moved distance with an unmoved next hop is not "changed";
   a reused frame slot; the 3-octet payload and unminted conductor-id guards; `reset`
@@ -167,12 +200,7 @@ are equivalent — see `fib.zig`).
 
 ## Backlog / deferred
 
-- RPF-acceptance variant (epoch-tagged forwarding predicate) as an alternative
-  to the explicit apply ordering.
-- Multi-destination scheduling and the control-plane propagation model, if this
-  graduates from a property-test jewel into a fabric component.
-- **Per-node delay/rank derivation** (a node computes its own position from its old/new distance, no global list). Why: that is how oFIB is deployed in a distributed IGP; the global order alone needs a conductor real networks do not have. Effort: ~2 days. Fits §2: yes.
-- **Multi-destination batching and ECMP-aware ordering.** Why: an IGP recomputes all destinations per event; per-call single tree makes callers loop and lose cross-destination interaction. Effort: ~1 week. Fits §2: yes.
+None.
 
 ## Anchoring
 

@@ -201,7 +201,7 @@ pub fn computeUpdateOrder(gpa: Allocator, old_tree: *const Tree, new_tree: *cons
 
 /// Sort context for `computeUpdateOrder` — see the ordering rules documented
 /// there. Total, deterministic (final key = node id), allocation-free.
-const UpdateOrderCtx = struct {
+pub const UpdateOrderCtx = struct {
     old_dist: []const spf.Distance,
     new_dist: []const spf.Distance,
 
@@ -209,11 +209,11 @@ const UpdateOrderCtx = struct {
     /// destination, newly-reachable included (`old_dist` is the
     /// `unreachable_dist` sentinel, i.e. +inf, so any finite `new_dist`
     /// classifies as a decrease).
-    fn migratesEarly(self: UpdateOrderCtx, n: NodeId) bool {
+    pub fn migratesEarly(self: UpdateOrderCtx, n: NodeId) bool {
         return self.new_dist[n] < self.old_dist[n];
     }
 
-    fn lessThan(self: UpdateOrderCtx, a: NodeId, b: NodeId) bool {
+    pub fn lessThan(self: UpdateOrderCtx, a: NodeId, b: NodeId) bool {
         const a_early = self.migratesEarly(a);
         const b_early = self.migratesEarly(b);
         if (a_early != b_early) return a_early; // all of class A before all of class B

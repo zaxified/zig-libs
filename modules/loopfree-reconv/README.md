@@ -34,6 +34,13 @@ defer gpa.free(order);
 - `naiveBadOrder(gpa, old_tree, new_tree) ![]NodeId` — the deliberately-WRONG
   "apply all FIBs instantly" baseline (changed set, ascending id). Used only
   as the positive control that proves the loop checker has teeth.
+- `RankTable.init(gpa, old, new)` — the per-node form: `rankOf(n)` / `delayOf(n,
+  max_fib)` give a node its own position (RFC 6976 section 4 timer form), computed
+  by the node from the two trees; equal-key nodes share a rank.
+- `Ecmp.fromTree` / `computeUpdateOrderEcmp` / `RankTable.initEcmp` — the same order
+  over next-hop SETS (ECMP).
+- `computeBatch(gpa, pairs)` — several destinations merged into one rank-sorted
+  timeline of (dest, node, rank) updates.
 - `Fabric` / `Mode` / `scenario` — a `netsim.Protocol` consumer (a 4-node ring
   with a per-node FIB and a hop-by-hop frame forwarder) whose **conductor**
   drives topology changes through the chosen ordering and *serializes*
@@ -56,7 +63,7 @@ source consulted or copied.
 
 ## Not provided
 
-Multi-destination scheduling, ECMP, per-node delay derivation and the control-plane propagation model; see `SPEC.md` *Backlog / deferred* and *Threat model / out of scope*.
+The control-plane propagation model and the RPF-acceptance variant; see `SPEC.md` *Backlog / deferred* and *Threat model / out of scope*.
 
 ## Verification
 
