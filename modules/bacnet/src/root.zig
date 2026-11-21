@@ -102,6 +102,9 @@ pub const npdu = @import("npdu.zig");
 pub const apdu = @import("apdu.zig");
 /// Clause 15/16 services.
 pub const service = @import("service.zig");
+/// Clause 13 alarm and event services: event notifications,
+/// `AcknowledgeAlarm`, `GetEventInformation`, `GetAlarmSummary`.
+pub const events = @import("events.zig");
 /// The datagram seam and its adapters.
 pub const transport = @import("transport.zig");
 /// A BACnet/IP client.
@@ -197,6 +200,7 @@ test {
     _ = npdu;
     _ = apdu;
     _ = service;
+    _ = events;
     _ = transport;
     _ = client;
     _ = device;
