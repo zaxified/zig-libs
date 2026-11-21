@@ -21,6 +21,9 @@ const Stub = struct {
     /// Per query served: the length of its COOKIE option data (0: none) and the client cookie.
     /// Queries received (before any delay), the address answered with, a delay before answering.
     seen: usize = 0,
+    /// The question name of the last query (wire form, up to 63 bytes) and its length.
+    last_q: [64]u8 = undefined,
+    last_q_len: usize = 0,
     ip: [4]u8 = .{ 192, 0, 2, 1 },
     delay_ms: i64 = 0,
     cookie_len: [4]usize = @splat(0),
@@ -39,6 +42,10 @@ const Stub = struct {
         const incoming = try st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io));
         const q = incoming.data;
         st.seen += 1;
+        var name_end: usize = message.header_len;
+        while (name_end < q.len and q[name_end] != 0) name_end += @as(usize, q[name_end]) + 1;
+        st.last_q_len = @min(st.last_q.len, name_end + 1 - message.header_len);
+        @memcpy(st.last_q[0..st.last_q_len], q[message.header_len..][0..st.last_q_len]);
         if (st.mode == .silent) {
             st.served += 1;
             return;
@@ -463,4 +470,35 @@ test "server metrics: per-server queries, replies, rcode failures, timeouts and 
     var q = resolver(io, &one_server, 1);
     defer q.deinit();
     try testing.expectEqual(@as(usize, 0), q.serverStats(&none));
+}
+
+test "idna: a non-ASCII name goes out as A-labels, an invalid one is BadName, off by default" {
+    if (comptime !Resolver.idna_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var stub = try bindStub(io, .{ 127, 0, 0, 1 }, 0, .answer, 4);
+    defer stub.sock.close(io);
+    var fut = try io.concurrent(Stub.run, .{&stub});
+    defer fut.cancel(io);
+    var r = resolver(io, &one_server, stub.sock.address.getPort());
+    defer r.deinit();
+    r.options.family = .v4;
+    // Off: the UTF-8 bytes go out as they are.
+    var raw = try r.lookupIp("b\u{fc}cher.example");
+    raw.deinit();
+    try testing.expectEqualSlices(u8, "\x07b\xc3\xbccher\x07example\x00", stub.last_q[0..stub.last_q_len]);
+    r.options.idna = .{};
+    var l = try r.lookupIp("B\u{dc}CHER.example");
+    l.deinit();
+    try testing.expectEqualSlices(u8, "\x0dxn--bcher-kva\x07example\x00", stub.last_q[0..stub.last_q_len]);
+    var m = try r.query("\u{4f8b}\u{3048}.example", .a);
+    m.deinit();
+    try testing.expectEqualSlices(u8, "\x0bxn--r8jz45g\x07example\x00", stub.last_q[0..stub.last_q_len]);
+    try testing.expectError(error.BadName, r.lookupIp("\u{301}x.example")); // starts with a combining mark
+    try testing.expectError(error.BadName, r.lookupIp("a\xffb.example")); // not UTF-8
+    // An ASCII name is never altered, even one UTS #46 would map.
+    var up = try r.lookupIp("Example.COM");
+    up.deinit();
+    try testing.expectEqualSlices(u8, "\x07Example\x03COM\x00", stub.last_q[0..stub.last_q_len]);
 }

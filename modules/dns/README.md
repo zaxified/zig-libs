@@ -10,7 +10,7 @@ update under RFC 8945 TSIG (what `nsupdate` does).
 - **Model after:** Go `net` dnsclient + `miekg/dns` (message codec) / c-ares;
   RFC 1035 (wire format), RFC 8484 (DoH).
 - **Deps:** `netaddr` (address parse/format, reverse-name construction,
-  RFC 6724 result ordering), `http` (DoH transport), `tlsclient` (DoT), `b64ct` (TSIG secrets), `std.json` (DoH-JSON),
+  RFC 6724 result ordering), `http` (DoH transport), `tlsclient` (DoT), `b64ct` (TSIG secrets), `unitext` (IDNA, behind `-Ddns-idna`), `std.json` (DoH-JSON),
   `std.Io.net` (UDP/TCP).
 
 Provenance: clean-room from RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV)
@@ -188,6 +188,9 @@ everything it returns lives in `arena`.
   wins), `parallel_servers = 2` (ask that many servers at once, first usable reply wins; needs a thread-tolerant allocator),
   `filter_addresses = &dns.Resolver.private_ranges` (drop private addresses from `lookupIp`, Unbound `private-address`) and
   `server_metrics = true` with `Resolver.serverStats` (queries, replies, timeouts, round-trip time per server).
+- `idna = .{}` (UTS #46 through `unitext.idna`: a name with non-ASCII bytes is asked in A-label form, an invalid one is
+  `BadName`; off by default; `-Ddns-idna=false`, the default under `-Dprofile=small`, leaves `unitext` out and the field
+  unsettable).
 - EDNS(0) advertises a 1232-byte UDP payload by default (DNS flag day 2020);
   set `edns_udp_size = null` for plain RFC 1035 queries.
 - DoH uses query id 0 (RFC 8484 §4.1 cache friendliness).
@@ -247,6 +250,6 @@ network) and `zig build live-dns` (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of
 ## Not provided
 
 DNSSEC validation (the sibling `dnssec` module; `authenticated` is a trusted
-upstream's AD bit), IDNA, per-record TTLs on each address (`Lookup.detail` has the two families'), server failover memory, DNS cookie
+upstream's AD bit), per-record TTLs on each address (`Lookup.detail` has the two families'), server failover memory, DNS cookie
 state, DoT connection reuse and RFC 8467 padding, DoQ / DoH3. See
 `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.

@@ -44,7 +44,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .blocking, // every lookup blocks; one owner per Resolver
     .model_after = "Go net dnsclient + miekg/dns (codec, update, TSIG) / c-ares; RFC 1035/2782/8659 (wire), RFC 8484 (DoH), RFC 2136/8945 (update, TSIG)",
-    .deps = .{ "netaddr", "http", "tlsclient", "b64ct" }, // b64ct: TSIG secrets (constant time); tlsclient: DoT (RFC 7858), behind -Ddns-dot; also uses std.json, std.Io.net
+    .deps = .{ "netaddr", "http", "tlsclient", "b64ct", "unitext" }, // b64ct: TSIG secrets (constant time); tlsclient: DoT (RFC 7858), behind -Ddns-dot; unitext: IDNA (UTS #46), behind -Ddns-idna; also uses std.json, std.Io.net
 };
 
 /// Pure wire codec (encode query / decode response) — no I/O.

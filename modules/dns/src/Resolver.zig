@@ -62,6 +62,17 @@ pub const dot_enabled: bool = zl_options.dns_dot orelse switch (zl_options.profi
     .small => false,
 };
 const tlsclient = if (dot_enabled) @import("tlsclient") else void;
+
+/// Whether IDNA is compiled in: `-Ddns-idna`, default `true`, `false` under
+/// `-Dprofile=small`. Without it `unitext` is not in the binary and
+/// `Options.idna` cannot be set (its type has no value but null).
+pub const idna_enabled: bool = zl_options.dns_idna orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
+const unitext = if (idna_enabled) @import("unitext") else void;
+/// `Options.idna`: the UTS #46 flags (`unitext.idna.Options`).
+pub const IdnaOptions = if (idna_enabled) unitext.idna.Options else noreturn;
 /// The system CA store for DoT's strict verification, loaded on first use.
 const DotCa = if (dot_enabled) http.Client.CaBundle else void;
 
@@ -381,6 +392,16 @@ pub const Options = struct {
     /// rebinding-protection list. Does not touch `query`, `reverse` or
     /// /etc/hosts.
     filter_addresses: []const netaddr.Prefix = &.{},
+    /// IDNA (UTS #46; dnspython, browsers and curl do it, Go, c-ares and hickory
+    /// leave it to the caller): a name with a non-ASCII byte is converted with
+    /// `unitext.idna.toAscii` (these flags; `.{}` = the WHATWG defaults) before
+    /// anything else, so `bücher.example` is asked as `xn--bcher-kva.example`;
+    /// an invalid one is `error.BadName`. ASCII names pass unchanged, so a
+    /// name already in A-label form is never altered. The names a lookup
+    /// returns (`canonical`, MX / SRV / NS hosts) are as the servers sent
+    /// them: A-labels; `unitext.idna.toUnicode` shows them. Null (the default)
+    /// leaves names alone. Not applied to `exchange`. Build knob `-Ddns-idna`.
+    idna: ?IdnaOptions = null,
     /// Per-server counters (`Resolver.serverStats`): queries, replies,
     /// timeouts, errors, rcode failures and round-trip time per server (hickory
     /// keeps the same per name server). Costs one mutex per asked server.
@@ -530,9 +551,11 @@ pub fn deinit(r: *Resolver) void {
 /// response (so the caller can inspect the rcode — NXDOMAIN is a valid
 /// answer, not an error). Does NOT consult /etc/hosts — use `lookupIp` for
 /// getaddrinfo-like behavior. Caller owns the message (`Message.deinit`).
-pub fn resolve(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Message {
+pub fn resolve(r: *Resolver, name_in: []const u8, ty: message.Type) Error!message.Message {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
+    var ascii_buf: [message.max_name_text_len]u8 = undefined;
+    const name = try r.asciiName(name_in, &ascii_buf);
     // RFC 7686 / 6761: `.onion` and `.invalid` never leave the host (a Tor
     // name leaked to the resolver). `query`, the raw primitive, does not
     // filter.
@@ -735,9 +758,11 @@ fn localLookup(comptime T: type, gpa: std.mem.Allocator, items: []const T) error
 /// while the other answers is tolerated and marked `partial`. A `.onion` /
 /// `.invalid` name not in /etc/hosts is NXDOMAIN without a query (RFC 7686,
 /// RFC 6761). Free with `deinit`.
-pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
+pub fn lookupIp(r: *Resolver, name_in: []const u8) Error!Lookup(netaddr.Ip) {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
+    var ascii_buf: [message.max_name_text_len]u8 = undefined;
+    const name = try r.asciiName(name_in, &ascii_buf);
 
     if (netaddr.parseIp(name)) |ip| {
         // A literal of the other family than `Options.family` asks for: none.
@@ -1106,7 +1131,9 @@ const Decisive = enum {
 /// `isAnswerRcode`) with no decisive reply anywhere is `error.ServerFailed`
 /// (an outage, not "no such name"), as in `lookupIp`. Every candidate empty:
 /// no message, the tally of all of them.
-fn resolveNamed(r: *Resolver, name: []const u8, ty: message.Type, buf: *[message.max_name_text_len]u8, decisive: Decisive) Error!Answered {
+fn resolveNamed(r: *Resolver, name_in: []const u8, ty: message.Type, buf: *[message.max_name_text_len]u8, decisive: Decisive) Error!Answered {
+    var ascii_buf: [message.max_name_text_len]u8 = undefined;
+    const name = try r.asciiName(name_in, &ascii_buf);
     if (config.isDnsAvoided(name)) return error.BadName;
     var search: []const []const u8 = &.{};
     var ndots: u8 = 1;
@@ -1406,6 +1433,26 @@ fn namesEqual(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(stripRootDot(a), stripRootDot(b));
 }
 
+/// `Options.idna`: `name` as ASCII, in `buf` when it had to be converted.
+fn asciiName(r: *const Resolver, name: []const u8, buf: *[message.max_name_text_len]u8) Error![]const u8 {
+    if (!idna_enabled) return name;
+    const io = r.options.idna orelse return name;
+    var ascii = true;
+    for (name) |b| if (b >= 0x80) {
+        ascii = false;
+        break;
+    };
+    if (ascii) return name;
+    const out = unitext.idna.toAscii(r.gpa, name, io) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidUtf8, error.InvalidDomain, error.TooLarge => return error.BadName,
+    };
+    defer r.gpa.free(out);
+    if (out.len > buf.len) return error.NameTooLong;
+    @memcpy(buf[0..out.len], out);
+    return buf[0..out.len];
+}
+
 fn stripRootDot(name: []const u8) []const u8 {
     return if (name.len > 1 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
 }
@@ -1476,10 +1523,12 @@ fn collectAddresses(a: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), msg:
 /// round, as glibc does (`testdata/config_oracle.zig` `rcodes`). If every
 /// server fails that way, the last such reply is returned, so the caller can
 /// still read its rcode. Any other rcode, NXDOMAIN included, is final.
-pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Message {
+pub fn query(r: *Resolver, name_in: []const u8, ty: message.Type) Error!message.Message {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
     var qbuf: [message.max_query_len]u8 = undefined;
+    var ascii_buf: [message.max_name_text_len]u8 = undefined;
+    const name = try r.asciiName(name_in, &ascii_buf);
 
     if (r.options.doh_url != null) {
         // Built without DoH: refuse, never quietly ask plain DNS instead.

@@ -55,7 +55,6 @@ cache with request coalescing, prefetch and serve-stale (`CachingResolver`) and 
 - **No callback- or poll-driven event-loop interface** (c-ares `ares_process_fd`, a `Future` per query on a runtime the
   caller already runs): in Zig that runtime is the `Io` itself, so there is no separate loop to integrate with. A plain
   `Resolver` stays single-owner and blocking, as Go's is; many lookups in flight go through `CachingResolver`.
-- **No IDNA** (dnspython encodes U-labels; Go, c-ares, hickory leave it to the caller). Backlog.
 - **No per-address TTL** (c-ares `ai_ttl`, Node `{ttl: true}`): RFC 2181 §5.2 makes it one value per RRset; `lookupIp` reports the two families' TTLs in `Lookup.detail`, `resolve` every record's. Not done on purpose.
 - **No DoQ/DoH3**: no QUIC stack in the collection. Backlog.
 - **DNSSEC validation** lives in the sibling `dnssec` module and is not wired into the resolver (unbound, hickory
@@ -145,6 +144,14 @@ that the parallel A/AAAA copy shares under a mutex; a `CachingResolver` therefor
   failures, timeouts, other errors and the round-trip time (last, mean); the 16 most recent servers are kept. A "query" is one ask of
   one server with its follow-ups (TCP on truncation, plain form, BADCOOKIE repeat). A `CachingResolver` keeps one set per pooled
   `Resolver` and exposes none.
+
+**IDNA (`Options.idna`).** dnspython encodes U-labels, curl and every browser do UTS #46 on a host name, Go, c-ares and
+hickory leave it to the caller; the module offers it as an opt-in (`idna: ?unitext.idna.Options`, null = names untouched, `.{}` =
+the WHATWG defaults, `unitext.idna.Options.std3()` strict). A name with a byte >= 0x80 goes through `unitext.idna.toAscii` at the
+top of `lookupIp`, `resolve`, the typed lookups and `query` (so the search list, the owner-chain checks and the cache key all see
+the A-label form), a refusal is `error.BadName`. An all-ASCII name is passed as given, so an A-label or a name UTS #46 would case-map is
+never altered (the wire is case-insensitive anyway). Returned names (`canonical`, MX/NS/SRV hosts) are as the servers sent them, in
+A-label form; `unitext.idna.toUnicode` is the way back. UTS #46 conformance itself is `unitext`'s (`IdnaTestV2.txt`).
 
 **Typed rdata.** `rdata.zig` gives typed views of TLSA, SSHFP, URI, NAPTR and SVCB/HTTPS rdata
 (`rdata.parse(T, arena, rec)` over `Record.data.unknown`); there is no new `Record.Data` variant, so the sibling `dnssec`
@@ -402,6 +409,7 @@ Consumer build options (CONVENTIONS §4.2), for a consumer that wants hop names 
 |---|---|---|---|
 | `dns-doh` | `true` / `false` | `true` (graded) | `false` |
 | `dns-dot` | `true` / `false` | `true` (graded) | `false` |
+| `dns-idna` | `true` / `false` | `true` (graded) | `false` |
 
 - **`false`:** `Resolver.doh_enabled` is false; `Resolver.http_client` is `?void`, so nothing of
   the `http` module (and the TLS/x509/RSA/EC stack behind `http.Client`) is analysed or linked.
@@ -414,6 +422,10 @@ Consumer build options (CONVENTIONS §4.2), for a consumer that wants hop names 
   the network-monitor consumer (ReleaseSafe, not stripped): 17.5 MB with DoH vs 5.5 MB before it used `dns`.
 - **What the consumer loses:** DoH (RFC 8484 wire and DoH-JSON). UDP/TCP, `/etc/hosts`,
   resolv.conf, `update`/TSIG are unaffected.
+- **`dns-idna=false`**: `Resolver.idna_enabled` is false, `unitext` is not analysed and `Options.idna` has the type
+  `?noreturn`, so a consumer that sets it fails to compile instead of silently resolving the raw bytes. The mapping
+  and Punycode tables are about 230 KB of source plus `unitext`'s normalization tables; none of it is linked unless
+  `Options.idna` code is reachable, which in a default build it always is (the field is runtime-optional), hence the knob.
 - **`dns-dot=false`**: `Resolver.dot_enabled` is false and `tlsclient` is not analysed;
   `transport = .tls` is refused with `error.NoDotSupport` on `query`/`exchange` -- never plain DNS
   instead. Size probe at `-Dprofile=small` (both off): 177 592 → 177 776 B (+184 B for the
@@ -430,8 +442,6 @@ Consumer build options (CONVENTIONS §4.2), for a consumer that wants hop names 
 
 ## Backlog / deferred
 
-- **IDNA (UTS #46 / RFC 5891) name encoding**: dnspython encodes U-labels; Go, c-ares and hickory leave it to the caller,
-  as this module does. Needs Unicode mapping tables (a sibling module's job, not the resolver's).
 - **DoQ / DoH3**: need a QUIC stack the collection does not have.
 
 ## Anchoring

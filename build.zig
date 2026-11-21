@@ -184,7 +184,7 @@ pub const module_list = [_]Module{
     .{ .name = "lzma", .libs = &.{"format"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "lz4", .libs = &.{ "format", "storage" }, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "zstd", .libs = &.{ "format", "storage", "web" }, .test_deps = &.{"testkit"}, .heavy = true },
-    .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http", "tlsclient", "b64ct" }, .test_deps = &.{ "testkit", "tlsserver" }, .loopback = true },
+    .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http", "tlsclient", "b64ct", "unitext" }, .test_deps = &.{ "testkit", "tlsserver" }, .loopback = true },
     .{ .name = "ramcache", .libs = &.{ "storage", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "router", .libs = &.{"web"}, .deps = &.{ "http", "regex" }, .timing = true, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
@@ -630,6 +630,11 @@ pub fn build(b: *std.Build) void {
         bool,
         "dns-dot",
         "dns: DNS over TLS in Resolver (default true; profile=small false = no tlsclient in the binary, transport .tls is refused)",
+    ));
+    zl_options.addOption(?bool, "dns_idna", b.option(
+        bool,
+        "dns-idna",
+        "dns: IDNA (UTS #46) names in Resolver via unitext (default true; profile=small false = no unitext tables in the binary, Options.idna cannot be set)",
     ));
     zl_options.addOption(?bool, "zipstream_builtin_decoders", b.option(
         bool,
