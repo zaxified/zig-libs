@@ -170,8 +170,13 @@ Every gap, with its verdict:
   selecting nothing is a legitimate answer. Not affected: column keys (still null on a missing key) and
   `parseDocument` / `query`, which already return what they select. A path can be proved well-formed
   first with `compile`.
-- **Declared `.list` / `.struct` columns are refused** (`error.UnsupportedColumnType`): `shape` builds
-  scalar cells only (`.categorical` is stored encoded, `.duration` parses like `.timestamp`); see *Backlog / deferred*.
+- **Declared `.list` / `.struct` columns** hold the nodes that are arrays / objects: each node is
+  written out as JSON text and the column decoded with `dataframe.jsonDecode`, so the element type and the
+  fields are inferred over all rows exactly as `readNdjson` infers them (polars' `str.json_decode`), a node of
+  another kind or a missing key is null, an empty array is an empty list. The text costs work (1 per 8 bytes,
+  charged after the node is written out). A decoder limit (columns, cells, cell bytes) is `WorkLimit`. `.array`
+  is `error.UnsupportedColumnType` (it needs a fixed width the spec cannot carry). Other scalar columns are
+  built cell by cell (`.categorical` is stored encoded, `.duration` parses like `.timestamp`).
 - **Concurrency:** reentrant, no shared state; pure logic, no I/O of its own.
 - **Boundary with `dataframe.readJson`.** `dataframe` reads a whole document of
   records, columns or ndjson into a frame and builds list and struct columns from the nested
@@ -263,10 +268,7 @@ pattern precompiled here against a compile per node on the foreign sides, a desi
 
 ## Backlog / deferred
 
-- **Declared `.list` / `.struct` columns** (`error.UnsupportedColumnType` today). `dataframe` exports no way
-  to turn a parsed `std.json.Value` into a nested cell (its JSON reader works on bytes). Wanted: a nested-cell
-  builder from a JSON value in `dataframe`.
-- **Speed: `eval_filter` against serde_json_path.** The one like-with-like row over 1.25× the fastest (see the
+- **Speed: `eval_filter` against serde_json_path** — BOUNCED to the quiet-host phase (a speedup claim needs numbers a loaded host cannot give). The one like-with-like row over 1.25× the fastest (see the
   card's Performance line). A singular query in a comparison builds a sub-`Ctx` and walks through `evalSegs`; a
   direct walk for singular queries is the first thing to try, keeping the work charges the sweep tests pin.
 - **The card's one unexplained mutation survivor** (from the first whole-module run, which did not record which

@@ -74,8 +74,8 @@ pub const Error = error{
 
 /// What `shape` returns: `Error`, and a refusal that only a column list can cause.
 pub const ShapeError = Error || error{
-    /// A declared column is `.list` or `.@"struct"`: `shape` builds scalar cells only
-    /// (SPEC § Backlog). Checked before any cell is read.
+    /// A declared column is `.array` (a fixed width the spec cannot carry). Checked before
+    /// any cell is read.
     UnsupportedColumnType,
     /// `ShapeSpec.strict` only. The path text is not a well-formed path (the
     /// engine otherwise degrades it to no rows).
@@ -225,7 +225,11 @@ fn checkNodes(bytes: []const u8, max: u64) Error!void {
 /// The result is a `dataframe.Frame`: one typed array per column, text copied (nothing
 /// borrows the JSON tree, though the tree still sits in `a`), a declared column whose
 /// cells come out of more than one kind boxed, a `.categorical` column stored encoded.
-/// A `.list` or `.@"struct"` declared column is `error.UnsupportedColumnType`.
+/// A `.list` or `.@"struct"` declared column holds the nodes that are arrays (objects):
+/// each is read back through `dataframe.jsonDecode`, so its element (its fields) are
+/// inferred as `readNdjson` infers them, and any other node, or a missing one, is null.
+/// A `.array` declared column (it needs a width the spec cannot give) is
+/// `error.UnsupportedColumnType`.
 pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame {
     const root = try parseDocument(a, bytes, .{ .max_depth = spec.max_depth, .max_nodes = spec.max_nodes, .duplicate_keys = spec.duplicate_keys });
     var work: Work = .{ .limit = spec.max_work orelse 1_000_000 +| 16 *| bytes.len };
@@ -239,13 +243,20 @@ pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) ShapeErro
     try work.charge(items.len *| (spec.columns.len +| 1));
     // After the charge: it saturates on a column count that is a lie, and the list is
     // not read before it.
+    var nested: usize = 0;
     for (spec.columns) |jc| {
-        if (jc.type == .list or jc.type == .array or jc.type == .@"struct") return error.UnsupportedColumnType;
+        if (jc.type == .array) return error.UnsupportedColumnType;
+        if (isNested(jc.type)) nested += 1;
     }
     const cols = try a.alloc(Column, spec.columns.len);
     const keys = try a.alloc(KeyRef, spec.columns.len);
     for (spec.columns, 0..) |jc, i| {
-        cols[i] = .{ .name = jc.name, .type = jc.type };
+        // A nested column is built as the JSON text of its cells and decoded below,
+        // under a name no other column has (two columns may share a name).
+        cols[i] = if (isNested(jc.type))
+            .{ .name = try a.print("\x00jsonshape.{d}", .{i}), .type = .text }
+        else
+            .{ .name = jc.name, .type = jc.type };
         keys[i] = try keyRef(a, jc.key);
     }
     var b = try df.FrameBuilder.init(a, cols, items.len);
@@ -253,14 +264,59 @@ pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) ShapeErro
     for (items) |item| {
         for (spec.columns, keys, row) |jc, kr, *cell| {
             const jv: ?std.json.Value = if (jc.key.len == 0) item else try resolveKey(a, root, item, kr, spec.max_matches, &work);
-            cell.* = if (jv) |v| try jsonToValue(a, &work, v, jc.type) else .null;
+            cell.* = if (jv) |v|
+                (if (isNested(jc.type)) try nestedText(a, &work, v, jc.type) else try jsonToValue(a, &work, v, jc.type))
+            else
+                .null;
         }
         b.appendRow(row) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.RowLength => unreachable, // `row` is as wide as `cols`
         };
     }
-    return encodeCategorical(a, try b.toOwned());
+    var frame = try b.toOwned();
+    if (nested != 0) frame = try decodeNested(a, frame, spec);
+    return encodeCategorical(a, frame);
+}
+
+fn isNested(t: ColumnType) bool {
+    return t == .list or t == .@"struct";
+}
+
+/// The JSON text of `jv` when it is the kind a `.list` (array) or `.@"struct"` (object)
+/// column holds; null for anything else.
+fn nestedText(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: ColumnType) Error!Value {
+    switch (jv) {
+        .array => if (want != .list) return .null,
+        .object => if (want != .@"struct") return .null,
+        else => return .null,
+    }
+    const text = std.json.Stringify.valueAlloc(a, jv, .{}) catch return error.OutOfMemory;
+    try work.charge(text.len / 8);
+    return .{ .text = text };
+}
+
+/// Replace each nested column's JSON text by the column it decodes to.
+fn decodeNested(a: std.mem.Allocator, f: Frame, spec: ShapeSpec) Error!Frame {
+    var out = f;
+    for (spec.columns, 0..) |jc, i| {
+        if (!isNested(jc.type)) continue;
+        out = df.jsonDecode(a, out, .{
+            .column = f.columns[i].name,
+            .type = jc.type,
+            .duplicate_keys = spec.duplicate_keys,
+        }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadJson => return error.BadJson,
+            else => return error.WorkLimit, // a limit of dataframe's reader (columns, cells, cell bytes)
+        };
+    }
+    // Back to the declared names.
+    const cols = try a.alloc(Column, out.columns.len);
+    @memcpy(cols, out.columns);
+    for (spec.columns, 0..) |jc, i| cols[i].name = jc.name;
+    out.columns = cols;
+    return out;
 }
 
 /// Deprecated: `shape` returns a `Frame` since 2026-11-08; this alias stays one release.
@@ -1606,7 +1662,7 @@ fn jsonToValue(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: Colu
         else => {},
     }
     return switch (want) {
-        .list, .array, .@"struct" => unreachable, // refused by `shape` before any cell is read
+        .list, .array, .@"struct" => unreachable, // `shape` builds them through `nestedText`, `.array` it refuses
         .int => .{ .int = jsonToInt(jv) orelse return .null },
         .float => .{ .float = jsonToFloat(jv) orelse return .null },
         // dataframe's width types (W11): the integer (a UInt64 above maxInt(i64) arrives as a
@@ -2834,7 +2890,73 @@ test "shape: a categorical column is stored encoded, a duration parses, list and
     try std.testing.expectEqual(@as(i64, 1_000_000), f.columnAt(1).get(0).int); // PT1S, in microseconds
     try std.testing.expectEqual(@as(i64, 5), f.columnAt(1).get(1).int); // a number is already in the unit
     try std.testing.expect(f.columnAt(1).get(2) == .null);
-    for ([_]ColumnType{ .list, .array, .@"struct" }) |t| {
-        try std.testing.expectError(error.UnsupportedColumnType, shape(a, "[]", .{ .columns = &.{.{ .name = "n", .key = "n", .type = t }} }));
-    }
+    try std.testing.expectError(error.UnsupportedColumnType, shape(a, "[]", .{ .columns = &.{.{ .name = "n", .key = "n", .type = .array }} }));
+}
+
+test "declared .list and .struct columns decode the arrays and objects, null for anything else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const doc =
+        \\{"rows":[
+        \\ {"id":1,"tags":["a","b"],"pt":{"x":1,"y":2.5},"n":[1,2,3]},
+        \\ {"id":2,"tags":[],"pt":{"x":3},"n":"nope"},
+        \\ {"id":3,"tags":null,"pt":[1],"n":[4]},
+        \\ {"id":4}
+        \\]}
+    ;
+    const f = try shape(a, doc, .{
+        .path = "rows",
+        .columns = &.{
+            .{ .name = "id", .key = "id", .type = .int },
+            .{ .name = "tags", .key = "tags", .type = .list },
+            .{ .name = "pt", .key = "pt", .type = .@"struct" },
+            .{ .name = "n", .key = "n", .type = .list },
+            .{ .name = "tags2", .key = "tags", .type = .list }, // the same key twice
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 4), f.len);
+    try std.testing.expectEqualStrings("tags", f.columns[1].name);
+    try std.testing.expectEqualStrings("tags2", f.columns[4].name);
+    try std.testing.expect(f.columns[1].type == .list);
+    try std.testing.expect(f.columns[2].type == .@"struct");
+    const tags = f.columnAt(1);
+    try std.testing.expectEqual(@as(usize, 2), tags.get(0).list.len());
+    try std.testing.expectEqualStrings("b", tags.get(0).list.get(1).text);
+    try std.testing.expectEqual(@as(usize, 0), tags.get(1).list.len()); // an empty array is an empty list
+    try std.testing.expect(tags.get(2) == .null); // JSON null
+    try std.testing.expect(tags.get(3) == .null); // key absent
+    const pt = f.columnAt(2);
+    try std.testing.expectEqual(@as(i64, 1), pt.get(0).record.field("x").?.int);
+    try std.testing.expectEqual(@as(f64, 2.5), pt.get(0).record.field("y").?.float);
+    try std.testing.expectEqual(@as(i64, 3), pt.get(1).record.field("x").?.int);
+    try std.testing.expect(pt.get(1).record.field("y").?.isNull()); // a field one object lacks
+    try std.testing.expect(pt.get(2) == .null); // an array where a struct was declared
+    const n = f.columnAt(3);
+    try std.testing.expectEqual(@as(i64, 3), n.get(0).list.get(2).int);
+    try std.testing.expect(n.get(1) == .null); // a string where a list was declared
+    try std.testing.expectEqual(@as(i64, 4), n.get(2).list.get(0).int);
+    try std.testing.expectEqual(@as(usize, 2), f.columnAt(4).get(0).list.len());
+    try std.testing.expectEqual(@as(i64, 4), f.columnAt(0).get(3).int);
+}
+
+test "a declared nested column over no rows, and the work budget over a big node" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const empty = try shape(a, "[]", .{ .columns = &.{.{ .name = "t", .key = "t", .type = .list }} });
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectEqualStrings("t", empty.columns[0].name);
+    // one array of 100000 numbers selected by an absolute key for every one of 50 rows
+    var doc: std.ArrayList(u8) = .empty;
+    try doc.appendSlice(a, "{\"big\":[");
+    for (0..100_000) |i| try doc.print(a, "{s}{d}", .{ if (i == 0) "" else ",", i });
+    try doc.appendSlice(a, "],\"rows\":[");
+    for (0..50) |i| try doc.print(a, "{s}{{}}", .{if (i == 0) "" else ","});
+    try doc.appendSlice(a, "]}");
+    try std.testing.expectError(error.WorkLimit, shape(a, doc.items, .{
+        .path = "rows",
+        .max_work = 100_000,
+        .columns = &.{.{ .name = "b", .key = "$.big", .type = .list }},
+    }));
 }

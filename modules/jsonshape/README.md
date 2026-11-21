@@ -91,7 +91,7 @@ honoring the column's declared `ColumnType`, including JSON's
   everything else (missing keys, type mismatches per cell, bad path/filter
   syntax, and numbers outside the target column's range) degrades to `.null`
   cells or an empty frame. The other errors are refusals of a limit:
-  `OutOfMemory`, `TooManyMatches`, `WorkLimit` and `DepthLimit`; a declared `.list` or `.struct` column is `UnsupportedColumnType`. RFC-legal
+  `OutOfMemory`, `TooManyMatches`, `WorkLimit` and `DepthLimit`; a declared `.array` column is `UnsupportedColumnType`. RFC-legal
   duplicate object keys are `BadJson` by default; `duplicate_keys = .last`
   takes the last value, as serde_json, Go and jq do.
   `strict = true` (opt-in) tells a wrong `path` from an empty result: `PathSyntax`,
@@ -139,7 +139,7 @@ const JsonCol = jsonshape.JsonCol; // { name, key = "", type: ColumnType = .floa
 const ShapeSpec = jsonshape.ShapeSpec; // { path, columns, x, y, max_matches, max_work, max_depth, duplicate_keys, strict }
 const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches, WorkLimit, DepthLimit }
 
-fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame; // `ShapeError` = `Error` + `UnsupportedColumnType`, and `PathSyntax` / `PathNotFound` / `NotAnArray` under `strict`; `shapeFrame` is a deprecated alias for one release
+fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame; // `ShapeError` = `Error` + `UnsupportedColumnType` (a declared `.array` column), and `PathSyntax` / `PathNotFound` / `NotAnArray` under `strict`; `shapeFrame` is a deprecated alias for one release
 
 // RFC 9535 as a query API. Results live in `a`, which must be an arena: nothing is freed.
 // A `Path` does not borrow `text`; nodes borrow the tree, and the tree may borrow `bytes`.
@@ -170,4 +170,4 @@ Benchmark: `zig build bench-jsonshape`, see `tools/README.md`.
 
 ## Not provided
 
-Streaming or bounded-memory parsing, JSON-to-JSON reshaping (a jq-style language), schema inference, a custom-function registry and editing a document through a path are not built; declared `.list`/`.struct` columns are refused (`UnsupportedColumnType`). SPEC's *What is deliberately not done* gives the reasons and *Backlog / deferred* what is open.
+Streaming or bounded-memory parsing, JSON-to-JSON reshaping (a jq-style language), schema inference, a custom-function registry and editing a document through a path are not built; a declared `.list`/`.struct` column is decoded through `dataframe.jsonDecode` (element and fields inferred), `.array` is refused (`UnsupportedColumnType`). SPEC's *What is deliberately not done* gives the reasons and *Backlog / deferred* what is open.
