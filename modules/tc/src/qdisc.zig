@@ -78,6 +78,59 @@ pub const TCA_NETEM = struct {
     pub const PAD: u16 = 9;
     pub const LATENCY64: u16 = 10;
     pub const JITTER64: u16 = 11;
+    pub const SLOT: u16 = 12;
+    pub const SLOT_DIST: u16 = 13;
+    pub const PRNG_SEED: u16 = 14;
+};
+
+/// `NETEM_LOSS_*` — the models nested in `TCA_NETEM_LOSS`.
+pub const NETEM_LOSS = struct {
+    pub const GI: u16 = 1;
+    pub const GE: u16 = 2;
+};
+
+/// `sizeof(struct tc_netem_slot)`.
+pub const tc_netem_slot_len = 40;
+/// The longest distribution table netem takes (`MAX_DIST` in the kernel is
+/// 16384 entries; one netlink attribute is the tighter bound here).
+pub const netem_max_dist = (std.math.maxInt(u16) - 4) / 2;
+
+/// `loss gemodel PERCENT [R [1-H [1-K]]]` — the Gilbert-Elliott model, the
+/// four arguments in percent, named as the command line has them. `tc` sends
+/// `p`, `r` and `k1 = 1-K` as given and `h` as `UINT32_MAX - scale(1-H)`.
+pub const NetemGe = struct {
+    p_pct: f64,
+    r_pct: f64 = 0,
+    one_minus_h_pct: f64 = 0,
+    one_minus_k_pct: f64 = 0,
+};
+
+/// `loss state` — the 4-state Markov model (`tc_netem_gimodel`), transition
+/// probabilities in percent.
+pub const NetemGi = struct {
+    p13_pct: f64,
+    p31_pct: f64 = 0,
+    p32_pct: f64 = 0,
+    p14_pct: f64 = 0,
+    p23_pct: f64 = 0,
+};
+
+/// A netem packet-loss model beyond plain random loss.
+pub const NetemLoss = union(enum) {
+    gemodel: NetemGe,
+    state: NetemGi,
+};
+
+/// `struct tc_netem_slot` — `slot MIN [MAX] [packets N] [bytes N]`, or the
+/// distribution form `slot distribution DIST DELAY JITTER`: delivery in
+/// bursts at slot boundaries.
+pub const NetemSlot = struct {
+    min_delay_ns: i64 = 0,
+    max_delay_ns: i64 = 0,
+    max_packets: i32 = 0,
+    max_bytes: i32 = 0,
+    dist_delay_ns: i64 = 0,
+    dist_jitter_ns: i64 = 0,
 };
 
 /// htb attribute types (linux/pkt_sched.h `TCA_HTB_*`).
@@ -285,9 +338,28 @@ pub const Netem = struct {
     corrupt_pct: f64 = 0,
     /// Corrupt correlation percent.
     corrupt_correlation_pct: f64 = 0,
-    /// Rate limit in bytes/s ("rate Rbit/Rbps"). 0 = unlimited. Only
-    /// `TCA_NETEM_RATE` (u32) is emitted; `TCA_NETEM_RATE64` is out of scope.
-    rate_bytes_per_sec: u32 = 0,
+    /// Rate limit in bytes/s ("rate Rbit/Rbps"). 0 = unlimited. A rate past
+    /// `u32` is carried in `TCA_NETEM_RATE64` (the `u32` field pinned to
+    /// `~0U`, as `tc` sends it).
+    rate_bytes_per_sec: u64 = 0,
+    /// `rate R PACKETOVERHEAD CELLSIZE CELLOVERHEAD`.
+    packet_overhead: i32 = 0,
+    cell_size: u32 = 0,
+    cell_overhead: i32 = 0,
+    /// `ecn` — mark instead of dropping (`TCA_NETEM_ECN`).
+    ecn: bool = false,
+    /// `loss gemodel …` / `loss state …` (`TCA_NETEM_LOSS`); replaces
+    /// `loss_pct`'s random loss for the kernel.
+    loss_model: ?NetemLoss = null,
+    /// A delay distribution table (`delay … distribution NAME`; `tc` reads
+    /// the 4096-entry tables of its `.dist` files). Signed 16-bit entries,
+    /// `TCA_NETEM_DELAY_DIST`. This module ships none.
+    delay_dist: []const i16 = &.{},
+    slot: ?NetemSlot = null,
+    /// The table of `slot distribution` (`TCA_NETEM_SLOT_DIST`).
+    slot_dist: []const i16 = &.{},
+    /// `seed N` — the random generator's seed (`TCA_NETEM_PRNG_SEED`).
+    prng_seed: ?u64 = null,
 };
 
 /// Wire-level readback of a netem qdisc's options. Deliberately separate from
@@ -314,16 +386,38 @@ pub const NetemWire = struct {
     reorder_correlation: u32 = 0,
     corrupt_probability: u32 = 0,
     corrupt_correlation: u32 = 0,
-    /// `TCA_NETEM_RATE.rate` (bytes/s); 0 if absent.
+    /// `TCA_NETEM_RATE.rate` (bytes/s); 0 if absent. `~0U` when `rate64`
+    /// carries the real value.
     rate_bytes_per_sec: u32 = 0,
+    packet_overhead: i32 = 0,
+    cell_size: u32 = 0,
+    cell_overhead: i32 = 0,
+    /// `TCA_NETEM_RATE64`, bytes/s; 0 if absent.
+    rate64: u64 = 0,
+    ecn: bool = false,
+    /// The raw `tc_netem_gimodel` (`p13`, `p31`, `p32`, `p14`, `p23`).
+    loss_gi: ?[5]u32 = null,
+    /// The raw `tc_netem_gemodel` (`p`, `r`, `h`, `k1`).
+    loss_ge: ?[4]u32 = null,
+    /// How many entries the delay / slot distribution tables carried.
+    delay_dist_len: u16 = 0,
+    slot_dist_len: u16 = 0,
+    slot: ?NetemSlot = null,
+    prng_seed: ?u64 = null,
 };
 
 /// Scale a `[0, 100]` percent to the kernel's `u32` probability scale
-/// (`percent/100 * UINT32_MAX`, rounded — matches `tc`'s own scaling).
+/// (`percent/100 * UINT32_MAX`, rounded half to even — matches `tc`'s own
+/// scaling).
 pub fn percentToU32(pct: f64) error{InvalidPercent}!u32 {
     if (!(pct >= 0.0 and pct <= 100.0)) return error.InvalidPercent;
-    const scaled = @round(pct / 100.0 * @as(f64, @floatFromInt(std.math.maxInt(u32))));
-    return @intFromFloat(scaled);
+    const x = pct / 100.0 * @as(f64, @floatFromInt(std.math.maxInt(u32)));
+    // Round half to even, as `tc` does (`rint`): 70% lands exactly on a half
+    // (3006477106.5) and `tc` sends ...106, where round-half-away gave ...107.
+    const f = @floor(x);
+    const d = x - f;
+    const up = d > 0.5 or (d == 0.5 and @mod(f, 2.0) != 0.0);
+    return @intFromFloat(if (up) f + 1.0 else f);
 }
 
 fn checkDelayNs(ns: u64) error{InvalidDelay}!void {
@@ -377,11 +471,22 @@ fn appendNetemOptions(
         std.mem.writeInt(u32, cor[4..8], corrupt_corr, native_endian);
         try appendAttr(gpa, list, TCA_NETEM.CORRUPT, &cor);
     }
-    if (n.rate_bytes_per_sec != 0) {
+    if (n.ecn) try codec.appendAttrU32(gpa, list, TCA_NETEM.ECN, 1);
+    if (n.loss_model) |m| try appendLossModel(gpa, list, m);
+    if (n.rate_bytes_per_sec != 0 or n.packet_overhead != 0 or n.cell_size != 0 or n.cell_overhead != 0) {
         // struct tc_netem_rate: rate, packet_overhead, cell_size,
-        // cell_overhead — the overhead/cell knobs are out of scope.
+        // cell_overhead. A rate past 32 bits is pinned to ~0U with the real
+        // value in RATE64, which `tc` sends first.
         var rate: [16]u8 = @splat(0);
-        std.mem.writeInt(u32, rate[0..4], n.rate_bytes_per_sec, native_endian);
+        const clamped: u32 = if (n.rate_bytes_per_sec >= (1 << 32))
+            std.math.maxInt(u32)
+        else
+            @intCast(n.rate_bytes_per_sec);
+        std.mem.writeInt(u32, rate[0..4], clamped, native_endian);
+        std.mem.writeInt(i32, rate[4..8], n.packet_overhead, native_endian);
+        std.mem.writeInt(u32, rate[8..12], n.cell_size, native_endian);
+        std.mem.writeInt(i32, rate[12..16], n.cell_overhead, native_endian);
+        if (n.rate_bytes_per_sec >= (1 << 32)) try appendAttrU64(gpa, list, TCA_NETEM.RATE64, n.rate_bytes_per_sec);
         try appendAttr(gpa, list, TCA_NETEM.RATE, &rate);
     }
     if (n.delay_ns != 0) {
@@ -394,6 +499,60 @@ fn appendNetemOptions(
         std.mem.writeInt(i64, &raw, @intCast(n.jitter_ns), native_endian);
         try appendAttr(gpa, list, TCA_NETEM.JITTER64, &raw);
     }
+    if (n.delay_dist.len != 0) try appendDistTable(gpa, list, TCA_NETEM.DELAY_DIST, n.delay_dist);
+    if (n.slot) |sl| {
+        var raw: [tc_netem_slot_len]u8 = undefined;
+        std.mem.writeInt(i64, raw[0..8], sl.min_delay_ns, native_endian);
+        std.mem.writeInt(i64, raw[8..16], sl.max_delay_ns, native_endian);
+        std.mem.writeInt(i32, raw[16..20], sl.max_packets, native_endian);
+        std.mem.writeInt(i32, raw[20..24], sl.max_bytes, native_endian);
+        std.mem.writeInt(i64, raw[24..32], sl.dist_delay_ns, native_endian);
+        std.mem.writeInt(i64, raw[32..40], sl.dist_jitter_ns, native_endian);
+        try appendAttr(gpa, list, TCA_NETEM.SLOT, &raw);
+    }
+    if (n.slot_dist.len != 0) try appendDistTable(gpa, list, TCA_NETEM.SLOT_DIST, n.slot_dist);
+    if (n.prng_seed) |seed| try appendAttrU64(gpa, list, TCA_NETEM.PRNG_SEED, seed);
+}
+
+fn appendDistTable(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    table: []const i16,
+) EncodeError!void {
+    if (table.len > netem_max_dist) return error.OptionsTooLong;
+    const raw = try gpa.alloc(u8, table.len * 2);
+    defer gpa.free(raw);
+    for (table, 0..) |v, i| std.mem.writeInt(i16, raw[i * 2 ..][0..2], v, native_endian);
+    try appendAttr(gpa, list, attr_type, raw);
+}
+
+fn appendLossModel(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    model: NetemLoss,
+) EncodeError!void {
+    const nest = try codec.nestBegin(gpa, list, TCA_NETEM.LOSS | codec.NLA_F_NESTED);
+    switch (model) {
+        .state => |g| {
+            var raw: [20]u8 = undefined;
+            std.mem.writeInt(u32, raw[0..4], try percentToU32(g.p13_pct), native_endian);
+            std.mem.writeInt(u32, raw[4..8], try percentToU32(g.p31_pct), native_endian);
+            std.mem.writeInt(u32, raw[8..12], try percentToU32(g.p32_pct), native_endian);
+            std.mem.writeInt(u32, raw[12..16], try percentToU32(g.p14_pct), native_endian);
+            std.mem.writeInt(u32, raw[16..20], try percentToU32(g.p23_pct), native_endian);
+            try appendAttr(gpa, list, NETEM_LOSS.GI, &raw);
+        },
+        .gemodel => |g| {
+            var raw: [16]u8 = undefined;
+            std.mem.writeInt(u32, raw[0..4], try percentToU32(g.p_pct), native_endian);
+            std.mem.writeInt(u32, raw[4..8], try percentToU32(g.r_pct), native_endian);
+            std.mem.writeInt(u32, raw[8..12], std.math.maxInt(u32) - try percentToU32(g.one_minus_h_pct), native_endian);
+            std.mem.writeInt(u32, raw[12..16], try percentToU32(g.one_minus_k_pct), native_endian);
+            try appendAttr(gpa, list, NETEM_LOSS.GE, &raw);
+        },
+    }
+    codec.nestEnd(list, nest) catch return error.OptionsTooLong;
 }
 
 /// Parse a `TCA_OPTIONS` payload for a netem qdisc: fixed `tc_netem_qopt`
@@ -427,6 +586,49 @@ pub fn parseNetemOptions(data: []const u8) codec.Error!NetemWire {
         },
         TCA_NETEM.RATE => if (a.data.len >= 4) {
             nw.rate_bytes_per_sec = std.mem.readInt(u32, a.data[0..4], native_endian);
+            if (a.data.len >= 16) {
+                nw.packet_overhead = std.mem.readInt(i32, a.data[4..8], native_endian);
+                nw.cell_size = std.mem.readInt(u32, a.data[8..12], native_endian);
+                nw.cell_overhead = std.mem.readInt(i32, a.data[12..16], native_endian);
+            }
+        },
+        TCA_NETEM.RATE64 => if (a.data.len == 8) {
+            nw.rate64 = std.mem.readInt(u64, a.data[0..8], native_endian);
+        },
+        TCA_NETEM.ECN => if (a.data.len == 4) {
+            nw.ecn = std.mem.readInt(u32, a.data[0..4], native_endian) != 0;
+        },
+        TCA_NETEM.LOSS => {
+            var lit: codec.AttrIterator = .{ .buf = a.data };
+            // A malformed nest is skipped like any other odd sub-attribute.
+            while (lit.next() catch null) |m| switch (m.type) {
+                NETEM_LOSS.GI => if (m.data.len >= 20) {
+                    var v: [5]u32 = undefined;
+                    for (&v, 0..) |*x, i| x.* = std.mem.readInt(u32, m.data[i * 4 ..][0..4], native_endian);
+                    nw.loss_gi = v;
+                },
+                NETEM_LOSS.GE => if (m.data.len >= 16) {
+                    var v: [4]u32 = undefined;
+                    for (&v, 0..) |*x, i| x.* = std.mem.readInt(u32, m.data[i * 4 ..][0..4], native_endian);
+                    nw.loss_ge = v;
+                },
+                else => {},
+            };
+        },
+        TCA_NETEM.DELAY_DIST => nw.delay_dist_len = @intCast(a.data.len / 2),
+        TCA_NETEM.SLOT_DIST => nw.slot_dist_len = @intCast(a.data.len / 2),
+        TCA_NETEM.SLOT => if (a.data.len >= tc_netem_slot_len) {
+            nw.slot = .{
+                .min_delay_ns = std.mem.readInt(i64, a.data[0..8], native_endian),
+                .max_delay_ns = std.mem.readInt(i64, a.data[8..16], native_endian),
+                .max_packets = std.mem.readInt(i32, a.data[16..20], native_endian),
+                .max_bytes = std.mem.readInt(i32, a.data[20..24], native_endian),
+                .dist_delay_ns = std.mem.readInt(i64, a.data[24..32], native_endian),
+                .dist_jitter_ns = std.mem.readInt(i64, a.data[32..40], native_endian),
+            };
+        },
+        TCA_NETEM.PRNG_SEED => if (a.data.len == 8) {
+            nw.prng_seed = std.mem.readInt(u64, a.data[0..8], native_endian);
         },
         TCA_NETEM.LATENCY64 => if (a.data.len == 8) {
             nw.delay_ns = std.mem.readInt(i64, a.data[0..8], native_endian);

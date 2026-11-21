@@ -58,8 +58,9 @@ const lo: u32 = 1;
 fn expectGolden(hex: []const u8, actual: []const u8) !void {
     if (native_endian != .little) return error.SkipZigTest; // captures are LE
     try testing.expectEqual(hex.len / 2, actual.len);
-    var expected: [4096]u8 = undefined;
-    const want = try std.fmt.hexToBytes(expected[0 .. hex.len / 2], hex);
+    const expected = try gpa.alloc(u8, hex.len / 2);
+    defer gpa.free(expected);
+    const want = try std.fmt.hexToBytes(expected, hex);
     try testing.expectEqualSlices(u8, want, actual);
 }
 
@@ -5148,3 +5149,531 @@ test "monitor: messages of other types are skipped" {
     var it = monitor.EventIterator.init(buf[0..16]);
     try testing.expectEqual(@as(?monitor.Event, null), try it.next());
 }
+
+// ── netem: loss models, slots, distributions, rate64, ecn, seed ─────────────
+
+fn netemGolden(comptime hex: []const u8, seq: u32, n: qdisc.Netem) !qdisc.NetemWire {
+    const codec = @import("netlink").codec;
+    const req = try message.buildQdiscSet(
+        gpa,
+        seq,
+        .add,
+        .{ .ifindex = lo, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .netem = n },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(hex, req);
+    var buf: [hex.len / 2]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&buf, hex);
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const q = try qdisc.parseQdisc((try it.next()).?.payload);
+    return q.netem.?;
+}
+
+/// The i16 entries of the attribute of `attr_type` inside a golden's netem
+/// options (the distribution tables `tc` reads from its `.dist` files).
+fn goldenDist(comptime hex: []const u8, attr_type: u16) ![]i16 {
+    const codec = @import("netlink").codec;
+    var buf: [hex.len / 2]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&buf, hex);
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const m = (try it.next()).?;
+    var ait: codec.AttrIterator = .{ .buf = m.payload[20..] };
+    while (try ait.next()) |a| {
+        if (a.type != qdisc.TCA.OPTIONS) continue;
+        var nit: codec.AttrIterator = .{ .buf = a.data[24..] };
+        while (try nit.next()) |n| {
+            if (n.type != attr_type) continue;
+            const out = try gpa.alloc(i16, n.data.len / 2);
+            for (out, 0..) |*v, i| v.* = std.mem.readInt(i16, n.data[i * 2 ..][0..2], native_endian);
+            return out;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "golden: netem loss models (gemodel, state)" {
+    // tc qdisc add dev lo root handle 1: netem loss gemodel 1% 10% 70% 0.1%
+    var w = try netemGolden(g_netem_loss_gemodel, seq_netem_loss_gemodel, .{
+        .loss_model = .{ .gemodel = .{ .p_pct = 1, .r_pct = 10, .one_minus_h_pct = 70, .one_minus_k_pct = 0.1 } },
+    });
+    try testing.expectEqual(@as(u32, 0x028f5c29), w.loss_ge.?[0]);
+    try testing.expectEqual(@as(u32, 0x4ccccccd), w.loss_ge.?[2]);
+    try testing.expectEqual(@as(?[5]u32, null), w.loss_gi);
+    // tc qdisc add dev lo root handle 1: netem loss state 1% 10% 70% 10% 0.1%
+    w = try netemGolden(g_netem_loss_state, seq_netem_loss_state, .{
+        .loss_model = .{ .state = .{ .p13_pct = 1, .p31_pct = 10, .p32_pct = 70, .p14_pct = 0.1, .p23_pct = 10 } },
+    });
+    try testing.expectEqual(@as(u32, 0x028f5c29), w.loss_gi.?[0]);
+    try testing.expectEqual(@as(u32, 0x00418937), w.loss_gi.?[3]);
+    try testing.expectEqual(@as(u32, 0x1999999a), w.loss_gi.?[4]);
+}
+
+test "golden: netem slot, slot distribution and delay distribution" {
+    // tc qdisc add dev lo root handle 1: netem slot 10ms 20ms packets 5 bytes 100
+    var w = try netemGolden(g_netem_slot, seq_netem_slot, .{ .slot = .{
+        .min_delay_ns = 10_000_000,
+        .max_delay_ns = 20_000_000,
+        .max_packets = 5,
+        .max_bytes = 100,
+    } });
+    try testing.expectEqual(@as(i32, 5), w.slot.?.max_packets);
+    try testing.expectEqual(@as(i64, 20_000_000), w.slot.?.max_delay_ns);
+    // tc qdisc add dev lo root handle 1: netem slot distribution normal 5ms 2ms
+    const sd = try goldenDist(g_netem_slot_dist, qdisc.TCA_NETEM.SLOT_DIST);
+    defer gpa.free(sd);
+    w = try netemGolden(g_netem_slot_dist, seq_netem_slot_dist, .{
+        .slot = .{ .dist_delay_ns = 5_000_000, .dist_jitter_ns = 2_000_000 },
+        .slot_dist = sd,
+    });
+    try testing.expectEqual(@as(u16, 4096), w.slot_dist_len);
+    try testing.expectEqual(@as(i64, 2_000_000), w.slot.?.dist_jitter_ns);
+    // tc qdisc add dev lo root handle 1: netem delay 10ms 2ms distribution normal
+    const dd = try goldenDist(g_netem_delay_dist, qdisc.TCA_NETEM.DELAY_DIST);
+    defer gpa.free(dd);
+    w = try netemGolden(g_netem_delay_dist, seq_netem_delay_dist, .{
+        .delay_ns = 10_000_000,
+        .jitter_ns = 2_000_000,
+        .delay_dist = dd,
+    });
+    try testing.expectEqual(@as(u16, 4096), w.delay_dist_len);
+    try testing.expectEqual(@as(i64, 10_000_000), w.delay_ns);
+}
+
+test "golden: netem rate (overheads, 64-bit), ecn and seed" {
+    // tc qdisc add dev lo root handle 1: netem rate 5gbit 10 20 30
+    var w = try netemGolden(g_netem_rate_overhead, seq_netem_rate_overhead, .{
+        .rate_bytes_per_sec = 625_000_000,
+        .packet_overhead = 10,
+        .cell_size = 20,
+        .cell_overhead = 30,
+    });
+    try testing.expectEqual(@as(u32, 625_000_000), w.rate_bytes_per_sec);
+    try testing.expectEqual(@as(i32, 10), w.packet_overhead);
+    try testing.expectEqual(@as(u32, 20), w.cell_size);
+    try testing.expectEqual(@as(i32, 30), w.cell_overhead);
+    // tc qdisc add dev lo root handle 1: netem rate 100gbit
+    w = try netemGolden(g_netem_rate64, seq_netem_rate64, .{ .rate_bytes_per_sec = 12_500_000_000 });
+    try testing.expectEqual(@as(u64, 12_500_000_000), w.rate64);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), w.rate_bytes_per_sec);
+    // tc qdisc add dev lo root handle 1: netem delay 10ms seed 5
+    w = try netemGolden(g_netem_seed, seq_netem_seed, .{ .delay_ns = 10_000_000, .prng_seed = 5 });
+    try testing.expectEqual(@as(?u64, 5), w.prng_seed);
+    // tc qdisc add dev lo root handle 1: netem rate 1mbit ecn loss 5% seed 77
+    w = try netemGolden(g_netem_ecn_rate_seed, seq_netem_ecn_rate_seed, .{
+        .rate_bytes_per_sec = 125_000,
+        .ecn = true,
+        .loss_pct = 5,
+        .prng_seed = 77,
+    });
+    try testing.expect(w.ecn);
+    try testing.expectEqual(@as(?u64, 77), w.prng_seed);
+}
+
+// ── captured request bytes: netem extras ────────────────────────────────────
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1795219138 len=100
+// tc qdisc add dev lo root handle 1: netem loss gemodel 1% 10% 70% 0.1%
+const g_netem_loss_gemodel =
+    "6400000024000506c2de006b00000000000000000100000000000100ffffffff000000000a0001006e6574656d00000034" ++
+    "00020000000000e8030000000000000000000000000000000000001800058014000200295c8f029a999919cdcccc4c3789" ++
+    "4100";
+const seq_netem_loss_gemodel: u32 = 1795219138;
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1795219138 len=104
+// tc qdisc add dev lo root handle 1: netem loss state 1% 10% 70% 10% 0.1%
+const g_netem_loss_state =
+    "6800000024000506c2de006b00000000000000000100000000000100ffffffff000000000a0001006e6574656d00000038" ++
+    "00020000000000e8030000000000000000000000000000000000001c00058018000100295c8f029a999919323333b33789" ++
+    "41009a999919";
+const seq_netem_loss_state: u32 = 1795219138;
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1795219138 len=120
+// tc qdisc add dev lo root handle 1: netem slot 10ms 20ms packets 5 bytes 100
+const g_netem_slot =
+    "7800000024000506c2de006b00000000000000000100000000000100ffffffff000000000a0001006e6574656d00000048" ++
+    "00020000000000e8030000000000000000000000000000000000002c000c008096980000000000002d3101000000000500" ++
+    "00006400000000000000000000000000000000000000";
+const seq_netem_slot: u32 = 1795219138;
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1795219138 len=8316
+// tc qdisc add dev lo root handle 1: netem slot distribution normal 5ms 2ms
+const g_netem_slot_dist =
+    "7c20000024000506c2de006b00000000000000000100000000000100ffffffff000000000a0001006e6574656d0000004c" ++
+    "20020000000000e8030000000000000000000000000000000000002c000c00000000000000000000000000000000000000" ++
+    "000000000000404b4c000000000080841e000000000004200d0000806d910997919a2e9d439f00a17fa2d0a3fea40fa608" ++
+    "a7eea7c3a88ba946aaf6aa9cab3bacd1ac61adebad6eaeedae67afdcaf4db0bbb025b18cb1f0b151b2afb20ab364b3bab3" ++
+    "0fb462b4b3b402b54fb59bb5e5b52db674b6bab6feb641b783b7c4b703b842b87fb8bbb8f7b831b96ab9a3b9dbb912ba48" ++
+    "ba7ebab3bae6ba1abb4cbb7ebbafbbe0bb10bc3fbc6ebc9cbccabcf8bc24bd51bd7cbda8bdd2bdfdbd27be50be79bea1be" ++
+    "cabef2be19bf40bf66bf8dbfb3bfd8bffebf22c047c06bc08fc0b3c0d6c0f9c01cc13ec161c182c1a4c1c5c1e7c107c228" ++
+    "c248c268c288c2a8c2c7c2e6c205c324c342c361c37fc39cc3bac3d7c3f5c312c42fc44bc468c484c4a0c4bcc4d8c4f4c4" ++
+    "0fc52ac545c560c57bc596c5b0c5cac5e5c5fec519c632c64cc665c67ec698c6b1c6c9c6e2c6fbc613c72bc744c75cc774" ++
+    "c78bc7a3c7bbc7d2c7e9c701c818c82fc846c85dc873c88ac8a0c8b7c8cdc8e3c8f9c80fc925c93bc950c966c97bc991c9" ++
+    "a6c9bbc9d0c9e5c9fac90fca24ca38ca4dca61ca76ca8aca9ecab2cac6cadacaeeca02cb15cb29cb3dcb50cb64cb77cb8a" ++
+    "cb9dcbb0cbc3cbd6cbe9cbfccb0fcc22cc34cc46cc59cc6ccc7ecc90cca2ccb5ccc7ccd9ccebccfccc0ecd20cd32cd44cd" ++
+    "55cd66cd78cd8acd9bcdaccdbdcdcecde0cdf1cd02ce13ce24ce34ce45ce56ce67ce77ce88ce98cea9ceb9cecacedaceea" ++
+    "cefbce0bcf1bcf2bcf3bcf4bcf5bcf6bcf7acf8acf9acfaacfbacfc9cfd9cfe8cff8cf07d017d026d035d044d054d063d0" ++
+    "72d081d090d09fd0aed0bdd0ccd0dbd0ead0f9d007d116d125d133d142d150d15fd16dd17cd18ad199d1a7d1b5d1c3d1d2" ++
+    "d1e0d1eed1fcd10ad218d227d234d242d250d25ed26cd27ad288d295d2a3d2b1d2bed2ccd2d9d2e7d2f5d202d310d31dd3" ++
+    "2ad338d345d352d35fd36dd37ad387d394d3a1d3aed3bcd3c9d3d6d3e3d3f0d3fcd309d416d423d430d43dd449d456d463" ++
+    "d46fd47cd489d496d4a2d4aed4bbd4c7d4d4d4e0d4edd4f9d406d512d51ed52bd537d543d54fd55bd568d574d580d58cd5" ++
+    "98d5a4d5b0d5bcd5c8d5d4d5e0d5ecd5f8d504d610d61bd627d633d63fd64bd656d662d66dd679d685d691d69cd6a8d6b3" ++
+    "d6bed6cad6d5d6e1d6ecd6f8d603d70fd71ad725d731d73cd747d752d75ed769d774d77fd78ad796d7a1d7acd7b7d7c2d7" ++
+    "cdd7d8d7e3d7eed7f9d704d80fd81ad825d830d83bd845d850d85bd866d871d87bd886d891d89bd8a6d8b1d8bcd8c6d8d1" ++
+    "d8dbd8e6d8f0d8fbd806d910d91bd925d930d93ad944d94fd959d964d96ed978d983d98dd997d9a2d9acd9b6d9c1d9cbd9" ++
+    "d5d9dfd9e9d9f3d9fed908da12da1cda26da30da3ada44da4eda58da62da6dda76da80da8ada94da9edaa8dab2dabcdac6" ++
+    "dad0dad9dae3daeddaf7da00db0adb14db1edb28db31db3bdb45db4edb58db62db6bdb75db7fdb88db92db9bdba5dbaedb" ++
+    "b8dbc2dbcbdbd5dbdedbe7dbf1dbfbdb04dc0edc17dc20dc29dc33dc3cdc46dc4fdc58dc61dc6bdc74dc7edc87dc90dc99" ++
+    "dca3dcacdcb5dcbedcc7dcd0dcdadce3dcecdcf5dcfedc07dd10dd1add23dd2cdd35dd3edd47dd50dd59dd62dd6bdd74dd" ++
+    "7ddd86dd8fdd98dda1ddaaddb3ddbcddc4ddcdddd6dddfdde8ddf1ddf9dd02de0bde14de1dde25de2ede37de40de48de51" ++
+    "de5ade63de6bde74de7dde86de8ede97de9fdea8deb1deb9dec2decaded3dedcdee4deeddef5defede06df0fdf17df20df" ++
+    "28df31df39df42df4adf53df5bdf64df6cdf74df7ddf85df8edf96df9edfa7dfafdfb8dfc0dfc8dfd0dfd9dfe1dfe9dff2" ++
+    "dffadf02e00ae012e01be023e02be034e03ce044e04ce054e05de065e06de075e07de085e08de096e09ee0a5e0aee0b6e0" ++
+    "bee0c6e0cee0d6e0dee0e6e0eee0f6e0fee006e10ee117e11ee127e12ee136e13ee146e14ee156e15ee166e16ee176e17e" ++
+    "e186e18de195e19de1a5e1ade1b5e1bce1c5e1cce1d4e1dce1e4e1ece1f3e1fbe103e20be212e21ae222e22ae232e239e2" ++
+    "41e248e250e258e260e267e26fe277e27fe286e28ee296e29de2a5e2ace2b4e2bce2c3e2cbe2d3e2dae2e2e2e9e2f1e2f8" ++
+    "e200e307e30fe317e31ee326e32de334e33ce344e34be353e35ae361e369e371e378e37fe387e38fe396e39de3a5e3ace3" ++
+    "b3e3bbe3c2e3cae3d1e3d8e3e0e3e7e3eee3f6e3fde305e40ce413e41be422e429e431e438e43fe446e44ee455e45de464" ++
+    "e46be472e47ae481e488e48fe496e49ee4a5e4ace4b3e4bbe4c2e4c9e4d0e4d7e4dee4e6e4ede4f4e4fbe402e509e511e5" ++
+    "18e51fe526e52de534e53be543e54ae551e558e55fe566e56de574e57be582e589e591e598e59fe5a5e5ace5b4e5bbe5c2" ++
+    "e5c9e5d0e5d7e5dee5e5e5ece5f3e5fae501e608e60fe616e61de624e62be631e638e63fe646e64de654e65be662e669e6" ++
+    "70e676e67de684e68be692e699e6a0e6a7e6aee6b4e6bbe6c2e6c9e6d0e6d7e6dee6e4e6ebe6f2e6f9e600e706e70de714" ++
+    "e71be722e728e72fe736e73de743e74ae751e758e75ee765e76ce772e779e780e787e78de794e79be7a1e7a8e7afe7b5e7" ++
+    "bce7c3e7cae7d0e7d7e7dee7e4e7ebe7f2e7f8e7ffe705e80ce813e819e820e827e82de834e83be841e848e84ee855e85b" ++
+    "e862e868e86fe876e87de883e88ae890e897e89de8a4e8aae8b1e8b7e8bee8c4e8cbe8d1e8d8e8dee8e5e8ece8f2e8f9e8" ++
+    "ffe805e90ce912e919e91fe926e92ce933e939e93fe946e94de953e959e960e966e96de973e97ae980e986e98de993e99a" ++
+    "e9a0e9a6e9ade9b3e9bae9c0e9c6e9cde9d3e9d9e9e0e9e6e9ede9f3e9f9e900ea06ea0cea13ea19ea20ea26ea2cea32ea" ++
+    "39ea3fea45ea4cea52ea58ea5fea65ea6bea71ea78ea7eea84ea8aea91ea97ea9deaa4eaaaeab0eab6eabdeac3eac9eacf" ++
+    "ead6eadceae2eae8eaefeaf5eafbea01eb07eb0eeb14eb1aeb20eb27eb2deb33eb39eb3feb46eb4ceb52eb58eb5eeb64eb" ++
+    "6aeb71eb77eb7deb83eb89eb8feb96eb9ceba2eba8ebaeebb4ebbaebc1ebc7ebcdebd3ebd9ebdfebe5ebecebf1ebf7ebfe" ++
+    "eb04ec0aec10ec16ec1cec22ec28ec2eec34ec3bec41ec46ec4dec53ec59ec5fec65ec6bec71ec77ec7dec83ec89ec8fec" ++
+    "95ec9beca1eca7ecadecb3ecb9ecbfecc5eccbecd1ecd7ecddece3ece9ecefecf5ecfbec01ed07ed0ded13ed19ed1fed25" ++
+    "ed2bed31ed37ed3ded43ed49ed4fed55ed5bed61ed66ed6ded72ed78ed7eed84ed8aed90ed96ed9ceda2eda8edaeedb3ed" ++
+    "baedbfedc5edcbedd1edd7edddede3ede9edeeedf4edfaed00ee06ee0cee12ee17ee1dee23ee29ee2fee35ee3bee40ee46" ++
+    "ee4cee52ee58ee5eee64ee69ee6fee75ee7bee81ee86ee8cee92ee98ee9eeea3eea9eeafeeb5eebbeec1eec6eecceed2ee" ++
+    "d8eedeeee3eee9eeefeef5eefaee00ef06ef0cef12ef17ef1def23ef29ef2eef34ef3aef3fef45ef4bef51ef56ef5cef62" ++
+    "ef68ef6def73ef79ef7fef84ef8aef90ef96ef9befa1efa7efacefb2efb8efbeefc3efc9efceefd4efdaefe0efe5efebef" ++
+    "f1eff7effcef02f007f00df013f019f01ef024f029f02ff035f03bf040f046f04bf051f057f05df062f068f06df073f079" ++
+    "f07ef084f08af08ff095f09af0a0f0a6f0abf0b1f0b7f0bcf0c2f0c7f0cdf0d3f0d8f0def0e3f0e9f0eff0f4f0faf000f1" ++
+    "05f10bf110f116f11bf121f127f12cf132f137f13df142f148f14ef153f159f15ef164f16af16ff175f17af180f185f18b" ++
+    "f190f196f19cf1a1f1a7f1acf1b2f1b7f1bdf1c2f1c8f1cdf1d3f1d8f1def1e3f1e9f1eef1f4f1f9f1fff105f20af210f2" ++
+    "15f21bf220f226f22bf231f236f23cf241f246f24cf252f257f25df262f268f26df273f278f27df283f288f28ef293f299" ++
+    "f29ff2a4f2a9f2aff2b4f2baf2bff2c5f2caf2d0f2d5f2daf2e0f2e5f2ebf2f0f2f6f2fbf200f306f30bf311f317f31cf3" ++
+    "21f327f32cf332f337f33cf342f347f34df352f358f35df362f368f36df373f378f37df383f388f38ef393f398f39ef3a3" ++
+    "f3a9f3aef3b3f3b9f3bef3c4f3c9f3cef3d4f3d9f3dff3e4f3e9f3eff3f4f3f9f3fff304f40af40ff414f41af41ff424f4" ++
+    "2af42ff435f43af43ff445f44af44ff455f45af45ff465f46af46ff475f47af480f485f48af490f495f49af4a0f4a5f4aa" ++
+    "f4b0f4b5f4baf4c0f4c5f4caf4d0f4d5f4daf4e0f4e5f4eaf4f0f4f5f4faf400f505f50af510f515f51af520f525f52af5" ++
+    "30f535f53af53ff545f54af54ff554f55af55ff564f56af56ff574f57af57ff584f58af58ff594f599f59ff5a4f5a9f5ae" ++
+    "f5b4f5b9f5bef5c4f5c9f5cef5d3f5d9f5def5e3f5e9f5eef5f3f5f8f5fef503f608f60ef612f618f61df622f628f62df6" ++
+    "32f637f63df642f647f64df652f657f65cf661f667f66cf671f676f67cf681f686f68bf691f696f69bf6a0f6a5f6abf6b0" ++
+    "f6b5f6baf6c0f6c5f6caf6cff6d5f6daf6dff6e4f6e9f6eff6f4f6f9f6fef604f709f70ef713f719f71df723f728f72df7" ++
+    "32f738f73df742f747f74df752f757f75cf761f766f76cf771f776f77bf781f786f78bf790f795f79af7a0f7a5f7aaf7af" ++
+    "f7b4f7baf7bff7c4f7c9f7cef7d3f7d9f7def7e3f7e8f7edf7f2f7f8f7fdf702f807f80cf812f817f81cf821f826f82bf8" ++
+    "30f836f83bf840f845f84af84ff855f85af85ff864f869f86ff874f879f87ef883f888f88df893f898f89df8a2f8a7f8ac" ++
+    "f8b1f8b7f8bcf8c1f8c6f8cbf8d0f8d5f8dbf8e0f8e5f8eaf8eff8f4f8f9f8fef804f909f90ef913f918f91df922f928f9" ++
+    "2df932f937f93cf941f946f94bf951f956f95bf960f965f96af96ff974f97af97ff984f989f98ef993f998f99df9a3f9a8" ++
+    "f9adf9b2f9b7f9bcf9c1f9c6f9cbf9d0f9d5f9dbf9e0f9e5f9eaf9eff9f4f9f9f9fef904fa09fa0efa13fa18fa1dfa22fa" ++
+    "27fa2cfa32fa36fa3bfa41fa46fa4bfa50fa55fa5afa5ffa64fa69fa6ffa74fa79fa7efa83fa88fa8dfa92fa97fa9cfaa1" ++
+    "faa6faacfab1fab6fabbfac0fac5facafacffad4fad9fadefae3fae9faeefaf2faf8fafdfa02fb07fb0cfb11fb16fb1bfb" ++
+    "20fb25fb2bfb30fb34fb3afb3ffb44fb49fb4efb53fb58fb5dfb62fb67fb6dfb71fb76fb7cfb81fb86fb8bfb90fb95fb9a" ++
+    "fb9ffba4fba9fbaefbb3fbb8fbbdfbc3fbc7fbccfbd2fbd7fbdcfbe1fbe6fbebfbf0fbf5fbfafbfffb04fc09fc0efc13fc" ++
+    "18fc1dfc22fc27fc2dfc32fc36fc3cfc41fc46fc4bfc50fc55fc5afc5ffc64fc69fc6efc73fc78fc7dfc82fc87fc8cfc91" ++
+    "fc96fc9cfca1fca5fcabfcb0fcb5fcbafcbffcc4fcc9fccefcd3fcd8fcddfce2fce7fcecfcf1fcf6fcfbfc00fd05fd0afd" ++
+    "10fd14fd19fd1efd24fd29fd2dfd33fd38fd3dfd42fd47fd4cfd51fd56fd5bfd60fd65fd6afd6ffd74fd79fd7efd83fd88" ++
+    "fd8dfd92fd97fd9cfda1fda6fdabfdb1fdb5fdbafdbffdc5fdcafdcefdd3fdd9fddefde3fde7fdedfdf2fdf7fdfcfd01fe" ++
+    "06fe0bfe10fe15fe1afe1ffe24fe29fe2efe33fe38fe3dfe42fe47fe4cfe51fe56fe5bfe60fe65fe6afe6ffe74fe79fe7e" ++
+    "fe83fe88fe8dfe92fe98fe9cfea1fea6feacfeb1feb5febafec0fec5fecafecefed4fed9fedefee3fee7feedfef2fef7fe" ++
+    "fbfe01ff06ff0bff10ff15ff1aff1fff24ff29ff2eff33ff38ff3dff42ff47ff4cff51ff56ff5bff60ff65ff6aff6fff74" ++
+    "ff79ff7eff83ff88ff8dff92ff97ff9cffa1ffa6ffabffb0ffb5ffbaffbfffc4ffc9ffceffd3ffd8ffddffe3ffe7ffecff" ++
+    "f1fff7fffbff000005000b001000140019001e00240029002d00320038003d00420046004c00510056005b00600065006a" ++
+    "006f00740079007e00830088008d00920097009c00a100a600ab00b000b500ba00bf00c400c900ce00d300d800dd00e200" ++
+    "e700ec00f100f600fb00000105010a010f01140119011e01230128012d01320137013c01420146014b01500156015b015f" ++
+    "0164016a016f01740178017e01830188018c01920197019c01a101a601ab01b001b501ba01bf01c401c901ce01d301d801" ++
+    "dd01e201e701ec01f101f601fb01000205020a020f02140219021e02230228022d02320237023c02420246024b02510256" ++
+    "025b025f0265026a026f02740279027e02830288028d02920297029c02a102a602ab02b002b502ba02bf02c402c902ce02" ++
+    "d302d802dd02e302e702ec02f202f702fb02000306030b03100315031a031f03240329032e03330338033d03420347034c" ++
+    "03510356035b03600365036a036f0374037a037f03830389038e03930398039d03a203a703ac03b103b603bb03c003c503" ++
+    "ca03cf03d403d903de03e303e903ee03f203f803fd03020407040c04110416041b04200425042a042f04340439043e0444" ++
+    "0448044e04530458045d04620467046c04710476047b04800485048a048f0495049a049f04a404a904ae04b304b804bd04" ++
+    "c204c704cc04d104d604dc04e004e604eb04f004f504fa04ff04040509050e05130518051d05220528052d05320537053c" ++
+    "05410546054b05500555055b055f0565056a056f05740579057e05830588058d05920598059c05a205a705ac05b105b605" ++
+    "bb05c005c505ca05d005d505d905df05e405e905ee05f305f805fe05020607060d06120617061c06210626062b06300636" ++
+    "063b06400645064a064f06540659065e06640668066e06730678067d06820687068c06910697069c06a106a606ab06b006" ++
+    "b506ba06c006c506ca06cf06d406d906de06e406e906ee06f306f806fd06020707070d07120717071c07210727072b0731" ++
+    "0736073b07400745074a074f0755075a075f07640769076e07740779077e07830788078d07930798079d07a207a707ac07" ++
+    "b107b707bc07c107c607cb07d007d507db07e007e507ea07ef07f507fa07ff07040809080e08140819081e08230828082d" ++
+    "08330838083d08420847084d08520857085c08610866086c08710876087b08810886088b08900895089a08a008a508aa08" ++
+    "af08b508ba08bf08c408c908ce08d408d908de08e308e908ee08f308f808fe08020908090d09120917091d09220927092c" ++
+    "09320937093c09410946094c09510956095b09610966096b09700976097b09800985098a09900995099a099f09a509aa09" ++
+    "af09b509ba09bf09c409ca09cf09d409d909de09e409e909ee09f409f909fe09030a090a0e0a130a190a1d0a230a280a2d" ++
+    "0a330a380a3d0a430a480a4d0a520a580a5d0a620a680a6d0a720a780a7d0a820a870a8c0a920a970a9c0aa20aa70aac0a" ++
+    "b20ab70abc0ac20ac70acc0ad10ad70adc0ae10ae70aec0af10af70afc0a010b070b0c0b110b170b1c0b210b270b2c0b31" ++
+    "0b360b3c0b410b460b4c0b510b560b5c0b610b660b6c0b710b770b7c0b810b870b8c0b910b970b9c0ba10ba70bac0bb10b" ++
+    "b70bbc0bc20bc70bcc0bd20bd70bdc0be20be70bec0bf20bf70bfd0b020c070c0d0c120c170c1d0c220c280c2d0c320c38" ++
+    "0c3d0c430c480c4d0c530c580c5e0c630c680c6e0c730c790c7e0c830c890c8e0c940c990c9f0ca40caa0caf0cb40cba0c" ++
+    "bf0cc50cca0ccf0cd50cda0ce00ce50ceb0cf00cf50cfb0c000d060d0b0d110d160d1b0d210d270d2c0d320d370d3c0d42" ++
+    "0d470d4d0d520d580d5d0d630d680d6d0d730d780d7e0d830d890d8f0d940d990d9f0da40daa0daf0db50dba0dc00dc50d" ++
+    "cb0dd00dd60ddc0de10de60dec0df10df70dfc0d020e070e0d0e120e180e1d0e230e290e2e0e340e390e3f0e440e4a0e4f" ++
+    "0e550e5b0e600e660e6b0e710e760e7c0e810e870e8c0e920e980e9d0ea30ea80eae0eb30eb90ebe0ec40eca0ecf0ed50e" ++
+    "da0ee00ee50eeb0ef10ef60efc0e020f070f0d0f120f180f1d0f230f290f2e0f340f3a0f3f0f450f4b0f500f560f5b0f61" ++
+    "0f660f6c0f720f780f7d0f830f880f8e0f930f990f9f0fa50faa0fb00fb50fbb0fc10fc70fcc0fd20fd70fdd0fe30fe90f" ++
+    "ee0ff40ff90fff0f05100b10101016101b10211027102d10321038103e10441049104f1055105b10601066106b10711077" ++
+    "107d10821088108e10931099109f10a510aa10b010b610bc10c110c710cd10d310d910de10e410ea10f010f510fb100111" ++
+    "07110c11121118111e11241129112f1135113b11411146114c11521158115d11641169116f1175117a11811186118c1192" ++
+    "1198119e11a311a911af11b511bb11c111c711cc11d211d811de11e411e911f011f511fb11011207120d12131219121e12" ++
+    "24122a12301236123c12421248124e12541259125f1265126b12711277127d12831289128f1295129a12a112a612ac12b2" ++
+    "12b812be12c412ca12d012d612dc12e212e812ee12f412fa12001306130c13121318131e1324132a13301336133c134213" ++
+    "48134e1354135a13601366136c13721378137e1384138a13901396139c13a213a813ae13b513ba13c113c713cd13d313d9" ++
+    "13df13e513eb13f113f713fe1303140914101416141c14221428142e1434143b14411447144d14531459145f1465146b14" ++
+    "711478147e1484148a14911497149d14a314a914af14b514bc14c214c814ce14d514db14e114e714ed14f314f914001506" ++
+    "150c15121519151f1525152b15321538153e1544154b15511557155d1564156a15701576157d1583158915901596159c15" ++
+    "a315a915af15b515bc15c215c815cf15d515dc15e215e815ee15f515fb15021608160e1614161b16211628162e1634163b" ++
+    "16411648164e1654165b16611668166e1674167b16811688168e1694169b16a116a816ae16b516bb16c216c816ce16d516" ++
+    "dc16e216e816ef16f516fc16021709170f1716171c1723172917301736173d1744174a17501757175d1764176a17711778" ++
+    "177e1785178b17921799179f17a617ac17b317ba17c017c717cd17d417db17e117e817ee17f517fc170218091810181718" ++
+    "1d1824182a18311838183e1845184c1852185918601866186d1874187a18811888188f1896189c18a318aa18b118b718be" ++
+    "18c518cc18d218d918e018e718ee18f418fb1802190919101916191d1924192b19321939193f1946194d1954195b196119" ++
+    "68196f1976197d1984198b19921999199f19a619ad19b419bb19c219c919d019d719de19e519ec19f319fa19011a081a0f" ++
+    "1a161a1d1a241a2b1a321a391a3f1a471a4e1a551a5c1a631a6a1a711a781a7f1a861a8d1a941a9b1aa21aaa1ab11ab81a" ++
+    "bf1ac61acd1ad41adb1ae31ae91af11af81aff1a061b0d1b141b1b1b231b2a1b311b391b3f1b471b4e1b551b5d1b641b6b" ++
+    "1b721b791b811b881b8f1b961b9e1ba51bac1bb31bbb1bc21bca1bd11bd81bdf1be71bee1bf51bfd1b041c0b1c131c1a1c" ++
+    "221c291c301c381c3f1c461c4e1c551c5d1c641c6c1c731c7a1c821c8a1c911c981ca01ca81caf1cb61cbe1cc51ccd1cd5" ++
+    "1cdc1ce31ceb1cf21cfa1c021d091d111d181d201d271d2f1d371d3e1d461d4d1d551d5d1d641d6c1d741d7b1d831d8b1d" ++
+    "931d9a1da21daa1db11db91dc11dc81dd01dd81de01de71def1df71dff1d071e0e1e161e1e1e261e2d1e351e3d1e451e4d" ++
+    "1e551e5d1e641e6c1e741e7c1e841e8c1e941e9c1ea31eac1eb31ebc1ec31ecb1ed31edb1ee31eeb1ef31efb1e031f0b1f" ++
+    "131f1b1f231f2b1f341f3b1f441f4c1f541f5c1f641f6c1f741f7d1f851f8c1f951f9d1fa51fad1fb51fbe1fc61fce1fd6" ++
+    "1fde1fe71fef1ff71f00200820102019202120292031203a2042204a2053205b2064206c2074207d2085208d2096209e20" ++
+    "a720af20b820c020c820d120d920e220ea20f320fb2004210d2115211d2126212f2137214021482151215a2162216b2174" ++
+    "217d2185218e2196219f21a821b121b921c221cb21d321dc21e521ee21f7210022082211221a2223222c2234223d224622" ++
+    "4f22582261226a2273227c2285228e229722a022a922b222bb22c422cd22d622df22e822f122fa2204230d2316231f2328" ++
+    "2331233b2344234d2356235f23682372237b2384238e239723a023aa23b323bc23c523cf23d823e223eb23f523fe230724" ++
+    "11241a2424242d24372440244a2454245d24662470247a2483248d249724a024aa24b324bd24c724d024da24e424ee24f8" ++
+    "2401250b2515251f25292532253c25462550255a2564256e25782582258c259625a025aa25b425be25c825d225dc25e625" ++
+    "f025fa2505260f26192623262d26372642264c26562661266b2675267f268a2694269f26a926b326be26c826d326dd26e8" ++
+    "26f226fd26072712271c27272732273c27472752275c27672771277c27872792279c27a827b227bd27c827d327de27e927" ++
+    "f327fe27092814281f282a28352840284b28562861286d28782883288e289a28a528b028bb28c628d228dd28e828f428ff" ++
+    "280b29162922292d29392944294f295b29662972297e2989299529a129ac29b829c429d029db29e729f329ff290b2a172a" ++
+    "222a2e2a3b2a462a522a5f2a6a2a762a832a8f2a9b2aa72ab32ac02acc2ad82ae52af12afd2a092b162b222b2f2b3b2b48" ++
+    "2b542b612b6d2b7a2b862b932ba02bac2bb92bc62bd32be02bed2bf92b062c132c202c2d2c3a2c472c542c612c6f2c7c2c" ++
+    "892c962ca32cb12cbe2ccb2cd92ce62cf42c012d0e2d1c2d292d372d452d522d602d6e2d7c2d892d972da52db32dc12dcf" ++
+    "2ddd2deb2df92d072e152e232e322e3f2e4e2e5c2e6a2e792e872e962ea42eb32ec12ed02ede2eed2efc2e0b2f192f282f" ++
+    "372f462f552f642f732f822f912fa12fb02fbf2fce2fde2fed2ffc2f0b301b302b303a304a305a306930793089309930a9" ++
+    "30b930c930d930e930f930093119312a313a314b315b316b317c318c319d31ae31be31cf31e031f1310232133224323532" ++
+    "4632583269327a328c329d32af32c132d232e432f632083319332b333d334f336233743386339933ab33be33d033e333f5" ++
+    "3308341b342e344134543467347a348e34a134b434c834dc34ef34033517352b353f35533567357b358f35a435b835cd35" ++
+    "e135f6350b36203635364a365f3674368a369f36b536ca36e036f6360c37223738374f3765377b379237a937c037d637ee" ++
+    "3705381c3833384b3862387a389238aa38c238da38f2380b3924393d3955396f398839a139ba39d439ee39073a223a3c3a" ++
+    "563a713a8b3aa63ac13adc3af73a133b2f3b4b3b663b833b9f3bbb3bd83bf53b123c303c4d3c6a3c883ca73cc53ce33c02" ++
+    "3d213d403d603d7f3d9f3dc03de03d003e223e433e643e863ea83eca3eec3e0f3f323f563f793f9d3fc23fe63f0b403140" ++
+    "56407c40a340ca40f0401841404168419141ba41e3410e42384263428e42ba42e642134341436f439d43cc43fb432c445d" ++
+    "448e44c044f34426455a458f45c545fb4532466a46a346dd46184753479047ce470c484c488d48cf48124957499d49e549" ++
+    "2d4a784ac44a114b614bb24b054c5b4cb24c0c4d684dc74d294e8d4ef54e5f4fce4f4050b7503251b2513752c2525353ec" ++
+    "538c543555e755a556705749583459335a4a5b7f5cdb5d685f38616a633466176aba70";
+const seq_netem_slot_dist: u32 = 1795219138;
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1795219138 len=8296
+// tc qdisc add dev lo root handle 1: netem delay 10ms 2ms distribution normal
+const g_netem_delay_dist =
+    "6820000024000506c2de006b00000000000000000100000000000100ffffffff000000000a0001006e6574656d00000038" ++
+    "20020000000000e8030000000000000000000000000000000000000c000a0080969800000000000c000b0080841e000000" ++
+    "00000420020000806d910997919a2e9d439f00a17fa2d0a3fea40fa608a7eea7c3a88ba946aaf6aa9cab3bacd1ac61adeb" ++
+    "ad6eaeedae67afdcaf4db0bbb025b18cb1f0b151b2afb20ab364b3bab30fb462b4b3b402b54fb59bb5e5b52db674b6bab6" ++
+    "feb641b783b7c4b703b842b87fb8bbb8f7b831b96ab9a3b9dbb912ba48ba7ebab3bae6ba1abb4cbb7ebbafbbe0bb10bc3f" ++
+    "bc6ebc9cbccabcf8bc24bd51bd7cbda8bdd2bdfdbd27be50be79bea1becabef2be19bf40bf66bf8dbfb3bfd8bffebf22c0" ++
+    "47c06bc08fc0b3c0d6c0f9c01cc13ec161c182c1a4c1c5c1e7c107c228c248c268c288c2a8c2c7c2e6c205c324c342c361" ++
+    "c37fc39cc3bac3d7c3f5c312c42fc44bc468c484c4a0c4bcc4d8c4f4c40fc52ac545c560c57bc596c5b0c5cac5e5c5fec5" ++
+    "19c632c64cc665c67ec698c6b1c6c9c6e2c6fbc613c72bc744c75cc774c78bc7a3c7bbc7d2c7e9c701c818c82fc846c85d" ++
+    "c873c88ac8a0c8b7c8cdc8e3c8f9c80fc925c93bc950c966c97bc991c9a6c9bbc9d0c9e5c9fac90fca24ca38ca4dca61ca" ++
+    "76ca8aca9ecab2cac6cadacaeeca02cb15cb29cb3dcb50cb64cb77cb8acb9dcbb0cbc3cbd6cbe9cbfccb0fcc22cc34cc46" ++
+    "cc59cc6ccc7ecc90cca2ccb5ccc7ccd9ccebccfccc0ecd20cd32cd44cd55cd66cd78cd8acd9bcdaccdbdcdcecde0cdf1cd" ++
+    "02ce13ce24ce34ce45ce56ce67ce77ce88ce98cea9ceb9cecacedaceeacefbce0bcf1bcf2bcf3bcf4bcf5bcf6bcf7acf8a" ++
+    "cf9acfaacfbacfc9cfd9cfe8cff8cf07d017d026d035d044d054d063d072d081d090d09fd0aed0bdd0ccd0dbd0ead0f9d0" ++
+    "07d116d125d133d142d150d15fd16dd17cd18ad199d1a7d1b5d1c3d1d2d1e0d1eed1fcd10ad218d227d234d242d250d25e" ++
+    "d26cd27ad288d295d2a3d2b1d2bed2ccd2d9d2e7d2f5d202d310d31dd32ad338d345d352d35fd36dd37ad387d394d3a1d3" ++
+    "aed3bcd3c9d3d6d3e3d3f0d3fcd309d416d423d430d43dd449d456d463d46fd47cd489d496d4a2d4aed4bbd4c7d4d4d4e0" ++
+    "d4edd4f9d406d512d51ed52bd537d543d54fd55bd568d574d580d58cd598d5a4d5b0d5bcd5c8d5d4d5e0d5ecd5f8d504d6" ++
+    "10d61bd627d633d63fd64bd656d662d66dd679d685d691d69cd6a8d6b3d6bed6cad6d5d6e1d6ecd6f8d603d70fd71ad725" ++
+    "d731d73cd747d752d75ed769d774d77fd78ad796d7a1d7acd7b7d7c2d7cdd7d8d7e3d7eed7f9d704d80fd81ad825d830d8" ++
+    "3bd845d850d85bd866d871d87bd886d891d89bd8a6d8b1d8bcd8c6d8d1d8dbd8e6d8f0d8fbd806d910d91bd925d930d93a" ++
+    "d944d94fd959d964d96ed978d983d98dd997d9a2d9acd9b6d9c1d9cbd9d5d9dfd9e9d9f3d9fed908da12da1cda26da30da" ++
+    "3ada44da4eda58da62da6dda76da80da8ada94da9edaa8dab2dabcdac6dad0dad9dae3daeddaf7da00db0adb14db1edb28" ++
+    "db31db3bdb45db4edb58db62db6bdb75db7fdb88db92db9bdba5dbaedbb8dbc2dbcbdbd5dbdedbe7dbf1dbfbdb04dc0edc" ++
+    "17dc20dc29dc33dc3cdc46dc4fdc58dc61dc6bdc74dc7edc87dc90dc99dca3dcacdcb5dcbedcc7dcd0dcdadce3dcecdcf5" ++
+    "dcfedc07dd10dd1add23dd2cdd35dd3edd47dd50dd59dd62dd6bdd74dd7ddd86dd8fdd98dda1ddaaddb3ddbcddc4ddcddd" ++
+    "d6dddfdde8ddf1ddf9dd02de0bde14de1dde25de2ede37de40de48de51de5ade63de6bde74de7dde86de8ede97de9fdea8" ++
+    "deb1deb9dec2decaded3dedcdee4deeddef5defede06df0fdf17df20df28df31df39df42df4adf53df5bdf64df6cdf74df" ++
+    "7ddf85df8edf96df9edfa7dfafdfb8dfc0dfc8dfd0dfd9dfe1dfe9dff2dffadf02e00ae012e01be023e02be034e03ce044" ++
+    "e04ce054e05de065e06de075e07de085e08de096e09ee0a5e0aee0b6e0bee0c6e0cee0d6e0dee0e6e0eee0f6e0fee006e1" ++
+    "0ee117e11ee127e12ee136e13ee146e14ee156e15ee166e16ee176e17ee186e18de195e19de1a5e1ade1b5e1bce1c5e1cc" ++
+    "e1d4e1dce1e4e1ece1f3e1fbe103e20be212e21ae222e22ae232e239e241e248e250e258e260e267e26fe277e27fe286e2" ++
+    "8ee296e29de2a5e2ace2b4e2bce2c3e2cbe2d3e2dae2e2e2e9e2f1e2f8e200e307e30fe317e31ee326e32de334e33ce344" ++
+    "e34be353e35ae361e369e371e378e37fe387e38fe396e39de3a5e3ace3b3e3bbe3c2e3cae3d1e3d8e3e0e3e7e3eee3f6e3" ++
+    "fde305e40ce413e41be422e429e431e438e43fe446e44ee455e45de464e46be472e47ae481e488e48fe496e49ee4a5e4ac" ++
+    "e4b3e4bbe4c2e4c9e4d0e4d7e4dee4e6e4ede4f4e4fbe402e509e511e518e51fe526e52de534e53be543e54ae551e558e5" ++
+    "5fe566e56de574e57be582e589e591e598e59fe5a5e5ace5b4e5bbe5c2e5c9e5d0e5d7e5dee5e5e5ece5f3e5fae501e608" ++
+    "e60fe616e61de624e62be631e638e63fe646e64de654e65be662e669e670e676e67de684e68be692e699e6a0e6a7e6aee6" ++
+    "b4e6bbe6c2e6c9e6d0e6d7e6dee6e4e6ebe6f2e6f9e600e706e70de714e71be722e728e72fe736e73de743e74ae751e758" ++
+    "e75ee765e76ce772e779e780e787e78de794e79be7a1e7a8e7afe7b5e7bce7c3e7cae7d0e7d7e7dee7e4e7ebe7f2e7f8e7" ++
+    "ffe705e80ce813e819e820e827e82de834e83be841e848e84ee855e85be862e868e86fe876e87de883e88ae890e897e89d" ++
+    "e8a4e8aae8b1e8b7e8bee8c4e8cbe8d1e8d8e8dee8e5e8ece8f2e8f9e8ffe805e90ce912e919e91fe926e92ce933e939e9" ++
+    "3fe946e94de953e959e960e966e96de973e97ae980e986e98de993e99ae9a0e9a6e9ade9b3e9bae9c0e9c6e9cde9d3e9d9" ++
+    "e9e0e9e6e9ede9f3e9f9e900ea06ea0cea13ea19ea20ea26ea2cea32ea39ea3fea45ea4cea52ea58ea5fea65ea6bea71ea" ++
+    "78ea7eea84ea8aea91ea97ea9deaa4eaaaeab0eab6eabdeac3eac9eacfead6eadceae2eae8eaefeaf5eafbea01eb07eb0e" ++
+    "eb14eb1aeb20eb27eb2deb33eb39eb3feb46eb4ceb52eb58eb5eeb64eb6aeb71eb77eb7deb83eb89eb8feb96eb9ceba2eb" ++
+    "a8ebaeebb4ebbaebc1ebc7ebcdebd3ebd9ebdfebe5ebecebf1ebf7ebfeeb04ec0aec10ec16ec1cec22ec28ec2eec34ec3b" ++
+    "ec41ec46ec4dec53ec59ec5fec65ec6bec71ec77ec7dec83ec89ec8fec95ec9beca1eca7ecadecb3ecb9ecbfecc5eccbec" ++
+    "d1ecd7ecddece3ece9ecefecf5ecfbec01ed07ed0ded13ed19ed1fed25ed2bed31ed37ed3ded43ed49ed4fed55ed5bed61" ++
+    "ed66ed6ded72ed78ed7eed84ed8aed90ed96ed9ceda2eda8edaeedb3edbaedbfedc5edcbedd1edd7edddede3ede9edeeed" ++
+    "f4edfaed00ee06ee0cee12ee17ee1dee23ee29ee2fee35ee3bee40ee46ee4cee52ee58ee5eee64ee69ee6fee75ee7bee81" ++
+    "ee86ee8cee92ee98ee9eeea3eea9eeafeeb5eebbeec1eec6eecceed2eed8eedeeee3eee9eeefeef5eefaee00ef06ef0cef" ++
+    "12ef17ef1def23ef29ef2eef34ef3aef3fef45ef4bef51ef56ef5cef62ef68ef6def73ef79ef7fef84ef8aef90ef96ef9b" ++
+    "efa1efa7efacefb2efb8efbeefc3efc9efceefd4efdaefe0efe5efebeff1eff7effcef02f007f00df013f019f01ef024f0" ++
+    "29f02ff035f03bf040f046f04bf051f057f05df062f068f06df073f079f07ef084f08af08ff095f09af0a0f0a6f0abf0b1" ++
+    "f0b7f0bcf0c2f0c7f0cdf0d3f0d8f0def0e3f0e9f0eff0f4f0faf000f105f10bf110f116f11bf121f127f12cf132f137f1" ++
+    "3df142f148f14ef153f159f15ef164f16af16ff175f17af180f185f18bf190f196f19cf1a1f1a7f1acf1b2f1b7f1bdf1c2" ++
+    "f1c8f1cdf1d3f1d8f1def1e3f1e9f1eef1f4f1f9f1fff105f20af210f215f21bf220f226f22bf231f236f23cf241f246f2" ++
+    "4cf252f257f25df262f268f26df273f278f27df283f288f28ef293f299f29ff2a4f2a9f2aff2b4f2baf2bff2c5f2caf2d0" ++
+    "f2d5f2daf2e0f2e5f2ebf2f0f2f6f2fbf200f306f30bf311f317f31cf321f327f32cf332f337f33cf342f347f34df352f3" ++
+    "58f35df362f368f36df373f378f37df383f388f38ef393f398f39ef3a3f3a9f3aef3b3f3b9f3bef3c4f3c9f3cef3d4f3d9" ++
+    "f3dff3e4f3e9f3eff3f4f3f9f3fff304f40af40ff414f41af41ff424f42af42ff435f43af43ff445f44af44ff455f45af4" ++
+    "5ff465f46af46ff475f47af480f485f48af490f495f49af4a0f4a5f4aaf4b0f4b5f4baf4c0f4c5f4caf4d0f4d5f4daf4e0" ++
+    "f4e5f4eaf4f0f4f5f4faf400f505f50af510f515f51af520f525f52af530f535f53af53ff545f54af54ff554f55af55ff5" ++
+    "64f56af56ff574f57af57ff584f58af58ff594f599f59ff5a4f5a9f5aef5b4f5b9f5bef5c4f5c9f5cef5d3f5d9f5def5e3" ++
+    "f5e9f5eef5f3f5f8f5fef503f608f60ef612f618f61df622f628f62df632f637f63df642f647f64df652f657f65cf661f6" ++
+    "67f66cf671f676f67cf681f686f68bf691f696f69bf6a0f6a5f6abf6b0f6b5f6baf6c0f6c5f6caf6cff6d5f6daf6dff6e4" ++
+    "f6e9f6eff6f4f6f9f6fef604f709f70ef713f719f71df723f728f72df732f738f73df742f747f74df752f757f75cf761f7" ++
+    "66f76cf771f776f77bf781f786f78bf790f795f79af7a0f7a5f7aaf7aff7b4f7baf7bff7c4f7c9f7cef7d3f7d9f7def7e3" ++
+    "f7e8f7edf7f2f7f8f7fdf702f807f80cf812f817f81cf821f826f82bf830f836f83bf840f845f84af84ff855f85af85ff8" ++
+    "64f869f86ff874f879f87ef883f888f88df893f898f89df8a2f8a7f8acf8b1f8b7f8bcf8c1f8c6f8cbf8d0f8d5f8dbf8e0" ++
+    "f8e5f8eaf8eff8f4f8f9f8fef804f909f90ef913f918f91df922f928f92df932f937f93cf941f946f94bf951f956f95bf9" ++
+    "60f965f96af96ff974f97af97ff984f989f98ef993f998f99df9a3f9a8f9adf9b2f9b7f9bcf9c1f9c6f9cbf9d0f9d5f9db" ++
+    "f9e0f9e5f9eaf9eff9f4f9f9f9fef904fa09fa0efa13fa18fa1dfa22fa27fa2cfa32fa36fa3bfa41fa46fa4bfa50fa55fa" ++
+    "5afa5ffa64fa69fa6ffa74fa79fa7efa83fa88fa8dfa92fa97fa9cfaa1faa6faacfab1fab6fabbfac0fac5facafacffad4" ++
+    "fad9fadefae3fae9faeefaf2faf8fafdfa02fb07fb0cfb11fb16fb1bfb20fb25fb2bfb30fb34fb3afb3ffb44fb49fb4efb" ++
+    "53fb58fb5dfb62fb67fb6dfb71fb76fb7cfb81fb86fb8bfb90fb95fb9afb9ffba4fba9fbaefbb3fbb8fbbdfbc3fbc7fbcc" ++
+    "fbd2fbd7fbdcfbe1fbe6fbebfbf0fbf5fbfafbfffb04fc09fc0efc13fc18fc1dfc22fc27fc2dfc32fc36fc3cfc41fc46fc" ++
+    "4bfc50fc55fc5afc5ffc64fc69fc6efc73fc78fc7dfc82fc87fc8cfc91fc96fc9cfca1fca5fcabfcb0fcb5fcbafcbffcc4" ++
+    "fcc9fccefcd3fcd8fcddfce2fce7fcecfcf1fcf6fcfbfc00fd05fd0afd10fd14fd19fd1efd24fd29fd2dfd33fd38fd3dfd" ++
+    "42fd47fd4cfd51fd56fd5bfd60fd65fd6afd6ffd74fd79fd7efd83fd88fd8dfd92fd97fd9cfda1fda6fdabfdb1fdb5fdba" ++
+    "fdbffdc5fdcafdcefdd3fdd9fddefde3fde7fdedfdf2fdf7fdfcfd01fe06fe0bfe10fe15fe1afe1ffe24fe29fe2efe33fe" ++
+    "38fe3dfe42fe47fe4cfe51fe56fe5bfe60fe65fe6afe6ffe74fe79fe7efe83fe88fe8dfe92fe98fe9cfea1fea6feacfeb1" ++
+    "feb5febafec0fec5fecafecefed4fed9fedefee3fee7feedfef2fef7fefbfe01ff06ff0bff10ff15ff1aff1fff24ff29ff" ++
+    "2eff33ff38ff3dff42ff47ff4cff51ff56ff5bff60ff65ff6aff6fff74ff79ff7eff83ff88ff8dff92ff97ff9cffa1ffa6" ++
+    "ffabffb0ffb5ffbaffbfffc4ffc9ffceffd3ffd8ffddffe3ffe7ffecfff1fff7fffbff000005000b001000140019001e00" ++
+    "240029002d00320038003d00420046004c00510056005b00600065006a006f00740079007e00830088008d00920097009c" ++
+    "00a100a600ab00b000b500ba00bf00c400c900ce00d300d800dd00e200e700ec00f100f600fb00000105010a010f011401" ++
+    "19011e01230128012d01320137013c01420146014b01500156015b015f0164016a016f01740178017e01830188018c0192" ++
+    "0197019c01a101a601ab01b001b501ba01bf01c401c901ce01d301d801dd01e201e701ec01f101f601fb01000205020a02" ++
+    "0f02140219021e02230228022d02320237023c02420246024b02510256025b025f0265026a026f02740279027e02830288" ++
+    "028d02920297029c02a102a602ab02b002b502ba02bf02c402c902ce02d302d802dd02e302e702ec02f202f702fb020003" ++
+    "06030b03100315031a031f03240329032e03330338033d03420347034c03510356035b03600365036a036f0374037a037f" ++
+    "03830389038e03930398039d03a203a703ac03b103b603bb03c003c503ca03cf03d403d903de03e303e903ee03f203f803" ++
+    "fd03020407040c04110416041b04200425042a042f04340439043e04440448044e04530458045d04620467046c04710476" ++
+    "047b04800485048a048f0495049a049f04a404a904ae04b304b804bd04c204c704cc04d104d604dc04e004e604eb04f004" ++
+    "f504fa04ff04040509050e05130518051d05220528052d05320537053c05410546054b05500555055b055f0565056a056f" ++
+    "05740579057e05830588058d05920598059c05a205a705ac05b105b605bb05c005c505ca05d005d505d905df05e405e905" ++
+    "ee05f305f805fe05020607060d06120617061c06210626062b06300636063b06400645064a064f06540659065e06640668" ++
+    "066e06730678067d06820687068c06910697069c06a106a606ab06b006b506ba06c006c506ca06cf06d406d906de06e406" ++
+    "e906ee06f306f806fd06020707070d07120717071c07210727072b07310736073b07400745074a074f0755075a075f0764" ++
+    "0769076e07740779077e07830788078d07930798079d07a207a707ac07b107b707bc07c107c607cb07d007d507db07e007" ++
+    "e507ea07ef07f507fa07ff07040809080e08140819081e08230828082d08330838083d08420847084d08520857085c0861" ++
+    "0866086c08710876087b08810886088b08900895089a08a008a508aa08af08b508ba08bf08c408c908ce08d408d908de08" ++
+    "e308e908ee08f308f808fe08020908090d09120917091d09220927092c09320937093c09410946094c09510956095b0961" ++
+    "0966096b09700976097b09800985098a09900995099a099f09a509aa09af09b509ba09bf09c409ca09cf09d409d909de09" ++
+    "e409e909ee09f409f909fe09030a090a0e0a130a190a1d0a230a280a2d0a330a380a3d0a430a480a4d0a520a580a5d0a62" ++
+    "0a680a6d0a720a780a7d0a820a870a8c0a920a970a9c0aa20aa70aac0ab20ab70abc0ac20ac70acc0ad10ad70adc0ae10a" ++
+    "e70aec0af10af70afc0a010b070b0c0b110b170b1c0b210b270b2c0b310b360b3c0b410b460b4c0b510b560b5c0b610b66" ++
+    "0b6c0b710b770b7c0b810b870b8c0b910b970b9c0ba10ba70bac0bb10bb70bbc0bc20bc70bcc0bd20bd70bdc0be20be70b" ++
+    "ec0bf20bf70bfd0b020c070c0d0c120c170c1d0c220c280c2d0c320c380c3d0c430c480c4d0c530c580c5e0c630c680c6e" ++
+    "0c730c790c7e0c830c890c8e0c940c990c9f0ca40caa0caf0cb40cba0cbf0cc50cca0ccf0cd50cda0ce00ce50ceb0cf00c" ++
+    "f50cfb0c000d060d0b0d110d160d1b0d210d270d2c0d320d370d3c0d420d470d4d0d520d580d5d0d630d680d6d0d730d78" ++
+    "0d7e0d830d890d8f0d940d990d9f0da40daa0daf0db50dba0dc00dc50dcb0dd00dd60ddc0de10de60dec0df10df70dfc0d" ++
+    "020e070e0d0e120e180e1d0e230e290e2e0e340e390e3f0e440e4a0e4f0e550e5b0e600e660e6b0e710e760e7c0e810e87" ++
+    "0e8c0e920e980e9d0ea30ea80eae0eb30eb90ebe0ec40eca0ecf0ed50eda0ee00ee50eeb0ef10ef60efc0e020f070f0d0f" ++
+    "120f180f1d0f230f290f2e0f340f3a0f3f0f450f4b0f500f560f5b0f610f660f6c0f720f780f7d0f830f880f8e0f930f99" ++
+    "0f9f0fa50faa0fb00fb50fbb0fc10fc70fcc0fd20fd70fdd0fe30fe90fee0ff40ff90fff0f05100b10101016101b102110" ++
+    "27102d10321038103e10441049104f1055105b10601066106b10711077107d10821088108e10931099109f10a510aa10b0" ++
+    "10b610bc10c110c710cd10d310d910de10e410ea10f010f510fb10011107110c11121118111e11241129112f1135113b11" ++
+    "411146114c11521158115d11641169116f1175117a11811186118c11921198119e11a311a911af11b511bb11c111c711cc" ++
+    "11d211d811de11e411e911f011f511fb11011207120d12131219121e1224122a12301236123c12421248124e1254125912" ++
+    "5f1265126b12711277127d12831289128f1295129a12a112a612ac12b212b812be12c412ca12d012d612dc12e212e812ee" ++
+    "12f412fa12001306130c13121318131e1324132a13301336133c13421348134e1354135a13601366136c13721378137e13" ++
+    "84138a13901396139c13a213a813ae13b513ba13c113c713cd13d313d913df13e513eb13f113f713fe1303140914101416" ++
+    "141c14221428142e1434143b14411447144d14531459145f1465146b14711478147e1484148a14911497149d14a314a914" ++
+    "af14b514bc14c214c814ce14d514db14e114e714ed14f314f914001506150c15121519151f1525152b15321538153e1544" ++
+    "154b15511557155d1564156a15701576157d1583158915901596159c15a315a915af15b515bc15c215c815cf15d515dc15" ++
+    "e215e815ee15f515fb15021608160e1614161b16211628162e1634163b16411648164e1654165b16611668166e1674167b" ++
+    "16811688168e1694169b16a116a816ae16b516bb16c216c816ce16d516dc16e216e816ef16f516fc16021709170f171617" ++
+    "1c1723172917301736173d1744174a17501757175d1764176a17711778177e1785178b17921799179f17a617ac17b317ba" ++
+    "17c017c717cd17d417db17e117e817ee17f517fc1702180918101817181d1824182a18311838183e1845184c1852185918" ++
+    "601866186d1874187a18811888188f1896189c18a318aa18b118b718be18c518cc18d218d918e018e718ee18f418fb1802" ++
+    "190919101916191d1924192b19321939193f1946194d1954195b19611968196f1976197d1984198b19921999199f19a619" ++
+    "ad19b419bb19c219c919d019d719de19e519ec19f319fa19011a081a0f1a161a1d1a241a2b1a321a391a3f1a471a4e1a55" ++
+    "1a5c1a631a6a1a711a781a7f1a861a8d1a941a9b1aa21aaa1ab11ab81abf1ac61acd1ad41adb1ae31ae91af11af81aff1a" ++
+    "061b0d1b141b1b1b231b2a1b311b391b3f1b471b4e1b551b5d1b641b6b1b721b791b811b881b8f1b961b9e1ba51bac1bb3" ++
+    "1bbb1bc21bca1bd11bd81bdf1be71bee1bf51bfd1b041c0b1c131c1a1c221c291c301c381c3f1c461c4e1c551c5d1c641c" ++
+    "6c1c731c7a1c821c8a1c911c981ca01ca81caf1cb61cbe1cc51ccd1cd51cdc1ce31ceb1cf21cfa1c021d091d111d181d20" ++
+    "1d271d2f1d371d3e1d461d4d1d551d5d1d641d6c1d741d7b1d831d8b1d931d9a1da21daa1db11db91dc11dc81dd01dd81d" ++
+    "e01de71def1df71dff1d071e0e1e161e1e1e261e2d1e351e3d1e451e4d1e551e5d1e641e6c1e741e7c1e841e8c1e941e9c" ++
+    "1ea31eac1eb31ebc1ec31ecb1ed31edb1ee31eeb1ef31efb1e031f0b1f131f1b1f231f2b1f341f3b1f441f4c1f541f5c1f" ++
+    "641f6c1f741f7d1f851f8c1f951f9d1fa51fad1fb51fbe1fc61fce1fd61fde1fe71fef1ff71f0020082010201920212029" ++
+    "2031203a2042204a2053205b2064206c2074207d2085208d2096209e20a720af20b820c020c820d120d920e220ea20f320" ++
+    "fb2004210d2115211d2126212f2137214021482151215a2162216b2174217d2185218e2196219f21a821b121b921c221cb" ++
+    "21d321dc21e521ee21f7210022082211221a2223222c2234223d2246224f22582261226a2273227c2285228e229722a022" ++
+    "a922b222bb22c422cd22d622df22e822f122fa2204230d2316231f23282331233b2344234d2356235f23682372237b2384" ++
+    "238e239723a023aa23b323bc23c523cf23d823e223eb23f523fe23072411241a2424242d24372440244a2454245d246624" ++
+    "70247a2483248d249724a024aa24b324bd24c724d024da24e424ee24f82401250b2515251f25292532253c25462550255a" ++
+    "2564256e25782582258c259625a025aa25b425be25c825d225dc25e625f025fa2505260f26192623262d26372642264c26" ++
+    "562661266b2675267f268a2694269f26a926b326be26c826d326dd26e826f226fd26072712271c27272732273c27472752" ++
+    "275c27672771277c27872792279c27a827b227bd27c827d327de27e927f327fe27092814281f282a28352840284b285628" ++
+    "61286d28782883288e289a28a528b028bb28c628d228dd28e828f428ff280b29162922292d29392944294f295b29662972" ++
+    "297e2989299529a129ac29b829c429d029db29e729f329ff290b2a172a222a2e2a3b2a462a522a5f2a6a2a762a832a8f2a" ++
+    "9b2aa72ab32ac02acc2ad82ae52af12afd2a092b162b222b2f2b3b2b482b542b612b6d2b7a2b862b932ba02bac2bb92bc6" ++
+    "2bd32be02bed2bf92b062c132c202c2d2c3a2c472c542c612c6f2c7c2c892c962ca32cb12cbe2ccb2cd92ce62cf42c012d" ++
+    "0e2d1c2d292d372d452d522d602d6e2d7c2d892d972da52db32dc12dcf2ddd2deb2df92d072e152e232e322e3f2e4e2e5c" ++
+    "2e6a2e792e872e962ea42eb32ec12ed02ede2eed2efc2e0b2f192f282f372f462f552f642f732f822f912fa12fb02fbf2f" ++
+    "ce2fde2fed2ffc2f0b301b302b303a304a305a306930793089309930a930b930c930d930e930f930093119312a313a314b" ++
+    "315b316b317c318c319d31ae31be31cf31e031f13102321332243235324632583269327a328c329d32af32c132d232e432" ++
+    "f632083319332b333d334f336233743386339933ab33be33d033e333f53308341b342e344134543467347a348e34a134b4" ++
+    "34c834dc34ef34033517352b353f35533567357b358f35a435b835cd35e135f6350b36203635364a365f3674368a369f36" ++
+    "b536ca36e036f6360c37223738374f3765377b379237a937c037d637ee3705381c3833384b3862387a389238aa38c238da" ++
+    "38f2380b3924393d3955396f398839a139ba39d439ee39073a223a3c3a563a713a8b3aa63ac13adc3af73a133b2f3b4b3b" ++
+    "663b833b9f3bbb3bd83bf53b123c303c4d3c6a3c883ca73cc53ce33c023d213d403d603d7f3d9f3dc03de03d003e223e43" ++
+    "3e643e863ea83eca3eec3e0f3f323f563f793f9d3fc23fe63f0b40314056407c40a340ca40f0401841404168419141ba41" ++
+    "e3410e42384263428e42ba42e642134341436f439d43cc43fb432c445d448e44c044f34426455a458f45c545fb4532466a" ++
+    "46a346dd46184753479047ce470c484c488d48cf48124957499d49e5492d4a784ac44a114b614bb24b054c5b4cb24c0c4d" ++
+    "684dc74d294e8d4ef54e5f4fce4f4050b7503251b2513752c2525353ec538c543555e755a556705749583459335a4a5b7f" ++
+    "5cdb5d685f38616a633466176aba70";
+const seq_netem_delay_dist: u32 = 1795219138;
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1795219138 len=96
+// tc qdisc add dev lo root handle 1: netem rate 5gbit 10 20 30
+const g_netem_rate_overhead =
+    "6000000024000506c2de006b00000000000000000100000000000100ffffffff000000000a0001006e6574656d00000030" ++
+    "00020000000000e8030000000000000000000000000000000000001400060040be40250a000000140000001e000000";
+const seq_netem_rate_overhead: u32 = 1795219138;
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1795219138 len=108
+// tc qdisc add dev lo root handle 1: netem rate 100gbit
+const g_netem_rate64 =
+    "6c00000024000506c2de006b00000000000000000100000000000100ffffffff000000000a0001006e6574656d0000003c" ++
+    "00020000000000e8030000000000000000000000000000000000000c00080000dd0ee90200000014000600ffffffff0000" ++
+    "00000000000000000000";
+const seq_netem_rate64: u32 = 1795219138;
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1795219138 len=100
+// tc qdisc add dev lo root handle 1: netem delay 10ms seed 5
+const g_netem_seed =
+    "6400000024000506c2de006b00000000000000000100000000000100ffffffff000000000a0001006e6574656d00000034" ++
+    "00020000000000e8030000000000000000000000000000000000000c000a0080969800000000000c000e00050000000000" ++
+    "0000";
+const seq_netem_seed: u32 = 1795219138;
+
+// ### RTM_NEWQDISC type=36 flags=0x605 seq=1795219138 len=116
+// tc qdisc add dev lo root handle 1: netem rate 1mbit ecn loss 5% seed 77
+const g_netem_ecn_rate_seed =
+    "7400000024000506c2de006b00000000000000000100000000000100ffffffff000000000a0001006e6574656d00000044" ++
+    "00020000000000e8030000cdcccc0c00000000000000000000000008000700010000001400060048e80100000000000000" ++
+    "0000000000000c000e004d00000000000000";
+const seq_netem_ecn_rate_seed: u32 = 1795219138;
