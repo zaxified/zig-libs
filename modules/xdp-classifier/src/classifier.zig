@@ -33,8 +33,8 @@ pub const KeyField = enum {
     dst,
 
     /// Byte offset from the start of the packet (Ethernet frame) — IPv4's
-    /// fixed (no-options) header places `saddr` at header-offset 12 and
-    /// `daddr` at 16, plus the 14-byte Ethernet header ahead of it.
+    /// header places `saddr` at header-offset 12 and
+    /// `daddr` at 16 whatever its options, plus the 14-byte Ethernet header ahead of it.
     fn offset(self: KeyField) i16 {
         return switch (self) {
             .src => 26,
@@ -98,7 +98,7 @@ pub const ClassifierOptions = struct {
     /// Which IPv4 address field the lookup key is drawn from.
     key_field: KeyField = .src,
     /// Class handle written for a packet that fails any parse/bounds check
-    /// (too short, non-IPv4 EtherType, IPv4 options present — see
+    /// (too short, non-IPv4 EtherType, an IHL below 5 — see
     /// `../README.md` "Scope") OR finds no LPM match. Callers conventionally
     /// reserve 0 for "unclassified / best-effort".
     default_class: u32 = 0,
@@ -183,7 +183,8 @@ const MissJumps = struct {
 ///     DISPATCH:
 ///     [V] if r4 == 0x86DD -> V6
 ///     if r4 != 0x0800            -> MISS
-///     IHL == 5, copy 4 bytes, prefixlen 32, lookup lpm  (pre-2026-10-06 code)
+///     IHL < 5 -> MISS (options, IHL > 5, follow the 20 fixed bytes the key is in),
+///     copy 4 bytes, prefixlen 32, lookup lpm
 ///     if r0 == 0                 -> MISS
 ///     [V] goto HIT
 ///     [V] V6: if r1 + 54 > r2 -> MISS; version == 6; copy 16 bytes;
@@ -231,7 +232,7 @@ fn emitParseAndLookup(b: *Buf, p: ParseSpec) MissJumps {
     // IPv4 (unchanged from the original program).
     b.emit(Insn.ldx(.byte, R.r4, R.r1, 14));
     b.emit(Insn.alu_and(R.r4, 0x0f));
-    miss.add(b.reserve(), Insn.jne(R.r4, @as(i32, 5), 0));
+    miss.add(b.reserve(), Insn.jlt(R.r4, @as(i32, 5), 0)); // IHL < 5 is malformed; options (IHL > 5) sit past the key
     const key_off = p.key_field.offset();
     var k: i16 = 0;
     while (k < 4) : (k += 1) {
@@ -307,11 +308,13 @@ fn emitParseAndLookup(b: *Buf, p: ParseSpec) MissJumps {
 ///     equivalent C bounds check to the identical instruction shape (mov +
 ///     add-immediate-34 + jgt against the SAME two registers) — see the
 ///     golden test below.
-///  3. **IPv4 options are out of scope** (see `../README.md`
-///     "Scope"): this program checks the IHL nibble equals 5 (a plain
-///     20-byte header, the overwhelming majority of real traffic) and falls
-///     to `opts.default_class` otherwise, rather than computing a
-///     variable-length header offset (a documented, ADDITIVE extension).
+///  3. **IPv4 options need no offset arithmetic.** The key is the source or
+///     destination address, at +12 / +16 of the IP header whatever its length
+///     (options come after those 20 bytes), so the program only checks that
+///     the IHL nibble is at least 5 (a smaller one is malformed and gets
+///     `opts.default_class`) and reads the key at the same constant offsets
+///     for every valid header: the 34-byte bounds check already covers them,
+///     and no packet-derived pointer is ever formed.
 ///  4. **LPM key construction** copies `opts.key_field`'s 4 address bytes
 ///     byte-wise into the stack (identical technique to `ebpf.xdpFilter`'s
 ///     key copy — alignment-safe, dominated by the same bounds check) and
@@ -375,7 +378,7 @@ fn emitParseAndLookup(b: *Buf, p: ParseSpec) MissJumps {
 ///
 /// Design note on the shared DEFAULT class: a too-short packet, an
 /// unrecognised EtherType (including IPv6 without an IPv6 map, or more VLAN
-/// tags than `vlan_depth`), an IPv4-with-options packet, an IPv6 packet whose
+/// tags than `vlan_depth`), an IPv4 packet with an IHL below 5, an IPv6 packet whose
 /// version nibble is not 6, and an LPM miss are all
 /// deliberately indistinguishable at the output (all of them write
 /// `opts.default_class`) — a caller needing to tell them apart needs a
@@ -584,7 +587,7 @@ pub const SteerBuildError = error{
 ///    range), then `bpf_redirect_map(&cpumap, r2, opts.redirect_flags)`; the
 ///    program returns the helper's result (`XDP_REDIRECT` on success). Every
 ///    OTHER path — too-short packet, unrecognised EtherType or too many VLAN
-///    tags, IPv4 options, a bad IPv6 version nibble, or an LPM miss — returns `XDP_PASS`, the safe fallback (the packet continues up
+///    tags, an IHL below 5, a bad IPv6 version nibble, or an LPM miss — returns `XDP_PASS`, the safe fallback (the packet continues up
 ///    the normal stack, exactly the classifier's "unclassified = best-effort"
 ///    default).
 ///
@@ -664,7 +667,7 @@ const builtin = @import("builtin");
 //   u16 eth_proto = *(u16*)(data + 12);
 //   u8 version_ihl = *(data + 14);
 //   if (eth_proto != 0x0008) return DEFAULT;      // htons(0x0800) on LE
-//   if ((version_ihl & 0x0f) != 5) return DEFAULT;
+//   if ((version_ihl & 0x0f) < 5) return DEFAULT;   // options (IHL > 5) follow the fixed 20 bytes
 //   key[0..4] = data[26..30];                     // src field
 //
 // which clang compiles (verified in this repo's own dev environment via
@@ -705,7 +708,7 @@ const golden_classifier = [_]Insn{
     .{ .code = 0x55, .dst = 4, .src = 0, .off = 20, .imm = 8 }, // jne   r4 != 0x0008 -> DEFAULT(27)
     .{ .code = 0x71, .dst = 4, .src = 1, .off = 14, .imm = 0 }, // ldx B r4 = version_ihl
     .{ .code = 0x57, .dst = 4, .src = 0, .off = 0, .imm = 15 }, // and   r4 &= 0x0f
-    .{ .code = 0x55, .dst = 4, .src = 0, .off = 17, .imm = 5 }, // jne   r4 != 5 -> DEFAULT(27)
+    .{ .code = 0xa5, .dst = 4, .src = 0, .off = 17, .imm = 5 }, // jlt   r4 < 5 -> DEFAULT(27)
     .{ .code = 0x71, .dst = 5, .src = 1, .off = 26, .imm = 0 }, // ldx B r5 = data[26]
     .{ .code = 0x73, .dst = 10, .src = 5, .off = -4, .imm = 0 }, // stx B key[0]
     .{ .code = 0x71, .dst = 5, .src = 1, .off = 27, .imm = 0 }, // ldx B r5 = data[27]
@@ -777,7 +780,7 @@ const golden_classifier_vlan2 = [_]Insn{
     .{ .code = 0x55, .dst = 4, .src = 0, .off = 20, .imm = 8 }, // 20 DISPATCH: jne IPv4 -> DEFAULT(41)
     .{ .code = 0x71, .dst = 4, .src = 1, .off = 14, .imm = 0 }, // 21 r4 = version_ihl
     .{ .code = 0x57, .dst = 4, .src = 0, .off = 0, .imm = 15 }, // 22 r4 &= 0x0f
-    .{ .code = 0x55, .dst = 4, .src = 0, .off = 17, .imm = 5 }, // 23 jne 5 -> DEFAULT(41)
+    .{ .code = 0xa5, .dst = 4, .src = 0, .off = 17, .imm = 5 }, // 23 jlt 5 -> DEFAULT(41)
     .{ .code = 0x71, .dst = 5, .src = 1, .off = 26, .imm = 0 }, // 24
     .{ .code = 0x73, .dst = 10, .src = 5, .off = -4, .imm = 0 }, // 25
     .{ .code = 0x71, .dst = 5, .src = 1, .off = 27, .imm = 0 }, // 26
@@ -1018,7 +1021,7 @@ const golden_steer = [_]Insn{
     .{ .code = 0x55, .dst = 4, .src = 0, .off = 25, .imm = 8 }, // 6  jne r4 != 0x0008 -> PASS(32)
     .{ .code = 0x71, .dst = 4, .src = 1, .off = 14, .imm = 0 }, // 7  ldx B r4 = version_ihl
     .{ .code = 0x57, .dst = 4, .src = 0, .off = 0, .imm = 15 }, // 8  and r4 &= 0x0f
-    .{ .code = 0x55, .dst = 4, .src = 0, .off = 22, .imm = 5 }, // 9  jne r4 != 5 -> PASS(32)
+    .{ .code = 0xa5, .dst = 4, .src = 0, .off = 22, .imm = 5 }, // 9  jlt r4 < 5 -> PASS(32)
     .{ .code = 0x71, .dst = 5, .src = 1, .off = 26, .imm = 0 }, // 10 ldx B r5 = data[26]
     .{ .code = 0x73, .dst = 10, .src = 5, .off = -4, .imm = 0 }, // 11 stx B key[0]
     .{ .code = 0x71, .dst = 5, .src = 1, .off = 27, .imm = 0 }, // 12 ldx B r5 = data[27]
@@ -1154,7 +1157,7 @@ test "structural: every non-hit path falls back to a single trailing XDP_PASS" {
     // miss) targets that shared PASS instruction.
     var branches: usize = 0;
     for (insns, 0..) |ins, i| {
-        const is_branch = ins.code == 0x2d or ins.code == 0x55 or (ins.code == 0x15 and ins.dst == 0);
+        const is_branch = ins.code == 0x2d or ins.code == 0x55 or ins.code == 0xa5 or (ins.code == 0x15 and ins.dst == 0);
         if (is_branch) {
             const target = i + 1 + @as(usize, @intCast(ins.off));
             try testing.expectEqual(pass_idx, target);

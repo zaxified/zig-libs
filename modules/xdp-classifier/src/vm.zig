@@ -223,6 +223,9 @@ pub fn exec(prog: []const Insn, env: *Env) VmError!Result {
             0x55 => if (r[dst] != imm64) { // jne imm
                 pc = @intCast(@as(i64, @intCast(pc)) + ins.off);
             },
+            0xa5 => if (r[dst] < imm64) { // jlt imm (unsigned)
+                pc = @intCast(@as(i64, @intCast(pc)) + ins.off);
+            },
             0x15 => if (r[dst] == imm64) { // jeq imm
                 pc = @intCast(@as(i64, @intCast(pc)) + ins.off);
             },
@@ -370,7 +373,7 @@ pub fn storeFromRules(buf: []LpmEntry, rs: []const rules.ClassifierRule) []LpmEn
 ///     and fewer than `vlan_depth` tags have been skipped, skip the 4-byte tag
 ///     and read the next EtherType;
 ///   * `0x0800`: the fixed 20-byte IPv4 header must be present and its IHL
-///     nibble 5; key = source (header +12) or destination (+16) address;
+///     nibble at least 5 (options follow the 20 bytes the key is in); key = source (header +12) or destination (+16) address;
 ///   * `0x86DD` with an IPv6 table: the fixed 40-byte IPv6 header must be
 ///     present and its version nibble 6; key = source (+8) or destination
 ///     (+24) address; extension headers are irrelevant to the key;
@@ -401,7 +404,7 @@ pub fn packetMatchReference(pkt: []const u8, cfg: RefConfig) ?u32 {
     switch (et) {
         0x0800 => {
             if (pkt.len < l3 + 20) return null;
-            if (pkt[l3] & 0x0f != 5) return null;
+            if (pkt[l3] & 0x0f < 5) return null;
             const at = l3 + @as(usize, if (cfg.key_field == .src) 12 else 16);
             const a: [4]u8 = pkt[at..][0..4].*;
             // Two defaults that cannot both be the answer: a hit returns the
@@ -592,7 +595,9 @@ pub const cases = [_]Case{
     .{ .name = "double 8100 IPv4", .tags = &.{ q100, .{ .tpid = 0x8100, .vid = 4095 } }, .l3 = v4_pair, .want_src = 3, .want_dst = 4 },
     .{ .name = "triple tag IPv4 (past depth 2)", .tags = &.{ ad10, q100, q100 }, .l3 = v4_pair, .want_src = null, .want_dst = null },
     .{ .name = "0x9100 TPID IPv4 (not recognised)", .tags = &.{.{ .tpid = 0x9100, .vid = 7 }}, .l3 = v4_pair, .want_src = null, .want_dst = null },
-    .{ .name = "IPv4 with options (IHL 6)", .tags = &.{q100}, .l3 = .{ .v4 = .{ .src = .{ 10, 1, 2, 3 }, .dst = .{ 192, 168, 0, 1 }, .ihl = 6 } }, .want_src = null, .want_dst = null },
+    .{ .name = "IPv4 with options (IHL 6)", .tags = &.{q100}, .l3 = .{ .v4 = .{ .src = .{ 10, 1, 2, 3 }, .dst = .{ 192, 168, 0, 1 }, .ihl = 6 } }, .want_src = 3, .want_dst = 4 },
+    .{ .name = "IPv4 with the longest options (IHL 15)", .tags = &.{}, .l3 = .{ .v4 = .{ .src = .{ 10, 1, 2, 3 }, .dst = .{ 192, 168, 0, 1 }, .ihl = 15 } }, .want_src = 3, .want_dst = 4 },
+    .{ .name = "IPv4 with a malformed IHL (4)", .tags = &.{q100}, .l3 = .{ .v4 = .{ .src = .{ 10, 1, 2, 3 }, .dst = .{ 192, 168, 0, 1 }, .ihl = 4 } }, .want_src = null, .want_dst = null },
     .{ .name = "untagged IPv6", .tags = &.{}, .l3 = v6_pair, .want_src = 13, .want_dst = 14 },
     .{ .name = "802.1Q IPv6", .tags = &.{q100}, .l3 = v6_pair, .want_src = 13, .want_dst = 14 },
     .{ .name = "QinQ IPv6", .tags = &.{ ad10, q100 }, .l3 = v6_pair, .want_src = 13, .want_dst = 14 },

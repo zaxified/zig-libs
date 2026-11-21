@@ -65,10 +65,11 @@ about by analogy (see `src/classifier.zig`'s golden-test provenance comment).
   another TPID (`0x9100`, …), gets the default class. Each skipped tag is a
   constant 4-byte cursor advance followed by a fresh bounds check, so every
   read stays verifier-provable (see `SPEC.md`, "VLAN and IPv6").
-- **Fixed 20-byte IPv4 header (no options).** The generated program checks
-  the IHL nibble equals 5 and falls to the configured default class
-  otherwise, rather than computing a variable-length header offset.
-  Variable-IHL support is a documented, additive extension.
+- **IPv4 options are accepted.** The key (source or destination address) sits at
+  header offset 12 / 16 whatever the header length, so the generated program only
+  checks that the IHL nibble is at least 5 (a smaller one is malformed and gets the
+  configured default class) and reads the key at the same constant offsets: no
+  packet-derived pointer, nothing new for the verifier.
 - **Always classifies, never filters.** The program returns `XDP_PASS` on
   every packet (matched or not) — it writes a class handle for a downstream
   `tc`/queueing stage to act on, it does not drop traffic itself. A
@@ -271,6 +272,6 @@ ported.
 
 ## Not provided
 
-Variable-length IPv4 options, PPPoE, more than two VLAN tags, a DROP-on-no-match variant, a flow-keyed output map,
+PPPoE, more than two VLAN tags, a DROP-on-no-match variant, a flow-keyed output map,
 `bpf_xdp_adjust_meta` handoff and the `tc` half of the pipeline are not built; SPEC *What is deliberately not done*
 and *Backlog / deferred* give the reasons and what is open.

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — Behaviour change: an IPv4 packet with options (IHL 6..15) is classified by its source or destination address like any other (the key is at the same constant offset whatever the header length); before, it got the default class. Only an IHL below 5 (malformed) gets the default class now. The generated programs change by one instruction (`jne r4, 5` is `jlt r4, 5`); the verifier sees a plain scalar compare, but the kernel-gated load test (`src/kernel_test.zig`) was not run for this change.
 - **2026-10-10** — tests: deterministic fuzz driver `XDP_FUZZ` over the existing harnesses (validate, lookup, validateSorted-vs-validate differential, IPv6 table, emitted packet path vs reference over generated frames); reach labels count real outcomes. No code or API change.
 - **2026-10-06** — ADDED, **BEHAVIOURAL, not breaking:** VLAN tag skip and IPv6 classification; scope mvp -> core.
   `ClassifierOptions`/`CpumapSteerOptions` gain `vlan_depth: VlanDepth = .double` (skip 0..2

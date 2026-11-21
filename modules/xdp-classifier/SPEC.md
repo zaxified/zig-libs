@@ -37,7 +37,7 @@ hand-written XDP data plane of the shapers the module is modelled on. Only READM
 **Where we are ahead:** the only path to a verifier-checked XDP classifier without clang, LLVM or a C
 toolchain: a rule set in, program and LPM/CPUMAP/scratch maps out, with a decision
 oracle (`lookupReference`) that tests can compare kernel results against. **Where we are behind:**
-IPv4 options (IHL > 5 falls to the default class), the `tc` half of the pipeline (no queue_mapping/class-setting TC
+the `tc` half of the pipeline (no queue_mapping/class-setting TC
 program is emitted) and PPPoE-encapsulated traffic; none is on the main path of an IPv4/IPv6 edge on a tagged or
 untagged link, hence `core`. IPv6 and VLAN-tagged links (0..2 tags, 802.1Q and 802.1ad) are classified, which makes this
 module even with LibreQoS and xdp-cpumap-tc for the address-classification job it does (their parsers' exact limits —
@@ -102,11 +102,11 @@ true of this module, but naming them sharpens the verdict): if the LPM key
 needed a variable-length prefix computed from packet content (it doesn't —
 prefixlen is always the fixed constant 32, see point 4 in
 `classifier.buildClassifierProgram`'s doc comment); if IPv4 options required
-a dynamic, packet-derived pointer offset into a bounds-checked region (out of
-scope for v1, see README "Scope" — this WOULD be a legitimate candidate for
-a future Fable-tier pass, since dynamic scalar-range-tracked pointer
-arithmetic is a genuinely subtler verifier interaction than anything in this
-module); or if the class handle needed to survive a MORE complex control-flow
+a dynamic, packet-derived pointer offset into a bounds-checked region (they do
+not: the key is at a constant offset in the 20 fixed bytes whatever the header
+length, so only IHL >= 5 is checked; a transport-port key would need the offset,
+and dynamic scalar-range-tracked pointer arithmetic is a genuinely subtler
+verifier interaction than anything in this module); or if the class handle needed to survive a MORE complex control-flow
 shape than "one register, two sequential calls" (it doesn't — see point 6 in
 the same doc comment for why a plain callee-saved register suffices here,
 unlike `ebpf.ringbufEmit`'s whole-CFG reference-release liveness property,
@@ -359,18 +359,16 @@ pattern again, not a dynamic offset:
 - **Per-flow (rather than per-subscriber) output keying** and a flow-keyed output map: the CPU-selection note under
   *CPUMAP steering* argues against it for a LibreQoS-style shaper; the scratch map is a single slot.
 
+- **PPPoE sessions** (EtherType `0x8864`, an 8-byte header): LibreQoS's README, the design reference, documents VLAN, VXLAN and MPLS
+  classification and says nothing of PPPoE, no other surveyed source offers it, and no consumer asks (a BNG-side deployment
+  would be the first). The shape is known if it is asked for: one more constant cursor advance of 8 after the VLAN levels,
+  the PPP protocol word (`0x0021` / `0x0057`) read where the EtherType would be.
+- **The `tc` half of the pipeline** (xdp-cpumap-tc's TC BPF program that sets `queue_mapping` and the class handle): this module
+  emits the XDP half; the `tc` module attaches classic-bytecode filters and typed qdiscs but not eBPF objects, and generating
+  the TC program needs that attachment first (a feature of `tc`, not of this module, which has no open item for it).
 ## Backlog / deferred
 
-- **Variable-length IPv4 options** (IHL > 5; survey item 3, rare in practice, effort medium-large): needs a DYNAMIC,
-  packet-derived pointer offset (IHL nibble × 4, bounds-checked before use), a step up in verifier-interaction
-  complexity from the fixed compile-time offsets used everywhere else (dynamic scalar-range-tracked pointer
-  arithmetic), and the most plausible future Fable-tier candidate if this module is extended (see the tier verdict).
-- **PPPoE sessions** (EtherType `0x8864`, an 8-byte header): a further fixed-offset skip, the same shape as a VLAN tag;
-  the next candidate if a BNG-side deployment needs it.
-- **The `tc` half of the pipeline** (survey item 4, effort medium): xdp-cpumap-tc pairs the cpumap redirect with a TC
-  BPF program that sets `queue_mapping` and the class handle; this module does not generate it. The `tc` module has
-  typed `ingress`/`clsact` qdiscs and a classic-bytecode `bpf` filter; attaching an eBPF-object classifier, which is
-  what this item wants generated, is still open in `tc`.
+None open.
 
 ## Anchoring
 
