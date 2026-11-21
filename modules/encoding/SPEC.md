@@ -55,6 +55,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - `Decoder` is the WHATWG UTF-8 and UTF-16 decoder state machines verbatim (UTF-8: bytes needed / seen / lower / upper boundary, so overlongs, surrogates and > U+10FFFF are refused at the offending byte and that byte is read again; UTF-16: lead byte, lead surrogate, an unpaired lead followed by another unit is one error and the unit is read again). Chunks of any size; `finish` turns an unfinished sequence into one U+FFFD (or `error.Malformed` with `.fatal`). A fatal decoder that failed refuses further input.
 - `decodeToUtf8(.utf8)` runs the same machine (after a validity fast path), so its U+FFFD count is WHATWG's — one per maximal subpart (`e2 82` is one, `f0 80 80` is three) — and the output is valid UTF-8 unconditionally.
 - UTF-32 (not in the Standard; Python `utf-32` and x/text `utf32` have it) uses the same shape: a malformed unit (above U+10FFFF, a surrogate) is one U+FFFD and a cut tail is one, as CPython's `errors="replace"`.
+- Detection (the limited form): `detect(bytes, more_follows)` → `Detection` = BOM (`utf8_bom`/`utf16le_bom`/`utf16be_bom`), `ascii`, `utf8` (non-ASCII but well-formed throughout) or `unknown`. Deterministic and allocation-free; `more_follows` forgives a UTF-8 sequence cut by the end of a streamed prefix. It never picks between legacy pages: `unknown` means "use the caller's default" (WHATWG, encoding_rs, Go `x/text` and Python `codecs` have no detector; `x/net/html/charset` and browsers also take valid UTF-8 as UTF-8).
 - BOMs: `sniffBom` recognises UTF-8 and UTF-16 (WHATWG: `ff fe 00 00` is UTF-16LE); `sniffBom32` additionally recognises UTF-32 (`ff fe 00 00` / `00 00 fe ff`); `decode` / `decode32` let a BOM override the fallback encoding and remove it. `encodeUtf16` / `encodeUtf32` take an optional BOM (malformed UTF-8 → U+FFFD).
 - Entry points: `decodeUtf16`, `encodeUtf16`, `decodeUtf32`, `encodeUtf32`, `decodeFatal` (`error.Malformed` instead of U+FFFD, also for a page's undefined byte).
 - **Unmappable modes** on encode (`Unmappable`): `.question_mark` (default, as Python `errors="replace"`), `.ignore`, `.html_ncr` (`&#NNNN;`, the Standard's own encoder mode for HTML forms) and `.fatal` (`error.Unmappable`; `Encoder.encodeInto` reports `EncodeStatus.unmappable` with the code point and stops before it).
@@ -71,7 +72,7 @@ Limits a consumer relies on: decode output is at most 3 bytes per input byte (pl
 
 ## What is deliberately not done
 
-- **Statistical encoding detection** (chardetng, Python `chardet`, ICU): not built; BOM sniffing only (R13). A limited form is open in *Backlog / deferred*.
+- **Statistical encoding detection** (chardetng, Python `chardet`, ICU): not built (R13): `detect` answers BOM / ASCII / valid UTF-8 / unknown only, and never ranks legacy code pages against each other; no reference implementation of the Standard does, and the ranking needs per-language statistics (chardetng, ICU).
 - **Unicode normalization (NFC/NFD), IDNA/punycode, UTF-7, base64/quoted-printable codecs, `utf-8-sig` as a named codec** (R14): other charters (normalization and IDNA would be a `unicodenorm` module if anyone asks); base64 has `b64ct`/`base32`; UTF-7 is rejected by WHATWG for security and maps to `replacement`; the UTF-8 BOM is handled by `decode`.
 - **CP855/858/860-866, EBCDIC, Kamenicky** (R12 remainder): no consumer; only CP437/850/852 are built (CP852 is Czech/Polish DOS).
 - **Backslash and name replacement on encode** (`\uXXXX`, `\N{}`, Python `backslashreplace`/`namereplace`): not built; `namereplace` would need the Unicode name table.
@@ -92,7 +93,6 @@ Limits a consumer relies on: decode output is at most 3 bytes per input byte (pl
 
 ## Backlog / deferred
 
-- **Encoding detection, limited form (R13):** "is this UTF-8, else which of our pages is most plausible" over the pages we have, as a convenience when an input encoding is unset; not built. A consumer might use it. (The full statistical detector is not planned, see *What is deliberately not done*.)
 - **Latin-1 fast converters** (encoding_rs `mem` `convert_latin1_to_utf8` …) are speed rows, not features: `latin1ToUtf8` / `utf8ToLatin1Lossy` are thin wrappers over the identity page.
 
 ## Anchoring

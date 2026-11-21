@@ -774,6 +774,74 @@ pub const Encoder = struct {
 
 // ── `mem`-style helpers (encoding_rs `mem`) ─────────────────────
 
+/// What `detect` could tell from the bytes alone.
+pub const Detection = enum {
+    /// A byte-order mark decided: see `sniffBom`.
+    utf8_bom,
+    utf16le_bom,
+    utf16be_bom,
+    /// Every byte is below 0x80 (and there is no BOM): any ASCII-compatible encoding reads it the same.
+    ascii,
+    /// Not ASCII, but well-formed UTF-8 throughout: a legacy page that happens to be valid UTF-8
+    /// is vanishingly rare, which is why browsers, Python's `chardet` and `x/net/html/charset`
+    /// all take it as UTF-8.
+    utf8,
+    /// Neither: some legacy encoding, which only the caller's context (a declared charset, the
+    /// locale, the language) can name. Use it as the cue to fall back to a default page.
+    unknown,
+
+    /// The `Encoding` to decode with when the answer is not `.unknown` (a BOM'd UTF-16 is not an
+    /// `Encoding`; decode it with `decode`).
+    pub fn encoding(self: Detection) ?Encoding {
+        return switch (self) {
+            .utf8_bom, .ascii, .utf8 => .utf8,
+            .utf16le_bom, .utf16be_bom, .unknown => null,
+        };
+    }
+};
+
+/// The limited form of encoding detection: BOM, then ASCII, then "is it UTF-8". Deterministic,
+/// allocation-free, one pass (vectorised). It never guesses between legacy code pages (no
+/// reference implementation of the WHATWG Encoding Standard, encoding_rs, Go `x/text` or Python
+/// `codecs` does; that is the job of a statistical detector such as chardetng or ICU, see
+/// *What is deliberately not done*): `.unknown` means "decode with the caller's default".
+///
+/// `more_follows` = `bytes` is a prefix of a longer stream: a multi-byte UTF-8 sequence cut off at
+/// the very end then does not count against UTF-8 (at most three bytes are forgiven).
+pub fn detect(bytes: []const u8, more_follows: bool) Detection {
+    if (sniffBom(bytes)) |b| return switch (b) {
+        .utf8 => .utf8_bom,
+        .utf16le => .utf16le_bom,
+        .utf16be => .utf16be_bom,
+        .utf32le, .utf32be => unreachable, // sniffBom never returns these
+    };
+    const ascii_len = core.asciiPrefix(bytes);
+    if (ascii_len == bytes.len) return .ascii;
+    const valid = core.utf8ValidUpTo(bytes[ascii_len..]) + ascii_len;
+    if (valid == bytes.len) return .utf8;
+    if (more_follows and bytes.len - valid < 4 and isCutUtf8Tail(bytes[valid..])) return .utf8;
+    return .unknown;
+}
+
+/// Is `tail` (1..3 bytes) the start of one well-formed UTF-8 sequence that only lacks its end?
+fn isCutUtf8Tail(tail: []const u8) bool {
+    if (tail.len == 0 or tail.len > 3) return false;
+    // Complete the sequence with continuation bytes and see whether it becomes valid; a lead byte
+    // that is itself invalid (C0, C1, F5..FF, a stray continuation) never does.
+    const lead = tail[0];
+    const need: usize = if (lead >= 0xC2 and lead <= 0xDF) 2 else if (lead >= 0xE0 and lead <= 0xEF) 3 else if (lead >= 0xF0 and lead <= 0xF4) 4 else return false;
+    if (tail.len >= need) return false;
+    var buf: [4]u8 = undefined;
+    @memcpy(buf[0..tail.len], tail);
+    // Complete with the lowest second byte the lead allows (E0: A0.., F0: 90..), the rest with 0x80.
+    var fill: u8 = 0x80;
+    if (tail.len == 1) {
+        if (lead == 0xE0) fill = 0xA0 else if (lead == 0xF0) fill = 0x90;
+    }
+    for (buf[tail.len..need]) |*b| b.* = fill;
+    return core.utf8ValidUpTo(buf[0..need]) == need;
+}
+
 /// Length of the longest well-formed UTF-8 prefix of `s`: the index of the
 /// first byte that is not part of well-formed UTF-8 (the start of an
 /// ill-formed sequence, or of one cut by the end of `s`), or `s.len`. So

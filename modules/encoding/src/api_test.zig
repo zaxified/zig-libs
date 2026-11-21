@@ -307,3 +307,35 @@ test "UTF-16 both ways on long ASCII-heavy text (the 16-unit fast paths) agree w
         try testing.expectEqualStrings(text.items, valid);
     }
 }
+
+test "detect: BOM, ASCII, UTF-8, unknown; a cut tail only counts when more follows" {
+    try testing.expectEqual(enc.Detection.utf8_bom, enc.detect("\xef\xbb\xbfabc", false));
+    try testing.expectEqual(enc.Detection.utf16le_bom, enc.detect("\xff\xfea\x00", false));
+    try testing.expectEqual(enc.Detection.utf16be_bom, enc.detect("\xfe\xff\x00a", false));
+    try testing.expectEqual(enc.Detection.ascii, enc.detect("", false));
+    try testing.expectEqual(enc.Detection.ascii, enc.detect("hello, world", false));
+    try testing.expectEqual(enc.Detection.utf8, enc.detect("caf\xc3\xa9", false));
+    try testing.expectEqual(enc.Detection.utf8, enc.detect("\xf0\x9f\x98\x80 ok", false));
+    // windows-1252 / Latin-1 text with a lone high byte.
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("caf\xe9", false));
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("\x80", false));
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("a\xc0\xaf", false)); // overlong
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("\xed\xa0\x80", false)); // surrogate
+    // A sequence cut by the end of the buffer.
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("caf\xc3", false));
+    try testing.expectEqual(enc.Detection.utf8, enc.detect("caf\xc3", true));
+    try testing.expectEqual(enc.Detection.utf8, enc.detect("x\xe2\x82", true));
+    try testing.expectEqual(enc.Detection.utf8, enc.detect("x\xf0\x9f\x98", true));
+    try testing.expectEqual(enc.Detection.utf8, enc.detect("x\xf0", true));
+    try testing.expectEqual(enc.Detection.utf8, enc.detect("x\xe0\xa0", true));
+    // ...but not a cut that could never become valid, nor an invalid byte before it.
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("x\xe0\x80", true)); // E0 80 is overlong
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("x\xed\xa0", true)); // ED A0 is a surrogate
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("x\xf4\x90", true)); // past U+10FFFF
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("x\xc0", true));
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("x\xff", true));
+    try testing.expectEqual(enc.Detection.unknown, enc.detect("\xe9\xc3", true)); // bad byte, then a cut one
+    try testing.expectEqual(@as(?Encoding, .utf8), enc.Detection.utf8.encoding());
+    try testing.expectEqual(@as(?Encoding, null), enc.Detection.unknown.encoding());
+    try testing.expectEqual(@as(?Encoding, null), enc.Detection.utf16le_bom.encoding());
+}
