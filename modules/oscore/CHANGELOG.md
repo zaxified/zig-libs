@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — `protect` / `unprotect` seal and open with the sibling `aesccm` module (`Aes128Ccm8Nonce13`) instead of `std.crypto.aead.aes_ccm`; the module now depends on `aesccm`. Wire bytes are unchanged (RFC 8613 vectors byte-identical). ctgrind: native counts unchanged, digests re-pinned; the `cpu=x86_64` rows drop to 40 / 41 in-file with no untainted-control or trap contexts.
 - **2026-10-10** — tests: deterministic fuzz driver `OSCORE_FUZZ` (testkit) over `OscoreOption.decode` (canonical re-encode) and a full protect/unprotect exchange (request and both response shapes accepted; a flipped ciphertext/tag bit, truncation, extra octet, changed AAD field or Partial IV, wrong key refused; replay refused). No change to the library code.
 - **2026-10-09** — Dead-stack sweep, part 2. `protect` and `unprotect` now run under a 4 KiB
   per-message burn (`burn.msg_burn`); new `deriveContextInto(out, …)` writes the context into

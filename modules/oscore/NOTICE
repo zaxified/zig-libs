@@ -29,7 +29,7 @@ against Appendix C's official worked examples while writing this module
 doc comment for the specific section + worked-example cross-checks
 performed).
 
-`std.crypto.aead.aes_ccm.Aes128Ccm8` / `std.crypto.kdf.hkdf.HkdfSha256` /
+`aesccm.Aes128Ccm8Nonce13` / `std.crypto.kdf.hkdf.HkdfSha256` /
 `std.crypto.hash.sha2.Sha256` (all MIT, part of Zig itself) supply the
 AEAD, KDF, and hash primitives via their public APIs; no new AEAD, KDF, or
 hash primitive is implemented here — RFC 8613's OWN construction on top of

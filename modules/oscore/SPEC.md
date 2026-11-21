@@ -50,8 +50,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   MANDATORY-to-implement ciphersuite is in scope: AES-CCM-16-64-128 (COSE
   algorithm 10) for the AEAD, HKDF-SHA-256 for §3.2.1 key derivation —
   `Algorithm` has exactly one member.
-- **`std.crypto.aead.aes_ccm.Aes128Ccm8` IS the exact target AEAD**: `Aes128Ccm8
-  = AesCcm(Aes128, tag_len=8, nonce_len=13)` — 128-bit key, 13-byte nonce,
+- **`aesccm.Aes128Ccm8Nonce13` (the sibling `aesccm` module) is the AEAD**: AES-128-CCM, tag 8, nonce 13 (std's `Aes128Ccm8` is the same shape and stays the independent oracle in the tests) — 128-bit key, 13-byte nonce,
   8-byte tag, matching RFC 8152 §10.2's AES-CCM-16-64-128 definition
   field-for-field. `std.crypto.kdf.hkdf.HkdfSha256` supplies RFC 5869's
   two-phase `extract`/`expand`, exactly what §3.2.1 specifies. Neither is
@@ -318,7 +317,7 @@ always correct.
   which is not constant-time by design, so the totals are non-zero (the taint
   demonstrably arrives) and the in-file zero means "no branch found".
 
-  The single `unprotect` context is std's `if (!valid)` in `aes_ccm.zig`, two
+  The single `unprotect` context is the `if (!ok)` in `aesccm`'s `open`, two
   lines after the `crypto.timing_safe.eql` that produced `valid`. Branching on
   the answer is the API; the comparison is the constant-time one. It appears
   only here because only `unprotect` verifies a tag.
@@ -352,7 +351,7 @@ construction step-by-step:
    *The §5.4 AAD*, byte-exact-gated independently of `protect`/`unprotect`,
    not just transitively.
 5. **`protect`**/**`unprotect`** (§8.1-§8.4) — `computeNonce` +
-   `buildAad` + `std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt`/`.decrypt`,
+   `buildAad` + `aesccm.Aes128Ccm8Nonce13.encrypt`/`.decrypt`,
    plus (`unprotect` only) the `ReplayWindow` check-then-verify-then-
    update ordering.
 

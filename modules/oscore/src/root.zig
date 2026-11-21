@@ -31,7 +31,7 @@
 //!
 //! ## Zig std recon (verify against std 0.16 source before relying on it)
 //!
-//! - `std.crypto.aead.aes_ccm.Aes128Ccm8` is `AesCcm(Aes128, tag_len=8,
+//! - `aesccm.Aes128Ccm8Nonce13` (like std's `Aes128Ccm8`) is `Ccm(Aes128, tag_len=8,
 //!   nonce_len=13)` — **exactly** OSCORE's AES-CCM-16-64-128: 128-bit key
 //!   (`Aes128Ccm8.key_length == 16`), 13-byte nonce (`.nonce_length ==
 //!   13`), 8-byte/64-bit tag (`.tag_length == 8`). Its API —
@@ -76,6 +76,7 @@
 //! member).
 
 const std = @import("std");
+const Aes128Ccm8Nonce13 = @import("aesccm").Aes128Ccm8Nonce13;
 const burn = @import("burn.zig");
 
 pub const meta = .{
@@ -108,11 +109,11 @@ pub const Algorithm = enum(i16) {
     aes_ccm_16_64_128 = 10,
 };
 
-/// `std.crypto.aead.aes_ccm.Aes128Ccm8.key_length` — 128-bit AEAD key.
+/// `aesccm.Aes128Ccm8Nonce13.key_length` — 128-bit AEAD key.
 pub const key_length: usize = 16;
-/// `std.crypto.aead.aes_ccm.Aes128Ccm8.nonce_length` — 13-byte AEAD nonce.
+/// `aesccm.Aes128Ccm8Nonce13.nonce_length` — 13-byte AEAD nonce.
 pub const nonce_length: usize = 13;
-/// `std.crypto.aead.aes_ccm.Aes128Ccm8.tag_length` — 8-byte/64-bit AEAD tag.
+/// `aesccm.Aes128Ccm8Nonce13.tag_length` — 8-byte/64-bit AEAD tag.
 pub const tag_length: usize = 8;
 
 /// §5.2 Figure 8's "nonce length minus 6 bytes" ID_PIV field width — at
@@ -1183,7 +1184,7 @@ pub const Protected = struct {
 ///    fixed-size stack buffer, `error.AadTooLarge` if it does not fit —
 ///    no allocation, unlike the rest of this function).
 /// 4. `ciphertext`: allocate `plaintext.len + tag_length` bytes;
-///    `std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(ciphertext[0..plaintext.len],
+///    `aesccm.Aes128Ccm8Nonce13.encrypt(ciphertext[0..plaintext.len],
 ///    ciphertext[plaintext.len..][0..tag_length], plaintext, full_aad,
 ///    nonce, ctx.sender.key)` — this module's target AEAD (see the
 ///    module doc comment's std-recon finding); tag appended after the
@@ -1228,14 +1229,19 @@ fn protectBody(
     const full_aad = buildAad(&aad_buf, aad) catch return error.AadTooLarge;
 
     const ciphertext = try allocator.alloc(u8, plaintext.len + tag_length);
-    std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(
+    errdefer allocator.free(ciphertext);
+    Aes128Ccm8Nonce13.encrypt(
         ciphertext[0..plaintext.len],
         ciphertext[plaintext.len..][0..tag_length],
         plaintext,
         full_aad,
         nonce,
         ctx.sender.key,
-    );
+    ) catch |err| switch (err) {
+        // Both are excluded by the `max_plaintext_len` check above and the buffer sizes.
+        error.MessageTooLong => return error.MessageTooLong,
+        error.BufferSizeMismatch => unreachable,
+    };
 
     // Only after a successful encrypt — a failure before this point must
     // not burn a nonce (§3.2.2/§7.2.1).
@@ -1322,7 +1328,7 @@ pub const UnprotectError = error{
 /// 5. Split `ciphertext` into `body = ciphertext[0..ciphertext.len -
 ///    tag_length]` / `tag = ciphertext[ciphertext.len - tag_length..]`;
 ///    `plaintext`: allocate `body.len` bytes;
-///    `std.crypto.aead.aes_ccm.Aes128Ccm8.decrypt(plaintext, body, tag.*,
+///    `aesccm.Aes128Ccm8Nonce13.decrypt(plaintext, body, tag.*,
 ///    full_aad, nonce, ctx.recipient.key)`; map
 ///    `error.AuthenticationFailed` through unchanged (same error name,
 ///    both sets define it).
@@ -1389,7 +1395,7 @@ fn unprotectBody(
 
     const plaintext = try allocator.alloc(u8, body.len);
     errdefer allocator.free(plaintext);
-    std.crypto.aead.aes_ccm.Aes128Ccm8.decrypt(
+    Aes128Ccm8Nonce13.decrypt(
         plaintext,
         body,
         tag,
