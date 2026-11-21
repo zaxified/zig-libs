@@ -35,7 +35,7 @@ Surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md` (first survey 2026-09-30); stars an
 
 **Survey verdicts** (every gap a user would notice):
 - **Checksum-file parse/verify** — done (`checksum`), against real coreutils output.
-- **XOF / keyed modes** — done: `xof` (SHAKE128/256, BLAKE3), `blake3Keyed`, `blake3DeriveKey`. BLAKE2b keyed / variable output size: not done, no consumer (*Backlog / deferred*).
+- **XOF / keyed modes** — done: `xof` (SHAKE128/256, BLAKE3), `blake3Keyed`, `blake3DeriveKey`; BLAKE2b keyed, salted, personalised and variable-size (1..64 bytes) as `blake2bVar` (RustCrypto's `Blake2bVar` shape, checked against OpenSSL's BLAKE2b).
 - **Bulk SHA-2 speed** — done by routing SHA-2 through the sibling `sha2` module (`modules/sha2`, exists); figures: the card's `**Performance:**` line. **This is a production dependency (`deps = sha2`), approved by the coordinator on condition that 32-bit targets keep working: `sha2` is used only on x86-64, std's engines elsewhere (see *Design notes by feature*, engines by target).**
 - **BLAKE2b-256 speed** — done in-module (`src/blake2b.zig`, `@Vector(4, u64)` rows), used when the build has AVX2. On baseline x86-64 (SSE2 only) it is slower than std's, so there std's is used.
 - **`std.Io.Writer` adapter** — std's `Io.Writer.Hashed`/`Hashing` own it (*What is deliberately not done*).
@@ -68,7 +68,9 @@ zig-libs authors — the constructions are public standards (RFC 7693 for BLAKE2
   there; both pass the module's tests under qemu), so `sha2`'s `.targets` stays `linux64`.
 - **BLAKE2b-256 engine** (`src/blake2b.zig`): four `@Vector(4, u64)` rows, G applied to columns, then to diagonals via
   lane shuffles; written from RFC 7693, streaming layout as std's. Unkeyed, 256-bit only (`Options` is empty,
-  `src/blake2b.zig`); byte-identical to `std.crypto.hash.blake2.Blake2b256`.
+  `src/blake2b.zig`); byte-identical to `std.crypto.hash.blake2.Blake2b256`. The keyed, salted, personalised and
+  variable-size BLAKE2b, `blake2bVar` (`src/root.zig`), runs on std's `Blake2b512` with `expected_out_bits` (the size is
+  part of the parameter block, so a short digest is not a prefix of a longer one); it wipes the state and, when keyed, burns the dead stack like `blake3Keyed`.
 - **`finalHex` finalises a copy of the state** (`Hasher.finalHex` `src/root.zig`, `MultiHasher.finalHex`
   `src/root.zig`) and wipes the copy, so `update` may continue and `finalHex` may repeat (finalising in place
   panics in std's SHA-3 on a later `update`).
@@ -90,7 +92,7 @@ zig-libs authors — the constructions are public standards (RFC 7693 for BLAKE2
 - **XOF and BLAKE3 modes.** `xof` (SHAKE128, SHAKE256, BLAKE3: any output length including 0), `blake3Keyed`
   (32-byte key) and `blake3DeriveKey` (context string + key material) go through std's engines (`src/root.zig`).
   The two BLAKE3 entry points wipe the key copy and the state and run a 16 KiB dead-stack burn (`stack_burn`,
-  `src/root.zig`), checked by `src/stackprobe_test.zig` (8 KiB left residue for 3000 bytes of derive material).
+  `src/root.zig`), checked by `src/stackprobe_test.zig` (8 KiB left residue for 3000 bytes of derive material); the probe also passes in ReleaseFast under qemu-user on aarch64, arm (hard float), mips, mipsel, riscv64 and 32-bit x86, where std's engines and the frame sizes differ.
 - **`Algorithm`.** Nine members (`src/root.zig`); `sha512_256` is NIST SHA-512/256 (distinct IV), not plain
   truncation. `Algorithm.Impl` names the engine type of each.
 
@@ -140,9 +142,9 @@ Run: `scripts/modtest hashdigest`; fuzz: `HASHDIGEST_FUZZ=<runs>[,<seed>] script
   size-0 `/proc` file read; hex buffers one byte short are `ShortBuffer`.
 - **Cross-implementation goldens** (`src/testdata/`, frozen): `golden.tsv` (every algorithm but BLAKE3, plus SHAKE128/256
   with 100 output bytes, messages of lengths straddling the block edges, from Python `hashlib`/OpenSSL; recipe
-  `tools/gen_golden.py`); `blake3_vectors.tsv` (hash, keyed_hash and derive_key rows sliced from the official BLAKE3
-  `test_vectors.json`, asserted through `xof`, `blake3Keyed`, `blake3DeriveKey`; each row also checks that the
-  wrong-order variant gives a different answer); `sums.txt` (lines written by GNU coreutils 9.7 and uutils coreutils
+  `tools/gen_golden.py`); `blake3_vectors.tsv` (hash, keyed_hash and derive_key rows for all 35 input lengths of the official BLAKE3
+  `test_vectors.json`, recipe `tools/blake3_vectors.py`, asserted through `xof`, `blake3Keyed`, `blake3DeriveKey`; each row also checks that the
+  wrong-order variant gives a different answer and that shorter and longer extendable outputs agree with the 131 bytes); `blake2b_param_vectors.tsv` (keyed, salted, personalised and 1..64-byte BLAKE2b from `hashlib`/OpenSSL, recipe `tools/blake2b_param_vectors.py`); `sums.txt` (lines written by GNU coreutils 9.7 and uutils coreutils
   0.10: plain, `--binary`, `--tag`, over names with space, backslash, newline, CR, tab, `*`, ` = `; every line verifies
   after the test recreates the files).
 - **Checksum files:** parse and verify cases (tampered, missing, malformed, unsafe-name, non-regular file statuses; empty-file
@@ -154,8 +156,8 @@ Run: `scripts/modtest hashdigest`; fuzz: `HASHDIGEST_FUZZ=<runs>[,<seed>] script
   a reach check that every outcome label is hit.
 - **No-panic sweep:** `src/sweep_test.zig` (hostile paths, update after `finalHex`, `xof`/BLAKE3 with empty and long
   outputs, hostile checksum text and names).
-- **Burn:** `src/stackprobe_test.zig` (ReleaseFast: `scripts/modtest --file modules/hashdigest/src/stackprobe_test.zig -OReleaseFast --dep testkit --dep sha2 -Mroot=modules/hashdigest/src/stackprobe_test.zig -Mtestkit=modules/testkit/src/root.zig -Msha2=modules/sha2/src/root.zig`); the probe reports residue when the `defer burnStack();` lines are removed in a copy.
-- **Constant time:** n/a — digests of public data; `blake3Keyed` is not ctgrind-checked.
+- **Burn:** `src/stackprobe_test.zig` (other targets: `scripts/modtest hashdigest -Dtarget=<t> -fqemu -Doptimize=ReleaseFast -Dtest-filter=STACKPROBE`; native, ReleaseFast: `scripts/modtest --file modules/hashdigest/src/stackprobe_test.zig -OReleaseFast --dep testkit --dep sha2 -Mroot=modules/hashdigest/src/stackprobe_test.zig -Mtestkit=modules/testkit/src/root.zig -Msha2=modules/sha2/src/root.zig`); the probe reports residue when the `defer burnStack();` lines are removed in a copy.
+- **Constant time:** n/a — digests of public data; `blake3Keyed` is not ctgrind-checked (*Backlog / deferred*).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 - **Bench:** `zig build bench-hashdigest` (see Performance).
 
@@ -169,11 +171,9 @@ Run: `scripts/modtest hashdigest`; fuzz: `HASHDIGEST_FUZZ=<runs>[,<seed>] script
 
 ## Backlog / deferred
 
-- **`verifyEntry` stat-then-open race:** a name swapped for a FIFO between the stat and the open can still hang the call. The checksum's directory has to be one the attacker cannot write to; `std.Io.Dir` offers no non-blocking open or fd-based stat to close it here.
-- **BLAKE3 vectors cover 8 lengths of the official file** (not all 35) and XOF only at 131 bytes; the keyed path through `std` is not ctgrind-checked.
-- **BLAKE2b keyed / salt / personal / variable output size:** the in-module engine is unkeyed 256-bit only; std's `Blake2b` has the options. Only if a consumer asks.
-- **SHA-2 SHA-NI/AVX2 parity on arm64:** `sha2` has no NEON path of its own; hashdigest inherits that. Not measured (x86-64 host only).
-- **Stack burn on other targets:** the 16 KiB burn is probe-checked for 20000-byte inputs on x86-64 only; MIPS/ARM (std engines, other frame sizes) are not probed.
+- **`verifyEntry` stat-then-open race:** a name swapped for a FIFO between the stat and the open can still hang the call. The checksum's directory has to be one the attacker cannot write to; `std.Io.Dir` offers no non-blocking open or fd-based stat to close it here (waits on `std`).
+- **`blake3Keyed` ctgrind harness:** the key goes only into std's BLAKE3 and is wiped after; the stack burn is probe-checked, but there is no `ctgrind_harness.zig` (and expected-table rows) that runs the keyed path under memcheck.
+- **SHA-2 SHA-NI/AVX2 parity on arm64:** `sha2` has no NEON path of its own; hashdigest inherits that. Not measured (x86-64 host only; correctness under qemu aarch64 is covered).
 
 ## Anchoring
 

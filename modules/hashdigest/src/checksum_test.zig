@@ -213,11 +213,11 @@ test "verify: a name past max_name_len is NameTooLong, not a panic" {
     try testing.expectError(error.NameTooLong, ck.verifyEntry(testing.io, tmp.dir, .sha256, e, .{}));
 }
 
-test "BLAKE3 official vectors (hash, keyed_hash, derive_key; 131 output bytes) through the public API; wrong-order variants differ" {
+test "BLAKE3 official vectors (all 35 lengths; hash, keyed_hash, derive_key; 131 output bytes) through the public API; wrong-order variants differ, XOF prefixes agree" {
     const rows = @embedFile("testdata/blake3_vectors.tsv");
     const key = "whats the Elvish word for friend";
     const ctx = "BLAKE3 2019-12-27 16:29:52 test vectors context";
-    var data: [8193]u8 = undefined;
+    var data: [102400]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @intCast(i % 251);
     var lines = std.mem.splitScalar(u8, rows, '\n');
     var n_rows: usize = 0;
@@ -244,9 +244,23 @@ test "BLAKE3 official vectors (hash, keyed_hash, derive_key; 131 output bytes) t
         try testing.expectEqualStrings(want, &hx);
         const wx = std.fmt.bytesToHex(wrong, .lower);
         try testing.expect(!std.mem.eql(u8, want, &wx));
+        // The output is extendable: a shorter or longer one starts with the 131 bytes.
+        if (std.mem.eql(u8, kind, "hash")) {
+            var short: [32]u8 = undefined;
+            hd.xof(.blake3, m, &short);
+            try testing.expectEqualSlices(u8, got[0..32], &short);
+            var long: [300]u8 = undefined;
+            hd.xof(.blake3, m, &long);
+            try testing.expectEqualSlices(u8, &got, long[0..131]);
+        } else if (std.mem.eql(u8, kind, "keyed_hash")) {
+            var short: [64]u8 = undefined;
+            hd.blake3Keyed(key, m, &short);
+            try testing.expectEqualSlices(u8, got[0..64], &short);
+        }
         n_rows += 1;
     }
-    try testing.expectEqual(@as(usize, 24), n_rows);
+    // All 35 input lengths of the official file, three modes each.
+    try testing.expectEqual(@as(usize, 105), n_rows);
 }
 
 test "hashFileIn: relative to the given directory, ShortBuffer checked" {

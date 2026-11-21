@@ -67,6 +67,7 @@ var long: [100]u8 = undefined;
 hd.xof(.shake256, "abc", &long);                 // any output length
 hd.blake3Keyed(&key32, "msg", &long);            // keyed hash (MAC)
 hd.blake3DeriveKey("my app v1 session", ikm, &long);
+try hd.blake2bVar(out20[0..], "msg", .{ .key = &key32, .salt = "s", .personal = "app" }); // BLAKE2b, 1..64 bytes
 ```
 
 `blake2b256` runs on this module's own row-vectorised BLAKE2b-256 (`src/blake2b.zig`) when the build has AVX2 (std's otherwise),
@@ -75,4 +76,4 @@ and random chunkings). On x86-64 SHA-2 comes from the sibling `sha2` module, els
 
 ## Not provided
 
-MD5, SHA-1, further algorithms, HMAC/HKDF and a writer adapter are refused or left to sibling modules and std; BLAKE2b keyed / variable-size output is not built. See SPEC *What is deliberately not done* and *Backlog / deferred*.
+MD5, SHA-1, further algorithms, HMAC/HKDF and a writer adapter are refused or left to sibling modules and std; the in-module BLAKE2b engine stays unkeyed 256-bit (`blake2bVar` covers key, salt, personalisation and size on std's engine). See SPEC *What is deliberately not done* and *Backlog / deferred*.

@@ -411,6 +411,57 @@ pub fn blake3DeriveKey(context: []const u8, material: []const u8, out: []u8) voi
     std.crypto.secureZero(u8, std.mem.asBytes(&h));
 }
 
+/// Parameters of `blake2b` (RFC 7693 section 2.5): a MAC key of up to 64
+/// bytes, a salt and a personalisation string of up to 16 bytes each (a
+/// shorter one is zero-padded, as OpenSSL and the BLAKE2 reference do).
+pub const Blake2bParams = struct {
+    key: []const u8 = "",
+    salt: []const u8 = "",
+    personal: []const u8 = "",
+};
+
+pub const Blake2bError = error{
+    /// `out` is empty or over 64 bytes.
+    InvalidOutputLength,
+    KeyTooLong,
+    SaltTooLong,
+    PersonalTooLong,
+};
+
+/// BLAKE2b (`blake2bVar`, as RustCrypto names it) with any output size from 1 to 64 bytes (`out.len`), optionally
+/// keyed (a MAC) and with a salt and a personalisation string. The digest of
+/// a given size is not a prefix of a longer one: the size is part of the
+/// parameter block, as in RFC 7693 and in `b2sum -l`, OpenSSL and RustCrypto's
+/// `Blake2bVar`. Without parameters and with a 32-byte `out` this is
+/// `Algorithm.blake2b256`. Runs on `std`'s BLAKE2b (the in-module vectorised
+/// engine behind `Algorithm.blake2b256` stays unkeyed 256-bit); the key and
+/// the state are wiped afterwards, and a keyed call burns the dead stack as
+/// `blake3Keyed` does.
+pub fn blake2bVar(out: []u8, data: []const u8, params: Blake2bParams) Blake2bError!void {
+    if (out.len == 0 or out.len > 64) return error.InvalidOutputLength;
+    if (params.key.len > 64) return error.KeyTooLong;
+    if (params.salt.len > 16) return error.SaltTooLong;
+    if (params.personal.len > 16) return error.PersonalTooLong;
+    const keyed = params.key.len != 0;
+    defer if (keyed) burnStack();
+    var salt: [16]u8 = @splat(0);
+    var personal: [16]u8 = @splat(0);
+    @memcpy(salt[0..params.salt.len], params.salt);
+    @memcpy(personal[0..params.personal.len], params.personal);
+    var h = std.crypto.hash.blake2.Blake2b512.init(.{
+        .key = if (keyed) params.key else null,
+        .salt = if (params.salt.len != 0) salt else null,
+        .context = if (params.personal.len != 0) personal else null,
+        .expected_out_bits = out.len * 8,
+    });
+    h.update(data);
+    var full: [64]u8 = undefined;
+    h.final(&full);
+    @memcpy(out, full[0..out.len]);
+    std.crypto.secureZero(u8, &full);
+    std.crypto.secureZero(u8, std.mem.asBytes(&h));
+}
+
 /// Dead-stack burn for the keyed / derived entry points (CONVENTIONS 2.1.1):
 /// zeroes `stack_burn` bytes below the caller's frame, where BLAKE3's state and
 /// intermediates were. `noinline` is load-bearing. Its depth is checked by
@@ -785,4 +836,63 @@ test "sha256FileMax: a path with no end stops at the cap (Linux /dev/zero)" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var hex_out: [hex_len]u8 = undefined;
     try std.testing.expectError(error.FileTooLarge, sha256FileMax(std.testing.io, "/dev/zero", &hex_out, 1 << 20));
+}
+
+test "blake2bVar: key, salt, personalisation and output sizes against OpenSSL's BLAKE2b (hashlib; tools/blake2b_param_vectors.py)" {
+    const rows = @embedFile("testdata/blake2b_param_vectors.tsv");
+    var data: [1000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast(i % 251);
+    var n_rows: usize = 0;
+    var lines = std.mem.splitScalar(u8, rows, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var f = std.mem.splitScalar(u8, line, '\t');
+        const out_len = try std.fmt.parseInt(usize, f.next().?, 10);
+        var key: [64]u8 = undefined;
+        var salt: [16]u8 = undefined;
+        var person: [16]u8 = undefined;
+        const k = try std.fmt.hexToBytes(&key, f.next().?);
+        const sa = try std.fmt.hexToBytes(&salt, f.next().?);
+        const pe = try std.fmt.hexToBytes(&person, f.next().?);
+        const data_len = try std.fmt.parseInt(usize, f.next().?, 10);
+        const want = f.next().?;
+        var got: [64]u8 = undefined;
+        try blake2bVar(got[0..out_len], data[0..data_len], .{ .key = k, .salt = sa, .personal = pe });
+        var hx: [128]u8 = undefined;
+        const text = try std.fmt.bufPrint(&hx, "{x}", .{got[0..out_len]});
+        try std.testing.expectEqualStrings(want, text);
+        n_rows += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 36), n_rows);
+}
+
+test "blake2bVar: no parameters and 32 bytes is blake2b256; a smaller size is not a prefix; limits are typed errors" {
+    var a: [32]u8 = undefined;
+    try blake2bVar(&a, "abc", .{});
+    const h = hexOf(.blake2b256, "abc");
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, &h);
+    try std.testing.expectEqualSlices(u8, &want, &a);
+    var short: [16]u8 = undefined;
+    try blake2bVar(&short, "abc", .{});
+    try std.testing.expect(!std.mem.eql(u8, &short, a[0..16]));
+    // The key matters, and so do the salt and the personalisation string.
+    var k1: [32]u8 = undefined;
+    var k2: [32]u8 = undefined;
+    try blake2bVar(&k1, "abc", .{ .key = "k" });
+    try blake2bVar(&k2, "abc", .{ .key = "l" });
+    try std.testing.expect(!std.mem.eql(u8, &k1, &k2) and !std.mem.eql(u8, &k1, &a));
+    try blake2bVar(&k2, "abc", .{ .key = "k", .salt = "s" });
+    try std.testing.expect(!std.mem.eql(u8, &k1, &k2));
+    try blake2bVar(&k2, "abc", .{ .key = "k", .personal = "p" });
+    try std.testing.expect(!std.mem.eql(u8, &k1, &k2));
+    var big: [65]u8 = undefined;
+    try std.testing.expectError(error.InvalidOutputLength, blake2bVar(big[0..0], "", .{}));
+    try std.testing.expectError(error.InvalidOutputLength, blake2bVar(&big, "", .{}));
+    const long: [65]u8 = @splat('x');
+    try std.testing.expectError(error.KeyTooLong, blake2bVar(big[0..32], "", .{ .key = &long }));
+    try std.testing.expectError(error.SaltTooLong, blake2bVar(big[0..32], "", .{ .salt = long[0..17] }));
+    try std.testing.expectError(error.PersonalTooLong, blake2bVar(big[0..32], "", .{ .personal = long[0..17] }));
+    // A key of exactly 64 bytes is the longest allowed.
+    try blake2bVar(big[0..32], "", .{ .key = long[0..64] });
 }
