@@ -95,6 +95,8 @@ fn lldpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
             try add(a, &out, "app={d}/{d}/{d}", .{ e.priority, e.selector, e.protocol });
         },
         .protocol_identity, .vid_usage_digest, .management_vid, .link_aggregation => return error.TestUnexpectedResult, // no such TLV in the oracle frames
+        .ets_config, .ets_recommendation, .evb, .cisco_poe => return error.TestUnexpectedResult, // tcpdump prints these as hex or not at all
+        .profinet_delay, .profinet_port_status, .profinet_mrp_port_status, .profinet_chassis_mac, .profinet_ptcp_status => return error.TestUnexpectedResult,
     };
     return out;
 }

@@ -54,8 +54,8 @@ real loss too. Two options exist for that, both opt-in, both defaulting to the s
 
 ## Not provided
 
-DCBX ETS, 802.1Qbg, Profinet and Cisco-OUI PoE org TLVs, typed builders for most org TLVs, RFC 3396
-long-option concatenation, and the vendor discovery protocols (EDP/FDP/SONMP): see SPEC.md
+802.1Qbg CDCP and the final-standard EVB TLV, builders for the remaining 802.1 TLVs (VLAN name, protocol identity, ...),
+and the vendor discovery protocols (EDP/FDP/SONMP): see SPEC.md
 *What is deliberately not done* and *Backlog / deferred*.
 
 ## Depends on
@@ -85,5 +85,5 @@ attribution, and that file is where the obligation lives. No third-party dissect
 (Wireshark, lldpd, net-snmp, tcpdump) was consulted or copied. `src/testdata/tcpdump_facts.zig`
 (`tools/tcpdump_oracle.py`) holds frames built from the standards and the facts the `tcpdump`
 program printed for them — observed output of a black-box tool, exempt per root `NOTICE` §0.
-DHCPv6 and the LLDP-MED location decoders are clean-room from RFC 8415, RFC 3646, RFC 4075, RFC 3825 and RFC 4776; the gopacket v1.7.2/v1.7.5 and insomniacslk/dhcp sources (both BSD-3-Clause) were read for their feature lists only and nothing was ported. `tools/go_bench/` holds a Go benchmark program written for this repository (BSD-3-Clause header); its `go.mod` names gopacket v1.7.5 and insomniacslk/dhcp c6bb46ad3f3a, and its `go.sum` was produced on 2026-11-04 by `go build -mod=mod` against proxy.golang.org with the checksum database on (so the hashes are the sum database's), after the sources were swept for exec, cgo, net/http and init.
+DHCPv6 and the LLDP-MED location decoders are clean-room from RFC 8415, RFC 3646, RFC 4075, RFC 3825 and RFC 4776; the gopacket v1.7.2/v1.7.5 and insomniacslk/dhcp sources (both BSD-3-Clause) were read for their feature lists only and nothing was ported (gopacket's `lldp.go` was also read for the byte layouts of the EVB, Cisco PoE and Profinet TLVs, which are facts about the wire; `tools/go_orgtlv/` runs gopacket as a black-box oracle on them). `tools/go_bench/` holds a Go benchmark program written for this repository (BSD-3-Clause header); its `go.mod` names gopacket v1.7.5 and insomniacslk/dhcp c6bb46ad3f3a, and its `go.sum` was produced on 2026-11-04 by `go build -mod=mod` against proxy.golang.org with the checksum database on (so the hashes are the sum database's), after the sources were swept for exec, cgo, net/http and init.
 License: MIT.

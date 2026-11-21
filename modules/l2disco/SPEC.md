@@ -32,15 +32,15 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 per `SURVEY-PLAYBOOK.md`; stars and 
 
 **Fastest:** `?`. Nothing measured beat the reference (gopacket, the only implementation measured on all six rows); insomniacslk/dhcp was measured on the two DHCP rows and is slower than gopacket there, but it decodes every typed option and ours does not decode the IAs, so no factor against ours is quoted. Not measured: lldpd (C daemon, no codec API, source unread by licence mix), dhcproto (Rust, not built). The P axis cannot go below 2 on this evidence.
 
-**Where we are ahead:** the only Zig LLDP+CDP+ARP+DHCPv4+DHCPv6 codec we found — allocation-free, builders as well as parsers, strict-by-default with opt-in tolerance that reports what was dropped, and checked against 15 real frames from tcpdump's dissector suite including four upstream crash reproducers. **Where we are behind** (re-checked 2026-11-04): the DCBX ETS configuration / recommendation subtypes, 802.1Qbg, Profinet and Cisco-OUI PoE org TLVs (not built: budget), the vendor CDP TLVs tcpdump does not decode, the other vendor discovery protocols (EDP/FDP/SONMP) and builders for most org TLVs. Built since the survey: LLDP-MED, 802.3 power, DHCPv4 options 42/43/60/66/67/82/119/121, ICMPv6 Neighbor Discovery (2026-10-04); DHCPv6 (RFC 8415), LLDP-MED location content, 802.1 link aggregation / protocol identity / VID digest / management VID, DCBX PFC and application priority and nine more CDP TLVs (2026-11-04).
+**Where we are ahead:** the only Zig LLDP+CDP+ARP+DHCPv4+DHCPv6 codec we found — allocation-free, builders as well as parsers, strict-by-default with opt-in tolerance that reports what was dropped, and checked against 15 real frames from tcpdump's dissector suite including four upstream crash reproducers. **Where we are behind:** CDP-side vendor TLVs tcpdump does not decode, the other vendor discovery protocols (EDP/FDP/SONMP), 802.1Qbg CDCP and the final-standard EVB form (gopacket reads neither). Built since the survey: DCBX ETS, 802.1Qbg (draft) EVB, Cisco-OUI PoE, Profinet and typed location builders (2026-11-21), LLDP-MED, 802.3 power, DHCPv4 options 42/43/60/66/67/82/119/121, ICMPv6 Neighbor Discovery (2026-10-04); DHCPv6 (RFC 8415), LLDP-MED location content, 802.1 link aggregation / protocol identity / VID digest / management VID, DCBX PFC and application priority and nine more CDP TLVs (2026-11-04).
 
-**Survey verdicts** (read 2026-11-04: gopacket v1.7.2/v1.7.5 `layers` and insomniacslk/dhcp read at the feature-list level; every feature a user would notice). *Done:* DHCPv6 (`dhcp6`: ids, IA_NA/TA/PD, IAADDR, prefix, prefix exclude, status, Client FQDN with partial names, every Vendor and User Class option, reconfigure, DNS/SNTP/domain list, relay); LLDP-MED location content (coordinate, civic, ELIN); 802.1 link aggregation (and the deprecated 802.3 copy), protocol identity, VID usage digest, management VID; IEEE 802.1Qaz DCBX PFC and application priority (anchored by tcpdump); CDP VoIP VLAN reply, power consumption, MTU, extended trust, untrusted CoS, system name, management addresses, location (all anchored by tcpdump 4.99.6). *Not built: budget (this round), spec exists:* DCBX ETS configuration and recommendation (IEEE 802.1Qaz is a public standard, but tcpdump 4.99.6 prints these two subtypes as hex only, so there is no anchor yet), 802.1Qbg, Profinet and Cisco-OUI PoE (tcpdump's decode of these was not checked this round). *Rejected (reasons under *What is deliberately not done*):* CDP power requested / available, spare-pair PoE and EnergyWise TLVs; CDP VLAN query, IP prefixes, hello and SysOID; EDP/FDP/SONMP; MLD, STP, VRRP, EAPOL and the other 100+ gopacket layers. *Sibling-owned:* Ethernet/IP/UDP header peeling (the caller; this is a payload codec), address text (`netaddr`). The typed DHCPv6 options in insomniacslk/dhcp beyond those above (boot file URL, ARCH type, SIP, NTP etc.) pass through `Message.option` raw: each is a flat value with no framing beyond the option header.
+**Survey verdicts** (read 2026-11-04: gopacket v1.7.2/v1.7.5 `layers` and insomniacslk/dhcp read at the feature-list level; every feature a user would notice). *Done:* DHCPv6 (`dhcp6`: ids, IA_NA/TA/PD, IAADDR, prefix, prefix exclude, status, Client FQDN with partial names, every Vendor and User Class option, reconfigure, DNS/SNTP/domain list, relay); LLDP-MED location content (coordinate, civic, ELIN); 802.1 link aggregation (and the deprecated 802.3 copy), protocol identity, VID usage digest, management VID; IEEE 802.1Qaz DCBX PFC and application priority (anchored by tcpdump); CDP VoIP VLAN reply, power consumption, MTU, extended trust, untrusted CoS, system name, management addresses, location (all anchored by tcpdump 4.99.6). *Built since:* DCBX ETS configuration and recommendation (self-anchored: tcpdump prints them as hex), 802.1Qbg EVB (the draft OUI form), Cisco-OUI PoE and the five Profinet TLVs (anchored by gopacket as a black-box oracle, `tools/go_orgtlv`). *Rejected (reasons under *What is deliberately not done*):* CDP power requested / available, spare-pair PoE and EnergyWise TLVs; CDP VLAN query, IP prefixes, hello and SysOID; EDP/FDP/SONMP; MLD, STP, VRRP, EAPOL and the other 100+ gopacket layers. *Sibling-owned:* Ethernet/IP/UDP header peeling (the caller; this is a payload codec), address text (`netaddr`). The typed DHCPv6 options in insomniacslk/dhcp beyond those above (boot file URL, ARCH type, SIP, NTP etc.) pass through `Message.option` raw: each is a flat value with no framing beyond the option header.
 
 ## Design & invariants
 
 - **Seven submodules, one MAC helper:** `lldp` (802.1AB LLDPDU 7-bit-type/9-bit-length TLV stream:
   mandatory Chassis ID / Port ID / TTL / End, optional descriptions/capabilities/management
-  address, org-specific type-127 with 802.1 + 802.3 + LLDP-MED decoding), `cdp` (version/holdtime/checksum
+  address, org-specific type-127 with 802.1 (incl. DCBX ETS/PFC/application priority) + 802.3 + LLDP-MED + 802.1Qbg-draft EVB, Cisco PoE and Profinet decoding, and typed builders for them and for the LLDP-MED location formats), `cdp` (version/holdtime/checksum
   header + type/length TLVs, RFC 1071 checksum compute/verify), `arp` (RFC 826 generic `Packet` +
   typed Ethernet+IPv4 `EthIpv4` request/reply/gratuitous/probe), `dhcp` (RFC 2131 header + magic
   cookie + RFC 2132 options), `dhcp6` (RFC 8415), `nd` (RFC 4861 Neighbor Discovery) and `mac` (48-bit EUI-48
@@ -146,6 +146,11 @@ Run: `scripts/modtest l2disco` (the module's tests; the Go benchmark is `zig bui
 
 ## What is deliberately not done
 
+- **802.1Qbg CDCP and the final-standard EVB TLV (OUI 00-80-C2 subtype 13):** gopacket names the CDCP subtype
+  but decodes only the draft EVB form (OUI 00-13-BF), tcpdump prints neither, so there is no oracle for either;
+  the draft EVB form is what is decoded.
+- **Profinet TLVs beyond the five gopacket reads** (subtype 3 and others), and Cisco's other LLDP TLVs: no
+  reference decodes them.
 - **Relaxing LLDP mandatory-TLV ordering** (Chassis ID, Port ID, TTL first, in that order). A
   consumer that asked for `lldp.ParseOptions.tolerant_optionals` separately flagged ordering as
   something it could imagine wanting relaxed too, but called it out as its own, distinct decision.
@@ -171,15 +176,10 @@ Run: `scripts/modtest l2disco` (the module's tests; the Go benchmark is `zig bui
 
 ## Backlog / deferred
 
-- **Not built: budget.** DCBX ETS configuration and recommendation org TLVs (IEEE 802.1Qaz is a public
-  standard, but tcpdump 4.99.6 prints these two subtypes as hex only, so there is no anchor yet),
-  802.1Qbg EVB/CDCP, Profinet and Cisco-OUI PoE org TLVs (tcpdump's decode unchecked), an encode
-  benchmark row, a paired bench row in which ours also decodes the IAs and DUIDs (so that
-  insomniacslk/dhcp could be compared like for like).
-- Typed LLDP org TLV builders for power, location and inventory (`Builder.addOrgSpecific` takes the
-  raw info; capabilities, network policy and port VLAN have typed adders).
-- RFC 3396 long-option concatenation for DHCPv4 (typed fields keep the last occurrence).
-- A typed accessor for DHCPv6 vendor-specific information (option 17), raw through `option(code)` today.
+- **Two benchmark rows** (`tools/bench.zig` + `tools/go_bench`): an encode row (our builders against gopacket's
+  `SerializeTo`), and a paired decode row for DHCPv4/v6 in which ours also decodes the IAs and DUIDs, so that
+  insomniacslk/dhcp can be compared like for like. Measured runs on a shared host, no claim on the card until
+  the spread is below the effect.
 
 ## Anchoring
 

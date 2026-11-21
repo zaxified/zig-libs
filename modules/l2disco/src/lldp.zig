@@ -53,6 +53,12 @@ pub const BuildError = error{
     BufferTooSmall,
     /// TLV value longer than the 9-bit length field allows (511 bytes).
     ValueTooLong,
+    /// A field the typed builders write is outside what its encoding can
+    /// carry: an ELIN that is not 10 to 25 octets, a civic address whose
+    /// `what` is above 2, whose country code is not two capital letters or
+    /// whose LCI is over 255 octets, a known coordinate beyond +-90 / +-180
+    /// degrees, an ETS traffic-class count above 8.
+    InvalidValue,
 };
 
 /// Maximum value length representable in the 9-bit length field.
@@ -248,6 +254,12 @@ pub const oui_ieee_8021 = [3]u8{ 0x00, 0x80, 0xc2 };
 pub const oui_ieee_8023 = [3]u8{ 0x00, 0x12, 0x0f };
 /// TIA (ANSI/TIA-1057, LLDP-MED) — what VoIP phones and PoE switches send.
 pub const oui_tia = [3]u8{ 0x00, 0x12, 0xbb };
+/// The OUI the 802.1Qbg draft's EVB TLV used (what gopacket decodes).
+pub const oui_ieee_8021qbg = [3]u8{ 0x00, 0x13, 0xbf };
+/// Cisco's second OUI: its PoE (spare pair) TLV.
+pub const oui_cisco = [3]u8{ 0x00, 0x01, 0x42 };
+/// PROFINET (PI), the industrial-Ethernet TLVs.
+pub const oui_profinet = [3]u8{ 0x00, 0x0e, 0xcf };
 
 /// LLDP-MED capability bits (TIA-1057 §10.2.2.2), for `MedCapabilities.capabilities`.
 pub const MED_CAP = struct {
@@ -321,6 +333,8 @@ pub const OrgSpecific = struct {
                     return .{ .management_vid = std.mem.readInt(u16, o.info[0..2], .big) };
                 },
                 7 => return linkAggregation(o.info),
+                9 => return if (EtsConfig.parse(o.info)) |e| .{ .ets_config = e } else null,
+                10 => return if (EtsRecommendation.parse(o.info)) |e| .{ .ets_recommendation = e } else null,
                 11 => { // IEEE 802.1Qaz PFC Configuration: flags (1) + enable bitmap (1)
                     if (o.info.len < 2) return null;
                     return .{ .pfc = .{
@@ -370,6 +384,17 @@ pub const OrgSpecific = struct {
                 },
                 else => return null,
             }
+        } else if (std.mem.eql(u8, &o.oui, &oui_ieee_8021qbg)) {
+            if (o.subtype == 0) return if (Evb.parse(o.info)) |e| .{ .evb = e } else null;
+        } else if (std.mem.eql(u8, &o.oui, &oui_cisco)) {
+            if (o.subtype == 1 and o.info.len >= 1) return .{ .cisco_poe = .{
+                .pse_four_wire = o.info[0] & 0x01 != 0,
+                .pd_spare_pair_shared = o.info[0] & 0x02 != 0,
+                .pd_request_spare_pair = o.info[0] & 0x04 != 0,
+                .pse_spare_pair_on = o.info[0] & 0x08 != 0,
+            } };
+        } else if (std.mem.eql(u8, &o.oui, &oui_profinet)) {
+            return profinetDecode(o);
         } else if (std.mem.eql(u8, &o.oui, &oui_tia)) {
             switch (o.subtype) {
                 1 => { // LLDP-MED Capabilities: capabilities (2) + device type (1)
@@ -711,6 +736,208 @@ pub const LinkAggregation = struct {
     port_id: u32,
 };
 
+/// A 4-octet table of 8 priority nibbles (IEEE 802.1Qaz §38.4.1): priority 0
+/// in the high nibble of the first octet.
+fn priorityTable(b: []const u8) [8]u4 {
+    var t: [8]u4 = undefined;
+    for (&t, 0..) |*e, i| e.* = @intCast(if (i % 2 == 0) b[i / 2] >> 4 else b[i / 2] & 0x0f);
+    return t;
+}
+
+fn writePriorityTable(out: []u8, t: [8]u4) void {
+    for (0..4) |i| out[i] = (@as(u8, t[2 * i]) << 4) | t[2 * i + 1];
+}
+
+/// DCBX ETS Configuration (IEEE 802.1Qaz §38.4.1, subtype 9): the sender's
+/// own enhanced transmission selection settings. `tsa` per traffic class:
+/// 0 strict priority, 1 credit-based shaper, 2 ETS, 255 vendor specific.
+pub const EtsConfig = struct {
+    willing: bool,
+    /// Credit-based shaper support.
+    cbs: bool,
+    /// The raw "max TCs" field: 0 means 8 (`trafficClasses`).
+    max_tcs: u3,
+    /// Traffic class of priority 0..7.
+    priority_to_tc: [8]u4,
+    /// Percent of the bandwidth of traffic class 0..7.
+    tc_bandwidth: [8]u8,
+    tsa: [8]u8,
+
+    pub fn trafficClasses(e: EtsConfig) u4 {
+        return if (e.max_tcs == 0) 8 else e.max_tcs;
+    }
+
+    /// `null` when the info is under 21 octets.
+    pub fn parse(info: []const u8) ?EtsConfig {
+        if (info.len < 21) return null;
+        return .{
+            .willing = info[0] & 0x80 != 0,
+            .cbs = info[0] & 0x40 != 0,
+            .max_tcs = @intCast(info[0] & 0x07),
+            .priority_to_tc = priorityTable(info[1..5]),
+            .tc_bandwidth = info[5..13].*,
+            .tsa = info[13..21].*,
+        };
+    }
+
+    fn write(e: EtsConfig, out: *[21]u8) void {
+        out[0] = (@as(u8, @intFromBool(e.willing)) << 7) | (@as(u8, @intFromBool(e.cbs)) << 6) | e.max_tcs;
+        writePriorityTable(out[1..5], e.priority_to_tc);
+        out[5..13].* = e.tc_bandwidth;
+        out[13..21].* = e.tsa;
+    }
+};
+
+/// DCBX ETS Recommendation (IEEE 802.1Qaz §38.4.2, subtype 10): what the
+/// sender recommends its peer to configure; the same tables as `EtsConfig`
+/// behind a reserved octet.
+pub const EtsRecommendation = struct {
+    priority_to_tc: [8]u4,
+    tc_bandwidth: [8]u8,
+    tsa: [8]u8,
+
+    pub fn parse(info: []const u8) ?EtsRecommendation {
+        if (info.len < 21) return null;
+        return .{
+            .priority_to_tc = priorityTable(info[1..5]),
+            .tc_bandwidth = info[5..13].*,
+            .tsa = info[13..21].*,
+        };
+    }
+
+    fn write(e: EtsRecommendation, out: *[21]u8) void {
+        out[0] = 0;
+        writePriorityTable(out[1..5], e.priority_to_tc);
+        out[5..13].* = e.tc_bandwidth;
+        out[13..21].* = e.tsa;
+    }
+};
+
+/// `Evb.supported` / `enabled` capability bits.
+pub const EVB_CAP = struct {
+    pub const standard_bridging: u16 = 1 << 7;
+    pub const reflective_relay: u16 = 1 << 6;
+    pub const retransmission_timer_exponent: u16 = 1 << 2;
+    pub const edge_control_protocol: u16 = 1 << 1;
+    pub const vsi_discovery_protocol: u16 = 1 << 0;
+};
+
+/// The 802.1Qbg (draft) Edge Virtual Bridging TLV, OUI 00-13-BF subtype 0,
+/// as gopacket reads it: capabilities supported and enabled, the number of
+/// VSIs supported and configured, the retransmission timer exponent.
+pub const Evb = struct {
+    supported: u16,
+    enabled: u16,
+    supported_vsis: u16,
+    configured_vsis: u16,
+    rte_exponent: u8,
+
+    /// `null` when the info is under 9 octets.
+    pub fn parse(info: []const u8) ?Evb {
+        if (info.len < 9) return null;
+        return .{
+            .supported = std.mem.readInt(u16, info[0..2], .big),
+            .enabled = std.mem.readInt(u16, info[2..4], .big),
+            .supported_vsis = std.mem.readInt(u16, info[4..6], .big),
+            .configured_vsis = std.mem.readInt(u16, info[6..8], .big),
+            .rte_exponent = info[8],
+        };
+    }
+};
+
+/// Cisco's PoE spare-pair TLV (OUI 00-01-42 subtype 1): one flag octet.
+pub const CiscoPoe = struct {
+    /// Bit 0: the PSE supports four-wire PoE.
+    pse_four_wire: bool,
+    /// Bit 1: the PD's spare pair architecture is shared.
+    pd_spare_pair_shared: bool,
+    /// Bit 2: the PD requests spare pair PoE on.
+    pd_request_spare_pair: bool,
+    /// Bit 3: the PSE's spare pair PoE is on.
+    pse_spare_pair_on: bool,
+
+    fn toOctet(c: CiscoPoe) u8 {
+        return @as(u8, @intFromBool(c.pse_four_wire)) | (@as(u8, @intFromBool(c.pd_spare_pair_shared)) << 1) |
+            (@as(u8, @intFromBool(c.pd_request_spare_pair)) << 2) | (@as(u8, @intFromBool(c.pse_spare_pair_on)) << 3);
+    }
+};
+
+/// PROFINET PNIO_DELAY (subtype 1): delays in nanoseconds.
+pub const ProfinetDelay = struct { rx_local: u32, rx_remote: u32, tx_local: u32, tx_remote: u32, cable_local: u32 };
+/// PROFINET PNIO_PORTSTATUS (subtype 2): RT class 2 and class 3 port status.
+pub const ProfinetPortStatus = struct { class2: u16, class3: u16 };
+/// PROFINET PNIO_MRPPORTSTATUS (subtype 4): MRP domain UUID and port status.
+pub const ProfinetMrpPortStatus = struct { uuid: [16]u8, status: u16 };
+/// PROFINET PNIO_PTCPSTATUS (subtype 6): the PTCP master and the IRT periods;
+/// each period is a valid flag with a 31-bit length or start.
+pub const ProfinetPtcpStatus = struct {
+    master_address: [6]u8,
+    subdomain_uuid: [16]u8,
+    ir_data_uuid: [16]u8,
+    period_valid: bool,
+    period_length: u31,
+    red_period_valid: bool,
+    red_period_begin: u31,
+    orange_period_valid: bool,
+    orange_period_begin: u31,
+    green_period_valid: bool,
+    green_period_begin: u31,
+};
+
+fn profinetDecode(o: OrgSpecific) ?OrgValue {
+    const i = o.info;
+    switch (o.subtype) {
+        1 => {
+            if (i.len < 20) return null;
+            return .{ .profinet_delay = .{
+                .rx_local = std.mem.readInt(u32, i[0..4], .big),
+                .rx_remote = std.mem.readInt(u32, i[4..8], .big),
+                .tx_local = std.mem.readInt(u32, i[8..12], .big),
+                .tx_remote = std.mem.readInt(u32, i[12..16], .big),
+                .cable_local = std.mem.readInt(u32, i[16..20], .big),
+            } };
+        },
+        2 => {
+            if (i.len < 4) return null;
+            return .{ .profinet_port_status = .{
+                .class2 = std.mem.readInt(u16, i[0..2], .big),
+                .class3 = std.mem.readInt(u16, i[2..4], .big),
+            } };
+        },
+        4 => {
+            if (i.len < 18) return null;
+            return .{ .profinet_mrp_port_status = .{ .uuid = i[0..16].*, .status = std.mem.readInt(u16, i[16..18], .big) } };
+        },
+        5 => {
+            if (i.len < 6) return null;
+            return .{ .profinet_chassis_mac = i[0..6].* };
+        },
+        6 => {
+            if (i.len < 54) return null;
+            const p = [4]u32{
+                std.mem.readInt(u32, i[38..42], .big),
+                std.mem.readInt(u32, i[42..46], .big),
+                std.mem.readInt(u32, i[46..50], .big),
+                std.mem.readInt(u32, i[50..54], .big),
+            };
+            return .{ .profinet_ptcp_status = .{
+                .master_address = i[0..6].*,
+                .subdomain_uuid = i[6..22].*,
+                .ir_data_uuid = i[22..38].*,
+                .period_valid = p[0] >> 31 != 0,
+                .period_length = @intCast(p[0] & 0x7fffffff),
+                .red_period_valid = p[1] >> 31 != 0,
+                .red_period_begin = @intCast(p[1] & 0x7fffffff),
+                .orange_period_valid = p[2] >> 31 != 0,
+                .orange_period_begin = @intCast(p[2] & 0x7fffffff),
+                .green_period_valid = p[3] >> 31 != 0,
+                .green_period_begin = @intCast(p[3] & 0x7fffffff),
+            } };
+        },
+        else => return null,
+    }
+}
+
 pub const OrgValue = union(enum) {
     port_vlan_id: u16, // IEEE 802.1 subtype 1
     port_protocol_vlan: PortProtocolVlan, // IEEE 802.1 subtype 2
@@ -720,7 +947,16 @@ pub const OrgValue = union(enum) {
     management_vid: u16, // IEEE 802.1 subtype 6
     link_aggregation: LinkAggregation, // IEEE 802.1 subtype 7 and the deprecated 802.3 subtype 3
     pfc: PfcConfig, // IEEE 802.1Qaz subtype 11 (DCBX priority flow control)
+    ets_config: EtsConfig, // IEEE 802.1Qaz subtype 9 (DCBX ETS configuration)
+    ets_recommendation: EtsRecommendation, // IEEE 802.1Qaz subtype 10 (DCBX ETS recommendation)
     app_priority: AppPriorityTable, // IEEE 802.1Qaz subtype 12 (DCBX application priority)
+    evb: Evb, // 802.1Qbg draft OUI 00-13-BF subtype 0
+    cisco_poe: CiscoPoe, // OUI 00-01-42 subtype 1
+    profinet_delay: ProfinetDelay, // OUI 00-0e-cf subtype 1
+    profinet_port_status: ProfinetPortStatus, // subtype 2
+    profinet_mrp_port_status: ProfinetMrpPortStatus, // subtype 4
+    profinet_chassis_mac: [6]u8, // subtype 5
+    profinet_ptcp_status: ProfinetPtcpStatus, // subtype 6
     mac_phy: MacPhy, // IEEE 802.3 subtype 1
     power_via_mdi: PowerViaMdi, // IEEE 802.3 subtype 2
     max_frame_size: u16, // IEEE 802.3 subtype 4
@@ -1108,6 +1344,126 @@ pub const Builder = struct {
     /// One LLDP-MED inventory string (TIA subtypes 5-11).
     pub fn addMedInventory(b: *Builder, field: MedInventoryField, text: []const u8) BuildError!void {
         try b.addOrgSpecific(oui_tia, @backingInt(field), text);
+    }
+
+    /// DCBX ETS Configuration (IEEE 802.1Qaz subtype 9).
+    pub fn addEtsConfig(b: *Builder, e: EtsConfig) BuildError!void {
+        var v: [21]u8 = undefined;
+        e.write(&v);
+        try b.addOrgSpecific(oui_ieee_8021, 9, &v);
+    }
+
+    /// DCBX ETS Recommendation (IEEE 802.1Qaz subtype 10).
+    pub fn addEtsRecommendation(b: *Builder, e: EtsRecommendation) BuildError!void {
+        var v: [21]u8 = undefined;
+        e.write(&v);
+        try b.addOrgSpecific(oui_ieee_8021, 10, &v);
+    }
+
+    /// The 802.1Qbg (draft) EVB TLV (`Evb`).
+    pub fn addEvb(b: *Builder, e: Evb) BuildError!void {
+        var v: [9]u8 = undefined;
+        std.mem.writeInt(u16, v[0..2], e.supported, .big);
+        std.mem.writeInt(u16, v[2..4], e.enabled, .big);
+        std.mem.writeInt(u16, v[4..6], e.supported_vsis, .big);
+        std.mem.writeInt(u16, v[6..8], e.configured_vsis, .big);
+        v[8] = e.rte_exponent;
+        try b.addOrgSpecific(oui_ieee_8021qbg, 0, &v);
+    }
+
+    /// Cisco's PoE spare-pair TLV (`CiscoPoe`).
+    pub fn addCiscoPoe(b: *Builder, c: CiscoPoe) BuildError!void {
+        try b.addOrgSpecific(oui_cisco, 1, &.{c.toOctet()});
+    }
+
+    pub fn addProfinetDelay(b: *Builder, d: ProfinetDelay) BuildError!void {
+        var v: [20]u8 = undefined;
+        inline for (.{ d.rx_local, d.rx_remote, d.tx_local, d.tx_remote, d.cable_local }, 0..) |x, i|
+            std.mem.writeInt(u32, v[i * 4 ..][0..4], x, .big);
+        try b.addOrgSpecific(oui_profinet, 1, &v);
+    }
+
+    pub fn addProfinetPortStatus(b: *Builder, s: ProfinetPortStatus) BuildError!void {
+        var v: [4]u8 = undefined;
+        std.mem.writeInt(u16, v[0..2], s.class2, .big);
+        std.mem.writeInt(u16, v[2..4], s.class3, .big);
+        try b.addOrgSpecific(oui_profinet, 2, &v);
+    }
+
+    pub fn addProfinetMrpPortStatus(b: *Builder, s: ProfinetMrpPortStatus) BuildError!void {
+        var v: [18]u8 = undefined;
+        v[0..16].* = s.uuid;
+        std.mem.writeInt(u16, v[16..18], s.status, .big);
+        try b.addOrgSpecific(oui_profinet, 4, &v);
+    }
+
+    pub fn addProfinetChassisMac(b: *Builder, mac: Mac) BuildError!void {
+        try b.addOrgSpecific(oui_profinet, 5, &mac.octets);
+    }
+
+    pub fn addProfinetPtcpStatus(b: *Builder, s: ProfinetPtcpStatus) BuildError!void {
+        var v: [54]u8 = undefined;
+        v[0..6].* = s.master_address;
+        v[6..22].* = s.subdomain_uuid;
+        v[22..38].* = s.ir_data_uuid;
+        const word = struct {
+            fn f(valid: bool, n: u31) u32 {
+                return (@as(u32, @intFromBool(valid)) << 31) | n;
+            }
+        }.f;
+        std.mem.writeInt(u32, v[38..42], word(s.period_valid, s.period_length), .big);
+        std.mem.writeInt(u32, v[42..46], word(s.red_period_valid, s.red_period_begin), .big);
+        std.mem.writeInt(u32, v[46..50], word(s.orange_period_valid, s.orange_period_begin), .big);
+        std.mem.writeInt(u32, v[50..54], word(s.green_period_valid, s.green_period_begin), .big);
+        try b.addOrgSpecific(oui_profinet, 6, &v);
+    }
+
+    /// LLDP-MED coordinate location (format 1, RFC 3825 / RFC 6225): the
+    /// inverse of `MedLocation.coordinate`. A known latitude or longitude
+    /// beyond +-90 / +-180 degrees is `error.InvalidValue` (it would decode as
+    /// `error.OutOfRange`).
+    pub fn addMedCoordinate(b: *Builder, c: Coordinate) BuildError!void {
+        if (c.latitudeKnown() and (c.lat > MedLocation.lat_limit or c.lat < -MedLocation.lat_limit)) return BuildError.InvalidValue;
+        if (c.longitudeKnown() and (c.lon > MedLocation.lon_limit or c.lon < -MedLocation.lon_limit)) return BuildError.InvalidValue;
+        const lat: u34 = @bitCast(c.lat);
+        const lon: u34 = @bitCast(c.lon);
+        const alt: u30 = @bitCast(c.alt);
+        const v: u128 = (@as(u128, c.lat_resolution) << 122) | (@as(u128, lat) << 88) |
+            (@as(u128, c.lon_resolution) << 82) | (@as(u128, lon) << 48) |
+            (@as(u128, c.altitude_type) << 44) | (@as(u128, c.alt_resolution) << 38) |
+            (@as(u128, alt) << 8) | c.datum;
+        var data: [16]u8 = undefined;
+        std.mem.writeInt(u128, &data, v, .big);
+        try b.addMedLocation(1, &data);
+    }
+
+    /// LLDP-MED civic address location (format 2, RFC 4776): `what` (0, 1 or
+    /// 2), a two-letter capital country code and the elements; an element is
+    /// written as CAtype, length, value. The LCI is at most 255 octets.
+    pub fn addMedCivic(b: *Builder, what: u8, country: [2]u8, elements: []const CivicElement) BuildError!void {
+        if (what > 2) return BuildError.InvalidValue;
+        for (country) |ch| if (ch < 'A' or ch > 'Z') return BuildError.InvalidValue;
+        var scratch: [max_tlv_len]u8 = undefined;
+        scratch[0] = 0; // the LCI length, filled in below
+        scratch[1] = what;
+        scratch[2..4].* = country;
+        var n: usize = 4;
+        for (elements) |e| {
+            if (e.value.len > 255) return BuildError.InvalidValue;
+            if (n + 2 + e.value.len > 256) return BuildError.InvalidValue;
+            scratch[n] = e.ca_type;
+            scratch[n + 1] = @intCast(e.value.len);
+            @memcpy(scratch[n + 2 ..][0..e.value.len], e.value);
+            n += 2 + e.value.len;
+        }
+        scratch[0] = @intCast(n - 1);
+        try b.addMedLocation(2, scratch[0..n]);
+    }
+
+    /// LLDP-MED ECS ELIN (format 3): the emergency number, 10 to 25 octets.
+    pub fn addMedElin(b: *Builder, elin: []const u8) BuildError!void {
+        if (elin.len < 10 or elin.len > 25) return BuildError.InvalidValue;
+        try b.addMedLocation(3, elin);
     }
 
     /// IEEE 802.3 Maximum Frame Size (subtype 4).
@@ -1963,6 +2319,211 @@ test "Builder: LLDP-MED capabilities and network policy reproduce the tcpdump-ch
     try b2.addMedNetworkPolicy(p);
     const o = try OrgSpecific.parse(buf[2..b2.pos]);
     try testing.expectEqualDeep(OrgValue{ .med_network_policy = p }, o.decode().?);
+}
+
+// ── vendor org TLVs: EVB, Cisco PoE, Profinet (gopacket facts), DCBX ETS, location builders ─
+
+/// The value of the one org TLV a fresh builder wrote.
+fn onlyOrg(buf: []const u8, end: usize) !OrgSpecific {
+    return OrgSpecific.parse(buf[2..end]);
+}
+
+fn hexBytes(comptime h: []const u8) [h.len / 2]u8 {
+    var out: [h.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
+    return out;
+}
+
+test "EVB, Cisco PoE and Profinet decode to what gopacket v1.7.5 reads (tools/go_orgtlv)" {
+    var buf: [128]u8 = undefined;
+    // evb {Supported:{STD RR ECP VDP} Enabled:{STD ECP VDP} SupportedVSIs:32 ConfiguredVSIs:16 RTEExponent:17}
+    var b = Builder.init(&buf);
+    try b.addOrgSpecific(oui_ieee_8021qbg, 0, &hexBytes("00c3008300200010" ++ "11"));
+    const evb = (try onlyOrg(&buf, b.pos)).decode().?.evb;
+    try testing.expectEqual(EVB_CAP.standard_bridging | EVB_CAP.reflective_relay | EVB_CAP.edge_control_protocol | EVB_CAP.vsi_discovery_protocol, evb.supported);
+    try testing.expectEqual(EVB_CAP.standard_bridging | EVB_CAP.edge_control_protocol | EVB_CAP.vsi_discovery_protocol, evb.enabled);
+    try testing.expectEqual(@as(u16, 32), evb.supported_vsis);
+    try testing.expectEqual(@as(u16, 16), evb.configured_vsis);
+    try testing.expectEqual(@as(u8, 17), evb.rte_exponent);
+    var b2 = Builder.init(&buf);
+    try b2.addEvb(evb);
+    try testing.expectEqualDeep(OrgValue{ .evb = evb }, (try onlyOrg(&buf, b2.pos)).decode().?);
+    // Under 9 octets gopacket errors; here the TLV stays raw.
+    const short = OrgSpecific{ .oui = oui_ieee_8021qbg, .subtype = 0, .info = &hexBytes("00c30083002000") };
+    try testing.expectEqual(@as(?OrgValue, null), short.decode());
+
+    // cisco 05 {PSEFourWire PDRequestSparePair}, 0a {PDShared PSESparePair}, 0f all, 00 none.
+    const expect = [_]struct { octet: u8, v: CiscoPoe }{
+        .{ .octet = 0x05, .v = .{ .pse_four_wire = true, .pd_spare_pair_shared = false, .pd_request_spare_pair = true, .pse_spare_pair_on = false } },
+        .{ .octet = 0x0a, .v = .{ .pse_four_wire = false, .pd_spare_pair_shared = true, .pd_request_spare_pair = false, .pse_spare_pair_on = true } },
+        .{ .octet = 0x0f, .v = .{ .pse_four_wire = true, .pd_spare_pair_shared = true, .pd_request_spare_pair = true, .pse_spare_pair_on = true } },
+        .{ .octet = 0x00, .v = .{ .pse_four_wire = false, .pd_spare_pair_shared = false, .pd_request_spare_pair = false, .pse_spare_pair_on = false } },
+    };
+    for (expect) |e| {
+        var cb = Builder.init(&buf);
+        try cb.addOrgSpecific(oui_cisco, 1, &.{e.octet});
+        try testing.expectEqualDeep(OrgValue{ .cisco_poe = e.v }, (try onlyOrg(&buf, cb.pos)).decode().?);
+        var rb = Builder.init(&buf);
+        try rb.addCiscoPoe(e.v);
+        try testing.expectEqual(e.octet, buf[2 + 4]); // after the OUI and subtype
+    }
+    // The high bits of the flag octet are not ours to read.
+    const hi = (OrgSpecific{ .oui = oui_cisco, .subtype = 1, .info = &.{0xf1} }).decode().?.cisco_poe;
+    try testing.expect(hi.pse_four_wire and !hi.pd_spare_pair_shared and !hi.pd_request_spare_pair and !hi.pse_spare_pair_on);
+
+    // Profinet, the facts of the oracle run.
+    const pn = [_]struct { sub: u8, info: []const u8 }{
+        .{ .sub = 1, .info = &hexBytes("0000000a0000000b0000000c0000000d0000000e") },
+        .{ .sub = 2, .info = &hexBytes("00010002") },
+        .{ .sub = 4, .info = &hexBytes("000102030405060708090a0b0c0d0e0f" ++ "8001") },
+        .{ .sub = 5, .info = &hexBytes("0a0b0c0d0e0f") },
+        .{ .sub = 6, .info = &hexBytes("0a0b0c0d0e0f" ++ "00112233445566778899aabbccddeeff" ++ "ffeeddccbbaa99887766554433221100" ++ "80000064" ++ "00000000" ++ "80000032" ++ "c8000000") },
+    };
+    for (pn) |e| {
+        const v = (OrgSpecific{ .oui = oui_profinet, .subtype = e.sub, .info = e.info }).decode().?;
+        // Decode, build with the typed builder, and the TLV is the same bytes.
+        var pb = Builder.init(&buf);
+        switch (v) {
+            .profinet_delay => |d| {
+                try testing.expectEqual(ProfinetDelay{ .rx_local = 10, .rx_remote = 11, .tx_local = 12, .tx_remote = 13, .cable_local = 14 }, d);
+                try pb.addProfinetDelay(d);
+            },
+            .profinet_port_status => |d| {
+                try testing.expectEqual(ProfinetPortStatus{ .class2 = 1, .class3 = 2 }, d);
+                try pb.addProfinetPortStatus(d);
+            },
+            .profinet_mrp_port_status => |d| {
+                try testing.expectEqual(@as(u16, 0x8001), d.status);
+                try testing.expectEqualSlices(u8, &hexBytes("000102030405060708090a0b0c0d0e0f"), &d.uuid);
+                try pb.addProfinetMrpPortStatus(d);
+            },
+            .profinet_chassis_mac => |m| {
+                try testing.expectEqualSlices(u8, &hexBytes("0a0b0c0d0e0f"), &m);
+                try pb.addProfinetChassisMac(.{ .octets = m });
+            },
+            .profinet_ptcp_status => |d| {
+                // period=true/100 red=false/0 orange=true/50 green=true/1207959552
+                try testing.expect(d.period_valid and d.period_length == 100);
+                try testing.expect(!d.red_period_valid and d.red_period_begin == 0);
+                try testing.expect(d.orange_period_valid and d.orange_period_begin == 50);
+                try testing.expect(d.green_period_valid and d.green_period_begin == 1207959552);
+                try testing.expectEqualSlices(u8, &hexBytes("0a0b0c0d0e0f"), &d.master_address);
+                try testing.expectEqualSlices(u8, &hexBytes("ffeeddccbbaa99887766554433221100"), &d.ir_data_uuid);
+                try pb.addProfinetPtcpStatus(d);
+            },
+            else => return error.TestUnexpectedVariant,
+        }
+        const back = try onlyOrg(&buf, pb.pos);
+        try testing.expectEqualSlices(u8, &oui_profinet, &back.oui);
+        try testing.expectEqual(e.sub, back.subtype);
+        try testing.expectEqualSlices(u8, e.info, back.info);
+    }
+    // Too short for their subtype: gopacket errors, here the TLV stays raw.
+    const zeros: [64]u8 = @splat(0);
+    for ([_]struct { u8, usize }{ .{ 1, 19 }, .{ 2, 3 }, .{ 4, 17 }, .{ 5, 5 }, .{ 6, 53 } }) |c| {
+        const o = OrgSpecific{ .oui = oui_profinet, .subtype = c[0], .info = zeros[0..c[1]] };
+        try testing.expectEqual(@as(?OrgValue, null), o.decode());
+    }
+    try testing.expectEqual(@as(?OrgValue, null), (OrgSpecific{ .oui = oui_profinet, .subtype = 3, .info = zeros[0..20] }).decode());
+}
+
+test "DCBX ETS configuration and recommendation: layout, round trip, short TLVs stay raw (self-derived)" {
+    const cfg: EtsConfig = .{
+        .willing = true,
+        .cbs = false,
+        .max_tcs = 3,
+        .priority_to_tc = .{ 0, 0, 1, 1, 2, 2, 7, 15 },
+        .tc_bandwidth = .{ 50, 30, 20, 0, 0, 0, 0, 0 },
+        .tsa = .{ 2, 2, 2, 0, 0, 0, 0, 255 },
+    };
+    var buf: [64]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.addEtsConfig(cfg);
+    // header, OUI 00-80-C2, subtype 9; then W|CBS|max TCs, the 4 nibble octets, 8 bandwidths, 8 TSAs.
+    const want = hexBytes("fe19" ++ "0080c2" ++ "09" ++ "83" ++ "0011227f" ++ "321e140000000000" ++ "02020200000000ff");
+    try testing.expectEqualSlices(u8, want[0..2], buf[0..2]);
+    try testing.expectEqualSlices(u8, want[2..], buf[2..b.pos]);
+    const back = (try onlyOrg(&buf, b.pos)).decode().?.ets_config;
+    try testing.expectEqualDeep(cfg, back);
+    try testing.expectEqual(@as(u4, 3), back.trafficClasses());
+    // A max TCs field of 0 means 8.
+    var eight = cfg;
+    eight.max_tcs = 0;
+    try testing.expectEqual(@as(u4, 8), eight.trafficClasses());
+
+    const rec: EtsRecommendation = .{ .priority_to_tc = cfg.priority_to_tc, .tc_bandwidth = cfg.tc_bandwidth, .tsa = cfg.tsa };
+    var b2 = Builder.init(&buf);
+    try b2.addEtsRecommendation(rec);
+    const o = try onlyOrg(&buf, b2.pos);
+    try testing.expectEqual(@as(u8, 10), o.subtype);
+    try testing.expectEqual(@as(u8, 0), o.info[0]); // reserved
+    try testing.expectEqualDeep(OrgValue{ .ets_recommendation = rec }, o.decode().?);
+    // One octet short of the 21: raw.
+    for ([_]u8{ 9, 10 }) |sub| {
+        const short = OrgSpecific{ .oui = oui_ieee_8021, .subtype = sub, .info = o.info[0..20] };
+        try testing.expectEqual(@as(?OrgValue, null), short.decode());
+    }
+}
+
+test "Builder: typed location TLVs are the inverse of the decoders" {
+    var buf: [128]u8 = undefined;
+    // 34.5 N, 118.25 W, 12.5 m, datum 1, resolutions 25/25/16.
+    const c: Coordinate = .{
+        .lat_resolution = 25,
+        .lat = @as(i34, 34) * (1 << 25) + (1 << 24),
+        .lon_resolution = 25,
+        .lon = -(@as(i34, 118) * (1 << 25) + (1 << 23)),
+        .altitude_type = 1,
+        .alt_resolution = 16,
+        .alt = 12 * 256 + 128,
+        .datum = 1,
+    };
+    var b = Builder.init(&buf);
+    try b.addMedCoordinate(c);
+    const loc = (try onlyOrg(&buf, b.pos)).decode().?.med_location;
+    try testing.expectEqual(@as(u8, 1), loc.format);
+    const back = (try loc.coordinate()).?;
+    try testing.expectEqualDeep(c, back);
+    try testing.expectApproxEqAbs(@as(f64, 34.5), back.latitudeDegrees().?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, -118.25), back.longitudeDegrees().?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 12.5), back.altitudeUnits().?, 1e-9);
+
+    // Civic: what 2 (the client), US, A1 = CA, A3 = Los Angeles.
+    var b2 = Builder.init(&buf);
+    try b2.addMedCivic(2, "US".*, &.{ .{ .ca_type = 1, .value = "CA" }, .{ .ca_type = 3, .value = "Los Angeles" } });
+    const civ = (try (try onlyOrg(&buf, b2.pos)).decode().?.med_location.civic()).?;
+    try testing.expectEqual(@as(u8, 2), civ.what);
+    try testing.expectEqualStrings("US", &civ.country);
+    var it = civ.iterator();
+    const e1 = (try it.next()).?;
+    try testing.expect(e1.ca_type == 1 and std.mem.eql(u8, e1.value, "CA"));
+    const e2 = (try it.next()).?;
+    try testing.expect(e2.ca_type == 3 and std.mem.eql(u8, e2.value, "Los Angeles"));
+    try testing.expectEqual(@as(?CivicElement, null), try it.next());
+
+    var b3 = Builder.init(&buf);
+    try b3.addMedElin("12125551212");
+    try testing.expectEqualStrings("12125551212", (try (try onlyOrg(&buf, b3.pos)).decode().?.med_location.elin()).?);
+
+    // What the decoders would refuse is refused here.
+    var b4 = Builder.init(&buf);
+    var bad = c;
+    bad.lat = 91 * (1 << 25);
+    try testing.expectError(BuildError.InvalidValue, b4.addMedCoordinate(bad));
+    bad = c;
+    bad.lon = -181 * (1 << 25);
+    try testing.expectError(BuildError.InvalidValue, b4.addMedCoordinate(bad));
+    // An unknown (resolution 0) latitude is not range-checked, as on decode.
+    bad = c;
+    bad.lat_resolution = 0;
+    bad.lat = 91 * (1 << 25);
+    try b4.addMedCoordinate(bad);
+    try testing.expectError(BuildError.InvalidValue, b4.addMedCivic(3, "US".*, &.{}));
+    try testing.expectError(BuildError.InvalidValue, b4.addMedCivic(1, "us".*, &.{}));
+    const long_value: [256]u8 = @splat('x');
+    try testing.expectError(BuildError.InvalidValue, b4.addMedCivic(1, "US".*, &.{.{ .ca_type = 1, .value = &long_value }}));
+    try testing.expectError(BuildError.InvalidValue, b4.addMedElin("123456789"));
+    try testing.expectError(BuildError.InvalidValue, b4.addMedElin("12345678901234567890123456"));
 }
 
 // ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────

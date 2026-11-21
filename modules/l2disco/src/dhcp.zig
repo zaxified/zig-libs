@@ -330,6 +330,34 @@ pub const Message = struct {
         return OptionIterator.init(m.options_raw);
     }
 
+    /// The regions that carry options, in wire order: the options field,
+    /// then `file` and `sname` when option overload says they do
+    /// (RFC 2132 §9.3).
+    fn optionRegions(m: *const Message) [3][]const u8 {
+        const ov: u8 = if (m.overload) |o| @backingInt(o) else 0;
+        return .{
+            m.options_raw,
+            if (ov & 1 != 0) m.file else &.{},
+            if (ov & 2 != 0) m.sname else &.{},
+        };
+    }
+
+    /// True when option `code` occurs more than once (RFC 3396: one logical
+    /// option sent as several instances). The typed fields of `Message` then
+    /// hold only the last instance; `concatOption` returns them joined. A
+    /// malformed overloaded region reads as not fragmented here (the error
+    /// is `concatOption`'s to report).
+    pub fn isFragmented(m: *const Message, code: u8) bool {
+        var n: usize = 0;
+        for (m.optionRegions()) |region| {
+            var it = OptionIterator.init(region);
+            while (it.next() catch return n > 1) |opt| {
+                if (opt.code == code) n += 1;
+            }
+        }
+        return n > 1;
+    }
+
     /// RFC 3396 long-option reassembly: every instance of option `code`, in
     /// wire order (the options field, then `file`, then `sname` when option
     /// overload says they carry options, RFC 2132 §9.3), concatenated. One
@@ -341,12 +369,7 @@ pub const Message = struct {
     /// the message), so use this for options that may exceed 255 octets
     /// (43, 82, 119, 121 ...).
     pub fn concatOption(m: *const Message, code: u8, out: []u8) ConcatError!?[]const u8 {
-        const ov: u8 = if (m.overload) |o| @backingInt(o) else 0;
-        const regions = [3][]const u8{
-            m.options_raw,
-            if (ov & 1 != 0) m.file else &.{},
-            if (ov & 2 != 0) m.sname else &.{},
-        };
+        const regions = m.optionRegions();
         var first: ?[]const u8 = null;
         var n: usize = 0;
         var copied = false;
@@ -616,6 +639,26 @@ pub const Builder = struct {
         b.buf[b.pos + 1] = @intCast(data.len);
         @memcpy(b.buf[b.pos + 2 ..][0..data.len], data);
         b.pos += 2 + data.len;
+    }
+
+    /// An option of any length (RFC 3396): data over 255 octets goes out as
+    /// consecutive instances of up to 255 octets each, which a receiver joins
+    /// (`Message.concatOption`, `Message.isFragmented`); data up to 255 is
+    /// one ordinary instance, as `addOption`. Nothing is written when it
+    /// does not all fit (`error.BufferTooSmall`). The message-size limits of
+    /// the sender's link are the caller's (`HeaderOptions` / `finish`).
+    pub fn addLongOption(b: *Builder, code: u8, data: []const u8) BuildError!void {
+        if (code == @backingInt(OptionCode.pad) or code == @backingInt(OptionCode.end))
+            return BuildError.InvalidOptionCode;
+        if (data.len <= 255) return b.addOption(code, data);
+        const instances = (data.len + 254) / 255;
+        if (b.pos + data.len + 2 * instances > b.buf.len) return BuildError.BufferTooSmall;
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = @min(255, data.len - off);
+            try b.addOption(code, data[off..][0..n]);
+            off += n;
+        }
     }
 
     /// Option 42; `addrs` as for `addRouters` (`error.InvalidAddressList`).
@@ -984,6 +1027,46 @@ test "DHCP: RFC 3396 concatOption joins repeated and overloaded instances" {
     buf[234..236].* = .{ 119, 9 }; // length runs past the end of `file`
     const bad = try Message.parse(buf[0..bytes_len]);
     try testing.expectError(ConcatError.TruncatedOption, bad.concatOption(119, &out));
+}
+
+test "DHCP: RFC 3396 addLongOption splits at 255 octets and concatOption joins them back" {
+    var data: [600]u8 = undefined;
+    for (&data, 0..) |*x, i| x.* = @truncate(i *% 7 +% 1);
+    var buf: [900]u8 = undefined;
+    var b = try Builder.init(&buf, .{ .op = .boot_reply, .xid = 4 });
+    try b.addLongOption(119, &data); // 255 + 255 + 90
+    try b.addLongOption(12, "host"); // short: one ordinary instance
+    const bytes = try b.finish(.{});
+    const m = try Message.parse(bytes);
+    var n: usize = 0;
+    var lens: [3]u8 = undefined;
+    var it = m.optionIterator();
+    while (try it.next()) |o| {
+        if (o.code != 119) continue;
+        lens[n] = @intCast(o.data.len);
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 90 }, &lens);
+    try testing.expect(m.isFragmented(119));
+    try testing.expect(!m.isFragmented(12));
+    try testing.expect(!m.isFragmented(120));
+    var out: [600]u8 = undefined;
+    try testing.expectEqualSlices(u8, &data, (try m.concatOption(119, &out)).?);
+    // A multiple of 255 ends with a full instance, no empty one.
+    var b2 = try Builder.init(&buf, .{ .op = .boot_reply, .xid = 5 });
+    try b2.addLongOption(121, data[0..510]);
+    const m2 = try Message.parse(try b2.finish(.{}));
+    var out2: [510]u8 = undefined;
+    try testing.expectEqualSlices(u8, data[0..510], (try m2.concatOption(121, &out2)).?);
+    // Nothing is written when it does not fit; Pad and End are refused.
+    var small: [400]u8 = undefined;
+    var b3 = try Builder.init(&small, .{ .op = .boot_reply, .xid = 6 });
+    const before = b3.pos;
+    try testing.expectError(BuildError.BufferTooSmall, b3.addLongOption(119, &data));
+    try testing.expectEqual(before, b3.pos);
+    try testing.expectError(BuildError.InvalidOptionCode, b3.addLongOption(0, &data));
+    try testing.expectError(BuildError.InvalidOptionCode, b3.addLongOption(255, "x"));
 }
 
 test "DHCP malformed: typed errors, no panic" {
