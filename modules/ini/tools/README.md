@@ -37,8 +37,8 @@ writers wrote, including an `Editor` session (its docstring has the commands).
 
 `bench.zig` is `zig build bench-ini`, the program behind the card's
 `**Performance:**` line. Its other sides are `go_bench` (go-ini, Apache-2.0),
-`rust_bench` (`configparser` crate, MIT OR LGPL, taken as MIT; `ini_core`, MIT;
-`cfg-if`, MIT OR Apache-2.0) and `c_bench.c` (inih, BSD-3-Clause), all pinned and
+`rust_bench` (`configparser` crate, MIT OR LGPL, taken as MIT; `rust-ini` 0.21.3, MIT, with its dependencies
+swept before compiling; `ini_core`, MIT; `cfg-if`, MIT OR Apache-2.0) and `c_bench.c` (inih, BSD-3-Clause), all pinned and
 read before the first compile (the crates' async and serde paths, which are off
 here, only skimmed). They come from the Go and cargo module
 caches; the header of `bench.zig` has the fetch commands.
