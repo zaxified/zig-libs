@@ -1405,12 +1405,12 @@ aesgcm	ReleaseFast	generic	1	6	96d433b8d464dac1	b60805fea700d105
 # the default Pippenger MSM, variable-time in the witness by design (SPEC.md
 # § 5b item 4); 26 in-file when pinned, bound >=10 so a compiler change in
 # the bucket loop does not turn the control red for nothing.
-groth16	ReleaseFast	zkprove_ct	1	6	2659e4e45eeb4324	928bc8e1cc116243
+groth16	ReleaseFast	zkprove_ct	1	6	02084e8dbd7108f0	928bc8e1cc116243
 # Zig 0.17.0 (2026-10-18): zkprove_vt 26 -> 54 in-file (bound >=10 holds). All added contexts are
 # the Pippenger `small` path's per-bit `if ((byte >> bit) & 1 == 1)` (msm.zig) and its zero/one
 # shortcuts, at more instruction addresses: LLVM 22 unrolls the 8-bit loop (19 jumps in the
 # ReleaseFast binary). Variable-time in the witness by design (SPEC § 5b item 4); zkprove_ct 6 SAME.
-groth16	ReleaseFast	zkprove_vt	1	>=10	2659e4e45eeb4324	928bc8e1cc116243
+groth16	ReleaseFast	zkprove_vt	1	>=10	02084e8dbd7108f0	928bc8e1cc116243
 # ripemd160 (2026-10-09) — unkeyed, so the MESSAGE is tainted: a hashed preimage
 # or key fed through hash160 is the case a branch in `compress` would leak.
 # hash: one-shot at 0/1/55/56/64/1000 B + a 3-chunk stream; hash160: std
