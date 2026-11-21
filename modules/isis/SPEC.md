@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [wireshark/wireshark](https://github.com/wireshark/wireshark) dissector | C | GPL-2.0 — used only as a black-box oracle (`sharkd`), source not read | 9.9k | pushed 2026-09-29 | Decodes everything, encodes nothing. Grades five of this module's PDU bodies and the Fletcher checksum. |
 | [openss7/pbbr](https://github.com/openss7/pbbr) | C | no LICENSE file in the repository (not readable; not read) | 36 | pushed 2019-04-18 | Claims IEEE 802.1aq SPBM for the Linux kernel; unmaintained since 2019. The only open SPB implementation found. |
 
-**Where we are ahead:** the only codec surveyed that types the SPB Instance sub-TLV (CIST root, bridge priority, SPSourceID, ECT-VID tuples) *and* the SPBM-SI with per-I-SID T/R bits (holo has SPBM-SI only — verified in `tlv.rs`; goisis/mdlayher do not mention SPB — *inferred*); zero-allocation bounded decode with a fuzz target that measurably reaches a PDU body; PDUs pinned against an independent dissector; LSP + CSNP + PSNP + both IIH variants in both directions (mdlayher covers the P2P hello only). **Where we are behind:** no typed IP/IPv6 reachability (#128/#130/#135/#232/#236) — what every IP IS-IS user carries; no MT-ISN #222 / #235 / #237; only 6-octet system-ids in typed bodies; no purge-originator (#13) or extended-sequence-number (#229) TLVs; no router-capability / SR TLVs. All are reachable byte-exact through the raw escape hatch (`rg 'ip_reach|ipv6|purge_originator' isis/src` finds no typed decoder; only the `ip_interface_address` code constant exists) (→ Backlog). Authentication (#10, RFC 5304/5310) is at parity with holo, plus FRR's opt-in `strict-rfc5310` keying and SHA-224, which holo does not configure.
+**Where we are ahead:** the only codec surveyed that types the SPB Instance sub-TLV (CIST root, bridge priority, SPSourceID, ECT-VID tuples) *and* the SPBM-SI with per-I-SID T/R bits (holo has SPBM-SI only — verified in `tlv.rs`; goisis/mdlayher do not mention SPB — *inferred*); zero-allocation bounded decode with a fuzz target that measurably reaches a PDU body; PDUs pinned against an independent dissector; LSP + CSNP + PSNP + both IIH variants in both directions (mdlayher covers the P2P hello only). **Where we are behind:** typed IP reachability only for the wide forms #135/#236 (no legacy #128/#130, no address TLVs #132/#232); no MT-ISN #222 / #235 / #237; only 6-octet system-ids in typed bodies; no purge-originator (#13) or extended-sequence-number (#229) TLVs; no router-capability / SR TLVs. All are reachable byte-exact through the raw escape hatch (→ Backlog). Authentication (#10, RFC 5304/5310) is at parity with holo, plus FRR's opt-in `strict-rfc5310` keying and SHA-224, which holo does not configure.
 
 ## Scope
 
@@ -97,6 +97,8 @@ sources:
 | 10 | Authentication (cleartext / HMAC-MD5 / RFC 5310 crypto) | ISO 10589 §9.5, RFC 5304, RFC 5310 |
 | 22 | Extended IS Reachability (+ sub-TLVs) | RFC 5305 |
 | 129 | Protocols Supported | RFC 1195 |
+| 135 | Extended IP Reachability (+ sub-TLVs; prefix host bits masked) | RFC 5305 §4 |
+| 236 | IPv6 Reachability (+ sub-TLVs; prefix host bits masked) | RFC 5308 §2 |
 | 137 | Dynamic Hostname | RFC 5301 |
 | 143 | MT-Port-Capability (SPB, IIH) | RFC 6165 / 6329 |
 | 144 | MT-Capability (SPB, LSP) | RFC 6329 |
@@ -253,7 +255,7 @@ Offline only: a pure codec with no live-interop surface here. Run: `scripts/modt
 
 ## Backlog / deferred
 
-- **Typed IP reachability TLVs** (#135 extended IPv4, #236 IPv6, legacy #128/#130, #132 address iterator, #232 IPv6 address) with prefix sub-TLVs. Why: the first thing an IP IS-IS user decodes from an LSP; holo, FRR and goisis all type them. Effort: ~2-3 days, same iterator shape as #22. Fits CONVENTIONS §2: yes (pure codec).
+- **The rest of the IP TLVs:** legacy #128/#130 reachability and the address TLVs #132 / #232 (the wide #135 and #236 are typed). Why: FRR carries the legacy forms with narrow metrics. Fits CONVENTIONS §2: yes (pure codec).
 - **Purge Originator Identification (#13, RFC 6232) and Extended Sequence Number (#229, RFC 7602).** Why: FRR and holo emit and consume them; a purge without #13 cannot be traced. Effort: ~1 day.
 - **Non-default ID length in typed bodies (ISO 10589 ID Length 1-8).** Today only 6 is wired and the rest return `UnsupportedIdLength`; the raw TLV walk is id-length-independent. Why: interop with the rare non-6 deployment. Effort: ~2 days, touches every fixed-offset read. Priority low.
 - **MT TLVs #222 / #235 / #237** (multi-topology IS-IS, RFC 5120; only the MT-ID of #143/#144 is parsed today). Effort: ~2 days. Priority low.

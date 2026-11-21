@@ -16,6 +16,8 @@
 //! | 9    | LSP Entries                | ISO 10589 §9.10   |
 //! | 22   | Extended IS Reachability   | RFC 5305          |
 //! | 129  | Protocols Supported        | RFC 1195          |
+//! | 135  | Extended IP Reachability   | RFC 5305 §4       |
+//! | 236  | IPv6 Reachability          | RFC 5308 §2       |
 //! | 137  | Dynamic Hostname           | RFC 5301          |
 //!
 //! Provenance: clean-room from the specs above; see /NOTICE (none required).
@@ -34,6 +36,8 @@ pub const code = struct {
     pub const authentication: u8 = 10;
     pub const extended_is_reachability: u8 = 22;
     pub const ip_interface_address: u8 = 132;
+    pub const extended_ip_reachability: u8 = 135;
+    pub const ipv6_reachability: u8 = 236;
     pub const protocols_supported: u8 = 129;
     pub const dynamic_hostname: u8 = 137;
     /// MT-Port-Capability (RFC 6165 / RFC 6329) — carried in IIH PDUs.
@@ -222,6 +226,173 @@ pub fn addExtendedIsReach(
     try b.addTlv(code.extended_is_reachability, scratch[0 .. 11 + sub_tlvs.len]);
 }
 
+// ── #135 Extended IP Reachability (RFC 5305 §4) / #236 IPv6 Reachability (RFC 5308 §2) ──
+
+/// One Extended IP Reachability (#135) entry: `metric(4) || control(1) ||
+/// prefix(ceil(len/8)) [|| sub_len(1) || sub_tlvs]`, control = Up/Down (0x80),
+/// sub-TLVs present (0x40), prefix length (low 6 bits, 0..32).
+pub const ExtIpReachEntry = struct {
+    metric: u32,
+    /// The Up/Down bit (RFC 5305 §4.1): set on a prefix leaked from a higher
+    /// level into a lower one (RFC 5302), so it is not leaked back up.
+    up_down: bool = false,
+    prefix_len: u8,
+    /// The prefix, host bits cleared (a sender's stray bits past `prefix_len`
+    /// are not part of the prefix and are masked off on decode).
+    prefix: [4]u8,
+    /// The prefix sub-TLV block, empty if none (walk with `tlv.TlvIterator`).
+    sub_tlvs: []const u8 = &.{},
+};
+
+/// Clear the bits of `bytes` past the first `len` bits.
+fn maskPrefix(bytes: []u8, len: u8) void {
+    for (bytes, 0..) |*b, i| {
+        const lo = i * 8;
+        if (len >= lo + 8) continue;
+        if (len <= lo) {
+            b.* = 0;
+        } else {
+            const keep: u3 = @intCast(len - lo); // 1..7 bits of this octet
+            b.* &= ~(@as(u8, 0xff) >> keep);
+        }
+    }
+}
+
+/// Walks an Extended IP Reachability (#135) value.
+pub const ExtIpReachIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn init(value: []const u8) ExtIpReachIterator {
+        return .{ .buf = value };
+    }
+
+    /// `BadTlvLength` for a truncated entry or a prefix length above 32.
+    pub fn next(it: *ExtIpReachIterator) ParseError!?ExtIpReachEntry {
+        if (it.pos == it.buf.len) return null;
+        if (it.pos + 5 > it.buf.len) return error.BadTlvLength;
+        const metric = std.mem.readInt(u32, it.buf[it.pos..][0..4], .big);
+        const ctl = it.buf[it.pos + 4];
+        const plen: u8 = ctl & 0x3f;
+        if (plen > 32) return error.BadTlvLength;
+        const nbytes: usize = (plen + 7) / 8;
+        var p = it.pos + 5;
+        if (p + nbytes > it.buf.len) return error.BadTlvLength;
+        var prefix: [4]u8 = @splat(0);
+        @memcpy(prefix[0..nbytes], it.buf[p..][0..nbytes]);
+        maskPrefix(&prefix, plen);
+        p += nbytes;
+        var subs: []const u8 = &.{};
+        if ((ctl & 0x40) != 0) {
+            if (p >= it.buf.len) return error.BadTlvLength;
+            const sl: usize = it.buf[p];
+            if (p + 1 + sl > it.buf.len) return error.BadTlvLength;
+            subs = it.buf[p + 1 ..][0..sl];
+            p += 1 + sl;
+        }
+        it.pos = p;
+        return .{ .metric = metric, .up_down = (ctl & 0x80) != 0, .prefix_len = plen, .prefix = prefix, .sub_tlvs = subs };
+    }
+};
+
+/// Appends one Extended IP Reachability (#135) TLV with a single entry.
+pub fn addExtIpReach(b: *tlv.Builder, e: ExtIpReachEntry) (tlv.BuildError || ParseError)!void {
+    if (e.prefix_len > 32) return error.BadTlvLength;
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    const nbytes: usize = (e.prefix_len + 7) / 8;
+    const has_sub = e.sub_tlvs.len != 0;
+    const total = 5 + nbytes + (if (has_sub) 1 + e.sub_tlvs.len else 0);
+    if (total > scratch.len or e.sub_tlvs.len > 255) return error.ValueTooLong;
+    std.mem.writeInt(u32, scratch[0..4], e.metric, .big);
+    scratch[4] = e.prefix_len | (if (e.up_down) @as(u8, 0x80) else 0) | (if (has_sub) @as(u8, 0x40) else 0);
+    var pfx = e.prefix;
+    maskPrefix(&pfx, e.prefix_len);
+    @memcpy(scratch[5..][0..nbytes], pfx[0..nbytes]);
+    if (has_sub) {
+        scratch[5 + nbytes] = @intCast(e.sub_tlvs.len);
+        @memcpy(scratch[6 + nbytes ..][0..e.sub_tlvs.len], e.sub_tlvs);
+    }
+    try b.addTlv(code.extended_ip_reachability, scratch[0..total]);
+}
+
+/// One IPv6 Reachability (#236) entry: `metric(4) || control(1) ||
+/// prefix_len(1) || prefix(ceil(len/8)) [|| sub_len(1) || sub_tlvs]`, control =
+/// Up/Down (0x80), External (0x40), sub-TLVs present (0x20).
+pub const Ipv6ReachEntry = struct {
+    metric: u32,
+    up_down: bool = false,
+    /// The X bit: the prefix was redistributed from another protocol.
+    external: bool = false,
+    prefix_len: u8,
+    prefix: [16]u8,
+    sub_tlvs: []const u8 = &.{},
+};
+
+/// Walks an IPv6 Reachability (#236) value.
+pub const Ipv6ReachIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn init(value: []const u8) Ipv6ReachIterator {
+        return .{ .buf = value };
+    }
+
+    /// `BadTlvLength` for a truncated entry or a prefix length above 128.
+    pub fn next(it: *Ipv6ReachIterator) ParseError!?Ipv6ReachEntry {
+        if (it.pos == it.buf.len) return null;
+        if (it.pos + 6 > it.buf.len) return error.BadTlvLength;
+        const metric = std.mem.readInt(u32, it.buf[it.pos..][0..4], .big);
+        const ctl = it.buf[it.pos + 4];
+        const plen = it.buf[it.pos + 5];
+        if (plen > 128) return error.BadTlvLength;
+        const nbytes: usize = (@as(usize, plen) + 7) / 8;
+        var p = it.pos + 6;
+        if (p + nbytes > it.buf.len) return error.BadTlvLength;
+        var prefix: [16]u8 = @splat(0);
+        @memcpy(prefix[0..nbytes], it.buf[p..][0..nbytes]);
+        maskPrefix(&prefix, plen);
+        p += nbytes;
+        var subs: []const u8 = &.{};
+        if ((ctl & 0x20) != 0) {
+            if (p >= it.buf.len) return error.BadTlvLength;
+            const sl: usize = it.buf[p];
+            if (p + 1 + sl > it.buf.len) return error.BadTlvLength;
+            subs = it.buf[p + 1 ..][0..sl];
+            p += 1 + sl;
+        }
+        it.pos = p;
+        return .{
+            .metric = metric,
+            .up_down = (ctl & 0x80) != 0,
+            .external = (ctl & 0x40) != 0,
+            .prefix_len = plen,
+            .prefix = prefix,
+            .sub_tlvs = subs,
+        };
+    }
+};
+
+/// Appends one IPv6 Reachability (#236) TLV with a single entry.
+pub fn addIpv6Reach(b: *tlv.Builder, e: Ipv6ReachEntry) (tlv.BuildError || ParseError)!void {
+    if (e.prefix_len > 128) return error.BadTlvLength;
+    var scratch: [tlv.max_value_len]u8 = undefined;
+    const nbytes: usize = (@as(usize, e.prefix_len) + 7) / 8;
+    const has_sub = e.sub_tlvs.len != 0;
+    const total = 6 + nbytes + (if (has_sub) 1 + e.sub_tlvs.len else 0);
+    if (total > scratch.len or e.sub_tlvs.len > 255) return error.ValueTooLong;
+    std.mem.writeInt(u32, scratch[0..4], e.metric, .big);
+    scratch[4] = (if (e.up_down) @as(u8, 0x80) else 0) | (if (e.external) @as(u8, 0x40) else 0) | (if (has_sub) @as(u8, 0x20) else 0);
+    scratch[5] = e.prefix_len;
+    var pfx = e.prefix;
+    maskPrefix(&pfx, e.prefix_len);
+    @memcpy(scratch[6..][0..nbytes], pfx[0..nbytes]);
+    if (has_sub) {
+        scratch[6 + nbytes] = @intCast(e.sub_tlvs.len);
+        @memcpy(scratch[7 + nbytes ..][0..e.sub_tlvs.len], e.sub_tlvs);
+    }
+    try b.addTlv(code.ipv6_reachability, scratch[0..total]);
+}
+
 // ── #129 Protocols Supported / #137 Dynamic Hostname ─────────────────────────
 
 /// Appends a Protocols Supported (#129) TLV: a flat list of NLPID octets.
@@ -396,4 +567,93 @@ test "protocols supported and hostname are flat values" {
     try addHostname(&b, "node-a");
     try testing.expectEqualSlices(u8, &.{ nlpid_ipv4, nlpid_ipv6 }, (try tlv.findFirst(b.written(), code.protocols_supported)).?);
     try testing.expectEqualStrings("node-a", (try tlv.findFirst(b.written(), code.dynamic_hostname)).?);
+}
+
+test "extended IP reachability: RFC 5305 §4 layout, masking, up/down, sub-TLVs" {
+    // 10.1.0.0/16 metric 20; 192.0.2.128/25 metric 5 with U/D set and one sub-TLV.
+    const value = [_]u8{ 0, 0, 0, 20, 16, 10, 1 } ++
+        [_]u8{ 0, 0, 0, 5, 0x80 | 0x40 | 25, 192, 0, 2, 0xff, 3, 1, 1, 0xaa };
+    var it = ExtIpReachIterator.init(&value);
+    const a = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 20), a.metric);
+    try testing.expectEqual(@as(u8, 16), a.prefix_len);
+    try testing.expectEqualSlices(u8, &.{ 10, 1, 0, 0 }, &a.prefix);
+    try testing.expect(!a.up_down and a.sub_tlvs.len == 0);
+    const b = (try it.next()).?;
+    try testing.expect(b.up_down);
+    try testing.expectEqual(@as(u8, 25), b.prefix_len);
+    // Host bits past /25 are masked: 0xff in the last octet keeps only the top bit.
+    try testing.expectEqualSlices(u8, &.{ 192, 0, 2, 0x80 }, &b.prefix);
+    try testing.expectEqualSlices(u8, &.{ 1, 1, 0xaa }, b.sub_tlvs);
+    try testing.expectEqual(@as(?ExtIpReachEntry, null), try it.next());
+}
+
+test "extended IP reachability: default route, host route, builder round trip" {
+    var buf: [128]u8 = undefined;
+    var b = tlv.Builder.init(&buf);
+    try addExtIpReach(&b, .{ .metric = 1, .prefix_len = 0, .prefix = @splat(0) });
+    try addExtIpReach(&b, .{ .metric = 0xFFFF_FFFF, .prefix_len = 32, .prefix = .{ 1, 2, 3, 4 }, .up_down = true, .sub_tlvs = &.{ 9, 0 } });
+    var ti = tlv.TlvIterator.init(b.written());
+    const t0 = (try ti.next()).?;
+    try testing.expectEqual(code.extended_ip_reachability, t0.code);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 0 }, t0.value);
+    var it = ExtIpReachIterator.init((try ti.next()).?.value);
+    const h = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), h.metric);
+    try testing.expectEqual(@as(u8, 32), h.prefix_len);
+    try testing.expect(h.up_down);
+    try testing.expectEqualSlices(u8, &.{ 9, 0 }, h.sub_tlvs);
+}
+
+test "extended IP reachability: lies and out-of-range lengths are typed errors" {
+    var it1 = ExtIpReachIterator.init(&.{ 0, 0, 0, 1, 33, 1, 2, 3, 4, 5 }); // /33
+    try testing.expectError(error.BadTlvLength, it1.next());
+    var it2 = ExtIpReachIterator.init(&.{ 0, 0, 0, 1, 24, 10, 1 }); // /24 needs 3 bytes
+    try testing.expectError(error.BadTlvLength, it2.next());
+    var it3 = ExtIpReachIterator.init(&.{ 0, 0, 0, 1, 0x40 | 8, 10, 9, 1 }); // sub_len 9, 1 byte present
+    try testing.expectError(error.BadTlvLength, it3.next());
+    var it4 = ExtIpReachIterator.init(&.{ 0, 0, 0 });
+    try testing.expectError(error.BadTlvLength, it4.next());
+    var none: [0]u8 = .{};
+    var b = tlv.Builder.init(&none);
+    try testing.expectError(error.BadTlvLength, addExtIpReach(&b, .{ .metric = 0, .prefix_len = 33, .prefix = @splat(0) }));
+}
+
+test "IPv6 reachability: RFC 5308 §2 layout, flags, masking, round trip" {
+    // 2001:db8::/32 metric 10, X set; a /62 with U/D and a sub-TLV.
+    var buf: [128]u8 = undefined;
+    var b = tlv.Builder.init(&buf);
+    var p1: [16]u8 = @splat(0);
+    p1[0..4].* = .{ 0x20, 0x01, 0x0d, 0xb8 };
+    try addIpv6Reach(&b, .{ .metric = 10, .external = true, .prefix_len = 32, .prefix = p1 });
+    var p2 = p1;
+    p2[4..8].* = .{ 0, 1, 0, 3 }; // bit 63 set: stray, past /62 below
+    try addIpv6Reach(&b, .{ .metric = 256, .up_down = true, .prefix_len = 62, .prefix = p2, .sub_tlvs = &.{ 1, 1, 7 } });
+    var ti = tlv.TlvIterator.init(b.written());
+    const t0 = (try ti.next()).?;
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 10, 0x40, 32, 0x20, 0x01, 0x0d, 0xb8 }, t0.value);
+    var it = Ipv6ReachIterator.init(t0.value);
+    const a = (try it.next()).?;
+    try testing.expect(a.external and !a.up_down);
+    try testing.expectEqualSlices(u8, &p1, &a.prefix);
+    var it2 = Ipv6ReachIterator.init((try ti.next()).?.value);
+    const c = (try it2.next()).?;
+    try testing.expect(c.up_down and !c.external);
+    try testing.expectEqual(@as(u8, 62), c.prefix_len);
+    // /62 keeps bits 0..61: the last octet 0x03 (bits 56..63) keeps 0x00 (top 6 bits of 0b11 -> 0)
+    try testing.expectEqualSlices(u8, &.{ 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0 }, c.prefix[0..8]);
+    try testing.expectEqualSlices(u8, &.{ 1, 1, 7 }, c.sub_tlvs);
+}
+
+test "IPv6 reachability: lies and out-of-range lengths are typed errors" {
+    var it1 = Ipv6ReachIterator.init(&.{ 0, 0, 0, 1, 0, 129, 0 });
+    try testing.expectError(error.BadTlvLength, it1.next());
+    var it2 = Ipv6ReachIterator.init(&.{ 0, 0, 0, 1, 0, 64, 1, 2 }); // /64 needs 8 bytes
+    try testing.expectError(error.BadTlvLength, it2.next());
+    var it3 = Ipv6ReachIterator.init(&.{ 0, 0, 0, 1, 0x20, 0, 5 }); // S set, sub_len 5 with none
+    try testing.expectError(error.BadTlvLength, it3.next());
+    var it4 = Ipv6ReachIterator.init(&.{ 0, 0, 0, 1, 0x20, 0 }); // S set, sub_len missing
+    try testing.expectError(error.BadTlvLength, it4.next());
+    var it5 = Ipv6ReachIterator.init(&.{ 0, 0, 0, 1, 0 });
+    try testing.expectError(error.BadTlvLength, it5.next());
 }

@@ -28,7 +28,7 @@ IANA IS-IS TLV/sub-TLV code-point registries cross-checked against RFC 6329.
 |-------|--------|
 | `header` | The 8-byte common PDU header (discriminator `0x83`, length indicator, ID length, 5-bit PDU type, max-area-addresses) + the typed `PduType` enum (L1/L2 LAN IIH, P2P IIH, L1/L2 LSP, L1/L2 CSNP/PSNP). |
 | `tlv` | The bounds-checked TLV core: zero-copy `TlvIterator` (top-level *and* sub-TLVs), the `RawTlv` escape hatch, `findFirst`/`count`, and a caller-buffer `Builder`. |
-| `tlvs` | Typed views of the common TLVs — Area Addresses (#1), IS Neighbours LSP (#2), IS Neighbours IIH SNPAs (#6), LSP Entries (#9), Extended IS Reachability (#22, with sub-TLVs), Protocols Supported (#129), Dynamic Hostname (#137). |
+| `tlvs` | Typed views of the common TLVs — Area Addresses (#1), IS Neighbours LSP (#2), IS Neighbours IIH SNPAs (#6), LSP Entries (#9), Extended IS Reachability (#22, with sub-TLVs), Protocols Supported (#129), Extended IP Reachability (#135), IPv6 Reachability (#236), Dynamic Hostname (#137). |
 | `pdu` | The IIH (LAN + P2P), LSP, CSNP, and PSNP bodies, each with a decoder and a `Builder` that backfills the PDU-Length field. |
 | `auth` | The **Authentication TLV (#10)**: cleartext (type 1), HMAC-MD5 (RFC 5304, type 54) and RFC 5310 generic crypto (type 3, Key ID + HMAC-SHA-1/224/256/384/512). `addPlaceholder` on a builder, `sign` over the finished PDU (re-stamps an LSP's checksum), `verify` against a key set with a constant-time compare. Plain RFC 2104 keying by default, like deployed routers; `Key.strict_rfc5310` for the RFC's own key preparation. |
 | `spb` | The SPB MT-Capability (#144, in LSPs) / MT-Port-Capability (#143, in IIH) container + the **SPB Instance** (sub-TLV 1) and **SPBM Service Identifier and Unicast Address** (sub-TLV 3 — B-MAC, Base VID, per-I-SID T/R bits) sub-TLVs. |
@@ -36,11 +36,11 @@ IANA IS-IS TLV/sub-TLV code-point registries cross-checked against RFC 6329.
 ### Modeled vs raw-only
 
 **Modeled as typed structs:** PDU types 15/16/17/18/20/24/25/26/27; TLVs #1, #2,
-#6, #9, #10, #22, #129, #137, #143, #144; SPB sub-TLVs 1 (SPB-Inst) and 3 (SPBM-SI).
+#6, #9, #10, #22, #129, #135, #137, #143, #144, #236; SPB sub-TLVs 1 (SPB-Inst) and 3 (SPBM-SI).
 
 **Raw-only** (reachable verbatim through `tlv.TlvIterator` / `RawTlv`, and they
 round-trip byte-exact): every other TLV code — Padding #8,
-IP Interface Address #132, Extended IP Reachability #135, IPv6 reachability,
+IP Interface Address #132, legacy IP reachability #128/#130,
 MT-ISN #222, …; the SPB sub-TLVs SPB-Inst-Opaque #2, SPBV #4 (in #144) and
 SPB-MCID #4 / SPB-Digest #5 / SPB-B-VID #6 (in #143). Modeling any of them later
 is additive — no wire change.
