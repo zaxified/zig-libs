@@ -184,12 +184,15 @@ const Op = struct {
     fn removeSection(ed: *ini.Editor) anyerror!void {
         _ = try ed.removeSection("a");
     }
+    fn compact(ed: *ini.Editor) anyerror!void {
+        try ed.compact();
+    }
 };
 
 const ops = [_]*const fn (*ini.Editor) anyerror!void{
     Op.setExisting,     Op.setMultiline,  Op.setNewKey,         Op.setNewSection, Op.setGlobal,
     Op.noValueExisting, Op.noValueNew,    Op.noValueNewSection, Op.addSection,    Op.commentKey,
-    Op.commentSection,  Op.commentRemove, Op.remove,            Op.removeSection,
+    Op.commentSection,  Op.commentRemove, Op.remove,            Op.removeSection, Op.compact,
 };
 
 const documents = [_]struct { text: []const u8, opts: ini.Options }{

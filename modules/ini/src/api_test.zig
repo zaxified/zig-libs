@@ -274,6 +274,30 @@ fn written(doc: *const ini.Document, o: ini.WriteOptions) ![]u8 {
     return out.toOwnedSlice();
 }
 
+test "Editor.compact gives back what replaced values left, and changes nothing else" {
+    var ed = try ini.Editor.init(gpa, "# top\n[a]\n  k = v1 ; note\nx=1\n\n[b]\nq\n", .{ .strict = false, .no_value_keys = true, .inline_comments = true });
+    defer ed.deinit();
+    ed.separator = "=";
+    var big: [512]u8 = undefined;
+    @memset(&big, 'z');
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        try ed.set("a", "k", big[0 .. 100 + i]);
+        try ed.set("a", "k", "v2");
+    }
+    const grown = ed.memoryUsed();
+    const before = try ed.toOwnedSlice(gpa);
+    defer gpa.free(before);
+    try ed.compact();
+    try testing.expect(ed.memoryUsed() < grown / 4);
+    try expectEdited(&ed, before);
+    try testing.expectEqualStrings("v2", ed.get("a", "k").?);
+    try testing.expectEqualStrings("=", ed.separator.?);
+    // Still an editor: edits after compacting work.
+    try ed.set("b", "new", "1");
+    try testing.expectEqualStrings("1", ed.get("b", "new").?);
+}
+
 test "Document.write: file order, or merged like configparser.write" {
     const text = "[a]\nk=1\nk=2\n[DEFAULT]\nd=x\n[a]\nm=l1\n  l2\n";
     var doc = try ini.parse(gpa, text, .configparser);

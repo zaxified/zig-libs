@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Added:** `Editor.compact` (frees the memory replaced lines and failed edits left in the arena by re-reading the edited text into a fresh one; unchanged on `error.OutOfMemory`; slices from `get` taken before it dangle) and `Editor.memoryUsed`. Additive; nothing existing changes.
+
 - **2026-11-02** — **Fixed, from an independent review; none of it shipped before:** `Editor.setComment` kept a slice of the caller's text when a line already had its marker (use after free). `Document.write(.merged)` wrote `[DEFAULT]` before the headerless entries, which then read back as its keys; and dropped the document's `[DEFAULT]` when the target options named none. A failed edit now changes nothing under `error.OutOfMemory` too (`set`, `setNoValue`, `addSection`, `setComment` prepare and reserve, then commit). A line skipped for continuing a bare key is no longer absorbed: `set` on that key is `error.NotRepresentable`, `remove` takes the line along. `setNoValue` keeps the line's own ending; on a bare key it is a no-op. `WriteOptions.eol` other than `\n`, `\r\n` is refused. `Node.indent` widened (a `u32` `@intCast` over 4 GiB of blanks). `Event.invalid` gains `continues_bare_key`, with a default. Docs: edits are amortized O(1), `StreamScanner`'s limit includes the newline, `escapeDesktop` and trailing blanks. Backlog names rust-ini as not measured.
 
 - **2026-11-02** — Docs: mark an inferred claim about the `write` row as inferred; say how far the foreign sources were read.

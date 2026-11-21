@@ -12,7 +12,7 @@
 //! `error.NotRepresentable` and nothing changed. So is `error.OutOfMemory`:
 //! every edit allocates and reserves all it needs first, then commits with
 //! operations that cannot fail. The only trace of a failed edit is memory the
-//! arena keeps until `deinit`.
+//! arena keeps until `deinit` or `compact`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -109,7 +109,8 @@ const KeyCtx = struct {
 };
 
 /// Edits go to the end of an arena: the memory of a replaced value comes back
-/// at `deinit`, so a long-lived editor rewriting one key forever grows.
+/// at `deinit` or at `compact`, so a long-lived editor rewriting one key
+/// forever grows until the caller compacts it (`memoryUsed` says how much).
 pub const Editor = struct {
     arena: std.heap.ArenaAllocator,
     opts: Options,
@@ -247,6 +248,37 @@ pub const Editor = struct {
     pub fn deinit(self: *Editor) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    /// Bytes the editor holds (its arena's capacity): the text, every replaced
+    /// line an edit left behind, the line list and the indexes.
+    pub fn memoryUsed(self: *const Editor) usize {
+        return self.arena.queryCapacity();
+    }
+
+    /// Give back the memory replaced lines and failed edits left in the arena:
+    /// the text as edited is read again into a fresh arena and the old one is
+    /// freed. The text, every lookup and the layout settings (`separator`,
+    /// `continuation_indent`, `blank_before_new_section`) stay as they were; slices
+    /// that `get` or `getComment`'s caller still holds into the editor are
+    /// invalid afterwards, as after `deinit`. Cost is one `write` plus one
+    /// parse; call it when `memoryUsed` has outgrown what the file needs. On
+    /// `error.OutOfMemory` the editor is unchanged.
+    pub fn compact(self: *Editor) Allocator.Error!void {
+        const gpa = self.arena.child_allocator;
+        const text = try self.toOwnedSlice(gpa);
+        defer gpa.free(text);
+        // The editor wrote this text, and every edit proved it reads back under
+        // `opts`, so only an allocation can fail here.
+        var fresh = Editor.init(gpa, text, self.opts) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        };
+        fresh.separator = self.separator;
+        fresh.continuation_indent = self.continuation_indent;
+        fresh.blank_before_new_section = self.blank_before_new_section;
+        self.arena.deinit();
+        self.* = fresh;
     }
 
     // ── reading ──────────────────────────────────────────────────────────────

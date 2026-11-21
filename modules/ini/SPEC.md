@@ -44,7 +44,7 @@ Surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 - ✔ Locale keys: `getLocale`. ✔ Child sections: `getInherited`. ✔ Shadows: `entries`. ✔ Lenient mode: go-ini's `SkipUnrecognizableLines`, GKeyFile has none. ✔ Quoting on write: `quote`, `escapeDesktop`.
 - ✘ git-config, PHP's `parse_ini_file`, backslash continuation, `"""` and backtick quoting, auto-increment `-` keys, AWS nesting, multiple sources / `Append` / `Reload`, file I/O, `ValueMapper` and name mappers, `Key.Value` shadows on write, `PrettyFormat` alignment, multi-byte delimiters and comment prefixes, UTF-16 BOM.
 
-**Where we are ahead:** the only entry in this table whose parser is measured against two foreign implementations, on 2,100 texts (905 of them against both); an edit that leaves every other byte alone and refuses what would change the file's meaning, proved by reading the new line with the parser's own classifier and fuzzed against reading the output back; a strict/lenient invariant; line numbers everywhere. **Where we are behind:** the `write` row against a crate that proves nothing and keeps no order; and `Editor` memory, which grows with each edit until `deinit`.
+**Where we are ahead:** the only entry in this table whose parser is measured against two foreign implementations, on 2,100 texts (905 of them against both); an edit that leaves every other byte alone and refuses what would change the file's meaning, proved by reading the new line with the parser's own classifier and fuzzed against reading the output back; a strict/lenient invariant; line numbers everywhere. **Where we are behind:** the `write` row against a crate that proves nothing and keeps no order; and `Editor` memory, which grows with each edit until `compact` or `deinit`.
 
 ## What this module is, and what it is not
 
@@ -72,7 +72,9 @@ implementation each on every text in the golden corpus.
   edit builds and reserves everything first, then commits with operations that
   cannot fail (`src/edit_fail_test.zig` fails every allocation of every edit on
   several documents and arena positions; the bytes and every lookup must be
-  unchanged). The only trace is memory the arena keeps. `remove` and
+  unchanged). The only trace is memory the arena keeps until `compact` (it
+  re-reads the edited text into a fresh arena and frees the old one; `memoryUsed`
+  says when it is worth calling) or `deinit`. `remove` and
   `removeSection` allocate nothing. Editing a continued value drops a comment
   between its lines; `setNoValue` on a key with a value drops the value's
   continuation lines and the inline comment too, and keeps the line's own ending.
@@ -244,6 +246,5 @@ outliving its last entry).
 ## Backlog / deferred
 
 - **`Document.write` speed:** the worst `fastest` row (a crate that neither proves its lines nor keeps file order is faster). The per-line proof is probably most of it (inferred, not profiled). A cheap way to skip it safely would need to know the document was read under the same options and has no stray `\r`; not worth a contract yet.
-- **`Editor` memory:** replaced lines stay in the arena until `deinit`. A long-lived editor rewriting one key forever grows; no consumer does.
 - **rust-ini not measured** (coordinator's decision): the most downloaded INI crate, but its dependency tree (ordered-multimap, dlv-list, hashbrown, ahash, ...) was not read, and foreign code is read before it is compiled. So the card's `fastest` is fastest of those measured.
 - **Mutation run over `scan`, `editor`, `value` and `write`:** the whole-module run predates them; the fuzz harnesses and the oracles cover them, a mutation run does not yet (the card's `src` stays `?`).
