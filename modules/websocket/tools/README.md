@@ -9,6 +9,7 @@ The frozen three-implementation corpus in `src/connection.zig` came from:
 | `cases.py` | the shared case table (valid and adversarial client frames) |
 | `oracle_python.py` | runs the cases through `websockets` 15.0.1 → `out_python.json`, `cases.json` |
 | `oracle_go_main.go` | runs the same cases against `coder/websocket` and `gorilla/websocket` over loopback: `go run oracle_go_main.go <cases.json> <out_go.json>` |
+| `oracle_ks.py` + `ks_server.zig` | a fourth peer, karlseguin/websocket.zig's server (see below), probed with the same cases and compared with the frozen peers column |
 | `report.py` | merges both → `merged.json` |
 | `emit_zig.py` | writes the Zig table → `corpus.zig.txt` |
 
@@ -93,3 +94,19 @@ cache) and denoland/fastwebsockets 0.10.0 + snapview/tungstenite 0.30.0 (`rust_f
 `cargo build --release --offline`, versions pinned with `=`, `Cargo.lock` committed; their
 dependency closure was read before the first build — build scripts, proc macros, the code paths
 run). `BENCH_FAST=0` skips these three sides.
+
+## The karlseguin/websocket.zig server as a fourth peer
+
+`ks_server.zig` is a read-and-ignore server on karlseguin/websocket.zig (MIT, Zig 0.17.0 branch,
+tested at commit 105eed7); `oracle_ks.py` probes it with `cases.py` like `oracle_go_main.go` probes the Go
+servers. The library is not a dependency of zig-libs: clone it outside the repository, build the
+server in a scratch package that depends on it by path, and run the probe from the repository root.
+
+```bash
+git clone --depth 1 https://github.com/karlseguin/websocket.zig $WS_WORK/ks
+mkdir -p $WS_WORK/app && cp modules/websocket/tools/ks_server.zig $WS_WORK/app/main.zig
+# $WS_WORK/app/build.zig: addExecutable("ks_server") from main.zig importing the "websocket" dependency module;
+# $WS_WORK/app/build.zig.zon: .dependencies = .{ .websocket = .{ .path = "../ks" } } (the fingerprint zig prints)
+(cd $WS_WORK/app && zig build -Doptimize=Debug --prefix ../bin)
+python3 -I modules/websocket/tools/oracle_ks.py $WS_WORK/bin/bin/ks_server
+```
