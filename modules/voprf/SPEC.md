@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-11-20 (251/256, 3 eq) · src 1b4923ff844c33c1
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, `voprf-verifiable` / `voprf-poprf` at `.scale` 10 = 20,000 runs, VOPRF_FUZZ; `voprf-decode-suites` added 2026-11-13, not yet driven) · ct 2026-11-13 (ctgrind ReleaseFast, 15 targets = 5 suites × server/client/keygen; ristretto255 `server` 5 / `client` 8 / `keygen` 3 in-file unchanged, single verdicts; decaf448 21/19/6 and p256 59/27/12 since the sibling fixes (ed448 `Fe.ctSelect`, p256 `isBasePointRepr`; were 38/34/9 and 61/29/12), what remains is verdicts, the siblings' canonical-range decode verdicts on values that always pass, and on the server the variable-time `mulPublic` on the public composite scalars; p384 30/15/3, p521 26/7/3 the same; the NIST hash-to-curve selects with the siblings' laundered `Fe.cMov` (p256, p521) and its own laundered byte select for p384; itemised in `scripts/checks/ctgrind-expected.tsv`) · input bounds 2026-11-13 (every `input`/`info` > 65535 bytes is `error.InputTooLong`, was an assert) · panic 2026-11-13 (sweep of every pub entry point of all five suites: a batch of 2^16 + 1 elements or more overflowed the u16 composite index in the prover and the verifier, now `ProofGenerationFailed` / `InvalidProof` (`max_batch_length` = 2^16 - 1, RFC 9497 §2.2.1); `expandMessageXmd`'s DST contract is a checked `@panic`; non-canonical / zero secrets, hostile encodings and wiped per-role objects are total on every suite, `sweep_test.zig`)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, `voprf-verifiable` / `voprf-poprf` at `.scale` 10 = 20,000 runs, VOPRF_FUZZ; `voprf-decode-suites` added 2026-11-13, not yet driven) · ct 2026-11-13 (ctgrind ReleaseFast, 15 targets = 5 suites × server/client/keygen; ristretto255 `server` 5 / `client` 8 / `keygen` 3 in-file unchanged, single verdicts; decaf448 21/19/6 and p256 59/27/12 since the sibling fixes (ed448 `Fe.ctSelect`, p256 `isBasePointRepr`; were 38/34/9 and 61/29/12), what remains is verdicts, the siblings' canonical-range decode verdicts on values that always pass, and on the server the variable-time `mulPublic` on the public composite scalars; p384 30/15/3, p521 26/7/3 the same; the NIST hash-to-curve selects with the siblings' laundered `Fe.cMov` (p256, p384, p521); itemised in `scripts/checks/ctgrind-expected.tsv`) · input bounds 2026-11-13 (every `input`/`info` > 65535 bytes is `error.InputTooLong`, was an assert) · panic 2026-11-13 (sweep of every pub entry point of all five suites: a batch of 2^16 + 1 elements or more overflowed the u16 composite index in the prover and the verifier, now `ProofGenerationFailed` / `InvalidProof` (`max_batch_length` = 2^16 - 1, RFC 9497 §2.2.1); `expandMessageXmd`'s DST contract is a checked `@panic`; non-canonical / zero secrets, hostile encodings and wiped per-role objects are total on every suite, `sweep_test.zig`)
 **Performance:** ref 0.18–0.86× CIRCL v1.6.1 `oprf` (stand-in for RFC 9497, whose reference is Sage; 4 suites × OPRF/VOPRF/POPRF, batch 1; POPRF blind and finalize counted as their sum, see § Performance; no decaf448 in CIRCL) · fastest ? (measured 2026-11-14)
 
 **Known defects:** none recorded
@@ -175,9 +175,8 @@ suite's `Ne`/`Nh`.
   is "the scalar is 0 mod n", voprf maps it to the identity element instead
   of an error, so no voprf API reports it. The NIST hash-to-curve treats the
   input as secret (it is the client's private input): `cMov` selects only,
-  no branch on `u` or any field value — the sibling's `Fe.cMov` where it
-  launders its mask (p256, p521), a local laundered byte
-  select for p384, whose `Fe.cMov` builds its mask from the bare bit. Per-suite ctgrind rows: see
+  no branch on `u` or any field value — the sibling's `Fe.cMov`, which
+  launders its mask (p256, p384, p521). Per-suite ctgrind rows: see
   the card's Hardening line and `scripts/checks/ctgrind-expected.tsv`.
 
   PUBLIC scalars stay on std's `mul` on purpose: `verifyProof`'s `s`/`c`
@@ -219,8 +218,15 @@ are returned by value; they carry no secret).
 `src/stackprobe_test.zig` paints the stack, calls each entry point and scans
 the dead window for the seed, key, blind and its inverse, the unblinded
 element, the PRF output, the DLEQ nonce, `c*k`, `t = sk + m`, `t^-1` and the
-input; each set has a control needle that must be found. It runs only in
-ReleaseFast/ReleaseSmall (Debug fills `undefined` with `0xaa`).
+input; each set has a control needle that must be found. The other four
+suites (decaf448, P-256, P-384, P-521, whose burns are scaled ×2,
+`groups.zig` `burn_scale`) are probed at `deriveKeyPair`,
+`scalarFromWideBytes`, `blind`, `blindEvaluate`, `finalize`, `evaluate`,
+`blindEvaluateVerifiable` and `evaluatePoprf` for the byte images the API
+handles (seed, key, blind, proof nonce, wide string, outputs, input); the
+sibling curves' internal encodings (`blind^-1`, the unblinded element) are
+not needles there. It runs only in ReleaseFast/ReleaseSmall (Debug fills
+`undefined` with `0xaa`).
 
 Not covered: the standalone helpers `hashToScalar`, `hashToGroup` and
 `expandMessageXmd` (public, defined over transcripts; they only see a secret
@@ -276,7 +282,7 @@ Run: `scripts/modtest voprf`. Tests sit beside the code (`kat_test.zig`, `suite_
   total; `expandMessageXmd` accepts the whole 1..255 DST range and reduces a longer DST (RFC 9380
   §5.3.3, `sha2.expandMessageXmd`); only an empty DST is a checked `@panic`.
 - **Dead-stack residue:** `stackprobe_test.zig` (ReleaseFast/ReleaseSmall only), see *Secret residue on
-  the dead stack*; ristretto255 only (→ Backlog).
+  the dead stack*; all five suites.
 - **Fuzz:** harnesses generic over their choice source, run by `std.testing.fuzz` and by the
   deterministic driver `VOPRF_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver): `voprf-decode`,
   `voprf-decode-suites`, `voprf-oprf`, `voprf-verifiable`, `voprf-poprf`.
@@ -320,23 +326,20 @@ current figures, with their date, are the card's `**Performance:**` line; they a
   cover both KATs and production use.
 - **Serialization frameworks** (facebook/voprf's serde derives) — the wire
   values are the RFC's fixed-width byte strings (`toBytes`/`fromBytes`).
+- **Moving the NIST hash-to-curve maps into `p256`/`p384`/`p521`.** This
+  module owns RFC 9380's P-256/P-384/P-521 `_XMD_SSWU_RO_` suites
+  (`h2c.zig`, the RFC's J.1.1/J.2.1/J.3.1 vectors) for its own ciphersuites;
+  the curve modules point here and offer no hash-to-curve API of their own
+  (their reference, OpenSSL, has none). `expand_message_xmd` is the shared
+  `sha2.expandMessageXmd`.
+- **A shared `expand_message_xof`.** `h2c.expandMessageXof` (parts,
+  SHAKE256), `bls12_381`'s and `decaf448`'s are three ten-line wrappers over
+  std's `Shake256` with different call shapes (parts / one message / a
+  runtime-length output); there is no SHAKE module to host one, and a module
+  for ten lines would cost more than the copies.
 
 ## Backlog / deferred
 
-- **Shared hash-to-curve module.** `h2c.zig` (expand_message_xmd/xof, the
-  NIST simplified SWU) lives in voprf; `bls12_381` (and `bbs` through it)
-  carry their own expanders of the same shape (`expandMessageXmdParts`). Move
-  both into one module so the duplicate-code pass can merge them; the
-  NIST maps could then also back `p256`/`p384`/`p521` hash-to-curve APIs
-  (none of them has one today).
-- **Dead-stack probe for the new suites.** `stackprobe_test.zig` probes the
-  ristretto255 entry points only; the other suites run under the same burns
-  scaled ×2 (`groups.zig` `burn_scale`), not measured.
-- **zig-libs request: p384 — `Fe.cMov` builds its mask from the bare bit.**
-  It measures clean under ctgrind, but p521's identical form
-  compiled to a jump on the bit at ReleaseFast, and p256/p521 now launder
-  theirs (`blackBox`). Until p384 does, `h2c.zig`'s `sel` keeps a laundered
-  byte select for p384 (`own_select`); then drop it.
 - **Performance leftovers** (every counted row of the card's Performance line is <= 0.86x CIRCL):
   `powC1` in `sqrt_ratio` is a plain square-and-multiply (an addition chain
   would cut it), and the composite sums use one `mulPublic` per term instead

@@ -127,6 +127,10 @@ as ours), `ecdhInto` (`ecdh`): 0 in-file contexts, ReleaseFast, CPU skylake — 
 the asm field is the one measured. The positive control `vartime` (a tainted scalar into
 `mulPublic`) reports 11 in-file.
 
+`Fe.cMov` (every constant-time select) builds its mask through an optimization barrier
+(`blackBox`), as p256 and p521 do: the bare `0 -% c` form compiled to a jump on `c` at ReleaseFast
+in p521.
+
 **Declassified, not absent** (`ct.zig`; each a value the API reveals): the range verdict on a
 secret scalar; "is the product the identity"; r = 0 / s = 0 and the published r, s; the RFC 6979
 retry bit (a candidate ≥ n, probability < 2^−190 per signature).

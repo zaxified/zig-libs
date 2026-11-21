@@ -220,10 +220,21 @@ pub const Fe = struct {
 
     /// `a.* = b` when `c == 1`, unchanged when `c == 0`; no branch.
     pub fn cMov(a: *Fe, b: Fe, c: u1) void {
-        const m = 0 -% @as(u64, c);
+        // The mask goes through `blackBox` so LLVM cannot see it is 0 or
+        // all ones and turn the select back into a branch on `c` (it did
+        // for p521's identical form at ReleaseFast), as p256 and p521 do.
+        const m = blackBox(0 -% @as(u64, c));
         inline for (0..6) |i| a.limbs[i] ^= (a.limbs[i] ^ b.limbs[i]) & m;
     }
 };
+
+/// An optimization barrier on a mask (as `group.zig`'s).
+inline fn blackBox(x: u64) u64 {
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
+}
 
 // ── tests ───────────────────────────────────────────────────────────────────
 

@@ -531,3 +531,148 @@ test "STACKPROBE: no key, blind or nonce residue on the dead stack (voprf)" {
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
+
+// ── the other four suites ───────────────────────────────────────────────────
+//
+// The same engine over `Suite(cs)`'s secret paths. Needles are the byte images
+// the API itself hands out or takes (seed, key, blind, proof nonce, the wide
+// string, the outputs, the password); the group-internal intermediates the
+// ristretto255 probe also lists (`blind^-1`, the unblinded element) are not
+// computed here: their encodings are the sibling curves' internals.
+
+fn SuiteProbe(comptime cs: voprf.Ciphersuite) type {
+    return struct {
+        const S = voprf.Suite(cs);
+        var s_seed: [32]u8 = undefined;
+        var s_sk: [S.Ns]u8 = undefined;
+        var s_pk: S.Element = undefined;
+        var s_wide: [S.wide_length]u8 = undefined;
+        var s_blind: [S.Ns]u8 = undefined;
+        var s_r: [S.Ns]u8 = undefined;
+        var s_blinded: S.Element = undefined;
+        var s_evaluated: S.Element = undefined;
+
+        var s_kp_sink: S.KeyPair = undefined;
+        var s_scalar_sink: [S.Ns]u8 = undefined;
+        var s_el_sink: S.Element = undefined;
+        var s_out_sink: [S.Nh]u8 = undefined;
+        var s_ve_sink: S.VerifiableEvaluation = undefined;
+
+        noinline fn sCallDerive() void {
+            S.deriveKeyPair(.voprf, &s_seed, info, &s_kp_sink) catch unreachable;
+        }
+        noinline fn sCallWide() void {
+            S.scalarFromWideBytes(&s_wide, &s_scalar_sink);
+        }
+        noinline fn sCallBlind() void {
+            s_el_sink = S.blind(.oprf, password, &s_blind) catch unreachable;
+        }
+        noinline fn sCallBlindEvaluate() void {
+            s_el_sink = S.blindEvaluate(&s_sk, s_blinded);
+        }
+        noinline fn sCallFinalize() void {
+            S.finalize(password, &s_blind, s_evaluated, &s_out_sink) catch unreachable;
+        }
+        noinline fn sCallEvaluate() void {
+            S.evaluate(.oprf, &s_sk, password, &s_out_sink) catch unreachable;
+        }
+        noinline fn sCallBlindEvaluateVerifiable() void {
+            s_ve_sink = S.blindEvaluateVerifiable(&s_sk, s_pk, s_blinded, &s_r) catch unreachable;
+        }
+        noinline fn sCallEvaluatePoprf() void {
+            S.evaluatePoprf(&s_sk, password, info, &s_out_sink) catch unreachable;
+        }
+
+        fn run(ci: u8) !usize {
+            const label = @tagName(cs);
+            s_seed = seedBytes(32, label ++ "-seed", ci);
+            var kp: S.KeyPair = undefined;
+            try S.deriveKeyPair(.voprf, &s_seed, info, &kp);
+            s_sk = kp.sk;
+            s_pk = kp.pk;
+            s_wide = seedBytes(S.wide_length, label ++ "-wide", ci);
+            S.scalarFromWideBytes(&s_wide, &s_blind);
+            S.scalarFromWideBytes(&seedBytes(S.wide_length, label ++ "-r", ci), &s_r);
+            leak_src = s_sk[0..LEAK].*;
+            s_blinded = try S.blind(.oprf, password, &s_blind);
+            s_evaluated = S.blindEvaluate(&s_sk, s_blinded);
+            var out_fin: [S.Nh]u8 = undefined;
+            try S.finalize(password, &s_blind, s_evaluated, &out_fin);
+            var out_eval: [S.Nh]u8 = undefined;
+            try S.evaluate(.oprf, &s_sk, password, &out_eval);
+            var out_poprf: [S.Nh]u8 = undefined;
+            try S.evaluatePoprf(&s_sk, password, info, &out_poprf);
+
+            var bad: usize = 0;
+            var n: Needles = .{};
+            n.addBytes("seed", &s_seed);
+            n.addBytes("sk", &s_sk);
+            addCommon(&n);
+            n.sort();
+            bad += try runProbe(label ++ ".deriveKeyPair", sCallDerive, &n);
+
+            n = .{};
+            n.addBytes("wide", &s_wide);
+            n.addBytes("blind", &s_blind);
+            addCommon(&n);
+            n.sort();
+            bad += try runProbe(label ++ ".scalarFromWideBytes", sCallWide, &n);
+
+            n = .{};
+            n.addBytes("blind", &s_blind);
+            n.addBytes("password", password);
+            addCommon(&n);
+            n.sort();
+            bad += try runProbe(label ++ ".blind", sCallBlind, &n);
+
+            n = .{};
+            n.addBytes("sk", &s_sk);
+            addCommon(&n);
+            n.sort();
+            bad += try runProbe(label ++ ".blindEvaluate", sCallBlindEvaluate, &n);
+
+            n = .{};
+            n.addBytes("blind", &s_blind);
+            n.addBytes("output", &out_fin);
+            n.addBytes("password", password);
+            addCommon(&n);
+            n.sort();
+            bad += try runProbe(label ++ ".finalize", sCallFinalize, &n);
+
+            n = .{};
+            n.addBytes("sk", &s_sk);
+            n.addBytes("output", &out_eval);
+            n.addBytes("password", password);
+            addCommon(&n);
+            n.sort();
+            bad += try runProbe(label ++ ".evaluate", sCallEvaluate, &n);
+
+            n = .{};
+            n.addBytes("sk", &s_sk);
+            n.addBytes("proof_r", &s_r);
+            addCommon(&n);
+            n.sort();
+            bad += try runProbe(label ++ ".blindEvaluateVerifiable", sCallBlindEvaluateVerifiable, &n);
+
+            n = .{};
+            n.addBytes("sk", &s_sk);
+            n.addBytes("output", &out_poprf);
+            n.addBytes("password", password);
+            addCommon(&n);
+            n.sort();
+            bad += try runProbe(label ++ ".evaluatePoprf", sCallEvaluatePoprf, &n);
+            return bad;
+        }
+    };
+}
+
+test "STACKPROBE: no key, blind or nonce residue on the dead stack (decaf448, P-256, P-384, P-521 suites)" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    for (0..n_cases) |ci| {
+        inline for (.{ .decaf448_shake256, .p256_sha256, .p384_sha384, .p521_sha512 }) |cs| {
+            bad += try SuiteProbe(cs).run(@intCast(ci));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
