@@ -63,8 +63,7 @@ const zn = try lz4.compressBlock(data, &zbuf, .{});
 
 ## Not provided
 
-No LZ4 HC levels (the decoder reads their output), no dictionaries, no streaming
-`std.Io.Reader`/`Writer` (whole buffers only), no writing of legacy frames, no `lz4` command-line program. See SPEC.md
+No optimal parser for HC levels 10..12, no writing of legacy frames, no `lz4` command-line program. See SPEC.md
 *What is deliberately not done* and *Backlog / deferred*.
 
 Tests: `zig build test-lz4` (hand-built frames, CLI goldens, a byte-at-a-time block model the

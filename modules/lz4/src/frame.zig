@@ -101,6 +101,13 @@ pub const EncodeOptions = struct {
     /// negative `compressionLevel` L as `1 - L` (`LZ4F_compressBlock`), so
     /// level -1 is acceleration 2.
     acceleration: u32 = 1,
+    /// 3..12: the HC matcher (liblz4's `compressionLevel` 3..12: smaller
+    /// output, several times slower; `lz4 -9`); 0..2 are the fast matcher and
+    /// `acceleration` applies; above 12 is 12. Levels 10..12 use the same
+    /// chain search as 9 and deeper, not liblz4's optimal parser. Without an
+    /// allocator (`compressInto`) the matcher's tables, about 192 KiB, are on
+    /// the stack.
+    hc_level: u8 = 0,
 };
 
 fn markSkippable(m: u32) bool {
@@ -122,6 +129,30 @@ const Decoder = struct {
     out: std.ArrayList(u8) = .empty,
     max_output: usize,
     opts: DecodeOptions,
+    /// The dictionary tail (`block.dictTail`), or empty.
+    dict: []const u8 = "",
+    /// Dictionary bytes currently sitting in `out` as history (they are not
+    /// output: `room` does not count them).
+    embedded: usize = 0,
+
+    /// Output bytes that may still be produced.
+    fn room(d: *const Decoder) usize {
+        return d.max_output + d.embedded - d.out.items.len;
+    }
+
+    /// Put the dictionary into `out` as history; returns where it starts.
+    fn embed(d: *Decoder) std.mem.Allocator.Error!usize {
+        const at = d.out.items.len;
+        try d.out.appendSlice(d.gpa, d.dict);
+        d.embedded = d.dict.len;
+        return at;
+    }
+
+    /// Take the dictionary out again (what was decoded after it moves down).
+    fn unembed(d: *Decoder, at: usize) void {
+        d.out.replaceRangeAssumeCapacity(at, d.dict.len, "");
+        d.embedded = 0;
+    }
 
     fn need(d: *Decoder, n: usize) DecodeError!void {
         if (d.src.len - d.pos < n) return error.TruncatedInput;
@@ -137,15 +168,15 @@ const Decoder = struct {
     /// Decode one compressed block of at most `max` output bytes whose
     /// matches may reach back to `prefix_start`.
     fn compressedBlock(d: *Decoder, data: []const u8, max: usize, prefix_start: usize) DecodeError!void {
-        const left = d.max_output - d.out.items.len;
+        const left = d.room();
         // No block decodes to more than 255 bytes per input byte (a length
         // byte of 255 is the densest), so a small block never reserves the
         // frame's whole block maximum.
         const dense = std.math.mul(usize, data.len, 255) catch std.math.maxInt(usize);
-        const room = @min(max, left, dense);
-        try d.out.ensureUnusedCapacity(d.gpa, room);
+        const fit = @min(max, left, dense);
+        try d.out.ensureUnusedCapacity(d.gpa, fit);
         const start = d.out.items.len;
-        const buf = d.out.allocatedSlice()[0 .. start + room];
+        const buf = d.out.allocatedSlice()[0 .. start + fit];
         const end = block.decodeInto(data, buf, start, prefix_start) catch |e| return switch (e) {
             error.Truncated => error.CorruptBlock,
             error.BadOffset => error.BadOffset,
@@ -179,10 +210,18 @@ const Decoder = struct {
             const v = std.mem.readInt(u64, desc[2..10], .little);
             break :blk if (v == 0) null else v;
         } else null;
-        // The dictionary id is read and not acted on (no dictionaries here):
-        // a block that needs one fails on its first out-of-range offset.
+        // The dictionary id is read and not acted on, as liblz4 does: the
+        // dictionary a caller gives `decompressDict` applies to every frame; a
+        // block that needs one the caller did not give fails on its first
+        // out-of-range offset.
         d.pos += desc_len + 1;
         if (content_size) |cs| if (cs > d.max_output - frame_start) return error.OutputTooLarge;
+        // Linked blocks: the dictionary is the history of the frame's first
+        // block, in `out` ahead of the content for the whole frame.
+        const linked_dict = d.dict.len > 0 and !independent;
+        var dict_at: usize = 0;
+        if (linked_dict) dict_at = d.embed() catch return error.OutOfMemory;
+        const base = d.out.items.len;
 
         while (true) {
             const word = try d.take32();
@@ -199,19 +238,26 @@ const Decoder = struct {
                 if (d.opts.verify_checksums and XxHash32.hash(0, data) != want) return error.BlockChecksumMismatch;
             }
             if (stored) {
-                if (len > d.max_output - d.out.items.len) return error.OutputTooLarge;
+                if (len > d.room()) return error.OutputTooLarge;
                 try d.out.appendSlice(d.gpa, data);
+            } else if (independent and d.dict.len > 0) {
+                // Every block starts from the dictionary: it goes in front of
+                // this block's output for the decode only.
+                const at = d.embed() catch return error.OutOfMemory;
+                try d.compressedBlock(data, block_max, at);
+                d.unembed(at);
             } else {
-                const prefix = if (independent) d.out.items.len else frame_start;
+                const prefix = if (independent) d.out.items.len else if (linked_dict) dict_at else base;
                 try d.compressedBlock(data, block_max, prefix);
             }
         }
-        const produced = d.out.items[frame_start..];
+        const produced = d.out.items[base..];
         if (content_size) |cs| if (produced.len != cs) return error.ContentSizeMismatch;
         if (has_content_sum) {
             const want = try d.take32();
             if (d.opts.verify_checksums and XxHash32.hash(0, produced) != want) return error.ContentChecksumMismatch;
         }
+        if (linked_dict) d.unembed(dict_at);
     }
 
     fn legacy(d: *Decoder) DecodeError!void {
@@ -274,6 +320,26 @@ pub fn decompress(gpa: std.mem.Allocator, src: []const u8, opts: DecodeOptions) 
     return d.out.toOwnedSlice(gpa);
 }
 
+/// `decompress` for frames made against a dictionary (`compressDict`, liblz4's
+/// `LZ4F_decompress_usingDict`, `lz4 -d -D`): `dictionary` (its last 64 KiB - 1
+/// bytes) is the history of every LZ4 frame's first block when blocks are
+/// linked, of every block when they are independent. The frame's Dictionary ID
+/// is not compared with anything (as in liblz4: knowing which dictionary a
+/// frame needs is the caller's job). Legacy frames take none. Caller owns the
+/// result. An empty `dictionary` is `decompress`.
+pub fn decompressDict(gpa: std.mem.Allocator, src: []const u8, dictionary: []const u8, opts: DecodeOptions) DecodeError![]u8 {
+    var d: Decoder = .{
+        .gpa = gpa,
+        .src = src,
+        .max_output = opts.max_output orelse std.math.maxInt(usize),
+        .opts = opts,
+        .dict = block.dictTail(dictionary),
+    };
+    errdefer d.out.deinit(gpa);
+    try d.run();
+    return d.out.toOwnedSlice(gpa);
+}
+
 /// As `decompress`, into `dst`: returns the decoded length. `dst.len` is a
 /// cap like `DecodeOptions.max_output` (the smaller of the two applies), so
 /// output that would not fit is `error.OutputTooLarge`, a frame whose header
@@ -315,8 +381,43 @@ pub const EncodeError = error{ NoSpaceLeft, InputTooLarge };
 /// Write one frame holding `src` into `dst`; `compressBound(src.len, opts)`
 /// bytes always fit. Returns the frame length.
 pub fn compressInto(src: []const u8, dst: []u8, opts: EncodeOptions) EncodeError!usize {
+    if (opts.hc_level >= block.hc_min_level) return compressIntoHc(src, dst, opts);
+    return encodeFrame(null, src, 0, "", null, dst, opts, null) catch |e| switch (e) {
+        error.OutOfMemory => unreachable, // no allocator is used without a dictionary
+        else => |x| return x,
+    };
+}
+
+/// `compressInto` with the HC matcher; out of line so the fast path's frame
+/// does not carry its tables.
+noinline fn compressIntoHc(src: []const u8, dst: []u8, opts: EncodeOptions) EncodeError!usize {
+    var t: block.HcTable = undefined;
+    t.init();
+    return encodeFrame(null, src, 0, "", null, dst, opts, &t) catch |e| switch (e) {
+        error.OutOfMemory => unreachable,
+        else => |x| return x,
+    };
+}
+
+/// The frame encoder. `buf[base..]` is the content; with a dictionary `buf`
+/// starts with its tail (`block.dictTail`), which is `buf[0..base]`, as
+/// history for linked blocks. Independent blocks with a dictionary are encoded
+/// one by one against `dict` (the blocks in between are not history), which
+/// takes `gpa`.
+fn encodeFrame(
+    gpa: ?std.mem.Allocator,
+    buf: []const u8,
+    base: usize,
+    dict: []const u8,
+    dict_id: ?u32,
+    dst: []u8,
+    opts: EncodeOptions,
+    hc: ?*block.HcTable,
+) (EncodeError || error{OutOfMemory})!usize {
+    const src = buf[base..];
     if (src.len > std.math.maxInt(u32)) return error.InputTooLarge;
-    if (dst.len < headerLen(opts)) return error.NoSpaceLeft;
+    const hdr = headerLen(opts) + @as(usize, if (dict_id != null) 4 else 0);
+    if (dst.len < hdr) return error.NoSpaceLeft;
     var at: usize = 0;
     std.mem.writeInt(u32, dst[0..4], magic, .little);
     var flg: u8 = 0x40;
@@ -324,6 +425,7 @@ pub fn compressInto(src: []const u8, dst: []u8, opts: EncodeOptions) EncodeError
     if (opts.block_checksum) flg |= 0x10;
     if (opts.content_size) flg |= 0x08;
     if (opts.content_checksum) flg |= 0x04;
+    if (dict_id != null) flg |= 0x01;
     dst[4] = flg;
     dst[5] = @as(u8, @backingInt(opts.block_size)) << 4;
     at = 6;
@@ -331,23 +433,37 @@ pub fn compressInto(src: []const u8, dst: []u8, opts: EncodeOptions) EncodeError
         std.mem.writeInt(u64, dst[6..14], src.len, .little);
         at = 14;
     }
+    if (dict_id) |id| {
+        std.mem.writeInt(u32, dst[at..][0..4], id, .little);
+        at += 4;
+    }
     dst[at] = @truncate(XxHash32.hash(0, dst[4..at]) >> 8);
     at += 1;
 
     const bmax = opts.block_size.bytes();
     const accel = block.clampAcceleration(opts.acceleration);
+    const per_block_dict = opts.independent_blocks and dict.len > 0;
     var table: block.Table = @splat(0);
-    var start: usize = 0;
-    while (start < src.len) {
-        const end = @min(src.len, start + bmax);
-        const raw = src[start..end];
+    if (!per_block_dict and base > 0 and hc == null) block.seedTable(buf[0..base], &table);
+    var start: usize = base;
+    while (start < buf.len) {
+        const end = @min(buf.len, start + bmax);
+        const raw = buf[start..end];
         if (dst.len - at < 4) return error.NoSpaceLeft;
         const body = dst[at + 4 ..];
         const history = if (opts.independent_blocks) start else start -| block.max_offset;
         // Room for at most `raw.len - 1` bytes: a block that does not
         // shrink is stored instead (liblz4 does the same).
         const room = @min(body.len, raw.len - 1);
-        const z: ?usize = block.encodeRange(src, start, end, history, &table, accel, body[0..room]) catch null;
+        const z: ?usize = if (per_block_dict)
+            block.compressDict(gpa.?, raw, dict, body[0..room], .{ .acceleration = accel, .hc_level = opts.hc_level }) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            }
+        else if (hc) |t|
+            block.encodeHc(buf, start, end, history, t, opts.hc_level, body[0..room]) catch null
+        else
+            block.encodeRange(buf, start, end, history, &table, accel, body[0..room]) catch null;
         var stored_len: usize = undefined;
         if (z) |zn| {
             std.mem.writeInt(u32, dst[at..][0..4], @intCast(zn), .little);
@@ -383,6 +499,49 @@ pub fn compressInto(src: []const u8, dst: []u8, opts: EncodeOptions) EncodeError
 pub fn compress(gpa: std.mem.Allocator, src: []const u8, opts: EncodeOptions) (EncodeError || error{OutOfMemory})![]u8 {
     const buf = try gpa.alloc(u8, compressBound(src.len, opts));
     errdefer gpa.free(buf);
-    const n = try compressInto(src, buf, opts);
+    var n: usize = undefined;
+    if (opts.hc_level >= block.hc_min_level) {
+        const t = try gpa.create(block.HcTable);
+        defer gpa.destroy(t);
+        t.init();
+        n = try encodeFrame(null, src, 0, "", null, buf, opts, t);
+    } else n = try compressInto(src, buf, opts);
     return gpa.realloc(buf, n);
+}
+
+/// One frame holding `src`, compressed against `dictionary` (liblz4's
+/// `LZ4F_compressBegin_usingDict`, `lz4 -D`): the header carries `dict_id`
+/// (the 4-byte Dictionary ID field; null leaves the field out, as liblz4 does
+/// when the caller names no id), linked blocks use the dictionary as the
+/// history of the first block, independent blocks each use it. Only the last
+/// 64 KiB - 1 of the dictionary counts. Decode with `decompressDict` (or any
+/// LZ4 frame decoder given the same dictionary). An empty dictionary is
+/// `compress`, plus the id field. Caller owns the result.
+pub fn compressDict(
+    gpa: std.mem.Allocator,
+    src: []const u8,
+    dictionary: []const u8,
+    dict_id: ?u32,
+    opts: EncodeOptions,
+) (EncodeError || error{OutOfMemory})![]u8 {
+    const d = block.dictTail(dictionary);
+    const out = try gpa.alloc(u8, compressBound(src.len, opts) + 4);
+    errdefer gpa.free(out);
+    var n: usize = undefined;
+    if (d.len == 0 or opts.independent_blocks) {
+        // Independent blocks are encoded one by one against the dictionary.
+        n = try encodeFrame(gpa, src, 0, d, dict_id, out, opts, null);
+    } else {
+        const buf = try gpa.alloc(u8, d.len + src.len);
+        defer gpa.free(buf);
+        @memcpy(buf[0..d.len], d);
+        @memcpy(buf[d.len..], src);
+        if (opts.hc_level >= block.hc_min_level) {
+            const t = try gpa.create(block.HcTable);
+            defer gpa.destroy(t);
+            t.init();
+            n = try encodeFrame(null, buf, d.len, buf[0..d.len], dict_id, out, opts, t);
+        } else n = try encodeFrame(null, buf, d.len, buf[0..d.len], dict_id, out, opts, null);
+    }
+    return gpa.realloc(out, n);
 }

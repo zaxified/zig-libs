@@ -506,6 +506,11 @@ noinline fn backExtend(buf: []const u8, ip: usize, cand: usize, max: usize) usiz
 }
 
 pub const CompressOptions = struct {
+    /// 3..12 selects the HC matcher (`encodeHc`: hash chains, lazy matching;
+    /// slower, a smaller block, the same format); 0 (default), 1 and 2 are the
+    /// fast matcher and `acceleration` applies; above 12 is 12. `compress` with
+    /// a level keeps the matcher's tables (about 192 KiB) on the stack.
+    hc_level: u8 = 0,
     /// LZ4's acceleration: 1 (the default) is LZ4's default level; each step
     /// up makes the match search skip faster over incompressible data.
     /// 0 is taken as 1; above 65537 is taken as 65537 (liblz4's bounds).
@@ -521,6 +526,7 @@ pub fn clampAcceleration(a: u32) u32 {
 /// bytes always fit; with less room `error.NoSpaceLeft` may come back.
 pub fn compress(src: []const u8, dst: []u8, opts: CompressOptions) error{ NoSpaceLeft, InputTooLarge }!usize {
     if (src.len > max_input_size) return error.InputTooLarge;
+    if (opts.hc_level >= hc_min_level) return compressHcStack(src, dst, opts.hc_level);
     const accel = clampAcceleration(opts.acceleration);
     if (src.len < small_limit) {
         // Every position a probe or a seed enters is at most
@@ -530,6 +536,220 @@ pub fn compress(src: []const u8, dst: []u8, opts: CompressOptions) error{ NoSpac
     }
     var table: Table = @splat(0);
     return encodeRange(src, 0, src.len, 0, &table, accel, dst);
+}
+
+// ── HC encoder ──────────────────────────────────────────────────────────
+
+pub const hc_hash_log = 15;
+pub const hc_min_level = 3;
+pub const hc_max_level = 12;
+
+/// The HC matcher's state, reused across the blocks of a frame: the newest
+/// position per 4-byte hash and, per position (mod 64 Ki), the distance to
+/// the previous position with the same hash (liblz4's `LZ4HC_CCtx_internal`
+/// `hashTable` and `chainTable`).
+pub const HcTable = struct {
+    head: [1 << hc_hash_log]u32,
+    chain: [1 << 16]u16,
+    /// Every position below this is in the table.
+    next: usize,
+
+    pub fn init(t: *HcTable) void {
+        t.head = @splat(0);
+        t.chain = @splat(0);
+        t.next = 0;
+    }
+};
+
+inline fn hcHash(v: u32) usize {
+    return @intCast((v *% 2654435761) >> (32 - hc_hash_log));
+}
+
+/// How many chain links a level follows: 16 at level 3, doubling per level.
+fn hcAttempts(level: u8) u32 {
+    const l = std.math.clamp(level, hc_min_level, hc_max_level);
+    return @as(u32, 1) << @intCast(l + 1);
+}
+
+inline fn hcInsert(t: *HcTable, buf: []const u8, upto: usize) void {
+    var p = t.next;
+    while (p < upto) : (p += 1) {
+        const h = hcHash(read32(buf, p));
+        const delta = p - t.head[h];
+        t.chain[p & 0xFFFF] = @intCast(@min(delta, 0xFFFF));
+        t.head[h] = @intCast(p);
+    }
+    if (upto > t.next) t.next = upto;
+}
+
+const HcMatch = struct { len: usize, cand: usize };
+
+/// The longest match at `ip` longer than `min_len` (null if none): walk the
+/// chain of positions with the same hash, at most `attempts` links, within
+/// the window `[low, ip)`. Positions below `ip` must be inserted.
+fn hcLongest(t: *const HcTable, buf: []const u8, ip: usize, extend_limit: usize, low: usize, attempts: u32, min_len: usize) ?HcMatch {
+    if (ip + min_match > extend_limit) return null;
+    const v = read32(buf, ip);
+    var best: ?HcMatch = null;
+    var best_len = min_len;
+    var cand: usize = t.head[hcHash(v)];
+    var left = attempts;
+    while (left > 0 and cand >= low and cand < ip) : (left -= 1) {
+        // A longer match must also agree at `best_len`; a cheap reject first.
+        if (ip + best_len < extend_limit and buf[cand + best_len] == buf[ip + best_len] and read32(buf, cand) == v) {
+            var e = ip + min_match;
+            var c = cand + min_match;
+            while (e < extend_limit and buf[e] == buf[c]) {
+                e += 1;
+                c += 1;
+            }
+            const len = e - ip;
+            if (len > best_len) {
+                best_len = len;
+                best = .{ .len = len, .cand = cand };
+            }
+        }
+        const delta: usize = t.chain[cand & 0xFFFF];
+        if (delta == 0 or cand < delta) break;
+        cand -= delta;
+    }
+    return best;
+}
+
+/// The HC counterpart of `encodeRange`: hash chains and lazy matching. A match
+/// at `ip` is replaced by a longer one a byte later (up to two bytes of
+/// lookahead), then written. `level` 3..9 follows 2^(level+1) links; 10..12
+/// follow 2048, 4096 and 16384 (liblz4 runs an optimal parser there; this is
+/// the same chain search with lazy matching, see SPEC).
+pub fn encodeHc(
+    buf: []const u8,
+    start: usize,
+    end: usize,
+    history_start: usize,
+    t: *HcTable,
+    level: u8,
+    dst: []u8,
+) error{NoSpaceLeft}!usize {
+    std.debug.assert(history_start <= start and start <= end and end <= buf.len);
+    std.debug.assert(end <= std.math.maxInt(u32));
+    var s: Sink = .{ .dst = dst };
+    const attempts: u32 = switch (level) {
+        10 => 2048,
+        11 => 4096,
+        12 => 16384,
+        else => hcAttempts(level),
+    };
+    var anchor = start;
+    if (t.next < history_start) t.next = history_start;
+    if (end - start >= mf_limit + 1) {
+        const match_limit = end - mf_limit; // a match starts at or before this
+        const extend_limit = end - last_literals; // and ends at or before this
+        var ip = start;
+        while (ip <= match_limit) {
+            hcInsert(t, buf, ip);
+            var m = hcLongest(t, buf, ip, extend_limit, @max(history_start, ip -| max_offset), attempts, min_match - 1) orelse {
+                ip += 1;
+                continue;
+            };
+            // Lazy: a longer match one or two bytes on wins; the bytes skipped
+            // become literals.
+            var look: u8 = 0;
+            while (look < 2 and ip + 1 <= match_limit) : (look += 1) {
+                hcInsert(t, buf, ip + 1);
+                const m2 = hcLongest(t, buf, ip + 1, extend_limit, @max(history_start, ip + 1 -| max_offset), attempts, m.len) orelse break;
+                ip += 1;
+                m = m2;
+                look = 0; // a new anchor of comparison: two more bytes of lookahead
+                if (m.len >= 256) break; // long enough: stop looking
+            }
+            var cand = m.cand;
+            var len = m.len;
+            // Extend backwards into the pending literals.
+            if (ip > anchor and cand > history_start) {
+                const k = backExtend(buf, ip, cand, @min(ip - anchor, cand - history_start));
+                ip -= k;
+                cand -= k;
+                len += k;
+            }
+            try s.matchSequence(buf, anchor, ip - anchor, @intCast(ip - cand), len);
+            ip += len;
+            anchor = ip;
+        }
+    }
+    try s.sequence(buf[anchor..end], null, 0);
+    return s.at;
+}
+
+// ── dictionaries ────────────────────────────────────────────────────────
+
+/// The part of `dict` a block can use: its last 64 KiB - 1 bytes, the reach
+/// of an offset (liblz4's `LZ4_loadDict` keeps the same).
+pub fn dictTail(dict: []const u8) []const u8 {
+    return dict[dict.len -| max_offset..];
+}
+
+/// `compress` with `dict` as the bytes before `src`: matches may point into
+/// it (liblz4's `LZ4_compress_fast_continue` after `LZ4_loadDict`). Only the
+/// last 64 KiB - 1 of `dict` count. The block decodes with `decompressDict`
+/// over the same dictionary. Allocates `dictTail(dict).len + src.len` bytes
+/// of scratch (the encoder reads history and input from one buffer).
+pub fn compressDict(
+    gpa: std.mem.Allocator,
+    src: []const u8,
+    dict: []const u8,
+    dst: []u8,
+    opts: CompressOptions,
+) (error{ NoSpaceLeft, InputTooLarge, OutOfMemory })!usize {
+    if (src.len > max_input_size) return error.InputTooLarge;
+    const d = dictTail(dict);
+    if (d.len == 0) return compress(src, dst, opts) catch |e| return e;
+    const buf = try gpa.alloc(u8, d.len + src.len);
+    defer gpa.free(buf);
+    @memcpy(buf[0..d.len], d);
+    @memcpy(buf[d.len..], src);
+    if (opts.hc_level >= hc_min_level) {
+        // The matcher inserts the dictionary's positions itself (its first call
+        // starts below them).
+        const t = try gpa.create(HcTable);
+        defer gpa.destroy(t);
+        t.init();
+        return encodeHc(buf, d.len, buf.len, 0, t, opts.hc_level, dst);
+    }
+    var table: Table = @splat(0);
+    seedTable(buf[0..d.len], &table);
+    return encodeRange(buf, d.len, buf.len, 0, &table, clampAcceleration(opts.acceleration), dst);
+}
+
+/// Seed `table` with the dictionary's positions, every third byte as liblz4's
+/// `LZ4_loadDict` does (a coarser table is faster to build and finds nearly
+/// the same matches, since the search also probes the byte after).
+pub fn seedTable(d: []const u8, table: *Table) void {
+    if (d.len < 4) return;
+    var i: usize = 0;
+    while (i + 4 <= d.len) : (i += 3) table[Wide.hash(read32(d, i))] = @intCast(i);
+}
+
+/// `decompress` of a block made with a dictionary (`compressDict`, or liblz4's
+/// `LZ4_compress_fast_continue` / python-lz4's `dict=`): offsets may reach
+/// into `dict`'s last 64 KiB - 1 bytes. Allocates that plus `dst.len` bytes
+/// of scratch (the decoder reads history and output from one buffer).
+pub fn decompressDict(gpa: std.mem.Allocator, src: []const u8, dict: []const u8, dst: []u8) (Error || error{OutOfMemory})!usize {
+    const d = dictTail(dict);
+    if (d.len == 0) return decompress(src, dst);
+    const buf = try gpa.alloc(u8, d.len + dst.len);
+    defer gpa.free(buf);
+    @memcpy(buf[0..d.len], d);
+    const end = try decodeInto(src, buf, d.len, 0);
+    @memcpy(dst[0 .. end - d.len], buf[d.len..end]);
+    return end - d.len;
+}
+
+/// `compress` at an HC level; out of line so the fast path's frame does not
+/// carry the matcher's 192 KiB.
+noinline fn compressHcStack(src: []const u8, dst: []u8, level: u8) error{NoSpaceLeft}!usize {
+    var t: HcTable = undefined;
+    t.init();
+    return encodeHc(src, 0, src.len, 0, &t, level, dst);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────

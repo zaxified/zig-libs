@@ -706,3 +706,194 @@ test "block API: a match is extended to the exact first differing byte" {
     try testing.expectEqual(@as(usize, 57), try lz4.decompressBlock(z[0..n], &back));
     try testing.expectEqualSlices(u8, &input, &back);
 }
+
+// ── dictionaries ────────────────────────────────────────────────────────
+
+fn dictText(a: std.mem.Allocator, n: usize, seed: u64) ![]u8 {
+    return lz4.interop_corpus.generate(a, .{ .name = "dict", .kind = .text, .len = n, .seed = seed });
+}
+
+test "block dictionary: round trip, smaller than without, wrong dictionary is not silently accepted" {
+    const dict = try dictText(gpa, 8000, 1);
+    defer gpa.free(dict);
+    // Data that repeats the dictionary's phrases but is not a copy of it.
+    const data = try dictText(gpa, 3000, 1);
+    defer gpa.free(data);
+    var with: [4096]u8 = undefined;
+    var without: [4096]u8 = undefined;
+    const bound = lz4.compressBlockBound(data.len);
+    try testing.expect(bound <= with.len);
+    const n_dict = try lz4.compressBlockDict(gpa, data, dict, &with, .{});
+    const n_plain = try lz4.compressBlock(data, &without, .{});
+    try testing.expect(n_dict < n_plain);
+    var out: [3000]u8 = undefined;
+    const got = try lz4.decompressBlockDict(gpa, with[0..n_dict], dict, &out);
+    try testing.expectEqualSlices(u8, data, out[0..got]);
+    // Without the dictionary the block cannot decode (an offset reaches before its start).
+    try testing.expectError(error.BadOffset, lz4.decompressBlock(with[0..n_dict], &out));
+    // An empty dictionary is the plain block.
+    const n_empty = try lz4.compressBlockDict(gpa, data, "", &with, .{});
+    try testing.expectEqualSlices(u8, without[0..n_plain], with[0..n_empty]);
+}
+
+test "block dictionary: only the last 64 KiB - 1 bytes count; tiny inputs and dictionaries" {
+    var big: [100_000]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    prng.random().bytes(&big);
+    const data = big[100_000 - 5000 ..][0..2000]; // inside the tail
+    var dst: [lz4.compressBlockBound(2000)]u8 = undefined;
+    const n = try lz4.compressBlockDict(gpa, data, &big, &dst, .{});
+    try testing.expect(n < 200); // one long match into the dictionary
+    var out: [2000]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2000), try lz4.decompressBlockDict(gpa, dst[0..n], &big, &out));
+    try testing.expectEqualSlices(u8, data, &out);
+    // The same data against the first bytes only (outside the window): no help.
+    const head = big[0..20_000];
+    const n2 = try lz4.compressBlockDict(gpa, data, head, &dst, .{});
+    try testing.expect(n2 > 1500);
+    for ([_]usize{ 0, 1, 3, 12, 13 }) |len| {
+        var d2: [64]u8 = undefined;
+        const m = try lz4.compressBlockDict(gpa, data[0..len], "abcdefghijklmnop", &d2, .{});
+        var o2: [16]u8 = undefined;
+        const g = try lz4.decompressBlockDict(gpa, d2[0..m], "abcdefghijklmnop", &o2);
+        try testing.expectEqualSlices(u8, data[0..len], o2[0..g]);
+    }
+}
+
+fn frameDictRoundTrip(opts: lz4.EncodeOptions, id: ?u32) !void {
+    const dict = try dictText(gpa, 20_000, 3);
+    defer gpa.free(dict);
+    const data = try dictText(gpa, 300_000, 3);
+    defer gpa.free(data);
+    const z = try lz4.compressDict(gpa, data, dict, id, opts);
+    defer gpa.free(z);
+    const back = try lz4.decompressDict(gpa, z, dict, .{});
+    defer gpa.free(back);
+    try testing.expectEqualSlices(u8, data, back);
+    // The id field is in the header when asked for.
+    try testing.expectEqual(id != null, z[4] & 1 != 0);
+    if (id) |v| try testing.expectEqual(v, std.mem.readInt(u32, z[if (opts.content_size) 14 else 6..][0..4], .little));
+    // Plain compress of the same data is bigger (the dictionary helps the first block at least).
+    const plain = try lz4.compress(gpa, data, opts);
+    defer gpa.free(plain);
+    try testing.expect(z.len <= plain.len);
+    // The plain decoder, without the dictionary, refuses or differs: never returns the data.
+    if (lz4.decompress(gpa, z, .{})) |wrong| {
+        defer gpa.free(wrong);
+        try testing.expect(!std.mem.eql(u8, wrong, data));
+    } else |_| {}
+}
+
+test "frame dictionary: linked and independent blocks, with and without id, size and checksums" {
+    try frameDictRoundTrip(.{}, null);
+    try frameDictRoundTrip(.{}, 0xCAFEBABE);
+    try frameDictRoundTrip(.{ .independent_blocks = true }, 42);
+    try frameDictRoundTrip(.{ .independent_blocks = true, .block_checksum = true, .content_checksum = true, .content_size = true }, null);
+    try frameDictRoundTrip(.{ .block_size = .max256KB, .content_checksum = true, .content_size = true }, 7);
+    try frameDictRoundTrip(.{ .acceleration = 8 }, null);
+}
+
+test "frame dictionary: empty dictionary is a plain frame plus the id; tiny and empty content; max_output holds" {
+    const z0 = try lz4.compressDict(gpa, "", "dictionary bytes", 5, .{});
+    defer gpa.free(z0);
+    const b0 = try lz4.decompressDict(gpa, z0, "dictionary bytes", .{});
+    defer gpa.free(b0);
+    try testing.expectEqual(@as(usize, 0), b0.len);
+    const z1 = try lz4.compressDict(gpa, "hello hello hello", "", 5, .{});
+    defer gpa.free(z1);
+    const b1 = try lz4.decompressDict(gpa, z1, "", .{});
+    defer gpa.free(b1);
+    try testing.expectEqualStrings("hello hello hello", b1);
+    const dict = try dictText(gpa, 5000, 9);
+    defer gpa.free(dict);
+    const data = try dictText(gpa, 4000, 9);
+    defer gpa.free(data);
+    const z = try lz4.compressDict(gpa, data, dict, null, .{ .content_size = true });
+    defer gpa.free(z);
+    // The cap counts output, not the dictionary placed ahead of it.
+    const ok = try lz4.decompressDict(gpa, z, dict, .{ .max_output = data.len });
+    defer gpa.free(ok);
+    try testing.expectEqualSlices(u8, data, ok);
+    try testing.expectError(error.OutputTooLarge, lz4.decompressDict(gpa, z, dict, .{ .max_output = data.len - 1 }));
+    const fa = testing.checkAllAllocationFailures(gpa, struct {
+        fn f(a: std.mem.Allocator, zz: []const u8, dd: []const u8) !void {
+            const r = try lz4.decompressDict(a, zz, dd, .{});
+            a.free(r);
+        }
+    }.f, .{ z, dict });
+    try fa;
+}
+
+// ── HC levels ───────────────────────────────────────────────────────────
+
+test "hc levels: every shape round-trips as a block and a frame, linked and independent, and shrinks text" {
+    const levels = [_]u8{ 3, 6, 9, 12 };
+    for (lz4.interop_corpus.shapes) |sh| {
+        if (sh.len > (1 << 20) + 7) continue; // the 5 MiB shape is for the bench
+        const data = try lz4.interop_corpus.generate(gpa, sh);
+        defer gpa.free(data);
+        for (levels) |lv| {
+            const dst = try gpa.alloc(u8, lz4.compressBlockBound(data.len));
+            defer gpa.free(dst);
+            const n = try lz4.compressBlock(data, dst, .{ .hc_level = lv });
+            const back = try gpa.alloc(u8, data.len);
+            defer gpa.free(back);
+            try testing.expectEqual(data.len, try lz4.decompressBlock(dst[0..n], back));
+            try testing.expectEqualSlices(u8, data, back);
+            for ([_]bool{ false, true }) |indep| {
+                const z = try lz4.compress(gpa, data, .{ .hc_level = lv, .independent_blocks = indep, .block_checksum = true, .content_checksum = true });
+                defer gpa.free(z);
+                const b2 = try lz4.decompress(gpa, z, .{});
+                defer gpa.free(b2);
+                try testing.expectEqualSlices(u8, data, b2);
+            }
+        }
+    }
+}
+
+test "hc levels: smaller than the fast matcher on text, more attempts never grow it much, level below 3 is the fast matcher" {
+    const data = try dictText(gpa, 400_000, 11);
+    defer gpa.free(data);
+    const dst = try gpa.alloc(u8, lz4.compressBlockBound(data.len));
+    defer gpa.free(dst);
+    const fast = try lz4.compressBlock(data, dst, .{});
+    var prev: usize = fast;
+    for ([_]u8{ 3, 5, 7, 9, 12 }) |lv| {
+        const n = try lz4.compressBlock(data, dst, .{ .hc_level = lv });
+        try testing.expect(n < fast);
+        try testing.expect(n <= prev + prev / 50); // deeper search: no worse than 2 % up
+        prev = n;
+    }
+    const f1 = try lz4.compressBlock(data, dst, .{ .hc_level = 1 });
+    try testing.expectEqual(fast, f1);
+    const too_high = try lz4.compressBlock(data, dst, .{ .hc_level = 200 });
+    const l12 = try lz4.compressBlock(data, dst, .{ .hc_level = 12 });
+    try testing.expectEqual(l12, too_high);
+    // Into a buffer that is too small: the exact error, no overrun.
+    const tiny = try gpa.alloc(u8, 100);
+    defer gpa.free(tiny);
+    try testing.expectError(error.NoSpaceLeft, lz4.compressBlock(data, tiny, .{ .hc_level = 9 }));
+}
+
+test "hc levels with a dictionary: block and frame, linked and independent" {
+    const dict = try dictText(gpa, 30_000, 5);
+    defer gpa.free(dict);
+    const data = try dictText(gpa, 150_000, 5);
+    defer gpa.free(data);
+    const dst = try gpa.alloc(u8, lz4.compressBlockBound(data.len));
+    defer gpa.free(dst);
+    const fast = try lz4.compressBlockDict(gpa, data, dict, dst, .{});
+    const n = try lz4.compressBlockDict(gpa, data, dict, dst, .{ .hc_level = 9 });
+    try testing.expect(n < fast);
+    const back = try gpa.alloc(u8, data.len);
+    defer gpa.free(back);
+    try testing.expectEqual(data.len, try lz4.decompressBlockDict(gpa, dst[0..n], dict, back));
+    try testing.expectEqualSlices(u8, data, back);
+    for ([_]bool{ false, true }) |indep| {
+        const z = try lz4.compressDict(gpa, data, dict, 9, .{ .hc_level = 7, .independent_blocks = indep });
+        defer gpa.free(z);
+        const b2 = try lz4.decompressDict(gpa, z, dict, .{});
+        defer gpa.free(b2);
+        try testing.expectEqualSlices(u8, data, b2);
+    }
+}

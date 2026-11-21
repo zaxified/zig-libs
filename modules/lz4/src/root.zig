@@ -31,6 +31,7 @@ pub const meta = .{
 
 const block = @import("block.zig");
 const frame = @import("frame.zig");
+const stream = @import("stream.zig");
 
 // ── block format ────────────────────────────────────────────────────────
 
@@ -42,6 +43,10 @@ pub const decompressBlock = block.decompress;
 /// Compress `src` as one block into `dst` (`compressBlockBound(src.len)`
 /// bytes always fit; with less, `error.NoSpaceLeft`).
 pub const compressBlock = block.compress;
+/// `compressBlock` with a dictionary as the bytes before `src`.
+pub const compressBlockDict = block.compressDict;
+/// `decompressBlock` of a block made with a dictionary.
+pub const decompressBlockDict = block.decompressDict;
 /// liblz4's `LZ4_COMPRESSBOUND(n)`: `n + n / 255 + 16`.
 pub const compressBlockBound = block.compressBound;
 /// The largest input `compressBlock` takes (liblz4's `LZ4_MAX_INPUT_SIZE`).
@@ -55,6 +60,8 @@ pub const DecodeOptions = frame.DecodeOptions;
 pub const default_max_output = frame.default_max_output;
 /// Every frame of `src`, concatenated. Caller owns the result.
 pub const decompress = frame.decompress;
+/// `decompress` for frames made against a dictionary.
+pub const decompressDict = frame.decompressDict;
 /// Every frame of `src` decoded into `dst`; returns the decoded length.
 /// `dst.len` caps the output (`error.OutputTooLarge` past it). No allocation.
 pub const decompressInto = frame.decompressInto;
@@ -64,6 +71,8 @@ pub const EncodeOptions = frame.EncodeOptions;
 pub const BlockSize = frame.BlockSize;
 /// One frame holding `src`. Caller owns the result.
 pub const compress = frame.compress;
+/// One frame compressed against a dictionary, with an optional Dictionary ID.
+pub const compressDict = frame.compressDict;
 /// One frame into a caller's buffer; returns its length.
 pub const compressInto = frame.compressInto;
 /// The largest frame `compress` writes for `n` bytes with `opts`.
@@ -74,12 +83,20 @@ pub const frame_magic = frame.magic;
 pub const legacy_frame_magic = frame.legacy_magic;
 pub const skippable_magic_base = frame.skippable_magic_base;
 
+/// A `std.Io.Writer` that writes one LZ4 frame block by block.
+pub const Compressor = stream.Compressor;
+pub const CompressorOptions = stream.CompressorOptions;
+/// A `std.Io.Reader` over LZ4 frames, block by block.
+pub const Decompressor = stream.Decompressor;
+pub const DecompressorOptions = stream.DecompressorOptions;
+
 /// The input shapes the differential tests use; public only so
 /// `tools/interop.zig` and `tools/bench.zig` can reach them. Not part of the API.
 pub const interop_corpus = @import("shapes.zig");
 
 test {
     _ = @import("block.zig");
+    _ = @import("stream_test.zig");
     _ = @import("frame_test.zig");
     _ = @import("shapes.zig");
     _ = @import("golden_test.zig");
