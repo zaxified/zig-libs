@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — ADDED `V3Client.trap` (SNMPv2-Trap over SNMPv3 at any security level; the client represents the sending, authoritative engine through `seedEngine`; `reportable` is cleared for it). Tests in `v3client.zig`.
 
 
 - **2026-11-17** — **Behaviour change:** `v3.decode` now refuses a `msgGlobalData` whose `msgID` is negative or whose `msgMaxSize` is below 484 (both with `error.InvalidValue`); before, any `i32` was accepted. RFC 3412 §6 gives the SYNTAX `msgID` 0..2147483647 and `msgMaxSize` 484..2147483647, and §7.2.2 makes a message outside it no SNMPv3Message (discard, `snmpInASNParseErrs`); net-snmp's `snmpv3_parse` rejects exactly these (`snmplib/snmp_api.c`). Values above `i32` max stay `IntegerTooLarge`. `V3Client.Options.initial_msg_id` below 0 is raised to 0 so the client never sends an illegal `msgID`. New `v3.min_msg_max_size`. The live interop test (`SNMP_TEST_PRIV_PROTO`) also accepts `AES192`, `AES256`, `AES192C`, `AES256C` (net-snmp's `-x` spellings).

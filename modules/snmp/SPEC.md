@@ -81,7 +81,7 @@ types), X.690 (BER) — see README "Provenance"; no NOTICE entry needed.
   per `retries` on the v1/v2c client). For v2c and v3 the library inserts `sysUpTime.0` and `snmpTrapOID.0` as the first
   two varbinds (RFC 3416 §4.2.6); a payload varbind naming either is `error.ReservedVarbind`, and more than
   `max_notification_varbinds` (32) payload varbinds is `error.TooManyOids` (`client.zig`,
-  `message.zig`). v3 **Trap** sending is not offered, see *Backlog / deferred*.
+  `message.zig`). `V3Client.trap` sends an SNMPv2-Trap over v3 (fire and forget, through `Transport.sendFn`): the sender is the authoritative engine (RFC 3414 §2.2.3), so the client must represent the LOCAL engine, `seedEngine(own_engine_id, boots, time)` (which localizes the user's keys to that id) and a current clock (`setEngineTime`/`advanceEngineTime`); the message has `reportable = false`, and the receiving manager configures the same user and passwords and localizes them to the sender's engine id. An unseeded client is `error.NotDiscovered`, authPriv needs a `SaltSeed` as for any encrypted message. v3 notification *receipt* is under *Roadmap*.
 - **`msgID` / `msgMaxSize` ranges.** RFC 3412 §6 gives `msgID` 0..2147483647 and `msgMaxSize` 484..2147483647 and
   §7.2.2 says a message outside them is no SNMPv3Message. `v3.decode` refuses a negative `msgID` and a `msgMaxSize`
   below `min_msg_max_size` (484) with `error.InvalidValue` (`v3.zig`); above `i32` max stays
@@ -293,12 +293,11 @@ over both the captured net-snmp datagrams and a live authPriv reply. Every one i
 
 ## Backlog / deferred
 
-- **v3 Trap sending and v3 notification receipt** (authenticated Trap send, authenticated Trap/Inform receive;
-  `receiver` is v1/v2c only). The v3 sender is the authoritative engine, which needs a local engine id / boots /
-  time (and users localized to it) that `V3Client` does not own. Effort: medium.
+None open.
 
 ## Roadmap
 
+- **v3 notification receipt** (authenticated Trap / Inform receive; `receiver` is v1/v2c only). Needs a USM user table, a per-sender engine cache with key localization and the RFC 3414 §3.2 time-window and replay rules for traps, the receiver's own authoritative engine (id, boots, time, Report generation) for informs. Size: a receiver engine, a few weeks.
 - **Deferred, no plan:** the agent (engine/server) role; a MIB compiler / SMI parsing; SNMPv3 over TLS/DTLS
   (RFC 6353); RFC 3826 `usmDHKickstart` and the `KeyChange` textual convention; context-engine-ID proxy forwarding. Size: each is its own protocol family or tool (agent engine, SMI compiler, TLS/DTLS transport), weeks to months.
 

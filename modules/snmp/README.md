@@ -104,8 +104,8 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
     protocols over MD5/SHA-1.
 ## Not provided
 
-No agent/engine (server) side, no MIB/SMI parsing, no SNMPv3 over TLS/DTLS (RFC 6353), no v3 Trap sending or
-v3 notification receipt. What is open and what is deferred is in SPEC *Backlog / deferred*.
+No agent/engine (server) side, no MIB/SMI parsing, no SNMPv3 over TLS/DTLS (RFC 6353), no v3
+notification receipt. What is deferred is in SPEC *Roadmap*.
 
 **Verified against a real agent.** The v3 stack is checked three ways: the
 RFC 3414 Appendix A.3 key-derivation KATs; byte-exact goldens captured from

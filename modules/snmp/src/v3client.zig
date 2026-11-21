@@ -432,13 +432,31 @@ pub const V3Client = struct {
     /// InformRequest (RFC 3416 §4.2.7) at the client's security level: the
     /// receiver is the authoritative engine, so discovery and keys work as for
     /// every other request. `sysUpTime.0` and `snmpTrapOID.0` are inserted as
-    /// the first two varbinds. Waits for the Response. (v3 *Trap* sending is
-    /// not offered: the sender would be authoritative, which needs a local
-    /// engine id / boots / time this client does not own.)
+    /// the first two varbinds. Waits for the Response.
     pub fn inform(c: *V3Client, n: message.Notification) Error!Response {
         var buf: [message.max_notification_varbinds + 2]VarBind = undefined;
         const vbs = try message.notificationVarbinds(&buf, n);
         return c.request(.inform_request, vbs, 0, 0);
+    }
+
+    /// SNMPv2-Trap (RFC 3416 §4.2.6) over SNMPv3, fire and forget (needs `Transport.sendFn`,
+    /// else `error.SendNotSupported`). Unlike `inform` the SENDER is the authoritative engine
+    /// (RFC 3414 §2.2.3): the engine identity, `snmpEngineBoots` and `snmpEngineTime` in the
+    /// message and the key localization are the sender's OWN. So this client must represent the
+    /// local engine: call `seedEngine(own_engine_id, boots, time)` first (it localizes the user's
+    /// keys to that id), keep the clock current with `setEngineTime` / `advanceEngineTime`, and
+    /// give the receiving manager the same user, protocols and passwords (it localizes them to
+    /// your engine id itself). No discovery is possible, so an unseeded client is
+    /// `error.NotDiscovered`. The message carries `reportable = false`; `sysUpTime.0` and
+    /// `snmpTrapOID.0` are inserted as the first two varbinds. At authPriv a `SaltSeed.csprng`
+    /// is required as for any encrypted message.
+    pub fn trap(c: *V3Client, n: message.Notification) (Error || error{SendNotSupported})!void {
+        if (!c.engine.discovered) return error.NotDiscovered;
+        const send = c.transport.sendFn orelse return error.SendNotSupported;
+        var buf: [message.max_notification_varbinds + 2]VarBind = undefined;
+        const vbs = try message.notificationVarbinds(&buf, n);
+        const p = try c.buildRequest(.trap_v2, vbs, 0, 0);
+        try send(c.transport.ctx, p.wire);
     }
 
     /// SetRequest with fully typed varbinds.
@@ -559,7 +577,9 @@ pub const V3Client = struct {
         const flags: v3.MsgFlags = .{
             .auth = level.hasAuth(),
             .priv = level.hasPriv(),
-            .reportable = true,
+            // RFC 3412 §6.4: reportableFlag is set for a confirmed-class PDU and for a request that
+            // expects a response, clear for an unconfirmed notification (SNMPv2-Trap).
+            .reportable = pdu_type != .trap_v2,
         };
 
         // `msgPrivacyParameters` is whatever the salt source chose, so the
@@ -2278,4 +2298,116 @@ test "V3 BulkWalker: a walk that ends on a row outside the subtree in mid-batch 
     try testing.expectEqual(@as(?VarBind, null), try w.next()); // the foreign row
     try testing.expectEqual(@as(?VarBind, null), try w.next());
     try testing.expectEqual(@as(usize, 1), agent.served);
+}
+
+/// A transport that only records the last datagram it was handed to `sendFn`.
+const SinkTransport = struct {
+    last: [max_message_len]u8 = undefined,
+    len: usize = 0,
+    sends: usize = 0,
+
+    fn transport(s: *SinkTransport) Transport {
+        return .{ .ctx = s, .exchangeFn = exchangeFn, .sendFn = sendFn };
+    }
+    fn exchangeFn(_: *anyopaque, _: []const u8, _: []u8) client_mod.TransportError!usize {
+        return error.TransportFailed; // a trap never waits for a reply
+    }
+    fn sendFn(ctx: *anyopaque, req: []const u8) client_mod.TransportError!void {
+        const s: *SinkTransport = @ptrCast(@alignCast(ctx));
+        @memcpy(s.last[0..req.len], req);
+        s.len = req.len;
+        s.sends += 1;
+    }
+    fn sent(s: *const SinkTransport) []const u8 {
+        return s.last[0..s.len];
+    }
+};
+
+const trap_engine_id = [_]u8{ 0x80, 0x00, 0x1f, 0x88, 0x04, 'z', 'l', 'i', 'b' };
+
+/// The receiving manager's side of one v3 trap: authenticate it and decrypt it with keys it
+/// localizes to the SENDER's engine id (RFC 3414 §2.2.3), then return the trap's varbinds.
+fn expectTrapFrom(wire: []const u8, user: User, uptime: u32) !void {
+    const m = try v3.decode(wire);
+    try testing.expect(!m.header.flags.reportable);
+    try testing.expectEqual(user.level.hasAuth(), m.header.flags.auth);
+    try testing.expectEqual(user.level.hasPriv(), m.header.flags.priv);
+    const params = try usm.parse(m.security_parameters);
+    try testing.expectEqualSlices(u8, &trap_engine_id, params.engine_id);
+    try testing.expectEqual(@as(u32, 7), params.engine_boots);
+    try testing.expectEqual(@as(u32, 1234), params.engine_time);
+    try testing.expectEqualStrings(user.name, params.user_name);
+    if (user.level.hasAuth()) {
+        var kb: [usm.max_key_len]u8 = undefined;
+        const key = try usm.passwordToKey(user.auth_protocol, user.auth_password, &trap_engine_id, &kb);
+        try usm.verify(user.auth_protocol, key, wire, params);
+        // A flipped bit in the body breaks the digest.
+        var bad: [max_message_len]u8 = undefined;
+        @memcpy(bad[0..wire.len], wire);
+        bad[wire.len - 1] ^= 1;
+        const bad_params = try usm.parse((try v3.decode(bad[0..wire.len])).security_parameters);
+        try testing.expectError(error.AuthenticationFailed, usm.verify(user.auth_protocol, key, bad[0..wire.len], bad_params));
+    }
+    var plain: [max_message_len]u8 = undefined;
+    const scoped: v3.ScopedPdu = switch (m.data) {
+        .plaintext => |s| s,
+        .encrypted => |bytes| blk: {
+            var kb: [usm.max_key_len]u8 = undefined;
+            const key = try priv.localizeKey(user.priv_protocol, user.auth_protocol, user.priv_password, &trap_engine_id, &kb);
+            break :blk try priv.decryptScopedPdu(user.priv_protocol, key, params.engine_boots, params.engine_time, params.priv_params, bytes, &plain);
+        },
+    };
+    try testing.expectEqualSlices(u8, &trap_engine_id, scoped.context_engine_id);
+    const t = scoped.pdu.trap_v2;
+    var vbs: [4]VarBind = undefined;
+    const got = try t.varbinds.collect(&vbs);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(uptime, got[0].value.time_ticks);
+    try testing.expect(got[1].value.oid.eql(&(try Oid.parse("1.3.6.1.6.3.1.1.5.3"))));
+}
+
+test "v3 trap: the sender is the authoritative engine, at every security level, verified by a receiver" {
+    const cases = [_]User{
+        .{ .name = "plain", .level = .no_auth_no_priv },
+        .{ .name = "auth", .level = .auth_no_priv, .auth_protocol = .hmac_sha256, .auth_password = "maplesyrup" },
+        .{ .name = "secret", .level = .auth_priv, .auth_protocol = .hmac_sha1, .auth_password = "maplesyrup", .priv_protocol = .aes128_cfb, .priv_password = "bluesyrup" },
+        .{ .name = "legacy", .level = .auth_priv, .auth_protocol = .hmac_md5, .auth_password = "maplesyrup", .priv_protocol = .des_cbc, .priv_password = "bluesyrup" },
+    };
+    for (cases) |user| {
+        var sink: SinkTransport = .{};
+        var c = V3Client.init(sink.transport(), user, .{ .salt_seed = test_salt_seed });
+        try c.seedEngine(&trap_engine_id, 7, 1234);
+        try c.trap(.{ .uptime = 99, .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.3") });
+        try testing.expectEqual(@as(usize, 1), sink.sends);
+        try expectTrapFrom(sink.sent(), user, 99);
+        // The next trap uses a fresh msgID (and, at authPriv, a fresh salt).
+        const first = try v3.decode(sink.sent());
+        const id1 = first.header.msg_id;
+        try c.trap(.{ .uptime = 99, .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.3") });
+        try testing.expect((try v3.decode(sink.sent())).header.msg_id != id1);
+    }
+}
+
+test "v3 trap: refusals: unseeded engine, no sendFn, no salt seed at authPriv, reserved varbind" {
+    var sink: SinkTransport = .{};
+    const user: User = .{ .name = "secret", .level = .auth_priv, .auth_password = "maplesyrup", .priv_password = "bluesyrup" };
+    const n: message.Notification = .{ .uptime = 1, .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.3") };
+
+    var unseeded = V3Client.init(sink.transport(), user, .{ .salt_seed = test_salt_seed });
+    try testing.expectError(error.NotDiscovered, unseeded.trap(n));
+    try testing.expectEqual(@as(usize, 0), sink.sends);
+
+    var no_send = V3Client.init(.{ .ctx = &sink, .exchangeFn = SinkTransport.exchangeFn }, user, .{ .salt_seed = test_salt_seed });
+    try no_send.seedEngine(&trap_engine_id, 1, 1);
+    try testing.expectError(error.SendNotSupported, no_send.trap(n));
+
+    var no_salt = V3Client.init(sink.transport(), user, .{});
+    try no_salt.seedEngine(&trap_engine_id, 1, 1);
+    try testing.expectError(error.SaltSeedRequired, no_salt.trap(n));
+
+    var plain = V3Client.init(sink.transport(), .{ .name = "p" }, .{});
+    try plain.seedEngine(&trap_engine_id, 1, 1);
+    const reserved = [_]VarBind{.{ .name = try Oid.parse("1.3.6.1.2.1.1.3.0"), .value = .null }};
+    try testing.expectError(error.ReservedVarbind, plain.trap(.{ .uptime = 1, .trap_oid = n.trap_oid, .varbinds = &reserved }));
+    try testing.expectEqual(@as(usize, 0), sink.sends);
 }
