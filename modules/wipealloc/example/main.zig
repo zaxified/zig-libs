@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
     const key = try sa.alloc(u8, 32);
     defer sa.free(key); // zeroed, then unmapped
     @memset(key, 0x42);
-    std.debug.assert(secure.canaryIntact(key));
+    if (!secure.canaryIntact(key)) std.debug.panic("example check failed: canary overwritten", .{});
 
     var buf: [128]u8 = undefined;
     var w = std.Io.File.stdout().writer(init.io, &buf);
