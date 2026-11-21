@@ -222,6 +222,11 @@ ECDH (about 11 %; safegcd would halve it).
   `p384_base_table.zig`, which this module's table replaced (tlsclient's P-384 key share, ECDHE,
   client-cert signing and server-signature verify run here).
 
+- **A build option to drop the fixed-base table** (the `p521-base-table` trade). Measured: with the table left out
+  (key generation on `mulCt(basePoint, s)`), a ReleaseSmall key-generation probe shrank 197 424 → 140 080 B, a gain of
+  57 344 B — under the ~100 KB a knob has to save (CONVENTIONS §4.2 practice), because the table's 119 808 bytes are
+  partly paid back by the variable-base code that replaces it. No consumer has asked.
+
 ## Open
 
 - Consumer wiring: x509 verifies P-384 certificate signatures through std's curve, not this module
@@ -229,9 +234,6 @@ ECDH (about 11 %; safegcd would halve it).
 
 ## Backlog / deferred
 
-- **Build option: fixed-base table size** (mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). Base-point table ~120 KB (estimate); `tlsclient` imports
-  this module unconditionally, so every HTTPS client consumer links it. `.small` → a smaller window (slower keygen/sign, verification unaffected
-  in kind; keep the masked lookup, re-run ctgrind). Unmeasured.
 - **Faster scalar inversion** — Fermat costs ~480 Montgomery products per signature; safegcd or
   blinding.
 - **ECDH's two field inversions** (table batch + affine output) — ~10 % of an ECDH.

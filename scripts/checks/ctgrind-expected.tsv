@@ -1970,12 +1970,12 @@ aes192	ReleaseFast	bitsliced	1	0	ba4c8387c14267e7	5ea64f081b0ffcbb
 # limbs and the product now comes back as (X·Z : Y : Z³) of the Jacobian
 # point — the same point (tests compare SEC1 bytes against the old RCB
 # ladder); `ecdh`/`keygen`/`sign` print affine bytes and did not move.
-p521	ReleaseFast	mul	1	0	68ac8ddf3b2054ca	7bcb91b4acac23e9
-p521	ReleaseFast	keygen	1	0	84b41aef8c39a02d	b44de7eb8b02a855
-p521	ReleaseFast	sign	1	0	84b41aef8c39a02d	b620c1c667ef0084
-p521	ReleaseFast	ecdh	1	0	68ac8ddf3b2054ca	a348bd01a2bccfcc
-p521	ReleaseFast	vartime	1	>=1	9eb7de72328a6412	11557f4b46d4c2af
-p521	ReleaseFast	cmov	1	0	daaa4ae0771d98ab	d38ed19668c79445
+p521	ReleaseFast	mul	1	0	45b5aceb0bfa367c	7bcb91b4acac23e9
+p521	ReleaseFast	keygen	1	0	2195906b4ab2369a	b44de7eb8b02a855
+p521	ReleaseFast	sign	1	0	2195906b4ab2369a	b620c1c667ef0084
+p521	ReleaseFast	ecdh	1	0	45b5aceb0bfa367c	a348bd01a2bccfcc
+p521	ReleaseFast	vartime	1	>=1	730e5c3a3b0ee6e3	11557f4b46d4c2af
+p521	ReleaseFast	cmov	1	0	90afb553958545d0	d38ed19668c79445
 # p384 (2026-10-13) — NIST P-384, new module (p521's algorithms over a Montgomery
 # field with an amd64 MULX/ADX core, fast_core.zig — CPU skylake has ADX, so the
 # asm path is the one measured). mul / keygen / sign / ecdh: secret tainted end to

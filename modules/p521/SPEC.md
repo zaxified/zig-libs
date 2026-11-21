@@ -230,6 +230,16 @@ ecdsap521 ecdhp521` on the same host: ECDH, sign and verify against OpenSSL's `e
 the card's `**Performance:**` line holds the current figures. The fastest implementation in the field is not
 measured (aws-lc is the likely one).
 
+## Build options
+
+`-Dp521-base-table=false` (and `-Dprofile=small`, which picks it) leaves the fixed-base table (`base_table`, 244 224
+bytes) out of the binary, the trade OpenSSL makes with `OPENSSL_SMALL_FOOTPRINT`. Key generation and the signing nonce
+then run `mulCt(basePoint, s)` — the same points (the comb is differentially tested against it, and a test holds
+`mulBaseCtUnburned` to both in either build), the same constant-time shape, slower — and verification's `u1·G` the
+wNAF path every other point takes. Measured: the `tools/sizeprobe.zig` key generation at ReleaseSmall shrinks
+275 248 → 95 024 B (gain 180 224 B, `scripts/checks/small-sizes.sh`). The default keeps the table: the card's
+Performance line is measured on it.
+
 ## What is deliberately not done
 
 - **No vendored fiat-crypto** (owner, 2026-10-10): hand-written Mersenne
@@ -239,9 +249,6 @@ measured (aws-lc is the likely one).
 
 ## Backlog / deferred
 
-- **Build option: fixed-base table size** (design in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). Base-point table ~230 KB (estimate); linked by every HTTPS consumer
-  via `tlsclient`/`x509`. `.small` → a smaller window, as p384. Pairs with tlsclient's algorithm-set knob (dropping P-521 entirely would
-  make this moot for TLS-only consumers). Unmeasured.
 - **Faster scalar inversion** — Fermat costs ~650 Montgomery products per
   signature; a constant-time safegcd (`p256/src/modinv.zig`'s shape) or
   blinding would remove most of it.

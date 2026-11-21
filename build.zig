@@ -615,6 +615,11 @@ pub fn build(b: *std.Build) void {
         "ct25519-base-comb",
         "ct25519: fixed-base comb table for mulBase/X25519 keygen (default true; profile=small false, ~3x slower keygen, -43 KB table)",
     ));
+    zl_options.addOption(?bool, "p521_base_table", b.option(
+        bool,
+        "p521-base-table",
+        "p521: fixed-base table for key generation, the signing nonce and verification's u1*G (default true; profile=small false, slower keygen/sign/verify, -239 KB table)",
+    ));
     zl_options.addOption(?bool, "montint_asm_unroll", b.option(
         bool,
         "montint-asm-unroll",

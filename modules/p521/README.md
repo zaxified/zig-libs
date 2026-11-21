@@ -67,6 +67,11 @@ pointer/`out` twin (`generateDeterministicInto`, `fromSecretKeyInto`,
 `signPrehashedInto`, `signerInto`). Differences from std's `Ecdsa` are listed in
 `SPEC.md` § Algorithm.
 
+## Build options
+
+`-Dp521-base-table=false` (or `-Dprofile=small`) drops the 244 KB fixed-base table: same results, slower key
+generation, signing and verification, about 180 KB less code. See SPEC.md § Build options.
+
 ## Verification
 
 `zig build test-p521` runs NIST CAVP (SigVer 75, SigGen 60, KeyPair 10, PKV 12,

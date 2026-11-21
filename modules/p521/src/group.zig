@@ -481,8 +481,9 @@ pub const P521 = struct {
     /// little-endian. Not for direct use; `mulInto` is the API.
     /// The fixed-base comb (`combMulBaseCt`); `mulCt(basePoint, s)` is the
     /// same point by another road, pinned by the differential test below.
+    /// Without the table (`use_base_table` false) it is `mulCt(basePoint, s)`.
     pub fn mulBaseCtUnburned(s: *const [66]u8) P521 {
-        return combMulBaseCt(&base_table, s);
+        return if (comptime use_base_table) combMulBaseCt(&base_table, s) else mulCt(basePoint, s);
     }
 
     /// Fixed-base `s·G` over a precomputed table (`base_table`): the scalar
@@ -623,7 +624,7 @@ pub const P521 = struct {
         try p1.rejectIdentity();
         try p2.rejectIdentity();
         const is_g = p1.z.equivalent(Fe.one) and p1.x.equivalent(basePoint.x) and p1.y.equivalent(basePoint.y);
-        const a = if (is_g) combMulBaseVt(s1) else wnafMulVt(p1, s1);
+        const a = if (comptime use_base_table) (if (is_g) combMulBaseVt(s1) else wnafMulVt(p1, s1)) else wnafMulVt(p1, s1);
         const q = a.addVt(wnafMulVt(p2, s2)).toProjectiveVt();
         try q.rejectIdentity();
         return q;
@@ -765,6 +766,18 @@ pub const BaseTable = [fb_t][fb_teeth]AffineCoordinates;
 /// arithmetic) rather than built at comptime: the comptime build cost every
 /// compile of the module ~1 minute and ~2 GB (2026-10-10).
 pub const base_table: BaseTable = @import("base_table.zig").table;
+
+/// Whether `base_table` (244 224 bytes) is linked: `-Dp521-base-table=false`, or
+/// `-Dprofile=small`, leaves it out (OpenSSL's `OPENSSL_SMALL_FOOTPRINT` trade).
+/// Key generation and the signing nonce then run `mulCt(basePoint, s)` — the
+/// same points (the comb is differentially tested against it), the same
+/// constant-time shape, slower — and verification's `u1·G` the wNAF path every
+/// other point takes. The default keeps the table: the grade is measured on it.
+pub const use_base_table: bool = zl_options.p521_base_table orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
+const zl_options = @import("zl_options");
 
 /// Optimization barrier: launder a value through an empty inline asm so LLVM
 /// loses what it knows about it (p256's `blackBox`, montint `b199192`).
@@ -952,6 +965,26 @@ test "comb: combMulBaseCt(s) == mulCt(G, s) on edge and random 66-byte scalars, 
     s[4] = 4 << 3;
     try testing.expect(!P521.combMulBaseCt(&bad, &s).equivalent(P521.mulCt(G, &s)));
     try testing.expect(P521.combMulBaseCt(&base_table, &s).equivalent(P521.mulCt(G, &s)));
+}
+
+test "mulBaseCtUnburned (either build) == mulCt(G, s) == the comb, on 0, 1, n − 1, n and random scalars" {
+    const G = P521.basePoint;
+    var cases: [6][66]u8 = undefined;
+    cases[0] = @splat(0);
+    cases[1] = @splat(0);
+    cases[1][0] = 1;
+    cases[2] = nBytes();
+    std.mem.reverse(u8, &cases[2]);
+    cases[3] = cases[2];
+    cases[3][0] -%= 1; // n − 1
+    var prng = std.Random.DefaultPrng.init(0x521_ba5e);
+    prng.random().bytes(&cases[4]);
+    prng.random().bytes(&cases[5]);
+    for (cases) |s| {
+        const got = P521.mulBaseCtUnburned(&s);
+        try testing.expect(got.equivalent(P521.mulCt(G, &s)));
+        try testing.expect(got.equivalent(P521.combMulBaseCt(&base_table, &s)));
+    }
 }
 
 test "comb: base_table entries are (j+1)·2^(5i)·G (spot checks against mulPublic)" {
