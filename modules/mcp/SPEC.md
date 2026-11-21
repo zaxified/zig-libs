@@ -514,15 +514,14 @@ shapes of the client declaration. The iframe bridge belongs to the host and the 
 
 ## Backlog / deferred
 
-- **TypeScript SDK client as a differential peer** (plan from the 2026-07-28 revision work: TypeScript SDK client as a
-  black-box peer over stdio; its source is off limits during the relicensing, running it is not). Only the Python SDK
-  oracle exists; needs Node, not on this host. The oracle would go into `tools/`.
+- **Speed against the TypeScript SDK is not measured.** The TypeScript SDK now runs as a differential peer (`tools/sdk_oracle/drive_ts.mjs`,
+  18 checks, session era; Node 22 and the SDK installed without root, see the script's header); a speed harness next to
+  `py_bench` is not written.
 - **Re-check two equivalence arguments** at the next whole-module mutation run: `compileText`'s `literalDepthOk` and
   `cancelInflight`'s `conformingId` guard are judged equivalent because `std.json` and `Stringify` are bounded by a
   buffer.
 - **`mcp-http` still answers `subscriptions/listen` with an empty filter and closes** (its README); wiring its
   held-open SSE stream to `PushSink` is `mcp-http`'s item, the mechanism here is complete.
-- **Speed against the TypeScript SDK is not measured** (and the TypeScript SDK as a differential peer, above): needs Node plus npm to install the SDK; this host has Node only inside a browser-test cache, no npm, and no network install without root of a full Node. Waits on a Node install.
 
 ## Anchoring
 
