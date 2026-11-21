@@ -60,6 +60,7 @@ pub const framing = @import("framing.zig");
 pub const getinfo = @import("getinfo.zig");
 pub const clientpin = @import("clientpin.zig");
 pub const ctaphid = @import("ctaphid.zig");
+pub const credential = @import("credential.zig");
 
 pub const StatusError = status.StatusError;
 pub const Transport = framing.Transport;
@@ -79,7 +80,9 @@ test {
     _ = getinfo;
     _ = clientpin;
     _ = ctaphid;
+    _ = credential;
     _ = @import("fido2_vectors.zig");
+    _ = @import("credential_vectors.zig");
     _ = @import("oracle_test.zig");
     _ = @import("client_test.zig");
     _ = @import("fuzz_test.zig");
@@ -89,6 +92,7 @@ test {
 
 const fido2_vectors = @import("fido2_vectors.zig");
 const testutil = @import("testutil.zig");
+const credential_vectors = @import("credential_vectors.zig");
 
 const fuzz_platform_scalar: [32]u8 = .{ 0x47, 0xbb, 0xb5, 0x64, 0x78, 0xbe, 0x49, 0x2d, 0xd1, 0xda, 0xb6, 0xa5, 0xea, 0x00, 0xd3, 0x7b, 0x17, 0x8a, 0x07, 0x83, 0x63, 0x65, 0x2d, 0x04, 0x02, 0x79, 0x7a, 0xaa, 0xa0, 0xdf, 0x60, 0x3f };
 
@@ -101,8 +105,9 @@ const fuzz_platform_scalar: [32]u8 = .{ 0x47, 0xbb, 0xb5, 0x64, 0x78, 0xbe, 0x49
 ///   4 token response + decrypt under a fixed secret (both protocols)
 ///   5 framing.splitResponse   6 Client.getPinToken against a valid key
 ///     agreement followed by these bytes as the token response
+///   7 credential.parseMakeCredentialResponse   8 credential.parseAssertionResponse
 const fz = @import("fuzz_test.zig");
-const RespMark = fz.Marker(enum { getinfo_ok, key_agreement_ok, pin_retries_ok, uv_retries_ok, token_ok, token_decrypted, split_ok, client_token_ok, refused });
+const RespMark = fz.Marker(enum { getinfo_ok, key_agreement_ok, pin_retries_ok, uv_retries_ok, token_ok, token_decrypted, split_ok, client_token_ok, make_credential_ok, assertion_ok, refused });
 const PinMark = fz.Marker(enum { token_roundtrip_p1, token_roundtrip_p2, short_ciphertext_refused, mac_differs_on_flip, wrong_secret_differs });
 
 fn fuzzResponsesSmith(_: void, smith: *std.testing.Smith) !void {
@@ -113,7 +118,7 @@ fn fuzzResponses(comptime S: type, src: *S, a: std.mem.Allocator) anyerror!void 
     var script: [2048]u8 = undefined;
     const n: usize = fz.drawInput(S, src, &script, &fuzz_seeds);
     if (n == 0) return;
-    const sel = (script[0] & 0x7f) % 7;
+    const sel = (script[0] & 0x7f) % 9;
     const body = script[1..n];
 
     switch (sel) {
@@ -142,6 +147,20 @@ fn fuzzResponses(comptime S: type, src: *S, a: std.mem.Allocator) anyerror!void 
                         } else |_| {}
                     }
                 },
+            }
+        },
+        7, 8 => {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            if (sel == 7) {
+                if (credential.parseMakeCredentialResponse(arena.allocator(), body)) |r| {
+                    // The attestation object of whatever parsed must encode.
+                    const obj = credential.attestationObject(arena.allocator(), r) catch return error.AttestationObjectFailed;
+                    if (obj.len == 0) return error.AttestationObjectFailed;
+                    RespMark.mark(.make_credential_ok);
+                } else |_| RespMark.mark(.refused);
+            } else {
+                if (credential.parseAssertionResponse(arena.allocator(), body)) |_| RespMark.mark(.assertion_ok) else |_| RespMark.mark(.refused);
             }
         },
         5 => if (framing.splitResponse(body)) |_| RespMark.mark(.split_ok) else |_| RespMark.mark(.refused),
@@ -188,6 +207,8 @@ const fuzz_seeds = [_][]const u8{
     // the status check, so the client path never reached its token decrypt.
     testkit.fuzz.seed(&[_]u8{6} ++ fido2_vectors.cases[5].responses[1]), // client, protocol One
     testkit.fuzz.seed(&[_]u8{0x86} ++ fido2_vectors.cases[15].responses[1]), // client, protocol Two
+    testkit.fuzz.seed(&[_]u8{7} ++ credential_vectors.cases[1].responses[0][1..]), // makeCredential response (epAtt, largeBlobKey)
+    testkit.fuzz.seed(&[_]u8{8} ++ credential_vectors.cases[4].responses[0][1..]), // getAssertion response (user, count)
 };
 
 test "fuzz: authenticator responses never panic or leak" {

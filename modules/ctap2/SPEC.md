@@ -37,11 +37,23 @@ request bytes are asserted equal to its output.
 outside a per-call arena, no device dependency (the caller owns the transport), every
 PIN request byte-anchored to a live python-fido2 capture, typed errors for every
 status code, secrets wiped, a fuzz harness on every parser of authenticator bytes.
-**Where we are behind:** only the PIN / GetInfo slice of CTAP2 (makeCredential,
-getAssertion, credential management, large blobs, bio enrolment, authenticatorConfig
+**Where we are behind:** only the PIN / GetInfo / makeCredential / getAssertion slice of CTAP2 (credential management, large blobs, bio enrolment, authenticatorConfig
 are absent), no NFC/BLE framing, and no device transport at all (by design).
 
 ## Design
+
+- **`credential.zig`: makeCredential, getAssertion, getNextAssertion** (CTAP 2.1 §6.1-§6.3). `MakeCredentialRequest` /
+  `GetAssertionRequest` become the CBOR map (`makeCredentialParams`, `getAssertionParams`; keys in canonical order, empty
+  optional members left out), the commands send them over any `Transport` and parse the answer (`parseMakeCredentialResponse`,
+  `parseAssertionResponse`; every field type-checked, required ones `MissingField`, `authData` at least 37 bytes,
+  `largeBlobKey` exactly 32, a descriptor's type `public-key`). `getAssertions` follows `numberOfCredentials` with
+  `getNextAssertion` (at most `max_assertions` = 64). Everything is allocated from the caller's arena. Not done here, on
+  purpose: the WebAuthn client steps (`clientDataJSON`, its hash, extension input processing: the caller passes
+  `clientDataHash` and the built extension map) and the verification of the answer, which is `webauthn`'s
+  (`attestationObject` builds the object it takes; the response's `authData` parses with `webauthn.parseAuthenticatorData`,
+  tested). The `pinUvAuthParam` is `Token.authenticate` over `clientDataHash`. A `pinUvAuthParam` is 16 or 32 bytes and
+  needs its protocol, else `InvalidRequest`. `credential` of a getAssertion answer is optional (CTAP 2.1 lets an authenticator
+  leave it out for a one-entry allow list); python-fido2 reads it the same way.
 
 - **Source of truth:** FIDO Alliance CTAP 2.1 (proposed standard 2021-06-15 with
   the 2022-06-21 errata): §6.4 authenticatorGetInfo, §6.5.5 authenticatorClientPIN,
@@ -137,6 +149,14 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
   python-fido2's, byte for byte; the token decrypted from the scripted response equals
   the token python-fido2 returned; the random script is consumed exactly. Also the
   GetInfo request and python-composed response.
+- `credential.zig` tests against `credential_vectors.zig` (python-fido2 2.2.1 as a black box, `tools/gen_credential_vectors.py`):
+  the request bytes of makeCredential (minimal; fully loaded under protocol One with exclude list, extensions, options,
+  `pinUvAuthParam`, `enterpriseAttestation`; protocol Two), getAssertion (minimal; allow list, extensions, options under protocol
+  Two) and getNextAssertion equal python-fido2's byte for byte; the scripted answers parse (a make-credential response with
+  `epAtt` / `largeBlobKey`, a two-credential assertion with user and `numberOfCredentials`, then the next one); typed statuses
+  (`CredentialExcluded`, `NoCredentials`, `OperationDenied`, `UserActionTimeout`, `PinInvalid`), request refusals, each malformed
+  response field. The response parsers are fuzz selectors 7 and 8 (100,000 driver runs clean). The python-fido2 answers are
+  composed by the recipe, not taken from a real authenticator: no real device was available.
 - `client_test.zig`: every status code through the client, hostile responses,
   key-agreement variants (kty, crv, alg, coordinate length, off-curve, identity,
   duplicate label), token length rules, validation-before-I/O, transport failure.
@@ -154,8 +174,7 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
 ## Non-goals
 
 - Device I/O of any kind (USB HID nodes, NFC, BLE): the caller supplies `Transport`.
-- The rest of CTAP2: makeCredential, getAssertion, credential management, large
-  blobs, bio enrolment, authenticatorConfig, enterprise attestation.
+- The rest of CTAP2: credential management, large blobs, bio enrolment, authenticatorConfig (the `enterpriseAttestation` request member and the `epAtt` response member are carried).
 - The authenticator side of `authenticatorClientPIN`.
 - CTAP1/U2F (`CTAPHID_MSG`), BLE and NFC framing.
 
@@ -180,5 +199,4 @@ against the spec's layouts and by round trip (no external CTAPHID capture).
 
 ## Backlog / deferred
 
-- Further CTAP2 commands on the same `Transport` (getAssertion / makeCredential): the reference clients (python-fido2, libfido2) have them. NOT REACHED (budget).
 

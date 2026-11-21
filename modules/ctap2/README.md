@@ -1,6 +1,6 @@
 # ctap2
 
-The CTAP 2.1 (FIDO2) client side of `authenticatorClientPIN` over a
+The CTAP 2.1 (FIDO2) client side of `authenticatorClientPIN`, `authenticatorMakeCredential` and `authenticatorGetAssertion` over a
 caller-supplied transport. The sibling `ctap2pin` is the `pinUvAuthProtocol`
 crypto (encapsulate, encrypt, decrypt, authenticate); this module is the command
 layer above it, so PIN handling is one call, not a page of primitives.
@@ -20,12 +20,17 @@ layer above it, so PIN handling is one call, not a page of primitives.
   `getPinUvAuthTokenUsingUvWithPermissions`, `getUVRetries`, on both PIN/UV
   protocols, with the spec's PIN rules (>= 4 code points or `minPINLength`,
   <= 63 bytes UTF-8, padded to 64) checked before anything is sent.
+- **`authenticatorMakeCredential` / `authenticatorGetAssertion` / `authenticatorGetNextAssertion`** (`ctap2.credential`) —
+  `makeCredential`, `getAssertion`, `getNextAssertion`, `getAssertions` over any `Transport`: requests (RP, user, `pubKeyCredParams`,
+  exclude / allow list, extensions, options, `pinUvAuthParam` + protocol, enterprise attestation) encoded canonically, responses
+  parsed (`fmt` / `authData` / `attStmt`, credential, signature, user, `numberOfCredentials`, `largeBlobKey`); `attestationObject`
+  builds the WebAuthn attestation object for the `webauthn` module. The caller supplies `clientDataHash` and the `pinUvAuthParam`.
 - **CTAPHID** — the 64-byte init/continuation report codec, `CTAPHID_INIT`, and a
   `Channel` that runs a `CTAPHID_CBOR` transaction over a report reader/writer you provide; keep-alives are reported to
   `Channel.on_keepalive` (`KeepaliveStatus`: processing / user presence needed) and `Channel.cancel` sends `CTAPHID_CANCEL`.
 - **Model after:** CTAP 2.1 §6.4, §6.5.5, §8.2, §11.2, clean-room. **Oracle:** for
   every subcommand and both protocols the request bytes equal python-fido2 2.2.1's
-  byte for byte (`src/fido2_vectors.zig`, recipe in `tools/gen_fido2_vectors.py`).
+  byte for byte (`src/fido2_vectors.zig`, recipe in `tools/gen_fido2_vectors.py`; makeCredential / getAssertion: `src/credential_vectors.zig`, `tools/gen_credential_vectors.py`).
   See `NOTICE`.
 - **Platform:** any. **Role:** codec. **Deps:** `cbor`, `ctap2pin`.
 

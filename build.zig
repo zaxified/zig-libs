@@ -405,7 +405,7 @@ pub const module_list = [_]Module{
     .{ .name = "minisign", .libs = &.{"crypto"}, .deps = &.{ "entropy", "b64ct", "wipealloc" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "otp", .libs = &.{"crypto"}, .deps = &.{"base32"}, .test_deps = &.{"testkit"} },
     .{ .name = "ctap2pin", .libs = &.{"crypto"}, .deps = &.{"p256"}, .test_deps = &.{"testkit"} },
-    .{ .name = "ctap2", .libs = &.{"crypto"}, .deps = &.{ "cbor", "ctap2pin", "unitext" }, .test_deps = &.{"testkit"} },
+    .{ .name = "ctap2", .libs = &.{"crypto"}, .deps = &.{ "cbor", "ctap2pin", "unitext" }, .test_deps = &.{ "testkit", "webauthn" } },
     .{ .name = "bls12_381", .libs = &.{"crypto"}, .deps = &.{ "entropy", "montint", "sha2" }, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy", "wipealloc" }, .test_deps = &.{"testkit"} },
     .{ .name = "coconut", .libs = &.{"crypto"}, .deps = &.{"bls12_381"}, .heavy = true, .test_deps = &.{"testkit"} },

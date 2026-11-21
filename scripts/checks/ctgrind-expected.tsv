@@ -1794,8 +1794,8 @@ tenantkex	ReleaseFast	xx	1	9	4ca8cd518a96d519	e3759d838e3b1880
 # bytes (unicode.zig `utf8CountCodepoints`, ASCII fast path then a decode per sequence): pin
 # 1 -> 0 with the mask-only utf8CountCt (one verdict; the harness marks that
 # returned verdict defined before its own `try`).
-ctap2	ReleaseFast	pin	1	0	e7eb4307746d757a	01e08eb2902d2802
-ctap2	ReleaseFast	token	1	0	e7eb4307746d757a	e927dca40cedb432
+ctap2	ReleaseFast	pin	1	0	1a774f0de6a12bd1	01e08eb2902d2802
+ctap2	ReleaseFast	token	1	0	1a774f0de6a12bd1	e927dca40cedb432
 # base32 (2026-10-10) — encode: a tainted 20-byte secret (+ 1..4-byte tails)
 # through encode, std/hex alphabets, padded/unpadded, upper/lower case: 0.
 # decode: the tainted encoded text through decode (padding required/optional,
@@ -2422,8 +2422,8 @@ dtls	ReleaseFast	hs12	1	48	7b4f4437e33818c7	d87712f4d6e60179	cpu=x86_64
 quic-crypto	ReleaseFast	aes	1	84	1ccd9cc4fbf9d862	4d96b4e7d3af1ed7	cpu=x86_64 control=3 trap=45
 aeskw	ReleaseFast	wrap	1	694	88dac35c72f0539b	23036d19c2656c6a	cpu=x86_64 control=8 trap=28
 aeadframe	ReleaseFast	aes	1	157	57d56203b5077c41	9e2cdfce46f95d92	cpu=x86_64 control=4 trap=4
-ctap2	ReleaseFast	pin	1	100	e7eb4307746d757a	01e08eb2902d2802	cpu=x86_64 control=6 trap=6
-ctap2	ReleaseFast	token	1	68	e7eb4307746d757a	e927dca40cedb432	cpu=x86_64 control=4 trap=4
+ctap2	ReleaseFast	pin	1	100	1a774f0de6a12bd1	01e08eb2902d2802	cpu=x86_64 control=6 trap=6
+ctap2	ReleaseFast	token	1	68	1a774f0de6a12bd1	e927dca40cedb432	cpu=x86_64 control=4 trap=4
 dnp3	ReleaseFast	keys	1	121	7f24eea64435e887	d2337903af778cbe	cpu=x86_64 control=2 trap=6
 # dnp3 keys5 on x86_64 (2026-11-19): tainted in-file 121, identical to keys
 # (nothing extra in sa.zig). control=4: std/Io/Writer.zig `printHex` (printing).
