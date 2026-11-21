@@ -173,16 +173,19 @@ try zipstream.extractAll(&archive, io, dest_dir, .{ .symlinks = .skip, .max_tota
 - **Entries:** comments (entry and archive), raw extra field, directories
   (`list_directories`), symlinks (`isSymlink`), Info-ZIP Unicode Path names,
   optional CP437 decoding of legacy names.
+- **Raw copy, append, check, Deflate64.** `ArchiveWriter.copyEntry` / `addRaw` move an entry between archives
+  without recompressing it (`Archive.openRaw` reads the stored bytes); `ArchiveWriter.initAppend` adds entries to an existing
+  archive; `Archive.verify` decodes every entry and looks for overlapping ones; Deflate64 (method 9) is read.
 - **Speed:** CRC-32 via the hardware-backed `crc32` module; 0.31–1.07× Go
   `archive/zip` (`zig build bench-zipstream`).
 
 ## Not provided
 
-Deflate64, PPMd and the legacy PKZIP methods (listed and refused with
+PPMd and the legacy PKZIP methods (listed and refused with
 `error.UnsupportedCompressionMethod`; a consumer can register its own `Codec`),
-in-place editing of an existing archive, multi-disk archives and ZipCrypto
-writing. SPEC *What is deliberately not done* and *Backlog / deferred* give the
-reasons and what is open.
+in-place editing of an existing archive (rebuild it with `copyEntry`, or
+`initAppend` to add), multi-disk archives and ZipCrypto writing. SPEC *What is
+deliberately not done* gives the reasons.
 
 ## Testing
 

@@ -69,10 +69,15 @@ pub fn parseAesExtra(d: []const u8) ?AesInfo {
 
 /// The 11-byte 0x9901 record for a written entry (AE-2).
 pub fn aesExtra(strength: Strength, method: u16) [11]u8 {
+    return aesExtraVersion(strength, method, 2);
+}
+
+/// The 0x9901 record with the vendor version given (1 = AE-1, 2 = AE-2): a raw copy keeps the source's.
+pub fn aesExtraVersion(strength: Strength, method: u16, version: u16) [11]u8 {
     var r: [11]u8 = undefined;
     std.mem.writeInt(u16, r[0..2], extra_id_aes, .little);
     std.mem.writeInt(u16, r[2..4], 7, .little);
-    std.mem.writeInt(u16, r[4..6], 2, .little); // AE-2
+    std.mem.writeInt(u16, r[4..6], version, .little);
     r[6] = 'A';
     r[7] = 'E';
     r[8] = @backingInt(strength);

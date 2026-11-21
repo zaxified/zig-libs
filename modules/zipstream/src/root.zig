@@ -50,6 +50,7 @@ const datefmt = @import("datefmt");
 const zl_options = @import("zl_options");
 const encoding = @import("encoding");
 const crypto = @import("crypto.zig");
+const deflate64 = @import("deflate64.zig");
 
 /// WinZip AES key strength.
 pub const AesStrength = crypto.Strength;
@@ -250,6 +251,27 @@ const Bzip2Codec = struct {
     }
 };
 
+/// Deflate64 (method 9, "enhanced deflate"): READ only, by the decoder in `deflate64.zig` (a 64 KiB
+/// window, distances up to 65536, length code 285 = 3..65538). No encoder: zip2 and libzip read it
+/// and do not write it either.
+pub const deflate64_codec: Codec = .{
+    .method = 9,
+    .open_reader = Deflate64Codec.openReader,
+};
+
+const Deflate64Codec = struct {
+    fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, _: CodecEntry) anyerror!CodecReader {
+        const s = try gpa.create(deflate64.Inflate);
+        s.init(input);
+        return .{ .reader = &s.reader, .state = s, .close = closeReader };
+    }
+
+    fn closeReader(state: *anyopaque, gpa: Allocator) void {
+        const s: *deflate64.Inflate = @ptrCast(@alignCast(state));
+        gpa.destroy(s);
+    }
+};
+
 /// LZMA (method 14) through the sibling `lzma` module: APPNOTE 5.8 — a
 /// 4-byte header (LZMA SDK version, properties size = 5), the 5 properties,
 /// then raw LZMA1; flag bit 1 means the stream ends with an end marker. Written
@@ -349,6 +371,7 @@ pub const builtin_decoders_enabled: bool = zl_options.zipstream_builtin_decoders
 /// instead would link every compressor into a binary that only reads.
 const builtin_decoders = if (builtin_decoders_enabled) [_]Codec{
     .{ .method = zstd_codec.method, .open_reader = ZstdCodec.openReader },
+    .{ .method = deflate64_codec.method, .open_reader = Deflate64Codec.openReader },
     .{ .method = bzip2_codec.method, .open_reader = Bzip2Codec.openReader },
     .{ .method = lzma_codec.method, .open_reader = LzmaCodec.openReader },
     .{ .method = xz_codec.method, .open_reader = LzmaCodec.openXzReader },
@@ -411,6 +434,8 @@ pub const Entry = struct {
     aes: ?crypto.AesInfo = null,
     /// The DOS time field as stored (ZipCrypto's check byte with flag bit 3).
     dos_time: u16 = 0,
+    /// The DOS date field as stored; with `dos_time`, what `ArchiveWriter.addRaw` writes back.
+    dos_date: u16 = 0,
 
     /// The compression method under any encryption.
     pub fn method(self: *const Entry) u16 {
@@ -612,6 +637,13 @@ pub const Archive = struct {
     /// The archive comment (end record), raw bytes; owned by the archive.
     comment: []const u8 = "",
     options: Options = .{},
+    /// Where the central directory starts and ends (the end of its last record),
+    /// how many records it holds (directory entries included, listed or not) and
+    /// the bytes before the archive that its offsets do not count; `ArchiveWriter.initAppend`.
+    cd_start: u64 = 0,
+    cd_end: u64 = 0,
+    cd_count: u64 = 0,
+    base: u64 = 0,
 
     pub const Options = struct {
         /// List directory entries too (`Entry.is_directory`); by default
@@ -792,9 +824,14 @@ pub const Archive = struct {
                 .is_directory = is_dir,
                 .aes = x.aes,
                 .dos_time = h.last_modification_time,
+                .dos_date = h.last_modification_date,
             });
         }
         if (n != dir.count) return Error.ZipBadCentralDirectory;
+        self.cd_start = dir.start;
+        self.cd_end = pos;
+        self.cd_count = n;
+        self.base = dir.base;
     }
 
     pub fn deinit(self: *Archive) void {
@@ -816,6 +853,122 @@ pub const Archive = struct {
     pub fn findSuffix(self: *const Archive, suffix: []const u8) ?*const Entry {
         for (self.entries.items) |*e| {
             if (std.mem.endsWith(u8, e.name, suffix)) return e;
+        }
+        return null;
+    }
+
+    /// Open `entry`'s COMPRESSED bytes as stored (Go `File.OpenRaw`, zip2 `by_index_raw`): no
+    /// decompression, decryption or CRC check, exactly `entry.compressed_size` bytes
+    /// (an encrypted entry's include their header and authentication code). The local header
+    /// is read for where the data starts; a range that does not fit the source is
+    /// `error.ZipBadFileOffset`. `raw` is initialised in place and, like an `EntryReader`,
+    /// valid until the next read of the same archive through a shared cursor (each reader has
+    /// its own, so concurrent use is fine). Pair it with `ArchiveWriter.addRaw`.
+    pub fn openRaw(self: *Archive, raw: *RawReader, entry: *const Entry) !void {
+        if (entry.file_offset >= self.source.size) return Error.ZipBadFileOffset;
+        raw.src_reader = .init(self.source, &raw.src_buf, entry.file_offset);
+        const fr = &raw.src_reader;
+        const local = fr.interface.takeStruct(std.zip.LocalFileHeader, .little) catch |err| switch (err) {
+            error.EndOfStream => return Error.ZipBadFileOffset,
+            error.ReadFailed => return err,
+        };
+        if (!std.mem.eql(u8, &local.signature, &std.zip.local_file_header_sig)) return Error.ZipBadFileOffset;
+        const data_off = entry.file_offset + @sizeOf(std.zip.LocalFileHeader) +
+            @as(u64, local.filename_len) + @as(u64, local.extra_len);
+        if (data_off > self.source.size or entry.compressed_size > self.source.size - data_off) return Error.ZipBadFileOffset;
+        fr.seekTo(data_off);
+        raw.limited = fr.interface.limited(.limited64(entry.compressed_size), &.{});
+    }
+
+    /// What `verify` checks and with what.
+    pub const VerifyOptions = struct {
+        /// The decompression-bomb cap for each entry (`EntryReader.open`).
+        max_output: u64 = default_max_output,
+        /// Opens encrypted entries (WinZip AES or ZipCrypto); without it they are skipped.
+        password: ?[]const u8 = null,
+        /// Look for entries whose stored bytes overlap another's (see `verify`).
+        check_overlap: bool = true,
+    };
+
+    /// The first thing `verify` found wrong.
+    pub const Problem = struct {
+        entry: *const Entry,
+        kind: Kind,
+
+        pub const Kind = enum {
+            /// The entry's local header or data lies (partly) inside another entry's: a
+            /// zip-bomb quine, or a directory that points two records at one member.
+            overlap,
+            /// The local header is not where the directory says, or the data runs past the source.
+            bad_offset,
+            /// The CRC-32 of the decompressed bytes does not match the directory's.
+            crc_mismatch,
+            /// A WinZip AES authentication code did not match.
+            auth_failed,
+            /// The password is wrong (`options.password`).
+            bad_password,
+            /// Not decodable: truncated or invalid compressed data, or sizes that disagree.
+            corrupt,
+            /// A method this build cannot decode (and no registered codec does).
+            unsupported_method,
+            /// More output than `VerifyOptions.max_output`.
+            too_large,
+        };
+    };
+
+    /// An archive-wide integrity check (Python `ZipFile.testzip`, 7-Zip `t`, `unzip -t`): decode every
+    /// entry to its end, which verifies every CRC-32 (and AES code), and look for overlapping
+    /// entries. Returns the first problem in archive order, null when everything checks out.
+    /// An encrypted entry is skipped without `options.password`. The overlap check uses the
+    /// least the directory proves (each entry occupies at least its 30-byte local header plus
+    /// `compressed_size` from its offset), so it has no false positive; it finds a quine
+    /// (David Fifield's overlapping-member bombs) and a doubly listed member, not every
+    /// possible overlap. Errors are allocation failures only; a failing source read is a problem.
+    pub fn verify(self: *Archive, options: VerifyOptions) !?Problem {
+        const n = self.entries.items.len;
+        if (options.check_overlap and n > 1) {
+            const order = try self.alloc.alloc(u32, n);
+            defer self.alloc.free(order);
+            for (order, 0..) |*o, i| o.* = @intCast(i);
+            const Ctx = struct {
+                es: []const Entry,
+                fn lt(c: @This(), a: u32, b: u32) bool {
+                    return c.es[a].file_offset < c.es[b].file_offset;
+                }
+            };
+            std.mem.sort(u32, order, Ctx{ .es = self.entries.items }, Ctx.lt);
+            var end: u64 = 0;
+            var bad: ?u32 = null;
+            for (order) |i| {
+                const e = &self.entries.items[i];
+                if (e.file_offset < end) {
+                    // The first in archive order among the overlapping.
+                    if (bad == null or i < bad.?) bad = i;
+                }
+                end = @max(end, e.file_offset +| 30 +| e.compressed_size);
+            }
+            if (bad) |i| return .{ .entry = &self.entries.items[i], .kind = .overlap };
+        }
+        const window = try self.alloc.alloc(u8, std.compress.flate.max_window_len);
+        defer self.alloc.free(window);
+        for (self.entries.items) |*e| {
+            if (e.encrypted and options.password == null) continue;
+            var er: EntryReader = undefined;
+            er.open(self, e, window, .{ .max_output = options.max_output, .password = options.password }) catch |err| {
+                er.deinit();
+                return .{ .entry = e, .kind = switch (err) {
+                    error.OutOfMemory => return err,
+                    error.UnsupportedCompressionMethod => .unsupported_method,
+                    error.ZipBadFileOffset => .bad_offset,
+                    error.ZipEntryTooLarge => .too_large,
+                    error.ZipBadPassword => .bad_password,
+                    else => .corrupt,
+                } };
+            };
+            defer er.deinit();
+            _ = er.reader().discardRemaining() catch {
+                return .{ .entry = e, .kind = if (er.crcMismatch()) .crc_mismatch else if (er.authFailed()) .auth_failed else .corrupt };
+            };
         }
         return null;
     }
@@ -1341,6 +1494,18 @@ pub const EntryReader = struct {
     }
 };
 
+/// An entry's compressed bytes as stored: `Archive.openRaw`.
+pub const RawReader = struct {
+    src_reader: SourceReader,
+    src_buf: [16 * 1024]u8,
+    limited: std.Io.Reader.Limited,
+
+    /// Exactly the entry's `compressed_size` bytes; a source that ends early is `error.EndOfStream`.
+    pub fn reader(self: *RawReader) *std.Io.Reader {
+        return &self.limited.interface;
+    }
+};
+
 /// `remaining` bytes of `source`, then zeros for ever (see `EntryReader`'s
 /// deflate arm for why the decoder must never reach an end of input). A
 /// source that ends early is padded the same way: the CRC-32 check, not an
@@ -1618,6 +1783,8 @@ pub const ArchiveWriter = struct {
     comment: []const u8 = "",
     /// The entry being streamed (`beginEntry` .. `endEntry`).
     open: ?*Streamed = null,
+    /// `initAppend`: the existing archive's central directory, copied verbatim ahead of the new records by `finish`.
+    prior: ?*Archive = null,
 
     const WrittenEntry = struct {
         name: []const u8,
@@ -1638,6 +1805,8 @@ pub const ArchiveWriter = struct {
         extra: []const u8,
         force_zip64: bool,
         aes_extra: ?[11]u8,
+        /// A raw copy's `version made by` host and external attributes, as the source stored them.
+        attrs: ?struct { host: u8, external: u32 } = null,
     };
 
     /// General-purpose flag bit 11 ("language encoding"): the name is UTF-8.
@@ -1679,6 +1848,26 @@ pub const ArchiveWriter = struct {
             .alloc = alloc,
             .name_arena = std.heap.ArenaAllocator.init(alloc),
         };
+    }
+
+    /// Append to an existing archive (Python `ZipFile(…, "a")`, zip2 `ZipWriter::new_append`):
+    /// the new entries go where the old central directory started, and `finish` writes the old
+    /// directory's records unchanged, then the new ones, then the end record. `out` must be
+    /// positioned at `archive.cd_start` of the file that holds the archive (the bytes before
+    /// it stay as they are; this writer's offsets start there), and the caller truncates the
+    /// file to `offset` (the archive's length) after `finish`. `archive` is read at `finish` and must stay open until then;
+    /// its comment becomes this writer's `comment` (change it before `finish` to replace it).
+    /// An archive with bytes in front of it (a self-extractor stub whose offsets were not
+    /// adjusted) is refused with `error.ZipAppendPrefixed`: its records' offsets cannot
+    /// be carried over. Nothing is checked about names: an appended name that the
+    /// archive already has is listed twice, as in Python.
+    pub fn initAppend(alloc: Allocator, out: *std.Io.Writer, archive: *Archive) !ArchiveWriter {
+        if (archive.base != 0) return error.ZipAppendPrefixed;
+        var w = init(alloc, out);
+        w.offset = archive.cd_start;
+        w.comment = archive.comment;
+        w.prior = archive;
+        return w;
     }
 
     pub fn deinit(self: *ArchiveWriter) void {
@@ -1889,6 +2078,113 @@ pub const ArchiveWriter = struct {
         try self.out.writeAll(stored);
         self.offset += stored.len;
         try self.record(name, h, crc, stored.len, data.len, local_header_offset, false, options);
+    }
+
+    /// General-purpose flag bits a raw copy keeps: 0 (encrypted), 1-2 (the Deflate level),
+    /// 5 (patched data), 6 (strong encryption). Bit 3 is decided by the layout, 11 by the name,
+    /// 13 (masked headers) is dropped.
+    const raw_flag_mask: u16 = 0b0110_0111;
+
+    /// Add an entry's COMPRESSED bytes as they are (Go `Writer.CreateRaw` / `Copy`, zip2
+    /// `raw_copy_file`, libzip's source copy): no compression, decompression, encryption or CRC
+    /// calculation; `raw` yields exactly `entry.compressed_size` bytes (else `error.EndOfStream`
+    /// from the read, with the output half written: the archive is unusable then). Everything in
+    /// `entry` is written back: name, method (WinZip AES with its vendor version), flags, CRC-32,
+    /// sizes, DOS time and date, the `UT` time, the host and external attributes (mode,
+    /// symlink, directory), comment and extra records. Not carried: the internal file attributes,
+    /// and the records the writer makes itself (zip64, `UT`, AES, alignment padding, Unicode
+    /// Path: the name is written as UTF-8 with flag bit 11 when it is). A ZipCrypto entry
+    /// made with a data descriptor keeps it (its check byte comes from the time). Change
+    /// `entry.name` on a copy of the value to rename. A hand-built `Entry` works: set what
+    /// you know (`name`, `compression`, sizes, `crc32`); a zero DOS time and date with an
+    /// `mtime` writes that time, with none the earliest DOS time. The name goes through
+    /// `isSafeEntryName` as for any entry.
+    pub fn addRaw(self: *ArchiveWriter, entry: *const Entry, raw: *std.Io.Reader) !void {
+        if (self.finished) @panic("zipstream: ArchiveWriter used after finish()");
+        if (self.open != null) @panic("zipstream: ArchiveWriter entry added while a streamed entry is open (call endEntry first)");
+        const name = entry.name;
+        if (!isSafeEntryName(name)) return Error.ZipUnsafeEntryName;
+        if (name.len > std.math.maxInt(u16)) return Error.ZipNameTooLong;
+        if (entry.comment.len > std.math.maxInt(u16)) return Error.ZipWriteTooLarge;
+        const csize = entry.compressed_size;
+        const usize_ = entry.uncompressed_size;
+        const zip64 = csize > u32_max or usize_ > u32_max;
+        if (!self.allow_zip64) {
+            if (zip64 or self.offset > u32_max) return Error.ZipWriteTooLarge;
+            if (self.entries.items.len >= std.math.maxInt(u16)) return Error.ZipWriteTooLarge;
+        }
+        // ZipCrypto's check byte is the high byte of the DOS time while bit 3 is set, of the CRC
+        // otherwise: the layout must follow the source's.
+        const streamed = entry.encrypted and entry.aes == null and entry.flags & flag_descriptor != 0;
+
+        // The records the writer makes itself are rebuilt, the others carried.
+        var kept: std.ArrayList(u8) = .empty;
+        defer kept.deinit(self.alloc);
+        var ut: ?u32 = null;
+        var rest = entry.extra;
+        while (rest.len >= 4) {
+            const id = std.mem.readInt(u16, rest[0..2], .little);
+            const len = std.mem.readInt(u16, rest[2..4], .little);
+            if (len > rest.len - 4) break;
+            const rec = rest[0 .. 4 + len];
+            rest = rest[4 + len ..];
+            switch (id) {
+                extra_id_ut => if (len >= 5 and rec[4] & 1 != 0) {
+                    ut = std.mem.readInt(u32, rec[5..9], .little);
+                },
+                0x0001, crypto.extra_id_aes, extra_id_align, 0x7075 => {},
+                else => try kept.appendSlice(self.alloc, rec),
+            }
+        }
+        if (kept.items.len > max_caller_extra) return Error.ZipWriteTooLarge;
+        const no_dos = entry.dos_time == 0 and entry.dos_date == 0;
+        if (ut == null and no_dos) if (entry.mtime) |t| {
+            ut = std.math.cast(u32, t);
+        };
+        const aes_extra: ?[11]u8 = if (entry.aes) |a| crypto.aesExtraVersion(a.strength, a.method, a.version) else null;
+        const has_attrs = entry.version_made_by != 0 or entry.external_attributes != 0;
+        const h: Header = .{
+            .method = entry.compression,
+            .flags = (entry.flags & raw_flag_mask) | nameFlags(name) | nameFlags(entry.comment),
+            .dos = if (!no_dos) .{ .time = entry.dos_time, .date = entry.dos_date } else if (entry.mtime) |t| .fromUnix(t) else .min,
+            .ut = ut,
+            .unix_mode = if (!has_attrs) if (entry.mode) |m| unix_regular_file | (@as(u32, m) & 0o7777) else null else null,
+            .aes_extra = aes_extra,
+        };
+        const options: AddEntryOptions = .{ .comment = entry.comment, .extra = kept.items };
+
+        const local_header_offset = self.offset;
+        try self.writeLocal(name, h, entry.crc32, csize, usize_, zip64, streamed, options);
+        try raw.streamExact64(self.out, csize);
+        self.offset += csize;
+        if (streamed) {
+            var dd: [24]u8 = undefined;
+            std.mem.writeInt(u32, dd[0..4], 0x08074b50, .little);
+            std.mem.writeInt(u32, dd[4..8], entry.crc32, .little);
+            const dd_len: usize = if (zip64) 24 else 16;
+            if (zip64) {
+                std.mem.writeInt(u64, dd[8..16], csize, .little);
+                std.mem.writeInt(u64, dd[16..24], usize_, .little);
+            } else {
+                std.mem.writeInt(u32, dd[8..12], @intCast(csize), .little);
+                std.mem.writeInt(u32, dd[12..16], @intCast(usize_), .little);
+            }
+            try self.out.writeAll(dd[0..dd_len]);
+            self.offset += dd_len;
+        }
+        try self.record(name, h, entry.crc32, csize, usize_, local_header_offset, streamed, options);
+        const rec = &self.entries.items[self.entries.items.len - 1];
+        rec.crc32 = entry.crc32; // AE-1 keeps its CRC; `record` zeroes it for AES (AE-2's is zero anyway)
+        if (has_attrs) rec.attrs = .{ .host = @intCast(entry.version_made_by >> 8), .external = entry.external_attributes };
+    }
+
+    /// Copy `entry` of `archive` into this archive without recompressing it: `Archive.openRaw` into
+    /// `addRaw`. Skipping entries while copying the rest is how an archive is edited by rebuilding;
+    /// copy the `Entry` value, change its `name`, and pass that to rename (the location fields stay as they were). Encrypted entries copy as they are.
+    pub fn copyEntry(self: *ArchiveWriter, archive: *Archive, entry: *const Entry) !void {
+        var rr: RawReader = undefined;
+        try archive.openRaw(&rr, entry);
+        return self.addRaw(entry, rr.reader());
     }
 
     /// A directory member (`name/`, stored, empty; Unix mode `0o755` unless
@@ -2133,6 +2429,20 @@ pub const ArchiveWriter = struct {
 
         const cd_offset = self.offset;
         if (!self.allow_zip64 and cd_offset > u32_max) return Error.ZipWriteTooLarge;
+        var prior_count: u64 = 0;
+        if (self.prior) |a| {
+            var buf: [16 * 1024]u8 = undefined;
+            var at = a.cd_start;
+            while (at < a.cd_end) {
+                const want: usize = @intCast(@min(buf.len, a.cd_end - at));
+                const got = try a.source.readAt(at, buf[0..want]);
+                if (got == 0) return Error.ZipBadCentralDirectory;
+                try self.out.writeAll(buf[0..got]);
+                at += got;
+            }
+            self.offset += a.cd_end - a.cd_start;
+            prior_count = a.cd_count;
+        }
         for (self.entries.items) |e| {
             // zip64 extra in the central directory: only the saturated
             // fields, in the fixed order (APPNOTE 4.5.3).
@@ -2163,7 +2473,7 @@ pub const ArchiveWriter = struct {
                 .signature = std.zip.central_file_header_sig,
                 // Host in the high byte: 0 = MS-DOS (no attributes), 3 = Unix
                 // (the high half of the external attributes is `st_mode`).
-                .version_made_by = (if (e.unix_mode != null) host_unix << 8 else 0) | @as(u16, if (has64) 45 else 20),
+                .version_made_by = (if (e.attrs) |a| @as(u16, a.host) << 8 else if (e.unix_mode != null) host_unix << 8 else 0) | @as(u16, if (has64) 45 else 20),
                 .version_needed_to_extract = if (has64) 45 else 20,
                 .flags = @bitCast(e.flags),
                 .compression_method = e.method,
@@ -2177,7 +2487,7 @@ pub const ArchiveWriter = struct {
                 .comment_len = @intCast(e.comment.len),
                 .disk_number = 0,
                 .internal_file_attributes = 0,
-                .external_file_attributes = if (e.unix_mode) |m| m << 16 else 0,
+                .external_file_attributes = if (e.attrs) |a| a.external else if (e.unix_mode) |m| m << 16 else 0,
                 .local_file_header_offset = if (big_o) u32_max else @intCast(e.local_header_offset),
             };
             try writeHeaderLE(std.zip.CentralDirectoryFileHeader, self.out, cdh);
@@ -2190,7 +2500,7 @@ pub const ArchiveWriter = struct {
             self.offset += @sizeOf(std.zip.CentralDirectoryFileHeader) + e.name.len + extra_len + e.comment.len;
         }
         const cd_size = self.offset - cd_offset;
-        const count = self.entries.items.len;
+        const count = self.entries.items.len + prior_count;
         const need64 = count >= 0xffff or cd_size > u32_max or cd_offset > u32_max;
         if (need64) {
             if (!self.allow_zip64) return Error.ZipWriteTooLarge;
@@ -2227,6 +2537,7 @@ pub const ArchiveWriter = struct {
         };
         try writeHeaderLE(std.zip.EndRecord, self.out, eocd);
         try self.out.writeAll(self.comment);
+        self.offset += @sizeOf(std.zip.EndRecord) + self.comment.len;
     }
 };
 
@@ -3775,6 +4086,8 @@ test {
     _ = @import("mtime_test.zig");
     _ = @import("go_oracle.zig");
     _ = @import("s2_test.zig");
+    _ = @import("raw_test.zig");
+    _ = @import("deflate64_test.zig");
     _ = @import("crypto_test.zig");
     _ = @import("crypto.zig");
     _ = @import("sweep_test.zig");
