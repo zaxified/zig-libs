@@ -671,6 +671,12 @@ same thread).
   pool slab it is paid per in-flight request, in per-connection `StreamBuffers` it stays resident while idle. Moving the
   WHOLE writer into the slab was tried and lost (`PooledBuffers.slabSize`). A real win needs storage whose page is
   touched anyway; none is obvious.
+- **A further shared server-side `ResponseWriter` buffer pool**: the writer's buffers — the response body buffer
+  (`StreamBuffers.response_body`, also the auto-`Content-Length` threshold) and the chunk scratch — already come from a
+  pool shared across connections when `Options.buffers_provider` is set (`PooledBuffers` over `bufpool.BufferPool`,
+  one slab per in-flight request). What stays per connection is the writer's own state (~6 KB, mostly `header_buf`,
+  above); moving it into the slab was measured and lost (+14 KiB of slab cost +18 KiB/conn of RSS at 200-connection
+  saturation, `PooledBuffers.slabSize`). No other pool shape is known that would win.
 - **WebSocket and an MQTT broker** are candidate consumers layered on `http`'s server (see the root README's
   Non-goals), not gaps in `http`.
 - **Auth, rate limiting, routing-level path normalization** — the sibling modules' (`aaa-gate`/`jwt`, `ratelimit`,
@@ -678,9 +684,6 @@ same thread).
 
 ## Backlog / deferred
 
-- **A shared server-side `ResponseWriter` buffer pool** across connections (the client-side one is `bufpool`): a perf
-  item, not attempted in wave 14 (needs a server bench A/B; see the `header_buf` note under *What is deliberately not
-  done* for what the h1 frame costs).
 - **Differential oracle against karlseguin/http.zig (httpz)** — feed the same raw request bytes to both h1 parsers and
   compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers), as a `tools/`
   oracle (MIT, Zig 0.16). Blocked: building a fresh third-party checkout was refused in the agent sandbox; it needs an
