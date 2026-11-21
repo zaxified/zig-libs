@@ -378,3 +378,9 @@ tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
   directions, and a tilt about the horizontal axis changes the vertical one.
 - **Small symbols at three pixels per module.** A version 1 reads at about 79 % of angles there, against 100 % at four
   pixels. The fix has to happen in binarisation (see *What is deliberately not done* for the sampling idea that failed).
+  Diagnosed 2026-11-21 (version 1, "HELLO", 3 px per module, every 3° of rotation): 27 of 30 angles read; at the
+  three that do not (24°, 27°, 45°) the finders are found and the size is right (21), and 18-31 of the 441 modules
+  come out wrong, scattered over finder edges and data alike. With no alignment pattern the grid is three finder
+  centres and nothing refines it, so a sub-pixel error in them moves every sample by a third of a module. It is
+  the grid, not the binarisation: the cure would be a sub-pixel finder centre (edge fit rather than the run
+  midpoint), not tried.
