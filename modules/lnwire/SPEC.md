@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 **Where we are ahead:** the only Zig BOLT#1/2/7 codec; strict TLV rules (increasing types, minimal BigSize, it's-ok-to-be-odd) pinned to the spec's vectors; ownership model documented (decode borrows the input); `update_fail_malformed_htlc`'s `BADONION` rule and `channel_reestablish`'s TLV lengths enforced in the codec itself (rust-lightning's own vector carries a `failure_code` without the bit, i.e. its message codec leaves that rule to a later layer). **Where we are even:** the base channel lifecycle (open → HTLCs → reestablish → close) and the gossip set a node needs to announce a channel and subscribe to gossip; typed `node_announcement` addresses; feature-bit reads. **Where we are behind:** interactive-tx / dual-funding / splicing / quiescence / `closing_complete`+`closing_sig` / `start_batch`, onion messages, zlib-compressed range queries, the named BOLT#9 feature table is partial (`features.Feature` holds only rows verified against the spec text).
 
-What remains behind (the v2/splicing message family, onion messages, zlib) is what newer peers *negotiate* by feature bit, and a peer that has not negotiated them never sends them: Backlog-grade, hence `core`, not `parity`.
+What remains behind (onion messages, BOLT#8-transport-adjacent peer storage, zlib *encoding*) is what newer peers negotiate by feature bit, and a peer that has not negotiated them never sends them: hence `core`, not `parity`.
 
 
 ## Design & invariants
@@ -58,7 +58,8 @@ allocation any decode performs is a message's `Extension.records` array — see 
   signature(s) sign, computed exactly as BOLT#7 specifies ("beginning at offset 256/64, up to the
   end of the message" — the offset is precisely the byte-size of the signature field(s) each
   message leads with).
-- `features.zig` — BOLT#9 feature-bit-vector reads/writes plus a named (partial) feature table with dependency check (`Feature`, `table`, `row`, `setFeature`, `hasFeature`, `checkDependencies`: 18 rows with the even bit, the I/N/9 contexts and dependencies; a row is included only once verified against the spec text).
+- `features.zig` — BOLT#9 feature-bit-vector reads/writes plus the named feature table with dependency check (`Feature`, `table`, `row`, `setFeature`, `hasFeature`, `checkDependencies`): all 25 rows of the table in `lightning/bolts` `09-features.md` (master, 2026-11) with the even bit, the I/N/C/9/B/T contexts and the Dependencies column, `ASSUMED` rows with an empty context. Not named: bit 3 (`initial_routing_sync`, not a row of the current table), bits 20/21 (`option_anchor_outputs`, removed from it in favour of `anchors`, 22/23) and the experimental/staging bits (trampoline routing); all stay usable by number.
+- `bolt2_v2.zig` — the BOLT#2 messages of the current spec beyond v1 channel establishment: `stfu`, `open_channel2`/`accept_channel2`, the interactive-tx set (`tx_add_input`, `tx_add_output`, `tx_remove_input`, `tx_remove_output`, `tx_complete`, `tx_signatures`, `tx_init_rbf`, `tx_ack_rbf`, `tx_abort`), `splice_init`/`splice_ack`/`splice_locked`, `closing_complete`/`closing_sig` and `start_batch`, with typed accessors for their TLV records and decode/encode-time length checks. Wire vectors are built from the spec layouts by an independent script (the spec has no byte vectors for them); the negotiation rules (serial-id parity, input/output limits, "exactly one signature") are the caller's.
 - `burn.zig` — dead-stack burn for the two codecs that carry a per-commitment secret on the wire (`revoke_and_ack`, `channel_reestablish`): each public entry point zeroes the stack its body dirtied.
 - `*_kat_vectors.zig` — vendored vectors (see *Verification*); `tlv_typed_test.zig`, `stackprobe_test.zig`, `fuzz_test.zig` and the `*_kat_test.zig` files are tests.
 - `root.zig` — `meta` + a flat re-export of every public type/function, plus the dark-tests
@@ -129,7 +130,7 @@ Every decode path returns a typed error, never panics, on truncated or adversari
 - `closing_signed`: `feeRange()`, exactly 16 octets.
 - `update_fulfill_htlc` / `update_fail_htlc`: `attributionData()`, exactly 920 octets (20 x u32 hold times and 210 x 4-octet truncated HMACs).
 - `init`: `networks()` (a multiple of 32 octets), `remoteAddr()` (one BOLT#7 address descriptor, nothing after it).
-- `query_short_channel_ids`: `queryFlags()`; an uncompressed list (`encoding_type` 0) is walked as minimal bigsizes, a zlib one is carried and `iterator()` answers `error.UnsupportedEncoding` (no zlib here).
+- `query_short_channel_ids`: `queryFlags()`; an uncompressed list (`encoding_type` 0) is walked as minimal bigsizes, a zlib one is carried and `iterator()` answers `error.UnsupportedEncoding`; `QueryFlags.decode`, `decodeShortIds` and `decodeTimestampPairs` read both encodings (`std.compress.flate` zlib inflate, decode only, output bounded by `ListOptions.max_output`, default 1 MiB; the Adler-32 trailer is compared here because `std` does not; trailing bytes after the zlib stream are ignored, as lnd does). No compressor: a node sends uncompressed lists (`encoding_type` 0), which every peer must accept.
 - `query_channel_range`: `queryOption()`, one minimal bigsize.
 - `channel_reestablish`: `next_funding` / `my_current_funding_locked`, exactly 33 octets each (`sha256 || retransmit_flags`); `reply_channel_range`'s `timestamps_tlv` / `checksums_tlv`.
 
@@ -158,7 +159,7 @@ them (see *Verification*):
 - **BOLT#11 invoices / BOLT#12 offers** — bech32-based encodings, a distinct concern from BOLT#1-style binary TLV wire messages: the sibling `lninvoice` module (BOLT#11 decode/encode, BOLT#12 offers and signed invoice_request/invoice).
 - **Signature verification** — every `signature`/`bip340sig`/`point` field is opaque bytes; no secp256k1 anywhere in this module (a pure codec has no business owning curve arithmetic — the caller verifies `channelAnnouncementDigest(payload)` etc. against the message's signature field(s) and `node_id`/`bitcoin_key`, exactly the split `bitcointx`'s sighash functions use relative to their caller's secp256k1). `verifyChannelAnnouncement`/`verifyNodeAnnouncement`/`verifyChannelUpdate` (`bolt7.zig`) are the seam that does the pairing for the caller: each takes an `EcdsaVerifyFn` (a `(ctx, digest, signature, pubkey) -> bool` function pointer the caller supplies, the same function-pointer-seam shape `iec62351` uses for `RawVerifier`) and calls it once per signature with BOLT#7's own digest/signature/pubkey pairing already resolved — a `decodeChannelAnnouncement` result carries no signal of its own that it is unverified; calling `verify*` (or not) is what a caller's code shows.
 - **Onion routing (BOLT#4)** — `update_add_htlc.onion_routing_packet` is an opaque 1366-byte array; encryption/decryption/Sphinx is the sibling `sphinx` module's job, not this codec's.
-- **Interpreting TLV values beyond the typed accessors** — `query_flags`'s bits per channel beyond the bigsize walk, the zlib-compressed form, and `channel_type`'s mapping to named channel types. `node_announcement.addresses` is carried verbatim (the signature covers it); `AddressIterator`/`encodeAddresses` type it.
+- **Interpreting TLV values beyond the typed accessors** — `query_flags`'s bits per channel beyond the bigsize walk and `channel_type`'s mapping to named channel types. `node_announcement.addresses` is carried verbatim (the signature covers it); `AddressIterator`/`encodeAddresses` type it.
 - **Script-form parsing** — `shutdown.scriptpubkey`'s `OP_0`/`OP_1`-`OP_16`/`OP_RETURN` allow-list is an opaque byte slice, the same "no Script interpretation" scope cut the sibling `bitcointx` module documents for `scriptSig`/`scriptPubKey`.
 
 ## Verification
@@ -184,9 +185,7 @@ Run with `scripts/modtest lnwire` (`zig build test-lnwire`, Debug and `-Doptimiz
 
 ## Backlog / deferred
 
-- **Dual-funding / interactive-tx / splicing / `stfu` / `closing_complete`+`closing_sig` message set** — what current LND/CLN/LDK peers negotiate. Effort: medium (mechanical, spec vectors exist); fits §2.
-- **BOLT#9 feature table rows not yet verified against the spec text** — dual_fund, attribution data, onion messages, provide storage, trampoline, simple close, splice, initial_routing_sync and the C/B contexts are omitted from `features.table`.
-- **zlib-compressed `short_channel_id` lists** — decode-only support would let extended queries interoperate with peers that compress (4 of the 10 spec rows). Effort: needs an inflate (no zlib/deflate module in this collection; `std.compress.flate` has a zlib-container `Decompress`); fits §2 if std is used.
+None open.
 
 ## Anchoring
 

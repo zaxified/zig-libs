@@ -8,9 +8,8 @@
 //! even = compulsory, odd = optional — and BOLT#1's "it's ok to be odd"
 //! rule means only an unknown EVEN bit makes a peer incompatible.
 //!
-//! The raw functions take bit numbers; `Feature`/`table` below add a NAMED
-//! subset of BOLT#9's assignments (only rows the author is sure of; see
-//! `table`'s doc), with `setFeature`/`hasFeature`/`checkDependencies`.
+//! The raw functions take bit numbers; `Feature`/`table` below add every NAMED
+//! row of BOLT#9's table, with `setFeature`/`hasFeature`/`checkDependencies`.
 //! Unlisted bits stay usable through the numeric functions. Every function
 //! is a pure read over (or write into) a caller-owned slice; out-of-range
 //! bits read as unset.
@@ -71,16 +70,19 @@ pub fn minimal(features: []const u8) []const u8 {
     return features[i..];
 }
 
-/// Where a feature may appear (BOLT#9 "Context" column: I, N, C, 9, B).
+/// Where a feature may appear (BOLT#9 "Context" column: I, N, C, 9, B, T; the C-/C+ variants
+/// (always odd / always even in `channel_announcement`) are not distinguished).
 pub const Contexts = packed struct {
     init: bool = false, // I: `init` message
     node_announcement: bool = false, // N
     channel_announcement: bool = false, // C
     invoice: bool = false, // 9: BOLT#11 invoice
     blinded_path: bool = false, // B
+    channel_type: bool = false, // T: used in the `channel_type` field when opening channels
 };
 
-/// Named BOLT#9 features. The value is the EVEN (compulsory) bit; the odd
+/// Named BOLT#9 features: every row of the table in `lightning/bolts` `09-features.md` (master,
+/// 2026-11), including the `ASSUMED` ones. The value is the EVEN (compulsory) bit; the odd
 /// (optional) bit is `bit + 1`. Names follow BOLT#9 without the `option_` prefix.
 pub const Feature = enum(u16) {
     data_loss_protect = 0,
@@ -92,15 +94,22 @@ pub const Feature = enum(u16) {
     payment_secret = 14,
     basic_mpp = 16,
     support_large_channel = 18,
-    anchor_outputs = 20,
-    anchors_zero_fee_htlc_tx = 22,
+    anchors = 22,
     route_blinding = 24,
     shutdown_anysegwit = 26,
+    dual_fund = 28,
     quiesce = 34,
+    attribution_data = 36,
+    onion_messages = 38,
+    zero_fee_commitments = 40,
+    provide_storage = 42,
     channel_type = 44,
     scid_alias = 46,
     payment_metadata = 48,
     zeroconf = 50,
+    simple_close = 60,
+    splice = 62,
+    onion_messages_only_channels = 66,
 
     /// The compulsory (even) bit.
     pub fn evenBit(self: Feature) usize {
@@ -120,34 +129,38 @@ pub const Row = struct {
     deps: []const Feature = &.{},
 };
 
-const ctx_in: Contexts = .{ .init = true, .node_announcement = true };
-const ctx_in9: Contexts = .{ .init = true, .node_announcement = true, .invoice = true };
-
-/// BOLT#9 rows entered here. NOT the full table: `initial_routing_sync` (odd
-/// only), `option_dual_fund`, attribution data, onion messages, provide
-/// storage, trampoline, simple close, splice and the experimental/staging
-/// bits are omitted until their numbers/dependencies are checked against the
-/// spec text. The `C`/`B` contexts are not filled in either (only `I`, `N`,
-/// `9` are), so treat `contexts` as a lower bound.
+/// BOLT#9's table, row for row (bits, `Context` column, `Dependencies` column) as in
+/// `lightning/bolts` `09-features.md` master, 2026-11. `ASSUMED` features have an empty context.
+/// Not rows of that table, hence not named here: bit 3 (`initial_routing_sync`), the bits of
+/// `option_anchor_outputs` (20/21, removed from the table in favour of `anchors`, 22/23), and
+/// experimental/staging bits (trampoline routing, ...); all stay usable through the numeric
+/// functions.
 pub const table = [_]Row{
-    .{ .feature = .data_loss_protect, .contexts = ctx_in },
-    .{ .feature = .upfront_shutdown_script, .contexts = ctx_in },
-    .{ .feature = .gossip_queries, .contexts = ctx_in },
-    .{ .feature = .var_onion_optin, .contexts = ctx_in9 },
-    .{ .feature = .gossip_queries_ex, .contexts = ctx_in, .deps = &.{.gossip_queries} },
-    .{ .feature = .static_remotekey, .contexts = ctx_in },
-    .{ .feature = .payment_secret, .contexts = ctx_in9, .deps = &.{.var_onion_optin} },
-    .{ .feature = .basic_mpp, .contexts = ctx_in9, .deps = &.{.payment_secret} },
-    .{ .feature = .support_large_channel, .contexts = ctx_in },
-    .{ .feature = .anchor_outputs, .contexts = ctx_in, .deps = &.{.static_remotekey} },
-    .{ .feature = .anchors_zero_fee_htlc_tx, .contexts = ctx_in, .deps = &.{.static_remotekey} },
-    .{ .feature = .route_blinding, .contexts = ctx_in9, .deps = &.{.var_onion_optin} },
-    .{ .feature = .shutdown_anysegwit, .contexts = ctx_in },
-    .{ .feature = .quiesce, .contexts = ctx_in },
-    .{ .feature = .channel_type, .contexts = ctx_in },
-    .{ .feature = .scid_alias, .contexts = ctx_in },
+    .{ .feature = .data_loss_protect, .contexts = .{} },
+    .{ .feature = .upfront_shutdown_script, .contexts = .{ .init = true, .node_announcement = true } },
+    .{ .feature = .gossip_queries, .contexts = .{} },
+    .{ .feature = .var_onion_optin, .contexts = .{} },
+    .{ .feature = .gossip_queries_ex, .contexts = .{ .init = true, .node_announcement = true } },
+    .{ .feature = .static_remotekey, .contexts = .{} },
+    .{ .feature = .payment_secret, .contexts = .{} },
+    .{ .feature = .basic_mpp, .contexts = .{ .init = true, .node_announcement = true, .invoice = true }, .deps = &.{.payment_secret} },
+    .{ .feature = .support_large_channel, .contexts = .{ .init = true, .node_announcement = true } },
+    .{ .feature = .anchors, .contexts = .{ .init = true, .node_announcement = true, .channel_type = true } },
+    .{ .feature = .route_blinding, .contexts = .{ .init = true, .node_announcement = true, .invoice = true } },
+    .{ .feature = .shutdown_anysegwit, .contexts = .{ .init = true, .node_announcement = true } },
+    .{ .feature = .dual_fund, .contexts = .{ .init = true, .node_announcement = true } },
+    .{ .feature = .quiesce, .contexts = .{ .init = true, .node_announcement = true } },
+    .{ .feature = .attribution_data, .contexts = .{ .init = true, .node_announcement = true, .invoice = true } },
+    .{ .feature = .onion_messages, .contexts = .{ .init = true, .node_announcement = true } },
+    .{ .feature = .zero_fee_commitments, .contexts = .{ .init = true, .node_announcement = true }, .deps = &.{.channel_type} },
+    .{ .feature = .provide_storage, .contexts = .{ .init = true, .node_announcement = true } },
+    .{ .feature = .channel_type, .contexts = .{} },
+    .{ .feature = .scid_alias, .contexts = .{ .init = true, .node_announcement = true, .channel_type = true } },
     .{ .feature = .payment_metadata, .contexts = .{ .invoice = true } },
-    .{ .feature = .zeroconf, .contexts = ctx_in, .deps = &.{.scid_alias} },
+    .{ .feature = .zeroconf, .contexts = .{ .init = true, .node_announcement = true, .channel_type = true }, .deps = &.{.scid_alias} },
+    .{ .feature = .simple_close, .contexts = .{ .init = true, .node_announcement = true }, .deps = &.{.shutdown_anysegwit} },
+    .{ .feature = .splice, .contexts = .{ .init = true, .node_announcement = true } },
+    .{ .feature = .onion_messages_only_channels, .contexts = .{ .init = true, .node_announcement = true }, .deps = &.{.onion_messages} },
 };
 
 /// The table row for `f` (every `Feature` has one).
@@ -258,23 +271,50 @@ test "named feature table: every Feature has exactly one row, deps are in-table"
     }
     try testing.expect(row(.basic_mpp).deps[0] == .payment_secret);
     try testing.expect(row(.payment_metadata).contexts.invoice and !row(.payment_metadata).contexts.init);
+    // The table is exactly the BOLT#9 rows: bits as published, ASSUMED rows without a context.
+    try testing.expectEqual(@as(usize, 25), table.len);
+    try testing.expectEqual(@as(usize, 28), Feature.dual_fund.evenBit());
+    try testing.expectEqual(@as(usize, 36), Feature.attribution_data.evenBit());
+    try testing.expectEqual(@as(usize, 38), Feature.onion_messages.evenBit());
+    try testing.expectEqual(@as(usize, 40), Feature.zero_fee_commitments.evenBit());
+    try testing.expectEqual(@as(usize, 42), Feature.provide_storage.evenBit());
+    try testing.expectEqual(@as(usize, 60), Feature.simple_close.evenBit());
+    try testing.expectEqual(@as(usize, 62), Feature.splice.evenBit());
+    try testing.expectEqual(@as(usize, 66), Feature.onion_messages_only_channels.evenBit());
+    try testing.expect(row(.anchors).contexts.channel_type and row(.scid_alias).contexts.channel_type and row(.zeroconf).contexts.channel_type);
+    try testing.expect(!row(.payment_secret).contexts.init and !row(.data_loss_protect).contexts.init);
+    try testing.expect(row(.attribution_data).contexts.invoice and row(.attribution_data).contexts.init);
+    try testing.expect(row(.simple_close).deps[0] == .shutdown_anysegwit);
+    try testing.expect(row(.zero_fee_commitments).deps[0] == .channel_type);
+    try testing.expect(row(.onion_messages_only_channels).deps[0] == .onion_messages);
 }
 
 test "checkDependencies: set but dependency missing" {
-    var buf: [7]u8 = @splat(0);
+    var buf: [9]u8 = @splat(0); // holds bit 66/67
     try testing.expectEqual(null, checkDependencies(&buf));
     try setFeature(&buf, .basic_mpp, false);
-    var r = checkDependencies(&buf).?;
+    const r = checkDependencies(&buf).?;
     try testing.expect(r.feature == .basic_mpp and r.missing == .payment_secret);
     try setFeature(&buf, .payment_secret, true);
-    r = checkDependencies(&buf).?;
-    try testing.expect(r.feature == .payment_secret and r.missing == .var_onion_optin);
-    try setFeature(&buf, .var_onion_optin, false);
     try testing.expectEqual(null, checkDependencies(&buf));
     // Either bit of the dependency's pair satisfies it; zeroconf needs scid_alias.
     try setFeature(&buf, .zeroconf, false);
     try testing.expect(checkDependencies(&buf).?.missing == .scid_alias);
     try setFeature(&buf, .scid_alias, true);
+    try testing.expectEqual(null, checkDependencies(&buf));
+    // The newer rows: simple_close needs shutdown_anysegwit, onion_messages_only_channels needs
+    // onion_messages, zero_fee_commitments needs channel_type.
+    try setFeature(&buf, .simple_close, false);
+    try testing.expect(checkDependencies(&buf).?.missing == .shutdown_anysegwit);
+    try setFeature(&buf, .shutdown_anysegwit, false);
+    try testing.expectEqual(null, checkDependencies(&buf));
+    try setFeature(&buf, .onion_messages_only_channels, true);
+    try testing.expect(checkDependencies(&buf).?.missing == .onion_messages);
+    try setFeature(&buf, .onion_messages, false);
+    try testing.expectEqual(null, checkDependencies(&buf));
+    try setFeature(&buf, .zero_fee_commitments, false);
+    try testing.expect(checkDependencies(&buf).?.missing == .channel_type);
+    try setFeature(&buf, .channel_type, true);
     try testing.expectEqual(null, checkDependencies(&buf));
     // Empty vector is consistent.
     try testing.expectEqual(null, checkDependencies(&.{}));

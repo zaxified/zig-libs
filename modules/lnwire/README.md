@@ -53,8 +53,9 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup and exact
   (`unparsed()` returns the rest); `encodeAddresses` builds the field and refuses port 0,
   non-ascending types, a second DNS name, and non-ASCII hostnames.
 - **Typed TLV records** — accessors with decode- and encode-time length checks for the known records of `init`, `open_channel`/`accept_channel`, `closing_signed`, `update_fulfill_htlc`/`update_fail_htlc`, `query_short_channel_ids`, `query_channel_range` and `channel_reestablish`; the raw `Extension` (`find(type)`) stays the lossless form (SPEC *Typed TLV records*).
+- **Newer BOLT#2 messages** (`bolt2_v2`) — `stfu`, `open_channel2`/`accept_channel2`, the interactive-tx messages, splicing, `closing_complete`/`closing_sig`, `start_batch`; **zlib-compressed lists** are read (`decodeShortIds`, `decodeTimestampPairs`, `QueryFlags.decode`).
 - **BOLT#9 feature bits** — `lnwire.features`: `isSet`, `supports` (either bit of a pair), `set`,
-  `byteLenFor`, `firstUnknownEvenBit`, `minimal`; named table (partial): `Feature`, `table`, `row`,
+  `byteLenFor`, `firstUnknownEvenBit`, `minimal`; every row of BOLT#9's table named: `Feature`, `table`, `row`,
   `setFeature`, `hasFeature`, `checkDependencies` (set feature whose dependency is missing).
 
 ## Not provided
@@ -134,8 +135,7 @@ Byte-exact against: BOLT#1 Appendix A's BigSize test vectors (all encode/decode/
 Appendix B's TLV stream test vectors (every decoding-success and decoding-failure case, including
 the ordering/duplicate-type and value-truncation vectors); `query_channel_range`/`reply_channel_range`/
 `query_short_channel_ids` against `lightning/bolts`' own `bolt07/extended-queries.json` (10 rows, both
-DECODE and ENCODE directions; 4 rows use the `COMPRESSED_ZLIB` encoding this module does not implement,
-so their compressed content is not independently reconstructed); the BOLT#1 and BOLT#2 messages, the three
+DECODE and ENCODE directions; the 4 `COMPRESSED_ZLIB` rows are decoded and compared with the arrays the file states, `bolt7_zlib_test.zig`); the BOLT#1 and BOLT#2 messages, the three
 BOLT#7 announcement/update messages (22 vectors), `channel_reestablish`, `update_fail_malformed_htlc`,
 `announcement_signatures`, `gossip_timestamp_filter` and the address-descriptor walker/encoder against
 `lightningdevkit/rust-lightning`'s encode/decode test hex (dual MIT/Apache-2.0; `lightning/bolts` carries no

@@ -613,6 +613,102 @@ pub fn verifyChannelUpdate(
     return verify_fn(ctx, digest, msg.signature, announcing_node_id);
 }
 
+// ── encoded lists: uncompressed and zlib (BOLT#7 `encoding_type` 0 / 1) ──
+
+/// `encoding_type` 1: the rest of the list is a zlib (RFC 1950) deflate stream.
+pub const ENCODING_ZLIB: u8 = 1;
+
+pub const InflateError = Allocator.Error || error{
+    /// Not a valid zlib stream (bad header, corrupt deflate data, truncated, bad Adler-32).
+    InvalidCompressedData,
+    /// The decompressed list is larger than `max_output`.
+    OutputTooLarge,
+};
+
+/// Inflates a zlib stream (decode only; this module has no compressor). The result is
+/// owned by the caller. `max_output` bounds the decompressed size, which a peer
+/// controls (a 64 KiB message inflates to far more); bytes after the end of the zlib
+/// stream are ignored, as Go's `zlib.NewReader` + `ReadAll` (lnd) does.
+pub fn inflateZlib(allocator: Allocator, compressed: []const u8, max_output: usize) InflateError![]u8 {
+    var in: std.Io.Reader = .fixed(compressed);
+    var dec = std.compress.flate.Decompress.init(&in, .zlib, &.{});
+    const out = dec.reader.allocRemaining(allocator, .limited(max_output)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => return error.OutputTooLarge,
+        error.ReadFailed => return error.InvalidCompressedData,
+    };
+    // `std.compress.flate` reads the Adler-32 trailer but does not compare it: do it here.
+    if (dec.container_metadata.zlib.adler != std.hash.Adler32.hash(out)) {
+        allocator.free(out);
+        return error.InvalidCompressedData;
+    }
+    return out;
+}
+
+pub const DecodeListError = InflateError || error{
+    /// An `encoding_type` other than 0 (uncompressed) and 1 (zlib).
+    UnsupportedEncoding,
+    /// Empty list, a length that is not a multiple of the element size, or a malformed `bigsize`.
+    InvalidEncodedList,
+};
+
+pub const ListOptions = struct {
+    /// Bound on the decompressed list size in bytes (default 1 MiB: 131072 short channel ids).
+    max_output: usize = 1 << 20,
+};
+
+/// A decoded list payload: borrowed from the message when uncompressed, inflated (owned) when not.
+const ListPayload = struct {
+    bytes: []const u8,
+    owned: ?[]u8,
+
+    fn deinit(self: ListPayload, allocator: Allocator) void {
+        if (self.owned) |o| allocator.free(o);
+    }
+};
+
+fn listPayload(allocator: Allocator, encoding_type: u8, data: []const u8, opts: ListOptions) DecodeListError!ListPayload {
+    switch (encoding_type) {
+        QueryFlags.ENCODING_UNCOMPRESSED => return .{ .bytes = data, .owned = null },
+        ENCODING_ZLIB => {
+            const inflated = try inflateZlib(allocator, data, opts.max_output);
+            return .{ .bytes = inflated, .owned = inflated };
+        },
+        else => return error.UnsupportedEncoding,
+    }
+}
+
+/// The ids of an `encoded_short_ids` field (`encoding_type` octet + the encoded list), in
+/// order, uncompressed or zlib. The slice is owned by the caller.
+pub fn decodeShortIds(allocator: Allocator, encoded: []const u8, opts: ListOptions) DecodeListError![]message.ShortChannelId {
+    if (encoded.len < 1) return error.InvalidEncodedList;
+    const payload = try listPayload(allocator, encoded[0], encoded[1..], opts);
+    defer payload.deinit(allocator);
+    if (payload.bytes.len % 8 != 0) return error.InvalidEncodedList;
+    const out = try allocator.alloc(message.ShortChannelId, payload.bytes.len / 8);
+    for (out, 0..) |*id, i| id.* = std.mem.readInt(u64, payload.bytes[i * 8 ..][0..8], .big);
+    return out;
+}
+
+/// One `encoded_timestamps` entry (BOLT#7 `timestamps_tlv`).
+pub const TimestampPair = struct { timestamp_node_id_1: u32, timestamp_node_id_2: u32 };
+
+/// The pairs of a `timestamps_tlv` record value (`encoding_type` + list), uncompressed or zlib.
+pub fn decodeTimestampPairs(allocator: Allocator, encoded: []const u8, opts: ListOptions) DecodeListError![]TimestampPair {
+    if (encoded.len < 1) return error.InvalidEncodedList;
+    const payload = try listPayload(allocator, encoded[0], encoded[1..], opts);
+    defer payload.deinit(allocator);
+    if (payload.bytes.len % 8 != 0) return error.InvalidEncodedList;
+    const out = try allocator.alloc(TimestampPair, payload.bytes.len / 8);
+    for (out, 0..) |*p, i| {
+        p.* = .{
+            .timestamp_node_id_1 = std.mem.readInt(u32, payload.bytes[i * 8 ..][0..4], .big),
+            .timestamp_node_id_2 = std.mem.readInt(u32, payload.bytes[i * 8 + 4 ..][0..4], .big),
+        };
+    }
+    return out;
+}
+
 // ── query_short_channel_ids / reply_short_channel_ids_end (261/262) ─────
 
 pub const QUERY_SHORT_CHANNEL_IDS_TYPE: u16 = 261;
@@ -639,10 +735,26 @@ pub const QueryFlags = struct {
 
     /// Walks the per-channel flag values of an uncompressed (`encoding_type`
     /// 0) list; zlib (1) and unknown encodings yield `error.UnsupportedEncoding`
-    /// (this module has no zlib, see SPEC).
+    /// (use `decode` for zlib).
     pub fn iterator(self: QueryFlags) IterError!Iterator {
         if (self.encoding_type != ENCODING_UNCOMPRESSED) return error.UnsupportedEncoding;
         return .{ .bytes = self.data };
+    }
+
+    /// The per-channel flag values of the list, uncompressed or zlib (`iterator` handles
+    /// only the uncompressed form without allocating). The slice is owned by the caller.
+    pub fn decode(self: QueryFlags, allocator: Allocator, opts: ListOptions) DecodeListError![]u64 {
+        const payload = try listPayload(allocator, self.encoding_type, self.data, opts);
+        defer payload.deinit(allocator);
+        var out: std.ArrayList(u64) = .empty;
+        errdefer out.deinit(allocator);
+        var pos: usize = 0;
+        while (pos < payload.bytes.len) {
+            const d = message.tlv.decodeBigSize(payload.bytes[pos..]) catch return error.InvalidEncodedList;
+            pos += d.consumed;
+            try out.append(allocator, d.value);
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     pub const Iterator = struct {

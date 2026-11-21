@@ -15,6 +15,7 @@ pub const tlv = @import("tlv.zig");
 pub const message = @import("message.zig");
 pub const bolt1 = @import("bolt1.zig");
 pub const bolt2 = @import("bolt2.zig");
+pub const bolt2_v2 = @import("bolt2_v2.zig");
 pub const bolt7 = @import("bolt7.zig");
 pub const features = @import("features.zig");
 
@@ -162,6 +163,9 @@ test {
     _ = message;
     _ = bolt1;
     _ = bolt2;
+    _ = bolt2_v2;
+    _ = @import("bolt2_v2_test.zig");
+    _ = @import("bolt7_zlib_test.zig");
     _ = bolt7;
     _ = features;
     _ = @import("bolt1_kat_test.zig");
