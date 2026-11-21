@@ -1232,13 +1232,19 @@ const psk_dhe_ke: u8 = 1;
 
 pub const default_cipher_suites = [_]record.CipherSuite{ .aes_256_gcm_sha384, .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
 pub const default_groups = [_]u16{ kex.x25519_mlkem768_group, kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group };
-/// Every group `Config.groups` may enable: the defaults, standalone
-/// ML-KEM-1024 (draft-ietf-tls-mlkem; rustls and BoringSSL leave it out of
-/// their defaults too — its shares are 1568 octets each way) and the RFC 7919
-/// finite-field groups ffdhe2048..ffdhe8192 (`kex.ffdhe*_group`; OpenSSL, GnuTLS,
-/// NSS and wolfSSL have them, most TLS stacks leave them out of the defaults;
-/// each costs a 2048..8192-bit modular exponentiation per handshake).
-pub const supported_groups = default_groups ++ [_]u16{kex.mlkem1024_group} ++ ffdhe_groups;
+/// Every group `Config.groups` may enable: the defaults, `extra_groups` and
+/// the RFC 7919 finite-field groups ffdhe2048..ffdhe8192 (`kex.ffdhe*_group`;
+/// OpenSSL, GnuTLS, NSS and wolfSSL have them, most TLS stacks leave them out
+/// of the defaults; each costs a 2048..8192-bit modular exponentiation per
+/// handshake).
+pub const supported_groups = default_groups ++ extra_groups ++ ffdhe_groups;
+/// The other groups `kex` computes, none in `default_groups`: standalone
+/// ML-KEM-1024, -768 and -512 (draft-ietf-tls-mlkem; OpenSSL 3.5 serves
+/// all three, rustls and BoringSSL leave them out of their defaults — an
+/// ML-KEM-1024 share is 1568 octets each way), secp521r1 (Go, OpenSSL,
+/// BoringSSL) and the NIST hybrids SecP256r1MLKEM768 and SecP384r1MLKEM1024
+/// (draft-ietf-tls-ecdhe-mlkem; Go 1.26 and OpenSSL 3.5).
+pub const extra_groups = [_]u16{ kex.mlkem1024_group, kex.secp521r1_group, kex.secp256r1_mlkem768_group, kex.secp384r1_mlkem1024_group, kex.mlkem768_group, kex.mlkem512_group };
 /// The RFC 7919 groups, smallest first. Not in `default_groups`.
 pub const ffdhe_groups = [_]u16{ kex.ffdhe2048_group, kex.ffdhe3072_group, kex.ffdhe4096_group, kex.ffdhe6144_group, kex.ffdhe8192_group };
 
@@ -7553,9 +7559,10 @@ test "FFDHE: ffdhe2048 is refused by default and served when Config.groups enabl
     for (ffdhe_groups) |g| try testing.expect(std.mem.indexOfScalar(u16, &default_groups, g) == null);
 }
 
-test "FFDHE: ffdhe_groups are exactly the five RFC 7919 code points in order, supported_groups is defaults ++ mlkem1024 ++ ffdhe" {
+test "FFDHE: ffdhe_groups are exactly the five RFC 7919 code points in order, supported_groups is defaults ++ extra ++ ffdhe" {
     try testing.expectEqualSlices(u16, &.{ 0x0100, 0x0101, 0x0102, 0x0103, 0x0104 }, &ffdhe_groups);
-    try testing.expectEqualSlices(u16, &default_groups ++ [_]u16{kex.mlkem1024_group} ++ [_]u16{ 0x0100, 0x0101, 0x0102, 0x0103, 0x0104 }, &supported_groups);
+    try testing.expectEqualSlices(u16, &.{ 0x0202, 0x0019, 0x11eb, 0x11ed, 0x0201, 0x0200 }, &extra_groups);
+    try testing.expectEqualSlices(u16, &default_groups ++ [_]u16{ 0x0202, 0x0019, 0x11eb, 0x11ed, 0x0201, 0x0200 } ++ [_]u16{ 0x0100, 0x0101, 0x0102, 0x0103, 0x0104 }, &supported_groups);
     // No group twice: a duplicate would also hide a missing one.
     for (supported_groups, 0..) |g, i| try testing.expect(std.mem.indexOfScalar(u16, supported_groups[i + 1 ..], g) == null);
 }
@@ -9570,5 +9577,29 @@ test "RFC 9149: a resumption takes resumption_count" {
         _ = try r2.hello(rec);
         try testing.expect(r2.s.isResumed());
         try testing.expectEqual(req[1], r2.s.tickets_due);
+    }
+}
+
+test "extra_groups: each is negotiated and served alone when Config.groups enables it, refused by the defaults" {
+    var prng = std.Random.DefaultPrng.init(0x0521);
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    for (extra_groups) |g| {
+        errdefer std.debug.print("group 0x{x}\n", .{g});
+        var kp: kex.KeyPair = undefined;
+        try kex.generate(g, prng.random(), &kp);
+        const ch: Hello = .{ .groups = &.{g}, .shares = &.{.{ g, kp.public[0..kp.public_len] }} };
+        const on: Config = .{ .certificate = .{ .fixed = testKey() }, .groups = &.{g}, .random = prng.random() };
+        try on.check();
+        var s: Server = undefined;
+        try accept(&s, &on, &joiner, &out, ch);
+        defer s.deinit();
+        try testing.expectEqual(@as(?u16, g), s.negotiatedGroup());
+        const off: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+        var s0: Server = .init(&off, &joiner, &out);
+        defer s0.deinit();
+        const rec = try buildRecord(testing.allocator, ch);
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.HandshakeFailure, s0.feed(rec));
     }
 }

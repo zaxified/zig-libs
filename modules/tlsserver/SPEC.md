@@ -68,9 +68,10 @@ EncryptedExtensions, Certificate, CertificateVerify, Finished → the client's F
 application data both ways and close_notify, over the record layer (header, in-place protection,
 the receive side, alerts), the ClientHello decoder and the message encoders. It handshakes with
 OpenSSL 3.5's `s_client` (ECDSA P-256/P-384/P-521, Ed25519, RSA-PSS and ML-DSA-65
-certificates; all three suites; X25519MLKEM768, X25519, secp256r1, secp384r1, ML-KEM-1024;
+certificates; all three suites; X25519MLKEM768, X25519, secp256r1, secp384r1, and the opt-in
+`extra_groups` secp521r1, SecP256r1MLKEM768, SecP384r1MLKEM1024, ML-KEM-512/768/1024;
 ALPN; with and without SNI), with Go's
-crypto/tls client (the same, Go's own defaults), with `tlsclient` and with Zig std's client;
+crypto/tls client (the same, Go's own defaults, and Go 1.26's secp521r1 and NIST hybrids), with `tlsclient` and with Zig std's client;
 `Connection` drives it over a `std.Io.Reader`/`Writer` pair; `keys.CertKeyPair` loads the
 certificate chain and private key from PEM. A client that sent no share for the chosen group
 gets a HelloRetryRequest. After the handshake KeyUpdate works both ways: a client's turns the

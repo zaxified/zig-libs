@@ -33,11 +33,13 @@ import (
 )
 
 var groupNames = map[string]tls.CurveID{
-	"X25519MLKEM768": tls.X25519MLKEM768,
-	"X25519":         tls.X25519,
-	"P-256":          tls.CurveP256,
-	"P-384":          tls.CurveP384,
-	"P-521":          tls.CurveP521,
+	"X25519MLKEM768":     tls.X25519MLKEM768,
+	"X25519":             tls.X25519,
+	"P-256":              tls.CurveP256,
+	"P-384":              tls.CurveP384,
+	"P-521":              tls.CurveP521,
+	"SecP256r1MLKEM768":  tls.SecP256r1MLKEM768,
+	"SecP384r1MLKEM1024": tls.SecP384r1MLKEM1024,
 }
 
 // fileCache holds at most one session: the one loaded from -sess-in, and
