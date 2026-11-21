@@ -347,6 +347,9 @@ formulas in nistz256's operation order, the Jacobian windowed multiply and comb)
 - **Hash-to-curve (RFC 9380 `P256_XMD:SHA-256_SSWU_RO_`) as a point API here.** The reference, OpenSSL 3.5.5, has none,
   nor do std and Go's `crypto/ecdh` (RustCrypto's `p256` does, behind a feature); the collection's RFC 9380 hashing to
   the NIST curves lives with its consumer, `voprf` (`src/h2c.zig`, the P256-SHA256 suite with the RFC's vectors).
+- **A build option to drop the fixed-base comb table** (the `p521-base-table` trade). The table is 43 × 32 affine
+  points = 88 064 bytes, under the ~100 KB a size knob has to save (CONVENTIONS §4.2), before counting the
+  variable-base code that would replace it.
 - **A self-hosted-backend compile in the module's checks.** No gate or CI lane uses the self-hosted backend (edit loop
   only). That backend builds the portable field path: `fast_core.supported` is false under it (its assembler rejects
   `movabsq` and it runs out of registers in `addRegs`/`subRegs`; see the `self-hosted backend:` comment there), and a

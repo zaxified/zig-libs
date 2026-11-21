@@ -35,7 +35,7 @@ operation (ECDH 0.97×, sign 0.74×, verify 0.84×) and 3–5× faster than Go's
 same host; RFC 6979 signatures byte-identical to OpenSSL's; ctgrind-checked
 secret paths and a dead-stack burn (neither Go nor RustCrypto states a machine check).
 **Where we are behind:** no measured fastest (aws-lc's s2n-bignum kernels; the portable field
-multiply has no MULX/ADX path → Backlog), no hash-to-curve (→ Backlog; none of the compared
+multiply has no MULX/ADX path → Backlog), no hash-to-curve (→ *What is deliberately not done*; none of the compared
 libraries ships it for P-521 either). Key codecs (PKCS#8/SPKI/PEM) deliberately live with the
 consumers, as Go keeps them in `crypto/x509`.
 
@@ -51,7 +51,7 @@ is that curve, with std's API shape so the consumers swap a type.
 Wired into ssh, x509, jwt, hpke and acme (their `p521` dependency).
 
 **Not here:** asm; hash-to-curve (RFC 9380
-P521_XMD:SHA-512_SSWU, needed by voprf's P521 suite; *Backlog*); PKCS#8/SPKI key codecs
+P521_XMD:SHA-512_SSWU, which `voprf` implements for its P521 suite; *What is deliberately not done*); PKCS#8/SPKI key codecs
 (the consumers own their ASN.1); point compression on the ECDH *output*
 (ECDH returns the x-coordinate only, as SEC 1 specifies).
 
@@ -246,6 +246,9 @@ Performance line is measured on it.
   arithmetic, held by the differential and the bound test.
 - **No ECDH object**: a function `ecdh`/`ecdhInto` next to `P521.mul`, as std
   has no ECDH type for its NIST curves either (owner, 2026-10-10).
+- **Hash-to-curve (RFC 9380 `P521_XMD:SHA-512_SSWU_RO_`) as a point API here.** The reference, OpenSSL 3.5.5, has none, nor
+  do std and Go's `crypto/ecdh`; the collection's RFC 9380 hashing to the NIST curves lives with its consumer, `voprf`
+  (`src/h2c.zig`, generic over the three curves, with the RFC's vectors).
 
 ## Backlog / deferred
 
@@ -255,7 +258,5 @@ Performance line is measured on it.
 - **amd64 MULX/ADX field multiply** — the portable u128 schoolbook only
   (LLVM spills it: 543 instructions for 81 `mulx`). The lever for P1 (fastest
   ≤ 1.25×) once aws-lc is measured.
-- **Hash-to-curve (RFC 9380 P521_XMD:SHA-512_SSWU_RO_)** — for voprf's
-  P521-SHA512 suite.
 - **Measure the fastest in the field** — aws-lc's P-521
   (s2n-bignum) is the likely candidate; until then the card says `fastest ?`.

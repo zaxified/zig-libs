@@ -35,7 +35,7 @@ representation (`Fe` converts one to one) and std's API shape; at or below OpenS
 measured operation and about twice Go's speed on the same host; RFC 6979 signatures byte-identical
 to OpenSSL's; ctgrind-checked secret paths and a dead-stack burn. **Where we are behind:** no
 measured fastest (aws-lc); no hash-to-curve in this module (RFC 9380 P384_XMD:SHA-384_SSWU — RustCrypto has it; `voprf` carries its own
-built on `Fe`; → Backlog); asm only on amd64 with ADX, BMI2 and AVX (elsewhere the portable product, ~1.4× slower field).
+built on `Fe`; → *What is deliberately not done*); asm only on amd64 with ADX, BMI2 and AVX (elsewhere the portable product, ~1.4× slower field).
 Key codecs (PKCS#8/SPKI/PEM) deliberately live with the consumers, as in `p521`.
 
 ## What this module is, and what it is not
@@ -221,11 +221,13 @@ ECDH (about 11 %; safegcd would halve it).
   points would cost every compile minutes) — the same numbers as tlsclient's former
   `p384_base_table.zig`, which this module's table replaced (tlsclient's P-384 key share, ECDHE,
   client-cert signing and server-signature verify run here).
-
 - **A build option to drop the fixed-base table** (the `p521-base-table` trade). Measured: with the table left out
   (key generation on `mulCt(basePoint, s)`), a ReleaseSmall key-generation probe shrank 197 424 → 140 080 B, a gain of
   57 344 B — under the ~100 KB a knob has to save (CONVENTIONS §4.2 practice), because the table's 119 808 bytes are
   partly paid back by the variable-base code that replaces it. No consumer has asked.
+- **Hash-to-curve (RFC 9380 `P384_XMD:SHA-384_SSWU_RO_`) as a point API here.** The reference, OpenSSL 3.5.5, has none, nor
+  do std and Go's `crypto/ecdh`; the collection's RFC 9380 hashing to the NIST curves lives with its consumer, `voprf`
+  (`src/h2c.zig`, generic over the three curves, with the RFC's vectors).
 
 ## Open
 
@@ -237,5 +239,4 @@ ECDH (about 11 %; safegcd would halve it).
 - **Faster scalar inversion** — Fermat costs ~480 Montgomery products per signature; safegcd or
   blinding.
 - **ECDH's two field inversions** (table batch + affine output) — ~10 % of an ECDH.
-- **Hash-to-curve (RFC 9380 P384_XMD:SHA-384_SSWU_RO_)** in this module — `voprf` implements it for its P384-SHA384 suite on `Fe`; a shared implementation here is not built.
 - **Measure the fastest in the field** (aws-lc) — until then `fastest ?`.
