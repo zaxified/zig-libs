@@ -578,19 +578,19 @@ foreign SA master computes the same.
 
 ## Backlog / deferred
 
-- **Secure Authentication, what the outstation integration leaves out:** the SAv5/SAv6
+- **Secure Authentication, what the outstation integration leaves out** (BOUNCED: the object layouts and procedures are in IEEE 1815-2012 Annex A / SAv5-SAv6 text, which is paywalled and not in hand): the SAv5/SAv6
   asymmetric update-key change (g120 v8/v10-v15), the g122 security-statistic *events* (g121 reads
   are served), authenticated responses in the monitoring direction,
   AES-GMAC as the challenge MAC (its IV derivation is out of scope in `sa.zig`), the master
   side.
-- **Open questions for the SA integration** (each needs the standard's text or a foreign
-  implementation to settle): (a) which bytes count as "the key-status message" in the g120v6
+- **Open questions for the SA integration** (BOUNCED: each needs the standard's text or a foreign
+  implementation to settle, neither available): (a) which bytes count as "the key-status message" in the g120v6
   wrapped data (object body, whole object or ASDU) and the padding byte (the decision itself is in
   *Key-wrap layout*); (b) what the g120v5 MAC covers (here: the received g120v6 object, under the new
   monitoring key, only in the confirmation); (c) the exact default critical-function table;
   (d) whether a reply may carry a sequence number other than the challenged request's; (e) the
   aggressive-mode MAC input (here: last challenge message || request up to g120v9).
-- **Portable ctgrind trap counts for `keys5`** include std soft-AES pad-lane definedness
+- **Portable ctgrind trap counts for `keys5`** (BOUNCED: waits on a std change, external): include std soft-AES pad-lane definedness
   reaching post-verdict public plaintext (`sa.zig` unwrap); revisit if std stops padding with
   undefined.
 
