@@ -142,15 +142,15 @@ fn recOf(local: i64) Rec {
 fn genLocal(arena: std.mem.Allocator, r: std.Random, zone: *const tz.Zone, lo: i64, hi: i64) ![]Rec {
     const out = try arena.alloc(Rec, per_zone);
     var first: usize = 0;
-    while (first < zone.trans.len and zone.trans[first].ts < lo) first += 1;
+    while (first < zone.len() and zone.tsAt(first) < lo) first += 1;
     var last = first;
-    while (last < zone.trans.len and zone.trans[last].ts < hi) last += 1;
+    while (last < zone.len() and zone.tsAt(last) < hi) last += 1;
     for (out) |*o| {
         var local = r.intRangeLessThan(i64, lo, hi);
         if (last > first and r.uintLessThan(u8, 10) == 0) {
             const k = first + r.uintLessThan(usize, last - first);
-            const before: i64 = if (k == 0) zone.init_off else zone.trans[k - 1].off;
-            local = zone.trans[k].ts + before + r.intRangeAtMost(i64, -7200, 7200);
+            const before: i64 = if (k == 0) zone.init_off else zone.at(k - 1).off;
+            local = zone.tsAt(k) + before + r.intRangeAtMost(i64, -7200, 7200);
         }
         o.* = recOf(local);
     }

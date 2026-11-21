@@ -107,7 +107,7 @@ pub fn zoneWithFooter(posix: []const u8) tz.Zone {
         .name = "Fuzz/Zone",
         .init_off = 0,
         .init_dst = false,
-        .trans = &[_]tz.Transition{},
+        .trans = &.{},
         .posix = posix,
     };
 }

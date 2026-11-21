@@ -43,18 +43,22 @@ pub const Zone = struct {
     init_off: i32,
     init_dst: bool,
     init_abbr: u16 = 0,        // offset into the table's abbreviation string
-    trans: []const Transition, // sorted ascending by ts
+    trans: []const Compact,    // 1970..2037 changes, 8 bytes each, ascending
+    pre: []const Transition = &.{}, // changes before `trans` (tz.full history, or a hand-built zone's)
     posix: []const u8,         // POSIX-TZ footer string
     footer: ?*const Footer = null,  // `posix`, parsed at generation time
     canonical: ?[]const u8 = null,  // set for links (aliases)
 };
 pub const Transition = struct { ts: i64, off: i32, dst: bool, abbr: u16 = 0 };
+pub const Compact = extern struct { ts: u32, info: u32 }; // Transition packed; .unpack() reads it back
+// Zone.len() / .at(i) / .tsAt(i): the i-th change over `pre` then `trans`.
 pub const zones: []const Zone; // all 598 zones, sorted by name
 ```
 
 A zone built by hand (a test, a caller's own `TZ` string) leaves `footer`
 null: `offsetAt` then parses `posix` per call, as it did before the footer
-was stored. Every shipped zone has `footer` set and `offsetAt` never re-parses.
+was stored (`tz.parseFooter(posix)` makes the stored one). A hand-built zone puts
+its changes in `pre`, whose entries have an `i64` time. Every shipped zone has `footer` set and `offsetAt` never re-parses.
 
 `find` binary-searches `zones` by name (case-sensitive, matching IANA
 spelling exactly). `offsetAt`:
@@ -123,13 +127,14 @@ tz.abbrevAt(z, -3_000_000_000); // "PMT"
 ```
 
 Its zones go through every function of the module (the two tables share one
-abbreviation table and agree from 1970 on). A program that never references
-`tz.full` does not contain it; one that does pays about +78 KB in ReleaseSmall.
+abbreviation table and agree from 1970 on; a full zone shares the default zone's `trans`
+array and adds the pre-1970 `pre`). A program that never references `tz.full` does not
+contain it; one that does pays about +78 KB in ReleaseSmall.
 
 ## Not provided
 
 Loading the system's TZif files (zone data come only from the pinned IANA release), a zoned date-time type and
-Windows zone names; see `SPEC.md` *What is deliberately not done*. Open size ideas are in *Backlog / deferred*.
+Windows zone names; see `SPEC.md` *What is deliberately not done*.
 
 ## Regenerating the data
 

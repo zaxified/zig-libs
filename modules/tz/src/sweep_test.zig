@@ -46,7 +46,7 @@ test "hand-built zone with a footer at the i64 edges never panics (sweep TZ-1)" 
 
 test "abbrevAt: a hand-built state with an abbreviation index past the table is empty (sweep TZ-2)" {
     const trans = [_]tz.Transition{.{ .ts = 100, .off = 3600, .dst = false, .abbr = std.math.maxInt(u16) }};
-    const z: tz.Zone = .{ .name = "Test/abbr", .init_off = 0, .init_dst = false, .init_abbr = std.math.maxInt(u16), .trans = &trans, .posix = "" };
+    const z: tz.Zone = .{ .name = "Test/abbr", .init_off = 0, .init_dst = false, .init_abbr = std.math.maxInt(u16), .pre = &trans, .posix = "" };
     try testing.expectEqualStrings("", tz.abbrevAt(&z, 0));
     try testing.expectEqualStrings("", tz.abbrevAt(&z, 200));
     try testing.expectEqualStrings("", tz.nextTransition(&z, 0).?.abbr);

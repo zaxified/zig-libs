@@ -10,14 +10,18 @@ const posix = @import("posix");
 // baseline `init_*`), plus each zone's POSIX-TZ footer — as text and parsed
 // (`posix.parse`, the same parser the module uses at run time) — for dates
 // past the last transition. The `full` variant keeps the history before 1970
-// (down to the first, local-mean-time state). The generated files are the pin
-// — regenerate when bumping the tzdata release.
+// (down to the first, local-mean-time state), as `Zone.pre`: tz_data_full.zig
+// holds only those pre-1970 changes and the initial states, and takes every
+// other field (including the 1970..2037 `trans` arrays) from tz_data.zig. The
+// post-1970 changes are stored packed (`Compact`, 8 bytes). The generated
+// files are the pin — regenerate when bumping the tzdata release.
 //
 // Checks that fail the run (a table that looks regenerated and is not is the
 // failure this tool exists to prevent): every zone has a footer, every footer
 // parses, every link target exists, no 4-day window holds more offset changes
-// than the module's `Changes` buffer can take, and the abbreviation table
-// fits the 16-bit index.
+// than the module's `Changes` buffer can take, the abbreviation table fits the
+// 11-bit index of a `Compact`, every post-1970 change time fits a `u32`, and
+// the full table's changes after the epoch are the default table's.
 
 /// Default table: drop everything at or before the epoch (baseline captured).
 const cutoff_default: i64 = 0;
@@ -121,13 +125,11 @@ pub fn main(init: std.process.Init) !void {
         for (z.trans) |t| _ = try abbrevs.intern(arena, t.abbr);
     };
 
-    inline for (.{ false, true }) |full| {
-        const path: ?[]const u8 = if (full) full_path else out_path;
-        if (path) |p| {
-            const zones = if (full) zones_full else zones_default;
-            try emit(gpa, io, p, version, zones, &abbrevs, full);
-            std.debug.print("tz-gen: {d} zones from tzdata {s} -> {s}\n", .{ zones.len, version, p });
-        }
+    try emit(gpa, io, out_path, version, zones_default, &abbrevs);
+    std.debug.print("tz-gen: {d} zones from tzdata {s} -> {s}\n", .{ zones_default.len, version, out_path });
+    if (full_path) |p| {
+        try emitFull(gpa, io, p, version, zones_full, zones_default, &abbrevs);
+        std.debug.print("tz-gen: {d} zones from tzdata {s} -> {s}\n", .{ zones_full.len, version, p });
     }
 }
 
@@ -292,7 +294,11 @@ const Abbrevs = struct {
     }
 };
 
-fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []const u8, zones: []const ZoneOut, abbrevs: *const Abbrevs, full: bool) !void {
+/// `types.Compact`'s bounds, checked here so the generated `make` calls cannot fail to compile.
+const compact_max_abbr: u16 = 2047;
+const compact_off_limit: i32 = 1 << 19;
+
+fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []const u8, zones: []const ZoneOut, abbrevs: *const Abbrevs) !void {
     var out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
     defer out_file.close(io);
     var wbuf: [128 * 1024]u8 = undefined;
@@ -310,22 +316,11 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
         \\//
         \\
     , .{version});
-    if (full) {
-        try w.writeAll(
-            \\// FULL variant: every offset/DST/abbreviation change zic emits, back to the
-            \\// zone's first (local mean time) state, which is `init_*`. Reached through
-            \\// `tz.full`; compiled only into a program that uses it.
-            \\
-        );
-    } else {
-        try w.writeAll(
-            \\// Per-zone UTC-offset/DST/abbreviation transitions from 1970 onward
-            \\// (`init_*` is the state in effect at the epoch; earlier history is folded
-            \\// into it -- `tz_data_full.zig` keeps it).
-            \\
-        );
-    }
     try w.writeAll(
+        \\// Per-zone UTC-offset/DST/abbreviation transitions from 1970 onward
+        \\// (`init_*` is the state in effect at the epoch; earlier history is folded
+        \\// into it -- `tz_data_full.zig` keeps it), in the packed 8-byte form
+        \\// (`Compact`: `c(ts, off, dst, abbr)`).
         \\// `posix` is the zone's POSIX-TZ footer rule, applied for instants after the
         \\// last explicit transition; `footer` is the same rule parsed at generation
         \\// time. `abbr`/`init_abbr` are byte offsets into `abbrevs` (one table for
@@ -333,31 +328,29 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
         \\
         \\const types = @import("types.zig");
         \\pub const Transition = types.Transition;
+        \\pub const Compact = types.Compact;
         \\pub const Zone = types.Zone;
         \\const Footer = types.Footer;
+        \\const c = Compact.make;
         \\
         \\
     );
 
-    if (full) {
-        try w.writeAll("/// The shared abbreviation table (tz_data.zig).\npub const abbrevs = @import(\"tz_data.zig\").abbrevs;\n\n");
-    } else {
-        try w.writeAll("/// NUL-terminated abbreviations; offset 0 is the empty string.\n");
-        try w.writeAll("pub const abbrevs: []const u8 =\n");
-        {
-            // One literal per abbreviation, a few per line.
-            var col: usize = 0;
-            try w.writeAll("    \"\\x00\"");
-            var at: usize = 1;
-            while (at < abbrevs.blob.items.len) {
-                const end = std.mem.findScalarPos(u8, abbrevs.blob.items, at, 0).?;
-                if (col % 8 == 7) try w.writeAll("\n    ++ ") else try w.writeAll(" ++ ");
-                try w.print("\"{s}\\x00\"", .{abbrevs.blob.items[at..end]});
-                col += 1;
-                at = end + 1;
-            }
-            try w.writeAll(";\n\n");
+    try w.writeAll("/// NUL-terminated abbreviations; offset 0 is the empty string.\n");
+    try w.writeAll("pub const abbrevs: []const u8 =\n");
+    {
+        // One literal per abbreviation, a few per line.
+        var col: usize = 0;
+        try w.writeAll("    \"\\x00\"");
+        var at: usize = 1;
+        while (at < abbrevs.blob.items.len) {
+            const end = std.mem.findScalarPos(u8, abbrevs.blob.items, at, 0).?;
+            if (col % 8 == 7) try w.writeAll("\n    ++ ") else try w.writeAll(" ++ ");
+            try w.print("\"{s}\\x00\"", .{abbrevs.blob.items[at..end]});
+            col += 1;
+            at = end + 1;
         }
+        try w.writeAll(";\n\n");
     }
 
     // Footers, deduplicated by their text.
@@ -397,7 +390,7 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
             continue;
         }
         var text: std.Io.Writer.Allocating = .init(arena);
-        try emitTransBody(&text.writer, abbrevs, z.trans);
+        try emitCompactBody(&text.writer, abbrevs, z.name, z.trans);
         const key = text.written();
         if (dedup.get(key)) |idx| {
             syms[i] = idx;
@@ -407,7 +400,7 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
         next_sym += 1;
         syms[i] = idx;
         try dedup.put(arena, key, idx);
-        try w.print("const t{d} = [_]Transition{{\n{s}}};\n", .{ idx, key });
+        try w.print("const t{d} = [_]Compact{{\n{s}}};\n", .{ idx, key });
     }
 
     try w.writeAll("pub const zones = [_]Zone{\n");
@@ -418,18 +411,132 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
         if (syms[i]) |idx| {
             try w.print("&t{d}", .{idx});
         } else {
-            try w.writeAll("&[_]Transition{}");
+            try w.writeAll("&.{}");
         }
         try w.writeAll(", .posix = ");
         try emitStr(w, z.posix);
         try w.print(", .footer = &ft{d}", .{footer_of[i]});
-        if (z.canonical) |c| {
+        if (z.canonical) |cn| {
             try w.writeAll(", .canonical = ");
-            try emitStr(w, c);
+            try emitStr(w, cn);
         }
         try w.writeAll(" },\n");
     }
     try w.writeAll("};\n");
+    try w.flush();
+}
+
+/// tz_data_full.zig: per zone the initial (local mean time) state and the
+/// changes up to the epoch (`pre`); everything else, `trans` included, is the
+/// default table's zone. The changes after the epoch must be the default
+/// table's, or the two tables would disagree.
+fn emitFull(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    out_path: []const u8,
+    version: []const u8,
+    full: []const ZoneOut,
+    default: []const ZoneOut,
+    abbrevs: *const Abbrevs,
+) !void {
+    if (full.len != default.len) return error.TablesDiffer;
+    var out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+    defer out_file.close(io);
+    var wbuf: [128 * 1024]u8 = undefined;
+    var fw = out_file.writer(io, &wbuf);
+    const w = &fw.interface;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try w.print(
+        \\// SPDX-License-Identifier: MIT
+        \\// GENERATED by scripts/gen/tz-gen from IANA tzdata {s} (public domain). DO NOT EDIT.
+        \\// Regenerate: scripts/gen/tz-gen/fetch-and-build.sh
+        \\//
+        \\// FULL variant: every offset/DST/abbreviation change zic emits, back to the
+        \\// zone's first (local mean time) state, which is `init_*`. Reached through
+        \\// `tz.full`; compiled only into a program that uses it. Per zone this file
+        \\// holds only that state and the changes up to the epoch (`pre`); every other
+        \\// field, the 1970..2037 `trans` array included, is the zone of tz_data.zig.
+        \\// `abbr`/`init_abbr` are byte offsets into the shared `abbrevs`.
+        \\
+        \\const types = @import("types.zig");
+        \\const default = @import("tz_data.zig");
+        \\const Transition = types.Transition;
+        \\
+        \\/// The shared abbreviation table (tz_data.zig).
+        \\pub const abbrevs = default.abbrevs;
+        \\
+        \\
+    , .{version});
+
+    var dedup: std.StringHashMapUnmanaged(usize) = .empty;
+    const syms = try arena.alloc(?usize, full.len);
+    var next_sym: usize = 0;
+    for (full, default, 0..) |z, d, i| {
+        if (!std.mem.eql(u8, z.name, d.name) or !std.mem.eql(u8, z.posix, d.posix)) return error.TablesDiffer;
+        // Split at the epoch; the part after it is the default table's list.
+        var n_pre: usize = 0;
+        while (n_pre < z.trans.len and z.trans[n_pre].ts <= cutoff_default) n_pre += 1;
+        const post = z.trans[n_pre..];
+        if (post.len != d.trans.len) {
+            std.debug.print("tz-gen: {s}: full table has {d} changes after the epoch, default {d}\n", .{ z.name, post.len, d.trans.len });
+            return error.TablesDiffer;
+        }
+        for (post, d.trans) |a, b| {
+            if (a.ts != b.ts or a.off != b.off or a.dst != b.dst or !std.mem.eql(u8, a.abbr, b.abbr)) {
+                std.debug.print("tz-gen: {s}: change at {d} differs between the tables\n", .{ z.name, a.ts });
+                return error.TablesDiffer;
+            }
+        }
+        if (n_pre == 0) {
+            syms[i] = null;
+            continue;
+        }
+        var text: std.Io.Writer.Allocating = .init(arena);
+        try emitTransBody(&text.writer, abbrevs, z.trans[0..n_pre]);
+        const key = text.written();
+        if (dedup.get(key)) |idx| {
+            syms[i] = idx;
+            continue;
+        }
+        const idx = next_sym;
+        next_sym += 1;
+        syms[i] = idx;
+        try dedup.put(arena, key, idx);
+        try w.print("const p{d} = [_]Transition{{\n{s}}};\n", .{ idx, key });
+    }
+
+    try w.writeAll(
+        \\
+        \\const Over = struct { init_off: i32, init_dst: bool, init_abbr: u16, pre: []const Transition };
+        \\const over = [_]Over{
+        \\
+    );
+    for (full, 0..) |z, i| {
+        try w.print("    .{{ .init_off = {d}, .init_dst = {}, .init_abbr = {d}, .pre = ", .{ z.init_off, z.init_dst, abbrevs.index.get(z.init_abbr) orelse 0 });
+        if (syms[i]) |idx| try w.print("&p{d}", .{idx}) else try w.writeAll("&.{}");
+        try w.writeAll(" },\n");
+    }
+    try w.writeAll(
+        \\};
+        \\
+        \\pub const zones = blk: {
+        \\    @setEvalBranchQuota(20_000);
+        \\    var z = default.zones;
+        \\    for (&z, over) |*e, o| {
+        \\        e.init_off = o.init_off;
+        \\        e.init_dst = o.init_dst;
+        \\        e.init_abbr = o.init_abbr;
+        \\        e.pre = o.pre;
+        \\    }
+        \\    const done = z;
+        \\    break :blk done;
+        \\};
+        \\
+    );
     try w.flush();
 }
 
@@ -447,6 +554,32 @@ fn emitTransBody(w: *std.Io.Writer, abbrevs: *const Abbrevs, trans: []const Tr) 
         if (col == 0) try w.writeAll("    ");
         const a = abbrevs.index.get(t.abbr) orelse 0;
         try w.print(".{{ .ts = {d}, .off = {d}, .dst = {}, .abbr = {d} }}, ", .{ t.ts, t.off, t.dst, a });
+        col += 1;
+        if (col == 4) {
+            try w.writeAll("\n");
+            col = 0;
+        }
+    }
+    if (col != 0) try w.writeAll("\n");
+}
+
+/// `trans` as `c(ts, off, dst, abbr)` calls, four per line. Refuses what a
+/// `Compact` cannot hold: a time outside `i32`, an offset beyond 20 bits, an
+/// abbreviation index past 11 bits.
+fn emitCompactBody(w: *std.Io.Writer, abbrevs: *const Abbrevs, zone: []const u8, trans: []const Tr) !void {
+    var col: usize = 0;
+    for (trans) |t| {
+        const ts = std.math.cast(u32, t.ts) orelse {
+            std.debug.print("tz-gen: {s}: change at {d} does not fit a u32\n", .{ zone, t.ts });
+            return error.TransitionBeyondU32;
+        };
+        const a = abbrevs.index.get(t.abbr) orelse 0;
+        if (a > compact_max_abbr or t.off < -compact_off_limit or t.off >= compact_off_limit) {
+            std.debug.print("tz-gen: {s}: change at {d} does not fit a Compact (abbr {d}, off {d})\n", .{ zone, t.ts, a, t.off });
+            return error.TransitionNotCompact;
+        }
+        if (col == 0) try w.writeAll("    ");
+        try w.print("c({d}, {d}, {}, {d}), ", .{ ts, t.off, t.dst, a });
         col += 1;
         if (col == 4) {
             try w.writeAll("\n");

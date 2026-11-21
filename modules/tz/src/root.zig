@@ -34,9 +34,12 @@ pub const meta = .{
 };
 
 pub const Zone = tz_data.Zone;
-/// A stored table entry (`Zone.trans`). `nextTransition`/`prevTransition`
-/// answer with a `Change`, which carries the abbreviation as text.
+/// A table entry in its full form (`Zone.pre`, and `Zone.at(i)` for any entry;
+/// the shipped `Zone.trans` stores it packed as `Compact`).
+/// `nextTransition`/`prevTransition` answer with a `Change`, which carries the
+/// abbreviation as text.
 pub const Transition = tz_data.Transition;
+pub const Compact = tz_data.Compact;
 pub const Footer = posix.Footer;
 
 /// Parse a POSIX-TZ footer (`CET-1CEST,M3.5.0,M10.5.0/3`) for a zone built by
@@ -117,21 +120,34 @@ fn fromTrans(t: Transition) Located {
 /// the POSIX footer.
 fn locate(zone: *const tz_data.Zone, unix: i64) Located {
     const tr = zone.trans;
+    const pre = zone.pre;
     const init: Located = .{ .off = zone.init_off, .dst = zone.init_dst, .abbr = .{ .idx = zone.init_abbr } };
-    if (tr.len == 0) return footerLocated(zone, unix) orelse init;
-    if (unix < tr[0].ts) return init;
-    if (unix >= tr[tr.len - 1].ts) {
-        // Past the last explicit transition — apply the POSIX-TZ footer rule.
-        return footerLocated(zone, unix) orelse fromTrans(tr[tr.len - 1]);
+    if (tr.len > 0 and unix >= tr[0].ts) {
+        if (unix >= tr[tr.len - 1].ts) {
+            // Past the last explicit transition — apply the POSIX-TZ footer rule.
+            return footerLocated(zone, unix) orelse fromTrans(tr[tr.len - 1].unpack());
+        }
+        // Rightmost transition with ts <= unix (unix is within [tr[0], tr[last])).
+        var lo: usize = 0;
+        var hi: usize = tr.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (tr[mid].ts <= unix) lo = mid + 1 else hi = mid;
+        }
+        return fromTrans(tr[lo - 1].unpack());
     }
-    // Rightmost transition with ts <= unix (unix is within [tr[0], tr[last])).
+    if (pre.len == 0) return if (tr.len == 0) footerLocated(zone, unix) orelse init else init;
+    if (unix < pre[0].ts) return init;
+    // Before `trans` (or no `trans`): the rightmost `pre` change at or before `unix`.
+    if (tr.len == 0 and unix >= pre[pre.len - 1].ts)
+        return footerLocated(zone, unix) orelse fromTrans(pre[pre.len - 1]);
     var lo: usize = 0;
-    var hi: usize = tr.len;
+    var hi: usize = pre.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (tr[mid].ts <= unix) lo = mid + 1 else hi = mid;
+        if (pre[mid].ts <= unix) lo = mid + 1 else hi = mid;
     }
-    return fromTrans(tr[lo - 1]);
+    return fromTrans(pre[lo - 1]);
 }
 
 /// UTC offset (+ DST flag) in `zone` at the given Unix instant.
@@ -294,21 +310,21 @@ fn footerChanges(f: *const Footer, y0: i64, y1: i64, out: *[8]i64) []const i64 {
 /// POSIX footer's DST starts and ends. The table starts at 1970: for an
 /// earlier instant the answer is the first change since 1970.
 pub fn nextTransition(zone: *const tz_data.Zone, unix: i64) ?Change {
-    const tr = zone.trans;
-    if (tr.len > 0 and unix < tr[tr.len - 1].ts) {
+    const n = zone.len();
+    if (n > 0 and unix < zone.tsAt(n - 1)) {
         // First transition with ts > unix.
         var lo: usize = 0;
-        var hi: usize = tr.len;
+        var hi: usize = n;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (tr[mid].ts <= unix) lo = mid + 1 else hi = mid;
+            if (zone.tsAt(mid) <= unix) lo = mid + 1 else hi = mid;
         }
-        const t = tr[lo];
+        const t = zone.at(lo);
         return .{ .ts = t.ts, .off = t.off, .dst = t.dst, .abbr = abbrText(.{ .idx = t.abbr }) };
     }
     var storage: Footer = undefined;
     const f = footerOf(zone, &storage) orelse return null;
-    const after = if (tr.len > 0) @max(unix, tr[tr.len - 1].ts) else unix;
+    const after = if (n > 0) @max(unix, zone.tsAt(n - 1)) else unix;
     const y: i64 = datefmt.unixToParts(after).year;
     var buf: [8]i64 = undefined;
     for (footerChanges(f, y - 1, y + 1, &buf)) |t| {
@@ -320,20 +336,20 @@ pub fn nextTransition(zone: *const tz_data.Zone, unix: i64) ?Change {
 /// The last change of `zone` strictly before `unix`, or null when there is
 /// none (before the table's first entry, or a zone that never changed).
 pub fn prevTransition(zone: *const tz_data.Zone, unix: i64) ?Change {
-    const tr = zone.trans;
-    if (tr.len > 0 and unix <= tr[tr.len - 1].ts) {
+    const n = zone.len();
+    if (n > 0 and unix <= zone.tsAt(n - 1)) {
         // First transition with ts >= unix; the one before it is the answer.
         var lo: usize = 0;
-        var hi: usize = tr.len;
+        var hi: usize = n;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (tr[mid].ts < unix) lo = mid + 1 else hi = mid;
+            if (zone.tsAt(mid) < unix) lo = mid + 1 else hi = mid;
         }
         if (lo == 0) return null;
-        const t = tr[lo - 1];
+        const t = zone.at(lo - 1);
         return .{ .ts = t.ts, .off = t.off, .dst = t.dst, .abbr = abbrText(.{ .idx = t.abbr }) };
     }
-    const last_ts: i64 = if (tr.len > 0) tr[tr.len - 1].ts else std.math.minInt(i64);
+    const last_ts: i64 = if (n > 0) zone.tsAt(n - 1) else std.math.minInt(i64);
     var storage: Footer = undefined;
     if (footerOf(zone, &storage)) |f| {
         const y: i64 = datefmt.unixToParts(unix).year;
@@ -345,8 +361,8 @@ pub fn prevTransition(zone: *const tz_data.Zone, unix: i64) ?Change {
             if (ch[i] < unix and ch[i] > last_ts) return changeAt(zone, ch[i]);
         }
     }
-    if (tr.len > 0) {
-        const t = tr[tr.len - 1];
+    if (n > 0) {
+        const t = zone.at(n - 1);
         return .{ .ts = t.ts, .off = t.off, .dst = t.dst, .abbr = abbrText(.{ .idx = t.abbr }) };
     }
     return null;
@@ -517,15 +533,15 @@ const Changes = struct {
 /// POSIX-footer changes of the years around.
 fn walkChanges(zone: *const tz_data.Zone, lo: i64, hi: i64, sink: anytype) void {
     {
-        const tr = zone.trans;
+        const n = zone.len();
         // First transition with ts >= lo.
         var a: usize = 0;
-        var b: usize = tr.len;
+        var b: usize = n;
         while (a < b) {
             const mid = a + (b - a) / 2;
-            if (tr[mid].ts < lo) a = mid + 1 else b = mid;
+            if (zone.tsAt(mid) < lo) a = mid + 1 else b = mid;
         }
-        while (a < tr.len and tr[a].ts <= hi) : (a += 1) sink.add(tr[a].ts);
+        while (a < n and zone.tsAt(a) <= hi) : (a += 1) sink.add(zone.tsAt(a));
         var storage: Footer = undefined;
         const f = footerOf(zone, &storage) orelse return;
         if (f.dst == null) return;
@@ -724,8 +740,9 @@ fn checkLocal(z: *const Zone, local: i64) !void {
 test "resolveLocal: around EVERY explicit transition of EVERY zone, the defining property holds" {
     var checked: usize = 0;
     for (&tz_data.zones) |*z| {
-        for (z.trans, 0..) |t, i| {
-            const before: i32 = if (i == 0) z.init_off else z.trans[i - 1].off;
+        for (0..z.len()) |i| {
+            const t = z.at(i);
+            const before: i32 = if (i == 0) z.init_off else z.at(i - 1).off;
             const lo = t.ts + @min(before, t.off);
             const hi = t.ts + @max(before, t.off);
             for ([_]i64{ lo - 1, lo, lo + @divTrunc(hi - lo, 2), hi - 1, hi }) |l| {
@@ -791,21 +808,22 @@ test "every shipped zone: stored footer == footer parsed per call (same answers)
 }
 
 test "no shipped zone truncates a resolveLocal window" {
-    for (&tz_data.zones) |*z| {
-        for (z.trans) |t| {
+    for ([_][]const Zone{ &tz_data.zones, &full.zones }) |table| for (table) |*z| {
+        for (0..z.len()) |i| {
+            const ts = z.tsAt(i);
             var c: Changes = .{};
-            c.collect(z, t.ts - local_window, t.ts + local_window);
+            c.collect(z, ts - local_window, ts + local_window);
             try testing.expect(!c.truncated);
             try testing.expect(c.len <= 8);
         }
         var c: Changes = .{};
         c.collect(z, 2_300_000_000 - local_window, 2_300_000_000 + local_window);
         try testing.expect(!c.truncated);
-    }
+    };
     // A hand-built zone with more changes than the buffer holds is flagged, not silent.
     var many: [40]Transition = undefined;
     for (&many, 0..) |*t, i| t.* = .{ .ts = 1000 + @as(i64, @intCast(i)) * 60, .off = @intCast(i % 2 * 3600), .dst = i % 2 == 1 };
-    const z = Zone{ .name = "Test/many", .init_off = 0, .init_dst = false, .trans = &many, .posix = "" };
+    const z = Zone{ .name = "Test/many", .init_off = 0, .init_dst = false, .pre = &many, .posix = "" };
     var c: Changes = .{};
     c.collect(&z, 0, 5000);
     try testing.expect(c.truncated);
@@ -817,7 +835,7 @@ test "resolveLocal: a hand-built zone with more changes than the buffer holds is
     // truncates, `resolveExact` answers. The oracle scans every instant an offset of 0 or 3600 could name.
     var many: [40]Transition = undefined;
     for (&many, 0..) |*t, i| t.* = .{ .ts = 100_000 + @as(i64, @intCast(i)) * 60, .off = @intCast(i % 2 * 3600), .dst = i % 2 == 1 };
-    const z = Zone{ .name = "Test/many", .init_off = 0, .init_dst = false, .trans = &many, .posix = "" };
+    const z = Zone{ .name = "Test/many", .init_off = 0, .init_dst = false, .pre = &many, .posix = "" };
     var c: Changes = .{};
     c.collect(&z, 0, 200_000);
     try testing.expect(c.truncated);
@@ -967,12 +985,14 @@ test "tz_data_full: same footer era, same history since 1970, LMT before" {
             const t = r.intRangeAtMost(i64, 0, 2_800_000_000);
             try testing.expectEqual(offsetAt(z, t), offsetAt(fzone, t));
         }
-        if (fzone.trans.len > z.trans.len) older += 1;
-        // Everything the default table knows is the tail of the full one.
-        try testing.expect(fzone.trans.len >= z.trans.len);
-        for (z.trans, fzone.trans[fzone.trans.len - z.trans.len ..]) |a, b| {
-            try testing.expectEqual(a.ts, b.ts);
-            try testing.expectEqual(a.off, b.off);
+        if (fzone.pre.len > 0) older += 1;
+        // The 1970..2037 table is the default table's own array, not a copy.
+        try testing.expectEqual(z.trans.ptr, fzone.trans.ptr);
+        try testing.expectEqual(z.trans.len, fzone.trans.len);
+        // Everything in `pre` is at or before the epoch, ascending.
+        for (fzone.pre, 0..) |p, k| {
+            try testing.expect(p.ts <= 0);
+            if (k > 0) try testing.expect(p.ts > fzone.pre[k - 1].ts);
         }
     }
     try testing.expect(older > 300);
@@ -1047,11 +1067,12 @@ test "offsetAt: the exact transition instant already carries the NEW offset" {
     // Prague's first transition: 1970-05-31 22:00:00Z, CEST begins (+7200,
     // DST). Picking the very first entry keeps "old offset" unambiguous:
     // it is `z.init_off`/`z.init_dst`, not some earlier transition.
-    const ts = tr[0].ts;
+    const first = tr[0].unpack();
+    const ts = first.ts;
     try testing.expectEqual(z.init_off, offsetAt(z, ts - 1).off);
     try testing.expectEqual(z.init_dst, offsetAt(z, ts - 1).dst);
-    try testing.expectEqual(tr[0].off, offsetAt(z, ts).off);
-    try testing.expectEqual(tr[0].dst, offsetAt(z, ts).dst);
+    try testing.expectEqual(first.off, offsetAt(z, ts).off);
+    try testing.expectEqual(first.dst, offsetAt(z, ts).dst);
 }
 
 test "offsetAt: fixed UTC" {
@@ -1075,7 +1096,7 @@ test "posix footer: Jn Julian-day rule — day 59 is Feb 28 regardless of leap y
         .name = "Test/Jn",
         .init_off = 0,
         .init_dst = false,
-        .trans = &[_]Transition{},
+        .trans = &.{},
         .posix = "XST0XDT,J59/0,J300/0",
     };
     // 2023 (non-leap): Feb 28 2023 00:00:00Z == 1677542400.
@@ -1097,7 +1118,7 @@ test "posix footer: n zero-based day-of-year rule — counts Feb 29 in leap year
         .name = "Test/n",
         .init_off = 0,
         .init_dst = false,
-        .trans = &[_]Transition{},
+        .trans = &.{},
         .posix = "YST0YDT,59/0,300/0",
     };
     // 2023 (non-leap): index 59 == March 1 2023 00:00:00Z == 1677628800.
@@ -1118,14 +1139,14 @@ test "posix footer: leap-year positive control — Jn and n resolve to different
         .name = "Test/Jn2",
         .init_off = 0,
         .init_dst = false,
-        .trans = &[_]Transition{},
+        .trans = &.{},
         .posix = "XST0XDT,J59/0,J300/0",
     };
     const yd = Zone{
         .name = "Test/n2",
         .init_off = 0,
         .init_dst = false,
-        .trans = &[_]Transition{},
+        .trans = &.{},
         .posix = "YST0YDT,59/0,300/0",
     };
     const feb28_2024 = 1709078400; // 2024-02-28T00:00:00Z

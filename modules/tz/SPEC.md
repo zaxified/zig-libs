@@ -70,8 +70,16 @@ Python's `fold=0` behave as `compatible`. The policy is a required argument.
   footer's names are used. Zones tzdata gives no letters appear as the sign and digits without angle brackets
   (`+05`, `-03`, `+0530`). A hand-built state whose index lies past the table gives the empty string, not a bounds
   panic. The default table and `tz.full` share this one table.
-- **Pre-1970 history** (`tz.full`: `find`, `zones`): the generator also emits `tz_data_full.zig`, every change back to
-  each zone's local mean time, and the two tables agree from 1970 on. The default table starts at 1970 on purpose
+- **Table storage**: the shipped changes after the epoch (`Zone.trans`) are `Compact`, 8 bytes: `ts` a `u32` (1970 to
+  2106; the latest shipped change is Morocco's, 2087), `off` 20 bits signed, `dst` and an 11-bit `abbr`; the
+  generator refuses a change that does not fit. Against 16 bytes per entry this cut the compiled-in table from 351 KB
+  to 213 KB (`nm -S` over a ReleaseSmall consumer, 2026-11-21: 18,364 entries, 276 shared arrays), `offsetAt`
+  stayed as fast (A/B interleaved, 8 pairs: 33-40 ns vs 38-44 ns; `resolveLocal` 155-172 ns vs 156-181 ns, no
+  difference). A zone's changes before `trans[0]` live in `Zone.pre` (`Transition`, `i64`), the home of the pre-1970
+  history and of a hand-built zone's whole table; `Zone.len/at/tsAt` read `pre` then `trans` as one sequence.
+- **Pre-1970 history** (`tz.full`: `find`, `zones`): the generator also emits `tz_data_full.zig`, per zone the local
+  mean time state and the changes up to the epoch (`pre`); every other field, the `trans` array included, is the
+  default table's zone, so the two tables agree from 1970 on by construction and the generator refuses a difference. The default table starts at 1970 on purpose
   (full history would add size for every consumer); `tz.full` is paid only by a program that references it, so no
   build option is needed. Its zones go through every function of the module.
 - **Transitions** (`nextTransition`, `prevTransition`, `Change`): the table, then the footer's DST starts and ends;
@@ -159,15 +167,10 @@ approximation, not a crash).
 
 ## Backlog / deferred
 
-- **R8: delta-encoded transitions, shared alias tables** (effort M; after R2/R3, to be measured). Store transition
-  times as `i32` deltas from a per-zone epoch (or a varint) instead of `i64` absolutes at 16 B per entry after
-  alignment: touches `scripts/gen/tz-gen` (emit deltas) and `offsetAt` (rebuild the absolute time inside the binary
-  search); a pure size win to be measured against the decode cost, and it would make `tz.full` cheaper.
-- **Build option: zone data subset** (mechanism and checklist in CONVENTIONS §4.2). `src/tz_data.zig` is 1 MB of
-  source (~0.45 MB in a binary, estimate); measure first (an HTTPS sizeprobe or `nm -S --size-sort` on a consumer
-  binary) and add a knob only for a measured gain of roughly >= 100 KB or a consumer request. `.small` options: a
-  zone allow-list (`tz-zones=Europe/*,UTC`) or system zoneinfo only — a capability cut, so an unknown zone must
-  return an error, never fall back to UTC silently. Unmeasured.
+- **Build option: zone data subset** (CONVENTIONS §4.2; `tz-zones=Europe/*,UTC`, an unknown zone must stay an error,
+  never a UTC fallback). The compiled-in table is 213 KB (measured, see Table storage), so a subset would save well
+  over the 100 KB bar. Open: `-Dprofile=small` must give the size probe a measurable gain and a zone cut has no safe
+  default meaning for it. Waits on a decision.
 
 ## Anchoring
 
