@@ -12,7 +12,90 @@
 
 const std = @import("std");
 const casefold = @import("casefold.zig");
-const tables = @import("unicode_tables.zig");
+const full_tables = @import("unicode_tables.zig");
+const zl_options = @import("zl_options");
+
+/// `-Dregex_unicode=go`: build in only the tables Go's `regexp` names plus
+/// the ones the engine itself uses — as Rust's `regex-syntax` lets a build
+/// drop its `unicode-*` features (`unicode-script`, `unicode-age`,
+/// `unicode-bool`, `unicode-segment`, …), shrinking the tables. A Rust-only
+/// property then fails with `error.UnicodeTableNotBuilt`.
+const go_only = zl_options.regex_unicode == .go;
+const tables = if (go_only) reduced_tables else full_tables;
+
+/// The keys the engine looks up itself (`isRustAlphabetic`, `isRustNumeric`,
+/// `replace.zig`'s `\pL`/`\p{Nd}`), kept in every build.
+const engine_keys = [_][]const u8{ "alphabetic", "n", "l", "nd" };
+
+/// The names and tables of `full_tables` that Go lists or the engine needs,
+/// compacted: `data` holds only the kept tables, `bases` and `names` are
+/// renumbered.
+const reduced_tables = blk: {
+    @setEvalBranchQuota(50_000_000);
+    const F = full_tables;
+    var keep_name: [F.names.len]bool = @splat(false);
+    var keep_base: [F.bases.len]bool = @splat(false);
+    var n_names: usize = 0;
+    for (F.names, 0..) |nm, i| {
+        var k = nm.go;
+        for (engine_keys) |e| {
+            if (std.mem.eql(u8, nm.name, e)) k = true;
+        }
+        if (k) {
+            keep_name[i] = true;
+            keep_base[nm.base] = true;
+            n_names += 1;
+        }
+    }
+    keep_base[F.perl_word] = true;
+    keep_base[F.perl_space] = true;
+    keep_base[F.perl_digit] = true;
+    var map: [F.bases.len]u16 = @splat(0);
+    var n_bases: usize = 0;
+    var n_data: usize = 0;
+    for (F.bases, 0..) |b, i| {
+        if (!keep_base[i]) continue;
+        map[i] = @intCast(n_bases);
+        n_bases += 1;
+        n_data += b.size;
+    }
+    var d_arr: [n_data]u8 = undefined;
+    var b_arr: [n_bases]F.Base = undefined;
+    var n_arr: [n_names]F.Name = undefined;
+    var di: usize = 0;
+    var bi: usize = 0;
+    for (F.bases, 0..) |b, i| {
+        if (!keep_base[i]) continue;
+        @memcpy(d_arr[di..][0..b.size], F.data[b.offset..][0..b.size]);
+        b_arr[bi] = .{ .offset = @intCast(di), .size = b.size, .count = b.count };
+        di += b.size;
+        bi += 1;
+    }
+    var ni: usize = 0;
+    for (F.names, 0..) |nm, i| {
+        if (!keep_name[i]) continue;
+        n_arr[ni] = .{ .name = nm.name, .base = map[nm.base], .go = nm.go };
+        ni += 1;
+    }
+    const final_data = d_arr;
+    const final_bases = b_arr;
+    const final_names = n_arr;
+    const final_map = map;
+    break :blk struct {
+        pub const Name = F.Name;
+        pub const data = final_data;
+        pub const bases = final_bases;
+        pub const names = final_names;
+        pub const props = [_]F.Prop{};
+        pub const perl_word: u16 = final_map[F.perl_word];
+        pub const perl_space: u16 = final_map[F.perl_space];
+        pub const perl_digit: u16 = final_map[F.perl_digit];
+    };
+};
+
+/// What a Rust-grammar property that is not found reports: in a `go` build the
+/// name may exist but not be built in.
+const rust_missing_class: Error = if (go_only) error.UnicodeTableNotBuilt else error.InvalidUnicodeClass;
 
 /// Where bytes-mode instructions keep a raw byte past ASCII: `byte_base + b`,
 /// past every code point (a range is all bytes or all code points).
@@ -83,6 +166,8 @@ pub const Error = error{
     /// `\p{Name}` with a name that is not a Unicode general category, its
     /// alias, a script or `Any`; or a `\p{` with no `}`.
     InvalidUnicodeClass,
+    /// A Rust-grammar Unicode property whose table a `-Dregex_unicode=go` build left out (or an unknown name: that build cannot tell the two apart).
+    UnicodeTableNotBuilt,
 };
 
 /// An inclusive range of code points.
@@ -1437,7 +1522,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 try b.addRustProperty(query[0..i], query[i + 1 ..]);
             } else {
                 var key: [max_class_name]u8 = undefined;
-                try b.addBase(findName(rustNormalize(query, &key)) orelse return error.InvalidUnicodeClass);
+                try b.addBase(findName(rustNormalize(query, &key)) orelse return rust_missing_class);
             }
             if (flags.fold) try b.foldFromWith(casefold, start);
             b.normalizeFrom(start);
@@ -1453,7 +1538,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             const prop = rustNormalize(name, &nbuf);
             const id = for (tables.props) |p| {
                 if (std.mem.eql(u8, p.name, prop)) break p.id;
-            } else return error.InvalidUnicodeClass;
+            } else return rust_missing_class;
             var vbuf: [max_class_name]u8 = undefined;
             const v = rustNormalize(value, &vbuf);
             var kbuf: [2 * max_class_name]u8 = undefined;
@@ -1462,7 +1547,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             kbuf[id.len] = '=';
             @memcpy(kbuf[id.len + 1 ..][0..v.len], v);
             const key = kbuf[0 .. id.len + 1 + v.len];
-            try b.addBase(findName(key) orelse return error.InvalidUnicodeClass);
+            try b.addBase(findName(key) orelse return rust_missing_class);
         }
 
         /// Append the ranges of `tables.bases[base]`.
@@ -2235,4 +2320,28 @@ test "foldNext: no fold is the identity, orbits close, the alternating-run parit
     try testing.expectEqual(@as(u21, 0x100), foldNext(0x101));
     // `(cp + run.lo) & 1` (the same parity as `cp - run.lo`) stays in a u21.
     for (casefold.runs) |run| if (run.alt) try testing.expect(@as(u32, run.hi) * 2 < (1 << 21));
+}
+
+test "regex_unicode: the build's tables, and what a go build refuses" {
+    const root = @import("root.zig");
+    const gpa = std.testing.allocator;
+    // Go's names and the Perl classes work in every build.
+    var go = try root.Regex.compile(gpa, "\\p{Greek}+\\pL");
+    defer go.deinit(gpa);
+    try std.testing.expect(go.isMatch("αβγx"));
+    var perl = try root.Regex.compileOptions(gpa, "\\w+\\d", .{ .syntax = .rust });
+    defer perl.deinit(gpa);
+    try std.testing.expect(perl.isMatch("é9"));
+    if (go_only) {
+        // A Rust-only property, by name and as `prop=value`: not built.
+        try std.testing.expectError(error.UnicodeTableNotBuilt, root.Regex.compileOptions(gpa, "\\p{Emoji}", .{ .syntax = .rust }));
+        try std.testing.expectError(error.UnicodeTableNotBuilt, root.Regex.compileOptions(gpa, "\\p{scx=Grek}", .{ .syntax = .rust }));
+        // The tables are a fraction of the full ones.
+        try std.testing.expect(tables.data.len * 3 < full_tables.data.len);
+    } else {
+        var emoji = try root.Regex.compileOptions(gpa, "\\p{Emoji}", .{ .syntax = .rust });
+        defer emoji.deinit(gpa);
+        try std.testing.expect(emoji.isMatch("😀"));
+        try std.testing.expectEqual(full_tables.data.len, tables.data.len);
+    }
 }

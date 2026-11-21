@@ -586,6 +586,11 @@ pub fn build(b: *std.Build) void {
         "profile",
         "Consumer build profile: default (speed+security, as graded) | small (code size)",
     ) orelse .default);
+    zl_options.addOption(RegexUnicode, "regex_unicode", b.option(
+        RegexUnicode,
+        "regex_unicode",
+        "regex: Unicode tables built in, full (default: every property of the Rust grammar) | go (only what Go's regexp lists and the Perl classes need; the rest of the tables is left out, a Rust-only property fails with error.UnicodeTableNotBuilt)",
+    ) orelse .full);
     // Knobs: fingerprint-exempt because each is null unless a `-D` sets it (the
     // lane key carries those), and only a module's own source gives it meaning.
     // fingerprint-exempt: begin
@@ -2000,6 +2005,9 @@ var selected_modules: []const []const u8 = &.{};
 /// and documents it in its SPEC § "Build options"; a module without such a
 /// trade-off ignores it. See CONVENTIONS.md § "Consumer build options".
 pub const Profile = enum { default, small };
+
+/// `-Dregex_unicode`: how much of the Unicode property data `regex` builds in.
+pub const RegexUnicode = enum { full, go };
 
 /// The `zl_options` module: the consumer's build options as comptime values.
 /// Imported by every compilation of a module's OWN sources (published module,

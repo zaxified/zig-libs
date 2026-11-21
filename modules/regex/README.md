@@ -160,6 +160,11 @@ next four bytes). Compiling the deepest accepted pattern
 fits a 512 KiB thread stack in Debug. A `Matcher` keeps a
 pointer to its `Regex`: do not move the `Regex` while a `Matcher` uses it.
 
+## Build option
+
+`-Dregex_unicode=go` leaves out the Unicode property tables only the Rust grammar uses (Go's names
+and `\w \s \d` stay); a missing property is `error.UnicodeTableNotBuilt`. Default `full`.
+
 ## Not provided
 
 Backreferences, lookaround, atomic groups, possessive quantifiers and recursion (they need backtracking), full case folding, RE2's `ANCHOR_BOTH`/Latin-1 mode/`FilteredRE2`; open items are listed in SPEC "Backlog / deferred", the refusals with their reasons in "What is deliberately not done".

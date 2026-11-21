@@ -225,6 +225,15 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   A bytes-mode `Regex` reads byte by byte through a window of the last and next four bytes
   (`BytesReader`: what `bytesBefore` and the sequence decoder look at), so the same engines
   serve a slice and a reader.
+- **Unicode tables** (`unicode_tables.zig`, 94 KB, every property the Rust grammar names) are built in
+  whole by default. `-Dregex_unicode=go` builds in only the tables Go's `regexp` lists plus the Perl
+  classes and the few the engine looks up itself (`\w \s \d`, `l`, `n`, `nd`, `alphabetic`), compacted at
+  compile time (`reduced_tables`, a fraction of the size); a Rust-grammar property that is then missing
+  — `\p{Emoji}`, `\p{scx=Grek}` — fails with `error.UnicodeTableNotBuilt` (that build cannot tell a
+  left-out table from an unknown name). It follows Rust's `regex-syntax`, whose `unicode-*` crate features
+  (`unicode-age`, `unicode-bool`, `unicode-gencat`, `unicode-perl`, `unicode-script`, `unicode-segment`)
+  drop the same data and make such a class a compile error. Case folding is unaffected. The default,
+  `full`, is today's behaviour.
 - **`ByteAutomaton`** (`Regex` as a byte-stepping automaton over whole keys): the shape `trie.search`
   takes (`State`, `start`, `accept`, `isMatch`, `canMatch`, `willAlwaysMatch`), after `regex-automata`
   in `fst`. The state is a bit set of live instructions (≤ 128) plus up to three bytes of a code
@@ -325,9 +334,6 @@ All open.
   `\b\w+\b` written for `.rust` is far slower than the same pattern in `.perl`. Rust keeps its lazy DFA and quits on a
   byte past ASCII; here the DFA contexts would need a Unicode-word class (start/word/other/newline/CR) and a quit to the
   VMs. Same for bytes mode (`Options.utf8 = false`), which has no prefilter either.
-- **Unicode tables cost every consumer 94 KB** — the grammar is chosen at run time, so `unicode_tables.zig` (every property
-  the Rust grammar names) is linked even into a program that only ever compiles `.perl` patterns (the Go-generated tables were
-  11 KB). A build option or a comptime-known grammar could leave the Rust-only properties out.
 - **Programs past `4 * max_insts`** (owner: no consumer setting may end in a panic or an OOM) — Go and Rust compile
   them; here `error.PatternTooLarge`, because `isMatch` has no allocator and a `Matcher` for 65,534 instructions x 64
   groups would be ~134 MiB. Taking them back needs matching in bounded memory for any size (a windowed or chunked state
