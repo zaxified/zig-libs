@@ -103,6 +103,8 @@ pub const meta = .{
 
 pub const handle = @import("handle.zig");
 pub const ratespec = @import("ratespec.zig");
+/// Derived `red` / `sfq`-RED parameters (`wlog`, `plog`, `scell_log`, `stab`, `max_p`).
+pub const redparams = @import("redparams.zig");
 pub const qdisc = @import("qdisc.zig");
 pub const filter = @import("filter.zig");
 pub const action = @import("action.zig");
@@ -1999,6 +2001,7 @@ test {
     // not pull x's tests into the test binary.
     _ = handle;
     _ = ratespec;
+    _ = redparams;
     _ = qdisc;
     _ = filter;
     _ = action;

@@ -70,6 +70,7 @@ parser, and the client-side `ifindex`/`parent` filtering (`ParentMatch`).
 |---|---|
 | `handle.zig` | `Handle` (`major:minor`), `TC_H_*`, `TC_H_MAKE`, hex parse/format |
 | `ratespec.zig` | `Psched` calibration, `tc_ratespec`, the 256-entry rate tables |
+| `redparams.zig` | derived `red` / `sfq`-RED parameters (`wlog`, `plog`, `scell_log`, `stab`, `max_p`) |
 | `qdisc.zig` | every qdisc kind's option encode+decode (netem, htb, tbf, fq_codel, mq, ingress, clsact, cake, prio, pfifo/bfifo, sfq, codel, fq, hfsc, red), statistics decoding, `Qdisc`/`Class` parsing |
 | `filter.zig` | u32, flower, matchall and bpf encode+decode, `tcm_info` packing, `Filter` parsing |
 | `action.zig` | the `TCA_ACT_*` list, `tc_gen`/`TC_ACT_*`, gact/mirred/police/skbedit/vlan |
@@ -350,8 +351,24 @@ All are typed with goldens captured from iproute2 6.19.0 (attribute order read o
   which is why `buildQdiscSet` pads after the options nest (`message.zig`). `red` is `TCA_RED_PARMS` (the
   16-octet `tc_red_qopt`, flags octet 0), `STAB` (`red_stab_len` = 256), `MAX_P` (when `max_p` is set),
   `FLAGS` (a bitfield32 with `red_supported_flags` = 0x0f as selector), in that order. `wlog`, `plog`,
-  `scell_log` and `stab` are the caller's: `tc` derives them from `burst`/`avpkt`/`probability`/`bandwidth`
-  and the derivation is not reproduced (same for `sfq` RED). The kernel does not dump `stab`.
+  `scell_log` and `stab` are the caller's, or come from `redparams.deriveRed` (below); same for `sfq` RED
+  (`redparams.deriveSfqRed`, which sets `scell_log` 0 as `tc` does). The kernel does not dump `stab`.
+- **Derived RED parameters** (`redparams.zig`): `deriveRed(RedParams, Psched)` returns what `tc qdisc add … red`
+  sends from the words of the man page (`limit`, `min`, `max`, `avpkt`, `burst`, `probability`, `bandwidth`),
+  and `deriveSfqRed` the `sfq` equivalent. Reference: Floyd and Jacobson, "Random Early Detection gateways for
+  Congestion Avoidance" (1993) for the weight; the rest are `tc`'s conventions, established as a black box
+  (unmodified iproute2 6.19 under `strace`, about 1 000 parameter sets; `tools/red_oracle.py` is the recipe, no
+  iproute2 source was read), and every row of the tables in the tests (74 `red`, 8 `sfq`, 96 weight rows)
+  agrees. The man page gives the defaults (`max` = `limit`/4, `min` = `max`/3, `probability` 0.02, `bandwidth`
+  10 Mbit/s, `burst` ≈ (2·`min` + `max`)/(3·`avpkt`) rounded down); a `min` given without `max` makes
+  `max` 3·`min` for `red` and `limit`/4 for `sfq`; 0 means "not given". `wlog` is the smallest `w` in 1..31 with
+  `burst + 1 − min/avpkt ≤ (1 − (1 − 2^−w)^burst)/2^−w` (`≤`; `f64`, the power in `f128`); a burst below
+  `min/avpkt` is `error.BurstTooSmall`. `plog` is the smallest `p` in 0..31 with `(max − min)/probability < 2^p`.
+  `max_p` is `probability · 2^32` cut to 32 bits (1.0 gives 0, as `tc` sends it). `scell_log` is the smallest
+  `c` in 0..31 with `256·K·2^c/T ≥ 15.5` (31 when none), `K = −ln(1 − 2^−wlog)` and `T` the transmit time of one
+  `avpkt` at `bandwidth` in psched ticks, rounded up; `stab[i]` (i < 255) is `trunc(K·(i << scell_log)/T)` with the
+  shift taken as a signed 32-bit number (a negative result and anything above 31 read as 31) and `stab[255]` is 31.
+  A `probability` above 1 is refused here; `tc` accepts it and wraps `max_p`.
 - **`matchall` and `bpf` classifiers** (`FilterSpec.matchall` / `.bpf`, `Filter.matchall` / `.bpf`):
   matchall sends CLASSID, ACT, FLAGS (`skip_sw` = 2, `skip_hw` = 1); `bpf` carries an inline classic-BPF
   program (`BpfInsn`, 1..`bpf_max_insns`) and sends CLASSID, ACT, OPS_LEN, OPS, FLAGS_GEN, FLAGS
@@ -522,11 +539,7 @@ Unverified gaps (the code exists, nothing observes it against the real thing):
 
 ## Backlog / deferred
 
-- **RED parameter derivation.** `tc` derives `wlog`, `plog`, `scell_log` and the 256-octet `stab` from
-  `burst`/`avpkt`/`probability`/`bandwidth` for `red` and `sfq` RED; the caller supplies them. Reproducing
-  it needs either iproute2's source (GPL, not read) or a permissively licensed statement of the formulas;
-  the man page gives the recipe only in words, and the RED paper (Floyd and Jacobson 1993) gives the weight's
-  inequality but not `tc`'s `plog`, `scell_log` and `stab` conventions. Waits for such a statement.
+None open.
 
 ## Verification
 

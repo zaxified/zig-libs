@@ -1408,8 +1408,8 @@ pub const tc_sfq_qopt_v1_len = 72;
 
 /// The RED part of `sfq` (`redflowlimit`/`min`/`max`/`avpkt`/`burst`/
 /// `probability`/`ecn`/`harddrop`), as the **wire fields** of
-/// `struct tc_sfq_qopt_v1`. `tc` derives `wlog`, `plog` and `scell_log` from
-/// `burst`/`avpkt`/`min`/`max`; this module does not, so the caller supplies
+/// `struct tc_sfq_qopt_v1`. `redparams.deriveSfqRed` derives `wlog`, `plog` and
+/// `max_p` from `burst`/`avpkt`/`min`/`max` as `tc` does, or the caller supplies
 /// them (the golden shows `burst 55 avpkt 1000 min 30000 max 90000 probability
 /// 0.4` as 5, 18, 0 and `max_p` = 0x66666666).
 pub const SfqRed = struct {
@@ -1733,7 +1733,7 @@ pub const red_stab_len = 256;
 
 /// Random early detection (`red`). `tc` derives `wlog`, `plog`, `scell_log` and
 /// the 256-octet idle-damping table `stab` from `burst`/`avpkt`/`probability`
-/// (and `bandwidth`); that derivation is NOT reproduced here, so the caller
+/// (and `bandwidth`); `redparams.deriveRed` does the same, or the caller
 /// supplies them (the kernel refuses a `red` without `stab`). `max_p` is
 /// `probability * 2^32`.
 pub const Red = struct {

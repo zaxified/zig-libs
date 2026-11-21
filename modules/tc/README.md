@@ -10,7 +10,9 @@ Zig with no `tc` binary shell-out and no libc.
   ACK-filter, overhead/MPU/ATM, memory, split-GSO, fwmark, ingress), the classic `prio`,
   `pfifo`/`bfifo`, `sfq`, `codel`, `fq`, `hfsc`, `red`, `pfifo_fast` and `pfifo_head_drop`, size
   tables (`stab`), and a `raw` escape hatch that takes a kind string and a pre-encoded
-  `TCA_OPTIONS` payload; netem also has loss models, slots, distributions and a 64-bit rate.
+  `TCA_OPTIONS` payload; netem also has loss models, slots, distributions and a 64-bit rate;
+  `redparams` derives a `red` (or `sfq` RED) qdisc's `wlog`, `plog`, `scell_log`, `stab` and `max_p` from
+  `limit`/`min`/`max`/`avpkt`/`burst`/`probability`/`bandwidth` as `tc` does.
 - **classes** (`RTM_NEWTCLASS`/`DELTCLASS`/`GETTCLASS`) — htb rate/ceil token buckets
   including the psched **rate tables** and the 64-bit `TCA_HTB_RATE64`/`CEIL64`
   attributes for rates above 4.29 GB/s; hfsc service curves.
