@@ -181,8 +181,9 @@ different prologue, so their bytes do not apply to tenantkex's transcript.)
   bump; a fresh handshake is simply a new tenantkex session. No scheduler here.
 * **Retransmission / timeout** of handshake messages — owned by the caller's
   transport (the WG-backed channel), not this module.
-* **Noise Pipes' `XXfallback`** (§10.2 role switch) — not built; see *Backlog / deferred*. The XX full handshake
-  exists as an explicit mode (§7), chosen by the caller.
+* **Noise Pipes' `XXfallback`** (§10.2 role switch) — would need `noise`'s `fallback` modifier, which `noise` does
+  not implement (its reference snow omits it, as do flynn/noise and WireGuard). The XX full handshake exists as an
+  explicit mode (§7), chosen by the caller; a stale responder key costs a new XX handshake.
 
 ## 7. XX mode
 
@@ -283,10 +284,7 @@ wipe: `wipe()`), `FabricContext` (public), and a `noise` build whose DH leaves m
 
 ## Backlog / deferred
 
-- **Noise Pipes `XXfallback` (§10.2 role switch)** — an IK attempt with a stale responder key recovering in the same
-  exchange instead of a new XX handshake. Depends on a `fallback` modifier in `noise` (its SPEC: deferred); snow
-  (which implements every Noise feature except `fallback`), flynn/noise and WireGuard lack it too. Effort: medium
-  (noise) + small (here).
+None open.
 
 ## Anchoring
 
