@@ -125,8 +125,10 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
   makes no by-value copy of SK.seed / SK.prf; `keyGenFromSeed`, `signInternal` and `sign`
   run their body one frame down and zero the stack it dirtied (`src/burn.zig`).
   `src/stackprobe_test.zig` (ReleaseFast only) scans a 1 MiB window below the call for
-  SK.seed, SK.prf, the HMAC key blocks of PRF_msg and the top-layer WOTS+ chain-start
-  secrets; 0 residue, negative control 0, positive control found. The caller's own
+  SK.seed, SK.prf, the HMAC key blocks of PRF_msg, the top-layer WOTS+ chain-start
+  secrets and, after `sign`/`signInternal`, unrevealed FORS leaf secrets (eight next to the
+  revealed leaf in the first and the last FORS tree; the probe recomputes H_msg from the
+  signature's `R` and checks it against every revealed leaf first); 0 residue, negative control 0, positive control found. The caller's own
   copy of the key (the `KeyPair` it passed in) is, as before, its to wipe.
 - **Deterministic vs hedged signing:** `addrnd = null` is the FIPS 205
   deterministic variant (opt_rand = PK.seed). FIPS 205 recommends hedged
@@ -195,10 +197,6 @@ pinned in this tree.
 
 ## Backlog / deferred
 
-- **Stack probe does not recompute FORS leaf secrets.** They sit at a message-dependent address (the tree and leaf come
-  out of H_msg), which the probe would have to reimplement. The probe's SK.seed windows and the WOTS+ chain-start
-  secrets (same `F(PK.seed, ADRS, SK.seed)` step) cover the inputs and the same code path; a differential needle
-  would need H_msg exposed to tests.
 
 ## Anchoring
 

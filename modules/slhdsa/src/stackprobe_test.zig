@@ -17,10 +17,15 @@
 //!   absorbing them;
 //! - the WOTS+ chain-start secrets `F(PK.seed, ADRS, SK.seed)` (chains 0 and
 //!   1) of every leaf of the top-layer tree (address tree 0, which key
-//!   generation and every signature compute). The FORS leaf secrets live at
-//!   a message-dependent address and are not recomputed here: they come out of
-//!   the same `F(.., SK.seed)` step, so the `SK.seed` windows cover the input
-//!   they would be derived from.
+//!   generation and every signature compute);
+//! - for `sign`/`signInternal`, FORS leaf secrets `F(PK.seed, ADRS, SK.seed)`
+//!   that the signature does NOT reveal: eight per probed tree (the first and
+//!   the last of the `k` FORS trees), next to the revealed leaf. Their
+//!   address is message-dependent (`idx_tree`, `idx_leaf` and the FORS
+//!   indices come out of H_msg), so the probe recomputes H_msg (FIPS 205
+//!   §11.1 SHAKE256 / §11.2 MGF1) from the signature's `R`, and proves its
+//!   recomputation right by matching every REVEALED leaf of the signature
+//!   (`forsNeedles`).
 //! Windows with fewer than 8 distinct bytes are skipped.
 //!
 //! ⛔ A zero is only readable next to the two controls in the same binary: a
@@ -364,6 +369,98 @@ fn Harness(comptime P: params.Params) type {
             }
         }
 
+        /// H_msg (FIPS 205 §11.1 / §11.2), recomputed from the signature's R.
+        fn hMsgRef(r: *const [n]u8, parts: []const []const u8) [P.m]u8 {
+            var out: [P.m]u8 = undefined;
+            if (comptime P.hash == .shake) {
+                var st = Shake256.init(.{});
+                st.update(r);
+                st.update(&key.pk.seed);
+                st.update(&key.pk.root);
+                for (parts) |x| st.update(x);
+                st.squeeze(&out);
+                return out;
+            }
+            const H = if (n == 16) Sha256 else Sha512;
+            var st = H.init(.{});
+            st.update(r);
+            st.update(&key.pk.seed);
+            st.update(&key.pk.root);
+            for (parts) |x| st.update(x);
+            var inner: [H.digest_length]u8 = undefined;
+            st.final(&inner);
+            var off: usize = 0;
+            var counter: u32 = 0;
+            while (off < P.m) : (counter += 1) {
+                var g = H.init(.{});
+                g.update(r);
+                g.update(&key.pk.seed);
+                g.update(&inner);
+                var ctr: [4]u8 = undefined;
+                std.mem.writeInt(u32, &ctr, counter, .big);
+                g.update(&ctr);
+                var block: [H.digest_length]u8 = undefined;
+                g.final(&block);
+                const take = @min(block.len, P.m - off);
+                @memcpy(out[off..][0..take], block[0..take]);
+                off += take;
+            }
+            return out;
+        }
+
+        fn beInt(bytes: []const u8) u64 {
+            var v: u64 = 0;
+            for (bytes) |b| v = (v << 8) | b;
+            return v;
+        }
+
+        /// FORS leaf secret `i` (tree index across the k trees) under the
+        /// signature's (idx_tree, idx_leaf).
+        fn forsLeaf(idx_tree: u64, idx_leaf: u32, i: u32) [n]u8 {
+            var a: address.Address = .{};
+            a.setTree(idx_tree);
+            a.setTypeAndClear(.fors_prf);
+            a.setKeyPair(idx_leaf);
+            a.setTreeIndex(i);
+            return prf(&key.pk.seed, a, &key.sk.seed);
+        }
+
+        /// Unrevealed FORS leaf secrets of the signature in `sig_sink`
+        /// (signed over `parts`); fails unless every revealed leaf matches.
+        fn forsNeedles(nd: *Needles, parts: []const []const u8) !void {
+            const digest = hMsgRef(sig_sink[0..n], parts);
+            const md = digest[0..P.mdLen()];
+            const tree_bits = P.h - P.hp;
+            const tree_mask: u64 = if (tree_bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(tree_bits)) - 1;
+            const idx_tree = beInt(digest[P.mdLen()..][0..P.idxTreeLen()]) & tree_mask;
+            const idx_leaf: u32 = @intCast(beInt(digest[P.mdLen() + P.idxTreeLen() ..][0..P.idxLeafLen()]) & ((@as(u64, 1) << P.hp) - 1));
+            // base_2^a (FIPS 205 Algorithm 4).
+            var indices: [P.k]u32 = undefined;
+            var in: usize = 0;
+            var bits: usize = 0;
+            var total: u64 = 0;
+            for (&indices) |*x| {
+                while (bits < P.a) {
+                    total = (total << 8) | md[in];
+                    in += 1;
+                    bits += 8;
+                }
+                bits -= P.a;
+                x.* = @intCast((total >> @intCast(bits)) & ((@as(u64, 1) << P.a) - 1));
+            }
+            const t: u32 = 1 << P.a;
+            for (0..P.k) |i| {
+                const leaf = forsLeaf(idx_tree, idx_leaf, @as(u32, @intCast(i)) * t + indices[i]);
+                try std.testing.expectEqualSlices(u8, sig_sink[n + i * (1 + P.a) * n ..][0..n], &leaf);
+            }
+            for ([_]usize{ 0, P.k - 1 }) |i| {
+                for (1..9) |j| {
+                    const other = indices[i] ^ @as(u32, @intCast(j));
+                    nd.addImage("FORS sk", &forsLeaf(idx_tree, idx_leaf, @as(u32, @intCast(i)) * t + other));
+                }
+            }
+        }
+
         /// The needle formula must be the engine's: a top-layer WOTS+ signature
         /// element whose digit is 0 IS the chain-start secret, so at least one
         /// recomputed secret has to appear in the signature the engine made.
@@ -416,8 +513,19 @@ fn Harness(comptime P: params.Params) type {
                 seedNeedles(&nd);
                 hmacNeedles(&nd);
                 wotsNeedles(&nd);
+                callSign();
+                try forsNeedles(&nd, &.{ &[_]u8{ 0x00, 3 }, "ctx", msg });
                 nd.sort();
                 bad += try runProbe(label ++ " sign", callSign, &nd);
+            }
+            {
+                var nd: Needles = .{};
+                seedNeedles(&nd);
+                hmacNeedles(&nd);
+                wotsNeedles(&nd);
+                callSignInternal();
+                try forsNeedles(&nd, &.{msg});
+                nd.sort();
                 bad += try runProbe(label ++ " signInternal (hedged)", callSignInternal, &nd);
             }
             {
