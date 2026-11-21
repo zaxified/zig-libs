@@ -217,7 +217,10 @@ pub const Options = struct {
     /// A hit (`get`, `pin`, `Sharded.getBuf`) and a `put` both refresh the idle
     /// deadline; the effective deadline of an entry is
     /// `min(inserted + ttl, last access + idle_ttl_ns)`. Idle expiry counts in
-    /// `Stats.expired`, like a write-TTL expiry. `<= 0` = off (the default),
+    /// `Stats.expired` when a `get` or `pin` finds the entry, like a write-TTL
+    /// expiry; an expired entry that the eviction step takes first, to make
+    /// room, counts in `Stats.evictions` (as Caffeine's `evictionCount` counts
+    /// expirations). `<= 0` = off (the default),
     /// treated exactly like `default_ttl_ns <= 0`: no assert, no clamp, simply
     /// "never expires by idleness". A `release` does not count as an access
     /// (it has no clock); the `pin` that opened the borrow did.

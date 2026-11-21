@@ -363,28 +363,37 @@ Closing it is the P1 item under *Backlog / deferred*.
 - **A random default `hash_seed` for a standalone `Cache`:** it keeps a public default (so its behaviour is
   reproducible run to run), accepted as is and documented on `Options.hash_seed`; `Sharded` seeds itself per instance.
 
+- **`drainDirty` and `on_evict` outside the shard lock; a fair lock.** Both callbacks run with the lock held, as Caffeine's
+  synchronous `evictionListener` runs inside the atomic map operation (its asynchronous `removalListener` needs an executor,
+  which the module does not take); the dirty bit and `drainDirty` are this module's own and have no reference to copy, so a
+  copy-out or bounded drain would be an invention to be asked for by a caller whose callback is slow (none is). The shard
+  lock is a test-and-set with spin and yield: no starvation was seen in the hammer tests, and a ticket lock costs the
+  uncontended path and convoys behind a descheduled holder, so it needs a contended benchmark that shows starvation first.
+- **An expiry-heap slot reserved for a borrowed entry's return.** `release` ignores an `expPush` allocation failure and the
+  entry then loses expired-first priority only (it still expires on its next `get`, and `put`/`pin` still re-file it); a
+  reservation would need a slot count kept in step on every heap push, pin, doom and release, for a state reachable
+  only on allocation failure.
+- **Expired-first eviction counted in `expired`.** It counts in `evictions`, as Caffeine's `evictionCount` counts expirations
+  (documented on `Options.idle_ttl_ns`); a lazy drop in `get`/`pin` counts in `expired`.
+- **`getOrLoad` stamping the load's completion.** The cache owns no clock; the stamp is the call's `now_ns`.
+- **`Sharded.Options.io`** (the shard lock and the single-flight wait as `std.Io` waits): the callbacks and loaders must not
+  suspend, which is documented, and no in-tree callback does; no reference cache has an `Io`.
+- **A differential oracle against `karlseguin/cache.zig`.** That cache is a plain LRU with TTL and ref-counted entries; this
+  module evicts by W-TinyLFU, so the two disagree on the hit and miss sequence as soon as the capacity bites, and without
+  capacity pressure there is nothing but TTL arithmetic left to compare, which the injected-clock model-fuzz already covers.
+
 ## Backlog / deferred
 
-- **`drainDirty`/`on_evict` hold the shard lock across the callback; the lock is an unfair test-and-set.**
-  Candidates: `drainDirtyMax`/copy-out, a ticket lock.
-- **Smaller leftovers (LOW):** `reserve` reserves no expiry-heap slot and `release` ignores `expPush` OOM (the entry
-  then loses expired-first priority); an expired-first eviction counts in `evictions`, not `expired`, against the
-  `idle_ttl_ns` doc; `getOrLoad` stamps the entry with the call's `now_ns`, not the load's completion.
+None open.
+
+## Roadmap
+
 - **P1: the fastest in the field is quick_cache, faster on every row** (`zig build bench-ramcache`; the card has the
   figures). Closing it is a design change of the hot paths, not a tuning pass: a hit that takes no exclusive lock
   and does no queue move (Caffeine's lossy read buffer drained under the lock, or a CLOCK/S3-FIFO reference bit
-  as quick_cache does), and an eviction that does not run the full W-TinyLFU contest per insert. Owner's call
-  which; a session of its own (like `sort`).
-- **`Sharded.Options.io`:** the shard lock is held across `on_evict` and the `drainDirty` callback and waits by
-  spinning/thread-yielding, so a callback that suspends in an `Io` running several tasks on one thread would hang
-  a waiter; the same holds for `Sharded.getOrLoad`: its waiters wait on the leader's flight by spinning/yielding,
-  so a `Loader` that suspends in an `Io` shared with a waiter's thread would hang that waiter. Documented as "must
-  not suspend"; no in-tree callback does. When one needs to, an optional `io` would make the shard lock an
-  `std.Io.Mutex` (the `kv.Lock` shape) and the waiters' wait an `Io` wait.
-- **Differential oracle against `karlseguin/cache.zig`** (thread-safe LRU with TTL and ref-counted entries; IDEA,
-  not scheduled). It has no wire format, so it is not a byte oracle; use it as a behavioural and benchmark reference:
-  the same get/put/expire trace should give the same hit/miss sequence, then compare throughput. It would live in
-  `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16.
+  as quick_cache does), and an eviction that does not run the full W-TinyLFU contest per insert. Size: a session of
+  its own (a rewrite of `get`, the queues and the eviction contest, with the model-fuzz and the sweeps re-run);
+  needs the owner's choice between the two designs first.
 
 ## Anchoring
 
