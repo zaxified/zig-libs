@@ -115,7 +115,7 @@ pub const Event = union(enum) {
 };
 
 const Packet = struct {
-    kind: enum { udp, icmp, syn, synack, rst },
+    kind: enum { udp, icmp, syn, synack, rst, syn_rst },
     src_host: u32,
     dst_host: u32,
     src: net.IpAddress,
@@ -641,6 +641,14 @@ pub const Net = struct {
                     .icmp => n.arriveIcmp(p),
                     .syn => n.arriveSyn(p),
                     .synack => n.arriveSynAck(p),
+                    // A SYN for a connection the server has already closed (it
+                    // never completed the handshake from the client's side): a
+                    // client still connecting is reset and can try afresh, an
+                    // established one is a late duplicate and is left alone.
+                    .syn_rst => if (n.socks.get(p.to_sid)) |s| if (s.state == .connecting) {
+                        s.err = .reset;
+                        n.notify(s);
+                    },
                     .rst => if (n.socks.get(p.to_sid)) |s| {
                         s.err = if (s.state == .connecting) .refused else .reset;
                         n.notify(s);
@@ -714,7 +722,9 @@ pub const Net = struct {
         if (n.syn_seen.get(p.from_sid)) |server_sid| {
             // Our SYN-ACK was lost and the client retried: answer again.
             if (n.socks.get(server_sid)) |c|
-                n.control(.synack, p.dst_host, p.src_host, c.local, p.src, c.sid, p.from_sid);
+                n.control(.synack, p.dst_host, p.src_host, c.local, p.src, c.sid, p.from_sid)
+            else
+                n.control(.syn_rst, p.dst_host, p.src_host, p.dst, p.src, 0, p.from_sid);
             return;
         }
         var it = h.handles.valueIterator();

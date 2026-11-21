@@ -66,6 +66,80 @@ pub const Transport = struct {
 /// The registered IEC 60870-5-104 TCP port (IANA `iec-104`).
 pub const default_port: u16 = 2404;
 
+/// `std.Io.Reader` over a stream whose underlying read can be bounded with a
+/// timeout. The stock `Stream.Reader` has no timeout, and the readiness wait
+/// this transport used to do with `poll(2)` on the raw descriptor is invisible
+/// to any `std.Io` implementation but the one backed by the kernel: it is not
+/// a cancellation point and no simulated clock or network can see it. A read
+/// submitted through `io.operateTimeout` is both.
+///
+/// With `timeout_ms == null` a read waits as long as the peer takes. A read
+/// that times out sets `timed_out` and fails with `ReadFailed`; every other
+/// failure leaves its cause in `err` (`Canceled` included, which
+/// `Io.Reader.Error` cannot carry).
+const TimedReader = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    interface: std.Io.Reader,
+    timeout_ms: ?u32 = null,
+    timed_out: bool = false,
+    err: ?std.Io.net.Stream.Reader.Error = null,
+
+    fn init(stream: std.Io.net.Stream, io: std.Io, buffer: []u8) TimedReader {
+        return .{
+            .io = io,
+            .stream = stream,
+            .interface = .{
+                .vtable = &.{ .stream = streamImpl, .readVec = readVec },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn streamImpl(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        const r: *TimedReader = @alignCast(@fieldParentPtr("interface", io_r));
+        var iovecs: [8][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs, data);
+        const op: std.Io.Operation = .{ .net_read = .{
+            .socket_handle = r.stream.socket.handle,
+            .data = iovecs[0..dest_n],
+        } };
+        r.timed_out = false;
+        const done = if (r.timeout_ms) |ms|
+            r.io.operateTimeout(op, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } })
+        else
+            r.io.operate(op);
+        const result = done catch |e| {
+            switch (e) {
+                error.Timeout => r.timed_out = true,
+                error.Canceled => r.err = error.Canceled,
+                error.ConcurrencyUnavailable => r.err = error.SystemResources,
+            }
+            return error.ReadFailed;
+        };
+        const got = result.net_read catch |e| {
+            r.err = e;
+            return error.ReadFailed;
+        };
+        if (got.data_len == 0) return error.EndOfStream;
+        if (got.data_len > data_size) {
+            io_r.end += got.data_len - data_size;
+            return data_size;
+        }
+        return got.data_len;
+    }
+};
+
 /// Blocking TCP transport over `std.Io.net`, for demos and live interop.
 ///
 /// It reads **one whole APDU per `read`**: two octets (start + length), then
@@ -82,7 +156,7 @@ pub const TcpTransport = struct {
     stream: std.Io.net.Stream,
     rbuf: [4096]u8 = undefined,
     wbuf: [apci.max_apdu_len]u8 = undefined,
-    reader: ?std.Io.net.Stream.Reader = null,
+    reader: ?TimedReader = null,
     writer: ?std.Io.net.Stream.Writer = null,
     /// Milliseconds a read may wait before reporting "nothing this round".
     /// Null blocks indefinitely.
@@ -97,42 +171,39 @@ pub const TcpTransport = struct {
     }
 
     /// Bounds how long a read blocks, so the caller's `poll` returns on an
-    /// idle link and the t1/t2/t3 timers can still fire. Implemented with
-    /// `poll(2)` on the socket rather than `SO_RCVTIMEO`, because an `EAGAIN`
-    /// surfacing out of `std.Io` is treated there as a programmer error.
+    /// idle link and the t1/t2/t3 timers can still fire. Implemented as a
+    /// timed read through `std.Io` (`io.operateTimeout`) rather than
+    /// `SO_RCVTIMEO` or `poll(2)`, so a simulated `Io` sees the wait too.
     pub fn setReadTimeout(self: *TcpTransport, milliseconds: u32) !void {
         self.read_timeout_ms = milliseconds;
     }
 
-    /// True when the socket has something to read (or the wait timed out and
-    /// the caller should be told "nothing this round").
-    ///
-    /// `std.posix.poll` is **not** a `std.Io` cancellation point: it restarts
-    /// itself on `EINTR`, so the signal `Future.cancel` sends is swallowed and
-    /// the wait still runs to its full timeout. Without the explicit
-    /// `checkCanceled` below, a canceled read would come back as `false` and
-    /// then as `0` from `readFn` — "nothing available this round" — and the
-    /// caller would keep polling a connection it had already abandoned.
     fn waitReadable(self: *TcpTransport) TransportError!bool {
         return self.waitReadableMs(self.read_timeout_ms);
     }
 
+    /// True when the socket has something to read (or the stream ended, which
+    /// the read that follows reports); false when `budget_ms` ran out first and
+    /// the caller should be told "nothing this round". Null waits for ever.
+    ///
+    /// The wait is a read into the reader's own buffer, bounded with
+    /// `io.operateTimeout`, so nothing is lost and a canceled wait is
+    /// `error.Canceled`, not an idle round.
     fn waitReadableMs(self: *TcpTransport, budget_ms: ?u32) TransportError!bool {
         const ms = budget_ms orelse return true;
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.stream.socket.handle,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        // A poll that fails outright defers to the real read, which reports
-        // the failure properly — but a cancel must not be lost on that path.
-        const n = std.posix.poll(&fds, @intCast(ms)) catch {
-            try self.checkCanceled();
-            return true;
+        const tr = &self.reader.?;
+        if (tr.interface.bufferedLen() != 0) return true;
+        const outer = tr.timeout_ms;
+        tr.timeout_ms = ms;
+        defer tr.timeout_ms = outer;
+        tr.interface.fill(1) catch |e| switch (e) {
+            error.EndOfStream => return true,
+            error.ReadFailed => {
+                if (tr.timed_out) return false;
+                return self.readFailure();
+            },
         };
-        if (n != 0) return true;
-        try self.checkCanceled();
-        return false;
+        return true;
     }
 
     /// Read exactly `dest.len` octets, waiting no longer than the read
@@ -174,13 +245,6 @@ pub const TcpTransport = struct {
         }
     }
 
-    /// `Io.checkCancel` acknowledges the request, so it reports a pending
-    /// cancel exactly once — the answer has to be turned into the error here
-    /// and not asked for again.
-    fn checkCanceled(self: *TcpTransport) TransportError!void {
-        self.io.checkCancel() catch return error.Canceled;
-    }
-
     /// Distinguish a canceled wait from a genuine read failure. `Io.Reader`'s
     /// error set cannot carry `Canceled`; the concrete reader records it here.
     fn readFailure(self: *TcpTransport) TransportError {
@@ -204,13 +268,16 @@ pub const TcpTransport = struct {
     // `modules/bacnet/src/sc_interop.zig` does not reproduce — see the
     // regression test at the end of this file, which pins it.
     fn ensure(self: *TcpTransport) void {
-        if (self.reader == null) self.reader = self.stream.reader(self.io, &self.rbuf);
+        if (self.reader == null) self.reader = TimedReader.init(self.stream, self.io, &self.rbuf);
         if (self.writer == null) self.writer = self.stream.writer(self.io, &self.wbuf);
     }
 
     fn readFn(ctx: *anyopaque, buf: []u8) TransportError!usize {
         const self: *TcpTransport = @ptrCast(@alignCast(ctx));
         self.ensure();
+        // Every underlying read of this frame waits at most the timeout: a peer
+        // that stops mid-frame fails the read instead of parking it.
+        self.reader.?.timeout_ms = self.read_timeout_ms;
         if (buf.len < apci.max_apdu_len) return error.ReadFailed;
         const r = &self.reader.?.interface;
         // Anything already buffered by a previous read counts as readable.

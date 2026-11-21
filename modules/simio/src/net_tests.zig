@@ -1084,3 +1084,77 @@ test "a stream read in a batch times out, then completes when data or the close 
     try testing.expectEqual(@as(usize, 2), out.got);
     try testing.expect(out.eof);
 }
+
+const Handshake = struct { connected_at_ns: i96 = -1, got: [2]u8 = undefined, n: usize = 0 };
+
+fn greeter(io: Io, port: u16) !void {
+    var server = try net.IpAddress.listen(&.{ .ip4 = .unspecified(port) }, io, .{});
+    defer server.deinit(io);
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    var wbuf: [8]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("ok");
+    try w.interface.flush();
+    try io.sleep(.fromSeconds(1), .awake);
+}
+
+fn handshakeClient(io: Io, server: net.IpAddress, out: *Handshake) !void {
+    const t0 = Io.Timestamp.now(io, .awake);
+    const stream = try server.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    out.connected_at_ns = Io.Timestamp.now(io, .awake).nanoseconds - t0.nanoseconds;
+    var rbuf: [8]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    out.n = try r.interface.readSliceShort(&out.got);
+}
+
+test "a lost SYN-ACK is answered again when the client retries its SYN" {
+    var sim: Sim = undefined;
+    newSim(&sim, 62);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{ .latency_ns = 5 * ns_per_ms });
+    try sim.scheduleFault(0, .{ .drop_once = .{ .from = b.id, .to = a.id } });
+    try b.spawn(greeter, .{ b.io(), 9 });
+    var out: Handshake = .{};
+    try a.spawn(handshakeClient, .{ a.io(), addr4(b, 9), &out });
+    _ = sim.run();
+    // The first SYN-ACK is gone; the retry one second later gets through.
+    try testing.expect(out.connected_at_ns >= ns_per_s and out.connected_at_ns < ns_per_s + 50 * ns_per_ms);
+    try testing.expectEqualStrings("ok", out.got[0..out.n]);
+}
+
+fn acceptAndClose(io: Io, port: u16) !void {
+    var server = try net.IpAddress.listen(&.{ .ip4 = .unspecified(port) }, io, .{});
+    defer server.deinit(io);
+    const stream = try server.accept(io);
+    stream.close(io);
+    try io.sleep(.fromSeconds(5), .awake);
+}
+
+fn connectOnce(io: Io, server: net.IpAddress, out: *?anyerror) !void {
+    const t0 = Io.Timestamp.now(io, .awake);
+    if (server.connect(io, .{ .mode = .stream })) |stream| {
+        stream.close(io);
+    } else |err| out.* = err;
+    // Failing fast, not after the 127 s SYN timeout.
+    try testing.expect(Io.Timestamp.now(io, .awake).nanoseconds - t0.nanoseconds < 2 * ns_per_s);
+}
+
+test "a SYN retried after the server closed the half-open connection is reset, not ignored" {
+    var sim: Sim = undefined;
+    newSim(&sim, 63);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{ .latency_ns = 5 * ns_per_ms });
+    try sim.scheduleFault(0, .{ .drop_once = .{ .from = b.id, .to = a.id } });
+    try b.spawn(acceptAndClose, .{ b.io(), 9 });
+    var err: ?anyerror = null;
+    try a.spawn(connectOnce, .{ a.io(), addr4(b, 9), &err });
+    _ = sim.run();
+    try testing.expectEqual(@as(?anyerror, error.ConnectionResetByPeer), err);
+    try testing.expectEqual(@as(usize, 0), a.failures);
+}
