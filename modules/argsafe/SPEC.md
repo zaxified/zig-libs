@@ -12,7 +12,7 @@
 
 **Performance:** n/a — every call is a few dozen byte compares on a string of at most a few hundred bytes (an estimate from the code, tens of ns, not measured) guarding a process spawn, itself a syscall path orders of magnitude dearer; the shared-shape reference (go-playground, a regexp) is not what a user chooses this module over for speed, and the same-work comparison would only restate that. Precedent: `probe`, `icmp` ("the CPU per probe is not what a user picks it for"). (2026-11-02)
 
-**Evidence:** model — independent reference models for the shape predicates (exhaustive to length 5 + seeded mutation, `src/model_test.zig`) and frozen foreign verdicts for 6 319 hostile strings: POSIX sh (Python `shlex` + dash), the UCRT command-line rules (our transcription of Microsoft's documentation, not a Windows run), go-playground/validator v10.30.5, the Linux kernel interface-name check (`src/oracle_test.zig`, recipe `tools/oracle.py`); the older predicates keep their golden tables. Not model-fuzz: no fuzz driver compares against the models
+**Evidence:** model-fuzz — independent reference models for the shape predicates (exhaustive to length 5 + seeded mutation, `src/model_test.zig`) and frozen foreign verdicts for 6 319 hostile strings: POSIX sh (Python `shlex` + dash), the UCRT command-line rules (our transcription of Microsoft's documentation, not a Windows run), go-playground/validator v10.30.5, the Linux kernel interface-name check (`src/oracle_test.zig`, recipe `tools/oracle.py`); the older predicates keep their golden tables. a deterministic fuzz driver (`ARGSAFE_FUZZ`, `src/fuzz_test.zig`) compares them with the models on structured edge-length strings.
 **Model:** src/model_test.zig · src/oracle_test.zig · tools/oracle.py
 
 **Known defects:** none recorded
@@ -126,7 +126,8 @@ Run: `scripts/modtest argsafe`; the foreign verdicts are re-taken with `tools/or
   by the `reject_leading_dash = false` opt-out; a wrong number of values as `ValueCountMismatch`.
 - **Reference models** (`src/model_test.zig`): hostname, interface name, port and bounded integer against models
   written a different way (label splitting, `std.fmt.parseInt`) on every string up to a short length over an alphabet
-  of each byte class that matters, then on seeded mutations of valid names; deterministic, no fuzz driver.
+  of each byte class that matters, then on seeded mutations of valid names; deterministic.
+- **Fuzz driver** (`src/fuzz_test.zig`, `ARGSAFE_FUZZ=<runs>[,<first seed>]`): the same models against strings built from a valid-looking hostname, interface name or number of an edge length (63/253, 15, the port range, the u64 maximum, leading zeros) with a few substitutions, insertions and truncations drawn from the byte classes that matter; a 4000-seed reach test runs in every test pass and fails if a predicate never gets both verdicts.
 - **Foreign oracle** (`src/oracle_test.zig`, vectors in `src/oracle_vectors.zig` from `tools/oracle.py`): frozen
   verdicts of POSIX sh (Python `shlex`, dash with glob-matching files present and an empty PATH), the UCRT
   command-line rules (a transcription of the documentation, not a Windows run), go-playground/validator
@@ -159,8 +160,6 @@ Run: `scripts/modtest argsafe`; the foreign verdicts are re-taken with `tools/or
 - **Mutation run over the shape predicates.** The recorded run (40/40) predates `isSafeHostname`, `isSafeUint`,
   `isSafePort` and `isSafeIfname`; the model tests are exhaustive to a short length, but no mutants were run against
   them, and the card's `src` hash does not cover them.
-- **Fuzz driver over the models (evidence E2 to E1).** The model tests are deterministic enumeration; a driver
-  comparing the predicates with the models on longer, structured inputs would earn model-fuzz.
 
 ## Anchoring
 

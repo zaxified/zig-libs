@@ -351,7 +351,7 @@ pub const module_list = [_]Module{
     .{ .name = "csvstream", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "csvsafe", .libs = &.{"format"}, .deps = &.{"csvstream"} },
     .{ .name = "numparse", .libs = &.{"format"}, .deps = &.{"decimal"} },
-    .{ .name = "argsafe", .libs = &.{"os"} },
+    .{ .name = "argsafe", .libs = &.{"os"}, .test_deps = &.{"testkit"} },
     .{ .name = "sessions", .libs = &.{"web"}, .deps = &.{ "router", "http", "cookies", "ramcache", "entropy", "kv", "clock" }, .test_deps = &.{"testkit"} },
     .{ .name = "jobqueue", .libs = &.{"storage"}, .deps = &.{ "kv", "clock" } },
     .{ .name = "reconcilable", .libs = &.{"net"}, .deps = &.{"resilience"} },

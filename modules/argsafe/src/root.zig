@@ -705,6 +705,7 @@ test {
     _ = @import("sweep_test.zig");
     _ = @import("model_test.zig");
     _ = @import("oracle_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 // --- CharClass: golden allow/reject over representative validators ------

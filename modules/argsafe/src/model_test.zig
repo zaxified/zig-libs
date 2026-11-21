@@ -8,7 +8,7 @@ const std = @import("std");
 const testing = std.testing;
 const argsafe = @import("root.zig");
 
-fn modelHostname(s: []const u8) bool {
+pub fn modelHostname(s: []const u8) bool {
     if (s.len == 0 or s.len > 253) return false;
     var it = std.mem.splitScalar(u8, s, '.');
     while (it.next()) |l| {
@@ -19,14 +19,14 @@ fn modelHostname(s: []const u8) bool {
     return true;
 }
 
-fn modelUint(s: []const u8, min: u64, max: u64) bool {
+pub fn modelUint(s: []const u8, min: u64, max: u64) bool {
     for (s) |c| if (c < '0' or c > '9') return false; // parseInt would take '_' and '+'
     if (s.len > 1 and s[0] == '0') return false;
     const n = std.fmt.parseInt(u64, s, 10) catch return false;
     return n >= min and n <= max;
 }
 
-fn modelIfname(s: []const u8) bool {
+pub fn modelIfname(s: []const u8) bool {
     if (s.len < 1 or s.len > 15) return false;
     if (std.mem.find(u8, s, "..") != null) return false;
     for (s, 0..) |c, i| {
