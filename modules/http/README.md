@@ -33,7 +33,7 @@ behavior. The full spec list and the design-reference record are in
    `activeConnections()`, 431/414/413 size limits, stall + whole-request +
    write timeouts (details below). **Phase 2.2 (DONE) added negotiated
    gzip response compression** (`Options.compression`, off by default —
-   see "Response compression"). Still plain HTTP only: a native TLS-terminating listener is planned over the sibling module `tlsserver` (our own TLS 1.3 server, already in the collection); until then TLS is the caller's (`serveStream` + ALPN) or a reverse proxy's.
+   see "Response compression"). TLS: `Options.tls` terminates it on the listener over the sibling module `tlsserver` (HTTP/1.1, or HTTP/2 when ALPN picks `h2`); or the caller's (`serveStream` + ALPN) or a reverse proxy's.
 3. **DONE — HTTP/2** (`hpack` RFC 7541 + `h2` RFC 9113 framing/state
    machine/flow control): opt-in cleartext h2c on the server
    (`Options.enable_h2c`, prior knowledge), a multiplexing client
@@ -104,6 +104,14 @@ streamed body cannot be replayed); the list is borrowed for the client's
 lifetime; do not call `request` on the same client from inside an
 interceptor. Bearer-token and tracing interceptors exist as test-only
 examples in `src/interceptor_test.zig`, not as module API.
+
+### No network: round tripper and synthetic responses
+
+`Client.Options.round_tripper` (Go's `Client.Transport`) answers every hop of
+`request`/`requestPlain` (redirects included) instead of a connection, and
+`client.synthetic(.{ .status = 200, .headers = ..., .body = "..." })` builds
+the `Response` for it, or for an interceptor that answers by itself. Tests and
+in-process backends need no socket (`src/roundtrip_test.zig`).
 
 ### Plaintext-only client
 
@@ -489,8 +497,11 @@ HEADERS frame is materialized into it once the body ends.
   (`Request.reader`); a handler that answers without reading never invites
   the body, and the response then closes the connection. Absolute-
   form request targets are rejected (origin-form + `*` only).
-- **No TLS in the server yet** — terminate TLS in front (Caddy/any proxy,
-  or your own TLS layer over `serveByAlpn` / `serveStream`); a built-in TLS-terminating listener over the sibling module `tlsserver` (our own TLS 1.3 server) is planned.
+- **TLS:** `Options.tls = .{ .config = &tls_config }` (a `tlsserver.Config`, `alpn_protocols`
+  `h2` and `http/1.1`) terminates it on the listener; or terminate in front (any proxy, or your own
+  TLS layer over `serveByAlpn` / `serveStream`). **PROXY protocol:** `Options.proxy_protocol = .{ .trusted = ... }`
+  reads a balancer's HAProxy header so `Request.peerAddress` is the real client's. **h2 CONNECT:**
+  `Options.h2_allow_connect` hands the tunnel to the handler (501 otherwise).
 
 ## Multicore accept engine (SO_REUSEPORT thread-per-core)
 
