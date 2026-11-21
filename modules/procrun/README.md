@@ -188,12 +188,12 @@ no-zombie and stable-fd-count invariants. Deliberate differences carry a
 - **Limits.** `Spec.rlimit` needs a POSIX `/bin/sh` with `ulimit`. `run`
   without `runTimeout` or `Spec.cancel` waits for pipe EOF without bound. A
   child that exits without reading all of `stdin_body` makes `run` return
-  `error.BrokenPipe`. `Handle.wait` must be called exactly once and must not
-  race `kill`/`cancel`/`signal*` from another thread. Details: `SPEC.md`.
+  `error.BrokenPipe`. `Handle.wait` must be called exactly once; a watchdog thread that
+  signals while it runs holds its own `Handle.retain`. Details: `SPEC.md`.
 
 ## Not provided
 
-`setsid`/`umask`/`PDEATHSIG`, a `close_fds` walk, PATH policies, pipelines, a
+`setsid`/`umask`/`PDEATHSIG`, a `close_fds` walk, pipelines, a
 pty, a type-level "consumed" marker for `Handle` (rejected), and Windows
 reap-race coverage; reasons in `SPEC.md` *What is deliberately not done* and
-*Backlog / deferred* (pidfd signalling, refcounted `Handle`, PATH policy).
+*Backlog / deferred* (Windows).

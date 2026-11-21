@@ -69,6 +69,11 @@ pub const Options = struct {
     /// Start the child with an empty signal mask (Go's `os/exec`, Rust's
     /// `Command`) instead of the spawning thread's current one.
     reset_signal_mask: bool = true,
+    /// Where to store a pidfd for the child (`CLONE_PIDFD`, Linux 5.2): taken
+    /// atomically with the clone, so it names this very process and no other
+    /// whatever happens to the pid. Set to -1 when the kernel has none; the
+    /// caller owns the descriptor on success.
+    pidfd: ?*posix.fd_t = null,
 };
 
 pub const Error = std.process.SpawnError;
@@ -252,15 +257,22 @@ pub fn spawn(gpa: std.mem.Allocator, opts: Options) Error!posix.pid_t {
         closeFd(ep[1]);
         return error.Unexpected;
     }
-    const rc = linux.clone(
+    const base_flags = linux.CLONE.VM | linux.CLONE.VFORK | @as(u32, @backingInt(linux.SIG.CHLD));
+    var pidfd: posix.fd_t = -1;
+    var rc = linux.clone(
         childMain,
         @intFromPtr(stack.ptr) + stack.len,
-        linux.CLONE.VM | linux.CLONE.VFORK | @as(u32, @backingInt(linux.SIG.CHLD)),
+        if (opts.pidfd != null) base_flags | linux.CLONE.PIDFD else base_flags,
         @intFromPtr(&args),
-        null,
+        if (opts.pidfd != null) &pidfd else null,
         0,
         null,
     );
+    // A kernel older than 5.2 refuses the flag with EINVAL: spawn without it.
+    if (opts.pidfd != null and linux.errno(rc) == .INVAL) {
+        pidfd = -1;
+        rc = linux.clone(childMain, @intFromPtr(stack.ptr) + stack.len, base_flags, @intFromPtr(&args), null, 0, null);
+    }
     _ = linux.sigprocmask(linux.SIG.SETMASK, &args.old_mask, null);
     closeFd(ep[1]);
     const pid: posix.pid_t = switch (linux.errno(rc)) {
@@ -275,6 +287,7 @@ pub fn spawn(gpa: std.mem.Allocator, opts: Options) Error!posix.pid_t {
     var code: u32 = 0;
     const n = readAll(ep[0], std.mem.asBytes(&code));
     if (n == @sizeOf(u32)) {
+        if (pidfd >= 0) closeFd(pidfd);
         var status: i32 = 0;
         while (true) switch (linux.errno(linux.wait4(pid, &status, 0, null))) {
             .INTR => continue,
@@ -283,6 +296,7 @@ pub fn spawn(gpa: std.mem.Allocator, opts: Options) Error!posix.pid_t {
         const c = std.enums.fromInt(ChildErr, code) orelse .unexpected;
         return c.toError();
     }
+    if (opts.pidfd) |out| out.* = pidfd;
     return pid;
 }
 

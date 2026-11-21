@@ -108,6 +108,20 @@ pub const EnvMode = enum {
     merge,
 };
 
+/// Which `PATH` resolves a bare `argv[0]` (one with no '/').
+pub const PathPolicy = enum {
+    /// The PARENT's `PATH`, whatever the child's environment says (Go's
+    /// `exec.Command`, and this module's behaviour so far). The default.
+    parent,
+    /// The CHILD's `PATH`: `Spec.env`'s under `env_mode` `.clear`/`.merge`, the
+    /// parent's under `.inherit`; `/bin:/usr/bin`-style default when the child has
+    /// none (Python's `subprocess` with `env=`, Rust's `Command::env("PATH", …)`).
+    child_env,
+    /// No search: a bare name is a path relative to the child's working
+    /// directory (`cwd`), the way `./name` would be.
+    none,
+};
+
 /// A process to run. `argv[0]` is resolved via `PATH` if it has no '/' —
 /// prefer an absolute `argv[0]` when the caller controls it, to avoid PATH-
 /// resolution ambiguity entirely. Note that this PATH lookup ALWAYS reads
@@ -127,6 +141,11 @@ pub const Spec = struct {
     /// Overriding / explicit environment. Interpreted per `env_mode`.
     env: ?*const std.process.Environ.Map = null,
     env_mode: EnvMode = .inherit,
+    /// Which `PATH` resolves a bare `argv[0]`; see `PathPolicy`. A resolved
+    /// `argv[0]` stays as given on Linux's spawner; on the fallback spawner (other
+    /// targets, or an unreadable `/proc/self/environ`) and under `rlimit` it is
+    /// replaced by the resolved path.
+    path_policy: PathPolicy = .parent,
     /// Working directory for the child; null = inherit the parent's.
     cwd: ?[]const u8 = null,
     /// Default `.ignore` (`/dev/null`; Go's default for a nil `Cmd.Stdin`):
@@ -466,11 +485,23 @@ pub fn waitTolerantExit(io: std.Io, child: *std.process.Child) Exit {
     }
 }
 
+/// std's `Child.kill` (signal and reap), plus the pidfd bookkeeping the reap
+/// would otherwise skip.
+fn killChild(io: std.Io, child: *std.process.Child) void {
+    const id = child.id;
+    child.kill(io);
+    if (builtin.os.tag != .windows) {
+        if (id) |pid| pidfds.remove(pid);
+    }
+}
+
 fn exitOf(status: u32, ru: ?Rusage) Exit {
     return .{ .term = statusToTerm(status), .core_dumped = statusCoreDumped(status), .rusage = ru };
 }
 
 fn reapTolerantPosix(pid: std.posix.pid_t) Exit {
+    // The pidfd (if the spawner took one) is closed once the pid is reaped.
+    defer pidfds.remove(pid);
     const posix = std.posix;
     var status: if (builtin.link_libc) c_int else i32 = undefined;
     if (have_wait4) {
@@ -528,6 +559,9 @@ fn deliver(child: *std.process.Child, kind: SigKind, raw: u8) void {
                 .kill => .KILL,
                 .raw => @fromBackingInt(@intCast(raw)),
             };
+            // Through the pidfd when the spawner took one: it names the process
+            // itself, so there is no pid to have been recycled.
+            if (pidfds.signal(id, sig)) return;
             if (!stillOurChild(id)) return; // see `stillOurChild`
             // sweep PR-3: not `std.posix.kill` -- it has `.INVAL => unreachable`
             // and `Handle.signal` takes any u8 (200 is EINVAL, not a bug here).
@@ -535,6 +569,100 @@ fn deliver(child: *std.process.Child, kind: SigKind, raw: u8) void {
         },
     }
 }
+
+/// pid → pidfd of the children the Linux spawner started, so a signal can go
+/// through the pidfd and cannot reach a recycled pid (`pidfd_send_signal` names
+/// the process, not the number). Bounded and allocation-free; a child that does
+/// not fit (or on a kernel without `CLONE_PIDFD`) is signalled by pid as before.
+/// The lock is held across the signal syscall, so `remove` cannot close a
+/// descriptor another thread is about to use.
+const PidfdTable = struct {
+    const cap = 256;
+    lock: std.atomic.Mutex = .unlocked,
+    pids: [cap]std.posix.pid_t = @splat(0),
+    fds: [cap]std.posix.fd_t = @splat(-1),
+
+    fn acquire(t: *PidfdTable) void {
+        while (!t.lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Takes ownership of `fd` (closed on `remove`, or at once when it does not fit).
+    fn add(t: *PidfdTable, pid: std.posix.pid_t, fd: std.posix.fd_t) void {
+        if (builtin.os.tag != .linux or fd < 0) return;
+        t.acquire();
+        defer t.lock.unlock();
+        var free: ?usize = null;
+        for (t.pids, 0..) |p, i| {
+            if (t.fds[i] < 0) {
+                if (free == null) free = i;
+            } else if (p == pid) {
+                // The pid was recycled after a reap this table never saw.
+                _ = std.os.linux.close(t.fds[i]);
+                t.fds[i] = fd;
+                return;
+            }
+        }
+        if (free) |i| {
+            t.pids[i] = pid;
+            t.fds[i] = fd;
+        } else _ = std.os.linux.close(fd);
+    }
+
+    fn remove(t: *PidfdTable, pid: std.posix.pid_t) void {
+        if (builtin.os.tag != .linux) return;
+        t.acquire();
+        defer t.lock.unlock();
+        for (t.pids, 0..) |p, i| {
+            if (t.fds[i] >= 0 and p == pid) {
+                _ = std.os.linux.close(t.fds[i]);
+                t.fds[i] = -1;
+                return;
+            }
+        }
+    }
+
+    /// Signals through the pidfd. True when `pid` has one (whatever the kernel
+    /// answered: a reaped process is `ESRCH`, and that is the whole point).
+    fn signal(t: *PidfdTable, pid: std.posix.pid_t, sig: std.posix.SIG) bool {
+        if (builtin.os.tag != .linux) return false;
+        t.acquire();
+        defer t.lock.unlock();
+        for (t.pids, 0..) |p, i| {
+            if (t.fds[i] >= 0 and p == pid) {
+                _ = std.os.linux.pidfd_send_signal(t.fds[i], sig, null, 0);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Does `pid` have a pidfd whose process still exists (not yet reaped)?
+    fn alive(t: *PidfdTable, pid: std.posix.pid_t) bool {
+        if (builtin.os.tag != .linux) return false;
+        t.acquire();
+        defer t.lock.unlock();
+        for (t.pids, 0..) |p, i| {
+            if (t.fds[i] >= 0 and p == pid) {
+                const sig: std.posix.SIG = @fromBackingInt(0);
+                return std.posix.errno(std.os.linux.pidfd_send_signal(t.fds[i], sig, null, 0)) == .SUCCESS;
+            }
+        }
+        return false;
+    }
+
+    /// Entries in use (tests).
+    fn count(t: *PidfdTable) usize {
+        t.acquire();
+        defer t.lock.unlock();
+        var n: usize = 0;
+        for (t.fds) |fd| {
+            if (fd >= 0) n += 1;
+        }
+        return n;
+    }
+};
+
+var pidfds: PidfdTable = .{};
 
 /// Is `pid` still one of OUR children — i.e. not yet reaped by anybody?
 ///
@@ -553,12 +681,11 @@ fn deliver(child: *std.process.Child, kind: SigKind, raw: u8) void {
 /// `deliverGroup` proceeded to signal the freed pid.
 ///
 /// ⚠ **This NARROWS the window, it does not close it.** The pid can be
-/// reaped between this answer and the `kill` below. Closing it properly means
-/// signalling through a `pidfd` opened at spawn (`pidfd_open` /
-/// `pidfd_send_signal`), which is immune to reuse by construction --
-/// recorded in `SPEC.md` rather than done here, because it needs a
-/// descriptor per child and a fallback for kernels without it. Non-Linux
-/// keeps the unguarded behaviour, also recorded.
+/// reaped between this answer and the `kill` below. It is the fallback for a
+/// child without a pidfd (std's spawner, a kernel before 5.2, a full
+/// `PidfdTable`, a signal to a whole group); a child the Linux spawner started
+/// is signalled through its pidfd (`PidfdTable`) instead. Non-Linux keeps the
+/// unguarded behaviour, recorded in `SPEC.md`.
 fn stillOurChild(pid: std.posix.pid_t) bool {
     if (builtin.os.tag != .linux) return true;
     var info: std.os.linux.siginfo_t = undefined;
@@ -587,7 +714,10 @@ fn deliverGroup(child: *std.process.Child, kind: SigKind, raw: u8, grouped: bool
                 .kill => .KILL,
                 .raw => @fromBackingInt(@intCast(raw)),
             };
-            if (!stillOurChild(id)) return; // see `stillOurChild`
+            // A pidfd cannot signal a group, but it answers whether the leader
+            // is still ours: while it is (even as an unreaped zombie) its pid
+            // cannot have been recycled, and the group id with it.
+            if (!pidfds.alive(id) and !stillOurChild(id)) return; // see `stillOurChild`
             _ = std.posix.system.kill(-id, sig); // sweep PR-3, see `deliver`
         },
     }
@@ -631,6 +761,10 @@ const grace_poll_ns: u64 = 5 * std.time.ns_per_ms;
 /// was raised, meaning the caller already knows the run is over).
 fn waitExitWithin(child: *std.process.Child, grace_ns: u64, stop: ?*const std.atomic.Value(bool)) bool {
     const id = child.id orelse return true;
+    return waitPidExitWithin(id, grace_ns, stop);
+}
+
+fn waitPidExitWithin(id: std.process.Child.Id, grace_ns: u64, stop: ?*const std.atomic.Value(bool)) bool {
     const end_ns = monoNowNs() +| grace_ns;
     while (true) {
         if (childExited(id)) return true;
@@ -709,6 +843,13 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
 
     const cwd: std.process.Child.Cwd = if (spec.cwd) |p| .{ .path = p } else .inherit;
 
+    // The PATH that resolves a bare argv[0] when it is not the parent's.
+    const path_override: ?[]const u8 = switch (spec.path_policy) {
+        .parent => null,
+        .child_env => if (env_ptr) |m| (m.get("PATH") orelse std.Io.Threaded.default_PATH) else null,
+        .none => ".",
+    };
+
     // rlimit sandbox: wrap argv through a small ulimit-then-exec shell (see
     // `RlimitSpec`). The wrapper's own storage only needs to stay alive for
     // the duration of the spawn call below (fork+exec is synchronous), so it
@@ -718,7 +859,7 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
     const effective_argv: []const []const u8 = blk: {
         const r = spec.rlimit orelse break :blk spec.argv;
         if (builtin.os.tag == .windows) return error.OperationUnsupported;
-        rlimit_wrap = try buildRlimitWrap(gpa, io, spec.argv, r);
+        rlimit_wrap = try buildRlimitWrap(gpa, io, spec.argv, r, path_override);
         break :blk rlimit_wrap.?.argv;
     };
 
@@ -785,8 +926,26 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
         if (comptime vfork_spawn.supported) {
             if (try spawnVfork(gpa, io, spec, effective_argv, env_ptr, in_io, out_io, err_io)) |c| break :spawned c;
         }
+        // std resolves a bare argv[0] on the parent's PATH, so another policy is
+        // applied here by replacing it with the resolved path.
+        var policy_argv0: ?[]u8 = null;
+        defer if (policy_argv0) |a| gpa.free(a);
+        var policy_argv: []const []const u8 = effective_argv;
+        var policy_argv_buf: ?[][]const u8 = null;
+        defer if (policy_argv_buf) |a| gpa.free(a);
+        if (path_override) |po| {
+            if (effective_argv.len > 0 and std.mem.findScalar(u8, effective_argv[0], '/') == null) {
+                policy_argv0 = if (spec.path_policy == .none)
+                    try std.fmt.allocPrint(gpa, "./{s}", .{effective_argv[0]})
+                else
+                    (try resolveArgv0ForRlimit(gpa, io, effective_argv[0], po)) orelse return error.FileNotFound;
+                policy_argv_buf = try gpa.dupe([]const u8, effective_argv);
+                policy_argv_buf.?[0] = policy_argv0.?;
+                policy_argv = policy_argv_buf.?;
+            }
+        }
         break :spawned try std.process.spawn(io, .{
-            .argv = effective_argv,
+            .argv = policy_argv,
             .cwd = cwd,
             .environ_map = env_ptr,
             .stdin = in_io,
@@ -846,8 +1005,12 @@ fn spawnVfork(
     // environment is unknown here: std's spawn has it, so let std do this one
     // rather than hand the child an empty environment (review 2026-10-20 M1).
     if (!try readProcEnviron(arena, io, &parent)) return null;
-    const search_path = parent.get("PATH") orelse std.Io.Threaded.default_PATH;
     const env_map: *const std.process.Environ.Map = env_ptr orelse &parent;
+    const search_path = switch (spec.path_policy) {
+        .parent => parent.get("PATH") orelse std.Io.Threaded.default_PATH,
+        .child_env => env_map.get("PATH") orelse std.Io.Threaded.default_PATH,
+        .none => ".",
+    };
     var entries: std.ArrayList([]const u8) = .empty;
     var it = env_map.iterator();
     while (it.next()) |e| {
@@ -858,7 +1021,9 @@ fn spawnVfork(
     const fds = try arena.alloc(std.posix.fd_t, spec.pass_fds.len);
     for (spec.pass_fds, fds) |f, *d| d.* = f.handle;
 
+    var pidfd: std.posix.fd_t = -1;
     const pid = try vfork_spawn.spawn(gpa, .{
+        .pidfd = &pidfd,
         .argv = argv,
         .cwd = spec.cwd,
         .env = entries.items,
@@ -872,6 +1037,7 @@ fn spawnVfork(
         .pgid = if (spec.new_process_group) 0 else null,
         .reset_signal_mask = spec.reset_signal_mask,
     });
+    pidfds.add(pid, pidfd);
     return .{ .id = pid, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
 }
 
@@ -963,13 +1129,18 @@ const RlimitWrap = struct {
 /// `env.PATH` pointed at a planted decoy directory — without `rlimit`,
 /// `error.FileNotFound` (the documented behaviour); with `rlimit` and no
 /// fix, the decoy binary ran.
-fn resolveArgv0ForRlimit(gpa: std.mem.Allocator, io: std.Io, argv0: []const u8) !?[]u8 {
+fn resolveArgv0ForRlimit(gpa: std.mem.Allocator, io: std.Io, argv0: []const u8, path_override: ?[]const u8) !?[]u8 {
     if (std.mem.findScalar(u8, argv0, '/') != null) return null;
+    // `PathPolicy.none`: relative to the CHILD's cwd, which the shell wrapper
+    // inherits, so it is not looked up here.
+    if (path_override) |po| {
+        if (std.mem.eql(u8, po, ".")) return try std.fmt.allocPrint(gpa, "./{s}", .{argv0});
+    }
 
     var parent_env = std.process.Environ.Map.init(gpa);
     defer parent_env.deinit();
     try loadParentEnv(gpa, io, &parent_env);
-    const path_var = parent_env.get("PATH") orelse return null;
+    const path_var = path_override orelse parent_env.get("PATH") orelse return null;
 
     var it = std.mem.tokenizeScalar(u8, path_var, ':');
     while (it.next()) |dir| {
@@ -1008,7 +1179,7 @@ fn ceilDiv(numerator: u64, denominator: u64) u64 {
 /// itself be the source of this specific signal. (`Handle.signal` could in
 /// principle deliver `SIGUSR1` to an already-`exec`'d child for unrelated
 /// reasons — that is a real but separate call, not this one.)
-fn buildRlimitWrap(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, r: RlimitSpec) !RlimitWrap {
+fn buildRlimitWrap(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, r: RlimitSpec, path_override: ?[]const u8) !RlimitWrap {
     var script: std.ArrayList(u8) = .empty;
     errdefer script.deinit(gpa);
     if (r.cpu_seconds) |v| try script.print(gpa, "ulimit -t {d} || kill -s USR1 $$\n", .{v});
@@ -1029,7 +1200,7 @@ fn buildRlimitWrap(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8,
     // ITS OWN (i.e. the child's, per env_mode) environment, breaking the
     // resolution guarantee `Spec`'s doc comment makes. See
     // `resolveArgv0ForRlimit`.
-    const resolved0: ?[]u8 = if (argv.len > 0) try resolveArgv0ForRlimit(gpa, io, argv[0]) else null;
+    const resolved0: ?[]u8 = if (argv.len > 0) try resolveArgv0ForRlimit(gpa, io, argv[0], path_override) else null;
     errdefer if (resolved0) |s| gpa.free(s);
 
     var wrapped: std.ArrayList([]const u8) = .empty;
@@ -1292,7 +1463,7 @@ const Pumps = struct {
     /// DRAIN threads, not `stdin`'s write — see F1's disposition.
     fn start(p: *Pumps, cap: usize, stdin_body: []const u8, deadline_ns: ?u64) !void {
         p.startInner(cap, stdin_body, deadline_ns) catch |e| {
-            p.child.kill(p.io);
+            killChild(p.io, p.child);
             p.join();
             return e;
         };
@@ -1386,7 +1557,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, spec: Spec, stdin_body: []const u
     if (spec.cancel != null) return runKilled(gpa, io, spec, stdin_body, null);
     ensureChildReaping();
     var child = try spawnChild(gpa, io, spec);
-    errdefer child.kill(io);
+    errdefer killChild(io, &child);
 
     var pumps: Pumps = .{ .io = io, .gpa = gpa, .child = &child };
     errdefer pumps.deinit();
@@ -1437,7 +1608,7 @@ fn runKilled(
     if (spec.cancel) |c| if (c.isRequested()) return error.Canceled;
     ensureChildReaping();
     var child = try spawnChild(gpa, io, spec);
-    errdefer child.kill(io);
+    errdefer killChild(io, &child);
 
     var pumps: Pumps = .{ .io = io, .gpa = gpa, .child = &child, .cancelable = spec.cancel != null };
     errdefer pumps.deinit();
@@ -1477,7 +1648,7 @@ fn runKilled(
         .grouped = spec.new_process_group,
     }}) catch |e| {
         // Without a killer nothing bounds the pumps: end the child first.
-        child.kill(io);
+        killChild(io, &child);
         pumps.join();
         return e;
     };
@@ -1826,6 +1997,51 @@ const StreamCtx = struct {
     /// reaping it). From then on a reader that finds the pipe idle for
     /// `default_pump_grace_ns` stops (sweep D8).
     exited: std.atomic.Value(bool) = .init(false),
+    /// Owners of this context: the `Handle` returned by `spawnStreaming` (one,
+    /// dropped by `wait`) plus one per `Handle.retain`. The last `release` frees it.
+    refs: std.atomic.Value(u32) = .init(1),
+    /// Guards `finished` and every signal sent through the handle, so a signal
+    /// can never follow the reap of the pid it names.
+    sig_lock: std.atomic.Mutex = .unlocked,
+    /// `wait` has (Linux: is about to) reaped the child; signals are no-ops from here.
+    finished: bool = false,
+
+    fn lockSig(ctx: *StreamCtx) void {
+        while (!ctx.sig_lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// `deliver` unless the child is already reaped.
+    fn sigDeliver(ctx: *StreamCtx, kind: SigKind, raw: u8) void {
+        ctx.lockSig();
+        defer ctx.sig_lock.unlock();
+        if (ctx.finished) return;
+        deliver(&ctx.child, kind, raw);
+    }
+
+    fn sigDeliverGroup(ctx: *StreamCtx, kind: SigKind, raw: u8) void {
+        ctx.lockSig();
+        defer ctx.sig_lock.unlock();
+        if (ctx.finished) return;
+        deliverGroup(&ctx.child, kind, raw, ctx.grouped);
+    }
+
+    /// The child's pid while it is still ours, null once `wait` has reaped it.
+    fn livePid(ctx: *StreamCtx) ?std.process.Child.Id {
+        ctx.lockSig();
+        defer ctx.sig_lock.unlock();
+        if (ctx.finished) return null;
+        return ctx.child.id;
+    }
+
+    fn markFinished(ctx: *StreamCtx) void {
+        ctx.lockSig();
+        defer ctx.sig_lock.unlock();
+        ctx.finished = true;
+    }
+
+    fn dropRef(ctx: *StreamCtx) void {
+        if (ctx.refs.fetchSub(1, .acq_rel) == 1) ctx.gpa.destroy(ctx);
+    }
 
     /// One read for a reader thread. Returns 0 (like EOF) when the child is
     /// known to be gone (`exited`) and the pipe stayed idle for the grace.
@@ -1909,8 +2125,26 @@ pub const Handle = struct {
 
     /// Ask the child to terminate (SIGTERM; TerminateProcess on Windows).
     pub fn cancel(h: Handle) void {
-        deliver(&h.ctx.child, .term, 0);
+        h.ctx.sigDeliver(.term, 0);
         wake(h.ctx);
+    }
+
+    /// Another owner of the handle, for a watchdog thread that may signal after
+    /// the owner's `wait` has returned: until the matching `release`, `cancel`,
+    /// `kill`, `signal`, `terminate` and their group forms may be called from
+    /// any thread at any time, including while `wait` runs and after it returned
+    /// (they are then no-ops, and never signal a recycled pid). Call it on a
+    /// handle whose `wait` has not returned (the owner's own copy is valid until
+    /// then), hand the result to the other thread, and `release` it there.
+    /// `wait` itself, `writeStdin`, `closeStdin` and `ack` keep their rules.
+    pub fn retain(h: Handle) Handle {
+        _ = h.ctx.refs.fetchAdd(1, .monotonic);
+        return h;
+    }
+
+    /// Drops a `retain`. The handle must not be used afterwards.
+    pub fn release(h: Handle) void {
+        h.ctx.dropRef();
     }
 
     /// Graceful stop for a streaming child (Go's `Cmd.Cancel` + `WaitDelay`,
@@ -1936,24 +2170,29 @@ pub const Handle = struct {
     }
 
     fn terminateImpl(h: Handle, group: bool, grace_ns: u64) bool {
-        wake(h.ctx); // free a reader parked on backpressure first
+        const ctx = h.ctx;
+        wake(ctx); // free a reader parked on backpressure first
         if (builtin.os.tag == .windows) {
-            deliver(&h.ctx.child, .kill, 0);
+            ctx.sigDeliver(.kill, 0);
             return false;
         }
-        return termThenKill(&h.ctx.child, group, grace_ns, null);
+        const id = ctx.livePid() orelse return true; // already reaped
+        if (group) ctx.sigDeliverGroup(.term, 0) else ctx.sigDeliver(.term, 0);
+        if (waitPidExitWithin(id, grace_ns, null)) return true;
+        if (group) ctx.sigDeliverGroup(.kill, 0) else ctx.sigDeliver(.kill, 0);
+        return false;
     }
 
     /// Force the child to terminate now (SIGKILL; TerminateProcess on Windows).
     pub fn kill(h: Handle) void {
-        deliver(&h.ctx.child, .kill, 0);
+        h.ctx.sigDeliver(.kill, 0);
         wake(h.ctx);
     }
 
     /// Send an arbitrary POSIX signal number. No-op mapping on Windows
     /// (routes to TerminateProcess).
     pub fn signal(h: Handle, sig: u8) void {
-        deliver(&h.ctx.child, .raw, sig);
+        h.ctx.sigDeliver(.raw, sig);
     }
 
     /// Ask the child's entire process GROUP to terminate (`SIGTERM` to
@@ -1962,7 +2201,7 @@ pub const Handle = struct {
     /// effect if `Spec.new_process_group` was set at spawn time; otherwise a
     /// documented no-op — see `grouped`.
     pub fn cancelGroup(h: Handle) void {
-        deliverGroup(&h.ctx.child, .term, 0, h.ctx.grouped);
+        h.ctx.sigDeliverGroup(.term, 0);
         wake(h.ctx);
     }
 
@@ -1970,7 +2209,7 @@ pub const Handle = struct {
     /// to `-pgid`). Only takes effect if `Spec.new_process_group` was set at
     /// spawn time; otherwise a documented no-op — see `grouped`.
     pub fn killGroup(h: Handle) void {
-        deliverGroup(&h.ctx.child, .kill, 0, h.ctx.grouped);
+        h.ctx.sigDeliverGroup(.kill, 0);
         wake(h.ctx);
     }
 
@@ -1978,7 +2217,7 @@ pub const Handle = struct {
     /// GROUP. Only takes effect if `Spec.new_process_group` was set at spawn
     /// time; otherwise a documented no-op — see `grouped`.
     pub fn signalGroup(h: Handle, sig: u8) void {
-        deliverGroup(&h.ctx.child, .raw, sig, h.ctx.grouped);
+        h.ctx.sigDeliverGroup(.raw, sig);
     }
 
     /// True iff this child was spawned with `Spec.new_process_group = true`,
@@ -2075,10 +2314,16 @@ pub const Handle = struct {
     /// `new_process_group` and `killGroup`. Windows: readers always run to
     /// EOF.
     ///
-    /// Not thread-safe against the other methods: once `wait` has started, no
-    /// other method of this handle may be called from another thread (`wait`
-    /// frees the handle). Stop a child from a watchdog thread BEFORE `wait`
-    /// starts, or serialise on the owning thread.
+    /// Call it exactly once, on the owning thread. It drops the owner's
+    /// reference: a `Handle` that nobody `retain`ed is freed here, and no
+    /// method of it may be called afterwards, nor from another thread once
+    /// `wait` has started. A `retain`ed copy outlives it and its signalling
+    /// methods stay safe (see `retain`): a watchdog may kill the child while
+    /// this `wait` blocks. Linux marks the child reaped just before the reap,
+    /// from the exit it observed without reaping, so no signal can follow it;
+    /// other POSIX targets have no non-reaping wait, so a signal racing the
+    /// reap itself can still meet a recycled pid (the window `stillOurChild`
+    /// narrows on Linux only).
     pub fn wait(h: Handle) Term {
         const ctx = h.ctx;
         if (builtin.os.tag == .linux) {
@@ -2089,10 +2334,11 @@ pub const Handle = struct {
         }
         if (ctx.t_out) |t| t.join();
         if (ctx.t_err) |t| t.join();
+        if (builtin.os.tag == .linux) ctx.markFinished();
         const term = waitTolerant(ctx.io, &ctx.child);
+        if (builtin.os.tag != .linux) ctx.markFinished();
         if (ctx.cb.on_exit) |f| f(ctx.cb.ctx, term);
-        const gpa = ctx.gpa;
-        gpa.destroy(ctx);
+        ctx.dropRef();
         return term;
     }
 };
@@ -2135,7 +2381,7 @@ pub fn spawnStreaming(gpa: std.mem.Allocator, io: std.Io, spec: Spec, cb: Callba
         .sema = .{ .permits = permits },
         .grouped = spec.new_process_group,
     };
-    errdefer ctx.child.kill(io);
+    errdefer killChild(io, &ctx.child);
 
     if (ctx.child.stdout != null) {
         ctx.t_out = try std.Thread.spawn(.{}, streamOutLoop, .{ctx});
@@ -4173,4 +4419,275 @@ test {
     // External evidence: replay of frozen Python `subprocess` results.
     _ = @import("oracle_test.zig");
     _ = @import("sweep_test.zig");
+}
+
+// ── pidfd signalling ────────────────────────────────────────────────────────
+
+test "pidfd: a child of the Linux spawner is signalled through its pidfd, and the entry goes with the reap" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!vfork_spawn.supported) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    ensureChildReaping();
+
+    const before = pidfds.count();
+    var child = try spawnChild(testing.allocator, io, .{ .argv = &.{ "sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    const pid = child.id.?;
+    // The kernel may predate CLONE_PIDFD (5.2); then there is nothing to test.
+    if (pidfds.count() == before) {
+        _ = waitTolerant(io, &child);
+        return error.SkipZigTest;
+    }
+    try testing.expect(pidfds.alive(pid));
+    deliver(&child, .kill, 0);
+    const term = waitTolerant(io, &child);
+    try testing.expectEqual(std.posix.SIG.KILL, term.signal);
+    try testing.expectEqual(before, pidfds.count());
+    try testing.expect(!pidfds.alive(pid));
+}
+
+test "pidfd: after an out-of-band reap the pidfd answers ESRCH, so nothing is signalled and the group gate closes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!vfork_spawn.supported) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    ensureChildReaping();
+
+    const before = pidfds.count();
+    var child = try spawnChild(testing.allocator, io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .new_process_group = true,
+    });
+    const pid = child.id.?;
+    if (pidfds.count() == before) {
+        _ = waitTolerant(io, &child);
+        return error.SkipZigTest;
+    }
+    try testing.expect(pidfds.signal(pid, .KILL));
+    var status: if (builtin.link_libc) c_int else i32 = undefined;
+    while (true) {
+        const rc = std.posix.system.wait4(pid, &status, 0, null);
+        if (std.posix.errno(rc) == .INTR) continue;
+        break;
+    }
+    // Reaped by "somebody else": the pidfd no longer finds a process, but the
+    // table still maps the pid, so `deliver` stays on the pidfd path (ESRCH)
+    // and never falls back to a bare `kill(pid)`.
+    try testing.expect(child.id != null);
+    try testing.expect(!pidfds.alive(pid));
+    try testing.expect(pidfds.signal(pid, .KILL));
+    deliverGroup(&child, .kill, 0, true);
+    _ = waitTolerant(io, &child);
+    try testing.expectEqual(before, pidfds.count());
+}
+
+test "pidfd: no descriptor outlives a run, a timeout or a cancel" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!vfork_spawn.supported) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const before = pidfds.count();
+    for (0..20) |_| {
+        var a = try run(testing.allocator, io, .{ .argv = &.{"true"} }, "");
+        a.deinit(testing.allocator);
+        var b = try runTimeout(testing.allocator, io, .{ .argv = &.{ "sleep", "30" } }, "", 50 * std.time.ns_per_ms);
+        try testing.expect(b.timed_out);
+        b.deinit(testing.allocator);
+    }
+    try testing.expectEqual(before, pidfds.count());
+}
+
+test "pidfd: the table is bounded and a full table falls back instead of failing" {
+    var t: PidfdTable = .{};
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var fds: [PidfdTable.cap + 1]std.posix.fd_t = undefined;
+    for (&fds) |*fd| {
+        const rc = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        fd.* = @intCast(rc);
+    }
+    for (fds[0..PidfdTable.cap], 0..) |fd, i| t.add(@intCast(i + 1), fd);
+    try testing.expectEqual(PidfdTable.cap, t.count());
+    // One too many: closed at once, not stored.
+    t.add(9999, fds[PidfdTable.cap]);
+    try testing.expectEqual(PidfdTable.cap, t.count());
+    try testing.expect(!t.alive(9999));
+    // A pid seen twice (recycled after an unseen reap) replaces the old entry.
+    const extra = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    t.add(1, @intCast(extra));
+    try testing.expectEqual(PidfdTable.cap, t.count());
+    for (1..PidfdTable.cap + 1) |i| t.remove(@intCast(i));
+    try testing.expectEqual(@as(usize, 0), t.count());
+}
+
+// ── retained handles ────────────────────────────────────────────────────────
+
+test "Handle.retain: a watchdog may kill the child while wait blocks, and signal after it returned" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .ignore,
+    }, .{});
+    const dog = h.retain();
+    const Watch = struct {
+        h: Handle,
+        late_done: std.atomic.Value(bool) = .init(false),
+        fn run(w: *@This(), wait_returned: *const std.atomic.Value(bool)) void {
+            sleepNs(100 * std.time.ns_per_ms);
+            w.h.kill(); // while the owner is blocked in `wait`
+            while (!wait_returned.load(.acquire)) sleepNs(std.time.ns_per_ms);
+            // After the owner's `wait` returned: no-ops, on live memory.
+            w.h.kill();
+            w.h.cancel();
+            w.h.signal(9);
+            w.h.killGroup();
+            w.h.cancelGroup();
+            w.h.signalGroup(9);
+            _ = w.h.terminate(1 * std.time.ns_per_ms);
+            _ = w.h.terminateGroup(1 * std.time.ns_per_ms);
+            w.late_done.store(true, .release);
+            w.h.release();
+        }
+    };
+    var returned: std.atomic.Value(bool) = .init(false);
+    var w = Watch{ .h = dog };
+    const t = try std.Thread.spawn(.{}, Watch.run, .{ &w, &returned });
+    const term = h.wait();
+    returned.store(true, .release);
+    t.join();
+    try testing.expect(term == .signal);
+    try testing.expect(w.late_done.load(.acquire));
+}
+
+test "Handle.retain: terminate from a retained handle races wait without touching a recycled pid" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const h = try spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.05; done" },
+        .stdin = .ignore,
+    }, .{});
+    const dog = h.retain();
+    const T = struct {
+        fn run(x: Handle, out: *bool) void {
+            sleepNs(100 * std.time.ns_per_ms);
+            out.* = x.terminate(2 * std.time.ns_per_s);
+            x.release();
+        }
+    };
+    var exited_in_grace = false;
+    const t = try std.Thread.spawn(.{}, T.run, .{ dog, &exited_in_grace });
+    const term = h.wait();
+    t.join();
+    try testing.expect(term == .exited);
+    try testing.expect(exited_in_grace);
+}
+
+// ── PATH policy ─────────────────────────────────────────────────────────────
+
+fn envWithPath(gpa: std.mem.Allocator, path: []const u8) !std.process.Environ.Map {
+    var m = std.process.Environ.Map.init(gpa);
+    errdefer m.deinit();
+    try m.put("PATH", path);
+    return m;
+}
+
+test "PathPolicy: parent searches the parent's PATH, child_env the child's, none the cwd" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The child's PATH is empty of programs; the parent's is not.
+    var nowhere = try envWithPath(testing.allocator, "/nonexistent-dir");
+    defer nowhere.deinit();
+    var ok = try run(testing.allocator, io, .{ .argv = &.{"true"}, .env = &nowhere, .env_mode = .clear }, "");
+    ok.deinit(testing.allocator);
+    try testing.expectError(error.FileNotFound, run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .env = &nowhere,
+        .env_mode = .clear,
+        .path_policy = .child_env,
+    }, ""));
+
+    // …and the other way round: only the child's PATH names the directory.
+    var bins = try envWithPath(testing.allocator, "/nonexistent-dir:/usr/bin:/bin");
+    defer bins.deinit();
+    var found = try run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .env = &bins,
+        .env_mode = .clear,
+        .path_policy = .child_env,
+    }, "");
+    try testing.expect(found.term == .exited and found.term.exited == 0);
+    found.deinit(testing.allocator);
+    // Under .merge the overlaid PATH is the child's.
+    try testing.expectError(error.FileNotFound, run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .env = &nowhere,
+        .env_mode = .merge,
+        .path_policy = .child_env,
+    }, ""));
+    // Under .inherit the child's PATH is the parent's.
+    var inh = try run(testing.allocator, io, .{ .argv = &.{"true"}, .path_policy = .child_env }, "");
+    inh.deinit(testing.allocator);
+
+    // none: a bare name is relative to the child's cwd.
+    var in_bin = try run(testing.allocator, io, .{ .argv = &.{"true"}, .cwd = "/usr/bin", .path_policy = .none }, "");
+    in_bin.deinit(testing.allocator);
+    try testing.expectError(error.FileNotFound, run(testing.allocator, io, .{ .argv = &.{"true"}, .cwd = "/", .path_policy = .none }, ""));
+    // A name with a '/' is never searched, under any policy.
+    var abs = try run(testing.allocator, io, .{ .argv = &.{"/usr/bin/true"}, .env = &nowhere, .env_mode = .clear, .path_policy = .none }, "");
+    abs.deinit(testing.allocator);
+}
+
+test "PathPolicy: the same under rlimit's shell wrapper" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var nowhere = try envWithPath(testing.allocator, "/nonexistent-dir");
+    defer nowhere.deinit();
+    const lim: RlimitSpec = .{ .open_files = 64 };
+    // child_env: nothing on the child's PATH, so the wrapper's `exec` fails (127).
+    var r1 = try run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .env = &nowhere,
+        .env_mode = .clear,
+        .path_policy = .child_env,
+        .rlimit = lim,
+    }, "");
+    try testing.expect(!(r1.term == .exited and r1.term.exited == 0));
+    r1.deinit(testing.allocator);
+    var bins = try envWithPath(testing.allocator, "/usr/bin:/bin");
+    defer bins.deinit();
+    var r2 = try run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .env = &bins,
+        .env_mode = .clear,
+        .path_policy = .child_env,
+        .rlimit = lim,
+    }, "");
+    try testing.expect(r2.term == .exited and r2.term.exited == 0);
+    r2.deinit(testing.allocator);
+    var r3 = try run(testing.allocator, io, .{ .argv = &.{"true"}, .cwd = "/usr/bin", .path_policy = .none, .rlimit = lim }, "");
+    try testing.expect(r3.term == .exited and r3.term.exited == 0);
+    r3.deinit(testing.allocator);
 }

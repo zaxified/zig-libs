@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [sindresorhus/execa](https://github.com/sindresorhus/execa) | JavaScript | MIT | 7.6k | v10.0.1 (2026-07-31) | Popular high-level runner for Node (piping, lines, IPC) *(inferred)*; not a Zig alternative, listed for the feature bar users bring. |
 | Zig 0.16 `std.process` (`spawn`, `run`, `Child.wait`) | Zig | MIT | — | Zig 0.16.0 | What this module wraps. Per this module's SPEC: `Child.wait` **panics** on `ECHILD` when a sibling thread reaps the child, and `std.process.run` fails with `error.StreamTooLong` and discards the output at the cap; no timeout, cancel, group kill or rlimit. `gh search` for Zig subprocess libraries found nothing notable. |
 
-**Where we are ahead:** of Zig `std`, on everything a supervisor needs: reap-race-tolerant wait (no panic), deadlock-free capture that keeps the prefix past the cap, hard timeout, `Cancel` token shared by many runs, SIGTERM-then-SIGKILL grace, whole-process-group kill, opt-in rlimits, streaming with backpressure and NDJSON line framing, streaming stdin, opt-in `argsafe` argv validation. Compared with Python, ahead on cancellation/grace/group-kill in one API (Python has `timeout` and `Popen` signals, not a cancel token) *(inferred)*. **Where we are behind:** no redirection to an arbitrary fd number (`pass_fds` keeps the number), no `umask`/`setsid` for the child, no `close_fds` walk (a non-CLOEXEC parent fd reaches the child), no pipelines, no pty (all rejected: *What is deliberately not done*); no pidfd-based signalling (PID-reuse window narrowed, not closed: *Threat model*, *Backlog / deferred*), Windows reap-race untested (*Backlog / deferred*).
+**Where we are ahead:** of Zig `std`, on everything a supervisor needs: reap-race-tolerant wait (no panic), deadlock-free capture that keeps the prefix past the cap, hard timeout, `Cancel` token shared by many runs, SIGTERM-then-SIGKILL grace, whole-process-group kill, opt-in rlimits, streaming with backpressure and NDJSON line framing, streaming stdin, opt-in `argsafe` argv validation. Compared with Python, ahead on cancellation/grace/group-kill in one API (Python has `timeout` and `Popen` signals, not a cancel token) *(inferred)*. **Where we are behind:** no redirection to an arbitrary fd number (`pass_fds` keeps the number), no `umask`/`setsid` for the child, no `close_fds` walk (a non-CLOEXEC parent fd reaches the child), no pipelines, no pty (all rejected: *What is deliberately not done*); no pidfd-based signalling to a process GROUP or for a child std's fallback spawner started (PID-reuse window narrowed there, not closed: *Threat model*), Windows reap-race untested (*Backlog / deferred*).
 
 ## Design & invariants
 
@@ -85,7 +85,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Graceful cancellation.** `Spec.cancel_grace_ns: ?u64` (default null = SIGKILL at once): on `Cancel.request` or the `runTimeout` deadline the killer thread sends SIGTERM (to `-pgid` with `new_process_group`), polls every 5 ms for the direct child to exit (Linux: `waitid(WNOHANG|WNOWAIT|WEXITED)`, non-consuming, so `waitTolerant` still gets the status), then SIGKILLs. The deadline path's pump deadline grows by the grace, keeping the invariant that SIGKILL was sent before the drainers give up. `Output.timed_out` (the deadline, as opposed to `canceled`) and `Output.grace_expired` (SIGKILL followed SIGTERM) say what happened. Streaming twin: `Handle.terminate(grace_ns) bool` / `terminateGroup`, blocking, from the owning thread, `true` = exited within the grace. A child that closes its stdout/stderr and keeps running is still waited for and killed at the deadline (Linux: after the pumps end `runKilled` waits for the exit with `WNOWAIT`; other POSIX targets have no non-reaping wait). Windows: no SIGTERM, `TerminateProcess` at once, grace ignored.
 - **Line-framed stdout.** `Callbacks.on_stdout_line` (replaces `on_stdout` when set) with `max_line_bytes` (default 1 MiB): `LineFramer` reassembles across reads. `\n` is stripped and ONE trailing `\r`; empty lines are delivered; a final unterminated line is flushed at EOF; an over-long line is delivered once, cut to `max_line_bytes` with `truncated = true`, the rest discarded to the next `\n` (memory stays bounded and the next line intact; an allocation failure is treated the same way). Backpressure is one permit per delivered line, acked once per callback, so a chunk holding many lines can block the reader mid-chunk. No JSON parser; stderr stays raw chunks.
 - **Streaming `Handle.wait`.** It observes the child's exit without reaping (`waitid WNOWAIT`, Linux); the readers then stop once the pipe has been idle for 250 ms (`default_pump_grace_ns`, not configurable; idle means inside `poll` only, never during callbacks or backpressure parking), so a descendant holding the pipe cannot hold `wait` unless it keeps writing (remedy: `new_process_group` + `killGroup`). Before the exit the readers wait in 500 ms `poll` slices. Join-before-reap and `on_exit`-after-the-last-chunk hold. `wait` does not close stdin or lift backpressure on entry: a child that reads stdin to EOF needs `closeStdin` first, and the consumer keeps acking while `wait` runs.
-- **`argv[0]` resolution.** Always against the PARENT's `PATH` (std does it), also under `Spec.rlimit`, where `resolveArgv0ForRlimit` resolves it before the wrapper shell runs (otherwise `exec "$@"` would search the child's `PATH`).
+- **`argv[0]` resolution.** `Spec.path_policy` (`PathPolicy`): `.parent` (default; Go's `exec.Command`) searches the PARENT's `PATH` whatever the child's environment says; `.child_env` (Python's `subprocess` with `env=`, Rust's `Command`) searches the child's (`Spec.env`'s under `.clear`/`.merge`, the parent's under `.inherit`, `std.Io.Threaded.default_PATH` when it has none); `.none` makes a bare name relative to the child's `cwd`. A name containing `/` is never searched. On the Linux spawner the search is done in the child against the chosen path and `argv[0]` stays as given; on std's fallback spawner (other targets, an unreadable `/proc/self/environ`) a non-default policy replaces `argv[0]` by the resolved path (std searches the parent's `PATH` only), and under `Spec.rlimit` `resolveArgv0ForRlimit` resolves it before the wrapper shell runs (otherwise `exec "$@"` would search the shell's own `PATH`), also replacing it. Empty `PATH` entries are skipped; a candidate is taken when `access(X_OK)` succeeds (an unreadable-but-executable file counts, a directory with the x bit does too, as in `execvp`'s first try).
 - **`argsafe` and `Spec.rlimit` plumbing.** `runValidated`/`buildValidatedArgv` are opt-in; `Spec.rlimit` (`RlimitSpec`: `cpu_seconds`, `address_space_bytes`, `open_files`, `file_size_bytes`) goes through the `/bin/sh -c 'ulimit ...; exec "$@"'` wrapper because `std.process.spawn` has no pre-exec hook (the immediate child, the shell, sets its own limits; POSIX guarantees they survive `exec`). `Spec.new_process_group` (`setpgid(0, 0)`) with `Handle.cancelGroup`/`killGroup`/`signalGroup` and a grouped `runTimeout` deadline-kill reaches a killed child's own descendants. `Handle.writeStdin`/`closeStdin` stream stdin after `spawnStreaming` (`Spec.stdin = .pipe`), independent of `run`'s one-shot `stdin_body`.
 
 ## Threat model / out of scope
@@ -135,19 +135,30 @@ Every signal passes `stillOurChild(pid)` first — `waitid` with `WNOHANG | WNOW
 non-destructive (it never consumes the status `waitTolerant` still needs), non-blocking for a
 running child or a zombie alike, and answers `ECHILD` exactly when the pid is no longer ours.
 
-⚠ **This narrows the window; it does not close it.** The pid can be reaped between that answer
-and the `kill`. Closing it properly means signalling through a `pidfd` opened at spawn
-(`pidfd_open` / `pidfd_send_signal`), which is immune to reuse by construction — not done, because it costs a descriptor per child and needs a fallback for kernels without it,
-and because `std.process.spawn` gives no hook to open the pidfd atomically with the fork. Also
-Linux-only: on other POSIX targets `stillOurChild` answers "ours" unconditionally and the
-unguarded behaviour stands. Actual pid RECYCLING was not reproduced (it needs the pid counter
-forced to wrap); what is pinned by a test is the gate itself, in both directions.
+**A child the Linux spawner started is signalled through a pidfd instead.** `clone` is given
+`CLONE_PIDFD` (Linux 5.2), so the descriptor is taken atomically with the fork and names that very
+process; `deliver` sends through `pidfd_send_signal`, which answers `ESRCH` for a reaped process and
+so cannot reach a recycled pid. The pid → pidfd table is fixed-size (256 live children), lock-held
+across the syscall so a reap cannot close a descriptor in use, and the descriptor is closed when the
+child is reaped (`waitTolerant`) or killed on an error path (`killChild`). The cost is one descriptor
+per live child. A kernel without the flag (`EINVAL`) is spawned without it, and so is a child past
+the table's size: both fall back to the gate below.
+
+⚠ **For everything else the gate narrows the window; it does not close it.** The pid can be reaped
+between that answer and the `kill`. This covers a child std's fallback spawner started, a kernel
+before 5.2, and every signal to a whole process GROUP (a pidfd cannot signal a group; for a pidfd
+child the group signal is gated on the leader still existing, which keeps the group id from being
+recycled, but is still a check followed by a `kill`). Also Linux-only: on other POSIX targets
+`stillOurChild` answers "ours" unconditionally and the unguarded behaviour stands. Actual pid
+RECYCLING was not reproduced (it needs the pid counter forced to wrap); what is pinned by a test is
+the gate itself, in both directions, and the pidfd path (an out-of-band reap answers `ESRCH`, the
+table empties with the reap).
 
 **Residual risks and caller contracts.**
 - `Handle.writeStdin` blocks the calling thread until the child reads; there is no deadline variant. A caller that needs one writes from its own thread.
 - `run` without `runTimeout`/`Spec.cancel` waits for pipe EOF without bound; a descendant holding the pipe holds `run`.
 - A child that exits on its own without reading all of `stdin_body` makes `run`/`runTimeout` return `error.BrokenPipe` and drop the captured output (a listed oracle difference: Python and Go swallow EPIPE; the build-tool consumer relies on it). When procrun itself kills the child (deadline/cancel) the EPIPE is swallowed and the `Output` is returned with `timed_out`/`canceled`.
-- `Handle.kill`/`cancel`/`signal*`/`terminate` from another thread racing `Handle.wait` is a use-after-free of the context (`wait` frees it) and is not allowed; call `wait` exactly once. A refcounted `Handle` would lift this (*Backlog / deferred*).
+- `Handle.kill`/`cancel`/`signal*`/`terminate` from another thread racing `Handle.wait` is a use-after-free of the context (`wait` frees it) **unless that thread holds its own reference**: `Handle.retain` (before `wait` returns) hands a copy to a watchdog, which may then signal at any time, during `wait` and after it returned (no-ops once the child is reaped, never a recycled pid), and `release` drops it. The context is freed by the last owner. The guard is a lock around `finished` and every signal; on Linux `wait` sets `finished` from the exit it observed without reaping, so a signal can never follow the reap, while another POSIX target has no non-reaping wait and marks it after the reap (the old window). Call `wait` exactly once; `writeStdin`, `closeStdin` and `ack` keep their rules.
 - `Spec.stream_permits` of 0 is treated as 1 and a huge value cannot make cancel/kill spin.
 - The stdin writer of a `runTimeout`/`Cancel` run is deadline-bounded (non-blocking writes polled in slices of at most 50 ms).
 - `Handle.writeStdinTimeout(data, timeout_ms)` is `writeStdin` with a deadline (Linux; `error.Unsupported` elsewhere): `error.Timeout` when the pipe did not take the whole body in time (an unknown prefix may have been written, as with Python's `communicate(timeout=)`'s `TimeoutExpired`); the descriptor is non-blocking only for the call.
@@ -166,7 +177,8 @@ forced to wrap); what is pinned by a test is the gate itself, in both directions
 ## What is deliberately not done
 
 - **`setsid`, `umask`, `PDEATHSIG`:** `std.process.spawn` has no pre-exec hook, so they are not possible without a shell wrapper; `new_process_group` plus group kill covers the clean case. Python's `start_new_session`/`umask` have no counterpart.
-- **PATH policy, `close_fds` walk, pipelines (`a | b`), pty:** not built; none is a common need for the daemon use this module targets, and a PATH policy needs an own resolver and decisions (X_OK semantics, whose PATH under `.merge`) that a consumer must state first.
+- **`close_fds` walk, pipelines (`a | b`), pty:** not built; none is a common need for the daemon use this module targets.
+- **A default `PathPolicy` of `.child_env`:** Python and Rust search the child's `PATH`, Go the parent's; changing the default would silently change which program runs for a caller using `.clear`, so `.parent` stays the default and the other is opt-in.
 - **Windows parity beyond compiling:** out of scope without a Windows runner (`new_process_group` is a no-op, `rlimit` is `error.OperationUnsupported`).
 - **Type-level "consumed" marker for `Handle`:** rejected. Zig has no move-only types, so any compile-time marker is defeated by copying the by-value `Handle`; a runtime flag cannot live in the state `wait` frees (a second `wait` is a use-after-free, not a detectable state) and keeping the state alive would leak per handle. The contract stays documented: call `wait` exactly once.
 - **Stop-signal helper for a daemon's own SIGTERM/SIGINT:** lives in the `stopsignal` module.
@@ -174,10 +186,7 @@ forced to wrap); what is pinned by a test is the gate itself, in both directions
 
 ## Backlog / deferred
 
-- **pidfd signalling (R10).** Signal through a `pidfd` opened at spawn (`pidfd_open`/`pidfd_send_signal`) to close the PID-reuse window that `stillOurChild` only narrows. Costs a descriptor per child, needs a fallback for kernels without it, and `std.process.spawn` gives no hook to open it atomically with the fork (the vfork spawner could). Effort medium.
-- **Windows reap-race coverage.** The `TerminateProcess`/`create_no_window` branch compiles but is untested for the POSIX-specific regression this module exists to fix; needs a Windows runner.
-- **Refcounted `Handle` for watchdog threads (D10).** Lifts the "no `kill`/`cancel`/`signal*`/`terminate` racing `wait`" rule (use-after-free of the context today).
-- **PATH-resolution policy.** Explicit control over `argv[0]` resolution (`.parent` | `.child_env` | `.none`/explicit `path`); needs an own resolver for everything but `.parent`, including the non-rlimit path, plus decisions on X_OK-vs-file semantics and on `env_mode = .merge`. Do it when a consumer states which policy it needs.
+- **Windows reap-race coverage.** The `TerminateProcess`/`create_no_window` branch compiles but is untested for the POSIX-specific regression this module exists to fix; needs a Windows runner (wait: no Windows machine here; the new `Handle.retain`/pidfd code is Linux-tested only, the Windows branch type-checks lazily and was not built).
 
 ## Anchoring
 
