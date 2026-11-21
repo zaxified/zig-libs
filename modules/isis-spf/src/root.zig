@@ -35,8 +35,10 @@
 //! Scope: **point-to-point and LAN topology → SPF → next-hop table**. A LAN
 //! pseudonode is transit only: members it lists and that list it back are
 //! joined by arcs at each member's own metric.
-//! Multi-level (L1/L2) leaking, IP/prefix reachability leaves, the overload
-//! bit's transit exclusion, and incremental SPF are deferred — see `SPEC.md`.
+//! Also, by `Options`: the overload bit's transit exclusion (default on), ECMP
+//! next-hop sets (`max_paths`), IP/IPv6 prefix routes (`prefixes`, #135/#236),
+//! the attached-bit default route, and (in `leak`) L1/L2 prefix leaking
+//! planning. Incremental SPF is not done — see `SPEC.md`.
 
 const std = @import("std");
 const isis = @import("isis");
@@ -65,6 +67,9 @@ pub const meta = .{
 /// first six octets, and each 7-octet neighbour-id's first six).
 pub const SystemId = [6]u8;
 
+/// Multi-level route leaking between an L1 and an L2 computation.
+pub const leak = @import("leak.zig");
+
 /// The caller's time unit, forwarded to `isis-lsdb` so lifetimes age to `now`.
 pub const Time = lsdb.Time;
 
@@ -76,6 +81,45 @@ pub const Route = struct {
     next_hop: SystemId,
     /// Total path cost from the local system (a sum of `spf-ect` edge weights).
     metric: u64,
+};
+
+/// An IP prefix a system advertises (#135 / #236). The address bytes past
+/// `len` bits are zero; an IPv4 address sits in `addr[0..4]`.
+pub const Prefix = struct {
+    pub const Family = enum { ipv4, ipv6 };
+    family: Family,
+    addr: [16]u8,
+    len: u8,
+
+    /// Total order: family (IPv4 first), address bytes, length.
+    pub fn order(a: Prefix, b: Prefix) std.math.Order {
+        if (a.family != b.family) return std.math.order(@backingInt(a.family), @backingInt(b.family));
+        const o = std.mem.order(u8, &a.addr, &b.addr);
+        if (o != .eq) return o;
+        return std.math.order(a.len, b.len);
+    }
+};
+
+/// The selected route to one prefix. `metric` is the total: the distance to
+/// the advertising system plus the metric it advertised (RFC 5305 §4:
+/// "the metric of the prefix is added to the cost to reach the router").
+pub const PrefixRoute = struct {
+    prefix: Prefix,
+    metric: u64,
+    /// The first hop toward the advertising system; `origin == next_hop ==
+    /// local` for a prefix the local system advertises itself. With
+    /// `Options.max_paths > 1` this is the lowest of the equal-cost hops.
+    next_hop: SystemId,
+    /// The advertising system (the lowest system-id among equal candidates).
+    origin: SystemId,
+    /// The Up/Down bit of the selected advertisement (RFC 5302: the prefix
+    /// was leaked from L2 into L1).
+    up_down: bool = false,
+    /// The IPv6 X bit of the selected advertisement.
+    external: bool = false,
+    /// Synthesised from an attached L1/L2 system (`Options.attached_default`),
+    /// not advertised by anybody.
+    attached_default: bool = false,
 };
 
 /// RFC 5305 §3: "If a link is advertised with the maximum link metric
@@ -123,6 +167,30 @@ pub const max_link_metric: u32 = 0xFFFFFF;
 /// function is NOT `pub` — it is unreachable from outside this file (and
 /// therefore from every other module) by construction, not by convention.
 pub const Options = struct {
+    /// Equal-cost next hops to keep per destination (the `max_paths` of
+    /// holo-isis). 1 (the default, and 0) is the single deterministic ECT
+    /// path SPB needs. More: `RouteTable.nextHops` / `prefixNextHops` list every
+    /// first hop on any shortest path, sorted by system-id and cut to this many,
+    /// and `Route.next_hop` / `PrefixRoute.next_hop` is the lowest of them.
+    max_paths: u8 = 1,
+    /// ISO/IEC 10589 §7.2.8.1 / RFC 3787: an LSP (fragment 0) with the overload
+    /// bit set marks its system as not to be used for transit, so the SPF
+    /// does not relax arcs out of it; the system stays reachable as a
+    /// destination, and the local system's own bit is ignored. FRR, holo-isis
+    /// and goisis all honour it by default. `false` computes as before.
+    honour_overload: bool = true,
+    /// Also select IP prefix routes from #135/#236 into `RouteTable.prefixes`.
+    prefixes: bool = false,
+    /// The database is level 2: ignore the Up/Down bit (RFC 5302 §3.3 "RECOMMENDED
+    /// that implementations ignore the up/down bit in L2 LSPs"). Default is
+    /// level 1: a prefix with the bit clear is preferred to one with it set
+    /// (RFC 5302 §3.1: L1 intra-area before L2->L1 inter-area).
+    level2: bool = false,
+    /// A level-1 system whose own LSP is not L1/L2 installs a default route
+    /// (0.0.0.0/0, ::/0) to the nearest reachable system that sets the
+    /// attached bit (ISO/IEC 10589 §7.2.9.2 / RFC 1195), if that system
+    /// supports the family. Needs `prefixes`.
+    attached_default: bool = false,
     /// Refuse a database that carries an asymmetric link at all — an
     /// **opt-in fabric-hygiene check, not a correctness guard**.
     ///
@@ -176,10 +244,71 @@ pub const RouteTable = struct {
     /// relies on) is misconfigured if this is non-zero — see
     /// `Options.reject_asymmetric`.
     asymmetric_links: u32 = 0,
+    /// IP prefix routes (`Options.prefixes`), sorted by family, address, length.
+    prefixes: []PrefixRoute = &.{},
+    /// Equal-cost hop sets (`Options.max_paths > 1`): `route_hops[i]` is the
+    /// span of `hop_pool` for `routes[i]`, `prefix_hops[i]` for `prefixes[i]`;
+    /// both empty when `max_paths <= 1`.
+    route_hops: []HopSpan = &.{},
+    prefix_hops: []HopSpan = &.{},
+    hop_pool: []SystemId = &.{},
 
     pub fn deinit(self: *RouteTable) void {
         self.gpa.free(self.routes);
+        self.gpa.free(self.prefixes);
+        self.gpa.free(self.route_hops);
+        self.gpa.free(self.prefix_hops);
+        self.gpa.free(self.hop_pool);
         self.* = undefined;
+    }
+
+    /// Every equal-cost first hop toward `dest` (sorted by system-id, at most
+    /// `Options.max_paths`), or `null` if unreachable. Without `max_paths > 1`
+    /// it is the single `next_hop`. The slice lives as long as the table.
+    pub fn nextHops(self: *const RouteTable, dest: SystemId) ?[]const SystemId {
+        var lo: usize = 0;
+        var hi: usize = self.routes.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (std.mem.order(u8, &self.routes[mid].dest, &dest)) {
+                .eq => {
+                    if (self.route_hops.len == 0) return @as(*const [1]SystemId, @ptrCast(&self.routes[mid].next_hop));
+                    const sp = self.route_hops[mid];
+                    return self.hop_pool[sp.start..][0..sp.len];
+                },
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+            }
+        }
+        return null;
+    }
+
+    /// The route to the exact prefix, or `null`. O(log n).
+    pub fn prefixRoute(self: *const RouteTable, prefix: Prefix) ?PrefixRoute {
+        const i = self.prefixIndex(prefix) orelse return null;
+        return self.prefixes[i];
+    }
+
+    /// Equal-cost first hops toward `prefix` (see `nextHops`).
+    pub fn prefixNextHops(self: *const RouteTable, prefix: Prefix) ?[]const SystemId {
+        const i = self.prefixIndex(prefix) orelse return null;
+        if (self.prefix_hops.len == 0) return @as(*const [1]SystemId, @ptrCast(&self.prefixes[i].next_hop));
+        const sp = self.prefix_hops[i];
+        return self.hop_pool[sp.start..][0..sp.len];
+    }
+
+    fn prefixIndex(self: *const RouteTable, prefix: Prefix) ?usize {
+        var lo: usize = 0;
+        var hi: usize = self.prefixes.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (self.prefixes[mid].prefix.order(prefix)) {
+                .eq => return mid,
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+            }
+        }
+        return null;
     }
 
     /// The route to `dest`, or `null` if `dest` is not reachable. O(log n) —
@@ -251,7 +380,15 @@ pub fn computeWith(
     now: Time,
     opts: Options,
 ) Error!RouteTable {
-    return computeInternal(gpa, db, local, now, .{ .require_two_way = true, .reject_asymmetric = opts.reject_asymmetric });
+    return computeInternal(gpa, db, local, now, .{
+        .require_two_way = true,
+        .reject_asymmetric = opts.reject_asymmetric,
+        .max_paths = opts.max_paths,
+        .honour_overload = opts.honour_overload,
+        .prefixes = opts.prefixes,
+        .level2 = opts.level2,
+        .attached_default = opts.attached_default,
+    });
 }
 
 /// The two-way-check-disabled path — deliberately WRONG (a one-way/stale
@@ -273,6 +410,11 @@ fn computeWithBrokenTwoWayForTesting(
 const InternalOptions = struct {
     require_two_way: bool,
     reject_asymmetric: bool,
+    max_paths: u8 = 1,
+    honour_overload: bool = false,
+    prefixes: bool = false,
+    level2: bool = false,
+    attached_default: bool = false,
 };
 
 fn computeInternal(
@@ -298,6 +440,17 @@ fn computeInternal(
     defer pn_lists.deinit(gpa);
     var to_pn: std.AutoHashMapUnmanaged([13]u8, spf.Weight) = .empty;
     defer to_pn.deinit(gpa);
+    // Per-system facts of fragment 0 (the only fragment whose flags count,
+    // ISO 10589 §9.8) and the prefixes advertised in any fragment.
+    var overloaded: std.AutoHashMapUnmanaged(SystemId, void) = .empty;
+    defer overloaded.deinit(gpa);
+    var attached: std.AutoHashMapUnmanaged(SystemId, void) = .empty;
+    defer attached.deinit(gpa);
+    var families: std.AutoHashMapUnmanaged(SystemId, u2) = .empty; // bit 0 IPv4, bit 1 IPv6 (#129)
+    defer families.deinit(gpa);
+    var local_is_l1l2 = false;
+    var cands: std.ArrayList(Candidate) = .empty;
+    defer cands.deinit(gpa);
 
     var view_it = db.iterator(now);
     while (view_it.next()) |ev| {
@@ -335,6 +488,11 @@ fn computeInternal(
         }
         const from: SystemId = lsp.lsp_id[0..6].*;
         try origins.put(gpa, from, {});
+        if (lsp.lsp_id[7] == 0) {
+            if (lsp.flags.overload) try overloaded.put(gpa, from, {});
+            if (lsp.flags.attached & 1 != 0) try attached.put(gpa, from, {});
+            if (std.mem.eql(u8, &from, &local) and lsp.flags.is_type == 3) local_is_l1l2 = true;
+        }
 
         var tlv_it = lsp.tlvIterator();
         // A malformed TLV terminates this LSP's walk safely (no over-read); the
@@ -367,6 +525,42 @@ fn computeInternal(
                         continue;
                     }
                     try addDirected(gpa, &directed, from, e.neighbour_id[0..6].*, e.default_metric & 0x3f);
+                }
+            },
+            isis.tlvs.code.protocols_supported => {
+                if (!opts.prefixes) continue;
+                const gop = try families.getOrPut(gpa, from);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                for (t.value) |n| {
+                    if (n == isis.tlvs.nlpid_ipv4) gop.value_ptr.* |= 1;
+                    if (n == isis.tlvs.nlpid_ipv6) gop.value_ptr.* |= 2;
+                }
+            },
+            isis.tlvs.code.extended_ip_reachability => {
+                if (!opts.prefixes) continue;
+                var pit = isis.tlvs.ExtIpReachIterator.init(t.value);
+                while (pit.next() catch break) |e| {
+                    var addr: [16]u8 = @splat(0);
+                    addr[0..4].* = e.prefix;
+                    try cands.append(gpa, .{
+                        .prefix = .{ .family = .ipv4, .addr = addr, .len = e.prefix_len },
+                        .origin = from,
+                        .metric = e.metric,
+                        .up_down = e.up_down,
+                    });
+                }
+            },
+            isis.tlvs.code.ipv6_reachability => {
+                if (!opts.prefixes) continue;
+                var pit = isis.tlvs.Ipv6ReachIterator.init(t.value);
+                while (pit.next() catch break) |e| {
+                    try cands.append(gpa, .{
+                        .prefix = .{ .family = .ipv6, .addr = e.prefix, .len = e.prefix_len },
+                        .origin = from,
+                        .metric = e.metric,
+                        .up_down = e.up_down,
+                        .external = e.external,
+                    });
                 }
             },
             else => {},
@@ -427,6 +621,20 @@ fn computeInternal(
 
     // ── 2b. LAN transit through pseudonodes ─────────────────────────────────
     try addLanArcs(gpa, &arcs, &pn_lists, &to_pn, opts.require_two_way);
+
+    // ── 2c. overload bit: no transit through an overloaded system ─────────────
+    // Its arcs out are dropped (it stays a destination through the arcs in);
+    // the local system's own bit does not apply to its own computation.
+    if (opts.honour_overload and overloaded.count() != 0) {
+        var drop: std.ArrayList([12]u8) = .empty;
+        defer drop.deinit(gpa);
+        var oit = arcs.iterator();
+        while (oit.next()) |kv| {
+            const f: SystemId = kv.key_ptr[0..6].*;
+            if (overloaded.contains(f) and !std.mem.eql(u8, &f, &local)) try drop.append(gpa, kv.key_ptr.*);
+        }
+        for (drop.items) |k| _ = arcs.remove(k);
+    }
 
     // ── 3. intern system-ids → dense NodeIds (sorted, deterministic) ─────────
     // Node set = every arc endpoint, plus `local` if it originated an LSP (so
@@ -489,23 +697,296 @@ fn computeInternal(
     var tree = try spf.shortestPathTree(gpa, &graph, local_node);
     defer tree.deinit();
 
-    // ── 5. route table: first-hop + total metric per reachable destination ───
+    // ── 5. first hops per reachable node ─────────────────────────────────────
+    // `hops` holds, per node, the first hops of its shortest paths: the single
+    // ECT choice by default, every equal-cost one (sorted, cut to `max_paths`)
+    // with `Options.max_paths > 1`. NodeIds ascend with system-id, so sorting
+    // NodeIds sorts by system-id.
+    const max_paths: usize = @max(1, opts.max_paths);
+    const ecmp = max_paths > 1;
+    const spans = try gpa.alloc(HopSpan, node_count);
+    defer gpa.free(spans);
+    @memset(spans, .{ .start = 0, .len = 0 });
+    var hops: std.ArrayList(spf.NodeId) = .empty;
+    defer hops.deinit(gpa);
+    if (!ecmp) {
+        var node: spf.NodeId = 0;
+        while (node < node_count) : (node += 1) {
+            if (!tree.reachable(node)) continue;
+            const nh = if (node == local_node) local_node else firstHop(&tree, local_node, node);
+            spans[node] = .{ .start = @intCast(hops.items.len), .len = 1 };
+            try hops.append(gpa, nh);
+        }
+    } else {
+        try ecmpHops(gpa, &arcs, &id_to_node, &tree, local_node, node_count, max_paths, spans, &hops);
+    }
+
+    // ── 6. route table: first-hop + total metric per reachable destination ───
     // Node ids are in ascending system-id order, so iterating them yields
     // routes already sorted by destination.
     var routes: std.ArrayList(Route) = .empty;
     errdefer routes.deinit(gpa);
+    var pool: std.ArrayList(SystemId) = .empty;
+    errdefer pool.deinit(gpa);
+    var route_hops: std.ArrayList(HopSpan) = .empty;
+    errdefer route_hops.deinit(gpa);
     var node: spf.NodeId = 0;
     while (node < node_count) : (node += 1) {
         if (!tree.reachable(node)) continue;
-        const next_node = if (node == local_node) local_node else firstHop(&tree, local_node, node);
+        const sp = spans[node];
         try routes.append(gpa, .{
             .dest = node_to_id[node],
-            .next_hop = node_to_id[next_node],
+            .next_hop = node_to_id[hops.items[sp.start]],
             .metric = tree.distanceTo(node),
         });
+        if (ecmp) {
+            try route_hops.append(gpa, .{ .start = @intCast(pool.items.len), .len = sp.len });
+            for (hops.items[sp.start..][0..sp.len]) |h| try pool.append(gpa, node_to_id[h]);
+        }
     }
 
-    return .{ .gpa = gpa, .routes = try routes.toOwnedSlice(gpa), .asymmetric_links = asymmetric_links };
+    // ── 7. IP prefix routes ─────────────────────────────────────────────────
+    var prefix_routes: std.ArrayList(PrefixRoute) = .empty;
+    errdefer prefix_routes.deinit(gpa);
+    var prefix_hops: std.ArrayList(HopSpan) = .empty;
+    errdefer prefix_hops.deinit(gpa);
+    if (opts.prefixes) {
+        if (opts.attached_default and !local_is_l1l2) {
+            try addAttachedDefaults(gpa, &cands, &attached, &families, local);
+        }
+        try selectPrefixes(gpa, cands.items, &id_to_node, &tree, local_node, spans, hops.items, node_to_id, opts, ecmp, max_paths, &prefix_routes, &prefix_hops, &pool);
+    }
+
+    return .{
+        .gpa = gpa,
+        .routes = try routes.toOwnedSlice(gpa),
+        .asymmetric_links = asymmetric_links,
+        .prefixes = try prefix_routes.toOwnedSlice(gpa),
+        .route_hops = try route_hops.toOwnedSlice(gpa),
+        .prefix_hops = try prefix_hops.toOwnedSlice(gpa),
+        .hop_pool = try pool.toOwnedSlice(gpa),
+    };
+}
+
+/// A span of `RouteTable.hop_pool`.
+pub const HopSpan = struct { start: u32, len: u32 };
+
+/// One advertised prefix, before selection.
+const Candidate = struct {
+    prefix: Prefix,
+    origin: SystemId,
+    metric: u32,
+    up_down: bool = false,
+    external: bool = false,
+    attached_default: bool = false,
+};
+
+/// 0.0.0.0/0 and ::/0 toward every attached system that supports the family,
+/// ranked below any advertised prefix by `selectPrefixes`.
+fn addAttachedDefaults(
+    gpa: Allocator,
+    cands: *std.ArrayList(Candidate),
+    attached: *const std.AutoHashMapUnmanaged(SystemId, void),
+    families: *const std.AutoHashMapUnmanaged(SystemId, u2),
+    local: SystemId,
+) Allocator.Error!void {
+    var it = attached.iterator();
+    while (it.next()) |kv| {
+        const sys = kv.key_ptr.*;
+        if (std.mem.eql(u8, &sys, &local)) continue;
+        const fam = families.get(sys) orelse 0;
+        if (fam & 1 != 0) try cands.append(gpa, .{ .prefix = .{ .family = .ipv4, .addr = @splat(0), .len = 0 }, .origin = sys, .metric = 0, .attached_default = true });
+        if (fam & 2 != 0) try cands.append(gpa, .{ .prefix = .{ .family = .ipv6, .addr = @splat(0), .len = 0 }, .origin = sys, .metric = 0, .attached_default = true });
+    }
+}
+
+/// Equal-cost first hops for every reachable node (`Options.max_paths > 1`).
+/// A first hop of `d` is every first hop of a predecessor `p` of `d` with
+/// `dist(p) + w(p, d) == dist(d)` (for `p == root`, `d` itself). Nodes are
+/// processed in ascending distance; weights are >= 1, so predecessors come
+/// first.
+fn ecmpHops(
+    gpa: Allocator,
+    arcs: *const std.AutoHashMapUnmanaged([12]u8, spf.Weight),
+    id_to_node: *const std.AutoHashMapUnmanaged(SystemId, spf.NodeId),
+    tree: *const spf.Tree,
+    root: spf.NodeId,
+    node_count: u32,
+    max_paths: usize,
+    spans: []HopSpan,
+    hops: *std.ArrayList(spf.NodeId),
+) Allocator.Error!void {
+    const Pred = struct { from: spf.NodeId, to: spf.NodeId };
+    var preds: std.ArrayList(Pred) = .empty;
+    defer preds.deinit(gpa);
+    var ait = arcs.iterator();
+    while (ait.next()) |kv| {
+        const a = id_to_node.get(kv.key_ptr[0..6].*).?;
+        const b = id_to_node.get(kv.key_ptr[6..12].*).?;
+        if (!tree.reachable(a) or !tree.reachable(b)) continue;
+        if (tree.distanceTo(a) + kv.value_ptr.* == tree.distanceTo(b)) try preds.append(gpa, .{ .from = a, .to = b });
+    }
+    // Group by destination, then by node id (determinism).
+    std.mem.sort(Pred, preds.items, {}, struct {
+        fn lt(_: void, x: Pred, y: Pred) bool {
+            if (x.to != y.to) return x.to < y.to;
+            return x.from < y.from;
+        }
+    }.lt);
+    const order = try gpa.alloc(spf.NodeId, node_count);
+    defer gpa.free(order);
+    var n_order: usize = 0;
+    var nd: spf.NodeId = 0;
+    while (nd < node_count) : (nd += 1) {
+        if (tree.reachable(nd)) {
+            order[n_order] = nd;
+            n_order += 1;
+        }
+    }
+    std.mem.sort(spf.NodeId, order[0..n_order], tree, struct {
+        fn lt(t: *const spf.Tree, x: spf.NodeId, y: spf.NodeId) bool {
+            const dx = t.distanceTo(x);
+            const dy = t.distanceTo(y);
+            if (dx != dy) return dx < dy;
+            return x < y;
+        }
+    }.lt);
+    var tmp: std.ArrayList(spf.NodeId) = .empty;
+    defer tmp.deinit(gpa);
+    // preds are sorted by `to`; walk them with a cursor per node in order of
+    // ascending distance via binary search of the group start.
+    for (order[0..n_order]) |node| {
+        if (node == root) {
+            spans[node] = .{ .start = @intCast(hops.items.len), .len = 1 };
+            try hops.append(gpa, root);
+            continue;
+        }
+        tmp.clearRetainingCapacity();
+        // First pred with `to >= node`.
+        var lo: usize = 0;
+        var hi: usize = preds.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (preds.items[mid].to < node) lo = mid + 1 else hi = mid;
+        }
+        var i = lo;
+        while (i < preds.items.len and preds.items[i].to == node) : (i += 1) {
+            const p = preds.items[i].from;
+            if (p == root) {
+                try tmp.append(gpa, node);
+            } else {
+                const sp = spans[p];
+                try tmp.appendSlice(gpa, hops.items[sp.start..][0..sp.len]);
+            }
+        }
+        std.mem.sort(spf.NodeId, tmp.items, {}, std.sort.asc(spf.NodeId));
+        var n: usize = 0;
+        for (tmp.items, 0..) |h, k| {
+            if (k != 0 and h == tmp.items[n - 1]) continue;
+            tmp.items[n] = h;
+            n += 1;
+        }
+        n = @min(n, max_paths);
+        spans[node] = .{ .start = @intCast(hops.items.len), .len = @intCast(n) };
+        try hops.appendSlice(gpa, tmp.items[0..n]);
+    }
+}
+
+/// Best advertisement per prefix. Rank, first difference wins: a real
+/// advertisement before an attached-bit default; Up/Down clear before set
+/// (level 1 only, RFC 5302 §3.1/§3.3); internal before external; the lower
+/// total metric (distance to the advertiser + advertised metric); then the
+/// lower advertiser id. With ECMP every candidate equal in all but the
+/// advertiser contributes its first hops.
+fn selectPrefixes(
+    gpa: Allocator,
+    cands: []const Candidate,
+    id_to_node: *const std.AutoHashMapUnmanaged(SystemId, spf.NodeId),
+    tree: *const spf.Tree,
+    local_node: spf.NodeId,
+    spans: []const HopSpan,
+    hops: []const spf.NodeId,
+    node_to_id: []const SystemId,
+    opts: InternalOptions,
+    ecmp: bool,
+    max_paths: usize,
+    out: *std.ArrayList(PrefixRoute),
+    out_hops: *std.ArrayList(HopSpan),
+    pool: *std.ArrayList(SystemId),
+) Allocator.Error!void {
+    _ = local_node;
+    const Ranked = struct {
+        c: Candidate,
+        node: spf.NodeId,
+        total: u64,
+        ud: bool,
+    };
+    var ranked: std.ArrayList(Ranked) = .empty;
+    defer ranked.deinit(gpa);
+    for (cands) |c| {
+        const node = id_to_node.get(c.origin) orelse continue;
+        if (!tree.reachable(node)) continue;
+        try ranked.append(gpa, .{
+            .c = c,
+            .node = node,
+            .total = tree.distanceTo(node) + c.metric,
+            .ud = c.up_down and !opts.level2,
+        });
+    }
+    const Ctx = struct {
+        fn lt(_: void, x: Ranked, y: Ranked) bool {
+            const po = x.c.prefix.order(y.c.prefix);
+            if (po != .eq) return po == .lt;
+            if (x.c.attached_default != y.c.attached_default) return !x.c.attached_default;
+            if (x.ud != y.ud) return !x.ud;
+            if (x.c.external != y.c.external) return !x.c.external;
+            if (x.total != y.total) return x.total < y.total;
+            return x.node < y.node;
+        }
+        fn sameRank(x: Ranked, y: Ranked) bool {
+            return x.c.prefix.order(y.c.prefix) == .eq and x.c.attached_default == y.c.attached_default and
+                x.ud == y.ud and x.c.external == y.c.external and x.total == y.total;
+        }
+    };
+    std.mem.sort(Ranked, ranked.items, {}, Ctx.lt);
+    var tmp: std.ArrayList(spf.NodeId) = .empty;
+    defer tmp.deinit(gpa);
+    var i: usize = 0;
+    while (i < ranked.items.len) {
+        const best = ranked.items[i];
+        var j = i + 1;
+        while (j < ranked.items.len and ranked.items[j].c.prefix.order(best.c.prefix) == .eq) : (j += 1) {}
+        const sp = spans[best.node];
+        try out.append(gpa, .{
+            .prefix = best.c.prefix,
+            .metric = best.total,
+            .next_hop = node_to_id[hops[sp.start]],
+            .origin = node_to_id[best.node],
+            .up_down = best.c.up_down,
+            .external = best.c.external,
+            .attached_default = best.c.attached_default,
+        });
+        if (ecmp) {
+            tmp.clearRetainingCapacity();
+            var k = i;
+            while (k < j and Ctx.sameRank(ranked.items[k], best)) : (k += 1) {
+                const ks = spans[ranked.items[k].node];
+                try tmp.appendSlice(gpa, hops[ks.start..][0..ks.len]);
+            }
+            std.mem.sort(spf.NodeId, tmp.items, {}, std.sort.asc(spf.NodeId));
+            var n: usize = 0;
+            for (tmp.items, 0..) |h, q| {
+                if (q != 0 and h == tmp.items[n - 1]) continue;
+                tmp.items[n] = h;
+                n += 1;
+            }
+            n = @min(n, max_paths);
+            try out_hops.append(gpa, .{ .start = @intCast(pool.items.len), .len = @intCast(n) });
+            for (tmp.items[0..n]) |h| try pool.append(gpa, node_to_id[h]);
+            out.items[out.items.len - 1].next_hop = node_to_id[tmp.items[0]];
+        }
+        i = j;
+    }
 }
 
 /// Record a directed advertisement `from ⟶ to`, keeping the minimum metric if
@@ -2383,4 +2864,331 @@ test "the asymmetric-link count survives an empty table (local absent)" {
     defer table.deinit();
     try testing.expectEqual(@as(usize, 0), table.routes.len);
     try testing.expectEqual(@as(u32, 1), table.asymmetric_links);
+}
+
+// ── overload, ECMP, prefixes, attached default ───────────────────────────────
+
+const Nbr = struct { nbr: SystemId, metric: u24 };
+const V4 = struct { addr: [4]u8, len: u8, metric: u32, ud: bool = false };
+const V6 = struct { addr: [16]u8, len: u8, metric: u32, ud: bool = false, x: bool = false };
+const NodeSpec = struct {
+    reach: []const Nbr = &.{},
+    overload: bool = false,
+    attached: bool = false,
+    is_type: u2 = 1,
+    nlpids: []const u8 = &.{},
+    v4: []const V4 = &.{},
+    v6: []const V6 = &.{},
+    fragment: u8 = 0,
+};
+
+fn insertNode(db: *lsdb.Lsdb, origin: SystemId, seq: u32, spec: NodeSpec) !void {
+    var buf: [1024]u8 = undefined;
+    var b = try isis.pdu.LspBuilder.init(&buf, .{
+        .remaining_lifetime = 1000,
+        .lsp_id = .{ origin[0], origin[1], origin[2], origin[3], origin[4], origin[5], 0, spec.fragment },
+        .sequence_number = seq,
+        .flags = .{ .partition_repair = false, .attached = if (spec.attached) 1 else 0, .overload = spec.overload, .is_type = spec.is_type },
+    });
+    if (spec.nlpids.len != 0) try isis.tlvs.addProtocolsSupported(&b.tlvs, spec.nlpids);
+    for (spec.reach) |r| {
+        const nbr7: [7]u8 = .{ r.nbr[0], r.nbr[1], r.nbr[2], r.nbr[3], r.nbr[4], r.nbr[5], 0 };
+        try isis.tlvs.addExtendedIsReach(&b.tlvs, nbr7, r.metric, &.{});
+    }
+    for (spec.v4) |p| try isis.tlvs.addExtIpReach(&b.tlvs, .{ .metric = p.metric, .prefix_len = p.len, .prefix = p.addr, .up_down = p.ud });
+    for (spec.v6) |p| try isis.tlvs.addIpv6Reach(&b.tlvs, .{ .metric = p.metric, .prefix_len = p.len, .prefix = p.addr, .up_down = p.ud, .external = p.x });
+    _ = try db.insert(b.finishStamped(), null, 0);
+}
+
+fn v4p(a: u8, b: u8, c: u8, d: u8, len: u8) Prefix {
+    return .{ .family = .ipv4, .addr = .{ a, b, c, d } ++ @as([12]u8, @splat(0)), .len = len };
+}
+
+fn v6p(first: [2]u8, len: u8) Prefix {
+    var addr: [16]u8 = @splat(0);
+    addr[0..2].* = first;
+    return .{ .family = .ipv6, .addr = addr, .len = len };
+}
+
+fn linkSpec(nbrs: []const Nbr) NodeSpec {
+    return .{ .reach = nbrs };
+}
+
+test "overload bit: an overloaded system is a destination but not a transit" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    const c = sysId(0xC);
+    const d = sysId(0xD);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    // A-B-C line plus a costly detour A-D-C. B is overloaded: C must go via D.
+    try insertNode(&db, a, 1, linkSpec(&.{ .{ .nbr = b, .metric = 10 }, .{ .nbr = d, .metric = 50 } }));
+    try insertNode(&db, b, 1, .{ .reach = &.{ .{ .nbr = a, .metric = 10 }, .{ .nbr = c, .metric = 10 } }, .overload = true });
+    try insertNode(&db, c, 1, linkSpec(&.{ .{ .nbr = b, .metric = 10 }, .{ .nbr = d, .metric = 50 } }));
+    try insertNode(&db, d, 1, linkSpec(&.{ .{ .nbr = a, .metric = 50 }, .{ .nbr = c, .metric = 50 } }));
+    var t = try compute(testing.allocator, &db, a, 0);
+    defer t.deinit();
+    try testing.expectEqual(Route{ .dest = b, .next_hop = b, .metric = 10 }, t.lookup(b).?);
+    try testing.expectEqual(Route{ .dest = c, .next_hop = d, .metric = 100 }, t.lookup(c).?);
+    // Off: the old behaviour, through B.
+    var t2 = try computeWith(testing.allocator, &db, a, 0, .{ .honour_overload = false });
+    defer t2.deinit();
+    try testing.expectEqual(Route{ .dest = c, .next_hop = b, .metric = 20 }, t2.lookup(c).?);
+    // The root's own overload bit does not apply to its own computation.
+    var db2 = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db2.deinit();
+    try insertNode(&db2, a, 1, .{ .reach = &.{.{ .nbr = b, .metric = 10 }}, .overload = true });
+    try insertNode(&db2, b, 1, linkSpec(&.{.{ .nbr = a, .metric = 10 }}));
+    var t3 = try compute(testing.allocator, &db2, a, 0);
+    defer t3.deinit();
+    try testing.expectEqual(@as(u64, 10), t3.lookup(b).?.metric);
+}
+
+test "overload bit: only fragment 0 counts, and a fully overloaded destination stays reachable" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertNode(&db, a, 1, linkSpec(&.{.{ .nbr = b, .metric = 10 }}));
+    try insertNode(&db, b, 1, .{ .reach = &.{.{ .nbr = a, .metric = 10 }} });
+    // A second fragment of B with the bit set: ignored.
+    try insertNode(&db, b, 1, .{ .overload = true, .fragment = 1 });
+    var t = try compute(testing.allocator, &db, a, 0);
+    defer t.deinit();
+    try testing.expectEqual(@as(u64, 10), t.lookup(b).?.metric);
+    // Setting it in fragment 0 keeps B reachable as a destination (arcs into B).
+    try insertNode(&db, b, 2, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .overload = true });
+    var t2 = try compute(testing.allocator, &db, a, 0);
+    defer t2.deinit();
+    try testing.expectEqual(@as(u64, 10), t2.lookup(b).?.metric);
+}
+
+fn diamond(db: *lsdb.Lsdb, a: SystemId, b: SystemId, c: SystemId, d: SystemId, wb: u24, wc: u24) !void {
+    try insertNode(db, a, 1, linkSpec(&.{ .{ .nbr = b, .metric = wb }, .{ .nbr = c, .metric = wc } }));
+    try insertNode(db, b, 1, linkSpec(&.{ .{ .nbr = a, .metric = wb }, .{ .nbr = d, .metric = 10 } }));
+    try insertNode(db, c, 1, linkSpec(&.{ .{ .nbr = a, .metric = wc }, .{ .nbr = d, .metric = 10 } }));
+    try insertNode(db, d, 1, linkSpec(&.{ .{ .nbr = b, .metric = 10 }, .{ .nbr = c, .metric = 10 } }));
+}
+
+test "ECMP: max_paths lists every equal-cost first hop, sorted, and cuts to the limit" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    const c = sysId(0xC);
+    const d = sysId(0xD);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try diamond(&db, a, b, c, d, 10, 10);
+    var t = try computeWith(testing.allocator, &db, a, 0, .{ .max_paths = 4 });
+    defer t.deinit();
+    const hops = t.nextHops(d).?;
+    try testing.expectEqual(@as(usize, 2), hops.len);
+    try testing.expectEqualSlices(u8, &b, &hops[0]);
+    try testing.expectEqualSlices(u8, &c, &hops[1]);
+    try testing.expectEqualSlices(u8, &b, &t.lookup(d).?.next_hop); // the lowest
+    try testing.expectEqual(@as(usize, 1), t.nextHops(b).?.len);
+    try testing.expectEqualSlices(u8, &a, &t.nextHops(a).?[0]);
+    try testing.expect(t.nextHops(sysId(9)) == null);
+    // Cut to 1 keeps the lowest.
+    var t1 = try computeWith(testing.allocator, &db, a, 0, .{ .max_paths = 2 });
+    defer t1.deinit();
+    try testing.expectEqual(@as(usize, 2), t1.nextHops(d).?.len);
+    // Unequal costs: a single hop.
+    var db2 = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db2.deinit();
+    try diamond(&db2, a, b, c, d, 10, 11);
+    var t2 = try computeWith(testing.allocator, &db2, a, 0, .{ .max_paths = 4 });
+    defer t2.deinit();
+    try testing.expectEqual(@as(usize, 1), t2.nextHops(d).?.len);
+    try testing.expectEqualSlices(u8, &b, &t2.nextHops(d).?[0]);
+    // Default options: nextHops is the single next_hop.
+    var t3 = try compute(testing.allocator, &db, a, 0);
+    defer t3.deinit();
+    try testing.expectEqual(@as(usize, 1), t3.nextHops(d).?.len);
+}
+
+test "ECMP: a multi-stage fan-out collects first hops through the DAG" {
+    // A -> {B,C} -> {D,E} (full bipartite) -> F: F has the two first hops B and C.
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    const c = sysId(0xC);
+    const d = sysId(0xD);
+    const e = sysId(0xE);
+    const f = sysId(0xF);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertNode(&db, a, 1, linkSpec(&.{ .{ .nbr = b, .metric = 1 }, .{ .nbr = c, .metric = 1 } }));
+    try insertNode(&db, b, 1, linkSpec(&.{ .{ .nbr = a, .metric = 1 }, .{ .nbr = d, .metric = 1 }, .{ .nbr = e, .metric = 1 } }));
+    try insertNode(&db, c, 1, linkSpec(&.{ .{ .nbr = a, .metric = 1 }, .{ .nbr = d, .metric = 1 }, .{ .nbr = e, .metric = 1 } }));
+    try insertNode(&db, d, 1, linkSpec(&.{ .{ .nbr = b, .metric = 1 }, .{ .nbr = c, .metric = 1 }, .{ .nbr = f, .metric = 1 } }));
+    try insertNode(&db, e, 1, linkSpec(&.{ .{ .nbr = b, .metric = 1 }, .{ .nbr = c, .metric = 1 }, .{ .nbr = f, .metric = 1 } }));
+    try insertNode(&db, f, 1, linkSpec(&.{ .{ .nbr = d, .metric = 1 }, .{ .nbr = e, .metric = 1 } }));
+    var t = try computeWith(testing.allocator, &db, a, 0, .{ .max_paths = 8 });
+    defer t.deinit();
+    try testing.expectEqual(@as(u64, 3), t.lookup(f).?.metric);
+    try testing.expectEqual(@as(usize, 2), t.nextHops(f).?.len);
+    try testing.expectEqual(@as(usize, 2), t.nextHops(d).?.len);
+}
+
+test "prefixes: total metric, next hop and the local prefix; opt-in only" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    const c = sysId(0xC);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertNode(&db, a, 1, .{ .reach = &.{.{ .nbr = b, .metric = 10 }}, .v4 = &.{.{ .addr = .{ 10, 0, 0, 0 }, .len = 24, .metric = 1 }} });
+    try insertNode(&db, b, 1, .{ .reach = &.{ .{ .nbr = a, .metric = 10 }, .{ .nbr = c, .metric = 5 } } });
+    try insertNode(&db, c, 1, .{
+        .reach = &.{.{ .nbr = b, .metric = 5 }},
+        .v4 = &.{ .{ .addr = .{ 192, 0, 2, 0 }, .len = 24, .metric = 100 }, .{ .addr = .{ 0, 0, 0, 0 }, .len = 0, .metric = 1 } },
+        .v6 = &.{.{ .addr = (@as([2]u8, .{ 0x20, 0x01 }) ++ @as([14]u8, @splat(0))), .len = 32, .metric = 7 }},
+    });
+    var off = try compute(testing.allocator, &db, a, 0);
+    defer off.deinit();
+    try testing.expectEqual(@as(usize, 0), off.prefixes.len);
+    var t = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true });
+    defer t.deinit();
+    try testing.expectEqual(@as(usize, 4), t.prefixes.len);
+    const local_p = t.prefixRoute(v4p(10, 0, 0, 0, 24)).?;
+    try testing.expectEqual(@as(u64, 1), local_p.metric);
+    try testing.expectEqualSlices(u8, &a, &local_p.next_hop);
+    const remote = t.prefixRoute(v4p(192, 0, 2, 0, 24)).?;
+    try testing.expectEqual(@as(u64, 115), remote.metric);
+    try testing.expectEqualSlices(u8, &b, &remote.next_hop);
+    try testing.expectEqualSlices(u8, &c, &remote.origin);
+    try testing.expectEqual(@as(u64, 16), t.prefixRoute(v4p(0, 0, 0, 0, 0)).?.metric);
+    try testing.expectEqual(@as(u64, 22), t.prefixRoute(v6p(.{ 0x20, 0x01 }, 32)).?.metric);
+    try testing.expect(t.prefixRoute(v4p(10, 0, 0, 0, 25)) == null);
+    // Sorted: IPv4 before IPv6, addresses ascending.
+    try testing.expect(t.prefixes[0].prefix.family == .ipv4 and t.prefixes[3].prefix.family == .ipv6);
+    try testing.expect(t.prefixes[0].prefix.len == 0);
+}
+
+test "prefixes: the best advertiser wins by total metric; ties go to the lowest id, or ECMP" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    const c = sysId(0xC);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    const anycast = [_]V4{.{ .addr = .{ 198, 51, 100, 0 }, .len = 24, .metric = 5 }};
+    try insertNode(&db, a, 1, linkSpec(&.{ .{ .nbr = b, .metric = 10 }, .{ .nbr = c, .metric = 10 } }));
+    try insertNode(&db, b, 1, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .v4 = &anycast });
+    try insertNode(&db, c, 1, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .v4 = &anycast });
+    var t = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true });
+    defer t.deinit();
+    const p = t.prefixRoute(v4p(198, 51, 100, 0, 24)).?;
+    try testing.expectEqual(@as(u64, 15), p.metric);
+    try testing.expectEqualSlices(u8, &b, &p.origin);
+    try testing.expectEqual(@as(usize, 1), t.prefixNextHops(p.prefix).?.len);
+    var e = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true, .max_paths = 4 });
+    defer e.deinit();
+    const hops = e.prefixNextHops(p.prefix).?;
+    try testing.expectEqual(@as(usize, 2), hops.len);
+    try testing.expectEqualSlices(u8, &b, &hops[0]);
+    try testing.expectEqualSlices(u8, &c, &hops[1]);
+    // A cheaper advertisement from C wins outright.
+    try insertNode(&db, c, 2, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .v4 = &.{.{ .addr = .{ 198, 51, 100, 0 }, .len = 24, .metric = 1 }} });
+    var t2 = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true, .max_paths = 4 });
+    defer t2.deinit();
+    try testing.expectEqualSlices(u8, &c, &t2.prefixRoute(p.prefix).?.origin);
+    try testing.expectEqual(@as(usize, 1), t2.prefixNextHops(p.prefix).?.len);
+}
+
+test "prefixes: Up/Down set loses to clear at any metric in a level-1 database, and is ignored at level 2; external ranks below internal" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    const c = sysId(0xC);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertNode(&db, a, 1, linkSpec(&.{ .{ .nbr = b, .metric = 10 }, .{ .nbr = c, .metric = 10 } }));
+    // B leaks the prefix from L2 (Up/Down set, cheap); C has it natively (clear, dear).
+    try insertNode(&db, b, 1, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .v4 = &.{.{ .addr = .{ 203, 0, 113, 0 }, .len = 24, .metric = 1, .ud = true }} });
+    try insertNode(&db, c, 1, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .v4 = &.{.{ .addr = .{ 203, 0, 113, 0 }, .len = 24, .metric = 50 }} });
+    const pfx = v4p(203, 0, 113, 0, 24);
+    var l1 = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true });
+    defer l1.deinit();
+    try testing.expectEqualSlices(u8, &c, &l1.prefixRoute(pfx).?.origin);
+    try testing.expect(!l1.prefixRoute(pfx).?.up_down);
+    var l2 = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true, .level2 = true });
+    defer l2.deinit();
+    try testing.expectEqualSlices(u8, &b, &l2.prefixRoute(pfx).?.origin);
+    // IPv6: external (X) ranks below internal even when cheaper.
+    var db2 = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db2.deinit();
+    const pa: [16]u8 = @as([2]u8, .{ 0x20, 0x01 }) ++ @as([14]u8, @splat(0));
+    try insertNode(&db2, a, 1, linkSpec(&.{ .{ .nbr = b, .metric = 10 }, .{ .nbr = c, .metric = 10 } }));
+    try insertNode(&db2, b, 1, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .v6 = &.{.{ .addr = pa, .len = 32, .metric = 1, .x = true }} });
+    try insertNode(&db2, c, 1, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .v6 = &.{.{ .addr = pa, .len = 32, .metric = 40 }} });
+    var t6 = try computeWith(testing.allocator, &db2, a, 0, .{ .prefixes = true });
+    defer t6.deinit();
+    const r = t6.prefixRoute(v6p(.{ 0x20, 0x01 }, 32)).?;
+    try testing.expectEqualSlices(u8, &c, &r.origin);
+    try testing.expect(!r.external);
+}
+
+test "prefixes: a prefix of an unreachable or two-way-less system is not routed; a malformed TLV is cut at the bad entry" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    const z = sysId(0xF);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    try insertNode(&db, a, 1, linkSpec(&.{.{ .nbr = b, .metric = 10 }}));
+    try insertNode(&db, b, 1, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .v4 = &.{.{ .addr = .{ 10, 1, 0, 0 }, .len = 16, .metric = 1 }} });
+    try insertNode(&db, z, 1, .{ .v4 = &.{.{ .addr = .{ 10, 9, 0, 0 }, .len = 16, .metric = 1 }} });
+    var t = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true });
+    defer t.deinit();
+    try testing.expect(t.prefixRoute(v4p(10, 1, 0, 0, 16)) != null);
+    try testing.expect(t.prefixRoute(v4p(10, 9, 0, 0, 16)) == null);
+    // A bad /33 entry after a good one: the good one still counts.
+    var buf: [128]u8 = undefined;
+    var lb = try isis.pdu.LspBuilder.init(&buf, .{
+        .remaining_lifetime = 1000,
+        .lsp_id = .{ b[0], b[1], b[2], b[3], b[4], b[5], 0, 1 },
+        .sequence_number = 1,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    try lb.tlvs.addTlv(isis.tlvs.code.extended_ip_reachability, &.{ 0, 0, 0, 1, 8, 172, 0, 0, 0, 1, 33, 1, 2, 3, 4, 5 });
+    _ = try db.insert(lb.finishStamped(), null, 0);
+    var t2 = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true });
+    defer t2.deinit();
+    try testing.expect(t2.prefixRoute(v4p(172, 0, 0, 0, 8)) != null);
+    try testing.expectEqual(@as(usize, 2), t2.prefixes.len);
+}
+
+test "attached default: nearest attached system, per supported family, only for a level-1-only local" {
+    const a = sysId(0xA);
+    const b = sysId(0xB);
+    const c = sysId(0xC);
+    var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
+    defer db.deinit();
+    const v4only = [_]u8{isis.tlvs.nlpid_ipv4};
+    const both = [_]u8{ isis.tlvs.nlpid_ipv4, isis.tlvs.nlpid_ipv6 };
+    try insertNode(&db, a, 1, linkSpec(&.{ .{ .nbr = b, .metric = 10 }, .{ .nbr = c, .metric = 5 } }));
+    try insertNode(&db, b, 1, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .attached = true, .is_type = 3, .nlpids = &both });
+    try insertNode(&db, c, 1, .{ .reach = &.{.{ .nbr = a, .metric = 5 }}, .attached = true, .is_type = 3, .nlpids = &v4only });
+    var t = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true, .attached_default = true });
+    defer t.deinit();
+    const d4 = t.prefixRoute(v4p(0, 0, 0, 0, 0)).?;
+    try testing.expect(d4.attached_default);
+    try testing.expectEqualSlices(u8, &c, &d4.next_hop); // nearer
+    try testing.expectEqual(@as(u64, 5), d4.metric);
+    const d6 = t.prefixRoute(.{ .family = .ipv6, .addr = @splat(0), .len = 0 }).?;
+    try testing.expectEqualSlices(u8, &b, &d6.next_hop); // only B supports IPv6
+    // An advertised 0/0 beats the synthesised one even when dearer.
+    try insertNode(&db, b, 2, .{ .reach = &.{.{ .nbr = a, .metric = 10 }}, .attached = true, .is_type = 3, .nlpids = &both, .v4 = &.{.{ .addr = .{ 0, 0, 0, 0 }, .len = 0, .metric = 100 }} });
+    var t2 = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true, .attached_default = true });
+    defer t2.deinit();
+    try testing.expect(!t2.prefixRoute(v4p(0, 0, 0, 0, 0)).?.attached_default);
+    // Off by default; and not for an L1/L2 local system.
+    var t3 = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true });
+    defer t3.deinit();
+    try testing.expect(t3.prefixRoute(.{ .family = .ipv6, .addr = @splat(0), .len = 0 }) == null);
+    try insertNode(&db, a, 2, .{ .reach = &.{ .{ .nbr = b, .metric = 10 }, .{ .nbr = c, .metric = 5 } }, .is_type = 3 });
+    var t4 = try computeWith(testing.allocator, &db, a, 0, .{ .prefixes = true, .attached_default = true });
+    defer t4.deinit();
+    try testing.expect(t4.prefixRoute(.{ .family = .ipv6, .addr = @splat(0), .len = 0 }) == null);
+}
+
+test {
+    _ = leak;
+    _ = @import("bench.zig");
 }

@@ -11,7 +11,10 @@ link-state database into forwarding decisions.
 Status: **gap** — covers **point-to-point and LAN** topology → SPF → next-hop
 table over the #22 Extended (RFC 5305) and #2 old-style (ISO §9.8)
 IS-reachability TLVs; a LAN pseudonode is a transit hop (members it lists and
-that list it back reach each other at their own metric, SPEC §3.2b).
+that list it back reach each other at their own metric, SPEC §3.2b). Opt-in/default-on options of
+`Options`: overload-bit transit exclusion, ECMP next-hop sets (`max_paths`), IP/IPv6 prefix routes
+(`prefixes`) with the attached-bit default (`attached_default`); `leak.plan` computes what an L1/L2 system
+advertises into each level (RFC 5302). SPEC §3.6-§3.10.
 
 Model after: **ISO/IEC 10589 §7.2** (the decision process / SPF) with the
 equal-cost tie-break delegated to `spf-ect` (**IEEE 802.1aq / RFC 6329 ECT**).
@@ -167,9 +170,9 @@ two-way-check/reconvergence/old-style-#2/robustness/degenerate/determinism
 tests above remain self-authored (SELF in the anchor record in `SPEC.md`) — they were not
 individually re-derived against FRR captures, only the one dedicated FRR
 topology test was added. LAN transit (since 2026-09-30) is self-authored too,
-not FRR-anchored; multi-level leaking remains out of scope (`SPEC.md` §6).
+not FRR-anchored; the overload, ECMP, prefix and leaking layers are self-authored too (`SPEC.md` §3.6-§3.10).
 
 ## Not provided
 
-Multi-level (L1/L2) leaking, IP/prefix reachability leaves, the overload bit's transit exclusion, ECMP next-hop
-sets and incremental SPF: see `SPEC.md` *Backlog / deferred*.
+Incremental SPF (measured, not worth it), legacy narrow IP TLVs #128/#130, multi-topology and pseudonode
+vertices: see `SPEC.md` *What is deliberately not done*.

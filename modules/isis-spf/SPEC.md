@@ -19,7 +19,7 @@
 Auditor/design reference. The consumer-facing purpose, API sketch, and verify
 steps live in `README.md`; this document is the decision-process pipeline, the
 two-way reachability rule (with the ISO cite), the metric handling, the next-hop
-resolution, the intern mapping, and the deferred list.
+resolution, the intern mapping, and the list of what is not done.
 
 ## Compared with
 
@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) | Go | Apache-2.0 (LICENSE file) — README/design doc only, source not read | 0 | v0.9.0 (2026-09-25) | Per-level SPF with pseudonode zero-cost edges, overload-bit transit avoidance, 64-bit metric accumulation, ECMP, back-off (design doc). |
 | [mdlayher/isis](https://github.com/mdlayher/isis) | Go | MIT | 0 | no release; pushed 2026-09-29 | Computes no routes (README: "the package computes no routes on its own"). |
 
-**Where we are ahead:** exact directed-metric handling with the ISO Annex C.2.4 clause quoted and frozen against live FRR (asymmetric links resolve to the same cost as FRR), a deterministic sorted-intern so identical databases give byte-identical tables, and `asymmetric_links`/`reject_asymmetric` reporting that is SPB-relevant (802.1aq needs symmetric metrics); bounded, allocation-free next-hop resolution. **Where we are behind:** LAN transit is folded into member-to-member arcs (distances exact, but no pseudonode vertex in the tree); no IP/prefix reachability leaves — the table maps system-ids, not prefixes; no overload-bit transit exclusion (bit decoded, ignored); single path per destination, no ECMP set (by design for SPB via `spf-ect`, but IP users expect it); no MT, no L1/L2 leaking, no incremental SPF (→ Backlog).
+**Where we are ahead:** exact directed-metric handling with the ISO Annex C.2.4 clause quoted and frozen against live FRR (asymmetric links resolve to the same cost as FRR), a deterministic sorted-intern so identical databases give byte-identical tables, and `asymmetric_links`/`reject_asymmetric` reporting that is SPB-relevant (802.1aq needs symmetric metrics); bounded, allocation-free next-hop resolution. **Where we are behind:** LAN transit is folded into member-to-member arcs (distances exact, but no pseudonode vertex in the tree); prefix routes cover the wide-metric TLVs #135/#236 only (no legacy #128/#130 narrow forms, no MT, no SR/Flex-Algo attributes); no incremental SPF (measured, see *What is deliberately not done*). Overload-bit transit exclusion (§3.6), ECMP next-hop sets (§3.7), IP/IPv6 prefix routes (§3.8), the attached-bit default (§3.9) and L1/L2 leaking (§3.10) are built.
 
 ## 1. Scope
 
@@ -41,7 +41,7 @@ synchronised link-state database (`isis-lsdb`) and produce a forwarding table
 `dest system-id → { next-hop system-id, total metric }`. Pure and deterministic;
 no I/O, no clock (time is only forwarded to `isis-lsdb` so lifetimes age to the
 caller's `now`). Point-to-point links and LAN segments (via the LSP of the pseudonode,
-§3.2b) are routed; out of scope: *Backlog / deferred*.
+§3.2b) are routed; IP prefixes, ECMP, overload and the attached default are opt-in or default-on options of `Options`; out of scope: *What is deliberately not done*.
 
 ## 2. What each dependency provides
 
@@ -194,6 +194,71 @@ chain until the node whose predecessor **is** the root — allocation-free (no
 `pathTo` slice is built). The total metric is `Tree.distanceTo(d)`. The local
 node is `{ self, self, 0 }`; a direct neighbour resolves to itself.
 
+### 3.6 Overload bit (ISO/IEC 10589 §7.2.8.1 / RFC 3787)
+
+The overload bit of fragment 0 of a system's LSP (the other fragments' flags are
+not read, ISO §9.8) marks it as not to be used for transit. After the arcs
+are admitted, every arc *out of* an overloaded system other than the local one
+is dropped (`Options.honour_overload`, default `true`): the system stays a
+destination (the arcs into it remain, and so do the prefixes it advertises) but
+no path runs through it. The local system's own bit is ignored in its own
+computation. FRR, holo-isis and goisis honour it by default; `false` restores
+the plain computation (SPB fabrics that never set it are unaffected). A pseudonode
+LSP's flags are ignored. `isis-lsdb`'s generator sets the bit while the database is
+overloaded (LSPDBOverload), which is what drains a system that ran out of room.
+
+### 3.7 ECMP next-hop sets (`Options.max_paths`)
+
+Default 1 (also 0): the single ECT-chosen path, as before. With `max_paths > 1` the
+first hops of every shortest path are collected without `spf-ect` changes: an arc
+`p ⟶ d` lies on a shortest path when `dist(p) + w == dist(d)`, and the first hops
+of `d` are those of each such `p` (`d` itself when `p` is the root), processed in
+ascending distance (weights are at least 1). The set is sorted by system-id, cut
+to `max_paths`, listed by `RouteTable.nextHops` / `prefixNextHops`, and
+`Route.next_hop` / `PrefixRoute.next_hop` is its lowest member. holo-isis has the same knob under
+the name `max_paths`.
+
+### 3.8 IP prefix routes (`Options.prefixes`, RFC 5305 §4, RFC 5308 §2)
+
+Off by default (an SPB fabric has none). When on, the extraction also reads #135 and
+#236 from every fragment of every non-pseudonode LSP (a malformed entry ends that TLV;
+earlier entries count) into candidates. After the tree: each candidate whose
+advertiser is reachable gets total metric `dist(advertiser) + advertised metric`
+(`PrefixRoute.metric`, `u64`), and per prefix the best one is selected by, first
+difference wins: a real advertisement before an attached-bit default (§3.9);
+Up/Down clear before set (level 1; RFC 5302 §3.1 puts L1 intra-area before
+L2->L1 inter-area, and §3.3 recommends ignoring the bit in L2 LSPs, so
+`Options.level2` does); internal before external (the IPv6 X bit; RFC 5302 §3.1
+ranks external routes below internal ones); the lower total metric; the lower advertiser
+system-id. With `max_paths > 1` the candidates equal in all but the advertiser
+(anycast) contribute all their first hops. The table is sorted by family, address,
+length; `prefixRoute` / `prefixNextHops` look one up. Legacy narrow TLVs #128/#130
+are not read (see below).
+
+### 3.9 Attached-bit default route (`Options.attached_default`, needs `prefixes`)
+
+ISO/IEC 10589 §7.2.9.2: a level-1-only system routes unknown destinations to the
+nearest L1/L2 system that sets the attached bit. When the local LSP's IS Type is
+not L1/L2, every reachable other system whose fragment 0 sets the default-metric
+attached bit contributes `0.0.0.0/0` (if its #129 lists IPv4) and `::/0` (IPv6);
+they are ranked below any advertised prefix, then by distance
+(`PrefixRoute.attached_default`).
+
+### 3.10 L1/L2 leaking (`leak.zig`, RFC 5302)
+
+A L1/L2 system runs the computation once per level (the L2 one with `level2`) and
+`leak.plan(gpa, l1_table, l2_table, policy)` turns the two tables into
+`into_l2` / `into_l1` advertisement lists. L1 -> L2: every L1 prefix selected from
+an advertisement with Up/Down clear, at the L1 total metric (RFC 5302 §3.1 default;
+"Prefixes with the up/down bit set that are learned via L1 routing MUST NOT be
+advertised by L1L2 routers back into L2"); attached defaults and
+`Policy.l1_to_l2_deny` are excluded. L2 -> L1: only by policy
+(`Policy.l2_to_l1`, covering prefixes), with Up/Down set and the L2 metric, and
+not over a prefix the L1 computation holds natively. Metrics are clamped to
+`MAX_PATH_METRIC`. `leak.addAdvert` builds the #135/#236 TLV for the generator
+(`isis-lsdb`, `Origin.tlvs`). Whether a native L1 route blocks the leak is an
+implementation choice (RFC 5302 gives the route preference, not this filter).
+
 ## 4. Degenerate cases (all documented, none panic)
 
 | Case | Result |
@@ -254,23 +319,24 @@ Test classes (`src/root.zig` unless noted):
   equal-cost tie-break could resolve differently at path metrics above 2^32. Closing it means clamping
   during relaxation, which lives in `spf-ect`; clamping only the reported metric would hide the difference.
 
+## What is deliberately not done
+
+- **Incremental / partial SPF.** Measured (`src/bench.zig`, `ISIS_SPF_BENCH`, ReleaseFast, 1000 systems in a
+  ring with chords, four links each, 7 rounds of 20 calls): one full `compute` takes 2.7-3.1 ms
+  (3.1-4.1 ms with prefixes), the bare shortest-path tree 0.60-0.78 ms, 21-27 % of it. Reusing the previous tree
+  could save at most that share (1.3x at best, inside the spread of the numbers), the LSP walk and hash maps
+  being the rest; skipping the walk needs a change log the LSDB does not keep. A recomputation of
+  ~3 ms for 1000 systems is far inside any SPF hold-down timer. The rewrite is not shown to pay off and is
+  not done.
+- **Legacy narrow IP reachability (#128/#130) and wide/narrow metric styles.** Only RFC 5305/5308
+  wide-metric prefixes are routed; the `isis` codec has no typed #128/#130 either.
+- **Multi-topology SPF (RFC 5120).** One topology per computation (the SPB fabric and a plain IP area);
+  MT TLVs #222/#235/#237 are not in the `isis` codec.
+- **Pseudonode vertices** (LAN transit stays folded into member-to-member arcs, §3.2b).
+
 ## Backlog / deferred
 
-- **Multi-level (L1/L2) route leaking.** One level per computation here; the L1↔L2 attached-bit default route
-  and prefix leaking are a separate layer.
-- **IP/IPv6 prefix reachability leaves** (#135/#236 as SPT leaves, best-path selection). The SPB fabric this
-  targets forwards on system-ids / I-SIDs, but without leaves the module cannot produce IP routes for an
-  ordinary IS-IS user; needs the typed reachability TLVs in `isis`. Effort ~1 week. Fits CONVENTIONS §2.
-- **Overload-bit transit exclusion.** An overloaded node (LSP `overload` flag) should not be used for
-  *transit* but remains reachable as a destination; operators set it to drain a node and FRR/holo/goisis
-  honour it. The bit is available on the decoded LSP, but `spf-ect` exposes no per-node transit-exclusion
-  hook yet, so this waits on that hook (an `spf-ect` Backlog item; `spf-ect` is extended additively when a
-  consumer needs it, as `Graph.addArc` was). Effort ~2 days once it exists.
-- **ECMP next-hop sets** (`max_paths` in holo). IP IS-IS load-shares over equal-cost paths; the
-  deterministic single-path result is right for SPB only. Needs multi-parent output from `spf-ect`. Effort
-  ~3 days.
-- **Incremental SPF.** Each call is a full recomputation; incremental / partial SPF on an LSDB delta is a
-  performance optimisation, not needed for correctness.
+None.
 
 ## Anchoring
 

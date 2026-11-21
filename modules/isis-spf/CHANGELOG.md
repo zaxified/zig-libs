@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **ADDITIVE (options, fields, a layer) + Behaviour change:** (1) overload-bit transit exclusion: `Options.honour_overload` (default `true`): arcs out of a system whose fragment-0 LSP sets the overload bit are not relaxed (it stays a destination); the local system's own bit is ignored. **Behaviour change** for a database that carries the bit; `false` restores the old computation. (2) ECMP: `Options.max_paths` (default 1 = unchanged), `RouteTable.nextHops`/`prefixNextHops`, `route_hops`/`prefix_hops`/`hop_pool`. (3) IP/IPv6 prefix routes: `Options.prefixes` (default off), `Options.level2`, `RouteTable.prefixes`, `prefixRoute`, `Prefix`, `PrefixRoute`; best advertisement by Up/Down, internal/external, total metric, advertiser id. (4) `Options.attached_default`: nearest attached system's 0/0 and ::/0. (5) `leak` (RFC 5302): `plan`, `addAdvert`. `RouteTable.deinit` now also frees the new slices (empty unless the options are set). 14 tests; the bench `src/bench.zig` (opt-in) shows incremental SPF would save at most 21-27 % and is not built.
 
 - **2026-10-18** — Ported to Zig 0.17.0 (test-only: `@typeInfo` struct `field_names`).
 
