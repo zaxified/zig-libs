@@ -111,7 +111,7 @@ honest fit here.
 
 ## Not provided
 
-JSON serialization (flattened/general) and multiple recipients, `RSA1_5`, `zip` (DEFLATE; refused
+Encrypting to several recipients at once (`decryptJson` reads multi-recipient JSON; `encryptJson` writes one recipient), `RSA1_5`, `zip` (DEFLATE; refused
 outright). See `SPEC.md` § What is deliberately not done and
 § Backlog / deferred.
 

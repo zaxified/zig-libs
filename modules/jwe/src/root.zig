@@ -8,10 +8,10 @@
 //!
 //! ## Scope (v1)
 //!
-//! **Compact serialization only** (RFC 7516 §3.1); the General/Flattened
-//! JSON serializations (§7.2) are OUT OF SCOPE — they exist to carry
-//! multiple recipients per message, which this module's single-`KeyMaterial`
-//! API has no seam for yet (see SPEC.md).
+//! **Compact serialization** (RFC 7516 §3.1) for encrypting and decrypting; the General/Flattened JSON
+//! serializations (§7.2) are read by `decryptJson` (any number of recipients, `aad`, shared unprotected header)
+//! and written for one recipient by `encryptJson`. Encrypting to several recipients at once (one CEK wrapped
+//! per recipient) is not offered: this module's single-`KeyMaterial` API has no seam for it (see SPEC.md).
 //!
 //! **Content encryption (`enc`, RFC 7518 §5)**:
 //!   - `A128GCM`/`A256GCM` — REAL (`aesgcm.Aes128Gcm`/`Aes256Gcm`); `A192GCM` —
@@ -651,6 +651,24 @@ fn decryptCompactBody(
     // skipped the content decryption entirely, so the two arms did different
     // amounts of WORK. Substituting a decoy CEK and proceeding is what makes
     // the work identical — every path now runs the AEAD and fails there.
+    return unwrapAndFinish(gpa, parsed, key, header_b64, encrypted_key, content_iv, ciphertext, tag, cek, cek_len, opts);
+}
+
+/// The key-unwrap and content-decryption tail shared by the compact and the JSON entry points: recover the CEK
+/// (substituting a decoy on a format/padding/length error, RFC 7516 §11.5) and decrypt with `aad` as the AEAD AAD.
+fn unwrapAndFinish(
+    gpa: std.mem.Allocator,
+    parsed: header.Parsed,
+    key: KeyMaterial,
+    aad: []const u8,
+    encrypted_key: []const u8,
+    content_iv: []const u8,
+    ciphertext: []const u8,
+    tag: []const u8,
+    cek: []u8,
+    cek_len: usize,
+    opts: DecryptOptions,
+) DecryptError![]u8 {
     var unwrap_failed = false;
     unwrapCek(parsed, key, encrypted_key, cek, cek_len, opts) catch |err| switch (err) {
         // Not "errors of encrypted keys": these are properties of the caller's
@@ -687,7 +705,202 @@ fn decryptCompactBody(
     };
     if (unwrap_failed) decoyCek(key, encrypted_key, cek);
 
-    return finishDecrypt(gpa, parsed, header_b64, cek, content_iv, ciphertext, tag);
+    return finishDecrypt(gpa, parsed, aad, cek, content_iv, ciphertext, tag);
+}
+
+// ── JSON serialization (RFC 7516 §7.2) ──────────────────────────────────────
+
+/// Largest JWE JSON document `decryptJson` reads.
+pub const max_json_len: usize = 8 << 20;
+/// Most recipients of a general JWE JSON document `decryptJson` looks at.
+pub const max_json_recipients: usize = 32;
+
+pub const JsonForm = enum { flattened, general };
+
+/// Re-serialize a compact JWE as the JSON serialization of one recipient (flattened, or general with a
+/// single-element `recipients` array). The protected header, encrypted key, IV, ciphertext and tag are the
+/// compact token's own segments, so the result decrypts with the same key through `decryptJson`. Multiple
+/// recipients and a JSON `aad` need the CEK shared across recipients and are not produced (see SPEC).
+pub fn encryptJson(
+    gpa: std.mem.Allocator,
+    form: JsonForm,
+    key_alg: Alg,
+    content_enc: Enc,
+    key: KeyMaterial,
+    plaintext: []const u8,
+    entropy: Entropy,
+    opts: EncryptOptions,
+) EncryptError![]u8 {
+    const compact = try encryptCompact(gpa, key_alg, content_enc, key, plaintext, "", entropy, opts);
+    defer gpa.free(compact);
+    var it = std.mem.splitScalar(u8, compact, '.');
+    const protected = it.next().?;
+    const ek = it.next().?;
+    const iv = it.next().?;
+    const ct = it.next().?;
+    const tag = it.next().?;
+    return switch (form) {
+        .flattened => try std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"encrypted_key\":\"{s}\",\"iv\":\"{s}\",\"ciphertext\":\"{s}\",\"tag\":\"{s}\"}}", .{ protected, ek, iv, ct, tag }),
+        .general => try std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"recipients\":[{{\"encrypted_key\":\"{s}\"}}],\"iv\":\"{s}\",\"ciphertext\":\"{s}\",\"tag\":\"{s}\"}}", .{ protected, ek, iv, ct, tag }),
+    };
+}
+
+fn jsonString(obj: std.json.ObjectMap, name: []const u8) DecryptError!?[]const u8 {
+    const v = obj.get(name) orelse return null;
+    return switch (v) {
+        .string => |str| str,
+        else => error.MalformedToken,
+    };
+}
+
+fn jsonObject(obj: std.json.ObjectMap, name: []const u8) DecryptError!?std.json.ObjectMap {
+    const v = obj.get(name) orelse return null;
+    return switch (v) {
+        .object => |o| o,
+        else => error.MalformedToken,
+    };
+}
+
+/// Add every member of `from` to `into`; a name already present is `MalformedToken` (RFC 7516 §7.2.1: header
+/// parameter names MUST be unique across the protected, shared unprotected and per-recipient headers).
+fn mergeHeader(arena: std.mem.Allocator, into: *std.json.ObjectMap, from: ?std.json.ObjectMap) DecryptError!void {
+    const f = from orelse return;
+    var it = f.iterator();
+    while (it.next()) |e| {
+        const gop = try into.getOrPut(arena, e.key_ptr.*);
+        if (gop.found_existing) return error.MalformedToken;
+        gop.value_ptr.* = e.value_ptr.*;
+    }
+}
+
+/// Decrypt a JWE in JSON serialization, flattened or general (RFC 7516 §7.2.1 / §7.2.2). Recipients are tried in
+/// order with `key`: one whose header (protected + shared unprotected + its own, names unique) names an `alg` the
+/// key cannot serve (`KeyMaterialMismatch`, `AlgMismatch`, ...) is skipped, and the first that decrypts wins; if none
+/// does, the last error is returned. The AEAD's AAD is `BASE64URL(protected)` and, when the document carries an
+/// `aad` member, `"." || aad` (§5.1). A document with both `recipients` and top-level `header` / `encrypted_key`
+/// is malformed. Returns `gpa`-owned plaintext.
+// secret-api-ok: KeyMaterial holds only BORROWED slices / pointers; a by-value copy copies a pointer, never key bytes
+pub fn decryptJson(
+    gpa: std.mem.Allocator,
+    key: KeyMaterial,
+    json: []const u8,
+    opts: DecryptOptions,
+) DecryptError![]u8 {
+    return burn.run(burn.content_burn, DecryptError![]u8, decryptJsonBody, .{ gpa, key, json, opts });
+}
+
+fn decryptJsonBody(
+    gpa: std.mem.Allocator,
+    key: KeyMaterial,
+    json: []const u8,
+    opts: DecryptOptions,
+) DecryptError![]u8 {
+    if (json.len > max_json_len) return error.MalformedToken;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}) catch return error.MalformedToken;
+    const top = switch (root) {
+        .object => |o| o,
+        else => return error.MalformedToken,
+    };
+
+    const protected_b64 = try jsonString(top, "protected");
+    var protected_obj: ?std.json.ObjectMap = null;
+    if (protected_b64) |pb| {
+        if (pb.len == 0) return error.MalformedToken;
+        if (pb.len > header.max_header_b64_len) return error.HeaderTooLarge;
+        const pj = try decodeSegmentAlloc(arena, pb);
+        const pv = std.json.parseFromSliceLeaky(std.json.Value, arena, pj, .{}) catch return error.MalformedToken;
+        protected_obj = switch (pv) {
+            .object => |o| o,
+            else => return error.MalformedToken,
+        };
+    }
+    const shared_unprotected = try jsonObject(top, "unprotected");
+    const iv_b64 = (try jsonString(top, "iv")) orelse return error.MalformedToken;
+    const ct_b64 = (try jsonString(top, "ciphertext")) orelse return error.MalformedToken;
+    const tag_b64 = (try jsonString(top, "tag")) orelse return error.MalformedToken;
+    const content_iv = try decodeSegmentAlloc(arena, iv_b64);
+    const ciphertext = try decodeSegmentAlloc(arena, ct_b64);
+    const tag = try decodeSegmentAlloc(arena, tag_b64);
+
+    // AAD (RFC 7516 §5.1): ASCII(BASE64URL(protected)), then "." || BASE64URL(aad) if `aad` is present.
+    const aad_member = try jsonString(top, "aad");
+    const aad: []const u8 = if (aad_member) |am| blk: {
+        _ = try decodeSegmentAlloc(arena, am); // must be base64url
+        break :blk try std.fmt.allocPrint(arena, "{s}.{s}", .{ protected_b64 orelse "", am });
+    } else protected_b64 orelse "";
+
+    // Recipients: general (`recipients` array) or flattened (the recipient's members are at the top level).
+    const Recipient = struct { header: ?std.json.ObjectMap, ek_b64: []const u8 };
+    var recipients: [max_json_recipients]Recipient = undefined;
+    var n_rec: usize = 0;
+    if (top.get("recipients")) |rv| {
+        if (top.get("header") != null or top.get("encrypted_key") != null) return error.MalformedToken;
+        const arr = switch (rv) {
+            .array => |a| a,
+            else => return error.MalformedToken,
+        };
+        if (arr.items.len == 0 or arr.items.len > max_json_recipients) return error.MalformedToken;
+        for (arr.items) |item| {
+            const o = switch (item) {
+                .object => |o| o,
+                else => return error.MalformedToken,
+            };
+            recipients[n_rec] = .{ .header = try jsonObject(o, "header"), .ek_b64 = (try jsonString(o, "encrypted_key")) orelse "" };
+            n_rec += 1;
+        }
+    } else {
+        recipients[0] = .{ .header = try jsonObject(top, "header"), .ek_b64 = (try jsonString(top, "encrypted_key")) orelse "" };
+        n_rec = 1;
+    }
+
+    var last_err: DecryptError = error.MalformedToken;
+    for (recipients[0..n_rec]) |rec| {
+        var merged: std.json.ObjectMap = .empty;
+        try mergeHeader(arena, &merged, protected_obj);
+        try mergeHeader(arena, &merged, shared_unprotected);
+        try mergeHeader(arena, &merged, rec.header);
+        const merged_json = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = merged }, .{});
+        const parsed = header.parse(arena, merged_json) catch |e| {
+            last_err = e;
+            continue;
+        };
+        if (parsed.alg == .unknown) {
+            last_err = error.UnsupportedAlg;
+            continue;
+        }
+        if (parsed.enc == .unknown) {
+            last_err = error.UnsupportedEnc;
+            continue;
+        }
+        if (opts.expect_alg) |want| if (want != parsed.alg) {
+            last_err = error.AlgMismatch;
+            continue;
+        };
+        if (opts.expect_enc) |want| if (want != parsed.enc) {
+            last_err = error.EncMismatch;
+            continue;
+        };
+        const cek_len = parsed.enc.cekLen() orelse {
+            last_err = error.UnsupportedEnc;
+            continue;
+        };
+        const encrypted_key = decodeSegmentAlloc(arena, rec.ek_b64) catch |e| {
+            last_err = e;
+            continue;
+        };
+        var cek_buf: [max_cek_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &cek_buf);
+        const plaintext = unwrapAndFinish(gpa, parsed, key, aad, encrypted_key, content_iv, ciphertext, tag, cek_buf[0..cek_len], cek_len, opts) catch |e| {
+            last_err = e;
+            continue;
+        };
+        return plaintext;
+    }
+    return last_err;
 }
 
 /// Derive a decoy CEK the peer cannot compute, so a failed key unwrap runs the
@@ -1057,6 +1270,82 @@ test "ECDH-ES over P-384 and P-521 round-trips, direct and with key wrap; epk is
         defer std.testing.allocator.free(t2);
         try std.testing.expectError(error.CurveMismatch, decryptCompact(std.testing.allocator, .{ .ec_private = &other.private }, t2, .{}));
     }
+}
+
+test "JSON serialization: flattened and general round-trip; tampering and a wrong key fail" {
+    const gpa = std.testing.allocator;
+    const kek: [16]u8 = @splat(0x5a);
+    for ([_]JsonForm{ .flattened, .general }) |form| {
+        const doc = try encryptJson(gpa, form, .A128KW, .A128GCM, .{ .symmetric = &kek }, "json form", seededForTest(), .{ .kid = "k1" });
+        defer gpa.free(doc);
+        const pt = try decryptJson(gpa, .{ .symmetric = &kek }, doc, .{ .expect_alg = .A128KW });
+        defer gpa.free(pt);
+        try std.testing.expectEqualStrings("json form", pt);
+        const wrong: [16]u8 = @splat(0x5b);
+        try std.testing.expectError(error.AuthenticationFailed, decryptJson(gpa, .{ .symmetric = &wrong }, doc, .{}));
+        try std.testing.expectError(error.AlgMismatch, decryptJson(gpa, .{ .symmetric = &kek }, doc, .{ .expect_alg = .A256KW }));
+        const bad = try gpa.dupe(u8, doc);
+        defer gpa.free(bad);
+        const at = std.mem.find(u8, bad, "\"ciphertext\":\"") orelse return error.TestUnexpectedResult;
+        bad[at + 14] = if (bad[at + 14] == 'A') 'B' else 'A';
+        try std.testing.expectError(error.AuthenticationFailed, decryptJson(gpa, .{ .symmetric = &kek }, bad, .{}));
+    }
+    try std.testing.expectError(error.MalformedToken, decryptJson(gpa, .{ .symmetric = &kek }, "[]", .{}));
+    try std.testing.expectError(error.MalformedToken, decryptJson(gpa, .{ .symmetric = &kek }, "{\"iv\":\"AA\"}", .{}));
+}
+
+test "JSON serialization: a two-recipient general JWE decrypts for either recipient; shared header names must be unique; aad is bound" {
+    const gpa = std.testing.allocator;
+    const b64 = std.base64.url_safe_no_pad;
+    const k1: [16]u8 = @splat(0x61);
+    const k2: [16]u8 = @splat(0x62);
+    const cek: [16]u8 = @splat(0x7c);
+    var w1: [24]u8 = undefined;
+    var w2: [24]u8 = undefined;
+    const e1 = try aeskw.wrap(&k1, &cek, &w1);
+    const e2 = try aeskw.wrap(&k2, &cek, &w2);
+    const protected = "{\"enc\":\"A128GCM\"}";
+    var pb: [64]u8 = undefined;
+    const protected_b64 = b64.Encoder.encode(&pb, protected);
+    const aad_b64 = "YWFk"; // "aad"
+    const aad = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ protected_b64, aad_b64 });
+    defer gpa.free(aad);
+    const iv: [12]u8 = @splat(0x33);
+    var ct: [16]u8 = undefined;
+    var tag: [16]u8 = undefined;
+    const n = try enc.encrypt(.A128GCM, &cek, &iv, aad, "two recipients", &ct, &tag);
+    var buf: [1024]u8 = undefined;
+    var f1: [64]u8 = undefined;
+    var f2: [64]u8 = undefined;
+    var fiv: [32]u8 = undefined;
+    var fct: [32]u8 = undefined;
+    var ftag: [32]u8 = undefined;
+    const doc = try std.fmt.bufPrint(&buf, "{{\"protected\":\"{s}\",\"aad\":\"{s}\",\"recipients\":[" ++
+        "{{\"header\":{{\"alg\":\"A128KW\",\"kid\":\"one\"}},\"encrypted_key\":\"{s}\"}}," ++
+        "{{\"header\":{{\"alg\":\"A128KW\",\"kid\":\"two\"}},\"encrypted_key\":\"{s}\"}}]," ++
+        "\"iv\":\"{s}\",\"ciphertext\":\"{s}\",\"tag\":\"{s}\"}}", .{
+        protected_b64,                   aad_b64,
+        b64.Encoder.encode(&f1, e1),     b64.Encoder.encode(&f2, e2),
+        b64.Encoder.encode(&fiv, &iv),   b64.Encoder.encode(&fct, ct[0..n]),
+        b64.Encoder.encode(&ftag, &tag),
+    });
+    for ([_]*const [16]u8{ &k1, &k2 }) |k| {
+        const pt = try decryptJson(gpa, .{ .symmetric = k }, doc, .{});
+        defer gpa.free(pt);
+        try std.testing.expectEqualStrings("two recipients", pt);
+    }
+    const other: [16]u8 = @splat(0x63);
+    try std.testing.expectError(error.AuthenticationFailed, decryptJson(gpa, .{ .symmetric = &other }, doc, .{}));
+    // A changed aad member breaks the AEAD.
+    var tampered: [1024]u8 = undefined;
+    @memcpy(tampered[0..doc.len], doc);
+    const at = std.mem.find(u8, tampered[0..doc.len], "\"aad\":\"YWFk") orelse return error.TestUnexpectedResult;
+    tampered[at + 9] = 'Z';
+    try std.testing.expectError(error.AuthenticationFailed, decryptJson(gpa, .{ .symmetric = &k1 }, tampered[0..doc.len], .{}));
+    // The same parameter name in the protected and a per-recipient header is malformed.
+    const dup = try std.mem.replaceOwned(u8, gpa, doc, "\"kid\":\"one\"", "\"enc\":\"A128GCM\"");
+    defer gpa.free(dup);
+    try std.testing.expectError(error.MalformedToken, decryptJson(gpa, .{ .symmetric = &k1 }, dup, .{}));
 }
 
 test "ECDH-ES+A256KW over X25519 real round-trip" {

@@ -31,8 +31,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** the only Zig JWE known; RFC 7516 Appendix A worked examples as tests;
 verify-before-decrypt CBC-HMAC with a single error for tag or padding failure; refuses `zip`
 outright (a deliberate anti-zip-bomb stance that go-jose, which implements DEF, does not take)
-and caps PBES2 iterations (`default_max_p2c`). **Where we are behind:** JSON
-serialization and multiple recipients (deliberate for v1, see *Design*), RSA1_5 (refused, see *What is deliberately not done*). ECDH-ES on P-256, P-384, P-521 and X25519 is implemented.
+and caps PBES2 iterations (`default_max_p2c`). **Where we are behind:** encrypting to
+several recipients at once (see *Design*), RSA1_5 (refused, see *What is deliberately not done*). ECDH-ES on P-256, P-384, P-521 and X25519 is implemented.
 
 Design + threat notes for auditors. Usage: see ./README.md.
 Attribution/provenance: see ./NOTICE (module-local — see its own note on
@@ -51,9 +51,11 @@ placement).
   this module's own original implementations, so their KATs and error
   shapes are unchanged. `kat_rfc7516.zig` carries the two RFC 7516 Appendix A
   full-token worked examples as tests.
-- **Compact serialization only** (RFC 7516 §3.1). The General/Flattened JSON
-  serializations (§7.2) are explicitly out of scope for v1: they exist to
-  carry **multiple recipients** (one `encrypted_key` per recipient, one
+- **Compact serialization for encryption; JSON serialization for decryption** (RFC 7516 §3.1, §7.2). `decryptJson` reads
+  the Flattened and General forms: the three header objects (protected, shared unprotected, per-recipient) are merged
+  with unique names, the AEAD's AAD is `BASE64URL(protected)` plus `.` `aad` when present, and recipients are tried in
+  order (a recipient the key cannot serve is skipped; the first that decrypts wins; else the last error). `encryptJson`
+  re-frames one compact encryption as a Flattened or single-recipient General document. Producing **multiple recipients** (one `encrypted_key` per recipient, one
   shared `ciphertext`/`tag`) sharing one CEK — this module's
   `KeyMaterial`/`encryptCompact` shape is single-recipient by construction
   (one `alg` + one key in, one `encrypted_key` out). Adding JSON
@@ -166,8 +168,7 @@ placement).
   wrong-KEK/corrupted-input unwrap into a timing oracle. On failure the
   output buffer is zeroed (`std.crypto.secureZero`) so no partially-unwrapped
   key material leaks to the caller.
-- **Out of scope for v1:** General/Flattened JSON serialization (multiple
-  recipients — see Design above), and any `enc`/`alg` this file doesn't
+- **Out of scope for v1:** encrypting to several recipients in one document (see Design above), a JSON `aad` on encrypt, and any `enc`/`alg` this file doesn't
   list. `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (RFC 7518 §4.6,
   elliptic-curve key agreement on P-256, P-384, P-521 or X25519 + the Concat KDF; P-384 and P-521 are checked against std's P-384 and the `p384`/`p521` modules' own ECDH, no foreign KAT) ARE in
   scope and implemented — see `ecdhes.zig`, byte-exact against RFC 7518
@@ -274,8 +275,9 @@ Run: `scripts/modtest jwe`. Tests sit beside the code (`src/root.zig`, `enc.zig`
 
 ## Backlog / deferred
 
-- **JWE JSON serialization (flattened/general) and multiple recipients** — go-jose and panva/jose both
-  ship it; deliberately out of scope for v1 (see *Design & invariants*), listed because it is an API
-  addition, not a framing change. Effort: medium. Fits §2: yes.
+- **Encrypting to multiple recipients in one JSON document, and the JSON `aad` member on encrypt** — go-jose and
+  panva/jose do both; needs an encrypt entry point that draws one CEK and wraps it per recipient (the per-algorithm
+  arms of `encryptCompact` draw their own CEK today). `decryptJson` already reads such documents. Effort: medium.
+  NOT REACHED (budget).
 - **Performance not measured** — the AES-GCM bulk path runs in `aesgcm` (see its Performance); jwe has no
   bench of its own. BOUNCED: needs a quiet host for numbers (quiet phase).
