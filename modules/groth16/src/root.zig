@@ -77,6 +77,7 @@ pub const circom = @import("circom.zig");
 pub const ptau = @import("ptau.zig");
 pub const zkprove = @import("zkprove.zig");
 pub const phase2 = @import("phase2.zig");
+pub const solidity = @import("solidity.zig");
 
 // Convenience re-exports.
 pub const Fr = field.Fr;
@@ -138,6 +139,7 @@ test {
     _ = @import("snarkjs_kat_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("audit_test.zig");
+    _ = @import("solidity.zig");
     _ = @import("bench.zig"); // opt-in via GROTH16_BENCH; SKIPs otherwise
 }
 

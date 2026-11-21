@@ -13,6 +13,7 @@
 #     tools/snarkjs/gen.sh ours       # snarkjs judges OUR proof (ours_proof.json)
 #     tools/snarkjs/gen.sh big        # 10 000-constraint circuit, both directions
 #     tools/snarkjs/gen.sh boundary   # 8-row and 9-row circuits (domain-size rule)
+#     tools/snarkjs/gen.sh calldata   # snarkjs's `zkey export soliditycalldata` line
 #     tools/snarkjs/gen.sh json       # how ffjavascript itself writes/reads JSON points
 #
 # Work happens in <repo>/.zig-cache/g16 (droppable). Node is fetched there
@@ -69,11 +70,17 @@ last() { sed 's/\x1b\[[0-9;]*m//g' | grep -Ev '^\s+[0-9a-f]{8} ' | tail -1; }
 
 build_g16() {
   local zig=${ZIG:-zig}
+  # montint's build options (`zl_options`): any options.zig a `zig build` of
+  # this repo wrote; run `scripts/modtest groth16` once first.
+  local opt
+  opt=$(cd "$repo" && grep -l montint_asm_unroll .zig-cache/o/*/options.zig | head -1)
+  opt=$repo/$opt
   (cd "$repo" && "$zig" build-exe -OReleaseFast -fllvm \
     --dep groth16 -Mroot=modules/groth16/tools/snarkjs/g16.zig \
     --dep bn254 -Mgroth16=modules/groth16/src/root.zig \
     --dep montint -Mbn254=modules/bn254/src/root.zig \
-    -Mmontint=modules/montint/src/root.zig \
+    --dep zl_options -Mmontint=modules/montint/src/root.zig \
+    -Mzl_options="$opt" \
     --cache-dir .zig-cache -femit-bin=.zig-cache/g16/g16)
 }
 
@@ -116,6 +123,12 @@ json)
         c.G2.isZero(c.G2.fromObject([["0", "0"], ["1", "0"], ["0", "0"]])));
       await c.terminate();
     });'
+  ;;
+calldata)
+  # snarkjs's Solidity calldata for the committed proof (pinned in
+  # src/snarkjs_files_test.zig; solidity.zig's contract consumes it).
+  td=$mod/src/testdata/snarkjs
+  $S zkey export soliditycalldata "$td/public.json" "$td/proof.json"
   ;;
 boundary)
   # Two circuits around a power of two of rows (constraints + public + 1):

@@ -31,6 +31,8 @@ const circom = @import("circom.zig");
 const ptau_mod = @import("ptau.zig");
 const zkprove = @import("zkprove.zig");
 const field = @import("field.zig");
+const snarkjs_import = @import("snarkjs_import.zig");
+const snarkjs_export = @import("snarkjs_export.zig");
 
 const Fp = bn254.Fp;
 const Fr = bn254.Fr;
@@ -296,6 +298,40 @@ test "phase2.newZkey: the domain-size boundary matches snarkjs (8 rows -> 8, 9 r
         defer testing.allocator.free(out);
         try testing.expectEqualSlices(u8, c.zkey, out);
     }
+}
+
+test "solidity calldata: our rendering of snarkjs's proof.json/public.json equals `zkey export soliditycalldata`" {
+    // `tools/snarkjs/gen.sh calldata`, snarkjs@0.7.6, on the committed files.
+    const want = "[\"0x189d45c26c091e09f6f0fc94e0c8b62997a99997fadad69738e713627163fabc\", \"0x004181b3fd792dbcfdf84a2c1be6d5cc3f3d6eafd336627816b35ce834c86e4a\"]," ++
+        "[[\"0x020e99a5aed3c780987ca4e2c8a0479510b519c813d42e0db3e27628749738dc\", \"0x10d697de1cd766f88768aac1d010d82045e56017333e73ce4534349ee67f454a\"]," ++
+        "[\"0x0c0645ddadd3c8b7da126d3294166a7857de4c155b5988f39843c18ea453347d\", \"0x141249b2629801b5551bdd25959949e96b31f459e2954942613c48d712da13d3\"]]," ++
+        "[\"0x16951f6d40f317be0c037be2342f21f8fc9ad8993a9123381ac6ee2a637a94b2\", \"0x1f08e0be7e50b027b72c8d36d76e108606bf4152e84ef813abcd5689ecb2edbb\"]," ++
+        "[\"0x000000000000000000000000000000000000000000000000000000000000006c\",\"0x0000000000000000000000000000000000000000000000000000000000000003\"]";
+    const a = testing.allocator;
+    const proof = try snarkjs_import.parseProof(a, @embedFile("testdata/snarkjs/proof.json"));
+    const public = try snarkjs_import.parsePublic(a, @embedFile("testdata/snarkjs/public.json"));
+    defer a.free(public);
+    const got = try snarkjs_export.solidityCalldata(a, proof, public);
+    defer a.free(got);
+    try testing.expectEqualStrings(want, got);
+}
+
+test "solidity verifier: the contract for snarkjs's vk.json is the one the EVM oracle ran" {
+    // `tools/solidity/run.sh` (solc 0.8.30, @ethereumjs/evm 10.1.3) compiled
+    // this exact text and called `verifyProof` with the calldata above:
+    // snarkjs's proof -> true; A.x + 1, input[0] + 1, input[0] + r -> false.
+    // Any change to the generator changes this hash: rerun the oracle, then
+    // update it.
+    const a = testing.allocator;
+    const vk = try snarkjs_import.parseVerifyingKey(a, @embedFile("testdata/snarkjs/vk.json"));
+    defer snarkjs_import.freeVerifyingKey(a, vk);
+    const src = try @import("solidity.zig").verifier(a, vk, "Groth16Verifier");
+    defer a.free(src);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(src, &digest, .{});
+    var hexbuf: [64]u8 = undefined;
+    const got = std.fmt.bufPrint(&hexbuf, "{x}", .{&digest}) catch unreachable;
+    try testing.expectEqualStrings("a001457f7c023926b1127257b299cb7bdccea95280719d8049a9f084dfb19408", got);
 }
 
 fn loadAll() !struct { r: circom.R1cs, p: ptau_mod.Ptau } {

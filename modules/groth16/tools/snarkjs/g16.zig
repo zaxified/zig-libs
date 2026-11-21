@@ -7,6 +7,8 @@
 //!     g16 newzkey    <circuit.r1cs> <ceremony.ptau> <out.zkey>
 //!     g16 contribute <in.zkey> <out.zkey> <name>
 //!     g16 verify     <circuit.r1cs> <ceremony.ptau> <circuit.zkey>
+//!     g16 solidity   <verification_key.json> <out.sol>
+//!     g16 calldata   <proof.json> <public.json>   (one line on stdout)
 //!
 //! Each prints the wall time of its phases on stderr. The proof's r, s come
 //! from `Fr.random(io)` (the `Io`'s CSPRNG); a contribution's secret, which
@@ -27,6 +29,8 @@ fn usage() noreturn {
         \\       g16 newzkey <r1cs> <ptau> <out.zkey>
         \\       g16 contribute <in.zkey> <out.zkey> <name>
         \\       g16 verify <r1cs> <ptau> <zkey>
+        \\       g16 solidity <vk.json> <out.sol>
+        \\       g16 calldata <proof.json> <public.json>
         \\
     , .{});
     std.process.exit(2);
@@ -136,5 +140,29 @@ pub fn main(init: std.process.Init) !void {
         }
         std.debug.print("{s} (contributions {d}, proofs checked here {d})\n", .{ @tagName(verdict), z.contributions.len, ours });
         if (verdict != .ok) std.process.exit(1);
+    } else if (std.mem.eql(u8, cmd, "solidity")) {
+        if (n != 2) usage();
+        const vbytes = try cwd.readFileAlloc(io, a[0], gpa, .limited(max_file));
+        defer gpa.free(vbytes);
+        const vk = try groth16.snarkjs_import.parseVerifyingKey(gpa, vbytes);
+        defer groth16.snarkjs_import.freeVerifyingKey(gpa, vk);
+        const src = try groth16.solidity.verifier(gpa, vk, "Groth16Verifier");
+        defer gpa.free(src);
+        try cwd.writeFile(io, .{ .sub_path = a[1], .data = src });
+    } else if (std.mem.eql(u8, cmd, "calldata")) {
+        if (n != 2) usage();
+        const pbytes = try cwd.readFileAlloc(io, a[0], gpa, .limited(max_file));
+        defer gpa.free(pbytes);
+        const proof = try groth16.snarkjs_import.parseProof(gpa, pbytes);
+        const ubytes = try cwd.readFileAlloc(io, a[1], gpa, .limited(max_file));
+        defer gpa.free(ubytes);
+        const public = try groth16.snarkjs_import.parsePublic(gpa, ubytes);
+        defer gpa.free(public);
+        const line = try groth16.snarkjs_export.solidityCalldata(gpa, proof, public);
+        defer gpa.free(line);
+        var out_buf: [4096]u8 = undefined;
+        var out = std.Io.File.stdout().writer(io, &out_buf);
+        try out.interface.print("{s}\n", .{line});
+        try out.interface.flush();
     } else usage();
 }

@@ -32,6 +32,7 @@ anchored by the `bn254` verifier and by real `snarkjs`/`circom` files (see [SPEC
 | `ptau.zig` | snarkjs powers-of-tau (`.ptau`) reader, points decoded on demand |
 | `zkprove.zig` | **the real prover**: `.zkey` + witness → proof, quotient on a coset; Pippenger MSM (variable-time in the witness, the default) or `proveWith(…, .{ .msm = .constant_time })` (~21× slower) |
 | `phase2.zig` | phase-2 ceremony: `newZkey(r1cs, ptau)`, `contribute`, `verifyContribution`, `verify` |
+| `solidity.zig` | `verifier(vk, name)`: a Solidity verifier contract for a key (snarkjs's `verifyProof` signature, EVM precompiles 0x06–0x08); the matching calldata is `snarkjs_export.solidityCalldata(proof, public)` |
 
 ## The anchor
 
@@ -140,7 +141,7 @@ SPEC.md § 5b has the reasons and the residual risks.
 
 ## Not provided
 
-No multi-threading, Solidity verifier or calldata export, witness calculation, circuit DSL, PLONK or other curves, and
+No multi-threading, witness calculation, circuit DSL, PLONK or other curves, and
 snarkjs's own `zkey verify` rejects keys made or contributed here. What is deliberately refused is in SPEC.md *What is
 deliberately not done*; what is wanted and open is in *Backlog / deferred*.
 

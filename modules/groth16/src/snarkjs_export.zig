@@ -224,6 +224,68 @@ pub fn publicJson(allocator: std.mem.Allocator, public_inputs: []const Fr) ![]u8
     return aw.toOwnedSlice();
 }
 
+// ── Solidity calldata ────────────────────────────────────────────────────
+//
+// `snarkjs zkey export soliditycalldata public.json proof.json` prints the
+// arguments of a verifier contract's `verifyProof(uint[2] a, uint[2][2] b,
+// uint[2] c, uint[n] input)` as one line. Observed by running snarkjs@0.7.6
+// (`gen.sh calldata`) on the committed `proof.json`/`public.json`, pinned in
+// `snarkjs_files_test.zig`: every value as `0x` + 64 lowercase hex digits; the
+// three proof arrays separated by `", "` inside and `,` between; the public
+// array by `","`; each `Fp2` coordinate in EIP-197 order (`c1` first, the
+// order the `0x08` pairing precompile reads); no trailing newline (the CLI's
+// own is `console.log`'s).
+
+fn writeHex32(w: *std.Io.Writer, be: [32]u8) std.Io.Writer.Error!void {
+    try w.print("\"0x{x}\"", .{&be});
+}
+
+fn writeG1Hex(w: *std.Io.Writer, p: G1.Affine) std.Io.Writer.Error!void {
+    // The EVM's point at infinity is (0, 0) (EIP-196).
+    const zero: [32]u8 = @splat(0);
+    try w.writeAll("[");
+    try writeHex32(w, if (p.infinity) zero else p.x.toBytes());
+    try w.writeAll(", ");
+    try writeHex32(w, if (p.infinity) zero else p.y.toBytes());
+    try w.writeAll("]");
+}
+
+fn writeFp2Hex(w: *std.Io.Writer, a: bn254.Fp2, inf: bool) std.Io.Writer.Error!void {
+    const zero: [32]u8 = @splat(0);
+    try w.writeAll("[");
+    try writeHex32(w, if (inf) zero else a.c1.toBytes());
+    try w.writeAll(", ");
+    try writeHex32(w, if (inf) zero else a.c0.toBytes());
+    try w.writeAll("]");
+}
+
+/// Writes `proof` and `public_inputs` as snarkjs's `zkey export
+/// soliditycalldata` line (see above), ready to paste into a call of a
+/// Groth16 verifier contract's `verifyProof`.
+pub fn writeSolidityCalldata(w: *std.Io.Writer, proof: bn254.Groth16Proof, public_inputs: []const Fr) std.Io.Writer.Error!void {
+    try writeG1Hex(w, proof.a);
+    try w.writeAll(",[");
+    try writeFp2Hex(w, proof.b.x, proof.b.infinity);
+    try w.writeAll(",");
+    try writeFp2Hex(w, proof.b.y, proof.b.infinity);
+    try w.writeAll("],");
+    try writeG1Hex(w, proof.c);
+    try w.writeAll(",[");
+    for (public_inputs, 0..) |pi, i| {
+        if (i != 0) try w.writeAll(",");
+        try writeHex32(w, pi.toBytes());
+    }
+    try w.writeAll("]");
+}
+
+/// `writeSolidityCalldata` into a fresh allocation.
+pub fn solidityCalldata(allocator: std.mem.Allocator, proof: bn254.Groth16Proof, public_inputs: []const Fr) std.mem.Allocator.Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    writeSolidityCalldata(&aw.writer, proof, public_inputs) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 test "decimalBytes: zero encodes as \"0\"" {
