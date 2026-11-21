@@ -359,7 +359,8 @@ All open.
 - **Programs past `4 * max_insts`** (owner: no consumer setting may end in a panic or an OOM) — Go and Rust compile
   them; here `error.PatternTooLarge`, because `isMatch` has no allocator and a `Matcher` for 65,534 instructions x 64
   groups would be ~134 MiB. Taking them back needs matching in bounded memory for any size (a windowed or chunked state
-  set), not an allocating side door.
+  set), not an allocating side door. *BOUNCED: an owner decision — no bounded-memory design for any size is known
+  without an allocator; the alternative is an opt-in allocating scratch (Go and Rust are unbounded).*
 - **A full forward table can stop caching two-byte steps** (perf only) — when `FindDfa` holds `limit` states and the next
   state already exists, `intern` does not empty the table, but `midAfter` has no room: every two-byte code point from that
   state is stepped uncached until some new state forces a flush. Not seen in the bench (<= 20 states). Flushing from
