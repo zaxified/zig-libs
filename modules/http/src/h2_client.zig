@@ -309,9 +309,10 @@ const Pending = struct {
 
 /// An HTTP/2 client connection: issue `request` any number of times (the
 /// streams run concurrently on the wire), then `awaitResponse` each stream
-/// id. Single-owner, like the rest of the module: one task drives a
-/// Session. `deinit` releases everything; call `shutdown` first for a
-/// graceful GOAWAY.
+/// id. Single-owner by default: one task drives a Session. With `share`,
+/// several tasks drive it, each holding the `Sync`'s mutex around every
+/// call (see `Sync`). `deinit` releases everything; call `shutdown` first
+/// for a graceful GOAWAY.
 pub const Session = struct {
     gpa: Allocator,
     /// Server → client bytes.
@@ -335,8 +336,57 @@ pub const Session = struct {
     user_agent: ?[]const u8 = null,
     /// `Options.max_response_body_bytes`.
     max_response_body_bytes: ?u64 = null,
+    /// Set by `share`: several tasks drive the session.
+    sync: ?*Sync = null,
 
     pub const Goaway = struct { last_stream_id: u31, code: h2.ErrorCode };
+
+    /// What lets several tasks drive one `Session` at once — Go's
+    /// `http2.ClientConn`, where every request's goroutine waits on its own
+    /// stream while one read loop feeds them all. Here the read loop is
+    /// whichever waiting task needs bytes first (leader/followers): a call
+    /// that must wait for the peer (`awaitHead`, `readBody`, `awaitResponse`,
+    /// `sendData` with a shut window) becomes the reader when no task is
+    /// reading, and reads the socket with `mutex` RELEASED, so the others
+    /// keep sending, collecting and releasing their own streams meanwhile;
+    /// it then takes `mutex` back, folds what it read into every stream and
+    /// wakes the waiters (`progress`). A call that finds another task
+    /// reading waits on `progress` and looks at its own stream again.
+    ///
+    /// The contract: every call on a shared `Session` is made holding
+    /// `mutex` (`lock`/`unlock`); a waiting call may give it up and take it
+    /// back inside. Writes to the transport happen under `mutex`, as one
+    /// task's writes always have here. A reader whose read fails latches
+    /// the session as `ConnectionClosed`, failing every stream on it, as a
+    /// dead socket does — so a reader task must not be canceled while
+    /// others still wait (its read is not cancel-safe).
+    pub const Sync = struct {
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+        progress: std.Io.Condition = .init,
+        /// A task is reading the transport (with `mutex` released).
+        reading: bool = false,
+        /// Times a task read the transport as the leader (tests).
+        reads: usize = 0,
+
+        pub fn init(io: std.Io) Sync {
+            return .{ .io = io };
+        }
+
+        pub fn lock(sy: *Sync) void {
+            sy.mutex.lockUncancelable(sy.io);
+        }
+
+        pub fn unlock(sy: *Sync) void {
+            sy.mutex.unlock(sy.io);
+        }
+    };
+
+    /// Let several tasks drive this session through `sync` (see `Sync`);
+    /// `sync` must outlive the session. Call before the session is shared.
+    pub fn share(s: *Session, sync: *Sync) void {
+        s.sync = sync;
+    }
 
     /// Send the §3.4 client connection preface (magic + our SETTINGS) and
     /// hand back a ready session. `in`/`out` must outlive it.
@@ -841,7 +891,31 @@ pub const Session = struct {
     /// connection-scoped ones answer GOAWAY and latch `broken` (§5.4.1).
     fn pump(s: *Session) Error!void {
         if (s.broken) |e| return e;
+        if (s.sync) |sy| {
+            if (sy.reading) {
+                // Another task reads: its progress may be ours. The caller
+                // looks at its stream again either way.
+                sy.progress.waitUncancelable(sy.io, &sy.mutex);
+                return;
+            }
+            sy.reading = true;
+            sy.reads += 1;
+            sy.unlock();
+            const got = s.in.peekGreedy(1);
+            sy.lock();
+            sy.reading = false;
+            // Every waiter looks again: at the frames folded below, or at
+            // the latched failure, or to become the next reader.
+            defer sy.progress.broadcast(sy.io);
+            _ = got catch return s.fail(error.ConnectionClosed);
+            return s.feed();
+        }
         _ = s.in.peekGreedy(1) catch return s.fail(error.ConnectionClosed);
+        return s.feed();
+    }
+
+    /// `pump`'s second half: what `in` holds, through the h2 state machine.
+    fn feed(s: *Session) Error!void {
         const bytes = s.in.buffered();
         var chunk: []const u8 = bytes;
         s.in.toss(bytes.len);
@@ -1240,6 +1314,178 @@ test "h2 client: multiplexing — interleaved DATA frames demux by stream id (of
     try testing.expectEqualStrings("AA-1 AA-2", res_a.body);
     try testing.expectEqual(@as(u16, 200), res_b.status);
     try testing.expectEqualStrings("BB-1 BB-2", res_b.body);
+}
+
+/// A transport the test feeds by hand: a read blocks until `push` (or
+/// `close`) — the socket a shared session's reader parks on.
+const GatedIn = struct {
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    data: std.ArrayList(u8) = .empty,
+    pos: usize = 0,
+    closed: bool = false,
+    buf: [4096]u8 = undefined,
+    reader: Reader = undefined,
+
+    fn init(g: *GatedIn, io: std.Io) void {
+        g.* = .{ .io = io };
+        g.reader = .{ .vtable = &.{ .stream = streamFn }, .buffer = &g.buf, .seek = 0, .end = 0 };
+    }
+
+    fn deinit(g: *GatedIn) void {
+        g.data.deinit(testing.allocator);
+    }
+
+    fn push(g: *GatedIn, bytes: []const u8) !void {
+        g.mutex.lockUncancelable(g.io);
+        defer g.mutex.unlock(g.io);
+        try g.data.appendSlice(testing.allocator, bytes);
+        g.cond.broadcast(g.io);
+    }
+
+    fn close(g: *GatedIn) void {
+        g.mutex.lockUncancelable(g.io);
+        defer g.mutex.unlock(g.io);
+        g.closed = true;
+        g.cond.broadcast(g.io);
+    }
+
+    fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+        const g: *GatedIn = @alignCast(@fieldParentPtr("reader", r));
+        g.mutex.lockUncancelable(g.io);
+        defer g.mutex.unlock(g.io);
+        while (g.pos == g.data.items.len and !g.closed) g.cond.waitUncancelable(g.io, &g.mutex);
+        if (g.pos == g.data.items.len) return error.EndOfStream;
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const n = @min(dest.len, g.data.items.len - g.pos);
+        @memcpy(dest[0..n], g.data.items[g.pos..][0..n]);
+        g.pos += n;
+        w.advance(n);
+        return n;
+    }
+};
+
+/// A task that collects one stream of a shared session.
+const SharedWaiter = struct {
+    s: *Session,
+    sync: *Session.Sync,
+    sid: u31,
+    done: std.atomic.Value(bool) = .init(false),
+    body: [64]u8 = undefined,
+    len: usize = 0,
+    err: ?Error = null,
+
+    fn run(w: *SharedWaiter) void {
+        w.sync.lock();
+        defer w.sync.unlock();
+        defer w.done.store(true, .release);
+        var res = w.s.awaitResponse(w.sid) catch |e| {
+            w.err = e;
+            return;
+        };
+        defer res.deinit(w.s.gpa);
+        w.len = @min(res.body.len, w.body.len);
+        @memcpy(w.body[0..w.len], res.body[0..w.len]);
+    }
+};
+
+fn awaitTrue(io: std.Io, flag: *const std.atomic.Value(bool)) !void {
+    var waited: usize = 0;
+    while (!flag.load(.acquire)) : (waited += 1) {
+        if (waited == 2000) return error.TestTimedOut;
+        io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+}
+
+test "h2 client: a shared session — one task reads for all, a second collects its stream while the first still waits" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var gate: GatedIn = undefined;
+    gate.init(io);
+    defer gate.deinit();
+    var out_buf: [16384]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &gate.reader, &out, .{});
+    defer s.deinit();
+    var sync: Session.Sync = .init(io);
+    s.share(&sync);
+
+    sync.lock();
+    const sid_a = try s.request(.get, "/a", .{ .authority = "t" });
+    const sid_b = try s.request(.get, "/b", .{ .authority = "t" });
+    var srv: ScriptedServer = try .init(out.buffered());
+    sync.unlock();
+    defer srv.deinit();
+
+    // A waits first and becomes the reader (parked in the transport, the
+    // mutex released); B then waits behind it.
+    var a: SharedWaiter = .{ .s = &s, .sync = &sync, .sid = sid_a };
+    var b: SharedWaiter = .{ .s = &s, .sync = &sync, .sid = sid_b };
+    const ta = try std.Thread.spawn(.{}, SharedWaiter.run, .{&a});
+    defer ta.join();
+    var reading: std.atomic.Value(bool) = .init(false);
+    while (!reading.load(.acquire)) {
+        sync.lock();
+        reading.store(sync.reading, .release);
+        sync.unlock();
+        if (!reading.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    const tb = try std.Thread.spawn(.{}, SharedWaiter.run, .{&b});
+    defer tb.join();
+    errdefer gate.close();
+
+    // B's response only: A reads it, B is woken and returns while A waits on.
+    try srv.conn.sendHeaders(&srv.wire, sid_b, &ok_fields, false);
+    try srv.conn.sendData(&srv.wire, sid_b, "BB", true);
+    try gate.push(srv.wire.items);
+    srv.wire.clearRetainingCapacity();
+    try awaitTrue(io, &b.done);
+    try testing.expectEqual(@as(?Error, null), b.err);
+    try testing.expectEqualStrings("BB", b.body[0..b.len]);
+    try testing.expect(!a.done.load(.acquire));
+
+    try srv.conn.sendHeaders(&srv.wire, sid_a, &ok_fields, false);
+    try srv.conn.sendData(&srv.wire, sid_a, "AA", true);
+    try gate.push(srv.wire.items);
+    try awaitTrue(io, &a.done);
+    try testing.expectEqual(@as(?Error, null), a.err);
+    try testing.expectEqualStrings("AA", a.body[0..a.len]);
+    sync.lock();
+    defer sync.unlock();
+    try testing.expect(!sync.reading);
+}
+
+test "h2 client: a shared session whose transport dies fails every waiting stream, the reader's and the others'" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var gate: GatedIn = undefined;
+    gate.init(io);
+    defer gate.deinit();
+    var out_buf: [16384]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &gate.reader, &out, .{});
+    defer s.deinit();
+    var sync: Session.Sync = .init(io);
+    s.share(&sync);
+    sync.lock();
+    const sid_a = try s.request(.get, "/a", .{ .authority = "t" });
+    const sid_b = try s.request(.get, "/b", .{ .authority = "t" });
+    sync.unlock();
+    var a: SharedWaiter = .{ .s = &s, .sync = &sync, .sid = sid_a };
+    var b: SharedWaiter = .{ .s = &s, .sync = &sync, .sid = sid_b };
+    const ta = try std.Thread.spawn(.{}, SharedWaiter.run, .{&a});
+    const tb = try std.Thread.spawn(.{}, SharedWaiter.run, .{&b});
+    io.sleep(.fromMilliseconds(20), .awake) catch {};
+    gate.close();
+    ta.join();
+    tb.join();
+    try testing.expectEqual(@as(?Error, error.ConnectionClosed), a.err);
+    try testing.expectEqual(@as(?Error, error.ConnectionClosed), b.err);
 }
 
 test "h2 client: response trailers are surfaced separately from the headers (offline)" {

@@ -20,46 +20,37 @@
 //!     var res = try pool.complete(call);             // collects it
 //!     defer res.deinit(pool.gpa);
 //!
-//! `begin` and `complete` are split precisely so a caller can launch several
-//! streams before collecting any — that is what puts multiple proxied
-//! requests concurrently in flight on the ONE connection (`begin` A, `begin`
-//! B, `complete` A, `complete` B — both streams coexist on the wire; the
-//! multiplex proof). `roundtrip` is the fused `begin`+`complete` for the
-//! common one-at-a-time relay.
+//! `begin` and `complete` are split so a caller can launch several streams
+//! before collecting any (`begin` A, `begin` B, `complete` A, `complete` B);
+//! several tasks may also each run their own `roundtrip` at once (see
+//! Concurrency). `roundtrip` is the fused `begin`+`complete`.
 //!
-//! ## Concurrency (and its honest bound)
+//! ## Concurrency
 //!
-//! An `h2_client.Session` is **single-owner and blocking**: `awaitResponse`
-//! pumps the socket, mutating shared demux state, so exactly one task may
-//! touch a session at a time. Each shared session therefore carries an
-//! `std.Io.Mutex` that serializes ALL of its I/O (both the brief `begin` send and the
-//! blocking `complete` await). Consequences:
-//! - Requests genuinely **multiplex on the wire**: nothing here checks a
-//!   connection out exclusively, and any streams already sent keep running
-//!   while another is collected — the demux table folds interleaved server
-//!   frames onto the right stream regardless of order.
-//! - But response *collection* is serialized per connection: while one task
-//!   blocks in `complete`, another cannot `begin`/`complete` on the same
-//!   backend until it returns. Full parallel-in-flight across OS threads is
-//!   bounded by that (a genuinely parallel h2 proxy needs a dedicated
-//!   per-connection reader task — a larger async redesign deliberately not
-//!   taken here, to reuse the existing session engine rather than fork a
-//!   second h2 stack). For deterministic simultaneity, issue several
-//!   `begin`s before the first `complete`.
+//! Every task with a `Call` drives the shared `h2_client.Session` through
+//! its `h2_client.Session.Sync` (Go's `http2.ClientConn`, one read loop
+//! feeding every request's goroutine): each pool call holds the session's
+//! lock only for itself, and a task that must wait for the backend reads the
+//! socket with the lock released, folding what arrives into every stream
+//! and waking the others. So while one task waits in `complete`, another
+//! `begin`s, collects and finishes its own stream on the same connection —
+//! parallel in flight across OS threads, no reader task to start or stop.
 //! Distinct backends never contend (per-entry locks); dialing a cold backend
 //! is serialized per backend (a `dial_mutex`) so a burst opens one
 //! connection, not N.
 //!
-//! ## Bodies (a documented limitation vs. the h1 path)
+//! ## Bodies
 //!
-//! The reused `h2_client.Session` assembles a request body from memory and a
-//! response body into memory (its per-stream `ArrayList`). So h2 upstreaming
-//! **buffers** each body (bounded — the proxy caps both), where the h1
-//! forward path streams them. Flow control is still exercised end to end: a
-//! body larger than the 64 KiB initial window drives WINDOW_UPDATE on send
-//! (`sendBody` blocks for grants) and on receive (`awaitResponse` replenishes
-//! the window). A response trailer section (`Response.trailers`) is relayed
-//! by the reverse proxy to the proxied response.
+//! `begin` + `complete` (and `roundtrip`) take the request body from memory
+//! and hand back the response assembled in memory (bounded,
+//! `RequestParts.max_response_body_bytes`). The streaming lifecycle holds
+//! neither: `beginStream` sends HEADERS, `sendBody` the request body in
+//! pieces, `awaitHead` the response head and `readBody` its DATA as it
+//! arrives, `finish` ends the `Call` — the reverse proxy relays h2 bodies
+//! this way, as its h1 path does. Flow control runs end to end either way:
+//! a body larger than the 64 KiB initial window drives WINDOW_UPDATE on send
+//! (`sendBody` blocks for grants) and on receive (credit goes back as the
+//! body is read).
 //!
 //! ## Failure recovery
 //!
@@ -75,6 +66,7 @@ const testkit = @import("testkit");
 const http = @import("root.zig");
 const Client = @import("Client.zig");
 const h2_client = @import("h2_client.zig");
+const hpack = @import("hpack.zig");
 const Allocator = std.mem.Allocator;
 
 /// Dial + request + await failures. `Client.Error` covers the dial (connect/
@@ -144,15 +136,16 @@ pub const Options = struct {
     dialer: ?Dialer = null,
 };
 
-/// A shared, ref-counted h2 session. `mutex` serializes all of its I/O
-/// (single-owner engine); `refs`/`retired` are guarded by the pool mutex.
+/// A shared, ref-counted h2 session, driven by every task with a `Call` on
+/// it through `sync` (`h2_client.Session.Sync`: each call holds its mutex,
+/// and a task waiting for the backend reads for all of them with it
+/// released); `refs`/`retired` are guarded by the pool mutex.
 const Shared = struct {
     hs: *Client.H2Session,
-    /// Held across the session's socket I/O: an `std.Io.Mutex`, so a task
-    /// waiting for it yields to the `Io` (a spinning or thread-yielding
-    /// waiter starves a holder suspended in the socket when the `Io` runs
-    /// several tasks on one thread).
-    mutex: std.Io.Mutex = .init,
+    /// An `std.Io.Mutex` inside, so a task waiting for it yields to the `Io`
+    /// (a spinning or thread-yielding waiter starves a holder suspended in
+    /// the socket when the `Io` runs several tasks on one thread).
+    sync: h2_client.Session.Sync,
     /// Entry's own ref (+1) plus one per in-flight `Call`.
     refs: usize,
     /// Marked dead: the entry has dropped its ref and re-dials next time;
@@ -282,13 +275,12 @@ pub const Pool = struct {
     /// `Response.deinit(pool.gpa)`).
     pub fn complete(p: *Pool, call: Call) Error!h2_client.Response {
         const shared = call.shared;
-        const pio = p.io();
-        shared.mutex.lockUncancelable(pio);
+        shared.sync.lock();
         const res = shared.hs.session.awaitResponseCapped(call.sid, call.max_body orelse shared.hs.session.max_response_body_bytes);
         // A connection-scoped death (or a latched GOAWAY) retires the session
         // so the next request re-dials; a lone stream reset does not.
         const broken = shared.hs.session.broken != null or shared.hs.session.goaway != null;
-        shared.mutex.unlock(pio);
+        shared.sync.unlock();
 
         if (res) |r| {
             if (broken) p.retire(call.entry, shared);
@@ -307,13 +299,128 @@ pub const Pool = struct {
         return p.complete(call);
     }
 
+    // ── the streaming lifecycle ──────────────────────────────────────────────
+    //
+    // Neither body is held whole: `beginStream` sends HEADERS only and the
+    // request body follows in `sendBody` calls; `awaitHead` gives the
+    // response head and `readBody` its DATA as it arrives; `finish` ends the
+    // `Call`. Each call holds the session's lock only for itself, so other
+    // requests on the connection run meanwhile. `begin` (an in-memory body)
+    // may be followed by `awaitHead`/`readBody`/`finish` too.
+
+    /// Open a stream for `parts` (its `body` ignored) whose request body
+    /// follows in `sendBody`; retried once on a fresh session like `begin`.
+    pub fn beginStream(p: *Pool, backend: Backend, parts: RequestParts) Error!Call {
+        var shared = try p.acquireShared(backend);
+        const sid = p.open(shared, parts) catch |err| retry: {
+            if (!isDeadSession(err)) {
+                p.releaseShared(shared);
+                return err;
+            }
+            const entry = p.entryFor(backend).?;
+            p.retire(entry, shared);
+            p.releaseShared(shared);
+            shared = try p.acquireShared(backend);
+            break :retry p.open(shared, parts) catch |err2| {
+                p.releaseShared(shared);
+                return err2;
+            };
+        };
+        return .{ .entry = p.entryFor(backend).?, .shared = shared, .sid = sid, .max_body = parts.max_response_body_bytes };
+    }
+
+    /// Send `bytes` of the request body (blocking under §5.2 flow control);
+    /// `end` closes it. A dead connection retires the session.
+    pub fn sendBody(p: *Pool, call: *const Call, bytes: []const u8, end: bool) Error!void {
+        const shared = call.shared;
+        shared.sync.lock();
+        defer shared.sync.unlock();
+        shared.hs.session.sendData(call.sid, bytes, end) catch |err| {
+            if (isDeadSession(err)) p.retireLocked(call);
+            return err;
+        };
+    }
+
+    /// Block until the response head of `call` arrives. Borrowed from the
+    /// session until `finish`.
+    pub fn awaitHead(p: *Pool, call: *const Call) Error!h2_client.Head {
+        const shared = call.shared;
+        shared.sync.lock();
+        defer shared.sync.unlock();
+        return shared.hs.session.awaitHead(call.sid) catch |err| {
+            if (isDeadSession(err)) p.retireLocked(call);
+            return err;
+        };
+    }
+
+    /// Up to `buf.len` octets of the response body; 0 once it is complete
+    /// (`trailers` is final then).
+    pub fn readBody(p: *Pool, call: *const Call, buf: []u8) Error!usize {
+        const shared = call.shared;
+        shared.sync.lock();
+        defer shared.sync.unlock();
+        return shared.hs.session.readBody(call.sid, buf) catch |err| {
+            if (isDeadSession(err)) p.retireLocked(call);
+            return err;
+        };
+    }
+
+    /// The response trailer section once the body is complete, else null;
+    /// borrowed until `finish`.
+    pub fn trailers(p: *Pool, call: *const Call) ?hpack.HeaderList {
+        _ = p;
+        const shared = call.shared;
+        shared.sync.lock();
+        defer shared.sync.unlock();
+        return shared.hs.session.trailers(call.sid);
+    }
+
+    /// End `call`: a stream finished both ways is released, any other reset
+    /// (CANCEL, as Go does for a body closed early). Consumes the `Call`.
+    pub fn finish(p: *Pool, call: Call) void {
+        const shared = call.shared;
+        const s = &shared.hs.session;
+        shared.sync.lock();
+        const done = s.ended(call.sid) and s.unreadLen(call.sid) == 0 and s.sendEnded(call.sid);
+        if (done) s.release(call.sid) else s.cancel(call.sid, .cancel);
+        const broken = s.broken != null or s.goaway != null;
+        shared.sync.unlock();
+        if (broken) p.retire(call.entry, shared);
+        p.releaseShared(shared);
+    }
+
+    /// `retire` from a call that holds the session's lock: only the mark
+    /// (the free waits for the `Call`'s own ref, dropped by `finish`).
+    fn retireLocked(p: *Pool, call: *const Call) void {
+        lockSpin(&p.mutex);
+        defer p.mutex.unlock();
+        call.shared.retired = true;
+        if (call.entry.current == call.shared) {
+            call.entry.current = null;
+            call.shared.refs -= 1; // the entry's own ref; the `Call`'s keeps it alive
+        }
+    }
+
+    /// HEADERS without END_STREAM for `parts` on `shared`.
+    fn open(p: *Pool, shared: *Shared, parts: RequestParts) Error!u31 {
+        _ = p;
+        shared.sync.lock();
+        defer shared.sync.unlock();
+        return shared.hs.openStream(parts.method, parts.path, .{
+            .method_token = parts.method_token,
+            .scheme = parts.scheme,
+            .authority = parts.authority,
+            .headers = parts.headers,
+        });
+    }
+
     // ── internals ────────────────────────────────────────────────────────────
 
     /// Send HEADERS (+ body) for `parts` on `shared` under its I/O lock.
     fn send(p: *Pool, shared: *Shared, parts: RequestParts) Error!u31 {
-        const pio = p.io();
-        shared.mutex.lockUncancelable(pio);
-        defer shared.mutex.unlock(pio);
+        _ = p;
+        shared.sync.lock();
+        defer shared.sync.unlock();
         return shared.hs.request(parts.method, parts.path, .{
             .method_token = parts.method_token,
             .scheme = parts.scheme,
@@ -398,7 +505,8 @@ pub const Pool = struct {
         const hs = try p.dial(backend);
         errdefer hs.close();
         const shared = p.gpa.create(Shared) catch return error.OutOfMemory;
-        shared.* = .{ .hs = hs, .refs = 2 }; // entry ref + this caller's ref
+        shared.* = .{ .hs = hs, .sync = .init(p.io()), .refs = 2 }; // entry ref + this caller's ref
+        hs.session.share(&shared.sync);
         lockSpin(&p.mutex);
         entry.current = shared;
         p.mutex.unlock();
@@ -610,6 +718,178 @@ test "h2_upstream: multiplex two proxied streams over one upstream connection" {
     // One dial served both streams — they multiplexed on one connection.
     try testing.expectEqual(@as(usize, 1), pool.dialCount());
     try testing.expectEqual(@as(usize, 1), pool.liveSessionCount());
+}
+
+/// A dispatcher that runs each h2 handler on its own thread (joined by
+/// `join` once the server is down): the backend answers streams at once.
+const ThreadDispatcher = struct {
+    threads: [16]std.Thread = undefined,
+    n: std.atomic.Value(usize) = .init(0),
+
+    fn iface(d: *ThreadDispatcher) Server.H2Dispatcher {
+        return .{ .ctx = d, .spawn = spawn, .max_concurrent_handlers = 8 };
+    }
+
+    fn spawn(ctx: ?*anyopaque, task: Server.H2Task) bool {
+        const d: *ThreadDispatcher = @ptrCast(@alignCast(ctx.?));
+        const i = d.n.load(.monotonic);
+        if (i == d.threads.len) return false;
+        d.threads[i] = std.Thread.spawn(.{}, run, .{task}) catch return false;
+        d.n.store(i + 1, .release);
+        return true;
+    }
+
+    fn run(task: Server.H2Task) void {
+        task.func(task.ctx);
+    }
+
+    fn join(d: *ThreadDispatcher) void {
+        for (d.threads[0..d.n.load(.acquire)]) |t| t.join();
+    }
+};
+
+/// `/slow` answers once `/fast` has been answered (or after 5 s, 504):
+/// only collections that run in parallel get a 200 for both.
+var parallel_fast_done: std.atomic.Value(bool) = .init(false);
+var parallel_io: std.Io = undefined;
+
+fn parallelHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    if (std.mem.eql(u8, req.path, "/fast")) {
+        try rw.writeAll("fast");
+        parallel_fast_done.store(true, .release);
+        return;
+    }
+    var waited: usize = 0;
+    while (!parallel_fast_done.load(.acquire)) : (waited += 1) {
+        if (waited == 1000) {
+            rw.setStatus(504);
+            return rw.writeAll("slow alone");
+        }
+        parallel_io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    try rw.writeAll("slow");
+}
+
+const ParallelCaller = struct {
+    pool: *Pool,
+    be: Backend,
+    path: []const u8,
+    status: u16 = 0,
+    body: [16]u8 = undefined,
+    len: usize = 0,
+    failed: ?anyerror = null,
+
+    fn run(c: *ParallelCaller) void {
+        var res = c.pool.roundtrip(c.be, .{ .method = .get, .path = c.path, .authority = "backend" }) catch |e| {
+            c.failed = e;
+            return;
+        };
+        defer res.deinit(c.pool.gpa);
+        c.status = res.status;
+        c.len = @min(res.body.len, c.body.len);
+        @memcpy(c.body[0..c.len], res.body[0..c.len]);
+    }
+};
+
+test "h2_upstream: two tasks collect their streams on one connection in parallel, neither waits for the other" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    parallel_io = io;
+    parallel_fast_done.store(false, .release);
+    var td: ThreadDispatcher = .{};
+    var backend = Server.init(io, gpa, .{ .handler = parallelHandler, .enable_h2c = true, .h2_dispatcher = td.iface() });
+    defer backend.deinit();
+    backend.bind() catch |err| return testkit.loopbackSkip("h2 backend bind failed ({t})", .{err});
+    const bt = try std.Thread.spawn(.{}, serveWrap, .{&backend});
+    defer td.join();
+    defer bt.join();
+    defer backend.shutdown();
+    const port = backend.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var pool = Pool.init(gpa, .{ .client = &client });
+    defer pool.deinit();
+    const be: Backend = .{ .host = "127.0.0.1", .port = port };
+    // Warm the connection, so both calls below share it.
+    var warm = pool.roundtrip(be, .{ .method = .get, .path = "/fast", .authority = "backend" }) catch |err|
+        return testkit.loopbackSkip("loopback h2c roundtrip failed ({t})", .{err});
+    warm.deinit(gpa);
+    parallel_fast_done.store(false, .release);
+
+    // The slow call first: it waits (and reads) while the fast one is sent,
+    // answered and collected on the same connection.
+    var slow: ParallelCaller = .{ .pool = &pool, .be = be, .path = "/slow" };
+    var fast: ParallelCaller = .{ .pool = &pool, .be = be, .path = "/fast" };
+    const ts = try std.Thread.spawn(.{}, ParallelCaller.run, .{&slow});
+    io.sleep(.fromMilliseconds(50), .awake) catch {};
+    const tf = try std.Thread.spawn(.{}, ParallelCaller.run, .{&fast});
+    tf.join();
+    ts.join();
+    try testing.expectEqual(@as(?anyerror, null), fast.failed);
+    try testing.expectEqual(@as(?anyerror, null), slow.failed);
+    try testing.expectEqual(@as(u16, 200), fast.status);
+    try testing.expectEqualStrings("fast", fast.body[0..fast.len]);
+    try testing.expectEqual(@as(u16, 200), slow.status);
+    try testing.expectEqualStrings("slow", slow.body[0..slow.len]);
+    try testing.expectEqual(@as(usize, 1), pool.dialCount());
+}
+
+test "h2_upstream: a streamed call sends its body in pieces and reads the response as it arrives" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const backend = try h2Backend(io);
+    defer testing.allocator.destroy(backend);
+    defer backend.deinit();
+    const bt = try std.Thread.spawn(.{}, serveWrap, .{backend});
+    defer bt.join();
+    defer backend.shutdown();
+    const port = backend.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var pool = Pool.init(gpa, .{ .client = &client });
+    defer pool.deinit();
+    const be: Backend = .{ .host = "127.0.0.1", .port = port };
+
+    // Past the 64 KiB initial window, in 4 KiB pieces: both directions run
+    // under flow control without either body held whole by the pool.
+    const piece: [4096]u8 = @splat('z');
+    const call = pool.beginStream(be, .{ .method = .post, .path = "/echo", .authority = "backend" }) catch |err|
+        return testkit.loopbackSkip("loopback h2c beginStream failed ({t})", .{err});
+    var finished = false;
+    defer if (!finished) pool.finish(call);
+    for (0..40) |_| try pool.sendBody(&call, &piece, false);
+    try pool.sendBody(&call, "", true);
+    const head = try pool.awaitHead(&call);
+    try testing.expectEqual(@as(u16, 200), head.status);
+    var total: usize = 0;
+    var buf: [3000]u8 = undefined;
+    while (true) {
+        const n = try pool.readBody(&call, &buf);
+        if (n == 0) break;
+        for (buf[0..n]) |b| try testing.expectEqual(@as(u8, 'z'), b);
+        total += n;
+    }
+    try testing.expectEqual(@as(usize, 40 * 4096), total);
+    try testing.expectEqual(@as(?hpack.HeaderList, null), pool.trailers(&call));
+    finished = true;
+    pool.finish(call);
+    try testing.expectEqual(@as(usize, 1), pool.liveSessionCount());
+
+    // The connection takes the next call; an abandoned stream is reset, not
+    // drained, and the connection lives on.
+    const call2 = try pool.begin(be, .{ .method = .get, .path = "/hello", .authority = "backend" });
+    _ = try pool.awaitHead(&call2);
+    pool.finish(call2);
+    var res = try pool.roundtrip(be, .{ .method = .get, .path = "/hello", .authority = "backend" });
+    defer res.deinit(gpa);
+    try testing.expectEqualStrings("hello from h2 backend", res.body);
+    try testing.expectEqual(@as(usize, 1), pool.dialCount());
 }
 
 test "h2_upstream: many sequential roundtrips reuse the one connection" {

@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.http` | Zig | MIT | — | Zig 0.16.0 | `Client` (TLS, redirects, pooling) and an HTTP/1.1 `Server` with `upgradeRequested`/`respondWebSocket`; no HTTP/2, no range/conditional/multipart/conneg helpers, no proxy (checked in 0.16.0's `lib/std/http/`). |
 | [tardy-org/zzz](https://github.com/tardy-org/zzz) | Zig | MPL-2.0 (source not read) | 790 | v0.3.2 (2026-06-13) | Alpha framework: HTTP and HTTPS server on the tardy runtime. Copyleft-file licence, so source is off limits here. |
 
-**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no HTTP/3 (Go's stdlib has none either); one exchange per h2 client connection (no multiplexing, *Backlog*), and the h2 upstream pool buffers bodies (*Backlog*). The client has a cookie jar (`Client.Options.cookie_jar`) and an outbound proxy (forward and `CONNECT`, Go's environment rules). The 2026-10-11 S2 survey (`go doc` of net/http, httputil, cookiejar, httptest against this module) listed gaps R1–R10, all closed 2026-10-12 (*Design notes by feature*).
+**Where we are ahead:** the only pure-Zig stack here with HTTP/2 on **both** client and server, h2c and BYO-TLS/ALPN (`serveStream`, `connectH2Over`), a reverse proxy over h1/h2, trailers in both directions and both protocols, streaming multipart, SSE, range/conditional/conneg/gzip/problem helpers, and a socket-free `serveStream` that makes every one of them testable offline; interop tests against curl and an h11 oracle. **Where we are behind:** no HTTP/3 (Go's stdlib has none either); one exchange per h2 client connection (no multiplexing, *Backlog*). The client has a cookie jar (`Client.Options.cookie_jar`) and an outbound proxy (forward and `CONNECT`, Go's environment rules). The 2026-10-11 S2 survey (`go doc` of net/http, httputil, cookiejar, httptest against this module) listed gaps R1–R10, all closed 2026-10-12 (*Design notes by feature*).
 
 ## Design & invariants
 Submodules: `Client` / `Server` (h1), `h1` (parser), `hpack` + `h2` + `h2_server` + `h2_client`
@@ -73,11 +73,12 @@ terminates TLS itself (*Design notes by feature*: native TLS listener). **Revers
 or, per-backend (`Backend.protocol` `.h2c`/`.h2`), over HTTP/2 through `h2_upstream.Pool` — one
 multiplexed h2 connection per backend origin, each proxied request a stream on it (reuses
 `h2_client.Session`; no second h2 stack). Header translation (hop-by-hop, `X-Forwarded-*`, `Via`) is
-shared across both forward paths; the h2 path buffers bodies (bounded, `h2_max_body_bytes`) where h1
-streams, and per-connection response collection is mutex-serialized (multiplex is on the wire, full
-cross-thread parallelism needs a dedicated reader task — deferred). h2 flow control is exercised
-end-to-end (WINDOW_UPDATE past the initial window); an h2 upstream's response trailers are relayed to the
-client. **Client buffer pool (`bufpool.BufferPool`):** an optional bounded, shared,
+shared across both forward paths; both paths stream bodies (the h2 one bounded by `h2_max_body_bytes`). The
+tasks of one upstream connection drive its session together (`h2_client.Session.Sync`, Go's `ClientConn`
+shape: whichever task waits for the backend reads the socket for all, with the session lock released), so
+streams on one connection are collected in parallel across OS threads. h2 flow control is exercised
+end-to-end (WINDOW_UPDATE past the initial window); an h2 upstream's announced response trailers are
+relayed to the client. **Client buffer pool (`bufpool.BufferPool`):** an optional bounded, shared,
 thread-safe slab pool wired via `Client.Options.buffer_pool`, backing h2 upstream dial buffers so a
 gateway that churns h2 connections reuses `O(peak)` slabs instead of allocating one per dial (h1's
 idle `Pool` already recycles whole warm connections, so it does not need it). **Trailers, both directions, both protocols:** the read side captures an incoming chunked trailer
@@ -660,11 +661,6 @@ same thread).
   leader that reads the socket WITHOUT holding the session lock while the others wait on a condition for progress (a
   lock around the blocking engine deadlocks: the holder blocks on the socket while the stream whose unread data shut
   the window waits for the lock). That means splitting the session's blocking read from its frame processing.
-- **h2 upstream forwarding** (`h2_upstream`, `proxy`) reuses `h2_client.Session`'s buffered surface, so it (a) buffers
-  request/response bodies in memory (bounded, `h2_max_body_bytes`) where the h1 path streams — `h2_client` has
-  `openStream`/`sendData`/`readBody` now, but streaming through the pool holds the session lock for the body's whole
-  life; (b) serializes response collection per upstream connection under a mutex — parallel in-flight streams across OS
-  threads need a per-connection reader task. (a) and (b) are one change, together with client multiplexing above.
 - **A shared server-side `ResponseWriter` buffer pool** across connections (the client-side one is `bufpool`): a perf
   item, not attempted in wave 14 (needs a server bench A/B; see the `header_buf` note under *What is deliberately not
   done* for what the h1 frame costs).

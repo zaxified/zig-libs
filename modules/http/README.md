@@ -561,7 +561,6 @@ route composes from above through that seam; `resilience` wraps the
 forward operation there too. Backends can also be forwarded over **HTTP/2**
 per-backend (`Backend.protocol` = `.h2c`/`.h2`), multiplexed through an
 `h2_upstream.Pool` — see "Reverse proxy" below. **Known gaps this pass:**
-h2-upstream bodies are buffered (bounded), not streamed like the h1 path;
 no shared response buffer pool for the *server*-side `ResponseWriter`
 (the *client*-side one, `Client.Options.buffer_pool`, already exists).
 Backend connection pooling is **not** a gap: `Client` keeps a keyed idle

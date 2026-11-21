@@ -80,13 +80,12 @@
 //! (the whole point of h2 upstreaming). This module still owns the
 //! translation — hop-by-hop stripping, `X-Forwarded-*` / `Via`, status +
 //! header + body relay are shared with the h1 path; the pool owns
-//! connection multiplexing, reuse and failure recovery. See `h2_upstream`
-//! for the concurrency bound (per-connection response collection is
-//! serialized) and the body-buffering caveat (the reused h2 client
-//! assembles bodies in memory, bounded by `Config.h2_max_body_bytes`,
-//! where the h1 path streams them). A response trailer section from the
-//! backend is relayed to the client (as a chunked h1 trailer section, or h2
-//! trailers), minus the fields no trailer may carry.
+//! connection multiplexing, reuse and failure recovery (see `h2_upstream`).
+//! Both bodies stream, as on the h1 path (Go's `ReverseProxy` over its h2
+//! `Transport`), each bounded by `Config.h2_max_body_bytes`. A response
+//! trailer section the backend announced (`Trailer`) is relayed to the
+//! client (as a chunked h1 trailer section, or h2 trailers), minus the
+//! fields no trailer may carry.
 //!
 //! ## Known gaps (this pass)
 //!
@@ -200,10 +199,11 @@ pub const Config = struct {
     /// `.http1` path never touches it. Shared across the server's connection
     /// threads, like `client`.
     h2_upstream: ?*h2_upstream.Pool = null,
-    /// Upper bound (bytes) on a request/response body proxied over h2: the
-    /// reused multiplexing h2 client assembles bodies in memory (unlike the
-    /// streaming h1 path), so both directions are capped. A larger body
-    /// answers 502. Ignored by the `.http1` path (which streams).
+    /// Upper bound (bytes) on a request/response body proxied over h2 (both
+    /// stream). A request body past it answers 502; so does a response
+    /// whose `content-length` is past it; a response body that crosses it
+    /// while streaming ends the response early (502 while none of it is on
+    /// the wire). Ignored by the `.http1` path.
     h2_max_body_bytes: usize = 8 * 1024 * 1024,
     /// When the relayed response body is pushed to the client (Go's
     /// `FlushInterval`). See `Flush`.
@@ -589,11 +589,10 @@ pub const ProxyHandler = struct {
     /// `h2_upstream.Pool`: translate the request into a stream on the
     /// backend's one multiplexed connection, collect the response, relay it
     /// back. Header translation and the hooks are shared with the h1 path;
-    /// the h2 body is buffered (bounded — see `Config.h2_max_body_bytes`).
+    /// both bodies stream, each bounded by `Config.h2_max_body_bytes`.
     fn forwardH2(self: *ProxyHandler, pr: *ProxyRequest, rw: *Server.ResponseWriter) anyerror!void {
         const req = pr.in;
         const pool = self.config.h2_upstream orelse return self.fail(rw, req, error.NoH2Upstream, 502);
-        const gpa = self.config.client.gpa;
         const backend = pr.backend;
 
         // `:authority` — a `Host` line in the outbound set (the client's,
@@ -615,61 +614,108 @@ pub const ProxyHandler = struct {
         else
             buildTarget(&target_buf, pr.path, pr.query) catch return self.fail(rw, req, error.BadOutboundRequest, 502);
 
-        // Read the request body into memory (bounded); the h2 client streams
-        // it out under §5.2 flow control (WINDOW_UPDATE past the window).
-        const has_body = req.head.chunked or (req.head.content_length orelse 0) != 0;
-        var body_buf: ?[]u8 = null;
-        defer if (body_buf) |b| gpa.free(b);
-        if (has_body) {
-            body_buf = req.reader().allocRemaining(gpa, .limited(self.config.h2_max_body_bytes)) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                // Over the cap or a read failure — nothing is on the wire yet.
-                else => return self.fail(rw, req, error.RequestBodyFailed, 502),
-            };
-        }
-
         const be: h2_upstream.Backend = .{
             .host = backend.host,
             .port = backend.port,
             .secure = backend.protocol == .h2,
         };
-        var res = pool.roundtrip(be, .{
+        const parts: h2_upstream.RequestParts = .{
             .method = req.method,
             .method_token = if (req.method == .other) req.methodName() else "",
             .path = target,
             .authority = authority,
             .scheme = if (backend.protocol == .h2) "https" else "http",
             .headers = pr.headers.slice(),
-            .body = body_buf,
-            .max_response_body_bytes = self.config.h2_max_body_bytes,
-        }) catch |err| return self.onH2Error(rw, req, err);
-        defer res.deinit(gpa);
+        };
+        const cap = self.config.h2_max_body_bytes;
+        // The request body streams through, piece by piece under §5.2 flow
+        // control, as on the h1 path (Go's `ReverseProxy` over its h2
+        // `Transport`); none: END_STREAM on HEADERS.
+        const has_body = req.head.chunked or (req.head.content_length orelse 0) != 0;
+        const call = (if (has_body) pool.beginStream(be, parts) else pool.begin(be, parts)) catch |err|
+            return self.onH2Error(rw, req, err);
+        defer pool.finish(call);
+        if (has_body) {
+            var piece: [8 * 1024]u8 = undefined;
+            var sent: usize = 0;
+            while (true) {
+                const n = req.reader().readSliceShort(&piece) catch
+                    return self.fail(rw, req, error.RequestBodyFailed, 502);
+                sent += n;
+                // Over the cap: nothing of the response is on the wire yet.
+                if (sent > cap) return self.fail(rw, req, error.RequestBodyFailed, 502);
+                const last = n < piece.len;
+                pool.sendBody(&call, piece[0..n], last) catch |err| return self.onH2Error(rw, req, err);
+                if (last) break;
+            }
+        }
 
+        const head = pool.awaitHead(&call) catch |err| return self.onH2Error(rw, req, err);
         // ── relay status + response headers ─────────────────────────────
         // h2 has no 101 (RFC 9113 §8.6) and a final head is never 1xx.
-        if (!finalStatus(res.status)) return self.relayFailed(rw, req);
-        rw.setStatus(res.status);
-        for (res.headers.fields, 0..) |f, at| {
+        if (!finalStatus(head.status)) return self.relayFailed(rw, req);
+        // A body the cap cannot take, announced: refused before the head.
+        if (head.header("content-length")) |cl| {
+            const len = std.fmt.parseUnsigned(u64, cl, 10) catch std.math.maxInt(u64);
+            if (len > cap) return self.onH2Error(rw, req, error.BodyTooLarge);
+        }
+        rw.setStatus(head.status);
+        const fields = head.headers.fields;
+        for (fields, 0..) |f, at| {
             if (f.name.len != 0 and f.name[0] == ':') continue; // pseudo-headers (:status)
-            if (isHopByHop(f.name, null) or connectionLists(FieldIter{ .fields = res.headers.fields }, f.name)) continue;
+            if (isHopByHop(f.name, null) or connectionLists(FieldIter{ .fields = fields }, f.name)) continue;
             if (std.ascii.eqlIgnoreCase(f.name, "connection") or
                 std.ascii.eqlIgnoreCase(f.name, "via")) continue;
-            relayField(rw, FieldIter{ .fields = res.headers.fields }, at, f.name, f.value) catch return self.relayFailed(rw, req);
+            relayField(rw, FieldIter{ .fields = fields }, at, f.name, f.value) catch return self.relayFailed(rw, req);
         }
-        // Response trailers (RFC 9113 §8.1): advertised and set before the
-        // body, so the response goes out chunked with the section after it;
-        // a field a trailer section must never carry, or one the writer
-        // cannot take (HEAD, no body), is dropped.
-        if (res.trailers) |tl| {
-            for (tl.fields) |f| rw.declareTrailers(&.{f.name}) catch {};
-            for (tl.fields) |f| rw.setTrailer(f.name, f.value) catch {};
+        // Response trailers (RFC 9113 §8.1), as Go's `ReverseProxy`: the
+        // names the backend announced in `Trailer` are declared before the
+        // body, so the response goes out chunked with the section after it,
+        // and their values are set when the body ends (`H2Body`). A field a
+        // trailer section must never carry, one not announced, or one the
+        // writer cannot take (HEAD, no body), is dropped.
+        for (fields) |f| {
+            if (!std.ascii.eqlIgnoreCase(f.name, "trailer")) continue;
+            var it = std.mem.tokenizeAny(u8, f.value, ", \t");
+            while (it.next()) |name| rw.declareTrailer(name) catch {};
         }
-        // The (buffered) body is copied into the writer, so — as on the h1
-        // path — the deferred `res.deinit(gpa)` is not racing an `end()`.
-        var body: std.Io.Reader = .fixed(res.body);
+        // The body streams too: read off the stream as the client takes it.
+        var body: H2Body = .{ .pool = pool, .call = &call, .rw = rw, .cap = cap };
+        body.reader = .{ .vtable = &.{ .stream = H2Body.stream }, .buffer = &body.buf, .seek = 0, .end = 0 };
         var via_buf: [max_via_len]u8 = undefined;
-        return self.finishResponse(rw, req, res.status, res.header("via"), &body, &via_buf);
+        return self.finishResponse(rw, req, head.status, head.header("via"), &body.reader, &via_buf);
     }
+
+    /// The response body of an h2 `Call`, read as it arrives; past `cap`
+    /// octets the read fails (the relay ends the response, or answers 502
+    /// while nothing is on the wire). At its end the trailer values go on
+    /// the response.
+    const H2Body = struct {
+        pool: *h2_upstream.Pool,
+        call: *const h2_upstream.Call,
+        rw: *Server.ResponseWriter,
+        cap: usize,
+        got: usize = 0,
+        buf: [8 * 1024]u8 = undefined,
+        reader: std.Io.Reader = undefined,
+
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const b: *H2Body = @alignCast(@fieldParentPtr("reader", r));
+            const dest = limit.slice(try w.writableSliceGreedy(1));
+            if (dest.len == 0) return 0;
+            const n = b.pool.readBody(b.call, dest) catch return error.ReadFailed;
+            if (n == 0) {
+                if (b.pool.trailers(b.call)) |tl| {
+                    for (tl.fields) |f| b.rw.setTrailer(f.name, f.value) catch {};
+                }
+                return error.EndOfStream;
+            }
+            b.got += n;
+            if (b.got > b.cap) return error.ReadFailed;
+            w.advance(n);
+            return n;
+        }
+    };
 
     /// Map an `h2_upstream` forward error to a gateway status (or surface a
     /// genuine OOM as the server's 500).
