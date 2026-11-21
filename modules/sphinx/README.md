@@ -23,6 +23,7 @@ threat model.
 | `hopframe.zig` | Per-hop `bigsize(length) ‖ payload ‖ hmac` framing + shift-size arithmetic (REAL) |
 | `core.zig` | `deriveHopSecrets`/`construct`/`process` — the Sphinx crypto cores; `sharedSecret` — a hop's own ECDH step |
 | `failure.zig` | BOLT#4 "Returning Errors": `create`/`forward`/`unwrap` the return-path failure packet (REAL) |
+| `blinded.zig` | BOLT#4 "Route Blinding": `createPath` / `unblind` (blinded node ids, `encrypted_recipient_data`, path keys) |
 | `burn.zig` | The dead-stack burn run around `generateKey` / `generateCipherStream` (`construct`/`process` carry their own in `core.zig`) |
 | `kat_vectors.zig` | The official BOLT#4 test vector, embedded |
 | `failure_vectors.zig` | The BOLT#4 "Returning Errors" vectors, embedded |
@@ -114,6 +115,16 @@ const failure = try sphinx.failure.parseFailure(src.data); // src.hop = index of
 ```
 
 `attribution_data` is not implemented.
+
+Route blinding (BOLT#4; the TLV payloads are the caller's bytes):
+
+```zig
+var hops: [2]sphinx.blinded.BlindedHop = .{ .{ .blinded_node_id = undefined, .encrypted_data = &enc0 }, .{ .blinded_node_id = undefined, .encrypted_data = &enc1 } };
+const first_path_key = try sphinx.blinded.createPath(&session_key, &node_ids, &payloads, &hops); // enc_i = payload_i.len + 16
+// at node i:
+var u: sphinx.blinded.Unblinded = undefined;
+try sphinx.blinded.unblind(&node_privkey, &path_key, encrypted, plain_buf, &u); // u.blinded_privkey peels the onion, u.next_path_key goes on
+```
 
 ## Verify
 

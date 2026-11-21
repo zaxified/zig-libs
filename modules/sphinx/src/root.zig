@@ -82,6 +82,8 @@ pub const packet = @import("packet.zig");
 pub const hopframe = @import("hopframe.zig");
 pub const core = @import("core.zig");
 pub const failure = @import("failure.zig");
+/// BOLT#4 route blinding: blinded paths, `createPath` / `unblind` (`blinded.zig`).
+pub const blinded = @import("blinded.zig");
 
 // ── convenience re-exports (the common call-site surface) ──────────────────
 
@@ -126,6 +128,7 @@ test {
     _ = hopframe;
     _ = core;
     _ = failure;
+    _ = blinded;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");

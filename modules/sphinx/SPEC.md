@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ACINQ/eclair](https://github.com/ACINQ/eclair) | Scala | Apache-2.0 | 1.3k | v0.14.3 (2026-09-14) | `Sphinx.scala`: packets, replay-protected peel, failure packets, blinded routes *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | GitHub search for Lightning/BOLT Zig repositories (2026-09-30) found none besides this collection. |
 
-**Where we are ahead:** the only Zig BOLT#4 sphinx; reproduces the spec's onion-test.json byte-exact, constant-time HMAC compare. **Where we are behind:** `attribution_data` (BOLT#4 `option_attribution_data`: per-hop hold times and truncated HMACs), a replay log (only the hook), route blinding (`path_key` tweak), BOLT#4 TLV payload semantics (opaque by design).
+**Where we are ahead:** the only Zig BOLT#4 sphinx; reproduces the spec's onion-test.json byte-exact, constant-time HMAC compare. **Where we are behind:** `attribution_data` (BOLT#4 `option_attribution_data`: per-hop hold times and truncated HMACs), a replay log (only the hook), BOLT#4 TLV payload semantics (opaque by design).
 
 ## Design
 
@@ -210,10 +210,27 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `short_channel_id`, `payment_data`, etc. — BOLT#4's own payload-format
   section defines these; this module treats `payload` as an opaque byte
   string throughout).
-- **Not yet — see Backlog:** route blinding's `path_key`/`blinding_ss`
-  tweak (BOLT#4 "Route Blinding" — a distinct mechanism layered on top of
-  plain Sphinx, not part of the base onion construction/decryption this
-  module implements), and `attribution_data` on the return path.
+- **Not yet — see Backlog:** `attribution_data` on the return path.
+
+## Route blinding (`blinded.zig`)
+
+BOLT#4 "Route Blinding", the cryptography only: `blinded.createPath(session_key,
+node_ids, payloads, out)` returns the first `path_key` `E_0` and, per node, the
+blinded node id `B_i = HMAC256("blinded_node_id", ss_i)·N_i` and the
+`encrypted_recipient_data` (ChaCha20-Poly1305 under `rho_i =
+HMAC256("rho", ss_i)`, zero nonce, empty AD), with `ss_i = SHA256(e_i·N_i)` and
+`e_{i+1} = SHA256(E_i ‖ ss_i)·e_i`; `blinded.unblind(node_privkey, path_key,
+encrypted, plain_out, out)` is the receiving node's step: the plaintext, its
+blinded private key `b_i` (the key `process` peels the onion addressed to
+`B_i` with) and the next `path_key`. A wrong key or tampered data is
+`DecryptionFailed` (plaintext zeroed). The TLV contents (`short_channel_id`,
+`payment_relay`, `next_path_key_override`, `path_id`) are the caller's, like
+every other payload here; two paths concatenate through the first one's
+`next_path_key_override`. Both entry points run under a 40 KiB dead-stack
+burn. Anchor: BOLT#4 `route-blinding-test.json`, the generate section (both
+concatenated segments: path keys, blinded node ids, encrypted data) and the
+unblind section (every hop's blinded private key, plaintext, next path key),
+byte-exact. No ctgrind row or stack-probe needle set for it yet (Backlog).
 
 ## Returning Errors (`failure.zig`)
 
@@ -329,7 +346,8 @@ are plain classic packets). Failure messages with `path_key` (blinded paths turn
 ## Backlog / deferred
 
 - **`attribution_data` and the success-path `fulfillment_payload`** (BOLT#4 `option_attribution_data`: per-hop hold times and truncated HMACs) — the attributable-failure revision of "Returning Errors"; the classic failure packets are implemented. Effort: medium; fits §2.
-- **Route blinding (BOLT#4 "Route Blinding")** — blinded-path construction and receiving (blinded payment hops, `path_key` tweak); needed for BOLT#12 payments. Effort: medium; fits §2. (The survey lists it as missing and it matters.)
+- **Route blinding hardening rows:** `blinded.createPath`/`unblind` have no ctgrind row and no stack-probe needles
+  (`e_i`, `ss_i`, `rho_i`, `b_i`) yet; they use the same secp256k1 and burn shapes as `core`.
 
 ## Anchoring
 
