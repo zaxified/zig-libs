@@ -129,6 +129,10 @@ pub const Event = union(enum) {
         svc: types.ConfirmedService,
         class: types.ErrorClass,
         code: types.ErrorCode,
+        /// Octets after the class and code: a `WritePropertyMultiple` error
+        /// carries the first failed write attempt here
+        /// (`service.FirstFailedWrite.decode`).
+        extra: []const u8 = &.{},
     },
     /// The device could not interpret the request.
     reject: struct { from: BipAddress, invoke_id: u8, reason: types.RejectReason },
@@ -153,6 +157,12 @@ pub const Event = union(enum) {
 pub const RpmSpec = struct {
     object: ObjectId,
     properties: []const service.PropertyReference,
+};
+
+/// A write-access specification for `writePropertyMultiple`.
+pub const WpmSpec = struct {
+    object: ObjectId,
+    writes: []const service.PropertyWrite,
 };
 
 pub fn Client(comptime max_pending: usize) type {
@@ -314,6 +324,72 @@ pub fn Client(comptime max_pending: usize) type {
             }
             try b.finish();
             return self.sendConfirmed(to, .read_property_multiple, w.written(), now_ms);
+        }
+
+        /// Writes several properties of several objects in one round trip
+        /// (clause 15.10). The device applies them in order and stops at the
+        /// first failure; its `Error` names that write in `extra`.
+        pub fn writePropertyMultiple(
+            self: *Self,
+            to: BipAddress,
+            specs: []const WpmSpec,
+            now_ms: u64,
+        ) Error!u8 {
+            var body: [1000]u8 = undefined;
+            var w = tag.Writer.init(&body);
+            var b = service.WpmRequestBuilder.init(&w);
+            for (specs) |s| {
+                try b.object(s.object);
+                for (s.writes) |pw| try b.property(pw);
+            }
+            try b.finish();
+            return self.sendConfirmed(to, .write_property_multiple, w.written(), now_ms);
+        }
+
+        /// Enables or disables a device's communication (clause 16.1).
+        pub fn deviceCommunicationControl(
+            self: *Self,
+            to: BipAddress,
+            req: service.DeviceCommunicationControl,
+            now_ms: u64,
+        ) Error!u8 {
+            var body: [48]u8 = undefined;
+            var w = tag.Writer.init(&body);
+            try req.encode(&w);
+            return self.sendConfirmed(to, .device_communication_control, w.written(), now_ms);
+        }
+
+        /// Asks a device to restart (clause 16.4).
+        pub fn reinitializeDevice(
+            self: *Self,
+            to: BipAddress,
+            req: service.ReinitializeDevice,
+            now_ms: u64,
+        ) Error!u8 {
+            var body: [48]u8 = undefined;
+            var w = tag.Writer.init(&body);
+            try req.encode(&w);
+            return self.sendConfirmed(to, .reinitialize_device, w.written(), now_ms);
+        }
+
+        /// Sends the time (clause 16.7) or, with `utc`, the UTC time (16.8)
+        /// to one device, or broadcasts it with `to == null`. Unconfirmed:
+        /// nothing comes back.
+        pub fn timeSynchronization(self: *Self, to: ?BipAddress, time: service.DateTime, utc: bool) Error!void {
+            var body: [16]u8 = undefined;
+            var w = tag.Writer.init(&body);
+            try (service.TimeSynchronization{ .time = time }).encode(&w);
+            const svc: types.UnconfirmedService = if (utc) .utc_time_synchronization else .time_synchronization;
+            if (to) |dest| {
+                var a_buf: [64]u8 = undefined;
+                const a = try apdu.encode(.{ .unconfirmed_request = .{ .service = svc, .data = w.written() } }, &a_buf);
+                var n_buf: [96]u8 = undefined;
+                const n = try npdu.encode(.{}, a, &n_buf);
+                const dgram = try bvll.wrap(.original_unicast_npdu, n, &self.tx);
+                return self.tp.send(dest, dgram);
+            }
+            const dgram = try self.buildUnconfirmed(svc, w.written());
+            try self.tp.broadcast(dgram);
         }
 
         /// Subscribes to change-of-value on `object`. `lifetime_seconds` of 0
@@ -500,6 +576,7 @@ pub fn Client(comptime max_pending: usize) type {
                         .svc = e.service,
                         .class = e.class,
                         .code = e.code,
+                        .extra = e.extra,
                     } };
                 },
                 .reject => |r| {

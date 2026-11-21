@@ -356,6 +356,258 @@ pub const WriteProperty = struct {
     }
 };
 
+// ── WritePropertyMultiple (clause 15.10) ────────────────────────────────────
+//
+// The request is a sequence of (object, [property values]); like RPM it is
+// modelled as a builder and an iterator so nothing allocates. A property value
+// is `BACnetPropertyValue`: property [0], array index [1] optional, value [2]
+// (an opened block, opaque here), priority [3] optional.
+
+/// One `BACnetPropertyValue` of a `WritePropertyMultiple` request.
+pub const PropertyWrite = struct {
+    property: PropertyIdentifier,
+    array_index: ?u32 = null,
+    /// Raw tagged octets of the `[2] ... ]2` block.
+    value: []const u8,
+    priority: ?u8 = null,
+
+    /// A write that relinquishes `priority` (the value is an application Null).
+    pub fn isRelinquish(self: PropertyWrite) bool {
+        return self.value.len == 1 and self.value[0] == 0x00;
+    }
+};
+
+/// Builds a `WritePropertyMultiple` request into a `tag.Writer`.
+pub const WpmRequestBuilder = struct {
+    w: *tag.Writer,
+    open_spec: bool = false,
+
+    pub fn init(w: *tag.Writer) WpmRequestBuilder {
+        return .{ .w = w };
+    }
+
+    /// Starts a new write-access specification for `object`.
+    pub fn object(self: *WpmRequestBuilder, oid: ObjectId) Error!void {
+        if (self.open_spec) try self.endObject();
+        try self.w.ctxObjectId(0, oid);
+        try self.w.open(1);
+        self.open_spec = true;
+    }
+
+    /// Adds a property value to the current specification.
+    pub fn property(self: *WpmRequestBuilder, pw: PropertyWrite) Error!void {
+        if (!self.open_spec) return error.MissingParameter;
+        if (pw.priority) |p| {
+            if (p < 1 or p > 16) return error.InvalidParameter;
+        }
+        try self.w.ctxEnumerated(0, @backingInt(pw.property));
+        if (pw.array_index) |i| try self.w.ctxUnsigned(1, i);
+        try self.w.open(2);
+        try self.w.raw(pw.value);
+        try self.w.close(2);
+        if (pw.priority) |p| try self.w.ctxUnsigned(3, p);
+    }
+
+    fn endObject(self: *WpmRequestBuilder) Error!void {
+        try self.w.close(1);
+        self.open_spec = false;
+    }
+
+    /// Closes the last specification; call it before the request is sent.
+    pub fn finish(self: *WpmRequestBuilder) Error!void {
+        if (self.open_spec) try self.endObject();
+    }
+};
+
+/// Walks the write-access specifications of a `WritePropertyMultiple` request.
+pub const WpmRequestIterator = struct {
+    r: tag.Reader,
+
+    pub fn init(data: []const u8) WpmRequestIterator {
+        return .{ .r = tag.Reader.init(data) };
+    }
+
+    pub const Spec = struct {
+        object: ObjectId,
+        /// Raw octets of the `[1] ... ]1` block; walk with `writes`.
+        values: []const u8,
+
+        pub fn writes(self: Spec) PropertyWriteIterator {
+            return .{ .r = tag.Reader.init(self.values) };
+        }
+    };
+
+    pub fn next(self: *WpmRequestIterator) Error!?Spec {
+        if (self.r.atEnd()) return null;
+        const oid = try self.r.ctxObjectId(0);
+        const block = try self.r.openedBlock(1);
+        // A specification with no property values is not valid (the list is
+        // `SEQUENCE OF`, one or more).
+        if (block.len == 0) return error.MissingParameter;
+        return .{ .object = oid, .values = block };
+    }
+};
+
+pub const PropertyWriteIterator = struct {
+    r: tag.Reader,
+
+    pub fn next(self: *PropertyWriteIterator) Error!?PropertyWrite {
+        if (self.r.atEnd()) return null;
+        const prop: PropertyIdentifier = @fromBackingInt(@intCast(try self.r.ctxEnumerated(0)));
+        var idx: ?u32 = null;
+        var t = try self.r.peek();
+        if (t.isContext(1)) idx = try narrow(u32, try self.r.ctxUnsigned(1));
+        const value = try self.r.openedBlock(2);
+        var prio: ?u8 = null;
+        if (!self.r.atEnd()) {
+            t = try self.r.peek();
+            if (t.isContext(3)) {
+                const p = try self.r.ctxUnsigned(3);
+                if (p < 1 or p > 16) return error.InvalidParameter;
+                prio = @intCast(p);
+            }
+        }
+        return .{ .property = prop, .array_index = idx, .value = value, .priority = prio };
+    }
+};
+
+/// The `Error` PDU's extra octets for a failed `WritePropertyMultiple`
+/// (`firstFailedWriteAttempt [1]`, a `BACnetObjectPropertyReference`).
+pub fn encodeFirstFailedWrite(w: *tag.Writer, object: ObjectId, property: PropertyIdentifier, array_index: ?u32) Error!void {
+    try w.open(1);
+    try w.ctxObjectId(0, object);
+    try w.ctxEnumerated(1, @backingInt(property));
+    if (array_index) |i| try w.ctxUnsigned(2, i);
+    try w.close(1);
+}
+
+/// What `encodeFirstFailedWrite` wrote.
+pub const FirstFailedWrite = struct {
+    object: ObjectId,
+    property: PropertyIdentifier,
+    array_index: ?u32 = null,
+
+    pub fn decode(extra: []const u8) Error!FirstFailedWrite {
+        var r = tag.Reader.init(extra);
+        const block = try r.openedBlock(1);
+        var b = tag.Reader.init(block);
+        const obj = try b.ctxObjectId(0);
+        const prop: PropertyIdentifier = @fromBackingInt(@intCast(try b.ctxEnumerated(1)));
+        var idx: ?u32 = null;
+        if (!b.atEnd()) idx = try narrow(u32, try b.ctxUnsigned(2));
+        return .{ .object = obj, .property = prop, .array_index = idx };
+    }
+};
+
+// ── DeviceCommunicationControl (15.4), ReinitializeDevice (16.4) ────────────
+
+/// The `enable-disable` choice of `DeviceCommunicationControl`.
+pub const CommunicationState = enum(u8) {
+    /// Respond and initiate normally.
+    enable = 0,
+    /// Respond to nothing but `DeviceCommunicationControl` and
+    /// `ReinitializeDevice`; initiate nothing.
+    disable = 1,
+    /// Respond normally, initiate nothing (no I-Am, no COV notification).
+    disable_initiation = 2,
+};
+
+fn decodePassword(r: *tag.Reader, n: u32) Error!?[]const u8 {
+    if (r.atEnd()) return null;
+    const t = try r.peek();
+    if (!t.isContext(n)) return null;
+    const cs = try r.ctxString(n);
+    // CharacterString (SIZE (1..20)); a password is compared as UTF-8.
+    const pw = cs.asUtf8() orelse return error.InvalidValue;
+    if (pw.len < 1 or pw.len > 20) return error.InvalidValue;
+    return pw;
+}
+
+fn encodePassword(w: *tag.Writer, n: u32, password: ?[]const u8) Error!void {
+    const pw = password orelse return;
+    if (pw.len < 1 or pw.len > 20) return error.InvalidParameter;
+    try w.ctxString(n, pw);
+}
+
+/// `DeviceCommunicationControl-Request`: `timeDuration [0]` minutes
+/// (optional; absent means until further notice, and is not allowed together
+/// with `enable`), `enable-disable [1]`, `password [2]` (1..20 characters).
+pub const DeviceCommunicationControl = struct {
+    duration_minutes: ?u16 = null,
+    state: CommunicationState,
+    password: ?[]const u8 = null,
+
+    pub fn encode(self: DeviceCommunicationControl, w: *tag.Writer) Error!void {
+        if (self.duration_minutes) |d| try w.ctxUnsigned(0, d);
+        try w.ctxEnumerated(1, @backingInt(self.state));
+        try encodePassword(w, 2, self.password);
+    }
+
+    pub fn decode(data: []const u8) Error!DeviceCommunicationControl {
+        var r = tag.Reader.init(data);
+        var dur: ?u16 = null;
+        const t = try r.peek();
+        if (t.isContext(0)) dur = try narrow(u16, try r.ctxUnsigned(0));
+        const st = try r.ctxEnumerated(1);
+        if (st > 2) return error.InvalidValue;
+        const pw = try decodePassword(&r, 2);
+        if (!r.atEnd()) return error.InvalidParameter;
+        return .{ .duration_minutes = dur, .state = @fromBackingInt(@intCast(st)), .password = pw };
+    }
+};
+
+/// `BACnetReinitializedStateOfDevice` (clause 16.4).
+pub const ReinitializedState = enum(u8) {
+    coldstart = 0,
+    warmstart = 1,
+    start_backup = 2,
+    end_backup = 3,
+    start_restore = 4,
+    end_restore = 5,
+    abort_restore = 6,
+    activate_changes = 7,
+};
+
+/// `ReinitializeDevice-Request`: `reinitialized-state-of-device [0]`,
+/// `password [1]` (1..20 characters).
+pub const ReinitializeDevice = struct {
+    state: ReinitializedState,
+    password: ?[]const u8 = null,
+
+    pub fn encode(self: ReinitializeDevice, w: *tag.Writer) Error!void {
+        try w.ctxEnumerated(0, @backingInt(self.state));
+        try encodePassword(w, 1, self.password);
+    }
+
+    pub fn decode(data: []const u8) Error!ReinitializeDevice {
+        var r = tag.Reader.init(data);
+        const st = try r.ctxEnumerated(0);
+        if (st > 7) return error.InvalidValue;
+        const pw = try decodePassword(&r, 1);
+        if (!r.atEnd()) return error.InvalidParameter;
+        return .{ .state = @fromBackingInt(@intCast(st)), .password = pw };
+    }
+};
+
+// ── TimeSynchronization (16.7), UTCTimeSynchronization (16.8) ───────────────
+
+/// The request of both `TimeSynchronization` and `UTCTimeSynchronization`
+/// (unconfirmed): one `BACnetDateTime`, local or UTC by the service choice.
+pub const TimeSynchronization = struct {
+    time: DateTime,
+
+    pub fn encode(self: TimeSynchronization, w: *tag.Writer) Error!void {
+        try self.time.encode(w);
+    }
+
+    pub fn decode(data: []const u8) Error!TimeSynchronization {
+        var r = tag.Reader.init(data);
+        const dt = try DateTime.decodeFrom(&r);
+        if (!r.atEnd()) return error.InvalidParameter;
+        return .{ .time = dt };
+    }
+};
+
 // ── ReadPropertyMultiple (clause 15.7) ─────────────────────────────────────
 //
 // The list-of-lists shape is what makes RPM awkward: a request is a sequence
@@ -1762,4 +2014,111 @@ test "fuzz driver: BACNET_FUZZ (fuzzServiceIntegers)" {
 
 test "fuzz harness: fuzzServiceIntegers, 400 seeds, reaches every outcome" {
     try fuzzServiceIntegersMark.reach(fuzzServiceIntegers, "bacnet-service-serviceIntegers", 400);
+}
+
+test "WritePropertyMultiple: encode, decode and the first failed attempt" {
+    var buf: [128]u8 = undefined;
+    var w = tag.Writer.init(&buf);
+    var b = WpmRequestBuilder.init(&w);
+    try b.object(.{ .type = .analog_value, .instance = 1 });
+    try b.property(.{ .property = .present_value, .value = &hex("4441bc0000"), .priority = 8 });
+    try b.property(.{ .property = .out_of_service, .value = &hex("11") });
+    try b.object(.{ .type = .analog_value, .instance = 2 });
+    try b.property(.{ .property = .present_value, .array_index = 3, .value = &hex("00"), .priority = 16 });
+    try b.finish();
+    // Byte-exact: object [0], opening [1], then per property id [0], index [1]
+    // optional, value [2] ... ]2, priority [3] optional.
+    try testing.expectEqualSlices(u8, &hex("0c00800001" ++ "1e" ++ "0955" ++ "2e4441bc00002f" ++ "3908" ++ "0951" ++ "2e112f" ++ "1f" ++ "0c00800002" ++ "1e" ++ "0955" ++ "1903" ++ "2e002f" ++ "3910" ++ "1f"), w.written());
+
+    var it = WpmRequestIterator.init(w.written());
+    const s1 = (try it.next()).?;
+    try testing.expectEqual(ObjectId{ .type = .analog_value, .instance = 1 }, s1.object);
+    var wi = s1.writes();
+    const p1 = (try wi.next()).?;
+    try testing.expectEqual(PropertyIdentifier.present_value, p1.property);
+    try testing.expectEqual(@as(?u8, 8), p1.priority);
+    try testing.expectEqualSlices(u8, &hex("4441bc0000"), p1.value);
+    try testing.expect(!p1.isRelinquish());
+    const p2 = (try wi.next()).?;
+    try testing.expectEqual(PropertyIdentifier.out_of_service, p2.property);
+    try testing.expectEqual(@as(?u8, null), p2.priority);
+    try testing.expectEqual(@as(?PropertyWrite, null), try wi.next());
+    const s2 = (try it.next()).?;
+    var wi2 = s2.writes();
+    const q = (try wi2.next()).?;
+    try testing.expectEqual(@as(?u32, 3), q.array_index);
+    try testing.expect(q.isRelinquish());
+    try testing.expectEqual(@as(?WpmRequestIterator.Spec, null), try it.next());
+
+    // A specification with no property values is refused, and so is a
+    // priority outside 1..16.
+    var it2 = WpmRequestIterator.init(&hex("0c008000011e1f"));
+    try testing.expectError(error.MissingParameter, it2.next());
+    var wbuf: [32]u8 = undefined;
+    var w2 = tag.Writer.init(&wbuf);
+    var b2 = WpmRequestBuilder.init(&w2);
+    try b2.object(.{ .type = .analog_value, .instance = 1 });
+    try testing.expectError(error.InvalidParameter, b2.property(.{ .property = .present_value, .value = &hex("00"), .priority = 17 }));
+
+    // firstFailedWriteAttempt [1]
+    var xb: [32]u8 = undefined;
+    var xw = tag.Writer.init(&xb);
+    try encodeFirstFailedWrite(&xw, .{ .type = .analog_value, .instance = 2 }, .present_value, 3);
+    try testing.expectEqualSlices(u8, &hex("1e0c00800002195529031f"), xw.written());
+    const f = try FirstFailedWrite.decode(xw.written());
+    try testing.expectEqual(@as(u22, 2), f.object.instance);
+    try testing.expectEqual(@as(?u32, 3), f.array_index);
+}
+
+test "DeviceCommunicationControl and ReinitializeDevice: encoding, passwords, limits" {
+    var buf: [64]u8 = undefined;
+    // timeDuration [0] 5, enable-disable [1] disable, password [2] "abc"
+    const dcc: DeviceCommunicationControl = .{ .duration_minutes = 5, .state = .disable, .password = "abc" };
+    try testing.expectEqualSlices(u8, &hex("0905" ++ "1901" ++ "2c00616263"), try enc(dcc, &buf));
+    const d = try DeviceCommunicationControl.decode(&hex("0905" ++ "1901" ++ "2c00616263"));
+    try testing.expectEqual(@as(?u16, 5), d.duration_minutes);
+    try testing.expectEqual(CommunicationState.disable, d.state);
+    try testing.expectEqualStrings("abc", d.password.?);
+    // Only the state is mandatory.
+    const e = try DeviceCommunicationControl.decode(&hex("1900"));
+    try testing.expectEqual(CommunicationState.enable, e.state);
+    try testing.expectEqual(@as(?u16, null), e.duration_minutes);
+    // An undefined state, an empty or 21-character password, trailing data.
+    try testing.expectError(error.InvalidValue, DeviceCommunicationControl.decode(&hex("1903")));
+    try testing.expectError(error.InvalidValue, DeviceCommunicationControl.decode(&hex("19002900")));
+    {
+        var lb: [40]u8 = undefined;
+        var lw = tag.Writer.init(&lb);
+        try lw.ctxEnumerated(1, 0);
+        try lw.ctxString(2, &@as([21]u8, @splat(0x61)));
+        try testing.expectError(error.InvalidValue, DeviceCommunicationControl.decode(lw.written()));
+        var lw2 = tag.Writer.init(&lb);
+        try lw2.ctxEnumerated(1, 0);
+        try lw2.ctxString(2, &@as([20]u8, @splat(0x61)));
+        try testing.expectEqual(@as(usize, 20), (try DeviceCommunicationControl.decode(lw2.written())).password.?.len);
+    }
+    try testing.expectError(error.InvalidParameter, DeviceCommunicationControl.decode(&hex("190009ff")));
+    var ew = tag.Writer.init(&buf);
+    try testing.expectError(error.InvalidParameter, (DeviceCommunicationControl{ .state = .enable, .password = "" }).encode(&ew));
+
+    // reinitialized-state-of-device [0], password [1]
+    try testing.expectEqualSlices(u8, &hex("0900" ++ "1a0078"), try enc(ReinitializeDevice{ .state = .coldstart, .password = "x" }, &buf));
+    try testing.expectEqualSlices(u8, &hex("0907"), try enc(ReinitializeDevice{ .state = .activate_changes }, &buf));
+    const r = try ReinitializeDevice.decode(&hex("0901" ++ "1a0078"));
+    try testing.expectEqual(ReinitializedState.warmstart, r.state);
+    try testing.expectEqualStrings("x", r.password.?);
+    try testing.expectError(error.InvalidValue, ReinitializeDevice.decode(&hex("0908")));
+}
+
+test "TimeSynchronization carries one date and one time, application-tagged" {
+    var buf: [16]u8 = undefined;
+    const ts: TimeSynchronization = .{ .time = .{
+        .date = .{ .year = 126, .month = 11, .day = 21, .weekday = 6 },
+        .time = .{ .hour = 13, .minute = 5, .second = 9, .hundredths = 50 },
+    } };
+    try testing.expectEqualSlices(u8, &hex("a47e0b1506" ++ "b40d050932"), try enc(ts, &buf));
+    const back = try TimeSynchronization.decode(&hex("a47e0b1506" ++ "b40d050932"));
+    try testing.expectEqual(@as(u8, 126), back.time.date.year);
+    try testing.expectEqual(@as(u8, 50), back.time.time.hundredths);
+    try testing.expectError(error.InvalidParameter, TimeSynchronization.decode(&hex("a47e0b1506" ++ "b40d050932" ++ "00")));
 }

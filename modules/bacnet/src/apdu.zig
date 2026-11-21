@@ -348,6 +348,26 @@ pub fn decode(buf: []const u8) Error!Apdu {
             if (b0 & 0x0F != 0) return error.InvalidPduType;
             if (buf.len < 3) return error.Truncated;
             var r = tag.Reader.init(buf[3..]);
+            // `WritePropertyMultiple-Error` wraps the error in `errorType [0]`;
+            // the plain pair is accepted too.
+            if (buf[2] == @backingInt(types.ConfirmedService.write_property_multiple)) {
+                const wrapped = (r.peek() catch return error.Truncated).isOpening(0);
+                if (wrapped) {
+                    const inner = r.openedBlock(0) catch return error.Truncated;
+                    var ir = tag.Reader.init(inner);
+                    const c = ir.expectApp(.enumerated) catch return error.Truncated;
+                    const k = ir.expectApp(.enumerated) catch return error.Truncated;
+                    if (c.enumerated > std.math.maxInt(u16)) return error.InvalidValue;
+                    if (k.enumerated > std.math.maxInt(u16)) return error.InvalidValue;
+                    return .{ .err = .{
+                        .invoke_id = buf[1],
+                        .service = @fromBackingInt(@intCast(buf[2])),
+                        .class = @fromBackingInt(@intCast(@as(u16, @intCast(c.enumerated)))),
+                        .code = @fromBackingInt(@intCast(@as(u16, @intCast(k.enumerated)))),
+                        .extra = r.rest(),
+                    } };
+                }
+            }
             const class_v = r.expectApp(.enumerated) catch return error.Truncated;
             const code_v = r.expectApp(.enumerated) catch return error.Truncated;
             if (class_v.enumerated > std.math.maxInt(u16)) return error.InvalidValue;
@@ -444,8 +464,13 @@ pub fn encode(a: Apdu, out: []u8) Error![]u8 {
             try w.byte(e.invoke_id);
             try w.byte(@backingInt(e.service));
             var tw = tag.Writer.init(out[w.pos..]);
+            // `WritePropertyMultiple-Error ::= SEQUENCE { errorType [0] Error,
+            // firstFailedWriteAttempt [1] }`: the pair sits inside `[0]`.
+            const wrap = e.service == .write_property_multiple;
+            if (wrap) tw.open(0) catch return error.NoSpace;
             tw.appEnumerated(@backingInt(e.class)) catch return error.NoSpace;
             tw.appEnumerated(@backingInt(e.code)) catch return error.NoSpace;
+            if (wrap) tw.close(0) catch return error.NoSpace;
             w.pos += tw.pos;
             try w.raw(e.extra);
         },
@@ -814,4 +839,28 @@ test "fuzz driver: BACNET_FUZZ (fuzzApdu)" {
 
 test "fuzz harness: fuzzApdu, 400 seeds, reaches every outcome" {
     try fuzzApduMark.reach(fuzzApdu, "bacnet-apdu-apdu", 400);
+}
+
+test "the WritePropertyMultiple Error wraps its class and code in [0], the plain pair is read too" {
+    const hex = @import("testkit").hex.literal;
+    var buf: [64]u8 = undefined;
+    const e: ErrorPdu = .{
+        .invoke_id = 7,
+        .service = .write_property_multiple,
+        .class = .property,
+        .code = .write_access_denied,
+        .extra = &.{ 0x1e, 0x0c, 0x00, 0x00, 0x00, 0x05, 0x09, 0x55, 0x1f },
+    };
+    const wire = try encode(.{ .err = e }, &buf);
+    // PDU type 5, invoke id, service 16, [0] { enumerated 2, enumerated 40 }, [1] { ... }
+    try testing.expectEqualSlices(u8, &hex("50" ++ "07" ++ "10" ++ "0e" ++ "9102" ++ "9128" ++ "0f" ++ "1e0c000000050955" ++ "1f"), wire);
+    const back = (try decode(wire)).err;
+    try testing.expectEqual(types.ErrorCode.write_access_denied, back.code);
+    try testing.expectEqualSlices(u8, e.extra, back.extra);
+    // Another service keeps the plain pair, and a plain pair for this one decodes.
+    const plain = try decode(&hex("50" ++ "07" ++ "10" ++ "9102" ++ "9128"));
+    try testing.expectEqual(types.ErrorClass.property, plain.err.class);
+    try testing.expectEqual(@as(usize, 0), plain.err.extra.len);
+    const other = try encode(.{ .err = .{ .invoke_id = 1, .service = .write_property, .class = .property, .code = .write_access_denied } }, &buf);
+    try testing.expectEqualSlices(u8, &hex("50" ++ "01" ++ "0f" ++ "9102" ++ "9128"), other);
 }

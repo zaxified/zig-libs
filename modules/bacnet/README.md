@@ -60,8 +60,9 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
 - **`service`** (clauses 15/16) — `ReadProperty`, `ReadPropertyMultiple` (with
   builders and iterators for its list-of-lists shape and its per-property
   errors), `WriteProperty` (with the **priority array** and the `NULL`
-  relinquish), `Who-Is`/`I-Am`, `Who-Has`/`I-Have`, `SubscribeCOV` with both
-  notification forms, and `ReadRange` with all three range selectors. Property
+  relinquish), `WritePropertyMultiple` (builder, iterator and the first-failed-attempt error), `Who-Is`/`I-Am`, `Who-Has`/`I-Have`,
+  `SubscribeCOV` with both notification forms, `ReadRange` with all three range selectors, and
+  `DeviceCommunicationControl`, `ReinitializeDevice`, `TimeSynchronization` and `UTCTimeSynchronization`. Property
   *values* are never interpreted: their datatype comes from the property, not
   the wire, so they are handed back as raw tagged octets.
 - **`client`** — discover devices, read and write properties, subscribe to
@@ -70,8 +71,10 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
   never reused while outstanding; a segmented response is answered with
   `Abort(segmentation_not_supported)` and reported, never mis-parsed.
 - **`device`** — a small object database that answers Who-Is, Who-Has,
-  ReadProperty, ReadPropertyMultiple (including the wildcards), WriteProperty
-  and SubscribeCOV, emits COV notifications on change, expires subscriptions,
+  ReadProperty, ReadPropertyMultiple (including the wildcards), WriteProperty,
+  WritePropertyMultiple, DeviceCommunicationControl (password, timed `disable` and
+  `disable_initiation`), ReinitializeDevice (acknowledged, handed to the application),
+  TimeSynchronization (handed to the application) and SubscribeCOV, emits COV notifications on change, expires subscriptions,
   and answers a unicast question with a unicast reply. Stand one up per
   simulated device.
 - **`sc`** (Annex AB) — the **BACnet/SC** virtual link layer, which replaces
@@ -118,7 +121,7 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
 ## Not provided
 
 No APDU segmentation (segmented PDUs are parsed and refused with `Abort`), no TLS (a seam, never verified), no
-MS/TP, IPv6 or BBMD behaviour, no alarms/events, WritePropertyMultiple, device-management or file services, no
+MS/TP, IPv6 or BBMD behaviour, no alarms/events, backup/restore, file services, no
 commandable priority array; see `SPEC.md` (*What is deliberately not done*, *Backlog / deferred*).
 
 ## Use

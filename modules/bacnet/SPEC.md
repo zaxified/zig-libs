@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bacnet-stack/bacnet-stack](https://github.com/bacnet-stack/bacnet-stack) — **reference** | C | GPL-2.0-or-later WITH GCC-exception-2.0 (its README) | 598 | push 2026-09-29 (no latest-release tag found) | Its README: BACnet/IP (with BBMD), IPv6, Ethernet, MS/TP and BACnet/SC data links, router and gateway apps, ports to embedded targets. We have IP and SC only; and no segmentation, alarms/events, WritePropertyMultiple, device management, priority array. |
+| [bacnet-stack/bacnet-stack](https://github.com/bacnet-stack/bacnet-stack) — **reference** | C | GPL-2.0-or-later WITH GCC-exception-2.0 (its README) | 598 | push 2026-09-29 (no latest-release tag found) | Its README: BACnet/IP (with BBMD), IPv6, Ethernet, MS/TP and BACnet/SC data links, router and gateway apps, ports to embedded targets. We have IP and SC only; and no segmentation, alarms/events, device management beyond DeviceCommunicationControl/ReinitializeDevice/TimeSync, priority array. |
 | [JoelBender/bacpypes3](https://github.com/JoelBender/bacpypes3) | Python | licence not reported by API (bacpypes, its predecessor, is MIT) | 97 | v0.0.108 (2026-09-19) | The Python reference for byte-comparison here (black-box); full client/server incl. segmentation *(inferred)*. Source not read. |
 | [jscott3201/rusty-bacnet](https://github.com/jscott3201/rusty-bacnet) | Rust | MIT | 28 | v0.11.0 (README); push 2026-09-30 | Young Rust stack targeting ASHRAE 135-2020 with clause-level conformance tracking, Python bindings, CLI (its README). |
 | [bacnet-rs/bacnet-rs](https://github.com/bacnet-rs/bacnet-rs) | Rust | other (per API) | 27 | push 2026-09-21 | Rust stack; licence unclear, not read. |
 | [alexbeltran/gobacnet](https://github.com/alexbeltran/gobacnet) | Go | GPL-2.0 | 53 | push 2024-05-09 | Go client; not read. |
 | [GavinMallott/BACnet-zig](https://github.com/GavinMallott/BACnet-zig) | Zig | none stated | 0 | push 2024-11-07 | Only Zig BACnet repository found; abandoned; no licence so not read. |
 
-**Where we are ahead:** the only maintained Zig BACnet; pure, allocation-free, time-injected; a complete BACnet/SC stack in pure computation (VLL codec, node with jittered reconnect and hub failover, hub) plus BACnet/IP, byte-compared with bacpypes3 and bacnet-stack and live round-tripped both ways; MIT versus GPL-with-exception C. **Where we are behind:** APDU segmentation (a large `object-list` read fails with Abort), WritePropertyMultiple, alarms/events, DeviceCommunicationControl/ReinitializeDevice/TimeSync, commandable priority array, BBMD behaviour, MS/TP, IPv6, file/object-management services (→ Backlog items).
+**Where we are ahead:** the only maintained Zig BACnet; pure, allocation-free, time-injected; a complete BACnet/SC stack in pure computation (VLL codec, node with jittered reconnect and hub failover, hub) plus BACnet/IP, byte-compared with bacpypes3 and bacnet-stack and live round-tripped both ways; MIT versus GPL-with-exception C. **Where we are behind:** APDU segmentation (a large `object-list` read fails with Abort), alarms/events, commandable priority array, BBMD behaviour, MS/TP, IPv6, file/object-management services (→ Backlog items).
 
 ## Design & invariants
 
@@ -240,6 +240,15 @@ or loops unboundedly — `Reader.skip` and `Reader.openedBlock` are bounded by t
 a fuzz test asserts `skip` always makes forward progress so a hostile buffer cannot stall it.
 `Client.poll` and `Device.poll` swallow *decode* errors into `.none` (a malformed datagram from a
 stranger must not kill the loop) while still propagating transport failures.
+
+### Commissioning services (`WritePropertyMultiple`, `DeviceCommunicationControl`, `ReinitializeDevice`, time synchronisation)
+
+- **`WritePropertyMultiple`** (clause 15.10): `service` has the request builder and iterator and `encodeFirstFailedWrite` / `FirstFailedWrite`; `Client.writePropertyMultiple`; the device applies the writes in order and stops at the first that fails, **earlier writes stay applied** (clause 15.10.2: processed in order, not atomic, no rollback) and the Error PDU names the failed one. A request that cannot be read at all, with nothing written, is a Reject; one that breaks after a write was applied is an Error whose first failed attempt is object instance 4194303 (addendum 135-2016bl). The Error PDU of this service wraps class and code in `errorType [0]` (`apdu.zig`; the plain pair is still read), and `Client.Event.err.extra` carries the first failed attempt.
+- **`DeviceCommunicationControl`** (16.1): the device keeps `comm` and an optional lapse time. `disable` answers nothing but `DeviceCommunicationControl` and `ReinitializeDevice`; `disable_initiation` answers as usual (including an I-Am to a Who-Is) but `announce()` and COV notifications send nothing. `Config.password` (1..20 characters) is checked when set (`Error(security, password_failure)`); unset accepts any. A duration is in minutes on the injected clock.
+- **`ReinitializeDevice`** (16.4): the password is checked, `coldstart`, `warmstart` and `activate_changes` are acknowledged and reported as `Event.reinitialize` for the application to act on (the module cannot restart anything); the backup and restore states are `Error(services, optional_functionality_not_supported)`.
+- **`TimeSynchronization` / `UTCTimeSynchronization`** (16.7, 16.8): unconfirmed; the device reports `Event.time_synchronized` and has no clock of its own to set. `Client.timeSynchronization` sends one to an address or broadcasts it.
+
+Anchoring: byte goldens derived from the clause 21 ASN.1 productions (self), the `WritePropertyMultiple-Error` shape from the standard's Error PDU table and interpretation IC 135-2012-7; no foreign-stack capture of these services yet.
 
 ## Verification
 
@@ -495,8 +504,7 @@ services, the commandable priority array and `COV_Increment`, BBMD behaviour, al
 - **Trend-log record transfer.** `ReadRange` is encoded and decoded, but a `BACnetLogRecord` inside
   the ACK is handed back as raw tagged octets rather than modelled.
 - **File services** (`AtomicReadFile`/`AtomicWriteFile`) and **object management**
-  (`CreateObject`, `DeleteObject`, `AddListElement`, `RemoveListElement`; `WritePropertyMultiple`
-  is a Backlog item).
+  (`CreateObject`, `DeleteObject`, `AddListElement`, `RemoveListElement`).
 - **`SubscribeCOVProperty` and the "multiple" COV variants** (the other commissioning services are Backlog items).
 - **Private transfer, text message and VT services.**
 - **BACnet Network Security (clause 24)** — the security network-layer messages (`Challenge-
@@ -557,7 +565,6 @@ its clause citations live in this file and in the module's doc comments.
 ## Backlog / deferred
 
 - (survey 2026-09-30) **Segmentation (clause 5.4)**: without it `ReadProperty(object-list)` on any real device with hundreds of objects fails; the first thing a BMS integrator hits; medium-large (window state machine, time-injected), fits §2. Ranked first. Segmented PDUs are parsed correctly and refused explicitly with `Abort(segmentation_not_supported)`; what is missing is buffering the segments and driving the SegmentACK window, so a `ReadProperty` of a large `object-list`, or an RPM whose answer exceeds the peer's max-APDU, fails cleanly with an `Abort` instead of succeeding.
-- (survey 2026-09-30) **WritePropertyMultiple, DeviceCommunicationControl, ReinitializeDevice, Time/UTCTimeSynchronization**: ubiquitous in commissioning tools; small each, fits §2.
 - (survey 2026-09-30) **Commandable priority array (16 slots + relinquish default) and COV_Increment on the device**: a simulated BACnet device that cannot be commanded is not a faithful fleet target; medium, fits §2. Today `WriteProperty`'s priority is decoded, carried and reported, but the device stores one value per property rather than sixteen slots plus a relinquish default, so it answers a relinquish with `optional_functionality_not_supported` unless the stored value is already Null; and it notifies subscribers on every `update`, not only when the change exceeds the object's COV increment.
 - (survey 2026-09-30) **BBMD behaviour and foreign-device registration timer**: needed across IP subnets; medium, fits §2. Registering as a foreign device (with its 30-second grace period and re-registration timer), maintaining a broadcast distribution table and re-emitting broadcasts as `Forwarded-NPDU` are policy this module encodes for but does not perform.
 - (survey 2026-09-30) **Alarms and events (intrinsic reporting, GetEventInformation, AcknowledgeAlarm)**: large sub-protocol with its own state machine (`AcknowledgeAlarm`, `GetAlarmSummary`, `GetEnrollmentSummary`, `GetEventInformation`, both event-notification services, the Event Enrollment object); fits §2.

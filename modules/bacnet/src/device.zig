@@ -158,6 +158,10 @@ pub const Config = struct {
     /// vanished subscriber's subscription eventually lapses. 0 disables the
     /// clamp (and allows indefinite subscriptions).
     max_cov_lifetime_s: u32 = 3600,
+    /// The password `DeviceCommunicationControl` and `ReinitializeDevice`
+    /// must carry (1..20 characters; clause 16.1.2, 16.4.2). `null` accepts
+    /// any password, or none: a simulator rarely has one.
+    password: ?[]const u8 = null,
 };
 
 /// What `poll` reports — a device is mostly silent, so these are for logging
@@ -174,6 +178,19 @@ pub const Event = union(enum) {
     wrote: struct { object: ObjectId, property: PropertyIdentifier },
     /// Accepted or cancelled a COV subscription.
     subscribed: struct { object: ObjectId, cancelled: bool },
+    /// Served a `WritePropertyMultiple`: every write up to the first failure
+    /// was applied (clause 15.10.2 does not roll back); `count` of them.
+    wrote_multiple: struct { count: usize },
+    /// Accepted a `DeviceCommunicationControl`; the new state (the device
+    /// applies it by itself, this is for logging).
+    communication_control: struct { state: service.CommunicationState, duration_minutes: ?u16 },
+    /// Accepted a `ReinitializeDevice` and acknowledged it. The device cannot
+    /// restart itself: the application does what `state` asks.
+    reinitialize: struct { state: service.ReinitializedState },
+    /// Received a `TimeSynchronization` (`utc` false) or
+    /// `UTCTimeSynchronization`. The device has no clock of its own to set:
+    /// the application applies `time`.
+    time_synchronized: struct { time: service.DateTime, utc: bool },
     /// Refused a request.
     refused: struct { class: types.ErrorClass, code: types.ErrorCode },
     /// Something arrived that this device does not serve.
@@ -192,6 +209,11 @@ pub fn Device(comptime max_subscriptions: usize) type {
         tx: [transport.max_datagram]u8 = undefined,
         /// Invoke ids for confirmed COV notifications this device originates.
         next_invoke: u8 = 0,
+        /// What `DeviceCommunicationControl` last set (clause 16.1).
+        comm: service.CommunicationState = .enable,
+        /// When a timed `disable` or `disable_initiation` lapses (`null`:
+        /// until `enable` or a restart).
+        comm_until_ms: ?u64 = null,
 
         pub fn init(tp: Transport, config: Config, objects: []Object) Self {
             return .{ .tp = tp, .config = config, .objects = objects };
@@ -211,7 +233,12 @@ pub fn Device(comptime max_subscriptions: usize) type {
 
         /// Broadcasts an unsolicited `I-Am`, which is what a device does on
         /// restart so controllers do not have to wait for the next Who-Is.
+        ///
+        /// Sends nothing while `DeviceCommunicationControl` has disabled
+        /// initiation (clause 16.1.3): an unsolicited I-Am is an initiated
+        /// message, the answer to a Who-Is is not.
         pub fn announce(self: *Self) Error!void {
+            if (self.comm != .enable) return;
             return self.sendIAm(null);
         }
 
@@ -263,6 +290,10 @@ pub fn Device(comptime max_subscriptions: usize) type {
         /// lapsed subscription.
         pub fn poll(self: *Self, now_ms: u64) Error!Event {
             self.expireSubscriptions(now_ms);
+            if (self.comm_until_ms) |t| if (now_ms >= t) {
+                self.comm = .enable;
+                self.comm_until_ms = null;
+            };
             const got = (try self.tp.recv(&self.rx)) orelse return .none;
             return self.handle(got.from, got.bytes, now_ms) catch |e| switch (e) {
                 error.NotBvlc,
@@ -320,6 +351,16 @@ pub fn Device(comptime max_subscriptions: usize) type {
             };
             const a = try apdu.decode(a_bytes);
 
+            // `disable`: nothing is answered but the two services that can end
+            // it (clause 16.1.3).
+            if (self.comm == .disable) {
+                const allowed = switch (a) {
+                    .confirmed_request => |r| r.service == .device_communication_control or r.service == .reinitialize_device,
+                    else => false,
+                };
+                if (!allowed) return .none;
+            }
+
             switch (a) {
                 .unconfirmed_request => |u| switch (u.service) {
                     .who_is => {
@@ -330,11 +371,15 @@ pub fn Device(comptime max_subscriptions: usize) type {
                         if (b.function() == .original_unicast_npdu) {
                             try self.announceTo(origin);
                         } else {
-                            try self.announce();
+                            try self.sendIAm(null);
                         }
                         return .announced;
                     },
                     .who_has => return self.handleWhoHas(u.data, origin, b.function()),
+                    .time_synchronization, .utc_time_synchronization => {
+                        const ts = service.TimeSynchronization.decode(u.data) catch return .none;
+                        return .{ .time_synchronized = .{ .time = ts.time, .utc = u.service == .utc_time_synchronization } };
+                    },
                     else => return .unhandled,
                 },
                 .confirmed_request => |r| {
@@ -348,6 +393,9 @@ pub fn Device(comptime max_subscriptions: usize) type {
                         .read_property => self.handleReadProperty(origin, r),
                         .read_property_multiple => self.handleRpm(origin, r),
                         .write_property => self.handleWriteProperty(origin, r),
+                        .write_property_multiple => self.handleWpm(origin, r),
+                        .device_communication_control => self.handleDcc(origin, r, now_ms),
+                        .reinitialize_device => self.handleReinitialize(origin, r),
                         .subscribe_cov => self.handleSubscribeCov(origin, r, now_ms),
                         else => blk: {
                             try self.sendApdu(origin, .{ .reject = .{
@@ -573,29 +621,12 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 } });
                 return .{ .refused = .{ .class = .services, .code = .reject_invalid_tag } };
             };
-            const obj = self.find(wp.object) orelse
-                return self.refuse(to, r.invoke_id, .write_property, .object, .unknown_object);
-            const p = obj.find(wp.property) orelse
-                return self.refuse(to, r.invoke_id, .write_property, .property, .unknown_property);
-            if (!p.writable)
-                return self.refuse(to, r.invoke_id, .write_property, .property, .write_access_denied);
-
-            // Relinquishing is not "write null": it hands the slot back, and a
-            // device with no priority array has nothing to hand back to.
-            if (wp.isRelinquish() and p.value != .null) {
-                return self.refuse(
-                    to,
-                    r.invoke_id,
-                    .write_property,
-                    .property,
-                    .optional_functionality_not_supported,
-                );
-            }
-
-            const parsed = Value.parse(wp.value) orelse
-                return self.refuse(to, r.invoke_id, .write_property, .property, .invalid_data_type);
-            if (!Value.sameKind(parsed, p.value))
-                return self.refuse(to, r.invoke_id, .write_property, .property, .invalid_data_type);
+            const target = switch (self.checkWrite(wp.object, wp.property, wp.value, wp.isRelinquish())) {
+                .ok => |t| t,
+                .refused => |e| return self.refuse(to, r.invoke_id, .write_property, e.class, e.code),
+            };
+            const p = target.prop;
+            const parsed = target.value;
 
             p.value = parsed;
             try self.sendApdu(to, .{ .simple_ack = .{
@@ -603,6 +634,159 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 .service = .write_property,
             } });
             return .{ .wrote = .{ .object = wp.object, .property = wp.property } };
+        }
+
+        const WriteCheck = union(enum) {
+            ok: struct { prop: *Property, value: Value },
+            refused: struct { class: types.ErrorClass, code: types.ErrorCode },
+        };
+
+        /// What clause 15.9.2 / 15.10.2 require of one write before it is
+        /// applied: the object and property exist, the property is writable,
+        /// a relinquish has something to hand back to, the datum has the
+        /// property's type.
+        fn checkWrite(self: *Self, oid: ObjectId, property: PropertyIdentifier, value: []const u8, relinquish: bool) WriteCheck {
+            const obj = self.find(oid) orelse
+                return .{ .refused = .{ .class = .object, .code = .unknown_object } };
+            const p = obj.find(property) orelse
+                return .{ .refused = .{ .class = .property, .code = .unknown_property } };
+            if (!p.writable)
+                return .{ .refused = .{ .class = .property, .code = .write_access_denied } };
+            // Relinquishing is not "write null": it hands the slot back, and a
+            // device with no priority array has nothing to hand back to.
+            if (relinquish and p.value != .null)
+                return .{ .refused = .{ .class = .property, .code = .optional_functionality_not_supported } };
+            const parsed = Value.parse(value) orelse
+                return .{ .refused = .{ .class = .property, .code = .invalid_data_type } };
+            if (!Value.sameKind(parsed, p.value))
+                return .{ .refused = .{ .class = .property, .code = .invalid_data_type } };
+            return .{ .ok = .{ .prop = p, .value = parsed } };
+        }
+
+        /// `WritePropertyMultiple` (clause 15.10): the writes are applied in
+        /// order and the first that fails ends the request, earlier ones
+        /// stay applied. A request that cannot be decoded at all is rejected;
+        /// one that breaks after a write was applied is an Error whose first
+        /// failed attempt names object instance 4194303 (addendum 135-2016bl).
+        fn handleWpm(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest) Error!Event {
+            var it = service.WpmRequestIterator.init(r.data);
+            var done: usize = 0;
+            while (true) {
+                const spec = (it.next() catch return self.wpmDecodeFailure(to, r.invoke_id, done)) orelse break;
+                var wi = spec.writes();
+                while (true) {
+                    const pw = (wi.next() catch return self.wpmDecodeFailure(to, r.invoke_id, done)) orelse break;
+                    switch (self.checkWrite(spec.object, pw.property, pw.value, pw.isRelinquish())) {
+                        .ok => |t| {
+                            t.prop.value = t.value;
+                            done += 1;
+                        },
+                        .refused => |e| return self.wpmFailure(to, r.invoke_id, e.class, e.code, spec.object, pw.property, pw.array_index),
+                    }
+                }
+            }
+            if (done == 0) return self.wpmDecodeFailure(to, r.invoke_id, 0);
+            try self.sendApdu(to, .{ .simple_ack = .{
+                .invoke_id = r.invoke_id,
+                .service = .write_property_multiple,
+            } });
+            return .{ .wrote_multiple = .{ .count = done } };
+        }
+
+        fn wpmDecodeFailure(self: *Self, to: BipAddress, invoke_id: u8, done: usize) Error!Event {
+            if (done == 0) {
+                try self.sendApdu(to, .{ .reject = .{ .invoke_id = invoke_id, .reason = .invalid_tag } });
+                return .{ .refused = .{ .class = .services, .code = .reject_invalid_tag } };
+            }
+            return self.wpmFailure(
+                to,
+                invoke_id,
+                .services,
+                .invalid_tag,
+                .{ .type = .device, .instance = service.max_instance },
+                .object_identifier,
+                null,
+            );
+        }
+
+        fn wpmFailure(
+            self: *Self,
+            to: BipAddress,
+            invoke_id: u8,
+            class: types.ErrorClass,
+            code: types.ErrorCode,
+            object: ObjectId,
+            property: PropertyIdentifier,
+            array_index: ?u32,
+        ) Error!Event {
+            var xbuf: [32]u8 = undefined;
+            var xw = tag.Writer.init(&xbuf);
+            try service.encodeFirstFailedWrite(&xw, object, property, array_index);
+            try self.sendApdu(to, .{ .err = .{
+                .invoke_id = invoke_id,
+                .service = .write_property_multiple,
+                .class = class,
+                .code = code,
+                .extra = xw.written(),
+            } });
+            return .{ .refused = .{ .class = class, .code = code } };
+        }
+
+        fn passwordOk(self: *const Self, given: ?[]const u8) bool {
+            const want = self.config.password orelse return true;
+            const got = given orelse return false;
+            return std.mem.eql(u8, want, got);
+        }
+
+        /// `DeviceCommunicationControl` (clause 16.1).
+        fn handleDcc(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest, now_ms: u64) Error!Event {
+            const req = service.DeviceCommunicationControl.decode(r.data) catch |e| {
+                const reason: types.RejectReason = switch (e) {
+                    error.InvalidValue, error.InvalidParameter => .parameter_out_of_range,
+                    error.MissingParameter => .missing_required_parameter,
+                    else => .invalid_tag,
+                };
+                try self.sendApdu(to, .{ .reject = .{ .invoke_id = r.invoke_id, .reason = reason } });
+                return .{ .refused = .{ .class = .services, .code = .reject_invalid_tag } };
+            };
+            if (!self.passwordOk(req.password))
+                return self.refuse(to, r.invoke_id, .device_communication_control, .security, .password_failure);
+            self.comm = req.state;
+            self.comm_until_ms = if (req.state == .enable) null else if (req.duration_minutes) |m|
+                now_ms + @as(u64, m) * 60_000
+            else
+                null;
+            try self.sendApdu(to, .{ .simple_ack = .{
+                .invoke_id = r.invoke_id,
+                .service = .device_communication_control,
+            } });
+            return .{ .communication_control = .{ .state = req.state, .duration_minutes = req.duration_minutes } };
+        }
+
+        /// `ReinitializeDevice` (clause 16.4). The device only acknowledges:
+        /// restarting is the application's business (`Event.reinitialize`).
+        /// The backup and restore procedures are not implemented.
+        fn handleReinitialize(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest) Error!Event {
+            const req = service.ReinitializeDevice.decode(r.data) catch |e| {
+                const reason: types.RejectReason = switch (e) {
+                    error.InvalidValue, error.InvalidParameter => .parameter_out_of_range,
+                    error.MissingParameter => .missing_required_parameter,
+                    else => .invalid_tag,
+                };
+                try self.sendApdu(to, .{ .reject = .{ .invoke_id = r.invoke_id, .reason = reason } });
+                return .{ .refused = .{ .class = .services, .code = .reject_invalid_tag } };
+            };
+            if (!self.passwordOk(req.password))
+                return self.refuse(to, r.invoke_id, .reinitialize_device, .security, .password_failure);
+            switch (req.state) {
+                .coldstart, .warmstart, .activate_changes => {},
+                else => return self.refuse(to, r.invoke_id, .reinitialize_device, .services, .optional_functionality_not_supported),
+            }
+            try self.sendApdu(to, .{ .simple_ack = .{
+                .invoke_id = r.invoke_id,
+                .service = .reinitialize_device,
+            } });
+            return .{ .reinitialize = .{ .state = req.state } };
         }
 
         fn handleSubscribeCov(
@@ -699,6 +883,8 @@ pub fn Device(comptime max_subscriptions: usize) type {
         }
 
         fn notifyCov(self: *Self, obj: *Object, now_ms: u64) Error!void {
+            // A notification is an initiated message (clause 16.1.3).
+            if (self.comm != .enable) return;
             for (&self.subs) |*s| {
                 if (!s.active or !s.object.eql(obj.id)) continue;
                 try self.notifyOne(s, obj, now_ms);
@@ -1319,6 +1505,148 @@ test "Who-Has by name and by identifier, answered with I-Have" {
     try c.whoHasName("NO-SUCH-POINT", null, null);
     try testing.expectEqual(device_event_none, try dev.poll(4));
     try testing.expectEqual(client.Event.none, try c.poll(5));
+}
+
+test "WritePropertyMultiple: applied in order, the first failure ends it, earlier writes stay" {
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, db.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const setpoint: ObjectId = .{ .type = .analog_value, .instance = 1 };
+
+    // Two good writes to one object.
+    var r1: [8]u8 = undefined;
+    var rw = tag.Writer.init(&r1);
+    try rw.appReal(30.0);
+    var b1: [4]u8 = undefined;
+    var bw = tag.Writer.init(&b1);
+    try bw.appBool(true);
+    _ = try c.writePropertyMultiple(rig.device_ep.address, &.{.{ .object = setpoint, .writes = &.{
+        .{ .property = .present_value, .value = rw.written(), .priority = 8 },
+        .{ .property = .out_of_service, .value = bw.written() },
+    } }}, 0);
+    try testing.expectEqual(@as(usize, 2), (try dev.poll(0)).wrote_multiple.count);
+    const ev = try c.poll(1);
+    try testing.expectEqual(types.ConfirmedService.write_property_multiple, ev.simple_ack.svc);
+    try testing.expectEqual(@as(f32, 30.0), db.av[2].value.real);
+    try testing.expectEqual(true, db.av[3].value.boolean);
+
+    // The second write is to a read-only property: the first stays applied,
+    // the third is never tried, and the Error names the second.
+    var r2: [8]u8 = undefined;
+    var rw2 = tag.Writer.init(&r2);
+    try rw2.appReal(40.0);
+    var r3: [8]u8 = undefined;
+    var rw3 = tag.Writer.init(&r3);
+    try rw3.appReal(50.0);
+    const input: ObjectId = .{ .type = .analog_input, .instance = 5 };
+    _ = try c.writePropertyMultiple(rig.device_ep.address, &.{
+        .{ .object = setpoint, .writes = &.{.{ .property = .present_value, .value = rw2.written() }} },
+        .{ .object = input, .writes = &.{.{ .property = .present_value, .value = rw3.written() }} },
+        .{ .object = setpoint, .writes = &.{.{ .property = .present_value, .value = rw3.written() }} },
+    }, 2);
+    _ = try dev.poll(2);
+    const ev2 = try c.poll(3);
+    try testing.expectEqual(types.ErrorCode.write_access_denied, ev2.err.code);
+    try testing.expectEqual(types.ErrorClass.property, ev2.err.class);
+    const first = try service.FirstFailedWrite.decode(ev2.err.extra);
+    try testing.expectEqual(input, first.object);
+    try testing.expectEqual(types.PropertyIdentifier.present_value, first.property);
+    try testing.expectEqual(@as(f32, 40.0), db.av[2].value.real);
+    try testing.expectEqual(@as(f32, 72.5), db.ai[2].value.real);
+}
+
+test "DeviceCommunicationControl: password, disable, disable_initiation, timed lapse" {
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .password = "secret" }, db.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const to = rig.device_ep.address;
+    const dev_obj: ObjectId = .{ .type = .device, .instance = 599 };
+
+    // No password, wrong password: Error(security, password_failure), still enabled.
+    _ = try c.deviceCommunicationControl(to, .{ .state = .disable }, 0);
+    _ = try dev.poll(0);
+    try testing.expectEqual(types.ErrorCode.password_failure, (try c.poll(1)).err.code);
+    _ = try c.deviceCommunicationControl(to, .{ .state = .disable, .password = "nope" }, 2);
+    _ = try dev.poll(2);
+    try testing.expectEqual(types.ErrorClass.security, (try c.poll(3)).err.class);
+    try testing.expectEqual(service.CommunicationState.enable, dev.comm);
+
+    // disable_initiation for one minute: still answers, initiates nothing.
+    _ = try c.deviceCommunicationControl(to, .{ .state = .disable_initiation, .duration_minutes = 1, .password = "secret" }, 4);
+    try testing.expectEqual(service.CommunicationState.disable_initiation, (try dev.poll(10)).communication_control.state);
+    try testing.expectEqual(types.ConfirmedService.device_communication_control, (try c.poll(11)).simple_ack.svc);
+    try dev.announce();
+    var rx: [transport.max_datagram]u8 = undefined;
+    try testing.expect((try rig.client_ep.transport().recv(&rx)) == null);
+    _ = try c.readProperty(to, dev_obj, .object_name, null, 12);
+    _ = try dev.poll(12);
+    try testing.expectEqual(types.ConfirmedService.read_property, (try c.poll(13)).complex_ack.svc);
+    try c.whoIs(null, null);
+    try testing.expectEqual(device_event_announced, try dev.poll(14));
+    _ = try c.poll(15);
+
+    // The minute lapses on its own.
+    _ = try dev.poll(60_011);
+    try testing.expectEqual(service.CommunicationState.enable, dev.comm);
+
+    // disable: nothing is answered but the two services that end it.
+    _ = try c.deviceCommunicationControl(to, .{ .state = .disable, .password = "secret" }, 60_012);
+    _ = try dev.poll(60_012);
+    _ = try c.poll(60_013);
+    _ = try c.readProperty(to, dev_obj, .object_name, null, 60_014);
+    try testing.expectEqual(Event.none, try dev.poll(60_014));
+    try c.whoIs(null, null);
+    try testing.expectEqual(Event.none, try dev.poll(60_015));
+    try testing.expect((try rig.client_ep.transport().recv(&rx)) == null);
+    _ = try c.deviceCommunicationControl(to, .{ .state = .enable, .password = "secret" }, 60_016);
+    try testing.expectEqual(service.CommunicationState.enable, (try dev.poll(60_016)).communication_control.state);
+    _ = try c.poll(60_017);
+    try testing.expectEqual(service.CommunicationState.enable, dev.comm);
+}
+
+test "ReinitializeDevice: password, acknowledged, handed to the application; backup is not served" {
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599, .password = "pw" }, db.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const to = rig.device_ep.address;
+
+    _ = try c.reinitializeDevice(to, .{ .state = .coldstart, .password = "bad" }, 0);
+    try testing.expectEqual(types.ErrorCode.password_failure, blk: {
+        _ = try dev.poll(0);
+        break :blk (try c.poll(1)).err.code;
+    });
+    _ = try c.reinitializeDevice(to, .{ .state = .warmstart, .password = "pw" }, 2);
+    try testing.expectEqual(service.ReinitializedState.warmstart, (try dev.poll(2)).reinitialize.state);
+    try testing.expectEqual(types.ConfirmedService.reinitialize_device, (try c.poll(3)).simple_ack.svc);
+    _ = try c.reinitializeDevice(to, .{ .state = .start_backup, .password = "pw" }, 4);
+    _ = try dev.poll(4);
+    try testing.expectEqual(types.ErrorCode.optional_functionality_not_supported, (try c.poll(5)).err.code);
+}
+
+test "TimeSynchronization and UTCTimeSynchronization reach the application, unconfirmed" {
+    var rig: Rig = .{};
+    rig.wire();
+    var db = Db.init();
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, db.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const t: service.DateTime = .{
+        .date = .{ .year = 126, .month = 11, .day = 21, .weekday = 6 },
+        .time = .{ .hour = 13, .minute = 5, .second = 9, .hundredths = 50 },
+    };
+    try c.timeSynchronization(rig.device_ep.address, t, false);
+    const ev = try dev.poll(0);
+    try testing.expectEqual(false, ev.time_synchronized.utc);
+    try testing.expectEqual(@as(u8, 13), ev.time_synchronized.time.time.hour);
+    try c.timeSynchronization(null, t, true);
+    try testing.expectEqual(true, (try dev.poll(1)).time_synchronized.utc);
+    var rx: [transport.max_datagram]u8 = undefined;
+    try testing.expect((try rig.client_ep.transport().recv(&rx)) == null);
 }
 
 test "the device refuses a segmented request rather than buffering it" {
