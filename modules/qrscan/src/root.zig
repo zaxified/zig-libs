@@ -349,6 +349,146 @@ pub fn scanAny(img: Image, scratch: []u8, opts: ScanOptions) Error!ScannedAny {
     return Error.NotFound;
 }
 
+/// How many symbols `scanAll` looks for at most: `out` beyond this is unused.
+pub const max_symbols = 16;
+
+pub const ScannedAll = struct {
+    /// The readable symbols, in the order they were found (best-scoring finder
+    /// triple first), a prefix of the caller's `out`.
+    found: []Found,
+    /// The transform under which they were found (all of them share it).
+    transform: Transform,
+};
+
+/// Every symbol in the frame that `qr.decode` can read, up to `out.len` (and at
+/// most `max_symbols`): quirc, rqrr and ZXing's multi-reader return all codes
+/// found, and a screen that shows two at once needs that. Same binarisation,
+/// retries and `ScanOptions` as `scanAny`; the first transform that yields at
+/// least one readable symbol is the one reported. Unlike `scan`, a grid `qr`
+/// cannot read is not returned (there is no "best effort" among several).
+/// `error.NotFound` when there is none or `out` is empty. Scratch is `scratchSize`
+/// as for `scan`; nothing else is allocated (the candidate lists are on the
+/// stack, `max_candidates` each).
+pub fn scanAll(img: Image, scratch: []u8, out: []Found, opts: ScanOptions) Error!ScannedAll {
+    try validate(img, scratch);
+    const cap = out[0..@min(out.len, max_symbols)];
+    if (cap.len == 0) return Error.NotFound;
+    var ws = Workspace.carve(img, scratch);
+    binarize(img, &ws.bits, ws.means);
+
+    var n = scanBitsMany(&ws, cap);
+    if (n != 0) return .{ .found = cap[0..n], .transform = .none };
+    if (opts.try_inverted) {
+        ws.bits.invert();
+        n = scanBitsMany(&ws, cap);
+        if (n != 0) return .{ .found = cap[0..n], .transform = .inverted };
+        if (opts.try_mirrored) {
+            ws.bits.invert();
+            ws.bits.mirror();
+            n = scanBitsMany(&ws, cap);
+            if (n != 0) return .{ .found = cap[0..n], .transform = .mirrored };
+            ws.bits.invert();
+            n = scanBitsMany(&ws, cap);
+            if (n != 0) return .{ .found = cap[0..n], .transform = .inverted_mirrored };
+        }
+    } else if (opts.try_mirrored) {
+        ws.bits.mirror();
+        n = scanBitsMany(&ws, cap);
+        if (n != 0) return .{ .found = cap[0..n], .transform = .mirrored };
+    }
+    return Error.NotFound;
+}
+
+/// The area one found symbol covers, in its own axes (along tl->tr and tl->bl,
+/// pixels from the top-left finder centre), so finders that belong to it -- its
+/// data region's false positives, mostly -- are not offered to the next triple.
+const Region = struct {
+    tl: Finder,
+    ux: f32,
+    uy: f32,
+    vx: f32,
+    vy: f32,
+    /// Extent along each axis from `tl`, and the outward margin (finders sit
+    /// 3.5 modules in from the edge; one module more than that is slack that
+    /// stays clear of a neighbour behind a 4-module quiet zone).
+    along: f32,
+    down: f32,
+    margin: f32,
+
+    fn of(c: Corners) Region {
+        const lu = @sqrt(dist2(c.tl, c.tr));
+        const lv = @sqrt(dist2(c.tl, c.bl));
+        return .{
+            .tl = c.tl,
+            .ux = (c.tr.x - c.tl.x) / lu,
+            .uy = (c.tr.y - c.tl.y) / lu,
+            .vx = (c.bl.x - c.tl.x) / lv,
+            .vy = (c.bl.y - c.tl.y) / lv,
+            .along = lu,
+            .down = lv,
+            .margin = 4.5 * c.module,
+        };
+    }
+
+    fn contains(r: Region, f: Finder) bool {
+        const dx = f.x - r.tl.x;
+        const dy = f.y - r.tl.y;
+        const s = dx * r.ux + dy * r.uy;
+        const t = dx * r.vx + dy * r.vy;
+        return s >= -r.margin and s <= r.along + r.margin and t >= -r.margin and t <= r.down + r.margin;
+    }
+};
+
+/// All readable symbols of the bitmap in `ws`, into `out`; how many.
+fn scanBitsMany(ws: *Workspace, out: []Found) usize {
+    const bits = &ws.bits;
+    var regions: [max_symbols]Region = undefined;
+    var n: usize = 0;
+    var located: [max_candidates]Finder = undefined;
+    // Strict pass first, then the relaxed one for what the strict pass missed
+    // (a small symbol whose ring broke); finders inside a symbol already found
+    // are dropped from the relaxed pass, so it cannot find that symbol twice.
+    for ([_]bool{ true, false }) |strict| {
+        const found = locateFinders(bits, &located, strict, ws.runs);
+        var live: [max_candidates]Finder = undefined;
+        var m: usize = 0;
+        for (found) |f| {
+            const taken = for (regions[0..n]) |r| {
+                if (r.contains(f)) break true;
+            } else false;
+            if (!taken) {
+                live[m] = f;
+                m += 1;
+            }
+        }
+        var tried: [max_candidates][3]u8 = undefined;
+        var nt: usize = 0;
+        while (n < out.len and nt < tried.len) {
+            var picked: [3]u8 = undefined;
+            const corners = orientSkipping(live[0..m], tried[0..nt], &picked) orelse break;
+            tried[nt] = picked;
+            nt += 1;
+            const got = sampleBestDimension(bits, corners) catch continue;
+            if (!readable(&got.found.matrix)) continue;
+            out[n] = got.found;
+            regions[n] = Region.of(corners);
+            // The finders it owns are spent; the triples tried so far refer to
+            // indices that have moved, so the list restarts.
+            var k: usize = 0;
+            for (live[0..m]) |f| {
+                if (!regions[n].contains(f)) {
+                    live[k] = f;
+                    k += 1;
+                }
+            }
+            m = k;
+            n += 1;
+            nt = 0;
+        }
+    }
+    return n;
+}
+
 const Attempt = struct { found: ?Found, readable: bool };
 
 /// One locate-and-sample pass over the already binarised bitmap in `ws`.
@@ -835,6 +975,14 @@ const Corners = struct {
 /// top-right then follows from the sign of the cross product, which is what
 /// makes this work at any rotation.
 fn orient(f: []Finder) ?Corners {
+    var picked: [3]u8 = undefined;
+    return orientSkipping(f, &.{}, &picked);
+}
+
+/// `orient` that leaves out the triples in `skip` (indices into `f`, each in
+/// ascending order) and says which triple it took in `picked`. At most 255
+/// candidates (`max_candidates` is 64).
+fn orientSkipping(f: []Finder, skip: []const [3]u8, picked: *[3]u8) ?Corners {
     if (f.len < 3) return null;
 
     // More than three candidates is the normal case, not the exception: the
@@ -848,11 +996,17 @@ fn orient(f: []Finder) ?Corners {
     for (0..f.len) |i| {
         for (i + 1..f.len) |j| {
             for (j + 1..f.len) |k| {
+                const idx = [3]u8{ @intCast(i), @intCast(j), @intCast(k) };
+                const skipped = for (skip) |sk| {
+                    if (std.mem.eql(u8, &sk, &idx)) break true;
+                } else false;
+                if (skipped) continue;
                 const t = [3]Finder{ f[i], f[j], f[k] };
                 const sc = tripleScore(t) orelse continue;
                 if (sc < best_score) {
                     best_score = sc;
                     best = t;
+                    picked.* = idx;
                 }
             }
         }
@@ -1898,6 +2052,109 @@ fn wreck(m: *qr.Matrix) void {
         var x: u16 = m.size / 2;
         while (x < m.size) : (x += 1) m.setDark(x, y, !m.isDark(x, y));
     }
+}
+
+/// Paint `img` (a rendered symbol) into the frame `dst` at (x0, y0).
+fn blit(dst: []u8, dst_stride: usize, img: Image, x0: usize, y0: usize) void {
+    for (0..img.height) |y| {
+        @memcpy(dst[(y0 + y) * dst_stride + x0 ..][0..img.width], img.luma[y * img.stride ..][0..img.width]);
+    }
+}
+
+fn expectText(f: *const Found, want: []const u8) !void {
+    var fm = f.matrix;
+    var out: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(want, try qr.decode(&fm, &out));
+}
+
+test "scanAll: every readable symbol of a frame, in any order, and the limits" {
+    const t = std.testing;
+    const w = 480;
+    const h = 220;
+    var frame: [w * h]u8 = undefined;
+    var scratch: [scratchSize(w, h)]u8 = undefined;
+    @memset(&frame, 255);
+    var ma: qr.Matrix = undefined;
+    var mb: qr.Matrix = undefined;
+    var mc: qr.Matrix = undefined;
+    try qr.encode(&ma, "FIRST CODE", .{ .ecc = .quartile });
+    try qr.encode(&mb, "second code, a longer one with a few more characters in it", .{ .ecc = .medium });
+    try qr.encode(&mc, "THIRD", .{ .ecc = .quartile });
+    var pa: [128 * 128]u8 = undefined;
+    var pb: [160 * 160]u8 = undefined;
+    var pc: [128 * 128]u8 = undefined;
+    const ia = render(&ma, 4, &pa);
+    const ib = render(&mb, 3, &pb);
+    const ic = render(&mc, 4, &pc);
+    blit(&frame, w, ia, 10, 10);
+    blit(&frame, w, ib, 170, 30);
+    blit(&frame, w, ic, 350, 100);
+    const img: Image = .{ .luma = &frame, .width = w, .height = h, .stride = w };
+
+    var out: [4]Found = undefined;
+    const all = try scanAll(img, &scratch, &out, .{});
+    try t.expectEqual(Transform.none, all.transform);
+    try t.expectEqual(@as(usize, 3), all.found.len);
+    var seen = [3]bool{ false, false, false };
+    for (all.found) |*f| {
+        var fm = f.matrix;
+        var buf: [256]u8 = undefined;
+        const text = try qr.decode(&fm, &buf);
+        if (std.mem.eql(u8, text, "FIRST CODE")) seen[0] = true;
+        if (std.mem.startsWith(u8, text, "second code")) seen[1] = true;
+        if (std.mem.eql(u8, text, "THIRD")) seen[2] = true;
+    }
+    try t.expect(seen[0] and seen[1] and seen[2]);
+
+    // The caller's `out` bounds the answer.
+    const two = try scanAll(img, &scratch, out[0..2], .{});
+    try t.expectEqual(@as(usize, 2), two.found.len);
+    try t.expectError(Error.NotFound, scanAll(img, &scratch, out[0..0], .{}));
+
+    // One symbol: the one `scan` reads.
+    var single: [128 * 128]u8 = undefined;
+    @memset(&single, 255);
+    var sc: [scratchSize(128, 128)]u8 = undefined;
+    blit(&single, 128, ia, 0, 0);
+    const one = try scanAll(.{ .luma = &single, .width = 128, .height = 128, .stride = 128 }, &sc, &out, .{});
+    try t.expectEqual(@as(usize, 1), one.found.len);
+    try expectText(&one.found[0], "FIRST CODE");
+
+    // A blank frame.
+    @memset(&single, 255);
+    try t.expectError(Error.NotFound, scanAll(.{ .luma = &single, .width = 128, .height = 128, .stride = 128 }, &sc, &out, .{}));
+}
+
+test "scanAll: inverted symbols side by side report the transform; an unreadable one is left out" {
+    const t = std.testing;
+    const w = 340;
+    const h = 150;
+    var frame: [w * h]u8 = undefined;
+    var scratch: [scratchSize(w, h)]u8 = undefined;
+    @memset(&frame, 255);
+    var ma: qr.Matrix = undefined;
+    var mb: qr.Matrix = undefined;
+    try qr.encode(&ma, "LEFT", .{ .ecc = .quartile });
+    try qr.encode(&mb, "RIGHT", .{ .ecc = .quartile });
+    var pa: [128 * 128]u8 = undefined;
+    var pb: [128 * 128]u8 = undefined;
+    const ia = render(&ma, 4, &pa);
+    wreck(&mb);
+    const ib = render(&mb, 4, &pb);
+    blit(&frame, w, ia, 10, 10);
+    blit(&frame, w, ib, 180, 10);
+    const img: Image = .{ .luma = &frame, .width = w, .height = h, .stride = w };
+    var out: [4]Found = undefined;
+    // The wrecked one is located and sampled, never reported.
+    const got = try scanAll(img, &scratch, &out, .{});
+    try t.expectEqual(@as(usize, 1), got.found.len);
+    try expectText(&got.found[0], "LEFT");
+    // Inverted frame.
+    invertLuma(&frame, img);
+    const inv = try scanAll(img, &scratch, &out, .{});
+    try t.expectEqual(Transform.inverted, inv.transform);
+    try t.expectEqual(@as(usize, 1), inv.found.len);
+    try t.expectError(Error.NotFound, scanAll(img, &scratch, &out, .{ .try_inverted = false, .try_mirrored = false }));
 }
 
 test "scanAny: an unreadable symbol comes back as the plain attempt's grid, never as a retry's" {

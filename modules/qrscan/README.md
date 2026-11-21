@@ -97,8 +97,8 @@ takes the tilt from the top edge and corrects for it.
 - **Three pixels per module is the floor.** There, a version 37 reads at about
   94 % of angles and a version 1 at about 79 %; at four pixels per module both
   are 100 %. Below three, binarisation is deciding modules from single pixels.
-- **One symbol per image.** The candidate search finds several, but only the best
-  triple is sampled.
+- **`scan` and `scanAny` return one symbol, the best.** `scanAll(img, &scratch, &out, .{})` returns
+  every readable one, up to `out.len` (at most `qrscan.max_symbols`, 16).
 - **`stride` below `width`, or a `luma` shorter than `stride * height`, is refused with
   `Error.BadImage`**, as is a dimension below 21.
 - **`width`/`height` above `qrscan.max_dimension` (8192) are refused with

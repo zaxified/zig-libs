@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [makiuchi-d/gozxing](https://github.com/makiuchi-d/gozxing) | Go | Apache-2.0 per its LICENSE *(API says NOASSERTION; inferred)* | 672 | pushed 2025-07-20 (no releases) | Go port of ZXing, all symbologies *(inferred)*. |
 | Zig ecosystem / `std` | Zig | — | — | — | No QR reader found: `gh search repos` for zig + "qr scanner"/"qr reader" returned nothing relevant; `std` has none. |
 
-**Where we are ahead:** the only pure-Zig QR reader found; allocation-free with one caller-owned scratch buffer (`scratchSize`), luma plus explicit `stride` so a V4L2 plane is read in place; Reed-Solomon decode is in the sibling `qr` module; a fuzzed and damage-tested pipeline; inverted (light-on-dark) and mirrored symbols through `scanAny`. **Where we are behind:** one symbol per image (quirc, ZXing, rqrr return several), tilt limited to 25–30° about the vertical axis in the zxing-cpp differential (`tools/README.md`, 2026-09-17; ZXing reads to 40°) and 10–25° in the in-repo render sweep, where the horizontal axis lags (*Verification*), with no curvature model, a three-pixel-per-module floor, and none of Micro QR / Model 1 / rMQR.
+**Where we are ahead:** the only pure-Zig QR reader found; allocation-free with one caller-owned scratch buffer (`scratchSize`), luma plus explicit `stride` so a V4L2 plane is read in place; Reed-Solomon decode is in the sibling `qr` module; a fuzzed and damage-tested pipeline; inverted (light-on-dark) and mirrored symbols through `scanAny`. **Where we are behind:** tilt limited to 25–30° about the vertical axis in the zxing-cpp differential (`tools/README.md`, 2026-09-17; ZXing reads to 40°) and 10–25° in the in-repo render sweep, where the horizontal axis lags (*Verification*), with no curvature model, a three-pixel-per-module floor, and none of Micro QR / Model 1 / rMQR.
 
 ## Design & invariants
 
@@ -202,6 +202,18 @@ p is the top-right. Inverted, the symbol is transposed — and a transposed symb
 still samples cleanly and still yields a well-formed grid, so the failure appears
 as "decodes to nothing" rather than as anything pointing at orientation.
 
+**Several symbols per frame: `scanAll(img, scratch, out, opts)`.** After binarising once it takes the
+best finder triple, samples it and keeps it if `qr.decode` can read the grid, then drops the finders that
+lie inside that symbol's area (its own, and the false 1:1:3:1:1 hits in its data) and takes the next best
+triple; a triple that does not read is skipped and the search goes on (at most `max_candidates` tries per
+pass). The strict pass runs first and the relaxed one after it for what the strict pass missed, so a symbol
+is not found twice. At most `min(out.len, max_symbols = 16)` readable symbols come back, in the order found,
+all under the first transform (`ScanOptions`, as `scanAny`) that yields any; unlike `scan` and `scanAny` an
+unreadable best-effort grid is never returned, since with several symbols there is no "the" grid. quirc, rqrr
+and zxing-cpp's multi-reader all return every code found. Nothing is allocated beyond the caller's scratch:
+the candidate lists are `max_candidates` (64) entries on the stack. Symbols whose finders sit inside one
+another's area (a code printed inside another's quiet zone) are not separated.
+
 **Inverted and mirrored symbols are retries on the binarised bitmap.** `scan` reads dark
 modules on a light ground only. `scanAny(img, scratch, ScanOptions)` runs the same
 pipeline and, only when the plain attempt yields no *readable* grid, flips the polarity of
@@ -361,6 +373,3 @@ tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
   finds the finders runs along rows, so the two axes are not the same thing to it, but that is a hypothesis.
 - **Small symbols at three pixels per module.** A version 1 reads at about 79 % of angles there, against 100 % at four
   pixels. The fix has to happen in binarisation (see *What is deliberately not done* for the sampling idea that failed).
-- **Multiple symbols per frame** (quirc, rqrr and ZXing return every code found; a wallet showing two codes at once is the
-  case). Candidates for several are already found; only the best triple is sampled. Effort: medium (the API would return
-  a slice, scratch stays bounded).

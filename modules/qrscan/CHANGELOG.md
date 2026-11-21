@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Added:** `scanAll` (every readable symbol of a frame, up to `out.len` and `max_symbols`, with `ScanOptions` retries), `ScannedAll`, `max_symbols`. `scan` and `scanAny` are unchanged (the triple search gained an internal skip list).
+
 - **2026-11-16** — **New:** `scanAny(img, scratch, ScanOptions)` — `scan`, then only if that finds no readable symbol, the inverted (light-on-dark), mirrored and inverted+mirrored images (ZXing-style retries; both `try_inverted` and `try_mirrored` default on). Returns `ScannedAny{ found, transform }` with `Transform = none | inverted | mirrored | inverted_mirrored`. Binarisation runs once and retries flip/mirror the bitmap in place, so a first-attempt success costs what `scan` costs; `scan` is unchanged and no error was added.
 
 
