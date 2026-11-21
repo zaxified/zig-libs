@@ -69,6 +69,16 @@ pub const ContentBlock = union(enum) {
     text: struct { text: []const u8, citations: []const std.json.Value = &.{} },
     thinking: struct { thinking: []const u8, signature: []const u8 },
     tool_use: struct { id: []const u8, name: []const u8, input: std.json.Value },
+    /// A call of a tool the API runs itself (`web_search`, `web_fetch`,
+    /// `code_execution`, ...); `input` is the raw JSON. Echo it back with
+    /// `ContentBlockParam.server_tool_use`.
+    server_tool_use: struct { id: []const u8, name: []const u8, input: std.json.Value },
+    /// The result of a server tool: `kind` is the block's own `"type"`
+    /// (`"web_search_tool_result"`, `"web_fetch_tool_result"`,
+    /// `"code_execution_tool_result"`, any `*_tool_result` the API adds),
+    /// `content` its raw JSON (the results, or an error object). Echo it
+    /// back with `ContentBlockParam.server_tool_result`.
+    server_tool_result: struct { kind: []const u8, tool_use_id: []const u8, content: std.json.Value },
     other: OtherBlock,
 };
 
@@ -95,6 +105,11 @@ pub const ContentBlockStart = union(enum) {
     text: struct { text: []const u8 = "" },
     thinking: struct { thinking: []const u8 = "" },
     tool_use: struct { id: []const u8, name: []const u8, input: std.json.Value },
+    /// See `ContentBlock.server_tool_use`; `input` fills in via
+    /// `input_json_delta`s.
+    server_tool_use: struct { id: []const u8, name: []const u8, input: std.json.Value },
+    /// See `ContentBlock.server_tool_result` (it arrives whole).
+    server_tool_result: struct { kind: []const u8, tool_use_id: []const u8, content: std.json.Value },
     other: OtherBlock,
 };
 
@@ -134,12 +149,12 @@ pub const StreamEvent = union(enum) {
 // ── ObjectMap field helpers (mirrors acme.Client / jwt's manual-extraction
 //    idiom for polymorphic JSON) ─────────────────────────────────────────────
 
-fn strField(obj: std.json.ObjectMap, name: []const u8) []const u8 {
+pub fn strField(obj: std.json.ObjectMap, name: []const u8) []const u8 {
     const v = obj.get(name) orelse return "";
     return if (v == .string) v.string else "";
 }
 
-fn optStrField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+pub fn optStrField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const v = obj.get(name) orelse return null;
     return if (v == .string) v.string else null;
 }
@@ -153,7 +168,7 @@ fn optStrField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 /// blocks by) and on `usage` (what it bills by). Measured with
 /// `"index":4294967296` and `"input_tokens":1e300`: exit 134 in both safe
 /// modes, `index=0` / `input_tokens=9223372036854775808` in ReleaseFast.
-fn u64Field(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
+pub fn u64Field(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
     const v = obj.get(name) orelse return 0;
     return switch (v) {
         .integer => |i| if (i < 0) error.MalformedResponse else @intCast(i),
@@ -171,7 +186,7 @@ fn u64Field(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
     };
 }
 
-fn optU64Field(obj: std.json.ObjectMap, name: []const u8) ParseError!?u64 {
+pub fn optU64Field(obj: std.json.ObjectMap, name: []const u8) ParseError!?u64 {
     if (obj.get(name) == null) return null;
     return try u64Field(obj, name);
 }
@@ -184,12 +199,12 @@ fn indexField(obj: std.json.ObjectMap) ParseError!u32 {
     return @intCast(v);
 }
 
-fn objField(obj: std.json.ObjectMap, name: []const u8) ?std.json.ObjectMap {
+pub fn objField(obj: std.json.ObjectMap, name: []const u8) ?std.json.ObjectMap {
     const v = obj.get(name) orelse return null;
     return if (v == .object) v.object else null;
 }
 
-fn arrField(obj: std.json.ObjectMap, name: []const u8) []const std.json.Value {
+pub fn arrField(obj: std.json.ObjectMap, name: []const u8) []const std.json.Value {
     const v = obj.get(name) orelse return &.{};
     return if (v == .array) v.array.items else &.{};
 }
@@ -223,7 +238,24 @@ fn parseContentBlock(obj: std.json.ObjectMap) ContentBlock {
         .name = strField(obj, "name"),
         .input = obj.get("input") orelse .null,
     } };
+    if (std.mem.eql(u8, t, "server_tool_use")) return .{ .server_tool_use = .{
+        .id = strField(obj, "id"),
+        .name = strField(obj, "name"),
+        .input = obj.get("input") orelse .null,
+    } };
+    if (isServerToolResult(t)) return .{ .server_tool_result = .{
+        .kind = t,
+        .tool_use_id = strField(obj, "tool_use_id"),
+        .content = obj.get("content") orelse .null,
+    } };
     return .{ .other = .{ .object = obj } };
+}
+
+/// A `"type"` of the form `<server tool>_tool_result` (a plain
+/// `tool_result` is the application's own and never in a response).
+fn isServerToolResult(t: []const u8) bool {
+    const suffix = "_tool_result";
+    return t.len > suffix.len and std.mem.endsWith(u8, t, suffix);
 }
 
 fn parseContentBlockStart(obj: std.json.ObjectMap) ContentBlockStart {
@@ -234,6 +266,16 @@ fn parseContentBlockStart(obj: std.json.ObjectMap) ContentBlockStart {
         .id = strField(obj, "id"),
         .name = strField(obj, "name"),
         .input = obj.get("input") orelse .null,
+    } };
+    if (std.mem.eql(u8, t, "server_tool_use")) return .{ .server_tool_use = .{
+        .id = strField(obj, "id"),
+        .name = strField(obj, "name"),
+        .input = obj.get("input") orelse .null,
+    } };
+    if (isServerToolResult(t)) return .{ .server_tool_result = .{
+        .kind = t,
+        .tool_use_id = strField(obj, "tool_use_id"),
+        .content = obj.get("content") orelse .null,
     } };
     return .{ .other = .{ .object = obj } };
 }
@@ -250,7 +292,7 @@ fn parseDelta(obj: std.json.ObjectMap) ParseError!Delta {
     return error.MalformedResponse;
 }
 
-fn messageFromObject(arena: std.mem.Allocator, obj: std.json.ObjectMap) ParseError!Message {
+pub fn messageFromObject(arena: std.mem.Allocator, obj: std.json.ObjectMap) ParseError!Message {
     const items = arrField(obj, "content");
     var content: []ContentBlock = &.{};
     if (items.len != 0) {
@@ -487,6 +529,41 @@ test "parseMessage: unrecognized content block type falls back to .other" {
     const msg = try parseMessage(arena.allocator(), body);
     try testing.expectEqual(StopReason.end_turn, msg.stop_reason.?);
     try testing.expect(msg.content[0] == .other);
+}
+
+test "parseMessage: server tool blocks are typed (server_tool_use, *_tool_result), an unknown type stays .other" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // SELF-DERIVED body in the shape of Anthropic's web search tool docs.
+    const body =
+        \\{"id":"msg_s","model":"claude-opus-4-8","role":"assistant","content":[
+        \\{"type":"text","text":"Searching."},
+        \\{"type":"server_tool_use","id":"srvtoolu_01","name":"web_search","input":{"query":"zig 0.17"}},
+        \\{"type":"web_search_tool_result","tool_use_id":"srvtoolu_01","content":[{"type":"web_search_result","url":"https://ziglang.org","title":"Zig"}]},
+        \\{"type":"code_execution_tool_result","tool_use_id":"srvtoolu_02","content":{"type":"code_execution_tool_result_error","error_code":"unavailable"}},
+        \\{"type":"tool_result_like","x":1}],
+        \\"stop_reason":"pause_turn","usage":{"input_tokens":1,"output_tokens":1}}
+    ;
+    const msg = try parseMessage(arena.allocator(), body);
+    try testing.expectEqualStrings("web_search", msg.content[1].server_tool_use.name);
+    try testing.expectEqualStrings("zig 0.17", msg.content[1].server_tool_use.input.object.get("query").?.string);
+    const r = msg.content[2].server_tool_result;
+    try testing.expectEqualStrings("web_search_tool_result", r.kind);
+    try testing.expectEqualStrings("srvtoolu_01", r.tool_use_id);
+    try testing.expectEqual(@as(usize, 1), r.content.array.items.len);
+    try testing.expectEqualStrings("code_execution_tool_result", msg.content[3].server_tool_result.kind);
+    try testing.expect(msg.content[3].server_tool_result.content == .object);
+    try testing.expect(msg.content[4] == .other);
+}
+
+test "parseStreamEvent: a server tool block starts as server_tool_use or arrives whole as a result" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try parseStreamEvent(a, "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}}");
+    try testing.expectEqualStrings("web_search", s.content_block_start.content_block.server_tool_use.name);
+    const r = try parseStreamEvent(a, "{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_1\",\"content\":[]}}");
+    try testing.expectEqualStrings("web_search_tool_result", r.content_block_start.content_block.server_tool_result.kind);
 }
 
 test "parseMessage: unrecognized stop_reason forward-compats to .unknown" {

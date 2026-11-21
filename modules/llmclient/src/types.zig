@@ -90,13 +90,42 @@ pub const ContentBlockParam = union(enum) {
         cache_control: ?CacheControl = null,
     },
     /// The result your application computed for a `tool_use`, sent back
-    /// as a `user` turn. `content` is plain text (the string shorthand —
-    /// block-array tool results are out of scope for v1).
+    /// as a `user` turn. `content` is plain text (the string shorthand;
+    /// `tool_result_blocks` takes a block array).
     tool_result: struct {
         type: []const u8 = "tool_result",
         tool_use_id: []const u8,
         content: []const u8 = "",
         is_error: ?bool = null,
+        cache_control: ?CacheControl = null,
+    },
+
+    /// A tool result whose `content` is a block array (text, images,
+    /// documents: a tool that returns a picture) instead of one string.
+    tool_result_blocks: struct {
+        type: []const u8 = "tool_result",
+        tool_use_id: []const u8,
+        content: []const ContentBlockParam,
+        is_error: ?bool = null,
+        cache_control: ?CacheControl = null,
+    },
+    /// A server tool call (`web_search`, `code_execution`, ...) the
+    /// assistant made, echoed back in the next turn's history (a response's
+    /// `ContentBlock.server_tool_use`).
+    server_tool_use: struct {
+        type: []const u8 = "server_tool_use",
+        id: []const u8,
+        name: []const u8,
+        input: std.json.Value,
+    },
+    /// The result of a server tool, echoed back (a response's
+    /// `ContentBlock.server_tool_result`): `type` is the block's own
+    /// (`"web_search_tool_result"`, `"code_execution_tool_result"`, ...),
+    /// `content` its raw JSON.
+    server_tool_result: struct {
+        type: []const u8,
+        tool_use_id: []const u8,
+        content: std.json.Value,
         cache_control: ?CacheControl = null,
     },
 
@@ -123,6 +152,9 @@ pub const ImageMediaType = enum {
 pub const ImageSource = union(enum) {
     base64: struct { media_type: ImageMediaType, data: []const u8 },
     url: []const u8,
+    /// A file uploaded through the Files API (`Client.uploadFile`): its
+    /// `file_id`. The request needs the `files-api-2025-04-14` beta.
+    file: []const u8,
 
     pub fn jsonStringify(self: ImageSource, jw: anytype) !void {
         try jw.beginObject();
@@ -140,6 +172,11 @@ pub const ImageSource = union(enum) {
                 try jw.objectField("url");
                 try jw.write(u);
             },
+            .file => |id| {
+                try jw.write("file");
+                try jw.objectField("file_id");
+                try jw.write(id);
+            },
         }
         try jw.endObject();
     }
@@ -154,6 +191,9 @@ pub const DocumentSource = union(enum) {
     base64_pdf: []const u8,
     text: []const u8,
     url: []const u8,
+    /// A file uploaded through the Files API: its `file_id` (needs the
+    /// `files-api-2025-04-14` beta; `count_tokens` does not take it).
+    file: []const u8,
 
     pub fn jsonStringify(self: DocumentSource, jw: anytype) !void {
         try jw.beginObject();
@@ -177,6 +217,11 @@ pub const DocumentSource = union(enum) {
                 try jw.write("url");
                 try jw.objectField("url");
                 try jw.write(u);
+            },
+            .file => |id| {
+                try jw.write("file");
+                try jw.objectField("file_id");
+                try jw.write(id);
             },
         }
         try jw.endObject();
@@ -224,6 +269,19 @@ pub fn pdfUrlBlock(url: []const u8) ContentBlockParam {
 /// A plain-text document (the text itself, not encoded).
 pub fn textDocumentBlock(text: []const u8) ContentBlockParam {
     return .{ .document = .{ .source = .{ .text = text } } };
+}
+
+pub fn imageFileBlock(file_id: []const u8) ContentBlockParam {
+    return .{ .image = .{ .source = .{ .file = file_id } } };
+}
+
+pub fn documentFileBlock(file_id: []const u8) ContentBlockParam {
+    return .{ .document = .{ .source = .{ .file = file_id } } };
+}
+
+/// A tool result carrying a block array (text, an image, ...).
+pub fn toolResultBlocks(tool_use_id: []const u8, content: []const ContentBlockParam) ContentBlockParam {
+    return .{ .tool_result_blocks = .{ .tool_use_id = tool_use_id, .content = content } };
 }
 
 pub fn textBlock(text: []const u8) ContentBlockParam {
@@ -350,10 +408,14 @@ pub const MessageRequest = struct {
     tools: ?[]const Tool = null,
     tool_choice: ?ToolChoice = null,
     thinking: ?ThinkingConfig = null,
+    /// Automatic prompt caching: a request-level `cache_control` makes the
+    /// API place the cache breakpoint itself (on the last cacheable block)
+    /// instead of at a block you marked. Not part of `count_tokens`.
+    cache_control: ?CacheControl = null,
     stream: bool = false,
 
     pub fn jsonStringify(self: MessageRequest, jw: anytype) !void {
-        try writeRequestObject(MessageRequest, self, jw);
+        try writeRequestObject(MessageRequest, self, jw, false);
     }
 };
 
@@ -383,18 +445,23 @@ pub const CountTokensRequest = struct {
     }
 
     pub fn jsonStringify(self: CountTokensRequest, jw: anytype) !void {
-        try writeRequestObject(CountTokensRequest, self, jw);
+        try writeRequestObject(CountTokensRequest, self, jw, false);
     }
 };
 
 /// The two request bodies' shared writer: fields in declaration order, a
 /// null optional left out, `system`/`system_blocks` merged under `system`.
-fn writeRequestObject(comptime T: type, self: T, jw: anytype) !void {
+fn writeRequestObject(comptime T: type, self: T, jw: anytype, omit_stream: bool) !void {
     try jw.beginObject();
     inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |f_name, f_type| {
         if (comptime std.mem.eql(u8, f_name, "system_blocks")) continue;
         if (comptime std.mem.eql(u8, f_name, "system")) {
             try writeSystem(self.system, self.system_blocks, jw);
+        } else if (comptime std.mem.eql(u8, f_name, "stream")) {
+            if (!omit_stream) {
+                try jw.objectField(f_name);
+                try jw.write(@field(self, f_name));
+            }
         } else if (@typeInfo(f_type) == .optional) {
             if (@field(self, f_name)) |v| {
                 try jw.objectField(f_name);
@@ -422,6 +489,29 @@ fn writeSystem(text: ?[]const u8, blocks: ?[]const SystemBlock, jw: anytype) !vo
     if (text) |t| try jw.write(SystemBlock{ .text = t });
     for (bs) |b| try jw.write(b);
     try jw.endArray();
+}
+
+/// One request of a Message Batch: your `custom_id` (1-64 characters of
+/// `A-Z a-z 0-9 _ -`, unique within the batch: how a result is matched to
+/// its request) and the usual `MessageRequest` (`stream` is not part of a
+/// batch request and is left out).
+pub const BatchRequest = struct {
+    custom_id: []const u8,
+    params: MessageRequest,
+
+    pub fn jsonStringify(self: BatchRequest, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("custom_id");
+        try jw.write(self.custom_id);
+        try jw.objectField("params");
+        try writeRequestObject(MessageRequest, self.params, jw, true);
+        try jw.endObject();
+    }
+};
+
+/// Render the body of `POST /v1/messages/batches`: `{"requests":[...]}`.
+pub fn stringifyBatchAlloc(gpa: std.mem.Allocator, requests: []const BatchRequest) ![]u8 {
+    return std.json.Stringify.valueAlloc(gpa, .{ .requests = requests }, .{ .emit_null_optional_fields = false });
 }
 
 /// Render `req` to a compact (no whitespace) JSON request body, allocated
@@ -937,4 +1027,98 @@ test "CountTokensRequest.fromMessageRequest keeps system_blocks and tools" {
     try testing.expectEqual(@as(usize, 1), ct.system_blocks.?.len);
     try testing.expect(ct.tools != null);
     try testing.expectEqualStrings("tl", ct.tools.?[0].name);
+}
+
+// ── Files API sources, block-array tool results, automatic caching, batches ──
+//
+// Self-derived goldens: the shapes follow Anthropic's published request
+// documentation (file sources, tool_result content arrays, the request-level
+// `cache_control`, the batch `requests` array) but are not JSON-compared with
+// an example of the docs.
+
+test "file sources: image and document blocks reference an uploaded file_id" {
+    const json = try stringifyAlloc(testing.allocator, .{
+        .max_tokens = 8,
+        .messages = &.{MessageParam.user(&.{ imageFileBlock("file_img"), documentFileBlock("file_doc"), textBlock("what?") })},
+    });
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(
+        "{\"model\":\"claude-opus-4-8\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":[" ++
+            "{\"type\":\"image\",\"source\":{\"type\":\"file\",\"file_id\":\"file_img\"}}," ++
+            "{\"type\":\"document\",\"source\":{\"type\":\"file\",\"file_id\":\"file_doc\"}}," ++
+            "{\"type\":\"text\",\"text\":\"what?\"}]}],\"stream\":false}",
+        json,
+    );
+}
+
+test "tool_result_blocks: the content is an array (text and an image), is_error and cache_control ride along" {
+    const inner = [_]ContentBlockParam{ textBlock("chart attached"), imageBlock(.@"image/png", "QUJD") };
+    var tr = toolResultBlocks("toolu_1", &inner);
+    tr.tool_result_blocks.is_error = false;
+    tr.tool_result_blocks.cache_control = .{};
+    const json = try stringifyAlloc(testing.allocator, .{
+        .max_tokens = 8,
+        .messages = &.{MessageParam.user(&.{tr})},
+    });
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(
+        "{\"model\":\"claude-opus-4-8\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":[" ++
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":[" ++
+            "{\"type\":\"text\",\"text\":\"chart attached\"}," ++
+            "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"QUJD\"}}]," ++
+            "\"is_error\":false,\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"stream\":false}",
+        json,
+    );
+}
+
+test "server tool blocks echo back as the API sent them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const input = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"query\":\"zig\"}", .{});
+    const content = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "[{\"type\":\"web_search_result\",\"url\":\"https://x\",\"title\":\"t\"}]", .{});
+    const json = try stringifyAlloc(testing.allocator, .{
+        .max_tokens = 8,
+        .messages = &.{MessageParam.assistant(&.{
+            .{ .server_tool_use = .{ .id = "srvtoolu_1", .name = "web_search", .input = input } },
+            .{ .server_tool_result = .{ .type = "web_search_tool_result", .tool_use_id = "srvtoolu_1", .content = content } },
+        })},
+    });
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(
+        "{\"model\":\"claude-opus-4-8\",\"max_tokens\":8,\"messages\":[{\"role\":\"assistant\",\"content\":[" ++
+            "{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{\"query\":\"zig\"}}," ++
+            "{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_1\",\"content\":[{\"type\":\"web_search_result\",\"url\":\"https://x\",\"title\":\"t\"}]}]}],\"stream\":false}",
+        json,
+    );
+}
+
+test "top-level cache_control is sent on a message request and left out of count_tokens" {
+    const req: MessageRequest = .{
+        .max_tokens = 8,
+        .messages = &.{MessageParam.user(&.{textBlock("hi")})},
+        .cache_control = .{ .ttl = "1h" },
+    };
+    const json = try stringifyAlloc(testing.allocator, req);
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(
+        "{\"model\":\"claude-opus-4-8\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}]," ++
+            "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"},\"stream\":false}",
+        json,
+    );
+    const count = try stringifyCountTokensAlloc(testing.allocator, .fromMessageRequest(req));
+    defer testing.allocator.free(count);
+    try testing.expect(std.mem.find(u8, count, "cache_control") == null);
+}
+
+test "stringifyBatchAlloc: requests array of custom_id + params, stream left out, order kept" {
+    const a: MessageRequest = .{ .max_tokens = 8, .messages = &.{MessageParam.user(&.{textBlock("one")})}, .stream = true };
+    const b: MessageRequest = .{ .max_tokens = 9, .model = "m2", .system = "s", .messages = &.{MessageParam.user(&.{textBlock("two")})} };
+    const json = try stringifyBatchAlloc(testing.allocator, &.{ .{ .custom_id = "r1", .params = a }, .{ .custom_id = "r2", .params = b } });
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(
+        "{\"requests\":[" ++
+            "{\"custom_id\":\"r1\",\"params\":{\"model\":\"claude-opus-4-8\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"one\"}]}]}}," ++
+            "{\"custom_id\":\"r2\",\"params\":{\"model\":\"m2\",\"max_tokens\":9,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"two\"}]}],\"system\":\"s\"}}]}",
+        json,
+    );
 }

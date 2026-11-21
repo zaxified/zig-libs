@@ -111,7 +111,37 @@ std.debug.print("{d} input tokens\n", .{n.input_tokens});
 - `betas` entries must be plain tokens (`A-Z a-z 0-9 . _ -`); anything else is
   `error.InvalidBeta` before a byte is sent. Several are joined with commas into one header,
   the form Anthropic documents.
-- Image/document blocks that come back inside a response parse as `ContentBlock.other`.
+- Image/document blocks that come back inside a response parse as `ContentBlock.other`;
+  `server_tool_use` and `*_tool_result` blocks (web search, code execution, ...) are typed
+  (`ContentBlock.server_tool_use` / `.server_tool_result`) and echo back as
+  `ContentBlockParam.server_tool_use` / `.server_tool_result`.
+- Per-request betas: `client.createWith(gpa, req, .{ .betas = &.{"..."} })` (also `streamWith`,
+  `countTokensWith`) replaces `client.betas` for that call. `MessageRequest.cache_control = .{}` asks for
+  automatic prompt caching; `llmclient.toolResultBlocks(id, &blocks)` returns an image from a tool;
+  `imageFileBlock(file_id)` / `documentFileBlock(file_id)` reference an uploaded file.
+
+**Batches and files:**
+
+```zig
+var batch = try client.createBatch(gpa, &.{
+    .{ .custom_id = "r1", .params = req },
+    .{ .custom_id = "r2", .params = other },
+});
+defer batch.deinit();
+// ... later: var b = try client.getBatch(gpa, batch.value.id); b.value.processing_status == .ended
+var it = try client.batchResults(gpa, batch.value.id);
+defer it.deinit();
+while (try it.next()) |item| switch (item.result) { // item.custom_id says which request
+    .succeeded => |msg| _ = msg,
+    .errored, .canceled, .expired => {},
+};
+
+var up = try client.uploadFile(gpa, .{ .filename = "report.pdf", .mime_type = "application/pdf", .data = pdf_bytes });
+defer up.deinit(); // up.value.id goes into documentFileBlock; the request needs betas "files-api-2025-04-14"
+```
+
+Also `listBatches`, `cancelBatch`, `deleteBatch`, `getFile`, `listFiles`, `fileContent`, `deleteFile`;
+an id or cursor that is not `A-Z a-z 0-9 _ -` is `error.InvalidArgument`.
 
 **Knobs on `Client`, and what each one bounds** (defaults in brackets):
 `max_response_bytes` [10 MiB] — a buffered body's bytes on the wire;
@@ -182,7 +212,6 @@ A streamed call can be retried only before its first event has been consumed.
 
 ## Not provided
 
-OpenAI-compatible mode, the Batch and Files APIs (and `file` sources), block-array `tool_result` content,
-top-level automatic `cache_control`, automatic retries / 429 backoff (compose with `resilience`) and
-prompt-caching tooling beyond the per-block `cache_control` field: see SPEC.md *What is deliberately not
-done* and *Backlog / deferred*.
+OpenAI-compatible mode, automatic retries / 429 backoff (compose with `resilience`) and
+prompt-caching tooling beyond the per-block and request-level `cache_control` fields: see SPEC.md *What is
+deliberately not done*.

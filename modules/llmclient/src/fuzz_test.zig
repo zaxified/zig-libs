@@ -9,7 +9,7 @@
 //! holds what they share with the driver: the reach counters with the N-seed
 //! in-suite check, and the input draw.
 //! Driver: `LLMCLIENT_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_ONLY` selects by
-//! harness name). Harness names: llmclient-sse-parse, llmclient-sse-stream, llmclient-message, llmclient-stream-event, llmclient-token-count.
+//! harness name). Harness names: llmclient-sse-parse, llmclient-sse-stream, llmclient-message, llmclient-stream-event, llmclient-token-count, llmclient-batch.
 //!
 
 const std = @import("std");

@@ -45,11 +45,11 @@ images), PDF and plain-text documents with citations (the returned citations as 
 `ContentBlock.text.citations`, streamed as `Delta.citations_delta`), prompt caching of content blocks and of
 the system prompt, beta features via `anthropic-beta`, and `count_tokens`; the request bodies
 for these are JSON-compared against Anthropic's own published examples.
-**Where we are behind:** the Batch and Files APIs (and `file` sources), automatic retries
-(deliberately left to `resilience`), block-array `tool_result` content, top-level automatic
-`cache_control`, typed server-tool result blocks (they parse as `.other`), OpenAI-compatible
-mode (→ Backlog). None blocks a single-request Messages API user; that is why the scope is
-`core`, not `parity`.
+**Where we are behind:** automatic retries (deliberately left to `resilience`), the SDKs' typed
+streaming accumulator and tool-runner helpers, typed content of server-tool result blocks (the
+`content` is raw JSON), OpenAI-compatible mode (not an SDK feature either). Every Messages-API,
+Message Batches and Files API call of the reference SDKs is covered; the scope stays `core` until a
+survey re-assesses it.
 
 ## Design & invariants
 
@@ -81,10 +81,36 @@ text blocks, each with an optional `cache_control`; both set: the string goes fi
 block), tools, `tool_choice` and `thinking`. Content blocks cover text, thinking, tool use / result,
 base64 and url images, base64 / url / plain-text documents (`title`, `context`, `citations`) and
 `cache_control` on blocks; the returned citations are raw JSON objects on `ContentBlock.text.citations`,
-streamed as `Delta.citations_delta`. Image/document blocks and server-tool result blocks in a
-response parse as `ContentBlock.other`. Request bodies are JSON-compared against Anthropic's own
+streamed as `Delta.citations_delta`. Image and document blocks also take a `file` source (an uploaded file's `file_id`; the
+`files-api-2025-04-14` beta), a tool result can carry a block array (`tool_result_blocks`: text,
+an image), `MessageRequest.cache_control` is the request-level automatic cache breakpoint (not part
+of `count_tokens`), and server-tool blocks are echoed back with `ContentBlockParam.server_tool_use` /
+`server_tool_result`. Image/document blocks in a response parse as `ContentBlock.other`; a
+`server_tool_use` block and any `*_tool_result` block (web search, web fetch, code execution, ...)
+are typed (`ContentBlock.server_tool_use`, `.server_tool_result` with the block's own `kind` and its
+raw JSON `content`). Request bodies are JSON-compared against Anthropic's own
 published examples (see *Verification*); the byte-exact field order and the system-string/blocks
 merge rule are self-derived goldens.
+
+**Per-request betas.** `createWith`, `streamWith` and `countTokensWith` take `RequestOptions.betas`,
+which REPLACES `Client.betas` for the call (the official SDKs' per-request `anthropic-beta` header
+overrides the client default); `null` keeps the client's list. The batch and file calls use `Client.betas`.
+
+**Message Batches** (`/v1/messages/batches`): `createBatch` (`types.BatchRequest`: your `custom_id` of 1-64
+`A-Z a-z 0-9 _ -` and a `MessageRequest`, `stream` left out), `getBatch`, `listBatches`, `cancelBatch`,
+`deleteBatch`, and `batchResults`, an iterator over the JSONL body: one `BatchResultItem` per `next()`
+(`succeeded` with the `Message`, `errored` with the API's error type and message, `canceled`, `expired`; the
+order is not the request order), a line bounded by `max_response_bytes`, its parse by `max_parsed_bytes`, each
+`next()` by `read_timeout_ms`. The batch object, list page and deletion acknowledgement are parsed into
+`MessageBatch`, `BatchList`, `DeletedBatch`. **Files API** (`/v1/files`, beta `files-api-2025-04-14`, added to
+the header of every file call and not repeated when `Client.betas` has it): `uploadFile` (a `multipart/form-data`
+body with one `file` part, built in memory; the boundary is one that occurs in neither data, name nor type; a
+quote or line break in the file name is percent-encoded), `getFile`, `listFiles`, `fileContent` (the
+bytes, bounded by `max_response_bytes`; only tool-produced files are downloadable) and `deleteFile`. Ids,
+cursors and `custom_id`s that could leave a URL path or query (`/ ? & .` ...), a `limit` outside 1..1000, an empty
+batch, and a MIME type or file name that cannot go into a header are `error.InvalidArgument` before a byte is
+sent. The request and response shapes are those of Anthropic's published Batches and Files documentation as
+recalled (self-derived goldens and docs-shaped bodies; no live call: the one live test stays skipped).
 
 ## Threat model / out of scope
 
@@ -205,6 +231,12 @@ loopback script server.
   and a `resilience` dependency would reach every consumer for something they can write in ten lines.
 - **Prompt-caching tooling beyond the per-block `cache_control` field** (breakpoint-placement helpers,
   cache-hit diagnostics).
+- **OpenAI-compatible variant** (`chat/completions`): the official Anthropic SDKs have no such mode (Anthropic's
+  OpenAI-compatibility layer is a server-side endpoint a caller points an OpenAI client at), and a second
+  provider mapping would be a second client, not a feature of this one.
+- **`sse_parse` as `http.sse.ClientReader`:** it stays here. The SSE parse is generic, but no second module
+  consumes client-side SSE (the only other `text/event-stream` users write the server side); moving it into
+  `http` would widen that module for one consumer. Revisit when a second consumer exists.
 - **Following redirects:** never, so `x-api-key` cannot leave `base_url` (see *Threat model*).
 - **A browser-grade SSE parser:** `sse_parse` takes LF/CRLF only and keeps no last-event-ID buffer
   across dispatch groups.
@@ -216,15 +248,7 @@ loopback script server.
 
 ## Backlog / deferred
 
-- **Batch API** (`/v1/messages/batches`) and **Files API** (with `file` image/document sources that
-  reference it). Medium.
-- **Smaller request-surface gaps:** block-array `tool_result` content (an image returned by a tool),
-  top-level automatic `cache_control`, per-request (rather than per-`Client`) betas, typed response
-  blocks for server tools (today `.other`). Each small; fits §2.
-- **OpenAI-compatible variant** (`chat/completions` request/response mapping): sketched only, a fairly
-  mechanical follow-up once a second consumer needs it.
-- **Upstream `sse_parse` as `http.sse.ClientReader`:** it is fully generic SSE parsing with nothing
-  Anthropic-specific in it; belongs in `http` once a second consumer needs client-side SSE.
+None open.
 
 ## Anchoring
 
@@ -233,4 +257,4 @@ loopback script server.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/response.zig parses Anthropic's own published basic-streaming SSE example byte-exact, including a `ping` event no hand-built fixture had; since 2026-10-06 src/types.zig also JSON-compares image/document/system-array/count_tokens request bodies against Anthropic's published docs examples, and src/response.zig parses the docs' count_tokens outputs; every other fixture is docs-derived and the one live API test is unconditionally SkipZigTest, so it anchors nothing
+**What the tests actually contain.** src/response.zig parses Anthropic's own published basic-streaming SSE example byte-exact, including a `ping` event no hand-built fixture had; since 2026-10-06 src/types.zig also JSON-compares image/document/system-array/count_tokens request bodies against Anthropic's published docs examples, and src/response.zig parses the docs' count_tokens outputs; every other fixture is docs-derived (the batch, file, server-tool and file-source bodies are docs-shaped, written from the published API documentation, not captured) and the one live API test is unconditionally SkipZigTest, so it anchors nothing

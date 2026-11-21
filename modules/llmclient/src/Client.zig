@@ -18,6 +18,8 @@ const testkit = @import("testkit");
 const http = @import("http");
 const types = @import("types.zig");
 const response = @import("response.zig");
+const batch = @import("batch.zig");
+const files = @import("files.zig");
 const sse_parse = @import("sse_parse.zig");
 
 const Client = @This();
@@ -91,7 +93,7 @@ pub const Error = error{
     /// died".
     ResponseTooLarge,
     /// `base_url` plus the endpoint path (`/v1/messages`,
-    /// `/v1/messages/count_tokens`) doesn't fit the 256-byte URL buffer.
+    /// `/v1/messages/count_tokens`) doesn't fit the 512-byte URL buffer.
     /// A caller configuration mistake, not anything the peer sent — kept
     /// distinct from `MalformedResponse` (whose name and doc comment are
     /// both about the wire) so a caller can't confuse "my base_url is too
@@ -101,6 +103,11 @@ pub const Error = error{
     /// `A-Z a-z 0-9 . _ -` — a caller configuration mistake, refused
     /// before the request is sent.
     InvalidBeta,
+    /// A caller-supplied argument that cannot go on the wire as given: a
+    /// batch or file id, a pagination cursor, a `custom_id`, a file name
+    /// or MIME type with a control byte, a `limit` outside 1..1000, an empty
+    /// list of batch requests. Refused before a byte is sent.
+    InvalidArgument,
 };
 
 pub fn init(http_client: *http.Client, api_key: []const u8) Client {
@@ -121,28 +128,71 @@ fn noteError(c: *Client, body: []const u8) void {
     c.error_len = n;
 }
 
+/// Per-request overrides of what a call sends.
+pub const RequestOptions = struct {
+    /// Beta feature names for this request. When set (even empty), they
+    /// REPLACE `Client.betas` for the call, as a per-request
+    /// `anthropic-beta` header replaces a client default in the official
+    /// SDKs; null (the default) uses `Client.betas`. Same name rules as
+    /// `Client.betas` (`error.InvalidBeta`).
+    betas: ?[]const []const u8 = null,
+};
+
+/// How `requestHeadersWith` builds the header set.
+const HeaderSpec = struct {
+    betas: ?[]const []const u8 = null,
+    /// A beta the call needs whatever the list says (the Files API's).
+    add_beta: ?[]const u8 = null,
+    content_type: []const u8 = "application/json",
+};
+
 /// The headers every request carries, into `out`; the joined
-/// `anthropic-beta` value (when `betas` is non-empty) is allocated from
-/// `a` and must outlive the request.
+/// `anthropic-beta` value (when there is one) is allocated from `a` and
+/// must outlive the request.
 fn requestHeaders(c: *const Client, a: std.mem.Allocator, out: *[4]http.Header) Error![]const http.Header {
+    return c.requestHeadersWith(a, out, .{});
+}
+
+fn requestHeadersWith(c: *const Client, a: std.mem.Allocator, out: *[4]http.Header, spec: HeaderSpec) Error![]const http.Header {
     out[0] = .{ .name = "x-api-key", .value = c.api_key };
     out[1] = .{ .name = "anthropic-version", .value = c.anthropic_version };
-    out[2] = .{ .name = "content-type", .value = "application/json" };
-    if (c.betas.len == 0) return out[0..3];
-    var len: usize = c.betas.len - 1;
-    for (c.betas) |b| {
+    out[2] = .{ .name = "content-type", .value = spec.content_type };
+    const list = spec.betas orelse c.betas;
+    var extra: ?[]const u8 = spec.add_beta;
+    var len: usize = 0;
+    var count: usize = 0;
+    for (list) |b| {
         if (!validBeta(b)) return error.InvalidBeta;
         len += b.len;
+        count += 1;
+        if (extra) |e| if (std.mem.eql(u8, e, b)) {
+            extra = null;
+        };
     }
+    if (extra) |e| {
+        len += e.len;
+        count += 1;
+    }
+    if (count == 0) return out[0..3];
+    len += count - 1;
     const joined = a.alloc(u8, len) catch return error.OutOfMemory;
     var i: usize = 0;
-    for (c.betas, 0..) |b, n| {
+    var n: usize = 0;
+    for (list) |b| {
         if (n != 0) {
             joined[i] = ',';
             i += 1;
         }
         @memcpy(joined[i..][0..b.len], b);
         i += b.len;
+        n += 1;
+    }
+    if (extra) |e| {
+        if (n != 0) {
+            joined[i] = ',';
+            i += 1;
+        }
+        @memcpy(joined[i..][0..e.len], e);
     }
     out[3] = .{ .name = "anthropic-beta", .value = joined };
     return out[0..4];
@@ -185,7 +235,7 @@ fn mapHttpError(err: http.Client.Error) Error {
 /// whole prompt. The API never answers 3xx; a 3xx is treated like any
 /// other non-2xx: `error.UnexpectedStatus` with the body in
 /// `lastErrorBody`.
-fn requestOptions(hdrs: []const http.Header, body: []const u8) http.Client.RequestOptions {
+fn requestOptions(hdrs: []const http.Header, body: ?[]const u8) http.Client.RequestOptions {
     return .{ .headers = hdrs, .body = body, .follow_redirects = false };
 }
 
@@ -347,6 +397,11 @@ const BoundedAllocator = struct {
 /// The returned `Parsed(Message)` owns an arena backing every string in
 /// the result — call `.deinit()`.
 pub fn create(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!std.json.Parsed(Message) {
+    return c.createWith(gpa, req, .{});
+}
+
+/// `create` with per-request `RequestOptions` (betas).
+pub fn createWith(c: *Client, gpa: std.mem.Allocator, req: MessageRequest, opts: RequestOptions) Error!std.json.Parsed(Message) {
     var non_stream = req;
     non_stream.stream = false;
 
@@ -357,15 +412,11 @@ pub fn create(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!std
     const a = arena.allocator();
 
     const body = types.stringifyAlloc(a, non_stream) catch return error.OutOfMemory;
-    const resp_body = try c.postBuffered(a, messages_path, body);
+    const resp_body = try c.sendBuffered(a, .post, messages_path, body, .{ .betas = opts.betas });
 
     // The parse, under `max_parsed_bytes` (A1 F5): the wire cap bounds
     // bytes, this bounds what they turn into.
-    var bounded: BoundedAllocator = .{ .child = a, .limit = c.max_parsed_bytes };
-    const msg = response.parseMessage(bounded.allocator(), resp_body) catch |err| switch (err) {
-        error.OutOfMemory => return if (bounded.exceeded) error.ResponseTooLarge else error.OutOfMemory,
-        error.MalformedResponse => return error.MalformedResponse,
-    };
+    const msg = try c.parseBounded(a, Message, response.parseMessage, resp_body);
     return .{ .arena = arena, .value = msg };
 }
 
@@ -375,30 +426,46 @@ pub fn create(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!std
 /// `MessageRequest` as it would be sent. Nothing is retained after the
 /// call returns.
 pub fn countTokens(c: *Client, gpa: std.mem.Allocator, req: CountTokensRequest) Error!TokenCount {
+    return c.countTokensWith(gpa, req, .{});
+}
+
+/// `countTokens` with per-request `RequestOptions` (betas).
+pub fn countTokensWith(c: *Client, gpa: std.mem.Allocator, req: CountTokensRequest, opts: RequestOptions) Error!TokenCount {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
     const body = types.stringifyCountTokensAlloc(a, req) catch return error.OutOfMemory;
-    const resp_body = try c.postBuffered(a, count_tokens_path, body);
+    const resp_body = try c.sendBuffered(a, .post, count_tokens_path, body, .{ .betas = opts.betas });
+    return c.parseBounded(a, TokenCount, response.parseTokenCount, resp_body);
+}
 
+/// `parse(bounded allocator, body)` under `max_parsed_bytes`: a parse that
+/// would cost more is `error.ResponseTooLarge`.
+fn parseBounded(
+    c: *const Client,
+    a: std.mem.Allocator,
+    comptime T: type,
+    comptime parse: fn (std.mem.Allocator, []const u8) response.ParseError!T,
+    body: []const u8,
+) Error!T {
     var bounded: BoundedAllocator = .{ .child = a, .limit = c.max_parsed_bytes };
-    return response.parseTokenCount(bounded.allocator(), resp_body) catch |err| switch (err) {
+    return parse(bounded.allocator(), body) catch |err| switch (err) {
         error.OutOfMemory => return if (bounded.exceeded) error.ResponseTooLarge else error.OutOfMemory,
         error.MalformedResponse => return error.MalformedResponse,
     };
 }
 
-/// One buffered JSON `POST` to `base_url ++ path`: the response body,
+/// One buffered request to `base_url ++ path_and_query`: the response body,
 /// allocated from `a`, when the status is 2xx; otherwise the body goes to
 /// `lastErrorBody` and the call is `error.UnexpectedStatus`.
-fn postBuffered(c: *Client, a: std.mem.Allocator, path: []const u8, body: []const u8) Error![]u8 {
-    var url_buf: [256]u8 = undefined;
-    const url = try endpointUrl(c.base_url, path, &url_buf);
+fn sendBuffered(c: *Client, a: std.mem.Allocator, method: http.Method, path_and_query: []const u8, body: ?[]const u8, spec: HeaderSpec) Error![]u8 {
+    var url_buf: [512]u8 = undefined;
+    const url = try endpointUrl(c.base_url, path_and_query, &url_buf);
     var hdr_buf: [4]http.Header = undefined;
-    const hdrs = try c.requestHeaders(a, &hdr_buf);
+    const hdrs = try c.requestHeadersWith(a, &hdr_buf, spec);
 
-    var res = c.http_client.request(.post, url, requestOptions(hdrs, body)) catch |err|
+    var res = c.http_client.request(method, url, requestOptions(hdrs, body)) catch |err|
         return mapHttpError(err);
     defer res.deinit();
 
@@ -419,10 +486,360 @@ fn postBuffered(c: *Client, a: std.mem.Allocator, path: []const u8, body: []cons
     return resp_body;
 }
 
+// ── Message Batches and Files API ───────────────────────────────────────────
+
+const batches_path = "/v1/messages/batches";
+const files_path = "/v1/files";
+
+pub const MessageBatch = batch.MessageBatch;
+pub const BatchList = batch.BatchList;
+pub const DeletedBatch = batch.DeletedBatch;
+pub const BatchResultItem = batch.BatchResultItem;
+pub const FileMetadata = files.FileMetadata;
+pub const FileList = files.FileList;
+pub const DeletedFile = files.DeletedFile;
+
+/// Pagination of the two list calls (`listBatches`, `listFiles`): at most
+/// `limit` (1..1000; the API's default is 20) entries, those before
+/// `before_id` or after `after_id` (the `first_id` / `last_id` of a page).
+pub const ListOptions = struct {
+    limit: ?u32 = null,
+    before_id: ?[]const u8 = null,
+    after_id: ?[]const u8 = null,
+};
+
+/// An id (or cursor, or `custom_id`) that can sit in a URL path or query
+/// untouched: `A-Z a-z 0-9 _ -`, at most `max` bytes.
+fn validId(s: []const u8, max: usize) bool {
+    if (s.len == 0 or s.len > max) return false;
+    for (s) |ch| switch (ch) {
+        'A'...'Z', 'a'...'z', '0'...'9', '_', '-' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// `base`, then `/id` and `suffix` when `id` is given, then the list query.
+fn apiPath(buf: []u8, base: []const u8, id: ?[]const u8, suffix: []const u8, list: ?ListOptions) Error![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll(base) catch return error.InvalidArgument;
+    if (id) |i| {
+        if (!validId(i, 128)) return error.InvalidArgument;
+        w.print("/{s}{s}", .{ i, suffix }) catch return error.InvalidArgument;
+    }
+    if (list) |o| {
+        var sep: u8 = '?';
+        if (o.limit) |n| {
+            if (n < 1 or n > 1000) return error.InvalidArgument;
+            w.print("{c}limit={d}", .{ sep, n }) catch return error.InvalidArgument;
+            sep = '&';
+        }
+        if (o.before_id) |b| {
+            if (!validId(b, 128)) return error.InvalidArgument;
+            w.print("{c}before_id={s}", .{ sep, b }) catch return error.InvalidArgument;
+            sep = '&';
+        }
+        if (o.after_id) |b| {
+            if (!validId(b, 128)) return error.InvalidArgument;
+            w.print("{c}after_id={s}", .{ sep, b }) catch return error.InvalidArgument;
+        }
+    }
+    return w.buffered();
+}
+
+/// One buffered call answered by a JSON object of type `T`, parsed under
+/// `max_parsed_bytes`; the result owns an arena.
+fn callParsed(
+    c: *Client,
+    gpa: std.mem.Allocator,
+    comptime T: type,
+    comptime parse: fn (std.mem.Allocator, []const u8) response.ParseError!T,
+    method: http.Method,
+    path: []const u8,
+    body: ?[]const u8,
+    spec: HeaderSpec,
+) Error!std.json.Parsed(T) {
+    const arena = gpa.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+    errdefer gpa.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const resp_body = try c.sendBuffered(a, method, path, body, spec);
+    const value = try c.parseBounded(a, T, parse, resp_body);
+    return .{ .arena = arena, .value = value };
+}
+
+/// `POST /v1/messages/batches`: runs `requests` (each a `MessageRequest`
+/// with your `custom_id`, 1-64 characters of `A-Z a-z 0-9 _ -`) in the
+/// background at a discount; the answer is the new batch (`in_progress`).
+/// An empty list or an invalid `custom_id` is `error.InvalidArgument`;
+/// the API's own limits (100,000 requests, 256 MB) are not checked here.
+/// The result owns an arena: call `.deinit()`.
+pub fn createBatch(c: *Client, gpa: std.mem.Allocator, requests: []const types.BatchRequest) Error!std.json.Parsed(MessageBatch) {
+    if (requests.len == 0) return error.InvalidArgument;
+    for (requests) |r| if (!validId(r.custom_id, 64)) return error.InvalidArgument;
+    var build = std.heap.ArenaAllocator.init(gpa);
+    defer build.deinit();
+    const body = types.stringifyBatchAlloc(build.allocator(), requests) catch return error.OutOfMemory;
+    return c.callParsed(gpa, MessageBatch, batch.parseBatch, .post, batches_path, body, .{});
+}
+
+/// `GET /v1/messages/batches/{id}`: the batch and how far it is.
+pub fn getBatch(c: *Client, gpa: std.mem.Allocator, id: []const u8) Error!std.json.Parsed(MessageBatch) {
+    var buf: [256]u8 = undefined;
+    const path = try apiPath(&buf, batches_path, id, "", null);
+    return c.callParsed(gpa, MessageBatch, batch.parseBatch, .get, path, null, .{});
+}
+
+/// `GET /v1/messages/batches`: one page of your batches, newest first.
+pub fn listBatches(c: *Client, gpa: std.mem.Allocator, opts: ListOptions) Error!std.json.Parsed(BatchList) {
+    var buf: [512]u8 = undefined;
+    const path = try apiPath(&buf, batches_path, null, "", opts);
+    return c.callParsed(gpa, BatchList, batch.parseBatchList, .get, path, null, .{});
+}
+
+/// `POST /v1/messages/batches/{id}/cancel`: starts the cancellation
+/// (`processing_status` `canceling`; requests already running still
+/// finish and are reported in the results).
+pub fn cancelBatch(c: *Client, gpa: std.mem.Allocator, id: []const u8) Error!std.json.Parsed(MessageBatch) {
+    var buf: [256]u8 = undefined;
+    const path = try apiPath(&buf, batches_path, id, "/cancel", null);
+    return c.callParsed(gpa, MessageBatch, batch.parseBatch, .post, path, "", .{});
+}
+
+/// `DELETE /v1/messages/batches/{id}`: removes an ended batch.
+pub fn deleteBatch(c: *Client, gpa: std.mem.Allocator, id: []const u8) Error!std.json.Parsed(DeletedBatch) {
+    var buf: [256]u8 = undefined;
+    const path = try apiPath(&buf, batches_path, id, "", null);
+    return c.callParsed(gpa, DeletedBatch, batch.parseDeletedBatch, .delete, path, null, .{});
+}
+
+/// `GET /v1/messages/batches/{id}/results`: the results of an ended batch
+/// as an iterator over the JSONL body, one `BatchResultItem` per
+/// `next()` (the order is not the order of the requests; match on
+/// `custom_id`). The batch must have ended (`results_url` set), else the
+/// API answers an error (`error.UnexpectedStatus`). Owns the connection:
+/// call `ResultIterator.deinit`.
+pub fn batchResults(c: *Client, gpa: std.mem.Allocator, id: []const u8) Error!ResultIterator {
+    var path_buf: [256]u8 = undefined;
+    const path = try apiPath(&path_buf, batches_path, id, "/results", null);
+    var url_buf: [512]u8 = undefined;
+    const url = try endpointUrl(c.base_url, path, &url_buf);
+    var build = std.heap.ArenaAllocator.init(gpa);
+    defer build.deinit();
+    var hdr_buf: [4]http.Header = undefined;
+    const hdrs = try c.requestHeadersWith(build.allocator(), &hdr_buf, .{});
+
+    var res = c.http_client.request(.get, url, requestOptions(hdrs, null)) catch |err|
+        return mapHttpError(err);
+    errdefer res.deinit();
+    if (res.status < 200 or res.status >= 300) {
+        var err_buf: [error_scratch_len]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&err_buf);
+        _ = runBounded(c.http_client.io, c.readDeadline(), streamErrorBody, .{ &res, &w }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => streamErrorBody(&res, &w) catch {},
+            else => {},
+        };
+        c.noteError(w.buffered());
+        return error.UnexpectedStatus;
+    }
+    return ResultIterator.init(gpa, res, c.http_client.io, .{
+        .max_line_bytes = c.max_response_bytes,
+        .max_parsed_bytes = c.max_parsed_bytes,
+        .read_deadline_ms = c.read_timeout_ms,
+    });
+}
+
+/// Pulls one `BatchResultItem` at a time off the JSONL body of
+/// `batchResults`.
+pub const ResultIterator = struct {
+    res: http.Client.Response,
+    line: std.Io.Writer.Allocating,
+    arena: std.heap.ArenaAllocator,
+    /// Copied from the client at `batchResults` time: the wire bytes one
+    /// result line may take, the memory its parse may allocate, and the
+    /// deadline of one `next()` (milliseconds, 0 = none).
+    max_line_bytes: usize,
+    max_parsed_bytes: usize,
+    read_deadline_ms: u32,
+    io: std.Io,
+
+    const Limits = struct { max_line_bytes: usize, max_parsed_bytes: usize, read_deadline_ms: u32 };
+
+    fn init(gpa: std.mem.Allocator, res: http.Client.Response, io: std.Io, l: Limits) ResultIterator {
+        return .{
+            .res = res,
+            .line = .init(gpa),
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .max_line_bytes = l.max_line_bytes,
+            .max_parsed_bytes = l.max_parsed_bytes,
+            .read_deadline_ms = l.read_deadline_ms,
+            .io = io,
+        };
+    }
+
+    pub fn deinit(it: *ResultIterator) void {
+        it.line.deinit();
+        it.arena.deinit();
+        it.res.deinit();
+        it.* = undefined;
+    }
+
+    /// One line of the body into `line` (without its newline); false at the
+    /// end of the body.
+    fn readLine(it: *ResultIterator) error{ ReadFailed, StreamTooLong, WriteFailed }!bool {
+        const r = it.res.reader();
+        it.line.clearRetainingCapacity();
+        _ = try r.streamDelimiterLimit(&it.line.writer, '\n', .limited(it.max_line_bytes));
+        _ = r.takeByte() catch |err| switch (err) {
+            // A last line with no newline, or the clean end.
+            error.EndOfStream => return it.line.written().len != 0,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        return true;
+    }
+
+    /// The next result, or null at the end. Its memory is valid until the
+    /// next `next()` or `deinit()`. Each call is bounded by `read_timeout_ms`
+    /// (`error.Timeout`), a line by `max_response_bytes` and its parse by
+    /// `max_parsed_bytes` (`error.ResponseTooLarge`); after an error the
+    /// connection is no longer usable.
+    pub fn next(it: *ResultIterator) Error!?BatchResultItem {
+        _ = it.arena.reset(.retain_capacity);
+        while (true) {
+            const deadline: ?std.Io.Clock.Timestamp = if (it.read_deadline_ms == 0) null else blk: {
+                const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(it.read_deadline_ms), .clock = .awake } };
+                break :blk t.toTimestamp(it.io);
+            };
+            const got = runBounded(it.io, deadline, readLine, .{it}) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => it.readLine() catch |e| return it.mapLineError(e),
+                error.Timeout => return error.Timeout,
+                error.Canceled => return error.Canceled,
+                else => |e| return it.mapLineError(e),
+            };
+            if (!got) return null;
+            const text = std.mem.trim(u8, it.line.written(), " \t\r");
+            if (text.len == 0) continue;
+            const a = it.arena.allocator();
+            var bounded: BoundedAllocator = .{ .child = a, .limit = it.max_parsed_bytes };
+            return batch.parseResultLine(bounded.allocator(), text) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    if (!bounded.exceeded) return error.OutOfMemory;
+                    _ = it.arena.reset(.free_all);
+                    return error.ResponseTooLarge;
+                },
+                error.MalformedResponse => return error.MalformedResponse,
+            };
+        }
+    }
+
+    fn mapLineError(it: *ResultIterator, err: error{ ReadFailed, StreamTooLong, WriteFailed }) Error {
+        return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            error.StreamTooLong => error.ResponseTooLarge,
+            error.ReadFailed => mapHttpError(it.res.readFailure()),
+        };
+    }
+};
+
+/// A file to upload: its name, MIME type (`type/subtype`, e.g.
+/// `application/pdf`, `text/plain`, `image/png`) and bytes. The whole file
+/// is held in memory for the request.
+pub const UploadFile = struct {
+    filename: []const u8,
+    mime_type: []const u8,
+    data: []const u8,
+};
+
+/// The bytes of a `multipart/form-data` body with one `file` part, and
+/// the `Content-Type` header value that names its boundary. The boundary
+/// is one that occurs in neither the data, the name nor the type. A
+/// file name has `"`, CR and LF percent-encoded (`%22`, `%0D`, `%0A`) as a
+/// browser form does; a MIME type with a byte outside printable ASCII is
+/// `error.InvalidArgument` (it goes into a header line).
+fn multipartBody(a: std.mem.Allocator, f: UploadFile) Error!struct { body: []u8, content_type: []u8 } {
+    if (f.filename.len == 0 or f.filename.len > 255) return error.InvalidArgument;
+    if (std.mem.findScalar(u8, f.mime_type, '/') == null) return error.InvalidArgument;
+    for (f.mime_type) |ch| if (ch < 0x20 or ch > 0x7e) return error.InvalidArgument;
+    var n: usize = 0;
+    var boundary_buf: [48]u8 = undefined;
+    const boundary = while (true) : (n += 1) {
+        const b = std.mem.print(&boundary_buf, "----llmclient-boundary-{d}", .{n}) catch unreachable;
+        if (std.mem.find(u8, f.data, b) == null and std.mem.find(u8, f.filename, b) == null and std.mem.find(u8, f.mime_type, b) == null) break b;
+    };
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.print("--{s}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"", .{boundary}) catch return error.OutOfMemory;
+    for (f.filename) |ch| switch (ch) {
+        '"' => w.writeAll("%22") catch return error.OutOfMemory,
+        '\r' => w.writeAll("%0D") catch return error.OutOfMemory,
+        '\n' => w.writeAll("%0A") catch return error.OutOfMemory,
+        else => w.writeByte(ch) catch return error.OutOfMemory,
+    };
+    w.print("\"\r\nContent-Type: {s}\r\n\r\n", .{f.mime_type}) catch return error.OutOfMemory;
+    w.writeAll(f.data) catch return error.OutOfMemory;
+    w.print("\r\n--{s}--\r\n", .{boundary}) catch return error.OutOfMemory;
+    const ct = a.print("multipart/form-data; boundary={s}", .{boundary}) catch return error.OutOfMemory;
+    return .{ .body = out.toOwnedSlice() catch return error.OutOfMemory, .content_type = ct };
+}
+
+const files_spec: HeaderSpec = .{ .add_beta = files.beta };
+
+/// `POST /v1/files`: uploads a file (multipart) for use as an
+/// `ImageSource.file` / `DocumentSource.file`. Sends the Files API beta
+/// header along with `Client.betas`.
+pub fn uploadFile(c: *Client, gpa: std.mem.Allocator, f: UploadFile) Error!std.json.Parsed(FileMetadata) {
+    var build = std.heap.ArenaAllocator.init(gpa);
+    defer build.deinit();
+    const mp = try multipartBody(build.allocator(), f);
+    var spec = files_spec;
+    spec.content_type = mp.content_type;
+    return c.callParsed(gpa, FileMetadata, files.parseFile, .post, files_path, mp.body, spec);
+}
+
+/// `GET /v1/files/{id}`: a file's metadata.
+pub fn getFile(c: *Client, gpa: std.mem.Allocator, id: []const u8) Error!std.json.Parsed(FileMetadata) {
+    var buf: [256]u8 = undefined;
+    const path = try apiPath(&buf, files_path, id, "", null);
+    return c.callParsed(gpa, FileMetadata, files.parseFile, .get, path, null, files_spec);
+}
+
+/// `GET /v1/files`: one page of your files, newest first.
+pub fn listFiles(c: *Client, gpa: std.mem.Allocator, opts: ListOptions) Error!std.json.Parsed(FileList) {
+    var buf: [512]u8 = undefined;
+    const path = try apiPath(&buf, files_path, null, "", opts);
+    return c.callParsed(gpa, FileList, files.parseFileList, .get, path, null, files_spec);
+}
+
+/// `GET /v1/files/{id}/content`: a file's bytes, allocated from `gpa`
+/// (caller frees), at most `max_response_bytes` (raise it for a large
+/// file). Only files a tool produced are downloadable
+/// (`FileMetadata.downloadable`); the API refuses an uploaded one.
+pub fn fileContent(c: *Client, gpa: std.mem.Allocator, id: []const u8) Error![]u8 {
+    var buf: [256]u8 = undefined;
+    const path = try apiPath(&buf, files_path, id, "/content", null);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const body = try c.sendBuffered(arena.allocator(), .get, path, null, files_spec);
+    return gpa.dupe(u8, body) catch return error.OutOfMemory;
+}
+
+/// `DELETE /v1/files/{id}`.
+pub fn deleteFile(c: *Client, gpa: std.mem.Allocator, id: []const u8) Error!std.json.Parsed(DeletedFile) {
+    var buf: [256]u8 = undefined;
+    const path = try apiPath(&buf, files_path, id, "", null);
+    return c.callParsed(gpa, DeletedFile, files.parseDeletedFile, .delete, path, null, files_spec);
+}
+
 /// `POST /v1/messages` with `stream: true` forced; returns an
 /// `EventIterator` that pulls one `StreamEvent` per SSE dispatch group.
 /// Owns the connection — call `EventIterator.deinit`.
 pub fn stream(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!EventIterator {
+    return c.streamWith(gpa, req, .{});
+}
+
+/// `stream` with per-request `RequestOptions` (betas).
+pub fn streamWith(c: *Client, gpa: std.mem.Allocator, req: MessageRequest, opts: RequestOptions) Error!EventIterator {
     var streaming = req;
     streaming.stream = true;
 
@@ -430,10 +847,10 @@ pub fn stream(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!Eve
     defer build_arena.deinit();
     const body = types.stringifyAlloc(build_arena.allocator(), streaming) catch return error.OutOfMemory;
 
-    var url_buf: [256]u8 = undefined;
+    var url_buf: [512]u8 = undefined;
     const url = try messagesUrl(c.base_url, &url_buf);
     var hdr_buf: [4]http.Header = undefined;
-    const hdrs = try c.requestHeaders(build_arena.allocator(), &hdr_buf);
+    const hdrs = try c.requestHeadersWith(build_arena.allocator(), &hdr_buf, .{ .betas = opts.betas });
 
     var res = c.http_client.request(.post, url, requestOptions(hdrs, body)) catch |err|
         return mapHttpError(err);
@@ -607,7 +1024,7 @@ test "Client.create: golden request body, headers, and non-2xx surfaces Unexpect
     try testing.expectEqualStrings("content-type", hdrs[2].name);
     try testing.expectEqualStrings("application/json", hdrs[2].value);
 
-    var url_buf: [256]u8 = undefined;
+    var url_buf: [512]u8 = undefined;
     const url = try messagesUrl(c.base_url, &url_buf);
     try testing.expectEqualStrings("https://api.anthropic.com/v1/messages", url);
 
@@ -861,7 +1278,17 @@ const FakePeer = struct {
     last_beta_buf: [256]u8 = undefined,
     last_beta_len: usize = 0,
     last_beta_count: usize = 0,
+    last_method_buf: [16]u8 = undefined,
+    last_method_len: usize = 0,
+    last_ctype_buf: [128]u8 = undefined,
+    last_ctype_len: usize = 0,
 
+    fn lastMethod(p: *const FakePeer) []const u8 {
+        return p.last_method_buf[0..p.last_method_len];
+    }
+    fn lastContentType(p: *const FakePeer) []const u8 {
+        return p.last_ctype_buf[0..p.last_ctype_len];
+    }
     fn lastTarget(p: *const FakePeer) []const u8 {
         return p.last_target_buf[0..p.last_target_len];
     }
@@ -889,9 +1316,17 @@ const FakePeer = struct {
             @memcpy(p.last_target_buf[0..p.last_target_len], req.target[0..p.last_target_len]);
             p.last_beta_len = 0;
             p.last_beta_count = 0;
+            p.last_method_len = @min(req.method.len, p.last_method_buf.len);
+            @memcpy(p.last_method_buf[0..p.last_method_len], req.method[0..p.last_method_len]);
+            p.last_ctype_len = 0;
             var lines = std.mem.splitSequence(u8, req.header_block, "\r\n");
             while (lines.next()) |line| {
                 const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+                if (std.ascii.eqlIgnoreCase(line[0..colon], "content-type")) {
+                    const v = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                    p.last_ctype_len = @min(v.len, p.last_ctype_buf.len);
+                    @memcpy(p.last_ctype_buf[0..p.last_ctype_len], v[0..p.last_ctype_len]);
+                }
                 if (!std.ascii.eqlIgnoreCase(line[0..colon], "anthropic-beta")) continue;
                 p.last_beta_count += 1;
                 const v = std.mem.trim(u8, line[colon + 1 ..], " \t");
@@ -1436,6 +1871,238 @@ test "EventIterator.mapParserError: OutOfMemory stays, DataTooLarge frees the ar
     try testing.expect(it.arena.queryCapacity() > 0);
     try testing.expectEqual(@as(Error, error.ResponseTooLarge), it.mapParserError(error.DataTooLarge));
     try testing.expectEqual(@as(usize, 0), it.arena.queryCapacity());
+}
+
+// ── Message Batches, Files API, per-request betas ───────────────────────────
+
+const batch_json =
+    "{\"id\":\"msgbatch_01\",\"type\":\"message_batch\",\"processing_status\":\"in_progress\"," ++
+    "\"request_counts\":{\"processing\":2,\"succeeded\":0,\"errored\":0,\"canceled\":0,\"expired\":0}," ++
+    "\"ended_at\":null,\"created_at\":\"2024-09-24T18:37:24Z\",\"expires_at\":\"2024-09-25T18:37:24Z\"," ++
+    "\"cancel_initiated_at\":null,\"results_url\":null}";
+
+test "Client.createBatch: POSTs {requests:[{custom_id,params}]} without stream and returns the batch" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .blob = batch_json }});
+    defer lb.finish();
+    var c = try lb.client();
+    var req = canned_request;
+    req.max_tokens = 16;
+    req.stream = true; // not part of a batch request
+    var parsed = try c.createBatch(testing.allocator, &.{.{ .custom_id = "my-first-request", .params = req }});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("msgbatch_01", parsed.value.id);
+    try testing.expectEqual(@as(u64, 2), parsed.value.request_counts.processing);
+    try testing.expectEqualStrings("POST", lb.peer.lastMethod());
+    try testing.expectEqualStrings("/v1/messages/batches", lb.peer.lastTarget());
+    try testing.expectEqualStrings("application/json", lb.peer.lastContentType());
+    try testing.expectEqualStrings(
+        "{\"requests\":[{\"custom_id\":\"my-first-request\",\"params\":{\"model\":\"claude-opus-4-8\",\"max_tokens\":16," ++
+            "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"audit canary prompt\"}]}]}}]}",
+        lb.peer.lastBody(),
+    );
+}
+
+test "Client.createBatch: an empty list and a bad custom_id are InvalidArgument before anything is sent" {
+    var c: Client = .init(undefined, "k");
+    try testing.expectError(error.InvalidArgument, c.createBatch(testing.allocator, &.{}));
+    try testing.expectError(error.InvalidArgument, c.createBatch(testing.allocator, &.{.{ .custom_id = "has space", .params = canned_request }}));
+    try testing.expectError(error.InvalidArgument, c.createBatch(testing.allocator, &.{.{ .custom_id = "", .params = canned_request }}));
+    const too_long: [65]u8 = @splat('a');
+    try testing.expectError(error.InvalidArgument, c.createBatch(testing.allocator, &.{.{ .custom_id = &too_long, .params = canned_request }}));
+}
+
+test "Client batches: retrieve, list with a cursor, cancel and delete use the documented verbs and paths" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{
+        .{ .blob = batch_json },
+        .{ .blob = "{\"data\":[" ++ batch_json ++ "],\"has_more\":true,\"first_id\":\"msgbatch_01\",\"last_id\":\"msgbatch_01\"}" },
+        .{ .blob = batch_json },
+        .{ .blob = "{\"id\":\"msgbatch_01\",\"type\":\"message_batch_deleted\"}" },
+    });
+    defer lb.finish();
+    var c = try lb.client();
+    var b = try c.getBatch(testing.allocator, "msgbatch_01");
+    b.deinit();
+    try testing.expectEqualStrings("GET", lb.peer.lastMethod());
+    try testing.expectEqualStrings("/v1/messages/batches/msgbatch_01", lb.peer.lastTarget());
+    try testing.expectEqual(@as(usize, 0), lb.peer.lastBody().len);
+
+    var l = try c.listBatches(testing.allocator, .{ .limit = 5, .after_id = "msgbatch_00" });
+    defer l.deinit();
+    try testing.expect(l.value.has_more);
+    try testing.expectEqual(@as(usize, 1), l.value.data.len);
+    try testing.expectEqualStrings("/v1/messages/batches?limit=5&after_id=msgbatch_00", lb.peer.lastTarget());
+
+    var x = try c.cancelBatch(testing.allocator, "msgbatch_01");
+    x.deinit();
+    try testing.expectEqualStrings("POST", lb.peer.lastMethod());
+    try testing.expectEqualStrings("/v1/messages/batches/msgbatch_01/cancel", lb.peer.lastTarget());
+
+    var d = try c.deleteBatch(testing.allocator, "msgbatch_01");
+    defer d.deinit();
+    try testing.expectEqualStrings("DELETE", lb.peer.lastMethod());
+    try testing.expectEqualStrings("/v1/messages/batches/msgbatch_01", lb.peer.lastTarget());
+    try testing.expectEqualStrings("msgbatch_01", d.value.id);
+}
+
+test "apiPath: ids and cursors that could leave the path are InvalidArgument; limit is 1..1000" {
+    var buf: [256]u8 = undefined;
+    try testing.expectError(error.InvalidArgument, apiPath(&buf, "/v1/files", "../x", "", null));
+    try testing.expectError(error.InvalidArgument, apiPath(&buf, "/v1/files", "a/b", "", null));
+    try testing.expectError(error.InvalidArgument, apiPath(&buf, "/v1/files", "", "", null));
+    try testing.expectError(error.InvalidArgument, apiPath(&buf, "/v1/files", "a?b=c", "", null));
+    try testing.expectError(error.InvalidArgument, apiPath(&buf, "/v1/files", null, "", .{ .limit = 0 }));
+    try testing.expectError(error.InvalidArgument, apiPath(&buf, "/v1/files", null, "", .{ .limit = 1001 }));
+    try testing.expectError(error.InvalidArgument, apiPath(&buf, "/v1/files", null, "", .{ .after_id = "x&y" }));
+    try testing.expectEqualStrings("/v1/files?limit=1000&before_id=b&after_id=a", try apiPath(&buf, "/v1/files", null, "", .{ .limit = 1000, .before_id = "b", .after_id = "a" }));
+    try testing.expectEqualStrings("/v1/files", try apiPath(&buf, "/v1/files", null, "", .{}));
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.InvalidArgument, apiPath(&tiny, "/v1/messages/batches", "x", "", null));
+}
+
+test "Client.batchResults: one item per JSONL line, blank lines skipped, order kept, last line without a newline" {
+    const lines =
+        "{\"custom_id\":\"a\",\"result\":{\"type\":\"succeeded\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\"," ++
+        "\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}}\n" ++
+        "\r\n" ++
+        "{\"custom_id\":\"b\",\"result\":{\"type\":\"errored\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}}}\r\n" ++
+        "{\"custom_id\":\"c\",\"result\":{\"type\":\"expired\"}}";
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .blob = lines }});
+    defer lb.finish();
+    var c = try lb.client();
+    var it = try c.batchResults(testing.allocator, "msgbatch_01");
+    defer it.deinit();
+    try testing.expectEqualStrings("GET", lb.peer.lastMethod());
+    try testing.expectEqualStrings("/v1/messages/batches/msgbatch_01/results", lb.peer.lastTarget());
+    const a = (try it.next()).?;
+    try testing.expectEqualStrings("a", a.custom_id);
+    try testing.expectEqualStrings("hi", a.result.succeeded.content[0].text.text);
+    const b = (try it.next()).?;
+    try testing.expectEqualStrings("invalid_request_error", b.result.errored.type);
+    const e = (try it.next()).?;
+    try testing.expect(e.result == .expired);
+    try testing.expectEqual(@as(?BatchResultItem, null), try it.next());
+}
+
+test "Client.batchResults: a malformed line, an over-long line and a refused request are typed errors" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{
+        .{ .blob = "{\"custom_id\":\"a\"}\n" },
+        .{ .blob = "{\"custom_id\":\"a\",\"result\":{\"type\":\"expired\"}}\n" },
+        .{ .status = .{ .code = 400, .body = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"not ended\"}}" } },
+    });
+    defer lb.finish();
+    var c = try lb.client();
+    {
+        var it = try c.batchResults(testing.allocator, "msgbatch_01");
+        defer it.deinit();
+        try testing.expectError(error.MalformedResponse, it.next());
+    }
+    c.max_response_bytes = 10;
+    {
+        var it = try c.batchResults(testing.allocator, "msgbatch_01");
+        defer it.deinit();
+        try testing.expectError(error.ResponseTooLarge, it.next());
+    }
+    c.max_response_bytes = 10 << 20;
+    try testing.expectError(error.UnexpectedStatus, c.batchResults(testing.allocator, "msgbatch_01"));
+    try testing.expect(std.mem.find(u8, c.lastErrorBody().?, "not ended") != null);
+    try testing.expectError(error.InvalidArgument, c.batchResults(testing.allocator, "x/../y"));
+}
+
+test "multipartBody: golden bytes, a boundary that is not in the data, escaped file name, bad type refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const mp = try multipartBody(a, .{ .filename = "note.txt", .mime_type = "text/plain", .data = "hello" });
+    try testing.expectEqualStrings("multipart/form-data; boundary=----llmclient-boundary-0", mp.content_type);
+    try testing.expectEqualStrings(
+        "------llmclient-boundary-0\r\nContent-Disposition: form-data; name=\"file\"; filename=\"note.txt\"\r\n" ++
+            "Content-Type: text/plain\r\n\r\nhello\r\n------llmclient-boundary-0--\r\n",
+        mp.body,
+    );
+    // The data holds the first boundary: the next one is used.
+    const clash = try multipartBody(a, .{ .filename = "x", .mime_type = "application/pdf", .data = "..----llmclient-boundary-0.." });
+    try testing.expectEqualStrings("multipart/form-data; boundary=----llmclient-boundary-1", clash.content_type);
+    // A quote or line break in the name cannot end the header line.
+    const esc = try multipartBody(a, .{ .filename = "a\"b\r\nc", .mime_type = "text/plain", .data = "" });
+    try testing.expect(std.mem.find(u8, esc.body, "filename=\"a%22b%0D%0Ac\"\r\n") != null);
+    try testing.expectError(error.InvalidArgument, multipartBody(a, .{ .filename = "", .mime_type = "text/plain", .data = "" }));
+    try testing.expectError(error.InvalidArgument, multipartBody(a, .{ .filename = "f", .mime_type = "text", .data = "" }));
+    try testing.expectError(error.InvalidArgument, multipartBody(a, .{ .filename = "f", .mime_type = "text/plain\r\nX: y", .data = "" }));
+}
+
+const file_json =
+    "{\"id\":\"file_011CNha8iCJcU1wXNR6q4V8w\",\"type\":\"file\",\"filename\":\"note.txt\",\"mime_type\":\"text/plain\"," ++
+    "\"size_bytes\":5,\"created_at\":\"2025-01-01T00:00:00Z\",\"downloadable\":false}";
+
+test "Client files: upload is multipart with the Files beta (merged with the client's), list, get, content, delete" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{
+        .{ .blob = file_json },
+        .{ .blob = "{\"data\":[" ++ file_json ++ "],\"has_more\":false,\"first_id\":\"f\",\"last_id\":\"f\"}" },
+        .{ .blob = file_json },
+        .{ .blob = "raw\x00bytes" },
+        .{ .blob = "{\"id\":\"file_011CNha8iCJcU1wXNR6q4V8w\",\"type\":\"file_deleted\"}" },
+    });
+    defer lb.finish();
+    var c = try lb.client();
+    c.betas = &.{"other-beta-2025-01-01"};
+    var up = try c.uploadFile(testing.allocator, .{ .filename = "note.txt", .mime_type = "text/plain", .data = "hello" });
+    defer up.deinit();
+    try testing.expectEqualStrings("file_011CNha8iCJcU1wXNR6q4V8w", up.value.id);
+    try testing.expectEqual(@as(u64, 5), up.value.size_bytes);
+    try testing.expectEqualStrings("POST", lb.peer.lastMethod());
+    try testing.expectEqualStrings("/v1/files", lb.peer.lastTarget());
+    try testing.expectEqualStrings("multipart/form-data; boundary=----llmclient-boundary-0", lb.peer.lastContentType());
+    try testing.expectEqualStrings("other-beta-2025-01-01,files-api-2025-04-14", lb.peer.lastBeta());
+    try testing.expect(std.mem.find(u8, lb.peer.lastBody(), "filename=\"note.txt\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n") != null);
+
+    c.betas = &.{"files-api-2025-04-14"}; // not repeated
+    var l = try c.listFiles(testing.allocator, .{ .limit = 2 });
+    defer l.deinit();
+    try testing.expectEqualStrings("/v1/files?limit=2", lb.peer.lastTarget());
+    try testing.expectEqualStrings("files-api-2025-04-14", lb.peer.lastBeta());
+    try testing.expectEqual(@as(usize, 1), lb.peer.last_beta_count);
+    var g = try c.getFile(testing.allocator, "file_011CNha8iCJcU1wXNR6q4V8w");
+    g.deinit();
+    try testing.expectEqualStrings("/v1/files/file_011CNha8iCJcU1wXNR6q4V8w", lb.peer.lastTarget());
+    const bytes = try c.fileContent(testing.allocator, "file_011CNha8iCJcU1wXNR6q4V8w");
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("raw\x00bytes", bytes);
+    try testing.expectEqualStrings("/v1/files/file_011CNha8iCJcU1wXNR6q4V8w/content", lb.peer.lastTarget());
+    var d = try c.deleteFile(testing.allocator, "file_011CNha8iCJcU1wXNR6q4V8w");
+    defer d.deinit();
+    try testing.expectEqualStrings("DELETE", lb.peer.lastMethod());
+    try testing.expectEqualStrings("file_011CNha8iCJcU1wXNR6q4V8w", d.value.id);
+}
+
+test "RequestOptions.betas replaces Client.betas for one call; null keeps them; a bad name is InvalidBeta" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{
+        .{ .blob = "{\"id\":\"m\",\"model\":\"x\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":\"end_turn\",\"usage\":{}}" },
+        .{ .blob = "{\"id\":\"m\",\"model\":\"x\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":\"end_turn\",\"usage\":{}}" },
+        .{ .blob = "{\"input_tokens\":3}" },
+        .{ .blob = "{\"id\":\"m\",\"model\":\"x\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":\"end_turn\",\"usage\":{}}" },
+    });
+    defer lb.finish();
+    var c = try lb.client();
+    c.betas = &.{"client-beta-1"};
+    var m1 = try c.createWith(testing.allocator, canned_request, .{ .betas = &.{ "req-beta-1", "req-beta-2" } });
+    m1.deinit();
+    try testing.expectEqualStrings("req-beta-1,req-beta-2", lb.peer.lastBeta());
+    var m2 = try c.createWith(testing.allocator, canned_request, .{ .betas = &.{} });
+    m2.deinit();
+    try testing.expectEqual(@as(usize, 0), lb.peer.last_beta_count);
+    _ = try c.countTokensWith(testing.allocator, .fromMessageRequest(canned_request), .{ .betas = &.{"count-beta"} });
+    try testing.expectEqualStrings("count-beta", lb.peer.lastBeta());
+    var m3 = try c.createWith(testing.allocator, canned_request, .{});
+    m3.deinit();
+    try testing.expectEqualStrings("client-beta-1", lb.peer.lastBeta());
+    try testing.expectError(error.InvalidBeta, c.createWith(testing.allocator, canned_request, .{ .betas = &.{"bad name"} }));
+    try testing.expectError(error.InvalidBeta, c.streamWith(testing.allocator, canned_request, .{ .betas = &.{""} }));
 }
 
 // Real network call against the live API — skipped unconditionally.

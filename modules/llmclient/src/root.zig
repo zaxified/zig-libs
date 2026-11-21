@@ -34,10 +34,10 @@
 //! }
 //! ```
 //!
-//! **Anthropic first; OpenAI deferred.** This v1 implements the Anthropic
-//! Messages API only. See the README's Provenance/DEFER notes for the
-//! full deferred-work list (OpenAI-compatible variant, retries/backoff,
-//! prompt-caching tooling, the Files and Batch APIs, connection reuse).
+//! **Anthropic only.** The Messages API, the Message Batches API
+//! (`Client.createBatch`, `batchResults`, ...) and the Files API
+//! (`Client.uploadFile`, ...) are in; see SPEC.md *What is deliberately not
+//! done* (OpenAI-compatible variant, retries/backoff, prompt-caching tooling).
 //! Image/document content blocks, the `system` block-array form,
 //! `anthropic-beta` headers (`Client.betas`) and `Client.countTokens` are
 //! in.
@@ -121,11 +121,23 @@ pub const parseStreamEvent = response.parseStreamEvent;
 pub const TokenCount = response.TokenCount;
 pub const parseTokenCount = response.parseTokenCount;
 
+// ── batches and files (batch.zig, files.zig) ────────────────────────────────
+
+pub const batch = @import("batch.zig");
+pub const files = @import("files.zig");
+pub const BatchRequest = types.BatchRequest;
+pub const stringifyBatchAlloc = types.stringifyBatchAlloc;
+pub const imageFileBlock = types.imageFileBlock;
+pub const documentFileBlock = types.documentFileBlock;
+pub const toolResultBlocks = types.toolResultBlocks;
+
 // ── tests (dark aggregator: force test discovery across all files) ─────────
 
 test {
     _ = types;
     _ = response;
+    _ = batch;
+    _ = files;
     _ = sse_parse;
     _ = Client;
 }

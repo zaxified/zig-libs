@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — ADDED the Message Batches API (`Client.createBatch`, `getBatch`, `listBatches`, `cancelBatch`, `deleteBatch`, `batchResults` with `ResultIterator`; `BatchRequest`, `stringifyBatchAlloc`, `batch.*` types and parsers) and the Files API (`uploadFile` as multipart, `getFile`, `listFiles`, `fileContent`, `deleteFile`; `files.*`), `file` sources (`ImageSource.file`, `DocumentSource.file`, `imageFileBlock`, `documentFileBlock`), block-array tool results (`ContentBlockParam.tool_result_blocks`, `toolResultBlocks`), the request-level `MessageRequest.cache_control`, per-request betas (`Client.RequestOptions`, `createWith`, `streamWith`, `countTokensWith`; they replace `Client.betas` for the call) and typed server-tool blocks (`ContentBlock` / `ContentBlockStart` `.server_tool_use` and `.server_tool_result`, echoed back with `ContentBlockParam.server_tool_use` / `.server_tool_result`). **Source-breaking:** `Client.Error` has a new value `InvalidArgument` and `ContentBlock`, `ContentBlockStart`, `ContentBlockParam`, `ImageSource` and `DocumentSource` have new variants, so an exhaustive `switch` over any of them needs a prong. **Behaviour change:** a `server_tool_use` block and any `*_tool_result` block parse as `.server_tool_use` / `.server_tool_result` instead of `.other`; the URL buffer of every call is 512 bytes (was 256).
+
 
 
 
