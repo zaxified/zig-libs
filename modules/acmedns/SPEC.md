@@ -152,6 +152,3 @@ them), a wrong key and another account's subdomain refused with 401, the account
 
 ## Backlog / deferred
 
-- **L2** `presentFn` maps `Canceled` to `SolverFailed`: `acme.Client.SolverError` is `{OutOfMemory, SolverFailed}`, so
-  the solver cannot hand a cancellation to the client. Needs `Canceled` in `acme`'s error set (source-breaking there:
-  every exhaustive switch over it); `Dns01Solver.present` itself returns `error.Canceled`.

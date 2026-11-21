@@ -186,6 +186,17 @@ pub const Profile = struct {
     description: []const u8,
 };
 
+/// The directory's `meta` object (RFC 8555 §9.7.6), each member read on its own: one of a
+/// shape this client does not expect (a number for `website`, say) is left out, not an error.
+pub const DirectoryMeta = struct {
+    terms_of_service: ?[]const u8 = null,
+    website: ?[]const u8 = null,
+    /// The CA's CAA identities (domain names a CAA `issue` record may name).
+    caa_identities: []const []const u8 = &.{},
+    /// True when `register` needs an external account binding.
+    external_account_required: bool = false,
+};
+
 pub const Options = struct {
     /// External account binding for `register` (default none).
     eab: ?ExternalAccountBinding = null,
@@ -317,8 +328,17 @@ const Directory = struct {
     renewal_info: ?[]u8 = null,
     /// `meta.profiles` (draft-ietf-acme-profiles), owned, directory order.
     profiles: []Profile = &.{},
+    /// `meta` (RFC 8555 §9.7.6), owned.
+    meta_tos: ?[]u8 = null,
+    meta_website: ?[]u8 = null,
+    meta_caa: [][]u8 = &.{},
+    meta_eab: bool = false,
 
     fn deinit(d: *Directory, gpa: Allocator) void {
+        if (d.meta_tos) |v| gpa.free(v);
+        if (d.meta_website) |v| gpa.free(v);
+        for (d.meta_caa) |v| gpa.free(v);
+        gpa.free(d.meta_caa);
         for (d.profiles) |pr| {
             gpa.free(pr.name);
             gpa.free(pr.description);
@@ -875,6 +895,19 @@ pub fn renewalInfo(c: *Client, cert_der: []const u8) Error!RenewalInfo {
 pub fn profiles(c: *Client) Error![]const Profile {
     try c.ensureDirectory();
     return c.dir.?.profiles;
+}
+
+/// The directory's `meta` (terms of service, website, CAA identities, whether an external
+/// account is required). Borrowed from the client; valid until `deinit`.
+pub fn directoryMeta(c: *Client) Error!DirectoryMeta {
+    try c.ensureDirectory();
+    const d = &c.dir.?;
+    return .{
+        .terms_of_service = d.meta_tos,
+        .website = d.meta_website,
+        .caa_identities = d.meta_caa,
+        .external_account_required = d.meta_eab,
+    };
 }
 
 /// `renewalInfo` for the first certificate of a PEM chain (`Certificate.chain_pem`).
@@ -1508,6 +1541,7 @@ pub fn solveAuthorization(c: *Client, url: []const u8) Error!void {
     const solver = c.solverFor(kind) orelse return error.DnsPublisherMissing;
     solver.present(solver.ctx, &req) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
         error.SolverFailed => {
             c.note(if (kind == .dns_01) "DNS-01 TXT record was not published" else "the challenge solver failed to present the proof");
             return if (kind == .dns_01) error.DnsPublishFailed else error.SolverFailed;
@@ -1557,7 +1591,9 @@ pub const ChallengeRequest = struct {
     }
 };
 
-pub const SolverError = error{ OutOfMemory, SolverFailed };
+/// `Canceled`: the io cancelled the call while the solver waited (a DNS publisher polling for
+/// propagation, say); the client returns it as `error.Canceled`, not as `SolverFailed`.
+pub const SolverError = error{ OutOfMemory, SolverFailed, Canceled };
 
 /// A challenge solver (lego's provider, certmagic's `acmez.Solver`): put the
 /// proof in place, and take it away again. The three built-ins
@@ -2185,7 +2221,46 @@ fn ensureDirectory(c: *Client) Error!void {
         meta_profiles = m;
     };
     const offered = try dupeProfiles(c.gpa, meta_profiles);
+    errdefer {
+        for (offered) |pr| {
+            c.gpa.free(pr.name);
+            c.gpa.free(pr.description);
+        }
+        c.gpa.free(offered);
+    }
+    // The other members, each on its own: a shape that is not the expected one is skipped.
+    var meta_tos: ?[]u8 = null;
+    errdefer if (meta_tos) |v| c.gpa.free(v);
+    var meta_website: ?[]u8 = null;
+    errdefer if (meta_website) |v| c.gpa.free(v);
+    var caa_list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (caa_list.items) |v| c.gpa.free(v);
+        caa_list.deinit(c.gpa);
+    }
+    var meta_eab = false;
+    if (parsed.value.meta) |meta| if (meta == .object) {
+        if (meta.object.get("termsOfService")) |v| if (v == .string) {
+            meta_tos = try c.gpa.dupe(u8, v.string);
+        };
+        if (meta.object.get("website")) |v| if (v == .string) {
+            meta_website = try c.gpa.dupe(u8, v.string);
+        };
+        if (meta.object.get("caaIdentities")) |v| if (v == .array) for (v.array.items) |item| if (item == .string) {
+            const owned = try c.gpa.dupe(u8, item.string);
+            errdefer c.gpa.free(owned);
+            try caa_list.append(c.gpa, owned);
+        };
+        if (meta.object.get("externalAccountRequired")) |v| if (v == .bool) {
+            meta_eab = v.bool;
+        };
+    };
+    const meta_caa = try caa_list.toOwnedSlice(c.gpa);
     c.dir = .{
+        .meta_tos = meta_tos,
+        .meta_website = meta_website,
+        .meta_caa = meta_caa,
+        .meta_eab = meta_eab,
         .new_nonce = new_nonce,
         .new_account = new_account,
         .new_order = new_order,
@@ -5612,6 +5687,8 @@ const ZoneSolver = struct {
     presents: u32 = 0,
     cleanups: u32 = 0,
     fail: bool = false,
+    /// Present is cancelled (a solver that waited and was cancelled by the io).
+    cancel: bool = false,
     wildcard_seen: bool = false,
 
     fn solver(z: *ZoneSolver) Solver {
@@ -5623,6 +5700,7 @@ const ZoneSolver = struct {
         z.presents += 1;
         z.wildcard_seen = req.wildcard;
         if (z.fail) return error.SolverFailed;
+        if (z.cancel) return error.Canceled;
         var name_buf: [dns01_max_name_len]u8 = undefined;
         const value = req.dnsTxtValue();
         const name = req.dnsRecordName(&name_buf) catch return error.SolverFailed;
@@ -5833,6 +5911,13 @@ test "W3: a caller's Solver replaces the built-in (no dns_publisher needed); a f
     zs.fail = true;
     try testing.expectError(error.DnsPublishFailed, c.obtain(&.{"*.acme-poc.example"}));
     try testing.expectEqual(@as(u32, 2), zs.presents);
+    try testing.expectEqual(@as(u32, 1), zs.cleanups);
+
+    // The solver is cancelled while it waits: the client's own `Canceled`, not a failed solver, and no cleanup.
+    zs.fail = false;
+    zs.cancel = true;
+    try testing.expectError(error.Canceled, c.obtain(&.{"*.acme-poc.example"}));
+    try testing.expectEqual(@as(u32, 3), zs.presents);
     try testing.expectEqual(@as(u32, 1), zs.cleanups);
 
     // Without the solver and without a publisher there is nothing to solve with.
@@ -6256,9 +6341,12 @@ test "review L9: a directory whose meta is null, or a profile's description not 
     const bodies = [_][]const u8{
         "{\"newNonce\":\"http://a/n\",\"newAccount\":\"http://a/a\",\"newOrder\":\"http://a/o\",\"meta\":null}",
         "{\"newNonce\":\"http://a/n\",\"newAccount\":\"http://a/a\",\"newOrder\":\"http://a/o\",\"meta\":{\"profiles\":{\"classic\":\"90 days\",\"odd\":5}}}",
+        // Typed members read on their own: a wrong shape is left out, the others stay.
+        "{\"newNonce\":\"http://a/n\",\"newAccount\":\"http://a/a\",\"newOrder\":\"http://a/o\",\"meta\":{\"termsOfService\":\"https://ca.example/tos\",\"website\":7,\"caaIdentities\":[\"ca.example\",5,\"ca2.example\"],\"externalAccountRequired\":true}}",
+        "{\"newNonce\":\"http://a/n\",\"newAccount\":\"http://a/a\",\"newOrder\":\"http://a/o\",\"meta\":{\"termsOfService\":[],\"website\":\"https://ca.example\",\"caaIdentities\":\"x\",\"externalAccountRequired\":\"yes\"}}",
     };
-    const want = [_]usize{ 0, 1 };
-    for (bodies, want) |body, n| {
+    const want = [_]usize{ 0, 1, 0, 0 };
+    for (bodies, want, 0..) |body, n, case| {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
         var listener = addr.listen(io, .{}) catch |err|
             return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
@@ -6285,6 +6373,26 @@ test "review L9: a directory whose meta is null, or a profile's description not 
         const got = try c.profiles();
         try testing.expectEqual(n, got.len);
         if (n == 1) try testing.expectEqualStrings("classic", got[0].name);
+        const meta = try c.directoryMeta();
+        switch (case) {
+            0, 1 => {
+                try testing.expect(meta.terms_of_service == null and meta.website == null and !meta.external_account_required);
+                try testing.expectEqual(@as(usize, 0), meta.caa_identities.len);
+            },
+            2 => {
+                try testing.expectEqualStrings("https://ca.example/tos", meta.terms_of_service.?);
+                try testing.expect(meta.website == null); // a number
+                try testing.expectEqual(@as(usize, 2), meta.caa_identities.len);
+                try testing.expectEqualStrings("ca2.example", meta.caa_identities[1]);
+                try testing.expect(meta.external_account_required);
+            },
+            else => {
+                try testing.expect(meta.terms_of_service == null);
+                try testing.expectEqualStrings("https://ca.example", meta.website.?);
+                try testing.expectEqual(@as(usize, 0), meta.caa_identities.len);
+                try testing.expect(!meta.external_account_required);
+            },
+        }
     }
 }
 

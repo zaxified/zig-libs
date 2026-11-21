@@ -64,6 +64,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     app-side (out of scope).** No system clock: the ephemeral cert uses a fixed wide UTCTime window
     (`tls_alpn_not_before`/`tls_alpn_not_after`). Keygen takes randomness from the caller (the `io`
     in the order flow; a `std.Random` for the standalone `x509.tlsAlpnCert`) — no `std.crypto.random`.
+- **Directory `meta`:** `Client.directoryMeta()` gives `termsOfService`, `website`, `caaIdentities` and `externalAccountRequired` (RFC 8555 §9.7.6) beside `profiles()`; each member is read on its own, so one of a shape this client does not expect (a number for `website`) is left out and the directory still loads. The object itself is parsed as a `std.json.Value` (bounded by the 1 MiB body and freed after the directory is read), then the members are copied out.
 - **Order options:** `profile` is checked against the directory's `meta.profiles`
   before the order goes out (`required` → `NotSupported`, `preferred` → omitted); `not_before` /
   `not_after` become RFC 3339 members; `preferred_chain` compares the issuer CN of the topmost
@@ -210,7 +211,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   call `certificate` for the names of its own event (an on-demand entry is busy then). **On-demand**
   without a strict `allow` lets a client make the server order a certificate for any name it sends
   (CA rate limits, account standing); `allow` is required and the rate limit bounds the rest. The
-  redirect reflects only the Host's hostname characters. Fleet: lock takeover and release run
+  redirect reflects only the Host's hostname characters. `OnDemand.max_cached` bounds the on-demand names held (CertMagic's `Cache` capacity): a new name past it forgets a random idle one that holds a certificate, which the next handshake for it reloads from storage without the CA, through `allow` and the rate limit like any name not held; `manage`d names are never forgotten. `run` asks the manager's clock again every second, so a host that was suspended renews within a second of waking, not after the awake seconds that were left. Fleet: lock takeover and release run
   under a `flock` guard (see Storage); where the file system refuses it, the cost of the race is one duplicate order,
   never a torn file.
 - **`Client.obtain` hands back the chain as the CA sent it.** Verification of the downloaded chain (RFC 5280 path to
@@ -303,20 +304,10 @@ and its offline replay inside the lane (see *Anchoring*); `zig build interop-acm
 - **A scheduled run against Let's Encrypt STAGING itself** (Boulder, a public name, port 80): out of scope for a
   loopback lane; Pebble is the only CA the module has run against.
 - **Replay transcript for the `manager` scenario:** the offline replay does not carry it (`tools/pebble.sh --check`
-  only); regenerate with `pebble.sh` once the replay test knows the scenario.
+  only). It cannot until the signing mock below exists: the Manager mints a fresh key per issuance and `checkPair`
+  requires the chain's leaf to carry it, which a recorded Pebble chain never does.
 - **Mock CA that signs the CSR's key:** the mock issues a fixed chain whatever the CSR, so the Manager's full path is
   exercised only by Pebble; a signing mock would bring it into the lane.
-- **In-memory certificate cache with a capacity** (CertMagic `Cache`) for on-demand fleets with very many names:
-  entries are never evicted today, and `maintain` scans them linearly.
-- **Suspended hosts:** `run()` sleeps on the awake clock in steps of at most an hour, so a suspended host renews late
-  by up to an hour.
-- **Typed directory `meta`:** it is parsed into a `std.json.Value` (at most about 30-50x the 1 MiB body, bounded and
-  freed); typing it would also change the deliberate tolerance of a `meta` of any shape, so it is not a small change.
-
-## Anchoring
-
-**Anchor grade:** class A · oracle EXTERNAL
-
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 

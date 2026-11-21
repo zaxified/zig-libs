@@ -177,6 +177,14 @@ pub const OnDemand = struct {
     /// handshake timeout). Not a limit on the handshake that started the
     /// issuance.
     wait_ms: u32 = 30_000,
+    /// At most this many on-demand names are held at once (CertMagic's `Cache`
+    /// capacity); 0 = no limit. When a new name would pass it, a random idle
+    /// one that holds a certificate is forgotten first (its certificate stays
+    /// in storage: the next handshake for it loads it from there, no CA call,
+    /// but through `allow` and the rate limit like any name not held). Names
+    /// being issued are never forgotten, so the count can pass the limit
+    /// briefly. `manage`d names do not count and are never forgotten.
+    max_cached: u32 = 0,
 };
 
 /// `window_s` 0 means no limit; `max` 0 means no on-demand issuance at all.
@@ -590,6 +598,31 @@ fn sweepIdleOnDemandLocked(m: *Manager, t: i64) void {
     }
 }
 
+/// Forget random idle on-demand entries that hold a certificate until fewer than `max`
+/// on-demand entries are held (lock held).
+fn evictOnDemandLocked(m: *Manager, max: u32) void {
+    while (true) {
+        var held: usize = 0;
+        var idle: usize = 0;
+        for (m.entries.items) |e| if (e.on_demand) {
+            held += 1;
+            if (!e.busy and e.cert != null) idle += 1;
+        };
+        if (held < max or idle == 0) return;
+        // The io's own randomness: handshake threads reach this, `prng` is the maintain thread's.
+        var raw: [8]u8 = undefined;
+        m.io.random(&raw);
+        var pick = std.mem.readInt(u64, &raw, .little) % idle;
+        for (m.entries.items) |e| if (e.on_demand and !e.busy and e.cert != null) {
+            if (pick == 0) {
+                m.dropEntryLocked(e);
+                break;
+            }
+            pick -= 1;
+        };
+    }
+}
+
 /// `maintain` forever, sleeping in between (at most an hour at a time, so
 /// a wall-clock jump is noticed). Returns only when the io cancels it.
 pub fn run(m: *Manager) error{Canceled}!void {
@@ -598,8 +631,13 @@ pub fn run(m: *Manager) error{Canceled}!void {
         const next = m.maintain();
         var wait_s = std.math.clamp(next -| m.now(), 0, 3600);
         // In one-second steps, so a `manage` or `addIssuer` meanwhile is
-        // served within a second rather than at the next due time.
+        // served within a second rather than at the next due time. The awake
+        // clock does not run while the host is suspended, so each step asks
+        // the manager's clock (the wall clock) again: a wake-up from suspend
+        // finds the due time passed within a second, not after the awake
+        // seconds that were left.
         while (wait_s > 0 and !m.wake.load(.acquire)) : (wait_s -= 1) {
+            if (m.now() >= next) break;
             const d: std.Io.Clock.Duration = .{ .raw = .fromSeconds(1), .clock = .awake };
             d.sleep(m.io) catch return error.Canceled;
         }
@@ -990,6 +1028,7 @@ pub fn certificate(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemo
     // A server that never runs `maintain` must not accumulate failed names
     // (one entry per distinct SNI the policy lets through).
     m.sweepIdleOnDemandLocked(t);
+    if (od.max_cached != 0) m.evictOnDemandLocked(od.max_cached);
     const allowed = m.limiter.take(t, od.rate);
     m.mutex.unlock(m.io);
     if (!allowed) return null;

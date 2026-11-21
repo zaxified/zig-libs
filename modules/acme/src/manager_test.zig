@@ -302,6 +302,50 @@ test "manage: issue, store, serve, renew at two thirds with replaces, restart fr
     try expectServes(&m2, "a.example", chainOf(fx.a2_crt));
 }
 
+/// A clock another thread may move.
+const JumpClock = struct {
+    t: std.atomic.Value(i64),
+    fn clock(c: *JumpClock) Manager.Clock {
+        return .{ .ctx = c, .now = now };
+    }
+    fn now(ctx: ?*anyopaque) i64 {
+        const c: *JumpClock = @ptrCast(@alignCast(ctx.?));
+        return c.t.load(.acquire);
+    }
+};
+
+fn runTask(m: *Manager) error{Canceled}!void {
+    return m.run();
+}
+
+test "run: a wall-clock jump (a suspended host waking up) renews within seconds, not after the awake time that was left" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var jc: JumpClock = .{ .t = .init(day0 + day) };
+    var fake: FakeIssuer = .{ .script = &.{
+        .{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } },
+        .{ .ok = .{ .chain = chainOf(fx.a2_crt), .key = fx.a2_key } },
+    } };
+    var m = Manager.init(f.threaded.io(), testing.allocator, .{ .storage = f.mem.storage(), .clock = jc.clock(), .random_seed = 7, .node_id = "node-a" }) catch unreachable;
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    const io = f.threaded.io();
+    var fut = io.concurrent(runTask, .{&m}) catch return error.SkipZigTest;
+    var waited: u32 = 0;
+    while (@atomicLoad(usize, &fake.calls, .acquire) < 1 and waited < 500) : (waited += 1) io.sleep(.fromMilliseconds(10), .awake) catch break;
+    try testing.expectEqual(@as(usize, 1), @atomicLoad(usize, &fake.calls, .acquire));
+    // The host sleeps for weeks: the awake clock did not move, the wall clock did. `run` was waiting for
+    // the renewal 60 days away (the wait is capped at an hour of awake seconds).
+    jc.t.store(day0 + 61 * day, .release);
+    waited = 0;
+    while (@atomicLoad(usize, &fake.calls, .acquire) < 2 and waited < 400) : (waited += 1) io.sleep(.fromMilliseconds(10), .awake) catch break;
+    const renewed = @atomicLoad(usize, &fake.calls, .acquire);
+    _ = fut.cancel(io) catch {};
+    try testing.expectEqual(@as(usize, 2), renewed);
+}
+
 test "manage: a stored certificate past its renewal point is served and renewed" {
     var f: Fixture = undefined;
     f.init(day0 + 70 * day); // a1 renews at day 60
@@ -671,6 +715,35 @@ test "on-demand: policy, rate limit, failure back-off, then renewed by maintain"
     f.clock.t = day0 + 61 * day;
     _ = m.maintain();
     try testing.expectEqual(@as(usize, 5), fake.calls); // both due, script exhausted → failures
+}
+
+test "on-demand: max_cached forgets an idle name, whose certificate comes back from storage without the CA" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{ .script = &.{
+        .{ .ok = .{ .chain = chainOf(fx.od1_crt), .key = fx.od1_key } },
+        .{ .ok = .{ .chain = chainOf(fx.od2_crt), .key = fx.od2_key } },
+    } };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{
+        .ctx = &policy,
+        .allow = Policy.allow,
+        .rate = .{ .max = 10, .window_s = 60 },
+        .max_cached = 1,
+    } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try expectServes(&m, "od.example", chainOf(fx.od1_crt));
+    try testing.expectEqual(@as(usize, 1), m.entries.items.len);
+    // A second name passes the limit of one: the first is forgotten, not served from memory any more.
+    try expectServes(&m, "od2.example", chainOf(fx.od2_crt));
+    try testing.expectEqual(@as(usize, 1), m.entries.items.len);
+    try testing.expectEqual(@as(usize, 2), fake.calls);
+    // The first again: the forgotten one is loaded from storage (the issuer's script is spent, so a CA call would fail).
+    try expectServes(&m, "od.example", chainOf(fx.od1_crt));
+    try testing.expectEqual(@as(usize, 2), fake.calls);
+    try testing.expectEqual(@as(usize, 1), m.entries.items.len);
 }
 
 fn askThread(m: *Manager, got: *std.atomic.Value(u32)) void {

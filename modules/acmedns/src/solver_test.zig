@@ -428,6 +428,12 @@ fn presentTask(s: *Dns01Solver) Dns01Solver.Error!void {
     return s.present("a.example.org", "t", "t.k");
 }
 
+fn solverTask(s: *Dns01Solver) acme.Client.SolverError!void {
+    const v = s.solver();
+    const req: acme.Client.ChallengeRequest = .{ .type = .dns_01, .identifier = "a.example.org", .ip = false, .wildcard = false, .token = "t", .key_authorization = "t.k" };
+    return v.present(v.ctx, &req);
+}
+
 test "present: a delay that is canceled removes what was published" {
     const io = std.testing.io;
     var c: Seen = .{};
@@ -449,4 +455,23 @@ test "present: a delay that is canceled removes what was published" {
     try testing.expectError(error.Canceled, res);
     try testing.expectEqual(@as(usize, 0), s.pendingCount());
     try testing.expectEqualStrings("a.example.org", c.dom.cleaned());
+}
+
+test "the Solver interface: a canceled present is Canceled, not SolverFailed" {
+    const io = std.testing.io;
+    var c: Seen = .{};
+    var s = Dns01Solver.init(io, testing.allocator, .{
+        .publisher = .{ .ctx = &c, .present = Seen.present, .cleanup = Seen.cleanup },
+        .zone = "example.org",
+        .follow_cname = false,
+        .check_propagation = false,
+        .delay_ms = 20_000,
+    });
+    defer s.deinit();
+    var fut = io.concurrent(solverTask, .{&s}) catch return error.SkipZigTest;
+    var waited: u32 = 0;
+    while (c.seen.load(.acquire) == 0 and waited < 400) : (waited += 1) io.sleep(.fromMilliseconds(5), .awake) catch break;
+    io.sleep(.fromMilliseconds(50), .awake) catch {};
+    try testing.expectError(error.Canceled, fut.cancel(io));
+    try testing.expectEqual(@as(usize, 0), s.pendingCount());
 }

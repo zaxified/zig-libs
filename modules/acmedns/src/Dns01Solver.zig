@@ -119,6 +119,7 @@ fn presentFn(ctx: ?*anyopaque, req: *const acme.Client.ChallengeRequest) acme.Cl
     const s: *Dns01Solver = @ptrCast(@alignCast(ctx.?));
     return s.present(req.identifier, req.token, req.key_authorization) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
         else => error.SolverFailed,
     };
 }
