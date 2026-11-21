@@ -88,7 +88,10 @@ var client = http.Client.init(io, gpa, .{ .cookie_jar = jar.cookieJar() });
   eviction past `max_cookies`/`max_per_domain`, and the `__Secure-`/`__Host-`
   name-prefix rules (§4.1.3: a cookie that breaks them is ignored, a deletion
   included). At most 256 matching cookies are sent per request, the most
-  specific first. Thread-safe; the lock is held while the caller's writer runs.
+  specific first. Thread-safe; the lock is not held while the caller's writer runs.
+  `saveNetscapeAt`/`loadNetscapeAt` (and the clock variants) keep the cookies
+  that outlive the session in a Netscape `cookies.txt`, the file curl, wget
+  and Python's `MozillaCookieJar` read and write.
   `setCookieAt`/`writeCookiesAt` take the time explicitly; `cookieJar()` is
   the `http.Client.CookieJar` view on the `Io`'s real clock, which the client
   calls for every request and response, redirect hops included.

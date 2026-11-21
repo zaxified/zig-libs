@@ -281,32 +281,38 @@ pub const Jar = struct {
     /// as a browser drops it.
     pub fn setCookieAt(j: *Jar, url: http.Url, field: []const u8, now: i64) error{OutOfMemory}!void {
         const sc = SetCookie.parse(field) orelse return;
+        _ = try j.storeParsed(url, sc, now);
+    }
+
+    /// `setCookieAt` after parsing: true when a cookie was stored (false: it was
+    /// refused, or an expired one only deleted its predecessor).
+    fn storeParsed(j: *Jar, url: http.Url, sc: SetCookie, now: i64) error{OutOfMemory}!bool {
         var host_buf: [256]u8 = undefined;
-        const host = lowerInto(&host_buf, url.host) orelse return;
+        const host = lowerInto(&host_buf, url.host) orelse return false;
         const secure_origin = url.scheme == .https;
         // 6265bis §5.7 step 12: Secure only from a secure origin.
-        if (sc.secure and !secure_origin) return;
+        if (sc.secure and !secure_origin) return false;
 
         // §5.3 steps 5-6: the domain.
         var dom_buf: [256]u8 = undefined;
         var domain = host;
         var host_only = true;
         if (sc.domain) |raw| {
-            const d = lowerInto(&dom_buf, raw) orelse return;
+            const d = lowerInto(&dom_buf, raw) orelse return false;
             // A Domain with a trailing dot is dropped (audit 2026-10-23, MED):
             // the PSL lookup reads `co.uk.` as no public suffix -- its last
             // label is empty -- so `http://bank.co.uk./` could set a cookie
             // for every `*.co.uk.` host. Only a fully qualified host ends in a
             // dot, and it still gets its host-only cookies.
-            if (d.len != 0 and d[d.len - 1] == '.') return;
+            if (d.len != 0 and d[d.len - 1] == '.') return false;
             const is_ip = isIp(host);
             const public = if (is_ip) false else if (j.options.psl) |list| list.isPublicSuffix(d) else true;
             if (is_ip or public) {
                 // An IP or a public suffix may only name the host itself,
                 // and then the cookie is host-only.
-                if (!std.mem.eql(u8, d, host)) return;
+                if (!std.mem.eql(u8, d, host)) return false;
             } else {
-                if (!domainMatch(host, d)) return;
+                if (!domainMatch(host, d)) return false;
                 domain = d;
                 host_only = false;
             }
@@ -316,16 +322,16 @@ pub const Jar = struct {
         // The Path attribute is capped at `max_attribute_bytes`; a default
         // path from a longer request URL is refused too, so no stored cookie
         // costs more than the caps say (no-panic sweep 2026-10-28, C-3).
-        if (path.len > max_attribute_bytes) return;
+        if (path.len > max_attribute_bytes) return false;
         // 6265bis §4.1.3 / §5.7: the cookie name prefixes. `__Secure-` needs
         // the Secure flag; `__Host-` needs Secure, host-only, and an explicit
         // `Path=/` attribute. Matched without regard to case as browsers do
         // and as `SetCookie.check` does (the draft text says case-sensitive;
         // refusing more is the safe direction).
-        if (startsWithIgnoreCase(sc.name, "__Secure-") and !sc.secure) return;
+        if (startsWithIgnoreCase(sc.name, "__Secure-") and !sc.secure) return false;
         if (startsWithIgnoreCase(sc.name, "__Host-")) {
             const explicit_root = if (sc.path) |sp| std.mem.eql(u8, sp, "/") else false;
-            if (!sc.secure or !host_only or !explicit_root) return;
+            if (!sc.secure or !host_only or !explicit_root) return false;
         }
         // §5.3 step 3: Max-Age wins over Expires.
         const expiry: ?i64 = if (sc.max_age) |ma|
@@ -341,7 +347,7 @@ pub const Jar = struct {
         if (!secure_origin) for (j.entries.items) |*e| {
             if (e.secure and !e.expired(now) and std.mem.eql(u8, e.name, sc.name) and
                 (domainMatch(e.domain, domain) or domainMatch(domain, e.domain)) and
-                pathMatch(path, e.path)) return;
+                pathMatch(path, e.path)) return false;
         };
         // §5.3 step 11: same name, domain, host-only-ness and path replace.
         var created = j.tick();
@@ -361,7 +367,7 @@ pub const Jar = struct {
         // An expiry in the past only deletes. (`evict` below would drop such
         // a cookie anyway; this spares the allocation. Mutation 2026-10-05:
         // removing it is an equivalent mutant.)
-        if (expiry) |x| if (x <= now) return;
+        if (expiry) |x| if (x <= now) return false;
 
         const buf = try j.gpa.alloc(u8, sc.name.len + sc.value.len + domain.len + path.len);
         errdefer j.gpa.free(buf);
@@ -387,6 +393,7 @@ pub const Jar = struct {
             .used = j.tick(),
         });
         j.evict(slices[2], now);
+        return true;
     }
 
     fn tick(j: *Jar) u64 {
@@ -445,7 +452,8 @@ pub const Jar = struct {
         const secure_ok = url.scheme == .https;
 
         j.lock();
-        defer j.mutex.unlock();
+        var locked = true;
+        defer if (locked) j.mutex.unlock();
         // Drop the expired first: removing while picking would shift the
         // indices already picked.
         j.purgeExpired(now);
@@ -478,6 +486,31 @@ pub const Jar = struct {
         }
         if (picked.items.len == 0) return false;
         std.sort.pdq(u32, picked.items, @as([]const Entry, entries), sendsBefore);
+        // Render under the lock, write after it: the caller's writer may block
+        // (a socket) and every other thread spins on the lock meanwhile. A stack
+        // buffer holds a usual header; a larger one takes a heap copy; only if
+        // that allocation fails is the writer called with the lock held.
+        var len: usize = prefix.len;
+        for (picked.items, 0..) |k, n| {
+            if (n > 0) len += 2;
+            len += entries[k].name.len + 1 + entries[k].value.len;
+        }
+        var stack: [2048]u8 = undefined;
+        const heap: ?[]u8 = if (len > stack.len) j.gpa.alloc(u8, len) catch null else null;
+        defer if (heap) |h| j.gpa.free(h);
+        if (len <= stack.len or heap != null) {
+            var fixed: std.Io.Writer = .fixed(heap orelse &stack);
+            fixed.writeAll(prefix) catch unreachable;
+            for (picked.items, 0..) |k, n| {
+                if (n > 0) fixed.writeAll("; ") catch unreachable;
+                fixed.print("{s}={s}", .{ entries[k].name, entries[k].value }) catch unreachable;
+                entries[k].used = j.tick();
+            }
+            locked = false;
+            j.mutex.unlock();
+            try w.writeAll(fixed.buffered());
+            return true;
+        }
         try w.writeAll(prefix);
         for (picked.items, 0..) |k, n| {
             if (n > 0) try w.writeAll("; ");
@@ -485,6 +518,126 @@ pub const Jar = struct {
             entries[k].used = j.tick();
         }
         return true;
+    }
+
+    /// The first line of a file `saveNetscapeAt` writes, and the one curl,
+    /// wget and Python's `MozillaCookieJar` write.
+    pub const netscape_header = "# Netscape HTTP Cookie File\n";
+
+    /// Write the cookies that outlive the session (not session cookies, not
+    /// expired ones) as a Netscape `cookies.txt`: one line per cookie, seven
+    /// tab-separated fields -- domain (with a leading dot for a domain cookie),
+    /// `TRUE`/`FALSE` for "applies to subdomains", path, `TRUE`/`FALSE` for
+    /// Secure, expiry in Unix seconds, name, value -- in the order they were
+    /// first stored; an `HttpOnly` cookie's line starts `#HttpOnly_` (curl's
+    /// convention, read by Python 3.10+ and browsers' export tools). A cookie
+    /// whose name or value holds a tab (the format cannot say it) is left out.
+    /// The text is built under the lock and written after it.
+    pub fn saveNetscapeAt(j: *Jar, w: *std.Io.Writer, now: i64) (std.Io.Writer.Error || error{OutOfMemory})!void {
+        var out: std.Io.Writer.Allocating = .init(j.gpa);
+        defer out.deinit();
+        {
+            j.lock();
+            defer j.mutex.unlock();
+            j.purgeExpired(now);
+            try out.writer.writeAll(netscape_header);
+            // Creation order, so a file written twice is the same file.
+            const order = try j.gpa.alloc(u32, j.entries.items.len);
+            defer j.gpa.free(order);
+            for (order, 0..) |*o, k| o.* = @intCast(k);
+            std.sort.pdq(u32, order, @as([]const Entry, j.entries.items), createdBefore);
+            for (order) |k| {
+                const e = &j.entries.items[k];
+                const expiry = e.expiry orelse continue;
+                if (std.mem.findScalar(u8, e.name, '\t') != null or std.mem.findScalar(u8, e.value, '\t') != null) continue;
+                if (e.http_only) try out.writer.writeAll("#HttpOnly_");
+                try out.writer.print("{s}{s}\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\n", .{
+                    if (e.host_only) "" else ".",
+                    e.domain,
+                    if (e.host_only) "FALSE" else "TRUE",
+                    e.path,
+                    if (e.secure) "TRUE" else "FALSE",
+                    expiry,
+                    e.name,
+                    e.value,
+                });
+            }
+        }
+        try w.writeAll(out.written());
+    }
+
+    /// `saveNetscapeAt` on the jar's clock.
+    pub fn saveNetscape(j: *Jar, w: *std.Io.Writer) (std.Io.Writer.Error || error{OutOfMemory})!void {
+        return j.saveNetscapeAt(w, j.clockNow());
+    }
+
+    /// Read a Netscape `cookies.txt` (see `saveNetscapeAt`; a file from curl,
+    /// wget or a browser extension works) into the jar and return how many
+    /// cookies it kept. Blank lines and `#` comments are skipped, as is a line
+    /// that does not have seven tab-separated fields, a cookie already expired
+    /// at `now`, and anything the jar would refuse from a `Set-Cookie` of the
+    /// same host: the file is not trusted more than the network is (the cookie
+    /// is stored as if that host had set it, so a public suffix keeps it
+    /// host-only, a `__Host-` name must be a secure host-only cookie for `/`, ...). Expiry 0 makes a session cookie, as in
+    /// curl and Python. Cookies of the file replace jar cookies of the same
+    /// name, domain and path.
+    pub fn loadNetscapeAt(j: *Jar, text: []const u8, now: i64) error{OutOfMemory}!usize {
+        var kept: usize = 0;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw| {
+            var line = std.mem.trimEnd(u8, raw, "\r");
+            var http_only = false;
+            if (std.mem.startsWith(u8, line, "#HttpOnly_")) {
+                http_only = true;
+                line = line["#HttpOnly_".len..];
+            }
+            if (line.len == 0 or line[0] == '#') continue;
+            var f = std.mem.splitScalar(u8, line, '\t');
+            const dom_raw = f.next() orelse continue;
+            const subs = f.next() orelse continue;
+            const path = f.next() orelse continue;
+            const secure = f.next() orelse continue;
+            const expiry_text = f.next() orelse continue;
+            const name = f.next() orelse continue;
+            const value = f.next() orelse continue;
+            if (f.next() != null) continue; // more than seven fields
+            const domain = if (dom_raw.len != 0 and dom_raw[0] == '.') dom_raw[1..] else dom_raw;
+            if (domain.len == 0 or path.len == 0 or path[0] != '/' or name.len == 0) continue;
+            const expiry = std.fmt.parseInt(i64, expiry_text, 10) catch continue;
+            // What `SetCookie.parse` and the Cookie header could not carry.
+            if (hasControl(name) or hasControl(value) or hasControl(domain) or hasControl(path)) continue;
+            if (std.mem.findAny(u8, name, "=;") != null or std.mem.findScalar(u8, value, ';') != null) continue;
+            if (std.mem.trim(u8, name, wsp).len != name.len or std.mem.trim(u8, value, wsp).len != value.len) continue;
+            if (name.len + value.len > max_name_value_bytes or path.len > max_attribute_bytes or domain.len > max_attribute_bytes) continue;
+            const is_secure = std.ascii.eqlIgnoreCase(secure, "TRUE");
+            const url: http.Url = .{
+                .scheme = if (is_secure) .https else .http,
+                .host = domain,
+                .port = if (is_secure) 443 else 80,
+                .path = "/",
+                .query = "",
+            };
+            const sc: SetCookie = .{
+                .name = name,
+                .value = value,
+                .expires = if (expiry > 0) expiry else null,
+                .domain = if (std.ascii.eqlIgnoreCase(subs, "TRUE")) domain else null,
+                .path = path,
+                .secure = is_secure,
+                .http_only = http_only,
+            };
+            if (try j.storeParsed(url, sc, now)) kept += 1;
+        }
+        return kept;
+    }
+
+    /// `loadNetscapeAt` on the jar's clock.
+    pub fn loadNetscape(j: *Jar, text: []const u8) error{OutOfMemory}!usize {
+        return j.loadNetscapeAt(text, j.clockNow());
+    }
+
+    fn createdBefore(es: []const Entry, a: u32, b: u32) bool {
+        return es[a].created < es[b].created;
     }
 
     /// §5.4 step 2 order: longer path first, then earlier creation.
@@ -1129,6 +1282,125 @@ test "an IP host: Domain naming the IP is stored host-only, so a later plain coo
     try j.setCookieAt(u("http://1.2.3.4/"), "a=2", t0);
     try testing.expectEqual(@as(usize, 1), j.count());
     try testing.expectEqualStrings("a=2", try header(&j, "http://1.2.3.4/", t0));
+}
+
+const LockProbe = struct {
+    w: std.Io.Writer,
+    jar: *Jar,
+    calls: usize = 0,
+    bytes: usize = 0,
+
+    fn init(jar: *Jar) LockProbe {
+        return .{ .jar = jar, .w = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } } };
+    }
+
+    // A lock held here would spin `count` forever.
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *LockProbe = @fieldParentPtr("w", w);
+        self.calls += 1;
+        _ = self.jar.count();
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        n += data[data.len - 1].len * splat;
+        self.bytes += n;
+        return n;
+    }
+};
+
+test "writeCookiesAt: the caller's writer runs after the lock is released, short header or long" {
+    var j = Jar.init(testing.allocator, undefined, .{});
+    defer j.deinit();
+    try j.setCookieAt(u("http://a.test/"), "a=1", t0);
+    var p = LockProbe.init(&j);
+    try testing.expect(try j.writeCookiesAt(u("http://a.test/"), t0, &p.w, "Cookie: "));
+    try testing.expectEqual(@as(usize, "Cookie: a=1".len), p.bytes);
+    try testing.expect(p.calls > 0);
+
+    // Over the 2 KiB stack buffer: a heap copy.
+    const big: [1500]u8 = @splat('v');
+    try j.setCookieAt(u("http://a.test/"), "b=" ++ &big, t0);
+    try j.setCookieAt(u("http://a.test/"), "c=" ++ &big, t0);
+    var p2 = LockProbe.init(&j);
+    try testing.expect(try j.writeCookiesAt(u("http://a.test/"), t0, &p2.w, ""));
+    try testing.expectEqual(@as(usize, 3 + 2 + 1502 + 2 + 1502), p2.bytes);
+}
+
+test "writeCookiesAt: a long header still goes out when the copy cannot be allocated" {
+    var fa = testing.FailingAllocator.init(testing.allocator, .{});
+    var j = Jar.init(fa.allocator(), undefined, .{});
+    defer j.deinit();
+    const big: [1500]u8 = @splat('v');
+    try j.setCookieAt(u("http://a.test/"), "b=" ++ &big, t0);
+    try j.setCookieAt(u("http://a.test/"), "c=" ++ &big, t0);
+    fa.fail_index = fa.alloc_index;
+    var out: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try testing.expect(try j.writeCookiesAt(u("http://a.test/"), t0, &w, ""));
+    try testing.expectEqualStrings("b=" ++ &big ++ "; c=" ++ &big, w.buffered());
+}
+
+test "Netscape cookies.txt: what is saved is what loads back, session and expired cookies stay out" {
+    var list = try PublicSuffixList.parse(testing.allocator, "");
+    defer list.deinit();
+    var a = Jar.init(testing.allocator, undefined, .{ .psl = &list });
+    defer a.deinit();
+    try a.setCookieAt(u("https://www.a.test/x/y"), "dom=1; Domain=a.test; Path=/; Max-Age=1000; Secure", t0);
+    try a.setCookieAt(u("http://www.a.test/"), "host=2; Max-Age=500; HttpOnly", t0);
+    try a.setCookieAt(u("http://www.a.test/"), "sess=3", t0);
+    try a.setCookieAt(u("http://www.a.test/"), "gone=4; Max-Age=10", t0);
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try a.saveNetscapeAt(&w, t0 + 100);
+    const want = Jar.netscape_header ++
+        "#HttpOnly_www.a.test\tFALSE\t/\tFALSE\t1800000500\thost\t2\n";
+    try testing.expect(std.mem.startsWith(u8, w.buffered(), Jar.netscape_header));
+    // `dom` came first, so it is the first line; `sess` and `gone` are absent.
+    try testing.expectEqualStrings(Jar.netscape_header ++
+        ".a.test\tTRUE\t/\tTRUE\t1800001000\tdom\t1\n" ++
+        "#HttpOnly_www.a.test\tFALSE\t/\tFALSE\t1800000500\thost\t2\n", w.buffered());
+    _ = want;
+
+    var b = Jar.init(testing.allocator, undefined, .{ .psl = &list });
+    defer b.deinit();
+    try testing.expectEqual(@as(usize, 2), try b.loadNetscapeAt(w.buffered(), t0 + 100));
+    try testing.expectEqualStrings("dom=1; host=2", try header(&b, "https://www.a.test/", t0 + 100));
+    // A domain cookie reaches the sibling host, the host-only one does not; Secure stays Secure.
+    try testing.expectEqualStrings("dom=1", try header(&b, "https://other.a.test/", t0 + 100));
+    try testing.expect(!try b.writeCookiesAt(u("http://other.a.test/"), t0 + 100, &w, ""));
+    // Saved again, the same file.
+    var buf2: [1024]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    try b.saveNetscapeAt(&w2, t0 + 100);
+    try testing.expectEqualStrings(w.buffered(), w2.buffered());
+    // After the first expiry, one is gone.
+    var buf3: [1024]u8 = undefined;
+    var w3: std.Io.Writer = .fixed(&buf3);
+    try b.saveNetscapeAt(&w3, t0 + 600);
+    try testing.expectEqualStrings(Jar.netscape_header ++ ".a.test\tTRUE\t/\tTRUE\t1800001000\tdom\t1\n", w3.buffered());
+}
+
+test "Netscape cookies.txt: curl's lines load, anything the jar would refuse from the network is skipped" {
+    var j = Jar.init(testing.allocator, undefined, .{});
+    defer j.deinit();
+    const text =
+        "# Netscape HTTP Cookie File\r\n" ++
+        "# a comment\r\n" ++
+        "\r\n" ++
+        "example.org\tFALSE\t/\tFALSE\t1900000000\tgood\tvalue with space\r\n" ++
+        "#HttpOnly_example.org\tFALSE\t/a\tFALSE\t0\tsession\tx\r\n" ++
+        ".example.org\tTRUE\t/\tFALSE\t1900000000\tdomain\tkept for the host\r\n" ++
+        "example.org\tFALSE\t/\tFALSE\t1000\told\texpired\r\n" ++
+        "example.org\tFALSE\t/\tFALSE\t1900000000\t__Host-x\tinsecure host prefix\r\n" ++
+        "example.org\tFALSE\t/\tFALSE\tnotanumber\tbad\tx\r\n" ++
+        "example.org\tFALSE\tnotapath\tFALSE\t1900000000\tbad\tx\r\n" ++
+        "example.org\tFALSE\t/\tFALSE\t1900000000\ta;b\tx\r\n" ++
+        "example.org\tFALSE\t/\tFALSE\t1900000000\tshort\n" ++
+        "example.org\tFALSE\t/\tTRUE\t1900000000\tsec\tonly https\n";
+    try testing.expectEqual(@as(usize, 4), try j.loadNetscapeAt(text, t0));
+    try testing.expectEqualStrings("good=value with space; domain=kept for the host", try header(&j, "http://example.org/", t0));
+    // The session cookie is for /a only; the Secure one needs https.
+    try testing.expectEqualStrings("session=x; good=value with space; domain=kept for the host", try header(&j, "http://example.org/a/b", t0));
+    try testing.expectEqualStrings("good=value with space; domain=kept for the host; sec=only https", try header(&j, "https://example.org/", t0));
 }
 
 test "writeCookiesAt: the prefix, and nothing at all when no cookie applies" {

@@ -84,7 +84,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   is never the binding constraint. Over-long ⇒ `error.BufferTooSmall`; a `Set-Cookie` is never
   truncated, since a truncated one still parses and would be stored silently corrupted.
 
-- **Client jar (`jar.zig`) and Public Suffix List (`psl.zig`).** `Jar` is RFC 6265 §5.2-§5.4 for a client: `jar.SetCookie.parse` (§5.2 with the §5.1.1 cookie-date algorithm), storage (§5.3), retrieval (§5.4: longest path first, then oldest). The list is the caller's (`PublicSuffixList.parse`); with none every `Domain` attribute counts as a public suffix (host-only when it names the host, otherwise dropped). A `Domain` with a trailing dot is dropped, since `co.uk.` reads as no public suffix. RFC 6265bis rules: `Secure` only from https and a plain origin cannot shadow a live (unexpired) secure cookie. A name+value over `max_name_value_bytes` (4096) or an attribute over `max_attribute_bytes` (1024) is ignored; eviction past `max_cookies`/`max_per_domain` removes expired cookies, then the least recently used. Thread-safe (a spin lock), and `writeCookiesAt` takes the time explicitly.
+- **Client jar (`jar.zig`) and Public Suffix List (`psl.zig`).** `Jar` is RFC 6265 §5.2-§5.4 for a client: `jar.SetCookie.parse` (§5.2 with the §5.1.1 cookie-date algorithm), storage (§5.3), retrieval (§5.4: longest path first, then oldest). The list is the caller's (`PublicSuffixList.parse`); with none every `Domain` attribute counts as a public suffix (host-only when it names the host, otherwise dropped). Persistence is the Netscape `cookies.txt` format that curl, wget and Python's `MozillaCookieJar` share (`saveNetscapeAt` writes the non-session, unexpired cookies, `#HttpOnly_` for HttpOnly; `loadNetscapeAt` stores each line as if its host had set it, through the same checks as a `Set-Cookie`, so a file is trusted no more than the network; expiry 0 is a session cookie; without a list a domain cookie comes back host-only). A `Domain` with a trailing dot is dropped, since `co.uk.` reads as no public suffix. RFC 6265bis rules: `Secure` only from https and a plain origin cannot shadow a live (unexpired) secure cookie. A name+value over `max_name_value_bytes` (4096) or an attribute over `max_attribute_bytes` (1024) is ignored; eviction past `max_cookies`/`max_per_domain` removes expired cookies, then the least recently used. Thread-safe (a spin lock), and `writeCookiesAt` takes the time explicitly.
 - **Jar name prefixes (6265bis §4.1.3 / §5.7).** `setCookieAt` ignores a `__Secure-` cookie without `Secure`; a `__Host-` cookie needs `Secure`, host-only (a `Domain` the list lets through makes it a domain cookie, the host's own name included; with no list a `Domain` naming the host stays host-only) and an explicit `Path=/` attribute (a missing or invalid `Path` does not count). A refused cookie is ignored entirely, a deletion (`Max-Age=0`) included. The draft is spec-mandatory for a user agent and curl and the browsers enforce both; the match is case-insensitive like the builder's (`SetCookie.check`), stricter than the draft text and the safe direction. There is no opt-out. Go's cookiejar and Python's `http.cookiejar` do no prefix handling, so the Go oracle has no vector with a prefixed name.
 - **Jar retrieval cap.** `writeCookiesAt` sends at most 256 matching cookies; when more match, the 256 sent are the first 256 in §5.4 order (a later match replaces the last picked one if it sorts before it). Expired cookies are purged in one compaction pass.
 
@@ -95,7 +95,7 @@ forges, alters or (with `.bound`/`private`) moves a value to another cookie name
 `private` against a client reading it. Does not: expire a plain `sign`/`seal` value on the server
 (it stays valid as long as its key; use the `*Timed` variants or rotate keys), prevent
 replay of a captured value within its lifetime, enforce (in the builder; `Jar` does) Domain/Path scoping or
-the public-suffix list, or evaluate Expires/Max-Age (no clock). The jar spin lock is held while the caller's writer runs (see *Backlog / deferred*), and the public percent helpers and `isCookieValue` are not constant-time (not used with secrets internally). `set` appends a `Set-Cookie` line
+the public-suffix list, or evaluate Expires/Max-Age (no clock). The jar's spin lock is never held while the caller's writer runs (the header is rendered into a 2 KiB stack buffer, or a heap copy when longer, and written after unlocking; only when that allocation fails is the writer called under the lock, as before), and the public percent helpers and `isCookieValue` are not constant-time (not used with secrets internally). `set` appends a `Set-Cookie` line
 per call (`addSetCookie`, as Go's `http.SetCookie`); it never replaces one. The parser is
 deliberately non-validating on read.
 
@@ -117,6 +117,7 @@ Run: `scripts/modtest cookies` (Debug and `-Doptimize=ReleaseFast`); `zig build 
 
 - **Server-side `CookieJar` with delta tracking** (cookie-rs): the caller calls `set` per cookie.
 - **Enforcing Domain/Path scoping and the public-suffix list in the builder**: the builder writes a line; `Jar` enforces both on ingest.
+- **Constant-time `percentEncode`/`percentDecode`/`isCookieValue`**: they use a hex table and `charToDigit`, and `isCookieValue` switches per byte; no cookie library (cookie-rs, Go) makes them constant-time and nothing in the module passes a secret through them (the signed and private cookies go through `secure.zig`'s own constant-time paths).
 - **Evaluating `Expires`/`Max-Age` in the builder**: no clock in the module; `expires` is a pre-formatted string.
 - **`Set-Cookie2` and `SameSite` enforcement in the client jar**: a browser's context, not an HTTP client's.
 - **Partitioned storage in the jar**: one top-level context, as Go's `cookiejar`.
@@ -126,10 +127,7 @@ Run: `scripts/modtest cookies` (Debug and `-Doptimize=ReleaseFast`); `zig build 
 
 ## Backlog / deferred
 
-- **Jar spin lock held across the caller's writer** (`Jar.writeCookiesAt` prints while locked): fixing it needs a copy of the matches, i.e. an allocation or a bounded buffer, a design choice.
-- **Constant-time `percentEncode`/`percentDecode`** (low): they use a hex table and `charToDigit`, and `isCookieValue` switches per byte; not used internally with secrets, so a constant-time variant waits for a consumer that needs one.
 - **A public punycode / IDNA module**: `psl.toAscii` punycodes the list's Unicode rules privately (RFC 3492, no UTS #46 mapping); a client with a Unicode host name needs the full IDNA mapping first, and `http.Url` refuses non-ASCII. A module of its own is the natural home. Effort medium (UTS #46 tables).
-- **Jar persistence**: save and load the non-session cookies. Go's jar has none either.
 
 ## Anchoring
 
