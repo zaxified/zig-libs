@@ -223,9 +223,11 @@ Offline only: a pure codec has no live-interop surface. Run `scripts/modtest l2e
 
 ## Backlog / deferred
 
-Two optional, low-priority items, both within CONVENTIONS §2:
+None open.
 
-- **Optional VXLAN/Geneve header codec** — for gateways that must speak to kernel `vxlan` devices; a separate module rather than a change to this one. Effort: small.
+## Roadmap
+
+- **Optional VXLAN/Geneve header codec** — for gateways that must speak to kernel `vxlan` / `geneve` devices; a separate module rather than a change to this one (RFC 7348 VXLAN and RFC 8926 Geneve with its option TLVs, as gopacket's `layers/vxlan.go` / `geneve.go` decode them). Size: a new module (card, catalog entry, RFC vectors, an external oracle), days; needs no change here.
 
 ## Anchoring
 
