@@ -346,6 +346,17 @@ The same missing precondition applies to `chain.zig`'s `parseShape`, which
 does not use this guard at all; it has its own `parseBitStringSafe`.
 
 
+**Extension values.** For every extension, the Extension SEQUENCE, its extnID, the optional critical BOOLEAN and the
+extnValue OCTET STRING header are checked (in bounds, definite length, single-byte tag). The extnValue CONTENT must also
+tile, by the same walk, for every id-ce extension (2.5.29.*: it contains every OID std's `ExtensionId` knows, and std's
+`verifyHostName` parses subjectAltName's content), every id-pe extension (1.3.6.1.5.5.7.1.*: AIA, TLS feature and the ACME
+identifier, which modules here decode) and any extension whose first element is not an OID. Every other extension value
+is opaque bytes, as std treats it (`Certificate.parse` skips an unknown OID before reading its value; re-read on
+0.17.1) and as Go's crypto/x509 keeps it (`Extension.Value`, not parsed). That is what lets an Android Keystore
+attestation certificate through: its KeyDescription (1.3.6.1.4.1.11129.2.1.17) uses high-tag-number fields such as
+`[600]`, which the walk refuses. Tests: "extnValue: a high-tag-number element inside an opaque extension is accepted;
+inside id-ce / id-pe it is not".
+
 `requireStdDescentPoints` also requires the trailing signatureValue BIT STRING (RFC 5280 §4.1): std reads its header at the
 end of `signatureAlgorithm`, so a certificate without it was well-formed DER yet made std read at the buffer's end
 (`safe.zig`, test "a certificate without its signatureValue is refused"). With that, every probe std makes lands inside
@@ -355,7 +366,7 @@ the buffer, `verifyChain` needs no padded copy and its API takes the caller's sl
 
 
 ⚠ `requireStdDescentPoints` mirrors `std.crypto.Certificate.parse` as of Zig
-0.16 (re-read on 0.17.0: `der.Element.parse` unchanged), which is a coupling. The alternative is to stop offering a guarded
+0.16 (re-read on 0.17.0: `der.Element.parse` unchanged; the extension loop re-read on 0.17.1), which is a coupling. The alternative is to stop offering a guarded
 `parse` at all and route every consumer through a defensive field walk of our
 own, the way `spkiOf` already does. That is the larger change and it is not
 made here. `safe.zig`'s tests take the union of the three former guards'

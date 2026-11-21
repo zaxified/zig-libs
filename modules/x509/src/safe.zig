@@ -90,7 +90,7 @@ const Certificate = std.crypto.Certificate;
 /// Bumping the constant below is the reviewer's signal that they re-read
 /// `Certificate.parse` in the new std and either found no new descent point,
 /// or added one to `requireStdDescentPoints` (and to this comment).
-const std_descent_points_verified_against: std.SemanticVersion = .{ .major = 0, .minor = 17, .patch = 0 };
+const std_descent_points_verified_against: std.SemanticVersion = .{ .major = 0, .minor = 17, .patch = 1 };
 comptime {
     if (builtin.zig_version.major != std_descent_points_verified_against.major or
         builtin.zig_version.minor != std_descent_points_verified_against.minor)
@@ -98,7 +98,7 @@ comptime {
         @compileError(
             "requireStdDescentPoints (modules/x509/src/safe.zig) mirrors " ++
                 "std.crypto.Certificate.parse's descent points as verified against Zig " ++
-                "0.17.0. This toolchain is on a different minor/major version. Before " ++
+                "0.17.1. This toolchain is on a different minor/major version. Before " ++
                 "raising std_descent_points_verified_against: re-read " ++
                 "std.crypto.Certificate.parse's source in THIS toolchain, confirm " ++
                 "requireStdDescentPoints still names every position it descends " ++
@@ -409,11 +409,18 @@ fn requireStdDescentPoints(bytes: []const u8, certificate: Header) Error!void {
         ext_i = extension.content_end;
 
         // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE,
-        //   extnValue OCTET STRING }. RFC 5280 §4.1: extnValue holds the DER
-        // encoding of the extension's own value, so it must tile — and it has
-        // to, because `Parsed.verifyHostName` parses TLVs straight out of the
-        // subjectAltName extension's content, one more descent into a
-        // primitive's interior.
+        //   extnValue OCTET STRING }. The Extension, its OID, the BOOLEAN and
+        // the extnValue header are always checked (decodeHeader: in bounds,
+        // definite length, single-byte tag). The extnValue CONTENT must also
+        // tile for the extensions something reads inside: std's
+        // `Parsed.verifyHostName` parses TLVs straight out of subjectAltName's
+        // content (one more descent into a primitive's interior), and this
+        // repository's own decoders read id-ce and id-pe values (see
+        // `walksExtensionValue`). Every other extension value is opaque bytes,
+        // as std treats it (`Certificate.parse` skips an unknown OID before
+        // even reading its value) and as Go's crypto/x509 keeps it
+        // (`Extension.Value`): its content may use encodings this walk refuses,
+        // e.g. the Android Keystore KeyDescription's high-tag-number `[600]`.
         const oid = try decodeHeader(b, extension.content_start, extension.content_end);
         if (oid.content_end >= extension.content_end) continue;
         const after_oid = try decodeHeader(b, oid.content_end, extension.content_end);
@@ -421,8 +428,25 @@ fn requireStdDescentPoints(bytes: []const u8, certificate: Header) Error!void {
             if (after_oid.content_end >= extension.content_end) continue;
             break :v try decodeHeader(b, after_oid.content_end, extension.content_end);
         };
-        try walk(b, value.content_start, value.content_end, max_depth);
+        if (walksExtensionValue(b[extension.content_start], b[oid.content_start..oid.content_end]))
+            try walk(b, value.content_start, value.content_end, max_depth);
     }
+}
+
+/// Whether `requireStdDescentPoints` requires an extension's extnValue content
+/// to tile. Yes for anything whose first element is not an OBJECT IDENTIFIER
+/// (malformed: fail closed), for every id-ce extension (2.5.29.*, which
+/// contains every OID std's `ExtensionId` knows, subjectAltName among them) and
+/// every id-pe extension (1.3.6.1.5.5.7.1.*: AIA, TLS feature, the ACME
+/// identifier, which modules here decode). Other OIDs (vendor and attestation
+/// extensions, SCT lists) are opaque to std and to every decoder here.
+fn walksExtensionValue(first_tag: u8, oid: []const u8) bool {
+    if (first_tag != 0x06) return true;
+    const id_ce = [_]u8{ 0x55, 0x1d };
+    const id_pe = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01 };
+    if (std.mem.startsWith(u8, oid, &id_ce)) return true;
+    if (std.mem.startsWith(u8, oid, &id_pe)) return true;
+    return false;
 }
 
 /// The structural half of `safeCertificate`, without the copy: `der` is a
@@ -1379,7 +1403,11 @@ test "differential: guard-accepted mutants reach std's parser and none of them p
     // (15_798 guarded before it).
     // parsed: 13_822 before the BIT STRING tag rule (std matches the tag
     // NUMBER only, the guard wants 0x03), 13_821 before the serial rule.
-    if (serial_refused != 86 or guarded != 15_752 or parsed != 13_777) {
+    // guarded 15_752 / parsed 13_777 before extension values outside id-ce /
+    // id-pe became opaque (2026-11-21): two mutants whose extnID byte turned an
+    // id-ce OID into an unknown one now pass, and std parses both (it skips an
+    // unknown OID's value) without a panic.
+    if (serial_refused != 86 or guarded != 15_754 or parsed != 13_779) {
         std.debug.print("serial_refused={d} guarded={d} parsed={d}\n", .{ serial_refused, guarded, parsed });
         return error.TestUnexpectedResult;
     } // guarded: 15_814 before the signatureValue rule (2026-10-10) // 13_822 before: std matches the BIT STRING tag NUMBER only, the guard wants 0x03
@@ -1501,6 +1529,92 @@ test "the guard rejects a primitive inside the extensions loop (X4a, subjectAltN
     try validateCertificate(&cert);
     var scratch: [max_certificate_len + parse_slack]u8 = undefined;
     try testing.expectError(error.PrimitiveWhereStdDescends, safeCertificate(&cert, &scratch));
+}
+
+/// A minimal v3 certificate whose extensions are exactly `ext` (one or more
+/// complete `Extension` TLVs; signature not valid; shape only).
+fn testCertWithExtensions(comptime ext: []const u8) []const u8 {
+    comptime {
+        const ec_algid = [_]u8{ 0x30, 0x13 } ++
+            [_]u8{ 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 } ++
+            [_]u8{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+        const algid_sha256rsa = [_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00 };
+        const validity_der = [_]u8{ 0x30, 0x1e, 0x17, 0x0d } ++ "250101000000Z".* ++
+            [_]u8{ 0x17, 0x0d } ++ "350101000000Z".*;
+        const spki_content = ec_algid ++ [_]u8{ 0x03, 0x02, 0x00, 0x00 };
+        const spki = [_]u8{ 0x30, spki_content.len } ++ spki_content;
+        const empty_name = [_]u8{ 0x30, 0x00 };
+        const extensions_seq = derTlv(0x30, ext);
+        const outer_extensions = derTlv(0xa3, extensions_seq);
+        const tbs_content = [_]u8{ 0xa0, 0x03, 0x02, 0x01, 0x02 } ++ [_]u8{ 0x02, 0x01, 0x01 } ++ algid_sha256rsa ++
+            empty_name ++ validity_der ++ empty_name ++ spki ++ outer_extensions[0..outer_extensions.len].*;
+        const tbs = derTlv(0x30, &tbs_content);
+        const cert_content = tbs[0..tbs.len].* ++ algid_sha256rsa ++ [_]u8{ 0x03, 0x02, 0x00, 0x00 };
+        const cert = derTlv(0x30, &cert_content);
+        const out = cert[0..cert.len].*;
+        return &out;
+    }
+}
+
+/// `tag`, a DER definite length (short form, or `81 nn` up to 255), `content`.
+fn derTlv(comptime tag: u8, comptime content: []const u8) []const u8 {
+    comptime {
+        const hdr = if (content.len < 0x80) [_]u8{ tag, content.len } else [_]u8{ tag, 0x81, content.len };
+        const out = hdr ++ content[0..content.len].*;
+        return &out;
+    }
+}
+
+test "extnValue: a high-tag-number element inside an opaque extension is accepted; inside id-ce / id-pe it is not" {
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    // extnValue content: SEQUENCE { [600] { INTEGER 1 } } -- the Android
+    // KeyDescription's AuthorizationList shape (context-specific, constructed,
+    // high tag number 600 = 0x04 0x58 in base 128).
+    const hi_tag_value = [_]u8{ 0x30, 0x07, 0xbf, 0x84, 0x58, 0x03, 0x02, 0x01, 0x01 };
+    const octet = [_]u8{ 0x04, hi_tag_value.len } ++ hi_tag_value;
+    // 1.3.6.1.4.1.11129.2.1.17 (Android key attestation), not critical.
+    const android_oid = [_]u8{ 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xd6, 0x79, 0x02, 0x01, 0x11 };
+    const android_ext = [_]u8{ 0x30, android_oid.len + octet.len } ++ android_oid ++ octet;
+    const opaque_cert = comptime testCertWithExtensions(&android_ext);
+    try validateForStdParse(opaque_cert);
+    const parsed_src = try safeCertificate(opaque_cert, &scratch);
+    _ = try parsed_src.parse();
+
+    // Same value under a critical flag: still opaque.
+    const android_ext_crit = [_]u8{ 0x30, android_oid.len + 3 + octet.len } ++ android_oid ++ [_]u8{ 0x01, 0x01, 0xff } ++ octet;
+    const crit_cert = comptime testCertWithExtensions(&android_ext_crit);
+    _ = try safeCertificate(crit_cert, &scratch);
+
+    // subjectAltName (2.5.29.17), another id-ce OID (2.5.29.99, unknown to
+    // std) and an id-pe OID (AIA, 1.3.6.1.5.5.7.1.1): the content is walked.
+    const refused_oids = comptime [_][]const u8{
+        &[_]u8{ 0x06, 0x03, 0x55, 0x1d, 0x11 },
+        &[_]u8{ 0x06, 0x03, 0x55, 0x1d, 0x63 },
+        &[_]u8{ 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01 },
+    };
+    inline for (refused_oids) |o| {
+        const ext = [_]u8{ 0x30, o.len + octet.len } ++ o[0..o.len].* ++ octet;
+        const cert = comptime testCertWithExtensions(&ext);
+        try testing.expectError(error.MultiByteTag, safeCertificate(cert, &scratch));
+    }
+
+    // An extnID that is not an OBJECT IDENTIFIER (an INTEGER): fail closed.
+    const not_oid = [_]u8{ 0x02, 0x01, 0x05 };
+    const bad_id_ext = [_]u8{ 0x30, not_oid.len + octet.len } ++ not_oid ++ octet;
+    const bad_id_cert = comptime testCertWithExtensions(&bad_id_ext);
+    try testing.expectError(error.MultiByteTag, safeCertificate(bad_id_cert, &scratch));
+
+    // The extnValue header itself is still checked for an opaque extension: an
+    // OCTET STRING whose length runs past its Extension is refused.
+    const overlong = [_]u8{ 0x04, hi_tag_value.len + 1 } ++ hi_tag_value;
+    const overlong_ext = [_]u8{ 0x30, android_oid.len + overlong.len } ++ android_oid ++ overlong;
+    const overlong_cert = comptime testCertWithExtensions(&overlong_ext);
+    try testing.expect(std.meta.isError(safeCertificate(overlong_cert, &scratch)));
+    // ...and so is a high-tag-number identifier on the extnValue itself.
+    const hi_outer = [_]u8{ 0x1f, 0x84, 0x58, 0x00 };
+    const hi_outer_ext = [_]u8{ 0x30, android_oid.len + hi_outer.len } ++ android_oid ++ hi_outer;
+    const hi_outer_cert = comptime testCertWithExtensions(&hi_outer_ext);
+    try testing.expectError(error.MultiByteTag, safeCertificate(hi_outer_cert, &scratch));
 }
 
 /// A minimal well-formed v1 certificate with the given serialNumber TLV

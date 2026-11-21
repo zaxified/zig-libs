@@ -139,13 +139,9 @@ test "verifyAttestation: fmt=android-key verifies signature, key binding, challe
     defer arena.deinit();
     const a = arena.allocator();
     const h = android.client_data_hash;
-    // x509.safe refuses any certificate whose extension values use a high-tag-number identifier, and every real
-    // Android KeyDescription does (AuthorizationList [600], [702]): until that layer treats an unrecognized
-    // extension's value as opaque, the positive path cannot run (see SPEC Backlog, android-key).
-    const r = webauthn.verifyAttestation(a, &android.attestation_object, h) catch |e| {
-        if (e == error.InvalidCertificate) return error.SkipZigTest;
-        return e;
-    };
+    // The KeyDescription uses high-tag-number fields (AuthorizationList [600], [702]); x509.safe treats a
+    // non-id-ce / non-id-pe extension value as opaque, so the certificate passes it.
+    const r = try webauthn.verifyAttestation(a, &android.attestation_object, h);
     try testing.expectEqual(webauthn.AttestationType.basic, r.attestation_type);
     try testing.expectEqualStrings("android-key", r.format);
     try testing.expect(r.leaf_cert_der != null);
@@ -165,13 +161,16 @@ test "verifyAttestation: fmt=android-key verifies signature, key binding, challe
     try testing.expectError(error.BadSignature, webauthn.verifyAttestation(a, &android.attestation_object, wrong));
 }
 
-test "verifyAttestation: the W3C §16.14 android-key certificate is refused by x509.safe (multi-byte tag), a typed error" {
+test "verifyAttestation: the W3C §16.14 android-key certificate passes x509.safe (high-tag-number KeyDescription)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const hash: [32]u8 = @splat(0);
-    // Today: the certificate is refused by x509.safe (multi-byte tag in the KeyDescription extension).
-    try testing.expectError(error.InvalidCertificate, webauthn.verifyAttestation(a, &vectors.android_key_es256_attestation_object, hash));
+    // The certificate is no longer refused for its KeyDescription's [600]/[702] fields. With a zero
+    // clientDataHash the statement itself must still fail, and with a typed attestation error, not a certificate one.
+    if (webauthn.verifyAttestation(a, &vectors.android_key_es256_attestation_object, hash)) |_| {
+        return error.TestUnexpectedResult;
+    } else |e| try testing.expect(e != error.InvalidCertificate);
 }
 
 test "verifyAttestation: fmt=tpm -> error.UnsupportedFormat (not yet implemented)" {
