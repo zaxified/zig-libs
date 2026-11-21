@@ -11,7 +11,8 @@
 //! (this repo's future "secure resolver" net-family consumer) is what walks
 //! the chain root -> tld -> ... -> target zone, calling this module once per
 //! cut and feeding the previous
-//! cut's now-trusted DNSKEY forward as the next cut's context. This file is
+//! cut's now-trusted DNSKEY forward as the next cut's context (`walk.zig` does
+//! that over a caller-supplied fetcher). This file is
 //! the one link in that chain — "does DS match DNSKEY, and is the DNSKEY
 //! RRset itself validly self-signed" — not the multi-round-trip resolver
 //! orchestration above it.

@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [rthalley/dnspython](https://github.com/rthalley/dnspython) | Python | ISC | 2.7k | v2.8.0 (2025-09-07) | `dns.dnssec` validates RRSIGs and can sign; no chain walking or denial proofs *(inferred)*. |
 | Zig `std` / Zig ecosystem | Zig | MIT (std) | — | Zig 0.16.0 | `std` has no DNSSEC. Only unrelated hit on GitHub search "dnssec language:zig" was a 3-star repo (`jackboykin/hark`, MIT), not a comparable library. Nothing to compare against in Zig. |
 
-**Where we are ahead:** the only DNSSEC validation core in Zig; unlike the Go and Python libraries it ships the NSEC and NSEC3 denial-of-existence proofs (opt-out, wildcard, NODATA, insecure delegation) and the RFC 9276 iteration cap (`nsec3.max_nsec3_iterations`), oracle-checked against `ldns` for algorithms 8/13/14/15 · **Where we are behind:** no delegation-chain walker from a root anchor and no RFC 5011 (Unbound, Hickory do), no zone signing or key generation (miekg/dns, ldns, dnspython have it), (*Backlog / deferred*).
+**Where we are ahead:** the only DNSSEC validation core in Zig; unlike the Go and Python libraries it ships the NSEC and NSEC3 denial-of-existence proofs (opt-out, wildcard, NODATA, insecure delegation) and the RFC 9276 iteration cap (`nsec3.max_nsec3_iterations`), oracle-checked against `ldns` for algorithms 8/13/14/15 · **Where we are behind:** no key generation (miekg/dns, ldns, dnspython have it; zone signing is `sign.zig`, a whole-zone signer with NSEC chain generation is not), no aggressive NSEC caching, no resolver (the walker takes the caller's fetcher), (*Backlog / deferred*).
 
 ## Design & invariants
 
@@ -54,7 +54,7 @@ NXDOMAIN) — see README.md "Validation core" + `src/oracle_test.zig`. The
 plain-NSEC proof is unit-tested, not oracle-verified (*Open*).
 
 Out of scope in this module (see "Threat model" below): the
-multi-zone-cut resolver orchestration.
+resolver itself (transport, caching, retries); `walk.zig` walks the delegation chain over the caller's fetcher.
 
 - **Bounds-checked, no panics on attacker input.** `rdata.zig`/`wire.zig`
   follow the same discipline as `dns.message`: malformed RDATA is a typed
@@ -69,13 +69,18 @@ multi-zone-cut resolver orchestration.
   logic is DNSSEC's own wire formats (RFC 3110/6605/8080 key encodings, the
   RRSIG/DS/NSEC/NSEC3 RDATA shapes), the canonical signed-data assembly, and
   the denial-of-existence proof — never bignum/ECC/EdDSA math itself.
-- **Single-zone-cut scope for `validate`/`chain.validateDnskeySet`.**
-  Climbing the full delegation chain from a root trust anchor down to the
-  target name (multiple zone cuts, each needing its own DNSKEY/DS round
-  trip) is the future secure-resolver consumer's job, calling this module
-  once per cut. This module validates one RRset against one already-fetched
-  DNSKEY set — see `chain.zig`'s doc comment for the reasoning (matches how
-  unbound/BIND/Knot Resolver factor the same problem).
+- **Single-zone-cut scope for `validate`/`chain.validateDnskeySet`; `walk.validateRrset` climbs the chain.**
+  `validate` authenticates one RRset against one already-fetched DNSKEY set, `chain.validateDnskeySet` is one
+  DS-to-DNSKEY link (as unbound/BIND/Knot Resolver factor the problem). `walk.validateRrset` composes them from a
+  trust anchor (the bundled IANA root DS pair `walk.root_anchors`, or any zone's anchors) to the RRset: for every
+  name below the current zone it asks the caller's `Fetcher` for the DS RRset, verifies it under the parent's keys,
+  establishes the child's DNSKEY set against it, or, without a DS, verifies the NSEC / NSEC3 RRsets and feeds
+  them to `nsec.proveDenial` / `nsec3.proveDenial` (an unsigned delegation or an Opt-Out cover is `.insecure`, a
+  NODATA at a non-cut name goes on, anything else is `.bogus`). The walker does no I/O, copies what it keeps (the
+  fetcher's result is valid until the next call) and checks every RRSIG window with `now`. It authenticates a
+  PRESENT RRset: the denial of the queried RRset itself and the RFC 4035 §5.3.4 wildcard proof are the caller's, as
+  for `validate`. Where the reference differs: Unbound drives its own iterator and caches aggressively; the
+  seam here is one function.
 - **RRSIG time-window uses RFC 1982 serial arithmetic** (`rrsigTimeValid`),
   not a naive integer compare — the 32-bit inception/expiration fields wrap
   in 2106, and a naive compare would silently misvalidate near that
@@ -163,6 +168,17 @@ Run: `scripts/modtest dnssec` (offline); `DNSSEC_FUZZ=<runs>` for the fuzz drive
   self-signature. The recipe `scripts/gen/gen-dnssec-oracle.sh` signs and independently verifies a fresh zone per
   algorithm; it does not regenerate the committed vectors byte for byte (their keys no longer exist), and the
   extractor that turned wire rdata into the `Vec` literals is not in the repository.
+- **Signing, foreign oracle:** `tools/interop.zig` (`zig build interop-dnssec`; needs `ldns-verify-zone`, package
+  `ldnsutils`) signs a zone (SOA, NS, A, DNSKEY, NSEC chain, every RRset with its RRSIG) with `sign.zig` for algorithms
+  8, 10, 13, 14, 15 and 16 and has `ldns-verify-zone` accept it; the same zone with one A record altered after signing
+  is refused ("Bogus DNSSEC signature"). In-suite, every algorithm's signature also verifies through
+  `keys.verifySignature` over `canonical.buildSignedData`.
+- **Chain walker:** `src/walk.zig` tests build a signed hierarchy with `sign.zig` (root, `org`, `example.org`, Ed25519)
+  behind a counting fetcher: secure end to end with the exact fetch count, DNSKEY and DS RRsets as the query, an NSEC
+  unsigned delegation and an NSEC3 Opt-Out cover (insecure), an unsupported-algorithm DS (insecure), and bogus for a
+  tampered answer, a stranger's DS, DNSKEY, DS signer or NSEC signer, a missing DS with no denial, a lying NSEC bitmap,
+  the wrong anchor and every RRSIG window edge; `root_anchors` are checked against the IANA root KSK DNSKEYs
+  (tags 20326 and 38696). Not run against a live resolver or `delv` (*Open*).
 - **Published vectors:** the RFC 8080 §6.2 Ed448 examples (`src/rfc8080_test.zig`), the RFC 4034 Appendix B key tag.
 - **Fuzz** (`src/fuzz_test.zig` and the harnesses beside their corpora): the parsers and `validate` under testkit's
   deterministic driver as `DNSSEC_FUZZ`; a genuine RRset is secure, a damaged signature bogus, damaged wire never
@@ -182,22 +198,16 @@ Run: `scripts/modtest dnssec` (offline); `DNSSEC_FUZZ=<runs>` for the fuzz drive
 
 ## Backlog / deferred
 
-- **Chain walker root to leaf with a bundled root trust anchor** (survey). Unbound and Hickory validate the whole
-  delegation chain; here the caller must call `chain.validateDnskeySet` once per cut and keep the DS/DNSKEY state
-  (`chain.zig` header draws the line on purpose). A user of a validating library expects "give me answer + records,
-  get secure/insecure/bogus". Effort: medium (state machine over `dns` messages, ~1-2 sittings). Fits CONVENTIONS §2
-  (pure Zig); needs the caller to fetch records (a transport seam like the other modules).
 - **RFC 5011 oracle:** `rollover.zig` (the add / remove hold-down state machine over `(algorithm, public key)`) is
   tested against the RFC's rules with hand-built timelines only; Unbound's and Hickory's behaviour was not compared. The
   caller owns the DNSKEY fetch, the validation of the RRset against `Tracker.isTrusted` keys, the `self_signed`
   determination and persistence.
-- **Signing oracle:** `sign.zig` (RRSIG creation for algorithms 8, 10, 13, 14, 15, DNSKEY / DS rdata, RFC 3110 RSA key
-  encoding; deterministic, no clock or RNG) is checked only by verifying its output with this module's own
-  `keys.verifySignature` over `canonical.buildSignedData`, not yet by a foreign verifier (`ldns-verify-zone`,
-  dnspython). Ed448 (16) has no signer in `ed448`. Key generation stays the caller's (std / `rsa` generate).
 
 ## Open
 
+- **Chain walker against a live validator:** `walk.validateRrset` is tested on a synthetic hierarchy only; a run
+  against real answers (`delv`, or a recursive resolver's DS / DNSKEY / NSEC3 responses, root KSK rollover included)
+  is not done.
 - **Plain-NSEC denial proof not `ldns`-oracle-verified:** `nsec.proveDenial` is unit-tested against the RFC 4034
   §6.1 ordering and positive/adversarial cases, but its reasoning is not checked against an independent validator the
   way the NSEC3 proof is.

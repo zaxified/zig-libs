@@ -37,7 +37,7 @@ See `src/oracle_test.zig` + `src/oracle_vectors.zig`.
 
 ## Not provided
 
-No delegation-chain walker from a root trust anchor (this module validates one zone cut, see `chain.zig`), RFC 5011 rollover only as a pure state machine (`rollover.zig`), no key generation (`sign.zig` signs RRsets and builds DNSKEY / DS data), and no choice of the strongest algorithm among several signatures
+No resolver (`walk.zig` climbs the delegation chain over the caller's fetcher, it fetches nothing itself), RFC 5011 rollover only as a pure state machine (`rollover.zig`), no key generation (`sign.zig` signs RRsets and builds DNSKEY / DS data) and no whole-zone signer, and no choice of the strongest algorithm among several signatures
 (RFC 6840 §5.11): the resolver's job. The plain-NSEC denial proof (`nsec.proveDenial`) is unit-tested but not yet
 checked against `ldns` the way the NSEC3 proof is. Details and open work: `SPEC.md` *Threat model*, *Backlog /
 deferred*, *Open*.
@@ -52,6 +52,7 @@ deferred*, *Open*.
 | `src/nsec.zig` | plain-NSEC (non-NSEC3) denial proof (RFC 4035 §5.4): canonical-order gap coverage (RFC 4034 §6.1), NODATA, wildcard, insecure-delegation | real, tested |
 | `src/keys.zig` | DNSKEY public-key wire decode (RFC 3110/6605/8080) + per-algorithm signature verify dispatch | real, tested |
 | `src/sign.zig` | Zone signing: RRSIG creation (RSA 8/10, ECDSA 13/14, Ed25519), DNSKEY / DS rdata encoding | real, tested |
+| `src/walk.zig` | Root-to-leaf chain walker over a caller-supplied `Fetcher`: DS / DNSKEY per cut, NSEC / NSEC3 DS denial, bundled IANA root anchors | real, tested |
 | `src/rollover.zig` | RFC 5011 trust-anchor rollover state machine (add / remove hold-down, revocation) | real, tested |
 | `src/ds.zig` | DS digest computation (RFC 4034 §5.1.4) + DNSKEY matching | real, tested |
 | `src/canonical.zig` | RFC 4034 §3.1.8.1 canonical RRset signed-data construction (wildcard + original-TTL + embedded-name lowering) | real, oracle-verified |
@@ -88,7 +89,12 @@ const denial = dnssec.nsec3.proveDenial(qname, qtype, .{ .records = nsec3_set },
 
 For a ZSK-signed RRset a resolver first calls `chain.validateDnskeySet` to
 trust the zone's keys, then `validate` with the now-trusted ZSK as a
-`.dnskey_rdata` anchor. Walking multiple zone cuts is the resolver's job.
+`.dnskey_rdata` anchor. To climb several zone cuts from the root, give `walk.validateRrset` a `Fetcher` (your resolver's
+DS / DNSKEY / NSEC lookups) and `walk.root_anchors`:
+
+```zig
+const verdict = try dnssec.walk.validateRrset(gpa, fetcher, &dnssec.walk.root_anchors, "www.example.org", 1, .{ .now = now });
+```
 
 ## Recon notes (why `dnssec` is a sibling module, not a `dns` extension)
 

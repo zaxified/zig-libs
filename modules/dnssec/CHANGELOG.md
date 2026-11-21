@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — ADDED `walk.zig` (`dnssec.walk`): `validateRrset` (root-to-leaf delegation chain walk over the caller's `Fetcher`), `Fetcher`, `Rrset`, `Options`, `WalkError`, `FetchError`, and `root_anchors` (the IANA root KSK-2017 / KSK-2024 DS records).
+- **2026-11-21** — **Source-breaking (new, unreleased `sign.zig`):** `sign.SigningKey` gains `.ed448` (Ed448, algorithm 16, pure with the empty context) via the `ed448` module; an exhaustive `switch` over `SigningKey` needs the new arm.
 - **2026-11-21** — ADDED `rollover.zig` (`dnssec.rollover`): `Tracker`, `Observed`, `TrackedKey`, `State`, `Options`, the RFC 5011 trust-anchor rollover state machine (`observe`, `isTrusted`, `restore`).
 - **2026-11-21** — ADDED `sign.zig` (`dnssec.sign`): `SigningKey` (RSASHA256, RSASHA512, ECDSAP256SHA256, ECDSAP384SHA384, ED25519), `SignParams`, `signRrset` (RRSIG RDATA over the same canonical signed data `validate` checks), `encodeDnskey`, `encodeRsaPublicKey`, `encodeDs`.
 - **2026-11-19** — **Behaviour change (via `rsa`):** an RSA DNSKEY with a modulus under 1024 bits is refused (`InvalidKeyEncoding`), as `rsa.PublicKey.fromBytes` now enforces Go 1.24's floor (was 512). Tests use 1024-bit moduli.

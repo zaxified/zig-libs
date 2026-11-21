@@ -6,8 +6,8 @@
 //!
 //! No clock and no randomness: inception and expiration are the caller's, and ECDSA signatures are
 //! deterministic (std's construction, `noise` null); RSA PKCS#1 v1.5 and Ed25519 are deterministic anyway.
-//! Algorithms: RSASHA256 (8), RSASHA512 (10), ECDSAP256SHA256 (13), ECDSAP384SHA384 (14), ED25519 (15). RSASHA1
-//! is not offered (RFC 8624: MUST NOT sign), and Ed448 (16) has no signer in the `ed448` module yet.
+//! Algorithms: RSASHA256 (8), RSASHA512 (10), ECDSAP256SHA256 (13), ECDSAP384SHA384 (14), ED25519 (15), ED448 (16).
+//! RSASHA1 is not offered (RFC 8624: MUST NOT sign).
 
 const std = @import("std");
 const dns = @import("dns");
@@ -20,6 +20,7 @@ const ds = @import("ds.zig");
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
+const ed448 = @import("ed448").ed448;
 
 /// A zone key pair for signing, by algorithm. Held by pointer (an RSA secret key is large).
 pub const SigningKey = union(enum) {
@@ -28,6 +29,7 @@ pub const SigningKey = union(enum) {
     ecdsa_p256: *const EcdsaP256.KeyPair,
     ecdsa_p384: *const EcdsaP384.KeyPair,
     ed25519: *const Ed25519.KeyPair,
+    ed448: *const ed448.KeyPair,
 
     /// The DNSSEC algorithm number (`rdata.algorithm`).
     pub fn algorithm(self: SigningKey) u8 {
@@ -37,6 +39,7 @@ pub const SigningKey = union(enum) {
             .ecdsa_p256 => rdata.algorithm.ecdsap256sha256,
             .ecdsa_p384 => rdata.algorithm.ecdsap384sha384,
             .ed25519 => rdata.algorithm.ed25519,
+            .ed448 => rdata.algorithm.ed448,
         };
     }
 };
@@ -118,6 +121,13 @@ pub fn signRrset(
         },
         .ed25519 => |kp| blk: {
             const s = kp.sign(signed, null) catch return error.SigningFailed;
+            const raw = s.toBytes();
+            @memcpy(sig_buf[0..raw.len], &raw);
+            break :blk sig_buf[0..raw.len];
+        },
+        .ed448 => |kp| blk: {
+            // RFC 8080 §4: pure Ed448 with the empty context.
+            const s = ed448.sign(kp, signed, "") catch return error.SigningFailed;
             const raw = s.toBytes();
             @memcpy(sig_buf[0..raw.len], &raw);
             break :blk sig_buf[0..raw.len];
@@ -213,13 +223,15 @@ fn checkRoundTrip(key: SigningKey, public_key: []const u8, flags: u16) !void {
     try testing.expectError(error.SignatureVerificationFailed, keys.verifySignature(rrsig.algorithm, decoded, other_signed, rrsig.signature));
 }
 
-test "signRrset: ECDSA P-256 and P-384 and Ed25519 signatures verify under keys.verifySignature" {
+test "signRrset: ECDSA P-256 and P-384, Ed25519 and Ed448 signatures verify under keys.verifySignature" {
     const kp256 = try EcdsaP256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x21)));
     try checkRoundTrip(.{ .ecdsa_p256 = &kp256 }, kp256.public_key.toUncompressedSec1()[1..], 0x0101);
     const kp384 = try EcdsaP384.KeyPair.generateDeterministic(@as([48]u8, @splat(0x22)));
     try checkRoundTrip(.{ .ecdsa_p384 = &kp384 }, kp384.public_key.toUncompressedSec1()[1..], 0x0101);
     const ed = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x23)));
     try checkRoundTrip(.{ .ed25519 = &ed }, &ed.public_key.toBytes(), 0x0101);
+    const ed4 = ed448.KeyPair.create(&@as([57]u8, @splat(0x26)));
+    try checkRoundTrip(.{ .ed448 = &ed4 }, &ed4.public_key.toBytes(), 0x0101);
 }
 
 test "signRrset: RSASHA256 and RSASHA512 verify; the RFC 3110 key encoding round-trips" {

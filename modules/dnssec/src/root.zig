@@ -92,6 +92,8 @@ pub const chain = @import("chain.zig");
 pub const sign = @import("sign.zig");
 /// RFC 5011 trust-anchor rollover state machine (`rollover.zig`).
 pub const rollover = @import("rollover.zig");
+/// Root-to-leaf delegation chain walker over a caller-supplied fetcher (`walk.zig`).
+pub const walk = @import("walk.zig");
 
 test {
     _ = wire;
@@ -104,6 +106,7 @@ test {
     _ = chain;
     _ = sign;
     _ = rollover;
+    _ = walk;
     _ = policy;
     _ = @import("oracle_test.zig");
     _ = @import("rfc8080_test.zig");
