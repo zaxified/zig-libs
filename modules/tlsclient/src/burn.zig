@@ -44,5 +44,7 @@ pub const sign_burn = 16 * 1024;
 /// Finished, application keys) 296 KiB, the same for every group and suite
 /// (ReleaseFast stack probe, 2026-10-09). 384 KiB leaves ~30 % over that for
 /// the paths the probe does not take (an RSA server key, bundle verification);
+/// a TLS 1.2 resumed handshake (`resume12_test.zig`'s probe, 2026-11-21)
+/// leaves no residue below it either;
 /// ~4 µs of vector stores next to a handshake.
 pub const init_burn = 384 * 1024;

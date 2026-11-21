@@ -373,7 +373,8 @@ Run `scripts/modtest tlsclient` (Debug; the OpenSSL tests skip when `openssl` is
 - **Stack residue:** `stackprobe_test.zig` (ReleaseFast): a canned ServerHello per group x suite and a
   full server flight, reach checked through `ssl_key_log`, needles for every seed, secret, handshake and
   application key and HKDF pad; zero residue through `initInto`. The client-auth signature is probed for
-  all three key types.
+  all three key types. `resume12_test.zig` probes a TLS 1.2 resumed handshake (the master secret and the
+  key block as needles, the reach checked by `did_resume`).
 - **Mutation:** schemata over `hello.zig`, `session.zig`, `verify.zig`, `keygen.zig` and the `Client.zig`
   additions, with survivors re-run against `tools/interop.zig` built on the mutated copy; the key-share
   comb and derivation, the resumption paths and the ALPN/client-auth additions each got their own runs.
@@ -423,9 +424,6 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
 - **ECH (Encrypted Client Hello)**: deferred by the owner ("deliberately not now"). Go's client has it
   (`EncryptedClientHelloConfigList`, configs from DNS HTTPS records); it would pull `hpke` (grade 3) into
   this module's closure, which then has to reach grade 2.
-- **Dead-stack probe for TLS 1.2 resumption**: `stackprobe_test.zig` drives TLS 1.3 only, and the +6 KiB of
-  `init` depth for TLS 1.2 resumption is an estimate against the 384 KiB burn. Add a TLS 1.2 resumed
-  handshake to the probe.
 - **Handshake messages split across records** (inherited from std): in TLS 1.3 the cleartext buffer flips
   after the Certificate message while the fragment indices carry over, and TLS 1.2 drops a first fragment; a
   server that splits a message there fails the handshake (bounds stay safe). Real servers seen so far do not;

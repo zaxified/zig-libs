@@ -963,3 +963,36 @@ test "resume: our ChangeCipherSpec and Finished are flushed before init returns 
     try testing.expect(r.err == null);
     try expectClientFinished(r.out, ch.len, &th);
 }
+
+// ── dead stack: a TLS 1.2 resumed handshake ────────────────────────────────
+
+var probe_storage: [2]Client.ClientSession = undefined;
+var probe_cache: Client.SessionCache = undefined;
+var probe_server: []const u8 = "";
+var probe_err: ?anyerror = null;
+
+noinline fn probeResume() void {
+    _ = prime(&probe_cache, .{});
+    probe_err = run(probe_server, .{ .cache = &probe_cache, .now_s = 1234 }).err;
+}
+
+test "STACKPROBE: no master secret or key block on the dead stack after a TLS 1.2 resumed Client.init" {
+    const sp = @import("testkit").stackprobe;
+    try sp.skipUnlessOptimized();
+    var buf: [2048]u8 = undefined;
+    const ch = try clientHello(&buf, .{}, .{ .cache = null });
+    var th: Sha256 = undefined;
+    probe_server = buildServer(&srv_buf, ch, .{}, &th);
+    probe_cache = newCache(&probe_storage);
+    defer probe_cache.deinit();
+    // Reach: the abbreviated handshake completes.
+    probeResume();
+    try testing.expectEqual(@as(?anyerror, null), probe_err);
+    try testing.expect(sink.did_resume);
+    const kb = prf("key expansion", &.{ &server_random, &clientRandom() }, 48);
+    const P = sp.Probe(.{ .window = 512 * 1024 });
+    // Residue below the burn's top (the body outgrowing `burn.init_burn`)
+    // or a needle anywhere fails the run.
+    _ = try P.run("Client.init TLS 1.2 resumption", probeResume, .{}, &.{ &master, &kb }, .{});
+    try testing.expectEqual(@as(?anyerror, null), probe_err);
+}
