@@ -85,4 +85,5 @@ test {
     _ = @import("pilots/iec104.zig");
     _ = @import("pilots/iec61850.zig");
     _ = @import("pilots/s7comm.zig");
+    _ = @import("pilots/opcua.zig");
 }
