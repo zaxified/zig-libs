@@ -3027,6 +3027,48 @@ test "live: a TPACKET_V3 ring on lo delivers injected frames, counts them, tears
     again.deinit();
 }
 
+test "live: a TPACKET_V2 ring on lo delivers injected frames, counts them, tears down and sets up again (needs CAP_NET_RAW + netns)" {
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    var cap = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 300 }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    var rg = ring.RingV2.init(cap, .{ .block_size = 1 << 16, .block_nr = 4, .frame_size = 2048 }) catch |e| switch (e) {
+        error.RingUnsupported => return error.SkipZigTest,
+        else => return e,
+    };
+    try testing.expectError(error.RingUnsupported, ring.RingV2.init(cap, .{}));
+    const sent = 40;
+    for (0..sent) |_| try injectOnLo("rawsock-ring2-yes", .{ 0x02, 0, 0, 0, 0, 7 }, test_ethertype);
+    var seen: usize = 0;
+    var idle: usize = 0;
+    while (idle < 3 and seen < sent) {
+        const f = (try rg.next(300)) orelse {
+            idle += 1;
+            continue;
+        };
+        const p = try f.packet();
+        if (std.mem.find(u8, p.bytes, "rawsock-ring2-yes") != null) {
+            seen += 1;
+            try testing.expect(p.ts_ns > 0 and p.wire_len >= p.bytes.len);
+        }
+        try rg.release(f);
+    }
+    if (seen == 0) {
+        rg.deinit();
+        return error.SkipZigTest; // no loopback delivery here
+    }
+    const st = try rg.stats();
+    try testing.expect(seen >= sent);
+    try testing.expect(st.packets >= seen);
+    try testing.expectEqual(@as(u64, 0), st.drops);
+    rg.deinit();
+    var again = try ring.RingV2.init(cap, .{ .block_size = 1 << 16, .block_nr = 2 });
+    again.deinit();
+}
+
 test {
     _ = @import("sweep_test.zig");
     _ = @import("ring.zig");

@@ -225,3 +225,35 @@ fn blockInitBody() void {
 test "ring.Block: random bytes never escape the block (sweep S3)" {
     try expectSurvives(blockInitBody);
 }
+
+fn ring2InitBody() void {
+    const ring = rawsock.ring;
+    const dummy: rawsock.Socket = .{ .fd = -1 };
+    const m = std.math.maxInt(u32);
+    const sizes = [_]u32{ 0, 1, 4095, 4096, 4097, 1 << 20, (16 << 20), (16 << 20) + 4096, m, m - 1, 1 << 31 };
+    const counts = [_]u32{ 0, 1, 2, 1024, 1025, m, 1 << 31 };
+    for (sizes) |bs| for (counts) |bn| for ([_]u32{ 0, 15, 16, 63, 64, 128, 2048, m }) |fs| {
+        _ = ring.RingV2.init(dummy, .{ .block_size = bs, .block_nr = bn, .frame_size = fs }) catch {};
+        _ = ring.RingV2.fromMap(&.{}, bs, bn, fs) catch {};
+    };
+}
+
+test "ring.RingV2.init: hostile sizes are errors, never an overflow or a panic (sweep)" {
+    try expectSurvives(ring2InitBody);
+}
+
+fn frame2Body() void {
+    const ring = rawsock.ring;
+    var buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(11);
+    for (0..2000) |_| {
+        prng.random().bytes(&buf);
+        const n = prng.random().uintAtMost(usize, buf.len);
+        const p = (ring.FrameV2{ .bytes = buf[0..n] }).packet() catch continue;
+        if (p.bytes.len > n) @panic("frame read escaped its bytes");
+    }
+}
+
+test "ring.FrameV2: random bytes never escape the frame (sweep)" {
+    try expectSurvives(frame2Body);
+}

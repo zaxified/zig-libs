@@ -87,7 +87,7 @@ const mask = try rawsock.ipv4Netmask(inj.fd, idx);  // [4]u8
   savefiles (µs or ns), byte-compatible with `tcpdump -w`/`-r`.
 - `pcapng.writeHeader` / `pcapng.writeRecord` / `pcapng.Reader` — pcapng savefiles (Wireshark's default): the reader takes either byte order, several sections and interfaces, `if_tsresol`/`if_tsoffset`, and skips blocks it has no use for.
 
-`rawsock.ring.Ring` — an opt-in `TPACKET_V3` receive ring (`init`, `next`, `release`, `stats`, `deinit`); `filter.compileOpts` takes `Options{ .vlan_ancillary, .link, .null_byte_order }` (`link`: `ethernet`, `linux_sll`, `linux_sll2`, `raw`, `ppp`, `bsd_null`, `bsd_loop`; `Link.dlt` gives the savefile link type); `filter.runLive` evaluates a live-form program in userspace from `Frame.vlan_tci`.
+`rawsock.ring.Ring` — an opt-in `TPACKET_V3` receive ring (`init`, `next`, `release`, `stats`, `deinit`), `rawsock.ring.RingV2` the same for `TPACKET_V2` (one frame per packet); `filter.compileOpts` takes `Options{ .vlan_ancillary, .link, .null_byte_order }` (`link`: `ethernet`, `linux_sll`, `linux_sll2`, `raw`, `ppp`, `bsd_null`, `bsd_loop`; `Link.dlt` gives the savefile link type); `filter.runLive` evaluates a live-form program in userspace from `Frame.vlan_tci`.
 
 Performance: `zig build bench-rawsock` (`tools/bench.zig`) measures the filter interpreter and compiler and the savefile codecs against libpcap built from source; the figures are the SPEC card's Performance line, which is authoritative. `filter.validate` is the kernel's attach-time check list (agrees with the kernel on the replayed program table); `filter.run` follows the kernel except for negative/ancillary loads (see `usesAncillary`, `runLive`, `runLiveMeta`).
 
@@ -122,4 +122,4 @@ unshare -rn zig build test-rawsock              # full socket path, all pass
 
 ## Not provided
 
-`recvmmsg` batching, a TX ring, `TPACKET_V2`, IPv6 Neighbor-Discovery helpers (the sibling `l2disco.nd` is the codec), 802.11 savefiles, a filter optimiser, `ip6 protochain` (the kernel refuses libpcap's backward jump; `run` is loop-free), `geneve` and a stack of `mpls` labels; Linux only (no BSD `/dev/bpf`). Why, and what is planned: SPEC *What is deliberately not done* and *Backlog / deferred*.
+`recvmmsg` batching, a TX ring, IPv6 Neighbor-Discovery helpers (the sibling `l2disco.nd` is the codec), 802.11 savefiles, a filter optimiser, `ip6 protochain` (the kernel refuses libpcap's backward jump; `run` is loop-free), `geneve` and a stack of `mpls` labels; Linux only (no BSD `/dev/bpf`). Why, and what is planned: SPEC *What is deliberately not done* and *Backlog / deferred*.

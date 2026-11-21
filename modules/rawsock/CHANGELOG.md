@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **CONSUMER-VISIBLE (additive):** `ring.RingV2`, `ring.OptionsV2`, `ring.FrameV2`: an opt-in `TPACKET_V2` receive ring (one `tpacket2_hdr` frame per packet, the V3 ring's hostile-header checks, ticketed `release`, kernel packet/drop counters). `Ring` (V3) unchanged.
+
 - **2026-11-21** — **BREAKING (enum widened):** `filter.Link` gains `ppp` (DLT_PPP 9: a 4-byte header, address, control and the PPP protocol; `Link.fromDlt(9)` names it). `compileOpts(..., .{ .link = .ppp })` compiles for a PPP savefile as libpcap does (IPv4 0x0021, IPv6 0x0057, ARP as is); an exhaustive `switch` over `Link` needs the new prong. 52 expression rows checked against `tcpdump -y PPP -r`.
 
 - **2026-11-21** — **Behaviour change (previously `UnsupportedExpression`):** `mpls [N]` and `pppoes [N]` combine with other primitives as in libpcap: what follows is shifted (4 / 8 bytes), `ip` / `ip6` over MPLS are the bottom-of-stack bit and the version nibble, over PPPoE the PPP protocol field (0x0021 / 0x0057). `arp`, `vlan`, a second `mpls`, nesting and the live ancillary `vlan` form around them stay `UnsupportedExpression`; MAC addresses and `multicast` over PPPoE too (libpcap refuses them). 66 rows checked against `tcpdump -r`.

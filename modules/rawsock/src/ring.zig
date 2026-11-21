@@ -374,6 +374,243 @@ pub const Ring = struct {
     }
 };
 
+// ── TPACKET_V2 ───────────────────────────────────────────────────────────────
+
+pub const tpacket_v2: c_int = 1;
+/// `sizeof(struct tpacket2_hdr)` (32): the per-frame header of a V2 ring.
+pub const frame_header_len = 32;
+/// The smallest `frame_size` a V2 ring takes: the kernel wants room for the
+/// 32-byte header plus a `sockaddr_ll` (`TPACKET2_HDRLEN`, 52), in steps of 16.
+pub const min_frame_size_v2: u32 = 64;
+
+pub const OptionsV2 = struct {
+    /// Bytes per block: a multiple of the page size, 4 KiB ..= `max_block_size`.
+    block_size: u32 = 1 << 16,
+    /// Blocks in the ring: 1 ..= `max_blocks`.
+    block_nr: u32 = 16,
+    /// Bytes per frame, one packet each: a multiple of 16, `min_frame_size_v2`
+    /// ..= `block_size`. A packet longer than the frame less its header is cut
+    /// (`Packet.wire_len` keeps the real length), so this is the snap length.
+    frame_size: u32 = 2048,
+};
+
+/// `struct tpacket_req` (the V1/V2 ring request).
+const Req2 = extern struct {
+    block_size: u32,
+    block_nr: u32,
+    frame_size: u32,
+    frame_nr: u32,
+};
+
+/// One slot of a V2 ring: a pure view over the frame's bytes (`frame_size` of
+/// them), so the header checks run on any buffer. Unlike a V3 block, a frame's
+/// header does not decide where the next one is (the slots are fixed-size), so
+/// a hostile header costs only that packet: `packet` returns `BadBlock`, the
+/// caller still releases the frame and the ring goes on.
+pub const FrameV2 = struct {
+    bytes: []const u8,
+    /// Which frame of the ring this is (for `RingV2.release`).
+    index: u32 = 0,
+    /// The hand-out `RingV2.next` gave: 0 for a frame built by hand;
+    /// `release` accepts only the held frame's own ticket.
+    ticket: u64 = 0,
+
+    /// The packet in this frame. Every header field is copied once and checked
+    /// against the frame's bounds before a slice is formed.
+    pub fn packet(f: FrameV2) error{BadBlock}!Packet {
+        const b = f.bytes;
+        if (b.len < frame_header_len) return error.BadBlock;
+        // struct tpacket2_hdr: status, len, snaplen (u32 each), mac, net (u16), sec, nsec (u32),
+        // vlan_tci, vlan_tpid (u16), padding[4].
+        const wire = rd32(b, 4);
+        const snaplen = rd32(b, 8);
+        const e = builtin.cpu.arch.endian();
+        const mac = std.mem.readInt(u16, b[12..14], e);
+        const sec = rd32(b, 16);
+        const nsec = rd32(b, 20);
+        const status = rd32(b, 0);
+        if (nsec >= 1_000_000_000) return error.BadBlock;
+        // The data lies inside the frame, after the header.
+        if (mac < frame_header_len or mac > b.len) return error.BadBlock;
+        if (snaplen > b.len - mac) return error.BadBlock;
+        return .{
+            .bytes = b[mac..][0..snaplen],
+            .wire_len = wire,
+            .ts_ns = @as(u64, sec) * std.time.ns_per_s + nsec,
+            .vlan_tci = if (status & status_vlan_valid != 0) std.mem.readInt(u16, b[24..26], e) else null,
+            .vlan_tpid = if (status & status_vlan_tpid_valid != 0) std.mem.readInt(u16, b[26..28], e) else null,
+        };
+    }
+};
+
+/// A `TPACKET_V2` receive ring: one frame header per packet, the kernel hands
+/// the frames over one at a time (libpcap's default ring before V3; the
+/// choice on kernels and drivers where V3's block retire timers misbehave).
+/// Same shape and the same misuse rules as `Ring`:
+///
+/// ```text
+/// var ring = try RingV2.init(sock, .{});
+/// defer ring.deinit();
+/// while (try ring.next(1000)) |f| {              // null = timeout
+///     const p = f.packet() catch { try ring.release(f); continue; };
+///     use(p.bytes, p.wire_len, p.ts_ns, p.vlan_tci);
+///     try ring.release(f);
+/// }
+/// ```
+///
+/// `next` after `deinit` is `Closed`, `next` while a frame is held is
+/// `BlockHeld`, a stale or forged handle is `WrongBlock` (the error names
+/// say "block"; read "frame"). `stats()` has no freeze counter on V2
+/// (`freezes` stays 0); the kernel's packet count includes the dropped
+/// ones. Not for use from two threads or across `fork`.
+pub const RingV2 = struct {
+    fd: i32,
+    map: []align(std.heap.page_size_min) u8,
+    block_size: u32,
+    frame_size: u32,
+    frames_per_block: u32,
+    frame_nr: u32,
+    /// The frame to look at next.
+    cur: u32 = 0,
+    held: bool = false,
+    next_ticket: u64 = 1,
+    held_ticket: u64 = 0,
+    closed: bool = false,
+    owns_map: bool = true,
+    totals: Stats = .{},
+
+    fn geometry(block_size: u32, block_nr: u32, frame_size: u32) error{BadSize}!u32 {
+        if (block_nr == 0 or frame_size < min_frame_size_v2 or frame_size % 16 != 0 or frame_size > block_size) return error.BadSize;
+        const fpb = block_size / frame_size;
+        const frames = @as(u64, fpb) * block_nr;
+        if (frames > std.math.maxInt(u32)) return error.BadSize;
+        return fpb;
+    }
+
+    /// A ring over caller-provided memory and no socket (the tests' door, as
+    /// for `Ring.fromMap`): `next` never waits, `stats` returns the totals.
+    pub fn fromMap(map: []align(std.heap.page_size_min) u8, block_size: u32, block_nr: u32, frame_size: u32) error{BadSize}!RingV2 {
+        if (block_size % 16 != 0) return error.BadSize;
+        const fpb = try geometry(block_size, block_nr, frame_size);
+        if (@as(u64, block_size) * block_nr > map.len) return error.BadSize;
+        return .{ .fd = -1, .map = map, .block_size = block_size, .frame_size = frame_size, .frames_per_block = fpb, .frame_nr = fpb * block_nr, .owns_map = false };
+    }
+
+    /// Switch `sock` to `TPACKET_V2` and map its receive ring. The caller keeps
+    /// owning (and closing) the socket.
+    pub fn init(sock: root.Socket, opts: OptionsV2) InitError!RingV2 {
+        if (opts.block_size == 0 or opts.block_size > max_block_size or opts.block_size % std.heap.pageSize() != 0) return error.BadSize;
+        if (opts.block_nr > max_blocks) return error.BadSize;
+        const fpb = geometry(opts.block_size, opts.block_nr, opts.frame_size) catch return error.BadSize;
+        const total: u64 = @as(u64, opts.block_size) * opts.block_nr;
+        if (total > max_total or total > std.math.maxInt(usize)) return error.BadSize;
+
+        const ver: c_int = tpacket_v2;
+        try Ring.setOpt(sock.fd, linux.PACKET.VERSION, std.mem.asBytes(&ver));
+        const req: Req2 = .{ .block_size = opts.block_size, .block_nr = opts.block_nr, .frame_size = opts.frame_size, .frame_nr = fpb * opts.block_nr };
+        try Ring.setOpt(sock.fd, linux.PACKET.RX_RING, std.mem.asBytes(&req));
+        const rc = linux.mmap(null, @intCast(total), .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, sock.fd, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .NOMEM, .AGAIN => {
+                freeRing(sock.fd);
+                return error.OutOfMemory;
+            },
+            else => {
+                freeRing(sock.fd);
+                return error.RingUnsupported;
+            },
+        }
+        const ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(rc);
+        return .{
+            .fd = sock.fd,
+            .map = ptr[0..@intCast(total)],
+            .block_size = opts.block_size,
+            .frame_size = opts.frame_size,
+            .frames_per_block = fpb,
+            .frame_nr = fpb * opts.block_nr,
+        };
+    }
+
+    fn freeRing(fd: i32) void {
+        const zero: Req2 = std.mem.zeroes(Req2);
+        _ = linux.setsockopt(fd, linux.SOL.PACKET, linux.PACKET.RX_RING, std.mem.asBytes(&zero).ptr, @sizeOf(Req2));
+    }
+
+    /// Unmap and free the ring; the socket stays open in `TPACKET_V2` mode with
+    /// no ring. A `FrameV2` or `Packet` still held points into the unmapped ring.
+    pub fn deinit(r: *RingV2) void {
+        if (r.closed) return;
+        r.closed = true;
+        r.held = false;
+        if (r.owns_map) {
+            _ = linux.munmap(r.map.ptr, r.map.len);
+            freeRing(r.fd);
+        }
+        r.map = r.map[0..0];
+    }
+
+    fn frameBytes(r: *const RingV2, i: u32) []u8 {
+        const off = @as(usize, i / r.frames_per_block) * r.block_size + @as(usize, i % r.frames_per_block) * r.frame_size;
+        return r.map[off..][0..r.frame_size];
+    }
+
+    fn status(r: *const RingV2, i: u32) u32 {
+        const p: *const u32 = @ptrCast(@alignCast(r.frameBytes(i)[0..4]));
+        return @atomicLoad(u32, p, .acquire);
+    }
+
+    /// Wait up to `timeout_ms` (-1 = forever) for the next frame the kernel
+    /// handed over. Null = timeout or EINTR. Give the frame back with `release`.
+    pub fn next(r: *RingV2, timeout_ms: i32) Error!?FrameV2 {
+        if (r.closed) return error.Closed;
+        if (r.held) return error.BlockHeld;
+        if (r.status(r.cur) & status_user == 0) {
+            if (r.fd < 0) return null;
+            var pfd = [1]linux.pollfd{.{ .fd = r.fd, .events = linux.POLL.IN, .revents = 0 }};
+            const rc = linux.poll(&pfd, 1, timeout_ms);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => return null,
+                else => return error.PollFailed,
+            }
+            if (pfd[0].revents & (linux.POLL.ERR | linux.POLL.NVAL) != 0) return error.SocketError;
+            if (r.status(r.cur) & status_user == 0) return null;
+        }
+        const f: FrameV2 = .{ .bytes = r.frameBytes(r.cur), .index = r.cur, .ticket = r.next_ticket };
+        r.held_ticket = r.next_ticket;
+        r.next_ticket +%= 1;
+        if (r.next_ticket == 0) r.next_ticket = 1;
+        r.held = true;
+        return f;
+    }
+
+    /// Give a frame back to the kernel (its packet's `bytes` are invalid from
+    /// here) and move to the next one.
+    pub fn release(r: *RingV2, f: FrameV2) ReleaseError!void {
+        if (r.closed) return error.Closed;
+        if (!r.held) return error.NotHeld;
+        if (f.index != r.cur or f.ticket != r.held_ticket or f.bytes.ptr != r.frameBytes(r.cur).ptr) return error.WrongBlock;
+        r.held = false;
+        const p: *u32 = @ptrCast(@alignCast(r.frameBytes(f.index)[0..4]));
+        @atomicStore(u32, p, status_kernel, .release);
+        r.cur = (f.index + 1) % r.frame_nr;
+    }
+
+    /// The kernel's counters since the last call, added to the running totals
+    /// (`tpacket_stats`: packets, drops; the kernel clears them on every read).
+    pub fn stats(r: *RingV2) Error!Stats {
+        if (r.closed) return error.Closed;
+        if (r.fd < 0) return r.totals;
+        var st: [2]u32 = @splat(0);
+        var len: linux.socklen_t = @sizeOf(@TypeOf(st));
+        if (linux.errno(linux.getsockopt(r.fd, linux.SOL.PACKET, linux.PACKET.STATISTICS, std.mem.asBytes(&st).ptr, &len)) != .SUCCESS or len < 8) return error.StatsFailed;
+        r.totals.packets += st[0];
+        r.totals.drops += st[1];
+        return r.totals;
+    }
+};
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -928,4 +1165,319 @@ test "Ring.fromMap: a block of exactly the header size, a sticky failure, and a 
     var r2 = try Ring.fromMap(&map, 4096, 1);
     std.mem.writeInt(u32, map[8..12], status_kernel, builtin.cpu.arch.endian());
     try testing.expect((try r2.next(-1)) == null);
+}
+
+// ── TPACKET_V2 tests ─────────────────────────────────────────────────────────
+
+/// A frame image in the kernel's `tpacket2_hdr` layout (native byte order): `len` data bytes at `mac`.
+fn buildFrame2(buf: []u8, len: u32, fill: u8) void {
+    @memset(buf, 0);
+    const e = builtin.cpu.arch.endian();
+    std.mem.writeInt(u32, buf[0..4], status_user, e);
+    std.mem.writeInt(u32, buf[4..8], len + 4, e); // tp_len
+    std.mem.writeInt(u32, buf[8..12], len, e); // tp_snaplen
+    std.mem.writeInt(u16, buf[12..14], 66, e); // tp_mac (the kernel's value for an Ethernet frame)
+    std.mem.writeInt(u16, buf[14..16], 80, e); // tp_net
+    std.mem.writeInt(u32, buf[16..20], 1000 + @as(u32, fill), e);
+    std.mem.writeInt(u32, buf[20..24], 5, e);
+    @memset(buf[66..][0..len], fill);
+}
+
+test "FrameV2: reads a well-formed frame, and the vlan status bits select tp_vlan_tci / tp_vlan_tpid at the tpacket2_hdr offsets" {
+    const e = builtin.cpu.arch.endian();
+    var buf: [256]u8 = undefined;
+    buildFrame2(&buf, 60, 7);
+    var p = try (FrameV2{ .bytes = &buf }).packet();
+    try testing.expectEqual(@as(usize, 60), p.bytes.len);
+    try testing.expectEqual(@as(u8, 7), p.bytes[0]);
+    try testing.expectEqual(@as(u32, 64), p.wire_len);
+    try testing.expectEqual(@as(u64, 1007) * std.time.ns_per_s + 5, p.ts_ns);
+    try testing.expect(p.vlan_tci == null and p.vlan_tpid == null);
+    // Offsets from <linux/if_packet.h>: tp_vlan_tci 24 (u16), tp_vlan_tpid 26 (u16), tp_padding 28.
+    std.mem.writeInt(u16, buf[24..26], 0x0123, e);
+    std.mem.writeInt(u16, buf[26..28], 0x88a8, e);
+    std.mem.writeInt(u32, buf[28..32], 0xdeadbeef, e); // decoy
+    std.mem.writeInt(u32, buf[0..4], status_user | status_vlan_valid, e);
+    p = try (FrameV2{ .bytes = &buf }).packet();
+    try testing.expectEqual(@as(?u16, 0x0123), p.vlan_tci);
+    try testing.expect(p.vlan_tpid == null);
+    std.mem.writeInt(u32, buf[0..4], status_user | status_vlan_tpid_valid, e);
+    p = try (FrameV2{ .bytes = &buf }).packet();
+    try testing.expect(p.vlan_tci == null);
+    try testing.expectEqual(@as(?u16, 0x88a8), p.vlan_tpid);
+    std.mem.writeInt(u32, buf[0..4], status_user | status_vlan_valid | status_vlan_tpid_valid, e);
+    p = try (FrameV2{ .bytes = &buf }).packet();
+    try testing.expect(p.vlan_tci == 0x0123 and p.vlan_tpid == 0x88a8);
+}
+
+test "FrameV2: hostile headers are BadBlock, never a read outside the frame; every limit is exact" {
+    const e = builtin.cpu.arch.endian();
+    var base: [256]u8 = undefined;
+    buildFrame2(&base, 60, 1);
+    // snaplen past the frame / by one, nsec out of range, mac inside the header / past the frame.
+    const Case = struct { off: usize, val: u32, wide: bool = false };
+    const bad = [_]Case{
+        .{ .off = 8, .val = 0xffffffff },
+        .{ .off = 8, .val = 256 - 66 + 1 },
+        .{ .off = 20, .val = 1_000_000_000 },
+        .{ .off = 12, .val = 0, .wide = true },
+        .{ .off = 12, .val = 31, .wide = true },
+        .{ .off = 12, .val = 257, .wide = true },
+        .{ .off = 12, .val = 0xffff, .wide = true },
+    };
+    for (bad) |c| {
+        var buf = base;
+        if (c.wide) std.mem.writeInt(u16, buf[c.off..][0..2], @intCast(c.val), e) else std.mem.writeInt(u32, buf[c.off..][0..4], c.val, e);
+        try testing.expectError(error.BadBlock, (FrameV2{ .bytes = &buf }).packet());
+    }
+    // The limits themselves: data ends exactly at the frame's end; mac exactly at the header's end; empty data at the very end.
+    var buf = base;
+    std.mem.writeInt(u32, buf[8..12], 256 - 66, e);
+    try testing.expectEqual(@as(usize, 256 - 66), (try (FrameV2{ .bytes = &buf }).packet()).bytes.len);
+    std.mem.writeInt(u16, buf[12..14], frame_header_len, e);
+    std.mem.writeInt(u32, buf[8..12], 256 - frame_header_len, e);
+    try testing.expectEqual(@as(usize, 256 - frame_header_len), (try (FrameV2{ .bytes = &buf }).packet()).bytes.len);
+    std.mem.writeInt(u16, buf[12..14], 256, e);
+    std.mem.writeInt(u32, buf[8..12], 0, e);
+    try testing.expectEqual(@as(usize, 0), (try (FrameV2{ .bytes = &buf }).packet()).bytes.len);
+    std.mem.writeInt(u32, buf[20..24], 999_999_999, e);
+    _ = try (FrameV2{ .bytes = &buf }).packet();
+    // A buffer shorter than the header.
+    try testing.expectError(error.BadBlock, (FrameV2{ .bytes = base[0 .. frame_header_len - 1] }).packet());
+    try testing.expectError(error.BadBlock, (FrameV2{ .bytes = base[0..frame_header_len] }).packet()); // its mac (66) lies past it
+}
+
+test "RingV2.init refuses sizes outside the limits before touching the socket; the limits themselves reach the syscall" {
+    const dummy: root.Socket = .{ .fd = -1 };
+    const bad = [_]OptionsV2{
+        .{ .block_size = 0 },
+        .{ .block_size = 4097 },
+        .{ .block_size = max_block_size + 4096 },
+        .{ .block_nr = 0 },
+        .{ .block_nr = max_blocks + 1 },
+        .{ .frame_size = 48 },
+        .{ .frame_size = 2056 },
+        .{ .block_size = 4096, .frame_size = 8192 }, // a frame larger than its block
+        .{ .block_size = 16 << 20, .block_nr = 1024 }, // 16 GiB: over max_total
+        .{ .block_size = 8 << 20, .block_nr = 64 }, // 512 MiB
+    };
+    for (bad) |o| try testing.expectError(error.BadSize, RingV2.init(dummy, o));
+    const edge = [_]OptionsV2{
+        .{ .block_size = 4096, .block_nr = 1, .frame_size = min_frame_size_v2 },
+        .{ .block_size = 4096, .block_nr = max_blocks, .frame_size = 4096 },
+        .{ .block_size = max_block_size, .block_nr = @intCast(max_total / max_block_size), .frame_size = 2048 },
+    };
+    for (edge) |o| {
+        if (RingV2.init(dummy, o)) |_| return error.UnexpectedSuccess else |e| try testing.expect(e != error.BadSize);
+    }
+}
+
+/// A fake V2 mapping: `blocks` blocks of `bs` bytes cut into frames of `fs`, the first `ready` frames handed to user space; frame i holds i+1 repeated.
+fn fakeMap2(map: []u8, bs: usize, blocks: usize, fs: usize, ready: usize) void {
+    const fpb = bs / fs;
+    for (0..blocks * fpb) |i| {
+        const f = map[(i / fpb) * bs + (i % fpb) * fs ..][0..fs];
+        buildFrame2(f, 40, @intCast(i + 1));
+        if (i >= ready) std.mem.writeInt(u32, f[0..4], status_kernel, builtin.cpu.arch.endian());
+    }
+}
+
+test "RingV2 state machine on a fake mapping: frame addressing across blocks, next, release, wrap, misuse" {
+    var map: [2 * 4096]u8 align(std.heap.page_size_min) = undefined;
+    fakeMap2(&map, 4096, 2, 1024, 3); // 8 frames, 3 ready
+    var r = try RingV2.fromMap(&map, 4096, 2, 1024);
+    try testing.expectEqual(@as(u32, 8), r.frame_nr);
+    for (0..3) |i| {
+        const f = (try r.next(0)).?;
+        try testing.expectEqual(@as(u32, @intCast(i)), f.index);
+        try testing.expectEqual(@as(u8, @intCast(i + 1)), (try f.packet()).bytes[0]); // each index reads its own frame
+        if (i == 0) {
+            try testing.expectError(error.BlockHeld, r.next(0));
+            var other = f;
+            other.index = 1;
+            try testing.expectError(error.WrongBlock, r.release(other));
+        }
+        try r.release(f);
+        try testing.expectError(error.NotHeld, r.release(f));
+        // The kernel's side of the handshake: the frame went back to status 0.
+        try testing.expectEqual(status_kernel, std.mem.readInt(u32, map[i * 1024 ..][0..4], builtin.cpu.arch.endian()));
+    }
+    try testing.expect((try r.next(0)) == null); // frame 3 not handed over: nothing to read, nothing waits
+    // The kernel hands over frames 3..7 (the second block starts at frame 4) and then 0 again: the cursor wraps.
+    for ([_]usize{ 3, 4, 5, 6, 7, 0 }) |i| {
+        const off = (i / 4) * 4096 + (i % 4) * 1024;
+        buildFrame2(map[off..][0..1024], 40, @intCast(i + 50));
+        const f = (try r.next(0)).?;
+        try testing.expectEqual(@as(u32, @intCast(i)), f.index);
+        try testing.expectEqual(@as(u8, @intCast(i + 50)), (try f.packet()).bytes[0]);
+        try r.release(f);
+    }
+    try testing.expectEqual(@as(u32, 1), r.cur);
+    try testing.expectEqual(@as(u64, 0), (try r.stats()).drops);
+    const held = (blk: {
+        buildFrame2(map[1024..][0..1024], 40, 9);
+        break :blk try r.next(0);
+    }).?;
+    r.deinit();
+    try testing.expectError(error.Closed, r.next(0));
+    try testing.expectError(error.Closed, r.stats());
+    try testing.expectError(error.Closed, r.release(held));
+    r.deinit();
+    // Sizes the mapping cannot hold, a frame too small, an unaligned block.
+    try testing.expectError(error.BadSize, RingV2.fromMap(&map, 4096, 3, 1024));
+    try testing.expectError(error.BadSize, RingV2.fromMap(&map, 4096, 0, 1024));
+    try testing.expectError(error.BadSize, RingV2.fromMap(&map, 4096, 1, 48));
+    try testing.expectError(error.BadSize, RingV2.fromMap(&map, 4096, 1, 8192));
+    try testing.expectError(error.BadSize, RingV2.fromMap(&map, 4090, 1, 64));
+}
+
+test "RingV2.release: a stale copy of an old handle and a forged FrameV2 are WrongBlock and move nothing; a bad packet header does not fail the ring" {
+    const e = builtin.cpu.arch.endian();
+    var map: [2 * 1024]u8 align(std.heap.page_size_min) = undefined;
+    fakeMap2(&map, 1024, 2, 512, 4);
+    var r = try RingV2.fromMap(&map, 1024, 2, 512);
+    std.mem.writeInt(u32, map[8..12], 0xffffffff, e); // frame 0: hostile snaplen
+    const first = (try r.next(0)).?;
+    try testing.expectError(error.BadBlock, first.packet());
+    try r.release(first);
+    for (1..4) |_| {
+        const f = (try r.next(0)).?;
+        _ = try f.packet();
+        try r.release(f);
+    }
+    // The cursor wrapped to frame 0 again (the kernel refilled it).
+    buildFrame2(map[0..512], 40, 1);
+    const again = (try r.next(0)).?;
+    try testing.expectEqual(first.index, again.index);
+    try testing.expect(again.ticket != first.ticket);
+    try testing.expectError(error.WrongBlock, r.release(first));
+    var elsewhere: [512]u8 = undefined;
+    buildFrame2(&elsewhere, 40, 1);
+    try testing.expectError(error.WrongBlock, r.release(.{ .bytes = &elsewhere, .index = 0, .ticket = again.ticket }));
+    try testing.expectError(error.WrongBlock, r.release(.{ .bytes = map[0..512], .index = 0, .ticket = 0 }));
+    try testing.expect(r.held and r.cur == 0);
+    try r.release(again);
+    try testing.expect(!r.held and r.cur == 1);
+}
+
+// ── fuzz: the V2 frame parser, and the V2 ring state machine ────────────────
+
+const Ring2Mark = fz.Marker(enum { rejected, packet });
+
+const image2 = blk: {
+    var img: [256]u8 = undefined;
+    buildFrame2(&img, 60, 3);
+    break :blk img;
+};
+const ring2_seeds = [_][]const u8{ testkit.fuzz.seed(&image2), testkit.fuzz.seed(image2[0..frame_header_len]), testkit.fuzz.seed("") };
+
+test "fuzz: FrameV2 over hostile bytes stays inside them" {
+    try testing.fuzz({}, fuzzRing2Smith, .{ .corpus = &ring2_seeds });
+}
+
+test "fuzz driver: RAWSOCK_FUZZ (ring v2)" {
+    try fz.fuzz_driver.run(fuzzRing2, .{ .prefix = "RAWSOCK_FUZZ", .name = "rawsock-ring2" });
+}
+
+test "fuzz harness: ring v2 frame, 300 seeds, reaches every outcome" {
+    try Ring2Mark.reach(fuzzRing2, "rawsock-ring2", 300);
+}
+
+fn fuzzRing2Smith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzRing2, smith, script[0..n]);
+}
+
+fn fuzzRing2(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [256]u8 = undefined;
+    const len: usize = fz.drawInput(S, smith, &buf, &ring2_seeds);
+    const bytes = buf[0..len];
+    const p = (FrameV2{ .bytes = bytes }).packet() catch return Ring2Mark.mark(.rejected);
+    const lo = @intFromPtr(bytes.ptr);
+    try testing.expect(@intFromPtr(p.bytes.ptr) >= lo and @intFromPtr(p.bytes.ptr) + p.bytes.len <= lo + len);
+    Ring2Mark.mark(.packet);
+}
+
+const Seq2Mark = fz.Marker(enum { delivered, idle, misuse });
+
+test "fuzz: RingV2 over a fake mapping and random operations never panics" {
+    try testing.fuzz({}, fuzzSeq2Smith, .{ .corpus = &ring2_seeds });
+}
+
+test "fuzz driver: RAWSOCK_FUZZ (ring v2 sequence)" {
+    try fz.fuzz_driver.run(fuzzSeq2, .{ .prefix = "RAWSOCK_FUZZ", .name = "rawsock-ring2-seq" });
+}
+
+test "fuzz harness: ring v2 sequence, 300 seeds, reaches every outcome" {
+    try Seq2Mark.reach(fuzzSeq2, "rawsock-ring2-seq", 300);
+}
+
+fn fuzzSeq2Smith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzSeq2, smith, script[0..n]);
+}
+
+fn fuzzSeq2(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [256]u8 = undefined;
+    const len: usize = fz.drawInput(S, smith, &buf, &ring2_seeds);
+    // Two blocks of 512 bytes, four 128-byte frames each: frame i is the input rotated by 29 * i, its status word from the input.
+    var map: [2 * 512]u8 align(std.heap.page_size_min) = undefined;
+    for (0..8) |i| {
+        const f = map[(i / 4) * 512 + (i % 4) * 128 ..][0..128];
+        for (0..128) |j| f[j] = if (len == 0) 0 else buf[(j + i * 29) % len];
+        std.mem.writeInt(u32, f[0..4], if (len > i and buf[i] & 1 != 0) status_user else status_kernel, builtin.cpu.arch.endian());
+    }
+    var r = try RingV2.fromMap(&map, 512, 2, 128);
+    var held: ?FrameV2 = null;
+    var stale: ?FrameV2 = null;
+    var m_cur: u32 = 0;
+    var m_held = false;
+    for (0..24) |step| {
+        const act: u8 = if (len == 0) 0 else buf[(step * 5 + 3) % len] % 5;
+        switch (act) {
+            0, 1 => {
+                if (r.next(0)) |maybe| {
+                    if (maybe) |f| {
+                        try testing.expect(!m_held);
+                        try testing.expectEqual(m_cur, f.index);
+                        m_held = true;
+                        held = f;
+                        if (f.packet()) |p| {
+                            const lo = @intFromPtr(&map);
+                            try testing.expect(@intFromPtr(p.bytes.ptr) >= lo and @intFromPtr(p.bytes.ptr) + p.bytes.len <= lo + map.len);
+                        } else |_| {}
+                        Seq2Mark.mark(.delivered);
+                    } else Seq2Mark.mark(.idle);
+                } else |e| {
+                    try testing.expect(e == error.BlockHeld and m_held);
+                    Seq2Mark.mark(.misuse);
+                }
+            },
+            2 => if (held) |f| {
+                try r.release(f);
+                held = null;
+                stale = f;
+                try testing.expect(m_held);
+                m_held = false;
+                m_cur = (m_cur + 1) % 8;
+                // The kernel refills the frame it was given back.
+                std.mem.writeInt(u32, map[(f.index / 4) * 512 + (f.index % 4) * 128 ..][0..4], status_user, builtin.cpu.arch.endian());
+            },
+            3 => {
+                const fake: FrameV2 = .{ .bytes = map[0..128], .index = @intCast(step % 8), .ticket = if (step % 2 == 0) 0 else 1000 + step };
+                if (r.release(fake)) |_| return error.ForgedHandleAccepted else |_| Seq2Mark.mark(.misuse);
+            },
+            else => if (stale) |sf| {
+                if (r.release(sf)) |_| return error.StaleHandleAccepted else |_| Seq2Mark.mark(.misuse);
+            },
+        }
+        try testing.expectEqual(m_cur, r.cur);
+        try testing.expectEqual(m_held, r.held);
+    }
+    r.deinit();
+    try testing.expectError(error.Closed, r.next(0));
 }
