@@ -187,8 +187,10 @@ Run: `scripts/modtest dnssec` (offline); `DNSSEC_FUZZ=<runs>` for the fuzz drive
   (`chain.zig` header draws the line on purpose). A user of a validating library expects "give me answer + records,
   get secure/insecure/bogus". Effort: medium (state machine over `dns` messages, ~1-2 sittings). Fits CONVENTIONS §2
   (pure Zig); needs the caller to fetch records (a transport seam like the other modules).
-- **RFC 5011 trust-anchor rollover** (survey). In Unbound and Hickory. Effort: medium (state machine with clock).
-  Fits §2.
+- **RFC 5011 oracle:** `rollover.zig` (the add / remove hold-down state machine over `(algorithm, public key)`) is
+  tested against the RFC's rules with hand-built timelines only; Unbound's and Hickory's behaviour was not compared. The
+  caller owns the DNSKEY fetch, the validation of the RRset against `Tracker.isTrusted` keys, the `self_signed`
+  determination and persistence.
 - **Signing oracle:** `sign.zig` (RRSIG creation for algorithms 8, 10, 13, 14, 15, DNSKEY / DS rdata, RFC 3110 RSA key
   encoding; deterministic, no clock or RNG) is checked only by verifying its output with this module's own
   `keys.verifySignature` over `canonical.buildSignedData`, not yet by a foreign verifier (`ldns-verify-zone`,

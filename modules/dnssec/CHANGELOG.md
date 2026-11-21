@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — ADDED `rollover.zig` (`dnssec.rollover`): `Tracker`, `Observed`, `TrackedKey`, `State`, `Options`, the RFC 5011 trust-anchor rollover state machine (`observe`, `isTrusted`, `restore`).
 - **2026-11-21** — ADDED `sign.zig` (`dnssec.sign`): `SigningKey` (RSASHA256, RSASHA512, ECDSAP256SHA256, ECDSAP384SHA384, ED25519), `SignParams`, `signRrset` (RRSIG RDATA over the same canonical signed data `validate` checks), `encodeDnskey`, `encodeRsaPublicKey`, `encodeDs`.
 - **2026-11-19** — **Behaviour change (via `rsa`):** an RSA DNSKEY with a modulus under 1024 bits is refused (`InvalidKeyEncoding`), as `rsa.PublicKey.fromBytes` now enforces Go 1.24's floor (was 512). Tests use 1024-bit moduli.
 - **2026-11-17** — **Additive + behaviour change:** Ed448 (algorithm 16, RFC 8080): `rdata.algorithm.ed448`, `keys.DecodedKey.ed448` (57-octet key, point-checked at decode), `keys.verifySignature` verifies pure Ed448 with the empty context via the `ed448` module (new dependency). Behaviour change: `policy.algorithmImplemented(16)` is now true, so a DS/RRSIG of algorithm 16 is validated instead of treated as unsupported/insecure. Tests: RFC 8080 §6.2 examples (`rfc8080_test.zig`; their Labels = 3 makes `validate` answer bogus per RFC 4035 §5.3.1), key-decode fuzz corpus gains an Ed448 key.

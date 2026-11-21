@@ -90,6 +90,8 @@ pub const policy = @import("policy.zig");
 pub const chain = @import("chain.zig");
 /// Zone signing: DNSKEY / DS record data and RRSIG creation (`sign.zig`).
 pub const sign = @import("sign.zig");
+/// RFC 5011 trust-anchor rollover state machine (`rollover.zig`).
+pub const rollover = @import("rollover.zig");
 
 test {
     _ = wire;
@@ -101,6 +103,7 @@ test {
     _ = canonical;
     _ = chain;
     _ = sign;
+    _ = rollover;
     _ = policy;
     _ = @import("oracle_test.zig");
     _ = @import("rfc8080_test.zig");
