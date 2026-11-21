@@ -830,6 +830,119 @@ test "server: a request compressed with an encoding that is not enabled is UNIMP
     try testing.expectEqualStrings("gzip,deflate,identity", r.header("grpc-accept-encoding").?);
 }
 
+// ── gRPC-Web ────────────────────────────────────────────────────────────────
+
+/// One request with `content_type` and `body` (already in the wire form of the flavour).
+fn webCall(peer: *TestPeer, path: []const u8, content_type: []const u8, body: []const u8) !u31 {
+    var fields = grpcFields(path);
+    fields[5] = .{ .name = "content-type", .value = content_type };
+    const sid = try peer.conn.startStream(&peer.wire, &fields, false);
+    try peer.conn.sendData(&peer.wire, sid, body, true);
+    return sid;
+}
+
+/// The message frames of a gRPC-Web response body and its trailer frame's text.
+fn webSplit(gpa: Allocator, body: []const u8, msgs: *std.ArrayList([]const u8)) ![]const u8 {
+    var trailer: []const u8 = "";
+    var at: usize = 0;
+    while (at < body.len) {
+        const h = frame.parseHeader(body[at..][0..frame.header_len]);
+        const payload = body[at + frame.header_len ..][0..h.length];
+        if (body[at] == 0x80) {
+            trailer = try gpa.dupe(u8, payload);
+        } else try msgs.append(gpa, try gpa.dupe(u8, payload));
+        at += frame.header_len + h.length;
+    }
+    return trailer;
+}
+
+test "gRPC-Web: a binary unary call answers messages and a trailer FRAME, no HTTP trailers" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa);
+    defer peer.deinit();
+    var router = defaultRouter();
+    try peer.conn.sendPreface(&peer.wire);
+    const req = try encodeReq(gpa, .{ .text = "web", .count = 4 });
+    defer gpa.free(req);
+    const framed = try frame.encodeAlloc(gpa, req);
+    defer gpa.free(framed);
+    const ok = try webCall(&peer, "/echo.Echo/Unary", "application/grpc-web+proto", framed);
+    const missing = try webCall(&peer, "/echo.Echo/Nope", "application/grpc-web", "");
+    try runOffline(&peer, &router);
+
+    const r = peer.resp(ok);
+    try testing.expectEqualStrings("application/grpc-web+proto", r.header("content-type").?);
+    try testing.expectEqual(@as(?[]const u8, null), r.trailer("grpc-status"));
+    var msgs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (msgs.items) |m| gpa.free(m);
+        msgs.deinit(gpa);
+    }
+    const trailer = try webSplit(gpa, r.body.items, &msgs);
+    defer gpa.free(trailer);
+    try testing.expectEqual(@as(usize, 1), msgs.items.len);
+    var decoded = try pb.decode(EchoReply, gpa, msgs.items[0], .{});
+    defer decoded.deinit();
+    try testing.expectEqualStrings("echo:web", decoded.value.text);
+    try testing.expectEqualStrings("grpc-status: 0\r\n", trailer);
+
+    // An error with no message sent: still HTTP 200, the status only in the body.
+    const rm = peer.resp(missing);
+    try testing.expectEqual(@as(u16, 200), rm.status);
+    try testing.expectEqual(@as(?[]const u8, null), rm.header("grpc-status"));
+    var none: std.ArrayList([]const u8) = .empty;
+    defer none.deinit(gpa);
+    const t2 = try webSplit(gpa, rm.body.items, &none);
+    defer gpa.free(t2);
+    try testing.expect(std.mem.startsWith(u8, t2, "grpc-status: 12\r\ngrpc-message: unknown method Nope for service echo.Echo\r\n"));
+}
+
+test "gRPC-Web: grpc-web-text is base64 both ways, and bad base64 is refused" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa);
+    defer peer.deinit();
+    var router = defaultRouter();
+    try peer.conn.sendPreface(&peer.wire);
+    const req = try encodeReq(gpa, .{ .text = "txt", .count = 9 });
+    defer gpa.free(req);
+    const framed = try frame.encodeAlloc(gpa, req);
+    defer gpa.free(framed);
+    const b64 = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(framed.len));
+    defer gpa.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, framed);
+    const ok = try webCall(&peer, "/echo.Echo/Unary", "application/grpc-web-text", b64);
+    const bad = try webCall(&peer, "/echo.Echo/Unary", "application/grpc-web-text+proto", "!!!!");
+    try runOffline(&peer, &router);
+
+    const r = peer.resp(ok);
+    try testing.expectEqualStrings("application/grpc-web-text", r.header("content-type").?);
+    const plain = try gpa.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(r.body.items));
+    defer gpa.free(plain);
+    try std.base64.standard.Decoder.decode(plain, r.body.items);
+    var msgs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (msgs.items) |m| gpa.free(m);
+        msgs.deinit(gpa);
+    }
+    const trailer = try webSplit(gpa, plain, &msgs);
+    defer gpa.free(trailer);
+    var decoded = try pb.decode(EchoReply, gpa, msgs.items[0], .{});
+    defer decoded.deinit();
+    try testing.expectEqualStrings("echo:txt", decoded.value.text);
+    try testing.expectEqual(@as(i32, 9), decoded.value.index);
+    try testing.expectEqualStrings("grpc-status: 0\r\n", trailer);
+
+    var none: std.ArrayList([]const u8) = .empty;
+    defer none.deinit(gpa);
+    const rb = peer.resp(bad);
+    const plain2 = try gpa.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(rb.body.items));
+    defer gpa.free(plain2);
+    try std.base64.standard.Decoder.decode(plain2, rb.body.items);
+    const t2 = try webSplit(gpa, plain2, &none);
+    defer gpa.free(t2);
+    try testing.expect(std.mem.startsWith(u8, t2, "grpc-status: 13\r\n")); // INTERNAL
+}
+
 // ── status details ──────────────────────────────────────────────────────────
 
 fn detailsImpl(c: *server.Call) anyerror!void {

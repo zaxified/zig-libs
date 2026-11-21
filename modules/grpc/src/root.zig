@@ -77,6 +77,7 @@ const call_mod = @import("call.zig");
 const frame_mod = @import("frame.zig");
 const compress_mod = @import("compress.zig");
 const pool_mod = @import("pool.zig");
+const web_mod = @import("web.zig");
 const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");
 const server_mod = @import("server.zig");
@@ -313,6 +314,7 @@ test {
     _ = frame_mod;
     _ = compress_mod;
     _ = pool_mod;
+    _ = web_mod;
     _ = metadata_mod;
     _ = call_mod;
     _ = @import("call_test.zig");

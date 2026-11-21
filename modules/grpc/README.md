@@ -170,6 +170,12 @@ const b = (try call.metadataValueDecoded("x-echo-bin")).?; // decoded; b.deinit(
 Header names this layer owns (`grpc-timeout`, `content-type`, `te`, the pseudo-headers, …) are
 refused with `error.ReservedMetadata` rather than duplicated onto the wire.
 
+### gRPC-Web
+
+The same `Router` answers `application/grpc-web[-text][+proto]` requests: messages as usual, the status
+in a last frame (flag `0x80`, `name: value` lines) instead of trailers, base64 for `-text`. Nothing to
+enable; a browser's `grpc-web` client can call the server directly (add CORS in front of it).
+
 ### Interceptors
 
 Call-level hooks, so credentials, logging and metrics are written once. On a channel,
@@ -332,5 +338,5 @@ Trailers-Only distinction, since both shapes use the same field names.
 
 Message compression other than `gzip`/`deflate` (`snappy`, `zstd`). **Retries**, **channel load balancing
 / name resolution**, a typed `google.rpc.Status` (`grpc-status-details-bin` is carried as raw bytes: `ServerCall.setStatusDetails`, `Failure.details`),
-**gRPC-Web** framing, and **reflection** services (the standard health service is provided, see Server). On the server: preemptive deadline cancellation, and concurrent handlers unless you set `Router.pool` (a `grpc.HandlerPool`; the default stays
+a gRPC-Web *client*, and **reflection** services (the standard health service is provided, see Server). On the server: preemptive deadline cancellation, and concurrent handlers unless you set `Router.pool` (a `grpc.HandlerPool`; the default stays
 sequential per connection). See SPEC.md *What is deliberately not done* for why each, and *Backlog / deferred* for the ones that are open work.

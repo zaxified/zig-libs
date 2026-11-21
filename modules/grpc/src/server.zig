@@ -95,6 +95,7 @@ const pb = @import("protobuf");
 const frame = @import("frame.zig");
 const compress = @import("compress.zig");
 const pool_mod = @import("pool.zig");
+const web = @import("web.zig");
 const status_mod = @import("status.zig");
 const metadata = @import("metadata.zig");
 const call_mod = @import("call.zig");
@@ -386,8 +387,10 @@ pub fn serve(
         .content_type = ct,
         .de = .{ .max_recv_message_size = r.options.max_recv_message_size },
         .read_buf = try arena.alloc(u8, @max(frame.header_len, r.options.read_chunk)),
+        .web_mode = web.modeOf(req.header("content-type") orelse ""),
     };
     defer call.deinit();
+    if (call.web_mode == .text) call.web_buf = try arena.alloc(u8, call.web_dec.maxOut(call.read_buf.len) + 3);
 
     dispatch(r, &call) catch |err| call.adoptError(err);
     var k = r.interceptors.len;
@@ -494,6 +497,12 @@ pub const Call = struct {
     /// are undone with it), and the one response messages leave in.
     request_encoding: compress.Encoding = .identity,
     response_encoding: compress.Encoding = .identity,
+    /// gRPC-Web flavour of the request (`web.zig`), its base64 codec state for
+    /// `-text` and the decoder's output buffer.
+    web_mode: web.Mode = .none,
+    web_enc: web.Encoder = .{},
+    web_dec: web.Decoder = .{},
+    web_buf: []u8 = &.{},
     /// The inflated form of the message `receive` returned last.
     inflated: ?[]u8 = null,
 
@@ -605,6 +614,7 @@ pub const Call = struct {
                 error.EndOfStream => {
                     // A stream that stops mid-message is a truncated
                     // request, not an empty one.
+                    if (!c.web_dec.complete()) return error.TruncatedRequest;
                     c.de.endOfStream() catch |e| return mapFrameError(e);
                     c.recv_done = true;
                     return null;
@@ -612,6 +622,12 @@ pub const Call = struct {
                 else => return error.RequestFailed,
             };
             if (n == 0) continue;
+            if (c.web_mode == .text) {
+                const plain = c.web_dec.push(w.buffered(), c.web_buf) catch
+                    return c.fail(.internal, "invalid base64 in a grpc-web-text request");
+                c.de.push(c.gpa, plain) catch |e| return mapFrameError(e);
+                continue;
+            }
             c.de.push(c.gpa, w.buffered()) catch |e| return mapFrameError(e);
         }
     }
@@ -637,8 +653,8 @@ pub const Call = struct {
         const wire = packed_msg orelse message;
         var hdr: [frame.header_len]u8 = undefined;
         frame.writeHeader(&hdr, packed_msg != null, @intCast(wire.len));
-        c.rw.writeAll(&hdr) catch return c.writeDied();
-        c.rw.writeAll(wire) catch return c.writeDied();
+        c.body(&hdr) catch return c.writeDied();
+        c.body(wire) catch return c.writeDied();
         // Each message is pushed all the way out: a server-streaming reply
         // that sits in the response buffer until the handler returns is not
         // a stream. With a trailer section coming, this costs nothing on
@@ -762,6 +778,11 @@ pub const Call = struct {
             c.rw.setHeader("grpc-encoding", c.response_encoding.name()) catch return c.writeDied();
         for (c.initial_md.items) |e|
             c.rw.setHeader(e.name, e.value) catch return error.BadMetadata;
+        // gRPC-Web keeps the status in the body (`finishWeb`): no trailer section.
+        if (c.web_mode != .none) {
+            c.head_committed = true;
+            return;
+        }
         // From here the status has nowhere to live but the trailer section,
         // so it is advertised before the head can escape.
         c.rw.declareTrailers(&.{ "grpc-status", "grpc-message", "grpc-status-details-bin" }) catch
@@ -807,6 +828,8 @@ pub const Call = struct {
             break :blk status_mod.encodeMessage(c.status_message, buf);
         };
 
+        if (c.web_mode != .none) return c.finishWeb(code, message);
+
         if (!c.head_committed) {
             // ── Trailers-Only ──
             // One field block, END_STREAM on it, no DATA frame and no
@@ -848,6 +871,37 @@ pub const Call = struct {
         const trailer_msg: ?[]const u8 = if (trailer_md_lost) md_lost_message else message;
         if (trailer_msg) |m| c.rw.setTrailer("grpc-message", m) catch {};
         if (c.detailsWire()) |d| c.rw.setTrailer("grpc-status-details-bin", d) catch {};
+    }
+
+    /// Response body bytes: as they are, or base64 for `grpc-web-text`.
+    fn body(c: *Call, bytes: []const u8) !void {
+        if (c.web_mode == .text) return c.web_enc.write(c.rw, bytes);
+        return c.rw.writeAll(bytes);
+    }
+
+    /// gRPC-Web ends every response with the status in a last frame (flag
+    /// 0x80, `name: value\r\n` lines) instead of trailers, so there is no
+    /// Trailers-Only shape: a response that never sent a message is just a head
+    /// and that frame.
+    fn finishWeb(c: *Call, code: []const u8, message: ?[]const u8) void {
+        if (!c.head_committed) {
+            c.rw.setStatus(200);
+            c.rw.setHeader("content-type", c.content_type) catch return;
+            c.rw.setHeader("grpc-accept-encoding", c.router.options.accept_encodings.header()) catch return;
+            for (c.initial_md.items) |e| c.rw.setHeader(e.name, e.value) catch {};
+            c.head_committed = true;
+        }
+        var lines: std.ArrayList(u8) = .empty;
+        lines.print(c.arena, "grpc-status: {s}\r\n", .{code}) catch return;
+        if (message) |m| lines.print(c.arena, "grpc-message: {s}\r\n", .{m}) catch return;
+        if (c.detailsWire()) |d| lines.print(c.arena, "grpc-status-details-bin: {s}\r\n", .{d}) catch {};
+        for (c.trailing_md.items) |e| lines.print(c.arena, "{s}: {s}\r\n", .{ e.name, e.value }) catch {};
+        var hdr: [frame.header_len]u8 = undefined;
+        frame.writeHeader(&hdr, false, @intCast(lines.items.len));
+        hdr[0] = web.trailer_flag;
+        c.body(&hdr) catch return;
+        c.body(lines.items) catch return;
+        if (c.web_mode == .text) c.web_enc.finish(c.rw) catch {};
     }
 
     /// The wire form (unpadded base64) of `status_details`, null when none or
@@ -984,13 +1038,18 @@ pub fn grpcContentType(ct: []const u8) ?[]const u8 {
     if (ct.len < base.len) return null;
     if (!std.ascii.eqlIgnoreCase(ct[0..base.len], base)) return null;
     if (ct.len == base.len) return ct;
-    return switch (ct[base.len]) {
+    // `-web` and `-web-text` are gRPC-Web (`web.zig`): the same envelope, the
+    // status in the body.
+    var at: usize = base.len;
+    if (web.modeOf(ct) != .none) at = std.mem.findAnyPos(u8, ct, base.len, "+; ") orelse ct.len;
+    if (at == ct.len) return ct;
+    return switch (ct[at]) {
         // `+subtype` runs until a parameter starts.
         '+' => blk: {
             const end = std.mem.findAny(u8, ct, "; ") orelse ct.len;
             break :blk ct[0..end];
         },
-        ';', ' ' => ct[0..base.len],
+        ';', ' ' => ct[0..at],
         else => null,
     };
 }

@@ -37,7 +37,7 @@ against Python `grpcio` (recorded replay plus live oracle); offline frame-level 
 Trailers-Only vs Trailers distinction; a decoded-size bound on every message (declared length
 never sizes an allocation), pure Zig with no C core, typed struct messages with no codegen step.
 **Where we are behind:** no retries, name resolution/load balancing, per-message (stream-wrapping) interceptors,
-keepalive, a typed `google.rpc.Status`, gRPC-Web, and no reflection service (the standard
+keepalive, a typed `google.rpc.Status`, and no reflection service (the standard
 `grpc.health.v1` health service is provided, `src/health.zig`); the server is sequential per connection unless the application sets `Router.pool` (a `HandlerPool`) or installs the `http` dispatcher itself.
 
 See [README.md](README.md) for what this module is and how to use it.
@@ -107,6 +107,19 @@ adds metadata through `Outgoing.add` (reserved names refused) and `on_finish` ru
 `Call.deinit` with the call's status, `.cancelled` if none arrived. A wrapper around each
 message of a stream (grpc-go's `StreamInterceptor` that replaces `RecvMsg`/`SendMsg`) is not
 provided: a hook per message would be a second dispatch layer over the same `Call`.
+
+### gRPC-Web
+
+`application/grpc-web`, `application/grpc-web-text` and their `+subtype` forms are served by the same
+`Router` (`web.zig`): the request is the same length-prefixed message stream (base64 for `-text`), the
+response echoes the content type and carries the messages followed by one frame with flag `0x80` whose
+payload is the `grpc-status`, `grpc-message`, `grpc-status-details-bin` and trailing-metadata lines
+(`name: value\r\n`), because a browser cannot read HTTP trailers. There is no Trailers-Only shape: even a
+failure that sent nothing is HTTP 200, a head and that frame. The `-text` encoder and decoder carry
+partial 3-byte and 4-character groups across writes and reads, so the stream is one valid base64
+text however the messages were chunked. Interceptors, compression, deadlines and the pool apply as
+for gRPC. Verified over HTTP/2 offline (`server_test.zig`); CORS and the browser's own `grpc-web` client
+library are not covered by a live test, and an HTTP/1.1 listener is the application's `http.Server` options.
 
 ### What the server does not do
 
@@ -418,8 +431,8 @@ Each item is refused with its reason here; the ones that are open work are also 
 - **A typed `google.rpc.Status` with `Any` details.** `grpc-status-details-bin` is carried as raw bytes
   (`ServerCall.setStatusDetails`, `Failure.details`); building and reading the `Any` entries is the
   caller's (`protobuf` deliberately does not implement `Any`).
-- **gRPC-Web.** Same LPM envelope over HTTP/1.1 with trailers folded into the body; `grpc.frame`
-  is the reusable half and the rest is a different transport.
+- **A gRPC-Web client.** The server side is provided (`web.zig`); a browser is the client that uses it,
+  and a Zig client speaks gRPC proper.
 - **Reflection and channelz services.** Ordinary services, expressible with what is
   here; not protocol. (`grpc.health.v1` is provided: `health.zig`.)
 - **Preemptive deadline cancellation.** A property of `h2_server`'s scheduling, not of this module;
@@ -438,4 +451,4 @@ Each item is refused with its reason here; the ones that are open work are also 
 
 Reasons for each are under *What is deliberately not done*; the first four are what a typical grpc-go/tonic user hits in ordinary use.
 
-- **Retries/hedging, name resolution and load balancing, keepalive, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.
+- **Retries/hedging, name resolution and load balancing, keepalive** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections (and keepalive needs a PING API on `http.h2_client.Session`, which it does not have).
