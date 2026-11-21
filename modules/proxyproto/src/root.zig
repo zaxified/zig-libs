@@ -155,6 +155,36 @@ pub const Header = struct {
     pub fn gcp(h: Header) error{Malformed}!?[]const u8 {
         return h.tlv(tlv_type.gcp);
     }
+    /// The AWS PrivateLink VPC endpoint id (`PP2_TYPE_AWS` 0xEA, sub-type 0x01,
+    /// then the id as ASCII, e.g. `vpce-0123...`): the slice after the sub-type
+    /// byte. Null when the TLV is absent or carries another sub-type; an empty
+    /// value is `Malformed`. AWS Elastic Load Balancing user guide, "Proxy protocol".
+    pub fn awsVpceId(h: Header) error{Malformed}!?[]const u8 {
+        const v = (try h.tlv(tlv_type.aws)) orelse return null;
+        if (v.len < 1) return error.Malformed;
+        if (v[0] != 0x01) return null;
+        return v[1..];
+    }
+    /// The Azure Private Link LinkID (`PP2_TYPE_AZURE` 0xEE, sub-type 0x01,
+    /// then a 4-byte little-endian UINT32). Null when absent or another
+    /// sub-type; a sub-type 0x01 value that is not 5 bytes is `Malformed`.
+    /// Microsoft Learn, "What is Azure Private Link service?".
+    pub fn azureLinkId(h: Header) error{Malformed}!?u32 {
+        const v = (try h.tlv(tlv_type.azure)) orelse return null;
+        if (v.len < 1) return error.Malformed;
+        if (v[0] != 0x01) return null;
+        if (v.len != 5) return error.Malformed;
+        return std.mem.readInt(u32, v[1..5], .little);
+    }
+    /// The Google Cloud Private Service Connect connection id (`PP2_TYPE_GCP`
+    /// 0xE0, an 8-byte value in network order, no sub-type); a value of any
+    /// other length is `Malformed`. Google Cloud VPC documentation, "Private
+    /// Service Connect backends".
+    pub fn gcpPscConnectionId(h: Header) error{Malformed}!?u64 {
+        const v = (try h.tlv(tlv_type.gcp)) orelse return null;
+        if (v.len != 8) return error.Malformed;
+        return std.mem.readInt(u64, v[0..8], .big);
+    }
 };
 
 pub const Tlv = struct { type: u8, value: []const u8 };

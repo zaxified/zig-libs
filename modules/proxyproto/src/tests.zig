@@ -313,6 +313,35 @@ fn tlvHeader(comptime tlvs: []const u8) [28 + tlvs.len]u8 {
     return h;
 }
 
+test "TLV: cloud-provider ids decode per the providers' layouts" {
+    const t = comptime hex.literal(
+        "ea0006" ++ "01" ++ "7670636501" ++ // AWS sub-type 1, "vpce" 0x01
+            "ee0005" ++ "01" ++ "78563412" ++ // Azure sub-type 1, LinkID 0x12345678 little-endian
+            "e00008" ++ "0102030405060708", // GCP, 8 bytes network order
+    );
+    const buf = tlvHeader(&t);
+    const h = (try expectHeader(try pp.parse(&buf))).h;
+    try testing.expectEqualSlices(u8, &hex.literal("7670636501"), (try h.awsVpceId()).?);
+    try testing.expectEqual(@as(u32, 0x12345678), (try h.azureLinkId()).?);
+    try testing.expectEqual(@as(u64, 0x0102030405060708), (try h.gcpPscConnectionId()).?);
+}
+
+test "TLV: cloud-provider ids refuse or skip what they cannot read" {
+    // other AWS/Azure sub-type -> null; bad lengths -> Malformed; absent -> null
+    const other = comptime hex.literal("ea0003" ++ "026162" ++ "ee0002" ++ "0211");
+    const b1 = tlvHeader(&other);
+    const h1 = (try expectHeader(try pp.parse(&b1))).h;
+    try testing.expect((try h1.awsVpceId()) == null);
+    try testing.expect((try h1.azureLinkId()) == null);
+    try testing.expect((try h1.gcpPscConnectionId()) == null);
+    const bad = comptime hex.literal("ea0000" ++ "ee0003" ++ "010000" ++ "e00004" ++ "deadbeef");
+    const b2 = tlvHeader(&bad);
+    const h2 = (try expectHeader(try pp.parse(&b2))).h;
+    try testing.expectError(error.Malformed, h2.awsVpceId());
+    try testing.expectError(error.Malformed, h2.azureLinkId());
+    try testing.expectError(error.Malformed, h2.gcpPscConnectionId());
+}
+
 test "TLV: typed helpers" {
     const t = comptime hex.literal(
         "010002" ++ "6832" ++ // ALPN "h2"

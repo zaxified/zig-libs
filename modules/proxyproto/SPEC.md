@@ -103,7 +103,7 @@ the test step; see Anchoring).
 
 ## Backlog / deferred
 
-- **Decoding the cloud-provider TLVs** (AWS VPCE id, Azure LinkID, GCP): the layouts are provider documentation, not the specification; the raw bytes are returned today (`aws`, `azure`, `gcp`).
+None open.
 
 ## Anchoring
 
