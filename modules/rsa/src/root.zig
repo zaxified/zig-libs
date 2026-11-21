@@ -243,6 +243,49 @@ fn montParamsFromModulus(mod: Modulus) MontParams {
     return MontParams.fromFf(mod) catch unreachable; // odd, ≥ 512 bits
 }
 
+/// The `std.crypto.ff` `Modulus` of a SECRET odd value `v` of exactly
+/// `nbits` bits (public), `mp` its montint modulus — what
+/// `Modulus.fromBytes` gives, field for field (test below), without its
+/// value-dependent setup (`shrink`, and `computeRR`'s `shiftIn` loop branch
+/// on the value): the limbs repacked to ff's 63-bit layout (`elemToFf`), the
+/// limb count and leading zeros from `nbits`, `m0inv` by ff's own Newton
+/// iteration (arithmetic only), and `R² mod v` with `R = 2^(63·limbs)` by
+/// montint (`reduceLimbs`, then one modular square).
+fn ffModulusSecret(v: *const MontElem, mp: *const MontParams, nbits: usize) Modulus {
+    const FeUint = @FieldType(Fe, "v");
+    const Limb = @TypeOf(@as(FeUint, undefined).limbs_buffer[0]);
+    const t_bits = @bitSizeOf(Limb) - 1;
+    const TLimb = @Int(.unsigned, t_bits);
+    const limbs = (nbits + t_bits - 1) / t_bits;
+
+    var zero_fe: Fe = .{ .v = FeUint.zero };
+    zero_fe.v.limbs_len = limbs;
+    const shape: struct { v: FeUint } = .{ .v = zero_fe.v }; // what `elemToFf` reads: the limb count
+    var m: Modulus = .{
+        .zero = zero_fe,
+        .v = MontParams.elemToFf(Fe, shape, v).v,
+        .rr = undefined,
+        .m0inv = undefined,
+        .leading = limbs * t_bits - nbits,
+    };
+    const lo = m.v.limbs_buffer[0];
+    var y = lo;
+    inline for (0..comptime std.math.log2_int(usize, t_bits)) |_| {
+        y = y *% (2 -% lo *% y);
+    }
+    m.m0inv = (@as(Limb, 1) << t_bits) - @as(TLimb, @truncate(y));
+
+    var r = MontParams.zero;
+    defer std.crypto.secureZero(u64, &r);
+    r[(t_bits * limbs) / 64] = @as(u64, 1) << @intCast((t_bits * limbs) % 64);
+    var r_mod = mp.reduceLimbs(&r);
+    defer std.crypto.secureZero(u64, &r_mod);
+    var rr = mp.mul(&r_mod, &r_mod);
+    defer std.crypto.secureZero(u64, &rr);
+    m.rr = MontParams.elemToFf(Fe, shape, &rr);
+    return m;
+}
+
 /// `fe` as a montint element — a positional limb repack, no branch on the
 /// value (`DynModint.elemFromFf`). The secret CRT exponents and `qInv` come
 /// through here on every private op: they stay `ff` fields so the existing
@@ -625,9 +668,10 @@ pub const SecretKey = struct {
     /// Timing note (2026-10-03): the derivation is montint limb arithmetic,
     /// constant-time in the primes — `n` a limb product, `λ` from
     /// `montint.nt.lcm`, `d`/`dP`/`dQ` from `inverseOfModulus` (inverses
-    /// modulo the even `λ`, `p−1`, `q−1`), `qInv` by Fermat on montint. The
-    /// one step still variable-time on `p`, `q` is building their
-    /// `std.crypto.ff` `Modulus` carriers (`sk.p`, `sk.q`); SPEC Backlog.
+    /// modulo the even `λ`, `p−1`, `q−1`), `qInv` by Fermat on montint, and
+    /// the `std.crypto.ff` `Modulus` carriers `sk.p`, `sk.q` filled
+    /// positionally (`ffModulusSecret`; 2026-11-21) rather than by ff's
+    /// value-branching `Modulus.fromBytes`.
     /// Cost: a few milliseconds at 8192-bit width (the gcd and lcm run at the
     /// full `max_modulus_bits` capacity, whatever the key size).
     pub fn fromPrimes(out: *SecretKey, p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!void {
@@ -939,13 +983,7 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8,
     // later `publicExponent()` (`toPrimitive(u32) catch unreachable`) relies on it.
     if (eb.len > 4) return error.InvalidPrivateKey;
 
-    // `Modulus.fromBytes` rejects even and < 3 values, covering p, q oddness.
-    // ⚠ These two `std.crypto.ff` constructions are the derivation's one
-    // remaining variable-time step on the secret primes (ff's Montgomery
-    // setup branches on the value) — they are the key's public carrier
-    // type (`sk.p`, `sk.q`); SPEC Backlog.
-    const p = Modulus.fromBytes(pb, .big) catch return error.InvalidPrivateKey;
-    const q = Modulus.fromBytes(qb, .big) catch return error.InvalidPrivateKey;
+    if (pb.len == 0 or qb.len == 0) return error.InvalidPrivateKey;
 
     // Everything else is montint limb arithmetic, constant-time in the
     // primes' values (2026-10-03; until then std.math.big.int — `gcd`,
@@ -955,6 +993,9 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8,
     defer std.crypto.secureZero(u64, &pv);
     var qv = MontParams.loadBE(qb) catch return error.InvalidPrivateKey;
     defer std.crypto.secureZero(u64, &qv);
+    // p, q odd (a prime factor of an RSA modulus always is; the verdict is
+    // the one branch on the low bit).
+    if ((pv[0] & qv[0] & 1) == 0) return error.InvalidPrivateKey;
     if (MontParams.eql(&pv, &qv)) return error.InvalidPrivateKey; // p == q
     // `FromPrimesOptions.check_primality`; the verdict is the one branch.
     if (check_primes and !(factorIsPrime(pb, &pv) and factorIsPrime(qb, &qv))) return error.InvalidPrivateKey;
@@ -1027,6 +1068,12 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8,
     var one = MontParams.zero;
     one[0] = 1;
     if (!MontParams.eql(&p_mont.mul(&qinv_el, &q_mod_p), &one)) return error.InvalidPrivateKey;
+
+    // The `std.crypto.ff` carriers of the secret primes (`sk.p`, `sk.q`),
+    // filled positionally (`ffModulusSecret`): ff's own `Modulus.fromBytes`
+    // branches on the value.
+    const p = ffModulusSecret(&pv, &p_mont, bitLenBe(pb));
+    const q = ffModulusSecret(&qv, &q_mont, bitLenBe(qb));
 
     // Into the `ff` carrier fields by a positional repack (ff's own
     // `fromBytes` branches on the value): d < λ < n, dP < p, dQ < q,
@@ -8601,4 +8648,33 @@ test "signPssBlinded: .cached and .none sign as signPss does for the same salt, 
     // The cache was used: its generator moved.
     var fresh = std.Random.DefaultPrng.init(7);
     try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&fresh), std.mem.asBytes(&blind_prng)));
+}
+
+test "ffModulusSecret equals Modulus.fromBytes field for field" {
+    // Odd values of every limb-boundary size, top bit set.
+    var prng = std.Random.DefaultPrng.init(0x5eC2e7);
+    // 63·k + 1 (top limb holding one bit), the 512- and 1024-bit primes of
+    // 1024- and 2048-bit keys, and the 4096-bit prime of the 8192-bit cap.
+    const sizes = [_]usize{ 61, 62, 63, 64, 65, 125, 126, 127, 189, 190, 512, 1009, 1024, 1025, 2017, 2047, 2048, 4096 };
+    for (sizes) |bits| {
+        var buf: [max_modulus_len]u8 = undefined;
+        const len = (bits + 7) / 8;
+        const be = buf[0..len];
+        prng.random().bytes(be);
+        be[0] &= @as(u8, 0xff) >> @intCast(8 * len - bits);
+        be[0] |= @as(u8, 1) << @intCast((bits - 1) % 8);
+        be[len - 1] |= 1;
+        const want = try Modulus.fromBytes(be, .big);
+        const v = try MontParams.loadBE(be);
+        const mp = try MontParams.fromLimbsBits(&v, bits);
+        const got = ffModulusSecret(&v, &mp, bits);
+        try testing.expectEqual(want.v.limbs_len, got.v.limbs_len);
+        try testing.expectEqual(want.leading, got.leading);
+        try testing.expectEqual(want.m0inv, got.m0inv);
+        try testing.expectEqual(want.bits(), got.bits());
+        try testing.expectEqualSlices(u64, want.v.limbs_buffer[0..want.v.limbs_len], got.v.limbs_buffer[0..got.v.limbs_len]);
+        try testing.expectEqualSlices(u64, &want.rr.v.limbs_buffer, &got.rr.v.limbs_buffer);
+        try testing.expectEqual(want.zero.v.limbs_len, got.zero.v.limbs_len);
+        try testing.expectEqualSlices(u64, &want.zero.v.limbs_buffer, &got.zero.v.limbs_buffer);
+    }
 }

@@ -103,9 +103,13 @@ prime `p`; it reveals only whether the key object lists the same prime first —
 `d mod (p−1)` since `(p−1) | λ`), `qInv` by Fermat on montint with its self-check kept; the
 values are byte-identical to the big-int derivation they replace (the OpenSSL KAT pins
 `d`/`dP`/`dQ`/`qInv`). `generate`'s Miller-Rabin is `DynModint.isProbablePrime`. ctgrind
-`keygen` (p, q tainted): no context in the derivation's arithmetic; the ≤ 173 left are the
-`std.crypto.ff` carriers of `p`, `q`, `n` (`sk.p`/`sk.q` are API fields — Backlog), the public
-`n` (tainted by derivation in the harness), length scans and verdicts, each class named in
+`keygen` (p, q tainted): no context in the derivation's arithmetic. The `std.crypto.ff` carriers
+`sk.p`/`sk.q` (API fields) are filled positionally by `ffModulusSecret` — the limbs repacked to
+ff's 63-bit layout, the limb count and leading zeros from the public bit length, `m0inv` by ff's
+Newton iteration, `R² mod p` by montint — equal field for field to ff's `Modulus.fromBytes` (test),
+whose `shrink`/`shiftIn`/`computeRR`/`normalize` branched on the primes (≤ 173 → ≤ 80,
+2026-11-21). The ≤ 80 left are the public `n`'s ff carrier and `Fe.fromBytes(n, e)` (`n` tainted
+by derivation in the harness), length scans and verdicts, each class named in
 `ctgrind-expected.tsv`.
 This module must never
 implement its own bignum or a non-constant-time exponentiation over secret data. `rsasp1`/
@@ -246,8 +250,7 @@ PublicKey.fromBytes does" covers both the default and the escape floor.
   Fermat self-check and the sign-time fault check refuses the key). Primes from an untrusted source:
   `fromPrimesWith(.., .{ .check_primality = true })`, 64 Miller-Rabin rounds on each with witnesses from a ChaCha CSPRNG
   keyed by SHA-256 of the prime (deterministic, `paillier.fromPrimes`'s shape), 2 × 64 modexps of the prime size.
-- `sk.p`/`sk.q` are `std.crypto.ff` `Modulus` carriers whose construction branches on the secret value; this is most of
-  ctgrind `keygen`'s count (Backlog). The prime search's sieve and Miller-Rabin's squaring count are observable for a kept
+- The prime search's sieve and Miller-Rabin's squaring count are observable for a kept
   prime (Backlog).
 - A `BlindingCache` holds key material (`r^e mod p` and `r⁻¹ mod p` give `p` by a gcd with `n`): it is wiped by `deinit`, and the
   per-operation stack burn does not cover it. One cache per thread, no lock.
@@ -375,10 +378,6 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 
 ## Backlog / deferred
 
-- **`p`, `q` as `std.crypto.ff` `Modulus` carriers.** `sk.p`/`sk.q` are public API fields of ff's type, and
-  `Modulus.fromBytes` on them branches on the value (`shrink`, `shiftIn`, `computeRR` — most of ctgrind `keygen`'s ≤ 173).
-  Fix: carry the CRT primes as `DynModint` only (`p_mont`/`q_mont` exist) and keep the ff `Modulus` for public values —
-  breaking for callers that read `sk.p`/`sk.q`. Effort: medium. Fits CONVENTIONS §2.
 - **Prime search sieve.** `bytesMod`'s `%` on the candidate (variable-latency division) and Miller-Rabin's squaring count
   `s = v2(p − 1)` stay observable for a kept prime. Fix: a sieve by multiplication with precomputed reciprocals over the whole
   table, and `p ≡ 3 mod 4` candidates (s = 1) if FIPS 186-5 shape allows. Effort: small–medium. Fits CONVENTIONS §2.
