@@ -47,6 +47,12 @@
 //! rounds, each keeping its best of five batches; ratio = ours/Go by wall time;
 //! the verdict is the worst row. MB/s is the file size (the output size for
 //! `write`) over the best time. Arguments filter workloads (substring).
+//!
+//! The field's fastest (2026-11-21): when liquidaty/zsv (C, MIT, SIMD) is built under `ZSV_PREFIX`
+//! (default `.zig-cache/zsv-install`, see `tools/README.md`), `tools/zsv_bench/main.c` is compiled
+//! against it and every reader row also runs on it (`narrow`, `wide`, `quoted`, `multiline`,
+//! `mem_narrow`: the same files, the same checksum, checked before timing like Go's); the row then
+//! prints a `zsv` line with ours/zsv. `write` has no zsv side. Without the build the row is skipped.
 
 const std = @import("std");
 const bench = @import("benchkit");
@@ -279,6 +285,22 @@ fn generate(io: std.Io, dir: std.Io.Dir, name: []const u8, seed: u64, genfn: *co
 
 const Check = struct { a: u64, b: u64, c: u64 };
 
+/// Compile the zsv driver against `ZSV_PREFIX` (default `.zig-cache/zsv-install`); null when
+/// that build is not there.
+fn zsvBuild(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, abs: []const u8) !?[]const u8 {
+    const prefix = environ.get("ZSV_PREFIX") orelse ".zig-cache/zsv-install";
+    const lib = try arena.print("{s}/lib/libzsv.a", .{prefix});
+    std.Io.Dir.cwd().access(io, lib, .{}) catch return null;
+    const exe = try arena.print("{s}/zsv_bench", .{abs});
+    const inc = try arena.print("-I{s}/include", .{prefix});
+    const res = try std.process.run(arena, io, .{ .argv = &.{ "cc", "-O3", inc, "modules/csvstream/tools/zsv_bench/main.c", lib, "-o", exe } });
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: compiling the zsv side failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.ForeignFailed;
+    }
+    return exe;
+}
+
 fn goCheck(arena: std.mem.Allocator, io: std.Io, exe: []const u8, abs: []const u8, name: []const u8) !Check {
     const res = try std.process.run(arena, io, .{ .argv = &.{ exe, abs, name, "check" } });
     if (res.term != .exited or res.term.exited != 0) {
@@ -312,6 +334,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const gexe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
 
+    const zexe = try zsvBuild(arena, io, init.environ_map, abs);
     var ctx: Ctx = .{ .io = io, .alloc = std.heap.page_allocator, .scratch = try arena.alloc(u8, 1 << 20) };
 
     var sizes: [works.len]u64 = undefined;
@@ -345,6 +368,13 @@ pub fn main(init: std.process.Init) !u8 {
             },
         }
         ok = ours.a == g.a and ours.b == g.b and ours.c == g.c;
+        if (ok and zexe != null and wk.kind != .write) {
+            const z = try goCheck(arena, io, zexe.?, abs, wk.name);
+            if (ours.a != z.a or ours.b != z.b or ours.c != z.c) {
+                try w.print("pre-check {s}: zsv {d} {d} {x} -- DISAGREE\n", .{ wk.name, z.a, z.b, z.c });
+                ok = false;
+            }
+        }
         try w.print("pre-check {s}: ours {d} {d} {x}; go {d} {d} {x}; {d} bytes -- {s}\n", .{ wk.name, ours.a, ours.b, ours.c, g.a, g.b, g.c, sizes[wi], if (ok) "agree" else "DISAGREE" });
         try w.flush();
         if (!ok) {
@@ -359,13 +389,18 @@ pub fn main(init: std.process.Init) !u8 {
     var s: bench.Summary = .{};
     try w.print("{s:<12} {s:>13} {s:>13} {s:>8} {s:>10} {s:>10} {s:>6} {s:>6}  count\n", .{ "workload", "ours ns", "go ns", "ours/go", "ours MB/s", "go MB/s", "spr us", "spr go" });
     try w.flush();
+    var zsv_worst: f64 = 0;
+    var zsv_best: f64 = std.math.inf(f64);
     for (works, 0..) |wk, wi| {
         if (!bench.selected(wk.name, filters)) continue;
         ctx.op = wi;
         var ours: bench.Side = .{};
         var ref: bench.Side = .{};
+        var fast: bench.Side = .{};
+        const with_zsv = zexe != null and wk.kind != .write;
         for (0..rounds) |_| {
             ref.add(try bench.foreign(arena, io, bench_name, gexe, abs, wk.name, &s.banner));
+            if (with_zsv) fast.add(try bench.foreign(arena, io, bench_name, zexe.?, abs, wk.name, null));
             ours.add(bench.timeIt(io, cyc, once, .{&ctx}, true));
         }
         const l = bench.score(ours, ref, null, false);
@@ -377,8 +412,15 @@ pub fn main(init: std.process.Init) !u8 {
             100 * ours.spread(false), 100 * ref.spread(false),  ours.count,
             if (!l.same_count) " ≠" else "",
         });
+        if (with_zsv) {
+            const lz = bench.score(ours, fast, null, false);
+            zsv_worst = @max(zsv_worst, lz.ref);
+            zsv_best = @min(zsv_best, lz.ref);
+            try w.print("  zsv        {d:>13.0} ns {d:>8.3} ours/zsv {d:>10.1} MB/s zsv  spr {d:.1}%\n", .{ fast.best_ns, lz.ref, mb * 1000 / fast.best_ns, 100 * fast.spread(false) });
+        }
         try w.flush();
     }
+    if (zsv_worst > 0) try w.print("worst ours/zsv = {d:.3} (best {d:.3}) over the reader rows\n", .{ zsv_worst, zsv_best });
     try w.print("rounds: {d}; ratios by wall time; largest spread {d:.1}%{s}\n", .{ rounds, 100 * s.max_spread, if (s.max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
     if (s.mismatch) {
         try w.print("{s}: FAILED -- an output count differs between the sides\n", .{bench_name});

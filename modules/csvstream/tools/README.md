@@ -7,6 +7,7 @@ own lane, with no Python and no Go (`CONVENTIONS.md` §9).
 | tool | role |
 |---|---|
 | `oracle.py` | Writes the vectors: Python's `csv` (reader, and `csv.writer` QUOTE_MINIMAL/CRLF) answering this module's own inputs, plus Go's answers through `go/`. |
+| `zsv_bench/main.c` | The zsv side of `bench-csvstream` (liquidaty/zsv, C, MIT, run as a black box through its public API): the five reader workloads over the same files with the same checksum; `bench.zig` compiles it with `cc -O3` against `$ZSV_PREFIX` (default `.zig-cache/zsv-install`) and skips the zsv rows when that is missing. |
 | `go/main.go` | Go's `encoding/csv` (`LazyQuotes`, any field count; writer with `UseCRLF`), stdlib only — every record, where it starts (`FieldPos(0)`), and the bytes it writes. |
 
 ```bash
@@ -33,3 +34,10 @@ them back as the fields (modulo its CRLF normalization), and so does this module
 
 This replaces the 2026-09-17 three-reader comparison (`gen.py`/`compare.py`/
 `dump.zig`, 146 one-line vectors, measured but not frozen).
+
+The zsv build for `bench-csvstream` (a droppable pinned clone under `.zig-cache`, libzsv only, no root):
+
+```bash
+git clone --depth 1 --branch v1.4.3 https://github.com/liquidaty/zsv.git .zig-cache/zsv-src
+(cd .zig-cache/zsv-src && ./configure --prefix=$PWD/../zsv-install && cd src && make install)
+```

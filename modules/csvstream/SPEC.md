@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, CSVSTREAM_FUZZ; dialect harness checks the event-jumping scanner against its bytewise reference — a planted cap mutant fails at seed 48) · ct n/a — CSV parsing (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: capacity sums saturate, scan start clamped, counters saturate, no-cut refills double (O(M log M)), EOF probe ≤ 64 KiB; delta audit 18/20 + 2 eq)
 
-**Performance:** ref 0.43–0.89× Go encoding/csv 1.26.8 (`ReuseRecord`, `LazyQuotes`; `zig build bench-csvstream`: narrow 10×1M, wide 100×100k, every field quoted, multi-line `.span`, in-memory, writer 1M records) · fastest ? (measured 2026-10-20)
+**Performance:** ref 0.43–0.89× Go encoding/csv 1.26.8 (`ReuseRecord`, `LazyQuotes`; `zig build bench-csvstream`: narrow 10×1M, wide 100×100k, every field quoted, multi-line `.span`, in-memory, writer 1M records) · fastest 1.02–2.05× zsv 1.4.3 (C, SIMD; the five reader rows, `bench-csvstream`, 2026-11-21, two runs of 5 and 7 rounds on a loaded machine: the ratios repeat, the spreads were 9-57%)
 
 **Known defects:** none recorded
 
@@ -240,7 +240,10 @@ submodule's tests run under a bare re-export.
 
 The bench is `zig build bench-csvstream` against Go `encoding/csv` (`ReuseRecord`, `LazyQuotes`); rows: narrow
 numeric, wide text, every field quoted, multi-line `.span`, in-memory `LineIterator` + `splitFields`, writer. The
-card's Performance line holds the figures (the card is authoritative).
+card's Performance line holds the figures (the card is authoritative). The field's fastest is zsv 1.4.3 (liquidaty/zsv, C, MIT,
+SIMD scan engine, default buffers), driven through its public API by `tools/zsv_bench/main.c` over the same files and the same
+checksum (checked before timing); the reader rows put this module at 1.02-2.05x of zsv (quoted rows about even, the narrow and wide
+rows 1.3-1.4x, the multi-line `.span` rows 1.9-2.05x) and, as before, at 0.5-0.8x of Go. rust `csv`/`csv-core` was not added (not attempted: it needs a Rust toolchain and crates fetched from the network); zsv alone answers "fastest" for the card.
 
 ## What is deliberately not done
 
@@ -264,10 +267,6 @@ Ids are those of the scope survey; the card's Scope line cites them.
 
 ## Backlog / deferred
 
-- **Speed against the fastest in the field.** The card's `fastest` is not measured. Plan: `zsv` (C, MIT; a pinned clone
-  built under `.zig-cache`, a ~40-line driver linked against `libzsv`, pattern `modules/decimal/tools/mpdec_bench`) and,
-  if its dependencies resolve offline, rust `csv`/`csv-core` (a path dependency on a pinned clone), on the same
-  seeded files as the Go rows; metric MB/s, min of 5, ReleaseFast, single reader.
 - **`.span` mode rescans its residual from the first byte after every refill.** The scanner is not resumable
   mid-record: `scan` returns `.incomplete` without its position inside a quoted field, the pending stray-quote
   look-ahead (`max_quoted_lines`) or a field check, and a resume would have to snapshot and validate that state
