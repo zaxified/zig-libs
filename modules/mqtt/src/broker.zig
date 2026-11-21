@@ -733,6 +733,9 @@ pub const Session = struct {
     queue: std.ArrayListUnmanaged(Message) = .empty,
     queue_head: usize = 0,
     queued_bytes: usize = 0,
+    /// The broker-wide sum of every session's `queued_bytes`
+    /// (`Config.max_queued_bytes_total`); set where the session is made.
+    total_queued: ?*std.atomic.Value(usize) = null,
     /// At most `max_in_flight`; capacity reserved when the session is made,
     /// so moving a message into flight cannot fail.
     inflight: std.ArrayListUnmanaged(Message) = .empty,
@@ -764,6 +767,33 @@ pub const Session = struct {
         x.has_owner = true;
     }
 
+    /// Caller holds `lock`.
+    fn subBytes(s: *Session, n: usize) void {
+        s.queued_bytes -= n;
+        if (s.total_queued) |t| _ = t.fetchSub(n, .monotonic);
+    }
+
+    /// Reserve `n` bytes against the broker-wide cap (`cap` 0 = none) and add
+    /// them to this session. False: the cap would be crossed. Caller holds `lock`.
+    fn addBytes(s: *Session, n: usize, cap: usize) bool {
+        if (s.total_queued) |t| {
+            if (cap != 0) {
+                var cur = t.load(.monotonic);
+                while (true) {
+                    if (cur +| n > cap) return false;
+                    cur = t.cmpxchgWeak(cur, cur + n, .monotonic, .monotonic) orelse break;
+                }
+            } else _ = t.fetchAdd(n, .monotonic);
+        }
+        s.queued_bytes += n;
+        return true;
+    }
+
+    /// Undo an `addBytes` whose message was not kept. Caller holds `lock`.
+    fn undoBytes(s: *Session, n: usize) void {
+        s.subBytes(n);
+    }
+
     fn queuedLen(s: *const Session) usize {
         return s.queue.items.len - s.queue_head;
     }
@@ -773,7 +803,7 @@ pub const Session = struct {
         if (s.queue_head >= s.queue.items.len) return null;
         const m = s.queue.items[s.queue_head];
         s.queue_head += 1;
-        s.queued_bytes -= m.bytes.len;
+        s.subBytes(m.bytes.len);
         if (s.queue_head == s.queue.items.len) {
             s.queue.clearRetainingCapacity();
             s.queue_head = 0;
@@ -1532,7 +1562,26 @@ pub const Config = struct {
     /// may hold up to `(max_sessions + max_connections) * max_queued_bytes`
     /// (about 2 GiB at the defaults) of messages for subscribers that do not
     /// acknowledge. Lower them (or `max_sessions` / `max_connections`) to fit
-    /// the machine; there is no global byte cap (mosquitto has none either).
+    /// the machine, or set `max_queued_bytes_total`.
+    /// Broker-wide cap on the bytes (topic + payload) queued across every
+    /// session and clean-session connection, 0 = none (the default and
+    /// Mosquitto's behaviour: it has no such cap). The per-session limits above
+    /// bound one subscriber; this bounds their sum, which at the defaults is
+    /// `(max_sessions + max_connections) * max_queued_bytes`. A message past it
+    /// is dropped for that subscriber and counted in `queueDrops`, as for the
+    /// per-session limits.
+    max_queued_bytes_total: usize = 0,
+    /// Broker-wide cap on the bytes of subscription filters held, 0 = none
+    /// (Mosquitto has none). `max_subscriptions_total` counts filters, and a
+    /// filter is at most one packet: the bytes are bounded by that times
+    /// `max_packet_size`, about three copies of each. A filter past this cap
+    /// is refused like one past `max_subscriptions_total` (SUBACK 0x80).
+    max_subscription_bytes_total: usize = 0,
+    /// Cap on the retained topics one SUBSCRIBE may EXAMINE (match against its
+    /// filters) under the registry lock, 0 = none (Mosquitto has none). The
+    /// delivery envelopes above bound what a SUBSCRIBE sends, not what it
+    /// walks; a walk cut by this counts in `Broker.retainedTruncations()`.
+    max_retained_examined: usize = 0,
     /// How long an offline session is kept, measured from when its connection
     /// closed (the latest time the broker had been given then: a packet's
     /// `now`, an `expireSessions` or `publishDueWills` call), when the caller
@@ -1856,6 +1905,10 @@ pub const Broker = struct {
     /// (`Connection.eq`) — or could not be made (`max_queued_messages` /
     /// `max_queued_bytes`, or out of memory). Only `countQueueDrop` moves it.
     queue_drops: std.atomic.Value(usize) = .init(0),
+    /// Bytes of subscription filters held (`Config.max_subscription_bytes_total`); under `mutex`.
+    subscription_bytes: usize = 0,
+    /// The sum of every session's and clean-session queue's `queued_bytes`.
+    queued_total: std.atomic.Value(usize) = .init(0),
 
     /// Persistent sessions, online and offline. Guarded by `mutex`.
     sessions: std.ArrayList(*Session) = .empty,
@@ -2409,6 +2462,12 @@ pub const Broker = struct {
                 b.indexUpdate(sub.filter, ref);
                 continue;
             }
+            if (b.config.max_subscription_bytes_total != 0 and
+                b.subscription_bytes +| sub.filter.len > b.config.max_subscription_bytes_total)
+            {
+                b.discardSession(x);
+                return error.TooManySubscriptions;
+            }
             b.addSessionSub(x, sub.filter, ref) catch {
                 b.discardSession(x);
                 return error.OutOfMemory;
@@ -2462,17 +2521,18 @@ pub const Broker = struct {
             m.released = false;
             m.id = 0;
             if (x.queuedLen() >= b.config.max_queued_messages or
-                x.queued_bytes + m.bytes.len > b.config.max_queued_bytes)
+                x.queued_bytes + m.bytes.len > b.config.max_queued_bytes or
+                !x.addBytes(m.bytes.len, b.config.max_queued_bytes_total))
             {
                 b.allocator.free(m.bytes);
                 b.countDrop(x);
                 continue;
             }
             x.queue.append(b.allocator, m) catch {
+                x.undoBytes(m.bytes.len);
                 b.allocator.free(m.bytes);
                 return error.OutOfMemory;
             };
-            x.queued_bytes += m.bytes.len;
         }
     }
 
@@ -2491,6 +2551,7 @@ pub const Broker = struct {
         errdefer x.subs.items.len -= 1;
         b.indexAdd(filter, ref) catch return error.OutOfMemory;
         b.subscriptions_total += 1;
+        b.subscription_bytes += filter.len;
     }
 
     // ── the subscription index, Shared Subscriptions included ───────────────
@@ -3884,7 +3945,7 @@ pub const Broker = struct {
     fn createSession(b: *Broker, client_id: []const u8, owner: ?[]const u8) Error!*Session {
         const x = try b.allocator.create(Session);
         errdefer b.allocator.destroy(x);
-        x.* = .{};
+        x.* = .{ .total_queued = &b.queued_total };
         @memcpy(x.client_id_buf[0..client_id.len], client_id);
         x.client_id_len = client_id.len;
         x.setOwner(owner);
@@ -3953,7 +4014,7 @@ pub const Broker = struct {
             var kept: usize = 0;
             for (live) |m| {
                 if (m.expires_at) |at| if (at <= now) {
-                    x.queued_bytes -= m.bytes.len;
+                    x.subBytes(m.bytes.len);
                     b.allocator.free(m.bytes);
                     _ = b.messages_expired.fetchAdd(1, .monotonic);
                     continue;
@@ -3991,6 +4052,7 @@ pub const Broker = struct {
         if (std.mem.findScalar(*Session, b.sessions.items, x)) |i| _ = b.sessions.swapRemove(i);
         for (x.subs.items) |f| {
             b.indexRemove(f, .{ .session = x });
+            b.subscription_bytes -= f.len;
             b.allocator.free(f);
             b.subscriptions_total -= 1;
         }
@@ -4007,6 +4069,7 @@ pub const Broker = struct {
     }
 
     fn freeSession(b: *Broker, x: *Session) void {
+        x.subBytes(x.queued_bytes); // what it still holds leaves the broker-wide total
         for (x.subs.items) |f| b.allocator.free(f);
         x.subs.deinit(b.allocator);
         for (x.queue.items[x.queue_head..]) |m| b.allocator.free(m.bytes);
@@ -4024,12 +4087,14 @@ pub const Broker = struct {
     fn enqueueLocked(b: *Broker, x: *Session, msg: Outgoing, qos: QoS, ids: []const u32, props: []const u8) void {
         const len = msg.topic.len + msg.payload.len + props.len + ids.len * 4;
         if (x.queuedLen() >= b.config.max_queued_messages or
-            x.queued_bytes + len > b.config.max_queued_bytes)
+            x.queued_bytes + len > b.config.max_queued_bytes or
+            !x.addBytes(len, b.config.max_queued_bytes_total))
         {
             b.countDrop(x);
             return;
         }
         const bytes = b.allocator.alignedAlloc(u8, .@"4", len) catch {
+            x.undoBytes(len);
             b.countDrop(x);
             return;
         };
@@ -4048,11 +4113,11 @@ pub const Broker = struct {
             .retain = msg.retain,
             .qos = qos,
         }) catch {
+            x.undoBytes(len);
             b.allocator.free(bytes);
             b.countDrop(x);
             return;
         };
-        x.queued_bytes += len;
     }
 
     /// Caller holds `x.lock`.
@@ -4298,6 +4363,7 @@ pub const Broker = struct {
             var walked_n: usize = 0;
             var snap_bytes: usize = 0;
             var truncated = false;
+            var examined: usize = 0;
             // ⛔ A connection a take-over has superseded may still be working
             // through packets it had already received. It must not register
             // anything: its session — if it had one — now belongs to the new
@@ -4344,6 +4410,13 @@ pub const Broker = struct {
                     walked[walked_n] = req.filter;
                     walked_n += 1;
                     for (b.retained.items) |r| {
+                        if (b.config.max_retained_examined != 0) {
+                            if (examined >= b.config.max_retained_examined) {
+                                truncated = true;
+                                break;
+                            }
+                            examined += 1;
+                        }
                         if (!topic.matches(req.filter, r.topic)) continue;
                         if (b.retainedGone(r, now)) continue; // gone (3.3.2-5, retain_expiry_interval_ms)
                         if (!b.deliveryAllowed(conn.clientId(), conn.usernameOpt(), r.topic)) continue;
@@ -4466,6 +4539,8 @@ pub const Broker = struct {
             }
         }
         if (b.subscriptions_total >= b.config.max_subscriptions_total) return .refused;
+        if (b.config.max_subscription_bytes_total != 0 and
+            b.subscription_bytes +| filter.len > b.config.max_subscription_bytes_total) return .refused;
         if (subs.items.len >= b.config.max_subscriptions_per_conn) return .refused;
         // Trie nodes are the real memory of a long filter (a Shared
         // Subscription lives in a flat group list, not in the trie).
@@ -4485,6 +4560,7 @@ pub const Broker = struct {
         errdefer subs.items.len -= 1; // undo the append on a later failure
         try b.indexAdd(filter, ref);
         b.subscriptions_total += 1;
+        b.subscription_bytes += filter.len;
         return .added;
     }
 
@@ -4508,6 +4584,7 @@ pub const Broker = struct {
                 while (live and i < subs.items.len) {
                     if (std.mem.eql(u8, subs.items[i], filter)) {
                         b.indexRemove(filter, owner);
+                        b.subscription_bytes -= subs.items[i].len;
                         b.allocator.free(subs.items[i]);
                         _ = subs.swapRemove(i);
                         b.subscriptions_total -= 1;
@@ -5088,7 +5165,7 @@ pub const Broker = struct {
                 b.countQueueDrop();
                 return;
             };
-            x.* = .{ .registered = false };
+            x.* = .{ .registered = false, .total_queued = &b.queued_total };
             conn.eq = x;
             break :blk x;
         };
@@ -5223,6 +5300,7 @@ pub const Broker = struct {
     fn dropSubscriptions(b: *Broker, conn: *Connection) void {
         for (conn.subs.items) |f| {
             b.indexRemove(f, .{ .conn = conn });
+            b.subscription_bytes -= f.len;
             b.allocator.free(f);
             b.subscriptions_total -= 1;
         }
@@ -5430,8 +5508,22 @@ pub const TcpServer = struct {
     /// message matches it inside the write, holding the connection's
     /// `tx_lock`. 0 = no deadline. Enforced by the connection's watchdog task
     /// on the monotonic clock, so it is accurate to about half this value
-    /// (at most one second). A per-connection bounded outbox is SPEC backlog.
+    /// (at most one second). `max_outbox_bytes` takes the wait out of the publisher.
     write_timeout_ms: u32 = 10_000,
+    /// Per-connection outbox, in bytes; 0 (the default) = none: a delivery
+    /// writes to the socket in the delivering thread, under `write_timeout_ms`.
+    /// Set (at least `Config.max_packet_size`): a write only appends to the
+    /// connection's outbox, which a task of its own drains to the socket, so a
+    /// publisher never waits for a slow subscriber at all. A write that would
+    /// leave more than this pending (the batch being written, at most as much
+    /// again, aside) fails: that subscriber is disconnected, the publishers
+    /// carry on (what EMQX does at `max_mqueue_len`-style overflow; Mosquitto
+    /// queues per client in the broker instead, which `max_queued_bytes`
+    /// already is here). An outbox is also what `close` waits for: the
+    /// DISCONNECT of a take-over and the last packets of a closing connection
+    /// are written before the socket goes (bounded by `write_timeout_ms`, and
+    /// not at all by a stalled peer when that is 0).
+    max_outbox_bytes: usize = 0,
     /// A TLS layer for this listener (see `Secure`); null = plaintext. One
     /// `TcpServer` is one listener: run one per port against the same broker,
     /// as Mosquitto's `listener 1883` and `listener 8883`.
@@ -5541,6 +5633,19 @@ pub const TcpServer = struct {
         defer if (is_secure) secure.closeFn(secure.ctx);
 
         var sock = SocketTransport{ .io = s.io, .stream = stream, .watch = &watch, .secure = if (is_secure) &secure else null };
+        // Declared before the connection: `remove` runs first (no writer left
+        // to append), then the writer task drains what is pending and ends.
+        var outbox: Outbox = .{ .io = s.io, .gpa = s.broker.allocator, .stream = stream, .watch = &watch, .secure = sock.secure, .cap = s.max_outbox_bytes };
+        defer outbox.deinit();
+        var outbox_task: ?std.Io.Future(@typeInfo(@TypeOf(Outbox.run)).@"fn".return_type.?) = null;
+        if (s.max_outbox_bytes != 0) {
+            outbox_task = s.io.concurrent(Outbox.run, .{&outbox}) catch return;
+            sock.outbox = &outbox;
+        }
+        defer if (outbox_task) |*t| {
+            outbox.finish();
+            t.await(s.io) catch {};
+        };
         const conn = s.broker.accept(sock.transport()) catch return;
         // `remove` drains in-flight fan-out references before returning, so
         // `sock` (this stack frame) outlives every concurrent writer to it.
@@ -5726,6 +5831,8 @@ const SocketTransport = struct {
     watch: ?*Watchdog = null,
     /// Set: writes go through it, not straight to `stream` (`TcpServer.secure`).
     secure: ?*SecureStream = null,
+    /// Set: a write appends here (`TcpServer.max_outbox_bytes`).
+    outbox: ?*Outbox = null,
 
     fn transport(t: *SocketTransport) Transport {
         return .{ .ctx = t, .writeFn = writeFn, .closeFn = closeFn, .io = t.io };
@@ -5733,11 +5840,16 @@ const SocketTransport = struct {
 
     fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
         const t: *SocketTransport = @ptrCast(@alignCast(ctx));
+        if (t.outbox) |o| return o.put(bytes);
         if (t.watch) |w| w.beginWrite();
         defer if (t.watch) |w| w.endWrite();
-        if (t.secure) |sec| return sec.writeFn(sec.ctx, bytes);
+        return writeRaw(t.io, t.stream, t.secure, bytes);
+    }
+
+    fn writeRaw(io: std.Io, stream: std.Io.net.Stream, secure: ?*SecureStream, bytes: []const u8) TransportError!void {
+        if (secure) |sec| return sec.writeFn(sec.ctx, bytes);
         var wbuf: [512]u8 = undefined;
-        var sw = t.stream.writer(t.io, &wbuf);
+        var sw = stream.writer(io, &wbuf);
         sw.interface.writeAll(bytes) catch return writeFailure(&sw);
         sw.interface.flush() catch return writeFailure(&sw);
     }
@@ -5754,7 +5866,103 @@ const SocketTransport = struct {
     /// the owner's own `stream.close` — no double close of the fd.
     fn closeFn(ctx: *anyopaque) void {
         const t: *SocketTransport = @ptrCast(@alignCast(ctx));
+        // With an outbox what was written before this (a take-over's
+        // DISCONNECT) goes out first; the outbox's task shuts the stream down.
+        if (t.outbox) |o| return o.closeAfterDrain();
         t.stream.shutdown(t.io, .both) catch {};
+    }
+};
+
+/// One connection's bounded outbox (`TcpServer.max_outbox_bytes`): a write
+/// appends under a short lock, a task of the connection's own writes the
+/// pending bytes to the socket in order.
+const Outbox = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+    watch: *Watchdog,
+    secure: ?*SecureStream,
+    cap: usize,
+    lock: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    /// Bytes not yet taken by the writer task.
+    pending: std.ArrayListUnmanaged(u8) = .empty,
+    /// The connection is ending: drain, then stop.
+    done: bool = false,
+    /// `Transport.close`: drain, shut the stream down, stop.
+    drain_close: bool = false,
+    /// A write failed or the cap was crossed: nothing more is taken.
+    broken: bool = false,
+
+    fn deinit(o: *Outbox) void {
+        o.pending.deinit(o.gpa);
+    }
+
+    /// `Transport.write`. Fails (and shuts the stream down, so the reader
+    /// wakes and the connection is reaped) when the outbox would pass its cap.
+    fn put(o: *Outbox, bytes: []const u8) TransportError!void {
+        o.lock.lockUncancelable(o.io);
+        defer o.lock.unlock(o.io);
+        if (o.broken or o.done or o.drain_close) return error.TransportFailed;
+        // One packet always fits an empty outbox, whatever the cap.
+        if (o.pending.items.len != 0 and o.pending.items.len + bytes.len > o.cap) {
+            o.broken = true;
+            o.stream.shutdown(o.io, .both) catch {};
+            o.cond.signal(o.io);
+            return error.TransportFailed;
+        }
+        o.pending.appendSlice(o.gpa, bytes) catch return error.TransportFailed;
+        o.cond.signal(o.io);
+    }
+
+    fn finish(o: *Outbox) void {
+        o.lock.lockUncancelable(o.io);
+        defer o.lock.unlock(o.io);
+        o.done = true;
+        o.cond.signal(o.io);
+    }
+
+    fn closeAfterDrain(o: *Outbox) void {
+        o.lock.lockUncancelable(o.io);
+        defer o.lock.unlock(o.io);
+        o.drain_close = true;
+        o.cond.signal(o.io);
+    }
+
+    /// The writer task.
+    fn run(o: *Outbox) std.Io.Cancelable!void {
+        var local: std.ArrayListUnmanaged(u8) = .empty;
+        defer local.deinit(o.gpa);
+        while (true) {
+            o.lock.lockUncancelable(o.io);
+            while (o.pending.items.len == 0 and !o.done and !o.drain_close and !o.broken) {
+                o.cond.wait(o.io, &o.lock) catch |e| {
+                    o.lock.unlock(o.io); // wait relocks, even when canceled
+                    return e;
+                };
+            }
+            std.mem.swap(std.ArrayListUnmanaged(u8), &o.pending, &local);
+            const shut = o.drain_close;
+            const broken = o.broken;
+            o.lock.unlock(o.io);
+            if (broken) return;
+            if (local.items.len == 0) {
+                if (shut) o.stream.shutdown(o.io, .both) catch {};
+                return;
+            }
+            o.watch.beginWrite();
+            const r = SocketTransport.writeRaw(o.io, o.stream, o.secure, local.items);
+            o.watch.endWrite();
+            local.clearRetainingCapacity();
+            r catch |e| {
+                o.lock.lockUncancelable(o.io);
+                o.broken = true;
+                o.lock.unlock(o.io);
+                o.stream.shutdown(o.io, .both) catch {};
+                if (e == error.Canceled) return error.Canceled;
+                return;
+            };
+        }
     }
 };
 
@@ -5811,6 +6019,60 @@ test "TcpServer serves a CONNECT over loopback and shuts down cleanly" {
     // tasks, and this one sat in its read until the watchdog's 1.5 x 30 s
     // keep-alive deadline — 45 s of every run of this module's tests, unseen
     // because the stress test was blamed for the time.
+    stream.close(io);
+    srv.shutdown();
+    serving.await(io);
+}
+
+test "max_outbox_bytes: a subscriber that never reads is cut off and the publisher never waits" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var srv = TcpServer.init(io, &b);
+    // A send deadline far beyond the test: without an outbox the first
+    // publisher to meet the stalled subscriber would sit in its write.
+    srv.write_timeout_ms = 120_000;
+    srv.max_outbox_bytes = 64 * 1024;
+    srv.bind("127.0.0.1", 0) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer srv.deinit();
+    var serving = try io.concurrent(serveTask, .{&srv});
+
+    const stream = srv.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        srv.shutdown();
+        serving.await(io);
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    };
+    var buf: [128]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(try packet.encodeConnect(&buf, .{ .client_id = "stalled", .keep_alive_s = 0 }));
+    try w.interface.writeAll(try packet.encodeSubscribe(&buf, 1, &.{.{ .filter = "#", .qos = .at_most_once }}));
+    try w.interface.flush();
+    var rbuf: [64]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    _ = try r.interface.takeArray(4); // CONNACK
+    _ = try r.interface.takeArray(5); // SUBACK
+    // From here the client reads nothing.
+
+    const payload: [4000]u8 = @splat('x');
+    const start = milliTimestamp();
+    for (0..8000) |_| try b.publish("flood", &payload, .at_most_once, false); // 32 MB
+    try testing.expect(milliTimestamp() - start < 20_000);
+
+    // The subscriber's connection was shut down by the overflow.
+    var waited: usize = 0;
+    while (waited < 200) : (waited += 1) {
+        b.mutex.lock();
+        const open = b.connections.items.len;
+        b.mutex.unlock();
+        if (open == 0) break;
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
+    }
+    try testing.expect(waited < 200);
+
     stream.close(io);
     srv.shutdown();
     serving.await(io);
@@ -6670,6 +6932,70 @@ test "the byte bound on a queue holds too" {
     try b.publish("a", "12", .at_least_once, false); // 9 + 3 > 10
     try testing.expectEqual(@as(?usize, 1), b.sessionQueued("web"));
     try testing.expectEqual(@as(u64, 1), b.queueDrops());
+}
+
+test "max_queued_bytes_total bounds the sum over sessions, and frees what leaves" {
+    var b = Broker.init(testing.allocator, .{ .max_queued_bytes_total = 12 });
+    defer b.deinit();
+    for ([_][]const u8{ "web", "app" }) |id| {
+        var t = TestTransport{};
+        const s = try connectSession(&b, &t, id, false, 0);
+        try feedSubscribe(&b, s.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+        b.remove(s.conn);
+    }
+    try b.publish("a", "12345678", .at_least_once, false); // 1 + 8 = 9 bytes for each
+    try testing.expectEqual(@as(usize, 9), b.queued_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), b.queueDrops()); // the second session's copy crosses 12
+    // The one that kept it is delivered on reconnect: the total drops to 0.
+    var t1 = TestTransport{};
+    var t2 = TestTransport{};
+    _ = try connectSession(&b, &t1, "web", false, 1);
+    _ = try connectSession(&b, &t2, "app", false, 1);
+    try testing.expectEqual(@as(usize, 0), b.queued_total.load(.monotonic));
+    // Default: no cap, the total is only counted.
+    var b2 = Broker.init(testing.allocator, .{});
+    defer b2.deinit();
+    var t3 = TestTransport{};
+    const s3 = try connectSession(&b2, &t3, "web", false, 0);
+    try feedSubscribe(&b2, s3.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    b2.remove(s3.conn);
+    try b2.publish("a", "12345678", .at_least_once, false);
+    try testing.expectEqual(@as(usize, 9), b2.queued_total.load(.monotonic));
+    // A session discarded with its queue gives the bytes back.
+    var t4 = TestTransport{};
+    _ = try connectSession(&b2, &t4, "web", true, 1);
+    try testing.expectEqual(@as(usize, 0), b2.queued_total.load(.monotonic));
+}
+
+test "max_subscription_bytes_total refuses a filter past the byte cap and gives bytes back" {
+    var b = Broker.init(testing.allocator, .{ .max_subscription_bytes_total = 5 });
+    defer b.deinit();
+    var t = TestTransport{};
+    const c = try connectClient(&b, &t, "c", 60, 0);
+    try feedSubscribe(&b, c, 1, &.{ .{ .filter = "abc" }, .{ .filter = "de" }, .{ .filter = "f" } });
+    const sa = (try t.next()).?.suback;
+    try testing.expectEqualSlices(u8, &.{ 0, 0, packet.suback_failure }, sa.codes);
+    try testing.expectEqual(@as(usize, 5), b.subscription_bytes);
+    b.remove(c);
+    try testing.expectEqual(@as(usize, 0), b.subscription_bytes);
+}
+
+test "max_retained_examined cuts the retained walk of one SUBSCRIBE" {
+    var b = Broker.init(testing.allocator, .{ .max_retained_examined = 5 });
+    defer b.deinit();
+    for (0..20) |i| {
+        var tbuf: [32]u8 = undefined;
+        try b.publish(try std.mem.print(&tbuf, "zl/{d}", .{i}), "p", .at_most_once, true);
+    }
+    var ts = CountingTransport{};
+    const sub_conn = try b.accept(ts.transport());
+    var cbuf: [128]u8 = undefined;
+    try b.feed(sub_conn, try packet.encodeConnect(&cbuf, .{ .client_id = "subr", .keep_alive_s = 0 }));
+    _ = try b.process(sub_conn, 1);
+    const before = ts.packets;
+    try feedSubscribe(&b, sub_conn, 1, &.{.{ .filter = "#", .qos = .at_most_once }});
+    try testing.expectEqual(@as(usize, 6), ts.packets - before); // SUBACK + the 5 examined
+    try testing.expectEqual(@as(u64, 1), b.retainedTruncations());
 }
 
 test "past the in-flight window messages wait, and a PUBACK sends the next" {

@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [karlseguin/mqttz](https://github.com/karlseguin/mqttz) | Zig | MIT | 59 | push 2026-06-01 | Zig client only, low-level and a POSIX client; its README describes an MQTT 5 client (`Client5`), no timeouts in the low-level one. No broker. |
 | [ikskuh/zig-mqtt](https://github.com/ikskuh/zig-mqtt) | Zig | MIT | 24 | push 2022-12-28 | Unmaintained since 2022 (push date); client only *(README not read)*. |
 
-**Where we are ahead** (2026-10-17): a broker with depth no Zig alternative shows; the message-path rows of `zig build bench-mqtt` against Mosquitto 2.1.2 with the same driver (the card's Performance line carries the range); session, topic and wire behaviour replayed byte for byte against Mosquitto and paho (`v5_replay`, `session_replay`, `topic_oracle_test`); fuzzing (six harnesses incl. random 5.0 packet streams through the extended-auth state machine), ctgrind on credentials, mutation-tested core. **Where we are behind:** nothing a Mosquitto user would notice in a library (2026-10-17: extended AUTH, `$SYS`, bridging, a persistence seam for retained messages and session bodies, ACL / password files with `%u`/`%c` and `$7$` hashes, `max_keepalive`, `retain_available`, `retain_expiry`, `queue_qos0_messages`, Payload Format validation, Reason Strings, reconnect + in-flight resume in the client, MQTT over WebSocket and TLS as tested recipes). Not built (see *Backlog / deferred*): a TLS *listener* in `TcpServer`, a bounded per-connection outbox. Built since: `$SYS` load and heap topics, an inline in-process subscribe (`InlineSubscriber`), MQTT 3.1 (`MQIsdp`). Outbound Topic Aliases, broker and client, are built. A configuration-file daemon, a dynamic-security plugin, clustering and rule engines are product features on top of the hooks, not library scope.
+**Where we are ahead** (2026-10-17): a broker with depth no Zig alternative shows; the message-path rows of `zig build bench-mqtt` against Mosquitto 2.1.2 with the same driver (the card's Performance line carries the range); session, topic and wire behaviour replayed byte for byte against Mosquitto and paho (`v5_replay`, `session_replay`, `topic_oracle_test`); fuzzing (six harnesses incl. random 5.0 packet streams through the extended-auth state machine), ctgrind on credentials, mutation-tested core. **Where we are behind:** nothing a Mosquitto user would notice in a library (2026-10-17: extended AUTH, `$SYS`, bridging, a persistence seam for retained messages and session bodies, ACL / password files with `%u`/`%c` and `$7$` hashes, `max_keepalive`, `retain_available`, `retain_expiry`, `queue_qos0_messages`, Payload Format validation, Reason Strings, reconnect + in-flight resume in the client, MQTT over WebSocket and TLS as tested recipes). Built since: a TLS listener seam in `TcpServer` (`secure`, with a `tlsserver` recipe), an opt-in bounded per-connection outbox, opt-in global byte caps, `$SYS` load and heap topics, an inline in-process subscribe (`InlineSubscriber`), MQTT 3.1 (`MQIsdp`). Outbound Topic Aliases, broker and client, are built. A configuration-file daemon, a dynamic-security plugin, clustering and rule engines are product features on top of the hooks, not library scope.
 
 ## Design & invariants
 Three allocation-free codec/client layers plus a broker, all offline-testable; MQTT 3.1.1 and 5.0
@@ -199,6 +199,17 @@ Bounds: `max_sessions` (new past it → CONNACK `server_unavailable`; a resume a
 `max_queued_messages` / `max_queued_bytes` per session (overflow drops the newest, counted in
 `queueDrops`), and `session_expiry_ms` applied by the caller's `expireSessions(now)`, since the
 broker has no clock. QoS 0 is not queued (3.1.2.4 leaves it optional).
+
+Opt-in global caps (Mosquitto has none, so the defaults are unchanged: 0 = unbounded):
+`max_queued_bytes_total` (queued bytes summed over every session and clean-session queue; a message past it
+is dropped for that subscriber and counted in `queueDrops`), `max_subscription_bytes_total` (bytes of
+subscription filters; a filter past it is refused like one past `max_subscriptions_total`) and
+`max_retained_examined` (retained topics one SUBSCRIBE may match against its filters under the registry
+lock; a cut walk counts in `retainedTruncations()`). `TcpServer.max_outbox_bytes` (0 = none) puts a bounded
+outbox in front of each socket: a delivery appends under a short lock and a task of the connection writes,
+so a publisher never waits for a slow subscriber; a subscriber whose pending bytes pass the cap is
+disconnected (a packet always fits an empty outbox), and a closing connection's last packets (a take-over's
+DISCONNECT) are written before the socket goes.
 
 ⚠ Not persisted by the broker: sessions are memory. A server that keeps them across its own
 restart does it with two calls: `sessionStates(arena)` copies out every session —
@@ -489,6 +500,3 @@ The bench is `zig build bench-mqtt` (`BENCH_ROUNDS=5`, ReleaseFast): one raw dri
 ## Backlog / deferred
 
 - **Differential oracle against karlseguin's library (idea, not scheduled).** `karlseguin/mqttz` is a client only (MIT, Zig 0.16): drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so the broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9).
-- **Global byte caps, if a consumer needs them:** queued bytes across all sessions and connections (`(max_sessions + max_connections) * max_queued_bytes`), subscription filter bytes (`max_subscriptions_total * max_packet_size`), and an examined-entries envelope for the retained walk at SUBSCRIBE (documented in `Config`; Mosquitto has no such caps either).
-- **Sweep-review items, each with the review's trigger:**
-  - R-MQ-1 follow-up: a bounded per-connection outbox (a slow subscriber is cut off by `TcpServer.write_timeout_ms`, but a publisher still waits up to that long inside the write).
