@@ -42,6 +42,19 @@ const line = try r.reader.takeDelimiter('\n');
 `ignore_trailing_garbage` (default off: bytes after the last stream are `error.TrailingData`).
 The decoder reads up to 8 bytes ahead of the end of the last stream.
 
+## Salvage a damaged file
+
+```zig
+const blocks = try bzip2.recover.findBlocks(gpa, damaged, .{});   // bzip2recover's block ranges
+defer gpa.free(blocks);
+for (blocks) |b| {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    try bzip2.recover.writeBlockStream(damaged, b, &w.writer);     // a .bz2 stream holding just this block
+    // bzip2.decompress(gpa, w.written(), .{}) fails for a block that was damaged
+}
+```
+
 ## Compress
 
 ```zig
@@ -63,8 +76,7 @@ buffer, `compressBound(n)` bytes always fit.
 
 ## Not provided
 
-No multithreaded (pbzip2 / lbzip2 style) block compression, no `bzip2recover` (finding intact
-blocks in a damaged file), no sync-flush marker, no low-memory decoding mode. See SPEC.md
+No multithreaded (pbzip2 / lbzip2 style) block compression, no sync-flush marker, no low-memory decoding mode. See SPEC.md
 *What is deliberately not done* and *Backlog / deferred*.
 
 ## Tests

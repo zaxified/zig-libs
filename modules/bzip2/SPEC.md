@@ -40,7 +40,7 @@ their own description or was measured as a black box.
 **Where we are ahead:** of the implementations above that do not link libbzip2, the only one whose
 compressor output is checked equal to libbzip2's, in pure Zig behind a `std.Io.Reader` /
 `std.Io.Writer`; a decompression-bomb cap and typed errors. **Where we are behind:** no
-multithreaded compression (backlog B1), no `bzip2recover` (B2).
+multithreaded compression (libbzip2 has none; pbzip2 and lbzip2 do).
 
 ## What this module is, and what it is not
 
@@ -52,7 +52,7 @@ block CRC and the stream CRC, reads the randomised blocks of bzip2 0.9.0, and ne
 than one block.
 
 **Not here (expected by some, deliberately absent):** multithreaded block compression (pbzip2,
-lbzip2, `bzip2 -p`); `bzip2recover`-style salvage of the intact blocks of a damaged file; a
+lbzip2, `bzip2 -p`); a
 sync-flush (`BZ_FLUSH`) — libbzip2's flush closes the current block early and is not chunk-neutral,
 this module's output is; the `small` (low-memory) decompression mode of libbzip2 (`bzip2 -s`: 2.5
 bytes per block byte instead of 4 — decoding already needs only 3.6 MB at level 9); the `bzip2`
@@ -95,6 +95,22 @@ fields are bit-packed, most significant bit first, with the stream padded to a b
 ## Constant-time contract
 
 None claimed: the data is public. There is no secret in this module.
+
+## Salvage (`recover`)
+
+`recover.findBlocks(gpa, input, opts)` scans a damaged file for the 48-bit block-header magic
+`0x314159265359` and the end-of-stream magic `0x177245385090` at any bit offset and returns the
+bit ranges of the blocks between them; `recover.writeBlockStream(input, block, writer)` writes one of
+them as a stream of its own: `BZh9`, the header magic, the block's bits, the end magic and a stream CRC
+(the block's own CRC, which is the first 32 bits of the block: the combined CRC of one block), zero-padded to a byte.
+Level 9 admits any block size. This is libbzip2's `bzip2recover` decision for decision, including
+its rules: the region before the first magic is not a block, a region of fewer than 130 bits is not a block, the
+trailing region after the last magic (the end-of-stream CRC, or a cut block) is not reported, and at most
+`Options.max_blocks` (default 50,000, bzip2recover's `BZ_MAX_HANDLED_BLOCKS`) are accepted. Nothing is decoded or
+checked: a damaged block is recovered like an intact one and fails when the stream is decoded, which is how a
+caller finds the survivors. `tools/interop.zig` compares both functions with the real `bzip2recover` byte for byte on
+intact, flipped, cut, bit-shifted and concatenated files; `src/recover_test.zig` round-trips every block of an
+intact file and shows a flipped bit costing exactly one block.
 
 ## Limits and refusals
 
@@ -193,19 +209,19 @@ None claimed: the data is public. There is no secret in this module.
   calls). The module follows the `BZ_RUN` behaviour of the bzip2 CLI, Python and libzip, which
   does not depend on how the input was chunked; the two differ only when the input ends within five
   bytes of a block boundary (`edge-99982` in the shapes).
+- **Multithreaded block compression** (pbzip2, lbzip2, `bzip2 -p`). The reference, libbzip2 1.0.8, has none and this
+  module's parity target is its output; blocks are independent, so a caller that wants threads can cut the input
+  at block-size multiples itself and concatenate the streams (the decoder reads concatenated streams).
 - **A `small` decoding mode** — not now; the 3.6 MB block is not what a consumer of this
   collection is short of.
 - **Verbose / statistics output** — never.
 
 ## Backlog / deferred
 
-- **B1** Multithreaded block compression (blocks are independent: sort in parallel, write in
-  order; output identical). Not now.
-- **B2** `bzip2recover`: scan for block magics at any bit offset and emit each intact block as a
-  stream. Not now.
-- **B3** Decoder speed: the Huffman walk is a 20-bit window with a per-length loop; a lookup table
+- **Decoder speed:** the Huffman walk is a 20-bit window with a per-length loop; a lookup table
   on the first 8-10 bits would take the common symbols in one step (the card's Performance line has the
-  decoder's current ratio).
+  decoder's current ratio). BOUNCED to the quiet-host phase: a speed claim needs an A/B of several interleaved
+  runs on an idle machine (the decoder rows are noisy even there).
 
 ## Open
 

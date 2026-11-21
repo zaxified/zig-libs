@@ -2,7 +2,7 @@
 # Builds the libbzip2 1.0.8 black-box driver `bzref` (tools/c_oracle/bzref.c)
 # from the pinned upstream clone. Needs: git (first run only) and cc.
 #
-#   modules/bzip2/tools/build-oracle.sh        # -> .zig-cache/bzip2-oracle/bzref
+#   modules/bzip2/tools/build-oracle.sh        # -> .zig-cache/bzip2-oracle/bzref and bzip2recover
 #
 # Run from the repository root. The clone is gitignored scratch under
 # .zig-cache/survey/bzip2 (override with BZIP2_SRC=<dir>); it is never built
@@ -20,4 +20,5 @@ mkdir -p "$out"
 cc -O2 -D_FILE_OFFSET_BITS=64 -I"$src" -o "$out/bzref" \
     modules/bzip2/tools/c_oracle/bzref.c \
     "$src"/{blocksort,huffman,crctable,randtable,compress,decompress,bzlib}.c
-echo "$out/bzref"
+cc -O2 -D_FILE_OFFSET_BITS=64 -o "$out/bzip2recover" "$src"/bzip2recover.c
+echo "$out/bzref $out/bzip2recover"

@@ -70,6 +70,12 @@ pub const Encoder = encoder.Encoder;
 /// a stream's block CRCs themselves.
 pub const crc = @import("crc.zig");
 
+// ── salvage ─────────────────────────────────────────────────────────────
+
+/// `bzip2recover`: the bit ranges of the blocks of a damaged file (`findBlocks`) and each as a
+/// stream of its own (`writeBlockStream`).
+pub const recover = @import("recover.zig");
+
 /// The input shapes the differential tests use; public only so
 /// `tools/interop.zig` can reach them. Not part of the API.
 pub const interop_corpus = @import("shapes.zig");
@@ -85,4 +91,5 @@ test {
     _ = @import("sweep_test.zig");
     _ = @import("worstcase_test.zig");
     _ = @import("tie_test.zig");
+    _ = @import("recover_test.zig");
 }

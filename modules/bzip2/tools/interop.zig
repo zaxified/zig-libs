@@ -20,6 +20,8 @@
 //!      Python's `bz2.compress`; concatenated streams; a randomised block;
 //!   4. mutated streams (bit flips, cuts, overwrites): ours and libbzip2's
 //!      verdicts agree (accepts with the same length, or both refuse).
+//!   5. `bzip2.recover` against libbzip2's `bzip2recover` on intact, flipped, cut,
+//!      bit-shifted and concatenated files: the same blocks, the same bytes.
 //! `--capture` freezes (1) as SHA-256 digests plus small reference streams
 //! into `src/testdata/`, which `src/golden_test.zig` replays offline.
 //!
@@ -32,6 +34,7 @@ const corpus = bzip2.interop_corpus;
 
 const scratch = ".zig-cache/bzip2-interop";
 const bzref = ".zig-cache/bzip2-oracle/bzref";
+const bzrecover = ".zig-cache/bzip2-oracle/bzip2recover";
 const testdata = "modules/bzip2/src/testdata";
 
 const Ctx = struct {
@@ -271,6 +274,77 @@ fn decoderChecks(c: *Ctx, quick: bool) !void {
     }
 }
 
+/// `recover.findBlocks` / `writeBlockStream` against libbzip2's own `bzip2recover` on intact, damaged,
+/// cut, bit-shifted and concatenated files: the same blocks, the same bytes of every recovered stream.
+fn recoverChecks(c: *Ctx, quick: bool) !void {
+    const plain = try corpus.generate(c.gpa, corpus.find(if (quick) "text-small" else "text-9999").?);
+    defer c.gpa.free(plain);
+    // Several blocks at level 1: repeat the text until there are about five.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(c.gpa);
+    while (big.items.len < 420_000) try big.appendSlice(c.gpa, plain);
+    const z = try bzip2.compress(c.gpa, big.items, .{ .level = 1 });
+    defer c.gpa.free(z);
+    const damaged = try c.gpa.dupe(u8, z);
+    defer c.gpa.free(damaged);
+    damaged[z.len / 2] ^= 0x40;
+    const shifted = try c.gpa.alloc(u8, z.len + 1);
+    defer c.gpa.free(shifted);
+    var carry: u8 = 0;
+    for (z, 0..) |b, i| {
+        shifted[i] = carry | (b >> 5);
+        carry = b << 3;
+    }
+    shifted[z.len] = carry;
+    const two = try std.mem.concat(c.gpa, u8, &.{ z, z });
+    defer c.gpa.free(two);
+    const cases = [_]struct { name: []const u8, data: []const u8 }{
+        .{ .name = "intact", .data = z },
+        .{ .name = "flipped", .data = damaged },
+        .{ .name = "cut", .data = z[0 .. z.len * 2 / 3] },
+        .{ .name = "shifted", .data = shifted },
+        .{ .name = "two streams", .data = two },
+        .{ .name = "no magic", .data = "BZh9 nothing to find here" },
+    };
+    for (cases) |case| {
+        c.checks += 1;
+        // libbzip2's recovered files: rec00001dmg.bz2 ...
+        var n: usize = 1;
+        while (n < 100) : (n += 1) {
+            var nb: [32]u8 = undefined;
+            c.dir.deleteFile(c.io, try std.mem.print(&nb, "rec{d:0>5}dmg.bz2", .{n})) catch {};
+        }
+        try c.put("dmg.bz2", case.data);
+        const r = try c.exec(&.{ bzrecover, scratch ++ "/dmg.bz2" });
+        c.gpa.free(r.stdout);
+        c.gpa.free(r.stderr);
+        const blocks = try bzip2.recover.findBlocks(c.gpa, case.data, .{});
+        defer c.gpa.free(blocks);
+        // bzip2recover exits 1 when it finds no block at all.
+        if (!Ctx.okExit(r) != (blocks.len == 0)) {
+            c.fail("recover {s}: bzip2recover ok={}, we found {d} blocks", .{ case.name, Ctx.okExit(r), blocks.len });
+            continue;
+        }
+        for (blocks, 1..) |b, i| {
+            var nb: [32]u8 = undefined;
+            const theirs = c.get(try std.mem.print(&nb, "rec{d:0>5}dmg.bz2", .{i})) catch {
+                c.fail("recover {s}: bzip2recover wrote no block {d}", .{ case.name, i });
+                break;
+            };
+            defer c.gpa.free(theirs);
+            var w: std.Io.Writer.Allocating = .init(c.gpa);
+            defer w.deinit();
+            try bzip2.recover.writeBlockStream(case.data, b, &w.writer);
+            if (!std.mem.eql(u8, theirs, w.written())) c.fail("recover {s}: block {d} differs from bzip2recover's", .{ case.name, i });
+        }
+        var extra: [32]u8 = undefined;
+        if (c.get(try std.mem.print(&extra, "rec{d:0>5}dmg.bz2", .{blocks.len + 1}))) |x| {
+            c.gpa.free(x);
+            c.fail("recover {s}: bzip2recover wrote more than our {d} blocks", .{ case.name, blocks.len });
+        } else |_| {}
+    }
+}
+
 fn mutantChecks(c: *Ctx, quick: bool) !void {
     const names = [_][]const u8{ "text-9999", "random-small", "run259", "all-bytes", "sparse-100" };
     var prng: std.Random.DefaultPrng = .init(0xb21b);
@@ -382,7 +456,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer dir.close(io);
     var c: Ctx = .{ .gpa = gpa, .io = io, .dir = dir };
 
-    if (std.Io.Dir.cwd().access(io, bzref, .{})) {} else |_| {
+    const have_oracle = if (std.Io.Dir.cwd().access(io, bzref, .{})) true else |_| false;
+    const have_recover = if (std.Io.Dir.cwd().access(io, bzrecover, .{})) true else |_| false;
+    if (have_oracle and have_recover) {} else {
         std.debug.print("building the libbzip2 oracle ...\n", .{});
         const r = try c.exec(&.{ "bash", "modules/bzip2/tools/build-oracle.sh" });
         gpa.free(r.stdout);
@@ -398,6 +474,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try encoderParity(&c, quick, &goldens);
     try decoderChecks(&c, quick);
     try mutantChecks(&c, quick);
+    try recoverChecks(&c, quick);
     std.debug.print("{d} checks, {d} failures\n", .{ c.checks, c.failures });
     if (c.failures != 0) return 1;
     if (capture) try writeGoldens(&c, goldens.items);
