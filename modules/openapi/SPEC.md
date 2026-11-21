@@ -160,6 +160,9 @@ Run: `scripts/modtest openapi` (offline). Interop instruments: `zig build intero
 
 ## What is deliberately not done
 
+- **A single-flight for `Endpoint.spec`.** Concurrent first callers each build the document (at most one per thread) and the first result wins; an `OutOfMemory` build is not cached and the next request builds again. The module has no `Io`, so a waiter could only spin or yield for the length of a build (the cost the build-under-lock design was changed away from), and the duplicated work is once per process.
+- **A tighter budget in the sweep timing tests.** Measured 2026-11-21: the heaviest linear case (30000 routes) takes about 1.2 s in Debug on a loaded host and a 1 s budget failed it, so the 5 s budget is the tightest that does not flake; the quadratic regressions they guard cost tens of seconds.
+- **Emitting or validating OpenAPI 3.2.** The latest Specification release is 3.2.1 and `openapi-spec-validator` 0.9.0 accepts it, but 3.1.0 documents stay valid under 3.2 and are what the commonly used toolchains consume; nothing in `router`'s model needs a 3.2-only construct (no `QUERY` method, no streaming media types). Revisit when a consumer needs one.
 - **OpenAPI 3.0 / Swagger 2.0 output, request/response runtime validation, client SDK generation:** out of scope, not planned. The module emits 3.1.0 only; `validateOpenApi31` accepts 3.1.x only.
 - **`route_extras` on `RouteDoc`:** rejected. `router` would grow OpenAPI-only concepts (security requirements, examples, header/cookie parameter schemas) and a deep copy of them, for every router user, while `Info.route_extras` gives the same document and keeps `router` independent of the spec format. Revisit only if a second consumer of `RouteDoc` needs the same fields.
 - **A router `{name:re}` constraint is NOT auto-emitted as `pattern`:** RE2 syntax is not ECMA-262, so a copy can be wrong; declare `pattern` in the `PathParameter` schema. No `encoding` object for multipart parts.
@@ -168,9 +171,7 @@ Run: `scripts/modtest openapi` (offline). Interop instruments: `zig build intero
 
 ## Backlog / deferred
 
-- **`Endpoint.spec` single-flight (LOW):** concurrent first callers each build the document (bounded by the thread count) and an `OutOfMemory` build is retried per request; there is no single-flight. Left as designed until a consumer sees the cost.
-- **Sweep timing tests (LOW):** the no-panic sweep's timing tests assert a 5 s budget on work that takes milliseconds, so they catch a quadratic regression only loosely; tighten if a regression slips through.
-- **OpenAPI 3.2:** the Specification repo's latest release is 3.2.1; we emit 3.1.0, which remains valid and widely supported. Watch only.
+None open.
 
 ## Anchoring
 

@@ -21,7 +21,9 @@ fn monoNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
-/// Generous: the linear work is milliseconds, the quadratic one tens of seconds.
+/// The linear work is milliseconds (the 30000-route case ~1.2 s in Debug on a
+/// loaded host), the quadratic one tens of seconds: 5 s is the tightest budget
+/// that does not flake.
 const budget_ns: u64 = 5 * std.time.ns_per_s;
 
 fn expectFast(started_ns: u64) !void {
