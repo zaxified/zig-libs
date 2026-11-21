@@ -402,7 +402,7 @@ Every one of the 267 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`websocket`](modules/websocket/README.md) | 1 | RFC 6455 WebSocket — handshake + frame layer (masking, fragmentation, UTF-8 validation, size caps), transport-agnostic client + server; permessage-deflate (no context takeover) and an optional read/write loop | any | http |
 | [`xml`](modules/xml/README.md) | 3 (S,E,H,P) | Namespace-aware, security-hardened XML 1.0 parser → C14N-ready infoset tree; DOCTYPE-reject default blocks XXE/billion-laughs/depth-bomb. Foundation for `xmldsig`/`saml` | any | — |
 | [`xmldsig`](modules/xmldsig/README.md) | 3 (S,E,P) | XML Canonicalization (C14N) + XML-Signature **verification only** — RSA/ECDSA, algorithm allow-list (XSLT/XPath rejected); KeyInfo cert is untrusted, caller must pin trust | any | xml, rsa, p256, p384, p521, wipealloc |
-| [`xmlenc`](modules/xmlenc/README.md) | 3 (S,E,P) | XML-Encryption (xmlenc-core-1) decryption and encryption — recovers `EncryptedAssertion` plaintext (RSA-OAEP/AES-KW key transport + AES-GCM/CBC content), decrypt-then-verify; `encryptData` writes `EncryptedData` | any | xml, rsa, aescbc, aeskw, aes192, aesgcm, wipealloc |
+| [`xmlenc`](modules/xmlenc/README.md) | 3 (S,E,P) | XML-Encryption (xmlenc-core-1) decryption and encryption — recovers `EncryptedAssertion` plaintext (RSA-OAEP/AES-KW/ECDH-ES key delivery + AES-GCM/CBC content), decrypt-then-verify; `encryptData` writes `EncryptedData` | any | xml, rsa, aescbc, aeskw, aes192, aesgcm, wipealloc, jwe |
 
 **Also worth reaching for from `web`** — these are filed under another library (in brackets), and appear here because a consumer working in `web` has a use for them:
 
