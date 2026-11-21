@@ -111,6 +111,13 @@ pub const FilterBlock = struct {
     body: []const Node,
 };
 
+/// `{% autoescape expr %}…{% endautoescape %}`: the body renders with
+/// autoescaping set to the truth value of `expr`.
+pub const Autoescape = struct {
+    expr: *const Expr,
+    body: []const Node,
+};
+
 pub const With = struct {
     assignments: []const Set,
     body: []const Node,
@@ -135,6 +142,10 @@ pub const MacroDef = struct {
     catch_varargs: bool = false,
     catch_kwargs: bool = false,
     uses_caller: bool = false,
+    /// Defined inside an `{% autoescape %}` block: its body follows the
+    /// caller's autoescape setting at run time (the reference compiles such a
+    /// body with a run-time check); any other macro uses the environment's.
+    in_autoescape_region: bool = false,
     line: usize = 0,
 };
 
@@ -197,6 +208,7 @@ pub const Node = union(enum) {
     set_block: SetBlock,
     filter_block: FilterBlock,
     with: With,
+    autoescape: Autoescape,
     /// `{% do expr %}` — evaluate for effect, emit nothing.
     do: struct { expr: *const Expr, line: usize },
     /// `{% extends expr %}` — records the parent; the renderer builds the

@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — New: filters `urlize`, `pprint` (byte-identical with Jinja2 3.1.6 on the tested inputs) and `random`, the global `lipsum()`, and `Options.random_seed` (the seed of the one per-render PRNG behind `random` and `lipsum`; default 0, so output is reproducible). These names were compile errors / `NotCallable` before; code that relied on that refusal now renders. Additive.
+- **2026-11-21** — New: `{% autoescape expr %}…{% endautoescape %}` (a per-region switch; it was a compile error) and `super.super()` (it was a render error). Behaviour change for any template that relied on the refusal; `Node` gained an `autoescape` variant (internal).
+- **2026-11-21** — New: `Options.delimiters` (+ `Delimiters`), `Options.line_statement_prefix` and `Options.line_comment_prefix` — Jinja2's custom delimiters and line statements/comments. Defaults reproduce the previous lexing exactly. Additive.
 - **2026-11-17** — Call-site `*args` / `**kwargs` (D9 part 1) for macros, `{% call %}`, filters, tests and the built-in globals: `f(1, *xs, k=2, **d)`. Grammar and errors follow Jinja2 3.1.6's `parse_call_args` (one `*` before any `**`, `**` last, keywords may follow `*xs`, positionals may not; a repeated keyword, literal or via `**`, a non-iterable after `*`, a non-mapping or non-string key after `**` are errors). `ast.Args` gains `star`/`dstar`. 39 new `d9_*` cases captured from the real reference; the transcript is 470 cases. Line statements and custom delimiters remain open.
 
 - **2026-11-16** — New globals `cycler(*items)` (`.next()`, `.current`, `.reset()`) and `joiner(sep=", ")` ("" on the first call, `sep` after), as in Jinja2 3.1; new stateful `Value.gadget` variant (`jinja.Gadget`). Both used to be a render error. `lipsum` is still absent.

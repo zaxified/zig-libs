@@ -120,6 +120,7 @@ pub const LoaderError = loader_mod.Error;
 /// its own filesystem loader can reuse exactly the same rules.
 pub const checkTemplateName = loader_mod.checkName;
 pub const UndefinedPolicy = render_mod.UndefinedPolicy;
+pub const Delimiters = lexer.Delimiters;
 
 pub const Options = struct {
     autoescape: bool = false,
@@ -127,7 +128,22 @@ pub const Options = struct {
     trim_blocks: bool = false,
     lstrip_blocks: bool = false,
     keep_trailing_newline: bool = false,
+    /// Tag delimiters (Jinja2's `block_start_string` etc.): the six strings
+    /// must be non-empty and the three start strings distinct, else a
+    /// template fails to compile.
+    delimiters: Delimiters = .{},
+    /// Line statements (Jinja2 `line_statement_prefix`): a line whose first
+    /// non-blank text is this prefix is a statement to the end of the line.
+    line_statement_prefix: ?[]const u8 = null,
+    /// Line comments (Jinja2 `line_comment_prefix`): from the prefix to the
+    /// end of the line.
+    line_comment_prefix: ?[]const u8 = null,
     max_output_bytes: usize = 64 << 20,
+    /// Seed of the PRNG behind the `random` filter and `lipsum()` (the same
+    /// seed gives the same output). The reference draws from Python's global
+    /// `random`, which has no seed to match; set this from your own entropy
+    /// where you want output that varies from render to render.
+    random_seed: u64 = 0,
     /// Total bytes one render may take from its scratch arena.
     ///
     /// The depth caps below bound DEPTH; the per-operation caps in `value.zig`
@@ -233,6 +249,9 @@ pub const Environment = struct {
             .trim_blocks = self.options.trim_blocks,
             .lstrip_blocks = self.options.lstrip_blocks,
             .keep_trailing_newline = self.options.keep_trailing_newline,
+            .delimiters = self.options.delimiters,
+            .line_statement_prefix = self.options.line_statement_prefix,
+            .line_comment_prefix = self.options.line_comment_prefix,
         }, d) catch |e| return e;
 
         const parsed = try parser.parse(a, lexed.pieces, .{
@@ -292,6 +311,9 @@ pub const Environment = struct {
             .trim_blocks = self.options.trim_blocks,
             .lstrip_blocks = self.options.lstrip_blocks,
             .keep_trailing_newline = self.options.keep_trailing_newline,
+            .delimiters = self.options.delimiters,
+            .line_statement_prefix = self.options.line_statement_prefix,
+            .line_comment_prefix = self.options.line_comment_prefix,
         }, diag);
         return parser.parse(arena, lexed.pieces, .{
             .ctx = self,
@@ -352,6 +374,7 @@ pub const Template = struct {
             .max_template_depth = self.env.options.max_template_depth,
             .max_call_depth = self.env.options.max_call_depth,
             .max_templates = self.env.options.max_templates,
+            .random_seed = self.env.options.random_seed,
         }, .{
             .ctx = self.env,
             .filter = Environment.filterLookup,
@@ -438,6 +461,9 @@ pub fn renderAlloc(
 test {
     _ = @import("value.zig");
     _ = @import("lexer.zig");
+    _ = @import("lorem.zig");
+    _ = @import("urlize.zig");
+    _ = @import("pprint.zig");
     _ = @import("parser.zig");
     _ = @import("ast.zig");
     _ = @import("render.zig");

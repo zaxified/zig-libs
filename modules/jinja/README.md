@@ -20,8 +20,7 @@ is HTML-escaped — are explicit options rather than defaults you discover in
 production.
 
 Anything the reference has that this does not — i18n (`{% trans %}`), the
-`{% autoescape %}` block, four filters, the `lipsum` global — is a
-**compile error naming the tag or name** (`lipsum`: a render error), never a
+`attr` filter — is a **compile error naming the tag or name**, never a
 silent no-op. `SPEC.md` §6 lists every one.
 
 Provenance: clean-room from the Jinja2 documentation (the template-designer
@@ -322,7 +321,8 @@ attribute='n')`, `join(', ', attribute='name')`, `default('x', true)`,
 `min`, `max`, `unique` and `dictsort` are case-**insensitive** by default, as
 there.
 
-Filters not implemented — `attr`, `pprint`, `random`, `urlize` — and why, are listed in
+`pprint`, `urlize` and `random` are byte-identical with the reference (`random` draws from a
+PRNG seeded by `Options.random_seed`, as does `lipsum`). The filter not implemented — `attr` — and why is listed in
 `SPEC.md` §6; `SPEC.md` §6.1 compares the whole builtin set with Jinja2 3.1.
 `upper`, `lower`, `capitalize` and `title` use full Unicode case mapping.
 
@@ -360,7 +360,12 @@ Jinja2, `x is >= 2` is not valid template syntax.
 
 Globals: `range(stop)` / `range(start, stop[, step])`, `dict(k=v, …)`,
 `namespace(k=v, …)`, `cycler(*items)` (`.next()`, `.current`, `.reset()`) and `joiner(sep=", ")`
-("" on the first call, `sep` afterwards). `lipsum` is not implemented.
+("" on the first call, `sep` afterwards) and `lipsum(n=5, html=True, min=20, max=100)` (seeded by
+`Options.random_seed`).
+
+Also: `{% autoescape expr %}…{% endautoescape %}` as a per-region switch; `super.super()`;
+`Options.delimiters` (`block_start` … `comment_end`), `line_statement_prefix` and
+`line_comment_prefix`, as Jinja2's arguments of the same names.
 
 `namespace()` is the way to accumulate across a `{% for %}` body, because a
 `{% set %}` inside a loop does not outlive the loop (that is the reference's
@@ -397,9 +402,8 @@ and the render arena are gone.
 
 ## Not provided
 
-i18n (`{% trans %}`), the `{% autoescape %}` block, line statements and custom
-delimiters, arbitrary-precision integers, and the filters `attr`, `pprint`,
-`random`, `urlize` are absent; the reasons are in `SPEC.md` *What is deliberately
+i18n (`{% trans %}`), arbitrary-precision integers, callables in the context and the
+`attr` filter are absent; the reasons are in `SPEC.md` *What is deliberately
 not done*, what may still come in *Backlog / deferred*.
 
 ## Verify

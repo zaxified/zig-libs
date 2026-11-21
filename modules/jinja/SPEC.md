@@ -44,9 +44,8 @@ replayed corpus of real Jinja2 3.1.6 outputs, with a maintained list of its dive
 (never a silent no-op) for anything missing; explicit `undefined` policy (strict by default) and autoescape as options;
 inheritance with `super()`, `scoped`, `required`, macros, `caller()`, `namespace()`, `recursive` loops and every
 whitespace control; a contained loader (path containment, cycle and expansion bounds) and output/nesting caps; Python-exact
-number semantics and `repr`. **Where we are behind:** the four missing filters (`urlize`, `pprint`, `random`, and `attr`, which is rejected — see *What is deliberately not done*), the missing `lipsum` global,
-`i64` integers, no `{% autoescape %}` block or `{% trans %}`, no line statements or
-custom delimiters, and vibe-jinja's larger built-in vocabulary.
+number semantics and `repr`. **Where we are behind:** the `attr` filter (rejected — see *What is deliberately not done*),
+`i64` integers, no `{% trans %}`, and vibe-jinja's larger built-in vocabulary.
 
 ## 1. Shape
 
@@ -268,21 +267,21 @@ or a documented, tested behaviour.
 | # | Divergence | Kind |
 |---|---|---|
 | D1 | Default `undefined_policy` is `.strict` (see §4) | default, opt-out |
-| D2 | i18n (`{% trans %}`/`{% pluralize %}`) and the `{% autoescape %}` block are not implemented — autoescaping is an environment option here, not a per-region switch | **compile error naming the tag** |
+| D2 | i18n (`{% trans %}`/`{% pluralize %}`) is not implemented (the reference needs its `i18n` extension and a gettext callable; see *What is deliberately not done*). The `{% autoescape %}` block is (§6.2), with one difference: inside a block whose expression is not a constant, the reference leaves a *literal* output (`{{ "<a>" }}`) unescaped (it folds it at compile time with the environment's setting); here it is escaped as every other value is | **compile error naming the tag** (`trans`); literal edge |
 | D3 | Integers are `i64`; Python's are arbitrary precision. Overflow is `error.OutOfRange` where Python grows the number | runtime error |
 | D4 | `upper`, `lower`, `capitalize`, `title`, `is upper`/`is lower`, and the case folding of `sort`/`min`/`max`/`unique`/`groupby` use `unitext` (CPython `str` semantics: ß → SS, Final_Sigma, no Turkish tailoring). Ill-formed UTF-8 passes through unchanged instead of failing. The `title` *filter* keeps Jinja's own word rule (split on `-`, whitespace, `(`, `{`, `[`, `<`; each piece `item[0].upper() + item[1:].lower()`), the `.title()` *method* is Python's `str.title` (any non-cased character ends a word). The string methods `isdigit`/`isalpha` and `wordcount` stay ASCII/byte-based (D18) | silent, ASCII-only residue (D18) |
 | D5 | `map`/`select`/`reject`/`selectattr`/`rejectattr`/`items`/`dictsort`/`batch`/`slice` return lists, not generators, so rendering one directly prints `[…]` where the reference prints `<generator object …>` | silent, strictly more useful |
-| D6 | Filters absent: `attr`, `pprint`, `random`, `urlize` (§6.1) | **compile error** |
+| D6 | Filter absent: `attr` (§6.1). `random` draws from a seeded PRNG, not Python's unseeded one (§6.2) | **compile error** (`attr`) |
 | D7 | Tests `filter`, `test` (they ask the environment, custom registrations included) and the symbolic aliases (`==` `!=` `>` `>=` `<` `<=`, usable via `select`/`reject`; `x is >=` is a syntax error in Jinja2 too) are implemented | none |
-| D8 | `cycler`/`joiner` are implemented (`Value.gadget`, a stateful object: `cycler(*items)` with `.next()`/`.current`/`.reset()`, `joiner(sep=", ")` callable). The `lipsum` global is absent | `lipsum`: **runtime error** |
-| D9 | Call-site `*args`/`**kwargs` follow Jinja2's `parse_call_args` rules and runtime errors (`d9_*` goldens). Line statements/comments and custom delimiters are not implemented | **compile error** |
+| D8 | `cycler`/`joiner` are implemented (`Value.gadget`, a stateful object: `cycler(*items)` with `.next()`/`.current`/`.reset()`, `joiner(sep=", ")` callable). `lipsum` is implemented with a seeded PRNG (§6.2), so its text is reproducible rather than random | seed |
+| D9 | Call-site `*args`/`**kwargs` follow Jinja2's `parse_call_args` rules and runtime errors (`d9_*` goldens). Line statements/comments and custom delimiters are implemented (§6.2) | none |
 | D10 | `{% do %}` and `{% with %}` need no extension to be enabled | superset |
 | D11 | String methods are a documented subset (README); an unknown one is a render error naming the type and method | runtime error |
 | D12 | `round(x, p)` falls back to scaled arithmetic when the exact integer form would exceed `u128` (roughly `|p| > 22`) | silent, beyond f64 precision |
 | D13 | `max_output_bytes` (64 MiB), a 4 Mi-element cap on `range()`/`'x' * n`, and `max_nesting_depth` (256) have no reference equivalent. The reference has no explicit nesting bound either, but CPython's recursion limit gives it an implicit one that is *tighter* for nested source: Jinja2 3.1.6 raises `RecursionError` for `{{ ((…1…)) }}` between 50 and 100 parentheses | extra refusal |
 | D14 | A loader is explicit: without one, a composition tag is `error.NoLoader`. There is no implicit filesystem access and no default search path | API |
 | D15 | Calling a name that is not a macro and not one of the three built-in globals is `error.NotCallable`; the reference would call any callable in the context | **runtime error** |
-| D16 | `super.super()` (reaching two levels up in one expression) is not implemented; `{{ super() }}` inside a block that itself overrides is the supported form | **runtime error** |
+| D16 | `super.super()` (and `super.super.super()` …) reaches that many definitions up, as in the reference; one past the oldest definition is `error.BlockError` | none |
 | D17 | A template name a loader *refuses* (an escape attempt) is `error.LoaderFailed` even under `ignore missing` — only genuine absence is ignorable | deliberate, stricter |
 | D18 | `wordcount` counts runs of `\w`, as the reference does, but its notion of a word character is ASCII alphanumerics, `_`, and every byte >= 0x80. Letters agree (`ěščř` is one word in both); non-ASCII *punctuation* does not (`a—b` is 2 there, 1 here) — the same residue as D4 | silent, ASCII-identical |
 | D19 | `striptags` knows 7 HTML entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, `&apos;`, `&nbsp;` is **not** among them); the reference unescapes the full HTML5 set, so `&nbsp;x` stays literal here | silent, under-unescaped |
@@ -302,8 +301,8 @@ reference's `jinja2/filters.py`, `tests.py`, `defaults.py`. Current status.
 **Filters.** Present: `abs` `batch` `capitalize` `center` `count` `d`/`default` `dictsort` `e`/`escape`
 `filesizeformat` `first` `float` `forceescape` `format` `groupby` `indent` `int` `items` `join` `last` `length` `list` `lower` `map`
 `max` `min` `reject` `rejectattr` `replace` `reverse` `round` `safe` `select` `selectattr` `slice` `sort` `string` `striptags` `sum`
-`title` `tojson` `trim` `truncate` `unique` `upper` `urlencode` `wordcount` `wordwrap` `xmlattr`. Absent: `attr` (deliberately,
-see *What is deliberately not done*), `pprint` (Python's pretty-printer layout), `random` (needs an injectable seed), `urlize` (URL/e-mail detection regexes).
+`title` `tojson` `trim` `truncate` `unique` `upper` `urlencode` `urlize` `wordcount` `wordwrap` `xmlattr`, and `pprint`, `random`. Absent: `attr` (deliberately,
+see *What is deliberately not done*).
 
 **Tests.** Present: `boolean` `callable` `defined` `divisibleby` `eq`/`equalto` `escaped`
 `even` `false` `float` `ge` `gt`/`greaterthan` `in` `integer` `iterable` `le` `lt`/`lessthan` `lower` `mapping` `ne` `none` `number`
@@ -311,7 +310,40 @@ see *What is deliberately not done*), `pprint` (Python's pretty-printer layout),
 registered, custom registrations included) and the symbolic aliases (`==`, `!=`, `>`, `>=`, `<`, `<=`, registered as test names for
 `select`/`reject`). Absent: none.
 
-**Globals.** Present: `range` `dict` `namespace` `cycler` `joiner`. Absent: `lipsum` (D8).
+**Globals.** Present: `range` `dict` `namespace` `cycler` `joiner` `lipsum`. Absent: none.
+
+### 6.2 Autoescape regions, delimiters, seeded randomness, `urlize`, `pprint`
+
+- **`{% autoescape expr %}…{% endautoescape %}`.** The renderer carries the current setting (`Renderer.ae`,
+  starting at `Options.autoescape`); the block sets it to the truth value of `expr` for its body and restores it. As in the
+  reference, a template reached by `include`/`import` starts from the environment's setting, a macro defined *outside* any
+  block runs with the environment's setting and a macro defined *inside* one follows its caller's; a macro's result is marked
+  safe when its *caller's* setting is on (Jinja2 wraps the result in `Markup` at the call). Pinned by cases whose expected
+  strings come from Jinja2 3.1.6.
+- **Delimiters.** `Options.delimiters` (`block_start`/`block_end`/`variable_start`/`variable_end`/`comment_start`/`comment_end`),
+  as Jinja2's `*_string` arguments: all six non-empty, the three start strings pairwise distinct, else a compile error; where
+  one start string begins another the longer wins. `{% raw %}` and the `-`/`+` whitespace markers use the configured strings.
+- **Line statements and comments.** `Options.line_statement_prefix` / `line_comment_prefix` (Jinja2's arguments of the same
+  names): a line whose first non-blank text is the statement prefix is a statement to the end of the line (a bracket left open
+  continues it), the blanks before it and the newline after it belong to the statement, and a trailing `:` after the header of
+  a block tag is ignored; a comment prefix may follow text, drops everything to the end of the line and leaves the newline. The
+  longer prefix wins when one starts the other. `{% raw %}` cannot be written as a line statement. Checked against the reference
+  on 8 templates (statement, comment, both prefixes, trim_blocks, brackets over lines, custom delimiters).
+- **`random`, `lipsum`.** Both draw from one PRNG per render, seeded by `Options.random_seed` (default 0), so the same seed
+  renders the same text. The reference uses Python's global unseeded `random`: no byte-exact oracle exists, so the tests pin
+  shape (members, paragraph structure, word counts) and determinism. `random` on an empty sequence is undefined (an error under
+  the strict policy), `lipsum(n=5, html=True, min=20, max=100)` follows `generate_lorem_ipsum` (its word list and sentence rules,
+  `max` exclusive) and returns markup when `html`.
+- **`urlize`.** A port of `jinja2.utils.urlize` without a regex engine (`urlize.zig`): the escaped text is split at whitespace,
+  leading `(`/`<` and trailing `)>.,` are peeled with the reference's balancing of brackets, then each word is tried as an
+  http(s)/`www.` URL, a basic-domain URL, an IPv4/IPv6 URL, a `mailto:` or plain e-mail address and the `extra_schemes`. The
+  `rel` attribute carries the policy default `noopener` plus `nofollow` and the argument's words, sorted. Byte-identical with the
+  reference on 10 inputs (`\w` is ASCII alphanumerics, `_` and bytes >= 0x80, the same residue as D18). Policy knobs other
+  than the arguments (`urlize.rel`, `urlize.target`, `urlize.extra_schemes`) are not environment options here.
+- **`pprint`.** `pprint.pformat` (width 80, indent 1, sorted dict keys, non-compact) over this module's values (`pprint.zig`):
+  dicts, lists, tuples and long strings wrap as `PrettyPrinter` wraps them, everything else is its `repr`. Byte-identical with the
+  reference on 9 inputs, nested and non-ASCII ones included. Dict keys sort by value where the types compare and by type name
+  otherwise.
 
 **`format` design.** `fmt % args` is Python's printf: the engine parses the specification itself and renders floats from the
 EXACT binary value (a small bignum), because std's printer rounds the shortest round-trip digits and answers `2.68` for
@@ -655,6 +687,15 @@ makes these bound tests rather than "it errored eventually" tests.
   undefined is a trap; a compile error saying it does not exist is better than a
   faithful no-op. `map(attribute=…)` and `selectattr` keep working on mapping
   keys, because those use the fallback path in the reference too.
+- **i18n (`{% trans %}`, `{% pluralize %}`, `{% endtrans %}`).** In the reference these exist only with the `jinja2.ext.i18n`
+  extension and a gettext-style callable installed in the environment; the core does not have them. A compile error naming
+  the tag is kept, as for any tag outside the core.
+- **Callables in the context (D15).** The value model has no function kind: a context is data converted eagerly, and
+  calling anything but a macro or a built-in global is `error.NotCallable`. A host function would need a new `Value` variant
+  and a registration API; the reference allows it because Python values are objects, not because templates are meant to
+  call host code. Filters and tests are the registration point for host functions (`Environment`).
+- **A lazy context adapter (§2).** The context is converted eagerly by design (bounded work, no host re-entry during a render);
+  no context too large to convert has been met, and a lazy one would put host callbacks inside the renderer.
 - **A caller-owned or environment-level compiled-template cache (§9).**
   Profiled: the removable cost is a fixed per-render overhead, not an asymptotic
   gap, and a cache would make `Environment` mutable or add a lock paid by every
@@ -662,21 +703,6 @@ makes these bound tests rather than "it errored eventually" tests.
 
 ## Backlog / deferred
 
-- **`pprint`, `random`, `urlize` (D6).** `pprint` needs Python's pretty-printer
-  layout, `random` needs a seed in the environment to be testable at all,
-  `urlize` needs the reference's URL/e-mail regexes. Each hit occasionally by
-  Jinja2 code ported as-is; today a compile error. (`attr` is rejected, see
-  above.)
-- **`lipsum` (D8).** A runtime error today; small.
-- **i18n (`{% trans %}`) and the `{% autoescape %}` block (D2).** The latter
-  needs autoescaping to become a per-region property of the renderer rather than
-  an environment option; worth doing only alongside the former.
-- **`super.super()` (D16) and callables in the context (D15).** Both small, both
-  waiting for a consumer that wants them.
-- **Line statements and configurable delimiters (D9).** Cheap in the lexer,
-  wanted only if a real consumer asks; today a compile error.
-- **A lazy context adapter (§2),** if a context ever appears that is too large to
-  convert eagerly.
-- **Arbitrary-precision integers (D3).** Python grows, we raise `OutOfRange`;
-  only matters for factorial-style arithmetic in templates. Effort: large; a
-  sibling bignum module may exist. Low priority.
+- **Arbitrary-precision integers (D3).** Python grows, we raise `OutOfRange`; matters only for factorial-style
+  arithmetic in templates. Large: a bignum `Value` kind and every integer filter. No general bignum module exists in the
+  collection (`montint` is modular arithmetic), so it needs a decision on where one would live; waits for it.

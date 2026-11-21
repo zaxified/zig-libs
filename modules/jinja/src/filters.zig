@@ -11,6 +11,8 @@ const std = @import("std");
 const value = @import("value.zig");
 const ut = @import("unitext");
 const pytext = @import("pytext.zig");
+const urlize_mod = @import("urlize.zig");
+const pprint_mod = @import("pprint.zig");
 
 const Value = value.Value;
 
@@ -51,6 +53,8 @@ pub const Ctx = struct {
     /// and `test` tests). Outside a render there is no environment: false.
     hasFilter: *const fn (ctx: *Ctx, name: []const u8) bool = noName,
     hasTest: *const fn (ctx: *Ctx, name: []const u8) bool = noName,
+    /// The render's seeded PRNG (`random`); null outside a render.
+    prng: ?*std.Random.DefaultPrng = null,
 
     fn noName(ctx: *Ctx, name: []const u8) bool {
         _ = ctx;
@@ -1050,6 +1054,89 @@ fn fList(ctx: *Ctx, input: Value, args: Args) Error!Value {
     return .{ .list = try seq(ctx, input) };
 }
 
+/// `urlize(trim_url_limit=None, nofollow=False, target=None, rel=None, extra_schemes=None)`.
+/// `rel` carries the environment policy's default, `noopener`, as the reference's does.
+fn fUrlize(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    const text = switch (input) {
+        .undef => if (ctx.strict) return error.UndefinedValue else "",
+        else => try ctx.toStr(input),
+    };
+    const limit: ?usize = blk: {
+        const v = args.get(0, "trim_url_limit") orelse break :blk null;
+        if (v == .none) break :blk null;
+        const n = try intArg(v, 0);
+        // A negative limit trims to nothing but the ellipsis, as a slice does
+        // not in Python (`x[:-1]`); refuse what has no single meaning.
+        if (n < 0) return error.BadArgument;
+        break :blk @intCast(n);
+    };
+    const nofollow = boolArg(args, 1, "nofollow", false);
+    const target: []const u8 = blk: {
+        const v = args.get(2, "target") orelse break :blk "";
+        if (v == .none) break :blk "";
+        break :blk try ctx.toStr(v);
+    };
+    // rel parts: the argument's words, `nofollow`, and the policy's `noopener`,
+    // sorted and unique.
+    var parts: std.ArrayList([]const u8) = .empty;
+    if (args.get(3, "rel")) |v| if (v != .none) {
+        var it = std.mem.tokenizeAny(u8, try ctx.toStr(v), " \t\r\n\x0b\x0c");
+        while (it.next()) |w| try parts.append(ctx.arena, w);
+    };
+    if (nofollow) try parts.append(ctx.arena, "nofollow");
+    try parts.append(ctx.arena, "noopener");
+    std.mem.sort([]const u8, parts.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var rel: std.ArrayList(u8) = .empty;
+    for (parts.items, 0..) |w, i| {
+        if (i > 0 and std.mem.eql(u8, w, parts.items[i - 1])) continue;
+        if (rel.items.len != 0) try rel.append(ctx.arena, ' ');
+        try rel.appendSlice(ctx.arena, w);
+    }
+    var schemes: std.ArrayList([]const u8) = .empty;
+    if (args.get(4, "extra_schemes")) |v| if (v != .none) {
+        for (try seq(ctx, v)) |sv| {
+            const sch = try ctx.toStr(sv);
+            // `^([\w.+-]{2,}:(/){0,2})$`
+            var k: usize = 0;
+            while (k < sch.len and (std.ascii.isAlphanumeric(sch[k]) or sch[k] == '_' or sch[k] >= 0x80 or sch[k] == '.' or sch[k] == '+' or sch[k] == '-')) k += 1;
+            const rest = sch[k..];
+            const ok = k >= 2 and rest.len >= 1 and rest[0] == ':' and rest.len <= 3 and
+                std.mem.count(u8, rest[1..], "/") == rest.len - 1;
+            if (!ok) return error.BadArgument;
+            try schemes.append(ctx.arena, sch);
+        }
+    };
+    const escaped: []const u8 = if (input == .string and input.string.safe) text else try value.escapeAlloc(ctx.arena, text);
+    const out = try urlize_mod.urlize(ctx.arena, escaped, .{
+        .trim_url_limit = limit,
+        .rel = rel.items,
+        .target = target,
+        .extra_schemes = schemes.items,
+    });
+    return .{ .string = .{ .bytes = out, .safe = ctx.autoescape } };
+}
+
+/// `pprint`: `pprint.pformat(value)`.
+fn fPprint(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    if (input == .undef and ctx.strict) return error.UndefinedValue;
+    return .{ .string = .{ .bytes = try pprint_mod.pformat(ctx.arena, input), .safe = false } };
+}
+
+/// `random`: one item of the sequence, from the render's seeded PRNG.
+/// Empty gives an undefined value, as the reference's `IndexError` path does.
+fn fRandom(ctx: *Ctx, input: Value, args: Args) Error!Value {
+    _ = args;
+    const items = try seq(ctx, input);
+    if (items.len == 0) return .{ .undef = .{ .name = "random" } };
+    const prng = ctx.prng orelse return error.BadArgument;
+    return items[prng.random().uintLessThan(usize, items.len)];
+}
+
 fn fFirst(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = args;
     const items = try seq(ctx, input);
@@ -1700,6 +1787,9 @@ pub const builtin_filters = [_]Entry{
     .{ .name = "tojson", .func = fTojson },
     .{ .name = "trim", .func = fTrim },
     .{ .name = "truncate", .func = fTruncate },
+    .{ .name = "random", .func = fRandom },
+    .{ .name = "pprint", .func = fPprint },
+    .{ .name = "urlize", .func = fUrlize },
     .{ .name = "unique", .func = fUnique },
     .{ .name = "upper", .func = fUpper },
     .{ .name = "urlencode", .func = fUrlencode },

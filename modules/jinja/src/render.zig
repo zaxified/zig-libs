@@ -11,6 +11,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const value = @import("value.zig");
 const filters = @import("filters.zig");
+const lorem = @import("lorem.zig");
 const loader_mod = @import("loader.zig");
 const parser = @import("parser.zig");
 const Diagnostic = @import("diag.zig").Diagnostic;
@@ -76,6 +77,10 @@ pub const Options = struct {
     max_call_depth: usize = 64,
     /// How many distinct templates one render may load.
     max_templates: usize = 256,
+    /// Seed of the render's PRNG (`random` filter, `lipsum()`): the same seed
+    /// gives the same picks. The reference uses Python's unseeded global
+    /// `random`, so no output can be pinned to it.
+    random_seed: u64 = 0,
 };
 
 /// How the renderer reaches the environment's filter/test registries without
@@ -156,6 +161,8 @@ pub fn render(
     var r: Renderer = .{
         .arena = arena,
         .opts = opts,
+        .prng = .init(opts.random_seed),
+        .ae = opts.autoescape,
         .lookup = lookup,
         .out = &counting,
         .diag = diag,
@@ -185,6 +192,10 @@ const Counting = struct {
 const Renderer = struct {
     arena: std.mem.Allocator,
     opts: Options,
+    prng: std.Random.DefaultPrng,
+    /// Autoescaping right now: `opts.autoescape`, changed inside an
+    /// `{% autoescape %}` block.
+    ae: bool,
     lookup: Lookup,
     out: *Counting,
     diag: *Diagnostic,
@@ -311,7 +322,7 @@ const Renderer = struct {
                     return e;
                 };
                 self.out = saved;
-                var v: Value = .{ .string = .{ .bytes = aw.written(), .safe = self.opts.autoescape } };
+                var v: Value = .{ .string = .{ .bytes = aw.written(), .safe = self.ae } };
                 if (s.filter) |chain| v = try self.evalWithBlockInput(chain, v);
                 try self.assign(s.target, v, 0);
             },
@@ -325,7 +336,7 @@ const Renderer = struct {
                     return e;
                 };
                 self.out = saved;
-                const input: Value = .{ .string = .{ .bytes = aw.written(), .safe = self.opts.autoescape } };
+                const input: Value = .{ .string = .{ .bytes = aw.written(), .safe = self.ae } };
                 const v = try self.evalWithBlockInput(fb.filter, input);
                 try self.emit(v, 0);
             },
@@ -337,6 +348,13 @@ const Renderer = struct {
                     try self.assign(a.target, v, 0);
                 }
                 try self.renderNodes(wth.body);
+            },
+            .autoescape => |a| {
+                const on = try self.truthy(a.expr, 0);
+                const saved = self.ae;
+                self.ae = on;
+                defer self.ae = saved;
+                try self.renderNodes(a.body);
             },
             .do => |d| _ = try self.eval(d.expr, d.line),
 
@@ -514,11 +532,20 @@ const Renderer = struct {
 
     /// `{{ super() }}` — the next definition of the block currently rendering.
     fn doSuper(self: *Renderer, line: usize) Error!Value {
+        return self.doSuperN(1, line);
+    }
+
+    /// `levels` definitions up: 1 is `super()`, 2 is `super.super()`.
+    fn doSuperN(self: *Renderer, levels: usize, line: usize) Error!Value {
         if (self.block_stack.items.len == 0)
             return self.fail(line, "super() outside a block", .{}, error.BlockError);
         const top = self.block_stack.items[self.block_stack.items.len - 1];
-        const found = self.resolveBlock(top.name, top.chain_index + 1) orelse
+        var found = self.resolveBlock(top.name, top.chain_index + 1) orelse
             return self.fail(line, "super() in block '{s}' has no parent definition", .{top.name}, error.BlockError);
+        for (1..levels) |_| {
+            found = self.resolveBlock(top.name, found.idx + 1) orelse
+                return self.fail(line, "super.super() in block '{s}' has no definition that far up", .{top.name}, error.BlockError);
+        }
 
         var aw: std.Io.Writer.Allocating = .init(self.arena);
         var sub: Counting = .{ .inner = &aw.writer, .limit = self.out.limit, .written = self.out.written };
@@ -530,7 +557,7 @@ const Renderer = struct {
         };
         self.out = saved;
         self.out.written = sub.written;
-        return .{ .string = .{ .bytes = aw.written(), .safe = self.opts.autoescape } };
+        return .{ .string = .{ .bytes = aw.written(), .safe = self.ae } };
     }
 
     /// `self` — every block of the current chain as a callable, resolved the
@@ -585,11 +612,16 @@ const Renderer = struct {
     fn renderNested(self: *Renderer, unit: *Unit, with_context: bool) Error!void {
         const saved_ctx = self.context;
         const saved_self = self.self_ns;
+        // A template rendered from inside an `{% autoescape %}` block starts
+        // from the environment's setting, as in the reference.
+        const saved_ae = self.ae;
         defer {
             self.context = saved_ctx;
             self.self_ns = saved_self;
+            self.ae = saved_ae;
         }
         self.self_ns = null;
+        self.ae = self.opts.autoescape;
 
         var frames: std.ArrayList(*Frame) = .empty;
         if (with_context) {
@@ -700,6 +732,8 @@ const Renderer = struct {
         const saved_caller = self.caller;
         const saved_recursive = self.recursive;
         const saved_self = self.self_ns;
+        const saved_ae = self.ae;
+        if (!def.in_autoescape_region) self.ae = self.opts.autoescape;
         if (!impl.keep_context) self.context = .{ .map = .{ .pairs = &.{} } };
         // A macro body is not inside the caller's loop.
         self.recursive = null;
@@ -711,6 +745,7 @@ const Renderer = struct {
             self.caller = saved_caller;
             self.recursive = saved_recursive;
             self.self_ns = saved_self;
+            self.ae = saved_ae;
         }
 
         if (impl.block_body == null) try self.bindMacroArgs(def, params_frame, args, ref.name, line);
@@ -726,7 +761,7 @@ const Renderer = struct {
         self.out.written = sink.written;
         try result;
 
-        return .{ .string = .{ .bytes = aw.written(), .safe = self.opts.autoescape } };
+        return .{ .string = .{ .bytes = aw.written(), .safe = saved_ae } };
     }
 
     fn bindMacroArgs(
@@ -867,7 +902,7 @@ const Renderer = struct {
         self.out = saved_out;
         self.out.written = sink.written;
         try result;
-        return .{ .string = .{ .bytes = aw.written(), .safe = self.opts.autoescape } };
+        return .{ .string = .{ .bytes = aw.written(), .safe = self.ae } };
     }
 
     fn bindTarget(self: *Renderer, t: ast.Target, item: Value) Error!void {
@@ -900,7 +935,7 @@ const Renderer = struct {
                 return self.fail(line, "'{s}' is undefined", .{v.undef.name}, error.UndefinedValue);
             return;
         }
-        if (!self.opts.autoescape or (v == .string and v.string.safe)) {
+        if (!self.ae or (v == .string and v.string.safe)) {
             // A plain string needs no formatting at all — write it straight
             // through, the same short-circuit `value.strAlloc` already takes,
             // instead of copying it into a throwaway arena buffer first.
@@ -964,7 +999,7 @@ const Renderer = struct {
             .binop => |b| {
                 const lhs = try self.eval(b.lhs, line);
                 const rhs = try self.eval(b.rhs, line);
-                if (b.op == .concat) return value.concat(self.arena, &.{ lhs, rhs }, self.opts.autoescape);
+                if (b.op == .concat) return value.concat(self.arena, &.{ lhs, rhs }, self.ae);
                 return value.binary(self.arena, b.op, lhs, rhs) catch |err| return self.opError(line, err);
             },
             .neg => |inner| {
@@ -1028,11 +1063,28 @@ const Renderer = struct {
             },
             .call => |c| return self.evalCall(c),
             .method => |m| {
+                // `super.super()`: the receiver chain is `super` itself.
+                if (m.args.positional.len == 0 and m.args.keyword.len == 0 and m.args.star == null and m.args.dstar == null and std.mem.eql(u8, m.name, "super") and
+                    self.block_stack.items.len != 0)
+                {
+                    if (superDepth(m.obj)) |d| return self.doSuperN(d + 1, m.line);
+                }
                 const obj = try self.eval(m.obj, m.line);
                 const args = try self.evalArgs(m.args, m.line);
                 return self.callMethod(obj, m.name, args, m.line);
             },
         }
+    }
+
+    /// How many `super` links a receiver chain `super.super…` has; null when
+    /// it is anything else (a user variable named `super` included is not
+    /// told apart here: inside a block `super` is the block reference).
+    fn superDepth(e: *const Expr) ?usize {
+        return switch (e.*) {
+            .name => |n| if (std.mem.eql(u8, n, "super")) 1 else null,
+            .getattr => |g| if (std.mem.eql(u8, g.name, "super")) (superDepth(g.obj) orelse return null) + 1 else null,
+            else => null,
+        };
     }
 
     fn opError(self: *Renderer, line: usize, err: Error) Error {
@@ -1074,13 +1126,14 @@ const Renderer = struct {
     fn filterCtx(self: *Renderer) filters.Ctx {
         return .{
             .arena = self.arena,
-            .autoescape = self.opts.autoescape,
+            .autoescape = self.ae,
             .strict = self.opts.undefined_policy == .strict,
             .user = self,
             .callFilter = callFilterThunk,
             .callTest = callTestThunk,
             .hasFilter = hasFilterThunk,
             .hasTest = hasTestThunk,
+            .prng = &self.prng,
         };
     }
 
@@ -1143,11 +1196,35 @@ const Renderer = struct {
             if (bound == .gadget) return self.callGadget(bound.gadget, args, c.line);
             if (std.mem.eql(u8, name, "cycler")) return self.globalCycler(args, c.line);
             if (std.mem.eql(u8, name, "joiner")) return self.globalJoiner(args, c.line);
-            if (std.mem.eql(u8, name, "lipsum"))
-                return self.fail(c.line, "global '{s}' is not implemented (see SPEC.md)", .{name}, error.NotCallable);
+            if (std.mem.eql(u8, name, "lipsum")) return self.globalLipsum(args, c.line);
             return self.fail(c.line, "'{s}' is not callable", .{name}, error.NotCallable);
         }
         return self.fail(c.line, "only the built-in globals are callable in this module (see SPEC.md)", .{}, error.NotCallable);
+    }
+
+    /// `lipsum(n=5, html=True, min=20, max=100)`.
+    fn globalLipsum(self: *Renderer, args: filters.Args, line: usize) Error!Value {
+        if (args.pos.len > 4) return self.fail(line, "lipsum() takes at most 4 arguments", .{}, error.BadArgument);
+        const names = [_][]const u8{ "n", "html", "min", "max" };
+        for (args.kw) |k| {
+            var ok = false;
+            for (names) |kn| {
+                if (std.mem.eql(u8, k.name, kn)) ok = true;
+            }
+            if (!ok) return self.fail(line, "lipsum() got an unexpected keyword '{s}'", .{k.name}, error.BadArgument);
+        }
+        var ints = [_]i64{ 5, 0, 20, 100 };
+        for (names, 0..) |nm, i| {
+            if (i == 1) continue;
+            if (args.get(i, nm)) |v| ints[i] = try intOf(v);
+        }
+        const html = if (args.get(1, "html")) |v| v.truthy() else true;
+        if (ints[0] < 0 or ints[0] > 1 << 16) return self.fail(line, "lipsum(): n out of range", .{}, error.BadArgument);
+        const text = lorem.generate(self.arena, self.prng.random(), @intCast(ints[0]), html, ints[2], ints[3]) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadArgument => return self.fail(line, "lipsum(): min must be below max", .{}, error.BadArgument),
+        };
+        return .{ .string = .{ .bytes = text, .safe = html } };
     }
 
     fn globalRange(self: *Renderer, args: filters.Args, line: usize) Error!Value {
@@ -1400,7 +1477,7 @@ const Renderer = struct {
                 return .{ .boolean = false };
             }
         }
-        return filters.callMethod(self.arena, obj, name, args, self.opts.autoescape) catch |err| switch (err) {
+        return filters.callMethod(self.arena, obj, name, args, self.ae) catch |err| switch (err) {
             error.Unsupported => self.fail(line, "'{s}' objects have no method '{s}' in this module (see SPEC.md)", .{ obj.typeName(), name }, error.NotCallable),
             else => |other| other,
         };

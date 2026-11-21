@@ -64,11 +64,163 @@ test "the tags that remain unimplemented are named as such, not as typos" {
     defer env.deinit();
     for ([_][]const u8{
         "{% trans %}hi{% endtrans %}",
-        "{% autoescape true %}{% endautoescape %}",
     }) |src| {
         var diag: jinja.Diagnostic = .{};
         try testing.expectError(error.TemplateSyntaxError, env.compile(src, &diag));
         try testing.expect(std.mem.find(u8, diag.message(), "not implemented") != null);
+    }
+}
+
+test "line statements, line comments and custom delimiters (expected strings from Jinja2 3.1.6)" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, opts: jinja.Options, want: []const u8 };
+    const ls: jinja.Options = .{ .line_statement_prefix = "#" };
+    const both: jinja.Options = .{ .line_statement_prefix = "#", .line_comment_prefix = "##" };
+    const erb: jinja.Options = .{ .delimiters = .{
+        .block_start = "<%",
+        .block_end = "%>",
+        .variable_start = "<%=",
+        .variable_end = "%>",
+        .comment_start = "<#",
+        .comment_end = "#>",
+    } };
+    const brk: jinja.Options = .{ .delimiters = .{
+        .block_start = "[%",
+        .block_end = "%]",
+        .variable_start = "[[",
+        .variable_end = "]]",
+        .comment_start = "[#",
+        .comment_end = "#]",
+    } };
+    for ([_]Case{
+        .{ .src = "# for i in [1, 2]:\n  <{{ i }}>\n# endfor\nend", .opts = ls, .want = "  <1>\n  <2>\nend" },
+        .{ .src = "a\n  # if 0\nyes\n  # else\nno\n  # endif\nz\n", .opts = ls, .want = "a\nno\nz" },
+        .{ .src = "a ## comment here\nb\n## whole line\nc", .opts = .{ .line_comment_prefix = "##" }, .want = "a\nb\n\nc" },
+        .{ .src = "# set d = {\n  \"a\": 1,\n  \"b\": 2}\n{{ d.b }}|x", .opts = ls, .want = "2|x" },
+        .{ .src = "x # y\n# if 1\nQ\n# endif\n## c\nR\n", .opts = both, .want = "x # y\nQ\n\nR" },
+        .{ .src = "# for i in [1,2]:\n{{ i }}\n# endfor\n", .opts = .{ .line_statement_prefix = "#", .trim_blocks = true }, .want = "1\n2\n" },
+        .{ .src = "<% if 1 %>A<%= 'Y' %><# c #>B<% endif %> {{ z }}", .opts = erb, .want = "AYB {{ z }}" },
+        .{ .src = "[[ 3 ]] [% if 3 %]a[%- endif %] {{ q }} [# c #]!", .opts = brk, .want = "3 a {{ q }} !" },
+    }) |c| {
+        const out = try renderWith(gpa, c.opts, c.src, .{ .map = .{ .pairs = &.{} } });
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+    // Bad delimiters are a compile error, not a guess.
+    var env = try jinja.Environment.init(gpa, .{ .delimiters = .{ .block_start = "{{" } });
+    defer env.deinit();
+    try testing.expectError(error.TemplateSyntaxError, env.compile("x", null));
+}
+
+test "random filter and lipsum(): seeded, so the same seed renders the same text" {
+    const gpa = testing.allocator;
+    const ctx: jinja.Value = .{ .map = .{ .pairs = &.{} } };
+    const src = "{% for i in range(6) %}{{ [10, 20, 30]|random }} {% endfor %}{{ 'ab'|random }}";
+    const a = try renderWith(gpa, .{ .random_seed = 5 }, src, ctx);
+    defer gpa.free(a);
+    const b = try renderWith(gpa, .{ .random_seed = 5 }, src, ctx);
+    defer gpa.free(b);
+    try testing.expectEqualStrings(a, b);
+    var it = std.mem.tokenizeScalar(u8, a, ' ');
+    var n: usize = 0;
+    while (it.next()) |tok| : (n += 1) {
+        if (n < 6) try testing.expect(std.mem.eql(u8, tok, "10") or std.mem.eql(u8, tok, "20") or std.mem.eql(u8, tok, "30"));
+    }
+    try testing.expect(a[a.len - 1] == 'a' or a[a.len - 1] == 'b');
+    // An empty sequence is undefined, as in the reference (an error under .strict).
+    try testing.expectError(error.UndefinedValue, renderWith(gpa, .{}, "{{ []|random }}", ctx));
+    const l = try renderWith(gpa, .{ .autoescape = true }, "{{ lipsum(2, min=3, max=6) }}|{{ lipsum(1, false, 4, 5) }}", ctx);
+    defer gpa.free(l);
+    try testing.expect(std.mem.startsWith(u8, l, "<p>"));
+    try testing.expect(std.mem.count(u8, l, "<p>") == 2 and std.mem.count(u8, l, "</p>") == 2);
+    try testing.expectError(error.BadArgument, renderWith(gpa, .{}, "{{ lipsum(1, true, 5, 5) }}", ctx));
+}
+
+test "urlize: byte-identical with Jinja2 3.1.6 on a set of inputs" {
+    const gpa = testing.allocator;
+    const Case = struct { tpl: []const u8, t: []const u8, want: []const u8 };
+    for ([_]Case{
+        .{ .tpl = "{{ t|urlize }}", .t = "Visit https://example.com/a?b=1&c=2, or www.example.org. Mail bob@example.com or mailto:x@y.org (see http://a.b/c_(d)).", .want = "Visit <a href=\"https://example.com/a?b=1&amp;c=2\" rel=\"noopener\">https://example.com/a?b=1&amp;c=2</a>, or <a href=\"https://www.example.org\" rel=\"noopener\">www.example.org</a>. Mail <a href=\"mailto:bob@example.com\">bob@example.com</a> or <a href=\"mailto:x@y.org\">x@y.org</a> (see http://a.b/c_(d))." },
+        .{ .tpl = "{{ t|urlize }}", .t = "(http://x.org/p) <https://foo.io> &lt;www.q.com&gt;", .want = "(<a href=\"http://x.org/p\" rel=\"noopener\">http://x.org/p</a>) &lt;<a href=\"https://foo.io\" rel=\"noopener\">https://foo.io</a>&gt; &amp;lt;www.q.com&amp;gt;" },
+        .{ .tpl = "{{ t|urlize }}", .t = "example.com foo.example.net/path#frag 10.0.0.1 http://192.168.1.1:8080/x http://[2001:db8::1]/z", .want = "<a href=\"https://example.com\" rel=\"noopener\">example.com</a> <a href=\"https://foo.example.net/path#frag\" rel=\"noopener\">foo.example.net/path#frag</a> 10.0.0.1 <a href=\"http://192.168.1.1:8080/x\" rel=\"noopener\">http://192.168.1.1:8080/x</a> <a href=\"http://[2001:db8::1]/z\" rel=\"noopener\">http://[2001:db8::1]/z</a>" },
+        .{ .tpl = "{{ t|urlize }}", .t = "plain text, no links @a@b bob@@x.com a@b a@b.c ftp://x.org", .want = "plain text, no links @a@b <a href=\"mailto:bob@@x.com\">bob@@x.com</a> a@b <a href=\"mailto:a@b.c\">a@b.c</a> ftp://x.org" },
+        .{ .tpl = "{{ t|urlize }}", .t = "x\n\nwww.com tail.", .want = "x\n\n<a href=\"https://www.com\" rel=\"noopener\">www.com</a> tail." },
+        .{ .tpl = "{{ t|urlize }}", .t = "<b>bold</b> http://x.org/?a=<b>", .want = "&lt;b&gt;bold&lt;/b&gt; <a href=\"http://x.org/?a=&lt;b&gt;\" rel=\"noopener\">http://x.org/?a=&lt;b&gt;</a>" },
+        .{ .tpl = "{{ t|urlize(20, true, \"_blank\", \"ext\") }}", .t = "Visit https://example.com/a?b=1&c=2, or www.example.org.", .want = "Visit <a href=\"https://example.com/a?b=1&amp;c=2\" rel=\"ext nofollow noopener\" target=\"_blank\">https://example.com/...</a>, or <a href=\"https://www.example.org\" rel=\"ext nofollow noopener\" target=\"_blank\">www.example.org</a>." },
+        .{ .tpl = "{{ t|urlize(extra_schemes=[\"tel:\",\"ftp://\"]) }}", .t = "call tel:123 now ftp://x.org/f tel:", .want = "call <a href=\"tel:123\" rel=\"noopener\">tel:123</a> now <a href=\"ftp://x.org/f\" rel=\"noopener\">ftp://x.org/f</a> tel:" },
+        .{ .tpl = "{{ t|urlize }}", .t = "http://example.com/a.b.c) www.x.org/(a)). a.com, b.org; http://[::1]:99/ http://[1:2:3:4:5:6:7:8]/", .want = "<a href=\"http://example.com/a.b.c\" rel=\"noopener\">http://example.com/a.b.c</a>) <a href=\"https://www.x.org/(a)\" rel=\"noopener\">www.x.org/(a)</a>). a.com, b.org; <a href=\"http://[::1]:99/\" rel=\"noopener\">http://[::1]:99/</a> <a href=\"http://[1:2:3:4:5:6:7:8]/\" rel=\"noopener\">http://[1:2:3:4:5:6:7:8]/</a>" },
+        .{ .tpl = "{{ t|urlize }}", .t = "https://xn--bcher-kva.example/ foo.xn--p1ai/ ab.cd.com/ a.com:123456 a.com:12345/x", .want = "<a href=\"https://xn--bcher-kva.example/\" rel=\"noopener\">https://xn--bcher-kva.example/</a> foo.xn--p1ai/ <a href=\"https://ab.cd.com/\" rel=\"noopener\">ab.cd.com/</a> a.com:123456 a.com:12345/x" },
+    }) |c| {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const ctx = try jinja.valueFrom(arena.allocator(), .{ .t = c.t });
+        const out = try renderWith(gpa, .{}, c.tpl, ctx);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "pprint: byte-identical with Jinja2 3.1.6 (Python 3.14 pprint.pformat)" {
+    const gpa = testing.allocator;
+    const Case = struct { tpl: []const u8, want: []const u8 };
+    for ([_]Case{
+        .{ .tpl = "{% set long = \"The quick brown fox jumps over the lazy dog and keeps running through the forest until night falls over everything\" %}{{ {'z':1,'a':[1,2,3],'m':{'k':'v'}}|pprint }}", .want = "{'a': [1, 2, 3], 'm': {'k': 'v'}, 'z': 1}" },
+        .{ .tpl = "{% set long = \"The quick brown fox jumps over the lazy dog and keeps running through the forest until night falls over everything\" %}{{ range(40)|list|pprint }}", .want = "[0,\n 1,\n 2,\n 3,\n 4,\n 5,\n 6,\n 7,\n 8,\n 9,\n 10,\n 11,\n 12,\n 13,\n 14,\n 15,\n 16,\n 17,\n 18,\n 19,\n 20,\n 21,\n 22,\n 23,\n 24,\n 25,\n 26,\n 27,\n 28,\n 29,\n 30,\n 31,\n 32,\n 33,\n 34,\n 35,\n 36,\n 37,\n 38,\n 39]" },
+        .{ .tpl = "{% set long = \"The quick brown fox jumps over the lazy dog and keeps running through the forest until night falls over everything\" %}{{ long|pprint }}", .want = "('The quick brown fox jumps over the lazy dog and keeps running through the '\n 'forest until night falls over everything')" },
+        .{ .tpl = "{% set long = \"The quick brown fox jumps over the lazy dog and keeps running through the forest until night falls over everything\" %}{{ [long, long]|pprint }}", .want = "['The quick brown fox jumps over the lazy dog and keeps running through the '\n 'forest until night falls over everything',\n 'The quick brown fox jumps over the lazy dog and keeps running through the '\n 'forest until night falls over everything']" },
+        .{ .tpl = "{% set long = \"The quick brown fox jumps over the lazy dog and keeps running through the forest until night falls over everything\" %}{{ {'text': long ~ ' ' ~ long, 'n': none, 'f': 1.5, 'b': true}|pprint }}", .want = "{'b': True,\n 'f': 1.5,\n 'n': None,\n 'text': 'The quick brown fox jumps over the lazy dog and keeps running '\n         'through the forest until night falls over everything The quick brown '\n         'fox jumps over the lazy dog and keeps running through the forest '\n         'until night falls over everything'}" },
+        .{ .tpl = "{% set long = \"The quick brown fox jumps over the lazy dog and keeps running through the forest until night falls over everything\" %}{{ ('line one\\nline two ' ~ long ~ '\\nthree')|pprint }}", .want = "('line one\\n'\n 'line two The quick brown fox jumps over the lazy dog and keeps running '\n 'through the forest until night falls over everything\\n'\n 'three')" },
+        .{ .tpl = "{% set long = \"The quick brown fox jumps over the lazy dog and keeps running through the forest until night falls over everything\" %}{{ {'b':1,'a':2,1:3,'c':{'y':long,'x':[long]}}|pprint }}", .want = "{1: 3,\n 'a': 2,\n 'b': 1,\n 'c': {'x': ['The quick brown fox jumps over the lazy dog and keeps running '\n             'through the forest until night falls over everything'],\n       'y': 'The quick brown fox jumps over the lazy dog and keeps running '\n            'through the forest until night falls over everything'}}" },
+        .{ .tpl = "{% set long = \"The quick brown fox jumps over the lazy dog and keeps running through the forest until night falls over everything\" %}{{ ['é'*40, 'ñ'*50]|pprint }}", .want = "['éééééééééééééééééééééééééééééééééééééééé',\n 'ññññññññññññññññññññññññññññññññññññññññññññññññññ']" },
+        .{ .tpl = "{% set long = \"The quick brown fox jumps over the lazy dog and keeps running through the forest until night falls over everything\" %}{{ ''|pprint }}{{ []|pprint }}{{ {}|pprint }}{{ 'short'|pprint }}{{ [1,'a',none,2.5]|pprint }}", .want = "''[]{}'short'[1, 'a', None, 2.5]" },
+    }) |c| {
+        const out = try renderWith(gpa, .{}, c.tpl, .{ .map = .{ .pairs = &.{} } });
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "super.super() reaches two definitions up (expected string from Jinja2 3.1.6)" {
+    const gpa = testing.allocator;
+    var map: jinja.MapLoader = .{ .entries = &.{
+        .{ .name = "base", .source = "[{% block b %}A{% endblock %}]" },
+        .{ .name = "mid", .source = "{% extends 'base' %}{% block b %}M{{ super() }}{% endblock %}" },
+        .{ .name = "leaf", .source = "{% extends 'mid' %}{% block b %}L{{ super.super() }}|{{ super() }}{% endblock %}" },
+        .{ .name = "leaf3", .source = "{% extends 'mid' %}{% block b %}{{ super.super.super() }}{% endblock %}" },
+    } };
+    var env = try jinja.Environment.initWithLoader(gpa, .{}, map.loader());
+    defer env.deinit();
+    const out = try env.renderAlloc(gpa, "{% extends 'leaf' %}", .{ .map = .{ .pairs = &.{} } }, null);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("[LA|MA]", out);
+    // Three levels up from a block that has two parents: no such definition.
+    try testing.expectError(error.BlockError, env.renderAlloc(gpa, "{% extends 'leaf3' %}", .{ .map = .{ .pairs = &.{} } }, null));
+}
+
+test "autoescape block: a per-region switch, as the reference (expected strings from Jinja2 3.1.6)" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, ae: bool, want: []const u8 };
+    for ([_]Case{
+        .{ .src = "{% autoescape true %}{{ '<a>' }}{% endautoescape %}|{{ '<a>' }}", .ae = false, .want = "&lt;a&gt;|<a>" },
+        .{ .src = "{% autoescape false %}{{ '<b>' }}{% endautoescape %}|{{ '<b>' }}", .ae = true, .want = "<b>|&lt;b&gt;" },
+        // A macro defined outside keeps the environment's setting ...
+        .{ .src = "{% macro m() %}{{ '<m>' }}{% endmacro %}{% autoescape true %}{{ m() }}{{ '<n>' }}{% endautoescape %}", .ae = false, .want = "<m>&lt;n&gt;" },
+        .{ .src = "{% macro m() %}{{ '<m>' }}{% endmacro %}{% autoescape false %}{{ m() }}{% endautoescape %}", .ae = true, .want = "&lt;m&gt;" },
+        // ... one defined inside follows the caller's.
+        .{ .src = "{% autoescape true %}{% macro m() %}{{ '<m>' }}{% endmacro %}{{ m() }}{% endautoescape %}", .ae = false, .want = "&lt;m&gt;" },
+        .{ .src = "{% autoescape true %}{% autoescape false %}{{ '<a>' }}{% endautoescape %}{{ '<b>' }}{% endautoescape %}", .ae = false, .want = "<a>&lt;b&gt;" },
+        .{ .src = "{% autoescape true %}{% for i in [1,2] %}{{ '<x>' ~ i }}{% endfor %}{% endautoescape %}", .ae = false, .want = "&lt;x&gt;1&lt;x&gt;2" },
+        .{ .src = "{% autoescape true %}{% set s %}<i>{% endset %}{{ s }}{{ s|safe }}{% endautoescape %}", .ae = false, .want = "<i><i>" },
+        // The truth value of a run-time expression decides.
+        .{ .src = "{% set a = 1 %}{% autoescape a %}{{ v }}{% endautoescape %}", .ae = false, .want = "&lt;a&gt;" },
+        .{ .src = "{% set a = 0 %}{% autoescape a %}{{ v }}{% endautoescape %}", .ae = true, .want = "<a>" },
+    }) |c| {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const ctx = try jinja.valueFrom(arena.allocator(), .{ .v = "<a>" });
+        const out = try renderWith(gpa, .{ .autoescape = c.ae }, c.src, ctx);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
     }
 }
 

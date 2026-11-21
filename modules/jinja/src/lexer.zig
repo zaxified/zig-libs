@@ -20,6 +20,24 @@ pub const Options = struct {
     /// Keep the single trailing newline that a template file almost always
     /// ends with. Off by default, matching the reference.
     keep_trailing_newline: bool = false,
+    delimiters: Delimiters = .{},
+    /// A line whose first non-blank text is this prefix is a statement up to
+    /// the end of the line (Jinja2 `line_statement_prefix`); the line's own
+    /// newline belongs to it. Null = none.
+    line_statement_prefix: ?[]const u8 = null,
+    /// From this prefix (after optional blanks) to the end of the line is a
+    /// comment, the newline stays (Jinja2 `line_comment_prefix`). Null = none.
+    line_comment_prefix: ?[]const u8 = null,
+};
+
+/// The tag delimiters (Jinja2's `block_start_string` ... `comment_end_string`).
+pub const Delimiters = struct {
+    block_start: []const u8 = "{%",
+    block_end: []const u8 = "%}",
+    variable_start: []const u8 = "{{",
+    variable_end: []const u8 = "}}",
+    comment_start: []const u8 = "{#",
+    comment_end: []const u8 = "#}",
 };
 
 pub const Error = error{ OutOfMemory, TemplateSyntaxError };
@@ -109,6 +127,15 @@ pub fn lex(arena: std.mem.Allocator, source: []const u8, opts: Options, diag: *D
         .opts = opts,
         .diag = diag,
     };
+    const dl = opts.delimiters;
+    for ([_][]const u8{ dl.block_start, dl.block_end, dl.variable_start, dl.variable_end, dl.comment_start, dl.comment_end }) |d| {
+        if (d.len == 0) return l.fail("a delimiter must not be empty");
+    }
+    if (std.mem.eql(u8, dl.block_start, dl.variable_start) or std.mem.eql(u8, dl.block_start, dl.comment_start) or
+        std.mem.eql(u8, dl.variable_start, dl.comment_start))
+        return l.fail("the start delimiters must differ");
+    if (opts.line_statement_prefix) |x| if (x.len == 0) return l.fail("a line prefix must not be empty");
+    if (opts.line_comment_prefix) |x| if (x.len == 0) return l.fail("a line prefix must not be empty");
     if (!opts.keep_trailing_newline) {
         if (std.mem.endsWith(u8, l.src, "\r\n")) {
             l.src = l.src[0 .. l.src.len - 2];
@@ -145,22 +172,119 @@ const Lexer = struct {
     fn run(self: *Lexer) Error!void {
         while (self.pos < self.src.len) {
             const start = self.pos;
-            const next = findTagStart(self.src, self.pos);
+            const next = findTagStart(self.src, self.pos, self.opts.delimiters);
+            const limit = if (next) |n| n.at else self.src.len;
+            if (self.findLineMarker(start, limit)) |m| {
+                if (m.at > start) try self.pushText(self.src[start..m.at]);
+                self.pos = m.at;
+                if (m.statement) try self.lexLineStatement() else self.skipLineComment();
+                continue;
+            }
             if (next == null) {
                 try self.pushText(self.src[start..]);
                 self.pos = self.src.len;
                 break;
             }
-            const at = next.?;
+            const at = next.?.at;
             if (at > start) try self.pushText(self.src[start..at]);
             self.pos = at;
-            switch (self.src[at + 1]) {
-                '#' => try self.lexComment(),
-                '{' => try self.lexTag(false),
-                '%' => try self.lexTag(true),
-                else => unreachable,
+            switch (next.?.kind) {
+                .comment => try self.lexComment(),
+                .variable => try self.lexTag(false),
+                .block => try self.lexTag(true),
             }
         }
+    }
+
+    const LineMarker = struct { at: usize, statement: bool };
+
+    /// The first line statement or line comment that starts in
+    /// `[from, limit)`. A statement needs the start of a line (blanks may
+    /// precede the prefix); a comment may follow text, and takes the blanks
+    /// before it. When one prefix is the other's start, the longer one wins.
+    fn findLineMarker(self: *const Lexer, from: usize, limit: usize) ?LineMarker {
+        const sp = self.opts.line_statement_prefix;
+        const cp = self.opts.line_comment_prefix;
+        if (sp == null and cp == null) return null;
+        const src = self.src;
+        var ls = from;
+        // `from` mid-line: no statement on this line, only a comment.
+        var at_line_start = from == 0 or src[from - 1] == '\n';
+        while (ls < limit) {
+            const eol = std.mem.findScalarPos(u8, src, ls, '\n') orelse src.len;
+            var q = ls;
+            while (q < eol and (src[q] == ' ' or src[q] == '\t' or src[q] == 0x0b)) q += 1;
+            const stmt_here = at_line_start and sp != null and std.mem.startsWith(u8, src[q..], sp.?);
+            const cmt_at = if (cp) |c| findPrefix(src, ls, eol, c) else null;
+            if (stmt_here) {
+                // A longer comment prefix at the same place wins.
+                if (cmt_at) |ca| if (ca.prefix_at == q and cp.?.len > sp.?.len) {
+                    if (ca.start < limit) return .{ .at = ca.start, .statement = false };
+                    return null;
+                };
+                if (ls < limit) return .{ .at = ls, .statement = true };
+                return null;
+            }
+            if (cmt_at) |ca| {
+                if (ca.start < limit) return .{ .at = @max(ca.start, from), .statement = false };
+                return null;
+            }
+            ls = eol + 1;
+            at_line_start = true;
+        }
+        return null;
+    }
+
+    /// Drop a line comment: everything up to the newline, which stays.
+    fn skipLineComment(self: *Lexer) void {
+        const eol = std.mem.findScalarPos(u8, self.src, self.pos, '\n') orelse self.src.len;
+        self.pos = eol;
+    }
+
+    /// A line statement: the tokens after the prefix up to the end of the
+    /// line, which a bracket left open carries over. The newline is consumed
+    /// with it, and so are the blanks before the prefix.
+    fn lexLineStatement(self: *Lexer) Error!void {
+        const src = self.src;
+        const tag_line = self.line;
+        var p = self.pos;
+        while (p < src.len and (src[p] == ' ' or src[p] == '\t' or src[p] == 0x0b)) p += 1;
+        p += self.opts.line_statement_prefix.?.len;
+        var toks: std.ArrayList(Token) = .empty;
+        var depth: usize = 0;
+        while (true) {
+            while (p < src.len and (src[p] == ' ' or src[p] == '\t' or src[p] == '\r' or src[p] == 0x0b or (depth > 0 and src[p] == '\n'))) : (p += 1) {
+                if (src[p] == '\n') self.line += 1;
+            }
+            if (p >= src.len) break;
+            if (src[p] == '\n') {
+                p += 1;
+                self.line += 1;
+                break;
+            }
+            try toks.append(self.arena, try self.lexToken(&p, &depth));
+        }
+        self.pos = p;
+        // `# for x in xs:` — a colon after the header of a block tag is
+        // allowed and ignored (Jinja2 skips it in `parse_statements`).
+        if (toks.items.len > 1 and toks.items[toks.items.len - 1].kind == .colon and toks.items[0].kind == .name) {
+            for ([_][]const u8{ "for", "if", "elif", "else", "macro", "call", "block", "filter", "with", "autoescape" }) |kw| {
+                if (std.mem.eql(u8, toks.items[0].text, kw)) {
+                    _ = toks.pop();
+                    break;
+                }
+            }
+        }
+        try self.pieces.append(self.arena, .{ .chunk = .{ .stmt = toks.items }, .line = tag_line });
+        try self.marks.append(self.arena, .{
+            .before = self.priorText(),
+            .after = self.pieces.items.len,
+            .block = false,
+            .strip_before = false,
+            .plus_before = false,
+            .strip_after = false,
+            .plus_after = false,
+        });
     }
 
     fn pushText(self: *Lexer, t: []const u8) Error!void {
@@ -175,7 +299,8 @@ const Lexer = struct {
     /// `{# … #}` — dropped entirely, but its whitespace control still applies
     /// to the text on both sides.
     fn lexComment(self: *Lexer) Error!void {
-        var p = self.pos + 2;
+        const dl = self.opts.delimiters;
+        var p = self.pos + dl.comment_start.len;
         var strip_before = false;
         var plus_before = false;
         if (p < self.src.len and self.src[p] == '-') {
@@ -185,7 +310,7 @@ const Lexer = struct {
             plus_before = true;
             p += 1;
         }
-        const end = std.mem.findPos(u8, self.src, p, "#}") orelse return self.fail("unclosed comment");
+        const end = std.mem.findPos(u8, self.src, p, dl.comment_end) orelse return self.fail("unclosed comment");
         var body_end = end;
         var strip_after = false;
         var plus_after = false;
@@ -205,13 +330,15 @@ const Lexer = struct {
             .strip_after = strip_after,
             .plus_after = plus_after,
         });
-        self.countLines(self.src[self.pos .. end + 2]);
-        self.pos = end + 2;
+        self.countLines(self.src[self.pos .. end + dl.comment_end.len]);
+        self.pos = end + dl.comment_end.len;
     }
 
     fn lexTag(self: *Lexer, block: bool) Error!void {
         const tag_line = self.line;
-        var p = self.pos + 2;
+        const dl = self.opts.delimiters;
+        const tag_end = if (block) dl.block_end else dl.variable_end;
+        var p = self.pos + (if (block) dl.block_start.len else dl.variable_start.len);
         var strip_before = false;
         var plus_before = false;
         if (p < self.src.len and self.src[p] == '-') {
@@ -237,20 +364,13 @@ const Lexer = struct {
             const c = self.src[p];
             // tag end?
             if (depth == 0) {
-                if ((c == '-' or c == '+') and p + 2 < self.src.len and
-                    ((block and self.src[p + 1] == '%' and self.src[p + 2] == '}') or
-                        (!block and self.src[p + 1] == '}' and self.src[p + 2] == '}')))
-                {
+                if ((c == '-' or c == '+') and std.mem.startsWith(u8, self.src[p + 1 ..], tag_end)) {
                     if (c == '-') strip_after = true else plus_after = true;
-                    p += 3;
+                    p += 1 + tag_end.len;
                     break;
                 }
-                if (block and c == '%' and p + 1 < self.src.len and self.src[p + 1] == '}') {
-                    p += 2;
-                    break;
-                }
-                if (!block and c == '}' and p + 1 < self.src.len and self.src[p + 1] == '}') {
-                    p += 2;
+                if (std.mem.startsWith(u8, self.src[p..], tag_end)) {
+                    p += tag_end.len;
                     break;
                 }
             }
@@ -295,9 +415,9 @@ const Lexer = struct {
     ) Error!void {
         var scan = self.pos;
         while (true) {
-            const open = std.mem.findPos(u8, self.src, scan, "{%") orelse
+            const open = std.mem.findPos(u8, self.src, scan, self.opts.delimiters.block_start) orelse
                 return self.fail("unclosed {% raw %}");
-            var q = open + 2;
+            var q = open + self.opts.delimiters.block_start.len;
             var strip_before = false;
             var plus_before = false;
             if (q < self.src.len and (self.src[q] == '-' or self.src[q] == '+')) {
@@ -307,7 +427,7 @@ const Lexer = struct {
             }
             while (q < self.src.len and isSpace(self.src[q])) q += 1;
             if (!std.mem.startsWith(u8, self.src[q..], "endraw")) {
-                scan = open + 2;
+                scan = open + self.opts.delimiters.block_start.len;
                 continue;
             }
             q += "endraw".len;
@@ -319,8 +439,8 @@ const Lexer = struct {
                 plus_after = self.src[q] == '+';
                 q += 1;
             }
-            if (!std.mem.startsWith(u8, self.src[q..], "%}")) return self.fail("malformed {% endraw %}");
-            q += 2;
+            if (!std.mem.startsWith(u8, self.src[q..], self.opts.delimiters.block_end)) return self.fail("malformed {% endraw %}");
+            q += self.opts.delimiters.block_end.len;
 
             const body = self.src[self.pos..open];
             const body_idx = self.pieces.items.len;
@@ -557,16 +677,37 @@ fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\r' or c == '\n';
 }
 
-/// Index of the next `{{`, `{%` or `{#`. `{` alone, and `{` followed by
-/// anything else, is ordinary text.
-fn findTagStart(src: []const u8, from: usize) ?usize {
+const TagStart = struct { at: usize, kind: enum { block, variable, comment } };
+
+/// The next tag start delimiter (the longest wins where one starts another).
+/// A lone `{`, or one followed by anything else, is ordinary text.
+fn findTagStart(src: []const u8, from: usize, d: Delimiters) ?TagStart {
+    const Cand = struct { s: []const u8, kind: @FieldType(TagStart, "kind") };
+    var cands = [3]Cand{
+        .{ .s = d.block_start, .kind = .block },
+        .{ .s = d.variable_start, .kind = .variable },
+        .{ .s = d.comment_start, .kind = .comment },
+    };
+    std.mem.sort(Cand, &cands, {}, struct {
+        fn lt(_: void, a: Cand, b: Cand) bool {
+            return a.s.len > b.s.len;
+        }
+    }.lt);
     var i = from;
-    while (i + 1 < src.len) : (i += 1) {
-        if (src[i] != '{') continue;
-        switch (src[i + 1]) {
-            '{', '%', '#' => return i,
-            else => {},
+    while (i < src.len) : (i += 1) {
+        for (cands) |c| {
+            if (std.mem.startsWith(u8, src[i..], c.s)) return .{ .at = i, .kind = c.kind };
         }
     }
     return null;
+}
+
+const PrefixAt = struct { start: usize, prefix_at: usize };
+
+/// The first `prefix` in `[ls, eol)` and where its blanks begin.
+fn findPrefix(src: []const u8, ls: usize, eol: usize, prefix: []const u8) ?PrefixAt {
+    const j = std.mem.findPos(u8, src[0..eol], ls, prefix) orelse return null;
+    var k = j;
+    while (k > ls and (src[k - 1] == ' ' or src[k - 1] == '\t' or src[k - 1] == 0x0b)) k -= 1;
+    return .{ .start = k, .prefix_at = j };
 }

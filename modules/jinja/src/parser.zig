@@ -79,7 +79,7 @@ pub const Registry = struct {
 /// not. They get a named error rather than "unknown tag", so the message says
 /// what is going on instead of looking like a typo.
 const unimplemented_tags = [_][]const u8{
-    "trans", "endtrans", "pluralize", "autoescape", "endautoescape",
+    "trans", "endtrans", "pluralize",
 };
 
 pub fn parse(
@@ -122,6 +122,8 @@ const Parser = struct {
     blocks: std.ArrayList(ast.BlockDef) = .empty,
     /// The first top-level `{% extends %}`.
     extends: ?*const Expr = null,
+    /// How many `{% autoescape %}` blocks enclose the statement being parsed.
+    autoescape_depth: usize = 0,
 
     fn failAt(self: *Parser, line: usize, comptime msg: []const u8) Error {
         self.diag.set(line, "{s}", .{msg});
@@ -213,6 +215,7 @@ const Parser = struct {
         if (std.mem.eql(u8, kw.text, "set")) return self.parseSet(rest, line, out);
         if (std.mem.eql(u8, kw.text, "filter")) return self.parseFilterBlock(rest, line, out);
         if (std.mem.eql(u8, kw.text, "with")) return self.parseWith(rest, line, out);
+        if (std.mem.eql(u8, kw.text, "autoescape")) return self.parseAutoescape(rest, line, out);
         if (std.mem.eql(u8, kw.text, "extends")) return self.parseExtends(rest, line, out);
         if (std.mem.eql(u8, kw.text, "block")) return self.parseBlock(rest, line, out);
         if (std.mem.eql(u8, kw.text, "include")) return self.parseInclude(rest, line, out);
@@ -346,6 +349,16 @@ const Parser = struct {
         try ts.expectEnd(line);
         const body = try self.parseBody(&.{"endwith"});
         try out.append(self.arena, .{ .with = .{ .assignments = assigns.items, .body = body.nodes } });
+    }
+
+    fn parseAutoescape(self: *Parser, rest: []const Token, line: usize, out: *std.ArrayList(Node)) Error!void {
+        var ts: Stream = .{ .toks = rest, .p = self };
+        const e = try ts.parseExpression(line, true);
+        try ts.expectEnd(line);
+        self.autoescape_depth += 1;
+        defer self.autoescape_depth -= 1;
+        const body = try self.parseBody(&.{"endautoescape"});
+        try out.append(self.arena, .{ .autoescape = .{ .expr = e, .body = body.nodes } });
     }
 
     // ── composition ─────────────────────────────────────────────────────────
@@ -505,6 +518,7 @@ const Parser = struct {
 
         const def = try self.arena.create(ast.MacroDef);
         def.* = .{
+            .in_autoescape_region = self.autoescape_depth != 0,
             .name = name.text,
             .params = params,
             .body = body.nodes,
@@ -569,6 +583,7 @@ fn nodeMentions(n: Node, name: []const u8) bool {
             for (w.assignments) |a| if (exprMentions(a.expr, name)) break :blk true;
             break :blk mentionsName(w.body, name);
         },
+        .autoescape => |a| exprMentions(a.expr, name) or mentionsName(a.body, name),
         .extends => |e| exprMentions(e.name, name),
         .block => false,
         .include => |i| exprMentions(i.names, name),
