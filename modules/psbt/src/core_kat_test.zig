@@ -61,9 +61,9 @@
 //! `invalid_with_msg`: `{20, 21, 22}` are rejected with
 //! `error.UnsupportedPsbtVersion` (the PSBTv2 marker; Core's own stated
 //! reason is more specific), `[0]` with `error.InvalidFixedFieldLength` (the
-//! BIP371 taproot BIP32 derivation shape) and `[1]` with
-//! `error.InvalidTapTree`; the rest are MuSig2 content, accepted as
-//! passthrough (test group D).
+//! BIP371 taproot BIP32 derivation shape), `[1]` with
+//! `error.InvalidTapTree`; the rest are BIP373 MuSig2 field defects, rejected
+//! with `InvalidKeyDataLength` / `InvalidFixedFieldLength` / `InvalidPublicKey`.
 
 const std = @import("std");
 const testing = std.testing;
@@ -155,7 +155,7 @@ test "Core invalid[]: BIP370 (PSBTv2) field mixes are accepted as opaque passthr
     }
 }
 
-test "Core invalid_with_msg: 5 of 23 rejected (3 as PSBTv2, 2 BIP371 defects); the other 18 are MuSig2 content, accepted" {
+test "Core invalid_with_msg: all 23 rejected (3 as PSBTv2, 2 BIP371 defects, 18 BIP373 MuSig2 defects)" {
     const allocator = testing.allocator;
     for (vectors.invalid_with_msg) |case| {
         const raw = try hexToBytesAlloc(allocator, case.hex);
@@ -187,16 +187,24 @@ test "Core invalid_with_msg: 5 of 23 rejected (3 as PSBTv2, 2 BIP371 defects); t
                 };
             },
             else => {
-                // Out-of-scope MuSig2 content: must be ACCEPTED.
+                // BIP373 (MuSig2) field defects: rejected with the error each names.
+                const want: ?anyerror = switch (case.core_index) {
+                    2, 8, 10, 11, 13, 14 => error.InvalidKeyDataLength,
+                    3, 4, 5, 6, 9, 16, 17, 18, 19 => error.InvalidPublicKey,
+                    7, 12 => error.InvalidFixedFieldLength,
+                    15 => null, // "Size of value was not the stated size": a framing error, whichever the parser names
+                    else => return error.TestUnexpectedResult,
+                };
                 if (result) |r| {
                     var res = r;
                     res.deinit(allocator);
+                    std.debug.print("FAIL (accepted a BIP373 defect): core_index={d} (core msg: \"{s}\")\n", .{ case.core_index, case.core_message });
+                    return error.TestUnexpectedSuccess;
                 } else |err| {
-                    std.debug.print(
-                        "FAIL (expected ACCEPT as out-of-scope MuSig2 content): core_index={d} (core msg: \"{s}\") err={}\n",
-                        .{ case.core_index, case.core_message, err },
-                    );
-                    return err;
+                    if (want) |w| testing.expectEqual(w, err) catch |e| {
+                        std.debug.print("FAIL: core_index={d} (core msg: \"{s}\") got {}\n", .{ case.core_index, case.core_message, err });
+                        return e;
+                    };
                 }
             },
         }

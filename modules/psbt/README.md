@@ -128,7 +128,7 @@ accounting are in `SPEC.md` "Verification".
 
 Also checked against Bitcoin Core's own `test/functional/data/rpc_psbt.json` (a separate external oracle,
 `core_kat_vectors.zig`/`core_kat_test.zig`): a present `PSBT_GLOBAL_VERSION` must be `0` (BIP174
-§"Version 0"), Core's BIP371 taproot-field defects are rejected, and the BIP370/MuSig2 content this module
+§"Version 0"), Core's BIP371 taproot-field and BIP373 MuSig2 defects are rejected, and the BIP370 content this module
 deliberately does not validate is asserted as accepted passthrough.
 
 The two spend shapes neither BIP174 nor Core's JSON reach, native P2WPKH and native P2WSH 2-of-3

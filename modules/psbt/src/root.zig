@@ -69,7 +69,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant, // no shared/global state; every call is over caller-owned values
     .model_after = "BIP174 (Partially Signed Bitcoin Transaction Format v0, bitcoin/bips)",
-    .deps = .{ "bitcointx", "bitcoinscript", "ripemd160" },
+    .deps = .{ "bitcointx", "bitcoinscript", "ripemd160", "bip340" },
 };
 
 // ── magic ────────────────────────────────────────────────────────────────
@@ -117,6 +117,12 @@ pub const input_key = struct {
     pub const TAP_INTERNAL_KEY: u64 = 0x17;
     /// BIP371: the 32-byte script-tree merkle root.
     pub const TAP_MERKLE_ROOT: u64 = 0x18;
+    /// BIP373: keydata the 33-byte aggregate public key, value the participants' 33-byte keys.
+    pub const MUSIG2_PARTICIPANT_PUBKEYS: u64 = 0x1a;
+    /// BIP373: keydata `<participant 33><aggregate 33>[<leaf hash 32>]`, value a 66-byte public nonce.
+    pub const MUSIG2_PUB_NONCE: u64 = 0x1b;
+    /// BIP373: same keydata, value a 32-byte partial signature.
+    pub const MUSIG2_PARTIAL_SIG: u64 = 0x1c;
 };
 
 pub const output_key = struct {
@@ -128,6 +134,8 @@ pub const output_key = struct {
     pub const TAP_INTERNAL_KEY: u64 = 0x05;
     pub const TAP_TREE: u64 = 0x06;
     pub const TAP_BIP32_DERIVATION: u64 = 0x07;
+    /// BIP373: keydata the 33-byte aggregate public key, value the participants' 33-byte keys.
+    pub const MUSIG2_PARTICIPANT_PUBKEYS: u64 = 0x08;
     pub const PROPRIETARY: u64 = 0xfc;
 };
 
@@ -371,6 +379,8 @@ pub const RecordError = error{
     /// a depth above 128, or its leaves are not the depth-first listing of one
     /// complete binary tree (BIP371).
     InvalidTapTree,
+    /// A BIP373 aggregate or participant key that is not a valid compressed curve point.
+    InvalidPublicKey,
     /// `PSBT_GLOBAL_VERSION` is present with a nonzero value. BIP174
     /// §"Version 0": "Version 0 PSBTs must either omit PSBT_GLOBAL_VERSION
     /// or include it and set it to 0." This module implements BIP174 v0
@@ -801,11 +811,12 @@ test {
     _ = @import("finalize_taproot_test.zig");
 }
 
-test "meta.deps names bitcointx, bitcoinscript and ripemd160" {
-    try testing.expectEqual(@as(usize, 3), meta.deps.len);
+test "meta.deps names bitcointx, bitcoinscript, ripemd160 and bip340" {
+    try testing.expectEqual(@as(usize, 4), meta.deps.len);
     try testing.expect(std.mem.eql(u8, meta.deps[0], "bitcointx"));
     try testing.expect(std.mem.eql(u8, meta.deps[1], "bitcoinscript"));
     try testing.expect(std.mem.eql(u8, meta.deps[2], "ripemd160"));
+    try testing.expect(std.mem.eql(u8, meta.deps[3], "bip340"));
 }
 
 test "rejects a buffer shorter than the magic" {

@@ -32,6 +32,7 @@ const bitcointx = @import("bitcointx");
 const bitcoinscript = @import("bitcoinscript");
 const psbt = @import("root.zig");
 const update = @import("update.zig");
+const bip340 = @import("bip340");
 
 const Record = psbt.Record;
 const Map = psbt.Map;
@@ -82,8 +83,43 @@ pub fn validateInputRecord(r: Record) RecordError!void {
             try psbt.requireNoKeyData(r);
             try psbt.requireFixedValueLen(r, 32);
         },
+        input_key.MUSIG2_PARTICIPANT_PUBKEYS => try validateParticipants(r),
+        input_key.MUSIG2_PUB_NONCE => {
+            try validateNonceKey(r);
+            if (r.value.len != 66) return error.InvalidFixedFieldLength;
+        },
+        input_key.MUSIG2_PARTIAL_SIG => {
+            try validateNonceKey(r);
+            if (r.value.len != 32) return error.InvalidFixedFieldLength;
+        },
         else => {},
     }
+}
+
+/// BIP373: a compressed point on the curve (prefix 02/03 and an x that lifts).
+fn validCompressedPoint(p: []const u8) bool {
+    if (p.len != 33 or (p[0] != 2 and p[0] != 3)) return false;
+    _ = bip340.XOnlyPublicKey.fromBytes(p[1..33].*) catch return false;
+    return true;
+}
+
+/// `PSBT_IN/OUT_MUSIG2_PARTICIPANT_PUBKEYS`: a 33-byte aggregate key as keydata, a whole number of 33-byte
+/// participant keys as value (Core: "Size of key was not ...", "... value size is not a multiple of 33").
+fn validateParticipants(r: Record) RecordError!void {
+    try requireKeyDataLen(r, 33);
+    if (!validCompressedPoint(r.keydata)) return error.InvalidPublicKey;
+    // Core reads the participants one by one (an invalid key is named before a ragged tail is).
+    var i: usize = 0;
+    while (i + 33 <= r.value.len) : (i += 33) {
+        if (!validCompressedPoint(r.value[i..][0..33])) return error.InvalidPublicKey;
+    }
+    if (r.value.len == 0 or r.value.len % 33 != 0) return error.InvalidFixedFieldLength;
+}
+
+/// `PSBT_IN_MUSIG2_PUB_NONCE` / `_PARTIAL_SIG` keydata: participant key, aggregate key, optionally a tapleaf hash.
+fn validateNonceKey(r: Record) RecordError!void {
+    if (r.keydata.len != 66 and r.keydata.len != 98) return error.InvalidKeyDataLength;
+    if (!validCompressedPoint(r.keydata[0..33]) or !validCompressedPoint(r.keydata[33..66])) return error.InvalidPublicKey;
 }
 
 /// Structural check of the BIP371 output fields.
@@ -101,8 +137,93 @@ pub fn validateOutputRecord(r: Record) RecordError!void {
             try requireKeyDataLen(r, 32);
             if (!derivationShapeOk(r.value)) return error.InvalidFixedFieldLength;
         },
+        output_key.MUSIG2_PARTICIPANT_PUBKEYS => try validateParticipants(r),
         else => {},
     }
+}
+
+// ── BIP373 (MuSig2) fields ──────────────────────────────────────────────
+
+/// The participants' public keys of a `MUSIG2_PARTICIPANT_PUBKEYS` record, 33 bytes each, in the order stored.
+pub const Participants = struct {
+    bytes: []const u8,
+
+    pub fn count(self: Participants) usize {
+        return self.bytes.len / 33;
+    }
+
+    pub fn get(self: Participants, i: usize) [33]u8 {
+        return self.bytes[i * 33 ..][0..33].*;
+    }
+};
+
+fn participants(m: Map, keytype: u64, aggregate: [33]u8) ?Participants {
+    const r = m.findKeyed(keytype, &aggregate) orelse return null;
+    return .{ .bytes = r.value };
+}
+
+/// `PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS` of the aggregate key `aggregate`, or `null`.
+pub fn inputMusig2Participants(m: Map, aggregate: [33]u8) ?Participants {
+    return participants(m, input_key.MUSIG2_PARTICIPANT_PUBKEYS, aggregate);
+}
+
+/// `PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS` of the aggregate key `aggregate`, or `null`.
+pub fn outputMusig2Participants(m: Map, aggregate: [33]u8) ?Participants {
+    return participants(m, output_key.MUSIG2_PARTICIPANT_PUBKEYS, aggregate);
+}
+
+fn nonceKey(buf: *[98]u8, participant: [33]u8, aggregate: [33]u8, leaf_hash: ?[32]u8) []const u8 {
+    buf[0..33].* = participant;
+    buf[33..66].* = aggregate;
+    if (leaf_hash) |h| {
+        buf[66..98].* = h;
+        return buf[0..98];
+    }
+    return buf[0..66];
+}
+
+/// `PSBT_IN_MUSIG2_PUB_NONCE` of (`participant`, `aggregate`, optional tapleaf hash): the 66-byte public nonce, or `null`.
+pub fn inputMusig2PubNonce(m: Map, participant: [33]u8, aggregate: [33]u8, leaf_hash: ?[32]u8) ?[66]u8 {
+    var kb: [98]u8 = undefined;
+    const r = m.findKeyed(input_key.MUSIG2_PUB_NONCE, nonceKey(&kb, participant, aggregate, leaf_hash)) orelse return null;
+    if (r.value.len != 66) return null;
+    return r.value[0..66].*;
+}
+
+/// `PSBT_IN_MUSIG2_PARTIAL_SIG` of (`participant`, `aggregate`, optional tapleaf hash): the 32-byte partial signature, or `null`.
+pub fn inputMusig2PartialSig(m: Map, participant: [33]u8, aggregate: [33]u8, leaf_hash: ?[32]u8) ?[32]u8 {
+    var kb: [98]u8 = undefined;
+    const r = m.findKeyed(input_key.MUSIG2_PARTIAL_SIG, nonceKey(&kb, participant, aggregate, leaf_hash)) orelse return null;
+    if (r.value.len != 32) return null;
+    return r.value[0..32].*;
+}
+
+fn participantsValue(allocator: Allocator, keys: []const [33]u8) Allocator.Error![]u8 {
+    const out = try allocator.alloc(u8, keys.len * 33);
+    for (keys, 0..) |k, i| @memcpy(out[i * 33 ..][0..33], &k);
+    return out;
+}
+
+pub fn setInputMusig2Participants(allocator: Allocator, ps: *psbt.Psbt, index: usize, aggregate: [33]u8, keys: []const [33]u8) update.UpdateError!void {
+    const value = try participantsValue(allocator, keys);
+    errdefer allocator.free(value);
+    try update.putInputOwned(allocator, ps, index, input_key.MUSIG2_PARTICIPANT_PUBKEYS, &aggregate, value);
+}
+
+pub fn setOutputMusig2Participants(allocator: Allocator, ps: *psbt.Psbt, index: usize, aggregate: [33]u8, keys: []const [33]u8) update.UpdateError!void {
+    const value = try participantsValue(allocator, keys);
+    errdefer allocator.free(value);
+    try update.putOutputOwned(allocator, ps, index, output_key.MUSIG2_PARTICIPANT_PUBKEYS, &aggregate, value);
+}
+
+pub fn setInputMusig2PubNonce(allocator: Allocator, ps: *psbt.Psbt, index: usize, participant: [33]u8, aggregate: [33]u8, leaf_hash: ?[32]u8, pubnonce: [66]u8) update.UpdateError!void {
+    var kb: [98]u8 = undefined;
+    try update.putInput(allocator, ps, index, input_key.MUSIG2_PUB_NONCE, nonceKey(&kb, participant, aggregate, leaf_hash), &pubnonce);
+}
+
+pub fn setInputMusig2PartialSig(allocator: Allocator, ps: *psbt.Psbt, index: usize, participant: [33]u8, aggregate: [33]u8, leaf_hash: ?[32]u8, partial_sig: [32]u8) update.UpdateError!void {
+    var kb: [98]u8 = undefined;
+    try update.putInput(allocator, ps, index, input_key.MUSIG2_PARTIAL_SIG, nonceKey(&kb, participant, aggregate, leaf_hash), &partial_sig);
 }
 
 // ── TAP_BIP32_DERIVATION ────────────────────────────────────────────────

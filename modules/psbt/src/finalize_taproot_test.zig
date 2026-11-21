@@ -326,3 +326,32 @@ test "P2TR script path: a 1-of-2 multi_a leaf takes exactly one signature even w
     try testing.expectEqual(@as(usize, 0), w[0].len); // the second key's slot: it gets no signature
     try testing.expectEqual(@as(usize, 64), w[1].len);
 }
+
+test "P2TR script path: a leaf with an invalid signature is skipped and the next valid leaf is used" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const k2 = try key(2);
+    const k3 = try key(3);
+    const sa = try checksigScript(a, k2.x);
+    const sb = try checksigScript(a, k3.x);
+    // Both orders of the two leaves in the PSBT, so "the first leaf is the bad one" holds either way.
+    inline for (.{ true, false }) |bad_first| {
+        var f = try fixture(a, &.{ sa, sb }, &.{ 1, 1 });
+        const bad_leaf = if (bad_first) leafIndex(&f, sa) else leafIndex(&f, sb);
+        const good_leaf = if (bad_first) leafIndex(&f, sb) else leafIndex(&f, sa);
+        const bad_key = if (bad_first) k2 else k3;
+        const good_key = if (bad_first) k3 else k2;
+        var bad_sig = try signLeaf(a, &f, bad_key, bad_leaf);
+        bad_sig[10] ^= 1; // a signature that does not verify
+        try bip371.setInputTapScriptSig(a, &f.ps, 0, bad_key.x, f.info.leaves[bad_leaf].leaf_hash, &bad_sig);
+        try addSig(a, &f, good_key, good_leaf);
+
+        const res = try psbt.finalize(a, f.ps, .{});
+        try testing.expectEqual(@as(?psbt.InputFinalizeError, null), res[0]);
+        const w = try witnessOf(a, &f);
+        try testing.expectEqual(@as(usize, 3), w.len);
+        const want = if (bad_first) sb else sa;
+        try testing.expectEqualSlices(u8, want, w[1]);
+    }
+}

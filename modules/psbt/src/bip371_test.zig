@@ -226,3 +226,55 @@ test "hostile: TAP_BIP32_DERIVATION with a leaf-hash count far beyond the value 
     rec[0].value = &.{ 0x00, 1, 2, 3, 4, 5 }; // a stray octet
     try testing.expectError(error.InvalidFixedFieldLength, psbt.validateInputRecord(rec[0]));
 }
+
+// ── BIP373 (MuSig2) fields ──────────────────────────────────────────────
+
+test "BIP373: setters and accessors round trip; the result parses back byte-exact; bad keys are refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const bitcointx = @import("bitcointx");
+
+    const vin = try a.alloc(bitcointx.TxIn, 1);
+    vin[0] = .{ .prevout = .{ .txid = @splat(7), .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    const vout = try a.alloc(bitcointx.TxOut, 1);
+    vout[0] = .{ .value = 1000, .script_pubkey = &.{ 0x00, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 } };
+    var ps = try psbt.fromUnsignedTx(a, .{ .version = 2, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false });
+
+    const agg: [33]u8 = @splat(2); // x = 0x0202..02 is on the curve
+    const p1: [33]u8 = @splat(2);
+    var p2: [33]u8 = @splat(2);
+    p2[0] = 3;
+    const leaf: [32]u8 = @splat(0xaa);
+    const nonce: [66]u8 = @splat(5);
+    const psig: [32]u8 = @splat(9);
+
+    try bip371.setInputMusig2Participants(a, &ps, 0, agg, &.{ p1, p2 });
+    try bip371.setOutputMusig2Participants(a, &ps, 0, agg, &.{p1});
+    try bip371.setInputMusig2PubNonce(a, &ps, 0, p1, agg, null, nonce);
+    try bip371.setInputMusig2PubNonce(a, &ps, 0, p2, agg, leaf, nonce);
+    try bip371.setInputMusig2PartialSig(a, &ps, 0, p1, agg, leaf, psig);
+
+    const inp = ps.inputs[0];
+    const parts = bip371.inputMusig2Participants(inp, agg).?;
+    try testing.expectEqual(@as(usize, 2), parts.count());
+    try testing.expectEqualSlices(u8, &p2, &parts.get(1));
+    try testing.expectEqual(@as(usize, 1), bip371.outputMusig2Participants(ps.outputs[0], agg).?.count());
+    try testing.expectEqualSlices(u8, &nonce, &bip371.inputMusig2PubNonce(inp, p1, agg, null).?);
+    try testing.expect(bip371.inputMusig2PubNonce(inp, p1, agg, leaf) == null);
+    try testing.expectEqualSlices(u8, &nonce, &bip371.inputMusig2PubNonce(inp, p2, agg, leaf).?);
+    try testing.expectEqualSlices(u8, &psig, &bip371.inputMusig2PartialSig(inp, p1, agg, leaf).?);
+    try testing.expect(bip371.inputMusig2PartialSig(inp, p1, agg, null) == null);
+
+    const bytes = try psbt.serialize(a, ps);
+    const again = try psbt.parse(a, bytes);
+    const bytes2 = try psbt.serialize(a, again);
+    try testing.expectEqualSlices(u8, bytes, bytes2);
+
+    // Refusals: a key off the curve, a wrong nonce length, a ragged participant list.
+    const bad: [33]u8 = @splat(3);
+    try testing.expectError(error.InvalidPublicKey, bip371.setInputMusig2Participants(a, &ps, 0, bad, &.{p1}));
+    try testing.expectError(error.InvalidPublicKey, bip371.setInputMusig2Participants(a, &ps, 0, agg, &.{bad}));
+    try testing.expectError(error.InvalidPublicKey, bip371.setInputMusig2PubNonce(a, &ps, 0, bad, agg, null, nonce));
+    try testing.expectError(error.InvalidFixedFieldLength, bip371.setInputMusig2Participants(a, &ps, 0, agg, &.{}));
+}

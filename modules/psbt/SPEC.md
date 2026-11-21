@@ -86,6 +86,14 @@ Concurrency: `.reentrant` — no shared/global state, every call is over caller-
   Updater example byte-exact).
 - *Allocator contract:* like `finalize`, an **arena-like** allocator is assumed; `Psbt.deinit` frees
   only the `records` arrays, so value buffers and replaced values are not tracked.
+- *BIP373* (`psbt.bip371`, MuSig2 fields `PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS` 0x1a, `_PUB_NONCE` 0x1b, `_PARTIAL_SIG` 0x1c,
+  `PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS` 0x08): `parse` and the setters validate them as Core does: aggregate key as keydata
+  (`InvalidKeyDataLength` otherwise), nonce / partial-signature keydata of 66 or 98 bytes (participant key, aggregate key,
+  optional tapleaf hash), every key a compressed curve point (`InvalidPublicKey`: prefix 02/03 and an x that lifts, via the now
+  required `bip340`), participant values a non-empty multiple of 33 bytes, nonce values 66 bytes, partial signatures 32
+  (`InvalidFixedFieldLength`). Readers `inputMusig2Participants`, `outputMusig2Participants` (`Participants`),
+  `inputMusig2PubNonce`, `inputMusig2PartialSig`; setters `setInputMusig2Participants`, `setOutputMusig2Participants`,
+  `setInputMusig2PubNonce`, `setInputMusig2PartialSig`. Signing and aggregation are `musig2`'s; this module carries the data.
 - *BIP371* (`psbt.bip371`): readers `inputTapInternalKey`, `inputTapMerkleRoot`, `inputTapScriptSig`,
   `inputTapLeafScripts` (iterator), `inputTapBip32Derivation`, `outputTapInternalKey`, `outputTapTree`
   (iterator), `outputTapBip32Derivation`; setters `setInputTapKeySig`, `setInputTapScriptSig`,
@@ -153,9 +161,9 @@ Run with `scripts/modtest psbt` (`zig build test-psbt`).
   decoded individually to determine why it is invalid, not pattern-matched on Core's message:
   - a present `PSBT_GLOBAL_VERSION` must be 0 (BIP174 §"Version 0"): `invalid[19]`/`[42]` are the external oracle
     for `error.UnsupportedPsbtVersion`;
-  - Core's BIP371 taproot-field defects (`invalid[28-35, 37, 38, 41]`, two `invalid_with_msg` entries) are asserted
+  - Core's BIP371 taproot-field defects (`invalid[28-35, 37, 38, 41]`, two `invalid_with_msg` entries) and the 18 BIP373 MuSig2 defects of `invalid_with_msg[2..19]` are asserted
     as rejects with their specific errors;
-  - what `parse` still accepts is BIP370 (PSBTv2) / MuSig2 content, outside this module's scope, asserted as
+  - what `parse` still accepts is BIP370 (PSBTv2) field mixes, outside this module's scope, asserted as
     accepts rather than skipped (`core_kat_vectors.invalid_out_of_scope`);
   - `invalid[39]`/`[40]` (`invalid_utxo_binding`): a UTXO that does not bind to its input is accepted by `parse`
     (layering, see *Threat model*) and asserted as a reject by `finalize` (`error.UtxoOutpointMismatch` /
@@ -274,11 +282,13 @@ PSBT dominated by one dense map; size for the dense figure if map size isn't bou
   scriptPubKey/redeemScript/witnessScript against a spend policy, then producing a signature);
   `PARTIAL_SIG`/`TAP_KEY_SIG` records are expected to be present by the time `finalize` runs. A
   `bip340`/`k256`-backed signer for the Updater's own keys would be a separate layer.
+- **Script-path finalize for other leaf shapes** (timelocked, hash-locked, miniscript tapscript leaves). Bitcoin Core's finalizer
+  does not do it either: it finalizes what the wallet's descriptors and signature providers produced, and a satisfier for arbitrary
+  scripts is miniscript's (`rust-miniscript`'s `PsbtExt`), a policy-and-descriptor engine of its own. `<key> OP_CHECKSIG` and
+  `multi_a` leaves are finalized; a leaf whose assembled witness does not verify is skipped for the next leaf.
 - **A typed accessor for `PROPRIETARY` (`0xFC`, every scope).** It stays opaque passthrough like any other
   unrecognized key type, round-trips byte-for-byte and has no convenience decoder.
 
 ## Backlog / deferred
 
 - **BIP370 (PSBTv2)** — the second wire format users meet (Core, rust-psbt). Effort L. Fits §2.
-- **Script-path finalize for other leaf shapes** — only `<key> OP_CHECKSIG` and `multi_a` leaves; timelocked / hash-locked / miniscript tapscript leaves (what `rust-miniscript`'s `PsbtExt` finalizes) need a satisfier. Also: a leaf with an invalid signature is not retried against the next leaf. Effort M–L.
-- **MuSig2 fields (BIP373)** — Core's `rpc_psbt.json` `invalid_with_msg[2..19]` are accepted as opaque passthrough.

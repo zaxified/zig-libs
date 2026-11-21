@@ -390,9 +390,16 @@ fn parseTapLeaf(script: []const u8) ?TapLeafShape {
 /// so it is the stack top; a key that does not sign gets an empty item and
 /// exactly `m` keys sign -- `OP_NUMEQUAL` rejects more). The first leaf that
 /// commits to the output key (BIP341) and that the signatures present
-/// satisfy is used; a leaf with an invalid signature is not retried -- the
-/// caller's `verifyScript` pass rejects the input.
-fn finalizeTaprootScriptPath(allocator: Allocator, m: psbt.Map, program: []const u8) InputFinalizeError![][]const u8 {
+/// satisfy is used; a leaf whose assembled witness does not verify (a bad
+/// signature) is skipped and the next leaf tried. When no leaf verifies, the
+/// first assembled witness is returned, so the caller's `verifyScript` pass
+/// rejects the input with that leaf's own error.
+fn finalizeTaprootScriptPath(allocator: Allocator, m: psbt.Map, program: []const u8, ctx: bitcoinscript.TxContext) InputFinalizeError![][]const u8 {
+    var first_candidate: ?[][]const u8 = null;
+    var spk: [34]u8 = undefined;
+    spk[0] = 0x51;
+    spk[1] = 0x20;
+    @memcpy(spk[2..], program[0..32]);
     var saw_leaf = false;
     var saw_recognized = false;
     var err: InputFinalizeError = error.MissingTaprootSignature;
@@ -426,8 +433,14 @@ fn finalizeTaprootScriptPath(allocator: Allocator, m: psbt.Map, program: []const
         }
         items[shape.n] = leaf.script;
         items[shape.n + 1] = leaf.control_block;
-        return items;
+        if (bitcoinscript.verifyScript(allocator, &.{}, &spk, items, bitcoinscript.ScriptFlags.standard, ctx)) |_| {
+            if (first_candidate) |c| allocator.free(c);
+            return items;
+        } else |_| {
+            if (first_candidate == null) first_candidate = items else allocator.free(items);
+        }
     }
+    if (first_candidate) |c| return c;
     if (saw_recognized) return err;
     return if (saw_leaf) error.NonStandardScript else error.MissingTaprootSignature;
 }
@@ -454,7 +467,7 @@ fn finalizeWitnessProgram(
         // P2TR: key path when TAP_KEY_SIG is there, else a script path.
         if (!all_utxos_resolved) return error.TaprootMissingAllUtxos;
         if (psbt.inputTapKeySig(m)) |sig| return try allocator.dupe([]const u8, &[_][]const u8{sig});
-        return try finalizeTaprootScriptPath(allocator, m, wp.program);
+        return try finalizeTaprootScriptPath(allocator, m, wp.program, ctx);
     }
     return error.NonStandardScript;
 }
