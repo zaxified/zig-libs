@@ -207,7 +207,14 @@ fn kemDecap(comptime Kem: type, taint: bool, recipient_ikm: []const u8, eph_ikm:
     // The call under test: `enc` is wire data (a genuine on-curve point,
     // not tainted); `skR.secret_key` is the tainted recipient private key.
     var shared_secret: [Kem.Nsecret]u8 = undefined;
-    try Kem.decap(&shared_secret, encapped.enc, &skR);
+    var verdict = Kem.decap(&shared_secret, encapped.enc, &skR);
+    // The only thing `decap` returns besides the secret is its error code, i.e.
+    // the RFC 9180 §7.1.4 all-zero-DH verdict, which the KEM's own frames
+    // already count as in-file contexts. X448's reaches the harness as a second
+    // branch on the same tainted accumulator (the `try` below); declassify the
+    // code so that branch is not an unattributable harness-frame context.
+    if (taint) std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&verdict));
+    try verdict;
     // Propagation witness: hex formatting is not constant-time.
     std.debug.print("shared_secret={x}\n", .{shared_secret});
 }

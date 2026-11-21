@@ -562,7 +562,8 @@ fuzz drivers and the stack probe run inside it), `zig build interop-hpke`
   pinned in `scripts/checks/ctgrind-expected.tsv` (the file attributes every nonzero
   context to a sibling module's code; the `x448_decap` / `x448_authdecap` rows, read with
   `--stacks`, are per X448 DH `ed448`'s `Fe.invert` zero test on the ladder's z_2 and this
-  module's RFC 9180 §7.1.4 all-zero verdict, and in decap the harness's own error branch —
+  module's RFC 9180 §7.1.4 all-zero verdict, and, in decap, the harness's own `try` on that same
+  verdict (the harness declassifies the returned error code so it is not a harness-frame context) —
   verdicts and a public small-order case, no branch on a scalar bit). The seal/open
   fuzz harness draws X448 (HKDF-SHA512, ChaCha20-Poly1305) as its fourth KEM.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
