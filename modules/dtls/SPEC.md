@@ -510,15 +510,27 @@ on `aesccm` with RFC 6655 §3's salt ‖ 8-byte explicit nonce (the GCM layout) 
 
 `use_srtp` (RFC 5764) is negotiated in the hellos, as in 1.3 (*Post-handshake* section).
 
-Deliberately not implemented in 1.2: see *What is deliberately not done*. Not yet (Backlog): the 1.2 connection ID
-(RFC 9146 `tls12_cid` records); the 1.3 one exists.
+**Connection ID (RFC 9146).** `Config.connection_id` works in the 1.2 engine too: the `connection_id` extension (54)
+in the ClientHello, answered in the ServerHello by a server that set one (a client CID over `max_cid_len` is declined,
+as in 1.3); once negotiated, every epoch-1 record this side sends — the Finished included — is a `tls12_cid` (25)
+record carrying the peer's CID when the peer asked for a non-empty one (`record12.sealCid`): `DTLSInnerPlaintext` =
+content ‖ real type, no padding, and the RFC 9146 §5.3 additional data (`seq_num_placeholder` of eight `0xff`,
+`tls12_cid`, `cid_length`, `tls12_cid`, version, epoch, sequence number, CID, inner length), pinned byte for byte in
+`record12.zig`. A received epoch-1 record must be a `tls12_cid` record with this side's own CID when that is
+non-empty (another CID, or none, is `error.Malformed`, RFC 9146 §3), and a `tls12_cid` record on a connection that
+expects none is `error.Malformed`. `Connection12.peerConnectionId()` / `Endpoint.peerConnectionId()`;
+`record.nextDatagramCid` cuts `tls12_cid` records. Self-interop (all three AEAD families, an empty client CID,
+fragmented certificate flights); no live peer: Debian's wolfSSL 5.9.1 negotiates it, then its client fails `connect`
+with -320 (build message failure) and its server goes silent at our CID-protected Finished.
+
+Deliberately not implemented in 1.2: see *What is deliberately not done*.
 
 ## Threat model / out of scope
 
 - **Not provided — see Backlog (not silently skipped):** session resumption /
   `NewSessionTicket` (no `"res binder"`/resumption-PSK path — only `"ext
-  binder"`/externally-configured PSK), 0-RTT/early data, the DTLS 1.2 connection ID and 1.3
-  CID updates (NewConnectionId / RequestConnectionId).
+  binder"`/externally-configured PSK), 0-RTT/early data, and 1.3 CID updates (NewConnectionId /
+  RequestConnectionId).
 - **Connection ID (DTLS 1.3, RFC 9146 §3 / RFC 9147 §9).** `Config.connection_id` (≤ `max_cid_len` = 32, mbedTLS's
   default cap; `error.InvalidConnectionId`): a client offers it in the ClientHello, a server that set one answers in
   the ServerHello (a peer CID longer than 32 bytes: the server does not negotiate, a client fails `Malformed`). Once
@@ -528,7 +540,8 @@ Deliberately not implemented in 1.2: see *What is deliberately not done*. Not ye
   empty own CID means the peer sends none. `Connection.peerConnectionId()`; the sender's records are cut into
   datagrams with `record.nextDatagramCid`. A caller that demultiplexes by CID reads it at byte 1 of the record.
   NewConnectionId / RequestConnectionId are not sent, and a received one is refused like any unknown post-handshake
-  message. Self-interop only (with fragmentation at 128 bytes); not driven against a live peer.
+  message. Self-interop (with fragmentation at 128 bytes) and live against wolfSSL 5.9.1 in both roles
+  (`psk-client-cid`, `psk-server-cid`, live-only: not in the committed transcript).
 
 - **Post-quantum key exchange.** `X25519MLKEM768`
   (0x11ec, draft-ietf-tls-ecdhe-mlkem) is wired end to end in both roles:
@@ -860,11 +873,9 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   `wolfssl_replay.zig`'s `recorded_cases_floor` 22 → 26 and `fuzz_corpus.zig`'s pinned frame counts.
 - **Session tickets / resumption and 0-RTT**, for both engines. Saves a handshake on constrained links; pion has it for
   1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.
-- **Connection ID, the rest (RFC 9146 / RFC 9147 §9).** DTLS 1.3 negotiates and uses one CID per direction (see
-  *Threat model*). Still open: (a) the DTLS 1.2 form — the `connection_id` extension in the hellos and `tls12_cid`
-  (25) records with the RFC 9146 §5.3 additional data (`seq_num_placeholder ‖ tls12_cid ‖ cid_length ‖ tls12_cid ‖
-  version ‖ epoch ‖ seq ‖ cid ‖ length_of_DTLSInnerPlaintext`) and the inner content type, which mbedTLS and pion
-  speak; (b) 1.3 CID updates (NewConnectionId / RequestConnectionId, §9). Effort: medium.
+- **Connection ID, the rest (RFC 9147 §9).** Both engines negotiate and use one CID per direction. Still open:
+  1.3 CID updates (NewConnectionId / RequestConnectionId, §9), and a live peer for the 1.2 form (mbedTLS; see the
+  second-stack item). Effort: medium.
 - **`CertificateEntry` extensions** (OCSP stapling `status_request`, SCT): wolfSSL and OpenSSL offer stapling.
   Framed empty on send, length-validated-but-discarded on receive. Needs an OCSP response verifier (the `x509`
   module checks CRLs). Effort: medium.

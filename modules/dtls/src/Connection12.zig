@@ -37,9 +37,10 @@
 //!
 //! **Deliberately absent:** CBC suites, static-RSA key exchange, compression
 //! (only `null` is offered or accepted), renegotiation, session resumption
-//! (session IDs / RFC 5077 tickets; every handshake is full), CCM suites,
-//! `use_srtp`, connection ID (RFC 9146), and sending alerts (errors are
-//! typed; the caller decides).
+//! (session IDs / RFC 5077 tickets; every handshake is full), and sending
+//! alerts (errors are typed; the caller decides). `use_srtp` (RFC 5764) and
+//! the connection ID (RFC 9146, `tls12_cid` records) are negotiated in the
+//! hellos.
 //!
 //! **Fragmentation** (RFC 6347 §4.2.3): with `Config.max_datagram_len` set,
 //! an epoch-0 handshake message whose record would exceed it is sent as
@@ -297,6 +298,15 @@ pub const Connection12 = struct {
     alpn_len: u8 = 0,
     /// RFC 5764: the negotiated SRTP protection profile, 0 = none.
     srtp_profile: u16 = 0,
+    /// RFC 9146 connection IDs, as in the 1.3 engine: `cid_own` is
+    /// `Config.connection_id` (what received epoch-1 records must carry),
+    /// `cid_peer` what the peer asked for (what sent epoch-1 records carry);
+    /// both meaningful once `cid_negotiated`.
+    cid_negotiated: bool = false,
+    cid_own: [conn13.max_cid_len]u8 = undefined,
+    cid_own_len: u8 = 0,
+    cid_peer: [conn13.max_cid_len]u8 = undefined,
+    cid_peer_len: u8 = 0,
     /// The last alert the peer sent (`level`, `description`), RFC 5246 §7.2.
     peer_alert: ?[2]u8 = null,
 
@@ -335,6 +345,39 @@ pub const Connection12 = struct {
     /// (`Config.srtp_profiles`).
     pub fn negotiatedSrtpProfile(self: *const Connection12) ?u16 {
         return if (self.srtp_profile == 0) null else self.srtp_profile;
+    }
+
+    /// RFC 9146: the CID this side puts on the epoch-1 records it sends (the
+    /// one the peer asked for), or null when none is negotiated or the peer
+    /// asked for an empty one. Cut the bytes `handleFlight` returns with
+    /// `record.nextDatagramCid(…, this.len)`.
+    pub fn peerConnectionId(self: *const Connection12) ?[]const u8 {
+        return if (self.cid_negotiated and self.cid_peer_len != 0) self.cid_peer[0..self.cid_peer_len] else null;
+    }
+
+    /// The CID length a received epoch-1 record carries (0 = none).
+    fn rxCidLen(self: *const Connection12) usize {
+        return if (self.cid_negotiated) self.cid_own_len else 0;
+    }
+
+    /// One epoch-1 record: `tls12_cid` (RFC 9146 §4) when the peer asked for
+    /// a CID, the plain RFC 6347 form otherwise.
+    fn seal1(self: *const Connection12, content_type: u8, bytes: []const u8, out: []u8) record12.Error![]u8 {
+        if (self.peerConnectionId()) |c| return record12.sealCid(&self.write_keys, 1, self.send_seq[1], content_type, bytes, c, out);
+        return record12.seal(&self.write_keys, 1, self.send_seq[1], content_type, bytes, out);
+    }
+
+    /// `opaque cid<0..2^8-1>` (RFC 9146 §3) from the peer's hello into
+    /// `cid_peer`, and the negotiation is on.
+    fn takePeerCid(self: *Connection12, data: []const u8) HandshakeError!void {
+        if (data.len < 1 or data.len != 1 + @as(usize, data[0])) return error.Malformed;
+        if (data[0] > conn13.max_cid_len) return error.Malformed;
+        @memcpy(self.cid_peer[0..data[0]], data[1..]);
+        self.cid_peer_len = data[0];
+        const own = self.config.connection_id.?;
+        @memcpy(self.cid_own[0..own.len], own);
+        self.cid_own_len = @intCast(own.len);
+        self.cid_negotiated = true;
     }
 
     pub fn isConnected(self: *const Connection12) bool {
@@ -469,7 +512,7 @@ pub const Connection12 = struct {
         if (self.state != .connected) return error.NotConnected;
         if (plaintext.len > 16384) return error.BufferTooShort;
         if (self.send_seq[1] == max_send_seq) return error.SequenceNumberExhausted;
-        const rec = record12.seal(&self.write_keys, 1, self.send_seq[1], content_application_data, plaintext, out) catch return error.BufferTooShort;
+        const rec = self.seal1(content_application_data, plaintext, out) catch return error.BufferTooShort;
         self.send_seq[1] += 1;
         return rec;
     }
@@ -485,6 +528,8 @@ pub const Connection12 = struct {
 
     fn recvBody(self: *Connection12, datagram: []const u8, out: []u8) SendError![]const u8 {
         if (self.state != .connected) return error.NotConnected;
+        if (datagram.len > 0 and datagram[0] == record12.content_tls12_cid) return self.recvCid(datagram, out);
+        if (self.rxCidLen() != 0 and datagram.len > 0 and datagram[0] != content_handshake) return error.Malformed; // RFC 9146 §3: the CID is required
         if (datagram.len < record.plaintext_header_len) return error.RecordTooShort;
         const hdr = record.decodePlaintext(datagram) catch return error.Malformed;
         if (datagram.len - record.plaintext_header_len < hdr.length) return error.RecordTooShort;
@@ -523,6 +568,38 @@ pub const Connection12 = struct {
         }
     }
 
+    /// `recv` for a `tls12_cid` record: it must carry this side's own CID.
+    fn recvCid(self: *Connection12, datagram: []const u8, out: []u8) SendError![]const u8 {
+        if (self.rxCidLen() == 0) return error.Malformed;
+        const hdr = record12.decodeCidHeader(datagram, self.cid_own_len) catch return error.Malformed;
+        if (!std.mem.eql(u8, hdr.cid, self.cid_own[0..self.cid_own_len])) return error.Malformed;
+        const hl = record12.CidHeader.len(self.cid_own_len);
+        if (datagram.len - hl < hdr.length) return error.RecordTooShort;
+        if (hdr.epoch != 1) return error.Malformed;
+        const oc = record12.openCid(&self.read_keys, hdr, datagram[hl..][0..hdr.length], out) catch |e| return switch (e) {
+            error.BufferTooShort => error.BufferTooShort,
+            error.RecordTooShort => error.RecordTooShort,
+            error.DecryptionFailed => error.DecryptionFailed,
+        };
+        if (!self.recv_win[1].accept(hdr.sequence_number)) {
+            std.crypto.secureZero(u8, oc.plaintext);
+            return error.ReplayedRecord;
+        }
+        switch (oc.content_type) {
+            content_application_data => return oc.plaintext,
+            content_alert => {
+                if (oc.plaintext.len != 2) return error.Malformed;
+                self.peer_alert = oc.plaintext[0..2].*;
+                return error.ReceivedAlert;
+            },
+            content_handshake => {
+                if (self.role == .server) self.resend_pending = true;
+                return error.ReceivedPostHandshakeMessage;
+            },
+            else => return error.Malformed,
+        }
+    }
+
     /// RFC 5705 exporter over the master secret. Requires the extended
     /// master secret (RFC 7627 §5.4: without it the exported values of two
     /// sessions can be synchronised by a man in the middle).
@@ -537,6 +614,20 @@ pub const Connection12 = struct {
     fn processDatagram(self: *Connection12, dg: []const u8, entropy: Entropy, now_ms: u64, o: *Out) HandshakeError!void {
         var pos: usize = 0;
         while (pos < dg.len) {
+            if (dg[pos] == record12.content_tls12_cid) {
+                // RFC 9146 §4: a record carrying this side's CID.
+                if (self.rxCidLen() == 0) return error.Malformed;
+                const ch = record12.decodeCidHeader(dg[pos..], self.cid_own_len) catch return error.Malformed;
+                if (!std.mem.eql(u8, ch.cid, self.cid_own[0..self.cid_own_len])) return error.Malformed;
+                const start = pos + record12.CidHeader.len(self.cid_own_len);
+                if (dg.len - start < ch.length) return error.Malformed;
+                const frag = dg[start..][0..ch.length];
+                pos = start + ch.length;
+                const hdr: record.PlaintextHeader = .{ .content_type = record12.content_tls12_cid, .legacy_version = record.legacy_version_dtls12, .epoch = ch.epoch, .sequence_number = ch.sequence_number, .length = ch.length };
+                try self.processRecord(hdr, ch, frag, entropy, now_ms, o);
+                if (self.stateless_reply) return;
+                continue;
+            }
             if (dg.len - pos < record.plaintext_header_len) return error.Malformed;
             const hdr = try record.decodePlaintext(dg[pos..]);
             const start = pos + record.plaintext_header_len;
@@ -544,15 +635,22 @@ pub const Connection12 = struct {
             const frag = dg[start..][0..hdr.length];
             pos = start + hdr.length;
             if (hdr.legacy_version[0] != 0xfe) return error.Malformed;
-            try self.processRecord(hdr, frag, entropy, now_ms, o);
+            // RFC 9146 §3: once a non-empty CID is negotiated, protected
+            // records without it are invalid.
+            if (hdr.epoch != 0 and self.rxCidLen() != 0) return error.Malformed;
+            try self.processRecord(hdr, null, frag, entropy, now_ms, o);
             if (self.stateless_reply) return;
         }
     }
 
-    fn processRecord(self: *Connection12, hdr: record.PlaintextHeader, frag: []const u8, entropy: Entropy, now_ms: u64, o: *Out) HandshakeError!void {
+    /// `cid` is the parsed header of a `tls12_cid` record (RFC 9146), null
+    /// for the RFC 6347 form.
+    fn processRecord(self: *Connection12, hdr: record.PlaintextHeader, cid: ?record12.CidHeader, frag: []const u8, entropy: Entropy, now_ms: u64, o: *Out) HandshakeError!void {
         var pt_buf: [max_plain]u8 = undefined;
         defer std.crypto.secureZero(u8, &pt_buf);
         var plain: []const u8 = undefined;
+        var content_type = hdr.content_type;
+        if (cid != null and hdr.epoch != 1) return error.Malformed;
         switch (hdr.epoch) {
             0 => {
                 // Checked here, recorded only below, once the record has
@@ -578,7 +676,15 @@ pub const Connection12 = struct {
                 // peer retransmits).
                 if (self.read_epoch != 1) return;
                 if (frag.len > pt_buf.len + record12.Bulk.overhead(self.read_keys.bulk)) return error.FlightTooLarge;
-                plain = record12.open(&self.read_keys, hdr, frag, &pt_buf) catch |e| return switch (e) {
+                if (cid) |ch| {
+                    const oc = record12.openCid(&self.read_keys, ch, frag, &pt_buf) catch |e| return switch (e) {
+                        error.DecryptionFailed => error.DecryptionFailed,
+                        error.RecordTooShort => error.RecordTooShort,
+                        error.BufferTooShort => error.FlightTooLarge,
+                    };
+                    plain = oc.plaintext;
+                    content_type = oc.content_type;
+                } else plain = record12.open(&self.read_keys, hdr, frag, &pt_buf) catch |e| return switch (e) {
                     error.DecryptionFailed => error.DecryptionFailed,
                     error.RecordTooShort => error.RecordTooShort,
                     error.BufferTooShort => error.FlightTooLarge,
@@ -592,7 +698,7 @@ pub const Connection12 = struct {
         defer if (hdr.epoch == 0 and !std.meta.eql(before, self.progress())) {
             self.recv_win[0].recordUnauthenticated(hdr.sequence_number);
         };
-        switch (hdr.content_type) {
+        switch (content_type) {
             content_handshake => try self.processHandshakeRecord(plain, hdr.epoch, entropy, now_ms, o),
             content_change_cipher_spec => {
                 if (plain.len != 1 or plain[0] != 1) return error.Malformed;
@@ -895,7 +1001,7 @@ pub const Connection12 = struct {
             any_cert = any_cert or kx.usesCertificate();
         }
         var ext_buf: [512]u8 = undefined;
-        var exts: [9]m12.Extension = undefined;
+        var exts: [10]m12.Extension = undefined;
         var n: usize = 0;
         var used: usize = 0;
         if (any_ecdhe) {
@@ -922,6 +1028,15 @@ pub const Connection12 = struct {
             const u = try messages.encodeUseSrtp(self.config.srtp_profiles, "", ext_buf[used..]);
             used += u.len;
             exts[n] = .{ .ext_type = messages.ext_use_srtp, .data = u };
+            n += 1;
+        }
+        if (self.config.connection_id) |c| {
+            // RFC 9146 §3: the CID this side wants to receive.
+            if (ext_buf.len - used < 1 + c.len) return error.BufferTooShort;
+            ext_buf[used] = @intCast(c.len);
+            @memcpy(ext_buf[used + 1 ..][0..c.len], c);
+            exts[n] = .{ .ext_type = conn13.ext_connection_id, .data = ext_buf[used..][0 .. 1 + c.len] };
+            used += 1 + c.len;
             n += 1;
         }
         exts[n] = .{ .ext_type = m12.ext_extended_master_secret, .data = &.{} };
@@ -1018,6 +1133,10 @@ pub const Connection12 = struct {
                 } else return error.Malformed;
                 @memcpy(self.alpn[0..name.len], name);
                 self.alpn_len = @intCast(name.len);
+            },
+            conn13.ext_connection_id => {
+                if (self.config.connection_id == null) return error.Malformed; // not offered
+                try self.takePeerCid(e.data);
             },
             // RFC 5246 §7.4.1.4: a server MUST NOT send an extension the
             // client did not offer.
@@ -1207,6 +1326,7 @@ pub const Connection12 = struct {
         var client_schemes: []const u8 = &.{};
         var alpn_offer: ?[]const u8 = null;
         var srtp_offer: ?[]const u8 = null;
+        var cid_offer: ?[]const u8 = null;
         var ems = false;
         var ri = m12.offersSuite(dec.cipher_suites_raw, m12.empty_renegotiation_info_scsv);
         for (dec.extensions) |e| switch (e.ext_type) {
@@ -1219,6 +1339,7 @@ pub const Connection12 = struct {
             },
             m12.ext_alpn => alpn_offer = e.data,
             messages.ext_use_srtp => srtp_offer = e.data,
+            conn13.ext_connection_id => cid_offer = e.data,
             m12.ext_ec_point_formats => if (!m12.pointFormatsIncludeUncompressed(e.data)) return error.Malformed,
             else => {},
         };
@@ -1285,6 +1406,14 @@ pub const Connection12 = struct {
                 self.srtp_profile = messages.selectSrtpProfile(self.config.srtp_profiles, so) orelse 0;
             }
         }
+        // RFC 9146 §3: answered only when both sides want it; a client CID
+        // longer than `max_cid_len` is declined (no answer), as in 1.3.
+        if (self.config.connection_id != null) {
+            if (cid_offer) |offer| {
+                if (offer.len < 1 or offer.len != 1 + @as(usize, offer[0])) return error.Malformed;
+                if (offer[0] <= conn13.max_cid_len) try self.takePeerCid(offer);
+            }
+        }
 
         source(entropy).bytes(&self.server_random);
         // RFC 8446 §4.1.3: a server that could have spoken 1.3 says so.
@@ -1296,7 +1425,8 @@ pub const Connection12 = struct {
         {
             var ext_buf: [300]u8 = undefined;
             var srtp_buf: [5]u8 = undefined;
-            var exts: [5]m12.Extension = undefined;
+            var cid_buf: [1 + conn13.max_cid_len]u8 = undefined;
+            var exts: [6]m12.Extension = undefined;
             var n: usize = 0;
             // RFC 5746 §3.6: answered only when the client signalled it
             // (RFC 5246 §7.4.1.4: no unsolicited extensions).
@@ -1319,6 +1449,12 @@ pub const Connection12 = struct {
             }
             if (self.negotiatedSrtpProfile()) |p| {
                 exts[n] = .{ .ext_type = messages.ext_use_srtp, .data = try messages.encodeUseSrtp(&.{p}, "", &srtp_buf) };
+                n += 1;
+            }
+            if (self.cid_negotiated) {
+                cid_buf[0] = self.cid_own_len;
+                @memcpy(cid_buf[1..][0..self.cid_own_len], self.cid_own[0..self.cid_own_len]);
+                exts[n] = .{ .ext_type = conn13.ext_connection_id, .data = cid_buf[0 .. 1 + @as(usize, self.cid_own_len)] };
                 n += 1;
             }
             const sh = m12.encodeServerHello(.{ .random = self.server_random, .cipher_suite = @backingInt(self.suite), .extensions = exts[0..n] }, &buf) catch return error.BufferTooShort;
@@ -1637,7 +1773,7 @@ pub const Connection12 = struct {
             },
             .handshake_epoch1 => {
                 if (self.send_seq[1] == max_send_seq) return error.SequenceNumberExhausted;
-                const rec = record12.seal(&self.write_keys, 1, self.send_seq[1], content_handshake, bytes, o.rest()) catch return error.BufferTooShort;
+                const rec = self.seal1(content_handshake, bytes, o.rest()) catch return error.BufferTooShort;
                 self.send_seq[1] += 1;
                 o.len += rec.len;
             },
@@ -1793,28 +1929,28 @@ test "audit: epoch-1 records before and after the ChangeCipherSpec" {
     var o = Out{ .buf = &ob };
     // Before the peer's CCS an epoch-1 record cannot be read: dropped, no error.
     const junk: [40]u8 = @splat(9);
-    try c.processRecord(.{ .content_type = content_handshake, .epoch = 1, .sequence_number = 0, .length = junk.len }, &junk, ent, 0, &o);
+    try c.processRecord(.{ .content_type = content_handshake, .epoch = 1, .sequence_number = 0, .length = junk.len }, null, &junk, ent, 0, &o);
     // One record the size of the plaintext buffer plus overhead is opened (and fails
     // authentication), not refused for size.
     c.read_epoch = 1;
     c.keys_live = true;
     c.read_keys = .{ .key = @splat(4), .iv = @splat(5) };
     var big: [max_plain + 24]u8 = @splat(0);
-    try std.testing.expectError(error.DecryptionFailed, c.processRecord(.{ .content_type = content_handshake, .epoch = 1, .sequence_number = 1, .length = big.len }, &big, ent, 0, &o));
+    try std.testing.expectError(error.DecryptionFailed, c.processRecord(.{ .content_type = content_handshake, .epoch = 1, .sequence_number = 1, .length = big.len }, null, &big, ent, 0, &o));
     // A genuine epoch-1 alert is reported once; its replay is dropped.
     var rb: [64]u8 = undefined;
     const alert = try record12.seal(&c.read_keys, 1, 7, content_alert, &.{ 1, 0 }, &rb);
     const hdr = try record.decodePlaintext(alert);
-    try std.testing.expectError(error.ReceivedAlert, c.processRecord(hdr, alert[record.plaintext_header_len..], ent, 0, &o));
-    try c.processRecord(hdr, alert[record.plaintext_header_len..], ent, 0, &o);
+    try std.testing.expectError(error.ReceivedAlert, c.processRecord(hdr, null, alert[record.plaintext_header_len..], ent, 0, &o));
+    try c.processRecord(hdr, null, alert[record.plaintext_header_len..], ent, 0, &o);
     // A ChangeCipherSpec under epoch 1 is a protocol violation.
     var cb: [64]u8 = undefined;
     const ccs1 = try record12.seal(&c.read_keys, 1, 8, content_change_cipher_spec, &.{1}, &cb);
     const h1 = try record.decodePlaintext(ccs1);
-    try std.testing.expectError(error.UnexpectedMessage, c.processRecord(h1, ccs1[record.plaintext_header_len..], ent, 0, &o));
+    try std.testing.expectError(error.UnexpectedMessage, c.processRecord(h1, null, ccs1[record.plaintext_header_len..], ent, 0, &o));
     // A retransmitted epoch-0 CCS after ours took effect marks a duplicate.
     c.saw_duplicate = false;
-    try c.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 3, .length = 1 }, &.{1}, ent, 0, &o);
+    try c.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 3, .length = 1 }, null, &.{1}, ent, 0, &o);
     try std.testing.expect(c.saw_duplicate);
     try std.testing.expectEqual(@as(u16, 1), c.read_epoch);
 }
@@ -1825,11 +1961,11 @@ test "audit: an early epoch-0 ChangeCipherSpec is dropped, not taken for a retra
     var c: Connection12 = .{ .role = .client, .config = auditCfg(), .state = .wait_server_hello_done };
     var ob: [256]u8 = undefined;
     var o = Out{ .buf = &ob };
-    try c.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 1, .length = 1 }, &.{1}, ent, 0, &o);
+    try c.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 1, .length = 1 }, null, &.{1}, ent, 0, &o);
     try std.testing.expect(!c.saw_duplicate);
     try std.testing.expectEqual(@as(u16, 0), c.read_epoch);
-    try std.testing.expectError(error.Malformed, c.processRecord(.{ .content_type = content_alert, .epoch = 0, .sequence_number = 2, .length = 1 }, &.{2}, ent, 0, &o));
-    try std.testing.expectError(error.Malformed, c.processRecord(.{ .content_type = content_alert, .epoch = 0, .sequence_number = 3, .length = 3 }, &.{ 2, 40, 0 }, ent, 0, &o));
+    try std.testing.expectError(error.Malformed, c.processRecord(.{ .content_type = content_alert, .epoch = 0, .sequence_number = 2, .length = 1 }, null, &.{2}, ent, 0, &o));
+    try std.testing.expectError(error.Malformed, c.processRecord(.{ .content_type = content_alert, .epoch = 0, .sequence_number = 3, .length = 3 }, null, &.{ 2, 40, 0 }, ent, 0, &o));
     try std.testing.expectEqual(@as(?[2]u8, null), c.peer_alert);
 }
 
@@ -1854,13 +1990,13 @@ test "epoch-0 replay window: only a record that advanced the handshake is record
     // earlier one (a duplicate), an early ChangeCipherSpec, application
     // data. None of them may move the window, whatever its record number.
     const later = testFragment(3, 40, 10, &fb);
-    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = huge, .length = @intCast(later.len) }, later, ent, 0, &o);
+    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = huge, .length = @intCast(later.len) }, null, later, ent, 0, &o);
     try std.testing.expect(c.rx_future_len > 0);
     const earlier = testFragment(1, 40, 40, &fb);
-    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = huge - 1, .length = @intCast(earlier.len) }, earlier, ent, 0, &o);
+    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = huge - 1, .length = @intCast(earlier.len) }, null, earlier, ent, 0, &o);
     try std.testing.expect(c.saw_duplicate);
-    try c.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = huge - 2, .length = 1 }, &.{1}, ent, 0, &o);
-    try c.processRecord(.{ .content_type = content_application_data, .epoch = 0, .sequence_number = huge - 3, .length = 1 }, &.{1}, ent, 0, &o);
+    try c.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = huge - 2, .length = 1 }, null, &.{1}, ent, 0, &o);
+    try c.processRecord(.{ .content_type = content_application_data, .epoch = 0, .sequence_number = huge - 3, .length = 1 }, null, &.{1}, ent, 0, &o);
     try std.testing.expect(!c.recv_win[0].seen_any);
 
     // A partial fragment of the expected message is taken but not recorded,
@@ -1868,7 +2004,7 @@ test "epoch-0 replay window: only a record that advanced the handshake is record
     // any (one forged byte with a huge record number would otherwise shadow
     // every genuine record).
     const cur = testFragment(2, 40, 10, &fb);
-    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = 5, .length = @intCast(cur.len) }, cur, ent, 0, &o);
+    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = 5, .length = @intCast(cur.len) }, null, cur, ent, 0, &o);
     try std.testing.expectEqual(@as(usize, 10), c.rx_filled);
     try std.testing.expect(!c.recv_win[0].seen_any);
 
@@ -1878,7 +2014,7 @@ test "epoch-0 replay window: only a record that advanced the handshake is record
     // back, window included).
     var m: Connection12 = .{ .role = .client, .config = auditCfg(), .state = .wait_server_finished, .next_recv_seq = 2, .rx_filled = 10 };
     const whole = testFragment(2, 10, 10, &fb);
-    try std.testing.expectError(error.UnexpectedMessage, m.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = 6, .length = @intCast(whole.len) }, whole, ent, 0, &o));
+    try std.testing.expectError(error.UnexpectedMessage, m.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = 6, .length = @intCast(whole.len) }, null, whole, ent, 0, &o));
     try std.testing.expectEqual(@as(u16, 3), m.next_recv_seq);
     try std.testing.expectEqual(@as(usize, 10), m.rx_filled);
     try std.testing.expectEqual(@as(u48, 6), m.recv_win[0].high);
@@ -1888,13 +2024,13 @@ test "epoch-0 replay window: only a record that advanced the handshake is record
     // handshake layer as a retransmission (which would resend our flight).
     var k: Connection12 = .{ .role = .client, .config = auditCfg(), .state = .wait_server_finished, .keys_live = true };
     const ccs: record.PlaintextHeader = .{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 7, .length = 1 };
-    try k.processRecord(ccs, &.{1}, ent, 0, &o);
+    try k.processRecord(ccs, null, &.{1}, ent, 0, &o);
     try std.testing.expectEqual(@as(u16, 1), k.read_epoch);
     try std.testing.expectEqual(@as(u48, 7), k.recv_win[0].high);
-    try k.processRecord(ccs, &.{1}, ent, 0, &o);
+    try k.processRecord(ccs, null, &.{1}, ent, 0, &o);
     try std.testing.expect(!k.saw_duplicate);
     // The same ChangeCipherSpec under a new record number is a retransmission.
-    try k.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 8, .length = 1 }, &.{1}, ent, 0, &o);
+    try k.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 8, .length = 1 }, null, &.{1}, ent, 0, &o);
     try std.testing.expect(k.saw_duplicate);
     try std.testing.expectEqual(@as(u48, 7), k.recv_win[0].high);
 }

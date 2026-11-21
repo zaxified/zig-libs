@@ -226,6 +226,13 @@ fn recordWireLen(buf: []const u8, cid_len: usize) ?usize {
         if (buf.len - dec.consumed < len) return null;
         return dec.consumed + len;
     }
+    if (buf[0] == tls12_cid_content_type) {
+        // RFC 9146 §4: `type || version || epoch || seq || cid || length`.
+        if (buf.len < plaintext_header_len + cid_len) return null;
+        const len = std.mem.readInt(u16, buf[11 + cid_len ..][0..2], .big);
+        if (buf.len - plaintext_header_len - cid_len < len) return null;
+        return plaintext_header_len + cid_len + len;
+    }
     const hdr = decodePlaintext(buf) catch return null;
     if (buf.len - plaintext_header_len < hdr.length) return null;
     return plaintext_header_len + hdr.length;
@@ -251,9 +258,12 @@ pub fn nextDatagram(records: []const u8, max_len: usize) DatagramSplit {
     return nextDatagramCid(records, max_len, 0);
 }
 
+/// RFC 9146 `tls12_cid`, the DTLS 1.2 record type that carries a CID.
+const tls12_cid_content_type: u8 = 25;
+
 /// `nextDatagram` for records that carry a connection ID of `cid_len` bytes
-/// (RFC 9147 §9: what `Connection.peerConnectionId` returns on the sending
-/// side).
+/// (RFC 9147 §9 unified headers, RFC 9146 `tls12_cid` records: what
+/// `peerConnectionId` returns on the sending side).
 pub fn nextDatagramCid(records: []const u8, max_len: usize, cid_len: usize) DatagramSplit {
     if (max_len == 0) return .{ .datagram = records, .rest = records[records.len..] };
     var end: usize = 0;

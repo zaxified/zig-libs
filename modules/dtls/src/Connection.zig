@@ -580,7 +580,9 @@ pub const Config = struct {
     /// on) carries the PEER's CID in the unified header (C bit), and a
     /// received record must carry this side's own one (`error.Malformed`
     /// otherwise, or for a CID on a connection that negotiated none). DTLS
-    /// 1.3 engine only.
+    /// 1.2 (RFC 9146): the same extension in the hellos, and every epoch-1
+    /// record (Finished included) is a `tls12_cid` record carrying the
+    /// peer's CID when it asked for a non-empty one.
     connection_id: ?[]const u8 = null,
 
     // ── DTLS 1.2 (RFC 6347), all ADDITIVE: the defaults keep a 1.3-only

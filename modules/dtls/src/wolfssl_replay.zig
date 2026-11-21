@@ -181,9 +181,17 @@ const Recorded = struct {
     binding_buf: [128]u8 = @splat(0),
     binding_len: usize = 0,
     has_binding: bool = false,
+    /// The optional `cid=` (RFC 9147 §9): the connection ID this side asked for.
+    cid_buf: [32]u8 = @splat(0),
+    cid_len: usize = 0,
+    has_cid: bool = false,
 
     fn parse(line: []const u8) !Recorded {
         var r: Recorded = .{};
+        if (arg(line, "cid")) |c| {
+            r.cid_len = try copyHex(&r.cid_buf, c);
+            r.has_cid = true;
+        }
         const kx = arg(line, "key_exchange") orelse return error.MissingArgument;
         r.cert_mode = std.mem.eql(u8, kx, "cert_dhe");
 
@@ -251,6 +259,15 @@ const Recorded = struct {
     /// SAME bytes off disk when the recording was taken, so "which certificate"
     /// has one answer in the tree, not one per consumer.
     fn config(self: *Recorded, role: enum { client, server }) Config {
+        var c = switch (role) {
+            .client => self.configBase(.client),
+            .server => self.configBase(.server),
+        };
+        if (self.has_cid) c.connection_id = self.cid_buf[0..self.cid_len];
+        return c;
+    }
+
+    fn configBase(self: *Recorded, role: enum { client, server }) Config {
         var names: usize = 0;
         if (self.alpn_len > 0) {
             var it = std.mem.splitScalar(u8, self.alpn_buf[0..self.alpn_len], ',');

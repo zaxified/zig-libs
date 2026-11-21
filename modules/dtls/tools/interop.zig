@@ -168,10 +168,17 @@ const Case = struct {
     /// Run the PSK handshake under `TLS13-AES256-GCM-SHA384` with `psk384`
     /// instead of `TLS13-AES128-GCM-SHA256` with `psk` (PSK cases only).
     sha384: bool = false,
+    /// Ask for a connection ID (`zig_cid`); the peer asks for `wolf_cid`.
+    cid: bool = false,
     /// One line of prose, copied into the transcript, saying what THIS case
     /// proves that no other one does.
     why: []const u8,
 };
+
+/// The connection IDs of the CID cases (RFC 9146, RFC 9147 section 9):
+/// duplicated in `tools/wolfssl_peer.c`.
+const zig_cid = "zig-libs-cid";
+const wolf_cid = "wolf-cid-1";
 
 const cases = [_]Case{
     .{
@@ -402,6 +409,25 @@ const cases = [_]Case{
         .expect_group = x25519_mlkem768_group,
         .app_expect = "hello from wolfssl cert client",
         .why = "wolfSSL offers the 1216-byte hybrid share and OUR server must encapsulate to it — the server half of the PQ hybrid, checked by foreign code",
+    },
+    .{
+        .name = "psk-client-cid",
+        .flow = .client,
+        .peer_mode = "server-cid",
+        .seed = 0x2c,
+        .cid = true,
+        .app_send = "hello from zig-libs",
+        .app_expect = "hello from zig-libs",
+        .why = "DTLS 1.3 connection ID (RFC 9147 section 9) against a live server: both sides ask for one in the hellos, our records carry wolfSSL's CID in the unified header and wolfSSL's carry ours",
+    },
+    .{
+        .name = "psk-server-cid",
+        .flow = .server,
+        .peer_mode = "client-cid",
+        .seed = 0x5b,
+        .cid = true,
+        .app_expect = "hello from wolfssl client",
+        .why = "the connection ID with OUR server answering a wolfSSL client's connection_id in the ServerHello",
     },
     .{
         .name = "psk-server-keyupdate-theirs",
@@ -822,6 +848,18 @@ fn caseSuites(case: Case) []const dtls.CipherSuite {
 }
 
 fn clientConfig(case: Case, fx: *const Fixtures) dtls.Config {
+    var c = clientConfigBase(case, fx);
+    if (case.cid) c.connection_id = zig_cid;
+    return c;
+}
+
+fn serverConfig(case: Case, fx: *const Fixtures, binding: ?[]const u8) dtls.Config {
+    var c = serverConfigBase(case, fx, binding);
+    if (case.cid) c.connection_id = zig_cid;
+    return c;
+}
+
+fn clientConfigBase(case: Case, fx: *const Fixtures) dtls.Config {
     if (!case.cert_mode) return .{
         .role = .client,
         .psk_identity = psk_identity,
@@ -849,7 +887,7 @@ fn clientConfig(case: Case, fx: *const Fixtures) dtls.Config {
     };
 }
 
-fn serverConfig(case: Case, fx: *const Fixtures, binding: ?[]const u8) dtls.Config {
+fn serverConfigBase(case: Case, fx: *const Fixtures, binding: ?[]const u8) dtls.Config {
     if (!case.cert_mode) return .{
         .role = .server,
         .psk_identity = psk_identity,
@@ -908,6 +946,7 @@ fn recordConfig(rec: *Recorder, case: Case, seed: [32]u8) void {
         rec.hexArg("psk", casePsk(case));
         rec.hexArg("cookie_secret", cookie_secret);
     }
+    if (case.cid) rec.hexArg("cid", zig_cid);
     rec.end();
 }
 
@@ -1010,6 +1049,7 @@ fn runClientFlow(
 
     try expectBool("sawHelloRetryRequest", case.expect_hrr, conn.sawHelloRetryRequest());
     try expectU16("negotiated suite", @backingInt(caseSuites(case)[0]), @backingInt(conn.suite));
+    if (case.cid) try expectBytes("the CID our records carry", wolf_cid, conn.peerConnectionId() orelse "");
     // The group the session keys were actually derived from. For the
     // secp256r1/hybrid cases this is the assertion that the retry was ACTED
     // ON: a client that echoed the cookie but kept its original share would
@@ -1409,6 +1449,7 @@ fn runServerFlow(
     // handshake would still complete, just without the check.
     if (cookie_mode and retries_served < 1) return error.NoRetryWasServed;
     try expectU16("negotiated suite", @backingInt(caseSuites(case)[0]), @backingInt(conn.?.suite));
+    if (case.cid) try expectBytes("the CID our records carry", wolf_cid, conn.?.peerConnectionId() orelse "");
     if (case.cert_mode) try expectU16("negotiated group", case.expect_group, conn.?.ecdhe_group);
     rec.op("expect");
     rec.numArg("hrr", @intFromBool(case.expect_hrr));
@@ -1505,6 +1546,12 @@ const Case12 = struct {
     expect_group: u16 = x25519_group,
     /// Client flow: wolfSSL's 1.2 server always runs the cookie exchange.
     expect_hvr: bool = false,
+    /// RFC 9146: ask for `zig_cid`; the peer asks for `wolf_cid`. No case
+    /// sets it: Debian's wolfSSL 5.9.1 negotiates the 1.2 connection ID but
+    /// its client then fails `connect` with -320 (build message failure), and
+    /// its server goes silent at our CID-protected Finished — the 1.2 form has
+    /// no live wolfSSL peer (`12-*-cid` peer modes kept for a fixed build).
+    cid: bool = false,
     expect_peer_cert_subject: ?[]const u8 = null,
     app_send: []const u8 = "hello from zig-libs over dtls 1.2",
     app_expect: []const u8 = "hello from zig-libs over dtls 1.2",
@@ -1931,6 +1978,7 @@ fn config12(case: Case12, role: dtls.Role, fx: *const Fixtures, binding: ?[]cons
         },
     }
     if (binding) |b| c.hello_retry = .{ .cookie_secret = cookie_secret, .peer_binding = b };
+    if (case.cid) c.connection_id = zig_cid;
     return c;
 }
 
@@ -1946,6 +1994,7 @@ fn recordConfig12(rec: *Recorder, case: Case12, seed: [32]u8) void {
     rec.hexArg("psk", &psk);
     rec.hexArg("psk_hint", psk12_hint);
     rec.hexArg("cookie_secret", cookie_secret);
+    if (case.cid) rec.hexArg("cid", zig_cid);
     rec.end();
 }
 
@@ -1968,6 +2017,7 @@ fn expectState12(conn: *const Connection12, case: Case12) !void {
     try expectU16("negotiated suite", @backingInt(case.expect_suite), @backingInt(conn.negotiatedSuite() orelse return error.NotConnected));
     try expectU16("negotiated group", case.expect_group, conn.ecdhe_group);
     try expectBool("extended master secret", true, conn.ems);
+    if (case.cid) try expectBytes("the CID our records carry", wolf_cid, conn.peerConnectionId() orelse "");
 }
 
 fn recordExpect12(rec: *Recorder, conn: *const Connection12) void {
@@ -2117,7 +2167,10 @@ fn runClientFlow12(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, case: C
     rec.end();
     try sock.send(io, &server_addr, record);
     var plain: [2048]u8 = undefined;
-    const echoed = try recvApplicationData12(io, sock, &conn, &rx, &plain, rec);
+    const echoed = recvApplicationData12(io, sock, &conn, &rx, &plain, rec) catch |err| {
+        reportPeerDiagnosis(gpa, io, &child, true, "no application data back from wolfSSL", err);
+        return err;
+    };
     try expectBytes("echoed application data", case.app_expect, echoed);
 
     if (case.expect_peer_cert_subject) |want| try checkPeerCertLine(&stdout_reader.interface, want, rec);
@@ -2158,7 +2211,11 @@ fn runServerFlow12(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, case: C
     var steps: usize = 0;
     while (true) : (steps += 1) {
         if (steps > 40) return error.TooManyFlights;
-        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        const incoming = sock.receiveTimeout(io, &rx, deadline(io, 10_000)) catch |err| {
+            // A client that gave up has exited: its stderr says why.
+            if (case.cid) reportPeerDiagnosis(gpa, io, &child, true, "wolfSSL went silent during the handshake", err);
+            return err;
+        };
         peer_addr = incoming.from;
         if (conn == null) {
             const binding = if (cookie_mode) try std.mem.print(&binding_buf, "{f}", .{incoming.from}) else null;
@@ -2202,7 +2259,10 @@ fn runServerFlow12(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, case: C
     rec.end();
 
     var plain: [2048]u8 = undefined;
-    const received = try recvApplicationData12(io, sock, &conn.?, &rx, &plain, rec);
+    const received = recvApplicationData12(io, sock, &conn.?, &rx, &plain, rec) catch |err| {
+        reportPeerDiagnosis(gpa, io, &child, true, "no application data from wolfSSL", err);
+        return err;
+    };
     try expectBytes("received application data", case.app_expect, received);
     const echo = try conn.?.send(received, &out);
     rec.op("send");

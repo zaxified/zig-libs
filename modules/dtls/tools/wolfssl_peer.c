@@ -91,6 +91,11 @@
 //                                     # PSK CLIENT that, after the echo, starts
 //                                     # a KeyUpdate, sends a message under its
 //                                     # new keys and expects it echoed back.
+//   ./wolfssl_peer server-cid|client-cid <port>
+//   ./wolfssl_peer 12-server-psk-cid|12-client-psk-cid|12-server-ecdsa-cid <port>
+//                                     # the connection ID (RFC 9146, RFC 9147
+//                                     # section 9): wolfSSL asks for "wolf-cid-1"
+//                                     # and must be asked for "zig-libs-cid".
 //   ./wolfssl_peer server-cert-alpn <port>
 //   ./wolfssl_peer server-cert-ku-ours <port>
 //   ./wolfssl_peer server-cert-ku-theirs <port>
@@ -152,6 +157,46 @@ static unsigned int g_psk_len = sizeof(kPsk);
 static const char *g_alpn = NULL;        // ALPN list offered (client) / accepted (server)
 static const char *g_alpn_expect = NULL; // client: the name the server must answer
 static int g_keyupdate = 0;              // 1: our side initiates, 2: wolfSSL initiates
+static int g_cid = 0;                    // RFC 9146 / RFC 9147 section 9 connection ID
+
+// The connection IDs of the `*-cid` modes: wolfSSL asks for `kWolfCid`, and
+// the Zig side for `kZigCid` (duplicated in `tools/interop.zig`).
+static const char kWolfCid[] = "wolf-cid-1";
+static const char kZigCid[] = "zig-libs-cid";
+
+static int apply_cid(WOLFSSL *ssl) {
+    if (!g_cid) return 0;
+    if (wolfSSL_dtls_cid_use(ssl) != WOLFSSL_SUCCESS ||
+        wolfSSL_dtls_cid_set(ssl, (unsigned char *)kWolfCid, (unsigned int)strlen(kWolfCid)) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "dtls_cid_use/set failed\n");
+        return 1;
+    }
+    return 0;
+}
+
+// After the handshake: the CID must be in use, wolfSSL must send OUR CID
+// (`tx`) and expect its own (`rx`).
+static int check_cid(WOLFSSL *ssl) {
+    if (!g_cid) return 0;
+    unsigned char *tx = NULL, *rx = NULL;
+    unsigned int txn = 0, rxn = 0;
+    if (!wolfSSL_dtls_cid_is_enabled(ssl) ||
+        wolfSSL_dtls_cid_get0_tx(ssl, &tx) != WOLFSSL_SUCCESS ||
+        wolfSSL_dtls_cid_get_tx_size(ssl, &txn) != WOLFSSL_SUCCESS ||
+        wolfSSL_dtls_cid_get0_rx(ssl, &rx) != WOLFSSL_SUCCESS ||
+        wolfSSL_dtls_cid_get_rx_size(ssl, &rxn) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "connection ID not negotiated\n");
+        return 1;
+    }
+    if (txn != strlen(kZigCid) || memcmp(tx, kZigCid, txn) != 0 ||
+        rxn != strlen(kWolfCid) || memcmp(rx, kWolfCid, rxn) != 0) {
+        fprintf(stderr, "connection IDs differ (tx %u, rx %u bytes)\n", txn, rxn);
+        return 1;
+    }
+    printf("CID tx=%.*s rx=%.*s\n", (int)txn, tx, (int)rxn, rx);
+    fflush(stdout);
+    return 0;
+}
 
 // Applies the ALPN switch to a fresh session. wolfSSL takes a comma-separated
 // list and, with FAILED_ON_MISMATCH, aborts the handshake instead of silently
@@ -316,6 +361,7 @@ static int run_server(int port, int hrr_cookie) {
     wolfSSL_set_fd(ssl, fd);
     if (!hrr_cookie) wolfSSL_disable_hrr_cookie(ssl);
     if (apply_alpn(ssl)) return 1;
+    if (apply_cid(ssl)) return 1;
     int rc = wolfSSL_accept(ssl);
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
@@ -327,6 +373,7 @@ static int run_server(int port, int hrr_cookie) {
     printf("HANDSHAKE %s\n", wolfSSL_get_cipher(ssl));
     fflush(stdout);
     if (report_alpn(ssl)) return 1;
+    if (check_cid(ssl)) return 1;
 
     char msg[256];
     int n = wolfSSL_read(ssl, msg, sizeof(msg) - 1);
@@ -622,6 +669,7 @@ static int run_client(int port) {
     WOLFSSL *ssl = wolfSSL_new(ctx);
     wolfSSL_set_fd(ssl, fd);
     if (apply_alpn(ssl)) return 1;
+    if (apply_cid(ssl)) return 1;
     int rc = wolfSSL_connect(ssl);
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
@@ -633,6 +681,7 @@ static int run_client(int port) {
     printf("HANDSHAKE %s\n", wolfSSL_get_cipher(ssl));
     fflush(stdout);
     if (report_alpn(ssl)) return 1;
+    if (check_cid(ssl)) return 1;
 
     const char *hello = "hello from wolfssl client";
     if (wolfSSL_write(ssl, hello, (int)strlen(hello)) <= 0) {
@@ -802,6 +851,7 @@ static int run12(int port, struct opts12 o) {
         fprintf(stderr, "dtls_set_mtu(%d) failed\n", o.mtu);
         return 1;
     }
+    if (apply_cid(ssl)) return 1;
     int rc = o.server ? wolfSSL_accept(ssl) : wolfSSL_connect(ssl);
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
@@ -812,6 +862,7 @@ static int run12(int port, struct opts12 o) {
     }
     printf("HANDSHAKE %s %s\n", wolfSSL_get_version(ssl), wolfSSL_get_cipher(ssl));
     fflush(stdout);
+    if (check_cid(ssl)) return 1;
     if (verify) {
         if (!o.server) {
             long vr = wolfSSL_get_verify_result(ssl);
@@ -868,9 +919,12 @@ static int run12_mode(const char *mode, int port, int mtu) {
     } else {
         return -1;
     }
-    if (strcmp(mode, "psk") == 0) {
+    if (strcmp(mode, "psk") == 0 || strcmp(mode, "psk-cid") == 0) {
         o.psk = 1;
         o.suite = "ECDHE-PSK-CHACHA20-POLY1305";
+        g_cid = strcmp(mode, "psk-cid") == 0;
+    } else if (strcmp(mode, "ecdsa-cid") == 0) {
+        g_cid = 1;
     } else if (strcmp(mode, "ecdsa") == 0) {
     } else if (strcmp(mode, "ecdsa-aes256") == 0) {
         o.suite = "ECDHE-ECDSA-AES256-GCM-SHA384";
@@ -915,7 +969,7 @@ int main(int argc, char **argv) {
                 "server-cert-mutual|client|client-cert|client-cert-mlkem|"
                 "server-alpn|client-alpn|server-ku-ours|server-ku-theirs|"
                 "client-ku-theirs|server-cert-alpn|server-cert-ku-ours|"
-                "server-cert-ku-theirs|"
+                "server-cert-ku-theirs|server-cid|client-cid|"
                 "server-aes256|server-aes256-hrr|client-aes256|"
                 "12-{server,client}-{psk,ecdsa,ecdsa-aes256,ecdsa-chacha,"
                 "ecdsa-p256,ecdsa-mutual,rsa} <port> [mtu] | version\n",
@@ -988,6 +1042,12 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[1], "server-ku-theirs") == 0) {
         g_keyupdate = 2;
         rc = run_server(port, 0);
+    } else if (strcmp(argv[1], "server-cid") == 0) {
+        g_cid = 1;
+        rc = run_server(port, 0);
+    } else if (strcmp(argv[1], "client-cid") == 0) {
+        g_cid = 1;
+        rc = run_client(port);
     } else if (strcmp(argv[1], "client-ku-theirs") == 0) {
         g_keyupdate = 2;
         rc = run_client(port);

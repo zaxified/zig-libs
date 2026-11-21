@@ -152,6 +152,13 @@ pub const Endpoint = union(enum) {
         };
     }
 
+    /// The CID this side's records carry (RFC 9146 / RFC 9147 §9), or null.
+    pub fn peerConnectionId(self: *const Endpoint) ?[]const u8 {
+        return switch (self.*) {
+            inline else => |*c| c.peerConnectionId(),
+        };
+    }
+
     pub fn deinit(self: *Endpoint) void {
         switch (self.*) {
             inline else => |*c| c.deinit(),

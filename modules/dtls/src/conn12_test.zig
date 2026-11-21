@@ -1272,3 +1272,123 @@ test "dtls12: PeerVerify.chain builds the path through the intermediate (and ref
     var bufs: Bufs = undefined;
     try testing.expectError(error.CertificateRejected, drive(&client, &server, seeded(&csprng), &bufs));
 }
+
+// ── connection ID (RFC 9146) ─────────────────────────────────────────────
+
+fn cidPair(c_cid: ?[]const u8, s_cid: ?[]const u8, suite: CipherSuite12, client: *Connection12, server: *Connection12) !void {
+    var ccfg = pskConfig(.client, &.{suite});
+    ccfg.connection_id = c_cid;
+    var scfg = pskConfig(.server, &.{suite});
+    scfg.connection_id = s_cid;
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x91)));
+    client.* = try Connection12.clientInit(ccfg);
+    server.* = try Connection12.serverInit(scfg);
+    var bufs: Bufs = .{};
+    try drive(client, server, seeded(&csprng), &bufs);
+}
+
+test "dtls12 CID (RFC 9146): both sides ask for one, every epoch-1 record is tls12_cid with the receiver's CID" {
+    for ([_]CipherSuite12{ .psk_with_aes_128_gcm_sha256, .ecdhe_psk_with_chacha20_poly1305_sha256, .psk_with_aes_128_ccm_8 }) |suite| {
+        var client: Connection12 = undefined;
+        var server: Connection12 = undefined;
+        try cidPair("cli", "a-server-cid-1234", suite, &client, &server);
+        defer client.deinit();
+        defer server.deinit();
+        try testing.expectEqualStrings("a-server-cid-1234", client.peerConnectionId().?);
+        try testing.expectEqualStrings("cli", server.peerConnectionId().?);
+        var b1: [256]u8 = undefined;
+        var b2: [256]u8 = undefined;
+        const rec = try client.send("over a cid", &b1);
+        try testing.expectEqual(@as(u8, 25), rec[0]);
+        try testing.expectEqualStrings("a-server-cid-1234", rec[11..][0..17]);
+        try testing.expectEqualStrings("over a cid", try server.recv(rec, &b2));
+        const back = try server.send("back", &b1);
+        try testing.expectEqualStrings("cli", back[11..][0..3]);
+        try testing.expectEqualStrings("back", try client.recv(back, &b2));
+        // Another CID, or none, is invalid (RFC 9146 §3).
+        const rec2 = try client.send("x", &b1);
+        var wrong: [256]u8 = undefined;
+        @memcpy(wrong[0..rec2.len], rec2);
+        wrong[11] ^= 1;
+        try testing.expectError(error.Malformed, server.recv(wrong[0..rec2.len], &b2));
+        try testing.expectEqualStrings("x", try server.recv(rec2, &b2));
+    }
+}
+
+test "dtls12 CID: an empty CID means the peer sends none; a server without one does not negotiate" {
+    {
+        var client: Connection12 = undefined;
+        var server: Connection12 = undefined;
+        try cidPair("", "srv-cid", .psk_with_aes_128_gcm_sha256, &client, &server);
+        defer client.deinit();
+        defer server.deinit();
+        try testing.expectEqualStrings("srv-cid", client.peerConnectionId().?);
+        try testing.expect(server.peerConnectionId() == null);
+        var b1: [256]u8 = undefined;
+        var b2: [256]u8 = undefined;
+        const up = try client.send("up", &b1);
+        try testing.expectEqual(@as(u8, 25), up[0]);
+        try testing.expectEqualStrings("up", try server.recv(up, &b2));
+        const down = try server.send("down", &b1);
+        try testing.expectEqual(@as(u8, 23), down[0]); // plain RFC 6347 record
+        try testing.expectEqualStrings("down", try client.recv(down, &b2));
+        // The server expects its CID: a plain record from the client is refused.
+        var plain12 = client;
+        plain12.cid_peer_len = 0;
+        const bare = try plain12.send("bare", &b1);
+        try testing.expectError(error.Malformed, server.recv(bare, &b2));
+    }
+    {
+        var client: Connection12 = undefined;
+        var server: Connection12 = undefined;
+        try cidPair("cli", null, .psk_with_aes_128_gcm_sha256, &client, &server);
+        defer client.deinit();
+        defer server.deinit();
+        try testing.expect(!client.cid_negotiated and !server.cid_negotiated);
+        try exchangeData(&client, &server);
+    }
+}
+
+test "dtls12 CID: fragmented flights cut with nextDatagramCid, certificate mode" {
+    var ccfg = ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    ccfg.connection_id = "c1";
+    ccfg.max_datagram_len = 200;
+    var scfg = ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256});
+    scfg.connection_id = "s-22";
+    scfg.max_datagram_len = 200;
+    var client = try Connection12.clientInit(ccfg);
+    defer client.deinit();
+    var server = try Connection12.serverInit(scfg);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x92)));
+    const rnd = seeded(&csprng);
+    var a: [8192]u8 = undefined;
+    var b: [8192]u8 = undefined;
+    var to_server: []const u8 = try client.startHandshake(rnd, 0, &a);
+    var rounds: usize = 0;
+    while (!(client.isConnected() and server.isConnected())) : (rounds += 1) {
+        if (rounds > 8) return error.TestHandshakeDidNotComplete;
+        var rest = to_server;
+        var s_out: []const u8 = &.{};
+        while (rest.len > 0) {
+            const sp = record.nextDatagramCid(rest, 200, if (client.peerConnectionId()) |c| c.len else 0);
+            try testing.expect(sp.datagram.len <= 200);
+            const r = try server.handleFlight(sp.datagram, rnd, 0, &b);
+            if (r.out.len > 0) s_out = r.out;
+            rest = sp.rest;
+        }
+        if (client.isConnected() and server.isConnected()) break;
+        rest = s_out;
+        var c_out: []const u8 = &.{};
+        while (rest.len > 0) {
+            const sp = record.nextDatagramCid(rest, 200, if (server.peerConnectionId()) |c| c.len else 0);
+            try testing.expect(sp.datagram.len <= 200);
+            const r = try client.handleFlight(sp.datagram, rnd, 0, &a);
+            if (r.out.len > 0) c_out = r.out;
+            rest = sp.rest;
+        }
+        to_server = c_out;
+    }
+    try testing.expectEqualStrings("s-22", client.peerConnectionId().?);
+    try exchangeData(&client, &server);
+}
