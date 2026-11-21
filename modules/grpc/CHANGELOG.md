@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Added:** `grpc-status-details-bin` as raw bytes: `ServerCall.setStatusDetails` (sent as a header on a Trailers-Only response, as a trailer otherwise) and `Failure.details` (owned, freed by `Failure.deinit`). The trailer name is now declared with the other status trailers.
+
 - **2026-11-21** — **Added:** call-level interceptors: `grpc.Interceptor` (`before`/`after`) in `Router.interceptors` for the server, `grpc.ClientInterceptor` (`on_start`/`on_finish`) in the client `Options.interceptors`, `grpc.ClientOutgoing`. Defaults (none) change nothing.
 
 - **2026-11-21** — **Added:** `grpc.HandlerPool` (new `src/pool.zig`, over `workerpool`; new dependency) and `Router.pool`: `httpOptions`/`h2ServerOptions` install it as the HTTP/2 dispatcher, so one connection's streams run concurrently on a bounded pool instead of one after another. Default (`pool = null`) unchanged.

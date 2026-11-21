@@ -37,7 +37,7 @@ against Python `grpcio` (recorded replay plus live oracle); offline frame-level 
 Trailers-Only vs Trailers distinction; a decoded-size bound on every message (declared length
 never sizes an allocation), pure Zig with no C core, typed struct messages with no codegen step.
 **Where we are behind:** no retries, name resolution/load balancing, per-message (stream-wrapping) interceptors,
-keepalive, `grpc-status-details-bin`, gRPC-Web, and no reflection service (the standard
+keepalive, a typed `google.rpc.Status`, gRPC-Web, and no reflection service (the standard
 `grpc.health.v1` health service is provided, `src/health.zig`); the server is sequential per connection unless the application sets `Router.pool` (a `HandlerPool`) or installs the `http` dispatcher itself.
 
 See [README.md](README.md) for what this module is and how to use it.
@@ -415,9 +415,9 @@ Each item is refused with its reason here; the ones that are open work are also 
   policy needs a channel that owns its connection lifecycle; this one borrows a session.
 - **Name resolution and load balancing.** A channel here is one HTTP/2 connection the caller
   opened. Multi-address channels are a client-architecture feature, not a protocol one.
-- **`grpc-status-details-bin`.** The value is a serialized `google.rpc.Status`, which pulls in
-  `google.protobuf.Any` — and `protobuf` deliberately does not implement `Any`. The field is
-  readable today as ordinary `-bin` metadata.
+- **A typed `google.rpc.Status` with `Any` details.** `grpc-status-details-bin` is carried as raw bytes
+  (`ServerCall.setStatusDetails`, `Failure.details`); building and reading the `Any` entries is the
+  caller's (`protobuf` deliberately does not implement `Any`).
 - **gRPC-Web.** Same LPM envelope over HTTP/1.1 with trailers folded into the body; `grpc.frame`
   is the reusable half and the rest is a different transport.
 - **Reflection and channelz services.** Ordinary services, expressible with what is
@@ -438,4 +438,4 @@ Each item is refused with its reason here; the ones that are open work are also 
 
 Reasons for each are under *What is deliberately not done*; the first four are what a typical grpc-go/tonic user hits in ordinary use.
 
-- **Retries/hedging, name resolution and load balancing, keepalive, `grpc-status-details-bin`, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.
+- **Retries/hedging, name resolution and load balancing, keepalive, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.

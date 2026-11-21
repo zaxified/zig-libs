@@ -912,6 +912,39 @@ test "client interceptors: a call released before its status is reported as canc
     try testing.expectError(error.ReservedMetadata, fx2.ch.start("/s/m", .{}));
 }
 
+test "failure: grpc-status-details-bin comes back as raw bytes, from the trailers or a Trailers-Only head" {
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |trailers_only| {
+        const fx = try Fx.init(gpa, .{});
+        defer fx.deinit();
+        var call = try fx.ch.start("/s/m", .{});
+        defer call.deinit();
+        try call.sendMessage("", true);
+        var peer = try Peer.init(fx.clientBytes());
+        defer peer.deinit();
+        if (trailers_only) {
+            try peer.conn.sendHeaders(&peer.wire, 1, &.{
+                .{ .name = ":status", .value = "200" },
+                .{ .name = "content-type", .value = "application/grpc+proto" },
+                .{ .name = "grpc-status", .value = "5" },
+                .{ .name = "grpc-status-details-bin", .value = "CAUSA2FiYw==" }, // padded is fine
+            }, true);
+        } else {
+            try peer.okHeaders(1, false);
+            try peer.trailers(1, &.{
+                .{ .name = "grpc-status", .value = "5" },
+                .{ .name = "grpc-status-details-bin", .value = "CAUSA2FiYw" },
+            });
+        }
+        fx.reply(peer.wire.items);
+        var failure: grpc.Failure = .{};
+        defer failure.deinit(gpa);
+        call.failure_out = &failure;
+        try testing.expectError(error.NotFound, call.finish());
+        try testing.expectEqualStrings("\x08\x05\x12\x03abc", failure.details);
+    }
+}
+
 // ── the unary contract ─────────────────────────────────────────────────────
 
 fn scriptNoMessage(p: *Peer) anyerror!void {

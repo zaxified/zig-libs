@@ -512,6 +512,9 @@ pub const Call = struct {
 
     status: Status = .ok,
     status_message: []const u8 = "",
+    /// Raw `grpc-status-details-bin` bytes (`setStatusDetails`), copied into
+    /// the call arena.
+    status_details: []const u8 = "",
     /// The status was chosen deliberately (`fail`), so a later error must
     /// not overwrite it.
     status_set: bool = false,
@@ -706,6 +709,15 @@ pub const Call = struct {
         return status_mod.toError(s);
     }
 
+    /// Attach `details` to the status the call ends with, as the
+    /// `grpc-status-details-bin` trailer: the serialized `google.rpc.Status`
+    /// (code, message, repeated `Any` details) other implementations read with
+    /// `status.FromProto`. The bytes are the caller's encoding of that message:
+    /// `protobuf` has no `Any`, so this module does not build it. Copied.
+    pub fn setStatusDetails(c: *Call, details: []const u8) Allocator.Error!void {
+        c.status_details = try c.arena.dupe(u8, details);
+    }
+
     /// `fail` with a message formatted into the call's arena.
     pub fn failFmt(
         c: *Call,
@@ -752,7 +764,7 @@ pub const Call = struct {
             c.rw.setHeader(e.name, e.value) catch return error.BadMetadata;
         // From here the status has nowhere to live but the trailer section,
         // so it is advertised before the head can escape.
-        c.rw.declareTrailers(&.{ "grpc-status", "grpc-message" }) catch
+        c.rw.declareTrailers(&.{ "grpc-status", "grpc-message", "grpc-status-details-bin" }) catch
             return c.writeDied();
         for (c.declared_md.items) |n|
             c.rw.declareTrailer(n) catch return error.BadMetadata;
@@ -816,6 +828,7 @@ pub const Call = struct {
                     head_md_lost = true;
                 };
             c.rw.setHeader("grpc-status", if (head_md_lost) md_lost_code else code) catch return;
+            if (c.detailsWire()) |d| c.rw.setHeader("grpc-status-details-bin", d) catch {};
             // `grpc-message` is optional (gRPC over HTTP/2: the machine-
             // readable half is `grpc-status`, which is already on the head by
             // now). Best-effort DELIBERATELY, and the client still learns
@@ -834,6 +847,16 @@ pub const Call = struct {
         c.rw.setTrailer("grpc-status", if (trailer_md_lost) md_lost_code else code) catch return;
         const trailer_msg: ?[]const u8 = if (trailer_md_lost) md_lost_message else message;
         if (trailer_msg) |m| c.rw.setTrailer("grpc-message", m) catch {};
+        if (c.detailsWire()) |d| c.rw.setTrailer("grpc-status-details-bin", d) catch {};
+    }
+
+    /// The wire form (unpadded base64) of `status_details`, null when none or
+    /// when the arena cannot hold it (best-effort, like `grpc-message`).
+    fn detailsWire(c: *Call) ?[]const u8 {
+        if (c.status_details.len == 0) return null;
+        const e: Entry = .{ .name = "grpc-status-details-bin", .value = c.status_details };
+        const buf = c.arena.alloc(u8, metadata.encodedValueLen(e)) catch return null;
+        return metadata.encodeValue(e, buf);
     }
 };
 

@@ -830,6 +830,43 @@ test "server: a request compressed with an encoding that is not enabled is UNIMP
     try testing.expectEqualStrings("gzip,deflate,identity", r.header("grpc-accept-encoding").?);
 }
 
+// ── status details ──────────────────────────────────────────────────────────
+
+fn detailsImpl(c: *server.Call) anyerror!void {
+    try c.setStatusDetails("\x08\x05\x12\x03abc");
+    return c.fail(.not_found, "gone");
+}
+
+fn detailsAfterSendImpl(c: *server.Call) anyerror!void {
+    try c.send("one");
+    try c.setStatusDetails("\x08\x05");
+    return c.fail(.not_found, "late");
+}
+
+const details_service: server.Service = .{
+    .name = "det.Svc",
+    .methods = &.{ server.Method.raw("Early", detailsImpl), server.Method.raw("Late", detailsAfterSendImpl) },
+};
+
+test "server: setStatusDetails sends grpc-status-details-bin, as a header when Trailers-Only and as a trailer after the head" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa);
+    defer peer.deinit();
+    var router: server.Router = .{ .gpa = gpa, .services = &.{details_service} };
+    try peer.conn.sendPreface(&peer.wire);
+    const early = try startCall(&peer, "/det.Svc/Early", &.{"go"});
+    const late = try startCall(&peer, "/det.Svc/Late", &.{"go"});
+    try runOffline(&peer, &router);
+    const re = peer.resp(early);
+    try testing.expect(re.isTrailersOnly());
+    // `\x08\x05\x12\x03abc` in unpadded base64.
+    try testing.expectEqualStrings("CAUSA2FiYw", re.header("grpc-status-details-bin").?);
+    try testing.expectEqualStrings("5", re.header("grpc-status").?);
+    const rl = peer.resp(late);
+    try testing.expectEqualStrings("5", rl.trailer("grpc-status").?);
+    try testing.expectEqualStrings("CAU", rl.trailer("grpc-status-details-bin").?);
+}
+
 // ── interceptors ────────────────────────────────────────────────────────────
 
 var ic_log: [16]u8 = undefined;

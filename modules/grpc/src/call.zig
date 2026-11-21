@@ -146,9 +146,15 @@ pub const Failure = struct {
     /// Decoded `grpc-message`, allocated with the channel's allocator when
     /// non-empty. Release with `deinit`.
     message: []const u8 = "",
+    /// The raw bytes of `grpc-status-details-bin` (a serialized
+    /// `google.rpc.Status`, which the caller decodes with the schema of its
+    /// choice: this module does not implement `google.protobuf.Any`),
+    /// allocated with the channel's allocator when the peer sent any.
+    details: []const u8 = "",
 
     pub fn deinit(f: *Failure, gpa: Allocator) void {
         if (f.message.len != 0) gpa.free(@constCast(f.message));
+        if (f.details.len != 0) gpa.free(@constCast(f.details));
         f.* = .{};
     }
 };
@@ -604,6 +610,18 @@ pub const Call = struct {
         out.status = s;
         if (c.status_message.len != 0) {
             out.message = c.ch.gpa.dupe(u8, c.status_message) catch "";
+        }
+        // The details ride in the trailers, or in the head of a Trailers-Only
+        // response.
+        const wire = if (c.ch.session.trailers(c.sid)) |hl|
+            findField(hl, "grpc-status-details-bin")
+        else if (c.head) |h|
+            h.header("grpc-status-details-bin")
+        else
+            null;
+        if (wire) |w| {
+            const d = metadata.decodeValue(c.ch.gpa, "grpc-status-details-bin", w) catch return;
+            if (d.owned) out.details = d.bytes;
         }
     }
 };
