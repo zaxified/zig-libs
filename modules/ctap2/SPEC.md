@@ -180,7 +180,5 @@ against the spec's layouts and by round trip (no external CTAPHID capture).
 
 ## Backlog / deferred
 
-- Further CTAP2 commands on the same `Transport` (getAssertion / makeCredential) if a consumer appears.
-- Keep-alive status surfacing (`CTAPHID_KEEPALIVE` UPNEEDED vs PROCESSING) to the caller for UI; `Channel` currently
-  discards keep-alives.
-- Cancel (`CTAPHID_CANCEL`) and timeouts are the `ReportDevice`'s business today.
+- Further CTAP2 commands on the same `Transport` (getAssertion / makeCredential): the reference clients (python-fido2, libfido2) have them. NOT REACHED (budget).
+

@@ -236,6 +236,22 @@ pub const max_keepalives = 100_000;
 /// `ReportDevice` does not time out.
 pub const max_foreign_packets = 100_000;
 
+/// CTAPHID_KEEPALIVE status byte (§11.2.9.1.3): what the authenticator is waiting for or doing.
+pub const KeepaliveStatus = enum(u8) {
+    /// The authenticator is still processing the current request.
+    processing = 1,
+    /// The authenticator is waiting for user presence (a touch): a UI should prompt for it.
+    user_presence_needed = 2,
+    _,
+};
+
+/// Called, on the calling thread, for each keep-alive of the running transaction. The handler may call
+/// `Channel.cancel` to abandon the request.
+pub const KeepaliveHandler = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, status: KeepaliveStatus) void,
+};
+
 /// One CTAPHID channel: `transact` runs a CTAPHID_CBOR exchange and can be
 /// wrapped as a `framing.Transport`.
 pub const Channel = struct {
@@ -243,6 +259,19 @@ pub const Channel = struct {
     cid: u32,
     /// Set when the last transaction ended with a CTAPHID_ERROR response.
     last_hid_error: ?HidError = null,
+    /// Told about each keep-alive (for a "touch your key" prompt); null ignores them. Keep-alives still count
+    /// against `max_keepalives`.
+    on_keepalive: ?KeepaliveHandler = null,
+
+    /// Send CTAPHID_CANCEL (§11.2.9.1.4) on this channel: the authenticator abandons the running request and
+    /// answers it with CTAP2_ERR_KEEPALIVE_CANCEL (0x2D), which the pending `transact` then returns as its
+    /// response. There is no response to CANCEL itself, so nothing is read. Call it from `on_keepalive`, or from
+    /// another thread than the one blocked in `transact` (the `ReportDevice` must allow a concurrent write).
+    pub fn cancel(self: *Channel) framing.TransportError!void {
+        var enc = Encoder.init(self.cid, .cancel, &.{}) catch return error.TransportFailed;
+        var pkt: Packet = undefined;
+        while (enc.next(&pkt)) try self.dev.writeFn(self.dev.ctx, &pkt);
+    }
 
     /// Allocate a channel: CTAPHID_INIT on the broadcast CID with a caller-chosen
     /// nonce (use fresh randomness).
@@ -291,6 +320,7 @@ pub const Channel = struct {
                     .keepalive => {
                         keepalives += 1;
                         if (keepalives > max_keepalives) return error.TransportFailed;
+                        if (self.on_keepalive) |h| if (m.payload.len >= 1) h.func(h.ctx, @fromBackingInt(@intCast(m.payload[0])));
                     },
                     .@"error" => {
                         self.last_hid_error = if (m.payload.len >= 1) @fromBackingInt(@intCast(m.payload[0])) else .other;
@@ -482,6 +512,7 @@ const FakeHid = struct {
     queue: std.ArrayList(Packet) = .empty,
     inject_error: ?u8 = null,
     caps: u8 = 0x04,
+    cancels: usize = 0,
 
     fn dev(self: *FakeHid) ReportDevice {
         return .{ .ctx = self, .writeFn = write, .readFn = read };
@@ -530,6 +561,7 @@ const FakeHid = struct {
                 @memcpy(out[1..], m.payload[1..]);
                 try self.push(m.cid, .cbor, out);
             },
+            .cancel => self.cancels += 1, // CANCEL has no response
             else => try self.push(m.cid, .@"error", &.{0x01}),
         }
     }
@@ -969,4 +1001,28 @@ fn fuzzHid(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         if (ch.last_hid_error != null) HidMark.mark(.channel_hid_error) else if (damage_at != null) HidMark.mark(.channel_refused);
         if (damage_at == null and !hid_err) return error.GenuineExchangeFailed;
     }
+}
+
+test "Channel: keep-alive statuses reach the handler in order; cancel is one CANCEL message and reads nothing" {
+    const a = testing.allocator;
+    var fake: FakeHid = .{ .a = a };
+    defer fake.queue.deinit(a);
+    var ch = try Channel.open(fake.dev(), .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const Probe = struct {
+        seen: [4]u8 = undefined,
+        n: usize = 0,
+        ch: *Channel,
+        fn on(ctx: *anyopaque, st: KeepaliveStatus) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen[self.n] = @backingInt(st);
+            self.n += 1;
+            if (st == .user_presence_needed) self.ch.cancel() catch unreachable;
+        }
+    };
+    var probe: Probe = .{ .ch = &ch };
+    ch.on_keepalive = .{ .ctx = &probe, .func = Probe.on };
+    var resp: [32]u8 = undefined;
+    _ = try ch.transact(&.{ 0x04, 0xa0 }, &resp);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, probe.seen[0..probe.n]);
+    try testing.expectEqual(@as(usize, 1), fake.cancels);
 }
