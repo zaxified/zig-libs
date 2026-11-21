@@ -38,10 +38,10 @@ techniques.
 | `report(u, ok, rtt)` | passive health: feeds the breaker, frees the slot, folds latency/EWMA | — |
 | `healthTick(now)` | active health: mark up/down + breaker recovery probe, at most once per interval | an injected `HealthChecker`, caller-supplied `now` |
 | `call(op, .{.max_tries})` | route + failover: pick → run → report → next healthy on failure | an op with `call(self, u: *Upstream) E!T` |
-| `pickByKey(key)` | `.ring_hash`: the key's ring owner, or the next admissible member on the ring | same admission as `pick()` |
+| `pickByKey(key)` | `.ring_hash` / `.maglev`: the key's owner, or the next admissible member after it | same admission as `pick()` |
 | `drain(u)` / `undrain(u)` | stop / resume routing new calls to `u`; calls in flight finish | — |
 | `remove(id)` / `reap()` | take a member out while serving (its keys alone move on the ring); free removed members once nothing is in flight on them | `reap` from the owner that stopped handing out their pointers |
-| `ringOwner(key)` | `.ring_hash`: the member that owns `key` on the ring, admissible or not (tests, routing decided elsewhere) | — |
+| `ringOwner(key)` | `.ring_hash` / `.maglev`: the member that owns `key` on the ring or table, admissible or not (tests, routing decided elsewhere) | — |
 | `upstreamStats(u)` / `stats()` | health, draining, breaker state, in-flight, picks, failures, latency min/avg/max; retired count | — |
 
 ## Strategies
@@ -57,6 +57,7 @@ techniques.
   never-measured upstreams score 0 and get tried first (warm-up).
 - `least_request` — power of two choices (Envoy's default least-request):
   two distinct random healthy members, the one with fewer in flight wins.
+- `maglev` — Maglev table (Envoy `MAGLEV`): O(1) key lookup, weighted turns, `maglev_table_size` (prime).
 - `ring_hash` — consistent hashing (Envoy `RING_HASH`, nginx `hash …
   consistent`): `weight × ring_points_per_weight` (160) points per member,
   `XxHash64(id ++ "-" ++ j)`; `pickByKey(key)` takes the first point at or
@@ -149,5 +150,11 @@ membership churn against a model, and a multi-thread `call()` hammer. See SPEC *
 
 ## Not provided
 
-Slow start, success-rate outlier ejection, Maglev, priorities/locality, service discovery (DNS resolution
-belongs to `dns`): see SPEC *What is deliberately not done* and *Backlog / deferred*.
+Locality-aware balancing and service discovery (DNS resolution belongs to `dns`): see SPEC *What is deliberately
+not done*.
+
+## Slow start, outlier ejection, priorities
+
+`Options.slow_start` and `Options.outlier` are driven by `pool.tick(now_ns)` (your clock, as for `healthTick`);
+`UpstreamSpec.priority` makes a member a failover level (nginx `backup`). Details: SPEC *Time-driven weights,
+ejection, priorities*.

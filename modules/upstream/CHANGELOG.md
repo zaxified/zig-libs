@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **FEATURE (source-breaking for an exhaustive `switch` over `Strategy`):** `Strategy.maglev` (Maglev table, `Options.maglev_table_size`), `Options.slow_start` and `Options.outlier` with `Pool.tick(now_ns)`, `UpstreamSpec.priority` (failover levels, every strategy), `UpstreamStats.ejected`, `SlowStart` and `Outlier` types. `pickByKey` and `ringOwner` serve `.maglev` as well; an ejected member is not `healthy`. Defaults unchanged.
 - **2026-10-18** — Zig 0.17.0: `@hasDecl` sees only `pub` declarations, so the operation type passed to `Pool.call` must declare `pub fn call` (a non-`pub` one is now reported as "has no call() method" at compile time). No code change.
 - **2026-10-04** — **mvp → core.** Membership changes while serving: `remove(id)`
   (drains, leaves the list and the ring, stays valid for calls in flight),

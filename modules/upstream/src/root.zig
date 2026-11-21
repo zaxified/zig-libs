@@ -138,6 +138,50 @@ pub const Strategy = enum {
     /// ring. `pick()` without a key hashes a PRNG draw (Envoy's behaviour
     /// for a request without a hash key).
     ring_hash,
+    /// Maglev consistent hashing (Envoy `MAGLEV`, Google's Maglev paper): a
+    /// lookup table of `Options.maglev_table_size` entries (a prime) filled
+    /// by each member's own permutation of the slots, `weight` turns per
+    /// round for a heavier member. `pickByKey(key)` reads
+    /// `table[XxHash64(key) % size]` (O(1), against the ring's binary
+    /// search); a key whose owner is not admissible walks on along the table
+    /// to the next distinct admissible member. Removing a member moves
+    /// close to only its own share of the keys, though a few more than on the
+    /// ring. `pick()` without a key hashes a PRNG draw, as `.ring_hash` does.
+    maglev,
+};
+
+/// Slow start (Envoy `slow_start_config`): a member that is new, or has just
+/// come back from an active-health failure, is weighted up gradually
+/// instead of taking its full share at once. Only `.weighted_round_robin`
+/// consults weights, so only it ramps. Driven by `Pool.tick(now_ns)`, the
+/// caller's clock, like `healthTick`.
+pub const SlowStart = struct {
+    /// Time to reach the full weight.
+    window_ns: u64,
+    /// Envoy's `aggression`: the weight grows as `(age / window) ^ (1 /
+    /// aggression)`; 1.0 is linear, above 1 ramps up faster at the start.
+    aggression: f64 = 1.0,
+    /// The weight a member starts with, in percent of its own (Envoy
+    /// `min_weight_percent`, default 10).
+    min_weight_percent: u8 = 10,
+};
+
+/// Success-rate outlier ejection (Envoy `outlier_detection`, the
+/// `success_rate` detector): every `interval_ns` the members that took at
+/// least `request_volume` reports in the window are compared; one whose
+/// success rate is more than `stdev_factor` standard deviations below the
+/// mean is ejected for `base_ejection_ns` times the number of times it has
+/// been ejected. At most `max_ejection_percent` of the members (and always
+/// at least one) are ejected at a time, and the detector does nothing with
+/// fewer than `minimum_hosts` qualifying members. Consecutive failures are
+/// the breaker's. Driven by `Pool.tick(now_ns)`.
+pub const Outlier = struct {
+    interval_ns: u64 = 10 * std.time.ns_per_s,
+    base_ejection_ns: u64 = 30 * std.time.ns_per_s,
+    max_ejection_percent: u8 = 10,
+    request_volume: u32 = 100,
+    minimum_hosts: u32 = 5,
+    stdev_factor: f64 = 1.9,
 };
 
 /// One member of the fleet. Created by `Pool.add`; stable address for the
@@ -180,6 +224,22 @@ pub const Upstream = struct {
     lat_max_ns: u64 = 0,
     ewma_ns: f64 = 0,
     wrr_current: i64 = 0,
+    /// Failover level (`UpstreamSpec.priority`).
+    priority: u8 = 0,
+    /// The weight `.weighted_round_robin` uses while `Options.slow_start` is
+    /// set, in thousandths of `weight`; `Pool.tick` ramps it. Pool lock.
+    eff_weight: u64 = 0,
+    /// When the slow-start ramp began (the tick that first saw the member, or
+    /// saw it recover); null = begin at the next tick. Pool lock.
+    born_ns: ?u64 = null,
+    /// Reports in the current outlier window (`Options.outlier`).
+    win_total: std.atomic.Value(u32) = .init(0),
+    win_ok: std.atomic.Value(u32) = .init(0),
+    /// Ejected by the outlier detector: `pick` skips it until its time is up.
+    ejected: std.atomic.Value(bool) = .init(false),
+    eject_until_ns: u64 = 0,
+    /// Times ejected, less one for every interval it then passed clean.
+    ejections: u32 = 0,
 };
 
 /// What `Pool.add` takes. `id` must be unique in the pool; `address` is
@@ -190,6 +250,10 @@ pub const UpstreamSpec = struct {
     id: []const u8,
     address: []const u8,
     weight: u32 = 1,
+    /// Failover level: members of a lower level take every pick while one of
+    /// them is admissible; a higher level (nginx `backup`, Envoy priority) only
+    /// when none is. Applies to every strategy.
+    priority: u8 = 0,
 };
 
 // ── active health seam ──────────────────────────────────────────────────────
@@ -269,6 +333,14 @@ pub const Options = struct {
     ring_points_per_weight: u32 = 160,
     /// `.ring_hash`: hard bound on the ring's size (16 bytes a point).
     max_ring_points: usize = 1 << 20,
+    /// `.maglev`: the table size, a prime (Envoy's default 65537); a larger
+    /// one spreads keys more evenly and costs 4 bytes a slot. Must be a prime
+    /// of at least 3 (`Pool.init` asserts).
+    maglev_table_size: u32 = 65537,
+    /// Weight ramp for new and recovered members; null (default) = none.
+    slow_start: ?SlowStart = null,
+    /// Success-rate outlier ejection; null (default) = none.
+    outlier: ?Outlier = null,
 };
 
 // ── the pool ────────────────────────────────────────────────────────────────
@@ -324,9 +396,17 @@ pub const Pool = struct {
     ring: []RingPoint = &.{},
     /// A `healthTick` is running its checks (outside the lock).
     health_busy: bool = false,
+    /// `.maglev`: the lookup table, member indexes into `upstreams`.
+    maglev: []u32 = &.{},
+    /// Some member has a non-zero priority.
+    any_priority: bool = false,
+    /// Start of the current outlier window (the first tick's time until then).
+    window_start_ns: ?u64 = null,
 
     pub fn init(gpa: Allocator, options: Options) Pool {
         std.debug.assert(options.ewma_alpha > 0 and options.ewma_alpha <= 1);
+        std.debug.assert(options.strategy != .maglev or isPrime(options.maglev_table_size));
+        if (options.slow_start) |ss| std.debug.assert(ss.aggression > 0 and ss.min_weight_percent <= 100);
         return .{
             .gpa = gpa,
             .options = options,
@@ -342,6 +422,7 @@ pub const Pool = struct {
         pool.retired.deinit(pool.gpa);
         pool.gpa.free(pool.scratch);
         pool.gpa.free(pool.ring);
+        pool.gpa.free(pool.maglev);
         pool.* = undefined;
     }
 
@@ -365,6 +446,8 @@ pub const Pool = struct {
             .id = spec.id,
             .address = target,
             .weight = @max(1, spec.weight),
+            .priority = spec.priority,
+            .eff_weight = if (pool.options.slow_start) |ss| scaledWeight(@max(1, spec.weight), ss, 0) else 0,
             .breaker = .init(pool.options.breaker),
             .bulkhead = if (pool.options.max_per_upstream != 0)
                 resilience.Bulkhead.init(.{ .max_concurrent = pool.options.max_per_upstream })
@@ -375,6 +458,7 @@ pub const Pool = struct {
         errdefer _ = pool.upstreams.pop();
         if (pool.scratch.len < pool.upstreams.items.len)
             pool.scratch = try pool.gpa.realloc(pool.scratch, pool.upstreams.items.len);
+        pool.any_priority = pool.any_priority or spec.priority != 0;
         try pool.rebuildRingLocked();
         return u;
     }
@@ -418,9 +502,13 @@ pub const Pool = struct {
         if (pool.rr_cursor >= pool.upstreams.items.len) pool.rr_cursor = 0;
         // A smaller ring never needs more memory; on the impossible failure
         // the old ring is dropped and `.ring_hash` picks see an empty ring.
+        pool.any_priority = false;
+        for (pool.upstreams.items) |m| pool.any_priority = pool.any_priority or m.priority != 0;
         pool.rebuildRingLocked() catch {
             pool.gpa.free(pool.ring);
             pool.ring = &.{};
+            pool.gpa.free(pool.maglev);
+            pool.maglev = &.{};
         };
         return true;
     }
@@ -479,6 +567,7 @@ pub const Pool = struct {
     // ── consistent-hash ring ────────────────────────────────────────────
 
     fn rebuildRingLocked(pool: *Pool) error{OutOfMemory}!void {
+        if (pool.options.strategy == .maglev) return pool.rebuildMaglevLocked();
         if (pool.options.strategy != .ring_hash) return;
         const items = pool.upstreams.items;
         var total_weight: u64 = 0;
@@ -497,6 +586,53 @@ pub const Pool = struct {
         std.mem.sortUnstable(RingPoint, ring, {}, RingPoint.lessThan);
         pool.gpa.free(pool.ring);
         pool.ring = ring;
+    }
+
+    /// Fill the Maglev table (Eisenbud et al., NSDI 2016, §3.4): member `i` has
+    /// the permutation `(offset_i + j * skip_i) mod M` of the slots, from two
+    /// hashes of its id; the members take turns claiming their next free slot
+    /// until the table is full. A heavier member's turn comes up in proportion
+    /// to its weight (a credit of `weight` per round, one claim per
+    /// `max_weight` of credit, Envoy's weighted variant).
+    fn rebuildMaglevLocked(pool: *Pool) error{OutOfMemory}!void {
+        const items = pool.upstreams.items;
+        const m: usize = pool.options.maglev_table_size;
+        const table = try pool.gpa.alloc(u32, if (items.len == 0) 0 else m);
+        errdefer pool.gpa.free(table);
+        if (items.len != 0) {
+            const none = std.math.maxInt(u32);
+            @memset(table, none);
+            const next = try pool.gpa.alloc(u32, items.len);
+            defer pool.gpa.free(next);
+            const credit = try pool.gpa.alloc(u64, items.len);
+            defer pool.gpa.free(credit);
+            @memset(next, 0);
+            @memset(credit, 0);
+            var max_w: u64 = 1;
+            for (items) |u| max_w = @max(max_w, u.weight);
+            var filled: usize = 0;
+            while (filled < m) {
+                for (items, 0..) |u, i| {
+                    credit[i] += u.weight;
+                    while (credit[i] >= max_w and filled < m) {
+                        credit[i] -= max_w;
+                        const off = std.hash.XxHash64.hash(0, u.id) % m;
+                        const skip = std.hash.XxHash64.hash(1, u.id) % (m - 1) + 1;
+                        // The member's next permutation entry that is still free.
+                        var slot = (off + @as(u64, next[i]) * skip) % m;
+                        while (table[slot] != none) {
+                            next[i] += 1;
+                            slot = (off + @as(u64, next[i]) * skip) % m;
+                        }
+                        table[slot] = @intCast(i);
+                        next[i] += 1;
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        pool.gpa.free(pool.maglev);
+        pool.maglev = table;
     }
 
     /// Points of a member of `weight` in a fleet of `total_weight`:
@@ -518,10 +654,10 @@ pub const Pool = struct {
     /// for any other strategy this is `pick()`. Same admission contract as
     /// `pick`: a non-null result must be `report`ed exactly once.
     pub fn pickByKey(pool: *Pool, key: []const u8) ?*Upstream {
-        if (pool.options.strategy != .ring_hash) return pool.pick();
+        if (pool.options.strategy != .ring_hash and pool.options.strategy != .maglev) return pool.pick();
         lockSpin(&pool.lock);
         defer pool.lock.unlock();
-        return pool.pickRingLocked(std.hash.XxHash64.hash(0, key));
+        return pool.pickHashedLocked(std.hash.XxHash64.hash(0, key));
     }
 
     /// The member that owns `key` on the ring, admissible or not — for
@@ -530,12 +666,60 @@ pub const Pool = struct {
     pub fn ringOwner(pool: *Pool, key: []const u8) ?*Upstream {
         lockSpin(&pool.lock);
         defer pool.lock.unlock();
+        const h = std.hash.XxHash64.hash(0, key);
+        if (pool.options.strategy == .maglev) {
+            if (pool.maglev.len == 0) return null;
+            return pool.upstreams.items[pool.maglev[h % pool.maglev.len]];
+        }
         if (pool.ring.len == 0) return null;
-        const at = ringIndex(pool.ring, std.hash.XxHash64.hash(0, key));
+        const at = ringIndex(pool.ring, h);
         return pool.upstreams.items[pool.ring[at].idx];
     }
 
-    fn pickRingLocked(pool: *Pool, h: u64) ?*Upstream {
+    /// The ring or the Maglev table, per strategy, walked from `h` at one
+    /// priority level after the other.
+    fn pickHashedLocked(pool: *Pool, h: u64) ?*Upstream {
+        var level: u8 = 0;
+        while (true) {
+            const found = if (pool.options.strategy == .maglev) pool.pickMaglevLocked(h, level) else pool.pickRingLocked(h, level);
+            if (found) |u| return u;
+            level = pool.nextLevel(level) orelse return null;
+        }
+    }
+
+    /// The lowest priority above `level` any member has, null when none.
+    fn nextLevel(pool: *const Pool, level: u8) ?u8 {
+        if (!pool.any_priority) return null;
+        var best: ?u8 = null;
+        for (pool.upstreams.items) |u| {
+            if (u.priority > level and (best == null or u.priority < best.?)) best = u.priority;
+        }
+        return best;
+    }
+
+    fn pickMaglevLocked(pool: *Pool, h: u64, level: u8) ?*Upstream {
+        const table = pool.maglev;
+        if (table.len == 0) return null;
+        const items = pool.upstreams.items;
+        // As the ring walk: each distinct member is tried once; at most one lap.
+        var refused: usize = 0;
+        defer for (pool.scratch[0..refused]) |u| {
+            u.ring_refused = false;
+        };
+        const start: usize = @intCast(h % table.len);
+        var off: usize = 0;
+        while (off < table.len and refused < items.len) : (off += 1) {
+            const u = items[table[(start + off) % table.len]];
+            if (u.ring_refused) continue;
+            if (u.priority == level and admit(u)) return u;
+            u.ring_refused = true;
+            pool.scratch[refused] = u;
+            refused += 1;
+        }
+        return null;
+    }
+
+    fn pickRingLocked(pool: *Pool, h: u64, level: u8) ?*Upstream {
         const ring = pool.ring;
         if (ring.len == 0) return null;
         const items = pool.upstreams.items;
@@ -551,7 +735,7 @@ pub const Pool = struct {
         while (off < ring.len and refused < items.len) : (off += 1) {
             const u = items[ring[(start + off) % ring.len].idx];
             if (u.ring_refused) continue;
-            if (admit(u)) return u;
+            if (u.priority == level and admit(u)) return u;
             u.ring_refused = true;
             pool.scratch[refused] = u;
             refused += 1;
@@ -600,18 +784,26 @@ pub const Pool = struct {
     }
 
     fn pickLocked(pool: *Pool) ?*Upstream {
+        if (pool.upstreams.items.len == 0) return null;
+        if (pool.options.strategy == .ring_hash or pool.options.strategy == .maglev)
+            return pool.pickHashedLocked(pool.prng.random().int(u64));
+        var level: u8 = 0;
+        while (true) {
+            if (pool.pickLevelLocked(level)) |u| return u;
+            level = pool.nextLevel(level) orelse return null;
+        }
+    }
+
+    /// `pick` among the members of one priority level.
+    fn pickLevelLocked(pool: *Pool, level: u8) ?*Upstream {
         const items = pool.upstreams.items;
         const n = items.len;
-        if (n == 0) return null;
-
-        if (pool.options.strategy == .ring_hash)
-            return pool.pickRingLocked(pool.prng.random().int(u64));
 
         if (pool.options.strategy == .round_robin) {
             // Strict rotation: walk from the cursor, first admissible wins.
             for (0..n) |off| {
                 const i = (pool.rr_cursor + off) % n;
-                if (admit(items[i])) {
+                if (items[i].priority == level and admit(items[i])) {
                     pool.rr_cursor = (i + 1) % n;
                     return items[i];
                 }
@@ -624,7 +816,7 @@ pub const Pool = struct {
         // and re-select among the rest.
         var len: usize = 0;
         for (items) |u| {
-            if (u.down.load(.seq_cst) or u.draining.load(.seq_cst)) continue;
+            if (u.down.load(.seq_cst) or u.draining.load(.seq_cst) or u.priority != level) continue;
             pool.scratch[len] = u;
             len += 1;
         }
@@ -641,16 +833,18 @@ pub const Pool = struct {
     /// Strategy selection among `set` (non-empty, pool lock held).
     fn selectIndex(pool: *Pool, set: []*Upstream) usize {
         switch (pool.options.strategy) {
-            .round_robin, .ring_hash => unreachable, // handled inline in pickLocked
+            .round_robin, .ring_hash, .maglev => unreachable, // handled inline in pickLocked
             .random => return pool.prng.random().uintLessThan(usize, set.len),
             .weighted_round_robin => {
                 // Smooth WRR (nginx): everyone earns its weight, the
                 // richest is chosen and pays back the total.
                 var total: i64 = 0;
                 var best: usize = 0;
+                const ramp = pool.options.slow_start != null;
                 for (set, 0..) |c, i| {
-                    c.wrr_current += c.weight;
-                    total += c.weight;
+                    const w: i64 = if (ramp) @intCast(c.eff_weight) else c.weight;
+                    c.wrr_current += w;
+                    total += w;
                     if (c.wrr_current > set[best].wrr_current) best = i;
                 }
                 set[best].wrr_current -= total;
@@ -695,6 +889,10 @@ pub const Pool = struct {
             _ = u.failures.fetchAdd(1, .monotonic);
         }
         if (u.bulkhead) |*bh| bh.release();
+        if (pool.options.outlier != null) {
+            _ = u.win_total.fetchAdd(1, .monotonic);
+            if (ok) _ = u.win_ok.fetchAdd(1, .monotonic);
+        }
 
         if (rtt_ns) |rtt| {
             lockSpin(&pool.lock);
@@ -773,7 +971,13 @@ pub const Pool = struct {
         // Checks run outside the lock (the checker may do real I/O).
         for (snap) |u| {
             if (hc.check(u.address, pool.options.health_timeout_ns)) {
-                u.down.store(false, .seq_cst);
+                // A member that was down starts its slow-start ramp over.
+                if (u.down.swap(false, .seq_cst) and pool.options.slow_start != null) {
+                    lockSpin(&pool.lock);
+                    u.born_ns = null;
+                    u.eff_weight = scaledWeight(u.weight, pool.options.slow_start.?, 0);
+                    pool.lock.unlock();
+                }
                 if (u.breaker.state() != .closed) {
                     // Recovery probe: admissible only after the cooldown
                     // (allow() is a no-op false before that).
@@ -782,6 +986,79 @@ pub const Pool = struct {
             } else {
                 u.down.store(true, .seq_cst);
             }
+        }
+    }
+
+    // ── time-driven weighting and ejection ──────────────────────────────
+
+    /// Caller-driven time for slow start and outlier ejection (`now_ns` from
+    /// the caller's clock, as for `healthTick`; `pick` still reads no
+    /// clock). A no-op unless `Options.slow_start` or `Options.outlier` is
+    /// set. Call it as often as the resolution you want: every tick advances
+    /// the ramps and un-ejects members whose time is up, and the first tick
+    /// at or past `interval_ns` after the window began runs the detector.
+    pub fn tick(pool: *Pool, now_ns: u64) void {
+        lockSpin(&pool.lock);
+        defer pool.lock.unlock();
+        const items = pool.upstreams.items;
+        if (pool.options.slow_start) |ss| {
+            for (items) |u| {
+                const born = u.born_ns orelse blk: {
+                    u.born_ns = now_ns;
+                    break :blk now_ns;
+                };
+                u.eff_weight = scaledWeight(u.weight, ss, now_ns -| born);
+            }
+        }
+        const oc = pool.options.outlier orelse return;
+        for (items) |u| {
+            if (u.ejected.load(.seq_cst) and now_ns >= u.eject_until_ns) u.ejected.store(false, .seq_cst);
+        }
+        const start = pool.window_start_ns orelse {
+            pool.window_start_ns = now_ns;
+            return;
+        };
+        if (now_ns -| start < oc.interval_ns) return;
+        pool.window_start_ns = now_ns;
+        // Success rates of the members with enough reports.
+        var n: u32 = 0;
+        var sum: f64 = 0;
+        for (items) |u| {
+            const total = u.win_total.load(.monotonic);
+            if (total >= oc.request_volume and total != 0) {
+                sum += rate(u);
+                n += 1;
+            }
+        }
+        if (n >= oc.minimum_hosts and n > 0) {
+            const mean = sum / @as(f64, @floatFromInt(n));
+            var var_sum: f64 = 0;
+            for (items) |u| {
+                const total = u.win_total.load(.monotonic);
+                if (total >= oc.request_volume and total != 0) var_sum += (rate(u) - mean) * (rate(u) - mean);
+            }
+            const stdev = @sqrt(var_sum / @as(f64, @floatFromInt(n)));
+            const threshold = mean - oc.stdev_factor * stdev;
+            var ejected_now: usize = 0;
+            for (items) |u| if (u.ejected.load(.seq_cst)) {
+                ejected_now += 1;
+            };
+            const cap = @max(1, items.len * oc.max_ejection_percent / 100);
+            for (items) |u| {
+                const total = u.win_total.load(.monotonic);
+                if (total < oc.request_volume or total == 0 or u.ejected.load(.seq_cst)) continue;
+                if (rate(u) >= threshold or ejected_now >= cap) continue;
+                u.ejections += 1;
+                u.eject_until_ns = now_ns +| oc.base_ejection_ns *| u.ejections;
+                u.ejected.store(true, .seq_cst);
+                ejected_now += 1;
+            }
+        }
+        for (items) |u| {
+            // A member that was not ejected this window earns back one ejection.
+            if (!u.ejected.load(.seq_cst) and u.ejections > 0) u.ejections -= 1;
+            u.win_total.store(0, .monotonic);
+            u.win_ok.store(0, .monotonic);
         }
     }
 
@@ -827,8 +1104,9 @@ pub const Pool = struct {
         defer pool.lock.unlock();
         return .{
             .id = u.id,
-            .healthy = !u.down.load(.seq_cst) and !u.draining.load(.seq_cst) and breaker_state != .open,
+            .healthy = !u.down.load(.seq_cst) and !u.draining.load(.seq_cst) and !u.ejected.load(.seq_cst) and breaker_state != .open,
             .draining = u.draining.load(.seq_cst),
+            .ejected = u.ejected.load(.seq_cst),
             .breaker_state = breaker_state,
             .in_flight = u.in_flight.load(.seq_cst),
             .picks = u.picks.load(.seq_cst),
@@ -848,7 +1126,7 @@ pub const Pool = struct {
         defer pool.lock.unlock();
         var s: PoolStats = .{ .upstreams = pool.upstreams.items.len, .retired = pool.retired.items.len };
         for (pool.upstreams.items) |u| {
-            if (!u.down.load(.seq_cst) and !u.draining.load(.seq_cst) and u.breaker.state() != .open) s.healthy += 1;
+            if (!u.down.load(.seq_cst) and !u.draining.load(.seq_cst) and !u.ejected.load(.seq_cst) and u.breaker.state() != .open) s.healthy += 1;
             s.in_flight += u.in_flight.load(.seq_cst);
             s.picks += u.picks.load(.seq_cst);
             s.failures += u.failures.load(.seq_cst);
@@ -857,11 +1135,34 @@ pub const Pool = struct {
     }
 };
 
+fn rate(u: *const Upstream) f64 {
+    return @as(f64, @floatFromInt(u.win_ok.load(.monotonic))) / @as(f64, @floatFromInt(u.win_total.load(.monotonic)));
+}
+
+/// `weight` after `age_ns` of slow start, in thousandths (Envoy: the weight
+/// times `max(min_weight_percent, (age / window) ^ (1 / aggression))`, at
+/// most the weight itself); never below 1.
+fn scaledWeight(weight: u32, ss: SlowStart, age_ns: u64) u64 {
+    const frac: f64 = if (ss.window_ns == 0 or age_ns >= ss.window_ns)
+        1.0
+    else
+        std.math.pow(f64, @as(f64, @floatFromInt(@max(age_ns, 1))) / @as(f64, @floatFromInt(ss.window_ns)), 1.0 / ss.aggression);
+    const f = @min(1.0, @max(@as(f64, @floatFromInt(ss.min_weight_percent)) / 100.0, frac));
+    return @max(1, @as(u64, @intFromFloat(@as(f64, @floatFromInt(weight)) * 1000.0 * f)));
+}
+
+fn isPrime(n: u32) bool {
+    if (n < 3 or n % 2 == 0) return n == 2;
+    var d: u32 = 3;
+    while (@as(u64, d) * d <= n) : (d += 2) if (n % d == 0) return false;
+    return true;
+}
+
 /// Full admission of one candidate (bulkhead slot first — an unpaired
 /// breaker admission would leak a half-open probe slot, an unpaired
 /// bulkhead slot is returned on the spot).
 fn admit(u: *Upstream) bool {
-    if (u.down.load(.seq_cst) or u.draining.load(.seq_cst)) return false;
+    if (u.down.load(.seq_cst) or u.draining.load(.seq_cst) or u.ejected.load(.seq_cst)) return false;
     if (u.bulkhead) |*bh| {
         if (!bh.tryAcquire()) return false; // bulkhead full → skip
     }
@@ -881,6 +1182,8 @@ pub const UpstreamStats = struct {
     healthy: bool,
     /// Drained or removed (`Pool.drain`, `Pool.remove`).
     draining: bool = false,
+    /// Ejected by the outlier detector and not yet back.
+    ejected: bool = false,
     breaker_state: resilience.CircuitBreaker.State,
     in_flight: u32,
     picks: u64,
@@ -2055,4 +2358,295 @@ test "healthTick: a tick started from inside a running tick's check is a no-op" 
     try addThree(&pool);
     pool.healthTick(1);
     try testing.expectEqual(3, n.calls);
+}
+
+// ── priorities, Maglev, slow start, outlier ejection ────────────────────────
+
+fn keyOf(buf: *[16]u8, i: usize) []const u8 {
+    return std.mem.print(buf, "key-{d}", .{i}) catch unreachable;
+}
+
+test "priority: a higher level takes picks only while every member of the lower level is out, in every strategy" {
+    inline for (@typeInfo(Strategy).@"enum".field_names) |name| {
+        const strategy = @field(Strategy, name);
+        var pool: Pool = .init(testing.allocator, .{ .strategy = strategy, .seed = 7 });
+        defer pool.deinit();
+        const a = try pool.add(.{ .id = "a", .address = "10.0.0.1:80" });
+        const b = try pool.add(.{ .id = "b", .address = "10.0.0.2:80" });
+        const spare = try pool.add(.{ .id = "spare", .address = "10.0.0.9:80", .priority = 1 });
+        const last = try pool.add(.{ .id = "last", .address = "10.0.0.10:80", .priority = 5 });
+        var buf: [16]u8 = undefined;
+        for (0..200) |i| {
+            const u = pool.pickByKey(keyOf(&buf, i)).?;
+            try testing.expect(u == a or u == b);
+            pool.report(u, true, null);
+        }
+        a.down.store(true, .seq_cst);
+        for (0..50) |i| {
+            const u = pool.pickByKey(keyOf(&buf, i)).?;
+            try testing.expect(u == b);
+            pool.report(u, true, null);
+        }
+        b.draining.store(true, .seq_cst);
+        for (0..50) |i| {
+            const u = pool.pickByKey(keyOf(&buf, i)).?;
+            try testing.expect(u == spare);
+            pool.report(u, true, null);
+        }
+        spare.down.store(true, .seq_cst);
+        for (0..50) |i| {
+            const u = pool.pickByKey(keyOf(&buf, i)).?;
+            try testing.expect(u == last);
+            pool.report(u, true, null);
+        }
+        // The lower level is back: it takes the picks again.
+        a.down.store(false, .seq_cst);
+        const u = pool.pickByKey("k").?;
+        try testing.expect(u == a);
+        pool.report(u, true, null);
+        last.down.store(true, .seq_cst);
+        a.down.store(true, .seq_cst);
+        try testing.expectEqual(null, pool.pickByKey("k"));
+    }
+}
+
+test "maglev: the table is full, deterministic, and every key has one owner" {
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .maglev, .maglev_table_size = 1009 });
+    defer pool.deinit();
+    try testing.expectEqual(null, pool.pickByKey("x")); // empty pool
+    try addThree(&pool);
+    try testing.expectEqual(@as(usize, 1009), pool.maglev.len);
+    var count = [_]usize{ 0, 0, 0 };
+    for (pool.maglev) |idx| count[idx] += 1;
+    // Maglev's balance guarantee: member shares differ by at most one slot.
+    try testing.expect(@max(count[0], count[1], count[2]) - @min(count[0], count[1], count[2]) <= 1);
+    var buf: [16]u8 = undefined;
+    for (0..500) |i| {
+        const key = keyOf(&buf, i);
+        const owner = pool.ringOwner(key).?;
+        const u = pool.pickByKey(key).?;
+        try testing.expect(owner == u);
+        pool.report(u, true, null);
+        try testing.expect(pool.ringOwner(key).? == owner);
+    }
+}
+
+test "maglev: 30000 keys split by weight 1:2:3, and a removal moves little else" {
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .maglev });
+    defer pool.deinit();
+    _ = try pool.add(.{ .id = "a", .address = "10.0.0.1:80", .weight = 1 });
+    _ = try pool.add(.{ .id = "b", .address = "10.0.0.2:80", .weight = 2 });
+    _ = try pool.add(.{ .id = "c", .address = "10.0.0.3:80", .weight = 3 });
+    var buf: [16]u8 = undefined;
+    var share = [_]usize{ 0, 0, 0 };
+    var before: [30000]u8 = undefined;
+    for (0..30000) |i| {
+        const id = pool.ringOwner(keyOf(&buf, i)).?.id[0];
+        before[i] = id;
+        share[id - 'a'] += 1;
+    }
+    // Expected 5000 / 10000 / 15000; the table is 65537 slots, so a percent of slack.
+    try testing.expect(share[0] > 4700 and share[0] < 5300);
+    try testing.expect(share[1] > 9700 and share[1] < 10300);
+    try testing.expect(share[2] > 14700 and share[2] < 15300);
+    try testing.expect(try pool.remove("b"));
+    var moved_from_kept: usize = 0;
+    for (0..30000) |i| {
+        const id = pool.ringOwner(keyOf(&buf, i)).?.id[0];
+        try testing.expect(id != 'b');
+        if (before[i] != 'b' and before[i] != id) moved_from_kept += 1;
+    }
+    // Keys of the surviving members rarely move (Maglev: close to none, not exactly none).
+    try testing.expect(moved_from_kept < 30000 / 10);
+}
+
+test "maglev: a down owner's keys walk on to another member, everyone else's stay" {
+    var pool: Pool = .init(testing.allocator, .{ .strategy = .maglev, .maglev_table_size = 1009 });
+    defer pool.deinit();
+    try addThree(&pool);
+    const b = pool.getById("b").?;
+    var buf: [16]u8 = undefined;
+    var owners: [300]*Upstream = undefined;
+    for (&owners, 0..) |*o, i| o.* = pool.ringOwner(keyOf(&buf, i)).?;
+    b.down.store(true, .seq_cst);
+    for (owners, 0..) |o, i| {
+        const u = pool.pickByKey(keyOf(&buf, i)).?;
+        try testing.expect(u != b);
+        if (o != b) try testing.expect(u == o);
+        pool.report(u, true, null);
+    }
+    b.down.store(false, .seq_cst);
+    try testing.expectEqual(null, blk: {
+        for (pool.upstreams.items) |u| u.down.store(true, .seq_cst);
+        break :blk pool.pickByKey("k");
+    });
+    // pick() without a key reaches every member.
+    for (pool.upstreams.items) |u| u.down.store(false, .seq_cst);
+    var seen = [_]bool{ false, false, false };
+    for (0..200) |_| {
+        const u = pool.pick().?;
+        seen[u.id[0] - 'a'] = true;
+        pool.report(u, true, null);
+    }
+    try testing.expect(seen[0] and seen[1] and seen[2]);
+}
+
+test "isPrime: the table size check" {
+    try testing.expect(isPrime(65537) and isPrime(1009) and isPrime(3) and isPrime(2));
+    try testing.expect(!isPrime(65536) and !isPrime(1) and !isPrime(9) and !isPrime(1001));
+}
+
+test "slow start: a new member ramps from min_weight_percent to its full share over the window" {
+    const s = std.time.ns_per_s;
+    var pool: Pool = .init(testing.allocator, .{
+        .strategy = .weighted_round_robin,
+        .slow_start = .{ .window_ns = 100 * s },
+    });
+    defer pool.deinit();
+    _ = try pool.add(.{ .id = "a", .address = "10.0.0.1:80" });
+    _ = try pool.add(.{ .id = "b", .address = "10.0.0.2:80" });
+    pool.tick(0);
+    pool.tick(100 * s); // both at full weight
+    try testing.expectEqual(@as(u64, 1000), pool.getById("a").?.eff_weight);
+    const c = try pool.add(.{ .id = "c", .address = "10.0.0.3:80" });
+    try testing.expectEqual(@as(u64, 100), c.eff_weight); // 10 % at once, before any tick
+    pool.tick(100 * s);
+    var hits = [_]usize{ 0, 0, 0 };
+    for (0..2100) |_| hits[pickReport(&pool).?.id[0] - 'a'] += 1;
+    try testing.expect(hits[2] > 80 and hits[2] < 120); // 100 / 2100 of the picks
+    pool.tick(150 * s); // half the window: weight 500
+    try testing.expectEqual(@as(u64, 500), c.eff_weight);
+    hits = .{ 0, 0, 0 };
+    for (0..2500) |_| hits[pickReport(&pool).?.id[0] - 'a'] += 1;
+    try testing.expect(hits[2] > 450 and hits[2] < 550);
+    pool.tick(200 * s);
+    try testing.expectEqual(@as(u64, 1000), c.eff_weight);
+    hits = .{ 0, 0, 0 };
+    for (0..3000) |_| hits[pickReport(&pool).?.id[0] - 'a'] += 1;
+    for (hits) |h| try testing.expect(h > 950 and h < 1050);
+}
+
+test "slow start: aggression, a heavier member, and a recovered member starting over" {
+    const s = std.time.ns_per_s;
+    const ss: SlowStart = .{ .window_ns = 100 * s, .aggression = 2.0, .min_weight_percent = 5 };
+    // (0.25)^(1/2) = 0.5 of a weight of 4 -> 2000; the floor at age 0 is 5 % of 4000.
+    try testing.expectEqual(@as(u64, 2000), scaledWeight(4, ss, 25 * s));
+    try testing.expectEqual(@as(u64, 200), scaledWeight(4, ss, 0));
+    try testing.expectEqual(@as(u64, 4000), scaledWeight(4, ss, 100 * s));
+    try testing.expectEqual(@as(u64, 4000), scaledWeight(4, ss, 1000 * s));
+    try testing.expectEqual(@as(u64, 1), scaledWeight(1, .{ .window_ns = 1_000_000, .min_weight_percent = 0 }, 0)); // never 0
+
+    var entries = [_]FakeChecker.Entry{.{ .host = "10.0.0.1", .up = true }};
+    var fake: FakeChecker = .{ .entries = &entries };
+    var pool: Pool = .init(testing.allocator, .{
+        .strategy = .weighted_round_robin,
+        .slow_start = .{ .window_ns = 100 * s },
+        .health_checker = fake.healthChecker(),
+        .health_interval_ns = 0,
+    });
+    defer pool.deinit();
+    const a = try pool.add(.{ .id = "a", .address = "10.0.0.1:80" });
+    pool.tick(0);
+    pool.tick(100 * s);
+    try testing.expectEqual(@as(u64, 1000), a.eff_weight);
+    fake.set("10.0.0.1", false);
+    pool.healthTick(101 * s);
+    try testing.expect(a.down.load(.seq_cst));
+    fake.set("10.0.0.1", true);
+    pool.healthTick(102 * s); // back up: the ramp starts over
+    try testing.expectEqual(@as(u64, 100), a.eff_weight);
+    pool.tick(102 * s);
+    pool.tick(152 * s);
+    try testing.expectEqual(@as(u64, 500), a.eff_weight);
+}
+
+fn outlierRound(pool: *Pool, bad_every: usize, rounds: usize) void {
+    var n: usize = 0;
+    for (0..rounds) |_| {
+        const u = pool.pick() orelse continue;
+        n += 1;
+        pool.report(u, !(u.id[0] == 'x' and n % bad_every == 0), null);
+    }
+}
+
+test "outlier: a member whose success rate is far below the others is ejected, then comes back" {
+    const s = std.time.ns_per_s;
+    var pool: Pool = .init(testing.allocator, .{
+        .outlier = .{ .interval_ns = 10 * s, .base_ejection_ns = 30 * s, .request_volume = 50, .minimum_hosts = 5 },
+        .breaker = .{ .failure_threshold = 1000 },
+    });
+    defer pool.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "x" }, 0..) |id, i| {
+        var abuf: [16]u8 = undefined;
+        _ = try pool.add(.{ .id = id, .address = std.mem.print(&abuf, "10.0.0.{d}:80", .{i + 1}) catch unreachable });
+    }
+    const x = pool.getById("x").?;
+    pool.tick(0); // window opens
+    // Round robin: every member gets 100 reports; x fails every second one.
+    var buf: [16]u8 = undefined;
+    _ = &buf;
+    for (0..600) |i| {
+        const u = pool.pick().?;
+        pool.report(u, !(u == x and (i / 6) % 2 == 0), null);
+    }
+    pool.tick(5 * s);
+    try testing.expect(!x.ejected.load(.seq_cst)); // the window is not over
+    pool.tick(10 * s);
+    try testing.expect(x.ejected.load(.seq_cst));
+    for (pool.upstreams.items) |u| if (u != x) try testing.expect(!u.ejected.load(.seq_cst));
+    try testing.expect(!pool.upstreamStats(x).healthy);
+    for (0..60) |_| try testing.expect(pickReport(&pool).? != x);
+    pool.tick(39 * s);
+    try testing.expect(x.ejected.load(.seq_cst));
+    pool.tick(40 * s); // 10 s + 30 s
+    try testing.expect(!x.ejected.load(.seq_cst));
+    // Healthy again and the window empty: nothing is ejected on a clean round.
+    for (0..600) |_| _ = pickReport(&pool);
+    pool.tick(50 * s);
+    for (pool.upstreams.items) |u| try testing.expect(!u.ejected.load(.seq_cst));
+}
+
+test "outlier: too few qualifying members, the ejection cap, and the base time scaling with repeats" {
+    const s = std.time.ns_per_s;
+    // Four members only, minimum_hosts 5: never ejects.
+    var small: Pool = .init(testing.allocator, .{ .outlier = .{ .interval_ns = 10 * s, .request_volume = 10, .minimum_hosts = 5 }, .breaker = .{ .failure_threshold = 1000 } });
+    defer small.deinit();
+    try addThree(&small);
+    _ = try small.add(.{ .id = "x", .address = "10.0.0.4:80" });
+    small.tick(0);
+    for (0..400) |_| {
+        const u = small.pick().?;
+        small.report(u, u.id[0] != 'x', null);
+    }
+    small.tick(10 * s);
+    for (small.upstreams.items) |u| try testing.expect(!u.ejected.load(.seq_cst));
+
+    // Ten members, two bad, max_ejection_percent 10 -> one ejected at a time.
+    var pool: Pool = .init(testing.allocator, .{
+        .outlier = .{ .interval_ns = 10 * s, .base_ejection_ns = 20 * s, .request_volume = 10, .minimum_hosts = 5, .max_ejection_percent = 10 },
+        .breaker = .{ .failure_threshold = 1000 },
+    });
+    defer pool.deinit();
+    for (0..10) |i| {
+        var ids: [10][2]u8 = undefined;
+        ids[i] = .{ if (i < 2) 'x' else 'g', @intCast('0' + i) };
+        var abuf: [16]u8 = undefined;
+        _ = try pool.add(.{ .id = std.heap.page_allocator.dupe(u8, &ids[i]) catch unreachable, .address = std.mem.print(&abuf, "10.0.0.{d}:80", .{i + 1}) catch unreachable });
+    }
+    defer for (pool.upstreams.items) |u| std.heap.page_allocator.free(u.id);
+    pool.tick(0);
+    for (0..2000) |_| {
+        const u = pool.pick().?;
+        pool.report(u, u.id[0] != 'x', null);
+    }
+    pool.tick(10 * s);
+    var ejected: usize = 0;
+    var which: ?*Upstream = null;
+    for (pool.upstreams.items) |u| if (u.ejected.load(.seq_cst)) {
+        ejected += 1;
+        which = u;
+    };
+    try testing.expectEqual(@as(usize, 1), ejected);
+    try testing.expectEqual(@as(u64, 30 * s), which.?.eject_until_ns); // 10 s + 20 s x 1
+    try testing.expectEqual(@as(u32, 1), which.?.ejections);
 }

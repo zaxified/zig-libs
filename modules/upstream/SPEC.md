@@ -40,8 +40,7 @@ Zig `std` has no load balancer.
 **Where we are ahead:** the only reusable Zig upstream-pool library found; passive (breaker)
 and active (`healthTick`) health kept orthogonal, bulkhead per upstream, pick-as-full-admission
 with a `PickGuard`, deterministic virtual-clock tests, no ambient clock or entropy.
-**Where we are behind:** no slow start and no success-rate outlier
-ejection (Envoy), no Maglev table, no priorities/locality, no service discovery (→ *Backlog / deferred*; DNS
+**Where we are behind:** no locality-aware balancing, no service discovery (→ *What is deliberately not done*; DNS
 resolution belongs to `dns`). Runtime add/remove/drain with safe
 retirement, consistent hashing on a ring (`ring_hash`, `pickByKey`) and power-of-two-choices
 (`least_request`) exist.
@@ -57,11 +56,11 @@ the breaker only (`failure_threshold` consecutive failures trip it, `pick` skips
 admits a probe); `healthTick(now_ns)` is caller-driven and separate — a failing check sets a down mark
 (skipped regardless of breaker state), a passing check clears the mark and doubles as the breaker's
 recovery probe, walking `open → half_open → closed` across ticks without risking a live request.
-Seven strategies (`Strategy` enum; the last two are described under "Ring hash" below): `round_robin` (default, strict rotation), `random` (uniform,
+Eight strategies (`Strategy` enum; the last two are described under "Ring hash" and "Time-driven weights, ejection, priorities" below): `round_robin` (default, strict rotation), `random` (uniform,
 seeded `std.Random` from `Options.seed` — no ambient entropy), `weighted_round_robin` (smooth WRR,
 the nginx algorithm — each healthy upstream chosen exactly `weight` times per window of
 `sum(weights)`, interleaved not bursty), `least_connections` (fewest in-flight), `ewma_latency`
-(lowest EWMA of reported RTTs; never-measured upstreams score 0 and are tried first for warm-up), `least_request`, `ring_hash`. No
+(lowest EWMA of reported RTTs; never-measured upstreams score 0 and are tried first for warm-up), `least_request`, `ring_hash`, `maglev`. No
 hidden clock: `healthTick` is caller-driven; the breaker's clock is injected via
 `Options.breaker.clock`; the RTT stopwatch inside `call()` uses `Options.clock`. Concurrency:
 `pick`/`report`/`call`/`healthTick`/stats are internally synchronized (a pool spinlock for strategy
@@ -74,6 +73,27 @@ them: a per-upstream `resilience.CircuitBreaker` (passive health) and optional p
 `resilience.Bulkhead` (concurrency cap), plus `probe`'s `Connector` seam for active checks.
 Clean-room; design references Envoy/HAProxy upstream-cluster semantics and resilience4j's Bulkhead
 (behavior only) — see README Provenance.
+
+**Time-driven weights, ejection, priorities.** `pick` reads no clock: slow start and outlier ejection move with
+`Pool.tick(now_ns)`, called from the caller's loop like `healthTick`.
+- *Slow start* (`Options.slow_start`, Envoy `slow_start_config`): `.weighted_round_robin` weighs a member by
+  `weight × max(min_weight_percent, (age / window)^(1 / aggression))` (Envoy's formula, defaults 10 % and 1.0), in
+  thousandths so the smooth-WRR arithmetic stays integer. A member starts at the minimum on `add` and its age begins
+  at the next tick; one that `healthTick` brings back from down starts over. Other strategies do not consult weights.
+- *Outlier ejection* (`Options.outlier`, Envoy's `success_rate` detector): each `interval_ns` the members with at least
+  `request_volume` reports in the window are compared; one below `mean - stdev_factor × stdev` (population) is ejected
+  for `base_ejection_ns × times ejected`; at most `max_ejection_percent` of the members (at least one) are out at a
+  time, nothing happens below `minimum_hosts` qualifying members, and a member that passes a window clean earns back
+  one ejection. `pick` skips an ejected member (`admit`); `UpstreamStats.ejected`, `healthy`. Consecutive failures stay
+  the breaker's, so the two are orthogonal.
+- *Priorities* (`UpstreamSpec.priority`; nginx `backup`, Envoy priority levels): every strategy first picks among the
+  lowest level and moves up only when no member of it is admissible. Strict failover; Envoy's overprovisioning
+  spill-over is not modelled.
+- *Maglev* (`Strategy.maglev`): Eisenbud et al. (NSDI 2016) §3.4 with Envoy's weighted turns; table size
+  `maglev_table_size` (a prime, default 65537), slots claimed along each member's `(offset + j × skip) mod M`
+  permutation from two `XxHash64` seeds of its id. Tests pin the balance (shares differ by one slot), weights 1:2:3
+  within a few percent, that a removal moves few keys of the survivors, and the walk past a down owner; there is no
+  external oracle for the exact table.
 
 **Membership while serving.** `add`, `remove`, `drain`/`undrain`, `reap`, `getById`,
 `count` and `stats` take the pool lock (`add`/`remove` allocate under it). `remove(id)` sets
@@ -133,17 +153,8 @@ responsibility, not this module's.
 ## What is deliberately not done
 
 - **Service discovery / DNS resolution** — belongs to `dns`; the pool takes `host:port` members.
-- **Slow start and success-rate outlier ejection are deferred, not refused** — see *Backlog / deferred*.
-
-## Backlog / deferred
-
-- **Slow start and outlier ejection beyond consecutive failures** (success-rate based; Envoy) — stop a fresh or
-  degraded member being hit at full weight. Both need time inside `pick` (this module reads no clock there; the
-  breaker and active health already eject on consecutive failures) and windowed statistics per member. Effort:
-  medium.
-- **Maglev** — the ring covers the use; Maglev trades rebuild cost for lookup speed, worth it only at fleet sizes
-  no consumer has.
-- **Priorities / locality** — no consumer.
+- **Locality / zone-aware balancing** (Envoy): nginx, HAProxy, traefik and tower have none; it needs per-member
+  locality metadata and panic thresholds. Failover between levels is `UpstreamSpec.priority`.
 
 ## Anchoring
 
