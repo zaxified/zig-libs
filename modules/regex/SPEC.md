@@ -67,8 +67,8 @@ DFA); `INV-([0-9]{4}-[0-9]{4})` find-all over 85 KiB 0.25–0.27 and dense `[A-Z
 (the backtracker's window); over 1 MiB of Czech/Greek/Cyrillic text (`\p{L}+`, `\b\w+\b`,
 `(?i)žluť\w*`, …) 0.05–0.32; short-string find and submatches 0.58–0.88; compile + submatch per
 call 0.39. **Where we are behind:** Nesting stops at 250 levels where Go goes further (CAPACITY, 1
-row). Bytes mode's `Matcher.find`/`captures` run on the VMs (behind the prefilter) only (Rust
-keeps its lazy DFA there).
+row). Bytes mode has a forward find DFA only: where threads of two starts meet, or under a
+Unicode word assertion past ASCII, the VMs find the start (Rust's hybrid DFA has a reverse pass).
 
 **Rust `regex` 1.13.1 and RE2, one by one** (survey 2026-10-28; every
 Rust row answered by the crate through `tools/rust_regex_oracle`): Rust's grammar → `Options{
@@ -196,6 +196,21 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   2 rounds; the bare engine's best above the prefiltered worst on every row): find-all `ABC` 425× (143× best/worst),
   `(?-u:\xff)[a-z]{3}` 42× (24×), `[XYZ][0-9]` (3,190 matches) 20× (10×), captures `Q([0-9]{2})-([0-9])` 52× (21×),
   `isMatch` `ABCDEFGHIJKLMNOPQRSTUVWXYZ$` 30× (8.7×); the same match counts.
+- **The bytes-mode find DFA** (`BytesFindDfa`; `Matcher.find`, the iterators and the span before `captures` in bytes
+  mode, programs ≤ 128 instructions, leftmost-first): a lazy DFA one byte per step whose state is the bytes-mode Pike
+  VM's list before its closures — in priority order, each thread `(pc, rem)` with the bytes it still waits inside a
+  UTF-8 sequence — plus the class of the byte before and whether a thread may still start. A step closes the entries in
+  order (a starting thread last), cuts everything after a match, and takes what `consumeBytes` gives, so the end it
+  reports is the VM's. Transitions are cached but over a valid lead byte (C2..F4); 256 states, emptied when full. The
+  start comes from the forward pass as `FindDfa.Track` reads it (where a thread began from an empty list, while no
+  later start joined); where starts met, the VMs search from that position (no thread was alive before it).
+  `captures` then runs the VMs anchored at the start. Under a Unicode word assertion it gives up at a byte past ASCII
+  it would step over or class a position by (the VMs answer). Made once the `Matcher` has read `dfa_after` bytes, as
+  `FindDfa`. Measured 2026-11-21 against the backtracker and the Pike VM it replaces (ReleaseFast, 1 MiB of printable
+  ASCII with 1 % `\xff`, find-all; A/B in one binary, best of 7, 2 rounds, same spans): `foo|bar|[XYZ]{2}` 3.5×
+  (2.3× old best / new worst), `[a-z]+[0-9]` 2.8× (2.1×), `\w+` 2.5× (1.8×), `[A-Z]+` 2.0× (1.5×), captures-all
+  `([A-Z])([0-9])` 1.8× (1.3×); `(?-u:\xff)[a-z]{3}` (prefilter-bound) 1.45× best/best, spread above the effect — no
+  claim.
 - **Backwards from the end** (`isMatch`): when every path to the match passes `\z`
   and not every one starts with `\A` (`Prefilter.end_anchored`), every match ends at the end of
   the text, so the lazy DFA runs from there towards the start (RE2's and Rust's reverse anchored
@@ -378,11 +393,6 @@ Consumer build options (CONVENTIONS §4.2), after Rust `regex-syntax`'s `unicode
 
 All open.
 
-- **`FindDfa` in bytes mode** — `isMatch`/`fullMatch` in bytes mode run the byte DFA and every bytes-mode engine has
-  the prefilter (above), but `Matcher.find`/`captures` (`Regex.vm_only`) still run the backtracker and the Pike VM
-  between the prefilter's candidates: a dense find-all pays the VM per match. `FindDfa` would need the byte DFA's
-  waiting threads (`[4]Set` by bytes still to wait) in its ordered lists, a raw-byte step beside its code-point and
-  mid-sequence ones, and a backward pass that reads a sequence from its last byte.
 - **Programs past `4 * max_insts`** (owner: no consumer setting may end in a panic or an OOM) — Go and Rust compile
   them; here `error.PatternTooLarge`, because `isMatch` has no allocator and a `Matcher` for 65,534 instructions x 64
   groups would be ~134 MiB. Taking them back needs matching in bounded memory for any size (a windowed or chunked state

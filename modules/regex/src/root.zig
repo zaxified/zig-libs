@@ -120,6 +120,10 @@ const Probe = enum {
     rune_wide,
     byte_dfa_skip,
     pike_bytes_skip,
+    bytes_find_step,
+    bytes_find_skip,
+    bytes_find_flush,
+    bytes_find_vm,
 };
 threadlocal var probe_counts: std.EnumArray(Probe, usize) = .initFill(0);
 
@@ -164,8 +168,9 @@ pub const Regex = struct {
     /// code point before (`Dfa.Ctx`) only then. Not a prefilter: it changes
     /// what a state is, not what the search may skip.
     asserts: bool = true,
-    /// Only the VMs run it (bytes mode, a `Set`'s program): the lazy DFAs,
-    /// the one-pass engine step aside.
+    /// The code-point DFAs and the one-pass engine step aside (bytes mode, a
+    /// `Set`'s program). Bytes mode has engines of its own: `isMatch`'s byte
+    /// DFA and `Matcher.find`'s `BytesFindDfa`, which read `bytes`.
     vm_only: bool = false,
     /// The program has an assertion only the Rust grammar writes (CRLF lines,
     /// Unicode or start/end word boundaries; not in bytes mode). The DFAs
@@ -842,6 +847,9 @@ pub const Regex = struct {
             if (skip and isEmptyKey(d.keys[s]) and pos < input.len) {
                 const p = re.prefilter.next(input, pos) orelse return false;
                 if (p != pos) {
+                    // The byte before the landing classes the position: past
+                    // ASCII under a Unicode word assertion, the set VM answers.
+                    if (re.ascii_dfa and input[p - 1] >= 0x80) return null;
                     probe(.byte_dfa_skip);
                     pos = p;
                     const ctx: Dfa.Ctx = .ofIf(re.asserts, if (input[p - 1] < 0x80) input[p - 1] else 0xfffd);
@@ -1681,6 +1689,218 @@ const RevDfa = struct {
 /// match among them cuts every later thread: the leftmost-first cut. Kept in
 /// the `Matcher` across calls, so a transition on an ASCII byte is worked out
 /// once per `Matcher`; a full table is emptied and refilled.
+/// `Matcher.find`'s lazy DFA in bytes mode, one step per byte (programs of
+/// up to `Dfa.max_insts` instructions, leftmost-first). A state is the
+/// bytes-mode Pike VM's list at a position before its closures — in priority
+/// order, each thread a `(pc, rem)` entry: `rem` bytes still to wait inside
+/// a UTF-8 sequence it took (`runOnBytesText`'s `List.rem`), 0 when its
+/// closure is taken here — plus the class of the byte before and whether a
+/// thread may still start (not after a match). A step closes the entries in
+/// order (the start's closure last), cuts everything after a match, and
+/// takes what `consumeBytes` gives, so its order is the VM's. Transitions
+/// over every byte but a valid lead byte (C2..F4, whose sequence depends on
+/// the bytes after it) are cached. The start comes from the forward pass as
+/// `FindDfa.Track` does it: the position where a thread began from an empty
+/// list, while no thread that began later joined; otherwise the VMs search
+/// from that position (no thread was alive before it). Under a Unicode word
+/// assertion it gives up at the first byte past ASCII (`error.GiveUp`).
+const BytesFindDfa = struct {
+    const max_states = 256;
+    /// `trans` flags; the next state + 1 is above them.
+    const f_matched: u16 = 1;
+    const f_began: u16 = 2;
+    const f_joined: u16 = 4;
+    const shift = 3;
+
+    const State = struct { off: u32, len: u16, ctx: Dfa.Ctx, restart: bool, hash: u32 };
+    /// The outcome of a search: the match's end, and where its leftmost
+    /// thread began (`clean`: the start; otherwise where the VMs search from).
+    const Found = struct { start: usize, end: usize, clean: bool };
+
+    gpa: std.mem.Allocator,
+    /// How many times the table was emptied (a row cached across one would
+    /// belong to another state).
+    flushes: u32 = 0,
+    states: std.ArrayList(State) = .empty,
+    trans: std.ArrayList([256]u16) = .empty,
+    /// The states' entries, one after another: `pc | rem << 8`.
+    ents: std.ArrayList(u16) = .empty,
+
+    fn deinit(d: *BytesFindDfa) void {
+        d.states.deinit(d.gpa);
+        d.trans.deinit(d.gpa);
+        d.ents.deinit(d.gpa);
+    }
+
+    fn ctxOf(re: *const Regex, b: ?u8) Dfa.Ctx {
+        const cp: ?u21 = if (b) |c| (if (c < 0x80) c else 0xfffd) else null;
+        return .ofIf(re.asserts, cp);
+    }
+
+    fn intern(d: *BytesFindDfa, list: []const u16, ctx: Dfa.Ctx, restart: bool) std.mem.Allocator.Error!u16 {
+        var h: u32 = 0x811c9dc5 ^ (@as(u32, @backingInt(ctx)) << 1 | @intFromBool(restart));
+        for (list) |e| h = (h ^ e) *% 0x01000193;
+        for (d.states.items, 0..) |st, i| {
+            if (st.hash == h and st.ctx == ctx and st.restart == restart and
+                std.mem.eql(u16, d.ents.items[st.off..][0..st.len], list)) return @intCast(i);
+        }
+        if (d.states.items.len == max_states) {
+            probe(.bytes_find_flush);
+            d.states.clearRetainingCapacity();
+            d.trans.clearRetainingCapacity();
+            d.ents.clearRetainingCapacity();
+            d.flushes += 1;
+        }
+        try d.ents.ensureUnusedCapacity(d.gpa, list.len);
+        try d.trans.ensureUnusedCapacity(d.gpa, 1);
+        try d.states.ensureUnusedCapacity(d.gpa, 1);
+        const off: u32 = @intCast(d.ents.items.len);
+        d.ents.appendSliceAssumeCapacity(list);
+        d.trans.appendAssumeCapacity(@splat(0));
+        d.states.appendAssumeCapacity(.{ .off = off, .len = @intCast(list.len), .ctx = ctx, .restart = restart, .hash = h });
+        return @intCast(d.states.items.len - 1);
+    }
+
+    /// One step from state `s` over the byte at `pos` (`pos == input.len`:
+    /// the end of the text, where only the match is looked for). Writes the
+    /// next state's entries to `out`.
+    fn step(re: *const Regex, st: State, list: []const u16, input: []const u8, pos: usize, out: *[4 * Dfa.max_insts]u16, n: *usize) u16 {
+        var seen: Dfa.Set = .{ 0, 0 };
+        var have: [8]u64 = @splat(0); // (pc, rem) already in `out`
+        const next: ?u21 = if (pos < input.len) (if (input[pos] < 0x80) input[pos] else 0xfffd) else null;
+        var flags: u16 = 0;
+        for (0..list.len + @intFromBool(st.restart)) |i| {
+            const e: u16 = if (i < list.len) list[i] else 0; // a thread starting here comes last
+            const before = n.*;
+            var hit = false;
+            if (e >> 8 != 0) {
+                // Waiting inside a sequence: keeps its place.
+                if (next != null) put(out, n, &have, e - (1 << 8));
+            } else hit = closure(re, &seen, e, st.ctx.rep(), next, input, pos, out, n, &have);
+            if (i == list.len and (n.* > before or hit)) flags |= if (list.len == 0) f_began else f_joined;
+            if (hit) return flags | f_matched;
+        }
+        return flags;
+    }
+
+    fn put(out: *[4 * Dfa.max_insts]u16, n: *usize, have: *[8]u64, e: u16) void {
+        const k = (e >> 8) * Dfa.max_insts + (e & 0xff);
+        const bit = @as(u64, 1) << @truncate(k);
+        if (have[k >> 6] & bit != 0) return;
+        have[k >> 6] |= bit;
+        out[n.*] = e;
+        n.* += 1;
+    }
+
+    /// `FindDfa.closure` in bytes mode: a consuming instruction appends the
+    /// one after it with the bytes it still waits (`consumeBytes`).
+    fn closure(re: *const Regex, seen: *Dfa.Set, pc0: u16, prev: ?u21, next: ?u21, input: []const u8, pos: usize, out: *[4 * Dfa.max_insts]u16, n: *usize, have: *[8]u64) bool {
+        var stack: [2 * Dfa.max_insts + 1]u16 = undefined;
+        stack[0] = pc0;
+        var sp: usize = 1;
+        while (sp != 0) {
+            sp -= 1;
+            const pc = stack[sp];
+            const bit = @as(u64, 1) << @truncate(pc);
+            if (seen[pc >> 6] & bit != 0) continue;
+            seen[pc >> 6] |= bit;
+            switch (re.insts[pc]) {
+                .jmp => |t| {
+                    stack[sp] = t;
+                    sp += 1;
+                },
+                .split => |sx| {
+                    stack[sp] = sx.y;
+                    stack[sp + 1] = sx.x;
+                    sp += 2;
+                },
+                .save => {
+                    stack[sp] = pc + 1;
+                    sp += 1;
+                },
+                .assert => |a| if (assertHolds(a, prev, next)) {
+                    stack[sp] = pc + 1;
+                    sp += 1;
+                },
+                .match => return true,
+                .rune, .any, .any_not_nl => if (next != null) {
+                    if (re.consumeBytes(pc, input, pos)) |w| put(out, n, have, (pc + 1) | @as(u16, @intCast(w - 1)) << 8);
+                },
+            }
+        }
+        return false;
+    }
+
+    /// The leftmost-first match at or after `from`, or null.
+    fn search(d: *BytesFindDfa, re: *const Regex, input: []const u8, from: usize) (std.mem.Allocator.Error || error{GiveUp})!?Found {
+        const pf = &re.prefilter;
+        const anchored = pf.anchored;
+        const skip = !anchored and pf.first != null;
+        var out: [4 * Dfa.max_insts]u16 = undefined;
+        // Under a Unicode word assertion the byte before a position the
+        // search starts from must be ASCII to be classed.
+        if (re.ascii_dfa and from > 0 and input[from - 1] >= 0x80) return error.GiveUp;
+        var s = try d.intern(&.{}, ctxOf(re, if (from == 0) null else input[from - 1]), true);
+        var pos = from;
+        var found: ?Found = null;
+        var origin = from;
+        var clean = true;
+        while (true) {
+            const st = d.states.items[s];
+            if (st.len == 0) {
+                if (!st.restart) break; // no thread, none can start
+                if (skip and pos < input.len) {
+                    const p = pf.next(input, pos) orelse break;
+                    if (p != pos) {
+                        if (re.ascii_dfa and input[p - 1] >= 0x80) return error.GiveUp;
+                        probe(.bytes_find_skip);
+                        pos = p;
+                        s = try d.intern(&.{}, ctxOf(re, input[p - 1]), true);
+                    }
+                }
+            }
+            if (pos == input.len) {
+                var n: usize = 0;
+                const cur = d.states.items[s];
+                const f = step(re, cur, d.ents.items[cur.off..][0..cur.len], input, pos, &out, &n);
+                if (f & f_began != 0) {
+                    origin = pos;
+                    clean = true;
+                }
+                if (f & f_joined != 0) clean = false;
+                if (f & f_matched != 0) found = .{ .start = origin, .end = pos, .clean = clean };
+                break;
+            }
+            const c = input[pos];
+            if (re.ascii_dfa and c >= 0x80) return error.GiveUp;
+            var t = d.trans.items[s][c];
+            if (t == 0) {
+                probe(.bytes_find_step);
+                var n: usize = 0;
+                const cur = d.states.items[s];
+                const f = step(re, cur, d.ents.items[cur.off..][0..cur.len], input, pos, &out, &n);
+                const restart = !anchored and cur.restart and f & f_matched == 0;
+                const gen = d.flushes;
+                const ns = try d.intern(out[0..n], ctxOf(re, c), restart);
+                t = (ns + 1) << shift | f;
+                // A valid lead byte: what its sequence is depends on the
+                // bytes after it — never cached. (`intern` may have emptied
+                // the table: `s` is then gone, and so is its row.)
+                if ((c < 0xc2 or c > 0xf4) and gen == d.flushes) d.trans.items[s][c] = t;
+            }
+            if (t & f_began != 0) {
+                origin = pos;
+                clean = true;
+            }
+            if (t & f_joined != 0) clean = false;
+            if (t & f_matched != 0) found = .{ .start = origin, .end = pos, .clean = clean };
+            s = (t >> shift) - 1;
+            pos += 1;
+        }
+        return found;
+    }
+};
+
 const FindDfa = struct {
     /// Rows are premultiplied by 256 in a `u16` (`trans`).
     const max_states = 255;
@@ -3178,6 +3398,8 @@ pub const Matcher = struct {
     bt_width: usize,
     /// `find`'s DFA, made once `vm_read` reaches `dfa_after`.
     dfa: ?*FindDfa = null,
+    /// Bytes mode: `find`'s DFA (`BytesFindDfa`), made the same way.
+    bdfa: ?*BytesFindDfa = null,
     /// Bytes of text `find` handed to the VMs before the DFA was made.
     vm_read: usize = 0,
     /// Tests only: always the Pike VM, to compare the two engines.
@@ -3273,6 +3495,10 @@ pub const Matcher = struct {
             d.deinit();
             m.gpa.destroy(d);
         }
+        if (m.bdfa) |d| {
+            d.deinit();
+            m.gpa.destroy(d);
+        }
         if (m.onepass) |op| {
             op.deinit();
             m.gpa.destroy(op);
@@ -3303,6 +3529,7 @@ pub const Matcher = struct {
     /// DFA does not apply or cannot get its memory.
     fn findDfa(m: *Matcher, input: []const u8, from: usize) ??Span {
         const re = m.re;
+        if (re.bytes) return m.findBytes(input, from);
         if (m.pike_only or m.anchor or re.vm_only or re.longest or re.insts.len > Dfa.max_insts) return null;
         const anchored = re.prefilter.anchored;
         if (anchored and from != 0) return @as(?Span, null); // `\A` holds at 0 only
@@ -3342,6 +3569,41 @@ pub const Matcher = struct {
             return .{ .start = from, .end = end };
         }
         return d.span(re, input, from) catch return null;
+    }
+
+    /// `find` in bytes mode by `BytesFindDfa`: the match, none, or null when
+    /// it does not apply or gives up (the VMs answer).
+    fn findBytes(m: *Matcher, input: []const u8, from: usize) ??Span {
+        const re = m.re;
+        if (m.pike_only or m.anchor or re.longest or re.insts.len > Dfa.max_insts) return null;
+        if (re.prefilter.anchored and from != 0) return @as(?Span, null); // `\A` holds at 0 only
+        const d = m.bdfa orelse blk: {
+            if (!m.warm(input, from)) return null;
+            const p = m.gpa.create(BytesFindDfa) catch return null;
+            p.* = .{ .gpa = m.gpa };
+            probe(.dfa_made);
+            m.bdfa = p;
+            break :blk p;
+        };
+        const f = (d.search(re, input, from) catch return null) orelse return @as(?Span, null);
+        if (f.clean) return .{ .start = f.start, .end = f.end };
+        // Threads of several starts met: the VMs, from where the first of
+        // them began (no thread was alive before it).
+        probe(.bytes_find_vm);
+        if (!m.run(input, f.start, false)) return null;
+        return .{ .start = m.best[0], .end = m.best[1] };
+    }
+
+    /// `captures` in bytes mode: the span by `findBytes`, then the VMs
+    /// anchored at its start (the leftmost start: the leftmost-first match
+    /// from there is the match). Null when `findBytes` does not apply.
+    fn capturesBytes(m: *Matcher, input: []const u8, from: usize) ?bool {
+        if (!m.re.bytes) return null;
+        const found = m.findBytes(input, from) orelse return null;
+        const span = found orelse return false;
+        m.anchor = true;
+        defer m.anchor = false;
+        return m.run(input, span.start, false);
     }
 
     /// Whether the `Matcher` has been handed enough text for the DFA (and
@@ -3386,7 +3648,7 @@ pub const Matcher = struct {
     /// took no part); `out` may be shorter or longer than the group count.
     pub fn captures(m: *Matcher, input: []const u8, from: usize, out: []?Span) bool {
         if (from > input.len) return false;
-        const found = m.capturesOnePass(input, from) orelse m.run(input, from, false);
+        const found = m.capturesOnePass(input, from) orelse m.capturesBytes(input, from) orelse m.run(input, from, false);
         if (!found) return false;
         m.fillCaptures(out);
         return true;
@@ -6768,45 +7030,45 @@ fn goldenRow(gpa: std.mem.Allocator, case: GoldenCase) ![1 + std.EnumArray(Probe
 }
 
 const golden_want = [_][1 + std.EnumArray(Probe, usize).len]u64{
-    .{ 15164632721457695747, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 132, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 144, 0, 0, 0, 0, 0 },
-    .{ 10048191757018527131, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 0, 404, 1260, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 2, 88, 326, 0, 0, 0, 0 },
-    .{ 16040365197490733272, 2, 5, 2, 0, 0, 0, 0, 8, 8, 0, 0, 0, 0, 0, 0, 96, 1371, 96, 756, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 5, 77, 0, 0, 0, 0, 0 },
-    .{ 12384312014502880017, 2, 5, 2, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 120, 480, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 24, 129, 0, 0, 0, 0, 0 },
-    .{ 15115527827644834550, 2, 5, 2, 0, 0, 0, 0, 43, 43, 0, 0, 0, 0, 0, 0, 174, 0, 27, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 36, 0, 0, 0, 0, 0 },
-    .{ 8638340579144201148, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 192, 0, 39, 360, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 28, 21, 0, 0, 0, 0 },
-    .{ 17510967732706982897, 2, 9, 6, 0, 0, 0, 0, 61, 61, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 288, 3, 0, 0, 0, 0, 59, 47, 0, 0, 0, 0, 0 },
-    .{ 1697275548591039429, 2, 13, 10, 0, 0, 0, 0, 36, 36, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 216, 3, 0, 0, 0, 0, 23, 53, 0, 0, 0, 0, 0 },
-    .{ 6803076195450018575, 2, 13, 10, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 189, 6, 96, 3, 0, 0, 0, 0, 12, 43, 0, 0, 0, 0, 0 },
-    .{ 7308186787397403972, 2, 5, 2, 0, 0, 0, 0, 45, 45, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 45, 18, 0, 0, 0, 0, 0 },
-    .{ 12216273954606837675, 2, 1, 0, 0, 0, 0, 0, 869, 869, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 560, 1, 0, 0, 0, 0, 0 },
-    .{ 16661322863164733733, 2, 9, 6, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 22, 32, 0, 0, 0, 0, 0 },
-    .{ 8957657828776279370, 4, 12, 9, 0, 0, 0, 0, 11, 11, 0, 0, 0, 0, 0, 0, 96, 0, 557, 420, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 99, 480, 3, 3, 0, 0 },
-    .{ 3698356145194735362, 1226, 96, 95, 0, 0, 0, 0, 2161, 2161, 0, 0, 0, 0, 0, 0, 0, 0, 135, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2151, 0, 0, 0, 0, 0 },
-    .{ 10115942991274251655, 2, 1264, 1262, 34, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 3222, 0, 0, 4, 217, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 10, 4502, 0, 0, 0, 0, 0 },
-    .{ 15643903801131319530, 0, 1248, 1248, 34, 0, 0, 0, 3002, 3002, 0, 0, 0, 0, 0, 6, 0, 0, 7690, 0, 0, 12, 439, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 1500, 11937, 0, 0, 0, 0, 0 },
-    .{ 16512095191518823459, 0, 4, 3, 0, 4, 0, 4, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0, 0, 0 },
-    .{ 16692255664732926537, 0, 1, 0, 0, 6, 0, 6, 1441, 1441, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 1200, 517, 0, 0, 0, 0, 0 },
-    .{ 12216273954606837675, 0, 1, 0, 0, 0, 0, 0, 1201, 1201, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 126, 7, 0, 3, 0, 0, 0, 0, 1200, 1, 0, 0, 0, 0, 0 },
-    .{ 9928401522073452516, 0, 12, 9, 0, 0, 0, 0, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 6, 32, 0, 0, 0, 0, 0 },
-    .{ 8817487514071533497, 0, 3, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 3, 8, 0, 0, 0, 0, 0 },
-    .{ 255220893118731787, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 1296, 78, 324, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 55, 0, 0, 0, 0, 0 },
-    .{ 9535395973114509801, 0, 18, 15, 0, 0, 0, 0, 4, 4, 0, 15, 24, 0, 6, 0, 0, 1482, 87, 216, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 100, 0, 0, 0, 0, 0 },
-    .{ 7977390198355055948, 2, 21, 18, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 330, 0, 0, 0, 33, 0, 0, 0, 0, 0, 168, 3, 0, 0, 0, 0, 5, 229, 136, 0, 0, 0, 0 },
-    .{ 6979640180260109447, 0, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 3, 0, 6, 0, 0, 2430, 144, 4746, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 432, 0, 1, 96, 0, 0, 0, 0, 0 },
-    .{ 9195713229761359493, 0, 5, 2, 0, 0, 0, 0, 2, 2, 0, 0, 6, 0, 6, 0, 0, 0, 24, 0, 4944, 3, 3, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 3, 31, 0, 0, 0, 0, 0 },
-    .{ 18108727944704394641, 24, 29, 26, 0, 0, 0, 0, 95, 95, 0, 0, 0, 0, 0, 0, 0, 0, 132, 288, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 70, 215, 0, 0, 0, 0, 0 },
-    .{ 5569908290217341108, 20, 54, 51, 0, 0, 0, 0, 72, 72, 0, 0, 36, 0, 12, 0, 96, 0, 349, 0, 168, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 271, 194, 30, 24, 0, 0 },
-    .{ 1304118577475789381, 0, 76, 73, 0, 0, 0, 0, 40, 40, 0, 0, 0, 0, 0, 0, 0, 0, 216, 96, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 22, 332, 0, 0, 0, 0, 0 },
-    .{ 2510107502798244048, 2, 14, 11, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 3, 0, 0, 0, 0, 0, 0, 678, 3, 0, 0, 0, 0, 9, 49, 0, 0, 0, 0, 0 },
-    .{ 12771596290932658175, 2, 5, 2, 0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 141, 0, 144, 3, 0, 0, 0, 0, 1, 7, 14, 0, 0, 0, 0 },
-    .{ 12524798475987748091, 2, 9, 6, 0, 0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 144, 0, 30, 144, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 25, 20, 0, 0, 0, 0 },
-    .{ 16695608249434358507, 0, 7, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 324, 324, 0, 0, 249, 0, 0, 0, 2, 0 },
-    .{ 7222689674609703483, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 150, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 160, 0, 0, 0, 0, 0 },
-    .{ 16025140877391608600, 0, 4, 3, 0, 6, 0, 8, 3002, 3002, 0, 0, 12, 0, 12, 6, 0, 0, 84, 0, 6, 6, 3, 0, 0, 0, 0, 0, 774, 3, 0, 0, 0, 0, 1500, 3087, 0, 0, 0, 0, 0 },
-    .{ 17791598714729744375, 2, 5, 2, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 114, 105, 18, 216, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 11, 20, 0, 0, 0, 0, 0 },
-    .{ 16512095191518823459, 0, 4, 3, 0, 0, 0, 0, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0, 0, 0 },
-    .{ 12216273954606837675, 0, 1, 0, 0, 6, 0, 6, 1501, 1501, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1500, 1, 0, 0, 0, 0, 0 },
-    .{ 12216273954606837675, 0, 1, 0, 0, 418, 0, 12, 865, 865, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 612, 702, 0, 0, 378, 0, 0 },
+    .{ 15164632721457695747, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 132, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 144, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 10048191757018527131, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 0, 404, 1260, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 2, 88, 326, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 16040365197490733272, 2, 5, 2, 0, 0, 0, 0, 8, 8, 0, 0, 0, 0, 0, 0, 96, 1371, 96, 756, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 5, 77, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 12384312014502880017, 2, 5, 2, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 120, 480, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 24, 129, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 15115527827644834550, 2, 5, 2, 0, 0, 0, 0, 43, 43, 0, 0, 0, 0, 0, 0, 174, 0, 27, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 8638340579144201148, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 192, 0, 39, 360, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 28, 21, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 17510967732706982897, 2, 9, 6, 0, 0, 0, 0, 61, 61, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 288, 3, 0, 0, 0, 0, 59, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 1697275548591039429, 2, 13, 10, 0, 0, 0, 0, 36, 36, 0, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 216, 3, 0, 0, 0, 0, 23, 53, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 6803076195450018575, 2, 13, 10, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 189, 6, 96, 3, 0, 0, 0, 0, 12, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 7308186787397403972, 2, 5, 2, 0, 0, 0, 0, 45, 45, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 45, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 12216273954606837675, 2, 1, 0, 0, 0, 0, 0, 869, 869, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 560, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 16661322863164733733, 2, 9, 6, 0, 0, 0, 0, 24, 24, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 22, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 8957657828776279370, 4, 12, 9, 0, 0, 0, 0, 11, 11, 0, 0, 0, 0, 0, 0, 96, 0, 557, 420, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 99, 480, 3, 3, 0, 0, 0, 0, 0, 0 },
+    .{ 3698356145194735362, 1226, 96, 95, 0, 0, 0, 0, 2161, 2161, 0, 0, 0, 0, 0, 0, 0, 0, 135, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2151, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 10115942991274251655, 2, 1264, 1262, 34, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 3222, 0, 0, 4, 217, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 10, 4502, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 15643903801131319530, 0, 1248, 1248, 34, 0, 0, 0, 3002, 3002, 0, 0, 0, 0, 0, 6, 0, 0, 7690, 0, 0, 12, 439, 0, 0, 0, 0, 0, 6, 3, 0, 0, 0, 0, 1500, 11937, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 16512095191518823459, 0, 4, 3, 0, 4, 0, 4, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 16692255664732926537, 0, 1, 0, 0, 6, 0, 6, 1441, 1441, 0, 0, 0, 0, 0, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 3, 0, 0, 0, 0, 1200, 517, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 12216273954606837675, 0, 1, 0, 0, 0, 0, 0, 1201, 1201, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 126, 7, 0, 3, 0, 0, 0, 0, 1200, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 9928401522073452516, 0, 12, 9, 0, 0, 0, 0, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 6, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 8817487514071533497, 0, 3, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 0, 0, 0, 3, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 255220893118731787, 2, 8, 5, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 96, 1296, 78, 324, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 55, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 9535395973114509801, 0, 18, 15, 0, 0, 0, 0, 4, 4, 0, 15, 24, 0, 6, 0, 0, 1482, 87, 216, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 7977390198355055948, 2, 21, 18, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 330, 0, 0, 0, 33, 0, 0, 0, 0, 0, 168, 3, 0, 0, 0, 0, 5, 229, 136, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 6979640180260109447, 0, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 3, 0, 6, 0, 0, 2430, 144, 4746, 6, 6, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 432, 0, 1, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 9195713229761359493, 0, 5, 2, 0, 0, 0, 0, 2, 2, 0, 0, 6, 0, 6, 0, 0, 0, 24, 0, 4944, 3, 3, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 3, 31, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 18108727944704394641, 24, 29, 26, 0, 0, 0, 0, 95, 95, 0, 0, 0, 0, 0, 0, 0, 0, 132, 288, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 70, 215, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 5569908290217341108, 20, 54, 51, 0, 0, 0, 0, 72, 72, 0, 0, 36, 0, 12, 0, 96, 0, 349, 0, 168, 6, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 28, 271, 194, 30, 24, 0, 0, 0, 0, 0, 0 },
+    .{ 1304118577475789381, 0, 76, 73, 0, 0, 0, 0, 40, 40, 0, 0, 0, 0, 0, 0, 0, 0, 216, 96, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 22, 332, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 2510107502798244048, 2, 14, 11, 0, 0, 0, 0, 14, 14, 0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 3, 0, 0, 0, 0, 0, 0, 678, 3, 0, 0, 0, 0, 9, 49, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 12771596290932658175, 2, 5, 2, 0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 141, 0, 144, 3, 0, 0, 0, 0, 1, 7, 14, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 12524798475987748091, 2, 9, 6, 0, 0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 144, 0, 30, 144, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 25, 20, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 16695608249434358507, 0, 7, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 36, 0, 0, 0, 2, 0, 15, 324, 0, 0 },
+    .{ 7222689674609703483, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 150, 1632, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, 160, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 16025140877391608600, 0, 4, 3, 0, 6, 0, 8, 3002, 3002, 0, 0, 12, 0, 12, 6, 0, 0, 84, 0, 6, 6, 3, 0, 0, 0, 0, 0, 774, 3, 0, 0, 0, 0, 1500, 3087, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 17791598714729744375, 2, 5, 2, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 114, 105, 18, 216, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 11, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 16512095191518823459, 0, 4, 3, 0, 0, 0, 0, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 12216273954606837675, 0, 1, 0, 0, 6, 0, 6, 1501, 1501, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1500, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 12216273954606837675, 0, 1, 0, 0, 418, 0, 12, 865, 865, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 612, 702, 0, 0, 378, 0, 0, 0, 0, 0, 0 },
 };
 
 test "golden work table: the engines' caches, limits and skips do the work they did" {
@@ -7752,4 +8014,89 @@ test "bytes mode: the prefilter (raw first bytes, raw literal prefix) skips only
     var f = try Regex.compileOptions(gpa, "a*", .{ .syntax = .rust, .utf8 = false });
     defer f.deinit(gpa);
     try testing.expectEqual(@as(?[4]u64, null), f.prefilter.first);
+}
+
+test "bytes mode: Matcher.find/captures by the byte-stepping find DFA give the Pike VM's answers" {
+    const gpa = testing.allocator;
+    const patterns = [_][]const u8{
+        "abc",                    "(?-u:\\xff)ab",        "(?-u:[\\x80-\\x9f])+x", "\u{00e9}+",
+        "[a-c]+\\d",              "(?-u:\\xc3)\\x{a9}",   "\\bfoo\\b",             "x$",
+        "\\Aab",                  "(a|ab)(c|bcd)",        "(?i)k",                 "(?-u:\\xe2\\x82)",
+        "(?-u:[\\xf0-\\xff])\\w", "\\d+(?-u:\\xff)?",     "[\u{4e00}-\u{9fff}]+",  "a*",
+        "(?-u:.)+?b",             "\u{00e9}|(?-u:\\xc3)", "(?-u:\\w+)\\s",         "(a+|b)+c",
+        "(?-u:\\B)x",             "\\w+\\b",              "(?m)^\\w+$",            "(?-u:[^a])(?-u:[^b])",
+        "x*y|(?-u:\\xff)*",       "[^\\x00-\\x7f]+",      "(?s-u:.){2}\u{00e9}",   "(?-u:\\x80)|\\x{80}",
+    };
+    const inputs = [_][]const u8{
+        "xxfoo yy abc",             "\xff\xffab \xffab",             "\x80\x85\x9fx \x9fx",                   "\u{00e9} \u{00e9}\xc3",
+        "zzb7 cc9 aab aabcbcd c",   "\xc3\xa9 \xc3 \xc2\x80\x80",    "\xe2\x82\xac \xe2\x82",                 "x\xff\xf0a\xf0\xff",
+        "ab abc abcbcd ababc",      "\u{65e5}\u{672c} k K \u{212a}", "",                                      "foo\xffbar 12\xff\nxy\n",
+        "aaab\xffbbc y xy\xff\xff", "\xf0\x9f\x98\x80 \xf0\x9f x",   "\u{00e9}foo \u{00e9}ab foo\u{00e9} ab", "\u{65e5}x\u{00e9}ab\xffab\xc3ab",
+    };
+    var made: usize = 0;
+    for (patterns) |pat| {
+        var re = try Regex.compileOptions(gpa, pat, .{ .syntax = .rust, .utf8 = false });
+        defer re.deinit(gpa);
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        m.dfa_eager = true;
+        var pm = try Matcher.init(gpa, &re);
+        defer pm.deinit();
+        pm.pike_only = true;
+        var want: [3]?Span = undefined;
+        var got: [3]?Span = undefined;
+        const ng = @min(want.len, re.groupCount() + 1);
+        for (inputs) |input| {
+            errdefer std.debug.print("/{s}/ on \"{s}\"\n", .{ pat, input });
+            for (0..input.len + 1) |from| {
+                errdefer std.debug.print("  from {d}\n", .{from});
+                @memset(&want, null);
+                const found = pm.captures(input, from, want[0..ng]);
+                const sp = m.find(input, from);
+                try testing.expectEqual(found, sp != null);
+                if (sp) |x| try testing.expectEqual(want[0].?, x);
+                @memset(&got, null);
+                try testing.expectEqual(found, m.captures(input, from, got[0..ng]));
+                if (found) for (want[0..ng], got[0..ng]) |w, g| try testing.expectEqual(w, g);
+            }
+            // And the iterator, which `find`s from each end on.
+            var it = m.iterator(input);
+            var it2 = pm.iterator(input);
+            while (it2.next()) |w| try testing.expectEqual(w, it.next().?);
+            try testing.expectEqual(@as(?Span, null), it.next());
+        }
+        made += @intFromBool(m.bdfa != null);
+    }
+    try testing.expect(made >= patterns.len - 1); // all but a program past the DFA's size
+
+    // Probes: the DFA answers on its own, the prefilter skips, the VMs take
+    // over where starts meet, a Unicode word assertion gives up past ASCII.
+    var a = try Regex.compileOptions(gpa, "[a-c]+\\d", .{ .syntax = .rust, .utf8 = false });
+    defer a.deinit(gpa);
+    var am = try Matcher.init(gpa, &a);
+    defer am.deinit();
+    am.dfa_eager = true;
+    probe_counts = .initFill(0);
+    try testing.expectEqual(Span{ .start = 10, .end = 13 }, am.find("zz \xff\xfe xxx ab7", 0).?);
+    try testing.expect(probe_counts.get(.bytes_find_step) > 0);
+    try testing.expect(probe_counts.get(.bytes_find_skip) > 0);
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.bytes_find_vm));
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.pike_bytes_step));
+    probe_counts = .initFill(0);
+    // `b` starts a thread while the one from `a` waits: they meet.
+    var j = try Regex.compileOptions(gpa, "(a+|b)+c", .{ .syntax = .rust, .utf8 = false });
+    defer j.deinit(gpa);
+    var jm = try Matcher.init(gpa, &j);
+    defer jm.deinit();
+    jm.dfa_eager = true;
+    try testing.expectEqual(Span{ .start = 0, .end = 4 }, jm.find("abac", 0).?);
+    var u = try Regex.compileOptions(gpa, "\\bab", .{ .syntax = .rust, .utf8 = false });
+    defer u.deinit(gpa);
+    var um = try Matcher.init(gpa, &u);
+    defer um.deinit();
+    um.dfa_eager = true;
+    // Landing after a byte past ASCII: not a boundary after `é`, the VMs say.
+    probe_counts = .initFill(0);
+    try testing.expectEqual(Span{ .start = 8, .end = 10 }, um.find("\u{00e9}ab \u{00e9} ab", 0).?);
+    try testing.expect(probe_counts.get(.pike_bytes_step) + probe_counts.get(.bt_at) > 0);
 }

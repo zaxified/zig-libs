@@ -111,6 +111,9 @@ fn replay(set: []const v.Pattern, bytes: bool, want_size_limit: usize, want_capa
         };
         var m = try regex.Matcher.init(testing.allocator, &re);
         defer m.deinit();
+        // Bytes mode: the find DFA from the first search on (the cases are
+        // short and would not warm it), so the crate checks it too.
+        m.dfa_eager = bytes;
         var out: [regex.max_groups]?regex.Span = undefined;
         const groups = out[0..re.names.len];
         for (p.cases) |c| {
