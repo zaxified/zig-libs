@@ -714,9 +714,11 @@ behind OUR stateless HelloVerifyRequest; ECDHE_ECDSA with AES-128-GCM, AES-256-G
 ChaCha20-Poly1305, on X25519 and secp256r1; ECDHE_RSA both roles; mutual authentication both ways (wolfSSL
 verifies our 1.2 CertificateVerify, we verify its); wolfSSL's own HelloVerifyRequest on every client case;
 wolfSSL fragmenting at a 256-byte MTU; our side fragmenting at 200 bytes in both roles. The live run found one
-wire defect, fixed: the server's RFC 5746 requirement (above). **Coverage gap:** plain PSK
-(`psk_with_aes_128_gcm_sha256`) cannot be checked against this peer — Debian's wolfSSL is built without
-`WOLFSSL_STATIC_PSK`, so it has no `PSK-AES128-GCM-SHA256`; it stays self-interop only (Backlog).
+wire defect, fixed: the server's RFC 5746 requirement (above). Plain PSK (`psk_with_aes_128_gcm_sha256`), which
+Debian's wolfSSL lacks (built without `WOLFSSL_STATIC_PSK`), runs against **OpenSSL 3.5** in both roles, in the same
+capture and file: our client against `openssl s_server -dtls1_2 -listen` (its stateless HelloVerifyRequest) and an
+`openssl s_client` offering only `PSK-AES128-GCM-SHA256` against our server (the identity hint in ServerKeyExchange);
+the application data is checked on OpenSSL's stdout and back, seventeen 1.2 cases in all.
 
 ### What it found
 
@@ -838,7 +840,7 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** a committed transcript of live interop vs a real wolfSSL 5.9.1 peer (both roles, both key exchanges, twenty-two flows), replayed byte-for-byte by `src/wolfssl_replay.zig` with no wolfSSL present, and a second one of fifteen DTLS 1.2 flows (`wolfDTLSv1_2_*_method`, `src/wolfssl12_replay.zig`); the live exchanges themselves are `tools/interop.zig` (`zig build interop-dtls`)
+**What the tests actually contain.** a committed transcript of live interop vs a real wolfSSL 5.9.1 peer (both roles, both key exchanges, twenty-two flows), replayed byte-for-byte by `src/wolfssl_replay.zig` with no wolfSSL present, and a second one of seventeen DTLS 1.2 flows (fifteen against `wolfDTLSv1_2_*_method`, two plain-PSK ones against OpenSSL 3.5, `src/wolfssl12_replay.zig`); the live exchanges themselves are `tools/interop.zig` (`zig build interop-dtls`)
 
 ## Backlog / deferred
 
@@ -849,8 +851,6 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   AES-256, seal and open); a whole `send` + `recv` of 64 bytes on AES-128-GCM is ~1.2 µs, of which ~0.6 µs is the two
   per-record AEAD calls. The rewrite (per-epoch `Context` storage behind `Protection(Aead)`, which ChaCha20 shares
   without needing it) waits for a quiet-machine A/B with the spread below the effect.
-- **DTLS 1.2 plain PSK against a live peer.** `psk_with_aes_128_gcm_sha256` is self-interop only, because Debian's
-  wolfSSL has no static PSK; an OpenSSL `s_server -dtls1_2 -psk` case would cover it.
 - **KeyUpdate / ALPN against a live peer, the rest:** a wolfSSL-initiated KeyUpdate with wolfSSL as the client, and
   ALPN and KeyUpdate in certificate mode.
 - **Session tickets / resumption and 0-RTT**, for both engines. Saves a handshake on constrained links; pion has it for

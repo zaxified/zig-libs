@@ -265,9 +265,9 @@ cases against wolfSSL 5.9.1 (`wolfDTLSv1_2_*_method`), both roles: ECDHE_PSK,
 ECDHE_ECDSA with all three AEADs and on secp256r1, ECDHE_RSA, mutual
 authentication both ways, wolfSSL's HelloVerifyRequest and ours (stateless),
 wolfSSL fragmenting at a 256-byte MTU, and our side fragmenting at 200 bytes.
-`src/wolfssl12_replay.zig` replays the recording on every test run. Plain PSK
-(`psk_with_aes_128_gcm_sha256`) is self-interop only: Debian's wolfSSL is
-built without static PSK suites.
+Two more run plain PSK (`psk_with_aes_128_gcm_sha256`, which Debian's wolfSSL
+lacks) against OpenSSL 3.5's `s_server -listen` and `s_client`, both roles.
+`src/wolfssl12_replay.zig` replays the recording on every test run.
 
 ## Import
 

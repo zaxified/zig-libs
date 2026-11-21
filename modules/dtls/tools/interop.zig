@@ -1393,8 +1393,8 @@ const now12_sec: i64 = 1798761600; // 2027-01-01
 const psk12_hint = "zig-libs-hint";
 
 const Kind12 = enum {
-    /// ECDHE_PSK (RFC 5489). Debian's wolfSSL has no static PSK, so plain
-    /// PSK is not reachable from this peer at all.
+    /// ECDHE_PSK (RFC 5489) against wolfSSL; plain PSK against OpenSSL
+    /// (Debian's wolfSSL has no static PSK).
     psk,
     /// ECDHE_ECDSA with the P-256 fixture chain.
     ecdsa,
@@ -1402,9 +1402,14 @@ const Kind12 = enum {
     rsa,
 };
 
+/// Which foreign 1.2 stack a case runs against. OpenSSL covers what Debian's
+/// wolfSSL cannot (it is built without static PSK): plain PSK, both roles.
+const Peer12 = enum { wolfssl, openssl };
+
 const Case12 = struct {
     name: []const u8,
     flow: Flow,
+    peer: Peer12 = .wolfssl,
     peer_mode: []const u8,
     seed: u8,
     kind: Kind12,
@@ -1426,6 +1431,10 @@ const Case12 = struct {
 };
 
 const wolfssl12_client_hello = "hello from wolfssl 1.2 client";
+/// What the OpenSSL peers send: `s_server` / `s_client` forward their stdin
+/// line by line, newline included.
+const openssl12_server_hello = "hello from openssl 1.2 server\n";
+const openssl12_client_hello = "hello from openssl 1.2 client\n";
 
 const cases12 = [_]Case12{
     .{
@@ -1587,7 +1596,221 @@ const cases12 = [_]Case12{
         .expect_peer_cert_subject = "dtls-test-client",
         .why = "the client side of it: OUR Certificate and CertificateVerify flight in 200-byte datagrams, reassembled and verified by wolfSSL",
     },
+    .{
+        .name = "dtls12-plainpsk-client-openssl",
+        .flow = .client,
+        .peer = .openssl,
+        .peer_mode = "",
+        .seed = 0x78,
+        .kind = .psk,
+        .expect_suite = .psk_with_aes_128_gcm_sha256,
+        .expect_group = 0,
+        .expect_hvr = true,
+        .app_send = "hello from zig-libs over dtls 1.2\n",
+        .app_expect = openssl12_server_hello,
+        .why = "plain PSK (RFC 4279 2, PSK-AES128-GCM-SHA256, no ECDHE) against a live OpenSSL s_server -listen: its stateless HelloVerifyRequest, the psk premaster of zeros || psk, EMS",
+    },
+    .{
+        .name = "dtls12-plainpsk-server-openssl",
+        .flow = .server,
+        .peer = .openssl,
+        .peer_mode = "",
+        .seed = 0x79,
+        .kind = .psk,
+        .expect_suite = .psk_with_aes_128_gcm_sha256,
+        .expect_group = 0,
+        .app_expect = openssl12_client_hello,
+        .why = "an OpenSSL s_client offering only PSK-AES128-GCM-SHA256 completes against OUR server: the identity hint in ServerKeyExchange, its identity in ClientKeyExchange, the plain-PSK premaster",
+    },
 };
+
+const openssl_cipher12 = "PSK-AES128-GCM-SHA256";
+
+fn pskHex() [2 * psk.len]u8 {
+    return std.fmt.bytesToHex(psk, .lower);
+}
+
+/// Reads the peer's stdout until a line equals `want` (newline stripped);
+/// `openssl` prints session details before the data it received.
+fn awaitPeerLine(reader: *std.Io.Reader, want: []const u8) !void {
+    const w = std.mem.trimEnd(u8, want, "\n");
+    var lines: usize = 0;
+    while (lines < 200) : (lines += 1) {
+        const line = peerLine(reader) catch return error.PeerNeverPrintedOurData;
+        if (std.mem.eql(u8, line, w)) return;
+    }
+    return error.PeerNeverPrintedOurData;
+}
+
+/// The handshake loop of `runClientFlow12` for a peer whose output we do not parse.
+fn clientHandshake12(io: std.Io, sock: net.Socket, server_addr: *const net.IpAddress, conn: *Connection12, rnd: Entropy, case: Case12, out: []u8, rx: []u8, rec: *Recorder) !void {
+    const hello = try conn.startHandshake(rnd, 0, out);
+    rec.op("start");
+    rec.hexArg("out", hello);
+    rec.end();
+    _ = try sendDatagrams(io, sock, server_addr, hello, case.max_datagram);
+    var steps: usize = 0;
+    while (!conn.isConnected()) : (steps += 1) {
+        if (steps > 40) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, rx, deadline(io, 10_000));
+        const result = conn.handleFlight(incoming.data, rnd, 0, out) catch |err| {
+            std.debug.print("\n  our client rejected OpenSSL's flight ({t})\n", .{err});
+            return err;
+        };
+        rec.op("flight");
+        rec.hexArg("in", incoming.data);
+        rec.hexArg("out", result.out);
+        rec.numArg("more", @intFromBool(result.need_more_data));
+        rec.end();
+        if (result.out.len > 0) _ = try sendDatagrams(io, sock, server_addr, result.out, case.max_datagram);
+    }
+}
+
+/// Our 1.2 client against `openssl s_server -dtls1_2 -listen` (plain PSK):
+/// our line goes up and must appear on its stdout, then the line we write to
+/// its stdin must come back to us as application data.
+fn runClientFlowOpenssl12(io: std.Io, case: Case12, fx: *const Fixtures, rec: *Recorder) !void {
+    const port = try freeLoopbackPort(io);
+    var port_buf: [8]u8 = undefined;
+    const port_str = try std.mem.print(&port_buf, "{d}", .{port});
+    const key_hex = pskHex();
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "openssl", "s_server", "-dtls1_2", "-listen", "-port", port_str, "-nocert", "-psk", &key_hex, "-psk_identity", psk_identity, "-cipher", openssl_cipher12, "-naccept", "1" },
+        .environ_map = child_env,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    var out_buf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &out_buf);
+    // `ACCEPT` once the socket is bound.
+    awaitPeerLine(&stdout_reader.interface, "ACCEPT") catch return error.PeerNeverReady;
+
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    const server_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+
+    const seed = @as([32]u8, @splat(case.seed));
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    const rnd = seededForTest(&csprng);
+    recordConfig12(rec, case, seed);
+    var conn = try Connection12.clientInit(config12(case, .client, fx, null));
+    defer conn.deinit();
+    rec.op("client_init");
+    rec.end();
+
+    var out: [8192]u8 = undefined;
+    var rx: [4096]u8 = undefined;
+    try clientHandshake12(io, sock, &server_addr, &conn, rnd, case, &out, &rx, rec);
+    try expectState12(&conn, case);
+    try expectBool("HelloVerifyRequest seen", case.expect_hvr, conn.hvr_count > 0);
+    recordExpect12(rec, &conn);
+    rec.end();
+
+    const record = try conn.send(case.app_send, &out);
+    rec.op("send");
+    rec.hexArg("in", case.app_send);
+    rec.hexArg("out", record);
+    rec.end();
+    try sock.send(io, &server_addr, record);
+    try awaitPeerLine(&stdout_reader.interface, case.app_send);
+    rec.note("peer stdout (not replayable): OpenSSL printed our application data", .{});
+
+    var stdin_buf: [256]u8 = undefined;
+    var stdin_writer = child.stdin.?.writer(io, &stdin_buf);
+    try stdin_writer.interface.writeAll(case.app_expect);
+    try stdin_writer.interface.flush();
+    var plain: [2048]u8 = undefined;
+    const got = try recvApplicationData12(io, sock, &conn, &rx, &plain, rec);
+    try expectBytes("OpenSSL's application data", case.app_expect, got);
+}
+
+/// `openssl s_client -dtls1_2` (plain PSK only) against our 1.2 server: its
+/// stdin line arrives as application data, our echo must appear on its
+/// stdout, and it exits 0 at end of input.
+fn runServerFlowOpenssl12(io: std.Io, case: Case12, fx: *const Fixtures, rec: *Recorder) !void {
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    var addr_buf: [32]u8 = undefined;
+    const addr_str = try std.mem.print(&addr_buf, "127.0.0.1:{d}", .{sock.address.getPort()});
+    const key_hex = pskHex();
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "openssl", "s_client", "-dtls1_2", "-connect", addr_str, "-psk", &key_hex, "-psk_identity", psk_identity, "-cipher", openssl_cipher12, "-no_ign_eof" },
+        .environ_map = child_env,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    var stdin_buf: [256]u8 = undefined;
+    var stdin_writer = child.stdin.?.writer(io, &stdin_buf);
+    try stdin_writer.interface.writeAll(case.app_expect);
+    try stdin_writer.interface.flush();
+
+    const seed = @as([32]u8, @splat(case.seed));
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    const rnd = seededForTest(&csprng);
+    recordConfig12(rec, case, seed);
+
+    var out: [8192]u8 = undefined;
+    var rx: [4096]u8 = undefined;
+    var peer_addr: net.IpAddress = undefined;
+    var conn: ?Connection12 = null;
+    defer if (conn) |*c| c.deinit();
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        if (steps > 40) return error.TooManyFlights;
+        const incoming = try sock.receiveTimeout(io, &rx, deadline(io, 10_000));
+        peer_addr = incoming.from;
+        if (conn == null) {
+            conn = try Connection12.serverInit(config12(case, .server, fx, null));
+            rec.op("server_init");
+            rec.end();
+        }
+        const result = conn.?.handleFlight(incoming.data, rnd, 0, &out) catch |err| {
+            std.debug.print("\n  our server rejected OpenSSL's flight ({t})\n", .{err});
+            return err;
+        };
+        rec.op("flight");
+        rec.hexArg("in", incoming.data);
+        rec.hexArg("out", result.out);
+        rec.numArg("more", @intFromBool(result.need_more_data));
+        rec.end();
+        if (result.out.len > 0) _ = try sendDatagrams(io, sock, &peer_addr, result.out, case.max_datagram);
+        if (conn.?.isConnected()) break;
+    }
+    try expectState12(&conn.?, case);
+    recordExpect12(rec, &conn.?);
+    rec.end();
+
+    var plain: [2048]u8 = undefined;
+    const received = try recvApplicationData12(io, sock, &conn.?, &rx, &plain, rec);
+    try expectBytes("received application data", case.app_expect, received);
+    const echo = try conn.?.send(received, &out);
+    rec.op("send");
+    rec.hexArg("in", received);
+    rec.hexArg("out", echo);
+    rec.end();
+    try sock.send(io, &peer_addr, echo);
+
+    var out_buf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &out_buf);
+    try awaitPeerLine(&stdout_reader.interface, received);
+    child.stdin.?.close(io);
+    child.stdin = null;
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("  openssl s_client exited {d}, not 0\n", .{code});
+            return error.PeerRejectedUs;
+        },
+        else => return error.PeerDiedAbnormally,
+    }
+    rec.note("peer exited 0 (not replayable): OpenSSL printed our echo and closed at end of input", .{});
+}
 
 const v12_only = [_]dtls.ProtocolVersion{.dtls12};
 
@@ -1934,6 +2157,13 @@ fn utcDate(buf: []u8) []const u8 {
     }) catch "unknown";
 }
 
+/// `openssl version`, for the 1.2 transcript header (its plain-PSK cases).
+fn readOpensslVersion(gpa: std.mem.Allocator, io: std.Io) []const u8 {
+    const r = std.process.run(gpa, io, .{ .argv = &.{ "openssl", "version" }, .environ_map = child_env }) catch return "unknown";
+    const trimmed = std.mem.trim(u8, r.stdout, " \r\n\t");
+    return if (trimmed.len == 0) "unknown" else trimmed;
+}
+
 fn writeHeader(w: *std.Io.Writer, wolfssl_version: []const u8, version: Version) !void {
     var date_buf: [16]u8 = undefined;
     try w.print(
@@ -2152,16 +2382,25 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
     if (only != .v13) {
         var rec: Recorder = .{ .enabled = capture, .out = &t12.writer };
-        if (capture) try writeHeader(&t12.writer, version, .v12);
+        if (capture) {
+            try writeHeader(&t12.writer, version, .v12);
+            try t12.writer.print("# The plain-PSK cases ran against {s} (`openssl s_server` / `s_client`).\n\n", .{readOpensslVersion(gpa, io)});
+        }
         for (cases12) |case| {
             if (!isSelected(selected[0..selected_len], case.name)) continue;
             std.debug.print("{s} ... ", .{case.name});
             const mark = t12.written().len;
             rec.raw("case {s}\n", .{case.name});
             rec.raw("why {s}\n", .{case.why});
-            const result = switch (case.flow) {
-                .client => runClientFlow12(gpa, io, work, case, &fx, &rec),
-                .server, .server_cookie => runServerFlow12(gpa, io, work, case, &fx, &rec),
+            const result = switch (case.peer) {
+                .wolfssl => switch (case.flow) {
+                    .client => runClientFlow12(gpa, io, work, case, &fx, &rec),
+                    .server, .server_cookie => runServerFlow12(gpa, io, work, case, &fx, &rec),
+                },
+                .openssl => switch (case.flow) {
+                    .client => runClientFlowOpenssl12(io, case, &fx, &rec),
+                    .server, .server_cookie => runServerFlowOpenssl12(io, case, &fx, &rec),
+                },
             };
             ran += 1;
             if (result) {

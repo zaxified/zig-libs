@@ -14,7 +14,9 @@
 //! flights when `Config.max_datagram_len` was set, and both directions of
 //! application data — ECDHE_PSK, ECDHE_ECDSA (AES-128-GCM, AES-256-GCM /
 //! SHA-384, ChaCha20-Poly1305, secp256r1) and ECDHE_RSA, both roles, mutual
-//! authentication both ways, and our stateless HelloVerifyRequest server.
+//! authentication both ways, and our stateless HelloVerifyRequest server; and
+//! plain PSK against OpenSSL `s_server -listen` / `s_client`, both roles (the
+//! same file: those two cases are recorded by the same capture).
 
 const std = @import("std");
 const testing = std.testing;
@@ -37,7 +39,7 @@ const boolArg = r13.boolArg;
 const transcript = @embedFile("testdata/wolfssl12_transcript.txt");
 
 /// A floor, not a mirror (see `wolfssl_replay.zig`'s `recorded_cases_floor`).
-const recorded_cases_floor = 15;
+const recorded_cases_floor = 17;
 
 var client_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
 var server_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
@@ -309,6 +311,10 @@ test "wolfSSL DTLS 1.2 transcript: every recorded exchange replays byte-for-byte
     try testing.expect(r.mutual_cases >= 3);
     try testing.expect(r.reassembling_cases >= 1);
     try testing.expect(r.fragmenting_cases >= 2);
+    // Plain PSK (0x00a8, OpenSSL's PSK-AES128-GCM-SHA256), the suite wolfSSL lacks.
+    for (r.suites_seen[0..r.suites_len]) |s| {
+        if (s == 0x00a8) break;
+    } else return error.TestExpectedPlainPsk;
 }
 
 test "wolfSSL DTLS 1.2 transcript: the header names the release, the date and the command that took it" {

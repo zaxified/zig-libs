@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** the recorded DTLS 1.2 interop transcript (`src/testdata/wolfssl12_transcript.txt`) was re-captured with two new plain-PSK cases against OpenSSL 3.5, both roles; the engine is unchanged.
 - **2026-11-21** — **NEW API:** `CertConfig.rsa_blinding` (`?*rsa.BlindingCache`, default null = unchanged): every RSA signature of both engines (1.3 CertificateVerify through `certverify.signWith`, 1.2 CertificateVerify and ServerKeyExchange, PSS and PKCS#1 v1.5) reuses the per-key blinding pair. **Source-breaking:** `sig12.sign` takes the cache as a new third parameter.
 - **2026-11-21** — **NEW API:** DTLS 1.3 connection ID (RFC 9146 §3, RFC 9147 §9): `Config.connection_id`, `Connection.peerConnectionId`, `max_cid_len` (32), `ext_connection_id`, `ConfigError.InvalidConnectionId`, `record.nextDatagramCid`. Negotiated in ClientHello / ServerHello; protected records from epoch 2 on carry the peer's CID; a received record with another CID, or without the expected one, is `error.Malformed`. Default (null) unchanged. **Source-breaking** for an exhaustive `switch` over `ConfigError`.
 - **2026-11-21** — **Behaviour change (1.3 server):** a client key share in secp384r1, secp521r1, ML-KEM-512/768/1024, SecP256r1MLKEM768 or SecP384r1MLKEM1024 is now answered (was `MissingKeyShare`), after the advertised groups in preference order; the client's offer is unchanged. `max_server_hello_body` 1216 → 1792.
