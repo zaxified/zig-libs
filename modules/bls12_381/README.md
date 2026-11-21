@@ -88,6 +88,7 @@ const parsed = try bls12_381.G1.fromBytesCompressed(compressed); // 48 bytes -> 
 const sum = a.add(a);                    // field ops: add/sub/neg/mul/square/inv/pow/sqrt
 const doubled = p.double();              // point ops: add/double/negate/scalarMul/toAffine
 const pk = p.scalarMul(s);               // constant-time (secret-scalar-safe)
+p.scalarMulInto(&out, &s);               // same, scalar by pointer, burned frame (secret scalar)
 const ok = pk.subgroupCheck();           // decoders do this; REQUIRED for points built otherwise
 
 // The pairing (Part 2 — subgroup inputs required, see SPEC.md):

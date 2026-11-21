@@ -29,6 +29,8 @@ const bls_sig = @import("bls_sig.zig");
 const eip2333 = @import("eip2333.zig");
 const threshold = @import("threshold.zig");
 const Fr = @import("scalar.zig").Fr;
+const g1 = @import("g1.zig");
+const g2 = @import("g2.zig");
 
 const SecretKey = bls_sig.SecretKey;
 const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
@@ -424,6 +426,16 @@ fn CallSign(comptime S: type) type {
         }
     };
 }
+var g1_sink: g1.Jacobian = undefined;
+var g2_sink: g2.Jacobian = undefined;
+noinline fn callG1MulInto() void {
+    g1.Jacobian.fromAffine(g1.Affine.generator).scalarMulInto(&g1_sink, &cur_sk.scalar);
+    std.mem.doNotOptimizeAway(&g1_sink);
+}
+noinline fn callG2MulInto() void {
+    g2.Jacobian.fromAffine(g2.Affine.generator).scalarMulInto(&g2_sink, &cur_sk.scalar);
+    std.mem.doNotOptimizeAway(&g2_sink);
+}
 noinline fn callPopProve() void {
     const sig = apiPopProve(&cur_sk);
     std.mem.doNotOptimizeAway(&sig);
@@ -516,6 +528,8 @@ test "STACKPROBE: no secret-key residue on the dead stack after BLS key generati
         bad += try runProbe("MinSigBasic.sign (G1)", CallSign(MinSigBasic).call, &nd);
         bad += try runProbe("MinPkAug.sign", CallSign(MinPkAug).call, &nd);
         bad += try runProbe("MinPkPop.popProve", callPopProve, &nd);
+        bad += try runProbe("g1.Jacobian.scalarMulInto", callG1MulInto, &nd);
+        bad += try runProbe("g2.Jacobian.scalarMulInto", callG2MulInto, &nd);
 
         // Fr.randomInto: the drawn bytes and the scalar they make.
         cur_draw = cur_sk.scalar.toBytes();

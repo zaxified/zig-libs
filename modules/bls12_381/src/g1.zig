@@ -18,6 +18,7 @@
 const std = @import("std");
 const fp = @import("fp.zig");
 const scalarmod = @import("scalar.zig");
+const burn = @import("burn.zig");
 
 pub const Fp = fp.Fp;
 pub const Fr = scalarmod.Fr;
@@ -273,6 +274,23 @@ pub const Jacobian = struct {
     /// `fp.zig`/`scalar.zig`'s `pow`/`powPublic` split.
     pub fn scalarMul(p: Jacobian, s: Fr) Jacobian {
         return scalarMulBytes(p, &s.toBytes());
+    }
+
+    /// `scalarMul` with the scalar by pointer and the product into `out`, in a
+    /// burned frame (`burn.sign_burn`): for a caller whose scalar is secret
+    /// (a nonce, a blinding factor) and who does not burn its own frame.
+    /// `scalarMul` takes `Fr` by value, so the caller's frame keeps the copy
+    /// it passed; this form reads the scalar through the pointer, wipes its
+    /// encoding, and zeroes the stack the multiply dirtied
+    /// (`stackprobe_test.zig`). Same constant-time double-and-add-always.
+    pub fn scalarMulInto(p: Jacobian, out: *Jacobian, s: *const Fr) void {
+        burn.run(burn.sign_burn, void, scalarMulIntoBody, .{ p, out, s });
+    }
+
+    fn scalarMulIntoBody(p: Jacobian, out: *Jacobian, s: *const Fr) void {
+        var bytes = s.toBytes();
+        defer std.crypto.secureZero(u8, &bytes);
+        out.* = scalarMulBytes(p, &bytes);
     }
 
     /// `[s]P` for an arbitrary-width big-endian scalar byte string —
@@ -777,6 +795,22 @@ test "G1 scalarMul edge cases: [0]P = O, [1]P = P, [2]P = double(P)" {
     try expectSamePoint(g.scalarMul(two), g.double());
     // [s]O == O
     try std.testing.expect(Jacobian.identity.scalarMul(two).isIdentity());
+}
+
+test "G1 scalarMulInto equals scalarMul (0, 1, r - 1, random); the scalar is only read" {
+    const g = jacGen();
+    const r_minus_1 = Fr.zero.sub(Fr.one);
+    var prng = std.Random.DefaultPrng.init(0x5ca1a);
+    var wide: [64]u8 = undefined;
+    prng.random().bytes(&wide);
+    const cases = [_]Fr{ Fr.zero, Fr.one, r_minus_1, Fr.reduceWide(&wide) };
+    for (cases) |s| {
+        var out: Jacobian = undefined;
+        const before = s;
+        g.scalarMulInto(&out, &s);
+        try expectSamePoint(out, g.scalarMul(s));
+        try std.testing.expect(s.eql(before));
+    }
 }
 
 test "G1 scalarMul distributes: [a+b]G == [a]G + [b]G and [a*b]G == [a]([b]G)" {

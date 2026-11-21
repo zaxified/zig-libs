@@ -781,8 +781,10 @@ design" below.
   `Fr.randomInto(out, io)` (`scalar.zig`) draws a scalar into the caller's slot under
   `burn.run` (`burn.random_burn`). `Fr.random` (`scalar.zig`) returns a secret by value,
   and `scalarMul` (`g1.zig`) and `msm` take scalars by value: a consumer that draws a nonce
-  or blinding factor and multiplies with it outside the module's own entry points leaves it in
-  its own frames and wraps the call in a burned frame of its own.
+  or blinding factor and multiplies with it outside the module's own entry points either wraps the
+  call in a burned frame of its own or calls `g1`/`g2` `Jacobian.scalarMulInto(out, &s)`: the scalar
+  by pointer, its encoding wiped, the multiply in a burned frame (in the stack probe). `msm` takes a
+  slice (no copy) and is for public data.
 
 ## Verification
 
@@ -865,18 +867,16 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
   generating it and makes no claim about the ceremony's toxic waste.
 - **Other hash-to-curve suites.** The two `_XMD:SHA-256_SSWU_RO_`/`_NU_` pairs and the `G1` SHAKE-256
   suite (BBS) are implemented; no `G2` XOF variant (no consumer), and the §5.3.3 long-DST rehash is
-  not implemented for either expander (`dst.len <= 255` is asserted, `hash_to_curve.zig`).
+  not implemented for the XOF expander (`dst.len <= 255` is asserted there, `hash_to_curve.zig`; the
+  XMD expander has it).
 - **Constant-time pairing, hash-to-curve, KZG.** They operate on public data; see the threat model.
-- **A shared `expand_message_xmd`.** The module carries its own general-`ell` implementation rather
-  than depend on `frost` or `voprf` (each is hardcoded to a fixed `ell`, and a dependency edge to a
-  threshold or OPRF module for one hash primitive is a layering smell); factoring one helper across
-  the three is a cross-module refactor.
+- **Variable-time public-scalar `scalarMul`, a secret-exponent `Fp2.pow` ladder, a cheaper
+  `pairingCheck` not-equal-to-one test** as public API: no consumer asks for them, and blst (the
+  reference) exposes none of the three (its `blst_p1_mult`/`blst_p2_mult` are the constant-time
+  multiply; variable-time paths are internal). The speed side of the last item is under *Backlog*.
 
 ## Backlog / deferred
 
-- **Pointer-taking scalar entry points.** `scalarMul` and `msm` take scalars by value (see the threat
-  model's "Secrets in callers' frames"); pointer-taking variants were not added (many call sites in
-  `g1`/`g2`/`msm`/the scheme code). Wanted when a consumer cannot burn its own frame.
 - **Sparse Miller-loop multiplication.** A fresh line value is structurally sparse (3 nonzero `Fp2`
   coefficients of 6, the "014" shape `lineValue` documents); the baseline promotes it to a dense
   `Fp12` (`pairing.zig`). A dedicated sparse multiply is a well-known follow-up
@@ -892,17 +892,18 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
   the `h_eff` step (the message is public).
 - **Fixed-window scalar multiplication** (currently constant-time double-and-add-always,
   `g1.zig`).
-- **Optional API additions if consumers appear.** A variable-time public-scalar `scalarMul` for
-  verification-side hot paths; a secret-exponent (ladder) `Fp2.pow`; skipping the full final
-  exponentiation in `pairingCheck` when a cheaper not-equal-to-one test suffices (`pairing.zig`
-  `TODO`).
 - **MSM beyond baseline Pippenger.** Signed/NAF digits, affine batch-inverted bucket additions,
   per-window parallelism (each addition still pays full Jacobian arithmetic); a cached
   bit-reversal-permuted Lagrange basis on `TrustedSetup` (currently re-permuted per commitment/proof).
+
+## Roadmap
+
 - **EIP-7594 (PeerDAS) cell proofs.** c-kzg-4844 has them (`compute_cells`, `compute_cells_and_kzg_proofs`,
   `verify_cell_kzg_proof_batch`, `recover_cells_and_kzg_proofs`); a materially larger, separate spec
   (`specs/fulu/polynomial-commitments-sampling.md` family) built on top of this module's primitives
   (`fft`/`ifft` are in place). Effort: large. Fits §2.
+  Size: weeks (a separate consensus-spec family: cell layout, the FK20 multi-proof, Reed-Solomon
+  recovery over the evaluation domain, its own KAT set from the consensus-spec tests).
 
 ## Anchoring
 **Anchor grade:** class B · oracle MIXED
