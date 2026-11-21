@@ -20,8 +20,7 @@ shows are unlinkable).
 
 ## Not provided
 
-Blind issuance (private attributes hidden from the issuing authorities, paper §4.3) and dealer-free key generation
-(`keygen` is a trusted dealer). `SPEC.md`, *Backlog / deferred*, has the plan.
+Dealer-free key generation (`keygen` is a trusted dealer). `SPEC.md`, *Backlog / deferred*, has the plan.
 
 ## API
 
@@ -50,6 +49,15 @@ const proof   = try coconut.proveCredential(allocator, io, p, vk, cred, &attribu
 defer proof.deinit(allocator);
 // The verifier passes the mask IT asked for, not the one inside the proof.
 const ok      = try coconut.verifyCredential(allocator, p, vk, proof, &disclosed, &disclosed_values, context);
+
+// Blind issuance (paper §4.3): the authorities never see the private attributes.
+var eg: coconut.ElGamalKeyPair = undefined;
+coconut.elgamalKeyGen(io, &eg); // the user's key; eg.deinit() wipes d
+var req = try coconut.prepareBlindSign(allocator, io, p, eg.gamma, &private_attrs, &public_attrs);
+defer req.deinit(allocator);
+// each authority j (checks the proof, error.InvalidProof otherwise):
+const bs = try coconut.blindSign(allocator, &keys.sk_shares[j], p, eg.gamma, &req, &public_attrs);
+const partial_j = coconut.unblind(&eg, &bs); // -> aggregateCredential as above; attributes = private ++ public
 ```
 
 A show proof is bound to `context`: issue a fresh nonce per show and refuse a

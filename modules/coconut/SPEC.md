@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [nymtech/nym](https://github.com/nymtech/nym) | Rust | mixed (`LICENSES/` directory; not read) | 2.0k | nym-binaries-v2026.18 (2026-09) | Production home of Coconut-derived credentials; the current `common/` tree lists `nym_offline_compact_ecash`, i.e. the project appears to have moved to compact e-cash *(inferred from directory names)*. |
 | Zig ecosystem (GitHub search "coconut credential", "bls12-381 pairing", language Zig, 2026-09-30) | Zig | — | — | — | No Coconut repository found. |
 
-**Where we are ahead:** the only Coconut implementation found that is not dormant (*inferred*: the four above were last pushed 2019-2023 or have moved on), and the only one in Zig; BLS12-381 (the curve production stacks now use) with RFC 9380 hash-to-curve; pure Zig on the in-repo `bls12_381`; a Fiat-Shamir transcript that is documented field by field, with the two commitments that are load-bearing named and owner-verified by dropping them (SPEC §1a); a ctgrind harness; the PS signature core and threshold aggregation are cross-checked against `coconut-crypto` (see Anchoring). **Where we are behind:** **no blind issuance** (paper §4.3: ElGamal-encrypted private attributes + formation proof `pi_s`), so authorities always see every attribute — the feature that distinguishes Coconut from plain threshold Pointcheval-Sanders and that the reference README lists first (→ Backlog); keygen is trusted-dealer only, although the sibling `dkg` is GJKR over secp256k1 and does not serve BLS12-381; no wire-compatibility of the show proof with any other implementation (none publishes vectors, SPEC §3).
+**Where we are ahead:** the only Coconut implementation found that is not dormant (*inferred*: the four above were last pushed 2019-2023 or have moved on), and the only one in Zig; BLS12-381 (the curve production stacks now use) with RFC 9380 hash-to-curve; pure Zig on the in-repo `bls12_381`; a Fiat-Shamir transcript that is documented field by field, with the two commitments that are load-bearing named and owner-verified by dropping them (SPEC §1a); a ctgrind harness; the PS signature core and threshold aggregation are cross-checked against `coconut-crypto` (see Anchoring). Blind issuance (paper §4.3, as the reference implements it: ElGamal-encrypted private attributes, the formation proof `π_s`, `blindSign`, `unblind`; §1b), so the authorities need not see the private attributes. **Where we are behind:** keygen is trusted-dealer only, although the sibling `dkg` is GJKR over secp256k1 and does not serve BLS12-381; no wire-compatibility of the show proof with any other implementation (none publishes vectors, SPEC §3).
 
 ## 1. Construction (Coconut, NDSS 2019, §4)
 
@@ -107,6 +107,32 @@ credential-to-attribute correspondence. So `Aw`/`Bw` are directly load-bearing i
 the hash; the other elements are additionally, transitively bound (owner-verify:
 dropping `σ₂'` from the hash does NOT let a σ₂'-swap through — the pairing rejects
 it).
+
+## 1b. Blind issuance (`blind.zig`, paper §4.3)
+
+The reference's `prepare_blind_sign` / `blind_sign` / `unblind`, attribute order `private ++ public`:
+
+- **User.** ElGamal key `(d, γ = [d] g1)` (`elgamalKeyGen`). `PrepareBlindSign`: `cm = [o] g1 + Σ [mᵢ] hᵢ`,
+  `h = H(cm)` (the same hash-to-curve and DST as `commonBase`, over the BLINDED `cm`), one ciphertext per private
+  attribute `(aᵢ, bᵢ) = ([kᵢ] g1, [kᵢ] γ + [mᵢ] h)`, and `π_s`: witnesses `w_o`, `w_kᵢ`, `w_mᵢ` (all `q`
+  attributes), commitments `Aᵢ = [w_kᵢ] g1`, `Bᵢ = [w_kᵢ] γ + [w_mᵢ] h`, `C = [w_o] g1 + Σ [w_mᵢ] hᵢ`, challenge
+  `c`, responses `z = w − c·secret` (the reference's sign).
+- **Challenge** (`blindChallenge`): `SHA-512` over `"COCONUT-BLS12381_XMD:SHA-512_BLINDSIGN-V01_CHALLENGE_"`, `q`,
+  `p` (u64 BE each), `g1`, `g2`, every `hᵢ`, `γ`, `cm`, `h`, every `(aᵢ, bᵢ)`, the public attribute values, `C`, every
+  `Aᵢ`, every `Bᵢ` — reduced wide into `Fr`. Fixed width given `(q, p)`, so injective. The reference hashes
+  `g1, g2, cm, h, C, hs, A, B`; the ciphertexts, `γ` and the public values are added here so the statement is
+  bound directly, not only through the recomputed commitments.
+- **Authority** (`blindSign`): refuses `γ`, `cm` or any ciphertext point outside the order-`r` subgroup (the
+  authority multiplies them by its key share, and `[y] T` for a small-order `T` leaks `y` modulo that order) or
+  (`γ` the identity), recomputes `A`, `B`, `C` from the responses and the challenge, and returns
+  `c̃ = (Σ [yᵢ] aᵢ, [x + Σ_{i>p} yᵢ mᵢ] h + Σ_{i≤p} [yᵢ] bᵢ)` only if the challenge matches (`error.InvalidProof`).
+- **Unblind**: `s = b − [d] a`, a `PartialCredential` on `h`; partials from `t` authorities aggregate with
+  `aggregateCredential` and show with `proveCredential` exactly like publicly issued ones (the base `h` is any
+  hash-to-curve point; PS verification does not care which).
+- **Secrets and the dead stack.** `d`, `o`, every `kᵢ`, every witness and the private attributes on the user side,
+  the share on the authority side: pointer in, out-parameter for key material, a burned body, scratch on the heap
+  zeroed on every path; `stackprobe_test.zig` has needles for each of `elgamalKeyGen`, `prepareBlindSign`,
+  `blindSign`, `unblind`.
 
 ## 2. Reuse map
 
@@ -261,15 +287,10 @@ them. Do not use either outside a test.
 
 ## Backlog / deferred
 
-- **Blind issuance (paper §4.3) — ElGamal-encrypted private attributes, formation NIZK `pi_s`, `blindSign`, `unblind`**
-  (survey 2026-09-30): the reason to pick Coconut over threshold PS; without it the issuing authorities learn every
-  attribute, so the privacy claim is only "hidden from the verifier" (selective disclosure at show time is fully
-  present and orthogonal). `params.hs` is already carried for it. Effort: medium (a new NIZK with its own transcript;
-  the most soundness-critical new code). Fits CONVENTIONS §2.
-- **Dead-stack sweep of blind issuance:** when it lands, the user's ElGamal secret key, the blinding factors `o`/`k`,
-  the hidden attributes in the request and the unblinding all need the same treatment as `keygen`/`proveCredential`
-  (pointer in, out-param out, burned body, a probe needle for each); `stackprobe_test.zig` has no needle for them
-  because the module has none of these paths yet.
+- **Wire codecs for the blind-issuance messages** (`BlindSignRequest`, `BlindSignature`, the ElGamal public key):
+  the user→authority and authority→user messages exist only in memory; `Credential`/`PartialCredential`/`ShowProof`
+  have codecs. Small (fixed-width given `q`, `p`; decode must run the G1 subgroup check). No ctgrind row covers
+  `prepareBlindSign`/`blindSign`/`unblind` yet.
 - **Dealer-free key generation for BLS12-381** (survey 2026-09-30): `keygen` is a trusted dealer; `dkg` targets
   secp256k1 only. A Pedersen/Feldman DKG over `Fr` of `bls12_381` (the shape `dkg` already has) would remove the
   dealer. Effort: medium; fits §2.

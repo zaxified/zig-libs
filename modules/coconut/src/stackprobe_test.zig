@@ -22,9 +22,13 @@
 //! the call too (the `ys` slices are wiped by `deinit`; the polynomials and
 //! `m~` by the call itself).
 //!
-//! Not built: the module has no blind issuance (no ElGamal key, no blinding
-//! factors, no unblinding; SPEC "Backlog / deferred"), and the `Entropy.io`
-//! arm is not probed (it differs from the seeded arm only in `Fr.random`,
+//! Blind issuance too: `elgamalKeyGen` (the ElGamal secret `d`),
+//! `prepareBlindSign` (the private attributes, the blinding `o`, every `k_i`
+//! and every proof witness), `blindSign` (the share and its exponent over the
+//! public attributes) and `unblind` (`d`, `−d`).
+//!
+//! Not probed: the `Entropy.io`
+//! arm (it differs from the seeded arm only in `Fr.random`,
 //! which `bls12_381` already swept).
 //!
 //! ⛔ A zero is only readable next to the two controls in the same binary: a
@@ -36,6 +40,7 @@ const builtin = @import("builtin");
 const bls = @import("bls12_381");
 const keys = @import("keys.zig");
 const cred = @import("credential.zig");
+const blind = @import("blind.zig");
 const params_mod = @import("params.zig");
 
 const g1 = bls.g1;
@@ -351,6 +356,19 @@ fn apiProve(a: std.mem.Allocator, random: std.Random, p: params_mod.Parameters, 
     return cred.proveCredentialSeededForTest(a, random, p, vk, c, attrs, &disclosed_mask, "probe") catch unreachable;
 }
 
+fn apiElGamal(random: std.Random, out: *blind.ElGamalKeyPair) void {
+    blind.elgamalKeyGenSeededForTest(random, out);
+}
+fn apiPrepare(a: std.mem.Allocator, random: std.Random, p: params_mod.Parameters, gamma: g1.Affine, private: []const Fr, public: []const Fr) blind.BlindSignRequest {
+    return blind.prepareBlindSignSeededForTest(a, random, p, gamma, private, public) catch unreachable;
+}
+fn apiBlindSign(a: std.mem.Allocator, sh: *const keys.SecretKeyShare, p: params_mod.Parameters, gamma: g1.Affine, req: *const blind.BlindSignRequest, public: []const Fr) blind.BlindSignature {
+    return blind.blindSign(a, sh, p, gamma, req, public) catch unreachable;
+}
+fn apiUnblind(kp: *const blind.ElGamalKeyPair, bs: *const blind.BlindSignature) cred.PartialCredential {
+    return blind.unblind(kp, bs);
+}
+
 // ── the probed calls (all `noinline`, secrets read from static memory) ──────
 
 var nd: Needles = .{};
@@ -368,6 +386,14 @@ var vks_sink: keys.VerificationKeyShare = undefined;
 var cred_sink: cred.Credential = undefined;
 var partial_sink: cred.PartialCredential = undefined;
 var proof_sink: cred.ShowProof = undefined;
+
+var eg_sink: blind.ElGamalKeyPair = undefined;
+var cur_eg: blind.ElGamalKeyPair = undefined;
+var cur_req: blind.BlindSignRequest = undefined;
+var req_sink: blind.BlindSignRequest = undefined;
+var cur_bs: blind.BlindSignature = undefined;
+var bs_sink: blind.BlindSignature = undefined;
+const P_PRIV = 2; // cur_attrs[0..2] private, [2..4] public in the blind calls
 
 var heap_buf: [256 * 1024]u8 = undefined;
 var heap_fba: std.heap.FixedBufferAllocator = undefined;
@@ -407,6 +433,28 @@ noinline fn callProve() void {
     call_prng = .init(cur_seed + 1000);
     proof_sink = apiProve(a, call_prng.random(), cur_params, cur_keys.master_vk, cur_cred, &cur_attrs);
     proof_sink.deinit(a);
+}
+
+noinline fn callElGamal() void {
+    call_prng = .init(cur_seed + 2000);
+    apiElGamal(call_prng.random(), &eg_sink);
+    std.mem.doNotOptimizeAway(&eg_sink.gamma);
+    eg_sink.deinit();
+}
+noinline fn callPrepare() void {
+    const a = freshHeap();
+    call_prng = .init(cur_seed + 3000);
+    req_sink = apiPrepare(a, call_prng.random(), cur_params, cur_eg.gamma, cur_attrs[0..P_PRIV], cur_attrs[P_PRIV..]);
+    req_sink.deinit(a);
+}
+noinline fn callBlindSign() void {
+    const a = freshHeap();
+    bs_sink = apiBlindSign(a, &cur_keys.sk_shares[1], cur_params, cur_eg.gamma, &cur_req, cur_attrs[P_PRIV..]);
+    std.mem.doNotOptimizeAway(&bs_sink);
+}
+noinline fn callUnblind() void {
+    partial_sink = apiUnblind(&cur_eg, &cur_bs);
+    std.mem.doNotOptimizeAway(&partial_sink);
 }
 
 fn frFrom(label: []const u8, ci: usize, i: usize) Fr {
@@ -492,6 +540,56 @@ test "STACKPROBE: no key, share, attribute or witness residue on the dead stack 
         leak_src = cur_attrs[1].toBytes(); // hidden
         heap_view = &heap_buf;
         bad += try runProbe("proveCredential", callProve, &nd);
+
+        // blind issuance: the ElGamal key
+        nd.reset();
+        replay(&nd, "eg d", cur_seed + 2000, 1);
+        nd.sort();
+        {
+            var pr = std.Random.DefaultPrng.init(cur_seed + 2000);
+            leak_src = apiScalar(pr.random()).toBytes();
+        }
+        bad += try runProbe("elgamalKeyGen", callElGamal, &nd);
+
+        {
+            var pr = std.Random.DefaultPrng.init(cur_seed + 4000);
+            apiElGamal(pr.random(), &cur_eg);
+        }
+        defer cur_eg.deinit();
+        // prepareBlindSign: private attributes, o, w_r, every k_i, w_k, w_m
+        nd.reset();
+        for (cur_attrs[0..P_PRIV]) |m| nd.addFr("private attr", m);
+        replay(&nd, "blinding", cur_seed + 3000, 2 + 2 * P_PRIV + Q);
+        nd.addFr("eg d", cur_eg.d);
+        nd.sort();
+        leak_src = cur_attrs[0].toBytes();
+        heap_view = &heap_buf;
+        bad += try runProbe("prepareBlindSign", callPrepare, &nd);
+
+        {
+            var pr = std.Random.DefaultPrng.init(cur_seed + 5000);
+            cur_req = apiPrepare(gpa, pr.random(), cur_params, cur_eg.gamma, cur_attrs[0..P_PRIV], cur_attrs[P_PRIV..]);
+        }
+        defer cur_req.deinit(gpa);
+        // blindSign: the share and its exponent x + sum_{public} y_i m_i
+        nd.reset();
+        addKeyNeedles(&nd);
+        {
+            var e = sh.x;
+            for (sh.ys[P_PRIV..], cur_attrs[P_PRIV..]) |y, m| e = e.add(y.mul(m));
+            nd.addFr("blind e", e);
+        }
+        nd.sort();
+        leak_src = sh.x.toBytes();
+        bad += try runProbe("blindSign", callBlindSign, &nd);
+
+        cur_bs = apiBlindSign(gpa, sh, cur_params, cur_eg.gamma, &cur_req, cur_attrs[P_PRIV..]);
+        nd.reset();
+        nd.addFr("eg d", cur_eg.d);
+        nd.addFr("eg -d", cur_eg.d.neg());
+        nd.sort();
+        leak_src = cur_eg.d.toBytes();
+        bad += try runProbe("unblind", callUnblind, &nd);
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }

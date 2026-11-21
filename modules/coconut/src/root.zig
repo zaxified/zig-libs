@@ -90,6 +90,7 @@ pub const params = @import("params.zig");
 pub const lagrange = @import("lagrange.zig");
 pub const keys = @import("keys.zig");
 pub const credential = @import("credential.zig");
+pub const blind = @import("blind.zig");
 
 // Convenience re-exports.
 pub const Parameters = params.Parameters;
@@ -115,6 +116,15 @@ pub const proveCredentialSeededForTest = credential.proveCredentialSeededForTest
 pub const verifyCredential = credential.verifyCredential;
 pub const psSignWithSecret = credential.psSignWithSecret;
 pub const psVerifyPlain = credential.psVerifyPlain;
+pub const ElGamalKeyPair = blind.ElGamalKeyPair;
+pub const elgamalKeyGen = blind.elgamalKeyGen;
+pub const BlindSignRequest = blind.BlindSignRequest;
+pub const BlindSignature = blind.BlindSignature;
+pub const BlindError = blind.BlindError;
+pub const prepareBlindSign = blind.prepareBlindSign;
+pub const verifyBlindSignRequest = blind.verifyBlindSignRequest;
+pub const blindSign = blind.blindSign;
+pub const unblind = blind.unblind;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -140,6 +150,7 @@ test {
     _ = lagrange;
     _ = keys;
     _ = credential;
+    _ = blind;
     _ = @import("harness_test.zig");
     _ = @import("interop_test.zig");
     _ = @import("stackprobe_test.zig");

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — Added: blind issuance (paper §4.3, `blind.zig`): `ElGamalKeyPair`/`elgamalKeyGen`, `prepareBlindSign` (commitment, ElGamal ciphertexts of the private attributes, formation proof `π_s`), `verifyBlindSignRequest`, `blindSign` (refuses a failed proof with `error.InvalidProof` and any point outside G1), `unblind`; `BlindError`. Secret-touching bodies are burned and stack-probed.
 - **2026-11-20** — **NO CONSUMER-VISIBLE CHANGE:** tests and test fixtures only (pinned show-challenge transcript, generator and common-base bytes, argument-error, torsion and aggregation-base cases), from the whole-module mutation run (143/145 killed, 2 equivalent); no production code moved.
 - **2026-10-18** — Ported to Zig 0.17.0. Tests: `@typeInfo(fn)` uses `param_types` (`?type` elements).
 - **2026-10-10** — tests: deterministic fuzz driver `COCONUT_FUZZ`: `coconut-credential-decode`, `coconut-partial-decode` (genuine encodings with 0-3 octets damaged; what decodes re-encodes to the same octets), `coconut-showproof-decode` (corpus entry damaged; same canonical round trip) and `coconut-protocol` (2-of-3 issuance, aggregation, show, verify; the wire form verifies; another context, key, mask or disclosed value and one flipped octet of the encoded proof are refused). No source change.
