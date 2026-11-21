@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [alexbeltran/gobacnet](https://github.com/alexbeltran/gobacnet) | Go | GPL-2.0 | 53 | push 2024-05-09 | Go client; not read. |
 | [GavinMallott/BACnet-zig](https://github.com/GavinMallott/BACnet-zig) | Zig | none stated | 0 | push 2024-11-07 | Only Zig BACnet repository found; abandoned; no licence so not read. |
 
-**Where we are ahead:** the only maintained Zig BACnet; pure, allocation-free, time-injected; a complete BACnet/SC stack in pure computation (VLL codec, node with jittered reconnect and hub failover, hub) plus BACnet/IP, byte-compared with bacpypes3 and bacnet-stack and live round-tripped both ways; MIT versus GPL-with-exception C. **Where we are behind:** APDU segmentation (a large `object-list` read fails with Abort), alarms/events, BBMD behaviour, MS/TP, IPv6, file/object-management services (→ Backlog items).
+**Where we are ahead:** the only maintained Zig BACnet; pure, allocation-free, time-injected; a complete BACnet/SC stack in pure computation (VLL codec, node with jittered reconnect and hub failover, hub) plus BACnet/IP, byte-compared with bacpypes3 and bacnet-stack and live round-tripped both ways; MIT versus GPL-with-exception C. **Where we are behind:** APDU segmentation (a large `object-list` read fails with Abort), alarms/events, MS/TP, IPv6, file/object-management services (→ Backlog items).
 
 ## Design & invariants
 
@@ -249,6 +249,10 @@ stranger must not kill the loop) while still propagating transport failures.
 - **`TimeSynchronization` / `UTCTimeSynchronization`** (16.7, 16.8): unconfirmed; the device reports `Event.time_synchronized` and has no clock of its own to set. `Client.timeSynchronization` sends one to an address or broadcasts it.
 
 - **Commandable properties and `COV_Increment`** (clause 19.2, 13.1.2): a `present_value` with `Property.priority_slots` (the caller's `[16]?Value`) is commandable. A write at priority `p` (16 when none is given, WriteProperty and WritePropertyMultiple alike) fills slot `p`, a Null empties it, and the stored value is the highest-priority non-empty slot, else the sibling `relinquish_default` property; priority 6 (minimum on/off) is `write_access_denied` for clients; a datum of another kind is `invalid_data_type`. The array is served by a sibling `priority_array` property carrying `Value.priority_array` (the same slots): the whole array, `[0]` its size, `[1..16]` one slot (`invalid_array_index` beyond). A property without `priority_slots` keeps the old rule (a relinquish is refused unless the stored value is Null). `Device.update` notifies a Real `present_value` only when it moved by at least the object's `cov_increment` property from the value last notified (an object without that property notifies on every update).
+
+### BBMD and foreign-device registration (`bbmd.zig`)
+
+`Bbmd(max_bdt, max_fdt)` follows Annex J.4 and J.5 (the reference stacks' behaviour is the same in outline; no foreign source was read): an Original-Broadcast from the local subnet is re-sent as `Forwarded-NPDU` (origin = the sender) to every BDT peer but itself, by unicast for a mask of `255.255.255.255` and by a directed broadcast to `ip | ~mask` otherwise, and to every registered foreign device; a Forwarded-NPDU is accepted only from an address in the BDT, rebroadcast locally unless this BBMD's own BDT entry has a mask other than all ones (the peer then reached the subnet itself), and sent to the foreign devices; Distribute-Broadcast-To-Network from a registered foreign device fans out to the local subnet, the peers and the other foreign devices, from anyone else it is a `BVLC-Result` NAK; Register-Foreign-Device lives `ttl + 30 s` and a full table is a NAK; Write-BDT is a NAK unless `Config.accept_bdt_writes`. `ForeignRegistration` re-registers at half the time-to-live and retries every 5 s without an answer or after a NAK; `distribute` is refused (`error.NotRegistered`) until the BBMD accepted. Every reply is a typed `bvll` message checked in the tests; the behaviours are derived from the annex text (self-anchored), not captured from a foreign BBMD.
 
 Anchoring: byte goldens derived from the clause 21 ASN.1 productions (self), the `WritePropertyMultiple-Error` shape from the standard's Error PDU table and interpretation IC 135-2012-7; no foreign-stack capture of these services yet.
 
@@ -476,7 +480,7 @@ Labelled honestly, because it was **not** checked against another implementation
 
 ## What is deliberately not done
 
-Out of scope for this module as it stands, each with a reason. Open items with a plan (segmentation, BBMD behaviour, alarms and events, MS/TP) are in
+Out of scope for this module as it stands, each with a reason. Open items with a plan (segmentation, alarms and events, MS/TP) are in
 *Backlog / deferred*.
 
 - **TLS itself, and certificate handling.** BACnet/SC is *implemented*; the TLS underneath it is a
@@ -566,6 +570,5 @@ its clause citations live in this file and in the module's doc comments.
 ## Backlog / deferred
 
 - (survey 2026-09-30) **Segmentation (clause 5.4)**: without it `ReadProperty(object-list)` on any real device with hundreds of objects fails; the first thing a BMS integrator hits; medium-large (window state machine, time-injected), fits §2. Ranked first. Segmented PDUs are parsed correctly and refused explicitly with `Abort(segmentation_not_supported)`; what is missing is buffering the segments and driving the SegmentACK window, so a `ReadProperty` of a large `object-list`, or an RPM whose answer exceeds the peer's max-APDU, fails cleanly with an `Abort` instead of succeeding.
-- (survey 2026-09-30) **BBMD behaviour and foreign-device registration timer**: needed across IP subnets; medium, fits §2. Registering as a foreign device (with its 30-second grace period and re-registration timer), maintaining a broadcast distribution table and re-emitting broadcasts as `Forwarded-NPDU` are policy this module encodes for but does not perform.
 - (survey 2026-09-30) **Alarms and events (intrinsic reporting, GetEventInformation, AcknowledgeAlarm)**: large sub-protocol with its own state machine (`AcknowledgeAlarm`, `GetAlarmSummary`, `GetEnrollmentSummary`, `GetEventInformation`, both event-notification services, the Event Enrollment object); fits §2.
 - (survey 2026-09-30) **MS/TP (clause 9)**: bacnet-stack has it. The RS-485 master-slave/token-passing data link has completely different framing (preamble, CRC, token rotation) with a real-time token timer, and needs a serial port to verify; it would be its own module — a question whether this is "never in this module" or "sibling module later".

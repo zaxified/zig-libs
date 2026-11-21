@@ -11,6 +11,9 @@
 //!   the socket actually delivered. Original unicast/broadcast NPDUs,
 //!   `Forwarded-NPDU`, and the BBMD/foreign-device functions that exist
 //!   because IP broadcasts do not cross subnets.
+//! * **`bbmd`** (Annex J.4, J.5) — a BBMD (forwarding, the BDT and FDT, the
+//!   30-second grace period) and the foreign device's registration timer, pure
+//!   and time-injected.
 //! * **`npdu`** (clause 6) — the network layer, whose layout the **control
 //!   octet decides**: which of DNET/DLEN/DADR, SNET/SLEN/SADR and the hop
 //!   count are present. A decoder that assumes a fixed prefix reads the APDU
@@ -91,6 +94,8 @@ pub const types = @import("types.zig");
 pub const tag = @import("tag.zig");
 /// Annex J BACnet/IP virtual link layer.
 pub const bvll = @import("bvll.zig");
+/// Annex J BBMD behaviour and the foreign-device registration timer.
+pub const bbmd = @import("bbmd.zig");
 /// Clause 6 network layer.
 pub const npdu = @import("npdu.zig");
 /// Clause 20.1 application layer PDUs.
@@ -188,6 +193,7 @@ test {
     _ = types;
     _ = tag;
     _ = bvll;
+    _ = bbmd;
     _ = npdu;
     _ = apdu;
     _ = service;

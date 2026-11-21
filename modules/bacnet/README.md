@@ -28,6 +28,11 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
   (`Register-Foreign-Device`, read/write of the broadcast-distribution table,
   read of the foreign-device table) with iterators over their entries. Default
   port 47808 (`0xBAC0`). Addresses go through the sibling `netaddr` module.
+- **`bbmd`** (Annex J.4, J.5) — a BBMD as a pure, time-injected state machine over a `Transport`: forwards
+  broadcasts to the peers of its broadcast-distribution table (one-hop unicast or two-hop directed
+  broadcast by mask) and to its registered foreign devices, serves the BDT and FDT requests, and
+  expires foreign devices after `ttl + 30 s`; `ForeignRegistration` keeps a foreign device's registration
+  alive (re-registers at half the time-to-live, retries a silent or refusing BBMD).
 - **`npdu`** (clause 6) — the network layer, whose **layout is decided by the
   control octet**: whether DNET/DLEN/DADR are present, whether SNET/SLEN/SADR
   are, and whether a hop count follows (it does iff the *destination* bit is
@@ -122,7 +127,7 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
 ## Not provided
 
 No APDU segmentation (segmented PDUs are parsed and refused with `Abort`), no TLS (a seam, never verified), no
-MS/TP, IPv6 or BBMD behaviour, no alarms/events, backup/restore, file services, no
+MS/TP or IPv6, no alarms/events, backup/restore, file services, no
 a priority array only on properties the caller marks commandable; see `SPEC.md` (*What is deliberately not done*, *Backlog / deferred*).
 
 ## Use
