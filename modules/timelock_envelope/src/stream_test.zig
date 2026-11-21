@@ -358,7 +358,7 @@ test "peekHeader reads version and round from either wire's 15-byte prefix" {
     bad[0] ^= 1;
     try testing.expectError(error.BadMagic, Env.peekHeader(&bad));
     bad = v2[0..stream.stream_header_bytes].*;
-    bad[4] = 3;
+    bad[4] = 4; // 3 is the multi-recipient envelope (multi_test.zig)
     try testing.expectError(error.UnsupportedVersion, Env.peekHeader(&bad));
     try testing.expectError(error.SuiteMismatch, envelope.Envelope192.peekHeader(v2));
 }

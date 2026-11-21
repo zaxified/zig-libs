@@ -173,8 +173,21 @@ Provenance: this module is a clean-room composition; the drand quicknet
 KAT vector it reuses for its timelock round-trip is `tlock`'s, whose
 provenance is in `modules/tlock/NOTICE`. See [SPEC.md](SPEC.md).
 
+## Several recipients (wire version 3)
+
+```zig
+const eks = [_]*const hqc.Hqc128.EncapsKey{ &alice_ek, &bob_ek };
+const wire = try Env.sealMulti(allocator, io, plaintext, &eks, p_pub, round, .{}); // .{ .max_recipients = 64 }
+const plaintext = try Env.openMulti(allocator, wire, &bob_dk, round_signature, .{});
+```
+
+One time lock shared by all, one HQC slot per recipient: any ONE recipient's secret key AND the round's
+signature open it. A stranger's key gives `AuthFailed`, an early signature `TimeGateClosed`; at most
+`max_recipients` slots on both ends (`TooManyRecipients`).
+
 ## Not provided
 
-Multiple recipients, `age`-file / armored interchange (a file sealed here is not readable by `tle`/`age`), beacon
+`age`-file / armored interchange (age's stanzas are an OR, the envelope's AND is not expressible in them; the
+`tlock` module reads and writes `tle` files for the time lock alone), beacon
 operation and `sig_R` verification (the caller's job, as in `tlock`), more than one suite, metadata privacy
-(`round`, `suite_id` and `pt_len` are in the clear): see SPEC.md *What is deliberately not done* and *Backlog / deferred*.
+(`round`, `suite_id` and `pt_len` are in the clear): see SPEC.md *What is deliberately not done*.

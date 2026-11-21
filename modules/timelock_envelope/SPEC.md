@@ -40,7 +40,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [thibmeu/tlock-rs](https://github.com/thibmeu/tlock-rs) (`tlock_age`) | Rust | MIT | 39 | push 2026-07-13 | README read: age Identity/Recipient for tlock, ASCII armor, interoperable with the Go and JS implementations. |
 | [KhoaNguyen55/zage](https://github.com/KhoaNguyen55/zage) | Zig | MIT | 6 | v0.7.0 (2025-08-13) | Zig age; no time lock *(inferred)*. |
 
-**Where we are ahead:** the only envelope found that requires BOTH a drand time lock AND a post-quantum KEM secret (HQC), bound into the key by HKDF and proven by positive-control tests; pure Zig. **Where we are behind:** one recipient, no age/armor interchange (a file sealed here is not readable by `tle`/`age`; deliberate, see *What is deliberately not done*), a single suite, the time lock itself is not post-quantum (documented). The version-1 wire is one-shot (`pt_len` is u32, whole plaintext buffered); the streaming format (wire version 2, `sealStream`/`openStream`, any size in about 128 KiB) covers files of any size.
+**Where we are ahead:** the only envelope found that requires BOTH a drand time lock AND a post-quantum KEM secret (HQC), bound into the key by HKDF and proven by positive-control tests; pure Zig. **Where we are behind:** no age/armor interchange (a file sealed here is not readable by `tle`/`age`; deliberate, see *What is deliberately not done*), a single suite, the time lock itself is not post-quantum (documented). The version-1 wire is one-shot (`pt_len` is u32, whole plaintext buffered); the streaming format (wire version 2, `sealStream`/`openStream`, any size in about 128 KiB) covers files of any size.
 
 
 ## The construction
@@ -180,6 +180,27 @@ parentheses; `hqc_ct` and total scale with the HQC parameter set.
 Version 1 stays as it is: compact for small secrets, one tag, `pt_len` ≤
 `u32`. Version 2 is for files.
 
+## Version 3: several recipients (`multi.zig`)
+
+`sealMulti` / `openMulti` (age's multi-recipient feature over the AND of locks): one time lock to round
+`R` shared by every recipient, and one slot per recipient. A random 32-byte file key `F` encrypts the
+content; slot `i` is `HQC.encaps(ek_i) → (ct_i, ss_i)` plus `F` sealed with ChaCha20-Poly1305 under
+`HKDF-SHA256(kdf_salt, s_time ‖ ss_i, "TLE1-slot-key" ‖ 3 ‖ suite ‖ BE64(R) ‖ BE16(i))` (key ‖ nonce),
+AAD `SHA-256(prefix ‖ time lock ‖ ct_i)`. The content is sealed under
+`HKDF-SHA256(kdf_salt, F, "TLE1-file-key" ‖ 3 ‖ suite ‖ BE64(R))` with everything before its tag
+(prefix, time lock, every slot) as AAD. **Any one recipient's HQC secret key AND the round's
+signature open the file**: `s_time` alone opens no slot (each slot key also needs `ss_i`), a recipient
+key alone opens none before `R` (`TimeGateClosed`), and slots cannot be added, dropped or swapped
+(`AuthFailed`).
+
+Wire: `magic ‖ 3 ‖ suite ‖ flags ‖ round(8) ‖ pt_len(4) ‖ count(u16) ‖ time_lock(128) ‖ count × (ct_i ‖
+wrapped_F(32) ‖ tag(16)) ‖ tag(16) ‖ ciphertext`, little-endian like versions 1 and 2. `count` is
+1..`MultiLimits.max_recipients` (default 64; age sets no bound, this module bounds it on both ends
+because the reader pays one HQC decapsulation per slot): `NoRecipients` / `TooManyRecipients` on seal,
+`TooManyRecipients` / `LengthMismatch` (count 0, wrong total) on open. Opening tries the slots in order,
+so its time says which slot was the reader's, and the slots sit side by side in the clear (age has
+both properties). `peekHeader` reports version 3. The payload is one-shot like version 1.
+
 ## Security model / threat model
 
 - **Guarantee.** The plaintext is recoverable iff (round `R` reached ⇒
@@ -244,14 +265,16 @@ panics and never returns a wrong plaintext (see `security_test.zig`).
 
 - **Streaming in version 1.** `seal`/`open` stay one-shot (`pt_len` is a
   `u32`); large payloads use version 2 (`sealStream`/`openStream`).
-- **`age`-file / armored interchange format.** This module ships its own
-  compact binary envelope, not `filippo.io/age` stanza framing. Interop
-  with drand's `tle` file format is not a goal (the question is kept under *Backlog / deferred*).
+- **`age`-file / armored interchange format.** age's recipient stanzas are an OR: any one
+  stanza opens the file. The envelope's AND (the time lock AND a PQ secret, bound into one key)
+  cannot be expressed as age stanzas, so a file sealed here is its own compact binary format.
+  `tle`/age interop for the time lock alone exists in the `tlock` module (byte-exact against Go
+  `tle`, including armor).
 - **Beacon operation and signature verification.** No drand node, no DKG,
   and no `sig_R`-vs-`p_pub` pairing check (caller's responsibility, as in
   `tlock`).
-- **Threshold PQ locks.** A single HQC recipient
-  per envelope; N-of-M KEM wrapping is not modelled (multiple recipients: see Backlog).
+- **Threshold PQ locks.** N-of-M KEM wrapping is not modelled; version 3 is 1-of-M
+  (any one recipient).
 - **Key/parameter agility beyond the three HQC sets and the single
   ChaCha20-Poly1305 / HKDF-SHA256 suite.** `version`/`suite_id` leave
   room to add suites later; only the shipped one is implemented.
@@ -272,6 +295,10 @@ Run `scripts/modtest timelock_envelope`.
 - **Tamper and malformed input:** a flipped byte in the round field, `tlock_ct`, `hqc_ct`, tag or content fails with a
   typed error; corrupted magic/version/suite fails at parse; truncation, a trailing byte, an undecodable `U`
   (`MalformedTimeLock`) and `PlaintextTooLarge` are refused; `peekHeader` over either wire's prefix.
+- **Version 3 (`multi_test.zig`):** three recipients each open, a stranger gets `AuthFailed`, a wrong signature
+  `TimeGateClosed`; a flipped byte in the flags, the time lock, a slot's HQC ciphertext, wrapped key or tag, the
+  content tag or the ciphertext is refused; `NoRecipients`, `TooManyRecipients` on both ends, count 0, a short buffer,
+  a version-3 buffer handed to `open`; two `sealMulti` calls draw fresh randomness; `peekHeader` reports version 3.
 - **Positive controls:** an s_pq-dropping KDF makes the wrong-PQ-key attack succeed (so the negative is a real detector),
   while the real key demonstrably depends on both `s_time` and `s_pq` (and on round, suite and version); `deriveKeys`
   is held against a Python HKDF recomputation.
@@ -294,9 +321,7 @@ Run `scripts/modtest timelock_envelope`.
 
 ## Backlog / deferred
 
-- **age-format interop (stanza + armor):** lets `tle` decrypt the time-lock half and gives users armored files. Effort: medium; fits §2. Question: interop is deliberately "not a goal" (see *What is deliberately not done*), so this is kept as a question, not a plan.
-- **Multiple recipients:** age's core feature. Effort: medium; fits §2.
-
+None open.
 
 ## Anchoring
 

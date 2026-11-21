@@ -58,6 +58,12 @@ pub const StreamSealError = stream.StreamSealError;
 pub const StreamOpenError = stream.StreamOpenError;
 pub const deriveStreamKey = stream.deriveStreamKey;
 
+/// The version-3 multi-recipient format.
+pub const multi = @import("multi.zig");
+pub const MultiLimits = multi.Limits;
+pub const MultiSealError = multi.MultiSealError;
+pub const MultiOpenError = multi.MultiOpenError;
+
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
@@ -84,6 +90,7 @@ test {
     _ = @import("security_test.zig");
     _ = stream;
     _ = @import("stream_test.zig");
+    _ = @import("multi_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
 }

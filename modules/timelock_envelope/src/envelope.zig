@@ -58,6 +58,7 @@ const hqc = @import("hqc");
 const chachapoly = @import("chachapoly");
 const entropy = @import("entropy");
 const stream = @import("stream.zig");
+const multi = @import("multi.zig");
 const burn = @import("burn.zig");
 
 const bls12_381 = tlock.bls12_381;
@@ -464,7 +465,8 @@ pub fn Envelope(comptime Kem: type) type {
         /// before anything is opened.
         pub const Header = struct {
             /// 1 for `seal`'s one-shot envelope, `stream.stream_version`
-            /// (2) for `sealStream`'s stream.
+            /// (2) for `sealStream`'s stream, `multi.multi_version` (3) for
+            /// `sealMulti`'s multi-recipient envelope.
             version: u8,
             /// The beacon round the envelope is locked to: fetch its
             /// signature, or show the unlock time, before `open`.
@@ -482,7 +484,7 @@ pub fn Envelope(comptime Kem: type) type {
             if (prefix.len < stream.stream_header_bytes) return error.Truncated;
             if (!std.mem.eql(u8, prefix[0..4], &magic)) return error.BadMagic;
             const v = prefix[4];
-            if (v != version and v != stream.stream_version) return error.UnsupportedVersion;
+            if (v != version and v != stream.stream_version and v != multi.multi_version) return error.UnsupportedVersion;
             if (prefix[5] != suite_id) return error.SuiteMismatch;
             return .{ .version = v, .round = std.mem.readInt(u64, prefix[round_off..][0..8], .little) };
         }
@@ -496,6 +498,19 @@ pub fn Envelope(comptime Kem: type) type {
         pub const openStream = stream.Stream(Kem).open;
         /// Total wire size of a `len`-byte plaintext in the stream format.
         pub const streamSealedLen = stream.Stream(Kem).sealedLen;
+
+        /// The version-3 multi-recipient envelope (`multi.zig`): one time
+        /// lock, one slot per recipient; any one recipient's HQC secret key
+        /// AND the round's signature open it.
+        pub const sealMulti = multi.Multi(Kem).seal;
+        /// `sealMulti` over caller-supplied randomness (tests).
+        pub const sealMultiWithRandomness = multi.Multi(Kem).sealWithRandomness;
+        /// Open a version-3 envelope with one recipient's secret key.
+        pub const openMulti = multi.Multi(Kem).open;
+        /// Total wire size for `count` recipients and a `len`-byte plaintext.
+        pub const multiSealedLen = multi.Multi(Kem).sealedLen;
+        /// The randomness `sealMultiWithRandomness` consumes.
+        pub const MultiRandomness = multi.Multi(Kem).Randomness;
     };
 }
 

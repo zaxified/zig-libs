@@ -1958,8 +1958,8 @@ lms	ReleaseFast	hss	1	6	ec1420f9605cb8fe	43dd64bf2e77e52a
 # tlock.encrypt (h3 scalar reduction, g2 toAffine inversion and compressed
 # encoding of U = r*G2, which is the PUBLIC ciphertext half) 5, HQC's
 # dkParse fixed-weight rejection sampling on the decapsulation key 2.
-timelock_envelope	ReleaseFast	kdf	1	0	eb2d6a114ee06a39	1dd423b6c587c4a7
-timelock_envelope	ReleaseFast	env	1	8	eb2d6a114ee06a39	eb40a7f3ed6eaa0a
+timelock_envelope	ReleaseFast	kdf	1	0	e951bb883d02c0d2	1dd423b6c587c4a7
+timelock_envelope	ReleaseFast	env	1	8	e951bb883d02c0d2	eb40a7f3ed6eaa0a
 # snmp (2026-10-10) — kdf: password through passwordToUserKey + localizeKey
 # (MD5, SHA-1); auth: localized key through computeDigestInto, all six
 # protocols; aes: AES-128-CFB privacy round trip. All 0. des: DES-CBC
