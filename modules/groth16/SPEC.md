@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; re-surveyed 2026-10-05 (stars and 
 | [Consensys/gnark](https://github.com/Consensys/gnark) | Go | Apache-2.0 (LICENSE) | 1.7k | v0.16.3 (2026-08-24) | Circuit DSL, Groth16 + PLONK on several curves, Solidity verifier export (BN254 primary), audited; own README warns serialized formats are unstable across versions. MPC setup support *(inferred, not in README)*. |
 | Zig ecosystem (GitHub search `groth16` / `snark` with `language:Zig`, 2026-10-05) | Zig | — | 0 | — | Nothing comparable: `groth16` finds no Zig repository; `snark` finds only `c0utin/znark` ("zk-SNARK library", 0 stars, no licence declared; not read). Nothing in Zig `std`. |
 
-**Where we are ahead:** the only Zig Groth16 prover we know of, pure Zig over the in-repo `bn254`. It reads snarkjs's `.zkey` and circom's `.wtns`/`.r1cs` and proves against them (`zkprove`); a real `snarkjs@0.7.6` accepts those proofs — pinned byte for byte on the committed fixture, and on a 10 000-constraint circuit in a manual `tools/snarkjs/gen.sh big` run at 1.9 s on one core against snarkjs's 1.8 s on all of them. Against rapidsnark, the native prover a Zig user would otherwise shell out to, we add phase 2: `phase2.newZkey` reproduces `snarkjs groth16 setup` byte for byte apart from the circuit hash, `phase2.contribute` produces keys snarkjs proves with, and `phase2.verify` checks a downloaded key against its `.r1cs` and `.ptau`. **Where we are even:** the main use case — circom circuit, real ceremony `.zkey`, `.wtns` → proof, verify, `proof.json`/`public.json`/`verification_key.json` that snarkjs reads (rapidsnark's whole feature set, minus speed); on-chain verification like snarkjs, gnark and ark-circom: `solidity.verifier` writes a verifier contract for a key (own text over the EVM's BN254 precompiles, snarkjs's `verifyProof` signature) and `snarkjs_export.solidityCalldata` writes snarkjs's `zkey export soliditycalldata` line byte for byte; solc compiled the contract and an EVM accepted snarkjs's proof with it and refused three tamperings (`tools/solidity/run.sh`). **Where we are behind (→ Backlog):** single-threaded (rapidsnark, snarkjs, arkworks, bellman and gnark all use every core); no witness calculation (ark-circom runs circom's WASM; here the `.wtns` comes from circom's own generator, as for rapidsnark; see *What is deliberately not done*); snarkjs's `zkey verify` rejects keys made or contributed here (§ 4b); the `.zkey` must be in memory (the prover reads every section of it; a `.ptau` need not be: `ptau.readCut` reads by position only the prefix a circuit's power needs, so a 2²⁸ ceremony file is usable for a small circuit); no `.ptau` phase 1 (reading only); no circuit DSL; BN254 only; no PLONK (the last three: *What is deliberately not done* and *Backlog / deferred*).
+**Where we are ahead:** the only Zig Groth16 prover we know of, pure Zig over the in-repo `bn254`. It reads snarkjs's `.zkey` and circom's `.wtns`/`.r1cs` and proves against them (`zkprove`); a real `snarkjs@0.7.6` accepts those proofs — pinned byte for byte on the committed fixture, and on a 10 000-constraint circuit in a manual `tools/snarkjs/gen.sh big` run at 1.9 s on one core against snarkjs's 1.8 s on all of them. Against rapidsnark, the native prover a Zig user would otherwise shell out to, we add phase 2: `phase2.newZkey` reproduces `snarkjs groth16 setup` byte for byte apart from the circuit hash, `phase2.contribute` produces keys snarkjs proves with, and `phase2.verify` checks a downloaded key against its `.r1cs` and `.ptau`. **Where we are even:** the main use case — circom circuit, real ceremony `.zkey`, `.wtns` → proof, verify, `proof.json`/`public.json`/`verification_key.json` that snarkjs reads (rapidsnark's whole feature set, minus speed); on-chain verification like snarkjs, gnark and ark-circom: `solidity.verifier` writes a verifier contract for a key (own text over the EVM's BN254 precompiles, snarkjs's `verifyProof` signature) and `snarkjs_export.solidityCalldata` writes snarkjs's `zkey export soliditycalldata` line byte for byte; solc compiled the contract and an EVM accepted snarkjs's proof with it and refused three tamperings (`tools/solidity/run.sh`). **Where we are behind (→ Backlog, Roadmap):** single-threaded (rapidsnark, snarkjs, arkworks, bellman and gnark all use every core); no witness calculation (ark-circom runs circom's WASM; here the `.wtns` comes from circom's own generator, as for rapidsnark; see *What is deliberately not done*); snarkjs's `zkey verify` rejects keys made or contributed here (§ 4b); the `.zkey` must be in memory (the prover reads every section of it; a `.ptau` need not be: `ptau.readCut` reads by position only the prefix a circuit's power needs, so a 2²⁸ ceremony file is usable for a small circuit); no `.ptau` phase 1 (reading only); no circuit DSL; BN254 only; no PLONK (the last three: *What is deliberately not done* and *Roadmap*).
 
 ## 1. Construction
 
@@ -348,8 +348,8 @@ stderr). Test classes:
   the ark-bn254 / snarkjs constant (generators 5 and 7 give the same root for every domain up to `2^5`, so small
   fixtures cannot tell them apart); every reader refusal reached through its own guard; the contribution transcript
   pinned by an independent derivation; the circuit hash pinned and sensitive to each of its six sections; `newZkey`'s
-  domain rule on circuits with coefficients and on exact powers of two (against this module's own rule, not snarkjs;
-  Backlog item 7).
+  domain rule on circuits with coefficients and on exact powers of two (this module's own rule; against snarkjs, the
+  `b8`/`b9` fixtures above).
 - **Fuzz** (`fuzz_test.zig`): `GROTH16_FUZZ=<runs>[,<first seed>]` through testkit's deterministic driver. It damages
   the real snarkjs/circom fixtures with aim at the structure (section table, header counts, flips, truncation,
   reordered sections, random bytes) and requires: no crash, hang or leak; an intact file accepted; `write(parse(x))`
@@ -406,7 +406,7 @@ computed from those inputs, not code or text of either project.
 - **PLONK, FFLONK, Halo2, universal / updatable setup, custom gates, other curves** (survey, scope): the
   scope explosion Groth16 was chosen to avoid. `.r1cs` custom-gate sections 4 and 5 are refused (`circom.zig`, `error.Unsupported`).
 - **Proof recursion / aggregation.**
-- **A circuit / gadget DSL.** R1CS is hand-built or comes from circom; the constraint-synthesis API is Backlog item 9.
+- **A circuit / gadget DSL.** R1CS is hand-built or comes from circom; the constraint-synthesis API is on the Roadmap.
 - **Dropping the toy prover's dead C path.** The toy `prover.prove` interpolates C and
   subtracts it although the quotient depends only on A·B's coefficients `>= n`; kept: that prover is the module's
   anchor and is kept simple on purpose.
@@ -416,7 +416,17 @@ computed from those inputs, not code or text of either project.
 
 Missing and it matters, most-hit first:
 
-1. **Multi-threaded prover and setup**: snarkjs, rapidsnark, arkworks, bellman and gnark all use every core; ours is one. Even at 10 000 constraints, but a user with a 10⁶-constraint circuit waits minutes where rapidsnark takes seconds *(inferred)*. MSM windows and the three coset FFTs split cleanly; an `std.Io`-group variant of `zkprove.prove`. Effort: medium. Fits §2.
-3. **snarkjs's circuit hash and contribution proof:** needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b) — hit by a ceremony that mixes snarkjs and this module, not by proving. Black-box only; 29 340 hash constructions tried, so possibly infeasible without reading GPL source. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks.
-8. **Phase-1 (`.ptau`) contribution and verification**: reading only; users take a published ceremony (§ 5b item 5).
-9. **Circuit-building API (constraint-synthesis trait or gadget helpers):** arkworks (`ark-relations`), bellman and gnark all let users write circuits; here R1CS is assembled by hand or comes from circom. Effort: medium-large. Fits §2.
+1. **snarkjs's circuit hash and contribution proof:** needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b) — hit by a ceremony that mixes snarkjs and this module, not by proving. Black-box only; 29 340 hash constructions tried, so possibly infeasible without reading GPL source. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks. Blocked: the only reference is snarkjs's GPL-3.0 source, which is not read.
+
+## Roadmap
+
+Project-size items (weeks of work each); not Backlog, they do not block the mutation campaign.
+
+- **Multi-threaded prover and setup**: snarkjs, rapidsnark, arkworks, bellman and gnark all use every core; ours is one. Even at 10 000 constraints, but a user with a 10⁶-constraint circuit waits minutes where rapidsnark takes seconds *(inferred)*. MSM windows and the three coset FFTs split cleanly; an `std.Io`-group variant of `zkprove.prove`. Effort: medium. Fits §2.
+  Size: a parallel rewrite of the MSM windows and the three coset FFTs behind an `std.Io` group, with a measured
+  speedup per core count; needs a multi-core benchmark host.
+- **Phase-1 (`.ptau`) contribution and verification**: reading only; users take a published ceremony (§ 5b item 5).
+  Size: a second ceremony (accumulator update, its proof of knowledge, the full-file verifier) and an oracle run
+  against snarkjs `powersoftau`.
+- **Circuit-building API (constraint-synthesis trait or gadget helpers):** arkworks (`ark-relations`), bellman and gnark all let users write circuits; here R1CS is assembled by hand or comes from circom. Effort: medium-large. Fits §2.
+  Size: an API design (variables, linear combinations, gadget library) plus witness generation; a DSL in all but name.

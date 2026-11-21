@@ -143,7 +143,7 @@ SPEC.md § 5b has the reasons and the residual risks.
 
 No multi-threading, witness calculation, circuit DSL, PLONK or other curves, and
 snarkjs's own `zkey verify` rejects keys made or contributed here. What is deliberately refused is in SPEC.md *What is
-deliberately not done*; what is wanted and open is in *Backlog / deferred*.
+deliberately not done*; what is wanted and open is in *Backlog / deferred* and *Roadmap*.
 
 ## Verify
 
