@@ -82,7 +82,7 @@ test "keyed scheduler: CSNP and PSNP carry a #10 that verifies; the LSP is forwa
     const lsp = try lspOf(&lbuf, key, 1);
     @memcpy(stored[0..lsp.len], lsp);
 
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .auth_keys = &keys });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .partial_snp_interval = 0, .auth_keys = &keys });
     defer sched.deinit();
     var out: [16]Effect = undefined;
     var scratch: [1024]u8 = undefined;
@@ -131,7 +131,7 @@ test "keyed scheduler signs every chunk of a multi-PDU CSNP and PSNP series" {
         try isis.auth.sign(buf[0..len], key);
         _ = try db.insert(buf[0..len], 1, 0);
     }
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .auth_keys = &keys, .lsp_entries_per_pdu = 2 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .partial_snp_interval = 0, .auth_keys = &keys, .lsp_entries_per_pdu = 2 });
     defer sched.deinit();
     var out: [32]Effect = undefined;
     var scratch: [4096]u8 = undefined;
@@ -155,7 +155,7 @@ test "auth_snp = false: unsigned SNPs, a receiver with auth_snp = false takes th
     var db = keyedDb(&keys, false);
     defer db.deinit();
     try withLsp(&db);
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .auth_keys = &keys, .auth_snp = false });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .partial_snp_interval = 0, .auth_keys = &keys, .auth_snp = false });
     defer sched.deinit();
     var out: [16]Effect = undefined;
     var scratch: [1024]u8 = undefined;
@@ -184,7 +184,7 @@ test "no keys: SNPs carry no #10 and buildXxxSigned(null) is buildXxx" {
     defer db.deinit();
     var buf: [256]u8 = undefined;
     _ = try db.insert(try lspOf(&buf, null, 1), 1, 0);
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .partial_snp_interval = 0 });
     defer sched.deinit();
     var out: [16]Effect = undefined;
     var scratch: [1024]u8 = undefined;
@@ -244,7 +244,7 @@ test "with several keys the first signs (rollover): a receiver holding only that
     const both = [_]Key{ key, old };
     var db = keyedDb(&both, true);
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .auth_keys = &both });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .partial_snp_interval = 0, .auth_keys = &both });
     defer sched.deinit();
     var out: [4]Effect = undefined;
     var scratch: [512]u8 = undefined;

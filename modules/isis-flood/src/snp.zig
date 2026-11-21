@@ -10,12 +10,14 @@
 //! (`scheduler.zig`) owns the *when* and the *which*; this file owns only the
 //! *how to serialise* and the range math.
 //!
-//! ## Single-TLV per PDU
-//! Each emitted PDU carries exactly one LSP-Entries (#9) TLV. An 8-bit TLV length
-//! caps that TLV at 255 octets = 15 sixteen-octet entries, so `max_entries_per_pdu`
-//! is 15. Packing several #9 TLVs into one PDU to fill an MTU is a deferred
-//! optimisation (see `../SPEC.md`); it changes nothing about the reconcile side,
-//! which walks *every* #9 TLV regardless.
+//! ## One TLV per PDU, or packed to an MTU
+//! An 8-bit TLV length caps one LSP-Entries (#9) TLV at 255 octets = 15
+//! sixteen-octet entries, so `max_entries_per_pdu` is 15 and the scheduler's
+//! default is one #9 TLV per PDU. A builder given more entries than that splits
+//! them over several #9 TLVs of at most 15 each, and `entriesFitting` says how
+//! many entries fill a PDU of a given size, which is how the scheduler packs an
+//! MTU (`Config.snp_pdu_len`: FRR packs to the LSP buffer size the same way).
+//! The receive side walks every #9 TLV, so nothing changes there.
 
 const std = @import("std");
 const isis = @import("isis");
@@ -32,13 +34,14 @@ pub const LspEntry = isis.tlvs.LspEntry;
 pub const min_lsp_id: LspId = @splat(0x00);
 pub const max_lsp_id: LspId = @splat(0xFF);
 
-/// The hard per-PDU entry cap: `floor(255 / 16)`, one #9 TLV's worth.
+/// The entry cap of ONE #9 TLV: `floor(255 / 16)`. The scheduler's default
+/// per-PDU count; a builder splits more entries over several TLVs.
 pub const max_entries_per_pdu: usize = 15;
 
 pub const BuildError = error{
     /// The scratch slice cannot hold the built PDU.
     BufferTooSmall,
-    /// More entries were handed than fit one #9 TLV (caller must chunk first).
+    /// A key's Authentication TLV does not fit its TLV (a secret over 254 octets).
     ValueTooLong,
 };
 
@@ -88,7 +91,7 @@ pub fn sortEntries(entries: []LspEntry) void {
 }
 
 /// Build one PSNP carrying `entries` (an ack or a request set) into `scratch`.
-/// `entries.len` must be `<= max_entries_per_pdu`. Unsigned; see `buildPsnpSigned`.
+/// More than `max_entries_per_pdu` entries go into several #9 TLVs. Unsigned; see `buildPsnpSigned`.
 pub fn buildPsnp(scratch: []u8, source_id: [7]u8, is_l2: bool, entries: []const LspEntry) BuildError![]const u8 {
     return buildPsnpSigned(scratch, source_id, is_l2, entries, null);
 }
@@ -100,12 +103,49 @@ pub fn buildPsnp(scratch: []u8, source_id: [7]u8, is_l2: bool, entries: []const 
 pub fn buildPsnpSigned(scratch: []u8, source_id: [7]u8, is_l2: bool, entries: []const LspEntry, key: ?isis.auth.Key) BuildError![]const u8 {
     var b = isis.pdu.PsnpBuilder.init(scratch, .{ .source_id = source_id, .is_l2 = is_l2 }) catch return error.BufferTooSmall;
     if (key) |k| isis.auth.addPlaceholder(&b.tlvs, k) catch |e| return mapBuildError(e);
-    isis.tlvs.addLspEntries(&b.tlvs, entries) catch |e| return mapBuildError(e);
+    addEntriesPacked(&b.tlvs, entries, true) catch |e| return mapBuildError(e);
     return signed(scratch, b.finish(), key);
 }
 
+/// Appends `entries` as #9 TLVs of at most `max_entries_per_pdu` entries each.
+/// No entries: one empty #9 TLV when `allow_empty` (a PSNP's shape), none otherwise.
+fn addEntriesPacked(tlvs: anytype, entries: []const LspEntry, allow_empty: bool) !void {
+    if (entries.len == 0) {
+        if (allow_empty) try isis.tlvs.addLspEntries(tlvs, entries);
+        return;
+    }
+    var i: usize = 0;
+    while (i < entries.len) {
+        const j = @min(i + max_entries_per_pdu, entries.len);
+        try isis.tlvs.addLspEntries(tlvs, entries[i..j]);
+        i = j;
+    }
+}
+
+pub const SnpKind = enum { csnp, psnp };
+
+/// How many LSP-Entries fill an SNP PDU of at most `pdu_len` octets (the link's
+/// MTU less its framing, e.g. 1492 on Ethernet), counting the PDU header, the
+/// Authentication TLV of `key` and the 2-octet header of each #9 TLV. At least 1.
+pub fn entriesFitting(pdu_len: usize, kind: SnpKind, key: ?isis.auth.Key) usize {
+    var tmp: [512]u8 = undefined;
+    const sid: [7]u8 = @splat(0);
+    const wire = switch (kind) {
+        .csnp => buildCsnpSigned(&tmp, sid, false, min_lsp_id, max_lsp_id, &.{}, key),
+        .psnp => buildPsnpSigned(&tmp, sid, false, &.{}, key),
+    } catch return 1;
+    // An empty PSNP carries one empty #9 TLV (2 octets) that packing replaces.
+    const overhead = wire.len - (if (kind == .psnp) @as(usize, 2) else 0);
+    if (pdu_len < overhead + 2 + 16) return 1;
+    const room = pdu_len - overhead;
+    const tlv_full = 2 + max_entries_per_pdu * 16;
+    const rest = room % tlv_full;
+    const extra: usize = if (rest >= 2 + 16) (rest - 2) / 16 else 0;
+    return @max(1, room / tlv_full * max_entries_per_pdu + extra);
+}
+
 /// Build one CSNP summarising `entries` over the inclusive range `[start, end]`
-/// into `scratch`. `entries.len` must be `<= max_entries_per_pdu`; an empty
+/// into `scratch`. More than `max_entries_per_pdu` entries go into several #9 TLVs; an empty
 /// `entries` is legal (a CSNP asserting "nothing in this range"). Unsigned; see
 /// `buildCsnpSigned`.
 pub fn buildCsnp(scratch: []u8, source_id: [7]u8, is_l2: bool, start: LspId, end: LspId, entries: []const LspEntry) BuildError![]const u8 {
@@ -122,7 +162,7 @@ pub fn buildCsnpSigned(scratch: []u8, source_id: [7]u8, is_l2: bool, start: LspI
         .end_lsp_id = end,
     }) catch return error.BufferTooSmall;
     if (key) |k| isis.auth.addPlaceholder(&b.tlvs, k) catch |e| return mapBuildError(e);
-    if (entries.len > 0) isis.tlvs.addLspEntries(&b.tlvs, entries) catch |e| return mapBuildError(e);
+    addEntriesPacked(&b.tlvs, entries, false) catch |e| return mapBuildError(e);
     return signed(scratch, b.finish(), key);
 }
 
@@ -152,6 +192,44 @@ test "successor increments big-endian with carry and saturates" {
     try testing.expectEqual(LspId{ 0, 0, 0, 0, 0, 0, 1, 0 }, successor(.{ 0, 0, 0, 0, 0, 0, 0, 0xFF }));
     try testing.expectEqual(LspId{ 0, 0, 0, 0, 0, 1, 0, 0 }, successor(.{ 0, 0, 0, 0, 0, 0, 0xFF, 0xFF }));
     try testing.expectEqual(max_lsp_id, successor(max_lsp_id)); // saturates
+}
+
+test "entriesFitting counts the header, the authentication TLV and every #9 TLV header" {
+    // CSNP header 33 octets: (1492 - 33) / 242 = 6 full TLVs (90 entries) with
+    // 7 octets over, too few for another entry.
+    try testing.expectEqual(@as(usize, 90), entriesFitting(1492, .csnp, null));
+    // PSNP header 17 octets: (1492 - 17) = 6 x 242 + 23 -> 90 + 1 entry.
+    try testing.expectEqual(@as(usize, 91), entriesFitting(1492, .psnp, null));
+    try testing.expectEqual(@as(usize, 15), entriesFitting(33 + 242, .csnp, null));
+    // Too small for one entry still answers 1: the caller's buffer decides.
+    try testing.expectEqual(@as(usize, 1), entriesFitting(10, .csnp, null));
+    // An HMAC-MD5 key costs 2 + 17 octets of Authentication TLV.
+    const key: isis.auth.Key = .{ .algorithm = .hmac_md5, .id = 1, .secret = "k" };
+    try testing.expectEqual(@as(usize, 89), entriesFitting(1492, .csnp, key));
+}
+
+test "a builder packs more than 15 entries into several #9 TLVs and the PDU decodes whole" {
+    var entries: [40]LspEntry = undefined;
+    for (&entries, 0..) |*e, i| e.* = .{
+        .remaining_lifetime = 900,
+        .lsp_id = .{ 0, 0, 0, 0, 0, 0, 0, @intCast(i) },
+        .sequence_number = 1,
+        .checksum = 0x1234,
+    };
+    var buf: [1024]u8 = undefined;
+    const wire = try buildPsnp(&buf, @splat(1), false, &entries);
+    const p = try isis.Psnp.decode(wire);
+    var tit = isis.tlv.TlvIterator.init(p.tlv_bytes);
+    var tlvs_seen: usize = 0;
+    var seen: usize = 0;
+    while (try tit.next()) |t| {
+        if (t.code != isis.tlvs.code.lsp_entries) continue;
+        tlvs_seen += 1;
+        var it = isis.tlvs.LspEntryIterator.init(t.value);
+        while (try it.next()) |e| : (seen += 1) try testing.expectEqual(entries[seen].lsp_id, e.lsp_id);
+    }
+    try testing.expectEqual(@as(usize, 3), tlvs_seen);
+    try testing.expectEqual(@as(usize, 40), seen);
 }
 
 test "midpoint halves a window and always terminates" {
@@ -235,15 +313,16 @@ test "midpoint does not depend on the operand order" {
     try testing.expectEqual(LspId{ 0, 0, 0, 0, 0, 0, 0, 7 }, midpoint(a, c));
 }
 
-test "buildPsnp / buildCsnp: ValueTooLong above 15 entries, BufferTooSmall for every shorter scratch" {
+test "buildPsnp / buildCsnp: 16 entries take a second #9 TLV, BufferTooSmall for every shorter scratch" {
     var entries: [16]LspEntry = undefined;
     for (&entries, 0..) |*e, i| e.* = .{ .remaining_lifetime = 1, .lsp_id = .{ 0, 0, 0, 0, 0, 1, 0, @intCast(i) }, .sequence_number = 1, .checksum = 0 };
     var buf: [512]u8 = undefined;
     const sid: [7]u8 = @splat(0);
-    try testing.expectError(error.ValueTooLong, buildPsnp(&buf, sid, false, &entries));
-    try testing.expectError(error.ValueTooLong, buildCsnp(&buf, sid, false, min_lsp_id, max_lsp_id, &entries));
-    // 15 is the ceiling and fits
-    _ = try buildPsnp(&buf, sid, false, entries[0..15]);
+    const one_tlv = (try buildPsnp(&buf, sid, false, entries[0..15])).len;
+    // 15 is one TLV's ceiling; the 16th costs a second TLV header and its 16 octets.
+    try testing.expectEqual(one_tlv + 2 + 16, (try buildPsnp(&buf, sid, false, &entries)).len);
+    const csnp_one = (try buildCsnp(&buf, sid, false, min_lsp_id, max_lsp_id, entries[0..15])).len;
+    try testing.expectEqual(csnp_one + 2 + 16, (try buildCsnp(&buf, sid, false, min_lsp_id, max_lsp_id, &entries)).len);
 
     const one = entries[0..1];
     const psnp_len = (try buildPsnp(&buf, sid, false, one)).len;

@@ -1,6 +1,6 @@
 # isis-flood
 
-A pure-Zig **IS-IS flooding transmit scheduler** for point-to-point circuits
+A pure-Zig **IS-IS flooding transmit scheduler** for point-to-point and broadcast circuits
 (ISO/IEC 10589 §7.3.15 + §7.3.16.3/.4) — the consumer that drains the
 `isis-lsdb` per-interface **SRM** (send LSP) and **SSN** (send PSNP) flag sets
 into the concrete, ordered list of PDUs to transmit, paces LSP retransmission,
@@ -11,11 +11,11 @@ monotonic `now` and the set of interfaces that currently hold an **Up** adjacenc
 (derived from `isis-adj`), calls `poll`, and physically sends the returned
 effects. This module decides **what** to send **when**.
 
-Status: **gap** — first increment, **point-to-point only**. Implements SRM-driven
+Status: **gap**. Point-to-point and broadcast (DIS-driven) circuits. Implements SRM-driven
 LSP flooding with retransmit pacing, SSN-driven PSNP acks/requests with chunking,
 the periodic CSNP cadence with contiguous range-chunking, the up-interface gate,
-and the next-wakeup deadline seam. LAN/DIS-driven flooding, mesh-groups, and the
-actual socket I/O are deliberately deferred — see `SPEC.md`.
+and the next-wakeup deadline seam, with optional MTU-packed SNPs, `partialSNPInterval`, an inter-LSP gap and
+`blocked` mesh-groups. Numbered mesh-group sets and the actual socket I/O are not here — see `SPEC.md`.
 
 Model after: **ISO/IEC 10589 §7.3.15** (flooding / SNP generation) + **§7.3.16.3/.4**
 (LSP transmission pacing) — clean-room from the spec (design references in Provenance). **Deps:** `isis` (PDU codecs, authentication), `isis-lsdb`
@@ -112,9 +112,7 @@ for (r.effects) |e| switch (e.kind) {
 
 ## Not provided
 
-Broadcast/LAN circuits and the DIS role, multi-TLV SNP packing to the MTU, `partialSNPInterval` and a real
-inter-LSP transmit gap, mesh-groups, and socket I/O; see `SPEC.md` *What is deliberately not done* and
-*Backlog / deferred*.
+Numbered mesh-group sets and socket I/O; see `SPEC.md` *What is deliberately not done*.
 
 ## Test
 

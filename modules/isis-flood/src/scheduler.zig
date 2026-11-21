@@ -75,6 +75,11 @@ pub const default_min_lsp_transmission_interval: Time = 5;
 /// circuit. Default 10 (seconds).
 pub const default_complete_snp_interval: Time = 10;
 
+/// ISO 10589 `partialSNPInterval` (§7.3.15.4): how long a circuit's pending
+/// acknowledgements and requests wait before one PSNP carries them all. Default 2
+/// (seconds), RFC 9681 §3's "reasonable value" and FRR's default; no jitter.
+pub const default_partial_snp_interval: Time = 2;
+
 /// Default per-PDU entry cap = one #9 TLV (see `snp.max_entries_per_pdu`).
 pub const default_lsp_entries_per_pdu: usize = snp.max_entries_per_pdu;
 
@@ -127,6 +132,11 @@ pub const Config = struct {
     min_lsp_transmission_interval: Time = default_min_lsp_transmission_interval,
     /// `completeSNPInterval`: the periodic CSNP cadence per circuit.
     complete_snp_interval: Time = default_complete_snp_interval,
+    /// `partialSNPInterval`: the first SSN flag set on a circuit starts this timer
+    /// and the PSNP that clears the flags goes out when it runs out, so a burst of
+    /// received LSPs is acknowledged by one PSNP instead of one per poll. 0 sends
+    /// PSNPs on the first poll that sees a flag.
+    partial_snp_interval: Time = default_partial_snp_interval,
     /// Entries packed into each generated PSNP/CSNP (`1..=snp.max_entries_per_pdu`).
     /// Set small in tests to force chunking; a real deployment leaves it at the
     /// one-TLV maximum.
@@ -156,6 +166,31 @@ pub const Config = struct {
     /// not use SNP authentication (FRR isisd default); set it to the same value
     /// as `isis-lsdb`'s `Config.auth_snp`. Ignored without `auth_keys`.
     auth_snp: bool = true,
+    /// Largest SNP PDU to build, in octets (the link's MTU less its framing,
+    /// e.g. 1492 on Ethernet): the entries of a CSNP or PSNP are packed into as
+    /// many #9 TLVs as fit, as FRR does, so a 4096-LSP database takes about 47
+    /// CSNPs instead of 274. 0 (the default) keeps one #9 TLV per PDU, byte for
+    /// byte what this scheduler always built; `lsp_entries_per_pdu` then sets
+    /// the count and is ignored when this is non-zero.
+    snp_pdu_len: u16 = 0,
+    /// The circuits that are **broadcast** (LAN); pass the same set as `isis-lsdb`'s
+    /// `Config.broadcast_interfaces`. On these SRM is cleared when the LSP is sent
+    /// (there is no per-neighbour acknowledgement: ISO 10589 §7.3.15.1, RFC 8405
+    /// §2), and the periodic CSNP goes out only while this system is the DIS of
+    /// the circuit (`setDis`); every other system learns what it lacks from the
+    /// DIS's CSNP and asks for it with a PSNP.
+    broadcast_interfaces: InterfaceSet = InterfaceSet.empty,
+    /// The circuits on which LSPs are never flooded out (RFC 2973 `mesh-group
+    /// blocked`): their SRM flags stay set and nothing is sent. CSNPs and PSNPs
+    /// are not affected.
+    blocked_interfaces: InterfaceSet = InterfaceSet.empty,
+    /// `minimumLSPTransmissionInterval` of ISO 10589 §7.3.15.1: the gap between two
+    /// LSPs sent on one circuit, in the caller's `Time` unit (33 ms by default in
+    /// the standard, so a unit coarser than that needs the burst cap instead). With
+    /// a non-zero gap a poll sends at most one LSP per circuit and `next_wakeup`
+    /// names the instant the next may go. 0 (the default) keeps the burst cap,
+    /// `max_lsps_per_iface_per_poll`, as the only bound.
+    lsp_transmit_gap: Time = 0,
 };
 
 /// The per-`(lsp, iface)` key of the last-sent map.
@@ -181,6 +216,13 @@ pub const Scheduler = struct {
     /// larger than one summary buffer is advertised across several polls; until
     /// the series reaches `max_lsp_id` the cadence timer is not re-armed.
     csnp_cursor: [max_interfaces]LspId = @splat(snp.min_lsp_id),
+    /// When the PSNP for a circuit's pending SSN flags is due; null while none is
+    /// pending. Started by the first poll that sees a flag.
+    psnp_due: [max_interfaces]?Time = @splat(null),
+    /// The broadcast circuits on which this system is the DIS (`setDis`).
+    dis: InterfaceSet = InterfaceSet.empty,
+    /// Earliest instant the next LSP may leave each circuit (`lsp_transmit_gap`).
+    lsp_next: [max_interfaces]Time = @splat(0),
 
     /// The `up` set the previous `poll` saw, so this one can spot the Down->Up
     /// edge. Per-circuit scheduling state describes an ADJACENCY, and an
@@ -202,7 +244,28 @@ pub const Scheduler = struct {
         self.victims.deinit(self.alloc);
     }
 
+    /// Tell the scheduler this system became (or stopped being) the DIS of a
+    /// broadcast circuit, from the election in `isis-dis`. The first periodic CSNP
+    /// of a new DIS goes out on the next poll, then every `complete_snp_interval`;
+    /// a system that is not the DIS sends none on that circuit. No effect on a
+    /// point-to-point circuit.
+    pub fn setDis(self: *Scheduler, iface: u8, is_dis: bool) void {
+        if (is_dis == self.dis.isSet(iface)) return;
+        if (is_dis) {
+            self.dis.set(iface);
+            self.csnp_primed[iface] = false;
+            self.csnp_cursor[iface] = snp.min_lsp_id;
+        } else self.dis.unset(iface);
+    }
+
     /// The key CSNPs/PSNPs are signed with, or null for unsigned SNPs.
+    /// Entries per generated SNP: what fits `snp_pdu_len`, else the configured
+    /// count clamped to one #9 TLV (see the clamp comments at the callers).
+    fn entriesPerPdu(self: *const Scheduler, kind: snp.SnpKind) usize {
+        if (self.cfg.snp_pdu_len != 0) return snp.entriesFitting(self.cfg.snp_pdu_len, kind, self.snpKey());
+        return std.math.clamp(self.cfg.lsp_entries_per_pdu, 1, snp.max_entries_per_pdu);
+    }
+
     fn snpKey(self: *const Scheduler) ?isis.auth.Key {
         if (self.cfg.auth_keys.len == 0 or !self.cfg.auth_snp) return null;
         return self.cfg.auth_keys[0];
@@ -255,6 +318,8 @@ pub const Scheduler = struct {
             self.csnp_primed[i_down] = false;
             self.csnp_cursor[i_down] = snp.min_lsp_id;
             self.csnp_next[i_down] = 0;
+            self.psnp_due[i_down] = null;
+            self.lsp_next[i_down] = 0;
             self.victims.clearRetainingCapacity();
             var lit = self.last_sent.iterator();
             while (lit.next()) |e| {
@@ -280,8 +345,19 @@ pub const Scheduler = struct {
 
             // ── 1. LSP transmit + retransmit pacing (SRM) ───────────────────────
             var sent_this_iface: usize = 0;
+            const broadcast = self.cfg.broadcast_interfaces.isSet(iface);
+            // SRM flags to clear once the walk is over (a broadcast circuit clears
+            // on send; the walk reads the queue the clear would change).
+            self.victims.clearRetainingCapacity();
             var sit = db.srmIterator(iface);
             while (sit.next()) |item| {
+                // Mesh-group blocked: nothing is flooded here, SRM stays set.
+                if (self.cfg.blocked_interfaces.isSet(iface)) break;
+                // Inter-LSP gap: the next LSP of this circuit is not due yet.
+                if (now < self.lsp_next[iface]) {
+                    wake = minOpt(wake, self.lsp_next[iface]);
+                    break;
+                }
                 const key: Key = .{ .id = item.lsp_id, .iface = iface };
                 const last = self.last_sent.get(key);
                 const eligible = !self.cfg.pace_lsp_retransmit or last == null or
@@ -295,29 +371,59 @@ pub const Scheduler = struct {
                     if (n_eff >= out.len) {
                         truncated = true;
                         wake = minOpt(wake, now);
+                        for (self.victims.items) |k| db.clearSrm(k.id, k.iface);
+                        self.victims.clearRetainingCapacity();
                         break :outer;
                     }
                     out[n_eff] = .{ .iface = iface, .kind = .lsp, .bytes = item.bytes };
                     n_eff += 1;
                     sent_this_iface += 1;
+                    const gapped = self.cfg.lsp_transmit_gap != 0;
+                    if (gapped) {
+                        self.lsp_next[iface] = now +| self.cfg.lsp_transmit_gap;
+                        wake = minOpt(wake, self.lsp_next[iface]);
+                    }
+                    if (broadcast) {
+                        // Broadcast: sent once, no acknowledgement to wait for. On OOM
+                        // the flag stays and the LSP is sent again, never lost.
+                        self.victims.append(self.alloc, key) catch {};
+                        if (gapped) break;
+                        continue;
+                    }
                     // Best-effort pacing record; on OOM we simply may re-send next
                     // poll (bounded by out.len), never a crash.
                     self.last_sent.put(self.alloc, key, now) catch {};
                     // P2P: SRM stays set — cleared by the ack path in isis-lsdb.
                     wake = minOpt(wake, now +| self.cfg.min_lsp_transmission_interval);
+                    if (gapped) break;
                 } else {
                     wake = minOpt(wake, last.? +| self.cfg.min_lsp_transmission_interval);
                 }
             }
 
-            // ── 2. PSNP acks / requests (SSN) — chunked ─────────────────────────
-            if (self.emitPsnp(now, iface, db, out, &n_eff, scratch, &scratch_used)) {
-                truncated = true;
-                wake = minOpt(wake, now);
-                break :outer;
+            for (self.victims.items) |k| db.clearSrm(k.id, k.iface);
+            self.victims.clearRetainingCapacity();
+
+            // ── 2. PSNP acks / requests (SSN) — chunked, after partialSNPInterval ─
+            var ssn_probe = db.ssnIterator(iface);
+            if (ssn_probe.next() == null) {
+                self.psnp_due[iface] = null;
+            } else {
+                const due = self.psnp_due[iface] orelse now +| self.cfg.partial_snp_interval;
+                self.psnp_due[iface] = due;
+                if (now >= due) {
+                    const more = self.emitPsnp(now, iface, db, out, &n_eff, scratch, &scratch_used);
+                    self.psnp_due[iface] = if (more) now else null;
+                    if (more) {
+                        truncated = true;
+                        wake = minOpt(wake, now);
+                        break :outer;
+                    }
+                } else wake = minOpt(wake, due);
             }
 
-            // ── 3. Periodic CSNP (§7.3.15.2) ────────────────────────────────────
+            // ── 3. Periodic CSNP (§7.3.15.2); on a broadcast circuit only the DIS ──
+            if (broadcast and !self.dis.isSet(iface)) continue;
             if (now >= self.csnp_next[iface]) {
                 const r = self.emitCsnp(now, iface, db, out, &n_eff, scratch, &scratch_used);
                 if (r.more) {
@@ -418,7 +524,7 @@ pub const Scheduler = struct {
         // i.e. "poll again immediately" — a zero-output livelock that never
         // gets smaller. Clamping only the lower end fixed the case and not
         // the rule. See CHANGELOG.
-        const per = std.math.clamp(self.cfg.lsp_entries_per_pdu, 1, snp.max_entries_per_pdu);
+        const per = self.entriesPerPdu(.psnp);
         const src = self.sourceId();
         var i: usize = 0;
         while (i < m) {
@@ -525,7 +631,7 @@ pub const Scheduler = struct {
         // are BOTH compiled out — it is an out-of-bounds read at an
         // address `usize.max` slots past `entries`, undefined behaviour on
         // a public function driven entirely by caller-supplied `Config`.
-        const per = std.math.clamp(self.cfg.lsp_entries_per_pdu, 1, snp.max_entries_per_pdu);
+        const per = self.entriesPerPdu(.csnp);
         const src = self.sourceId();
         var i: usize = 0;
         var advertised_to: ?LspId = null;
@@ -658,13 +764,13 @@ fn countKind(effects: []const Effect, kind: PduKind) usize {
 }
 
 fn testCfg() Config {
-    return .{ .local_system_id = sys_local };
+    return .{ .local_system_id = sys_local, .partial_snp_interval = 0 };
 }
 
 test "SRM drain + pace: one send, no re-send within the interval, re-send after" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5 });
     defer sched.deinit();
 
     var lbuf: [128]u8 = undefined;
@@ -700,7 +806,7 @@ test "positive control: unpaced re-sends every poll; the pace-boundary test need
     var scratch: [512]u8 = undefined;
 
     // Paced scheduler: second poll within the interval emits nothing.
-    var paced = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5, .pace_lsp_retransmit = true });
+    var paced = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5, .pace_lsp_retransmit = true });
     defer paced.deinit();
     _ = paced.poll(0, up, &db, &out, &scratch);
     try testing.expectEqual(@as(usize, 0), countKind(paced.poll(1, up, &db, &out, &scratch).effects, .lsp));
@@ -708,7 +814,7 @@ test "positive control: unpaced re-sends every poll; the pace-boundary test need
     // Unpaced scheduler (gate disabled): second poll re-sends immediately — this
     // is what the pacing gate prevents. If pacing regressed to this, the boundary
     // test above would go RED.
-    var unpaced = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5, .pace_lsp_retransmit = false });
+    var unpaced = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5, .pace_lsp_retransmit = false });
     defer unpaced.deinit();
     _ = unpaced.poll(0, up, &db, &out, &scratch);
     try testing.expectEqual(@as(usize, 1), countKind(unpaced.poll(1, up, &db, &out, &scratch).effects, .lsp));
@@ -717,7 +823,7 @@ test "positive control: unpaced re-sends every poll; the pace-boundary test need
 test "ack clears retransmit: a PSNP that reconciles SRM stops the re-send" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5 });
     defer sched.deinit();
 
     var lbuf: [128]u8 = undefined;
@@ -799,7 +905,7 @@ test "SSN -> PSNP: exactly the flagged LSPs, decoded, and SSN cleared" {
 test "periodic CSNP: emitted on cadence, not every poll, summarising the DB" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .complete_snp_interval = 10 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .complete_snp_interval = 10 });
     defer sched.deinit();
 
     var buf: [128]u8 = undefined;
@@ -842,7 +948,7 @@ test "CSNP chunking: contiguous [start,end] ranges tile the DB with no gap/overl
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
     defer db.deinit();
     // Tiny per-PDU cap forces chunking with only a few LSPs.
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .lsp_entries_per_pdu = 2 });
     defer sched.deinit();
 
     var buf: [128]u8 = undefined;
@@ -887,6 +993,199 @@ test "CSNP chunking: contiguous [start,end] ranges tile the DB with no gap/overl
     try testing.expectEqual(@as(usize, 5), total_entries); // full coverage, no loss
 }
 
+test "lsp_transmit_gap sends one LSP per circuit per poll and names when the next may go" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 100, .complete_snp_interval = 1000, .lsp_transmit_gap = 2 });
+    defer sched.deinit();
+    var buf: [128]u8 = undefined;
+    for (0..3) |n| _ = try db.insert(buildLsp(&buf, sys_other, @intCast(n), 1, 900), null, 0);
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    const r0 = sched.poll(0, oneUp(0), &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 1), countKind(r0.effects, .lsp));
+    try testing.expectEqual(@as(?Time, 2), r0.next_wakeup);
+    try testing.expectEqual(@as(usize, 0), countKind(sched.poll(1, oneUp(0), &db, &out, &scratch).effects, .lsp));
+    try testing.expectEqual(@as(usize, 1), countKind(sched.poll(2, oneUp(0), &db, &out, &scratch).effects, .lsp));
+    try testing.expectEqual(@as(usize, 1), countKind(sched.poll(4, oneUp(0), &db, &out, &scratch).effects, .lsp));
+    // All three have gone out once; the retransmit interval is far off.
+    try testing.expectEqual(@as(usize, 0), countKind(sched.poll(6, oneUp(0), &db, &out, &scratch).effects, .lsp));
+}
+
+test "broadcast circuit: an LSP is sent once and SRM cleared; a point-to-point circuit keeps retransmitting" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 3, .capacity = 8 });
+    defer db.deinit();
+    var bc = InterfaceSet.empty;
+    bc.set(1);
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000, .broadcast_interfaces = bc });
+    defer sched.deinit();
+    var buf: [128]u8 = undefined;
+    // Arrives on circuit 2: SRM on 0 (point to point) and 1 (broadcast).
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 900), 2, 0);
+    var up = InterfaceSet.empty;
+    up.set(0);
+    up.set(1);
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    const r0 = sched.poll(0, up, &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 2), countKind(r0.effects, .lsp));
+    // Past the retransmit interval: circuit 0 sends again, circuit 1 never does.
+    const r1 = sched.poll(10, up, &db, &out, &scratch);
+    var on0: usize = 0;
+    var on1: usize = 0;
+    for (r1.effects) |e| {
+        if (e.kind != .lsp) continue;
+        if (e.iface == 0) on0 += 1 else on1 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), on0);
+    try testing.expectEqual(@as(usize, 0), on1);
+    try testing.expect(!db.interfacesWithSrm().isSet(1));
+}
+
+test "broadcast circuit: the periodic CSNP is the DIS's alone" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 3, .capacity = 8 });
+    defer db.deinit();
+    var bc = InterfaceSet.empty;
+    bc.set(1);
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .complete_snp_interval = 10, .broadcast_interfaces = bc });
+    defer sched.deinit();
+    var up = InterfaceSet.empty;
+    up.set(0);
+    up.set(1);
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    // Not the DIS: only the point-to-point circuit sends its CSNP, now and later.
+    const r0 = sched.poll(0, up, &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 1), countKind(r0.effects, .csnp));
+    try testing.expectEqual(@as(u8, 0), r0.effects[0].iface);
+    for ([_]Time{ 10, 20, 30 }) |t| {
+        for (sched.poll(t, up, &db, &out, &scratch).effects) |e| try testing.expectEqual(@as(u8, 0), e.iface);
+    }
+    // Elected DIS: the next poll sends it, then every interval.
+    sched.setDis(1, true);
+    var on1: usize = 0;
+    for (sched.poll(31, up, &db, &out, &scratch).effects) |e| {
+        if (e.kind == .csnp and e.iface == 1) on1 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), on1);
+    on1 = 0;
+    for (sched.poll(42, up, &db, &out, &scratch).effects) |e| {
+        if (e.kind == .csnp and e.iface == 1) on1 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), on1);
+    // Resigning stops them.
+    sched.setDis(1, false);
+    for (sched.poll(60, up, &db, &out, &scratch).effects) |e| try testing.expect(e.iface != 1);
+}
+
+test "a blocked circuit floods no LSP and keeps its SRM flags; SNPs are unaffected" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 3, .capacity = 8 });
+    defer db.deinit();
+    var blocked = InterfaceSet.empty;
+    blocked.set(1);
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .complete_snp_interval = 10, .blocked_interfaces = blocked });
+    defer sched.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 900), 2, 0);
+    var up = InterfaceSet.empty;
+    up.set(0);
+    up.set(1);
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    const r = sched.poll(0, up, &db, &out, &scratch);
+    var lsps = [_]usize{ 0, 0 };
+    var csnps = [_]usize{ 0, 0 };
+    for (r.effects) |e| {
+        if (e.kind == .lsp) lsps[e.iface] += 1;
+        if (e.kind == .csnp) csnps[e.iface] += 1;
+    }
+    try testing.expectEqualSlices(usize, &.{ 1, 0 }, &lsps);
+    try testing.expectEqualSlices(usize, &.{ 1, 1 }, &csnps);
+    try testing.expect(db.interfacesWithSrm().isSet(1));
+}
+
+test "partial_snp_interval batches the acknowledgements of a burst into one PSNP" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 2, .complete_snp_interval = 1000 });
+    defer sched.deinit();
+
+    var buf: [128]u8 = undefined;
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    // Three LSPs arrive on circuit 0 over two time units: each sets SSN there.
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 900), 0, 0);
+    try testing.expectEqual(@as(usize, 0), countKind(sched.poll(0, oneUp(0), &db, &out, &scratch).effects, .psnp));
+    _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 900), 0, 1);
+    const r1 = sched.poll(1, oneUp(0), &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 0), countKind(r1.effects, .psnp));
+    // The timer started at the first sight of a flag: due at 2, and the caller is told.
+    try testing.expect(r1.next_wakeup.? <= 2);
+    _ = try db.insert(buildLsp(&buf, sys_other, 2, 1, 900), 0, 1);
+    const r2 = sched.poll(2, oneUp(0), &db, &out, &scratch);
+    try testing.expectEqual(@as(usize, 1), countKind(r2.effects, .psnp));
+    for (r2.effects) |e| {
+        if (e.kind != .psnp) continue;
+        const p = try isis.Psnp.decode(e.bytes);
+        var it = isis.tlvs.LspEntryIterator.init((try isis.tlv.findFirst(p.tlv_bytes, isis.tlvs.code.lsp_entries)).?);
+        var n: usize = 0;
+        while (try it.next()) |_| n += 1;
+        try testing.expectEqual(@as(usize, 3), n);
+    }
+    // Nothing is pending afterwards, so nothing more goes out.
+    try testing.expectEqual(@as(usize, 0), countKind(sched.poll(3, oneUp(0), &db, &out, &scratch).effects, .psnp));
+}
+
+test "snp_pdu_len packs several #9 TLVs per CSNP and the ranges still tile" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 300 });
+    defer db.deinit();
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .snp_pdu_len = 1492 });
+    defer sched.deinit();
+
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    while (n < 200) : (n += 1) {
+        const id: u8 = @intCast(n % 250);
+        const sys: [6]u8 = .{ 0x02, 0, 0, 0, @intCast(n / 250), id };
+        _ = try db.insert(buildLsp(&buf, sys, 0, 1, 900), 0, 0);
+        db.clearSrm(idOf(sys, 0), 0);
+        db.clearSsn(idOf(sys, 0), 0);
+    }
+
+    var out: [16]Effect = undefined;
+    var scratch: [8192]u8 = undefined;
+    const r = sched.poll(0, oneUp(0), &db, &out, &scratch);
+    // 200 entries at 88 per 1492-octet PDU (6 TLVs: 5 x 15 + 13): three PDUs
+    // where one TLV per PDU needs fourteen.
+    try testing.expectEqual(@as(usize, 3), countKind(r.effects, .csnp));
+    var prev_end: ?LspId = null;
+    var total: usize = 0;
+    var tlv_count: usize = 0;
+    for (r.effects) |e| {
+        if (e.kind != .csnp) continue;
+        try testing.expect(e.bytes.len <= 1492);
+        const cs = try isis.Csnp.decode(e.bytes);
+        if (prev_end) |pe| {
+            try testing.expectEqual(snp.successor(pe), cs.start_lsp_id);
+        } else try testing.expectEqual(snp.min_lsp_id, cs.start_lsp_id);
+        prev_end = cs.end_lsp_id;
+        var tit = isis.tlv.TlvIterator.init(cs.tlv_bytes);
+        while (try tit.next()) |t| {
+            if (t.code != isis.tlvs.code.lsp_entries) continue;
+            tlv_count += 1;
+            var it = isis.tlvs.LspEntryIterator.init(t.value);
+            while (try it.next()) |entry| {
+                try testing.expect(std.mem.order(u8, &entry.lsp_id, &cs.start_lsp_id) != .lt);
+                try testing.expect(std.mem.order(u8, &entry.lsp_id, &cs.end_lsp_id) != .gt);
+                total += 1;
+            }
+        }
+    }
+    try testing.expectEqual(snp.max_lsp_id, prev_end.?);
+    try testing.expectEqual(@as(usize, 200), total);
+    try testing.expect(tlv_count > 3);
+}
+
 test "up-interface gating: SRM on a down iface is not sent; sent once it is Up" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 4, .capacity = 8 });
     defer db.deinit();
@@ -916,13 +1215,13 @@ test "next-wakeup is the min of the next paced retransmit and the next CSNP" {
     var scratch: [512]u8 = undefined;
 
     // interval 5, csnp 10 → after sending, retransmit gate (now+5) is the min.
-    var s1 = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5, .complete_snp_interval = 10 });
+    var s1 = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5, .complete_snp_interval = 10 });
     defer s1.deinit();
     const r0 = s1.poll(0, up, &db, &out, &scratch);
     try testing.expectEqual(@as(?Time, 5), r0.next_wakeup); // min(0+5 LSP, 10 CSNP)
 
     // interval 100, csnp 10 → the CSNP cadence is the min.
-    var s2 = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 100, .complete_snp_interval = 10 });
+    var s2 = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 100, .complete_snp_interval = 10 });
     defer s2.deinit();
     const r1 = s2.poll(0, up, &db, &out, &scratch);
     try testing.expectEqual(@as(?Time, 10), r1.next_wakeup); // min(0+100 LSP, 10 CSNP)
@@ -984,7 +1283,7 @@ test "determinism: identical (lsdb ops, now, up) yield identical effects, order 
         fn drive(alloc: std.mem.Allocator) !struct { snap: EffectSnapshot, wake: ?Time } {
             var db = Lsdb.init(alloc, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
             defer db.deinit();
-            var sched = Scheduler.init(alloc, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
+            var sched = Scheduler.init(alloc, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .lsp_entries_per_pdu = 2 });
             defer sched.deinit();
             var buf: [128]u8 = undefined;
             // Arrive on iface 0; flood out iface 1 (up) so split horizon
@@ -1173,7 +1472,7 @@ test "split horizon: a received LSP is never scheduled back out its arrival circ
     // them and "does the scheduler respect the exception" was untestable here.
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5 });
     defer sched.deinit();
 
     var lbuf: [128]u8 = undefined;
@@ -1246,7 +1545,7 @@ test "fail-open guard: lsp_entries_per_pdu == 0 does not underflow emitCsnp / st
     // struct literal does.
     var sched: Scheduler = .{
         .alloc = testing.allocator,
-        .cfg = .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 0 },
+        .cfg = .{ .local_system_id = sys_local, .partial_snp_interval = 0, .lsp_entries_per_pdu = 0 },
     };
     defer sched.deinit();
 
@@ -1317,7 +1616,7 @@ test "a circuit that flaps is re-primed and re-synchronised from the bottom of t
         _ = try db.insert(buildLspId(&lbuf, idNth(sys_other, @intCast(n)), 1, 1000), arrival, 0);
     }
 
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0 });
     defer sched.deinit();
     var out: [128]Effect = undefined;
     var scratch: [65536]u8 = undefined;
@@ -1356,7 +1655,7 @@ test "more than max_summary_entries pending SSN flags reports truncated, not a f
     const over = max_summary_entries + 44;
     for (0..over) |n| _ = try db.insert(buildLspId(&lbuf, idNth(sys_other, @intCast(n)), 1, 1000), arrival, 0);
 
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0 });
     defer sched.deinit();
 
     // Driven directly rather than through `poll`, so the periodic CSNP's own
@@ -1418,7 +1717,7 @@ test "CSNP chunks tile a SPARSE id space with no gap — the successor rule, on 
     };
     for (sparse) |id| _ = try db.insert(buildLspId(&lbuf, id, 1, 1000), arrival, 0);
 
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .lsp_entries_per_pdu = 2 });
     defer sched.deinit();
 
     var out: [32]Effect = undefined;
@@ -1470,7 +1769,7 @@ test "fail-open guard: lsp_entries_per_pdu ABOVE snp.max_entries_per_pdu does no
     // assert is all a Debug build has and all a ReleaseFast build does not.
     var sched: Scheduler = .{
         .alloc = testing.allocator,
-        .cfg = .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 100 },
+        .cfg = .{ .local_system_id = sys_local, .partial_snp_interval = 0, .lsp_entries_per_pdu = 100 },
     };
     defer sched.deinit();
 
@@ -1521,7 +1820,7 @@ test "fail-open guard: lsp_entries_per_pdu == 0 does not underflow emitCsnp's en
 
     var sched: Scheduler = .{
         .alloc = testing.allocator,
-        .cfg = .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 0 },
+        .cfg = .{ .local_system_id = sys_local, .partial_snp_interval = 0, .lsp_entries_per_pdu = 0 },
     };
     defer sched.deinit();
 
@@ -1545,7 +1844,7 @@ fn entriesOf(tlv_bytes: []const u8, out: []LspEntry) !usize {
 test "last-sent pruning never resurrects a stale victim: a re-armed LSP stays paced" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000 });
     defer sched.deinit();
     var lbuf: [128]u8 = undefined;
     const id = idOf(sys_other, 0);
@@ -1568,7 +1867,7 @@ test "last-sent pruning never resurrects a stale victim: a re-armed LSP stays pa
 test "a circuit that goes Down loses its own pacing records and no other circuit's" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 3, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000 });
     defer sched.deinit();
     var lbuf: [128]u8 = undefined;
     _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), 2, 0); // SRM on circuits 0 and 1
@@ -1589,7 +1888,7 @@ test "a circuit that goes Down loses its own pacing records and no other circuit
 test "the per-circuit burst cap sends exactly that many LSPs, reports truncated and asks to be polled again at once" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .max_lsps_per_iface_per_poll = 2 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .max_lsps_per_iface_per_poll = 2 });
     defer sched.deinit();
     var lbuf: [128]u8 = undefined;
     for (0..3) |n| _ = try db.insert(buildLsp(&lbuf, sys_other, @intCast(n), 1, 1000), arrival, 0);
@@ -1604,7 +1903,7 @@ test "the per-circuit burst cap sends exactly that many LSPs, reports truncated 
 test "pacing is measured from the real send time, and the wakeup names the retransmit" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5, .complete_snp_interval = 1000 });
     defer sched.deinit();
     var lbuf: [128]u8 = undefined;
     try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), idOf(sys_other, 0));
@@ -1642,7 +1941,7 @@ test "an unfinished CSNP series asks to be polled again NOW, not at its stale ca
 test "a PSNP that cannot get an effect slot is reported truncated even when no CSNP is due" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .complete_snp_interval = 1000 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .complete_snp_interval = 1000 });
     defer sched.deinit();
     var lbuf: [128]u8 = undefined;
     _ = try db.insert(buildLsp(&lbuf, sys_other, 0, 1, 1000), arrival, 0);
@@ -1660,7 +1959,7 @@ test "a PSNP that cannot get an effect slot is reported truncated even when no C
 test "a PSNP that cannot get scratch space ends the pass: nothing else is served, truncated is reported" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 3, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .complete_snp_interval = 1000 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .complete_snp_interval = 1000 });
     defer sched.deinit();
     var lbuf: [128]u8 = undefined;
     var up01 = oneUp(0);
@@ -1698,7 +1997,7 @@ test "a CSNP that cannot get scratch space ends the pass: later circuits are not
 test "several PSNPs keep their own bytes and list the acknowledged LSPs in ascending LSP-ID order" {
     var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .lsp_entries_per_pdu = 2 });
     defer sched.deinit();
     var lbuf: [128]u8 = undefined;
     var n: u8 = 5;

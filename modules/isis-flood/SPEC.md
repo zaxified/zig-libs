@@ -32,17 +32,20 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) | Go | Apache-2.0 (LICENSE file) — README/design doc only, source not read | 0 | v0.9.0 (2026-09-25) | Per-circuit SRM/SSN with LAN clear-on-send and p2p PSNP-driven retransmission (design doc §Flooding), LSP generation throttling. |
 | [mdlayher/isis](https://github.com/mdlayher/isis) | Go | MIT | 0 | no release; pushed 2026-09-29 | No LSP flooding. |
 
-**Where we are ahead:** the transmit side as a pure, time-injected scheduler with a `next_wakeup` deadline, bounded state (last-sent map pruned every poll), and CSNP range tiling that claims coverage only over windows it enumerated in full; the 62x `summarise` regression is recorded and pinned. **Where we are behind:** point-to-point only — no broadcast circuits (SRM cleared on send, DIS-gated periodic CSNP; `rg -i broadcast isis-flood/src` finds only the deferral comment); SNPs carry one 15-entry #9 TLV per PDU rather than filling the MTU (SPEC §5, Backlog); no `partialSNPInterval` (PSNPs unpaced, Backlog); inter-LSP pacing approximated by a per-poll burst cap; no mesh-groups; no flooding reduction; authentication is sender-side for SNPs only (§8): one key list for every circuit, `keys[0]` signs, and the module originates no LSP (it floods what the LSDB stores), so there is nothing else here for it to sign.
+**Where we are ahead:** the transmit side as a pure, time-injected scheduler with a `next_wakeup` deadline, bounded state (last-sent map pruned every poll), and CSNP range tiling that claims coverage only over windows it enumerated in full; the 62x `summarise` regression is recorded and pinned. **Where we are behind:** no mesh-group sets (only `blocked`: a set needs the arrival circuit of each LSP, which `isis-lsdb` owns); no flooding reduction; authentication is sender-side for SNPs only (§8): one key list for every circuit, `keys[0]` signs, and the module originates no LSP (it floods what the LSDB stores), so there is nothing else here for it to sign.
 
 ## 1. Scope
 
 The IS-IS **flooding transmit scheduler** (ISO/IEC 10589 §7.3.15 SNP generation +
-§7.3.16.3/.4 LSP transmission) for **point-to-point** circuits, one level. Pure,
+§7.3.16.3/.4 LSP transmission) for point-to-point and broadcast circuits, one level. Pure,
 time-injected, single-owner: the caller supplies `now` and the set of Up
 interfaces, calls `poll`, and performs the sends; the scheduler decides what to
 send when and updates the LSDB flags (clearing SSN). It reads the `isis-lsdb`
 SRM/SSN flags + owned LSP bytes + `summarise`, and reconciliation of received
 PDUs stays in `isis-lsdb`. Out of scope: *What is deliberately not done* and *Backlog*.
+
+`Config` options beyond the default point-to-point behaviour: `broadcast_interfaces` (and `setDis`), `snp_pdu_len`,
+`partial_snp_interval`, `lsp_transmit_gap`, `blocked_interfaces`; each is described where its rule is (§3, §5, §6).
 
 ## 2. What the siblings provide, and what this module adds
 
@@ -84,9 +87,23 @@ timer verbatim.
 (`reconcilePsnp` → per-entry `compare == same` → `srm.unset(iface)`) or when a
 superseding LSP replaces the entry. The scheduler therefore **never** clears SRM;
 it relies on retransmission until the ack path clears it. This is the P2P
-"implicit/explicit ack retransmit" model. (On a **broadcast** circuit the rule
-inverts — SRM is cleared on send and the DIS's periodic CSNP drives sync — which
-is why that case is deferred, not hacked into the P2P path; see Backlog.)
+"implicit/explicit ack retransmit" model.
+
+**Broadcast circuits** (`Config.broadcast_interfaces`, the same set as `isis-lsdb`'s) invert the rule, as ISO 10589
+§7.3.15.1 and RFC 8405 §2 have it: an LSP is sent **once** and its SRM cleared on the spot, with no per-neighbour
+acknowledgement and so no retransmit pacing record; the periodic CSNP goes out only while this system is the
+circuit's DIS (`Scheduler.setDis`, fed from the `isis-dis` election; a new DIS sends its first CSNP on the next poll
+and then every `complete_snp_interval`); a system that is not the DIS learns what it lacks from the DIS's CSNP and
+asks for it with a PSNP (`isis-lsdb` sets SSN on a broadcast circuit only for requests, never as an acknowledgement).
+
+**Inter-LSP gap.** With `lsp_transmit_gap` non-zero, a poll sends at most one LSP per circuit and `next_wakeup` names
+the instant the next may go (ISO 10589 `minimumLSPTransmissionInterval`, 33 ms in the standard; the unit is the
+caller's `Time`). Zero keeps the burst cap above as the only bound.
+
+**Mesh-group `blocked`** (RFC 2973, FRR `mesh-group blocked`): a circuit in `blocked_interfaces` floods no LSP, its
+SRM flags stay set, SNPs are unaffected. A numbered mesh-group set (an LSP received on a circuit of set N is not flooded
+to the others of N) is not here: it needs the arrival circuit of every stored LSP, which only `isis-lsdb` knows
+(*What is deliberately not done*).
 
 ## 4. SRM / SSN / CSNP output rules
 
@@ -156,11 +173,12 @@ listed in that range's PDU**. An empty DB emits one CSNP covering the whole rang
 with no entries (a valid "I hold nothing" assertion that makes the neighbour flood
 everything to us).
 
-**Per-PDU cap.** Each emitted PDU carries exactly one #9 TLV, so an 8-bit TLV
+**Per-PDU cap.** By default each emitted PDU carries exactly one #9 TLV, so an 8-bit TLV
 length caps it at 255 / 16 = 15 entries; `lsp_entries_per_pdu ∈ [1, 15]`
-(asserted at `init`). Packing several #9 TLVs into one PDU to fill an MTU is a
-deferred optimisation (Backlog) — it changes nothing on the reconcile side, which
-walks every #9 TLV.
+(asserted at `init`). With `snp_pdu_len` set (the link's MTU less framing, e.g. 1492) the entries of a PDU are
+packed into as many #9 TLVs as fit (`snp.entriesFitting`: header, authentication TLV and the 2 octets of each TLV
+counted), as FRR's `lsp-mtu` does, so a 4096-LSP database takes about 47 CSNPs instead of 274; the receive side walks
+every #9 TLV and the range tiling is unchanged.
 
 ## 6. Next-wakeup computation
 
@@ -168,12 +186,15 @@ walks every #9 TLV.
 
 - the next paced LSP retransmit: `last_sent[(id,i)] + minimum_lsp_transmission_interval`
   for each still-SRM-flagged LSP (for one just sent, `now + interval`), and
-- the next periodic CSNP: `csnp_next[i]`.
+- the next periodic CSNP: `csnp_next[i]` (a broadcast circuit that is not the DIS has none), and
+- the next PSNP: `psnp_due[i]`, and the next LSP slot, `lsp_next[i]`, with a transmit gap.
 
 It is `now` when `truncated` (work remains this instant — poll again immediately)
 and `null` when nothing is pending (no Up interface). PSNP acks are emitted
-immediately and unpaced, so they contribute to the wakeup only via `truncated`
-— which is why `emitPsnp` reports `truncated` when more than
+after `partial_snp_interval` (ISO 10589 `partialSNPInterval`, default 2 as in RFC 9681 §3 and FRR; no jitter): the
+first poll that finds an SSN flag on a circuit starts the timer, the PSNP that clears the flags goes out when it runs
+out, so a burst of received LSPs is acknowledged by one PSNP, and 0 sends on the first poll. A chunked drain contributes
+to the wakeup via `truncated` — which is why `emitPsnp` reports `truncated` when more than
 `max_summary_entries` flags are pending on a circuit and its summary buffer
 caps the drain (the leftover acks and requests are reachable at stock settings:
 `request_capacity` defaults to `capacity / 4` = 1024, four times the buffer).
@@ -320,18 +341,18 @@ No third-party code ported (the README's `Provenance:` line). Like the sibling `
 
 ## What is deliberately not done
 
+- **Numbered mesh-group sets (RFC 2973).** An LSP received on a circuit of set N must not be flooded out the others of
+  N; the SRM flags are set by `isis-lsdb` when the LSP arrives, and the scheduler never learns which circuit it came
+  from. The rule belongs in `isis-lsdb`'s SRM assignment (reference: FRR `mesh-group`, docs only); only `blocked` is
+  here.
+
 - **Socket I/O.** The scheduler returns effects; the caller owns the wire.
 - **LSP purge-specific flooding.** A purge is an LSP with SRM set by the LSDB; the SRM flag already
   encodes it.
 
 ## Backlog / deferred
 
-Missing-and-it-matters items from the competitive survey.
-
-- **Broadcast-circuit flooding** (SRM cleared on send, periodic CSNP only when local system is DIS, PSNP only as request). Why: every reference runs LAN circuits; on a broadcast circuit SRM is cleared **on send** (no per-neighbour ack), only the DIS sends the periodic CSNP, and receivers send PSNPs only to request missing LSPs. Hook: the LSDB's `broadcast_interfaces` set plus a DIS-role input would switch an interface to clear-on-send + DIS-gated CSNP; the `up`-set + per-interface timer structure is the place. Effort: ~3–4 days plus LAN tests. Fits §2: yes.
-- **Multi-TLV SNP packing to the link MTU** (several #9 TLVs per PDU instead of one 15-entry TLV). Why: at 15 entries per PDU a 4096-LSP database needs ~270 CSNPs where FRR needs ~15 at 1500 bytes. Purely an efficiency change; the receiver side already walks every #9 TLV. Effort: ~1 day. Fits §2: yes.
-- **`partialSNPInterval` pacing and real inter-LSP transmit gap.** Why: standard timer set; a burst cap is not a rate (the sub-second per-circuit LSP gap is approximated by `max_lsps_per_iface_per_poll`, §3). ISO 10589 defines `partialSNPInterval` alongside `minimumLSPTransmissionInterval` and `completeSNPInterval` (RFC 9681 §3 quotes it, "a reasonable value is 2 s"); this module emits PSNPs immediately and unpaced instead (§6). The CSNP → request-placeholder → PSNP reflection ratio is ~1:1, so that is not an amplification surface, but it is a deviation from the standard's timer set. Effort: ~1–2 days. Fits §2: yes. Priority low.
-- **Mesh-groups (RFC 2973).** Not built; no hook beyond the per-interface SRM flag.
+None open.
 
 ## Anchoring
 

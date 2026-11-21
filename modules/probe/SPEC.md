@@ -48,7 +48,7 @@ declared) and network-stack libraries, none offering connect classification with
 with a real wall-clock bound (`poll` on a non-blocking socket, EINTR-safe; 200 ms budget measured at 200.3 ms), races
 the resolved addresses (RFC 8305, 250 ms attempt delay) where the reference dials one, returns the raw `errno`, aggregates min/avg/max/jitter/loss through
 `latency-stats`, and fans out with a hard worker cap and order-stable results, all offline-testable through the
-`Connector` seam, reports the answering address (`Result.addr`), and binds a source address or interface, restricts or prefers an IP family and spaces repetitions. **Where we are behind:** no send/expect over the open connection (banner grabbing is deliberately not done, see *What is deliberately not done*), no TLS timing (sibling `tls` modules exist for that), `PosixConnector` is Linux-only (consciously deferred → *Backlog / deferred*).
+`Connector` seam, reports the answering address (`Result.addr`), and binds a source address or interface, restricts or prefers an IP family and spaces repetitions. **Where we are behind:** no send/expect over the open connection (banner grabbing is deliberately not done, see *What is deliberately not done*), no TLS timing (sibling `tls` modules exist for that), `PosixConnector` is Linux-only (consciously not done → *What is deliberately not done*).
 
 ## Design & invariants
 Pure engine behind a `Connector` seam: all connect I/O goes through `connectFn(target,
@@ -210,8 +210,13 @@ probing, banner grabbing, TLS/protocol handshakes, port-range sweeping, IPv6 zon
 
 - **Bounding name resolution by `timeout_ns`**: a `poll`-based connector cannot; see *Threat model* for what
   each `Resolve` mode promises.
-- **A bounded `LiveConnector` connect**: its `timeout_ns` stays advisory, because `std.Io.Threaded` panics on a
-  connect timeout; the answer is `PosixConnector`, not waiting for std.
+- **A bounded `LiveConnector` connect on `std.Io.Threaded`**: its `timeout_ns` stays advisory there, because
+  `std.Io.Threaded` panics on a connect timeout; the answer is `PosixConnector`, not waiting for std. An `Io`
+  that implements connect timeouts gets them with `LiveConnector.bounded`.
+- **A non-Linux `PosixConnector`** (BSD/macOS through the same non-blocking connect and `poll`): BSD and macOS
+  have no stable syscall ABI, so a libc-free poll connector there means libc, which §2 rules out for this
+  module. `LiveConnector` stays the portable path. blackbox_exporter's Go runtime has the portability for free;
+  that is the one place it is ahead.
 - **UDP/ICMP probing, raw or SYN scans, banner grabbing and send/expect over the open connection
   (blackbox's `query_response`), TLS/protocol handshakes, port-range sweeping, IPv6 zone/scope ids.** So `AppCheck` never gets the open socket: it is a post-connect predicate over the `Target` (it opens its own connection if it needs to talk), and the connect that made it run is already closed.
 - **Stopping the fan-out instead of recording a `.canceled` outcome** (shape B in *Design*).
@@ -263,11 +268,7 @@ probing, banner grabbing, TLS/protocol handshakes, port-range sweeping, IPv6 zon
 
 ## Backlog / deferred
 
-- **Non-Linux `PosixConnector`** (BSD/macOS via the same poll technique) *(survey 2026-09-30)*. Consciously
-  deferred: BSD/macOS have no stable syscall ABI, so a libc-free poll connector there means libc, which §2 rules
-  out for this module; `LiveConnector` stays the portable path (owner can overrule). Why: only `LiveConnector`
-  is portable and it cannot bound a connect. Effort: medium; needs a syscall path other than `std.os.linux` (fits §2
-  only if no libc — check per target).
+None open.
 
 ## Anchoring
 

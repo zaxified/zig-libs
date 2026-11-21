@@ -126,9 +126,9 @@ test "flood an LSP, ack it back, and the retransmit stops (both sides real)" {
     var b_db = lsdb.Lsdb.init(testing.allocator, .{ .local_system_id = sys_b, .interface_count = 1, .capacity = 8 });
     defer b_db.deinit();
 
-    var a_sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .min_lsp_transmission_interval = 5 });
+    var a_sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_a, .partial_snp_interval = 0, .min_lsp_transmission_interval = 5 });
     defer a_sched.deinit();
-    var b_sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_b });
+    var b_sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_b, .partial_snp_interval = 0 });
     defer b_sched.deinit();
 
     var lbuf: [128]u8 = undefined;

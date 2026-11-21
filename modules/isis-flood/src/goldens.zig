@@ -152,7 +152,7 @@ const golden1_csnp_l1_full = [_]u8{
 test "golden L1 CSNP full range (Wireshark-anchored): Scheduler.poll reproduces the exact bytes" {
     var db = lsdb_mod.Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0 });
     defer sched.deinit();
 
     const id_a: LspId = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x09, 0x0a };
@@ -247,7 +247,7 @@ const golden2_csnp_l2_partial = [_]u8{
 test "golden L2 CSNP partial range (Wireshark-anchored): Scheduler.poll's own chunking reproduces the exact bytes" {
     var db = lsdb_mod.Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .is_l2 = true, .lsp_entries_per_pdu = 1 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .is_l2 = true, .lsp_entries_per_pdu = 1 });
     defer sched.deinit();
 
     var buf: [256]u8 = undefined;
@@ -322,7 +322,7 @@ const golden3_psnp_l1 = [_]u8{
 test "golden L1 PSNP (Wireshark-anchored): Scheduler.poll's SSN-drain reproduces the exact bytes" {
     var db = lsdb_mod.Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0 });
     defer sched.deinit();
 
     const id_a: LspId = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x09, 0x0a };
@@ -381,7 +381,7 @@ const golden4_psnp_l2 = [_]u8{
 test "golden L2 PSNP (Wireshark-anchored): Scheduler.poll selects the L2 PSNP type code" {
     var db = lsdb_mod.Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .is_l2 = true });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .is_l2 = true });
     defer sched.deinit();
 
     const id_a: LspId = .{ 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0, 1 };
@@ -470,7 +470,7 @@ const golden5_csnp_truncated_series = [_]u8{
 test "golden truncated CSNP series (Wireshark-anchored): the End LSP-ID is enumerated, not FF…FF" {
     var db = lsdb_mod.Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 512 });
     defer db.deinit();
-    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .partial_snp_interval = 0, .lsp_entries_per_pdu = 2 });
     defer sched.deinit();
 
     // 300 LSPs — more than `max_summary_entries` (256), so the series cannot be
