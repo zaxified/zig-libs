@@ -424,6 +424,12 @@ pub const ThreadPool = struct {
             };
             return;
         }
+        if (comptime builtin.single_threaded) {
+            // wasm32-wasi: no `std.Thread.spawn`. A pool needs `Options.io` there.
+            gpa.free(pool.queue);
+            pool.queue = &.{};
+            return error.ConcurrencyUnavailable;
+        }
         const threads = gpa.alloc(std.Thread, n) catch |e| {
             gpa.free(pool.queue);
             pool.queue = &.{};

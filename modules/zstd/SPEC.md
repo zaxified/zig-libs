@@ -2917,10 +2917,13 @@ Where it is slower than libzstd, apart from the backlog's P1 item:
 
 `meta.targets` (`root.zig`): `.linux64` (mandatory), `.linux32`, `.windows`
 (`check-portable`'s vocabulary, `build.zig`'s `PortableTarget` -- see its
-doc comments before adding a target here). Not `.wasm32`: `zstdmt.zig`'s
-worker pool uses `std.Thread.spawn`, unavailable in `wasm32-wasi`'s
-single-threaded build (`std/Thread.zig`'s `@compileError`) -- undecided,
-see *Backlog / deferred*.
+doc comments before adding a target here), and `.wasm32` (`wasm32-wasi`,
+single-threaded): the worker pools (`zstdmt.zig`'s `ThreadPool`, the
+dictionary optimizer's) have no `std.Thread.spawn` there, so a `ThreadPool`
+built without `Options.io` answers `ConcurrencyUnavailable` and the
+optimizer runs its one worker on the calling thread; the tests that need
+threads skip (`portable-zstd-wasm32` compiles the library and every test).
+Compile-checked only: no wasi runtime runs the tests here.
 
 `.linux32` is `mips-linux-musl`, `mips32,soft_float` -- 32-bit **and**
 big-endian at once, libzstd's actual combination on real hardware (an
@@ -3069,4 +3072,3 @@ The `Z` numbers cited through this document (`Z1` … `Z35`) are former backlog 
 - **`fill.zig` against a vectorised `memset`.** `fill.zig` clears small tables in 32-byte stores because Zig 0.16's `compiler_rt.memset` stores byte by byte. 0.17.0's is vectorised (`fastMemset`); re-measure, then decide whether `fill.zig` goes (its header says to delete it with a Zig whose `memset` is vectorised).
 - **Build option: compressor feature set** (mechanism and checklist in CONVENTIONS §4.2). Compressor strategies, long-distance matching, `dict_builder` and `huf_asm` sit beside the decoder. Measure first (an HTTPS size probe, or `nm -S --size-sort` on a consumer binary: does a decode-only consumer link any of it, as with brotli?) and add a knob only for a measured gain of roughly 100 KB or more, or a consumer request; `.small` would cap the strategy set (higher levels become an error). Unmeasured.
 - **In-place decompression.** libzstd's one-shot decoder decodes in place (`ZSTD_memmove` for raw blocks, the `oBlockEnd` clamp). This one refuses overlapping `dst` and `src` with a checked panic (*Limits and refusals*). Porting the clamp and a `@memmove` for the raw-block copy and the 16-byte literal copies waits until a consumer needs in-place decoding.
-- **`.wasm32` target.** `meta.targets` omits it: `zstdmt.zig`'s worker pool uses `std.Thread.spawn`, which `wasm32-wasi`'s single-threaded build does not have (`std/Thread.zig`'s `@compileError`). Whether to gate the pool there (with `builtin.single_threaded` the jobs already run on the calling thread) is undecided and unverified.

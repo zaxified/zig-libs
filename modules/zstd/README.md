@@ -532,8 +532,7 @@ content does not match its checksum), `FrameIndexTooLarge`,
 ## Not provided
 
 Run-time CPU dispatch (build for the target CPU instead), libzstd's legacy
-v0.5–v0.7 frame decoders, its legacy dictionary trainer and `--trace`, and
-`.wasm32` builds. SPEC.md, *What is deliberately not done* gives the reasons
+v0.5–v0.7 frame decoders, its legacy dictionary trainer and `--trace`. (`wasm32-wasi` builds, single-threaded: a `ThreadPool` needs `Options.io` there.) SPEC.md, *What is deliberately not done* gives the reasons
 and *Backlog / deferred* what is open.
 
 ## Tests

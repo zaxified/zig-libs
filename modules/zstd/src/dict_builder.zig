@@ -1282,6 +1282,8 @@ fn Optimizer(comptime trainer: Trainer, comptime ScorerPtr: type) type {
             o.slots = try o.meta.alloc(Slot, n);
             for (o.slots) |*s| s.* = .{ .owner = o };
             if (n < 2) return;
+            // `workerCount` gives 1 when single-threaded, so this is not reached there.
+            if (comptime builtin.single_threaded) unreachable;
             const threads = try o.meta.alloc(std.Thread, n);
             for (threads, 0..) |*t, i| {
                 t.* = std.Thread.spawn(.{}, worker, .{ o, &o.slots[i] }) catch {
@@ -2257,6 +2259,7 @@ test "optimizer: every thread count keeps the single-threaded winner, ties inclu
 }
 
 test "parallel optimizers: memory_limit bounds the sum; the result does not change" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest; // wasm32-wasi: no threads
     const gpa = testing.allocator;
     const gen = try testSet("json-200");
     defer gen.deinit(gpa);
@@ -2332,6 +2335,7 @@ const HogScorer = struct {
 };
 
 test "parallel optimizers: candidates refused under contention are rerun, compared once each, in order" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest; // wasm32-wasi: no threads
     const gpa = testing.allocator;
     const gen = try testSet("json-200");
     defer gen.deinit(gpa);
@@ -2383,6 +2387,7 @@ const ThreadScorer = struct {
 };
 
 test "parallel optimizers: one thread runs on the caller, no more slots than a d has candidates, as many at once as the ceiling holds" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest; // wasm32-wasi: no threads
     const gpa = testing.allocator;
     const gen = try testSet("json-200");
     defer gen.deinit(gpa);
@@ -2482,6 +2487,7 @@ const GateScorer = struct {
 };
 
 test "parallel optimizers: a refusal at any position is rerun from it, in grid order; a failure of its own is final" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest; // wasm32-wasi: no threads
     const gpa = testing.allocator;
     const gen = try testSet("json-200");
     defer gen.deinit(gpa);

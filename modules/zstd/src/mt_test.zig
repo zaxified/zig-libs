@@ -435,6 +435,7 @@ fn runOnPool(gpa: std.mem.Allocator, pool: *zstd.ThreadPool, workers: u32, part:
 }
 
 test "a shared thread pool gives the same bytes, smaller or larger than nb_workers" {
+    if (comptime @import("builtin").single_threaded) return error.SkipZigTest; // wasm32-wasi: no threads
     if (@import("builtin").cpu.arch.isMIPS32()) return error.SkipZigTest; // see above
     const gpa = std.testing.allocator;
     // two threads for three workers: jobs wait for a free thread
