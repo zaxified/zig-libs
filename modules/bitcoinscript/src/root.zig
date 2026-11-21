@@ -36,6 +36,9 @@
 //!   (key-path + script-path) orchestration built on `interpreter.eval`.
 //! - `script.zig` — `ScriptBuilder` (shortest pushes, bounded) and `toAsm`
 //!   (Core-style disassembly).
+//! - `sigops.zig` — sigop counting (`GetSigOpCount`, `GetTransactionSigOpCost`).
+//! - `standard.zig` — `Solver` / `IsStandard` / `ExtractDestination` template
+//!   classification of output scripts.
 //! - `script_tests_vectors.zig` / `script_tests_test.zig` — a pinned
 //!   subset of Bitcoin Core's official `script_tests.json` corpus.
 //! - `script_tests_witness_vectors.zig` / `script_tests_witness_test.zig` —
@@ -83,6 +86,8 @@ pub const tapscript = @import("tapscript.zig");
 pub const interpreter = @import("interpreter.zig");
 pub const verify = @import("verify.zig");
 pub const script = @import("script.zig");
+pub const sigops = @import("sigops.zig");
+pub const standard = @import("standard.zig");
 
 // Flat re-exports of the primary public surface.
 pub const ScriptFlags = flags.ScriptFlags;
@@ -112,6 +117,10 @@ test {
     _ = interpreter;
     _ = verify;
     _ = script;
+    _ = sigops;
+    _ = standard;
+    _ = @import("sigops_test.zig");
+    _ = @import("standard_test.zig");
     _ = @import("script_asm_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("asmparser.zig");

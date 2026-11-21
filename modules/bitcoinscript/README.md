@@ -39,8 +39,7 @@ Implemented:
 
 ## Not provided
 
-No sigop counting, no standardness / template classification (basic classification and destination extraction live
-in the sibling `btcaddr`), no signing, no script debugger; see `SPEC.md` *Backlog / deferred*.
+No signing, no script debugger, no script compression; see `SPEC.md` *Backlog / deferred*.
 
 ## Use
 

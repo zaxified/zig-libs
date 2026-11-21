@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** | C++ | MIT | 90.3k | v31.1 (2026-07-08) | The consensus definition. `script_tests.json` (1207 data rows) and `script_assets_test.json` are the yardsticks; here every witness-bearing row plus a machine-filtered subset of the non-witness rows are pinned, not the full file. Core also has sigop counting, `Solver`/standardness, `ExtractDestination`, script compression — none here. |
+| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** | C++ | MIT | 90.3k | v31.1 (2026-07-08) | The consensus definition. `script_tests.json` (1207 data rows) and `script_assets_test.json` are the yardsticks; here every witness-bearing row plus a machine-filtered subset of the non-witness rows are pinned, not the full file. Core also has script compression (a UTXO storage format) — not provided; sigop counting, `Solver`/standardness and `ExtractDestination` are here (`sigops.zig`, `standard.zig`). |
 | [btcsuite/btcd (`txscript`)](https://github.com/btcsuite/btcd/tree/master/txscript) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | Full engine plus `scriptbuilder.go`, `standard.go` (classification, sigop counts), `pkscript.go`, `taproot.go`, `sign.go`: a Go user gets a builder, a disassembler, standardness and signing beside the VM (file list read via the GitHub API). |
 | [rust-bitcoin/rust-bitcoin (`script`, `bitcoinconsensus` feature)](https://github.com/rust-bitcoin/rust-bitcoin) | Rust | CC0-1.0 | 2.7k | units-0.2.0 (tag; push 2026-09-30) | Script types, builder and asm/hex display; verification only by binding libbitcoinconsensus *(inferred)*. A pure-Rust interpreter exists in rust-miniscript for miniscript fragments only *(inferred)*. |
 | [rust-bitcoin/rust-miniscript](https://github.com/rust-bitcoin/rust-miniscript) | Rust | CC0-1.0 | 426 | push 2026-09-26 | Miniscript/descriptors and their satisfaction; no consensus VM, no descriptor layer here either. |
 | [bitcoin-core/btcdeb](https://github.com/bitcoin-core/btcdeb) | C++ | MIT | 595 | push 2026-07-26 | Script debugger built on Core's interpreter — a step-through tool this module has no counterpart of. |
 | [bitcoinjs/bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) | JavaScript | MIT | 6.0k | v7.0.1 (tag; push 2026-02-17) | Script compile/decompile/toASM and payments; no consensus interpreter *(inferred)*. |
 
-**Where we are ahead:** the only consensus script interpreter in pure Zig (no libbitcoinconsensus link, unlike the Rust/JS ecosystems that bind it): all `SCRIPT_VERIFY_*` flags, BIP342 tapscript incl. `OP_SUCCESSx` and validation weight, a per-transaction sighash cache; Core's own FindAndDelete/tx_valid rows pinned. **Where we are behind:** no sigop counting, no standardness check (basic template classification and destination extraction live in the sibling `btcaddr` module), and only part of `script_tests.json` and of `script_assets_test.json` (five real transactions of the latter, see *Verification*).
+**Where we are ahead:** the only consensus script interpreter in pure Zig (no libbitcoinconsensus link, unlike the Rust/JS ecosystems that bind it): all `SCRIPT_VERIFY_*` flags, BIP342 tapscript incl. `OP_SUCCESSx` and validation weight, a per-transaction sighash cache, sigop counting and Core's `Solver`/`IsStandard`/`ExtractDestination`; Core's own FindAndDelete/tx_valid rows pinned. **Where we are behind:** only part of `script_tests.json` and of `script_assets_test.json` (five real transactions of the latter, see *Verification*).
 
 ## Design & invariants
 
@@ -80,6 +80,7 @@ A stack machine executing UNTRUSTED, attacker-supplied bytes, layered bottom-up:
 - `tapscript.zig` — BIP341/342 script-path primitives: control-block/tapleaf/Merkle-root/tweak
   commitment (`verifyCommitment`), the `ext_flag=1` sighash extension, and BIP340 Schnorr signature
   checking (`checkSchnorrSig`).
+- `sigops.zig` / `standard.zig` — sigop counting and output-template classification (below).
 - `verify.zig` — `verifyScript`: legacy → BIP16 P2SH → BIP141 segwit-v0
   (P2WPKH/P2WSH) → BIP341 taproot-key-path → BIP341/342 taproot-script-path orchestration on top of
   `interpreter.eval`/`evalTapscript`.
@@ -313,6 +314,31 @@ clean-room), btcd's `txscript.ScriptBuilder` for the bounds.
   writes `OP_0`..`OP_16` and `OP_1NEGATE` as numbers and every data push as hex) and has no
   sighash decoding.
 
+## Sigop counting and template classification (`sigops.zig`, `standard.zig`)
+
+**Sigops** (`sigops`) transcribe Bitcoin Core's counting: `countScript(script, accurate)` is
+`CScript::GetSigOpCount` (1 per `OP_CHECKSIG(VERIFY)`; per `OP_CHECKMULTISIG(VERIFY)` the `OP_1..OP_16`
+immediately before it when `accurate`, else 20; a script that stops decoding ends the walk without an
+error, as `while (GetOp(...))` does), `countP2sh` is `GetSigOpCount(scriptSig)` (the redeem script is the
+last push of a push-only scriptSig, else 0), `legacyCount` / `p2shCount` / `witnessCount` are
+`GetLegacySigOpCount` / `GetP2SHSigOpCount` / `CountWitnessSigOps` (v0 key hash = 1, v0 script hash = the
+accurate count of the last witness item, taproot and unknown versions = 0, P2SH-wrapped programs through
+the redeem script) and `transactionCost` is `GetTransactionSigOpCost` (legacy x 4, P2SH x 4 with
+`flags.p2sh`, witness x 1 with `flags.witness`; a coinbase only its legacy count). The caller sums a
+block and compares with `max_block_sigops_cost` (80 000). The unit test of Core's `script_tests.cpp`
+(`GetSigOpCount`) is reproduced.
+
+**Templates** (`standard`) are Core's `Solver` (`solve` returns a `Template` that borrows from the
+script: pubkey, pubkeyhash, scripthash, bare multisig up to `OP_16` keys, `OP_RETURN` + pushes, witness
+v0 key/script hash, taproot, pay-to-anchor `OP_1 <4e73>`, any other witness program as
+`witness_unknown`, else `nonstandard`), `IsStandard` (`isStandard`: bare multisig at most 3 keys with
+`1 <= m <= n`; a data carrier at most `max_datacarrier_bytes`, Core v31 default 100 000, or none when
+null) and `ExtractDestination` (`extractDestination`; a bare pubkey becomes its hash160, multisig,
+data carriers and non-standard scripts have none). A bare-pubkey / multisig key is accepted when its
+header and length agree (`CPubKey::ValidSize`: 02/03 with 33 bytes, 04/06/07 with 65), with no curve
+check, exactly as Core. Deliberately not done: script compression (`CompressScript`, a storage format of
+Core's UTXO set, which btcd and rust-bitcoin do not have).
+
 ## Verification
 
 Run `scripts/modtest bitcoinscript`. Every vector file is machine-transcribed (never hand-typed) from Bitcoin Core's
@@ -473,7 +499,5 @@ verifier.
 
 ## Backlog / deferred
 
-- **Sigop counting (legacy, P2SH, witness) — `GetLegacySigOpCount`/`GetTransactionSigOpCost` equivalents** (survey 2026-09-30) — block validation is impossible without it (block sigop cost limit) and btcd/Core expose it. `rg -i sigop src/` finds only the tapscript validation-weight budget. Effort M. Fits §2.
-- **Template classification / destination extraction (Solver, IsStandard, ExtractDestination)** (survey 2026-09-30) — needed to tell a wallet what an output pays to; btcd `standard.go`, Core `solver.cpp`. Effort M. Fits §2. Partly covered: `btcaddr.classify` / `btcaddr.toScriptPubKey` recognise the standard output templates and extract the payload; Solver-style standardness is still absent.
 - **Pin the full `script_tests.json` and `script_assets_test.json`** (survey 2026-09-30) — the non-witness rows are a sample by design; from the BIP342 corpus (`script_assets_test.json`) only the 5-transaction slice in `consensus_kat_vectors.zig` is pinned. Effort M (vendoring size). Fits §2.
 - **Shared `commonSigMsg` in `bitcointx`.** `tapscript.sigMsg` rebuilds the BIP341 common signature message because `bitcointx.bip341.sigMsg` is key-path-only (`spend_type = 0x00`, no extension); lifting one shared implementation into `bitcointx` would remove the duplicate (the `ext_flag = 0` prefix is cross-checked byte for byte today).
