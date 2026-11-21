@@ -27,8 +27,8 @@
 //!     back `clean` — proving the harness does not cry wolf on correct code.
 //!     `RefQueue` is also the linearizability oracle: a coarse-locked queue is
 //!     trivially linearizable, so multiset-equality against it is a sound
-//!     correctness check for the lock-free queue (full history/linearization
-//!     checking is a documented next increment — SPEC).
+//!     correctness check for the lock-free queue (the interval-based
+//!     linearizability check is `history_test.zig`).
 //!
 //! The use-after-free teeth live one layer down in `pool.zig` (poison +
 //! canary), because sanitizers are unusable here (SPEC §Verification). The

@@ -562,6 +562,8 @@ independent of the core under test:
 | DEQUE DRIVER TEETH | the same driver over a `pop` that skips the last-item CAS: `duplicated` in round 1, 5/5 runs | **probabilistic** (high) |
 | SEGQUEUE | driver over `SegQueue` 8×8×50 000 with 1-, 3- and 63-slot blocks (one-slot blocks put a hand-off and a retire on every item), 8×1 and 1×8 | **probabilistic** |
 | SEGQUEUE DRIVER TEETH | the same driver over a pop that skips the `written` wait (push dawdling 256 pauses between claim and write), and over a retire that poisons the block's items unscanned: both `corrupted` | **probabilistic** (high); safety-checked builds only (the poison) |
+| HISTORY (`src/history_test.zig`) | per-operation intervals (stamps from one shared counter before and after each call), then the four non-linearizable patterns of Henzinger et al. (CONCUR 2013) for queues with distinct values: `fresh`, `repeat`, `order`, `witness`; `MpmcQueue` and `SegQueue` (1-, 3- and default-slot blocks), 4 threads of mixed enqueues and dequeues | **probabilistic** run, **deterministic** checker |
+| HISTORY TEETH | the checker on hand-built histories (each pattern flagged, overlapping calls not); a coarse-locked LIFO (multiset-clean, wrong order) and a queue that answers empty with an item inside, both flagged | **deterministic** (the LIFO also under threads) |
 | segqueue corners | FIFO across hand-offs and block reuse; `len` across laps and the closed position; a payload wider than a word; a push that cannot get a block fails before claiming; a steady flow stops allocating | **deterministic** |
 | deque corners | thief stalled between its reads and its CAS loses to the owner; a thief reading a retired buffer; a growth that cannot allocate; concurrent `len` while the owner pops empty | **deterministic** (the `len` one probabilistic) |
 
@@ -570,7 +572,11 @@ dequeued and requires each producer's sequence numbers to rise (`reordered`
 otherwise). Any FIFO queue must pass it: one producer's enqueues are ordered,
 hence so are their dequeues, and one consumer's dequeues are ordered by its
 program order. It is weaker than a linearizability check (it says nothing about
-two producers' items relative to each other) but it is free.
+two producers' items relative to each other) but it is free; `history_test.zig` is the stronger one (rows HISTORY above): it
+flags a queue that is multiset-clean and per-producer ordered but takes two producers' items in the wrong order, or answers
+empty with an item inside. A clean history is not claimed linearizable (only the four patterns are looked for), and
+`BoundedQueue` is not run through it: a Vyukov ring answers empty while a claimed, unpublished slot precedes a published
+one, which is the `witness` pattern (§4b, "stalled claim").
 
 **The multiset invariant.** Each of N producers enqueues a disjoint tagged range
 — value = `(pid << 48) | seq`. After the run the merged dequeued multiset must
@@ -979,10 +985,6 @@ bench did not change it.
 - **Hazard-pointer reclamation** — the alternative to EBR for a consumer needing
   bounded per-node reclamation latency (§2); would slot in beside `ebr.zig` behind
   the same `Retired` callback shape.
-- **Linearizability history check** — the oracle is multiset equality against a
-  coarse-locked queue (sound for no lost/duplicated/corrupted items); a per-op
-  timestamped history with a sequential-witness search would additionally verify
-  ordering under concurrency. Tractable, deferred.
 - **A litmus pair for `SegQueue`'s retire/scan shape** — the consumer's `read`
   store → the scanner's acquire load is message passing, already shape 2; the
   pending stack is a Treiber push plus swap-all. Effort: small-medium.

@@ -115,6 +115,7 @@ test {
     _ = segqueue;
     _ = deque;
     _ = harness;
+    _ = @import("history_test.zig");
     _ = @import("sweep_test.zig");
 }
 
