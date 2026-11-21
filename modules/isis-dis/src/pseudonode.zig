@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! pseudonode.zig -- what the DIS puts on the wire and on the LAN once it is
 //! elected (ISO/IEC 10589 §7.3.8, §8.4.1): the pseudonode LSP, its purge, the
 //! DIS Hello cadence and the per-circuit pseudonode-id.

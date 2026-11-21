@@ -276,8 +276,29 @@ MODULES = {
         # `devlink`, genetlink has no separate `uapi.zig`: its constants live
         # alongside the resolver logic in `root.zig` itself.
         "zig_files": ["modules/genetlink/src/root.zig"],
-        "headers": ["/usr/include/linux/genetlink.h"],
+        # `netlink.h` carries `NL_ATTR_TYPE_*`, the kinds `getPolicy` reports (`PolicyKind`).
+        "headers": ["/usr/include/linux/genetlink.h", "/usr/include/linux/netlink.h"],
         "prefixes": [""],
+        "member_aliases": {
+            "PolicyKind.invalid": "NL_ATTR_TYPE_INVALID",
+            "PolicyKind.flag": "NL_ATTR_TYPE_FLAG",
+            "PolicyKind.u8": "NL_ATTR_TYPE_U8",
+            "PolicyKind.u16": "NL_ATTR_TYPE_U16",
+            "PolicyKind.u32": "NL_ATTR_TYPE_U32",
+            "PolicyKind.u64": "NL_ATTR_TYPE_U64",
+            "PolicyKind.s8": "NL_ATTR_TYPE_S8",
+            "PolicyKind.s16": "NL_ATTR_TYPE_S16",
+            "PolicyKind.s32": "NL_ATTR_TYPE_S32",
+            "PolicyKind.s64": "NL_ATTR_TYPE_S64",
+            "PolicyKind.binary": "NL_ATTR_TYPE_BINARY",
+            "PolicyKind.string": "NL_ATTR_TYPE_STRING",
+            "PolicyKind.nul_string": "NL_ATTR_TYPE_NUL_STRING",
+            "PolicyKind.nested": "NL_ATTR_TYPE_NESTED",
+            "PolicyKind.nested_array": "NL_ATTR_TYPE_NESTED_ARRAY",
+            "PolicyKind.bitfield32": "NL_ATTR_TYPE_BITFIELD32",
+            "PolicyKind.sint": "NL_ATTR_TYPE_SINT",
+            "PolicyKind.uint": "NL_ATTR_TYPE_UINT",
+        },
         # `header_len` (this module's own sizing constant, not a kernel
         # macro name) and `GENL_ID_CTRL` (the kernel spells it
         # `NLMSG_MIN_TYPE` inside `linux/netlink.h`, a different header this
