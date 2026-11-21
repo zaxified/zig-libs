@@ -356,9 +356,11 @@ few samples gains little (the block key dominates, and a 1-sample block costs mo
   (17 B per raw sample), so a window over a very large series is O(window). Kept because the
   one-transaction atomicity is the contract and kvtree's transaction holds the deletes anyway; for a
   very large window prefer `sweep` or several smaller calls.
-- **`sweepToBudget` memory with a huge `max_deletes`.** The picked entries (17 B each) are held until the
-  commits run, so `max_deletes = maxInt` ("until the budget is met") costs memory proportional to the
-  excess; the default 65536 is about 1 MB. Documented on the option.
+- **`sweepToBudget` memory.** The picked entries (17 B each) are committed every `chunk_deletes` inside the
+  pop loop (`unitAt` re-probes by the successor of the popped key, so a committed delete is never seen
+  again), so the call holds one chunk of keys whatever `max_deletes` is (test: a 4 KB allocator deletes
+  3000 points). The call as a whole is not atomic: an error after the first chunk leaves the earlier chunks
+  committed, as an interrupted call does.
 - **`max_cached_series` worst case.** The default 65536 cached series times a 3 KiB canonical form is
   about 200 MB if every series is maximal; documented in `Options.max_cached_series`. Lower it for
   untrusted label sources.
@@ -474,11 +476,9 @@ section is its citation.
 - **Coalescing small compacted blocks.** A sparse series gains only 25 → 20 bytes per sample; an
   internal space optimisation with no API change.
 - **Thread-safe `Db`** (cache synchronisation; readers are already MVCC). Today `single_owner`.
-- **Bounded `deleteRange` and `sweepToBudget` memory.** `deleteRange` holds every affected key and each
-  straddling block's suffix (17 B per raw sample); `sweepToBudget` holds the picked entries (17 B each)
-  until the commits run. A bounded `deleteRange` would be a new chunked, non-atomic entry point (cf.
-  `deleteSeries`); `sweepToBudget` could flush a transaction every `chunk_deletes` inside the pop loop
-  (`unitAt` re-probes by successor key, so it is safe against already-committed deletes).
+- **Bounded `deleteRange` memory.** `deleteRange` holds every affected key and each straddling block's
+  suffix (17 B per raw sample); a bounded entry point would be a new chunked, non-atomic one (cf.
+  `deleteSeries`).
 
 ## Anchoring
 

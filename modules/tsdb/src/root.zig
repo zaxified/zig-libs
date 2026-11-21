@@ -1147,15 +1147,15 @@ pub const Db = struct {
 
     pub const SweepToBudgetOptions = struct {
         /// Entries deleted per committed transaction. Bounds one transaction's
-        /// size, same role as `SweepOptions.chunk_deletes` — but see the
-        /// doc comment on `sweepToBudget` for why chunking here does NOT
-        /// give the same resumability `sweep` has. 0 means "the default" (4096).
+        /// size and the keys the call holds in memory (17 bytes each), same role
+        /// as `SweepOptions.chunk_deletes` — but see the doc comment on
+        /// `sweepToBudget` for why chunking here does NOT give the same
+        /// resumability `sweep` has. 0 means "the default" (4096).
         chunk_deletes: usize = 4096,
         /// Upper bound on SAMPLES this call deletes, checked before each
         /// entry — so a block (up to `chunk.max_block_samples` samples) can
-        /// carry the total past it by less than one block. The picked entries
-        /// (17 bytes each) are held in memory until they are committed, so a
-        /// huge value costs memory proportional to the work done.
+        /// carry the total past it by less than one block. Memory does not grow
+        /// with it: the picked entries are committed every `chunk_deletes`.
         max_deletes: usize = 65536,
     };
 
@@ -1237,6 +1237,12 @@ pub const Db = struct {
             }
         }
 
+        // The picked entries are committed every `per_txn` of them, inside the
+        // pop loop, so the call holds at most one chunk of keys (17 bytes
+        // each) whatever `max_deletes` is. `unitAt` re-probes by the SUCCESSOR
+        // of the popped key, so an already committed delete cannot be seen again.
+        // 0 = the default (sweep D10; TS-3: never an empty-commit loop).
+        const per_txn = orDefault(opts.chunk_deletes, (SweepToBudgetOptions{}).chunk_deletes);
         var deletes: std.ArrayList([codec.point_key_len]u8) = .empty;
         defer deletes.deinit(self.gpa);
         var freed: u64 = 0;
@@ -1247,25 +1253,26 @@ pub const Db = struct {
             freed += u.bytes;
             deleted += u.samples;
             if (try self.unitAt(&codec.pointKeySuccessor(u.key), u.series, u.block)) |n| try heap.push(self.gpa, n);
-        }
-
-        var i: usize = 0;
-        // 0 = the default (sweep D10; TS-3: never an empty-commit loop).
-        const per_txn = orDefault(opts.chunk_deletes, (SweepToBudgetOptions{}).chunk_deletes);
-        while (i < deletes.items.len) {
-            const end = i + @min(per_txn, deletes.items.len - i);
-            var txn = try self.tree.begin();
-            {
-                errdefer txn.rollback();
-                for (deletes.items[i..end]) |*k| try txn.del(k);
+            if (deletes.items.len >= per_txn) {
+                try self.commitDeletes(deletes.items);
+                deletes.clearRetainingCapacity();
             }
-            try txn.commit();
-            self.noteOwnCommit(0);
-            i = end;
         }
+        if (deletes.items.len != 0) try self.commitDeletes(deletes.items);
 
         const after = before - freed;
         return .{ .before = before, .after = after, .deleted = deleted, .done = after <= max_bytes };
+    }
+
+    /// Delete `keys` in one transaction.
+    fn commitDeletes(self: *Db, keys: []const [codec.point_key_len]u8) Error!void {
+        var txn = try self.tree.begin();
+        {
+            errdefer txn.rollback();
+            for (keys) |*k| try txn.del(k);
+        }
+        try txn.commit();
+        self.noteOwnCommit(0);
     }
 
     // ── maintenance ──────────────────────────────────────────────────────────
@@ -3861,6 +3868,29 @@ test "sweepToBudget: chunk_deletes bounds the entries per commit" {
     r = try db.sweepToBudget(before - 4 * codec.point_entry_bytes, .{ .chunk_deletes = 1 });
     try testing.expectEqual(@as(usize, 4), r.deleted);
     try testing.expectEqual(4 * per_commit, counting.sync_count - t0);
+}
+
+test "sweepToBudget: memory does not grow with max_deletes (a 4 KB allocator deletes 3000 points)" {
+    // Kills: collecting every picked key before the first commit (3000 x 17 B
+    // does not fit the buffer).
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    var batch: std.ArrayList(Sample) = .empty;
+    defer batch.deinit(gpa);
+    for (0..3000) |i| try batch.append(gpa, .{ .ts = @intCast(i), .value = 1 });
+    var off: usize = 0;
+    while (off < batch.items.len) : (off += 500) try fx.db.appendMany(s, batch.items[off..@min(off + 500, batch.items.len)]);
+
+    var tiny: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&tiny);
+    fx.db.gpa = fba.allocator();
+    defer fx.db.gpa = gpa;
+    const r = try fx.db.sweepToBudget(0, .{ .chunk_deletes = 16, .max_deletes = std.math.maxInt(usize) });
+    try testing.expectEqual(@as(usize, 3000), r.deleted);
+    try testing.expect(r.done);
+    try testing.expectEqual(@as(u64, 0), try fx.db.liveSize());
 }
 
 test "deleteSeries: deleting a LOWER id never touches a higher series, and chunking is exact" {
