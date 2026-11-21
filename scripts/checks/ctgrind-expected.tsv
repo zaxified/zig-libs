@@ -1431,8 +1431,8 @@ sessions	ReleaseFast	newid	1	0	219f8536123f8967	7a197b81f402a7ea
 # mqtt (2026-10-09) — CONNECT password + 5.0 authentication data tainted
 # through encodePacket (CONNECT 3.1.1/5.0, AUTH) and, as wire bytes only,
 # through decodePacket. The codec copies/slices them and nothing else.
-mqtt	ReleaseFast	encode	1	0	9a0cb070f50ccfd1	f9bc065c9f983504
-mqtt	ReleaseFast	decode	1	0	9a0cb070f50ccfd1	c3c3038ba153dcbb
+mqtt	ReleaseFast	encode	1	0	178ddcf949f6c3e8	f9bc065c9f983504
+mqtt	ReleaseFast	decode	1	0	178ddcf949f6c3e8	c3c3038ba153dcbb
 # 2026-10-17: acl.Passwords.verify with the password tainted -- PBKDF2-HMAC-SHA512 then
 # timing_safe.eql; 0 contexts inside acl.zig (the bool it returns is the verdict).
 mqtt	ReleaseFast	pwverify	1	0	59f0f38ee60f886c	bcc95d04fa79c847
