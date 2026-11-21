@@ -421,6 +421,9 @@ Map-in-map (`ARRAY_OF_MAPS`/`HASH_OF_MAPS` with an inner definition) and
 `PROG_ARRAY` initializers (`.values = { &inner, [1] = &prog }`) are created and
 filled by `load`.
 
+`struct_ops` maps (`.struct_ops`, `.struct_ops.link`) are planned against the
+kernel's BTF, created, and registered with `Object.attachStructOps`.
+
 Global data: `Object.initialData(".rodata")` (seed a `const volatile` before
 `load`), `Object.dataVariables`, `Object.mapData` (the live `.data`/`.bss`
 mapped into the process), and `ebpf.generateSkeleton` (a Zig skeleton with typed

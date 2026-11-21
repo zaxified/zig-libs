@@ -108,6 +108,7 @@ const btf_mod = @import("btf.zig");
 const btfext = @import("btfext.zig");
 const tracing = @import("tracing.zig");
 const bpfsys = @import("bpfsys.zig");
+const bpflink = @import("bpflink.zig");
 const btfsanitize = @import("btfsanitize.zig");
 
 pub const Insn = BPF.Insn;
@@ -129,6 +130,8 @@ pub const BPF_PSEUDO_CALL: u4 = 1;
 /// `BPF_PSEUDO_KFUNC_CALL`.
 pub const BPF_PSEUDO_KFUNC_CALL: u4 = 2;
 
+/// `BPF_F_LINK` — a struct_ops map attached through a link.
+pub const BPF_F_LINK: u32 = 1 << 13;
 /// `BPF_F_RDONLY_PROG` — the map is read-only *from the program's side*,
 /// which is what makes a `.rodata` map's contents visible to the verifier as
 /// constants.
@@ -348,6 +351,9 @@ pub const MapOrigin = enum {
     /// Synthesized by the loader for `.rodata`/`.data`/`.bss` — global
     /// variables live in a one-entry `ARRAY` map, not in the program.
     internal,
+    /// A variable of the `.struct_ops` / `.struct_ops.link` section: a
+    /// `BPF_MAP_TYPE_STRUCT_OPS` map (see `Object.attachStructOps`).
+    struct_ops,
 };
 
 /// One map, as described by the object (before creation) and then as created
@@ -402,6 +408,47 @@ pub const MapSpec = struct {
     /// Set by `load` for an internal data map created with `BPF_F_MMAPABLE`
     /// (see `Object.mapData`).
     mmapable: bool = false,
+    /// `.struct_ops.link`: attached with a link (`BPF_LINK_CREATE`) instead of
+    /// by registering through `BPF_MAP_UPDATE_ELEM`.
+    struct_ops_link: bool = false,
+    /// Which program fills which function-pointer member of the variable
+    /// (from `.rel.struct_ops`).
+    struct_ops_progs: []const StructOpsProg = &.{},
+    /// Set by `load`: the member translation to the kernel's layout, and the
+    /// kernel-layout value (`bpf_struct_ops_<name>`) with the program fds in.
+    struct_ops_plan: ?StructOpsPlan = null,
+    struct_ops_value: []u8 = &.{},
+};
+
+/// A `.struct_ops` function-pointer slot filled by a program.
+pub const StructOpsProg = struct {
+    /// Byte offset of the member in the variable.
+    member_off: u32,
+    /// Index into `Object.programs`.
+    program: usize,
+};
+
+/// One member copied from the object's struct into the kernel's value.
+pub const StructOpsMember = struct {
+    local_off: u32,
+    /// Offset in the kernel VALUE (the `data` offset already added).
+    kern_off: u32,
+    size: u32,
+    /// Index of the member in the kernel's struct: the `expected_attach_type`
+    /// of a program that implements it.
+    kern_index: u16,
+    is_func: bool,
+};
+
+/// How the object's struct maps onto `bpf_struct_ops_<name>` of a kernel.
+pub const StructOpsPlan = struct {
+    /// `btf_vmlinux_value_type_id` of the map: `bpf_struct_ops_<name>`.
+    value_type_id: u32,
+    /// Id of the kernel's `struct <name>` (the programs' `attach_btf_id`).
+    kern_type_id: u32,
+    /// `sizeof(bpf_struct_ops_<name>)`: the map's value size.
+    value_size: u32,
+    members: []const StructOpsMember,
 };
 
 /// A global variable of a `.data` / `.rodata` / `.bss` section, as the object's
@@ -501,6 +548,9 @@ pub const ProgramSpec = struct {
     func_info: []btfext.FuncInfo,
     line_info: []btfext.LineInfo,
     core_relos: []btfext.CoreRelo,
+    /// BTF id of the attach target (`struct_ops`: the kernel struct), set by
+    /// `load`; 0 for a program with none.
+    attach_btf_id: u32 = 0,
     /// Sub-program references still to be resolved (always empty on an
     /// `Object` returned by `open`).
     call_sites: []CallSite = &.{},
@@ -607,6 +657,12 @@ pub const LoadError = error{
     /// `BPF_OBJ_PIN` of a freshly created map failed (no bpffs there, a
     /// missing directory, the path exists as something else).
     PinFailed,
+    /// The running kernel's BTF has no `struct <name>` / `bpf_struct_ops_<name>`
+    /// for a `.struct_ops` variable (vmlinux only; a module's is not read).
+    StructOpsTypeNotFound,
+    /// A `.struct_ops` member that the kernel struct lacks, or whose size
+    /// differs, or a function pointer where the kernel has something else.
+    StructOpsMemberMismatch,
     /// The map pinned at the map's pin path does not have the type, sizes or
     /// flags this object declares, so it cannot be reused.
     PinnedMapMismatch,
@@ -688,6 +744,43 @@ pub const Object = struct {
         }
         if (self.btf_fd >= 0) _ = linux.close(self.btf_fd);
         self.btf_fd = -1;
+    }
+
+    /// Activate a loaded `.struct_ops` map: register it with the kernel (a TCP
+    /// congestion control becomes selectable, ...). A `.struct_ops` variable is
+    /// registered by `BPF_MAP_UPDATE_ELEM` and unregistered by deleting the
+    /// element; a `.struct_ops.link` one by `BPF_LINK_CREATE`, whose fd's
+    /// lifetime is the registration. `StructOpsAttachment.detach` undoes it.
+    pub fn attachStructOps(self: *Object, name: []const u8) StructOpsError!StructOpsAttachment {
+        const m = self.findMap(name) orelse return error.NoSuchMap;
+        if (m.origin != .struct_ops) return error.NotStructOps;
+        if (m.fd < 0 or m.struct_ops_value.len == 0) return error.NotLoaded;
+        if (m.struct_ops_link) {
+            const h = bpflink.linkCreate(m.fd, 0, .struct_ops, .{}) catch |e| return switch (e) {
+                error.PermissionDenied => error.PermissionDenied,
+                error.AlreadyAttached => error.AlreadyAttached,
+                error.LinkNotSupported => error.NotSupported,
+                error.SystemResources => error.SystemResources,
+                else => error.Unexpected,
+            };
+            return .{ .link = h };
+        }
+        var key: [4]u8 = @splat(0);
+        var elem: BPF.MapElemAttr = .{
+            .map_fd = m.fd,
+            .key = @intFromPtr(&key),
+            .result = .{ .value = @intFromPtr(m.struct_ops_value.ptr) },
+            .flags = 0,
+        };
+        const rc = linux.bpf(.map_update_elem, @ptrCast(&elem), @sizeOf(BPF.MapElemAttr));
+        return switch (linux.errno(rc)) {
+            .SUCCESS => .{ .registered = m.fd },
+            .PERM, .ACCES => error.PermissionDenied,
+            .EXIST, .BUSY => error.AlreadyAttached,
+            .INVAL, .BADF => error.InvalidArgument,
+            .NOMEM, .NOSPC => error.SystemResources,
+            else => error.Unexpected,
+        };
     }
 
     /// The global variables of a data section (`".rodata"`, `".data"`,
@@ -832,6 +925,41 @@ pub const Object = struct {
         if (m.fd < 0) return null;
         defer m.fd = -1;
         return m.fd;
+    }
+};
+
+pub const StructOpsError = error{
+    NoSuchMap,
+    /// The map is not a `.struct_ops` variable.
+    NotStructOps,
+    /// `load` has not run.
+    NotLoaded,
+    AlreadyAttached,
+    NotSupported,
+    PermissionDenied,
+    InvalidArgument,
+    SystemResources,
+    Unexpected,
+};
+
+/// A live struct_ops registration.
+pub const StructOpsAttachment = union(enum) {
+    /// Registered by `BPF_MAP_UPDATE_ELEM`: the map's fd (still the
+    /// `Object`'s).
+    registered: linux.fd_t,
+    link: bpflink.LinkHandle,
+
+    /// Unregister: delete the element, or close the link.
+    pub fn detach(self: *StructOpsAttachment) void {
+        switch (self.*) {
+            .registered => |fd| {
+                var key: [4]u8 = @splat(0);
+                var elem: BPF.MapElemAttr = .{ .map_fd = fd, .key = @intFromPtr(&key), .result = .{ .value = 0 }, .flags = 0 };
+                _ = linux.bpf(.map_delete_elem, @ptrCast(&elem), @sizeOf(BPF.MapElemAttr));
+                self.* = .{ .registered = -1 };
+            },
+            .link => |*l| l.detach(),
+        }
     }
 };
 
@@ -1057,6 +1185,9 @@ fn parseImage(
 
     // ── pass 4b: map-in-map / prog_array initial slots (`.rel.maps`) ──
     if (maps_btf_sec) |i| try collectMapSlots(&obj, a, i);
+
+    // ── pass 4c: struct_ops maps (`.struct_ops`, `.struct_ops.link`) ──
+    try collectStructOps(&obj, a);
 
     // ── pass 5: relocations + .BTF.ext slices ──
     for (obj.programs) |*p| {
@@ -1528,6 +1659,194 @@ fn collectRelocations(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) Pa
     }
     prog.relos = relos.toOwnedSlice(a) catch return error.OutOfMemory;
     prog.call_sites = calls.toOwnedSlice(a) catch return error.OutOfMemory;
+}
+
+/// `.struct_ops` / `.struct_ops.link`: each `VAR` of the `DATASEC` is a
+/// `struct <kernel ops>` initializer and becomes a `BPF_MAP_TYPE_STRUCT_OPS`
+/// map named after it. Its bytes are the section's, with the function-pointer
+/// members zero and filled by `R_BPF_64_ABS64` relocations in `.rel<section>`
+/// against the implementing programs.
+fn collectStructOps(obj: *Object, a: std.mem.Allocator) ParseError!void {
+    if (obj.btf == null) return;
+    var maps: std.ArrayList(MapSpec) = .empty;
+    maps.appendSlice(a, obj.maps) catch return error.OutOfMemory;
+    const first_new = maps.items.len;
+    for ([_][]const u8{ ".struct_ops", ".struct_ops.link" }) |sec_name| {
+        const sec_idx = obj.image.findSection(sec_name) orelse continue;
+        const data = obj.image.sectionData(sec_idx) catch return error.MalformedElf;
+        const vars = try obj.dataVariables(sec_name);
+        const link = std.mem.eql(u8, sec_name, ".struct_ops.link");
+        const base = maps.items.len;
+        for (vars) |v| {
+            if (v.offset > data.len or v.size > data.len - v.offset) return error.MalformedElf;
+            maps.append(a, .{
+                .name = a.dupe(u8, v.name) catch return error.OutOfMemory,
+                .map_type = .struct_ops,
+                .key_size = 4,
+                .value_size = v.size,
+                .max_entries = 1,
+                .btf_value_type_id = v.type_id,
+                .origin = .struct_ops,
+                .sec_idx = sec_idx,
+                .initial_data = data[v.offset..][0..v.size],
+                .struct_ops_link = link,
+            }) catch return error.OutOfMemory;
+        }
+        // relocations: the program behind each function-pointer member
+        const rel_idx: usize = blk: {
+            for (obj.image.sections, 0..) |sh, i| {
+                if (sh.sh_type == elfsym.SHT_REL and sh.sh_info == sec_idx) break :blk i;
+            }
+            continue;
+        };
+        const count = obj.image.relocationCount(rel_idx) catch return error.MalformedElf;
+        const lists = a.alloc(std.ArrayList(StructOpsProg), vars.len) catch return error.OutOfMemory;
+        for (lists) |*l| l.* = .empty;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const rel = obj.image.relocation(rel_idx, i) catch return error.MalformedElf;
+            if (rel.type != R_BPF_64_ABS64 and rel.type != R_BPF_64_64) return error.UnsupportedRelocation;
+            // the variable holding `r_offset`: the last one starting at or before it
+            var lo: usize = 0;
+            var hi: usize = vars.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (vars[mid].offset <= rel.r_offset) lo = mid + 1 else hi = mid;
+            }
+            if (lo == 0) return error.RelocationOutOfRange;
+            const v = vars[lo - 1];
+            if (rel.r_offset - v.offset >= v.size) return error.RelocationOutOfRange;
+            const sym = obj.image.symbol(obj.symtab_idx, rel.sym) catch return error.MalformedElf;
+            if (sym.kind() != STT_FUNC) return error.UnresolvedRelocation;
+            const prog = for (obj.programs, 0..) |p, k| {
+                if (p.sec_idx == sym.st_shndx and p.sec_byte_off == sym.st_value) break k;
+            } else return error.UnresolvedRelocation;
+            lists[lo - 1].append(a, .{
+                .member_off = @intCast(rel.r_offset - v.offset),
+                .program = prog,
+            }) catch return error.OutOfMemory;
+        }
+        for (lists, 0..) |*l, k| {
+            maps.items[base + k].struct_ops_progs = l.toOwnedSlice(a) catch return error.OutOfMemory;
+        }
+    }
+    if (maps.items.len == first_new) return;
+    // a variable name must not collide with another map's
+    for (maps.items[first_new..], first_new..) |m, i| {
+        for (maps.items[0..i]) |n| {
+            if (std.mem.eql(u8, m.name, n.name)) return error.DuplicateMap;
+        }
+    }
+    obj.maps = maps.toOwnedSlice(a) catch return error.OutOfMemory;
+}
+
+/// Plan how `local`'s `struct <ops>` (type `local_type_id`) maps onto the
+/// kernel's `bpf_struct_ops_<ops>` in `kern`: members are matched by NAME and
+/// must have the same size; a member of the object that the kernel lacks is an
+/// error (a typo must not silently load a no-op), the kernel's extra members
+/// stay zero (the kernel fills `owner`, `list`, ...). A function pointer must
+/// face a function pointer. Pure over the two BTFs.
+pub fn planStructOps(a: std.mem.Allocator, local: *const Btf, local_type_id: u32, kern: *const Btf) LoadError!StructOpsPlan {
+    const lt = local.resolve(local_type_id) catch return error.StructOpsMemberMismatch;
+    if (lt.kind != .@"struct") return error.StructOpsMemberMismatch;
+    const raw_name = local.str(lt.name_off) orelse return error.StructOpsTypeNotFound;
+    if (raw_name.len == 0) return error.StructOpsTypeNotFound;
+    const name = btfext.stripFlavor(raw_name);
+
+    const kern_type_id = kern.findByNameKind(name, .@"struct") orelse return error.StructOpsTypeNotFound;
+    var vname_buf: [128]u8 = undefined;
+    const vname = std.mem.print(&vname_buf, "bpf_struct_ops_{s}", .{name}) catch return error.StructOpsTypeNotFound;
+    const value_type_id = kern.findByNameKind(vname, .@"struct") orelse return error.StructOpsTypeNotFound;
+    const vt = kern.byId(value_type_id) catch return error.StructOpsTypeNotFound;
+    // the kernel struct sits at `data` in the value wrapper
+    var data_off: ?u32 = null;
+    var vi: u16 = 0;
+    while (vi < vt.vlen) : (vi += 1) {
+        const m = kern.member(vt, vi) catch return error.StructOpsTypeNotFound;
+        const mn = kern.str(m.name_off) orelse continue;
+        if (std.mem.eql(u8, mn, "data")) data_off = m.bit_offset / 8;
+    }
+    const doff = data_off orelse return error.StructOpsTypeNotFound;
+    const kt = kern.byId(kern_type_id) catch return error.StructOpsTypeNotFound;
+    const value_size = kern.sizeOf(value_type_id) catch return error.StructOpsTypeNotFound;
+    if (value_size > std.math.maxInt(u32)) return error.StructOpsTypeNotFound;
+
+    var members: std.ArrayList(StructOpsMember) = .empty;
+    var i: u16 = 0;
+    while (i < lt.vlen) : (i += 1) {
+        const lm = local.member(lt, i) catch return error.StructOpsMemberMismatch;
+        const mname = local.str(lm.name_off) orelse return error.StructOpsMemberMismatch;
+        if (mname.len == 0) continue; // an anonymous member cannot be matched by name
+        if (lm.bitfield_size != 0 or lm.bit_offset % 8 != 0) return error.StructOpsMemberMismatch;
+        var found: ?struct { m: btf_mod.Member, idx: u16 } = null;
+        var k: u16 = 0;
+        while (k < kt.vlen) : (k += 1) {
+            const km = kern.member(kt, k) catch return error.StructOpsMemberMismatch;
+            const kn = kern.str(km.name_off) orelse continue;
+            if (std.mem.eql(u8, kn, mname)) {
+                found = .{ .m = km, .idx = k };
+                break;
+            }
+        }
+        const f = found orelse return error.StructOpsMemberMismatch;
+        if (f.m.bitfield_size != 0 or f.m.bit_offset % 8 != 0) return error.StructOpsMemberMismatch;
+        const lsz = local.sizeOf(lm.type_id) catch return error.StructOpsMemberMismatch;
+        const ksz = kern.sizeOf(f.m.type_id) catch return error.StructOpsMemberMismatch;
+        if (lsz != ksz or lsz > std.math.maxInt(u32)) return error.StructOpsMemberMismatch;
+        const l_func = isFuncPtr(local, lm.type_id);
+        if (l_func != isFuncPtr(kern, f.m.type_id)) return error.StructOpsMemberMismatch;
+        members.append(a, .{
+            .local_off = lm.bit_offset / 8,
+            .kern_off = std.math.add(u32, doff, f.m.bit_offset / 8) catch return error.StructOpsMemberMismatch,
+            .size = @intCast(lsz),
+            .kern_index = f.idx,
+            .is_func = l_func,
+        }) catch return error.OutOfMemory;
+    }
+    return .{
+        .value_type_id = value_type_id,
+        .kern_type_id = kern_type_id,
+        .value_size = @intCast(value_size),
+        .members = members.toOwnedSlice(a) catch return error.OutOfMemory,
+    };
+}
+
+fn isFuncPtr(b: *const Btf, type_id: u32) bool {
+    const t = b.resolve(type_id) catch return false;
+    if (t.kind != .ptr) return false;
+    const target = t.refType() orelse return false;
+    if (target == 0) return false;
+    const ft = b.resolve(target) catch return false;
+    return ft.kind == .func_proto;
+}
+
+/// The kernel-layout value for a planned `.struct_ops` map: zeros, the
+/// object's scalar members copied in, and each function-pointer member set to
+/// the fd of the program that implements it (`prog_fds[k]` is the fd of
+/// `Object.programs[k]`). A function pointer nobody implements stays NULL.
+pub fn buildStructOpsValue(
+    a: std.mem.Allocator,
+    plan: StructOpsPlan,
+    initial: []const u8,
+    progs: []const StructOpsProg,
+    prog_fds: []const linux.fd_t,
+) LoadError![]u8 {
+    const out = a.alloc(u8, plan.value_size) catch return error.OutOfMemory;
+    @memset(out, 0);
+    for (plan.members) |m| {
+        if (m.local_off > initial.len or m.size > initial.len - m.local_off) return error.StructOpsMemberMismatch;
+        if (m.kern_off > out.len or m.size > out.len - m.kern_off) return error.StructOpsMemberMismatch;
+        if (m.is_func) {
+            for (progs) |p| {
+                if (p.member_off != m.local_off) continue;
+                if (p.program >= prog_fds.len or prog_fds[p.program] < 0) return error.MapNotCreated;
+                std.mem.writeInt(u64, out[m.kern_off..][0..8], @intCast(prog_fds[p.program]), builtin.cpu.arch.endian());
+            }
+        } else {
+            @memcpy(out[m.kern_off..][0..m.size], initial[m.local_off..][0..m.size]);
+        }
+    }
+    return out;
 }
 
 /// `.rel.maps` carries the initializer of a map-in-map or `PROG_ARRAY`
@@ -2038,6 +2357,10 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
     if (!opts.ignore_unknown_sections and obj.unknown_sections.len != 0)
         return error.UnknownProgramSection;
 
+    // The kernel's BTF, read at most once: CO-RE and struct_ops both need it.
+    var kernel_owned: ?Btf = null;
+    defer if (kernel_owned) |*o| o.deinit();
+
     // ── CO-RE, before anything is created: a relocation failure should not
     // leave maps behind. ──
     if (opts.core) {
@@ -2047,12 +2370,7 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
         }
         if (have_relos) {
             if (obj.btf) |*local| {
-                var owned: ?Btf = null;
-                defer if (owned) |*o| o.deinit();
-                const target: *const Btf = if (opts.target_btf) |t| t else blk: {
-                    owned = btf_mod.loadKernel(obj.gpa) catch return error.KernelBtfUnavailable;
-                    break :blk &owned.?;
-                };
+                const target = try kernelBtf(obj, opts, &kernel_owned);
                 for (obj.programs) |*p| {
                     _ = try applyCoreRelos(p, local, target);
                 }
@@ -2060,8 +2378,31 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
         }
     }
 
+    // ── struct_ops: plan each map against the kernel's types, and tell the
+    // programs which member they implement (before they are loaded). ──
+    for (obj.maps) |*m| {
+        if (m.origin != .struct_ops) continue;
+        const local = &(obj.btf orelse return error.StructOpsTypeNotFound);
+        const target = try kernelBtf(obj, opts, &kernel_owned);
+        const plan = try planStructOps(obj.arena.allocator(), local, m.btf_value_type_id, target);
+        m.struct_ops_plan = plan;
+        for (plan.members) |mem| {
+            if (!mem.is_func) continue;
+            for (m.struct_ops_progs) |sp| {
+                if (sp.member_off != mem.local_off) continue;
+                const p = &obj.programs[sp.program];
+                p.attach_btf_id = plan.kern_type_id;
+                p.expected_attach_type = @fromBackingInt(mem.kern_index);
+            }
+        }
+    }
+
     // ── maps ──
     for (obj.maps) |*m| {
+        if (m.origin == .struct_ops) {
+            m.fd = try createStructOpsMap(m);
+            continue;
+        }
         if (m.pinning > 1) return error.PinningUnsupported;
         if (m.max_entries == 0 and needsEntries(m.map_type)) return error.ZeroMaxEntries;
         const pin: ?[]const u8 = if (m.pin_path.len != 0)
@@ -2117,10 +2458,14 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
     // ── programs ──
     const license = opts.license orelse obj.license;
     for (obj.programs) |*p| {
+        // A struct_ops program no map uses has no attach target: not loaded
+        // (libbpf skips it as well).
+        if (p.prog_type == .struct_ops and p.attach_btf_id == 0) continue;
         try relocateProgram(p, obj.maps);
         p.fd = try loadOneProgram(obj, p, license, opts);
     }
     try fillInitSlots(obj);
+    try buildStructOpsValues(obj);
 }
 
 /// A map found at its pin must be the map this object declares; the check is
@@ -2175,6 +2520,54 @@ fn needsEntries(t: BPF.MapType) bool {
         .struct_ops, .sk_storage => false,
         else => true,
     };
+}
+
+/// The kernel's BTF for CO-RE and struct_ops: the caller's `target_btf`, or
+/// `/sys/kernel/btf/vmlinux`, read once into `owned`.
+fn kernelBtf(obj: *Object, opts: LoadOptions, owned: *?Btf) LoadError!*const Btf {
+    if (opts.target_btf) |t| return t;
+    if (owned.* == null) owned.* = btf_mod.loadKernel(obj.gpa) catch return error.KernelBtfUnavailable;
+    return &owned.*.?;
+}
+
+/// `BPF_MAP_TYPE_STRUCT_OPS`: sized by the kernel's `bpf_struct_ops_<name>`,
+/// typed by `btf_vmlinux_value_type_id`. The BTF key/value type ids must stay
+/// zero (the kernel refuses both at once).
+fn createStructOpsMap(m: *const MapSpec) LoadError!linux.fd_t {
+    const plan = m.struct_ops_plan orelse return error.StructOpsTypeNotFound;
+    var attr: BPF.MapCreateAttr = std.mem.zeroes(BPF.MapCreateAttr);
+    attr.map_type = @backingInt(BPF.MapType.struct_ops);
+    attr.key_size = 4;
+    attr.value_size = plan.value_size;
+    attr.max_entries = 1;
+    attr.map_flags = if (m.struct_ops_link) BPF_F_LINK else 0;
+    attr.btf_vmlinux_value_type_id = plan.value_type_id;
+    const nm = m.name[0..@min(m.name.len, attr.map_name.len - 1)];
+    @memcpy(attr.map_name[0..nm.len], nm);
+    var buf: AttrBuf = .{ .map_create = attr };
+    const rc = linux.bpf(.map_create, @ptrCast(&buf), @sizeOf(BPF.MapCreateAttr));
+    return switch (linux.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .PERM, .ACCES => error.PermissionDenied,
+        .INVAL => error.InvalidArgument,
+        .NOMEM, .NOSPC, .MFILE, .NFILE => error.SystemResources,
+        else => error.MapCreateFailed,
+    };
+}
+
+/// With every program loaded, build each struct_ops map's kernel-layout value
+/// (the program fds go in as the function pointers).
+fn buildStructOpsValues(obj: *Object) LoadError!void {
+    const a = obj.arena.allocator();
+    var fds: std.ArrayList(linux.fd_t) = .empty;
+    defer fds.deinit(obj.gpa);
+    for (obj.maps) |*m| {
+        if (m.origin != .struct_ops) continue;
+        if (fds.items.len == 0) {
+            for (obj.programs) |p| fds.append(obj.gpa, p.fd) catch return error.OutOfMemory;
+        }
+        m.struct_ops_value = try buildStructOpsValue(a, m.struct_ops_plan.?, m.initial_data, m.struct_ops_progs, fds.items);
+    }
 }
 
 /// Create `m`, first creating its inner-map template when it is a
@@ -2284,6 +2677,7 @@ fn loadOneProgram(obj: *Object, p: *ProgramSpec, license: []const u8, opts: Load
             .license = license,
             .prog_name = p.kernelName(),
             .expected_attach_type = p.expected_attach_type,
+            .attach_btf_id = p.attach_btf_id,
             .prog_flags = if (p.sleepable) BPF_F_SLEEPABLE else 0,
             .kern_version = obj.kern_version,
         };
@@ -5237,4 +5631,178 @@ test "mapData: refuses before load and on a map not created mmapable; the view h
     try testing.expectError(error.SizeMismatch, md.variable(.{ .name = "x", .offset = 17, .size = 0, .type_id = 1 }));
     const Big = extern struct { a: [3]u64 };
     try testing.expectError(error.SizeMismatch, md.view(Big));
+}
+
+const fx_struct_ops = @embedFile("testdata/struct_ops.bpf.o");
+
+/// A kernel BTF with `tcp_congestion_ops { cong_avoid; ssthresh; undo_cwnd; name[N] }`
+/// and its `bpf_struct_ops_` wrapper (`common` 8 bytes, then `data`).
+fn structOpsKernelBlob(gpa: std.mem.Allocator, with_undo: bool, name_len: u32, name_is_func: bool) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_ops = try r.str(gpa, "tcp_congestion_ops");
+    const n_vt = try r.str(gpa, "bpf_struct_ops_tcp_congestion_ops");
+    const n_ca = try r.str(gpa, "cong_avoid");
+    const n_ss = try r.str(gpa, "ssthresh");
+    const n_un = try r.str(gpa, "undo_cwnd");
+    const n_nm = try r.str(gpa, "name");
+    const n_common = try r.str(gpa, "common");
+    const n_data = try r.str(gpa, "data");
+    const u32_t = try r.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32}); // 1
+    const chr = try r.rec(gpa, 0, btf_mod.K_INT, 0, false, 1, &.{8}); // 2
+    const arr = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ chr, u32_t, name_len }); // 3
+    const proto = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, 0, &.{}); // 4
+    const fptr = try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, proto, &.{}); // 5
+    const name_ty: u32 = if (name_is_func) fptr else arr;
+    const ops = if (with_undo)
+        try r.rec(gpa, n_ops, btf_mod.K_STRUCT, 4, false, 24 + name_len, &.{ n_ca, fptr, 0, n_ss, fptr, 64, n_un, fptr, 128, n_nm, name_ty, 192 })
+    else
+        try r.rec(gpa, n_ops, btf_mod.K_STRUCT, 3, false, 16 + name_len, &.{ n_ca, fptr, 0, n_ss, fptr, 64, n_nm, name_ty, 128 });
+    const common = try r.rec(gpa, 0, btf_mod.K_STRUCT, 0, false, 8, &.{});
+    _ = try r.rec(gpa, n_vt, btf_mod.K_STRUCT, 2, false, 8 + 24 + name_len, &.{ n_common, common, 0, n_data, ops, 64 });
+    return r.finish(gpa);
+}
+
+test "struct_ops: a clang object's .struct_ops and .struct_ops.link variables become maps with their programs" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_struct_ops, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 2), o.maps.len);
+    const cc = o.findMap("zl_cc").?;
+    try testing.expectEqual(MapOrigin.struct_ops, cc.origin);
+    try testing.expectEqual(BPF.MapType.struct_ops, cc.map_type);
+    try testing.expectEqual(@as(u32, 4), cc.key_size);
+    try testing.expectEqual(@as(u32, 1), cc.max_entries);
+    try testing.expectEqual(@as(u32, 40), cc.value_size); // the object's own struct size
+    try testing.expect(!cc.struct_ops_link);
+    try testing.expectEqualStrings("zl_test", std.mem.sliceTo(cc.initial_data[0..16], 0));
+    try testing.expectEqual(@as(usize, 3), cc.struct_ops_progs.len);
+    // each function-pointer slot names its program
+    for (cc.struct_ops_progs) |sp| {
+        const want: []const u8 = switch (sp.member_off) {
+            16 => "zl_ssthresh",
+            24 => "zl_undo_cwnd",
+            32 => "zl_cong_avoid",
+            else => unreachable,
+        };
+        try testing.expectEqualStrings(want, o.programs[sp.program].name);
+        try testing.expectEqual(BPF.ProgType.struct_ops, o.programs[sp.program].prog_type);
+    }
+    const lk = o.findMap("zl_cc_link").?;
+    try testing.expect(lk.struct_ops_link);
+    try testing.expectEqual(@as(usize, 1), lk.struct_ops_progs.len);
+    try testing.expectEqual(@as(u32, 16), lk.struct_ops_progs[0].member_off);
+}
+
+test "struct_ops: members are matched by name and size against the kernel's, and the value is laid out in its wrapper" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_struct_ops, .{});
+    defer o.deinit();
+    const cc = o.findMap("zl_cc").?;
+    const blob = try structOpsKernelBlob(gpa, true, 16, false);
+    defer gpa.free(blob);
+    var kern = try btf_mod.parse(gpa, blob, .{});
+    defer kern.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plan = try planStructOps(a, &o.btf.?, cc.btf_value_type_id, &kern);
+    try testing.expectEqual(@as(u32, 8), plan.value_type_id); // bpf_struct_ops_tcp_congestion_ops
+    try testing.expectEqual(@as(u32, 6), plan.kern_type_id); // tcp_congestion_ops
+    try testing.expectEqual(@as(u32, 48), plan.value_size);
+    try testing.expectEqual(@as(usize, 4), plan.members.len);
+    for (plan.members) |m| {
+        const want: struct { kern_off: u32, idx: u16, func: bool } = switch (m.local_off) {
+            0 => .{ .kern_off = 32, .idx = 3, .func = false }, // name[16]: after common (8) + 3 pointers
+            16 => .{ .kern_off = 16, .idx = 1, .func = true }, // ssthresh
+            24 => .{ .kern_off = 24, .idx = 2, .func = true }, // undo_cwnd
+            32 => .{ .kern_off = 8, .idx = 0, .func = true }, // cong_avoid
+            else => unreachable,
+        };
+        try testing.expectEqual(want.kern_off, m.kern_off);
+        try testing.expectEqual(want.idx, m.kern_index);
+        try testing.expectEqual(want.func, m.is_func);
+    }
+
+    // program fds go in at the function-pointer members, the name is copied
+    var fds: [3]linux.fd_t = undefined;
+    for (o.programs, 0..) |p, k| fds[k] = if (std.mem.eql(u8, p.name, "zl_ssthresh")) 31 else if (std.mem.eql(u8, p.name, "zl_undo_cwnd")) 32 else 33;
+    const v = try buildStructOpsValue(a, plan, cc.initial_data, cc.struct_ops_progs, &fds);
+    try testing.expectEqual(@as(usize, 48), v.len);
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, v[0..8], .little)); // `common`: the kernel's
+    try testing.expectEqual(@as(u64, 33), std.mem.readInt(u64, v[8..16], .little)); // cong_avoid
+    try testing.expectEqual(@as(u64, 31), std.mem.readInt(u64, v[16..24], .little)); // ssthresh
+    try testing.expectEqual(@as(u64, 32), std.mem.readInt(u64, v[24..32], .little)); // undo_cwnd
+    try testing.expectEqualStrings("zl_test", std.mem.sliceTo(v[32..48], 0));
+    // a program that was not loaded cannot be a function pointer
+    fds[0] = -1;
+    try testing.expect(blk: {
+        _ = buildStructOpsValue(a, plan, cc.initial_data, cc.struct_ops_progs, &fds) catch |e| break :blk e == error.MapNotCreated;
+        break :blk false;
+    });
+    // the link variable implements only ssthresh: its other pointers stay NULL
+    const lk = o.findMap("zl_cc_link").?;
+    const lv = try buildStructOpsValue(a, plan, lk.initial_data, lk.struct_ops_progs, &[_]linux.fd_t{ 31, 32, 33 });
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, lv[8..16], .little));
+    try testing.expectEqual(@as(u64, 31), std.mem.readInt(u64, lv[16..24], .little));
+}
+
+test "struct_ops: every way the object and the kernel can disagree is typed" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_struct_ops, .{});
+    defer o.deinit();
+    const cc = o.findMap("zl_cc").?;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Case = struct { undo: bool, name_len: u32, name_func: bool, want: anyerror };
+    for ([_]Case{
+        .{ .undo = false, .name_len = 16, .name_func = false, .want = error.StructOpsMemberMismatch }, // no undo_cwnd in the kernel
+        .{ .undo = true, .name_len = 8, .name_func = false, .want = error.StructOpsMemberMismatch }, // name[8] vs name[16]
+        .{ .undo = true, .name_len = 16, .name_func = true, .want = error.StructOpsMemberMismatch }, // a pointer where the object has bytes
+    }) |c| {
+        const blob = try structOpsKernelBlob(gpa, c.undo, c.name_len, c.name_func);
+        defer gpa.free(blob);
+        var kern = try btf_mod.parse(gpa, blob, .{});
+        defer kern.deinit();
+        try testing.expectError(c.want, planStructOps(a, &o.btf.?, cc.btf_value_type_id, &kern));
+    }
+    // a kernel BTF that has neither type
+    var e = try RawB.init(gpa);
+    defer e.deinit(gpa);
+    _ = try e.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    const eb = try e.finish(gpa);
+    defer gpa.free(eb);
+    var none = try btf_mod.parse(gpa, eb, .{});
+    defer none.deinit();
+    try testing.expectError(error.StructOpsTypeNotFound, planStructOps(a, &o.btf.?, cc.btf_value_type_id, &none));
+    // attach before load / on a map that is not struct_ops
+    try testing.expectError(error.NotLoaded, o.attachStructOps("zl_cc"));
+    try testing.expectError(error.NoSuchMap, o.attachStructOps("nope"));
+    var m2 = try open(gpa, fx_mapinmap, .{});
+    defer m2.deinit();
+    try testing.expectError(error.NotStructOps, m2.attachStructOps("outer"));
+}
+
+test "struct_ops: planning against THIS machine's vmlinux BTF (skipped where it cannot be read)" {
+    const gpa = testing.allocator;
+    var kern = btf_mod.loadKernel(gpa) catch return error.SkipZigTest;
+    defer kern.deinit();
+    if (kern.findByNameKind("tcp_congestion_ops", .@"struct") == null) return error.SkipZigTest;
+    var o = try open(gpa, fx_struct_ops, .{});
+    defer o.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const plan = try planStructOps(arena.allocator(), &o.btf.?, o.findMap("zl_cc").?.btf_value_type_id, &kern);
+    try testing.expectEqual(@as(usize, 4), plan.members.len);
+    try testing.expect(plan.value_size > 100);
+    // the member indices agree with the kernel's own struct, found by name
+    const kt = try kern.byId(plan.kern_type_id);
+    for (plan.members) |m| {
+        if (!m.is_func) continue;
+        const km = try kern.member(kt, m.kern_index);
+        const nm = kern.str(km.name_off).?;
+        try testing.expect(std.mem.eql(u8, nm, "ssthresh") or std.mem.eql(u8, nm, "undo_cwnd") or std.mem.eql(u8, nm, "cong_avoid"));
+    }
 }

@@ -754,6 +754,26 @@ that path whatever `pinning` says. Internal data maps are never auto-pinned, a `
 removing it is `unlink`). The path policy is therefore the caller's: the root directory is an option, never a guess, and
 nothing is pinned unless the object asks for it or the caller does.
 
+### `struct_ops`
+
+Each variable of `.struct_ops` and `.struct_ops.link` is a `struct <kernel ops>` initializer (`struct tcp_congestion_ops
+cc = { .name = "x", .ssthresh = (void *)prog }`) and becomes a `BPF_MAP_TYPE_STRUCT_OPS` map named after it
+(`MapOrigin.struct_ops`; `.link` selects `BPF_F_LINK`); the section's bytes are the seed, and the `R_BPF_64_ABS64` records
+of its relocation section say which program fills which function-pointer member (`MapSpec.struct_ops_progs`; programs live
+in `struct_ops/<name>` sections). `load` reads the kernel's BTF (vmlinux only; a module's struct_ops are not read:
+`error.StructOpsTypeNotFound`) and `planStructOps` matches the members **by name and size** against the kernel's
+`struct <ops>`, which sits at `data` inside `bpf_struct_ops_<ops>`: a member the kernel lacks, one of another size, or a
+function pointer facing a non-pointer is `error.StructOpsMemberMismatch` (a typo must not load a no-op), the kernel's own
+members (`owner`, `list`) stay zero. The plan tells each implementing program its `attach_btf_id` (the kernel struct) and
+`expected_attach_type` (the member's index in the kernel struct) before it is loaded; a struct_ops program that no map uses
+has no target and is left unloaded (as libbpf does). The map is created with `btf_vmlinux_value_type_id` and no BTF key or
+value ids (the kernel refuses both at once). After the programs are loaded `buildStructOpsValue` produces the
+kernel-layout value (scalars copied, program fds as function pointers, an implemented-by-nobody pointer NULL).
+Nothing is registered by `load`: `Object.attachStructOps(name)` does it, `BPF_MAP_UPDATE_ELEM` for `.struct_ops` (delete the
+element to unregister) and `BPF_LINK_CREATE` for `.struct_ops.link`; `StructOpsAttachment.detach` undoes either. The plan and
+the value are tested against synthetic kernel BTFs and against this machine's vmlinux; creating and registering the map
+needs a privileged kernel and is not verified here.
+
 ### Global data: seeds, mmap and the skeleton
 
 The internal `.data`/`.rodata`/`.bss` maps are created `BPF_F_MMAPABLE` (`LoadOptions.mmap_data`, as libbpf does; a kernel
@@ -1067,8 +1087,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
 - **kfuncs / externs / ksyms.** An `SHN_UNDEF` symbol is `error.ExternSymbolUnsupported`. Real support needs
   `BPF_PSEUDO_KFUNC_CALL` with the kfunc's BTF id resolved out of vmlinux (and out of module BTF, which the split-BTF
   parser can already read) plus an `fd_array` of module BTF fds, and, for extern variables, a synthesized `.kconfig` map.
-- **`struct_ops` maps**: the section is classified, but populating a `struct_ops` value (function pointers resolved to
-  program fds) is not implemented.
 
 ### Priority order
 
