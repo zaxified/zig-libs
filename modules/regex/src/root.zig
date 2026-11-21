@@ -163,9 +163,18 @@ pub const Regex = struct {
     /// what a state is, not what the search may skip.
     asserts: bool = true,
     /// The program has an assertion only the Rust grammar writes (CRLF lines,
-    /// Unicode or start/end word boundaries): the lazy DFAs and the one-pass
-    /// engine, whose contexts know ASCII only, step aside for the VMs.
+    /// Unicode or start/end word boundaries): `Matcher`'s lazy DFAs and the
+    /// one-pass engine step aside for the VMs. `isMatch`/`fullMatch`'s DFAs
+    /// (`runDfa`, `runRevDfa`) run them (`rust_asserts`).
     vm_only: bool = false,
+    /// `vm_only` because of a Rust-grammar assertion (not bytes mode, not a
+    /// set): `isMatch`/`fullMatch` still run their lazy DFAs.
+    rust_asserts: bool = false,
+    /// The program has a Unicode word assertion: `isMatch`/`fullMatch`'s
+    /// DFAs, whose contexts know ASCII only, give up at the first code point
+    /// past ASCII (before or at a position) and the VM answers, as Rust's
+    /// lazy DFA quits on a non-ASCII byte under a Unicode `\b`.
+    ascii_dfa: bool = false,
     /// Compiled with `Options.utf8 = false` (bytes mode).
     bytes: bool = false,
 
@@ -246,7 +255,7 @@ pub const Regex = struct {
             tp.* = t;
             pf.teddy = tp;
         };
-        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = pf, .longest = opts.isLongest(), .source = source, .asserts = hasAsserts(insts), .vm_only = bytes or hasRustAsserts(insts), .bytes = bytes };
+        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = pf, .longest = opts.isLongest(), .source = source, .asserts = hasAsserts(insts), .vm_only = bytes or hasRustAsserts(insts), .rust_asserts = !bytes and hasRustAsserts(insts), .ascii_dfa = hasUnicodeAsserts(insts), .bytes = bytes };
     }
 
     pub fn deinit(re: *Regex, gpa: std.mem.Allocator) void {
@@ -407,7 +416,7 @@ pub const Regex = struct {
 
     fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
         if (re.bytes) return re.runSetBytes(input, full);
-        if (re.vm_only) {
+        if (re.vm_only and !re.rust_asserts) {
             var t: SliceText = .{ .input = input };
             return re.runSetOn(&t, full);
         }
@@ -451,7 +460,9 @@ pub const Regex = struct {
                 // No thread alive: jump to where a match can start.
                 probe(.dfa_skip);
                 pos = pf.next(input, pos) orelse return false;
-                s = d.intern(start, .ofIf(re.asserts, runeBefore(input, pos)), restart);
+                const before = runeBefore(input, pos);
+                if (re.ascii_dfa and before != null and before.? >= 0x80) return null;
+                s = d.intern(start, .ofIf(re.asserts, before), restart);
             }
             if (pos == input.len) return re.dfaAccepts(d.keys[s], d.ctxs[s]);
             const c = input[pos];
@@ -465,6 +476,8 @@ pub const Regex = struct {
                 if (t == 1) return true;
             }
             const here = decode(input, pos);
+            // A Unicode word assertion past ASCII: the contexts cannot say.
+            if (re.ascii_dfa and here.cp.? >= 0x80) return null;
             probe(.dfa_step);
             const next = re.dfaStep(d.keys[s], d.ctxs[s], here.cp.?, restart, full) orelse {
                 if (c < 0x80) d.trans[s][c] = 1;
@@ -512,7 +525,10 @@ pub const Regex = struct {
         var s = d.add(end, .ofIf(asserts, null));
         var pos = input.len;
         while (true) {
-            if (re.revAccepts(&d, s, if (asserts) runeBefore(input, pos) else ' ')) return true;
+            const before: ?u21 = if (asserts) runeBefore(input, pos) else ' ';
+            // A Unicode word assertion past ASCII: the contexts cannot say.
+            if (re.ascii_dfa and before != null and before.? >= 0x80) return null;
+            if (re.revAccepts(&d, s, before)) return true;
             if (pos == 0) return false;
             const here = decodeBefore(input, pos);
             const c = input[pos - 1];
@@ -1285,7 +1301,7 @@ pub fn comptimeCompileOptions(comptime pattern: []const u8, comptime opts: Optio
             pf.teddy = &final_teddy;
         };
         const final_pf = pf;
-        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = final_pf, .longest = opts.isLongest(), .source = pattern, .asserts = hasAsserts(&insts), .vm_only = bytes or hasRustAsserts(&insts), .bytes = bytes };
+        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = final_pf, .longest = opts.isLongest(), .source = pattern, .asserts = hasAsserts(&insts), .vm_only = bytes or hasRustAsserts(&insts), .rust_asserts = !bytes and hasRustAsserts(&insts), .ascii_dfa = hasUnicodeAsserts(&insts), .bytes = bytes };
     }
 }
 
@@ -1404,10 +1420,15 @@ const Dfa = struct {
         newline,
         word,
         other,
+        /// `\r`, for the CRLF line assertions (otherwise as `other`).
+        cr,
+
+        const count = std.enums.values(Ctx).len;
 
         fn of(cp: ?u21) Ctx {
             const c = cp orelse return .start;
             if (c == '\n') return .newline;
+            if (c == '\r') return .cr;
             return if (isWord(c)) .word else .other;
         }
 
@@ -1424,6 +1445,7 @@ const Dfa = struct {
                 .newline => '\n',
                 .word => 'a',
                 .other => ' ',
+                .cr => '\r',
             };
         }
     };
@@ -1471,7 +1493,7 @@ const RevDfa = struct {
 
     keys: [max_states]Dfa.Set,
     ctxs: [max_states]Dfa.Ctx,
-    accepts: [max_states][4]Accept,
+    accepts: [max_states][Dfa.Ctx.count]Accept,
     n: u8,
     /// `trans[s][c]`: 0 not worked out yet, 1 the set is empty, otherwise
     /// the state before `c` + 2.
@@ -1593,16 +1615,16 @@ const FindDfa = struct {
     /// Open addressing (a power of two, over twice `max_states`): state + 1, 0 empty.
     table: [512]u16 = @splat(0),
     /// `idleAt`'s states per context, + 1 (0 not made yet).
-    idle: [4]u16 = @splat(0),
+    idle: [Dfa.Ctx.count]u16 = @splat(0),
     /// `anchoredAt`'s, the same way.
-    anchored: [4]u16 = @splat(0),
+    anchored: [Dfa.Ctx.count]u16 = @splat(0),
     /// Transitions on code points of three and four bytes and on invalid
     /// bytes (`Wide`), made on the first such code point: a `Matcher` for
     /// one ASCII search does not pay for them (measured: 3× a short
     /// compile-and-match).
     wide: ?*WideCaches = null,
     /// `rev`'s first state (the match) per context after the end, + 1.
-    rev_start: [4]u16 = @splat(0),
+    rev_start: [Dfa.Ctx.count]u16 = @splat(0),
     /// Times the table was emptied (tests).
     flushes: usize = 0,
     /// Scans past an idle code point beyond ASCII that moved a block or
@@ -1633,7 +1655,7 @@ const FindDfa = struct {
         const max_states = 255;
         keys: std.ArrayList(Dfa.Set) = .empty,
         ctxs: std.ArrayList(Dfa.Ctx) = .empty,
-        accepts: std.ArrayList([4]Accept) = .empty,
+        accepts: std.ArrayList([Dfa.Ctx.count]Accept) = .empty,
         /// As `State.mid`.
         mids: std.ArrayList(u16) = .empty,
         /// `trans[s + 1][c]` (row 0 unused), `c` the byte before the
@@ -2502,6 +2524,20 @@ const OnePass = struct {
 fn hasRustAsserts(insts: []const Inst) bool {
     for (insts) |inst| {
         if (inst == .assert and @backingInt(inst.assert) > @backingInt(Assert.not_word_boundary)) return true;
+    }
+    return false;
+}
+
+/// A Unicode word assertion (the Rust grammar's `\b`, `\B`, `\<`, `\>` and
+/// half boundaries under Unicode): the code point's class past ASCII is not
+/// one of `Dfa.Ctx`'s.
+fn hasUnicodeAsserts(insts: []const Inst) bool {
+    for (insts) |inst| {
+        if (inst != .assert) continue;
+        switch (inst.assert) {
+            .word_boundary_unicode, .not_word_boundary_unicode, .word_start_unicode, .word_end_unicode, .word_start_half_unicode, .word_end_half_unicode => return true,
+            else => {},
+        }
     }
     return false;
 }
@@ -6549,7 +6585,7 @@ const golden_want = [_][1 + std.EnumArray(Probe, usize).len]u64{
     .{ 12771596290932658175, 2, 5, 2, 0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 141, 0, 144, 3, 0, 0, 0, 0, 1, 7, 14, 0, 0 },
     .{ 12524798475987748091, 2, 9, 6, 0, 0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 144, 0, 30, 144, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1, 25, 20, 0, 0 },
     .{ 16695608249434358507, 0, 0, 0, 0, 0, 0, 0, 0, 0, 92, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6588, 6918, 0, 0, 3771, 0, 0, 0 },
-    .{ 11218002173469069820, 0, 0, 0, 0, 0, 0, 0, 11, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3930, 5568, 0, 4, 11153, 0, 0, 0 },
+    .{ 11218002173469069820, 2, 6, 3, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3930, 5568, 0, 4, 11146, 0, 0, 0 },
     .{ 16025140877391608600, 0, 4, 3, 0, 6, 0, 8, 3002, 3002, 0, 0, 12, 0, 12, 6, 0, 0, 84, 0, 6, 6, 3, 0, 0, 0, 0, 0, 774, 3, 0, 0, 0, 0, 1500, 3087, 0, 0, 0 },
     .{ 17791598714729744375, 2, 5, 2, 0, 0, 0, 0, 16, 16, 0, 0, 0, 0, 0, 0, 114, 105, 18, 216, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 11, 20, 0, 0, 0 },
     .{ 16512095191518823459, 0, 4, 3, 0, 0, 0, 0, 2193, 2193, 0, 0, 0, 0, 0, 0, 0, 0, 129, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1200, 2117, 0, 0, 0 },
@@ -7217,4 +7253,61 @@ test "mutation M: bytes mode finds a four-byte code point on the Pike VM" {
         try testing.expectEqual(Span{ .start = 0, .end = 4 }, caps[1].?);
         try testing.expectEqual(Span{ .start = 4, .end = 8 }, caps[2].?);
     }
+}
+
+test "Rust-grammar assertions run isMatch's lazy DFAs: same answers as the VM, on ASCII the DFA steps, past ASCII it gives up" {
+    const gpa = testing.allocator;
+    const patterns = [_][]const u8{
+        "\\b\\w+\\b",       "\\bfoo\\b",      "\\Bo\\B",              "\\<ab",       "ab\\>",     "\\b{start}x", "x\\b{end}",
+        "\\b{start-half}a", "a\\b{end-half}", "(?-u:\\b)ab(?-u:\\b)", "(?-u:\\<)ab", "(?Rm)^ab$", "(?Rm)a$",     "(?Rm)^b",
+        "\\bé\\b",
+        "[a-z]+\\b$",       "^\\b\\w",
+    };
+    const texts = [_][]const u8{
+        "",       "foo",    " foo ",                                                                      "afoo", "foo_", "ab", "xab", "ab x", "a\r\nb", "ab\r\n", "a\rb", "\r\nab\r\n",
+        "héllo wörld",
+        "é",
+        " é ",
+        "fooé",
+        "éfoo",
+        "ab\xff", "\xffab", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa foo",
+    };
+    for (patterns) |pat| {
+        var re = try Regex.compileOptions(gpa, pat, .{ .syntax = .rust });
+        defer re.deinit(gpa);
+        // The same program with the DFAs off: the VM's answers. (`(?-u:\b)`
+        // is the Perl assertion, never `vm_only`: the control.)
+        var vm = re;
+        vm.rust_asserts = false;
+        for (texts) |t| {
+            errdefer std.debug.print("/{s}/ on \"{s}\"\n", .{ pat, t });
+            try testing.expectEqual(vm.isMatch(t), re.isMatch(t));
+            try testing.expectEqual(vm.fullMatch(t), re.fullMatch(t));
+        }
+    }
+    var rust: usize = 0;
+    for (patterns) |pat| {
+        var r = try Regex.compileOptions(gpa, pat, .{ .syntax = .rust });
+        defer r.deinit(gpa);
+        if (r.rust_asserts) rust += 1;
+    }
+    try testing.expect(rust >= patterns.len - 1);
+    // An ASCII text: the DFA's steps; past ASCII under a Unicode `\b`: none
+    // (given up at once), then the VM.
+    var re = try Regex.compileOptions(gpa, "\\b\\w+\\b", .{ .syntax = .rust });
+    defer re.deinit(gpa);
+    try testing.expect(re.ascii_dfa);
+    probe_counts = .initFill(0);
+    try testing.expect(re.isMatch("  hello  "));
+    try testing.expect(probe_counts.get(.dfa_step) > 0);
+    probe_counts = .initFill(0);
+    try testing.expect(re.isMatch("é hello"));
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.dfa_step));
+    // ASCII-only word assertions do not give up past ASCII.
+    var half = try Regex.compileOptions(gpa, "(?-u:\\<)ab", .{ .syntax = .rust });
+    defer half.deinit(gpa);
+    try testing.expect(half.rust_asserts and !half.ascii_dfa);
+    probe_counts = .initFill(0);
+    try testing.expect(half.isMatch("é ab"));
+    try testing.expect(probe_counts.get(.dfa_step) > 0);
 }

@@ -169,7 +169,14 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   ASCII bytes are kept in ~4.7 KiB of stack; a non-ASCII step is worked out each time; a full
   table is emptied and refilled (each step then costs what an NFA step does — still linear).
   The state holding only the start uses the prefilter's skip. Larger programs and the reader
-  front end run the NFA set simulation (`runSetOn`).
+  front end run the NFA set simulation (`runSetOn`). The Rust grammar's assertions run here too
+  (`Regex.rust_asserts`): a fifth context, `\r`, serves the CRLF line assertions, and under a Unicode
+  word assertion (`Regex.ascii_dfa`) the DFA — forwards and backwards — gives up at the first code
+  point past ASCII it would have to class, and the NFA set simulation answers from the start, as Rust's
+  lazy DFA quits on a non-ASCII byte under a Unicode `\b`. Measured 2026-11-21 (ReleaseFast, 1 MiB of
+  ASCII words, no match; A/B in one binary, best of 7, the VM's best above the DFA's worst on every row):
+  `\b[a-z]{3}[0-9]\b` 2.6–3.0×, `\b{start}[a-z]+[0-9]` 7.5×, `(?Rm)^[a-z]+[0-9]$` 1.9–2.0×,
+  `\b\w+[0-9]\b` 8.5–9.0× faster than the VM.
 - **Backwards from the end** (`isMatch`): when every path to the match passes `\z`
   and not every one starts with `\A` (`Prefilter.end_anchored`), every match ends at the end of
   the text, so the lazy DFA runs from there towards the start (RE2's and Rust's reverse anchored
@@ -344,11 +351,11 @@ Consumer build options (CONVENTIONS §4.2), after Rust `regex-syntax`'s `unicode
 
 All open.
 
-- **The Rust grammar's assertions in the DFAs** — a program with a Unicode `\b` (the Rust grammar's default),
-  `\<`/`\>`, the half boundaries or CRLF lines runs on the backtracker and the Pike VM only (`Regex.vm_only`):
-  `\b\w+\b` written for `.rust` is far slower than the same pattern in `.perl`. Rust keeps its lazy DFA and quits on a
-  byte past ASCII; here the DFA contexts would need a Unicode-word class (start/word/other/newline/CR) and a quit to the
-  VMs. Same for bytes mode (`Options.utf8 = false`), which has no prefilter either.
+- **The Rust grammar's assertions in `Matcher`'s DFAs** — `isMatch`/`fullMatch` run their lazy DFAs on them (see the
+  lazy DFA above); `Matcher.find`'s DFAs (`FindDfa`, `Back`) and the one-pass engine still step aside for the VMs on a
+  program with a Rust-grammar assertion (`Regex.vm_only`), so `find`/`captures` of `\b\w+\b` written for `.rust` are slower
+  than in `.perl`. The same give-up past ASCII would serve there; `FindDfa`'s premultiplied rows and two-byte mid states
+  need it at each decode. Bytes mode (`Options.utf8 = false`) runs the VMs only and has no prefilter either.
 - **Programs past `4 * max_insts`** (owner: no consumer setting may end in a panic or an OOM) — Go and Rust compile
   them; here `error.PatternTooLarge`, because `isMatch` has no allocator and a `Matcher` for 65,534 instructions x 64
   groups would be ~134 MiB. Taking them back needs matching in bounded memory for any size (a windowed or chunked state
