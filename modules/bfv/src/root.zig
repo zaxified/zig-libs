@@ -76,16 +76,14 @@
 //! closed via `std.Io.randomSecure` is settled policy now, not an open
 //! question (`CONVENTIONS.md` §2.2, formerly tracked as B7).
 //!
-//! Deferred increments: bootstrapping, CKKS (approximate), key rotation /
-//! Galois automorphisms (batching rotations), full CRT-slot SIMD encoding,
-//! byte codecs.
+//! Deferred increments: bootstrapping, BGV and CKKS (SPEC.md "Roadmap").
 
 const std = @import("std");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "BFV leveled homomorphic encryption (Fan-Vercauteren) over `Z_q[X]/(X^N+1)`, RNS — exact-integer keygen/encrypt/decrypt/multiply/relinearize. Only `params.sec_n8192_logq218` claims a security level (~128-bit classical, cited from the HomomorphicEncryption.org tables, not estimated here); the other sets are correctness-only toys.",
+    .doc = "BFV leveled homomorphic encryption (Fan-Vercauteren) over `Z_q[X]/(X^N+1)`, RNS — exact-integer keygen/encrypt/decrypt/multiply/relinearize, plaintext operands, CRT-slot batching with Galois rotations, modulus switching, byte codecs. `params.sec_n8192_logq218` and `params.secure` (SEAL's default chains) claim a security level (cited from the HomomorphicEncryption.org tables, not estimated here); the other sets are correctness-only toys.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -105,6 +103,7 @@ pub const rns = @import("rns.zig");
 pub const ring = @import("ring.zig");
 pub const encode = @import("encode.zig");
 pub const params = @import("params.zig");
+pub const batch = @import("batch.zig");
 
 // Scheme layer (types real; cores gated).
 pub const gate = @import("gate.zig");
@@ -118,6 +117,7 @@ pub const kat_vectors = @import("kat_vectors.zig");
 pub const Ntt = ntt.Ntt;
 pub const RnsPoly = ring.RnsPoly;
 pub const Plaintext = encode.Plaintext;
+pub const BatchEncoder = batch.BatchEncoder;
 pub const Params = params.Params;
 
 // Pull every submodule's tests into the test binary (CONVENTIONS.md §6
@@ -130,9 +130,11 @@ test {
     _ = ring;
     _ = encode;
     _ = params;
+    _ = batch;
     _ = bfv_mod;
     _ = kat_vectors;
     _ = @import("kat_test.zig");
+    _ = @import("ops_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("bench.zig"); // opt-in via BFV_BENCH; SKIPs otherwise
 }

@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [tuneinsight/lattigo](https://github.com/tuneinsight/lattigo) | Go | Apache-2.0 | 1.5k | v6.2.0 (2026-02-02) | Its README: BFV as a wrapper over BGV, CKKS, multiparty versions, linear transformations / slot permutations and polynomial evaluation circuits. Source not read (not MIT). |
 | Zig ecosystem | Zig | — | — | — | No FHE library of any kind in `std` (ML-KEM/ML-DSA only) and none found on GitHub (`gh search repos "fhe zig"` returned nothing on 2026-09-30). The sibling `paillier` is additively homomorphic only. |
 
-**Where we are ahead:** the only FHE scheme found for Zig, pure Zig with `std` offering none (and `paillier` additively homomorphic only); exact-integer BFV that adds and multiplies to a bounded depth with relinearization and a noise-budget report. **Where we are even:** the BFV core that SEAL, OpenFHE and Lattigo also carry (keygen, encrypt, decrypt, add, multiply) and SEAL's default parameter/NTT design, but no SEAL vectors have been produced or checked in, so this is a design match, not a verified interop. **Where we are behind:** BGV and CKKS, bootstrapping, batching, Galois rotations, modulus switching and byte codecs (see Backlog), which the references offer; only one security-grade parameter set (`sec_n8192_logq218`), the others being toy sets.
+**Where we are ahead:** the only FHE scheme found for Zig, pure Zig with `std` offering none (and `paillier` additively homomorphic only); exact-integer BFV that adds and multiplies to a bounded depth with relinearization and a noise-budget report. **Where we are even:** the BFV core that SEAL, OpenFHE and Lattigo also carry (keygen, encrypt, decrypt, add, multiply) and SEAL's default parameter/NTT design, but no SEAL vectors have been produced or checked in, so this is a design match, not a verified interop. Also even with SEAL's BFV API: plaintext operands (`addPlain`/`subPlain`/`mulPlain`/`mulScalar`/`negate`), CRT-slot batching in SEAL's `2 × N/2` slot layout with row rotations and the row swap (`applyGalois`), modulus switching (`modSwitchToNext`), SEAL's `BFVDefault` prime chains at 128/192/256 bits (`params.secure`), and versioned byte codecs for every key and ciphertext (a format of our own, not SEAL's). **Where we are behind:** BGV and CKKS, bootstrapping (see Roadmap); rotation by an arbitrary step needs the key for that step (SEAL composes power-of-two keys); the codecs carry no compression and are not SEAL's wire format.
 
 ## What this module is
 
@@ -170,6 +170,58 @@ that reconstructs but transforms in a different convention cannot match
 `forward_a`. Per CONVENTIONS.md §5 this needs no `NOTICE` entry (a public
 paper/spec is not a copyrightable work; no third-party source was ported).
 
+## Plaintext operands, batching, rotations, modulus switching, codecs
+
+- **Plaintext operands.** `addPlain`/`subPlain` add/subtract `Δ·m` to `c0`, the
+  same scaled plaintext `encrypt` uses. `mulPlain` multiplies every component by
+  `m` lifted to `R_q` with coefficients in `[0,t)` (SEAL's `multiply_plain`):
+  the phase becomes `(Δa + v)·m`, i.e. `Δ·(a·m mod t)` plus `v·m` plus an
+  `r_t`-sized carry per multiple of `t` folded away; noise grows by at most
+  `‖m‖₁ ≤ N(t−1)`. `mulScalar(k)` is the same with the constant `k mod t`.
+- **Batching (`batch.zig`).** For a prime `t ≡ 1 (mod 2N)` the plaintext ring
+  splits into `N` slots `m(ζ^e)`, `e` odd. Layout as SEAL's `BatchEncoder`: row
+  0 column `i` at `e = 3^i`, row 1 at `e = −3^i (mod 2N)`. `encodeSlots`/
+  `decodeSlots` are one inverse/forward NTT mod `t`; the output position of
+  each slot is found at `init` by transforming the polynomial `X` (its
+  transform is the list of evaluation points), so the layout does not depend
+  on the NTT's output order. A slot value `≥ t` is refused, as SEAL refuses it.
+- **Galois rotations.** `σ_g: X ↦ X^g` (`g` odd, `< 2N`) maps slot `e` to slot
+  `e·g`: `g = 3^k` rotates both rows left by `k` (`galoisElement(k)`, negative
+  `k` rotates right), `g = 2N − 1` swaps the rows (`galois_row_swap`) — SEAL's
+  `rotate_rows`/`rotate_columns`. `applyGalois` applies `σ_g` to both
+  components and key-switches `σ_g(c1)` from `σ_g(s)` back to `s` with a
+  `GaloisKey`, whose rows are built exactly like the relinearisation key's with
+  target `σ_g(s)` instead of `s²` (`genSwitchRows`), and consumed by the same
+  digit decomposition (`keySwitchAccumulate`), so the added noise is the relin
+  bound `relin_digits·N·(w−1)`. One key per element: no composition of
+  power-of-two keys.
+- **Modulus switching.** `modSwitchToNext` divides and rounds by the last prime
+  (`c' = ⌊(c + ⌊q_L/2⌋)/q_L⌋`, computed per limb as `(c_i + ⌊q_L/2⌋ − r)·q_L^{-1}`
+  with `r = (c_L + ⌊q_L/2⌋) mod q_L`: SEAL's `divide_and_round_q_last`). The
+  result belongs to `Bfv(params.dropLast(P))` (`Next`): the parameter set is
+  comptime, so a level is a type. It decrypts under `modSwitchSecretKey(sk)`
+  (the same `s`, one limb fewer) with noise `≈ v/q_L + (1 + ‖s‖₁)/2`.
+- **Byte codecs.** `"ZBFV"`, a version byte, an object kind, then the full
+  parameter fingerprint (`N`, `L`, `t`, the primes, `relin_base_log2`), then
+  the object's rings as coefficient-domain `u64` residues, little-endian. A
+  decoder refuses another parameter set, a version or kind it does not know, a
+  residue `≥ q_i`, a wrong length, a component count outside `{2,3}` and an
+  invalid Galois element, so every decoded value is one an encoder could have
+  produced for this `P`. The secret key is decoded into an out-parameter, and
+  its residues are range-checked without an early exit. SEAL's own format
+  (with zlib/zstd compression) is not reproduced.
+- **Standard parameter chains.** `params.defaultPrimes(n, level)` returns the
+  primes of SEAL 4.x `CoeffModulus::BFVDefault` (its
+  `default_coeff_modulus_128/192/256` tables, MIT) for `n = 1024 … 32768`;
+  `params.maxLogQ` is the HomomorphicEncryption.org maximum `log2 q`
+  (`CoeffModulus::MaxBitCount`). The tests re-check every chain (prime,
+  `≡ 1 mod 2n`, SEAL's total width, within the standard) instead of trusting
+  the table. `params.secure(n, t, level)` builds a `Params` from them with a
+  relinearisation base of one digit per prime (one bit under the smallest
+  prime's width) when the chain has two or more primes. One-prime chains
+  (`n ≤ 2048`, and `n = 4096` at 256 bits) are, as in SEAL, too small for
+  key switching with a large `t`.
+
 ## Reuse map (dedup)
 
 - **`std.crypto` NTT (ML-KEM/ML-DSA):** NOT reusable — hardwired to `q=3329`
@@ -197,8 +249,9 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   worst-case ledger in `params.zig` guarantees depth 4); the ~128-bit figure is
   a citation of the standard tables, **not** a lattice estimate run in this
   repo. There is also no side-channel hardening beyond the boundary in
-  "Partially constant-time" below, and no byte codecs — so this is a set to
-  benchmark and reason about, not one to deploy behind.
+  "Partially constant-time" below — so this is a set to benchmark and reason
+  about, not one to deploy behind. The same holds for `params.secure`'s chains:
+  the security level is SEAL's/the standard's table, cited, not estimated.
 - **The entropy seam is typed, not documented.** `keyGen`, `encrypt` and
   `genRelinKey` take `io: std.Io` and draw through `entropy.SecureSource`
   (`modules/entropy`), the fail-closed `std.Random` adapter over
@@ -259,8 +312,9 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   - decrypt rounding and `noiseBudget` KATs with exact values (including `t = 5` and a 3-component product);
   - homomorphic add, mul+relin and multiply-depth end to end over random and boundary plaintexts on `test_mul`, a depth-2 evaluation on the security-grade set, and an enc/dec round-trip at `bfv_toy` (`N = 1024`);
   - the three multiply paths (`mulExactRef`, `mulRnsNtt`, `mulBehz`) bit-identical at `log q ∈ {11, 36, 120, 300}`, including saturating inputs;
+  - `ops_test.zig`: plaintext operands, batch-encoded row rotations / row swap / slot-wise product, modulus switching, codec round-trips and every decoder refusal, all decrypted and compared against the plaintext-space result; `batch.zig` checks each slot against direct evaluation `m(ζ^e)`; an end-to-end multiply + relinearize + rotate at `params.secure(4096, 65537, .tc128)`; every `defaultPrimes` chain re-validated;
   - parameter and modulus refusals (`init` running `validate`, `Ntt.init` on a composite `q`, the `2^62` bounds, auxiliary primes equal to a main prime skipped).
-- **Stack probe:** `src/stackprobe_test.zig` (`testkit.stackprobe`) checks that `keyGen`, `genRelinKey`, `decrypt` and `noiseBudget` leave no secret-key residue on the dead stack, at `bfv_toy` and at the security-grade set (ReleaseFast).
+- **Stack probe:** `src/stackprobe_test.zig` (`testkit.stackprobe`) checks that `keyGen`, `genRelinKey`, `genGaloisKey` (at `bfv_toy`), `decrypt` and `noiseBudget` leave no secret-key residue on the dead stack, at `bfv_toy` and at the security-grade set (ReleaseFast).
 - **Fuzz:** none (the card's Hardening line records the fuzz obligation as n/a).
 - **ctgrind:** `src/ctgrind_harness.zig`, targets `keygen`, `encrypt`, `decrypt` (ReleaseFast; rows in `scripts/checks/ctgrind-expected.tsv`, run by `scripts/checks/ctgrind.sh`); the baseline-CPU variant is `CTGRIND_CPU=x86_64`. Source-level CT only, see *Threats / caveats*.
 - **Mutation:** the whole-module run covers every non-test file (`modarith`, `ntt`, `rns`, `ring`, `encode`, `params`, `bfv`); comptime sizing, `gate.zig`, `bench.zig`, the ctgrind harness and the KAT data are not mutated. Three kinds of mutant: functional (one ReleaseSafe schemata build), burn-site (one `burn.run` per secret entry point, read by the stack probe, `DeadStackResidue`) and constant-time (judged by ctgrind only: `csub`'s and `subMod`'s `blackBox` removed, the `sampleTernary` trit select written as `if`/`else`; no functional test can see them).
@@ -279,12 +333,10 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 
 Open items only. All are additive; none is a defect of what exists.
 
-- **Bootstrapping** (the depth-refresh step): the biggest deferred piece; the scheme is leveled, so the multiplicative depth is bounded by the parameter set's noise ledger.
-- **Byte codecs for `SecretKey`/`PublicKey`/`RelinKey`/`Ciphertext`** *(survey 2026-09-30; shape fixed, serialisation to fill in)*: without them a ciphertext cannot leave the process, so the client/server split that FHE exists for cannot be built; SEAL serializes every object. Small (a day; fixed-width RNS limbs, versioned header); fits CONVENTIONS §2 (pure Zig).
-- **Plaintext-operand ops** (`addPlain`, `mulPlain`, plain-constant multiply) *(survey 2026-09-30)*: the cheapest way to apply a model weight or a mask to a ciphertext, used in almost every SEAL/OpenFHE BFV program; none exists (searched `pub fn` in `src/bfv.zig`). Small; fits §2.
-- **CRT-slot batch encoding (`encode.zig`, needs `t` prime with `t ≡ 1 mod 2N`) and Galois rotations (rotate rows/columns, key switching for `x -> x^g`)** *(survey 2026-09-30)*: SIMD packing is how BFV gets throughput; the sum-of-slots and matrix-vector products need rotations. Medium (a week: slot permutation tables, Galois keys); fits §2.
-- **Modulus switching** *(survey 2026-09-30)*: shrinks ciphertexts and noise after a multiply; SEAL/OpenFHE/Lattigo all offer it. Medium; fits §2.
-- **Standard security-level parameter selection** *(survey 2026-09-30)*: only one security-grade set (`sec_n8192_logq218`) and no `N`/depth chooser, where SEAL ships `CoeffModulus::BFVDefault` for the HomomorphicEncryption.org tables at 128/192/256 bits. `sec_n8192_logq218` is hand-derived; there is no function that picks a chain for a target `N`/`log q`/depth. Small-to-medium; fits §2.
-- **BGV and CKKS** *(survey 2026-09-30)*: CKKS is what most SEAL/OpenFHE/Lattigo users actually run (real-number arithmetic, ML inference). Large (a month each: encoder, rescale, bootstrapping for CKKS); fits §2. Torn on whether this is "missing and it matters" for a BFV module — recorded here so the question is asked, not assumed.
 - **Fast RNS step for the multiply's input lift:** Halevi–Polyakov base conversion replacing `rns.Basis.convertExact` for the `[0,q)` CRT lift of the multiply's inputs. `mulBehz` itself needs no exact tensor and no big-integer division; that input lift is the only wide arithmetic left on the multiply path.
 - **Rescale loop: restore vectorisation under the CT barrier (vector-select form):** since `csub`/`subMod` launder their mask, the `rescale/coeff` BEHZ-RNS micro-row of the opt-in bench reads 59.1 -> 131.9 ns at log2 q=36 and 1.25-1.33x slower at q=120..300 (`BFV_BENCH=1`, ReleaseFast, measured on a shared, noisy host; end-to-end HomMul not slower). Not done: one primitive, always constant-time; a vector-select form would let LLVM vectorise again without a branch. Re-measure on a quiet host first.
+
+## Roadmap
+
+- **Bootstrapping** (the depth-refresh step): the biggest deferred piece; the scheme is leveled, so the multiplicative depth is bounded by the parameter set's noise ledger. Project-size (weeks–months): needs digit extraction / homomorphic decryption circuits and a parameter regime large enough to run them.
+- **BGV and CKKS** *(survey 2026-09-30)*: CKKS is what most SEAL/OpenFHE/Lattigo users actually run (real-number arithmetic, ML inference). Large (a month each: encoder, rescale, bootstrapping for CKKS); fits §2. Torn on whether this is "missing and it matters" for a BFV module — recorded here so the question is asked, not assumed. Project-size: a new scheme each, with its own encoder and noise model.

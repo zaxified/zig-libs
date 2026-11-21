@@ -139,7 +139,129 @@ pub const sec_n8192_logq218 = Params{
     .relin_base_log2 = 55,
 };
 
+/// `p` with its last RNS prime dropped: the next level down the modulus
+/// chain (`Bfv(P).modSwitchToNext`). Needs at least two primes.
+pub fn dropLast(comptime p: Params) Params {
+    if (p.primes.len < 2) @compileError("dropLast needs a chain of at least two primes");
+    var out = p;
+    out.primes = p.primes[0 .. p.primes.len - 1];
+    return out;
+}
+
+/// Security level of the HomomorphicEncryption.org standard tables (classical,
+/// ternary secret), as SEAL's `sec_level_type::tc128/tc192/tc256`.
+pub const SecurityLevel = enum { tc128, tc192, tc256 };
+
+/// The largest `log2 q` the HomomorphicEncryption.org standard allows for
+/// ring degree `n` at `level` (SEAL's `CoeffModulus::MaxBitCount`), or `null`
+/// for a degree outside the tables (`1024 … 32768`).
+pub fn maxLogQ(n: usize, level: SecurityLevel) ?u16 {
+    const idx: usize = switch (n) {
+        1024 => 0,
+        2048 => 1,
+        4096 => 2,
+        8192 => 3,
+        16384 => 4,
+        32768 => 5,
+        else => return null,
+    };
+    const table = switch (level) {
+        .tc128 => [6]u16{ 27, 54, 109, 218, 438, 881 },
+        .tc192 => [6]u16{ 19, 37, 75, 152, 305, 611 },
+        .tc256 => [6]u16{ 14, 29, 58, 118, 237, 476 },
+    };
+    return table[idx];
+}
+
+/// The default prime chain for ring degree `n` at `level`: exactly the primes
+/// of SEAL 4.x `CoeffModulus::BFVDefault` (its `default_coeff_modulus_128/
+/// 192/256` tables), each `≡ 1 (mod 2n)`, with `log2 q` at the standard's
+/// maximum or just under it. The values are re-checked by this file's tests
+/// (prime, NTT-friendly, total width), not taken on trust.
+pub fn defaultPrimes(comptime n: usize, comptime level: SecurityLevel) []const u64 {
+    return switch (level) {
+        .tc128 => switch (n) {
+            1024 => &.{0x7e00001},
+            2048 => &.{0x3fffffff000001},
+            4096 => &.{ 0xffffee001, 0xffffc4001, 0x1ffffe0001 },
+            8192 => &.{ 0x7fffffd8001, 0x7fffffc8001, 0xfffffffc001, 0xffffff6c001, 0xfffffebc001 },
+            16384 => &.{ 0xfffffffd8001, 0xfffffffa0001, 0xfffffff00001, 0x1fffffff68001, 0x1fffffff50001, 0x1ffffffee8001, 0x1ffffffea0001, 0x1ffffffe88001, 0x1ffffffe48001 },
+            32768 => &.{ 0x7fffffffe90001, 0x7fffffffbf0001, 0x7fffffffbd0001, 0x7fffffffba0001, 0x7fffffffaa0001, 0x7fffffffa50001, 0x7fffffff9f0001, 0x7fffffff7e0001, 0x7fffffff770001, 0x7fffffff380001, 0x7fffffff330001, 0x7fffffff2d0001, 0x7fffffff170001, 0x7fffffff150001, 0x7ffffffef00001, 0xfffffffff70001 },
+            else => @compileError("defaultPrimes: n must be a power of two in 1024..32768"),
+        },
+        .tc192 => switch (n) {
+            1024 => &.{0x7f001},
+            2048 => &.{0x1ffffc0001},
+            4096 => &.{ 0x1ffc001, 0x1fce001, 0x1fc0001 },
+            8192 => &.{ 0x3ffffac001, 0x3ffff54001, 0x3ffff48001, 0x3ffff28001 },
+            16384 => &.{ 0x3ffffffdf0001, 0x3ffffffd48001, 0x3ffffffd20001, 0x3ffffffd18001, 0x3ffffffcd0001, 0x3ffffffc70001 },
+            32768 => &.{ 0x3fffffffd60001, 0x3fffffffca0001, 0x3fffffff6d0001, 0x3fffffff5d0001, 0x3fffffff550001, 0x7fffffffe90001, 0x7fffffffbf0001, 0x7fffffffbd0001, 0x7fffffffba0001, 0x7fffffffaa0001, 0x7fffffffa50001 },
+            else => @compileError("defaultPrimes: n must be a power of two in 1024..32768"),
+        },
+        .tc256 => switch (n) {
+            1024 => &.{0x3001},
+            2048 => &.{0x1ffc0001},
+            4096 => &.{0x3ffffffff040001},
+            8192 => &.{ 0x7ffffec001, 0x7ffffb0001, 0xfffffdc001 },
+            16384 => &.{ 0x7ffffffc8001, 0x7ffffff00001, 0x7fffffe70001, 0xfffffffd8001, 0xfffffffa0001 },
+            32768 => &.{ 0xffffffff00001, 0x1fffffffe30001, 0x1fffffffd80001, 0x1fffffffd10001, 0x1fffffffc50001, 0x1fffffffbf0001, 0x1fffffffb90001, 0x1fffffffb60001, 0x1fffffffa50001 },
+            else => @compileError("defaultPrimes: n must be a power of two in 1024..32768"),
+        },
+    };
+}
+
+/// A parameter set at a standard security level: ring degree `n`, plaintext
+/// modulus `t` (choose `t` prime and `≡ 1 (mod 2n)` for batching, e.g.
+/// `65537` up to `n = 32768`), the `defaultPrimes(n, level)` chain. The
+/// relinearisation base is about one gadget digit per chain prime
+/// (`log2 w` one below the smallest prime's bit width) when the chain has two
+/// or more primes, else the historical `2^8`. The security claim is the standard's
+/// table for `(n, log q)`, not an estimate made here; how many multiplies a set
+/// carries for a given `t` is the caller's noise ledger (`noiseBudget`).
+pub fn secure(comptime n: usize, comptime t: u64, comptime level: SecurityLevel) Params {
+    const ps = defaultPrimes(n, level);
+    var min_bits: u7 = 62;
+    for (ps) |p| min_bits = @min(min_bits, @as(u7, 64 - @clz(p)) - 1);
+    return .{
+        .n = n,
+        .t = t,
+        .primes = ps,
+        .relin_base_log2 = if (ps.len >= 2) min_bits else 8,
+    };
+}
+
 const testing = std.testing;
+
+test "defaultPrimes: every chain is prime, NTT-friendly, at SEAL's width and within the standard" {
+    const levels = [_]SecurityLevel{ .tc128, .tc192, .tc256 };
+    // SEAL's documented total widths (`default_coeff_modulus_*` comments).
+    const totals = [3][6]u16{
+        .{ 27, 54, 109, 218, 438, 881 },
+        .{ 19, 37, 75, 152, 300, 600 },
+        .{ 14, 29, 58, 118, 237, 476 },
+    };
+    inline for (levels, 0..) |lv, li| {
+        inline for (.{ 1024, 2048, 4096, 8192, 16384, 32768 }, 0..) |n, ni| {
+            const ps = comptime defaultPrimes(n, lv);
+            try (Params{ .n = n, .t = 2, .primes = ps }).validate();
+            var bits: u32 = 0;
+            for (ps) |p| bits += 64 - @clz(p);
+            try testing.expectEqual(@as(u32, totals[li][ni]), bits);
+            try testing.expect(bits <= maxLogQ(n, lv).?);
+        }
+    }
+    try testing.expectEqual(@as(?u16, null), maxLogQ(512, .tc128));
+}
+
+test "secure: relinearisation base is the smallest prime's width, 8 for one-prime chains" {
+    const p = comptime secure(4096, 65537, .tc128);
+    try p.validate();
+    try testing.expectEqual(@as(u7, 35), p.relin_base_log2); // 0xffffee001 has 36 bits
+    try testing.expectEqual(@as(u7, 8), secure(2048, 65537, .tc128).relin_base_log2);
+    const d = comptime dropLast(p);
+    try testing.expectEqual(@as(usize, 2), d.primes.len);
+    try testing.expectEqual(p.primes[1], d.primes[1]);
+}
 
 test "sec_n8192_logq218 validates and has the documented shape" {
     try sec_n8192_logq218.validate();

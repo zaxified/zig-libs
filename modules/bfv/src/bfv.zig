@@ -53,11 +53,11 @@
 //! CRT-accumulator type) and `TensorI` are both derived from the parameter set,
 //! so `params.sec_n8192_logq218` (`N = 8192`, `log q = 218`) builds and runs —
 //! see the end-to-end test in `kat_test.zig`. Still deferred: bootstrapping,
-//! CKKS, Galois automorphisms, CRT-slot batch encoding.
+//! BGV, CKKS.
 //!
 //! ## Randomness — a security contract, not a portability tag
 //!
-//! `keyGen`, `encrypt` and `genRelinKey` — the three production entry points
+//! `keyGen`, `encrypt`, `genRelinKey` and `genGaloisKey` — the production entry points
 //! that consume entropy — take `io: std.Io` and draw through
 //! `entropy.SecureSource`, the fail-closed `std.Random` adapter over
 //! `std.Io.randomSecure` (`modules/entropy`). That is deliberately NOT
@@ -1077,16 +1077,31 @@ pub fn Bfv(comptime P: params.Params) type {
         /// note above.
         fn genRelinKeyInner(self: *const Self, sk: *const SecretKey, random: std.Random, rlk: *RelinKey) void {
             const s2 = sk.s.mul(&sk.s, &self.engines);
+            self.genSwitchRows(&s2, sk, random, &rlk.b, &rlk.a);
+        }
+
+        /// The gadget key-switching rows from `target` to `sk.s`: row `i`
+        /// pseudo-encrypts `w^i·target` under `s`, `b_i = w^i·target −
+        /// (a_i·s + e_i)`, `a_i` uniform, `e_i` ternary. `target = s²` gives
+        /// the relinearisation key, `target = σ_g(s)` a Galois key.
+        fn genSwitchRows(
+            self: *const Self,
+            target: *const Ring,
+            sk: *const SecretKey,
+            random: std.Random,
+            b: *[relin_digits]Ring,
+            a: *[relin_digits]Ring,
+        ) void {
             var w_pow: QU = 1; // w^i < q for all rows used (see relin_digits)
             for (0..relin_digits) |i| {
                 const a_i = self.sampleUniform(random);
                 const e_i = self.sampleTernary(random);
-                var b_i = self.scalarMul(&s2, w_pow); // w^i·s²
+                var b_i = self.scalarMul(target, w_pow); // w^i·target
                 var mask = a_i.mul(&sk.s, &self.engines); // a_i·s
                 mask.addAssign(&e_i, &self.primes); // + e_i
-                b_i.subAssign(&mask, &self.primes); // w^i·s² − (a_i·s + e_i)
-                rlk.b[i] = b_i;
-                rlk.a[i] = a_i;
+                b_i.subAssign(&mask, &self.primes); // w^i·target − (a_i·s + e_i)
+                b[i] = b_i;
+                a[i] = a_i;
                 const WPow = @Int(.unsigned, @as(u16, @bitSizeOf(QU)) + relin_base_log2);
                 w_pow = @intCast((@as(WPow, w_pow) << relin_base_log2) % @as(WPow, q_product));
             }
@@ -1439,19 +1454,35 @@ pub fn Bfv(comptime P: params.Params) type {
         /// by an encryption of the same value under `s`.
         pub fn relinearize(self: *const Self, ct: *const Ciphertext, rlk: *const RelinKey) Ciphertext {
             std.debug.assert(ct.len == 3);
-            // Exact base-w digits of every coefficient of c2.
+            var c0 = ct.components[0];
+            var c1 = ct.components[1];
+            self.keySwitchAccumulate(&ct.components[2], &rlk.b, &rlk.a, &c0, &c1);
+            return .{ .components = .{ c0, c1, Ring.zero(.coeff) }, .len = 2 };
+        }
+
+        /// `(c0, c1) += (Σ d_i·b_i, Σ d_i·a_i)` for the exact base-`w` digits
+        /// `d_i` of `c` (`c = Σ w^i·d_i`, digits in `[0,w)`). With rows
+        /// `b_i + a_i·s = w^i·target − e_i` this adds `c·target` to the
+        /// phase, up to the key-switch noise `‖Σ d_i·e_i‖ ≤ relin_digits·N·(w−1)`.
+        fn keySwitchAccumulate(
+            self: *const Self,
+            c: *const Ring,
+            b: *const [relin_digits]Ring,
+            a: *const [relin_digits]Ring,
+            c0: *Ring,
+            c1: *Ring,
+        ) void {
+            // Exact base-w digits of every coefficient of c.
             var digits: [relin_digits][N]u64 = undefined;
             for (0..N) |j| {
                 var res: [L]u64 = undefined;
-                for (0..L) |i| res[i] = ct.components[2].limbs[i][j];
+                for (0..L) |i| res[i] = c.limbs[i][j];
                 var v: QU = self.reconstruct(&res); // [0, q)
                 for (0..relin_digits) |i| {
                     digits[i][j] = @intCast(v & (relin_base - 1));
                     v >>= relin_base_log2;
                 }
             }
-            var c0 = ct.components[0];
-            var c1 = ct.components[1];
             for (0..relin_digits) |i| {
                 // d_i as a ring element: the same small integer digit per
                 // coefficient across all limbs (its residues), like the
@@ -1461,12 +1492,11 @@ pub fn Bfv(comptime P: params.Params) type {
                     const m = &self.engines[l].modulus;
                     for (0..N) |j| d.limbs[l][j] = m.reduce(digits[i][j]);
                 }
-                var tb = d.mul(&rlk.b[i], &self.engines);
+                var tb = d.mul(&b[i], &self.engines);
                 c0.addAssign(&tb, &self.primes);
-                var ta = d.mul(&rlk.a[i], &self.engines);
+                var ta = d.mul(&a[i], &self.engines);
                 c1.addAssign(&ta, &self.primes);
             }
-            return .{ .components = .{ c0, c1, Ring.zero(.coeff) }, .len = 2 };
         }
 
         /// Remaining noise budget (bits) of `ct` under `sk`:
@@ -1511,6 +1541,374 @@ pub fn Bfv(comptime P: params.Params) type {
             const ratio = q_product / (2 * vmax);
             if (ratio <= 1) return 0;
             return @intCast(std.math.log2_int(QU, ratio));
+        }
+
+        // ── plaintext operands ──────────────────────────────────────────────
+
+        /// `pt` lifted into `R_q`: each coefficient `m_j` as the same small
+        /// integer in every limb (no `Δ` scaling).
+        fn liftPlain(self: *const Self, pt: *const Plaintext) Ring {
+            var out = Ring.zero(.coeff);
+            for (0..L) |i| {
+                const m = &self.engines[i].modulus;
+                for (0..N) |j| out.limbs[i][j] = m.reduce(pt.coeffs[j]);
+            }
+            return out;
+        }
+
+        /// `Enc(a) ⊕ m` for a plaintext operand: `c0 += Δ·m` (the same scaled
+        /// plaintext `encrypt` adds). Adds no noise beyond what decrypt's
+        /// `Δ·t = q − r_t` rounding already budgets. Any component count.
+        pub fn addPlain(self: *const Self, ct: *const Ciphertext, pt: *const Plaintext) Ciphertext {
+            var out = ct.*;
+            const dm = self.scaledPlaintext(pt);
+            out.components[0].addAssign(&dm, &self.primes);
+            return out;
+        }
+
+        /// `Enc(a) ⊖ m` for a plaintext operand: `c0 −= Δ·m`.
+        pub fn subPlain(self: *const Self, ct: *const Ciphertext, pt: *const Plaintext) Ciphertext {
+            var out = ct.*;
+            const dm = self.scaledPlaintext(pt);
+            out.components[0].subAssign(&dm, &self.primes);
+            return out;
+        }
+
+        /// `Enc(a) ⊗ m` for a plaintext operand: every component times `m`
+        /// lifted to `R_q` (coefficients in `[0,t)`, as SEAL's
+        /// `multiply_plain`). Decrypts to `a·m` in `R_t`; the noise is
+        /// multiplied by at most `‖m‖₁ ≤ N·(t−1)` plus an `r_t`-sized carry
+        /// term, far less than a ciphertext multiply. Needs no relin key.
+        pub fn mulPlain(self: *const Self, ct: *const Ciphertext, pt: *const Plaintext) Ciphertext {
+            var mn = self.liftPlain(pt);
+            mn.toNtt(&self.engines);
+            var out = ct.*;
+            for (0..ct.len) |c| {
+                var x = ct.components[c];
+                x.toNtt(&self.engines);
+                x.mulPointwise(&mn, &self.engines);
+                x.fromNtt(&self.engines);
+                out.components[c] = x;
+            }
+            return out;
+        }
+
+        /// `Enc(a) ⊗ k` for a plaintext constant `k` (reduced mod `t`): every
+        /// coefficient times `k`. Noise grows by the factor `k < t`.
+        pub fn mulScalar(self: *const Self, ct: *const Ciphertext, k: u64) Ciphertext {
+            var out = ct.*;
+            for (0..ct.len) |c| out.components[c] = self.scalarMul(&ct.components[c], k % P.t);
+            return out;
+        }
+
+        /// `−Enc(a)`: every component negated.
+        pub fn negate(self: *const Self, ct: *const Ciphertext) Ciphertext {
+            var out = ct.*;
+            for (0..ct.len) |c| out.components[c].negate(&self.primes);
+            return out;
+        }
+
+        // ── Galois automorphisms (slot rotations) ────────────────────────────
+
+        /// A key-switching key from `σ_g(s)` back to `s`, for one Galois
+        /// element `g` (odd, `< 2N`). Same gadget layout as `RelinKey`.
+        pub const GaloisKey = struct {
+            g: u64,
+            b: [relin_digits]Ring,
+            a: [relin_digits]Ring,
+        };
+
+        /// The Galois element that rotates both rows of a batch-encoded
+        /// plaintext (`batch.BatchEncoder`) LEFT by `steps` columns (negative:
+        /// right): `3^steps mod 2N`, as SEAL's `rotate_rows`. Needs `N ≥ 4`.
+        pub fn galoisElement(steps: i64) u64 {
+            comptime std.debug.assert(N >= 4);
+            const half: i64 = @intCast(N / 2); // the order of 3 in (Z/2N)^*
+            const e: u64 = @intCast(@mod(steps, half));
+            return ma.powMod(3, e, 2 * N);
+        }
+
+        /// The Galois element that swaps the two rows of a batch-encoded
+        /// plaintext: `2N − 1` (`X ↦ X^{−1}`), as SEAL's `rotate_columns`.
+        pub const galois_row_swap: u64 = 2 * N - 1;
+
+        /// `σ_g(r)`: `X^j ↦ X^{j·g mod 2N}` with `X^N = −1`, on a
+        /// coefficient-domain ring. `g` is public; the positions it moves
+        /// coefficients to depend on `g` only.
+        fn automorphism(self: *const Self, r: *const Ring, g: u64) Ring {
+            std.debug.assert(r.domain == .coeff);
+            var out = Ring.zero(.coeff);
+            for (0..N) |j| {
+                const k = (@as(u64, j) * g) % (2 * N);
+                for (0..L) |i| {
+                    const v = r.limbs[i][j];
+                    if (k < N)
+                        out.limbs[i][k] = v
+                    else
+                        out.limbs[i][k - N] = ma.subMod(0, v, self.primes[i]);
+                }
+            }
+            return out;
+        }
+
+        fn checkGaloisElement(g: u64) error{InvalidGaloisElement}!void {
+            if (g & 1 == 0 or g >= 2 * N) return error.InvalidGaloisElement;
+        }
+
+        /// Generate the Galois key for element `g` (odd, `< 2N`; see
+        /// `galoisElement`/`galois_row_swap`). `io`'s CSPRNG supplies the rows'
+        /// masks and errors, as for `genRelinKey`; the key is written through
+        /// `out`. One key per element: a rotation by `k` steps needs the key
+        /// for `galoisElement(k)` (no composition of power-of-two keys).
+        pub fn genGaloisKey(self: *const Self, sk: *const SecretKey, g: u64, io: std.Io, out: *GaloisKey) error{InvalidGaloisElement}!void {
+            try checkGaloisElement(g);
+            return burn.run(burn.rings(Ring, 16), void, genGaloisKeyBody, .{ self, sk, g, io, out });
+        }
+
+        fn genGaloisKeyBody(self: *const Self, sk: *const SecretKey, g: u64, io: std.Io, out: *GaloisKey) void {
+            var src: entropy.SecureSource = .{ .io = io };
+            self.genGaloisKeyInner(sk, g, src.interface(), out);
+        }
+
+        fn genGaloisKeyInner(self: *const Self, sk: *const SecretKey, g: u64, random: std.Random, out: *GaloisKey) void {
+            const sg = self.automorphism(&sk.s, g);
+            out.g = g;
+            self.genSwitchRows(&sg, sk, random, &out.b, &out.a);
+        }
+
+        /// TEST/KAT ONLY — `genGaloisKey` with caller-chosen draws.
+        pub fn genGaloisKeyForTest(self: *const Self, sk: *const SecretKey, g: u64, random: std.Random, out: *GaloisKey) error{InvalidGaloisElement}!void {
+            comptime if (!builtin.is_test) @compileError(
+                "this is a TEST-ONLY entry point: it takes a caller-supplied std.Random. Production code must use the std.Io entry point of the same name, which cannot be handed a seeded PRNG.",
+            );
+            try checkGaloisElement(g);
+            return burn.run(burn.rings(Ring, 16), void, genGaloisKeyInner, .{ self, sk, g, random, out });
+        }
+
+        /// Apply `σ_g` to a 2-component ciphertext and key-switch the result
+        /// back to `s`: decrypts to `σ_g(m)`. On a batch-encoded plaintext that
+        /// is a row rotation (`galoisElement`) or the row swap
+        /// (`galois_row_swap`). Adds the same key-switch noise as
+        /// `relinearize`.
+        pub fn applyGalois(self: *const Self, ct: *const Ciphertext, gk: *const GaloisKey) Ciphertext {
+            std.debug.assert(ct.len == 2);
+            var c0 = self.automorphism(&ct.components[0], gk.g);
+            const c1g = self.automorphism(&ct.components[1], gk.g);
+            var c1 = Ring.zero(.coeff);
+            self.keySwitchAccumulate(&c1g, &gk.b, &gk.a, &c0, &c1);
+            return .{ .components = .{ c0, c1, Ring.zero(.coeff) }, .len = 2 };
+        }
+
+        // ── modulus switching ────────────────────────────────────────────────
+
+        /// The instance one level down the modulus chain: `P` with its last
+        /// prime dropped (`void` for a one-prime chain).
+        pub const Next = if (L >= 2) Bfv(params.dropLast(P)) else void;
+
+        /// Modulus switching: `c' = ⌊c·q'/q⌉ = ⌊c/q_last⌉` per coefficient,
+        /// `q' = q/q_last` (SEAL's `mod_switch_to_next` for BFV:
+        /// divide-and-round by the last prime, in RNS, no wide arithmetic).
+        /// The result decrypts under `modSwitchSecretKey(sk)` to the same
+        /// plaintext with noise `≈ v/q_last + (1 + ‖s‖₁)/2`: it shrinks the
+        /// ciphertext by one limb and, while `v` is large, the noise with it.
+        pub fn modSwitchToNext(self: *const Self, ct: *const Ciphertext) Next.Ciphertext {
+            const ql = self.primes[L - 1];
+            const half = ql >> 1;
+            var out: Next.Ciphertext = .{ .components = undefined, .len = ct.len };
+            for (&out.components) |*c| c.* = Next.Ring.zero(.coeff);
+            for (0..ct.len) |c| {
+                const src = &ct.components[c];
+                std.debug.assert(src.domain == .coeff);
+                for (0..L - 1) |i| {
+                    const qi = self.primes[i];
+                    const m = &self.engines[i].modulus;
+                    const inv = ma.invMod(m.reduce(ql), qi) catch unreachable; // distinct primes
+                    const inv_s = ma.Shoup.init(inv, qi);
+                    const half_i = m.reduce(half);
+                    for (0..N) |j| {
+                        // r = (c + ⌊q_last/2⌋) mod q_last; c' = (c + ⌊q_last/2⌋ − r)/q_last.
+                        const r = m.reduce(ma.addMod(src.limbs[L - 1][j], half, ql));
+                        const x = ma.subMod(ma.addMod(src.limbs[i][j], half_i, qi), r, qi);
+                        out.components[c].limbs[i][j] = inv_s.mul(x, qi);
+                    }
+                }
+            }
+            return out;
+        }
+
+        /// The secret key for `Next`: the same ternary `s`, last limb dropped.
+        /// Written through `out`, like every key.
+        pub fn modSwitchSecretKey(sk: *const SecretKey, out: *Next.SecretKey) void {
+            for (0..L - 1) |i| out.s.limbs[i] = sk.s.limbs[i];
+            out.s.domain = sk.s.domain;
+        }
+
+        // ── byte codecs ──────────────────────────────────────────────────────
+        //
+        // Layout (little-endian): "ZBFV", version (1), kind, then the
+        // parameter fingerprint — n (u32), L (u8), t (u64), the L primes
+        // (u64 each), relin_base_log2 (u8) — then the kind's body. A ring
+        // element is its L·N coefficient-domain residues as u64, limb by limb.
+        // Decoders refuse a different parameter set, a residue `≥ q_i` and a
+        // wrong length, so every decoded value is one an encoder could have
+        // produced for this `P`.
+
+        pub const ObjectKind = enum(u8) {
+            secret_key = 1,
+            public_key = 2,
+            relin_key = 3,
+            ciphertext = 4,
+            galois_key = 5,
+        };
+
+        pub const DecodeError = error{
+            WrongLength,
+            BadMagic,
+            UnsupportedVersion,
+            WrongKind,
+            ParameterMismatch,
+            NonCanonical,
+            BadComponentCount,
+            InvalidGaloisElement,
+        };
+
+        pub const codec_version: u8 = 1;
+        pub const codec_header_bytes: usize = 4 + 1 + 1 + 4 + 1 + 8 + 8 * L + 1;
+        const poly_bytes: usize = 8 * L * N;
+        pub const secret_key_bytes: usize = codec_header_bytes + poly_bytes;
+        pub const public_key_bytes: usize = codec_header_bytes + 2 * poly_bytes;
+        pub const relin_key_bytes: usize = codec_header_bytes + 2 * relin_digits * poly_bytes;
+        pub const galois_key_bytes: usize = codec_header_bytes + 8 + 2 * relin_digits * poly_bytes;
+        /// Encoded size of a ciphertext with `components` (2 or 3) components.
+        pub fn ciphertextBytes(components: usize) usize {
+            return codec_header_bytes + 1 + components * poly_bytes;
+        }
+
+        fn writeHeader(kind: ObjectKind, out: []u8) []u8 {
+            @memcpy(out[0..4], "ZBFV");
+            out[4] = codec_version;
+            out[5] = @backingInt(kind);
+            std.mem.writeInt(u32, out[6..10], @intCast(N), .little);
+            out[10] = @intCast(L);
+            std.mem.writeInt(u64, out[11..19], P.t, .little);
+            for (0..L) |i| std.mem.writeInt(u64, out[19 + 8 * i ..][0..8], primes[i], .little);
+            out[19 + 8 * L] = relin_base_log2;
+            return out[codec_header_bytes..];
+        }
+
+        fn readHeader(kind: ObjectKind, bytes: []const u8) DecodeError![]const u8 {
+            if (bytes.len < codec_header_bytes) return error.WrongLength;
+            if (!std.mem.eql(u8, bytes[0..4], "ZBFV")) return error.BadMagic;
+            if (bytes[4] != codec_version) return error.UnsupportedVersion;
+            if (bytes[5] != @backingInt(kind)) return error.WrongKind;
+            var want: [codec_header_bytes]u8 = undefined;
+            _ = writeHeader(kind, &want);
+            if (!std.mem.eql(u8, bytes[6..codec_header_bytes], want[6..])) return error.ParameterMismatch;
+            return bytes[codec_header_bytes..];
+        }
+
+        fn writePoly(r: *const Ring, out: []u8) []u8 {
+            std.debug.assert(r.domain == .coeff);
+            var o: usize = 0;
+            for (0..L) |i| for (0..N) |j| {
+                std.mem.writeInt(u64, out[o..][0..8], r.limbs[i][j], .little);
+                o += 8;
+            };
+            return out[poly_bytes..];
+        }
+
+        fn readPoly(bytes: []const u8, r: *Ring) DecodeError![]const u8 {
+            r.domain = .coeff;
+            var o: usize = 0;
+            var bad: u64 = 0;
+            for (0..L) |i| for (0..N) |j| {
+                const v = std.mem.readInt(u64, bytes[o..][0..8], .little);
+                // Accumulated, not early-exit: a secret key's residues are
+                // decoded without a branch on any one of them.
+                bad |= @intFromBool(v >= primes[i]);
+                r.limbs[i][j] = v;
+                o += 8;
+            };
+            if (bad != 0) return error.NonCanonical;
+            return bytes[poly_bytes..];
+        }
+
+        pub fn encodeSecretKey(sk: *const SecretKey, out: *[secret_key_bytes]u8) void {
+            _ = writePoly(&sk.s, writeHeader(.secret_key, out));
+        }
+
+        /// Decode a secret key into `out` (key material goes through an
+        /// out-param, never a return slot).
+        pub fn decodeSecretKey(bytes: []const u8, out: *SecretKey) DecodeError!void {
+            if (bytes.len != secret_key_bytes) return error.WrongLength;
+            _ = try readPoly(try readHeader(.secret_key, bytes), &out.s);
+        }
+
+        pub fn encodePublicKey(pk: *const PublicKey, out: *[public_key_bytes]u8) void {
+            _ = writePoly(&pk.p1, writePoly(&pk.p0, writeHeader(.public_key, out)));
+        }
+
+        pub fn decodePublicKey(bytes: []const u8, out: *PublicKey) DecodeError!void {
+            if (bytes.len != public_key_bytes) return error.WrongLength;
+            const rest = try readPoly(try readHeader(.public_key, bytes), &out.p0);
+            _ = try readPoly(rest, &out.p1);
+        }
+
+        pub fn encodeRelinKey(rlk: *const RelinKey, out: *[relin_key_bytes]u8) void {
+            var rest = writeHeader(.relin_key, out);
+            for (0..relin_digits) |i| rest = writePoly(&rlk.a[i], writePoly(&rlk.b[i], rest));
+        }
+
+        pub fn decodeRelinKey(bytes: []const u8, out: *RelinKey) DecodeError!void {
+            if (bytes.len != relin_key_bytes) return error.WrongLength;
+            var rest = try readHeader(.relin_key, bytes);
+            for (0..relin_digits) |i| {
+                rest = try readPoly(rest, &out.b[i]);
+                rest = try readPoly(rest, &out.a[i]);
+            }
+        }
+
+        pub fn encodeGaloisKey(gk: *const GaloisKey, out: *[galois_key_bytes]u8) void {
+            var rest = writeHeader(.galois_key, out);
+            std.mem.writeInt(u64, rest[0..8], gk.g, .little);
+            rest = rest[8..];
+            for (0..relin_digits) |i| rest = writePoly(&gk.a[i], writePoly(&gk.b[i], rest));
+        }
+
+        pub fn decodeGaloisKey(bytes: []const u8, out: *GaloisKey) DecodeError!void {
+            if (bytes.len != galois_key_bytes) return error.WrongLength;
+            var rest = try readHeader(.galois_key, bytes);
+            out.g = std.mem.readInt(u64, rest[0..8], .little);
+            checkGaloisElement(out.g) catch return error.InvalidGaloisElement;
+            rest = rest[8..];
+            for (0..relin_digits) |i| {
+                rest = try readPoly(rest, &out.b[i]);
+                rest = try readPoly(rest, &out.a[i]);
+            }
+        }
+
+        /// Encode `ct` into `out[0..ciphertextBytes(ct.len)]`; returns that
+        /// slice. `error.NoSpaceLeft` if `out` is shorter.
+        pub fn encodeCiphertext(ct: *const Ciphertext, out: []u8) error{NoSpaceLeft}![]u8 {
+            const n = ciphertextBytes(ct.len);
+            if (out.len < n) return error.NoSpaceLeft;
+            var rest = writeHeader(.ciphertext, out[0..n]);
+            rest[0] = @intCast(ct.len);
+            rest = rest[1..];
+            for (0..ct.len) |c| rest = writePoly(&ct.components[c], rest);
+            return out[0..n];
+        }
+
+        pub fn decodeCiphertext(bytes: []const u8) DecodeError!Ciphertext {
+            var rest = try readHeader(.ciphertext, bytes);
+            if (rest.len < 1) return error.WrongLength;
+            const len = rest[0];
+            if (len != 2 and len != 3) return error.BadComponentCount;
+            if (bytes.len != ciphertextBytes(len)) return error.WrongLength;
+            rest = rest[1..];
+            var ct: Ciphertext = .{ .components = .{ Ring.zero(.coeff), Ring.zero(.coeff), Ring.zero(.coeff) }, .len = len };
+            for (0..len) |c| rest = try readPoly(rest, &ct.components[c]);
+            return ct;
         }
     };
 }

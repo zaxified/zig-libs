@@ -84,6 +84,18 @@ const cb = inst.encrypt(&kp.pk, &pb, io);
 const sum = inst.add(&ca, &cb);                   // Dec == a+b (mod t)
 const prod = inst.relinearize(&inst.mul(&ca, &cb), &rlk); // Dec == a·b (mod t)
 const bits_left = inst.noiseBudget(&kp.sk, &prod); // remaining headroom (bits)
+
+// Standard-level chain (SEAL's BFVDefault primes), batching and rotations.
+const S = bfv.Bfv(bfv.params.secure(8192, 65537, .tc128));
+const enc = try bfv.BatchEncoder(8192).init(65537);    // t prime, ≡ 1 mod 2N
+const pt = try enc.encodeSlots(&values);                // 8192 slots, 2 rows
+var gk: S.GaloisKey = undefined;
+try s_inst.genGaloisKey(&s_kp.sk, S.galoisElement(1), io, &gk);
+const rotated = s_inst.applyGalois(&ct, &gk);           // rows rotated left by 1
+const scaled = s_inst.mulPlain(&ct, &pt);               // also addPlain/subPlain/mulScalar/negate
+const smaller = s_inst.modSwitchToNext(&ct);            // an S.Next.Ciphertext
+var bytes: [S.ciphertextBytes(2)]u8 = undefined;
+const wire = try S.encodeCiphertext(&ct, &bytes);       // decodeCiphertext(wire) on the other side
 ```
 
 ## Verify
@@ -104,9 +116,8 @@ the module's tests.
 
 ## Not provided
 
-Bootstrapping, BGV/CKKS, batching and Galois rotations, modulus switching,
-byte codecs for keys and ciphertexts, plaintext-operand ops and a parameter
-chooser: see `SPEC.md` "Backlog / deferred".
+Bootstrapping and BGV/CKKS (see `SPEC.md` "Roadmap"); SEAL's wire format;
+rotation keys composed from power-of-two steps.
 
 **Deps:** `entropy` (the `SecureSource` adapter behind `keyGen`/`encrypt`/`genRelinKey`); everything else is `std`.
 

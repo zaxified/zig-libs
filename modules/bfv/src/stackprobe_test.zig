@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe for every secret-touching entry point (`testkit.stackprobe`):
-//! residue below each burn, and the secret key / relinearisation key bytes as
+//! residue below each burn, and the secret key / relinearisation / Galois key bytes as
 //! needles in any frame. ReleaseFast only (`skipUnlessOptimized`, a runtime
 //! skip, so the body is type-checked in every mode). Probed at `bfv_toy`
 //! (N = 1024, two limbs, a 16 KiB ring); the burns scale with the ring, so the
@@ -18,6 +18,7 @@ const B = root.Bfv(root.params.bfv_toy);
 var kp: B.KeyPair = undefined;
 var kp2: B.KeyPair = undefined;
 var rlk: B.RelinKey = undefined;
+var gk: B.GaloisKey = undefined;
 var ct: B.Ciphertext = undefined;
 var pt: B.Plaintext = undefined;
 
@@ -54,6 +55,7 @@ test "STACKPROBE: no secret key residue after any entry point" {
     _ = try P.run("genRelinKey", B.genRelinKey, .{ &inst, &kp.sk, io, &rlk }, &[_][]const u8{ sn, std.mem.sliceAsBytes(&rlk.b[0].limbs) }, .{});
     _ = try P.run("decrypt", B.decrypt, .{ &inst, &kp.sk, &ct }, &[_][]const u8{sn}, .{});
     _ = try P.run("noiseBudget", B.noiseBudget, .{ &inst, &kp.sk, &ct }, &[_][]const u8{sn}, .{});
+    _ = try P.run("genGaloisKey", B.genGaloisKey, .{ &inst, &kp.sk, B.galoisElement(1), io, &gk }, &[_][]const u8{ sn, std.mem.sliceAsBytes(&gk.b[0].limbs) }, .{});
 }
 
 // ── security-grade set (N = 8192, 4 limbs): burns `rings(Ring, 16)` ≈ 4 MiB ──

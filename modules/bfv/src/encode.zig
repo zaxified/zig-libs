@@ -12,8 +12,8 @@
 //!     decoded by Horner evaluation at `t` — a simple scalar encoding.
 //!
 //! CRT **batch/SIMD slot** encoding (an NTT mod `t`, giving `N` independent
-//! integer slots) is a deferred increment (SPEC.md): it needs `t ≡ 1 mod 2N`
-//! and is orthogonal to the Part-1 backbone. All of this is REAL/ungated.
+//! integer slots; needs a prime `t ≡ 1 mod 2N`) lives in `batch.zig`. All of
+//! this is REAL/ungated.
 
 const std = @import("std");
 
