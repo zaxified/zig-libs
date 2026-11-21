@@ -1216,12 +1216,20 @@ fn doubleDiagText(comptime L: usize) []const u8 {
 
 const have_avx = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx);
 
+/// Whether `zeroWords` may use vector stores (not under the self-hosted backend, see there).
+const vector_stores = builtin.zig_backend != .stage2_x86_64;
+
 /// Zero `n` words with vector stores, in asm. Two reasons not to write
 /// `@memset`/`secureZero`: past a few hundred bytes LLVM lowers `@memset` to
 /// a call into Zig 0.16's byte-wise `compiler_rt.memset` (735 cycles for the
 /// 768-byte `A` of an L = 48 multiply, about a quarter of its product phase —
 /// perf on the bench host), and an asm store with a memory
 /// clobber can never be elided, so the same routine is the wipe.
+///
+/// self-hosted backend: its assembler rejects a vector store to memory
+/// (`unknown size: '0(%%rdi)'` for `vmovdqu`/`movdqu`, Zig 0.17.1), so that
+/// backend (the edit loop only) gets one `movq $0` per word — still an asm
+/// store, still never elided.
 pub fn zeroWords(comptime n: usize, p: *[n]u64) void {
     const text = comptime blk: {
         @setEvalBranchQuota(100_000);
@@ -1229,7 +1237,7 @@ pub fn zeroWords(comptime n: usize, p: *[n]u64) void {
         const vw = if (have_avx) 4 else 2;
         s.put(if (have_avx) " vpxor %%xmm0, %%xmm0, %%xmm0\n" else " pxor %%xmm0, %%xmm0\n");
         var i: usize = 0;
-        while (i + vw <= n) : (i += vw) {
+        while (vector_stores and i + vw <= n) : (i += vw) {
             s.put((if (have_avx) " vmovdqu %%ymm0, " else " movdqu %%xmm0, ") ++ decStr(8 * i) ++ "(%%rdi)\n");
         }
         while (i < n) : (i += 1) s.put(" movq $0, " ++ decStr(8 * i) ++ "(%%rdi)\n");
