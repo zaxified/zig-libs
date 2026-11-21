@@ -37,7 +37,7 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 per `SURVEY-PLAYBOOK.md`; stars and 
 | `list [pattern]`, `call`, `listen [pattern...]` | done (`Client.subscribe`, `Client.subscribeMany`: one `register` per pattern on one connection, each answered STATUS 0 [V, `listen_two_register`: an event matching one pattern was printed once]); list fails on a non-zero closing STATUS instead of returning an empty "complete" listing, and a closing STATUS without a code is `BadMessage` [V: the real LOOKUP closes with STATUS 0 after the entries and 4 for no match, always with the code attr] |
 | `-t <timeout>` | done: `Options.call_timeout_ms`, `Client.openWith` [V]. `-t 0` (no limit) is a parity gap kept on purpose, see *What is deliberately not done*: 0 is `error.Unsupported` and a caller wanting a long call passes a large value |
 | `send <type> [json]` | done: `Client.sendEvent`; the request is byte-identical to the real CLI's (INVOKE of the registry's `send` with `{id, data}`), answered by one STATUS 0, delivered to a `listen`er as an INVOKE with NO_REPLY [V]; an ordinary user is refused with 6 [V] |
-| `wait_for <obj>...` | done: `Client.waitFor`, a 50 ms LOOKUP poll under a deadline. [V] only for the LOOKUP it sends (byte-identical to the real CLI's `list <name>` request, answered by the real reply, replayed from `lookup_match`); the real CLI instead registers for `ubus.object.add` events (captured: ADD_OBJECT, `register`, LOOKUP) and that path is not reproduced (*Backlog / deferred*), so the mark covers the observable result and the 50 ms latency bound, not the same wire |
+| `wait_for <obj>...` | done: `Client.waitFor`, a 50 ms LOOKUP poll under a deadline. [V] only for the LOOKUP it sends (byte-identical to the real CLI's `list <name>` request, answered by the real reply, replayed from `lookup_match`); the real CLI instead registers for `ubus.object.add` events (captured: ADD_OBJECT, `register`, LOOKUP) and that path is not reproduced (*What is deliberately not done*), so the mark covers the observable result and the 50 ms latency bound, not the same wire |
 | `monitor` | done: `Client.monitor` / `MonitorStream`. The request is the CLI's INVOKE `add` on the daemon's monitor object (id 3), byte-identical; the daemon then sends a MONITOR frame per routed message (client, peer, direction, seq, type, the message's own attrs), including the answer to the request itself, before the request's STATUS; `-m`/`-M` are filtered on the CLI's side (the request does not change), so they are the caller's. Every line of the real CLI's output for the captured session is reproduced field for field [V]. A frame with a repeated attr id, a non-UTF-8 string or a missing mandatory attr is dropped whole and counted in `malformed` (no duplicate JSON key, no half-written line); ids are written unsigned where the CLI prints them signed; a message type is written by name only for the five the CLI printed in the capture (hello, status, data, lookup, invoke), else as its number |
 | `subscribe <object>` / notifications | done: `Client.subscribeObject` / `ObjectStream`. ADD_OBJECT (no attrs), LOOKUP, SUBSCRIBE{OBJID, TARGET}, byte-identical to the real CLI's; only a LOOKUP entry whose OBJPATH is the requested name counts (it must carry its OBJID, else `BadMessage`; no entry at all, even after STATUS 0, is `NotFound`); a notification arrives as an INVOKE (METHOD = type, DATA) the subscriber must answer with STATUS 0 (same seq and peer) or the notifier waits; UNSUBSCRIBE from the daemon naming our object and the target sets `target_gone`, any other is counted in `malformed`; a notification whose attrs cannot be walked is counted and answered STATUS 2 only if what was read before the damage already shows it is ours and wants an answer [V for the choreography; the answer to a garbled frame is a decision, not an observation: a real notifier waits for a STATUS, a stray one for a NO_REPLY event was not tried]. A name that is empty, has `*` or a NUL, or cannot fit a message is refused before any connection (`Unsupported`, `TooLarge`). Subscribing to an object that does not exist is `NotFound` (STATUS 4) [V] |
 | object provider side (`ubus_add_object`, handlers, `ubus_send_reply`, `ubus_notify`) | refused by design, see *What is deliberately not done*; the role stays `client` |
@@ -213,12 +213,15 @@ authoritative). The `walk` rows are close to the reference's JCC-padded build, s
 - **Monitor filters** (`-m <type>`, `-M r|t`) stay the caller's: a `MonitorStream.setFilter` would only save the
   caller a JSON parse; nothing needs it.
 - **A check of a reply's `peer`**: see *Threat model / Limits*.
+- **`ubus.object.add`-driven `wait_for`** (the real CLI registers for the event: ADD_OBJECT, `register`, LOOKUP, as
+  captured). `Client.waitFor` has the same observable result (block until every object exists, then return) and
+  bounds the wait at 50 ms of extra latency; the event path would also need a second connection and a fallback to
+  polling, because without ACL files `ubusd` lets only uid 0 register events (an ordinary user gets STATUS 6), so the
+  poll must stay. A latency gain of at most 50 ms for a one-off startup wait is not worth the state.
 
 ## Backlog / deferred
 
-- **`ubus.object.add`-driven `wait_for`**: would remove the 50 ms polling latency. The shape is visible in the
-  capture (the real CLI's `wait_for` = ADD_OBJECT, `register` with the object name, LOOKUP of everything); deferred
-  until a consumer needs lower latency, because it adds state.
+None open.
 
 ## Anchoring
 
