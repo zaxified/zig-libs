@@ -111,6 +111,10 @@ pub const header_annotations = @import("header_annotations.zig");
 pub const schema_check = @import("schema_check.zig");
 /// Typed tools: `schemaOf(T)` and `ToolCall.argsAs(T)`.
 pub const typed = @import("typed.zig");
+
+/// MCP Apps helpers (`io.modelcontextprotocol/ui`): tool and resource `_meta`,
+/// an HTML app resource, the client's declaration; see `apps.zig`.
+pub const apps = @import("apps.zig");
 /// The JSON Schema text for a Zig type, for `Tool.input_schema` /
 /// `Tool.output_schema` (see `typed.zig` for the mapping).
 pub const schemaOf = typed.schemaOf;
@@ -551,6 +555,10 @@ pub const ClientCapabilities = struct {
     roots: bool = false,
     /// `roots.listChanged`.
     roots_list_changed: bool = false,
+    /// `extensions["io.modelcontextprotocol/ui"].mimeTypes` lists
+    /// `text/html;profile=mcp-app`: the client renders MCP Apps (see
+    /// `apps.zig`). Any other shape of the declaration grants nothing.
+    apps: bool = false,
 
     /// Parse the `capabilities` value from `initialize` params. Anything
     /// unparseable yields all-false (fail closed) — a malformed handshake must
@@ -603,6 +611,16 @@ pub const ClientCapabilities = struct {
             if (list_changed == .malformed) break :grant;
             c.roots = true;
             c.roots_list_changed = list_changed == .present;
+        }
+        if (present(caps.object.get("extensions"))) |e| apps: {
+            if (e != .object) break :apps;
+            const ui = present(e.object.get("io.modelcontextprotocol/ui")) orelse break :apps;
+            if (ui != .object) break :apps;
+            const mimes = present(ui.object.get("mimeTypes")) orelse break :apps;
+            if (mimes != .array) break :apps;
+            for (mimes.array.items) |m| {
+                if (m == .string and std.mem.eql(u8, m.string, apps.mime_type)) c.apps = true;
+            }
         }
         return c;
     }
@@ -3571,6 +3589,12 @@ pub const Server = struct {
     /// field is truncated (at a UTF-8 boundary), never a reason to reject
     /// the handshake.
     max_client_info_field_len: usize = 256,
+    /// Cap, in bytes, on the uris of every open `subscriptions/listen` over
+    /// every peer together: `max_listens` listens of `max_listen_uri_bytes`
+    /// each could otherwise hold about 1 GiB. A listen that would pass it is
+    /// answered "Too many subscriptions". Unbounded by default, as the
+    /// references are; a server that takes many peers should set it.
+    max_listen_bytes: usize = std.math.maxInt(usize),
     /// Outbound (server→client) requests awaiting the client's response.
     pending: std.ArrayList(Pending) = .empty,
     /// Next server→client request id. Monotonic and **never reused**: an id is
@@ -4588,7 +4612,8 @@ pub const Server = struct {
             uri_bytes += u.len;
         }
         if (uris.items.len > max_subscriptions_per_peer or uri_bytes > max_listen_uri_bytes or
-            self.countListens(peer) >= max_subscriptions_per_peer or self.listens.items.len >= max_listens)
+            self.countListens(peer) >= max_subscriptions_per_peer or self.listens.items.len >= max_listens or
+            (self.max_listen_bytes != std.math.maxInt(usize) and self.listenUriBytes() +| uri_bytes > self.max_listen_bytes))
             return sendError(arena, out, id, error_code.invalid_params, "Too many subscriptions");
         l = try self.ownListen(l, id, uris.items);
         // The acknowledgment is built before the entry is registered and the
@@ -4627,6 +4652,15 @@ pub const Server = struct {
             copied += 1;
         }
         return owned;
+    }
+
+    /// The uri bytes of every open listen (only asked when `max_listen_bytes` is set).
+    fn listenUriBytes(self: *const Server) usize {
+        var n: usize = 0;
+        for (self.listens.items) |l| for (l.uris) |u| {
+            n += u.len;
+        };
+        return n;
     }
 
     fn countListens(self: *const Server, peer: u64) usize {
@@ -5871,6 +5905,7 @@ test {
     _ = schema_check;
     _ = uri_template;
     _ = typed;
+    _ = apps;
     _ = @import("sdk_oracle.zig");
 }
 
@@ -13376,6 +13411,34 @@ test "mutation 2026-11-11: a peer holds 1024 listens and 1024 subscriptions; all
         try s.session_subs.append(testing.allocator, .{ .peer = 100 + s.session_subs.items.len / 1000, .uri = try testing.allocator.dupe(u8, "z") });
     }
     try testing.expect(try answeredWith(&s, over, 8, "Too many subscriptions"));
+}
+
+test "max_listen_bytes: the uris of all open listens together are capped, per peer or not; off by default" {
+    var st = std.heap.ArenaAllocator.init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    const ack = "notifications/subscriptions/acknowledged";
+    const sixty: [60]u8 = @splat('u');
+    const uris = [_][]const u8{&sixty};
+    // No cap: as before.
+    try testing.expect(try answeredWith(&s, try listenLine(a, "a", &uris), 0, ack));
+    s.max_listen_bytes = 100;
+    // 60 held, 60 more would be 120 > 100, from this peer or another.
+    try testing.expect(try answeredWith(&s, try listenLine(a, "b", &uris), 0, "Too many subscriptions"));
+    try testing.expect(try answeredWith(&s, try listenLine(a, "c", &uris), 1, "Too many subscriptions"));
+    // 40 more fit exactly (100), 41 do not.
+    const forty: [40]u8 = @splat('v');
+    const f1 = [_][]const u8{&forty};
+    const forty1: [41]u8 = @splat('w');
+    const f2 = [_][]const u8{&forty1};
+    try testing.expect(try answeredWith(&s, try listenLine(a, "d", &f2), 1, "Too many subscriptions"));
+    try testing.expect(try answeredWith(&s, try listenLine(a, "e", &f1), 1, ack));
+    // Dropping a peer's listens frees its share.
+    s.forgetPeer(0);
+    try testing.expect(try answeredWith(&s, try listenLine(a, "f", &uris), 2, ack));
 }
 
 test "mutation 2026-11-11: subscribe and unsubscribe are per peer, idempotent, and unsubscribing an unknown uri adds nothing" {

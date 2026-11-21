@@ -48,6 +48,10 @@
 //!     and within a relative 1e-9 of a whole number (so `0.07` is a multiple of
 //!     `0.01`, which ajv and Python jsonschema refuse by default);
 //!   - `uniqueItems` charges one step per comparison, so it shares the budget;
+//!   - a string (`minLength` / `maxLength`) or a number literal is charged one
+//!     extra step per 4 KiB it holds, once per node it is checked at: the work is
+//!     linear in its size, so many keywords over one huge value end in the budget
+//!     rather than costing one step each;
 //!   - `then` / `else` without `if` are compiled and ignored (as in the spec);
 //!   - instance nesting deeper than `max_depth` is a `depth` failure, never a
 //!     stack overflow.
@@ -70,6 +74,9 @@ pub const max_depth = 256;
 /// branch, so an attacker-chosen instance can make the work exponential; the
 /// budget turns that into a `"budget"` failure.
 pub const max_steps: u32 = 1_000_000;
+
+/// A string or number literal is charged one step per `1 << size_shift` bytes.
+const size_shift = 12;
 
 pub const CompileError = error{
     OutOfMemory,
@@ -520,6 +527,9 @@ const Checker = struct {
     }
 
     fn applyObject(c: Checker, o: std.json.ObjectMap, inst: std.json.Value, path: ?*const Path, depth: u32, refs: u32) error{OutOfMemory}!?Failure {
+        // A number literal is parsed (`toNum`) at each node that looks at it:
+        // linear in its digits, so its size is charged (see the module doc).
+        if (inst == .number_string) if (try c.spend(inst.number_string.len >> size_shift, path)) |f| return f;
         if (o.get("$ref")) |r| {
             if (refs >= max_ref_depth) return c.fail(path, "$ref", "reference depth limit {d} exceeded", .{@as(u32, max_ref_depth)});
             if (r == .string) {
@@ -594,10 +604,12 @@ const Checker = struct {
     fn string(c: Checker, o: std.json.ObjectMap, s: []const u8, path: ?*const Path) error{OutOfMemory}!?Failure {
         // `pattern` is deliberately not checked (no regex engine here).
         if (o.get("minLength")) |l| if (asCount(l)) |lim| {
+            if (try c.spend(s.len >> size_shift, path)) |f| return f;
             const n = codePoints(s);
             if (n < lim) return c.fail(path, "minLength", "string has {d} characters, at least {d} required", .{ n, lim });
         };
         if (o.get("maxLength")) |l| if (asCount(l)) |lim| {
+            if (try c.spend(s.len >> size_shift, path)) |f| return f;
             const n = codePoints(s);
             if (n > lim) return c.fail(path, "maxLength", "string has {d} characters, at most {d} allowed", .{ n, lim });
         };
@@ -1356,4 +1368,27 @@ test "mutation 2026-11-11: a reference name is unescaped over exactly its own by
     try testing.expect(unescapeName(&buf2, "a~") == null);
     var buf3: [8]u8 = undefined;
     try testing.expectEqualStrings("a~b/c", unescapeName(&buf3, "a~0b~1c").?);
+}
+
+test "step budget: a huge string or number literal is charged by its size, so many keywords over it end in the budget" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const big = try a.alloc(u8, 1 << 20); // 256 steps per scan
+    @memset(big, 'a');
+    const sv = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"minLength\":1,\"maxLength\":2000000}", .{});
+    const sch = try Schema.compile(a, sv);
+    // Two scans of 1 MiB: 512 steps plus the application's own.
+    try testing.expect((try sch.validateBudget(a, .{ .string = big }, 600)) == null);
+    const f = (try sch.validateBudget(a, .{ .string = big }, 400)).?;
+    try testing.expectEqualStrings("budget", f.keyword);
+    // The same string costs next to nothing when it is short.
+    try testing.expect((try sch.validateBudget(a, .{ .string = big[0..4000] }, 4)) == null);
+    // A number literal of a million digits is parsed at the node: 256 steps.
+    const digits = try a.alloc(u8, 1 << 20);
+    @memset(digits, '9');
+    const nv = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"minimum\":0}", .{});
+    const ns = try Schema.compile(a, nv);
+    try testing.expectEqualStrings("budget", (try ns.validateBudget(a, .{ .number_string = digits }, 200)).?.keyword);
+    try testing.expect((try ns.validateBudget(a, .{ .number_string = digits }, 300)) == null);
 }

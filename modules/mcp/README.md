@@ -310,6 +310,10 @@ Not implemented: sampling-with-tools (`tools`/`toolChoice`), `includeContext`,
   `removeTool`/`removeResource`/`removePrompt`/`removeResourceTemplate`.
 - **Extensions:** `addMethod` / `addNotification` for vendor methods;
   `setCapabilityExtras(extensions_json, experimental_json)`.
+  **MCP Apps** (`mcp.apps`): `toolMeta` / `resourceMeta` for the `_meta.ui` of a tool and of a
+  `ui://` resource, `HtmlResource` for a fixed page served as `text/html;profile=mcp-app`,
+  `extensions_json` for `setCapabilityExtras`, `ClientCapabilities.apps` for what the client
+  declared, `verify(&server)` for unbound or mis-typed `ui://` resources.
 
 Tests: `zig build test-mcp` — JSON-RPC parse/encode incl. all standard error
 codes, version negotiation, golden `tools/list`/`initialize` JSON, ctx-pointer

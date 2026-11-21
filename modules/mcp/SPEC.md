@@ -258,7 +258,8 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   (`tools/schema_suite`, `src/schema_suite_vectors.zig`). A schema outside the subset is not refused: that one tool is
   simply not validated (`compile` reports `UnsupportedKeyword`, the server keeps the tool). `pattern` and the
   annotation keywords are accepted and ignored. Work is bounded: `max_steps` schema applications (a budget
-  failure rather than exponential work), `max_depth` nesting, `max_ref_depth` `$ref` hops. `Server.validate_tool_io =
+  failure rather than exponential work; a string under `minLength`/`maxLength` and a number literal are also charged one step per 4 KiB, so
+  many keywords over one huge value end in the budget), `max_depth` nesting, `max_ref_depth` `$ref` hops. `Server.validate_tool_io =
   false` turns both checks off.
 - **`x-mcp-header` annotations (`src/header_annotations.zig`).** `Server.addTool` refuses a tool whose annotations
   break the 2026-07-28 rules (server/tools.mdx and the Streamable HTTP "Schema Extension"), because an HTTP client
@@ -333,7 +334,9 @@ that the user who opens it is the user it was minted for) is the application's, 
 
 - Per-peer caps count entries, not bytes: a peer may hold up to `max_subscriptions_per_peer` listens, each with up to
   `max_listen_uri_bytes` of uris (`max_listens` in total, `max_subscription_uri_len` per uri), and a `max_line_len`
-  (16 MiB) line can parse into a much larger `std.json.Value`. The transport owns the real memory limit.
+  (16 MiB) line can parse into a much larger `std.json.Value`. `Server.max_listen_bytes` (default unbounded, as the reference
+  SDKs) caps the uri bytes of every open listen over all peers together; without it the table-wide bound is about 1 GiB
+  (`max_listens` × `max_listen_uri_bytes`). The transport owns the real memory limit.
 - `readLine` keeps its buffer capacity after one long line.
 - A pending server→client request never expires on stdio: `max_pending` (256) unanswered sampling/elicitation requests
   block further ones until `cancelRequest`.
@@ -467,6 +470,17 @@ No diary here: the card's `**Performance:**` line carries the figures. The bench
 (`tools/bench.zig`; five stdio sessions of 64 requests each against the Go SDK, `tools/go_bench`, and the Rust SDK,
 `tools/rs_field`); the TypeScript SDK needs Node.
 
+**MCP Apps (`apps.zig`).** The Python SDK's `mcp.server.apps` and the TypeScript `registerAppTool` / `registerAppResource` over the
+existing `meta_json` and `setCapabilityExtras`: `toolMeta(arena, "ui://…", visibility)` writes `{"ui":{"resourceUri":…,"visibility":[…]}}`,
+`resourceMeta(arena, .{ .csp, .permissions, .domain, .prefers_border })` the resource side (spec key spelling: `connectDomains`,
+`clipboardWrite`, …, only what is set), `HtmlResource{…}.resource()` a `Resource` serving a fixed document with mime type
+`text/html;profile=mcp-app`, `extensions_json` the capability to advertise, and `ClientCapabilities.apps` is true when the client
+declared `extensions["io.modelcontextprotocol/ui"].mimeTypes` listing that mime type (a wrong shape of the declaration grants
+nothing, like every other capability). `verify(&server)` makes the two checks the Python SDK makes when a server takes its `Apps`:
+a tool naming a `ui://` resource finds it registered (`UnboundUiResource`), and every `ui://` resource carries the app mime type
+(`WrongMimeType`). Tests: golden meta text, an end-to-end `tools/list` + `resources/read` + `resources/list`, `verify`, ten
+shapes of the client declaration. The iframe bridge belongs to the host and the view.
+
 ## What is deliberately not done
 
 - **Logging** (`logging/setLevel`, `notifications/message`, a per-request `logLevel`): spec 2026-07-28 logging.mdx says
@@ -486,6 +500,15 @@ No diary here: the card's `**Performance:**` line carries the figures. The bench
 - **Typed-tools extras:** unions and `oneOf`, `default` emission, `format`/`pattern`/`minLength` constraints (Zig
   types carry none), a `description` on the struct itself.
 - **Framework ergonomics** (middleware, OpenTelemetry, lifespan) and **OAuth**: `mcp-http` / `aaa-gate`, not the core.
+- **A Skills extension helper:** the Python SDK 2.3.0 documents an Apps helper (`mcp.server.apps`) and nothing for skills (its
+  `ext-apps` repository ships agent skills, which are not a protocol extension), so there is no reference API to follow;
+  `addMethod`, `Resource.meta_json` and `setCapabilityExtras` are the building blocks if a skills extension appears.
+- **Caps that are bounded and left as they are:** the per-peer and table-wide listen and subscription counts
+  (`max_subscriptions_per_peer`, `max_listens`, `max_session_subscriptions`) are linear scans of tables of at most 4096 and 65 536
+  entries; a consumer that takes many peers sets `Server.max_peers` and `max_listen_bytes`. `uri_template.match` is O(v·n·m)
+  by construction (no backtracking: each variable is one scan plus one substring search, and a failed scan ends the match),
+  so one adversarial template costs at most the uri length times its longest literal, and the caps (8 KiB template, 64 KiB
+  uri) bound that; no input makes it super-polynomial (analysed, not measured).
 - **Removing the session path:** both eras stay until no consumer's client needs the old one and the spec's own window
   for what it deprecates has passed.
 
@@ -499,12 +522,6 @@ No diary here: the card's `**Performance:**` line carries the figures. The bench
   buffer.
 - **`mcp-http` still answers `subscriptions/listen` with an empty filter and closes** (its README); wiring its
   held-open SSE stream to `PushSink` is `mcp-http`'s item, the mechanism here is complete.
-- **Apps and Skills extension helpers** (the Python SDK has them): on demand, with `addMethod` and
-  `setCapabilityExtras` as the building blocks.
-- **LOW, no-panic sweep, not fixed:** large but bounded caps (listen uris up to about 1 GiB in total across peers,
-  linear scans of the pending and listen tables); `uri_template.match` costs about n × literal length per template on
-  adversarial uris (hypothesis, unmeasured); the schema step budget is not size-aware (`codePoints`/`toNum` over a
-  16 MiB string cost one step).
 - **Speed against the TypeScript and Python SDKs is not measured** (the card compares with the Go and Rust SDKs only).
 
 ## Anchoring
