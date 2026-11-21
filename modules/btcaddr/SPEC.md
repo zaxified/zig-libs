@@ -40,7 +40,7 @@ check and secret scratch wiped; checked against Core's own 140-row corpus in bot
 **Where we are behind:** no output descriptors, no P2TR key-path construction from an internal
 key (needs the tweak — `bip340`/`taproot` layer), no address-type *policy* checks (dust,
 standardness), no bech32 error location, no `Address` generic over "unchecked" phantom
-state (→ Backlog).
+state (→ *What is deliberately not done*, *Roadmap*).
 
 ## What this module is, and what it is not
 
@@ -128,13 +128,29 @@ helper results, whose expected values were derived independently with Python `ha
   selection, WIF length / flag / key range, helper bounds).
 - **Mutation run:** Whole-module mutation run (mutant schemata, ReleaseSafe; 84 mutants over `root.zig`: network constants, `classify`, script/address conversion, Base58Check and segwit decode, WIF decode/encode, the constant-time `keyInRange`, public-key and script-size helpers): 84 killed, 0 equivalent, 0 open.
 
+## What is deliberately not done
+
+- **P2TR from an internal key** (BIP341 tweak): Bitcoin Core does it in its descriptor/signing layer, not in
+  `DecodeDestination`/`GetScriptForDestination`; here it belongs with `bip340` (the tweak), and this module takes the
+  tweaked output key.
+- **An "unchecked" address type** (rust-bitcoin's `Address<NetworkUnchecked>`): the reference (Core) has none — its
+  `DecodeDestination` takes the chain's parameters, as `decodeFor` does; `Decoded.chains` carries the network set for a
+  caller that decodes first and decides later.
+- **Typed hints for non-standard scripts** (P2PK, bare multisig, `OP_RETURN`): none of them has an address, which is
+  all this module encodes; Core's `ExtractDestination` reports them as non-address destinations, and a script
+  classifier belongs with `bitcoinscript`.
+- **Curve validation of public keys** in the key helpers: Core's `CPubKey::IsValid` checks length and prefix only (the
+  full point check is the separate `IsFullyValid`, used by the signing code), and this module would need `k256` for it.
+
 ## Backlog / deferred
 
-- **Output descriptors** (`addr()`, `pkh()`, `wpkh()`, `tr()` …) — not now; needs a Script/miniscript layer above.
-- **P2TR from an internal key** (BIP341 tweak) — belongs with `bip340`/`bitcointx`; this module takes the tweaked key.
-- **"Unchecked" address type** (rust-bitcoin's `Address<NetworkUnchecked>`): a value type carrying the `Chains` set that must be `assume/require`d — the current `Decoded.chains` covers the information but not the type-level enforcement. Not now.
-- **Non-standard-script hints** (P2PK, bare multisig, `OP_RETURN` data) as a typed `ScriptKind` instead of `UnsupportedScript` — never for addresses (they have none); maybe as `classify` extension if a consumer asks.
-- **Public-key validation** via `k256` (point on curve) in the key helpers — not now: would add a dependency for a check most callers already made.
+None open.
+
+## Roadmap
+
+- **Output descriptors** (`addr()`, `pkh()`, `wpkh()`, `tr()` …) — needs a Script/miniscript layer above.
+  Size: weeks to months — BIP 380-386 parsing, checksums, key expressions with BIP32 paths and the taproot tree;
+  its own module above `btcaddr`, `bip32` and `bip340`.
 
 ## Anchoring
 
