@@ -22,7 +22,8 @@ length prefix). No third-party code.
 - **One connection per request.** Every request is a fresh `connect → write
   one frame → read one frame → close`. No persistent or multiplexed
   connection; `acceptOne` + `handleOne` service exactly one connection at a
-  time.
+  time, and `Mux` is the single-threaded poll loop that serves many at once
+  (per-connection deadline, `max_conns`).
 - **No baked-in dispatch.** `Server.handleOne` calls a caller-supplied
   `dispatch(ctx, req_bytes, gpa) !reply_bytes`. All command handling lives in
   the app.
@@ -85,8 +86,7 @@ a socket fd are also exported for callers that need to build their own loop.
 
 ## Not provided
 
-No push/notify (subscribers poll `Bus.version`), no persistent or multiplexed connections, no
-multi-connection concurrency (one connection is serviced at a time; pass `Options.timeout_ms` so a
-stalled peer cannot hold the loop), no in-band password/token authentication (access is the socket
+No push/notify (subscribers poll `Bus.version`), no persistent connections, no
+parallel `dispatch` (`Mux` interleaves connections but runs one request at a time), no in-band password/token authentication (access is the socket
 path's permissions plus the `PeerPolicy` uid check), pathname sockets only. See SPEC *What is
-deliberately not done* and *Backlog / deferred*.
+deliberately not done* and *Roadmap*.

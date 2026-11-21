@@ -7,8 +7,9 @@
 //!    `Bus` is lock-free and MUST be touched from that one thread/loop only.
 //!  * **One connection per request.** Every request is a fresh `connect →
 //!    write one frame → read one frame → close`. There is no persistent
-//!    multiplexed connection and no server-side concurrency: `acceptOne` +
-//!    `handleOne` service exactly one connection at a time.
+//!    multiplexed connection. `acceptOne` + `handleOne` service exactly one
+//!    connection at a time; `Mux` is the single-threaded poll loop that serves
+//!    many at once, each with its own deadline.
 //!  * **No baked-in dispatch.** `Server.handleOne` takes a caller-supplied
 //!    `dispatch` callback `fn(ctx, req_bytes, gpa) !reply_bytes`. All
 //!    application command handling lives in the app, never in this module.
@@ -493,6 +494,242 @@ pub const Server = struct {
             return if (fw.timed_out) error.Timeout else e;
         fw.interface.flush() catch |e|
             return if (fw.timed_out) error.Timeout else e;
+    }
+};
+
+// ── multiplexed server loop ─────────────────────────────────────────────────
+
+/// Options of `Mux`.
+pub const MuxOptions = struct {
+    /// Connections in service at once. Further clients wait in the listen backlog (accepting
+    /// resumes as slots free), so a flood cannot exhaust descriptors or memory.
+    max_conns: u16 = 64,
+    /// Budget for one connection from accept to the end of its reply: a client that has not
+    /// delivered a whole frame, or has not drained its reply, by then is closed (counted in
+    /// `Mux.timed_out`). `null` = no deadline (a stalled client then holds its slot forever).
+    timeout_ms: ?u32 = 5000,
+    /// Frame limits, as `Server.handleOne`'s.
+    limits: framing.Limits = .{},
+};
+
+/// A single-threaded, poll-based server loop over a `Server`: many connections are in flight at
+/// once, each read and written with non-blocking I/O against its own deadline, so one slow or
+/// stalled client no longer blocks the others. `dispatch` still runs one request at a time on
+/// the calling thread, so the `Bus` and the owner's state keep their single-owner discipline.
+/// The connection model is unchanged (one framed request, one framed reply, close), the peer
+/// admission policy of the `Server` applies at accept.
+///
+/// Drive it from the owner's loop: `while (running) _ = try mux.step(ctx, dispatch, 250);`.
+pub const Mux = struct {
+    server: *Server,
+    gpa: std.mem.Allocator,
+    opts: MuxOptions,
+    conns: []Conn,
+    pfds: []linux.pollfd,
+    /// Connections currently in service.
+    open: usize = 0,
+    /// Replies fully written.
+    served: u64 = 0,
+    /// Connections closed for blowing `timeout_ms`.
+    timed_out: u64 = 0,
+    /// Connections closed for a bad frame, an early EOF, an I/O error or a failing `dispatch`.
+    failed: u64 = 0,
+
+    const Conn = struct {
+        fd: Fd = -1,
+        deadline: Deadline = .{},
+        dec: framing.Decoder = undefined,
+        out: []u8 = &.{},
+        out_off: usize = 0,
+        writing: bool = false,
+    };
+
+    pub const StepError = error{ OutOfMemory, PollFailed };
+
+    pub fn init(gpa: std.mem.Allocator, server: *Server, opts: MuxOptions) std.mem.Allocator.Error!Mux {
+        const n: usize = @max(opts.max_conns, 1);
+        const conns = try gpa.alloc(Conn, n);
+        errdefer gpa.free(conns);
+        @memset(conns, .{});
+        const pfds = try gpa.alloc(linux.pollfd, n + 1);
+        return .{ .server = server, .gpa = gpa, .opts = opts, .conns = conns, .pfds = pfds };
+    }
+
+    /// Close every connection still open and free the tables. The `Server` stays the caller's.
+    pub fn deinit(self: *Mux) void {
+        for (self.conns) |*c| if (c.fd >= 0) self.drop(c);
+        self.gpa.free(self.conns);
+        self.gpa.free(self.pfds);
+        self.* = undefined;
+    }
+
+    fn drop(self: *Mux, c: *Conn) void {
+        closeFd(c.fd);
+        c.dec.deinit(self.gpa);
+        if (c.out.len != 0) self.gpa.free(c.out);
+        c.* = .{};
+        self.open -= 1;
+    }
+
+    /// One round: wait up to `poll_ms` (-1 = until something happens; shortened to the nearest
+    /// connection deadline) for readiness, accept a pending client when a slot is free, read what
+    /// arrived, run `dispatch` for every connection whose request is complete, write replies as far
+    /// as the sockets take them, and close the expired. Returns the number of requests dispatched.
+    ///
+    /// `dispatch(ctx, req, scratch) ![]const u8` is `Server.handleOne`'s callback; `scratch` is
+    /// `arena.allocator()` and the arena is reset after each request once the reply is copied. An
+    /// error from `dispatch` closes that one connection (no reply, counted in `failed`); it does
+    /// not stop the loop.
+    pub fn step(
+        self: *Mux,
+        ctx: anytype,
+        comptime dispatch: fn (@TypeOf(ctx), []const u8, std.mem.Allocator) anyerror![]const u8,
+        arena: *std.heap.ArenaAllocator,
+        poll_ms: i32,
+    ) StepError!usize {
+        // 1. the poll set: slot 0 is the listen socket, switched off while every slot is taken.
+        self.pfds[0] = .{ .fd = if (self.open < self.conns.len) self.server.listen_fd else -1, .events = linux.POLL.IN, .revents = 0 };
+        var wait_ms = poll_ms;
+        for (self.conns, 0..) |*c, i| {
+            self.pfds[i + 1] = .{ .fd = c.fd, .events = if (c.writing) linux.POLL.OUT else linux.POLL.IN, .revents = 0 };
+            if (c.fd >= 0 and c.deadline.end_ns != null) {
+                const left = c.deadline.pollMs();
+                if (wait_ms < 0 or left < wait_ms) wait_ms = left;
+            }
+        }
+        const rc = linux.poll(self.pfds.ptr, @intCast(self.pfds.len), wait_ms);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => return 0,
+            else => return error.PollFailed,
+        }
+
+        // 2. accept (one per round; the listen socket stays readable while more wait).
+        if (self.pfds[0].revents & linux.POLL.IN != 0) try self.acceptOneNonBlocking();
+
+        // 3. service ready connections.
+        var dispatched: usize = 0;
+        for (self.conns, 0..) |*c, i| {
+            if (c.fd < 0) continue;
+            const re = self.pfds[i + 1].revents;
+            if (re == 0) continue;
+            if (c.writing) {
+                self.flushReply(c);
+            } else if (try self.readRequest(c, ctx, dispatch, arena)) dispatched += 1;
+        }
+
+        // 4. deadlines.
+        for (self.conns) |*c| {
+            if (c.fd < 0) continue;
+            if (c.deadline.end_ns) |end| if (Deadline.nowNs() >= end) {
+                self.timed_out +|= 1;
+                self.drop(c);
+            };
+        }
+        return dispatched;
+    }
+
+    fn acceptOneNonBlocking(self: *Mux) StepError!void {
+        const rc = linux.accept4(self.server.listen_fd, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR, .AGAIN, .CONNABORTED => return,
+            // EMFILE/ENFILE/ENOBUFS/ENOMEM: no descriptor to give; the client waits in the backlog.
+            else => return,
+        }
+        const fd: Fd = @intCast(rc);
+        if (!self.server.admit(fd)) return;
+        for (self.conns) |*c| {
+            if (c.fd >= 0) continue;
+            c.* = .{ .fd = fd, .deadline = Deadline.after(self.opts.timeout_ms), .dec = framing.Decoder.init(self.opts.limits) };
+            self.open += 1;
+            return;
+        }
+        closeFd(fd); // unreachable: the listen socket is not polled while full
+    }
+
+    /// Read what is there; when a whole frame arrived run `dispatch` and start the reply.
+    /// Returns true when a request was dispatched.
+    fn readRequest(
+        self: *Mux,
+        c: *Conn,
+        ctx: anytype,
+        comptime dispatch: fn (@TypeOf(ctx), []const u8, std.mem.Allocator) anyerror![]const u8,
+        arena: *std.heap.ArenaAllocator,
+    ) StepError!bool {
+        var buf: [io_buf_size]u8 = undefined;
+        while (true) {
+            const rc = linux.read(c.fd, &buf, buf.len);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                .AGAIN => return false,
+                else => {
+                    self.failed +|= 1;
+                    self.drop(c);
+                    return false;
+                },
+            }
+            if (rc == 0) { // EOF before a whole frame
+                self.failed +|= 1;
+                self.drop(c);
+                return false;
+            }
+            c.dec.feed(self.gpa, buf[0..rc]) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.NotDrained => {
+                    self.failed +|= 1;
+                    self.drop(c);
+                    return false;
+                },
+            };
+            const frame = c.dec.next() catch {
+                self.failed +|= 1; // oversize or bad length, refused before the body arrived
+                self.drop(c);
+                return false;
+            } orelse continue;
+            defer _ = arena.reset(.retain_capacity);
+            const reply = dispatch(ctx, frame, arena.allocator()) catch {
+                self.failed +|= 1;
+                self.drop(c);
+                return true;
+            };
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            errdefer aw.deinit();
+            framing.writeFrame(&aw.writer, reply, self.opts.limits) catch |e| switch (e) {
+                error.WriteFailed => return error.OutOfMemory,
+                else => { // reply over the frame cap: nothing to send
+                    aw.deinit();
+                    self.failed +|= 1;
+                    self.drop(c);
+                    return true;
+                },
+            };
+            c.out = aw.toOwnedSlice() catch return error.OutOfMemory;
+            c.out_off = 0;
+            c.writing = true;
+            self.flushReply(c);
+            return true;
+        }
+    }
+
+    /// Write as much of the reply as the socket takes; close when it is all out.
+    fn flushReply(self: *Mux, c: *Conn) void {
+        while (c.out_off < c.out.len) {
+            const rc = linux.write(c.fd, c.out[c.out_off..].ptr, c.out.len - c.out_off);
+            switch (linux.errno(rc)) {
+                .SUCCESS => c.out_off += rc,
+                .INTR => continue,
+                .AGAIN => return, // wait for POLLOUT
+                else => {
+                    self.failed +|= 1;
+                    self.drop(c);
+                    return;
+                },
+            }
+        }
+        self.served +|= 1;
+        self.drop(c);
     }
 };
 
@@ -1178,4 +1415,164 @@ test "Server.acceptOne: an allowlist that names our uid admits us" {
     const a = try srv.acceptOne();
     defer closeFd(a);
     try testing.expectEqual(me, (try peerCred(a)).uid);
+}
+
+// ── Mux tests ───────────────────────────────────────────────────────────────
+
+fn muxClient(path: [:0]const u8, msg: []const u8, out: *[]u8, buf: []u8, ok: *bool) void {
+    out.* = Client.request(path, msg, buf, .{}) catch return;
+    ok.* = true;
+}
+
+/// Step `mux` until `done` says so or ~5 s pass.
+fn muxUntil(mux: *Mux, arena: *std.heap.ArenaAllocator, comptime done: fn (*const Mux) bool) !void {
+    var rounds: usize = 0;
+    while (!done(mux) and rounds < 100) : (rounds += 1)
+        _ = try mux.step({}, echoDispatch, arena, 50);
+    try testing.expect(done(mux));
+}
+
+fn servedOne(m: *const Mux) bool {
+    return m.served >= 1;
+}
+fn servedTwo(m: *const Mux) bool {
+    return m.served >= 2;
+}
+
+test "Mux: a stalled client does not block a fast one; the stalled one is closed at its deadline" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    var mux = try Mux.init(testing.allocator, &srv, .{ .timeout_ms = 300 });
+    defer mux.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // A client that connects and says nothing.
+    const stalled = try connectUnix(path);
+    defer closeFd(stalled);
+    // A half-frame client: the 4-byte prefix announces 10 bytes, 3 arrive.
+    const half = try connectUnix(path);
+    defer closeFd(half);
+    try writeAllFd(half, &.{ 10, 0, 0, 0, 'a', 'b', 'c' });
+
+    var reply_buf: [64]u8 = undefined;
+    var reply: []u8 = &.{};
+    var ok = false;
+    const th = try std.Thread.spawn(.{}, muxClient, .{ path, "ping", &reply, &reply_buf, &ok });
+    try muxUntil(&mux, &arena, servedOne);
+    th.join();
+    try testing.expect(ok);
+    try testing.expectEqualStrings("ping", reply);
+    // The two silent ones are still in service until their deadline passes.
+    try testing.expectEqual(@as(usize, 2), mux.open);
+    var rounds: usize = 0;
+    while (mux.open != 0 and rounds < 100) : (rounds += 1) _ = try mux.step({}, echoDispatch, &arena, 50);
+    try testing.expectEqual(@as(usize, 0), mux.open);
+    try testing.expectEqual(@as(u64, 2), mux.timed_out);
+    try testing.expectEqual(@as(u64, 1), mux.served);
+}
+
+test "Mux: a request dribbled in one byte at a time is served; the reply may exceed a socket buffer" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    var mux = try Mux.init(testing.allocator, &srv, .{});
+    defer mux.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const fd = try connectUnix(path);
+    defer closeFd(fd);
+    const payload = "dribble";
+    var frame: [4 + payload.len]u8 = undefined;
+    std.mem.writeInt(u32, frame[0..4], payload.len, .little);
+    @memcpy(frame[4..], payload);
+    for (frame) |b| {
+        try writeAllFd(fd, &.{b});
+        _ = try mux.step({}, echoDispatch, &arena, 20);
+    }
+    try muxUntil(&mux, &arena, servedOne);
+    var out: [4 + payload.len]u8 = undefined;
+    try readExact(fd, &out);
+    try testing.expectEqualSlices(u8, &frame, &out);
+
+    // A ~600 KiB echo: the non-blocking write must continue across rounds until the client drains it.
+    const big = try testing.allocator.alloc(u8, 600 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 'z');
+    const rb = try testing.allocator.alloc(u8, 700 * 1024);
+    defer testing.allocator.free(rb);
+    var reply: []u8 = &.{};
+    var ok = false;
+    const th = try std.Thread.spawn(.{}, muxClient, .{ path, big, &reply, rb, &ok });
+    try muxUntil(&mux, &arena, servedTwo);
+    th.join();
+    try testing.expect(ok);
+    try testing.expectEqual(big.len, reply.len);
+}
+
+fn failingDispatch(_: void, req: []const u8, gpa: std.mem.Allocator) anyerror![]const u8 {
+    if (std.mem.eql(u8, req, "boom")) return error.Boom;
+    return gpa.dupe(u8, req);
+}
+
+test "Mux: max_conns bounds the connections in service, the rest wait in the backlog; a failing dispatch closes only its own connection; an oversize frame is refused" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    var mux = try Mux.init(testing.allocator, &srv, .{ .max_conns = 2, .timeout_ms = 2000, .limits = .{ .max_frame = 1024 } });
+    defer mux.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Two idle clients fill the table; a third connects and must wait.
+    const a = try connectUnix(path);
+    defer closeFd(a);
+    const b = try connectUnix(path);
+    defer closeFd(b);
+    var i: usize = 0;
+    while (mux.open < 2 and i < 20) : (i += 1) _ = try mux.step({}, failingDispatch, &arena, 20);
+    try testing.expectEqual(@as(usize, 2), mux.open);
+    var reply_buf: [64]u8 = undefined;
+    var reply: []u8 = &.{};
+    var ok = false;
+    const th = try std.Thread.spawn(.{}, muxClient, .{ path, "third", &reply, &reply_buf, &ok });
+    for (0..5) |_| _ = try mux.step({}, failingDispatch, &arena, 20);
+    try testing.expectEqual(@as(usize, 2), mux.open); // still not accepted
+    try testing.expectEqual(@as(u64, 0), mux.served);
+    // Free a slot: `a` sends "boom" (dispatch fails, only `a` closes), the third is accepted and served.
+    try writeAllFd(a, &.{ 4, 0, 0, 0, 'b', 'o', 'o', 'm' });
+    i = 0;
+    while (mux.served < 1 and i < 100) : (i += 1) _ = try mux.step({}, failingDispatch, &arena, 50);
+    th.join();
+    try testing.expect(ok);
+    try testing.expectEqualStrings("third", reply);
+    try testing.expectEqual(@as(u64, 1), mux.failed);
+    // `b` announces more than max_frame: refused before a body arrives.
+    try writeAllFd(b, &.{ 0xff, 0xff, 0x00, 0x00 });
+    i = 0;
+    while (mux.failed < 2 and i < 50) : (i += 1) _ = try mux.step({}, failingDispatch, &arena, 20);
+    try testing.expectEqual(@as(u64, 2), mux.failed);
+    try testing.expectEqual(@as(usize, 0), mux.open);
+}
+
+test "Mux: a refused peer is counted and closed like acceptOne does; deinit closes what is open" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listenWithPolicy(path, .{ .uids = &.{} }); // nobody is admitted
+    defer srv.deinit();
+    var mux = try Mux.init(testing.allocator, &srv, .{});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fd = try connectUnix(path);
+    defer closeFd(fd);
+    var i: usize = 0;
+    while (srv.refused == 0 and i < 20) : (i += 1) _ = try mux.step({}, echoDispatch, &arena, 20);
+    try testing.expectEqual(@as(u64, 1), srv.refused);
+    try testing.expectEqual(@as(usize, 0), mux.open);
+    mux.deinit();
 }

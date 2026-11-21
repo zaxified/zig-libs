@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [godbus/dbus](https://github.com/godbus/dbus) | Go | BSD-2-Clause | 1.2k | v5.2.2 (2025-12-29) | D-Bus client for Go: calls, signals, exported objects. |
 | Zig `std` / ecosystem | Zig | MIT (std) | — | Zig 0.16.0 | `std.Io.net` gives unix sockets (`std` checked only by name, *inferred*); no Zig request/reply bus found: the only `zig-ipc` hit (pseudocc/zig-ipc, MIT, 7 stars) is a shared-memory example. |
 
-**Where we are ahead:** small, libc-free (raw syscalls) and dependency-light (`framing` only); the frame length is checked before the body is read and the request buffer is sized to the announced length, so a peer cannot force a per-connection allocation; socket lifecycle (stale-socket unlink) handled; a scratch `Bus` with a change `version`. **Where we are behind:** no concurrency (one connection at a time), no persistent or multiplexed connections, no push/pub-sub, no in-band auth (peer uid check only), timeouts are opt-in per call (`Options.timeout_ms`; default blocks), Linux only, pathname sockets only (no abstract namespace) — see *What is deliberately not done* and *Backlog / deferred*.
+**Where we are ahead:** small, libc-free (raw syscalls) and dependency-light (`framing` only); the frame length is checked before the body is read and the request buffer is sized to the announced length, so a peer cannot force a per-connection allocation; socket lifecycle (stale-socket unlink) handled; a scratch `Bus` with a change `version`. **Where we are behind:** `Mux` serves many connections from one thread but runs `dispatch` one request at a time, no persistent or multiplexed connections, no push/pub-sub, no in-band auth (peer uid check only), timeouts are opt-in per call (`Options.timeout_ms`; default blocks), Linux only, pathname sockets only (no abstract namespace) — see *What is deliberately not done* and *Backlog / deferred*.
 
 ## Design & invariants
 
@@ -43,12 +43,27 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (raw `std.os.linux` syscalls). Original work of the zig-libs authors. Command handling is a
   caller-supplied `dispatch` callback, so this module hosts no application commands.
 - **One connection per request.** Every request is a fresh `connect → write one frame → read one
-  frame → close`; `acceptOne`/`handleOne` service exactly one connection at a time. No persistent
+  frame → close`; `acceptOne`/`handleOne` service exactly one connection at a time (the blocking pair; `Mux` is the multiplexed loop). No persistent
   or multiplexed connection.
 - **Framing delegated to `framing`.** Every message is a length-prefixed frame; an oversize header
   is rejected *before* the body is read, so a bogus length never blocks waiting for a body that
   will not arrive. `handleOne` sizes the request buffer to the announced length (checked against
   `limits.max_frame` first), so the cap is a rejection threshold, not a per-connection price.
+- **`Mux` (concurrent connections, one thread).** `Mux.init(gpa, &server, MuxOptions)` and
+  `step(ctx, dispatch, &arena, poll_ms)` run a poll loop over the listen socket and up to
+  `max_conns` (64) non-blocking connections: bytes are fed to `framing.Decoder` as they arrive, a
+  whole request is handed to `dispatch` (still ONE at a time on the calling thread, so `Bus` and
+  the owner's state stay single-owner), the framed reply is written as far as the socket takes it
+  per round, then the connection closes. Each connection has its own deadline from accept
+  (`timeout_ms`, default 5 s, `null` = none): a stalled or slow client is closed and counted in
+  `Mux.timed_out` while the others are served; a bad or oversize frame (refused before its body
+  arrives), an early EOF, an I/O error or a failing `dispatch` closes only that connection
+  (`Mux.failed`; a `dispatch` error never stops the loop). A full table stops accepting (clients
+  wait in the listen backlog), so a flood cannot exhaust descriptors. The `Server`'s `PeerPolicy`
+  applies at accept (`Server.refused`). Arena discipline: the callback's allocator is the caller's
+  arena, reset after every request. A single-threaded design is the answer to the stalled-client
+  problem without threads (D-Bus, NNG and Redis serve the same way); parallel `dispatch` is left
+  to the caller (call `handleOne` from a pool).
 - **Peer admission.** `Server.acceptOne` reads the kernel-recorded `SO_PEERCRED` uid of every
   accepted connection and applies the server's `PeerPolicy`: `.same_uid` (default, the server's
   effective uid at `listen`), `.uids` (an allowlist; the server's own uid is not implied) or `.any`
@@ -117,9 +132,7 @@ module has no wire format of its own (see *Anchoring*).
 
 ## Backlog / deferred
 
-- **Concurrent connections** — a slow or stalled client blocks every other request (one connection
-  at a time; a per-call timeout is opt-in). Effort: medium (poll-based accept loop or `std.Io`
-  group; per-connection deadline). Fits §2.
+None open.
 
 ## Roadmap
 
