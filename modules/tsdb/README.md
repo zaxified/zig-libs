@@ -13,8 +13,10 @@ none of them stores a point beyond process lifetime.
   shared by Prometheus's TSDB, OpenTSDB and InfluxDB TSM; LMDB-style ordered
   range scans for the read path.
 - **Platform:** any — all I/O goes through `kvtree` → `kv`'s `Storage` seam.
-  **Role:** util. **Concurrency:** `single_owner` (inherits kvtree's model: one
-  writer, MVCC snapshot readers; this module adds no shared state of its own).
+  **Role:** util. **Concurrency:** `threadsafe` — one internal lock (`kvtree.Lock`)
+  serialises every `Db` call and every `Range` / `SeriesIterator` `next` and `deinit`, so threads may share a `Db`
+  (a call blocks while another runs, an iterator holds the lock only inside `next`); `kvtree.Db` underneath stays
+  single-owner, so a tree shared with other users is the caller's to guard, and a `Db` must not be moved once shared.
 - **Deps:** `kvtree`, `regex` (anchored label matchers).
 
 Provenance: clean-room from a publicly documented design; no third-party
@@ -239,7 +241,7 @@ const n = try db.aggregate(id, from, from + 60 * step, step, .avg, &buf);
 
 ## Not provided
 
-Downsampling/rollups, a cross-metric-name label lookup, per-series retention, a WAL plus in-memory
+Downsampling/rollups, an inverted label index, per-series retention, a WAL plus in-memory
 head (every commit is durable instead), and any query language (`aggregate` is a per-bucket read
 helper, not a query engine). See `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.
 

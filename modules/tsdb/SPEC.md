@@ -34,7 +34,7 @@ to show what a "real TSDB" user expects; this module is a storage layer over `kv
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [prometheus/prometheus](https://github.com/prometheus/prometheus) `tsdb` — **reference** | Go | Apache-2.0 | 66.3k | v3.15.0 (2026-09-25) | Gorilla-style compressed chunks, WAL, inverted label index with matchers (`=`, `!=`, regex), time and size retention, series deletion, compaction. This module has exact-label lookup, a name-scoped superset filter, name-scoped `=`/`!=`/`=~`/`!~` matchers (`findSeriesMatching`), time retention, a size budget, Gorilla-compressed blocks (`compact`), `deleteSeries` and `deleteRange`; no cross-name label lookup. |
+| [prometheus/prometheus](https://github.com/prometheus/prometheus) `tsdb` — **reference** | Go | Apache-2.0 | 66.3k | v3.15.0 (2026-09-25) | Gorilla-style compressed chunks, WAL, inverted label index with matchers (`=`, `!=`, regex), time and size retention, series deletion, compaction. This module has exact-label lookup, a name-scoped superset filter, `=`/`!=`/`=~`/`!~` matchers name-scoped (`findSeriesMatching`) and across metric names (`findSeriesAcrossNames`, a scan, no inverted index), time retention, a size budget, Gorilla-compressed blocks (`compact`), `deleteSeries` and `deleteRange`. |
 | [nakabonne/tstorage](https://github.com/nakabonne/tstorage) | Go | Apache-2.0 | 1.3k | v0.3.6 (2023-03-24), pushed 2026-03 | Embeddable library: time-partitioned storage with `InsertRows`/`Select`, in-memory default, disk mode. Its README (read this run) leads with ingestion speed; compression/WAL details not verified *(inferred)*. |
 | [VictoriaMetrics/VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics) | Go | Apache-2.0 | 17.8k | v1.153.0 (2026-09-28) | A server: strong compression, downsampling, MetricsQL. Not an embeddable library *(inferred)*. |
 | [influxdata/influxdb](https://github.com/influxdata/influxdb) | Rust | Apache-2.0 | 31.8k | v3.11.4 (2026-09-08) | A server with SQL/InfluxQL; the TSM row-key shape this module's key codec follows is v1/v2-era. |
@@ -46,7 +46,7 @@ multi-series batches (`appendBatch`); MVCC snapshot range scans that stream with
 resumable, idempotent bounded retention sweeps and a size budget (`sweepToBudget`); overwrite by
 (series, ts) identity; negative timestamps; built on a crash-checked COW B-tree
 (`kvtree`) rather than a bespoke file; compression that needs no migration and keeps writes
-raw (§5b). **Where we are behind:** no downsampling, no cross-name label lookup, no per-series retention, no WAL-plus-head durability model, no query language (→ Backlog and *What is deliberately not done*).
+raw (§5b). **Where we are behind:** no inverted label index (a cross-name lookup scans every series), no WAL-plus-head durability model, no query language (→ *What is deliberately not done*).
 
 ## 1. Substrate: `kvtree`, not `kv`
 
@@ -117,7 +117,7 @@ keys, or a forward scan would terminate early.
 | `0x03 \| series(BE u64)` | canonical(name, labels) |
 | `0x05 \| series(BE u64) \| orderedTs(LAST sample)(BE u64)` | compressed block (`chunk.zig`) |
 
-`0x04` is reserved for an inverted label index (Backlog). Keys outside these tags are untouched, so
+`0x04` is reserved for an inverted label index (see *What is deliberately not done*). Keys outside these tags are untouched, so
 the tree can be shared. The block partition sorts above both indexes: a raw scan that leaves its
 partition never reaches blocks by accident, and vice versa.
 
@@ -248,10 +248,9 @@ blocks (Pelkonen et al., VLDB 2015, §4.1: delta-of-delta timestamps in 0/7/9/12
 XOR'd values with a leading/meaningful-bits window; ≤ 1024 samples and ≤ 1 KiB per block, so a
 block is always an inline kvtree value). Clean-room from the paper; no implementation was read.
 
-**Why keyed by the LAST timestamp.** kvtree's cursor only moves forward (no `prev`/`seekLE`). A
-range `[from, to)` needs the first block that can hold `from`; with blocks keyed by their last
-sample that is exactly `seek(blockKey(series, from))`. Keyed by the first sample it would need
-the block BEFORE the seek position.
+**Why keyed by the LAST timestamp.** A range `[from, to)` needs the first block that can hold `from`;
+with blocks keyed by their last sample that is exactly `seek(blockKey(series, from))`, one forward
+step. Keyed by the first sample it would need the block BEFORE the seek position (`prev`) on every read.
 
 **Invariants.** (B1) A series' blocks never overlap: each starts after the previous one ends.
 (B2) A block's key is its last sample, its header its first, its samples strictly ascending —
@@ -269,8 +268,14 @@ timestamp. Past the last block → a new block, but only once at least `min_run`
 there, so a caller compacting every minute does not cut a tiny block per minute. The rule is
 judged per chunk piece: a series' run split across chunks (`chunk_points` smaller than the run)
 can leave more than `min_run − 1` raw; a later run places them (as a gap run once a block follows).
-A gap run is always placed. A 1-sample block costs 35 bytes against 25 raw, so a tiny `min_run`
-on a sparse series can grow `liveSize`; blocks are never coalesced after they are cut.
+A gap run is always placed. **Coalescing:** a run is merged into a *small* block next to it (fewer than
+`Db.coalesce_below` = 64 samples, and the merge still fits `chunk.max_block_samples`) instead of cutting
+another small block: a gap run joins the block after it (together with the samples inside that block's
+span, in the same step), a run past the end joins the series' last block (found with `seekAfter` + `prev`;
+not when the same run already wrote a block in the open transaction, because the cursor would show the
+stale last block). A sparse series compacted after every sample so grows one block to 64 samples, then
+the next (test: 200 samples, 4 blocks, instead of 200 blocks of 35 bytes against 25 raw). Blocks are never
+merged after the fact: only a compaction that places a run next to a small block coalesces.
 
 **Transactions.** One per chunk (`chunk_points` raw samples): the blocks written and the raw
 keys deleted commit together, so every sample is present exactly once after a crash (crash sweep
@@ -315,8 +320,11 @@ few samples gains little (the block key dominates, and a 1-sample block costs mo
   have reads as the empty string, so `.neq` matches a series without the label and `.eq` with value `""`
   matches one too; `.re`/`.nre` are fully anchored (the whole value must match), compiled once with the
   `regex` module, and a bad pattern is `error.InvalidRegex`. It scans only the series registered under
-  `name` (the same name-prefix range as `findSeries`); there is no inverted index of its own (`0x04`
-  stays reserved).
+  `name` (the same name-prefix range as `findSeries`). **`findSeriesAcrossNames(matchers)`** is the same
+  filter over every series (one reverse-index scan, in id order): the metric name is matched by a matcher
+  named `__name__` (`Db.name_label`), as in Prometheus, and shadows a series' own label of that name; no
+  matchers yields every series. There is no inverted index (`0x04` stays reserved): the scan is O(series),
+  which a lookup that knows the metric name avoids with `findSeriesMatching`.
 - **`deleteRange(series, from, to)`** removes `from <= ts < to` from the raw partition and the blocks in
   ONE transaction (all or nothing across a crash; crash-swept in all four modes). A straddling block is
   decoded, stripped and re-encoded. The result counts a timestamp held both raw and in a block twice.
@@ -354,9 +362,16 @@ few samples gains little (the block key dominates, and a 1-sample block costs mo
   being read as garbage.
 - **Sample values are opaque.** NaN/±Inf round-trip bit-exactly; this layer
   never compares or aggregates them.
-- **Not concurrency-safe by itself.** `single_owner`, inherited: one writer at a
-  time. A `Range` holds an MVCC snapshot, so a leaked `Range` pins kvtree's page
-  reclaim — hence `defer r.deinit()`.
+- **Concurrency.** `threadsafe` (Prometheus' tsdb is safe for concurrent use): every `Db` entry point takes
+  one lock (`kvtree.Lock`, `Db.lock`; the `...Locked` functions are the bodies and call each other
+  unlocked), and `Range` / `SeriesIterator` take it in `next` and `deinit`, so the single-owner `kvtree.Db`
+  (cursors, snapshots, pager) and this module's caches are only ever touched by one thread at a time
+  (test: four writers, two readers and a compactor on one `Db`). Calls are serialised, not parallel: a long
+  `compact` or `sweep` call holds the lock for its whole duration (it is chunked internally but does not
+  release between chunks). A `Range` holds an MVCC snapshot, so a leaked `Range` pins kvtree's page
+  reclaim — hence `defer r.deinit()`. A tree shared with other users of the same `kvtree.Db` is not covered:
+  their calls bypass this lock. The `Db` must not be moved once shared or while an iterator is live (the
+  iterators point at its lock).
 - **Inherited caveats from kvtree**, not re-argued here: see `kvtree/SPEC.md`.
 - **`deleteRange` memory.** It holds every affected key and each straddling block's suffix in memory
   (17 B per raw sample), so a window over a very large series is O(window). Kept because the
@@ -465,23 +480,22 @@ section is its citation.
 - **Exemplars, native histograms, PromQL, mmap.** Out of scope for a storage layer over `kvtree`; mmap is
   kvtree's.
 - **Consistent snapshot copy while writing.** Belongs to kvtree.
+- **Downsampling / rollups.** Prometheus' tsdb has none (recording rules and Thanos do it above the store);
+  VictoriaMetrics offers it as an enterprise feature. It would also need a resolution-aware key tag and a
+  rollup watermark. `aggregate` reduces a window on read.
+- **A retention policy per series.** One cutoff (`sweep`) and one budget (`sweepToBudget`), as Prometheus'
+  global time and size retention; per-series retention is a VictoriaMetrics enterprise feature. A caller
+  with different ages per metric calls `sweep` per series group or `deleteRange` per series.
+- **A resume record for `sweepToBudget`.** No reference has one (Prometheus drops whole blocks), and it
+  would not make a call linear: every call recomputes `liveSize`, a scan of both partitions, whatever a
+  record said about the merge.
+- **An inverted label index (`0x04`).** The cross-name lookup scans the reverse index; an index would cost a
+  write per new series, a backfill for stores that exist, and a rebuild path, for a lookup that is O(series)
+  today. Build it when a measured series count makes the scan too slow.
 
 ## Backlog / deferred
 
-- **Downsampling / rollups.** Precomputed `(min, max, sum, count)` per coarse bucket, written by a
-  background pass, with reads picking a resolution. Needs a resolution-aware key tag and a rollup
-  watermark; independent of everything else. No consumer asks.
-- **Cross-name label lookup.** `findSeries` and `findSeriesMatching` answer "name plus these labels";
-  missing is a lookup across metric names ("every series with `host=web-1`"). It wants the `0x04`
-  inverted-index partition (scan-based matchers were enough so far; build it if series counts grow).
-  No consumer asks.
-- **A retention policy per series.** One global cutoff today; per-series retention wants the policy
-  stored beside the reverse index and the sweep reading it per series, which changes the sweep's skip
-  rule. No consumer asks.
-- **A resume record for `sweepToBudget`.** Would make an interrupted budget sweep linear.
-- **Coalescing small compacted blocks.** A sparse series gains only 25 → 20 bytes per sample; an
-  internal space optimisation with no API change.
-- **Thread-safe `Db`** (cache synchronisation; readers are already MVCC). Today `single_owner`.
+None open.
 
 ## Anchoring
 

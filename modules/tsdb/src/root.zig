@@ -45,9 +45,10 @@ pub const meta = .{
     .targets = .{.linux64},
     .platform = .any, // all I/O via kvtree → kv's Storage seam
     .role = .util, // a layer over a store the caller owns
-    // Inherits kvtree's model: one writer at a time; readers take MVCC
-    // snapshots. This module adds no shared mutable state of its own.
-    .concurrency = .single_owner,
+    // Every `Db` entry point (and `Range` / `SeriesIterator` use) takes the
+    // `Db`'s lock, which serialises access to the single-owner `kvtree.Db`
+    // underneath. A tree shared with other users is the caller's to guard.
+    .concurrency = .threadsafe,
     // The composite `(series id, big-endian timestamp)` row key is the
     // documented, publicly described shape shared by Prometheus's TSDB,
     // OpenTSDB's HBase rowkeys and InfluxDB's TSM; the read path is LMDB-style
@@ -152,6 +153,11 @@ pub const Db = struct {
     /// blocks; if a sweep removed them all, `range` only pays the seek).
     blocks_seen: bool = false,
     opts: Options = .{},
+    /// Serialises every public entry point (and `Range` / `SeriesIterator` use),
+    /// so one `Db` may be shared by threads. `kvtree.Db` underneath stays
+    /// single-owner; this lock is its caller's serializer. The `Db` must not be
+    /// moved once shared or while an iterator is live.
+    lock: kvtree.Lock,
     /// Registered-series count for `Options.max_series`, valid only while the
     /// tree is still at kvtree version `series_count_at` (another `Db` over
     /// the same tree committing moves the version and forces a recount).
@@ -174,11 +180,11 @@ pub const Db = struct {
     };
 
     pub fn init(gpa: Allocator, tree: *kvtree.Db) Db {
-        return .{ .gpa = gpa, .tree = tree };
+        return .{ .gpa = gpa, .tree = tree, .lock = .{ .io = tree.io() } };
     }
 
     pub fn initOptions(gpa: Allocator, tree: *kvtree.Db, opts: Options) Db {
-        return .{ .gpa = gpa, .tree = tree, .opts = opts };
+        return .{ .gpa = gpa, .tree = tree, .opts = opts, .lock = .{ .io = tree.io() } };
     }
 
     /// Frees the in-memory series-id cache and sweep scratch. Does not touch
@@ -205,16 +211,8 @@ pub const Db = struct {
 
     // ── series identity ──────────────────────────────────────────────────────
 
-    /// Resolve (metric name, labels) to its stable id, creating it if new.
-    ///
-    /// The id survives restart because both directions of the mapping and the
-    /// allocation counter live in the same tree, written in ONE transaction —
-    /// so a crash can never leave an id handed out but unrecorded, or a
-    /// forward index without its reverse.
-    ///
-    /// Label ORDER is irrelevant: `{a=1,b=2}` and `{b=2,a=1}` canonicalize
-    /// identically and therefore resolve to the same id.
-    pub fn seriesId(self: *Db, name: []const u8, labels: []const Label) Error!SeriesId {
+    // Body of `seriesId` (contract on the public wrapper below).
+    fn seriesIdLocked(self: *Db, name: []const u8, labels: []const Label) Error!SeriesId {
         var idx_key: std.ArrayList(u8) = .empty;
         defer idx_key.deinit(self.gpa);
         try self.indexKey(&idx_key, name, labels);
@@ -257,14 +255,8 @@ pub const Db = struct {
     /// One series to resolve in `seriesIds`.
     pub const SeriesSpec = struct { name: []const u8, labels: []const Label };
 
-    /// `seriesId` for many series at once: existing ones are looked up, the
-    /// missing ones are registered together in ONE transaction (one commit,
-    /// not one per series — a first scrape of 1000 new series was 1000 commits
-    /// with two fsyncs each). `out[i]` is the id of `specs[i]`; the same series
-    /// twice in `specs` gets the same id. All or nothing: on an error no new
-    /// series exists. `max_series` counts the whole batch. Precondition:
-    /// `out.len >= specs.len` (a shorter `out` panics).
-    pub fn seriesIds(self: *Db, specs: []const SeriesSpec, out: []SeriesId) Error!void {
+    // Body of `seriesIds` (contract on the public wrapper below).
+    fn seriesIdsLocked(self: *Db, specs: []const SeriesSpec, out: []SeriesId) Error!void {
         if (out.len < specs.len) @panic("tsdb: seriesIds: out is shorter than specs");
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -378,8 +370,8 @@ pub const Db = struct {
         } else self.series_count_at = null;
     }
 
-    /// Resolve without creating. Null when the series has never been written.
-    pub fn lookupSeries(self: *Db, name: []const u8, labels: []const Label) Error!?SeriesId {
+    // Body of `lookupSeries` (contract on the public wrapper below).
+    fn lookupSeriesLocked(self: *Db, name: []const u8, labels: []const Label) Error!?SeriesId {
         var idx_key: std.ArrayList(u8) = .empty;
         defer idx_key.deinit(self.gpa);
         try self.indexKey(&idx_key, name, labels);
@@ -394,19 +386,14 @@ pub const Db = struct {
         return id;
     }
 
-    /// The canonical bytes registered for `id` (caller frees), or null. Decode
-    /// with `codec.parseCanonical` for the name + sorted labels.
-    pub fn seriesCanonical(self: *Db, gpa: Allocator, id: SeriesId) Error!?[]u8 {
+    // Body of `seriesCanonical` (contract on the public wrapper below).
+    fn seriesCanonicalLocked(self: *Db, gpa: Allocator, id: SeriesId) Error!?[]u8 {
         const rev_key = reverseKey(id);
         return self.tree.get(gpa, &rev_key);
     }
 
-    /// Every registered series, id + parsed descriptor, in ascending id
-    /// order. Replaces walking ids `1, 2, 3, …` until one is missing (which
-    /// only ever worked because ids happen to be dense today — this reads
-    /// the reverse index directly, so it stays correct if that ever
-    /// changes). Holds an MVCC snapshot like `range` — `defer it.deinit()`.
-    pub fn seriesIterator(self: *Db) Error!SeriesIterator {
+    // Body of `seriesIterator` (contract on the public wrapper below).
+    fn seriesIteratorLocked(self: *Db) Error!SeriesIterator {
         var snap = try self.tree.snapshot();
         errdefer snap.release();
         var cur = try snap.cursor();
@@ -415,21 +402,8 @@ pub const Db = struct {
         return .{ .snap = snap, .cur = cur, .mode = .all };
     }
 
-    /// Every series registered under exactly `name`, filtered to those whose
-    /// labels are a SUPERSET of `filter` — every `(name, value)` pair in
-    /// `filter` must be present with an equal value; the series may carry
-    /// further labels `filter` says nothing about. For a reader that knows
-    /// the metric name but not every label value up front (the terminal-UI consumer's own
-    /// `key`/`field` disambiguation: today it walks and decodes every series
-    /// in the store to find the ones for one source, `src/diskhist.zig`,
-    /// marked `zig-libs request: tsdb — list series`).
-    ///
-    /// `filter` is borrowed — it must outlive the returned iterator, same
-    /// convention as `labels` in `seriesId`. Scans only the series registered
-    /// under `name` (a name-prefix range over the forward index), never the
-    /// whole series catalog, so a store with many metric names costs this
-    /// call nothing proportional to the ones that don't match.
-    pub fn findSeries(self: *Db, name: []const u8, filter: []const Label) Error!SeriesIterator {
+    // Body of `findSeries` (contract on the public wrapper below).
+    fn findSeriesLocked(self: *Db, name: []const u8, filter: []const Label) Error!SeriesIterator {
         if (name.len > codec.max_component_len) return error.ComponentTooLong;
         var snap = try self.tree.snapshot();
         errdefer snap.release();
@@ -477,18 +451,16 @@ pub const Db = struct {
 
     // ── writes ───────────────────────────────────────────────────────────────
 
-    /// Append (or overwrite) one sample. Same `(series, ts)` twice = last write
-    /// wins; the key IS the identity, so there is no duplicate-point state.
-    pub fn append(self: *Db, series: SeriesId, ts: Timestamp, value: f64) Error!void {
+    // Body of `append` (contract on the public wrapper below).
+    fn appendLocked(self: *Db, series: SeriesId, ts: Timestamp, value: f64) Error!void {
         const key = codec.pointKey(series, ts);
         const val = codec.encodeValue(value);
         try self.tree.put(&key, &val);
         self.noteOwnCommit(0);
     }
 
-    /// Append a batch atomically — one transaction, so a crash leaves either
-    /// all of `points` or none of it.
-    pub fn appendMany(self: *Db, series: SeriesId, points: []const Sample) Error!void {
+    // Body of `appendMany` (contract on the public wrapper below).
+    fn appendManyLocked(self: *Db, series: SeriesId, points: []const Sample) Error!void {
         if (points.len == 0) return;
         var txn = try self.tree.begin();
         {
@@ -503,18 +475,8 @@ pub const Db = struct {
         self.noteOwnCommit(0);
     }
 
-    /// Append points for MULTIPLE series in ONE transaction — a crash or an
-    /// error partway through leaves every series untouched, never some
-    /// committed and others not. A flush across N series via `appendMany`
-    /// (one call per series) is N transactions and therefore N commits of
-    /// kvtree's own COW protocol (two `fsync`s each: one for the written
-    /// pages, one for the meta swap that makes the commit durable — see
-    /// `kvtree/src/core.zig`'s `commit`) — `appendBatch` is a CONSTANT number
-    /// of commits (one) regardless of how many series are in `batches`, not
-    /// one per series. Replaces the terminal-UI consumer's own per-series-transaction flush
-    /// loop (`src/diskhist.zig`, marked `zig-libs request: tsdb — append
-    /// points of many series in one transaction`).
-    pub fn appendBatch(self: *Db, batches: []const SeriesBatch) Error!void {
+    // Body of `appendBatch` (contract on the public wrapper below).
+    fn appendBatchLocked(self: *Db, batches: []const SeriesBatch) Error!void {
         var any = false;
         for (batches) |b| {
             if (b.points.len != 0) {
@@ -561,24 +523,8 @@ pub const Db = struct {
         existed: bool = false,
     };
 
-    /// Drop series `id`: every sample (raw and compacted) and its index
-    /// entries. The data goes in bounded chunks; the LAST transaction removes
-    /// the forward and reverse index together, so the series disappears from
-    /// `lookupSeries`/`seriesIterator` only once its data is gone. A crash
-    /// part-way leaves a registered series with fewer samples — call again;
-    /// the operation is idempotent. The id is never handed out again (the
-    /// counter only grows), so a name registered afterwards gets a fresh id
-    /// and no stale sample can resurface under it.
-    ///
-    /// The id is dead afterwards: do not `append` through a `SeriesId` held
-    /// from before the delete — those samples would have no index entry (no
-    /// listing or budget sweep reaches them, though `liveSize` counts them).
-    /// Re-resolve with `seriesId`.
-    ///
-    /// A block whose header does not decode is deleted anyway but contributes
-    /// nothing to `DeleteSeriesResult.deleted` (so the count is a lower bound
-    /// on a rotted series; `sweep` still reports such a block as `CorruptPoint`).
-    pub fn deleteSeries(self: *Db, id: SeriesId, opts: DeleteSeriesOptions) Error!DeleteSeriesResult {
+    // Body of `deleteSeries` (contract on the public wrapper below).
+    fn deleteSeriesLocked(self: *Db, id: SeriesId, opts: DeleteSeriesOptions) Error!DeleteSeriesResult {
         const chunk_deletes = orDefault(opts.chunk_deletes, (DeleteSeriesOptions{}).chunk_deletes); // 0 = default (sweep D10)
         const rev_key = reverseKey(id);
         const canon = (try self.tree.get(self.gpa, &rev_key)) orelse return .{};
@@ -640,6 +586,10 @@ pub const Db = struct {
     // can only come from a write AFTER that block was made (compaction deletes
     // every raw key it absorbs, in the same transaction). See SPEC.md §5b.
 
+    /// A block with fewer samples than this is "small": `compact` merges a new
+    /// run into it instead of cutting another small block beside it.
+    pub const coalesce_below: u32 = 64;
+
     pub const CompactOptions = struct {
         /// A run of raw samples AFTER a series' last block (the ordinary
         /// "new data" case) is left raw until at least this many of them are
@@ -672,17 +622,8 @@ pub const Db = struct {
         done: bool = false,
     };
 
-    /// Pack every raw sample with `ts < before` into compressed blocks.
-    ///
-    /// Each chunk is ONE transaction that writes the blocks and deletes the
-    /// raw keys they absorbed, so a crash or an error leaves every sample
-    /// exactly once — raw or in a block, never both lost, never torn. There is
-    /// no resume record: compaction is idempotent ("pack what is still raw"),
-    /// and a re-run reads only what is still raw, which after a completed run
-    /// is the short tail per series plus everything at or above `before`.
-    /// Choose `before` so recent data — still being written, perhaps out of
-    /// order — stays raw (e.g. `now - 1h`).
-    pub fn compact(self: *Db, before: Timestamp, opts_in: CompactOptions) Error!CompactResult {
+    // Body of `compact` (contract on the public wrapper below).
+    fn compactLocked(self: *Db, before: Timestamp, opts_in: CompactOptions) Error!CompactResult {
         // A zero chunk size reads as the default (sweep D10; TS-4 progress).
         var opts = opts_in;
         opts.chunk_points = orDefault(opts.chunk_points, (CompactOptions{}).chunk_points);
@@ -773,6 +714,10 @@ pub const Db = struct {
             for (runs.items) |run| {
                 const r = samples.items[run.start..run.end];
                 var i: usize = 0;
+                // Whether this run already wrote a block in the open transaction:
+                // the cursor still reads the tree as of the last commit, so the
+                // last block it shows may be stale then.
+                var wrote = false;
                 while (i < r.len) {
                     _ = scratch.reset(.retain_capacity);
                     // The first block that can hold r[i]: the lowest whose last
@@ -798,16 +743,55 @@ pub const Db = struct {
                         for (r[i..j]) |sm| try txn.del(&codec.pointKey(run.series, sm.ts));
                         compacted += j - i;
                         i = j;
+                        wrote = true;
                         continue;
                     };
                     // In the gap before `blk`, or past the last block.
                     const limit: ?Timestamp = if (blk) |b| b.first else null;
                     while (j < r.len and (limit == null or r[j].ts < limit.?)) j += 1;
                     if (limit == null and j - i < opts.min_run) break; // short tail: stays raw
+                    // Coalesce: a small block next to the new run absorbs it
+                    // instead of a second small block being cut (the one after
+                    // a gap run, the last one for a run past the end).
+                    var near: ?BlockRef = blk;
+                    if (limit == null) {
+                        near = null;
+                        if (!wrote) {
+                            try bcur.seekAfter(&codec.blockKey(run.series, std.math.maxInt(Timestamp)));
+                            if (try bcur.prev()) |pe| if (codec.decodeBlockKey(pe.key)) |pk| if (pk.series == run.series) {
+                                near = .{
+                                    .key = pe.key[0..codec.block_key_len].*,
+                                    .last = pk.ts,
+                                    .first = chunk.firstTs(pe.val) catch return error.CorruptPoint,
+                                    .val = try sa.dupe(u8, pe.val),
+                                };
+                            };
+                        }
+                    }
+                    if (near) |nb| {
+                        const have = try blockCount(nb.val);
+                        // After the gap run, the samples inside `nb`'s span go in the
+                        // same step: the tree still holds the old `nb` until the commit.
+                        var j2 = j;
+                        if (limit != null) {
+                            while (j2 < r.len and r[j2].ts <= nb.last) j2 += 1;
+                        }
+                        if (have < coalesce_below and have + (j2 - i) <= chunk.max_block_samples) {
+                            const merged = try mergeIntoBlock(sa, nb, r[i..j2]);
+                            try txn.del(&nb.key); // the last piece re-puts this key when the span ends there
+                            blocks += try putBlocks(&txn, run.series, merged);
+                            for (r[i..j2]) |sm| try txn.del(&codec.pointKey(run.series, sm.ts));
+                            compacted += j2 - i;
+                            i = j2;
+                            wrote = true;
+                            continue;
+                        }
+                    }
                     blocks += try putBlocks(&txn, run.series, r[i..j]);
                     for (r[i..j]) |sm| try txn.del(&codec.pointKey(run.series, sm.ts));
                     compacted += j - i;
                     i = j;
+                    wrote = true;
                 }
             }
         }
@@ -818,15 +802,8 @@ pub const Db = struct {
 
     // ── reads ────────────────────────────────────────────────────────────────
 
-    /// Stream `[from, to)` of one series in ascending time order.
-    ///
-    /// The upper bound is EXCLUSIVE — half-open windows are what makes
-    /// consecutive queries tile without double-counting the boundary sample.
-    ///
-    /// The scan streams: it holds an MVCC snapshot and a `kvtree.Cursor` (a
-    /// root-to-leaf page stack), so iterating a month of points costs tree
-    /// depth, not the size of the window. This layer buffers nothing.
-    pub fn range(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp) Error!Range {
+    // Body of `range` (contract on the public wrapper below).
+    fn rangeLocked(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp) Error!Range {
         var snap = try self.tree.snapshot();
         errdefer snap.release();
         var cur = try snap.cursor();
@@ -892,26 +869,8 @@ pub const Db = struct {
         done: bool = false,
     };
 
-    /// Delete every point with `ts < cutoff`, in bounded chunks.
-    ///
-    /// Each chunk is ONE transaction that deletes at most `chunk_deletes`
-    /// points AND advances (or clears) the persisted resume position. That
-    /// pairing is the whole guarantee — see SPEC.md §Retention:
-    ///
-    /// - **Consistent under interruption.** A crash or an early return leaves
-    ///   the tree on a chunk boundary: kvtree commits atomically, so the
-    ///   deletions and the resume position are both there or both absent. No
-    ///   chunk is ever half-applied.
-    /// - **Resumable.** A later call with the SAME cutoff continues from the
-    ///   persisted position instead of rescanning. A call with a DIFFERENT
-    ///   cutoff restarts from the beginning — a larger cutoff expires data the
-    ///   old position has already scanned past, and resuming would strand it
-    ///   forever.
-    /// - **Idempotent.** Re-running after an interruption converges on exactly
-    ///   the end state an uninterrupted sweep produces: the operation is
-    ///   "delete the keys below a bound", deletes of absent keys are no-ops,
-    ///   and the position is only ever an optimization on top.
-    pub fn sweep(self: *Db, cutoff: Timestamp, opts_in: SweepOptions) Error!SweepResult {
+    // Body of `sweep` (contract on the public wrapper below).
+    fn sweepLocked(self: *Db, cutoff: Timestamp, opts_in: SweepOptions) Error!SweepResult {
         var opts = opts_in;
         // 0 = the default: a literal 0 would commit once per key (sweep D10).
         opts.chunk_deletes = orDefault(opts.chunk_deletes, (SweepOptions{}).chunk_deletes);
@@ -1075,15 +1034,14 @@ pub const Db = struct {
     fn resumePosition(self: *Db, cutoff: Timestamp) Error!ScanPos {
         var pos: ScanPos = .{};
         pos.set(&[_]u8{codec.tag_point}); // sorts below every point key
-        const st = (try self.retentionState()) orelse return pos;
+        const st = (try self.retentionStateLocked()) orelse return pos;
         if (st.cutoff != cutoff) return pos;
         pos.set(st.pos());
         return pos;
     }
 
-    /// The persisted retention resume record, if a sweep is mid-flight.
-    /// Exposed for operators and for the tests that assert resumability.
-    pub fn retentionState(self: *Db) Error!?RetentionState {
+    // Body of `retentionState` (contract on the public wrapper below).
+    fn retentionStateLocked(self: *Db) Error!?RetentionState {
         const v = (try self.tree.get(self.gpa, &codec.meta_key_retention)) orelse return null;
         defer self.gpa.free(v);
         if (v.len < 1 + 8 or v[0] != 1) return error.CorruptIndex;
@@ -1119,15 +1077,8 @@ pub const Db = struct {
     // own `fileSize()`, `src/diskhist.zig`) and which these two functions
     // cannot promise to shrink.
 
-    /// Live sample-data size, in bytes: every raw point entry
-    /// (`codec.point_entry_bytes` each) plus every block entry's key and
-    /// value bytes as stored. EXACT, not an estimate — it sums the entries'
-    /// own lengths. Excludes the series index/reverse-index entries (small —
-    /// one per series, never touched by retention) and kvtree's own on-disk
-    /// page/freelist overhead (the file itself never shrinks — see this
-    /// section's doc comment above). Costs one forward scan of both
-    /// partitions: O(raw points + blocks).
-    pub fn liveSize(self: *Db) Error!u64 {
+    // Body of `liveSize` (contract on the public wrapper below).
+    fn liveSizeLocked(self: *Db) Error!u64 {
         var cur = try self.tree.cursor();
         defer cur.deinit();
         try cur.seek(&[_]u8{codec.tag_point});
@@ -1172,41 +1123,9 @@ pub const Db = struct {
         done: bool = false,
     };
 
-    /// Delete the globally OLDEST data — across every series, by timestamp,
-    /// not by key order — until live data is at most `max_bytes`, or until
-    /// `opts.max_deletes` is spent (call again to continue). A no-op,
-    /// `.done = true`, if the budget is already met.
-    ///
-    /// **Unit of deletion.** A raw point, or a WHOLE compacted block, ordered
-    /// by its oldest timestamp (a block's first sample). Splitting a block to
-    /// free a few bytes would cost a rewrite and gain little; a block holds a
-    /// bounded window, so the newest sample dropped this way is at most one
-    /// block span younger than a per-sample policy would have dropped.
-    ///
-    /// **Why not `sweep` with a computed cutoff.** A key sorts `(series,
-    /// timestamp)` — series-MAJOR — so "the earliest keys in the tree" is NOT
-    /// "the oldest data in the store": series 9 can hold data from a decade
-    /// ago while series 0 was created five minutes ago. Age retention
-    /// (`sweep`) applies ONE cutoff independently to every series; a size
-    /// BUDGET is a comparison across series, and only timestamps answer it.
-    ///
-    /// **The algorithm**: a k-way merge over per-series, per-partition "oldest
-    /// surviving entry" candidates, seeded once via `seriesIterator` (two tree
-    /// probes per series) and kept in a min-heap ordered by timestamp (ties
-    /// broken by series id, then BLOCK before raw — see `less`). Popping
-    /// the minimum and re-probing that one stream costs O(log(series count))
-    /// per entry — no rescan of the store, no bisection over candidate
-    /// cutoffs.
-    ///
-    /// **Crash-safety — narrower than `sweep`'s.** Each chunk of
-    /// `opts.chunk_deletes` deletions commits atomically (kvtree's COW
-    /// commit), so a crash mid-call leaves a CONSISTENT tree — never a torn
-    /// chunk. But there is no persisted resume record: a crash (or hitting
-    /// `max_deletes`) leaves the merge's in-memory progress on the floor; the
-    /// next call recomputes `liveSize` and reseeds from scratch, reaching the
-    /// same end state (deleting the globally oldest entries is idempotent).
-    pub fn sweepToBudget(self: *Db, max_bytes: u64, opts: SweepToBudgetOptions) Error!SweepToBudgetResult {
-        const before = try self.liveSize();
+    // Body of `sweepToBudget` (contract on the public wrapper below).
+    fn sweepToBudgetLocked(self: *Db, max_bytes: u64, opts: SweepToBudgetOptions) Error!SweepToBudgetResult {
+        const before = try self.liveSizeLocked();
         if (before <= max_bytes) return .{ .before = before, .after = before, .done = true };
         const excess = before - max_bytes;
 
@@ -1226,7 +1145,7 @@ pub const Db = struct {
         var heap: std.PriorityQueue(Unit, void, less) = .empty;
         defer heap.deinit(self.gpa);
         {
-            var it = try self.seriesIterator();
+            var it = try self.seriesIteratorLocked();
             defer it.deinit();
             while (try it.next(self.gpa)) |entry_val| {
                 var entry_mut = entry_val;
@@ -1300,42 +1219,29 @@ pub const Db = struct {
         budget: ?SweepToBudgetResult = null,
     };
 
-    /// One call that does the periodic housekeeping: age retention, then
-    /// compaction, then the size budget. Run it from a timer (e.g. every few
-    /// minutes); nothing in this module runs by itself, and a store that is
-    /// never maintained keeps 25 bytes per sample and grows without bound.
-    ///
-    /// The order is deliberate: expired data is dropped before it is packed,
-    /// and the budget sees the compacted size. Each step keeps its own
-    /// guarantees (chunked transactions, resumable sweep); a step that hits
-    /// its `max_chunks` / `max_deletes` limit reports `done = false` and the
-    /// next call continues. `now` and the durations share the timestamps' unit;
-    /// subtraction saturates.
-    pub fn maintain(self: *Db, now: Timestamp, policy: Policy) Error!MaintainResult {
+    // Body of `maintain` (contract on the public wrapper below).
+    fn maintainLocked(self: *Db, now: Timestamp, policy: Policy) Error!MaintainResult {
         var res: MaintainResult = .{};
-        if (policy.retention) |keep| res.sweep = try self.sweep(now -| keep, policy.sweep_options);
-        if (policy.compact_after) |age| res.compact = try self.compact(now -| age, policy.compact_options);
-        if (policy.max_bytes) |cap| res.budget = try self.sweepToBudget(cap, policy.budget_options);
+        if (policy.retention) |keep| res.sweep = try self.sweepLocked(now -| keep, policy.sweep_options);
+        if (policy.compact_after) |age| res.compact = try self.compactLocked(now -| age, policy.compact_options);
+        if (policy.max_bytes) |cap| res.budget = try self.sweepToBudgetLocked(cap, policy.budget_options);
         return res;
     }
 
     // ── label names / values ─────────────────────────────────────────────────
 
-    /// Every metric name that has a registered series, sorted, unique. The
-    /// slice and the strings are allocated on `arena`.
-    pub fn metricNames(self: *Db, arena: Allocator) Error![][]const u8 {
+    // Body of `metricNames` (contract on the public wrapper below).
+    fn metricNamesLocked(self: *Db, arena: Allocator) Error![][]const u8 {
         return self.collectStrings(arena, .metric, "");
     }
 
-    /// Every label name used by any series, sorted, unique (the metric name
-    /// is not a label). Allocated on `arena`. One reverse-index scan.
-    pub fn labelNames(self: *Db, arena: Allocator) Error![][]const u8 {
+    // Body of `labelNames` (contract on the public wrapper below).
+    fn labelNamesLocked(self: *Db, arena: Allocator) Error![][]const u8 {
         return self.collectStrings(arena, .label_names, "");
     }
 
-    /// Every value `name` takes across all series, sorted, unique. Allocated
-    /// on `arena`.
-    pub fn labelValues(self: *Db, arena: Allocator, name: []const u8) Error![][]const u8 {
+    // Body of `labelValues` (contract on the public wrapper below).
+    fn labelValuesLocked(self: *Db, arena: Allocator, name: []const u8) Error![][]const u8 {
         return self.collectStrings(arena, .label_values, name);
     }
 
@@ -1343,7 +1249,7 @@ pub const Db = struct {
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(self.gpa);
         var out: std.ArrayList([]const u8) = .empty;
-        var it = try self.seriesIterator();
+        var it = try self.seriesIteratorLocked();
         defer it.deinit();
         while (try it.next(self.gpa)) |e_val| {
             var e = e_val;
@@ -1366,20 +1272,35 @@ pub const Db = struct {
 
     // ── matchers ─────────────────────────────────────────────────────────────
 
-    /// Series of metric `name` whose labels satisfy EVERY matcher (see
-    /// `Matcher`). Scans only the series registered under `name` (the same
-    /// name-prefix range as `findSeries`); no index of its own. `matchers` is
-    /// borrowed and must outlive the iterator. `re`/`nre` patterns are
-    /// compiled once here (fully anchored, as in Prometheus: the whole value
-    /// must match) and freed by the iterator's `deinit`; a bad pattern is
-    /// `error.InvalidRegex`.
-    pub fn findSeriesMatching(self: *Db, name: []const u8, matchers: []const Matcher) Error!SeriesIterator {
+    // Body of `findSeriesMatching` (contract on the public wrapper below).
+    fn findSeriesMatchingLocked(self: *Db, name: []const u8, matchers: []const Matcher) Error!SeriesIterator {
+        const res = try self.compileMatchers(matchers);
+        errdefer freeMatchers(self.gpa, res);
+        var it = try self.findSeriesLocked(name, &.{});
+        it.mode.by_name.matchers = matchers;
+        it.regexes = res;
+        it.regex_gpa = self.gpa;
+        return it;
+    }
+
+    // Body of `findSeriesAcrossNames` (contract on the public wrapper below).
+    fn findSeriesAcrossNamesLocked(self: *Db, matchers: []const Matcher) Error!SeriesIterator {
+        const res = try self.compileMatchers(matchers);
+        errdefer freeMatchers(self.gpa, res);
+        var it = try self.seriesIteratorLocked();
+        it.across = matchers;
+        it.regexes = res;
+        it.regex_gpa = self.gpa;
+        return it;
+    }
+
+    /// The label name that stands for the metric name in `findSeriesAcrossNames`.
+    pub const name_label = "__name__";
+
+    fn compileMatchers(self: *Db, matchers: []const Matcher) Error![]?regex.Regex {
         const res = try self.gpa.alloc(?regex.Regex, matchers.len);
         @memset(res, null);
-        errdefer {
-            for (res) |*r| if (r.*) |*x| x.deinit(self.gpa);
-            self.gpa.free(res);
-        }
+        errdefer freeMatchers(self.gpa, res);
         for (matchers, res) |m, *r| {
             if (m.op != .re and m.op != .nre) continue;
             r.* = regex.Regex.compile(self.gpa, m.value) catch |err| switch (err) {
@@ -1387,23 +1308,18 @@ pub const Db = struct {
                 else => return error.InvalidRegex,
             };
         }
-        var it = try self.findSeries(name, &.{});
-        it.mode.by_name.matchers = matchers;
-        it.regexes = res;
-        it.regex_gpa = self.gpa;
-        return it;
+        return res;
+    }
+
+    fn freeMatchers(gpa: Allocator, res: []?regex.Regex) void {
+        for (res) |*r| if (r.*) |*x| x.deinit(gpa);
+        gpa.free(res);
     }
 
     // ── range deletion ───────────────────────────────────────────────────────
 
-    /// Delete the samples of `series` with `from <= ts < to`, raw and
-    /// compacted, in ONE transaction (all or nothing across a crash). A block
-    /// that straddles the window is decoded, stripped of the window's samples
-    /// and re-encoded. Returns the number of samples removed (a timestamp
-    /// held both raw and in a block counts twice). The transaction holds the
-    /// affected keys and straddling blocks in memory: for a very large window
-    /// use `deleteRangeChunked`.
-    pub fn deleteRange(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp) Error!usize {
+    // Body of `deleteRange` (contract on the public wrapper below).
+    fn deleteRangeLocked(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp) Error!usize {
         if (from >= to) return 0;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
@@ -1428,16 +1344,8 @@ pub const Db = struct {
         chunks: usize = 0,
     };
 
-    /// `deleteRange` in bounded steps, for a window too large to hold in one
-    /// transaction: each step removes the window's samples below some bound
-    /// (about `opts.chunk_points` of them) in its own transaction and the next
-    /// step continues above it, so memory is one chunk, not the window.
-    /// **Not atomic as a whole**: a crash or an error leaves a consistent
-    /// store from which a prefix of the window (in time order) is gone;
-    /// calling it again with the same window finishes the job (idempotent,
-    /// like `deleteSeries`). Every step is atomic, and a reader sees each
-    /// step's result as a whole.
-    pub fn deleteRangeChunked(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp, opts: DeleteRangeOptions) Error!DeleteRangeResult {
+    // Body of `deleteRangeChunked` (contract on the public wrapper below).
+    fn deleteRangeChunkedLocked(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp, opts: DeleteRangeOptions) Error!DeleteRangeResult {
         var res: DeleteRangeResult = .{};
         const cap = orDefault(opts.chunk_points, (DeleteRangeOptions{}).chunk_points);
         var pos = from;
@@ -1548,20 +1456,14 @@ pub const Db = struct {
         return std.math.cast(usize, n) orelse std.math.maxInt(usize);
     }
 
-    /// Reduce `[from, to)` of one series into fixed `step`-wide buckets with
-    /// `func`, streaming over `range` (nothing buffered). Bucket `i` covers
-    /// `[from + i*step, from + (i+1)*step)` clipped to `to`. `out` must hold
-    /// `bucketCount(from, to, step)` entries (else `error.InvalidAggregate`);
-    /// an empty bucket is null for every function (also `count`). NaN samples
-    /// are ignored by `min`/`max` unless a bucket holds only NaNs, and
-    /// propagate through `sum`/`avg`. Returns the number of buckets written.
-    pub fn aggregate(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp, step: Timestamp, func: AggFn, out: []?f64) Error!usize {
+    // Body of `aggregate` (contract on the public wrapper below).
+    fn aggregateLocked(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp, step: Timestamp, func: AggFn, out: []?f64) Error!usize {
         if (step <= 0) return error.InvalidAggregate;
         const n = bucketCount(from, to, step);
         if (out.len < n) return error.InvalidAggregate;
         @memset(out[0..n], null);
         if (n == 0) return 0;
-        var r = try self.range(series, from, to);
+        var r = try self.rangeLocked(series, from, to);
         defer r.deinit();
         var cur_idx: usize = 0;
         var acc: f64 = 0;
@@ -1630,6 +1532,379 @@ pub const Db = struct {
             .block = false,
         };
     }
+
+    // ── locking wrappers ────────────────────────────────────────────────────
+    // Every public entry point takes `lock`, so a `Db` may be shared by threads;
+    // the `...Locked` functions are the bodies (documented above) and call each
+    // other without re-locking. Iterators and `Range` take the same lock in
+    // `next` and `deinit`.
+    /// Resolve (metric name, labels) to its stable id, creating it if new.
+    ///
+    /// The id survives restart because both directions of the mapping and the
+    /// allocation counter live in the same tree, written in ONE transaction —
+    /// so a crash can never leave an id handed out but unrecorded, or a
+    /// forward index without its reverse.
+    ///
+    /// Label ORDER is irrelevant: `{a=1,b=2}` and `{b=2,a=1}` canonicalize
+    /// identically and therefore resolve to the same id.
+    pub fn seriesId(self: *Db, name: []const u8, labels: []const Label) Error!SeriesId {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.seriesIdLocked(name, labels);
+    }
+
+    /// `seriesId` for many series at once: existing ones are looked up, the
+    /// missing ones are registered together in ONE transaction (one commit,
+    /// not one per series — a first scrape of 1000 new series was 1000 commits
+    /// with two fsyncs each). `out[i]` is the id of `specs[i]`; the same series
+    /// twice in `specs` gets the same id. All or nothing: on an error no new
+    /// series exists. `max_series` counts the whole batch. Precondition:
+    /// `out.len >= specs.len` (a shorter `out` panics).
+    pub fn seriesIds(self: *Db, specs: []const SeriesSpec, out: []SeriesId) Error!void {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.seriesIdsLocked(specs, out);
+    }
+
+    /// Resolve without creating. Null when the series has never been written.
+    pub fn lookupSeries(self: *Db, name: []const u8, labels: []const Label) Error!?SeriesId {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.lookupSeriesLocked(name, labels);
+    }
+
+    /// The canonical bytes registered for `id` (caller frees), or null. Decode
+    /// with `codec.parseCanonical` for the name + sorted labels.
+    pub fn seriesCanonical(self: *Db, gpa: Allocator, id: SeriesId) Error!?[]u8 {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.seriesCanonicalLocked(gpa, id);
+    }
+
+    /// Every registered series, id + parsed descriptor, in ascending id
+    /// order. Replaces walking ids `1, 2, 3, …` until one is missing (which
+    /// only ever worked because ids happen to be dense today — this reads
+    /// the reverse index directly, so it stays correct if that ever
+    /// changes). Holds an MVCC snapshot like `range` — `defer it.deinit()`.
+    pub fn seriesIterator(self: *Db) Error!SeriesIterator {
+        self.lock.acquire();
+        defer self.lock.release();
+        var it = try self.seriesIteratorLocked();
+        it.lock = &self.lock;
+        return it;
+    }
+
+    /// Every series registered under exactly `name`, filtered to those whose
+    /// labels are a SUPERSET of `filter` — every `(name, value)` pair in
+    /// `filter` must be present with an equal value; the series may carry
+    /// further labels `filter` says nothing about. For a reader that knows
+    /// the metric name but not every label value up front (the terminal-UI consumer's own
+    /// `key`/`field` disambiguation: today it walks and decodes every series
+    /// in the store to find the ones for one source, `src/diskhist.zig`,
+    /// marked `zig-libs request: tsdb — list series`).
+    ///
+    /// `filter` is borrowed — it must outlive the returned iterator, same
+    /// convention as `labels` in `seriesId`. Scans only the series registered
+    /// under `name` (a name-prefix range over the forward index), never the
+    /// whole series catalog, so a store with many metric names costs this
+    /// call nothing proportional to the ones that don't match.
+    pub fn findSeries(self: *Db, name: []const u8, filter: []const Label) Error!SeriesIterator {
+        self.lock.acquire();
+        defer self.lock.release();
+        var it = try self.findSeriesLocked(name, filter);
+        it.lock = &self.lock;
+        return it;
+    }
+
+    /// Append (or overwrite) one sample. Same `(series, ts)` twice = last write
+    /// wins; the key IS the identity, so there is no duplicate-point state.
+    pub fn append(self: *Db, series: SeriesId, ts: Timestamp, value: f64) Error!void {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.appendLocked(series, ts, value);
+    }
+
+    /// Append a batch atomically — one transaction, so a crash leaves either
+    /// all of `points` or none of it.
+    pub fn appendMany(self: *Db, series: SeriesId, points: []const Sample) Error!void {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.appendManyLocked(series, points);
+    }
+
+    /// Append points for MULTIPLE series in ONE transaction — a crash or an
+    /// error partway through leaves every series untouched, never some
+    /// committed and others not. A flush across N series via `appendMany`
+    /// (one call per series) is N transactions and therefore N commits of
+    /// kvtree's own COW protocol (two `fsync`s each: one for the written
+    /// pages, one for the meta swap that makes the commit durable — see
+    /// `kvtree/src/core.zig`'s `commit`) — `appendBatch` is a CONSTANT number
+    /// of commits (one) regardless of how many series are in `batches`, not
+    /// one per series. Replaces the terminal-UI consumer's own per-series-transaction flush
+    /// loop (`src/diskhist.zig`, marked `zig-libs request: tsdb — append
+    /// points of many series in one transaction`).
+    pub fn appendBatch(self: *Db, batches: []const SeriesBatch) Error!void {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.appendBatchLocked(batches);
+    }
+
+    /// Drop series `id`: every sample (raw and compacted) and its index
+    /// entries. The data goes in bounded chunks; the LAST transaction removes
+    /// the forward and reverse index together, so the series disappears from
+    /// `lookupSeries`/`seriesIterator` only once its data is gone. A crash
+    /// part-way leaves a registered series with fewer samples — call again;
+    /// the operation is idempotent. The id is never handed out again (the
+    /// counter only grows), so a name registered afterwards gets a fresh id
+    /// and no stale sample can resurface under it.
+    ///
+    /// The id is dead afterwards: do not `append` through a `SeriesId` held
+    /// from before the delete — those samples would have no index entry (no
+    /// listing or budget sweep reaches them, though `liveSize` counts them).
+    /// Re-resolve with `seriesId`.
+    ///
+    /// A block whose header does not decode is deleted anyway but contributes
+    /// nothing to `DeleteSeriesResult.deleted` (so the count is a lower bound
+    /// on a rotted series; `sweep` still reports such a block as `CorruptPoint`).
+    pub fn deleteSeries(self: *Db, id: SeriesId, opts: DeleteSeriesOptions) Error!DeleteSeriesResult {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.deleteSeriesLocked(id, opts);
+    }
+
+    /// Pack every raw sample with `ts < before` into compressed blocks.
+    ///
+    /// Each chunk is ONE transaction that writes the blocks and deletes the
+    /// raw keys they absorbed, so a crash or an error leaves every sample
+    /// exactly once — raw or in a block, never both lost, never torn. There is
+    /// no resume record: compaction is idempotent ("pack what is still raw"),
+    /// and a re-run reads only what is still raw, which after a completed run
+    /// is the short tail per series plus everything at or above `before`.
+    /// Choose `before` so recent data — still being written, perhaps out of
+    /// order — stays raw (e.g. `now - 1h`).
+    pub fn compact(self: *Db, before: Timestamp, opts_in: CompactOptions) Error!CompactResult {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.compactLocked(before, opts_in);
+    }
+
+    /// Stream `[from, to)` of one series in ascending time order.
+    ///
+    /// The upper bound is EXCLUSIVE — half-open windows are what makes
+    /// consecutive queries tile without double-counting the boundary sample.
+    ///
+    /// The scan streams: it holds an MVCC snapshot and a `kvtree.Cursor` (a
+    /// root-to-leaf page stack), so iterating a month of points costs tree
+    /// depth, not the size of the window. This layer buffers nothing.
+    pub fn range(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp) Error!Range {
+        self.lock.acquire();
+        defer self.lock.release();
+        var it = try self.rangeLocked(series, from, to);
+        it.lock = &self.lock;
+        return it;
+    }
+
+    /// Delete every point with `ts < cutoff`, in bounded chunks.
+    ///
+    /// Each chunk is ONE transaction that deletes at most `chunk_deletes`
+    /// points AND advances (or clears) the persisted resume position. That
+    /// pairing is the whole guarantee — see SPEC.md §Retention:
+    ///
+    /// - **Consistent under interruption.** A crash or an early return leaves
+    ///   the tree on a chunk boundary: kvtree commits atomically, so the
+    ///   deletions and the resume position are both there or both absent. No
+    ///   chunk is ever half-applied.
+    /// - **Resumable.** A later call with the SAME cutoff continues from the
+    ///   persisted position instead of rescanning. A call with a DIFFERENT
+    ///   cutoff restarts from the beginning — a larger cutoff expires data the
+    ///   old position has already scanned past, and resuming would strand it
+    ///   forever.
+    /// - **Idempotent.** Re-running after an interruption converges on exactly
+    ///   the end state an uninterrupted sweep produces: the operation is
+    ///   "delete the keys below a bound", deletes of absent keys are no-ops,
+    ///   and the position is only ever an optimization on top.
+    pub fn sweep(self: *Db, cutoff: Timestamp, opts_in: SweepOptions) Error!SweepResult {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.sweepLocked(cutoff, opts_in);
+    }
+
+    /// The persisted retention resume record, if a sweep is mid-flight.
+    /// Exposed for operators and for the tests that assert resumability.
+    pub fn retentionState(self: *Db) Error!?RetentionState {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.retentionStateLocked();
+    }
+
+    /// Live sample-data size, in bytes: every raw point entry
+    /// (`codec.point_entry_bytes` each) plus every block entry's key and
+    /// value bytes as stored. EXACT, not an estimate — it sums the entries'
+    /// own lengths. Excludes the series index/reverse-index entries (small —
+    /// one per series, never touched by retention) and kvtree's own on-disk
+    /// page/freelist overhead (the file itself never shrinks — see this
+    /// section's doc comment above). Costs one forward scan of both
+    /// partitions: O(raw points + blocks).
+    pub fn liveSize(self: *Db) Error!u64 {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.liveSizeLocked();
+    }
+
+    /// Delete the globally OLDEST data — across every series, by timestamp,
+    /// not by key order — until live data is at most `max_bytes`, or until
+    /// `opts.max_deletes` is spent (call again to continue). A no-op,
+    /// `.done = true`, if the budget is already met.
+    ///
+    /// **Unit of deletion.** A raw point, or a WHOLE compacted block, ordered
+    /// by its oldest timestamp (a block's first sample). Splitting a block to
+    /// free a few bytes would cost a rewrite and gain little; a block holds a
+    /// bounded window, so the newest sample dropped this way is at most one
+    /// block span younger than a per-sample policy would have dropped.
+    ///
+    /// **Why not `sweep` with a computed cutoff.** A key sorts `(series,
+    /// timestamp)` — series-MAJOR — so "the earliest keys in the tree" is NOT
+    /// "the oldest data in the store": series 9 can hold data from a decade
+    /// ago while series 0 was created five minutes ago. Age retention
+    /// (`sweep`) applies ONE cutoff independently to every series; a size
+    /// BUDGET is a comparison across series, and only timestamps answer it.
+    ///
+    /// **The algorithm**: a k-way merge over per-series, per-partition "oldest
+    /// surviving entry" candidates, seeded once via `seriesIterator` (two tree
+    /// probes per series) and kept in a min-heap ordered by timestamp (ties
+    /// broken by series id, then BLOCK before raw — see `less`). Popping
+    /// the minimum and re-probing that one stream costs O(log(series count))
+    /// per entry — no rescan of the store, no bisection over candidate
+    /// cutoffs.
+    ///
+    /// **Crash-safety — narrower than `sweep`'s.** Each chunk of
+    /// `opts.chunk_deletes` deletions commits atomically (kvtree's COW
+    /// commit), so a crash mid-call leaves a CONSISTENT tree — never a torn
+    /// chunk. But there is no persisted resume record: a crash (or hitting
+    /// `max_deletes`) leaves the merge's in-memory progress on the floor; the
+    /// next call recomputes `liveSize` and reseeds from scratch, reaching the
+    /// same end state (deleting the globally oldest entries is idempotent).
+    pub fn sweepToBudget(self: *Db, max_bytes: u64, opts: SweepToBudgetOptions) Error!SweepToBudgetResult {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.sweepToBudgetLocked(max_bytes, opts);
+    }
+
+    /// One call that does the periodic housekeeping: age retention, then
+    /// compaction, then the size budget. Run it from a timer (e.g. every few
+    /// minutes); nothing in this module runs by itself, and a store that is
+    /// never maintained keeps 25 bytes per sample and grows without bound.
+    ///
+    /// The order is deliberate: expired data is dropped before it is packed,
+    /// and the budget sees the compacted size. Each step keeps its own
+    /// guarantees (chunked transactions, resumable sweep); a step that hits
+    /// its `max_chunks` / `max_deletes` limit reports `done = false` and the
+    /// next call continues. `now` and the durations share the timestamps' unit;
+    /// subtraction saturates.
+    pub fn maintain(self: *Db, now: Timestamp, policy: Policy) Error!MaintainResult {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.maintainLocked(now, policy);
+    }
+
+    /// Every metric name that has a registered series, sorted, unique. The
+    /// slice and the strings are allocated on `arena`.
+    pub fn metricNames(self: *Db, arena: Allocator) Error![][]const u8 {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.metricNamesLocked(arena);
+    }
+
+    /// Every label name used by any series, sorted, unique (the metric name
+    /// is not a label). Allocated on `arena`. One reverse-index scan.
+    pub fn labelNames(self: *Db, arena: Allocator) Error![][]const u8 {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.labelNamesLocked(arena);
+    }
+
+    /// Every value `name` takes across all series, sorted, unique. Allocated
+    /// on `arena`.
+    pub fn labelValues(self: *Db, arena: Allocator, name: []const u8) Error![][]const u8 {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.labelValuesLocked(arena, name);
+    }
+
+    /// Series of metric `name` whose labels satisfy EVERY matcher (see
+    /// `Matcher`). Scans only the series registered under `name` (the same
+    /// name-prefix range as `findSeries`); no index of its own. `matchers` is
+    /// borrowed and must outlive the iterator. `re`/`nre` patterns are
+    /// compiled once here (fully anchored, as in Prometheus: the whole value
+    /// must match) and freed by the iterator's `deinit`; a bad pattern is
+    /// `error.InvalidRegex`.
+    pub fn findSeriesMatching(self: *Db, name: []const u8, matchers: []const Matcher) Error!SeriesIterator {
+        self.lock.acquire();
+        defer self.lock.release();
+        var it = try self.findSeriesMatchingLocked(name, matchers);
+        it.lock = &self.lock;
+        return it;
+    }
+
+    /// Series of ANY metric name whose labels satisfy every matcher, in id
+    /// order (Prometheus' `Select`: "every series with `host=web-1`"). The
+    /// metric name is matched by a matcher named `__name__`
+    /// (`name_label`), as in Prometheus; it reads as a label of every series,
+    /// so a series' own label of that name is shadowed. Semantics otherwise as
+    /// `findSeriesMatching`: a label the series lacks reads as the empty string,
+    /// `re`/`nre` are fully anchored, a bad pattern is `error.InvalidRegex`.
+    /// No matchers at all yields every series. One scan of the reverse index
+    /// (O(series)): there is no inverted index, and a lookup that knows the
+    /// metric name should use `findSeriesMatching`, which scans only that
+    /// name's range. `matchers` is borrowed and must outlive the iterator.
+    pub fn findSeriesAcrossNames(self: *Db, matchers: []const Matcher) Error!SeriesIterator {
+        self.lock.acquire();
+        defer self.lock.release();
+        var it = try self.findSeriesAcrossNamesLocked(matchers);
+        it.lock = &self.lock;
+        return it;
+    }
+
+    /// Delete the samples of `series` with `from <= ts < to`, raw and
+    /// compacted, in ONE transaction (all or nothing across a crash). A block
+    /// that straddles the window is decoded, stripped of the window's samples
+    /// and re-encoded. Returns the number of samples removed (a timestamp
+    /// held both raw and in a block counts twice). The transaction holds the
+    /// affected keys and straddling blocks in memory: for a very large window
+    /// use `deleteRangeChunked`.
+    pub fn deleteRange(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp) Error!usize {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.deleteRangeLocked(series, from, to);
+    }
+
+    /// `deleteRange` in bounded steps, for a window too large to hold in one
+    /// transaction: each step removes the window's samples below some bound
+    /// (about `opts.chunk_points` of them) in its own transaction and the next
+    /// step continues above it, so memory is one chunk, not the window.
+    /// **Not atomic as a whole**: a crash or an error leaves a consistent
+    /// store from which a prefix of the window (in time order) is gone;
+    /// calling it again with the same window finishes the job (idempotent,
+    /// like `deleteSeries`). Every step is atomic, and a reader sees each
+    /// step's result as a whole.
+    pub fn deleteRangeChunked(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp, opts: DeleteRangeOptions) Error!DeleteRangeResult {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.deleteRangeChunkedLocked(series, from, to, opts);
+    }
+
+    /// Reduce `[from, to)` of one series into fixed `step`-wide buckets with
+    /// `func`, streaming over `range` (nothing buffered). Bucket `i` covers
+    /// `[from + i*step, from + (i+1)*step)` clipped to `to`. `out` must hold
+    /// `bucketCount(from, to, step)` entries (else `error.InvalidAggregate`);
+    /// an empty bucket is null for every function (also `count`). NaN samples
+    /// are ignored by `min`/`max` unless a bucket holds only NaNs, and
+    /// propagate through `sum`/`avg`. Returns the number of buckets written.
+    pub fn aggregate(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp, step: Timestamp, func: AggFn, out: []?f64) Error!usize {
+        self.lock.acquire();
+        defer self.lock.release();
+        return self.aggregateLocked(series, from, to, step, func, out);
+    }
 };
 
 /// Add `str` to `out` (copied onto `arena`) unless `seen` has it.
@@ -1660,11 +1935,14 @@ pub const Matcher = struct {
 };
 
 /// True iff `have` satisfies every matcher; `res[i]` is the compiled pattern
-/// of matcher `i` for re/nre.
-fn matchersMatch(have: []const Label, matchers: []const Matcher, res: []const ?regex.Regex) bool {
+/// of matcher `i` for re/nre. With `name` set, a matcher named
+/// `Db.name_label` reads that name instead of a label.
+fn matchersMatch(name: ?[]const u8, have: []const Label, matchers: []const Matcher, res: []const ?regex.Regex) bool {
     for (matchers, 0..) |m, i| {
         var v: []const u8 = "";
-        for (have) |h| if (std.mem.eql(u8, h.name, m.name)) {
+        if (name != null and std.mem.eql(u8, m.name, Db.name_label)) {
+            v = name.?;
+        } else for (have) |h| if (std.mem.eql(u8, h.name, m.name)) {
             v = h.value;
             break;
         };
@@ -1809,9 +2087,13 @@ pub const SeriesIterator = struct {
     snap: kvtree.Snapshot,
     cur: kvtree.Cursor,
     mode: Mode,
+    /// `findSeriesAcrossNames`: the matchers applied to the `.all` scan.
+    across: ?[]const Matcher = null,
     /// Compiled `Matcher` patterns (`findSeriesMatching`), owned.
     regexes: []?regex.Regex = &.{},
     regex_gpa: ?Allocator = null,
+    /// The owning `Db`'s lock, taken by `next` and `deinit` (set by the `Db` finders).
+    lock: ?*kvtree.Lock = null,
 
     const Mode = union(enum) {
         /// `Db.seriesIterator`: the whole reverse index, in id order.
@@ -1832,13 +2114,25 @@ pub const SeriesIterator = struct {
     /// returned entry's `canon` buffer and `descriptor.labels` on `gpa` —
     /// the caller's to free via `SeriesEntry.deinit`.
     pub fn next(self: *SeriesIterator, gpa: Allocator) Error!?SeriesEntry {
+        if (self.lock) |l| l.acquire();
+        defer if (self.lock) |l| l.release();
+        return self.nextUnlocked(gpa);
+    }
+
+    fn nextUnlocked(self: *SeriesIterator, gpa: Allocator) Error!?SeriesEntry {
         while (true) {
             const e = (try self.cur.next()) orelse return null;
             switch (self.mode) {
                 .all => {
                     if (e.key.len != 9 or e.key[0] != codec.tag_series_rev) return null;
                     const id = std.mem.readInt(u64, e.key[1..9], .big);
-                    return try self.decodeEntry(gpa, id, e.val);
+                    const entry = try self.decodeEntry(gpa, id, e.val);
+                    if (self.across) |ms| if (!matchersMatch(entry.descriptor.name, entry.descriptor.labels, ms, self.regexes)) {
+                        var mut = entry;
+                        mut.deinit(gpa);
+                        continue;
+                    };
+                    return entry;
                 },
                 .by_name => |m| {
                     const prefix = m.prefix[0..m.prefix_len];
@@ -1848,7 +2142,7 @@ pub const SeriesIterator = struct {
                     const id = std.mem.readInt(u64, e.val[0..8], .big);
                     const entry = try self.decodeEntry(gpa, id, e.key[1..]);
                     if (!labelsMatch(entry.descriptor.labels, m.filter) or
-                        !matchersMatch(entry.descriptor.labels, m.matchers, self.regexes))
+                        !matchersMatch(null, entry.descriptor.labels, m.matchers, self.regexes))
                     {
                         var mut = entry;
                         mut.deinit(gpa);
@@ -1875,6 +2169,9 @@ pub const SeriesIterator = struct {
     }
 
     pub fn deinit(self: *SeriesIterator) void {
+        const lock = self.lock;
+        if (lock) |l| l.acquire();
+        defer if (lock) |l| l.release();
         if (self.regex_gpa) |g| {
             for (self.regexes) |*r| if (r.*) |*x| x.deinit(g);
             g.free(self.regexes);
@@ -1930,8 +2227,16 @@ pub const Range = struct {
     blk_buf: [chunk.max_block_bytes]u8 = undefined,
     blk_len: usize = 0,
     reader: ?chunk.Reader = null,
+    /// The owning `Db`'s lock, taken by `next` and `deinit` (set by `Db.range`).
+    lock: ?*kvtree.Lock = null,
 
     pub fn next(self: *Range) Error!?Sample {
+        if (self.lock) |l| l.acquire();
+        defer if (self.lock) |l| l.release();
+        return self.nextUnlocked();
+    }
+
+    fn nextUnlocked(self: *Range) Error!?Sample {
         try self.fillRaw();
         try self.fillBlock();
         const r = self.raw_peek;
@@ -2010,6 +2315,9 @@ pub const Range = struct {
     }
 
     pub fn deinit(self: *Range) void {
+        const lock = self.lock;
+        if (lock) |l| l.acquire();
+        defer if (lock) |l| l.release();
         if (self.bcur) |*c| c.deinit();
         self.cur.deinit();
         self.snap.release();
@@ -4196,6 +4504,47 @@ test "findSeriesMatching: eq, neq (absent label reads as empty), re and nre are 
     try testing.expectEqual(@as(usize, 0), none.len);
 }
 
+test "findSeriesAcrossNames: label lookup across metric names, __name__ matcher, same semantics as findSeriesMatching" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const a = try fx.db.seriesId("cpu", &.{ .{ .name = "host", .value = "web-1" }, .{ .name = "core", .value = "0" } });
+    const b = try fx.db.seriesId("mem", &.{.{ .name = "host", .value = "web-1" }});
+    const c = try fx.db.seriesId("mem", &.{.{ .name = "host", .value = "web-2" }});
+    const d = try fx.db.seriesId("up", &.{});
+    const e = try fx.db.seriesId("disk", &.{ .{ .name = "host", .value = "web-1" }, .{ .name = "dev", .value = "sda" } });
+
+    const t = struct {
+        fn run(g: Allocator, db: *Db, ms: []const Matcher, expect: []const SeriesId) !void {
+            var it = try db.findSeriesAcrossNames(ms);
+            defer it.deinit();
+            var out: std.ArrayList(SeriesId) = .empty;
+            defer out.deinit(g);
+            while (try it.next(g)) |ev| {
+                var en = ev;
+                defer en.deinit(g);
+                try out.append(g, en.id);
+            }
+            try testing.expectEqualSlices(SeriesId, expect, out.items); // id order
+        }
+    }.run;
+    try t(gpa, &fx.db, &.{}, &.{ a, b, c, d, e });
+    try t(gpa, &fx.db, &.{.{ .name = "host", .value = "web-1" }}, &.{ a, b, e });
+    try t(gpa, &fx.db, &.{.{ .name = "host", .value = "web-1", .op = .neq }}, &.{ c, d }); // d has no host: reads as ""
+    try t(gpa, &fx.db, &.{ .{ .name = "host", .value = "web-1" }, .{ .name = "__name__", .value = "mem" } }, &.{b});
+    try t(gpa, &fx.db, &.{.{ .name = "__name__", .value = "cpu|disk", .op = .re }}, &.{ a, e });
+    try t(gpa, &fx.db, &.{.{ .name = "__name__", .value = "mem", .op = .neq }}, &.{ a, d, e });
+    try t(gpa, &fx.db, &.{.{ .name = "host", .value = "web-.", .op = .re }}, &.{ a, b, c, e });
+    try t(gpa, &fx.db, &.{.{ .name = "host", .value = "", .op = .eq }}, &.{d}); // lacking the label
+    try t(gpa, &fx.db, &.{.{ .name = "host", .value = "nowhere" }}, &.{});
+    try testing.expectError(error.InvalidRegex, fx.db.findSeriesAcrossNames(&.{.{ .name = "host", .value = "(", .op = .re }}));
+    // `findSeriesMatching` keeps reading `__name__` as an ordinary label.
+    const lbl = try fx.db.seriesId("x", &.{.{ .name = "__name__", .value = "y" }});
+    const got = try matchIds(gpa, &fx.db, "x", &.{.{ .name = "__name__", .value = "y" }});
+    defer gpa.free(got);
+    try testing.expectEqualSlices(SeriesId, &.{lbl}, got);
+}
+
 test "findSeriesMatching: no leak when the pattern list fails to compile midway" {
     var fx = try Fixture.init(testing.allocator);
     defer fx.deinit();
@@ -4313,6 +4662,119 @@ test "deleteRange: model check against a map, random windows over a partly compa
         }
         _ = try checkBlockInvariants(&fx.db);
     }
+}
+
+test "threads: concurrent appends, reads, series lookups, compaction and listing on one Db lose nothing" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const writers = 4;
+    const per = 250;
+    const Ctx = struct {
+        db: *Db,
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn write(c: *@This(), w: usize) void {
+            c.writeImpl(w) catch c.failed.store(true, .release);
+        }
+        fn writeImpl(c: *@This(), w: usize) !void {
+            var nm: [8]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nm, "m{d}", .{w});
+            const id = try c.db.seriesId(name, &.{.{ .name = "w", .value = "x" }});
+            for (0..per) |i| try c.db.append(id, @intCast(i), @floatFromInt(i));
+        }
+        fn read(c: *@This()) void {
+            c.readImpl() catch c.failed.store(true, .release);
+        }
+        fn readImpl(c: *@This()) !void {
+            for (0..40) |_| {
+                var it = try c.db.findSeriesAcrossNames(&.{.{ .name = "w", .value = "x" }});
+                defer it.deinit();
+                while (try it.next(testing.allocator)) |ev| {
+                    var e = ev;
+                    defer e.deinit(testing.allocator);
+                    var r = try c.db.range(e.id, 0, per);
+                    defer r.deinit();
+                    var last: Timestamp = -1;
+                    while (try r.next()) |sm| {
+                        if (sm.ts <= last) return error.OutOfOrder;
+                        last = sm.ts;
+                    }
+                }
+                _ = try c.db.liveSize();
+            }
+        }
+        fn maintain(c: *@This()) void {
+            c.maintainImpl() catch c.failed.store(true, .release);
+        }
+        fn maintainImpl(c: *@This()) !void {
+            for (0..10) |_| _ = try c.db.compact(per, .{ .min_run = 1 });
+        }
+    };
+    var ctx: Ctx = .{ .db = &fx.db };
+    var threads: [writers + 3]std.Thread = undefined;
+    for (threads[0..writers], 0..) |*t, w| t.* = try std.Thread.spawn(.{}, Ctx.write, .{ &ctx, w });
+    threads[writers] = try std.Thread.spawn(.{}, Ctx.read, .{&ctx});
+    threads[writers + 1] = try std.Thread.spawn(.{}, Ctx.read, .{&ctx});
+    threads[writers + 2] = try std.Thread.spawn(.{}, Ctx.maintain, .{&ctx});
+    for (threads) |t| t.join();
+    try testing.expect(!ctx.failed.load(.acquire));
+    for (0..writers) |w| {
+        var nm: [8]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nm, "m{d}", .{w});
+        const id = (try fx.db.lookupSeries(name, &.{.{ .name = "w", .value = "x" }})).?;
+        const got = try collect(gpa, &fx.db, id, all_lo, all_hi);
+        defer gpa.free(got);
+        try testing.expectEqual(@as(usize, per), got.len);
+        for (got, 0..) |sm, i| {
+            try testing.expectEqual(@as(Timestamp, @intCast(i)), sm.ts);
+            try testing.expectEqual(@as(f64, @floatFromInt(i)), sm.value);
+        }
+    }
+    _ = try checkBlockInvariants(&fx.db);
+}
+
+test "compact: a sparse series compacted after every sample grows one small block instead of cutting a block per sample" {
+    // Kills: the tail coalescing dropped (200 one-sample blocks), and a stale read of the last block.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("sparse", &.{});
+    for (0..200) |i| {
+        try fx.db.append(s, @as(Timestamp, @intCast(i)) * 60, @floatFromInt(i));
+        _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    }
+    // 64, 64, 64 and the 8 that remained: a block is closed once it holds `coalesce_below` samples.
+    try testing.expectEqual(@as(usize, 4), try checkBlockInvariants(&fx.db));
+    try testing.expectEqual(@as(usize, 0), try rawCount(&fx.db));
+    const got = try collect(gpa, &fx.db, s, all_lo, all_hi);
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 200), got.len);
+    for (got, 0..) |sm, i| {
+        try testing.expectEqual(@as(Timestamp, @intCast(i)) * 60, sm.ts);
+        try testing.expectEqual(@as(f64, @floatFromInt(i)), sm.value);
+    }
+    try testing.expect(try fx.db.liveSize() < 200 * codec.point_entry_bytes); // raw would be 5000 bytes
+}
+
+test "compact: a gap run next to a small block joins it, and samples inside its span go in the same step" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("g", &.{});
+    for (100..110) |i| try fx.db.append(s, @intCast(i), 1);
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 }); // one small block [100, 109]
+    for (0..5) |i| try fx.db.append(s, @intCast(i), 2); // a gap run before it
+    for ([_]Timestamp{ 103, 107 }) |ts| try fx.db.append(s, ts, 3); // overwrites inside it
+    _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+    try testing.expectEqual(@as(usize, 1), try checkBlockInvariants(&fx.db));
+    try testing.expectEqual(@as(usize, 0), try rawCount(&fx.db));
+    const got = try collect(gpa, &fx.db, s, all_lo, all_hi);
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 15), got.len);
+    try testing.expectEqual(@as(f64, 3), got[8].value); // ts 103
+    try testing.expectEqual(@as(Timestamp, 107), got[12].ts);
+    try testing.expectEqual(@as(f64, 3), got[12].value);
 }
 
 test "deleteRangeChunked: model check against a map, random windows and chunk sizes over a partly compacted series" {
