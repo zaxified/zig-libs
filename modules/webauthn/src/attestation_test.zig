@@ -10,6 +10,8 @@ const testing = std.testing;
 const webauthn = @import("root.zig");
 const cbor = @import("cbor");
 const vectors = @import("vectors.zig");
+const apple = @import("apple_fixture.zig");
+const android = @import("android_key_fixture.zig");
 
 fn clientDataHash(client_data_json: []const u8) [32]u8 {
     var h: [32]u8 = undefined;
@@ -132,22 +134,68 @@ test "verifyAttestation: real W3C §16.16 vector (fmt=fido-u2f)" {
 
 // ── deferred formats: structurally recognized and rejected ─────────────────
 
-test "verifyAttestation: fmt=tpm -> error.UnsupportedFormat (deferred, not half-verified)" {
+test "verifyAttestation: fmt=android-key verifies signature, key binding, challenge and AuthorizationList rules" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // clientDataHash content is irrelevant here -- fmt dispatch happens
-    // before any signature is touched.
+    const h = android.client_data_hash;
+    // x509.safe refuses any certificate whose extension values use a high-tag-number identifier, and every real
+    // Android KeyDescription does (AuthorizationList [600], [702]): until that layer treats an unrecognized
+    // extension's value as opaque, the positive path cannot run (see SPEC Backlog, android-key).
+    const r = webauthn.verifyAttestation(a, &android.attestation_object, h) catch |e| {
+        if (e == error.InvalidCertificate) return error.SkipZigTest;
+        return e;
+    };
+    try testing.expectEqual(webauthn.AttestationType.basic, r.attestation_type);
+    try testing.expectEqualStrings("android-key", r.format);
+    try testing.expect(r.leaf_cert_der != null);
+    // Properties may come from either list: software-only enforcement is accepted (the RP's policy to refuse).
+    _ = try webauthn.verifyAttestation(a, &android.software_only_attestation_object, h);
+    // Each rule of §8.4 has a variant that breaks only it.
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, &android.bad_challenge_attestation_object, h));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, &android.all_applications_attestation_object, h));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, &android.bad_origin_attestation_object, h));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, &android.no_origin_attestation_object, h));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, &android.extra_purpose_attestation_object, h));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, &android.verify_purpose_attestation_object, h));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, &android.other_key_attestation_object, h));
+    // The signature covers the clientDataHash.
+    var wrong = h;
+    wrong[0] ^= 1;
+    try testing.expectError(error.BadSignature, webauthn.verifyAttestation(a, &android.attestation_object, wrong));
+}
+
+test "verifyAttestation: the W3C §16.14 android-key certificate is refused by x509.safe (multi-byte tag), a typed error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const hash: [32]u8 = @splat(0);
+    // Today: the certificate is refused by x509.safe (multi-byte tag in the KeyDescription extension).
+    try testing.expectError(error.InvalidCertificate, webauthn.verifyAttestation(a, &vectors.android_key_es256_attestation_object, hash));
+}
+
+test "verifyAttestation: fmt=tpm -> error.UnsupportedFormat (not yet implemented)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     const hash: [32]u8 = @splat(0);
     try testing.expectError(error.UnsupportedFormat, webauthn.verifyAttestation(a, &vectors.tpm_es256_attestation_object, hash));
 }
 
-test "verifyAttestation: fmt=android-key -> error.UnsupportedFormat (deferred, not half-verified)" {
+test "verifyAttestation: fmt=apple verifies the nonce extension and the credential key; AnonCA type" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const hash: [32]u8 = @splat(0);
-    try testing.expectError(error.UnsupportedFormat, webauthn.verifyAttestation(a, &vectors.android_key_es256_attestation_object, hash));
+    const r = try webauthn.verifyAttestation(a, &apple.attestation_object, apple.client_data_hash);
+    try testing.expectEqual(webauthn.AttestationType.anonymization_ca, r.attestation_type);
+    try testing.expect(r.leaf_cert_der != null);
+    // Another clientDataHash changes the expected nonce.
+    var wrong = apple.client_data_hash;
+    wrong[31] ^= 1;
+    try testing.expectError(error.BadSignature, webauthn.verifyAttestation(a, &apple.attestation_object, wrong));
+    // A nonce computed over other data, and a certificate over a different key than the credential's.
+    try testing.expectError(error.BadSignature, webauthn.verifyAttestation(a, &apple.bad_nonce_attestation_object, apple.client_data_hash));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, &apple.other_key_attestation_object, apple.client_data_hash));
 }
 
 // ── adversarial reject-teeth ────────────────────────────────────────────────
@@ -2188,4 +2236,35 @@ test "verifySignature: malformed keys and signatures are typed errors, never rea
     n512[63] = 0x01;
     const rsa_small: webauthn.CoseKey = .{ .rsa = .{ .alg = webauthn.alg_rs256, .n = &n512, .e = &.{ 1, 0, 1 } } };
     try testing.expectError(error.InvalidKey, webauthn.verifySignature(rsa_small, webauthn.alg_rs256, msg, &@as([64]u8, @splat(0))));
+}
+
+test "verifyAttestationChain: no x5c is NoCertificateChain; an unanchored x5c is refused by x509" {
+    const a = testing.allocator;
+    try testing.expectError(error.NoCertificateChain, webauthn.verifyAttestationChain(a, &vectors.none_es256.attestation_object, &.{}, .{ .now_sec = 1_800_000_000 }));
+    const r = webauthn.verifyAttestationChain(a, &vectors.packed_es256_full.attestation_object, &.{}, .{ .now_sec = 1_800_000_000 });
+    try testing.expect(std.meta.isError(r));
+}
+
+test "parseExtensionOutputs: credProtect and hmac-secret are typed, unknown keys skipped, wrong types refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ok = "\xa3\x6bcredProtect\x03\x6bhmac-secret\xf5\x61x\x01";
+    const r = try webauthn.parseExtensionOutputs(a, ok);
+    try testing.expectEqual(webauthn.CredProtect.user_verification_required, r.cred_protect.?);
+    try testing.expectEqual(true, r.hmac_secret.?.supported);
+    const enc = try webauthn.parseExtensionOutputs(a, "\xa1\x6bhmac-secret\x42\x01\x02");
+    try testing.expectEqualSlices(u8, "\x01\x02", enc.hmac_secret.?.encrypted);
+    try testing.expectError(error.WrongType, webauthn.parseExtensionOutputs(a, "\xa1\x6bcredProtect\xf5"));
+    try testing.expectError(error.WrongType, webauthn.parseExtensionOutputs(a, "\x01"));
+}
+
+test "parseClientExtensionResults: credProps.rk" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try webauthn.parseClientExtensionResults(a, "{\"credProps\":{\"rk\":true},\"other\":1}");
+    try testing.expectEqual(@as(?bool, true), r.cred_props_rk);
+    try testing.expectEqual(@as(?bool, null), (try webauthn.parseClientExtensionResults(a, "{}")).cred_props_rk);
+    try testing.expectError(error.InvalidJson, webauthn.parseClientExtensionResults(a, "{\"credProps\":{\"rk\":1}}"));
 }

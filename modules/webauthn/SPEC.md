@@ -152,7 +152,7 @@ tampers exactly one input and asserts the *specific* typed error, not merely "so
   authenticators always report `0`) — that stateful comparison is a caller/storage-layer concern,
   not something a stateless verifier function can own.
 - **Out of scope, by design (not silently skipped):**
-  - **`tpm`/`android-key` attestation formats** — see *Backlog / deferred* below.
+  - **`tpm` attestation format** (and `android-key`, which cannot run yet) — see *Backlog / deferred* below.
   - **Attestation trust-chain validation / FIDO Metadata Service (MDS) lookups** — this module
     proves the attestation statement's signature is internally consistent (the leaf cert really
     signed this blob with its own key), not that the leaf cert chains to a trusted root or that
@@ -187,8 +187,14 @@ section numbers). They cover:
 - **Attestation, the three implemented formats:** §16.2 (`none`), §16.3 (`packed` self),
   §16.7/§16.10/§16.11 (`packed` x5c/basic — ES256/RS256/EdDSA credentials, all signed by the
   shared spec-CA's EC P-256 attestation key), §16.16 (`fido-u2f`).
-- **Structural rejection of unsupported formats:** §16.13 (`tpm`) and §16.14 (`android-key`) real
-  vectors fed to `verifyAttestation` give `error.UnsupportedFormat`.
+- **Structural rejection of unsupported formats:** the §16.13 (`tpm`) real vector fed to `verifyAttestation`
+  gives `error.UnsupportedFormat`; the §16.14 (`android-key`) one gives `error.InvalidCertificate` (see Backlog).
+- **`apple` (§8.8):** a generated attestation (`tools/gen_apple_fixture.py`: nonce extension, credential key binding)
+  verifies as `anonymization_ca`; a wrong clientDataHash, a nonce over other data and a certificate over another key
+  each fail. No real Apple attestation was available offline.
+- **Extension decoders and chain hook:** `parseExtensionOutputs` (`credProtect`, `hmac-secret`), `parseClientExtensionResults`
+  (`credProps.rk`) and `verifyAttestationChain` (`x509.verifyChain` over `attStmt.x5c` against caller anchors) are covered
+  by unit tests with hand-built inputs.
 - **Registration ceremony:** all six implemented §16 registration vectors verify through
   `verifyRegistration` against their own separately-stated `registration_challenge`, `rp_id` and
   `origin`.
@@ -256,23 +262,18 @@ is no external vector for them.
 
 ## Backlog / deferred
 
-- **`apple` anonymous attestation (§8.8), `android-key` (§8.4), then `tpm` (§8.3)** — go-webauthn
-  supports them; an RP that requires direct attestation from Apple, Android or Windows Hello devices
-  cannot use this module. `apple` is small (the nonce extension), `android-key` medium (the Android
-  Keystore X.509 extension, OID `1.3.6.1.4.1.11129.2.1.17`, a nested `KeyDescription` /
-  `AuthorizationList`), `tpm` large (TCG `TPMS_ATTEST`/`TPMT_SIGNATURE`/`TPMT_PUBLIC` structs: a
-  third wire format, plus `certInfo`/`pubArea` binding and an EK/AIK chain for full trust). Until
-  built, `verifyAttestation` recognizes `fmt == "tpm"` / `"android-key"` and returns
-  `error.UnsupportedFormat` instead of half-parsing (a partially checked attestation is a false
-  sense of security). Fits §2.
-- **Attestation trust-chain validation hook** — chain `x5c` to a caller store via
-  `x509.verifyChain` and expose the leaf and intermediates in the result (today only
-  `AttestationResult.leaf_cert_der`, and `.basic` means only "the statement is internally
-  consistent"); go-webauthn plus MDS answers "is this a genuine model". Needs a trust-store/MDS
-  design decision this module should not make unilaterally for every caller (the MDS download itself
-  is the caller's I/O). Effort: medium. Fits §2.
-- **Typed decoders for authenticator extension outputs** (`credProtect`, `hmac-secret`,
-  `credProps`) — returned raw today; add if a consumer wants them.
+- **`android-key` attestation (§8.4) is implemented but cannot run yet.** `verifyAttestation` dispatches `fmt ==
+  "android-key"` (signature under the certificate key, certificate key == credential key, `attestationChallenge ==
+  clientDataHash`, `allApplications` absent, `origin == KM_ORIGIN_GENERATED`, `purpose == {KM_PURPOSE_SIGN}`, over
+  `softwareEnforced` and `teeEnforced` together), but every real Android KeyDescription uses high-tag-number tags
+  (`[600]`, `[702]`) and `x509.safe` refuses a certificate with any such tag in any extension value
+  (`MultiByteTag` -> `error.InvalidCertificate`), including W3C §16.14. Blocked on `x509.safe` treating an
+  unrecognized extension's value as opaque (std's `Certificate.parse` never reads it); the generated fixtures
+  (`tools/gen_android_key_fixture.py`) already cover every rule and their test skips until then.
+- **`tpm` attestation (§8.3)** — large: TCG `TPMS_ATTEST` / `TPMT_SIGNATURE` / `TPMT_PUBLIC` structs (a third wire
+  format), `certInfo` / `pubArea` binding, the AIK certificate profile. `fmt == "tpm"` returns
+  `error.UnsupportedFormat` instead of half-parsing (a partially checked attestation is a false sense of
+  security). NOT REACHED (budget).
 
 ## Anchoring
 

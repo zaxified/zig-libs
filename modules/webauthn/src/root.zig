@@ -558,7 +558,13 @@ pub const AttestationError = AttestationObjectError || AuthDataError || Signatur
     AaguidExtensionMismatch,
 };
 
-pub const AttestationType = enum { none, basic, self_attestation };
+pub const AttestationType = enum {
+    none,
+    basic,
+    self_attestation,
+    /// WebAuthn "AnonCA" (`apple`, §8.8): a certificate issued per credential by the vendor's anonymization CA.
+    anonymization_ca,
+};
 
 /// The outcome of a registration ceremony.
 ///
@@ -783,6 +789,230 @@ fn firstX5cDer(att_stmt: []const cbor.MapEntry, require_single: bool) Attestatio
     };
 }
 
+// ── DER helpers for the `apple` and `android-key` statements ─────────────────
+
+/// One DER TLV: the tag as (class bits, constructed, number — high-tag-number form supported), its content and
+/// what follows.
+const Tlv = struct {
+    class: u2,
+    constructed: bool,
+    tag: u32,
+    content: []const u8,
+    rest: []const u8,
+
+    fn read(buf: []const u8) error{InvalidCertificate}!Tlv {
+        if (buf.len < 2) return error.InvalidCertificate;
+        var i: usize = 0;
+        const b0 = buf[i];
+        i += 1;
+        var tag: u32 = b0 & 0x1f;
+        if (tag == 0x1f) {
+            tag = 0;
+            while (true) {
+                if (i >= buf.len or tag > (1 << 24)) return error.InvalidCertificate;
+                const b = buf[i];
+                i += 1;
+                tag = (tag << 7) | (b & 0x7f);
+                if (b & 0x80 == 0) break;
+            }
+        }
+        if (i >= buf.len) return error.InvalidCertificate;
+        var len: usize = buf[i];
+        i += 1;
+        if (len & 0x80 != 0) {
+            const n = len & 0x7f;
+            if (n == 0 or n > 4 or i + n > buf.len) return error.InvalidCertificate;
+            len = 0;
+            for (buf[i..][0..n]) |b| len = (len << 8) | b;
+            i += n;
+        }
+        if (len > buf.len - i) return error.InvalidCertificate;
+        return .{
+            .class = @intCast(b0 >> 6),
+            .constructed = b0 & 0x20 != 0,
+            .tag = tag,
+            .content = buf[i..][0..len],
+            .rest = buf[i + len ..],
+        };
+    }
+
+    fn universal(buf: []const u8, tag: u32) error{InvalidCertificate}!Tlv {
+        const t = try read(buf);
+        if (t.class != 0 or t.tag != tag) return error.InvalidCertificate;
+        return t;
+    }
+};
+
+fn derInteger(content: []const u8) error{InvalidCertificate}!i64 {
+    if (content.len == 0 or content.len > 8) return error.InvalidCertificate;
+    var v: i64 = if (content[0] & 0x80 != 0) -1 else 0;
+    for (content) |b| v = (v << 8) | b;
+    return v;
+}
+
+/// The `extnValue` content of the certificate extension with this DER-encoded OID content, or null.
+fn certExtension(cert: std.crypto.Certificate, oid: []const u8) AttestationError!?[]const u8 {
+    const maybe_slice = x509.extensions.findExtensions(cert) catch return error.InvalidCertificate;
+    const slice = maybe_slice orelse return null;
+    var it = x509.extensions.iterate(slice, cert);
+    while (it.next() catch return error.InvalidCertificate) |entry| {
+        if (std.mem.eql(u8, entry.oid, oid)) return entry.value;
+    }
+    return null;
+}
+
+/// True iff the certificate's subject public key is the credential public key (WebAuthn §8.4 / §8.8: the
+/// attestation certificate attests the credential's own key).
+fn certKeyIsCredentialKey(parsed: std.crypto.Certificate.Parsed, key: CoseKey) bool {
+    switch (key) {
+        .ec2 => |k| {
+            if (parsed.pub_key_algo != .X9_62_id_ecPublicKey) return false;
+            const want_len: usize = switch (k.crv) {
+                cbor.cose.crv_p256 => 32,
+                else => return false,
+            };
+            if (k.x.len != want_len or k.y.len != want_len) return false;
+            const pk = parsed.pubKey();
+            return pk.len == 1 + 2 * want_len and pk[0] == 0x04 and
+                std.mem.eql(u8, pk[1..][0..want_len], k.x) and std.mem.eql(u8, pk[1 + want_len ..], k.y);
+        },
+        .okp => |k| {
+            if (parsed.pub_key_algo != .curveEd25519) return false;
+            return std.mem.eql(u8, parsed.pubKey(), k.x);
+        },
+        .rsa => |k| {
+            if (parsed.pub_key_algo != .rsaEncryption) return false;
+            const c = std.crypto.Certificate.rsa.PublicKey.parseDer(parsed.pubKey()) catch return false;
+            return std.mem.eql(u8, std.mem.trimStart(u8, c.modulus, "\x00"), std.mem.trimStart(u8, k.n, "\x00")) and
+                std.mem.eql(u8, std.mem.trimStart(u8, c.exponent, "\x00"), std.mem.trimStart(u8, k.e, "\x00"));
+        },
+    }
+}
+
+/// `apple` anonymous attestation (WebAuthn §8.8): `attStmt = {x5c}`. The credential certificate carries, in the
+/// extension 1.2.840.113635.100.8.2, `SEQUENCE { [1] EXPLICIT OCTET STRING nonce }` with
+/// `nonce = SHA-256(authData || clientDataHash)`, and its public key is the credential public key. There is no
+/// signature in the statement; trust is the chain to Apple's anonymization CA, which the caller checks
+/// (`AttestationResult.leaf_cert_der`).
+fn verifyApple(
+    allocator: Allocator,
+    att_stmt: []const cbor.MapEntry,
+    obj: AttestationObject,
+    att: AttestedCredentialData,
+    client_data_hash: [32]u8,
+) AttestationError!StatementResult {
+    const leaf_der = (try firstX5cDer(att_stmt, false)) orelse return error.MissingField;
+    var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+    const cert = x509.safe.safeCertificate(leaf_der, &scratch) catch return error.InvalidCertificate;
+    const parsed = cert.parse() catch return error.InvalidCertificate;
+
+    const msg = try std.mem.concat(allocator, u8, &.{ obj.auth_data_raw, &client_data_hash });
+    var nonce: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(msg, &nonce, .{});
+
+    const ext = (try certExtension(cert, &apple_nonce_oid)) orelse return error.InvalidAttestationStatement;
+    // SEQUENCE { [1] EXPLICIT { OCTET STRING } }
+    const seq = Tlv.universal(ext, 0x10) catch return error.InvalidCertificate;
+    const ctx = Tlv.read(seq.content) catch return error.InvalidCertificate;
+    if (ctx.class != 2 or ctx.tag != 1 or !ctx.constructed or ctx.rest.len != 0 or seq.rest.len != 0) return error.InvalidCertificate;
+    const oct = Tlv.universal(ctx.content, 0x04) catch return error.InvalidCertificate;
+    if (oct.rest.len != 0) return error.InvalidCertificate;
+    if (!std.mem.eql(u8, oct.content, &nonce)) return error.BadSignature;
+    if (!certKeyIsCredentialKey(parsed, att.credential_public_key)) return error.InvalidAttestationStatement;
+    return .{ .attestation_type = .anonymization_ca, .leaf_cert_der = leaf_der };
+}
+
+const apple_nonce_oid = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x63, 0x64, 0x08, 0x02 };
+/// 1.3.6.1.4.1.11129.2.1.17, the Android Keystore attestation extension.
+const android_key_description_oid = [_]u8{ 0x2B, 0x06, 0x01, 0x04, 0x01, 0xD6, 0x79, 0x02, 0x01, 0x11 };
+
+/// What `android-key` needs out of one `AuthorizationList`: the `purpose` set, `origin`, and whether
+/// `allApplications` is present.
+const AuthList = struct {
+    purpose_sign: bool = false,
+    purpose_other: bool = false,
+    origin: ?i64 = null,
+    all_applications: bool = false,
+};
+
+fn readAuthList(content: []const u8, out: *AuthList) error{InvalidCertificate}!void {
+    var rest = content;
+    while (rest.len != 0) {
+        const t = try Tlv.read(rest);
+        rest = t.rest;
+        if (t.class != 2 or !t.constructed) continue; // every AuthorizationList field is [n] EXPLICIT
+        switch (t.tag) {
+            1 => { // purpose: SET OF INTEGER
+                const set = try Tlv.universal(t.content, 0x11);
+                var items = set.content;
+                while (items.len != 0) {
+                    const it = try Tlv.universal(items, 0x02);
+                    items = it.rest;
+                    if ((try derInteger(it.content)) == 2) out.purpose_sign = true else out.purpose_other = true;
+                }
+            },
+            702 => { // origin: INTEGER
+                const v = try Tlv.universal(t.content, 0x02);
+                out.origin = try derInteger(v.content);
+            },
+            600 => out.all_applications = true,
+            else => {},
+        }
+    }
+}
+
+/// `android-key` attestation (WebAuthn §8.4): `attStmt = {alg, sig, x5c}`. The signature is over
+/// `authData || clientDataHash` under the credential certificate's key, which must be the credential public key;
+/// the certificate's Android KeyDescription extension carries `attestationChallenge == clientDataHash`, and in
+/// `softwareEnforced` and `teeEnforced` taken together `allApplications` is absent, `origin` is
+/// `KM_ORIGIN_GENERATED` (0) and `purpose` is exactly `{KM_PURPOSE_SIGN (2)}`. Which of the two lists vouches
+/// for a property (hardware-backed or not) is the caller's policy: `leaf_cert_der` is returned for that.
+fn verifyAndroidKey(
+    allocator: Allocator,
+    att_stmt: []const cbor.MapEntry,
+    obj: AttestationObject,
+    att: AttestedCredentialData,
+    client_data_hash: [32]u8,
+) AttestationError!StatementResult {
+    const alg_v = cborMapGetStr(att_stmt, "alg") orelse return error.MissingField;
+    const alg = alg_v.toI64() orelse return error.WrongType;
+    const sig_v = cborMapGetStr(att_stmt, "sig") orelse return error.MissingField;
+    const sig = switch (sig_v) {
+        .bytes => |b| b,
+        else => return error.WrongType,
+    };
+    const leaf_der = (try firstX5cDer(att_stmt, false)) orelse return error.MissingField;
+
+    const msg = try std.mem.concat(allocator, u8, &.{ obj.auth_data_raw, &client_data_hash });
+    try verifyLeafCertSignature(leaf_der, alg, msg, sig, null);
+
+    var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+    const cert = x509.safe.safeCertificate(leaf_der, &scratch) catch return error.InvalidCertificate;
+    const parsed = cert.parse() catch return error.InvalidCertificate;
+    if (!certKeyIsCredentialKey(parsed, att.credential_public_key)) return error.InvalidAttestationStatement;
+
+    const ext = (try certExtension(cert, &android_key_description_oid)) orelse return error.InvalidAttestationStatement;
+    // KeyDescription ::= SEQUENCE { attestationVersion INTEGER, attestationSecurityLevel ENUMERATED,
+    //   keymasterVersion INTEGER, keymasterSecurityLevel ENUMERATED, attestationChallenge OCTET STRING,
+    //   uniqueId OCTET STRING, softwareEnforced AuthorizationList, teeEnforced AuthorizationList }
+    const seq = Tlv.universal(ext, 0x10) catch return error.InvalidCertificate;
+    var rest = seq.content;
+    var fields: [8]Tlv = undefined;
+    for (&fields) |*f| {
+        f.* = Tlv.read(rest) catch return error.InvalidCertificate;
+        rest = f.rest;
+    }
+    if (fields[4].class != 0 or fields[4].tag != 0x04) return error.InvalidCertificate;
+    if (!std.mem.eql(u8, fields[4].content, &client_data_hash)) return error.InvalidAttestationStatement;
+    var al: AuthList = .{};
+    readAuthList(fields[6].content, &al) catch return error.InvalidCertificate;
+    readAuthList(fields[7].content, &al) catch return error.InvalidCertificate;
+    if (al.all_applications) return error.InvalidAttestationStatement;
+    if (al.origin == null or al.origin.? != 0) return error.InvalidAttestationStatement;
+    if (!al.purpose_sign or al.purpose_other) return error.InvalidAttestationStatement;
+    return .{ .attestation_type = .basic, .leaf_cert_der = leaf_der };
+}
+
 /// The attestation-statement dispatch result: the type, plus the leaf
 /// certificate DER when one was verified (`.basic` only — see
 /// `AttestationResult.leaf_cert_der`).
@@ -874,8 +1104,12 @@ fn verifyStatement(
         return verifyPacked(obj.att_stmt, msg, att.credential_public_key, att.aaguid);
     } else if (std.mem.eql(u8, obj.fmt, "fido-u2f")) {
         return verifyFidoU2f(allocator, obj.att_stmt, obj.auth_data, client_data_hash);
+    } else if (std.mem.eql(u8, obj.fmt, "apple")) {
+        return verifyApple(allocator, obj.att_stmt, obj, att, client_data_hash);
+    } else if (std.mem.eql(u8, obj.fmt, "android-key")) {
+        return verifyAndroidKey(allocator, obj.att_stmt, obj, att, client_data_hash);
     }
-    return error.UnsupportedFormat; // covers "tpm", "android-key", and anything unrecognized
+    return error.UnsupportedFormat; // covers "tpm" and anything unrecognized
 }
 
 fn attestationResult(
@@ -921,6 +1155,126 @@ pub fn verifyAttestation(
     const att = obj.auth_data.attested_credential_data orelse return error.MissingAttestedCredentialData;
     const statement = try verifyStatement(allocator, obj, att, client_data_hash);
     return attestationResult(obj, att, statement);
+}
+
+// ── attestation trust chain ─────────────────────────────────────────────────
+
+pub const ChainError = error{
+    /// The attestation statement has no `x5c` (`none`, self attestation): there is no certificate to chain.
+    NoCertificateChain,
+} || AttestationObjectError || AuthDataError || x509.VerifyChainError;
+
+/// Chain the attestation certificates of `attestation_object_raw` (`attStmt.x5c`, leaf first) to the caller's
+/// `trust_anchors` with `x509.verifyChain` and return what it verified. This is the "is the attestation signed
+/// by a CA I trust" half that `verifyAttestation` deliberately leaves out (`.basic` only means the statement
+/// is internally consistent): call it after `verifyAttestation` / `verifyRegistration` succeeded, with the
+/// anchors for the authenticator vendors the RP accepts (an MDS-derived store, or a pinned set). Fetching and
+/// refreshing that store, and the validity time in `opts`, are the caller's. Free the result as
+/// `x509.VerifiedChain` documents.
+pub fn verifyAttestationChain(
+    allocator: Allocator,
+    attestation_object_raw: []const u8,
+    trust_anchors: []const []const u8,
+    opts: x509.Options,
+) ChainError!x509.VerifiedChain {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const obj = try parseAttestationObject(a, attestation_object_raw);
+    const x5c_v = cborMapGetStr(obj.att_stmt, "x5c") orelse return error.NoCertificateChain;
+    const arr = switch (x5c_v) {
+        .array => |arr| arr,
+        else => return error.WrongType,
+    };
+    if (arr.len == 0) return error.NoCertificateChain;
+    const certs = try a.alloc([]const u8, arr.len);
+    for (arr, certs) |v, *c| c.* = switch (v) {
+        .bytes => |b| b,
+        else => return error.WrongType,
+    };
+    return x509.verifyChain(allocator, certs, trust_anchors, opts);
+}
+
+// ── authenticator and client extension outputs ──────────────────────────────
+
+/// `credProtect` policy (CTAP 2.1 §12.1): the credential's protection level.
+pub const CredProtect = enum(u8) {
+    user_verification_optional = 1,
+    user_verification_optional_with_credential_id_list = 2,
+    user_verification_required = 3,
+    _,
+};
+
+/// `hmac-secret` output: at registration a boolean (the authenticator supports it for this credential), at
+/// assertion the encrypted HMAC outputs (decrypting them is the client's, with the shared secret).
+pub const HmacSecretOutput = union(enum) {
+    supported: bool,
+    encrypted: []const u8,
+};
+
+/// The authenticator extension outputs this module understands; any other entry is ignored.
+pub const ExtensionOutputs = struct {
+    cred_protect: ?CredProtect = null,
+    hmac_secret: ?HmacSecretOutput = null,
+};
+
+pub const ExtensionError = error{ WrongType, OutOfMemory } || cbor.DecodeError;
+
+/// Decode `AuthenticatorData.extensions` (the raw CBOR map) into typed outputs. A recognized key with a value
+/// of the wrong CBOR type is `error.WrongType`; unknown keys are skipped. `bytes` of `hmac_secret.encrypted`
+/// are borrowed from `allocator`.
+pub fn parseExtensionOutputs(allocator: Allocator, raw: []const u8) ExtensionError!ExtensionOutputs {
+    const v = try cbor.decode(allocator, raw, .{});
+    const entries = switch (v) {
+        .map => |m| m,
+        else => return error.WrongType,
+    };
+    var out: ExtensionOutputs = .{};
+    if (cborMapGetStr(entries, "credProtect")) |cp| {
+        const n = switch (cp) {
+            .uint => |u| u,
+            else => return error.WrongType,
+        };
+        if (n > 255) return error.WrongType;
+        out.cred_protect = @fromBackingInt(@intCast(@as(u8, @intCast(n))));
+    }
+    if (cborMapGetStr(entries, "hmac-secret")) |hs| {
+        out.hmac_secret = switch (hs) {
+            .bool => |b| .{ .supported = b },
+            .bytes => |b| .{ .encrypted = b },
+            else => return error.WrongType,
+        };
+    }
+    return out;
+}
+
+/// Client extension results (`getClientExtensionResults()` serialized as JSON) this module reads.
+pub const ClientExtensionResults = struct {
+    /// `credProps.rk`: whether the credential is client-side discoverable (a passkey); null when not reported.
+    cred_props_rk: ?bool = null,
+};
+
+/// Parse the JSON of `getClientExtensionResults()`. Unknown members are ignored; a `credProps.rk` that is not a
+/// boolean is `error.InvalidJson`.
+pub fn parseClientExtensionResults(allocator: Allocator, json: []const u8) ClientDataError!ClientExtensionResults {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return error.InvalidJson;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.InvalidJson,
+    };
+    var out: ClientExtensionResults = .{};
+    if (root.get("credProps")) |cp| {
+        const o = switch (cp) {
+            .object => |o| o,
+            else => return error.InvalidJson,
+        };
+        if (o.get("rk")) |rk| out.cred_props_rk = switch (rk) {
+            .bool => |b| b,
+            else => return error.InvalidJson,
+        };
+    }
+    return out;
 }
 
 // ── registration ceremony — WebAuthn §7.1 ──────────────────────────────────

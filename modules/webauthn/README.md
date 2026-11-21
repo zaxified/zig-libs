@@ -8,8 +8,8 @@ primitives — `p256` (ES256), `p384` (ES384), `p521` (ES512), `std.crypto.sign.
 CBOR/COSE — not a new crypto implementation.
 
 **Status: assertion verify complete (ES256/ES384/ES512/EdDSA/RS256). Attestation verify
-complete for `none`/`packed`/`fido-u2f`; `tpm`/`android-key` structurally
-not supported (`error.UnsupportedFormat`, not half-implemented).** See `SPEC.md`
+complete for `none`/`packed`/`fido-u2f`/`apple`; `tpm` structurally
+not supported (`error.UnsupportedFormat`, not half-implemented); `android-key` is implemented but blocked on `x509.safe`.** See `SPEC.md`
 for the full threat model and *Backlog / deferred*.
 
 **Deps:** `cbor` (CBOR/COSE), `rsa`, `p256`, `p384`, `p521`, `x509` (certificate parsing through
@@ -108,7 +108,7 @@ yourself, `verifyAttestation(allocator, attestation_object, client_data_hash)`
 verifies the attestation **statement** alone. It cannot check the ceremony —
 it never sees the clientDataJSON.
 
-`tpm`/`android-key` attestation objects return `error.UnsupportedFormat` —
+`tpm` attestation objects return `error.UnsupportedFormat` —
 see `SPEC.md` *Backlog / deferred* for why, and what it would take to add them.
 
 ### Signature verification alone
@@ -129,7 +129,7 @@ rejection is a specific typed error, proven by the adversarial test suite
 
 ## Not provided
 
-Options generation and any credential or session model (verification only), FIDO MDS lookups and
-attestation trust-chain validation, the `tpm` / `android-key` / `apple` attestation formats, a
+Options generation and any credential or session model (verification only), FIDO MDS lookups (the
+caller supplies trust anchors to `verifyAttestationChain`), the `tpm` attestation format, a
 signature-counter policy and a `crossOrigin` policy (both returned to the caller). See SPEC *What
 is deliberately not done* and *Backlog / deferred*.
