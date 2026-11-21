@@ -199,8 +199,8 @@ consumer's to remove.
 
 - Runs only where `std.Io.fiber` exists (x86_64, aarch64, riscv64): upstream-bound (std); a 32-bit or
   other host cannot run a simulation at all.
-- File locks wait by polling, so a lock never released ends the run as `.step_limit`, not `.deadlock`.
-- `MSG_TRUNC` is not reported on request (an oversized datagram is still truncated and flagged).
+- A blocking file lock parks on the file's release counter like a futex waiter (an unlock, downgrade or close wakes it at that instant), so a lock nobody releases ends the run as `.deadlock` with the waiter counted.
+- `MSG_TRUNC` is not honoured on request (an oversized datagram is still truncated and flagged): `std.Io.net.IncomingMessage` has no field for the full length (`data` is a slice of the caller's buffer), and `Io.Threaded` hands back `data_buffer[0..rc]` with the kernel's larger count, so there is no behaviour to match.
 - Code that bypasses `std.Io` (raw syscalls, `std.Thread`, a wall-clock read) is invisible to the
   simulation; `checkDeterminism` reports the resulting nondeterminism.
 - Any in-simulation lock held across a call that suspends is the code under test's bug: an io-less
@@ -242,23 +242,17 @@ Run `scripts/modtest simio` (loopback-dependent tests skip where binding is unav
   resolver runs against simulated name servers), **`socketpair`**, **Unix datagram sockets**, **terminals
   beyond stderr**, **preemptive threads** and **the CPU memory model** — an operation simio does not
   simulate behaves as in `std.Io.failing`; reasons under *Scope*.
+- **Sweeping the raw clock reads of about 60 other modules.** A module's clock moves behind its `Io` when its own pilot is written (`sntp`, `mqtt` and the `http` Server did); reads in tests and benchmarks are real time by design. Not a change to simio.
 - **Simulated `io_uring`** (turmoil has one) — in Zig `io_uring` is an `std.Io` implementation, not an API
   the code under test calls.
 
 ## Backlog / deferred
 
-- **File-lock waiters parked like futex waiters:** file locks wait by polling, so the deadlock detector
-  never sees the waiter as blocked. Wanted: waiters parked like futex waiters, so the outcome names the
-  stuck tasks.
-- **`MSG_TRUNC` on request:** a caller asking for the full datagram length (`MSG_TRUNC` in flags) does not
-  get it.
 - **Six modules out of simio's reach:** `fleetsim`, `probe`, `iec104`, `iec61850`, `s7comm` and `opcua`
   poll or sleep with raw syscalls (`poll`, `clock_gettime`, `nanosleep`) instead of `std.Io`, so their timing
   cannot be simulated. Each needs its socket waits and clocks moved behind the `Io` it is given — the same
   change `sntp`, `mqtt` and the `http` Server got for their pilots — and then a pilot in `src/pilots/`. Their
   loopback tests stay as the real-kernel half.
-- **Raw clock reads elsewhere:** about 60 modules read the clock with `clock_gettime` instead of `std.Io`,
-  many only in tests or benchmarks; each is invisible to a simulated `Io` and is fixed when its pilot reaches it.
 - **`kv` `FsStorage`:** `allocate` and `syncData` call `fallocate`/`fdatasync` directly (std.Io has neither)
   and get `EBADF` under simio; `Db` never calls them.
 

@@ -91,6 +91,9 @@ pub const Node = struct {
     atime: i96 = 0,
     lock_exclusive: bool = false,
     lock_shared: u32 = 0,
+    /// Counts the releases and downgrades of this file's locks: what a task
+    /// waiting for a lock parks on, as on a futex word.
+    lock_gen: u32 = 0,
 
     fn freeEntries(gpa: Allocator, map: *std.StringArrayHashMapUnmanaged(*Node)) void {
         for (map.keys()) |k| gpa.free(k);
@@ -1173,23 +1176,18 @@ pub const Fs = struct {
             const of = fs.fileOf(file) orelse return error.WouldBlock;
             if (fs.tryAcquire(of, l)) return;
             if (!blocking) return error.WouldBlock;
-            // Poll: a lock holder releases on close or crash, both visible
-            // here within a millisecond of virtual time.
+            // Park on the file's release counter like a futex waiter: a holder
+            // releases on unlock, downgrade or close (a crash takes the waiter
+            // down with it), each of which wakes the parked tasks, and a wait
+            // nobody can end is a deadlock the outcome names.
             const sim = fs.host.sim;
-            const me = sim.running();
-            try sim.cancelPoint(me);
-            const reason = sim.block(me, .sleep, true, sim.now + std.time.ns_per_ms) catch .normal;
-            if (reason == .canceled) {
-                me.acknowledgeCancel();
-                return error.Canceled;
-            }
+            try sim.futexWait(&of.node.lock_gen, of.node.lock_gen, .none, true);
         }
     }
 
     fn tryAcquire(fs: *Fs, of: *OpenFile, l: File.Lock) bool {
-        _ = fs;
         const n = of.node;
-        fsReleaseLock(of);
+        fs.fsReleaseLock(of);
         switch (l) {
             .none => return true,
             .shared => {
@@ -1206,23 +1204,30 @@ pub const Fs = struct {
     }
 
     fn releaseLock(fs: *Fs, of: OpenFile) void {
-        _ = fs;
         var copy = of;
-        fsReleaseLock(&copy);
+        fs.fsReleaseLock(&copy);
     }
 
-    fn fsReleaseLock(of: *OpenFile) void {
+    /// Drop `of`'s lock and wake the tasks parked on the file's locks.
+    fn fsReleaseLock(fs: *Fs, of: *OpenFile) void {
+        if (of.lock == .none) return;
         switch (of.lock) {
-            .none => {},
+            .none => unreachable,
             .shared => of.node.lock_shared -= 1,
             .exclusive => of.node.lock_exclusive = false,
         }
         of.lock = .none;
+        fs.lockChanged(of.node);
+    }
+
+    fn lockChanged(fs: *Fs, n: *Node) void {
+        n.lock_gen +%= 1;
+        fs.host.sim.futexWake(&n.lock_gen, std.math.maxInt(u32));
     }
 
     pub fn unlock(fs: *Fs, file: File) void {
         const of = fs.fileOf(file) orelse return;
-        fsReleaseLock(of);
+        fs.fsReleaseLock(of);
     }
 
     pub fn downgrade(fs: *Fs, file: File) void {
@@ -1231,5 +1236,6 @@ pub const Fs = struct {
         of.node.lock_exclusive = false;
         of.node.lock_shared += 1;
         of.lock = .shared;
+        fs.lockChanged(of.node);
     }
 };

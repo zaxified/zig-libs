@@ -311,6 +311,92 @@ test "a crash releases the locks the host held" {
     try testing.expect(got);
 }
 
+fn lockHolder(io: Io, held: *bool, closed_at: *i96) !void {
+    var a = try Dir.cwd().openFile(io, "lock", .{});
+    try a.lock(io, .exclusive);
+    held.* = true;
+    try io.sleep(.fromMilliseconds(5), .awake);
+    closed_at.* = Io.Timestamp.now(io, .awake).nanoseconds;
+    a.close(io); // the close releases the lock
+}
+
+fn lockWaiter(io: Io, held: *const bool, got_at: *i96) !void {
+    var a = try Dir.cwd().openFile(io, "lock", .{});
+    defer a.close(io);
+    while (!held.*) try io.sleep(.fromMilliseconds(1), .awake);
+    try a.lock(io, .exclusive); // parks until the holder closes
+    got_at.* = Io.Timestamp.now(io, .awake).nanoseconds;
+}
+
+test "a blocking lock parks and is woken by the release itself, not by a poll" {
+    var sim: Sim = undefined;
+    newSim(&sim, 21);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    try h.putFile("lock", "");
+    var held = false;
+    var closed_at: i96 = -2;
+    var got_at: i96 = -1;
+    try h.spawn(lockHolder, .{ h.io(), &held, &closed_at });
+    try h.spawn(lockWaiter, .{ h.io(), &held, &got_at });
+    try testing.expectEqual(sched.Outcome.quiescent, sim.run().outcome);
+    try testing.expectEqual(@as(?anyerror, null), h.failure);
+    // The waiter got the lock at the very instant of the holder's close, not up
+    // to a poll interval later.
+    try testing.expect(closed_at > 0);
+    try testing.expectEqual(closed_at, got_at);
+}
+
+fn lockCrossed(io: Io, first: []const u8, second: []const u8) !void {
+    var a = try Dir.cwd().openFile(io, first, .{});
+    var b = try Dir.cwd().openFile(io, second, .{});
+    try a.lock(io, .exclusive);
+    try io.sleep(.fromMilliseconds(1), .awake);
+    try b.lock(io, .exclusive);
+}
+
+test "two tasks waiting for each other's file locks are a deadlock the outcome names" {
+    var sim: Sim = undefined;
+    newSim(&sim, 22);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    try h.putFile("la", "");
+    try h.putFile("lb", "");
+    try h.spawn(lockCrossed, .{ h.io(), "la", "lb" });
+    try h.spawn(lockCrossed, .{ h.io(), "lb", "la" });
+    const r = sim.run();
+    try testing.expectEqual(sched.Outcome.deadlock, r.outcome);
+    try testing.expectEqual(@as(usize, 2), r.blocked);
+}
+
+fn lockCanceled(io: Io, got: *?anyerror) !void {
+    var a = try Dir.cwd().openFile(io, "lock", .{});
+    defer a.close(io);
+    var g = io.async(lockOnce, .{ io, &a });
+    try io.sleep(.fromMilliseconds(2), .awake);
+    got.* = if (g.cancel(io)) |_| null else |e| e;
+}
+
+fn lockOnce(io: Io, f: *File) !void {
+    try f.lock(io, .exclusive);
+}
+
+test "a task parked on a file lock can be canceled" {
+    var sim: Sim = undefined;
+    newSim(&sim, 23);
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    try h.putFile("lock", "");
+    var held = false;
+    var closed_at: i96 = 0;
+    try h.spawn(lockHolder, .{ h.io(), &held, &closed_at });
+    var got: ?anyerror = null;
+    try h.spawn(lockCanceled, .{ h.io(), &got });
+    try testing.expectEqual(sched.Outcome.quiescent, sim.run().outcome);
+    try testing.expectEqual(@as(?anyerror, null), h.failure);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), got);
+}
+
 fn printer(io: Io) !void {
     var buf: [16]u8 = undefined;
     var w = File.stdout().writerStreaming(io, &buf);

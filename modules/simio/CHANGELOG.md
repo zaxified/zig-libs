@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **BEHAVIOURAL, not breaking:** a blocking file lock (`File.lock`, `openFile` with `.lock`) now parks on the file's release counter like a futex waiter instead of polling every virtual millisecond: it gets the lock at the instant of the holder's unlock, downgrade or close, and a lock nobody releases ends the run as `.deadlock` (it was `.step_limit`). Seeded traces of runs with lock contention differ from before.
 - **2026-11-08** — **FIX:** the simulated ICMPv4 checksum (`icmp4ChecksumOk`, `setIcmp4Checksum`) accumulated in `u32` and overflowed past ~131 KB of `0xffff` words; it now uses `icmp.checksum` (`u64` accumulator). Results for smaller messages are identical. New dependency: `icmp`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the watchdog's private monotonic read (duplicate-code pass) is replaced by `clock.monotonicNs()`. New dependency: `clock`.
 
