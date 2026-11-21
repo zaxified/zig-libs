@@ -5865,7 +5865,7 @@ pub fn estimatePeakMemory(opts_in: CompressOptions, input_len: usize) usize {
     const q4: u64 = 220 * k + 20 * n1 + 4 * (n -| 70 * k);
     const q9: u64 = if (n <= 300 * k) 300 * k + 62 * n else if (n <= 1024 * k) 20480 * k else 40960 * k;
     const est: u64 = switch (opts.effort) {
-        .q0 => 256 * k + n / 2,
+        .q0 => 256 * k + 2 * n, // the output buffer grows by copying where the allocator cannot remap: up to 2.5 n at once
         .q1 => 280 * k + 10 * n2 + 3 * (n -| 1024 * k) / 2,
         .q4 => @min(q4, 5632 * k),
         .q6 => 64 * k + 35 * n1 + 4 * (n -| 70 * k),

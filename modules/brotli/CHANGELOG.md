@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Behaviour change:** `estimatePeakMemory(.{ .effort = .q0 }, n)` is `256 KiB + 2 n` (was `256 KiB + n / 2`): the output buffer grows by copying under an allocator that cannot remap (aarch64's testing allocator, `smp_allocator` past its size classes), where up to 2.5 n of it is live at once, and the old bound was exceeded there (a 70 KB noise input measured 411 KB against 297 KB + the stream). Other efforts were already above that worst case.
+
 - **2026-11-21** — **CONSUMER-VISIBLE (additive):** `CompressOptions.literal_context_modeling` / `StreamOptions.literal_context_modeling` (false: one literal code from `.q6` up, google's DISABLE_LITERAL_CONTEXT_MODELING), `estimatePeakMemory(opts, input_len)` (google's `BrotliEncoderEstimatePeakMemoryUsage`), `parallel.compressPart` / `parallel.Part` / `parallel.PartError` (a stream built in pieces by separate calls: appendable streams, `STREAM_OFFSET`), and `Options.fixed_ring` (decoder: the whole ring at once, google's DISABLE_RING_BUFFER_REALLOCATION). Source-breaking only for positional struct literals of the option structs. Defaults change no stream.
 
 - **2026-11-21** — **CONSUMER-VISIBLE (additive):** `DistanceParams` and `CompressOptions.distance` / `StreamOptions.distance`: NPOSTFIX and NDIRECT for the encoder to write from `.q4` up, in place of the mode's (google/brotli's `BROTLI_PARAM_NPOSTFIX` / `BROTLI_PARAM_NDIRECT`); `{ .npostfix = 1, .ndirect = 12 }` writes the bytes `.mode = .font` does. Default (null) changes no stream.

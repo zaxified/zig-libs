@@ -248,16 +248,15 @@ const Peak = struct {
         return p;
     }
     fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
-        const w: *Peak = @ptrCast(@alignCast(ctx));
-        if (!w.backing.rawResize(m, al, n, ra)) return false;
-        w.bump(@as(isize, @intCast(n)) - @as(isize, @intCast(m.len)));
-        return true;
+        // Refused, like `remap`: a buffer that grows in place or shrinks to fit (the `mremap` of Linux on x86-64)
+        // holds less at its peak than one an allocator can only grow by copying (the testing allocator on
+        // aarch64, `smp_allocator` past its size classes), and the estimate has to bound the second.
+        _ = .{ ctx, m, al, n, ra };
+        return false;
     }
     fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
-        const w: *Peak = @ptrCast(@alignCast(ctx));
-        const p = w.backing.rawRemap(m, al, n, ra) orelse return null;
-        w.bump(@as(isize, @intCast(n)) - @as(isize, @intCast(m.len)));
-        return p;
+        _ = .{ ctx, m, al, n, ra }; // refused: see `resize`
+        return null;
     }
     fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
         const w: *Peak = @ptrCast(@alignCast(ctx));

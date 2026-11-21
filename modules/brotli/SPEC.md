@@ -282,8 +282,9 @@ bytes verbatim; otherwise it is rolled back out of the bit writer and re-emitted
 - **`estimatePeakMemory(opts, input_len)`** (google's `BrotliEncoderEstimatePeakMemoryUsage`): an upper bound of
   `compressWith`'s peak without input and output, per effort in the input length up to 2 MiB (the tables and
   per-block arrays follow the input, whatever the window). Fitted to a counting allocator on random, text-like and
-  run-heavy inputs of 0 to 600 KB at every effort and windows 12, 16 and the default, generous (about 1.2-2x of
-  the worst measured, more on tiny inputs); a raw dictionary and `.q11` far beyond 2 MiB are not covered.
+  run-heavy inputs of 0 to 600 KB at every effort and windows 12, 16 and the default, with an allocator that
+  never grows or shrinks a buffer in place (the output buffer then grows by copying, up to 2.5 times its size at once,
+  which `.q0`'s term covers), generous (about 1.2-2x of the worst measured, more on tiny inputs); a raw dictionary and `.q11` far beyond 2 MiB are not covered.
 - **`parallel.compressPart(gpa, history, input, opts, .{ .first, .last })`** (rust-brotli's appendable streams and
   `catli`, google's `BROTLI_PARAM_STREAM_OFFSET`: a stream built in pieces by separate calls): the parts'
   bytes concatenated, the first with the header, the last with the final meta-block, every other part byte-aligned
