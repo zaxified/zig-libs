@@ -49,7 +49,8 @@ impersonate any host. Here:
    `required_eku = .server_auth` (`verify.zig`).
 
 **Defaults are Go's `crypto/tls` client's** (owner decision). The ClientHello is built at run
-time (`hello.zig`): Go's groups (X25519MLKEM768, X25519, P-256, P-384, P-521)
+time (`hello.zig`): Go 1.26's groups (X25519MLKEM768, SecP256r1MLKEM768, SecP384r1MLKEM1024,
+X25519, P-256, P-384, P-521; the NIST hybrids put the ECDH share first, draft-ietf-tls-ecdhe-mlkem)
 with shares for the first two, the rest reached by HelloRetryRequest. std's
 shape stays reachable -- `groups = key_share_groups = std_groups` -- and a test
 pins that hello to std's byte for byte, except the three TLS 1.2 ECDHE_ECDSA
@@ -410,6 +411,10 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
 
 ## What is deliberately not done
 
+- **A build option for a smaller algorithm set** (CONVENTIONS §4.2: a knob only for ~100 KB or a consumer
+  request): measured 2026-11-21 on the HTTPS size probe (`modules/http/sizeprobe`, x86_64-linux-musl
+  ReleaseSmall, `nm -S`), the candidates to drop link P-521 6.5 KB, AEGIS 4.3 KB and client authentication
+  9.9 KB — about 21 KB together. No consumer has asked; revisit on a request.
 - **Revocation (OCSP/CRL) and certificate transparency:** std has neither and adding them is not this
   module's job; a stapled OCSP response and SCTs are requested and exposed, not verified (Go verifies
   neither).
@@ -449,13 +454,3 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
   which the std-copied handshake reads field by field. Sharing one means moving this record layer off the
   std shape (the handshake's every `P.AEAD` use), a refactor with no measured gain left once both are on
   `aesgcm`.
-- **Build option: algorithm set**: every cipher suite, group and client-auth signer is linked (`p384` and
-  `p521` are imported unconditionally, TLS 1.2 suites, AEGIS, client certificates, `tlsresume`). A `.small`
-  "modern web" set could drop P-521, AEGIS and client auth; a peer that insists on a dropped algorithm
-  fails the handshake loudly. Not a knob: the ML-KEM hybrid group (post-quantum protection is a security
-  property, CONVENTIONS §4.2 rule 2) and certificate verification. Mechanism and checklist: CONVENTIONS
-  §4.2; measure first (the HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary) and add a knob only
-  for a measured gain of roughly 100 KB or more, or a consumer request. Size unmeasured; `Client.init`
-  alone was 0.8 MB (native ReleaseSafe). Dependents' tests: under rsa `.small` (4096 cap) any test with an
-  8192-bit certificate must branch on `rsa.max_modulus_bits` first.
-

@@ -421,6 +421,25 @@ test "tlsclient ↔ Server: every group with a lone key share, every suite" {
     }
 }
 
+test "tlsclient ↔ Server: the NIST hybrids and secp521r1 from extra_groups, a lone share each, every suite" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const groups = [_]NamedGroup{ ZlClient.secp256r1_mlkem768, ZlClient.secp384r1_mlkem1024, .secp521r1 };
+    for (groups) |g| {
+        for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 }) |suite| {
+            var storage: [16 * 1024]u8 = undefined;
+            var info: ZlClient.ConnectionInfo = .init(&storage);
+            const o = try handshake(ZlClient, testing.allocator, &ck, .{ .suites = &.{suite}, .groups = &server_mod.supported_groups }, .{ .groups = &.{g}, .key_share_groups = &.{g}, .info = &info });
+            defer testing.allocator.free(o.echoed);
+            try testing.expectEqual(@backingInt(g), o.group);
+            try testing.expectEqual(g, info.negotiated_group.?);
+            try testing.expect(!o.retried);
+            try testing.expectEqualStrings("hello there", o.echoed);
+        }
+    }
+}
+
 test "tlsclient ↔ Server: the client's first group with a share; ALPN" {
     var fx: Fixture = undefined;
     try fx.init();

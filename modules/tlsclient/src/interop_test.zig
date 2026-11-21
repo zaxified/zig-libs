@@ -1360,18 +1360,20 @@ test "std profile: with std's groups and shares the ClientHello is std's, plus t
     try testing.expectEqualSlices(u8, theirs[cs + 2 .. ins], ours[cs + 2 .. ins]);
 }
 
-test "default options: Go's shape -- five groups listed, shares for X25519MLKEM768 and X25519 only" {
+test "default options: Go 1.26's shape -- seven groups listed, shares for X25519MLKEM768 and X25519 only" {
     var a: [4096]u8 = undefined;
     var b: [4096]u8 = undefined;
     const go = try clientHelloWith(&a, .{});
     const std_shape = try clientHello(Client, &b, &.{});
     // Two shares instead of four: P-256 (65 + 4) and P-384 (97 + 4) bytes
-    // gone, P-521 (2) added to supported_groups; then Go's requests:
+    // gone, SecP256r1MLKEM768, SecP384r1MLKEM1024 and P-521 (2 each) added
+    // to supported_groups; then Go's requests:
     // status_request (9), signed_certificate_timestamp (4),
     // extended_master_secret (4), renegotiation_info (5).
-    try testing.expectEqual(std_shape.len - (65 + 4) - (97 + 4) + 2 + 9 + 4 + 4 + 5, go.len);
+    try testing.expectEqual(std_shape.len - (65 + 4) - (97 + 4) + 3 * 2 + 9 + 4 + 4 + 5, go.len);
     try testing.expect(std.mem.endsWith(u8, go, "\x00\x05\x00\x05\x01\x00\x00\x00\x00" ++ "\x00\x12\x00\x00" ++ "\x00\x17\x00\x00" ++ "\xff\x01\x00\x01\x00"));
-    const groups = "\x00\x0a\x00\x0c\x00\x0a\x11\xec\x00\x1d\x00\x17\x00\x18\x00\x19";
+    // Go 1.26's `defaultCurvePreferences` order.
+    const groups = "\x00\x0a\x00\x10\x00\x0e\x11\xec\x11\xeb\x11\xed\x00\x1d\x00\x17\x00\x18\x00\x19";
     try testing.expect(std.mem.find(u8, go, groups) != null);
     // key_share: X25519MLKEM768 (1184 + 32) then X25519 (32).
     const ks_at = std.mem.find(u8, go, "\x00\x33").?;
@@ -1442,5 +1444,23 @@ test "interop: handshake messages split across records (s_server -max_send_frag 
         defer srv.stop(io);
         const s = try session(io, srv.port, &bundle, .{});
         try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+    }
+}
+
+test "interop: Go 1.26's NIST hybrids SecP256r1MLKEM768 and SecP384r1MLKEM1024 against OpenSSL 3.5 s_server (a HelloRetryRequest from the default shares)" {
+    const io = testing.io;
+    var tmp = try setUp(io);
+    defer tmp.cleanup();
+    var bundle = try rootBundle(io, tmp.dir);
+    defer bundle.deinit(testing.allocator);
+    inline for (.{ .{ "SecP256r1MLKEM768", Client.secp256r1_mlkem768 }, .{ "SecP384r1MLKEM1024", Client.secp384r1_mlkem1024 } }) |g| {
+        var srv = try Server.startProto(io, tmp.dir, "-tls1_3", "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-groups", g[0], "-rev" });
+        defer srv.stop(io);
+        var storage: [16 * 1024]u8 = undefined;
+        var ci: Client.ConnectionInfo = .init(&storage);
+        const s = try session(io, srv.port, &bundle, .{ .connection_info = &ci });
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
+        try testing.expectEqual(g[1], ci.negotiated_group.?);
+        try testing.expect(ci.hello_retry_request);
     }
 }

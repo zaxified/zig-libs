@@ -1795,7 +1795,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                         try main_cert_pub_key.verifySignature(.tls_1_2, &hsd, &.{ &client_hello_rand, &server_hello_rand, hsd.buf[0..hsd.idx] });
                         // zig-libs tlsclient: one of our groups (and not the
                         // TLS 1.3-only hybrid); its key pair is made now.
-                        if (named_group == .x25519_ml_kem768 or
+                        if (named_group == .x25519_ml_kem768 or named_group == secp256r1_mlkem768 or named_group == secp384r1_mlkem1024 or
                             mem.findScalar(tls.NamedGroup, options.groups, named_group) == null) return error.TlsIllegalParameter;
                         key_share.ensure(named_group) catch return error.InsufficientEntropy;
                         try key_share.exchange(named_group, server_pub_key);
@@ -3491,8 +3491,13 @@ fn big(x: anytype) @TypeOf(x) {
 /// default preferences for them (Go `CurvePreferences`): every group listed,
 /// key shares for the two Go sends; the others are reached through a
 /// HelloRetryRequest.
-pub const supported_groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .x25519, .secp256r1, .secp384r1, .secp521r1 };
+pub const supported_groups = [_]tls.NamedGroup{ .x25519_ml_kem768, secp256r1_mlkem768, secp384r1_mlkem1024, .x25519, .secp256r1, .secp384r1, .secp521r1 };
+/// Go 1.26's `defaultCurvePreferences`: the ML-KEM hybrids first.
 pub const default_groups = supported_groups;
+/// draft-ietf-tls-ecdhe-mlkem: P-256 + ML-KEM-768 and P-384 + ML-KEM-1024,
+/// the ECDH share first (std names 0x11EB `secp256r1_ml_kem256`).
+pub const secp256r1_mlkem768: tls.NamedGroup = @fromBackingInt(0x11eb);
+pub const secp384r1_mlkem1024: tls.NamedGroup = @fromBackingInt(0x11ed);
 pub const default_key_share_groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .x25519 };
 /// std's ClientHello shape: these groups, a share for each.
 pub const std_groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .secp256r1, .secp384r1, .x25519 };
@@ -3503,6 +3508,7 @@ fn groupSupported(g: tls.NamedGroup) bool {
 
 const KeyShare = struct {
     ml_kem768_kp: mlkem.MLKem768.KeyPair,
+    ml_kem1024_kp: mlkem.MLKem1024.KeyPair,
     secp256r1_kp: crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair,
     secp384r1_kp: p384.EcdsaP384Sha384.KeyPair,
     secp521r1_kp: p521.EcdsaP521Sha512.KeyPair,
@@ -3515,6 +3521,8 @@ const KeyShare = struct {
     /// re-encode the NIST keys, a field inversion each -- on std's slow P-256
     /// `divstep` for P-256.
     hybrid_pub: [mlkem.MLKem768.PublicKey.encoded_length + crypto.dh.X25519.public_length]u8,
+    p256_hybrid_pub: [65 + mlkem.MLKem768.PublicKey.encoded_length]u8,
+    p384_hybrid_pub: [97 + mlkem.MLKem1024.PublicKey.encoded_length]u8,
     secp256r1_sec1: [65]u8,
     secp384r1_sec1: [97]u8,
     secp521r1_sec1: [133]u8,
@@ -3522,6 +3530,10 @@ const KeyShare = struct {
     /// share is offered or a server picks its group (HelloRetryRequest, TLS
     /// 1.2 ServerKeyExchange), so a handshake pays only for what it uses.
     have_ml_kem: bool = false,
+    have_ml_kem768: bool = false,
+    have_ml_kem1024: bool = false,
+    have_p256_hybrid: bool = false,
+    have_p384_hybrid: bool = false,
     have_x25519: bool = false,
     have_p256: bool = false,
     have_p384: bool = false,
@@ -3533,6 +3545,7 @@ const KeyShare = struct {
 
     const sk_max_len = @max(
         crypto.dh.X25519.shared_length + mlkem.MLKem768.shared_length,
+        48 + mlkem.MLKem1024.shared_length, // SecP384r1MLKEM1024
         crypto.ecc.P256.scalar.encoded_length,
         crypto.ecc.P384.scalar.encoded_length,
         66, // P-521 x
@@ -3542,6 +3555,9 @@ const KeyShare = struct {
     fn init(seed: *const [176]u8) KeyShare {
         return .{
             .ml_kem768_kp = undefined,
+            .ml_kem1024_kp = undefined,
+            .p256_hybrid_pub = undefined,
+            .p384_hybrid_pub = undefined,
             .secp256r1_kp = undefined,
             .secp384r1_kp = undefined,
             .secp521r1_kp = undefined,
@@ -3565,9 +3581,38 @@ const KeyShare = struct {
             .x25519_ml_kem768 => {
                 try ks.ensure(.x25519);
                 if (ks.have_ml_kem) return;
-                ks.ml_kem768_kp = .generateDeterministic(ks.seed[0..64].*);
+                ks.ensureMlKem768();
                 ks.hybrid_pub = ks.ml_kem768_kp.public_key.toBytes() ++ ks.x25519_kp.public_key;
                 ks.have_ml_kem = true;
+            },
+            // zig-libs tlsclient: Go 1.26's NIST hybrids, the ECDH share
+            // first; the ECDH and ML-KEM-768 key pairs are the ones the
+            // lone groups use (as Go shares the X25519 key between
+            // X25519MLKEM768 and X25519).
+            secp256r1_mlkem768 => {
+                try ks.ensure(.secp256r1);
+                if (ks.have_p256_hybrid) return;
+                ks.ensureMlKem768();
+                ks.p256_hybrid_pub = ks.secp256r1_sec1 ++ ks.ml_kem768_kp.public_key.toBytes();
+                ks.have_p256_hybrid = true;
+            },
+            secp384r1_mlkem1024 => {
+                try ks.ensure(.secp384r1);
+                if (ks.have_p384_hybrid) return;
+                if (!ks.have_ml_kem1024) {
+                    // ML-KEM-1024, which std's seed layout lacks: an HKDF
+                    // expansion of the whole seed, as P-521's.
+                    const Hkdf = crypto.kdf.hkdf.HkdfSha512;
+                    var prk = Hkdf.extract("zig-libs tlsclient ML-KEM-1024 key share", ks.seed);
+                    defer crypto.secureZero(u8, &prk);
+                    var s: [64]u8 = undefined;
+                    defer crypto.secureZero(u8, &s);
+                    Hkdf.expand(&s, "", prk);
+                    ks.ml_kem1024_kp = .generateDeterministic(s);
+                    ks.have_ml_kem1024 = true;
+                }
+                ks.p384_hybrid_pub = ks.secp384r1_sec1 ++ ks.ml_kem1024_kp.public_key.toBytes();
+                ks.have_p384_hybrid = true;
             },
             .x25519 => if (!ks.have_x25519) {
                 try ct25519.X25519.KeyPair.generateDeterministicInto(&ks.x25519_kp, ks.seed[144..176]);
@@ -3600,9 +3645,18 @@ const KeyShare = struct {
         }
     }
 
+    /// The ML-KEM-768 key pair (std's seed 0..64), once.
+    fn ensureMlKem768(ks: *KeyShare) void {
+        if (ks.have_ml_kem768) return;
+        ks.ml_kem768_kp = .generateDeterministic(ks.seed[0..64].*);
+        ks.have_ml_kem768 = true;
+    }
+
     fn has(ks: *const KeyShare, group: tls.NamedGroup) bool {
         return switch (group) {
             .x25519_ml_kem768 => ks.have_ml_kem,
+            secp256r1_mlkem768 => ks.have_p256_hybrid,
+            secp384r1_mlkem1024 => ks.have_p384_hybrid,
             .x25519 => ks.have_x25519,
             .secp256r1 => ks.have_p256,
             .secp384r1 => ks.have_p384,
@@ -3616,6 +3670,8 @@ const KeyShare = struct {
         assert(ks.has(group));
         return switch (group) {
             .x25519_ml_kem768 => &ks.hybrid_pub,
+            secp256r1_mlkem768 => &ks.p256_hybrid_pub,
+            secp384r1_mlkem1024 => &ks.p384_hybrid_pub,
             .x25519 => &ks.x25519_kp.public_key,
             .secp256r1 => &ks.secp256r1_sec1,
             .secp384r1 => &ks.secp384r1_sec1,
@@ -3645,6 +3701,23 @@ const KeyShare = struct {
                 @memcpy(ks.sk_buf[0..hsk.len], &hsk);
                 @memcpy(ks.sk_buf[hsk.len..][0..xsk.len], &xsk);
                 ks.sk_len = hsk.len + xsk.len;
+            },
+            secp256r1_mlkem768 => {
+                // ECDH share (65) ‖ ML-KEM-768 ciphertext; secret ECDH x ‖ ML-KEM.
+                const ct_len = mlkem.MLKem768.ciphertext_length;
+                if (server_pub_key.len != 65 + ct_len) return error.TlsIllegalParameter;
+                try ks.exchange(.secp256r1, server_pub_key[0..65]);
+                const ss = ks.ml_kem768_kp.secret_key.decaps(server_pub_key[65..][0..ct_len]);
+                @memcpy(ks.sk_buf[32..][0..ss.len], &ss);
+                ks.sk_len = 32 + ss.len;
+            },
+            secp384r1_mlkem1024 => {
+                const ct_len = mlkem.MLKem1024.ciphertext_length;
+                if (server_pub_key.len != 97 + ct_len) return error.TlsIllegalParameter;
+                try ks.exchange(.secp384r1, server_pub_key[0..97]);
+                const ss = ks.ml_kem1024_kp.secret_key.decaps(server_pub_key[97..][0..ct_len]);
+                @memcpy(ks.sk_buf[48..][0..ss.len], &ss);
+                ks.sk_len = 48 + ss.len;
             },
             .secp256r1 => {
                 const PublicKey = crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey;

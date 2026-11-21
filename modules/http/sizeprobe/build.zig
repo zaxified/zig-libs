@@ -57,7 +57,8 @@ pub fn build(b: *std.Build) void {
     const zl_mod = zl_options.createModule();
     rsa_mod.addImport("zl_options", zl_mod);
     rsa_mod.addImport("aescbc", dep.mod(b, target, optimize, "aescbc"));
-    rsa_mod.addImport("aes192", dep.mod(b, target, optimize, "aes192"));
+    const aes192_mod = dep.mod(b, target, optimize, "aes192");
+    rsa_mod.addImport("aes192", aes192_mod);
     const b64ct_mod = dep.mod(b, target, optimize, "b64ct");
     rsa_mod.addImport("b64ct", b64ct_mod);
     const keycodec_mod = dep.mod(b, target, optimize, "keycodec");
@@ -82,7 +83,13 @@ pub fn build(b: *std.Build) void {
     tlsclient_mod.addImport("p384", p384_mod);
     tlsclient_mod.addImport("p521", p521_mod);
     tlsclient_mod.addImport("rsa", rsa_mod);
-    tlsclient_mod.addImport("tlsresume", dep.mod(b, target, optimize, "tlsresume"));
+    // aesgcm: tlsresume's ticket AEAD and tlsclient's AES-GCM records.
+    const aesgcm_mod = dep.mod(b, target, optimize, "aesgcm");
+    aesgcm_mod.addImport("aes192", aes192_mod);
+    const tlsresume_mod = dep.mod(b, target, optimize, "tlsresume");
+    tlsresume_mod.addImport("aesgcm", aesgcm_mod);
+    tlsclient_mod.addImport("tlsresume", tlsresume_mod);
+    tlsclient_mod.addImport("aesgcm", aesgcm_mod);
     const ct25519_mod = dep.mod(b, target, optimize, "ct25519");
     ct25519_mod.addImport("entropy", entropy_mod);
     ct25519_mod.addImport("zl_options", zl_mod);
