@@ -104,6 +104,10 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
 - `signContent(scheme, SecretKey, content, ?Random, out)`: `sign` over content already built —
   what a TLS stack hands a signer when the key is offloaded (`tlsserver`'s
   `CertifiedKey.offload`); the content is not checked against §4.4.3's form.
+- `signWith` / `signContentWith(…, SignOptions, out)`: with what a signer keeps between signatures
+  of one key — `rsa_blinding`, a per-key `rsa.BlindingCache` (OpenSSL keeps a `BN_BLINDING` per key)
+  that saves the fresh blinding `r`, its inverse and `r^e` of every RSA-PSS signature (5 % of an
+  RSA-2048 signature, `rsa` SPEC); not thread-safe, the caller's to own.
 - `verifyContent(scheme, PublicKey, content, signature)`: `verify` over content the caller
   built (RFC 9345's delegated credential signature has its own context string).
   ECDSA signatures are DER on the wire, Ed25519 raw 64 bytes (verified with `verifyStrict`),
@@ -381,15 +385,8 @@ benchmark `zig build bench-tls13` (see *Performance*), the example `zig build ru
 
 ## Backlog / deferred
 
-- **Performance: `cli_x25519` and `sign_rsa_pss_rsae_sha256`.** `cli_x25519` (`ct25519`'s ladder against
-  s2n-bignum) is the row over the 1.25× fastest-candidate bound; re-measure on a quiet host before the card says
-  P1. `sign_rsa_pss_rsae_sha256` is the worst row against OpenSSL (figures on the card). OpenSSL signs RSA-2048
-  here with its scalar MULX/ADX code (`rsaz_avx2` declines on a BMI2+ADX CPU); both sides run at the same IPC and
-  the 1024-bit modexp is at parity (`montint` SPEC "Almost-Montgomery ladder"). What remains is mostly the
-  stateless `.csprng` base blinding `rsa.signPss` does per call, ~5–6 % of a 2048-bit private op (the fresh `r`,
-  its inverse and `r^e`); OpenSSL caches a blinding pair per key. Closing it needs an `rsa` entry point taking a
-  `Blinding` (`.cached` with a per-key `BlindingCache`, as `signPkcs1v15Blinded` has) and a mutable per-key cache
-  held next to `certverify.SecretKey.rsa`: an API/ownership decision, not done.
+- **Performance: `cli_x25519`.** `cli_x25519` (`ct25519`'s ladder against s2n-bignum) is the row over the 1.25×
+  fastest-candidate bound; re-measure on a quiet host before the card says P1.
 - **Engine support for secp521r1 / MLKEM512 / MLKEM768:** `kex` computes them (OpenSSL oracle both ways);
   `tlsserver` and `dtls` keep their offered/accepted group lists, so no engine offers them yet.
 - **End-to-end interop for SecP256r1MLKEM768 / SecP384r1MLKEM1024:** `tlsserver` (and

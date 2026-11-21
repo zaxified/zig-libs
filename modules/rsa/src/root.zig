@@ -2286,19 +2286,19 @@ pub fn signPss(sk: *const SecretKey, comptime Hash: type, random: std.Random, ms
 noinline fn signPssUnburned(sk: *const SecretKey, comptime Hash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
     var m_hash: [Hash.digest_length]u8 = undefined;
     Hash.hash(msg, &m_hash, .{});
-    return signPssDigestUnburned(sk, Hash, Hash, random, &m_hash, salt_len, out);
+    return signPssDigestUnburned(sk, Hash, Hash, random, .{ .csprng = random }, &m_hash, salt_len, out);
 }
 
 /// `signPss` over a digest the caller already has (`digest` = Hash(M)) --
 /// e.g. a TLS CertificateVerify over a running transcript hash. Same
 /// signature as `signPss(M)` for the same salt.
 pub fn signPssPrehashed(sk: *const SecretKey, comptime Hash: type, random: std.Random, digest: *const [Hash.digest_length]u8, salt_len: usize, out: []u8) SignPssError![]u8 {
-    const r = signPssDigestUnburned(sk, Hash, Hash, random, digest, salt_len, out);
+    const r = signPssDigestUnburned(sk, Hash, Hash, random, .{ .csprng = random }, digest, salt_len, out);
     burn.stack(burn.private_op_burn);
     return r;
 }
 
-noinline fn signPssDigestUnburned(sk: *const SecretKey, comptime Hash: type, comptime MgfHash: type, random: std.Random, digest: *const [Hash.digest_length]u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+noinline fn signPssDigestUnburned(sk: *const SecretKey, comptime Hash: type, comptime MgfHash: type, random: std.Random, blinding: Blinding, digest: *const [Hash.digest_length]u8, salt_len: usize, out: []u8) SignPssError![]u8 {
     const k = byteLen(sk.n.bits());
     if (out.len < k) return error.BufferTooSmall;
     const em_bits = sk.n.bits() - 1;
@@ -2322,14 +2322,32 @@ noinline fn signPssDigestUnburned(sk: *const SecretKey, comptime Hash: type, com
 
     // §8.1.1 step 2: RSASP1. EM < 2^emBits < n by construction (step 11
     // cleared the top bits), so the primitive's range check cannot fail.
-    // `random` also drives F2 base blinding inside the CRT op; a Bellcore
-    // fault (F3) is surfaced, never signed over.
-    privateOpCrtPtr(sk, em_buf[0..k], out[0..k], .{ .csprng = random }) catch |err| switch (err) {
+    // `blinding` (`random` unless the caller chose otherwise) masks the
+    // CRT op's base (F2); a Bellcore fault (F3) is surfaced, never signed
+    // over.
+    privateOpCrtPtr(sk, em_buf[0..k], out[0..k], blinding) catch |err| switch (err) {
         error.MessageRepresentativeOutOfRange => unreachable,
         error.FaultDetected => return error.FaultDetected,
         error.EntropyFailure => return error.EntropyFailure,
     };
     return out[0..k];
+}
+
+/// `signPss` with an explicit F2 base-blinding choice; `random` still draws
+/// the salt. `.cached` (a `BlindingCache` the caller keeps next to the key,
+/// OpenSSL's per-key `BN_BLINDING`) saves the fresh `r`, its inverse and
+/// `r^e` that `signPss` computes per call (~5 % of a 2048-bit signature);
+/// `.csprng` is `signPss`. The signature is the same for the same salt.
+pub fn signPssBlinded(sk: *const SecretKey, comptime Hash: type, random: std.Random, blinding: Blinding, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+    const r = signPssBlindedUnburned(sk, Hash, random, blinding, msg, salt_len, out);
+    burn.stack(burn.private_op_burn);
+    return r;
+}
+
+noinline fn signPssBlindedUnburned(sk: *const SecretKey, comptime Hash: type, random: std.Random, blinding: Blinding, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
+    var m_hash: [Hash.digest_length]u8 = undefined;
+    Hash.hash(msg, &m_hash, .{});
+    return signPssDigestUnburned(sk, Hash, Hash, random, blinding, &m_hash, salt_len, out);
 }
 
 /// `signPss` with the MGF1 hash decoupled from the message hash (OpenSSL
@@ -2344,7 +2362,7 @@ pub fn signPssH(sk: *const SecretKey, comptime Hash: type, comptime MgfHash: typ
 noinline fn signPssHUnburned(sk: *const SecretKey, comptime Hash: type, comptime MgfHash: type, random: std.Random, msg: []const u8, salt_len: usize, out: []u8) SignPssError![]u8 {
     var m_hash: [Hash.digest_length]u8 = undefined;
     Hash.hash(msg, &m_hash, .{});
-    return signPssDigestUnburned(sk, Hash, MgfHash, random, &m_hash, salt_len, out);
+    return signPssDigestUnburned(sk, Hash, MgfHash, random, .{ .csprng = random }, &m_hash, salt_len, out);
 }
 
 /// `signPssPrehashed` with the hash chosen at run time (Go
@@ -8557,4 +8575,30 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "signPssBlinded: .cached and .none sign as signPss does for the same salt, and .cached verifies" {
+    const sk = try kat2048.secretKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    // The salt comes from `random` alone: the same seed, the same salt.
+    var sig_a: [max_modulus_len]u8 = undefined;
+    var sig_b: [max_modulus_len]u8 = undefined;
+    var sig_c: [max_modulus_len]u8 = undefined;
+    var salt_a = std.Random.DefaultPrng.init(42);
+    const a = try signPss(&sk, Sha256, salt_a.random(), "pss cached", 32, &sig_a);
+    var blind_prng = std.Random.DefaultPrng.init(7);
+    var cache = BlindingCache.init(blind_prng.random());
+    defer cache.deinit();
+    for (0..3) |_| {
+        var salt_b = std.Random.DefaultPrng.init(42);
+        const b = try signPssBlinded(&sk, Sha256, salt_b.random(), .{ .cached = &cache }, "pss cached", 32, &sig_b);
+        try testing.expectEqualSlices(u8, a, b);
+    }
+    var salt_c = std.Random.DefaultPrng.init(42);
+    const c = try signPssBlinded(&sk, Sha256, salt_c.random(), .none, "pss cached", 32, &sig_c);
+    try testing.expectEqualSlices(u8, a, c);
+    try verifyPss(sk.publicKey(), Sha256, "pss cached", a, 32);
+    // The cache was used: its generator moved.
+    var fresh = std.Random.DefaultPrng.init(7);
+    try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&fresh), std.mem.asBytes(&blind_prng)));
 }

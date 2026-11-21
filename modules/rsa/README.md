@@ -65,7 +65,7 @@ PKCS#8), `b64ct` (constant-time PEM base64 of private keys), `keycodec` (the PEM
   byte-identical either way; only the side-channel posture differs.
 - **Cached blinding** (`Blinding.cached`, the OpenSSL scheme): a server that
   blinds every op keeps one `BlindingCache` per thread and saves ~5 % of a
-  2048-bit op over `.csprng`. The cache holds key material — wipe it:
+  2048-bit op over `.csprng` (`signPssBlinded` for RSA-PSS signatures). The cache holds key material — wipe it:
 
   ```zig
   var cache = rsa.BlindingCache.init(csprng.random());

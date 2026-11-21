@@ -106,6 +106,7 @@
 
 const std = @import("std");
 const tls13 = @import("tls13");
+const rsa = @import("rsa");
 const record = @import("record.zig");
 const alert = @import("alert.zig");
 const inbound = @import("inbound.zig");
@@ -180,6 +181,14 @@ pub const CertifiedKey = struct {
     /// cannot produce and the ones TLS 1.3 forbids (RSA PKCS#1 v1.5,
     /// SHA-1) are skipped.
     signature_schemes: ?[]const u16 = null,
+    /// An RSA key's base-blinding cache (`certverify.SignOptions.rsa_blinding`,
+    /// OpenSSL's per-key `BN_BLINDING`): each RSA-PSS CertificateVerify
+    /// reuses its pair instead of a fresh `r`, its inverse and `r^e` (~5 %
+    /// of an RSA-2048 signature, 2026-11-21). Mutable, secret and not
+    /// thread-safe: every connection signing with this `CertifiedKey` uses
+    /// it, so give each thread its own `CertifiedKey` (and cache), or none.
+    /// Null: a fresh blinding per signature.
+    rsa_blinding: ?*rsa.BlindingCache = null,
     /// The Certificate message compressed ahead of time (RFC 8879), in the
     /// server's order of preference: the first one whose algorithm the
     /// client's `compress_certificate` offers and whose staples are the ones
@@ -3538,7 +3547,7 @@ pub const Server = struct {
                 return;
             };
             var sig_buf: [certverify.max_signature_len]u8 = undefined;
-            const sig = certverify.sign(scheme, key, .server, &th, cfg.random, &sig_buf) catch return error.InternalError;
+            const sig = certverify.signWith(scheme, key, .server, &th, cfg.random, .{ .rsa_blinding = ck.rsa_blinding }, &sig_buf) catch return error.InternalError;
             try self.send(H, try encoded(messages.certificateVerify(self.out.slot(), @backingInt(scheme), sig)));
         }
         try self.finishFlight(H, &server_hs);
@@ -9006,7 +9015,6 @@ test "STACKPROBE: wave 3 — no ECH private key residue after ech.openFirst call
 }
 
 test "wave 3: an RSA key too short for PSS-SHA-512 does not get that scheme; a CRT fault while signing is internal_error" {
-    const rsa = @import("rsa");
     var prng = std.Random.DefaultPrng.init(0x5a);
     const kp = try testing.allocator.create(rsa.KeyPair);
     defer testing.allocator.destroy(kp);

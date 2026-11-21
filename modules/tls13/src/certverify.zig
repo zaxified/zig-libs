@@ -539,9 +539,33 @@ pub fn sign(
     random: ?std.Random,
     out: []u8,
 ) SignError![]u8 {
+    return signWith(scheme, secret_key, side, transcript_hash, random, .{}, out);
+}
+
+/// What a signer may keep between signatures with the same key.
+pub const SignOptions = struct {
+    /// RSA-PSS: base blinding from this per-key cache (`rsa.BlindingCache`,
+    /// OpenSSL's per-key `BN_BLINDING`) instead of a fresh `r`, its inverse
+    /// and `r^e` per signature (~5 % of an RSA-2048 signature). Mutable and
+    /// secret, and not thread-safe: one per key and thread, or behind the
+    /// caller's lock. Null: `rsa.signPss`'s fresh blinding.
+    rsa_blinding: ?*rsa.BlindingCache = null,
+};
+
+/// `sign` with `SignOptions`.
+// secret-api-ok: as `sign` — the union holds pointers; the signers run under their own burns.
+pub fn signWith(
+    scheme: SignatureScheme,
+    secret_key: SecretKey,
+    side: Side,
+    transcript_hash: []const u8,
+    random: ?std.Random,
+    opts: SignOptions,
+    out: []u8,
+) SignError![]u8 {
     var content_buf: [max_signed_content_len]u8 = undefined;
     const content = try buildSignedContent(side, transcript_hash, &content_buf);
-    return signContent(scheme, secret_key, content, random, out);
+    return signContentWith(scheme, secret_key, content, random, opts, out);
 }
 
 /// `sign` over content already built (`buildSignedContent`'s output): what
@@ -557,6 +581,19 @@ pub fn signContent(
     random: ?std.Random,
     out: []u8,
 ) SignError![]u8 {
+    return signContentWith(scheme, secret_key, content, random, .{}, out);
+}
+
+/// `signContent` with `SignOptions`.
+// secret-api-ok: as `sign` — the union holds pointers; the signers run under their own burns.
+pub fn signContentWith(
+    scheme: SignatureScheme,
+    secret_key: SecretKey,
+    content: []const u8,
+    random: ?std.Random,
+    opts: SignOptions,
+    out: []u8,
+) SignError![]u8 {
     return switch (scheme) {
         .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => blk: {
             const sk = switch (secret_key) {
@@ -566,7 +603,7 @@ pub fn signContent(
             const rnd = random orelse return error.RandomRequired;
             const modulus_len = (sk.n.bits() + 7) / 8;
             if (out.len < modulus_len) return error.BufferTooSmall;
-            break :blk burn.run(burn.rsa_burn, SignError![]u8, signRsaPss, .{ scheme, sk, content, rnd, out });
+            break :blk burn.run(burn.rsa_burn, SignError![]u8, signRsaPss, .{ scheme, sk, content, rnd, opts.rsa_blinding, out });
         },
         .ecdsa_secp256r1_sha256 => blk: {
             const sk = switch (secret_key) {
@@ -637,16 +674,18 @@ fn verifyRsaPss(scheme: SignatureScheme, pk: rsa.PublicKey, content: []const u8,
     };
 }
 
-fn signRsaPss(scheme: SignatureScheme, sk: *const rsa.SecretKey, content: []const u8, random: std.Random, out: []u8) SignError![]u8 {
+fn signRsaPss(scheme: SignatureScheme, sk: *const rsa.SecretKey, content: []const u8, random: std.Random, cache: ?*rsa.BlindingCache, out: []u8) SignError![]u8 {
     const sha2 = std.crypto.hash.sha2;
     // RFC 8446 §4.2.3: salt_len == Hash.digest_length, always randomized
     // (`random` non-null is enforced by `sign` before dispatching here).
     // rsa.signPss hashes `content` internally (RFC 8017 §9.1.1 step 2) and
     // draws the fresh salt from `random` itself.
+    // With a per-key cache the base blinding reuses its pair (`rsa.Blinding.cached`).
+    const blinding: rsa.Blinding = if (cache) |c| .{ .cached = c } else .{ .csprng = random };
     const result = switch (scheme) {
-        .rsa_pss_rsae_sha256 => rsa.signPss(sk, sha2.Sha256, random, content, sha2.Sha256.digest_length, out),
-        .rsa_pss_rsae_sha384 => rsa.signPss(sk, sha2.Sha384, random, content, sha2.Sha384.digest_length, out),
-        .rsa_pss_rsae_sha512 => rsa.signPss(sk, sha2.Sha512, random, content, sha2.Sha512.digest_length, out),
+        .rsa_pss_rsae_sha256 => rsa.signPssBlinded(sk, sha2.Sha256, random, blinding, content, sha2.Sha256.digest_length, out),
+        .rsa_pss_rsae_sha384 => rsa.signPssBlinded(sk, sha2.Sha384, random, blinding, content, sha2.Sha384.digest_length, out),
+        .rsa_pss_rsae_sha512 => rsa.signPssBlinded(sk, sha2.Sha512, random, blinding, content, sha2.Sha512.digest_length, out),
         else => return error.UnsupportedScheme, // `sign` only routes rsa_pss_rsae_* here
     };
     return result catch |err| switch (err) {
@@ -1485,4 +1524,26 @@ test "uncompressedSec1P256: equals std's for affine and for projective keys" {
         try testing.expectEqual(@as(u8, 4), uncompressedSec1P256(proj)[0]);
     }
     try testing.expect(projective_seen);
+}
+
+test "signWith: an RSA-PSS signature with a per-key blinding cache is the one signContent makes for the same salt, and verifies" {
+    var sk: rsa.SecretKey = undefined;
+    try kat.rsa_pss_sha256_server.secretKey(&sk);
+    const th = kat.rsa_pss_sha256_server.transcript_hash;
+    var plain: [max_signature_len]u8 = undefined;
+    var cached: [max_signature_len]u8 = undefined;
+    var salt_a = std.Random.DefaultPrng.init(3);
+    const a = try sign(.rsa_pss_rsae_sha256, .{ .rsa = &sk }, .server, &th, salt_a.random(), &plain);
+    var blind_prng = std.Random.DefaultPrng.init(4);
+    var cache = rsa.BlindingCache.init(blind_prng.random());
+    defer cache.deinit();
+    for (0..2) |_| {
+        var salt_b = std.Random.DefaultPrng.init(3);
+        const b = try signWith(.rsa_pss_rsae_sha256, .{ .rsa = &sk }, .server, &th, salt_b.random(), .{ .rsa_blinding = &cache }, &cached);
+        try testing.expectEqualSlices(u8, a, b);
+    }
+    try verify(.rsa_pss_rsae_sha256, .{ .rsa = sk.publicKey() }, .server, &th, a);
+    // The cache drew its pair from its own generator.
+    var fresh = std.Random.DefaultPrng.init(4);
+    try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&fresh), std.mem.asBytes(&blind_prng)));
 }

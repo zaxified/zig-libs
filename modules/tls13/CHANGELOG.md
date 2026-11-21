@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Added:** `certverify.SignOptions`, `certverify.signWith` and `certverify.signContentWith`: `sign` / `signContent` with an optional per-key `rsa.BlindingCache` (`rsa_blinding`) for RSA-PSS, ~5 % of an RSA-2048 signature (OpenSSL keeps a blinding pair per key). `sign` / `signContent` are unchanged.
 - **2026-11-20** — New `keyschedule.verifyFinished` (also on `tls13`/`dtls13`) and `Schedule.verifyPskBinder`: recompute the Finished `verify_data` / PSK binder under the burn, compare with `std.crypto.timing_safe.eql` (a wrong-length input is false) and wipe the expected MAC, so a consumer cannot reach for `std.mem.eql`. Additive. Tests: RFC 8448 §4 binder, every flipped octet, short / long / empty inputs, SHA-384.
 
 - **2026-11-14** — **Tests:** delta mutation audit of `certverify` `signRsaPss`'s new `EntropyFailure` arm: an all-zero `random` must surface `error.EntropyFailure` on every RSA-PSS scheme (kills the arm remapped to another error).

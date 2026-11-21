@@ -977,6 +977,10 @@ Test classes, by area:
 
 ## Performance
 
+An RSA key can keep a per-key blinding pair (`CertifiedKey.rsa_blinding`, an `rsa.BlindingCache`, as OpenSSL keeps
+one per key): ~5 % of each RSA-2048 CertificateVerify (`rsa` SPEC); not thread-safe, so one `CertifiedKey` per thread
+when set, null by default (the bench rows sign without it).
+
 Bench: `zig build bench-tlsserver` (`BENCH_ROUNDS` rounds, ReleaseFast; `tools/bench.zig`, `tools/c_bench/foreign_bench.c`,
 `tools/rust_bench`). The card's `**Performance:**` line is the authoritative figure. Workloads: a full handshake with
 ECDSA P-256 over X25519 and over X25519MLKEM768, a full handshake with RSA-2048 (PSS) over X25519, a resumption

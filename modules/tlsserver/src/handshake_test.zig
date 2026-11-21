@@ -385,6 +385,23 @@ test "tlsclient ↔ Server: every certificate kind, chain verified by x509" {
     }
 }
 
+test "tlsclient ↔ Server: an RSA key with a per-key blinding cache (CertifiedKey.rsa_blinding) signs every CertificateVerify" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    var prng = std.Random.DefaultPrng.init(11);
+    var cache = rsa.BlindingCache.init(prng.random());
+    defer cache.deinit();
+    const ck: server_mod.CertifiedKey = .{ .chain = &.{&certs.rsa2048_cert}, .key = .{ .rsa = &fx.rsa2048 }, .rsa_blinding = &cache };
+    for (0..3) |_| {
+        const o = try handshake(ZlClient, testing.allocator, &ck, .{}, .{});
+        defer testing.allocator.free(o.echoed);
+        try testing.expectEqualStrings("hello there", o.echoed);
+    }
+    // The cache drew its pair from its own generator.
+    var fresh = std.Random.DefaultPrng.init(11);
+    try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&fresh), std.mem.asBytes(&prng)));
+}
+
 test "tlsclient ↔ Server: every group with a lone key share, every suite" {
     var fx: Fixture = undefined;
     try fx.init();

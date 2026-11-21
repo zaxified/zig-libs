@@ -149,6 +149,9 @@ than the one it last served (compared by the public `n` and `e` and by the key's
 branch-free and folded into one verdict that says only whether this key object lists the same prime first, because
 `n` and `e` do not identify the pair when a key lists its primes the other way round). Measured at 2048 bits (standalone
 harness, `decryptOaepBlinded`, instructions/op): `.csprng` +6.0 % over `.none`, `.cached` +0.85 %.
+`signPssBlinded` takes it for RSA-PSS (the salt still from its `random`): 2048-bit signatures 5 % faster
+than `signPss`'s fresh blinding (2026-11-21, ReleaseFast, 15 interleaved rounds, paired ratio median
+0.948, IQR 0.929–0.973).
 The keys stay `*const`; the cache is the caller's mutable state, one per thread (no lock). It holds
 key material — `r^e mod p` and `r⁻¹ mod p` give `p` by a gcd with `n` — so it is wiped by `deinit`,
 and the per-op stack burn does not cover it. Consecutive pairs are known squares of each other;
