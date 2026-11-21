@@ -80,7 +80,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match, onepass, onepass_match, rust, rust_vm_only, bytes, twin, twin_match, bytes_twin, bytes_twin_match, set, set_match, set_big, set_too_large, heap, too_large, shortest, shortest_ref, anchored_match };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match, onepass, onepass_match, rust, rust_asserts, bytes, twin, twin_match, bytes_twin, bytes_twin_match, set, set_match, set_big, set_too_large, heap, too_large, shortest, shortest_ref, anchored_match };
 
 /// `Dfa.max_insts` in root.zig: a longer program is matched by `runSetOn`.
 const dfa_max_insts = 128;
@@ -439,7 +439,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     switch (mode) {
         .rust => {
             hit(.rust);
-            if (re.vm_only) hit(.rust_vm_only);
+            if (re.rust_asserts) hit(.rust_asserts);
         },
         .bytes => hit(.bytes),
         else => {},

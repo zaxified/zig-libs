@@ -190,7 +190,13 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   level from the end holds one or two ASCII bytes (`Prefilter.tail`, up to 16: a literal suffix,
   or its two cases under `(?i)`): a text whose tail cannot end a match costs a few compares.
 - **The find DFAs** (`FindDfa`; `Matcher.find`, the iterator and the span before `captures`; leftmost-first
-  programs of up to `Dfa.max_insts` (128) instructions that are not `vm_only`). A forward pass finds where
+  programs of up to `Dfa.max_insts` (128) instructions that are not `vm_only`, the Rust grammar's assertions
+  included, under the same contexts and give-up as the lazy DFA above: under a Unicode word assertion a code point
+  past ASCII next to a position the search must class — forwards, backwards, or where a skip lands — gives the
+  search up to the backtracker and the Pike VM, as Rust's hybrid DFA quits. Measured 2026-11-21 against the same
+  program on the VMs (ReleaseFast, find-all or captures-all over 1 MiB of ASCII words; A/B in one binary, best of 7,
+  2 rounds, the VMs' best above the DFAs' worst on every row): `\b\w+\b` 4.0×, `\b[a-z]{3}[0-9]\b` 12.7–13.3×,
+  `(?Rm)^[a-z]+$` 4.9–5.3×, `\b{start}[a-z]+q` 12.6–13.3× faster). A forward pass finds where
   the match ends and, when it can, where it starts: a transition marks where a thread began from a state
   with none and where a later one joined the live threads (or matched empty beside them); with no join
   since the last begin every live thread descends from that start, so it is the leftmost-first start. Otherwise
@@ -210,7 +216,9 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   anchored, the next code point always picks at most one way on (`INV-([0-9]{4}-[0-9]{4})`,
   `(\w+)@(\w+)\.com`, `\b(\w+)\b`, `^(\d+)-(\d+)$`), the search is one thread whose captures are written in
   place: one table load per ASCII byte, the step packing the next root's row offset, the slots set and the
-  assertions passed. Programs of up to 128 instructions and 16 groups (`max_slots` 32); a match past an
+  assertions passed (one bit per assertion kind the program uses, eight at most — of the 18, the Rust grammar's
+  included; a program with more is not taken). The assertions are judged from the code points themselves, so
+  Unicode word boundaries need no give-up. Programs of up to 128 instructions and 16 groups (`max_slots` 32); a match past an
   assertion is allowed when no way lies below it. The start comes as `find` gets it (a fast prefilter's
   candidates read anchored by the engine itself, else the DFAs' span). Made with the find DFA; the
   backtracker and the Pike VM answer where it does not apply. The tests compare it with the Pike VM from every start.
@@ -351,11 +359,8 @@ Consumer build options (CONVENTIONS §4.2), after Rust `regex-syntax`'s `unicode
 
 All open.
 
-- **The Rust grammar's assertions in `Matcher`'s DFAs** — `isMatch`/`fullMatch` run their lazy DFAs on them (see the
-  lazy DFA above); `Matcher.find`'s DFAs (`FindDfa`, `Back`) and the one-pass engine still step aside for the VMs on a
-  program with a Rust-grammar assertion (`Regex.vm_only`), so `find`/`captures` of `\b\w+\b` written for `.rust` are slower
-  than in `.perl`. The same give-up past ASCII would serve there; `FindDfa`'s premultiplied rows and two-byte mid states
-  need it at each decode. Bytes mode (`Options.utf8 = false`) runs the VMs only and has no prefilter either.
+- **Bytes mode in the DFAs** — bytes mode (`Options.utf8 = false`, `Regex.vm_only`) runs the VMs only and has no
+  prefilter either.
 - **Programs past `4 * max_insts`** (owner: no consumer setting may end in a panic or an OOM) — Go and Rust compile
   them; here `error.PatternTooLarge`, because `isMatch` has no allocator and a `Matcher` for 65,534 instructions x 64
   groups would be ~134 MiB. Taking them back needs matching in bounded memory for any size (a windowed or chunked state
