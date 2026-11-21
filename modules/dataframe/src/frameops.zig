@@ -661,7 +661,11 @@ fn parseRule(rule: []const u8) ?RuleSpec {
             return .{ .every = .{ .us = std.math.mul(i64, per, k) catch return null }, .fixed = true };
         }
     }.mk;
-    if (eq(u8, u, "D")) return fixed(us_per_day_i, n);
+    if (eq(u8, u, "D")) {
+        var r = fixed(us_per_day_i, n) orelse return null;
+        r.every.days = n;
+        return r;
+    }
     if (eq(u8, u, "h") or eq(u8, u, "H")) return fixed(3_600_000_000, n);
     if (eq(u8, u, "min") or eq(u8, u, "T")) return fixed(60_000_000, n);
     if (eq(u8, u, "s") or eq(u8, u, "S")) return fixed(1_000_000, n);
@@ -792,8 +796,9 @@ fn inWindow(closed: DynamicClosed, t: i64, lo: i64, up: i64) bool {
 /// a gap is the first instant after it).
 fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!Frame {
     const ii = try mustIndex(f, spec.index);
-    const zn = f.columns[ii].time_zone orelse return groupByDynamicNaive(a, f, spec);
+    const zn = f.columns[ii].time_zone orelse return groupByDynamicNaive(a, f, spec, null);
     const zone = tz.find(zn) orelse return error.BadArgument;
+    if (elapsedGrid(spec)) return groupByDynamicNaive(a, f, spec, zone);
     try checkRows(f);
     const cols = try a.dupe(Column, f.columns);
     cols[ii].time_zone = null;
@@ -806,7 +811,7 @@ fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Erro
         c.* = if (isMissing(v)) .null else try dtf.toLocal(a, v, zone);
     }
     data[ii] = try fm.conformColumn(a, try fm.columnFromCells(a, wall), f.columns[ii], f.len);
-    const out = try groupByDynamicNaive(a, .{ .columns = cols, .data = data, .len = f.len }, spec);
+    const out = try groupByDynamicNaive(a, .{ .columns = cols, .data = data, .len = f.len }, spec, null);
     const ocols = try a.dupe(Column, out.columns);
     const odata = try a.alloc(ColumnData, out.columns.len);
     for (odata, 0..) |*d, i| d.* = out.columnAt(i);
@@ -836,8 +841,65 @@ fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Erro
     return .{ .columns = ocols, .data = odata, .len = out.len };
 }
 
-/// The general `groupByDynamic` on a naive index: see `DynamicSpec`.
-fn groupByDynamicNaive(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!Frame {
+/// Whether the windows of a zoned index step by elapsed time: `every` (and `period`, `offset`)
+/// made of hours or less and no calendar day, week or month (a `rule` of `D` is a calendar day).
+fn elapsedGrid(spec: DynamicSpec) bool {
+    const every: dtf.Duration = if (spec.rule) |r| (parseRule(r) orelse return false).every else dtf.parseDuration(spec.every) orelse return false;
+    if (every.months != 0 or every.days != 0 or every.weeks != 0) return false;
+    if (spec.rule) |r| if ((parseRule(r) orelse return false).start_by != .window) return false;
+    for ([_]?[]const u8{ spec.period, spec.offset }) |o| {
+        const d = dtf.parseDuration(o orelse continue) orelse return false;
+        if (d.months != 0 or d.days != 0 or d.weeks != 0) return false;
+    }
+    return true;
+}
+
+/// The instant of the wall-clock time `local` (microseconds) in `zone`: a time the zone shows
+/// twice is its first pass, a time it skips the first instant after the gap.
+fn instantOfWall(zone: *const tz.Zone, local: i64) ?i64 {
+    const secs = @divFloor(local, 1_000_000);
+    const inst: i64 = switch (tz.resolveLocal(zone, secs)) {
+        .unique => |u| u,
+        .nonexistent => |g| g.later,
+        .ambiguous => |g| g.earlier,
+    };
+    const base = std.math.mul(i64, inst, 1_000_000) catch return null;
+    return std.math.add(i64, base, @mod(local, 1_000_000)) catch null;
+}
+
+/// The grid origin (an instant) of one group of a zoned index stepping by elapsed time: polars
+/// truncates the first point's wall clock to a multiple of `every`; `start_by` and an explicit
+/// pandas `origin` are read on the wall clock too (the instants `first` and `last` themselves for
+/// the origins that are those points).
+fn zonedOrigin(a: std.mem.Allocator, zone: *const tz.Zone, ref: ?Value, ref_us: i64, spec: DynamicSpec, kind: Origin, start_by: StartBy, every: dtf.Duration, first: i64, last: i64) error{OutOfMemory}!?i64 {
+    if (start_by == .datapoint) return first;
+    const off = struct {
+        fn at(z: *const tz.Zone, x: i64) i64 {
+            return @as(i64, tz.offsetAt(z, @divFloor(x, 1_000_000)).off) * 1_000_000;
+        }
+    }.at;
+    if (start_by == .window and spec.rule == null and spec.origin == null) {
+        const rv = ref orelse return null;
+        const d = std.math.sub(i64, first, ref_us) catch return null;
+        const cell = try dtf.offsetBy(a, rv, .{ .us = d });
+        const t = try dtf.roundToZoned(a, cell, every, .floor, zone);
+        return dtf.instantOf(t);
+    }
+    if (start_by == .window) switch (kind) {
+        .start => return first,
+        .end => return last,
+        else => {},
+    };
+    const wf = std.math.add(i64, first, off(zone, first)) catch return null;
+    const wl = std.math.add(i64, last, off(zone, last)) catch return null;
+    const w = originFor(kind, start_by, every, wf, wl) orelse return null;
+    return instantOfWall(zone, w);
+}
+
+/// The general `groupByDynamic` on a naive index: see `DynamicSpec`. With a `zone` the index
+/// holds instants of a zoned column and the grid steps by elapsed time from an origin read on the
+/// wall clock (`elapsedGrid`).
+fn groupByDynamicNaive(a: std.mem.Allocator, f: Frame, spec: DynamicSpec, zone: ?*const tz.Zone) Error!Frame {
     try checkRows(f);
     const ii = try mustIndex(f, spec.index);
     var every: dtf.Duration = undefined;
@@ -924,7 +986,10 @@ fn groupByDynamicNaive(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!
     for (0..ng) |g| {
         grids[g] = null;
         if (!seen[g]) continue;
-        const org = originFor(origin_kind, start_by, every, firsts[g], lasts[g]) orelse return error.TooLarge;
+        const org = (if (zone) |z|
+            try zonedOrigin(a, z, ref, ref_us, spec, origin_kind, start_by, every, firsts[g], lasts[g])
+        else
+            originFor(origin_kind, start_by, every, firsts[g], lasts[g])) orelse return error.TooLarge;
         const gr: Grid = .{ .origin = org, .every = every, .offset = offset, .period = period };
         k0[g] = gr.indexAtOrBefore(firsts[g], closed == .right) orelse return error.TooLarge;
         grids[g] = gr;
@@ -1091,6 +1156,7 @@ pub fn groupByDynamic(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!F
         spec.label == .left and spec.start_by == .window and spec.origin == null and !spec.include_boundaries;
     if (!plain) return groupByDynamicGeneral(a, f, spec);
     const ii = try mustIndex(f, spec.index);
+    if (f.columns[ii].time_zone != null and elapsedGrid(spec)) return groupByDynamicGeneral(a, f, spec);
     const d = dtf.parseDuration(spec.every) orelse return error.BadArgument;
     if (!((d.months > 0 and d.us == 0) or (d.months == 0 and d.us > 0))) return error.BadArgument;
     const win_name = "\x00window";

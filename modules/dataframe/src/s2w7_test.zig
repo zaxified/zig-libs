@@ -193,6 +193,73 @@ test "groupByDynamic on a zoned index through the general path (rule D) cuts at 
     try expectInt(stamp("2024-03-30T23:00:00Z"), g.cell(2, "ts").?);
 }
 
+/// `n` points `step_h` hours apart from `first` (an ISO instant, values 0, 1, ...) in Prague,
+/// grouped by `spec`; the window starts (as instants of the ISO text list), sums and counts must be as given.
+fn expectZonedWindows(first: []const u8, n: usize, step_h: i64, spec: df.DynamicSpec, starts: []const []const u8, sums: []const i64, counts: []const i64) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const us = try a.alloc(i64, n);
+    for (us, 0..) |*u, i| u.* = stamp(first) + @as(i64, @intCast(i)) * step_h * 3600 * s_us;
+    const f0 = try one(a, prague, us);
+    const vs = try a.alloc(Value, n);
+    for (vs, 0..) |*v, i| v.* = .{ .int = @intCast(i) };
+    const cols = try a.dupe(Column, &.{ f0.columns[0], .{ .name = "v", .type = .int } });
+    const data = try a.dupe(df.ColumnData, &.{ f0.data[0], try df.columnFromCells(a, vs) });
+    const f: Frame = .{ .columns = cols, .data = data, .len = n };
+    var sp = spec;
+    sp.index = "ts";
+    sp.aggs = &.{ .{ .src = "v", .out = "s", .func = .sum }, .{ .src = "v", .out = "n", .func = .count } };
+    const g = try df.groupByDynamic(a, f, sp);
+    try testing.expectEqual(sums.len, g.len);
+    for (sums, counts, 0..) |sm, c, ri| {
+        try expectInt(sm, g.cell(ri, "s").?);
+        try expectInt(c, g.cell(ri, "n").?);
+    }
+    if (starts.len == 0) return;
+    // starts: the first, then every `starts[1]` hours (given as "+3h")
+    for (starts, 0..) |t, ri| {
+        if (t[0] == '+') {
+            const h = try std.fmt.parseInt(i64, t[1..], 10);
+            const prev = g.cell(ri - 1, "ts").?.int;
+            try expectInt(prev + h * 3600 * s_us, g.cell(ri, "ts").?);
+        } else try expectInt(stamp(t), g.cell(ri, "ts").?);
+    }
+    try testing.expectEqualStrings(prague, g.columns[g.columnIndex("ts").?].time_zone.?);
+}
+
+test "groupByDynamic of a zoned index with a sub-day every steps by elapsed time from the first point's truncated wall clock (polars)" {
+    const sums3 = [_]i64{ 3, 12, 21, 30, 39, 48, 57, 66, 75, 84 };
+    const n3 = [_]i64{ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 };
+    const steps3 = [_][]const u8{ "2024-03-30T20:00:00Z", "+3", "+3", "+3", "+3", "+3", "+3", "+3", "+3", "+3" };
+    // across the spring change: 21:00 CET, 00:00 CET, 04:00 CEST (three hours elapsed), ...
+    try expectZonedWindows("2024-03-30T20:10:00Z", 30, 1, .{ .index = "", .every = "3h", .aggs = &.{} }, &steps3, &sums3, &n3);
+    try expectZonedWindows("2024-03-30T20:10:00Z", 30, 1, .{ .index = "", .every = "3h", .closed = .right, .aggs = &.{} }, &steps3, &sums3, &n3);
+    // start_by datapoint: the first point itself
+    const dp = [_][]const u8{ "2024-03-30T20:10:00Z", "+3", "+3", "+3", "+3", "+3", "+3", "+3", "+3", "+3" };
+    try expectZonedWindows("2024-03-30T20:10:00Z", 30, 1, .{ .index = "", .every = "3h", .start_by = .datapoint, .aggs = &.{} }, &dp, &sums3, &n3);
+    // an every that does not divide a day: the wall clock of the first point is cut at a multiple from 1970-01-01 (17:00)
+    try expectZonedWindows("2024-03-30T20:10:00Z", 30, 1, .{ .index = "", .every = "5h", .aggs = &.{} }, &.{ "2024-03-30T16:00:00Z", "+5", "+5", "+5", "+5", "+5", "+5" }, &.{ 0, 15, 40, 65, 90, 115, 110 }, &.{ 1, 5, 5, 5, 5, 5, 4 });
+    // longer than a day, and back across the autumn change
+    try expectZonedWindows("2024-03-30T20:10:00Z", 30, 1, .{ .index = "", .every = "36h", .aggs = &.{} }, &.{ "2024-03-29T23:00:00Z", "+36" }, &.{ 105, 330 }, &.{ 15, 15 });
+    const sums2 = [_]i64{ 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57 };
+    const n2 = [_]i64{ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 };
+    try expectZonedWindows("2024-10-26T20:10:00Z", 30, 1, .{ .index = "", .every = "2h", .aggs = &.{} }, &.{ "2024-10-26T20:00:00Z", "+2", "+2", "+2", "+2", "+2", "+2", "+2", "+2", "+2", "+2", "+2", "+2", "+2", "+2" }, &sums2, &n2);
+    // a weekday start: Monday 00:00 CET plus multiples of five hours, elapsed (probed with polars 2.1)
+    try expectZonedWindows("2024-03-29T20:10:00Z", 30, 2, .{ .index = "", .every = "5h", .start_by = .monday, .aggs = &.{} }, &.{ "2024-03-29T18:00:00Z", "+5" }, &.{ 1, 5, 15, 15, 30, 25, 45, 35, 60, 45, 75, 55, 29 }, &.{ 2, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 1 });
+    // offset and a closed that takes the edge
+    try expectZonedWindows("2024-03-30T20:10:00Z", 30, 1, .{ .index = "", .every = "3h", .offset = "30m", .aggs = &.{} }, &.{ "2024-03-30T17:30:00Z", "+3" }, &.{ 0, 6, 15, 24, 33, 42, 51, 60, 69, 78, 57 }, &.{ 1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2 });
+}
+
+test "resample (rule) of a zoned index with an hour rule counts elapsed time from local midnight (pandas)" {
+    const sums3 = [_]i64{ 3, 12, 21, 30, 39, 48, 57, 66, 75, 84 };
+    const n3 = [_]i64{ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 };
+    try expectZonedWindows("2024-03-30T20:10:00Z", 30, 1, .{ .index = "", .rule = "3h", .aggs = &.{} }, &.{ "2024-03-30T20:00:00Z", "+3", "+3", "+3", "+3", "+3", "+3", "+3", "+3", "+3" }, &sums3, &n3);
+    try expectZonedWindows("2024-03-30T20:10:00Z", 30, 1, .{ .index = "", .rule = "3h", .origin = .start, .aggs = &.{} }, &.{ "2024-03-30T20:10:00Z", "+3" }, &sums3, &n3);
+    // 5h from the local midnight of 30 March: 20:00 CET
+    try expectZonedWindows("2024-03-30T20:10:00Z", 30, 1, .{ .index = "", .rule = "5h", .aggs = &.{} }, &.{ "2024-03-30T19:00:00Z", "+5" }, &.{ 6, 30, 55, 80, 105, 130, 29 }, &.{ 4, 5, 5, 5, 5, 5, 1 });
+}
+
 test "groupByDynamic on a zoned index: aggregates of the index come back as instants in the zone" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

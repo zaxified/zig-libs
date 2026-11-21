@@ -766,6 +766,13 @@ cut on the wall clock for every step, hour or day alike (the engines agree, also
 keeps the result on the right side of the input is taken, a gap boundary moves forward by the jump), so a DST day's
 bucket is 23 or 25 hours. `groupByDynamic` (and `resample` through `rule`) of a zoned index cuts windows at local
 midnight and month starts, and labels them with the instants of those local times (polars and pandas agree).
+An `every` (or `rule`) of hours or less, with no day, week or month in it, steps by elapsed time instead: the grid origin
+is read on the wall clock (polars: the first point's wall clock cut to a multiple of `every` counted from 1970-01-01;
+`start_by = datapoint`: the first instant; a weekday `start_by` and pandas' `origin` (`start_day`, `epoch`, `end_day`:
+the local midnight or wall time) likewise, a fold taking its first pass and a gap the first instant after it) and every
+window is `origin + k * every` of elapsed time, so across a DST change `3h` windows start 21:00 CET, 00:00 CET, 04:00 CEST
+(polars 2.1 and pandas 3.1 agree; a window is then 3 elapsed hours long, never 2 or 4). `offset` and `period` of the
+same kind step the same way; a calendar part in either keeps the wall-clock windows.
 `offset_by` of a zoned column moves calendar units on the wall clock and sub-day units as elapsed time (polars;
 wave W10, below). `upsample`/`rolling` by time on a zoned column work on
 instants.
@@ -1200,4 +1207,4 @@ Open items only; everything here is LOW unless marked, and none is a known wrong
 - **Build size knobs (CONVENTIONS §4.2; owner decision):** `regex` brings its Unicode tables and `unitext` adds 158,056 B (+15%) to a ReleaseSmall binary that calls `mutate` with one `add`; a `dataframe-regex` and a `dataframe-unicode` option (default on, off = the former ASCII behaviour) would remove them: measure with a size probe, the owner decides.
 - **Categoricals and speed:** group/join/sort keyed on the codes of an unordered categorical column (the speed of an encoded key; measure first); `pivot` and the order-aware `window` functions (`cummin`, `rank`) still read a categorical's text.
 - **Nested keys:** group/join/sort keys over list and struct columns take the encoded-row path with no typed fast path (measure first).
-- **Time zones:** (1) `groupByDynamic` of a zoned index with a sub-day `every` cuts every window on the wall clock like `truncate`; polars truncates the first point's wall clock and then steps by elapsed time (probed: `every = "3h"` over Europe/Prague on 2024-03-31 gives windows starting 21:00 CET, 00:00 CET, 04:00 CEST, 07:00 CEST, here 21, 00, 03, 06 wall hours), so the two differ across a DST change (the vectors cover `1d` and `1mo`). (2) `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until it is made a zoned column before 1970 shows the zone's state at the epoch.
+- **Time zones:** `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until it is made a zoned column before 1970 shows the zone's state at the epoch.
