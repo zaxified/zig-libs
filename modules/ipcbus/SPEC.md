@@ -117,12 +117,15 @@ module has no wire format of its own (see *Anchoring*).
 
 ## Backlog / deferred
 
-- **Real push / notify (pub/sub)** — no server-initiated push; subscribers poll `Bus.version`.
-  NNG, ZeroMQ and D-Bus users expect notifications. Effort: medium-large (needs persistent
-  connections and an event loop). Fits CONVENTIONS §2.
 - **Concurrent connections** — a slow or stalled client blocks every other request (one connection
   at a time; a per-call timeout is opt-in). Effort: medium (poll-based accept loop or `std.Io`
   group; per-connection deadline). Fits §2.
+
+## Roadmap
+
+- **Real push / notify (pub/sub)** — no server-initiated push; subscribers poll `Bus.version`.
+  NNG, ZeroMQ and D-Bus users expect notifications. Effort: medium-large (needs persistent
+  connections and an event loop). Fits CONVENTIONS §2. Size: persistent connections, an event loop and a wire-protocol extension, weeks.
 
 ## Anchoring
 

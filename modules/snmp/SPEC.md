@@ -296,8 +296,11 @@ over both the captured net-snmp datagrams and a live authPriv reply. Every one i
 - **v3 Trap sending and v3 notification receipt** (authenticated Trap send, authenticated Trap/Inform receive;
   `receiver` is v1/v2c only). The v3 sender is the authoritative engine, which needs a local engine id / boots /
   time (and users localized to it) that `V3Client` does not own. Effort: medium.
+
+## Roadmap
+
 - **Deferred, no plan:** the agent (engine/server) role; a MIB compiler / SMI parsing; SNMPv3 over TLS/DTLS
-  (RFC 6353); RFC 3826 `usmDHKickstart` and the `KeyChange` textual convention; context-engine-ID proxy forwarding.
+  (RFC 6353); RFC 3826 `usmDHKickstart` and the `KeyChange` textual convention; context-engine-ID proxy forwarding. Size: each is its own protocol family or tool (agent engine, SMI compiler, TLS/DTLS transport), weeks to months.
 
 ## Anchoring
 

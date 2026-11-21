@@ -443,5 +443,8 @@ CONVENTIONS.md §5 also puts outside NOTICE's scope.
 
 ## Backlog / deferred
 
-- **DKIM signing (RFC 6376)** *(survey 2026-09-30)*. Bulk senders need it; mail-send bundles it *(inferred)*. Effort: medium, best as its own module (see *What is deliberately not done*). Fits §2 (RSA/Ed25519 exist in the repo).
 - **Differential oracle against karlseguin's library** — IDEA (not scheduled). `karlseguin/smtp_client.zig`. Point both clients at one recording SMTP server with the same message and compare the command/DATA transcripts: dot-stuffing, line endings, EHLO parameters and AUTH. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT, but its last commit predates Zig 0.16, so it needs a port or a 0.15 toolchain first.
+
+## Roadmap
+
+- **DKIM signing (RFC 6376)** *(survey 2026-09-30)*. Bulk senders need it; mail-send bundles it *(inferred)*. Effort: medium, best as its own module (see *What is deliberately not done*). Fits §2 (RSA/Ed25519 exist in the repo). Size: its own module (RFC 6376 canonicalisation, header selection, signature fold and verify counterpart, RSA-SHA256 and Ed25519 keys), weeks; needs the `rsa` and `ct25519` siblings and a DKIM verifier as oracle.

@@ -231,13 +231,17 @@ deterministic.
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - **Durable, cross-process leases.** Leases live in memory (single-process worker model); several
-  worker processes would need a shared queue and a cross-process lock in `kv`. Effort: large.
+  worker processes would need a shared queue and a cross-process lock in `kv`. Effort: large. Size: a shared queue with a cross-process lock in `kv`, weeks.
 - **Worker runtime** (concurrency, graceful shutdown, handler dispatch by job type, a scheduler that
   fires `Cron` entries, a background lease-sweep / `kv.compact` thread with a trigger policy):
   Sidekiq and Asynq ship it; here the caller writes the loop and drives `reapExpiredLeases` and
   `kv.compact` (`workerpool` exists as a sibling). A separate module composing `jobqueue` +
-  `workerpool`. Effort: large.
+  `workerpool`. Effort: large. Size: a separate module composing `jobqueue` and `workerpool` (scheduler, graceful shutdown, handler dispatch), weeks.
 
 ## Anchoring
 

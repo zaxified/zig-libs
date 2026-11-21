@@ -389,8 +389,11 @@ Offline only — pure logic, no live-interop surface. `scripts/modtest l2forward
 - **Local-port dimension** — learning which *access* port a MAC sits behind, so a PE with several customer ports can
   unicast locally instead of delivering to all access circuits; a bridge does this natively. Effort: medium; changes the
   `Decision` shape (ask before starting).
+
+## Roadmap
+
 - **IGMP/MLD snooping** — multicast currently floods like broadcast (`isBumAddress`); snooping limits it to interested
-  PEs. Effort: large; probably belongs in a separate module.
+  PEs. Effort: large; probably belongs in a separate module. Size: a protocol engine (IGMPv3/MLDv2 state machines, querier election, group tables), weeks; probably its own module.
 
 ## Anchoring
 

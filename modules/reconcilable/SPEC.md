@@ -303,6 +303,11 @@ convergence, which has no oracle at all.
 
 ## What is deliberately not done
 
+- A `Reconciler` that owns several key *kinds* (upstream's manager/controller split). Today each kind is its own
+  `Reconciler` instance with its own `Ctx`; that is sufficient for both consumers and avoids type erasure.
+  Revisit only if a consumer needs cross-kind ordering. Not planned: neither consumer needs it and the per-kind instance avoids type erasure.
+- `WorkQueue` is reachable only as a generic function; if a consumer wants a scheduler that is not a reconciler, its
+  `Finish` API may want a friendlier surface. Not planned: no non-reconciler consumer exists.
 - **A global rate limit** (client-go's token bucket): the caller owns the loop and `budget_per_tick` expresses
   throughput in its clock; a bucket would need a clock inside a module built to have none (§2, §4).
 - **Per-key metrics** (time-in-queue, reconcile duration): they would require a clock inside the module (§2); the
@@ -311,8 +316,4 @@ convergence, which has no oracle at all.
 
 ## Backlog / deferred
 
-- A `Reconciler` that owns several key *kinds* (upstream's manager/controller split). Today each kind is its own
-  `Reconciler` instance with its own `Ctx`; that is sufficient for both consumers and avoids type erasure.
-  Revisit only if a consumer needs cross-kind ordering.
-- `WorkQueue` is reachable only as a generic function; if a consumer wants a scheduler that is not a reconciler, its
-  `Finish` API may want a friendlier surface.
+None open.

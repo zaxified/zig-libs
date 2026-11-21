@@ -322,8 +322,11 @@ conntrack-tools adds. The delete path is additionally proven end-to-end by the l
 
 ## Backlog / deferred
 
-- **`nfnetlink_cttimeout` as its own module** — a different subsystem (cthelper and acct likewise); nothing in this module depends on it.
 - **A live-dump comparison row** against ti-mo and florianl in a netns — a kernel tie; needs thousands of inserted flows; not measured.
+
+## Roadmap
+
+- **`nfnetlink_cttimeout` as its own module** — a different subsystem (cthelper and acct likewise); nothing in this module depends on it. Size: a new module for a different netlink subsystem (cttimeout, cthelper, acct), weeks.
 
 ## Anchoring
 

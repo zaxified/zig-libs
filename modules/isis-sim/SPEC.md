@@ -550,8 +550,11 @@ ported (the README's `Provenance:` line).
 
 ## Backlog / deferred
 
-- **Wire `isis-adj`'s LAN machine (`LanCircuit`) into the fabric's LAN circuits** (hello exchange and the DIS election input from real neighbour tables instead of scheduled events, §12). The point-to-point half is §14.
 - **Sequence exhaustion** in the aging run: a node whose next origination would pass `max_sequence_number` stops for MaxAge + ZeroAgeLifetime and restarts (ISO 10589 §7.3.16.1). A first version was written and not kept: the run ended not quiescent and the cause was not found.
+
+## Roadmap
+
+- **Wire `isis-adj`'s LAN machine (`LanCircuit`) into the fabric's LAN circuits** (hello exchange and the DIS election input from real neighbour tables instead of scheduled events, §12). The point-to-point half is §14. Size: multi-day change of the fabric model plus the LAN hello exchange (2-3 days of work and new convergence scenarios).
 
 ## Anchoring
 

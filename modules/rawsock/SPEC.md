@@ -152,8 +152,10 @@ Root-free tests (pure helpers, `sockaddr_ll` decode, BPF encoding, struct ABI si
 ## Backlog / deferred
 
 - **The IPC gap to the distro libpcap.so.** Same instruction count or fewer (0.93), 1.18× the cycles on `filter_run`; unprofiled. To chase it: `perf stat -e instructions:u,cycles:u,branch-misses:u,L1-icache-load-misses:u` for `bench-rawsock fixed filter_run 3000` against `FIXED_REPS=3000 .zig-cache/bench-rawsock/foreign_bench .zig-cache/bench-rawsock filter_run` (the distro-linked foreign binary), then `perf record -e cycles:u` and `perf annotate` of `exec` against `bpf_filter`; compare the dispatch `switch` layout (jump table or compare chain) and the `-Djcc-safe` effect.
-- **802.11 savefiles and monitor mode.** Radiotap, the `wlan` qualifiers; no consumer, and no 802.11 capture to anchor a live path on this machine.
 
+## Roadmap
+
+- **802.11 savefiles and monitor mode.** Radiotap, the `wlan` qualifiers; no consumer, and no 802.11 capture to anchor a live path on this machine. Size: new link types, radiotap and wlan qualifiers in the filter compiler; needs an 802.11 capture to anchor on.
 
 ## Anchoring
 
