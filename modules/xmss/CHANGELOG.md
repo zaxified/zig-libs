@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Behaviour change (source-breaking):** `SigningKey.init(dst, sk: *SecretKey, persist)` takes `*SecretKey` (was `*const`) and retires the source after moving it into the handle: its seeds are wiped (`zeroize`) and its `idx` set to `max_signatures`, so a stale `sign` on the old key is `error.KeyExhausted` instead of a second signer at the same leaf (as `lms.SigningKey.init` does). A caller passing a `const` key must make it `var`. The dead-stack probe also looks for the masked chain inputs `x XOR bitmask`.
 
 - **2026-10-10** — tests: deterministic fuzz driver `XMSS_FUZZ` (`xmss-verify`, `xmss-pubkey`, `xmss-sign-verify`, new `src/fuzz_test.zig`; the Smith harnesses in `root.zig` are unchanged), XMSS-SHA2_10_256: key / message / signature each intact or damaged -- only the intact triple verifies, wild triples never; `PublicKey.fromBytes` re-encodes what it accepts; signatures from a stateful key verify, and a flipped octet, a truncation, an extension, another message, another root or seed do not. No change in `src/` outside tests.
 - **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (target `sign`, ReleaseFast): `SK_SEED` and `SK_PRF` are tainted through `keyGen` and five `sign`s, including the BDS updates, at tree height 4. The 2 in-file contexts are the WOTS chain loop, whose count comes from `H_msg` over `r = PRF(SK_PRF, idx)`. `r` is published in the signature, so this is a tainting artefact, not a leak. No code change.

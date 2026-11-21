@@ -559,11 +559,16 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
                 PersistFailed,
             };
 
-            /// Initialize `dst` in place from a copy of `sk` (the seeds travel
-            /// by pointer, never by value). `dst` must already be at its final
-            /// address; `sk.zeroize()` the original once it is in the handle.
-            pub fn init(dst: *SigningKey, sk: *const SecretKey, persist: ?Persist) void {
+            /// Takes ownership of `*sk`: moved into `dst` (the seeds travel by
+            /// pointer, never by value), then the source is retired — its two
+            /// seeds wiped (`zeroize`) and its `idx` set to `max_signatures`,
+            /// so a stale `sign` on it is `error.KeyExhausted` rather than a
+            /// second signer at the same leaf (as `lms.SigningKey.init` wipes
+            /// its source). `dst` must already be at its final address.
+            pub fn init(dst: *SigningKey, sk: *SecretKey, persist: ?Persist) void {
                 dst.* = .{ .sk = sk.*, .home = dst, .busy = .init(false), .persist = persist };
+                sk.zeroize();
+                sk.idx = @intCast(max_signatures);
             }
 
             /// Next unused leaf. Racy to read while another thread signs —
@@ -1195,6 +1200,22 @@ const PersistLog = struct {
         return .{ .ctx = self, .write = write };
     }
 };
+
+test "SigningKey.init retires its source: seeds wiped, a stale sign is KeyExhausted" {
+    var kp: TestX.KeyPair = undefined;
+    testKeyPair(&kp);
+    const before = kp.sk;
+    var handle: TestX.SigningKey = undefined;
+    TestX.SigningKey.init(&handle, &kp.sk, null);
+    try std.testing.expectEqualSlices(u8, &before.sk_seed, &handle.sk.sk_seed);
+    try std.testing.expectEqualSlices(u8, &before.sk_prf, &handle.sk.sk_prf);
+    try std.testing.expect(std.mem.allEqual(u8, &kp.sk.sk_seed, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &kp.sk.sk_prf, 0));
+    var sig: [TestX.signature_length]u8 = undefined;
+    try std.testing.expectError(error.KeyExhausted, TestX.sign(&kp.sk, &sig, "stale"));
+    try handle.sign(&sig, "fresh");
+    try std.testing.expect(TestX.verify(kp.pk, "fresh", &sig));
+}
 
 test "SigningKey: the durable index is written BEFORE the signature, and a failed write burns no leaf" {
     var kp: TestX.KeyPair = undefined;

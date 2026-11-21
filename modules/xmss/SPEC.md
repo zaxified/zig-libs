@@ -147,7 +147,9 @@ scheme's security argument collapses per-index, not per-signature.
 
   Errors: `KeyExhausted`, `KeyHandleCopied`, `PersistFailed`. It does not stop a caller from also holding a
   `*SecretKey` into `handle.sk`, or from restoring an old serialised key: rollback across process lifetimes is a
-  storage property, not an API one. `SigningKey.init` copies the `SecretKey` (seeds by pointer): zeroize the original.
+  storage property, not an API one. `SigningKey.init` takes ownership of the `SecretKey`: it is moved into the handle
+  (seeds by pointer) and the source retired, its seeds wiped and its `idx` set to `max_signatures`, so a stale `sign`
+  on it is `error.KeyExhausted`, never a second signer at the same leaf (as `lms.SigningKey.init` wipes its source).
 
 ## Threat notes
 
@@ -172,14 +174,17 @@ scheme's security argument collapses per-index, not per-signature.
   Each entry point runs its computation one
   frame down (`burn.zig`) and zeroes 16 KiB below it (the call trees reach
   5.9 / 8.4 / 5.9 KiB for `keyGen` / `sign` / `buildAuth` at h=4); a probe
-  (`stackprobe_test.zig`) asserts zero residue of the seeds and of every
-  chain value beside a negative and a positive control. `zeroize` still wipes
+  (`stackprobe_test.zig`) asserts zero residue of the seeds, of every
+  chain value and of every masked value `x XOR bitmask` a chain step feeds to F
+  (as secret as `x`; the mask is public) beside a negative and a positive control. `zeroize` still wipes
   only the two seeds.
 - **No secret crosses the API by value.**
   `keyGen` writes the `KeyPair` through `*KeyPair` and takes the seeds as
   `*const`; `prfKeygen`/`wotsSkGen` write through an out-param; `chain` and
   `chainStep` update a chain value in place; `SigningKey.init` takes
-  `*const SecretKey`. `wotsPkGen`, `wotsSign` and `genLeaf` return by value
+  `*SecretKey` and retires the source. `hashF`/`hashH`/`prf`/`hashMsg`
+  return by value: their key is public and their inputs are the caller's.
+  `wotsPkGen`, `wotsSign` and `genLeaf` return by value
   only because their results are public. They, and the other raw WOTS+
   primitives, do not burn: a caller using them directly owns that stack. A
   `SecretKey` the caller copies is the caller's copy: `zeroize` it.
@@ -195,6 +200,10 @@ scheme's security argument collapses per-index, not per-signature.
 
 ## What is deliberately not done
 
+- **Fast restore of a BDS state after a restart.** An index jump or a restored key re-syncs in O(target·h) leaf
+  generations (hours at h = 20, see *Design & invariants*). Making it fast needs a documented BDS-state encoding,
+  which is the secret-key serialisation this module declines (next item): a stale encoded state is what reuses a leaf.
+  The reference keeps BDS state in its own secret-key byte format; here the caller keeps the `SecretKey` value.
 - **No serialisation of the secret key.** `SecretKey` carries the BDS state as well as the seeds and the index, so a
   hand-rolled encoding that keeps only the RFC's fields silently costs a resync, and one that is stale reuses a
   leaf. Only the public key has a wire form (`PublicKey.toBytes` / `fromBytes`).
@@ -278,26 +287,16 @@ scheme's security argument collapses per-index, not per-signature.
   `n = 32` and SHA-256 are module-level constants (`root.zig` `n`, `hashF`…), so
   the whole file would need a hash/`n` parameter; needs a hash/`n` parameter and one
   cross-checked KAT per suite from the reference. Fits CONVENTIONS §2 (pure Zig).
+
+## Roadmap
+
 - **XMSS^MT (RFC 8391 §4.2)**. The way to get more than 2^20
   signatures per key with a bounded key-generation time; the reference and go-xmssmt
   ship it. The module's SPEC lists it as "Not implemented" and notes CNSA 2.0
   excludes the multi-tree variants, which is a policy reason for a CNSA user but
   not a general refusal. Large (hypertree signing, another OID space, BDS across
   layers). Pure Zig.
-- **Fast restore of a BDS state after a restart**. An index
-  jump or restored key re-syncs in O(target·h) leaf generations — hours at
-  h = 20 (see *Design & invariants*). A user who restarts a signer
-  hits this on every restart. Moderate; needs a documented BDS-state encoding,
-  which conflicts with the stated no-serialisation choice, so it is a decision for
-  the maintainer rather than a plain to-do. Pure Zig.
-- **Stack hygiene beyond the entry points**. The
-  probe's needles are the raw seeds and the unmasked chain values; the masked value
-  `x XOR bitmask` that `chainStep` feeds to F, and SHA-256 block buffers holding it,
-  are not needles (the mask is public, so they are as secret as the chain value).
-  The probe is h = 4 only. `hashF`/`hashH`/`prf`/`hashMsg` return by value
-  (generic, public-role primitives). `SecretKey` is still a plain value type that
-  `SigningKey.init` copies; a handle that owns the only copy would need `init` to
-  consume it. Small. Pure Zig.
+  Size: weeks (hypertree signing and BDS across layers, the XMSS^MT OID space, reference KATs per parameter set).
 
 ## Anchoring
 

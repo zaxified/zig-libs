@@ -19,6 +19,8 @@
 //!   leaf a measured `sign` used, the positions at or above the published
 //!   digit follow from the signature and are dropped; the positions below it
 //!   forge lower digits. Any other leaf's values forge that leaf's index.
+//! - the masked value `x XOR bitmask` each chain step feeds to F (and the
+//!   SHA-256 block buffer holds), for the same positions.
 //! Not needles: the randomizer `r = PRF(SK_PRF, idx)` (the signature publishes
 //! it, and it is only unpredictable, not secret, once `sign` returns), the
 //! message hash, the tree nodes and the root (public).
@@ -56,14 +58,14 @@ const pub_seed = seedOf(203);
 
 // ── needle set ──────────────────────────────────────────────────────────────
 
-const max_windows = 40000;
+const max_windows = 80000;
 
 const Needles = struct {
     win: [max_windows]u128 = undefined,
     owner: [max_windows]u8 = undefined,
     len: usize = 0,
 
-    const names = [_][]const u8{ "seed", "sk_prf", "used_leaf", "other_leaf" };
+    const names = [_][]const u8{ "seed", "sk_prf", "used_leaf", "other_leaf", "used_masked", "other_masked" };
 
     fn addValue(self: *Needles, id: u8, v: *const [n]u8) void {
         for ([_]usize{ 0, W }) |off| {
@@ -308,6 +310,16 @@ fn buildNeedles(needles: *Needles, used: ?u32) void {
             while (pos < w - 1) : (pos += 1) {
                 if (is_used and std.mem.eql(u8, &value, published)) break;
                 needles.addValue(if (is_used) 2 else 3, &value);
+                // `value XOR bitmask`, the input `chainStep` feeds to F
+                // (and SHA-256's block buffer holds): as secret as `value`,
+                // the mask being public.
+                var m = a;
+                m.setHashAddress(pos);
+                m.setKeyAndMask(1);
+                const bm = xmss.prf(&pub_seed, &m.toBytes());
+                var masked: [n]u8 = undefined;
+                for (&masked, value, bm) |*o, x, y| o.* = x ^ y;
+                needles.addValue(if (is_used) 4 else 5, &masked);
                 xmss.chain(&value, pos, 1, &pub_seed, &a);
             }
         }
