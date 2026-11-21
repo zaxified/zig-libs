@@ -36,7 +36,7 @@ Zig `std` has no gRPC.
 against Python `grpcio` (recorded replay plus live oracle); offline frame-level tests for the
 Trailers-Only vs Trailers distinction; a decoded-size bound on every message (declared length
 never sizes an allocation), pure Zig with no C core, typed struct messages with no codegen step.
-**Where we are behind:** no compression, retries, name resolution/load balancing, interceptors,
+**Where we are behind:** no retries, name resolution/load balancing, interceptors,
 keepalive, `grpc-status-details-bin`, gRPC-Web, and no reflection service (the standard
 `grpc.health.v1` health service is provided, `src/health.zig`); the server is sequential per connection unless the application installs
 the `http` dispatcher (→ Backlog).
@@ -251,9 +251,21 @@ table (404 → `UNIMPLEMENTED`, 401 → `UNAUTHENTICATED`, 429/502/503/504 → `
 would be fed to the deframer and its first five bytes read as a length.
 
 Likewise, the compressed flag: **any** non-zero value of the flag byte means compressed, not just
-`0x01`, and a compressed frame is refused (`INTERNAL`) rather than handed to the protobuf decoder
-as if it were plaintext. `grpc-encoding` on the response is checked against what we advertised
-for the same reason.
+`0x01`, and a compressed frame under no negotiated encoding is refused (`INTERNAL`) rather than
+handed to the protobuf decoder as if it were plaintext. `grpc-encoding` on the response is checked
+against what we advertised for the same reason.
+
+**Compression** (`compress.zig`, `doc/compression.md`): `gzip` and `deflate` (a zlib stream, as the
+other implementations name it), received on by default (`Options.accept_encodings`, the client's
+`accept_encoding` list) and sent only when asked for (`Options.send_encoding` on the server, once the
+client's `grpc-accept-encoding` lists it; `request_encoding` on the client; grpc-go and tonic also
+default to identity). A message inflates against `max_recv_message_size` **while it is being
+inflated**: the output grows only by produced bytes and stops one byte over the limit, so a 4 KiB
+frame of zeros cannot become gigabytes (`RESOURCE_EXHAUSTED`); a corrupt stream, a wrong CRC-32 or
+Adler-32 (std's inflater leaves the checksum to its caller, so `decompress` checks it), or bytes
+after the stream are `INTERNAL`. An encoding that is not enabled is `UNIMPLEMENTED` carrying
+`grpc-accept-encoding`. Snappy and zstd are not provided: grpc-go and the C core ship gzip only
+by default and the others need an extra codec dependency on both sides.
 
 ### 6. Caller metadata cannot forge protocol headers
 
@@ -383,11 +395,9 @@ an arbitrary response shape).
 
 Each item is refused with its reason here; the ones that are open work are also under *Backlog / deferred*.
 
-- **Message compression** (`grpc-encoding: gzip`/`deflate`/`snappy`). Doing it right means
-  bounding the *decompressed* size against `max_recv_message_size` — a decompression bomb is a
-  second, independent instance of invariant 1, and deserves its own design pass rather than being
-  bolted on. The client advertises `identity` only and refuses a compressed frame
-  loudly. This is the most likely next addition.
+- **Message compression other than `gzip` and `deflate`** (`snappy`, `zstd`): grpc-go and the C
+  core register gzip by default and the rest are opt-in codecs on both sides; an unknown
+  `grpc-encoding` is `UNIMPLEMENTED` with `grpc-accept-encoding`.
 - **Retries and hedging** (`grpc-retry-pushback-ms`, the service-config retry policy). Retry
   policy needs a channel that owns its connection lifecycle; this one borrows a session.
 - **Name resolution and load balancing.** A channel here is one HTTP/2 connection the caller
@@ -415,7 +425,6 @@ Each item is refused with its reason here; the ones that are open work are also 
 
 Reasons for each are under *What is deliberately not done*; the first four are what a typical grpc-go/tonic user hits in ordinary use.
 
-- **Message compression (gzip, deflate)** — a peer that mandates gzip cannot be talked to, and `grpc-accept-encoding: identity` only is unusual next to grpc-go/tonic. Needs a decompressed-size bound (a second instance of invariant 1). Effort: medium (a gzip decoder already exists in `http`; the bound is the design work). Fits §2: yes.
 - **Interceptors / middleware hooks** (auth, logging, metrics on client and server) — a grpc-go/tonic staple; absent, every caller wraps calls by hand. Effort: medium (needs an API decision). Fits §2: yes.
 - **Default server concurrency** — a connection's streams run sequentially unless the application installs the `h2_server` dispatcher; a slow handler blocks the connection. Effort: small–medium (wire a pool option into `grpc.Server`). Fits §2: yes.
 - **Retries/hedging, name resolution and load balancing, keepalive, `grpc-status-details-bin`, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.

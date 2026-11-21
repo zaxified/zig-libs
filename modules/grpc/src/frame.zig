@@ -130,10 +130,14 @@ pub const Deframer = struct {
     /// Hard ceiling on a single message, checked against the *declared*
     /// length the moment a header completes.
     max_recv_message_size: u32 = default_max_recv_message_size,
-    /// Whether a set compressed flag can be handled. False for this build
-    /// (identity only), so a compressed frame fails loudly instead of being
-    /// handed to a decoder as if it were plain protobuf.
+    /// Whether a set compressed flag can be handled. False (the default: no
+    /// encoding was negotiated), a compressed frame fails loudly instead of
+    /// being handed to a decoder as if it were plain protobuf. True: the
+    /// caller must undo the encoding of every message `next` returns while
+    /// `last_compressed` is set.
     accept_compressed: bool = false,
+    /// The compressed flag of the message `next` returned last.
+    last_compressed: bool = false,
 
     pub fn deinit(d: *Deframer, gpa: Allocator) void {
         d.buf.deinit(gpa);
@@ -169,6 +173,7 @@ pub const Deframer = struct {
         if (h.compressed and !d.accept_compressed) return error.CompressedUnsupported;
         if (avail.len - header_len < h.length) return null;
         d.pos += header_len + h.length;
+        d.last_compressed = h.compressed;
         return avail[header_len .. header_len + h.length];
     }
 

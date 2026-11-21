@@ -131,7 +131,8 @@ const r = grpc.unary(Req, Rep, &ch, "/svc/M", req, .{ .failure = &failure });
 | `max_send_message_size` | null | Local ceiling on one sent message. |
 | `content_subtype` | `"proto"` | The `application/grpc+{subtype}` sent and required. |
 | `user_agent` | `"grpc-zig-libs/0.1"` | null omits it. |
-| `accept_encoding` | `"identity"` | `grpc-accept-encoding`. |
+| `accept_encoding` | `"gzip,deflate,identity"` | `grpc-accept-encoding`; a response in another encoding fails the call. |
+| `request_encoding` | `.identity` | `.gzip` / `.deflate`: compress every request message and send `grpc-encoding`. |
 | `scheme` | `"http"` | `:scheme` — `"https"` over TLS. |
 | `read_chunk` | 16 KiB | Read buffer size, not a message limit. |
 
@@ -263,7 +264,9 @@ section and went through it or does not and never did.
 | `:method` is not POST | **405** + `Allow: POST` (HTTP, not gRPC — a gRPC error is HTTP 200) |
 | `content-type` does not begin `application/grpc` | **415** (spec: SHOULD) |
 | malformed path, unknown service, unknown method | `grpc-status` **12 UNIMPLEMENTED**, Trailers-Only |
-| `grpc-encoding` this build cannot undo | **12 UNIMPLEMENTED** + `grpc-accept-encoding: identity` |
+| `grpc-encoding` that is not enabled (`snappy`, ...) | **12 UNIMPLEMENTED** + `grpc-accept-encoding: gzip,deflate,identity` |
+| a message that inflates past `max_recv_message_size` | **8 RESOURCE_EXHAUSTED** |
+| a corrupt compressed message | **13 INTERNAL** |
 | malformed `grpc-timeout` | **13 INTERNAL** — never silently ignored |
 | request message over `max_recv_message_size` | **8 RESOURCE_EXHAUSTED**, refused at the 5-byte header |
 
@@ -317,8 +320,7 @@ Trailers-Only distinction, since both shapes use the same field names.
 
 ## Not provided
 
-Message **compression** (`grpc-encoding` other than `identity`) — a compressed frame is refused
-rather than handed to the decoder as if it were plaintext. **Retries**, **channel load balancing
+Message compression other than `gzip`/`deflate` (`snappy`, `zstd`). **Retries**, **channel load balancing
 / name resolution**, **`grpc-status-details-bin`** (the `google.rpc.Status` detail payload),
 **gRPC-Web** framing, and **reflection** services (the standard health service is provided, see Server). On the server: concurrent handlers (`h2_server`
 has the dispatch seam, but `grpc.Server` installs no pool of its own — the default stays

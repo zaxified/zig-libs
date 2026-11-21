@@ -93,6 +93,7 @@ const http = @import("http");
 const pb = @import("protobuf");
 
 const frame = @import("frame.zig");
+const compress = @import("compress.zig");
 const status_mod = @import("status.zig");
 const metadata = @import("metadata.zig");
 const call_mod = @import("call.zig");
@@ -130,6 +131,13 @@ pub const Options = struct {
     /// the engine boundaries. Off, `grpc-timeout` is still parsed and
     /// surfaced — the handler decides.
     enforce_deadline: bool = true,
+    /// Which `grpc-encoding`s a request may use. A message is inflated against
+    /// `max_recv_message_size` (see `compress.zig`), so this is safe on.
+    accept_encodings: compress.Accept = .{},
+    /// Compress response messages with this encoding when the client's
+    /// `grpc-accept-encoding` lists it. `.identity` (the default, as in
+    /// grpc-go and tonic): never.
+    send_encoding: compress.Encoding = .identity,
 };
 
 // ── errors ──────────────────────────────────────────────────────────────────
@@ -144,8 +152,9 @@ pub const CallError = status_mod.StatusError || metadata.DecodeError || error{
     TruncatedRequest,
     /// A declared request-message length exceeded `max_recv_message_size`.
     MessageTooLarge,
-    /// A request message carried the compressed flag; this build negotiated
-    /// identity only, so it is refused rather than handed to a decoder.
+    /// A request message carried the compressed flag but no encoding was
+    /// negotiated (no `grpc-encoding`, or `identity`), so it is refused rather
+    /// than handed to a decoder.
     CompressedUnsupported,
     /// A response message exceeds `Options.max_send_message_size`.
     SendMessageTooLarge,
@@ -355,18 +364,25 @@ pub fn serve(
 }
 
 fn dispatch(r: *const Router, c: *Call) anyerror!void {
-    // Message-Encoding: this build negotiated identity only. A message
-    // compressed with anything else is UNIMPLEMENTED, and the answer must
-    // carry `grpc-accept-encoding` so the peer learns what would work
-    // (doc/compression.md).
+    // Message-Encoding (doc/compression.md): a request in an encoding that is
+    // not enabled is UNIMPLEMENTED, and the answer must carry
+    // `grpc-accept-encoding` so the peer learns what would work.
     if (c.req.header("grpc-encoding")) |enc| {
-        if (!std.ascii.eqlIgnoreCase(enc, "identity")) {
+        const known = compress.Encoding.parse(enc);
+        if (known == null or !r.options.accept_encodings.allows(known.?)) {
             c.accept_encoding_in_status = true;
             return c.failFmt(
                 .unimplemented,
                 "grpc: no decompressor available for grpc-encoding \"{s}\"",
                 .{enc},
             );
+        }
+        c.request_encoding = known.?;
+        c.de.accept_compressed = known.? != .identity;
+    }
+    if (r.options.send_encoding != .identity) {
+        if (c.req.header("grpc-accept-encoding")) |list| {
+            if (compress.listAccepts(list, r.options.send_encoding)) c.response_encoding = r.options.send_encoding;
         }
     }
 
@@ -426,6 +442,12 @@ pub const Call = struct {
     de: frame.Deframer,
     read_buf: []u8,
     recv_done: bool = false,
+    /// The encoding the request's `grpc-encoding` named (compressed frames
+    /// are undone with it), and the one response messages leave in.
+    request_encoding: compress.Encoding = .identity,
+    response_encoding: compress.Encoding = .identity,
+    /// The inflated form of the message `receive` returned last.
+    inflated: ?[]u8 = null,
 
     /// **The Trailers-Only predicate.** False ⇒ nothing has gone out ahead
     /// of the status, so the whole response is one field block. True ⇒ the
@@ -456,6 +478,7 @@ pub const Call = struct {
     messages_sent: usize = 0,
 
     fn deinit(c: *Call) void {
+        if (c.inflated) |b| c.gpa.free(b);
         c.de.deinit(c.gpa);
         // Everything else lives in the request arena.
     }
@@ -507,10 +530,23 @@ pub const Call = struct {
     /// valid until the next `receive` — decode or copy it first.
     pub fn receive(c: *Call) CallError!?[]const u8 {
         if (c.recv_done) return null;
+        if (c.inflated) |b| {
+            c.gpa.free(b);
+            c.inflated = null;
+        }
         while (true) {
             if (c.de.next() catch |e| return mapFrameError(e)) |msg| {
                 c.messages_received += 1;
-                return msg;
+                if (!c.de.last_compressed) return msg;
+                // The frame's size was checked against the limit on the wire;
+                // the message it inflates to is checked while inflating.
+                const plain = compress.decompress(c.gpa, c.request_encoding, msg, c.router.options.max_recv_message_size) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.TooLarge => return c.fail(.resource_exhausted, "decompressed message larger than the maximum receive size"),
+                    error.Corrupt => return c.fail(.internal, "failed to decompress the request message"),
+                };
+                c.inflated = plain;
+                return plain;
             }
             try c.checkDeadline();
             var w: Writer = .fixed(c.read_buf);
@@ -541,10 +577,17 @@ pub const Call = struct {
         if (message.len > std.math.maxInt(u32)) return error.SendMessageTooLarge;
         try c.checkDeadline();
         try c.commitHead();
+        var packed_msg: ?[]u8 = null;
+        defer if (packed_msg) |b| c.gpa.free(b);
+        if (c.response_encoding != .identity and message.len != 0) {
+            packed_msg = try compress.compress(c.gpa, c.response_encoding, message);
+            if (packed_msg.?.len > std.math.maxInt(u32)) return error.SendMessageTooLarge;
+        }
+        const wire = packed_msg orelse message;
         var hdr: [frame.header_len]u8 = undefined;
-        frame.writeHeader(&hdr, false, @intCast(message.len));
+        frame.writeHeader(&hdr, packed_msg != null, @intCast(wire.len));
         c.rw.writeAll(&hdr) catch return c.writeDied();
-        c.rw.writeAll(message) catch return c.writeDied();
+        c.rw.writeAll(wire) catch return c.writeDied();
         // Each message is pushed all the way out: a server-streaming reply
         // that sits in the response buffer until the handler returns is not
         // a stream. With a trailer section coming, this costs nothing on
@@ -654,7 +697,9 @@ pub const Call = struct {
         if (c.write_failed) return error.ResponseFailed;
         c.rw.setStatus(200);
         c.rw.setHeader("content-type", c.content_type) catch return c.writeDied();
-        c.rw.setHeader("grpc-accept-encoding", "identity") catch return c.writeDied();
+        c.rw.setHeader("grpc-accept-encoding", c.router.options.accept_encodings.header()) catch return c.writeDied();
+        if (c.response_encoding != .identity)
+            c.rw.setHeader("grpc-encoding", c.response_encoding.name()) catch return c.writeDied();
         for (c.initial_md.items) |e|
             c.rw.setHeader(e.name, e.value) catch return error.BadMetadata;
         // From here the status has nowhere to live but the trailer section,
@@ -712,7 +757,7 @@ pub const Call = struct {
             c.rw.setStatus(200);
             c.rw.setHeader("content-type", c.content_type) catch return;
             if (c.accept_encoding_in_status)
-                c.rw.setHeader("grpc-accept-encoding", "identity") catch return;
+                c.rw.setHeader("grpc-accept-encoding", c.router.options.accept_encodings.header()) catch return;
             var head_md_lost = false;
             for (c.initial_md.items) |e|
                 c.rw.setHeader(e.name, e.value) catch {

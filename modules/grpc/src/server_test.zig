@@ -22,6 +22,7 @@ const pb = @import("protobuf");
 
 const server = @import("server.zig");
 const frame = @import("frame.zig");
+const compress = @import("compress.zig");
 const status_mod = @import("status.zig");
 
 const h2 = http.h2;
@@ -804,7 +805,7 @@ test "server: an unknown service or method is UNIMPLEMENTED, Trailers-Only" {
     );
 }
 
-test "server: a request compressed with an unknown encoding is UNIMPLEMENTED + accept-encoding" {
+test "server: a request compressed with an encoding that is not enabled is UNIMPLEMENTED + accept-encoding" {
     const gpa = testing.allocator;
     var peer: TestPeer = .init(gpa);
     defer peer.deinit();
@@ -817,7 +818,7 @@ test "server: a request compressed with an unknown encoding is UNIMPLEMENTED + a
         .{ .name = ":path", .value = "/echo.Echo/Unary" },
         .{ .name = ":authority", .value = "t" },
         .{ .name = "content-type", .value = "application/grpc" },
-        .{ .name = "grpc-encoding", .value = "gzip" },
+        .{ .name = "grpc-encoding", .value = "snappy" },
     };
     const sid = try peer.conn.startStream(&peer.wire, &fields, true);
     try runOffline(&peer, &router);
@@ -826,7 +827,135 @@ test "server: a request compressed with an unknown encoding is UNIMPLEMENTED + a
     try testing.expect(r.isTrailersOnly());
     try testing.expectEqualStrings("12", r.header("grpc-status").?);
     // The compression spec: the answer has to say what WOULD work.
-    try testing.expectEqualStrings("identity", r.header("grpc-accept-encoding").?);
+    try testing.expectEqualStrings("gzip,deflate,identity", r.header("grpc-accept-encoding").?);
+}
+
+// ── message compression ─────────────────────────────────────────────────────
+
+/// A request with `grpc-encoding: enc` (and `accept` as `grpc-accept-encoding`
+/// when given) carrying `payload` as ONE message whose compressed flag is set
+/// and whose body is `payload` compressed with `enc`.
+fn startCompressedCall(peer: *TestPeer, enc: compress.Encoding, accept: ?[]const u8, payload: []const u8) !u31 {
+    const gpa = testing.allocator;
+    const base = grpcFields("/echo.Echo/Unary");
+    var fields: [8]hpack.Field = undefined;
+    @memcpy(fields[0..6], &base);
+    var n: usize = 6;
+    fields[n] = .{ .name = "grpc-encoding", .value = enc.name() };
+    n += 1;
+    if (accept) |a| {
+        fields[n] = .{ .name = "grpc-accept-encoding", .value = a };
+        n += 1;
+    }
+    const sid = try peer.conn.startStream(&peer.wire, fields[0..n], false);
+    const body = try compress.compress(gpa, enc, payload);
+    defer gpa.free(body);
+    const framed = try gpa.alloc(u8, frame.header_len + body.len);
+    defer gpa.free(framed);
+    frame.writeHeader(framed[0..frame.header_len], true, @intCast(body.len));
+    @memcpy(framed[frame.header_len..], body);
+    try peer.conn.sendData(&peer.wire, sid, framed, true);
+    return sid;
+}
+
+test "server: a gzip or deflate request message is inflated and answered" {
+    const gpa = testing.allocator;
+    for ([_]compress.Encoding{ .gzip, .deflate }) |enc| {
+        var peer: TestPeer = .init(gpa);
+        defer peer.deinit();
+        var router = defaultRouter();
+        try peer.conn.sendPreface(&peer.wire);
+        const req = try encodeReq(gpa, .{ .text = "squeeze me squeeze me squeeze me", .count = 3 });
+        defer gpa.free(req);
+        const sid = try startCompressedCall(&peer, enc, null, req);
+        try runOffline(&peer, &router);
+        const r = peer.resp(sid);
+        try testing.expectEqualStrings("0", r.trailer("grpc-status").?);
+        // Nothing asked for a compressed answer: identity, flag clear.
+        try testing.expectEqual(@as(?[]const u8, null), r.header("grpc-encoding"));
+        try testing.expectEqualStrings("gzip,deflate,identity", r.header("grpc-accept-encoding").?);
+        var msgs: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (msgs.items) |m| gpa.free(m);
+            msgs.deinit(gpa);
+        }
+        try r.messages(gpa, &msgs);
+        var decoded = try pb.decode(EchoReply, gpa, msgs.items[0], .{});
+        defer decoded.deinit();
+        try testing.expectEqualStrings("echo:squeeze me squeeze me squeeze me", decoded.value.text);
+    }
+}
+
+test "server: a decompression bomb is RESOURCE_EXHAUSTED, bounded by the inflated size" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa);
+    defer peer.deinit();
+    var router = defaultRouter();
+    router.options.max_recv_message_size = 64 * 1024;
+    try peer.conn.sendPreface(&peer.wire);
+    const zeros = try gpa.alloc(u8, 4 * 1024 * 1024);
+    defer gpa.free(zeros);
+    @memset(zeros, 0);
+    // Valid protobuf prefix is irrelevant: it must not get that far.
+    const sid = try startCompressedCall(&peer, .gzip, null, zeros);
+    try runOffline(&peer, &router);
+    const r = peer.resp(sid);
+    try testing.expectEqualStrings("8", (r.trailer("grpc-status") orelse r.header("grpc-status")).?); // RESOURCE_EXHAUSTED
+}
+
+test "server: a corrupt compressed message is INTERNAL, and a compressed flag under identity is refused" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa);
+    defer peer.deinit();
+    var router = defaultRouter();
+    try peer.conn.sendPreface(&peer.wire);
+    const base = grpcFields("/echo.Echo/Unary");
+    var fields: [7]hpack.Field = undefined;
+    @memcpy(fields[0..6], &base);
+    fields[6] = .{ .name = "grpc-encoding", .value = "gzip" };
+    const sid = try peer.conn.startStream(&peer.wire, &fields, false);
+    try peer.conn.sendData(&peer.wire, sid, &.{ 1, 0, 0, 0, 5, 'n', 'o', 't', 'g', 'z' }, true);
+    try runOffline(&peer, &router);
+    const r = peer.resp(sid);
+    try testing.expectEqualStrings("13", (r.trailer("grpc-status") orelse r.header("grpc-status")).?); // INTERNAL
+}
+
+test "server: send_encoding compresses responses only for a client that accepts it" {
+    const gpa = testing.allocator;
+    for ([_]?[]const u8{ "identity, gzip", null }) |accept| {
+        var peer: TestPeer = .init(gpa);
+        defer peer.deinit();
+        var router = defaultRouter();
+        router.options.send_encoding = .gzip;
+        try peer.conn.sendPreface(&peer.wire);
+        const base = grpcFields("/echo.Echo/Unary");
+        var fields: [7]hpack.Field = undefined;
+        @memcpy(fields[0..6], &base);
+        fields[6] = .{ .name = "grpc-accept-encoding", .value = accept orelse "identity" };
+        const sid = try peer.conn.startStream(&peer.wire, fields[0..7], false);
+        const req = try encodeReq(gpa, .{ .text = "ask", .count = 1 });
+        defer gpa.free(req);
+        const framed = try frame.encodeAlloc(gpa, req);
+        defer gpa.free(framed);
+        try peer.conn.sendData(&peer.wire, sid, framed, true);
+        try runOffline(&peer, &router);
+        const r = peer.resp(sid);
+        try testing.expectEqualStrings("0", r.trailer("grpc-status").?);
+        const body = r.body.items;
+        const h = frame.parseHeader(body[0..frame.header_len]);
+        if (accept != null) {
+            try testing.expectEqualStrings("gzip", r.header("grpc-encoding").?);
+            try testing.expect(h.compressed);
+            const plain = try compress.decompress(gpa, .gzip, body[frame.header_len..][0..h.length], 1 << 16);
+            defer gpa.free(plain);
+            var decoded = try pb.decode(EchoReply, gpa, plain, .{});
+            defer decoded.deinit();
+            try testing.expectEqualStrings("echo:ask", decoded.value.text);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), r.header("grpc-encoding"));
+            try testing.expect(!h.compressed);
+        }
+    }
 }
 
 test "server: a message carrying the compressed flag is refused, not decoded" {

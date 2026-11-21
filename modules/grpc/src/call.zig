@@ -43,6 +43,7 @@ const std = @import("std");
 const http = @import("http");
 const status_mod = @import("status.zig");
 const frame = @import("frame.zig");
+const compress = @import("compress.zig");
 const metadata = @import("metadata.zig");
 
 const Allocator = std.mem.Allocator;
@@ -86,9 +87,14 @@ pub const Options = struct {
     content_subtype: []const u8 = "proto",
     /// `user-agent`; null omits it.
     user_agent: ?[]const u8 = "grpc-zig-libs/0.1",
-    /// `grpc-accept-encoding`. This build can only undo `identity`, so
-    /// advertising anything else would invite a body it cannot read.
-    accept_encoding: []const u8 = "identity",
+    /// `grpc-accept-encoding`: what the server may compress its messages with.
+    /// A response in an encoding this list does not name (or one this module
+    /// cannot undo: only `gzip`, `deflate` and `identity`) fails the call.
+    accept_encoding: []const u8 = "gzip,deflate,identity",
+    /// Compress every request message with this encoding and say so in
+    /// `grpc-encoding`. `.identity` (the default, as in grpc-go and tonic):
+    /// never. A server that does not understand it answers UNIMPLEMENTED.
+    request_encoding: compress.Encoding = .identity,
     /// `:scheme` — "https" when the session runs over TLS.
     scheme: []const u8 = "http",
     /// Size of the buffer each call reads HTTP/2 body bytes into before
@@ -250,9 +256,10 @@ pub const Channel = struct {
             const buf = try arena.alloc(u8, Timeout.max_len);
             try fields.append(arena, .{ .name = "grpc-timeout", .value = t.write(buf) });
         }
-        // We only ever produce identity-encoded messages, so `grpc-encoding`
-        // is omitted (identity is the default) and only the accept list is
-        // advertised.
+        // `grpc-encoding` only when request messages are compressed (identity
+        // is the default); the accept list is always advertised.
+        if (ch.options.request_encoding != .identity)
+            try fields.append(arena, .{ .name = "grpc-encoding", .value = ch.options.request_encoding.name() });
         try fields.append(arena, .{ .name = "grpc-accept-encoding", .value = ch.options.accept_encoding });
 
         for (opts.metadata) |e| {
@@ -288,6 +295,10 @@ pub const Call = struct {
     read_buf: []u8,
     de: frame.Deframer,
     failure_out: ?*Failure,
+    /// What the response's `grpc-encoding` named, and the inflated form of the
+    /// message `receive` returned last.
+    response_encoding: compress.Encoding = .identity,
+    inflated: ?[]u8 = null,
 
     /// Borrowed from the session; valid until this call is released.
     head: ?h2c.Head = null,
@@ -309,6 +320,7 @@ pub const Call = struct {
     pub fn deinit(c: *Call) void {
         const gpa = c.ch.gpa;
         if (c.status_message_owned) gpa.free(@constCast(c.status_message));
+        if (c.inflated) |b| gpa.free(b);
         c.de.deinit(gpa);
         gpa.free(c.read_buf);
         // A call abandoned before its stream ended is a cancellation — the
@@ -333,10 +345,17 @@ pub const Call = struct {
             if (message.len > limit) return error.SendMessageTooLarge;
         }
         if (message.len > std.math.maxInt(u32)) return error.SendMessageTooLarge;
+        var packed_msg: ?[]u8 = null;
+        defer if (packed_msg) |b| c.ch.gpa.free(b);
+        if (c.ch.options.request_encoding != .identity and message.len != 0) {
+            packed_msg = try compress.compress(c.ch.gpa, c.ch.options.request_encoding, message);
+            if (packed_msg.?.len > std.math.maxInt(u32)) return error.SendMessageTooLarge;
+        }
+        const wire = packed_msg orelse message;
         var hdr: [frame.header_len]u8 = undefined;
-        frame.writeHeader(&hdr, false, @intCast(message.len));
+        frame.writeHeader(&hdr, packed_msg != null, @intCast(wire.len));
         try c.ch.session.sendData(c.sid, &hdr, false);
-        try c.ch.session.sendData(c.sid, message, end);
+        try c.ch.session.sendData(c.sid, wire, end);
     }
 
     /// Half-close the request side with no further message.
@@ -374,10 +393,14 @@ pub const Call = struct {
             return;
         }
         // A body is coming, so the peer must not have compressed it with
-        // something we cannot undo.
+        // something we did not accept or cannot undo.
         if (head.header("grpc-encoding")) |enc| {
-            if (!std.ascii.eqlIgnoreCase(enc, "identity"))
+            const known = compress.Encoding.parse(enc) orelse
                 return c.failLocal(.internal, "response uses a message encoding this client did not accept");
+            if (known != .identity and !compress.listAccepts(c.ch.options.accept_encoding, known))
+                return c.failLocal(.internal, "response uses a message encoding this client did not accept");
+            c.response_encoding = known;
+            c.de.accept_compressed = known != .identity;
         }
     }
 
@@ -389,8 +412,22 @@ pub const Call = struct {
     pub fn receive(c: *Call) Error!?[]const u8 {
         try c.readHead();
         if (c.recv_done) return null;
+        if (c.inflated) |b| {
+            c.ch.gpa.free(b);
+            c.inflated = null;
+        }
         while (true) {
-            if (c.de.next() catch |e| return c.mapFrameError(e)) |msg| return msg;
+            if (c.de.next() catch |e| return c.mapFrameError(e)) |msg| {
+                if (!c.de.last_compressed) return msg;
+                // Bounded while inflating, not by the claim (`compress.zig`).
+                const plain = compress.decompress(c.ch.gpa, c.response_encoding, msg, c.ch.options.max_recv_message_size) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.TooLarge => return c.failLocal(.resource_exhausted, "decompressed message larger than the maximum receive size"),
+                    error.Corrupt => return c.failLocal(.internal, "failed to decompress the response message"),
+                };
+                c.inflated = plain;
+                return plain;
+            }
             const n = try c.ch.session.readBody(c.sid, c.read_buf);
             if (n == 0) {
                 c.de.endOfStream() catch |e| return c.mapFrameError(e);

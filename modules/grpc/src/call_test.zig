@@ -202,7 +202,7 @@ test "request: pseudo-headers, te/content-type, timeout, metadata and the LPM bo
     try testing.expectEqualStrings("trailers", fieldValue(hl, "te").?);
     try testing.expectEqualStrings("application/grpc+proto", fieldValue(hl, "content-type").?);
     try testing.expectEqualStrings("250m", fieldValue(hl, "grpc-timeout").?);
-    try testing.expectEqualStrings("identity", fieldValue(hl, "grpc-accept-encoding").?);
+    try testing.expectEqualStrings("gzip,deflate,identity", fieldValue(hl, "grpc-accept-encoding").?);
     try testing.expectEqualStrings("abc", fieldValue(hl, "x-token").?);
     // The -bin key travels base64-encoded, unpadded, and the caller never saw
     // the encoding.
@@ -730,7 +730,7 @@ test "response: a 200 that is not application/grpc is refused before deframing" 
 
 test "response: a message encoding we never accepted is refused" {
     const gpa = testing.allocator;
-    const fx = try Fx.init(gpa, .{});
+    const fx = try Fx.init(gpa, .{ .accept_encoding = "identity" });
     defer fx.deinit();
 
     var call = try fx.ch.start("/s/m", .{});
@@ -749,6 +749,74 @@ test "response: a message encoding we never accepted is refused" {
     fx.reply(peer.wire.items);
 
     try testing.expectError(error.Internal, call.readHead());
+}
+
+fn compressedFrame(gpa: Allocator, enc: grpc.compression.Encoding, payload: []const u8) ![]u8 {
+    const body = try grpc.compression.compress(gpa, enc, payload);
+    defer gpa.free(body);
+    const out = try gpa.alloc(u8, grpc.frame.header_len + body.len);
+    grpc.frame.writeHeader(out[0..grpc.frame.header_len], true, @intCast(body.len));
+    @memcpy(out[grpc.frame.header_len..], body);
+    return out;
+}
+
+test "response: a gzip or deflate message is inflated; one that inflates past the limit is RESOURCE_EXHAUSTED" {
+    const gpa = testing.allocator;
+    for ([_]grpc.compression.Encoding{ .gzip, .deflate }) |enc| {
+        const fx = try Fx.init(gpa, .{ .max_recv_message_size = 4096 });
+        defer fx.deinit();
+        var call = try fx.ch.start("/s/m", .{});
+        defer call.deinit();
+        try call.sendMessage("", true);
+        var peer = try Peer.init(fx.clientBytes());
+        defer peer.deinit();
+        const ok = try compressedFrame(gpa, enc, "squeeze me squeeze me squeeze me");
+        defer gpa.free(ok);
+        const zeros = try gpa.alloc(u8, 1 << 20);
+        defer gpa.free(zeros);
+        @memset(zeros, 0);
+        const bomb = try compressedFrame(gpa, enc, zeros);
+        defer gpa.free(bomb);
+        try testing.expect(bomb.len < 4096); // under the wire limit, far over it inflated
+        try peer.conn.sendHeaders(&peer.wire, 1, &.{
+            .{ .name = ":status", .value = "200" },
+            .{ .name = "content-type", .value = "application/grpc+proto" },
+            .{ .name = "grpc-encoding", .value = enc.name() },
+        }, false);
+        try peer.data(1, ok, false);
+        try peer.data(1, bomb, false);
+        try peer.okTrailers(1);
+        fx.reply(peer.wire.items);
+        try testing.expectEqualStrings("squeeze me squeeze me squeeze me", (try call.receive()).?);
+        try testing.expectError(error.ResourceExhausted, call.receive());
+    }
+}
+
+test "request: request_encoding compresses every message and says so" {
+    const gpa = testing.allocator;
+    const fx = try Fx.init(gpa, .{ .request_encoding = .gzip });
+    defer fx.deinit();
+    var call = try fx.ch.start("/s/m", .{});
+    defer call.deinit();
+    try call.sendMessage("compress compress compress compress", true);
+    var peer = try Peer.init(fx.clientBytes());
+    defer peer.deinit();
+    const hl = peer.requestHeaders(1).?;
+    var found = false;
+    for (hl.fields) |f| {
+        if (std.mem.eql(u8, f.name, "grpc-encoding")) {
+            found = true;
+            try testing.expectEqualStrings("gzip", f.value);
+        }
+    }
+    try testing.expect(found);
+    const body = try peer.requestBody(gpa, 1);
+    defer gpa.free(body);
+    const h = grpc.frame.parseHeader(body[0..grpc.frame.header_len]);
+    try testing.expect(h.compressed);
+    const plain = try grpc.compression.decompress(gpa, .gzip, body[grpc.frame.header_len..][0..h.length], 1024);
+    defer gpa.free(plain);
+    try testing.expectEqualStrings("compress compress compress compress", plain);
 }
 
 // ── the unary contract ─────────────────────────────────────────────────────

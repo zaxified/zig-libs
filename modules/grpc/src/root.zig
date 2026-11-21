@@ -75,6 +75,7 @@ pub const meta = .{
 
 const call_mod = @import("call.zig");
 const frame_mod = @import("frame.zig");
+const compress_mod = @import("compress.zig");
 const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");
 const server_mod = @import("server.zig");
@@ -114,6 +115,12 @@ pub const statusEncodedMessageLen = status_mod.encodedMessageLen;
 pub const frame = frame_mod;
 pub const Deframer = frame_mod.Deframer;
 pub const default_max_recv_message_size = frame_mod.default_max_recv_message_size;
+
+// ── compression ─────────────────────────────────────────────────────────────
+
+/// `gzip` and `deflate` message compression with a bound on the inflated size
+/// (`grpc-encoding`); see `compress.zig`.
+pub const compression = compress_mod;
 
 // ── metadata ────────────────────────────────────────────────────────────────
 
@@ -293,6 +300,7 @@ test {
     // pull them in (CONVENTIONS.md §6.3, the dark-tests rule).
     _ = status_mod;
     _ = frame_mod;
+    _ = compress_mod;
     _ = metadata_mod;
     _ = call_mod;
     _ = @import("call_test.zig");
