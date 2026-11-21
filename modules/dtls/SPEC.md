@@ -662,27 +662,23 @@ collection's `tlsserver` / `tlsclient`, whose API shapes `Ticketer`, `StekTicket
   the intermediate missing, a wrong name, a wrong EKU, a wrong root. The received Certificate message is still bounded
   by `max_cert_message_body` (4096 bytes). OCSP staples and SCTs are carried raw (*OCSP stapling*); their verdict is
   the caller's.
-- **The cookie exchange is not stateless against a FRAGMENTED ClientHello.**
-  `serverProcessClientHello` fully reassembles the ClientHello (`takeHandshakeMessage`) before the cookie
-  check ever runs — the cookie lives inside the ClientHello body, so it cannot be read from a partial one.
-  A 26-byte datagram declaring a 2048-byte message with a 1-byte fragment returns `need_more_data` before the
-  cookie logic (or `sendHelloRetryRequest`) is reached, and the caller cannot tell that apart from a
-  legitimately fragmenting client — both produce an empty `out`. Each such source address costs the server one
-  live `Connection` (~13 KB) held until `max_flight_bytes` forces `FlightTooLarge`: a ~500x memory
-  amplification against a 26-byte packet, on the path §5.1's cookie exists to keep stateless.
-  `sendHelloRetryRequest`'s "stores nothing" claim is true once reached — the gap is everything upstream of
-  it. A real design tension: a legitimate peer with a large (e.g. PQ-hybrid) ClientHello genuinely needs to
-  fragment, and `max_flight_bytes` bounds one connection's growth, not how many a caller ends up holding.
-  **Opt-in refusal:** `HelloRetryConfig.refuse_fragmented_client_hello = true` refuses a ClientHello whose first
-  record does not carry the whole message (`error.FragmentedClientHello`, before any reassembly), which closes the
-  gap at the price of every client whose hello exceeds the path MTU. Reference behaviour: OpenSSL's `DTLSv1_listen`
-  never reassembles a ClientHello (it reads the cookie from the first fragment only, `SSL_R_FRAGMENTED_CLIENT_HELLO`
-  otherwise), mbedTLS's cookie check does not understand a fragmented one (Mbed-TLS issue #7549), and wolfSSL
-  accepts a fragmented first DTLS 1.3 ClientHello only with cookies disabled (wolfSSL PR #11475). It is off by
-  default because DTLS 1.3 differs from the 1.2 listen path those describe: a HelloRetryRequest cookie commits to
-  `Hash(ClientHello1)` (RFC 8446 §4.4.1), so it cannot be minted from a first fragment, and here ClientHello2 also
-  lands on a fresh stateless `Connection`, so the switch refuses fragmented hellos in both rounds — including a PQ
-  hybrid ClientHello (~1.4 KB) on a 1280-byte path.
+- **The cookie exchange is stateless against a FRAGMENTED ClientHello only by refusing it (the default).**
+  The cookie lives inside the ClientHello body, so it cannot be read from a partial one; reassembling the
+  ClientHello (`takeHandshakeMessage`) before the cookie check would cost the server one live `Connection`
+  (~13 KB, held until `max_flight_bytes` forces `FlightTooLarge`) per source address for a 26-byte datagram
+  declaring a 2048-byte message with a 1-byte fragment — a ~500x memory amplification on the path §5.1's cookie
+  exists to keep stateless, and the caller cannot tell the empty `out` of `need_more_data` from a legitimately
+  fragmenting client. So `HelloRetryConfig.refuse_fragmented_client_hello` is `true` by default: a ClientHello whose
+  first record does not carry the whole message is `error.FragmentedClientHello`, before any reassembly. Reference
+  behaviour: OpenSSL's `DTLSv1_listen` never reassembles a ClientHello (it reads the cookie from the first fragment
+  only, `SSL_R_FRAGMENTED_CLIENT_HELLO` otherwise), mbedTLS's cookie check does not understand a fragmented one
+  (Mbed-TLS issue #7549), and wolfSSL accepts a fragmented first DTLS 1.3 ClientHello only with cookies disabled
+  (wolfSSL PR #11475). The price is every client whose hello exceeds the path MTU, a PQ hybrid ClientHello
+  (~1.4 KB) on a 1280-byte path included; DTLS 1.3 differs from the 1.2 listen path those describe — a
+  HelloRetryRequest cookie commits to `Hash(ClientHello1)` (RFC 8446 §4.4.1), so it cannot be minted from a first
+  fragment, and here ClientHello2 also lands on a fresh stateless `Connection`, so both rounds refuse. Opt out with
+  `refuse_fragmented_client_hello = false` to reassemble (then `sendHelloRetryRequest`'s "stores nothing" holds
+  only once reached, and the caller bounds how many `Connection`s it holds).
 - **Cookie rotation.** RFC 9147 §5.1 RECOMMENDS accepting the previous `cookie_secret` for a period.
   `HelloRetryConfig` takes one secret; a caller wanting the overlap retries ClientHello2 under a second
   `Connection` configured with the older secret — caller policy.

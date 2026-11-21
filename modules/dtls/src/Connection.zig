@@ -303,19 +303,22 @@ pub const HelloRetryConfig = struct {
     /// Refuse a ClientHello that does not arrive as ONE whole fragment
     /// (`error.FragmentedClientHello`) instead of reassembling it, so an
     /// unverified peer can make this server hold no reassembly state at all
-    /// (SPEC *Threat model*, "The cookie exchange is not stateless against a
-    /// FRAGMENTED ClientHello"). What the field does: OpenSSL's
-    /// `DTLSv1_listen` never reassembles a ClientHello ("it is unable to
-    /// process fragmented messages"; it reads the cookie from the first
-    /// fragment only), mbedTLS's cookie check does not understand a
-    /// fragmented one, and wolfSSL accepts a fragmented first DTLS 1.3
-    /// ClientHello only with cookies disabled. Off by default: a DTLS 1.3
-    /// HelloRetryRequest cookie commits to `Hash(ClientHello1)`, so unlike
-    /// 1.2's HelloVerifyRequest it cannot be minted from a first fragment,
-    /// and this server's ClientHello2 also arrives at a fresh, stateless
-    /// `Connection` — turning it on refuses every client whose hello
-    /// exceeds the path MTU (an X25519MLKEM768 ClientHello is ~1.4 KB).
-    refuse_fragmented_client_hello: bool = false,
+    /// (SPEC *Threat model*, "The cookie exchange is stateless against a
+    /// FRAGMENTED ClientHello only by refusing it"). On by default, as the
+    /// references do: OpenSSL's `DTLSv1_listen` never reassembles a
+    /// ClientHello ("it is unable to process fragmented messages"; it reads
+    /// the cookie from the first fragment only), mbedTLS's cookie check does
+    /// not understand a fragmented one, and wolfSSL accepts a fragmented first
+    /// DTLS 1.3 ClientHello only with cookies disabled. The price: every
+    /// client whose hello exceeds the path MTU is refused (an X25519MLKEM768
+    /// ClientHello is ~1.4 KB), in both rounds — a DTLS 1.3 HelloRetryRequest
+    /// cookie commits to `Hash(ClientHello1)`, so unlike 1.2's
+    /// HelloVerifyRequest it cannot be minted from a first fragment, and this
+    /// server's ClientHello2 also arrives at a fresh, stateless `Connection`.
+    /// Set `false` to reassemble (a server that must take fragmenting
+    /// clients, and holds the reassembly state they cost: one live
+    /// `Connection` per source address).
+    refuse_fragmented_client_hello: bool = true,
 };
 
 /// This side's certificate identity for certificate-mode authentication
@@ -4928,28 +4931,13 @@ pub const Connection = struct {
     /// first ClientHello produces a byte-identical HelloRetryRequest from a
     /// brand-new `Connection` — no memory of the first one is needed.
     ///
-    /// ⚠ Audit A1 (dtls) F6/LOW6: that "stores nothing" is true of THIS
-    /// function, but only once it is reached — and it is only reached after
-    /// `serverProcessClientHello` has fully REASSEMBLED the ClientHello
-    /// (`takeHandshakeMessage`, called before any of this file runs). A
-    /// FRAGMENTED ClientHello (a 26-byte datagram declaring a 2048-byte
-    /// message with a 1-byte fragment is enough) returns `need_more_data`
-    /// from `handleFlight` before this function — or the cookie check right
-    /// before it — is ever entered, and the caller has no signal to
-    /// distinguish that from a legitimately fragmenting client: an empty
-    /// `out` is what both produce. Each such source address then costs the
-    /// server one live `Connection` (~13 KB, dominated by `rx_flight`/
-    /// `tx_buf`/`ecdhe_public`) held until `max_flight_bytes` forces
-    /// `FlightTooLarge` — a ~500x memory amplification against a 26-byte
-    /// packet, on the exact path the cookie exchange exists to keep
-    /// stateless. This is a real design tension, not a coding error: the
-    /// cookie extension lives inside the ClientHello body, so checking for
-    /// it before full reassembly would mean parsing extensions out of a
-    /// possibly-incomplete buffer, and a legitimate peer with a large
-    /// (e.g. PQ-hybrid) ClientHello genuinely must be allowed to fragment.
-    /// `max_flight_bytes` bounds the growth, not the count of such
-    /// half-open connections a caller may be holding. Left as a documented
-    /// limit rather than restructured here; see the module's SPEC.md.
+    /// With `HelloRetryConfig.refuse_fragmented_client_hello` off, that
+    /// "stores nothing" is true of THIS function only once it is reached: a
+    /// FRAGMENTED ClientHello is reassembled (`takeHandshakeMessage`) before
+    /// the cookie check, one live `Connection` (~13 KB) per source address
+    /// until `max_flight_bytes` forces `FlightTooLarge`. The default (on)
+    /// refuses such a ClientHello before any reassembly; see the module's
+    /// SPEC.md.
     ///
     /// The one thing it must decide up front is the cipher suite: RFC 8446
     /// §4.1.4 puts it in the HelloRetryRequest and requires the eventual
@@ -12154,7 +12142,7 @@ test "partial retransmission: an ACK naming part of the flight re-sends the rest
     try testing.expect(sf.done);
 }
 
-test "hello_retry.refuse_fragmented_client_hello: a fragmented ClientHello is refused before reassembly; a whole one still gets its HelloRetryRequest" {
+test "hello_retry.refuse_fragmented_client_hello (default true): a fragmented ClientHello is refused before reassembly, false reassembles; a whole one still gets its HelloRetryRequest" {
     var cc = hrrClientConfig("hrr-psk");
     cc.max_datagram_len = min_max_datagram_len;
     var client = try Connection.clientInit(cc);
@@ -12167,14 +12155,18 @@ test "hello_retry.refuse_fragmented_client_hello: a fragmented ClientHello is re
     try testing.expect(countRecords(ch) > 1);
     const first = record.nextDatagram(ch, min_max_datagram_len).datagram;
 
+    // The default refuses (`hrrServerConfig` leaves the field alone).
+    try testing.expect(hrrServerConfig("peer-a").hello_retry.?.refuse_fragmented_client_hello);
     var strict = hrrServerConfig("peer-a");
     strict.hello_retry.?.refuse_fragmented_client_hello = true;
     var s1 = try Connection.serverInit(strict);
     defer s1.deinit();
     try testing.expectError(error.FragmentedClientHello, s1.handleFlight(first, rnd, 0, &b2));
     try testing.expectEqual(@as(usize, 0), s1.rx_flight_len);
-    // The default keeps reassembling.
-    var s2 = try Connection.serverInit(hrrServerConfig("peer-a"));
+    // The opt-out reassembles.
+    var loose = hrrServerConfig("peer-a");
+    loose.hello_retry.?.refuse_fragmented_client_hello = false;
+    var s2 = try Connection.serverInit(loose);
     defer s2.deinit();
     try testing.expect((try s2.handleFlight(first, rnd, 0, &b2)).need_more_data);
     // A whole ClientHello under the strict setting is answered as before.
