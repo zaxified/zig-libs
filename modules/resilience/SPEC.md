@@ -156,7 +156,7 @@ card's Performance line carries the figures and is authoritative.
   code (34 mutants) with `src` not recorded; the code has since gained the rate breaker, the listener and the
   sweep fixes, which only the model harnesses (8 planted mutants) and a 13-mutant delta cover. A schemata run
   over the whole module is due.
-- **Hedging / preemptive time limiter on top of `Io.Group`** — BOUNCED, waits on `Io` cancellation; the module stays `Io`-free until then (see *What is deliberately not done*).
+- *BOUNCED (waits-external):* **Hedging / preemptive time limiter on top of `Io.Group`** — waits on `Io` cancellation; the module stays `Io`-free until then (see *What is deliberately not done*).
 
 ## Anchoring
 

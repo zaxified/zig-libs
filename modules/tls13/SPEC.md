@@ -394,7 +394,7 @@ benchmark `zig build bench-tls13` (see *Performance*), the example `zig build ru
 
 ## Backlog / deferred
 
-- **Performance: `cli_x25519`.** `cli_x25519` (`ct25519`'s ladder against s2n-bignum) is the row over the 1.25×
+- *BOUNCED (quiet-host):* **Performance: `cli_x25519`.** `cli_x25519` (`ct25519`'s ladder against s2n-bignum) is the row over the 1.25×
   fastest-candidate bound; re-measure on a quiet host before the card says P1.
 - **`dtls` engine groups:** `tlsserver` serves secp521r1, MLKEM512/768/1024 and the NIST hybrids
   (`extra_groups`, live against OpenSSL 3.5 and Go 1.26); `dtls` keeps its own accepted group list

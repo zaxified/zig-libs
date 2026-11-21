@@ -185,4 +185,4 @@ figures are on the card's `**Performance:**` line.
 
 ## Backlog / deferred
 
-- **Level 2 `random-trace-id` flag** — set/keep bit 1 once Level 2 is a recommendation. Effort: trivial. Waits on the spec.
+- *BOUNCED (waits-external):* **Level 2 `random-trace-id` flag** — set/keep bit 1 once Level 2 is a recommendation. Effort: trivial. Waits on the spec.

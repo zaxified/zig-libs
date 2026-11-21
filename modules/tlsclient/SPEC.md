@@ -490,7 +490,7 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
 
 ## Backlog / deferred
 
-- **Stack requirement checked at run time**: `init` documents about 400 KiB; a caller on a small fibre stack
+- *BOUNCED (waits-external):* **Stack requirement checked at run time**: `init` documents about 400 KiB; a caller on a small fibre stack
   overflows. A check needs the thread's stack bounds (no std API); revisit if a consumer runs clients on
   small stacks.
 - **One record-protection layer with `tlsserver`**: both now seal AES-GCM with `aesgcm`, but through two

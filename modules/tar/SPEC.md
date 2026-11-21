@@ -233,10 +233,10 @@ of a member to disk and a sparse header of a few hundred bytes can declare a lar
 
 ## Backlog / deferred
 
-- **`packDir` over a file whose `read` returns EINVAL panics in Debug only:** `std.Io` maps EINVAL from `read()` to
+- *BOUNCED (waits-external):* **`packDir` over a file whose `read` returns EINVAL panics in Debug only:** `std.Io` maps EINVAL from `read()` to
   `errnoBug`, a panic in Debug; ReleaseSafe/Fast get the error and pad + count it in `skipped` as documented (sysfs
   attributes do this). Not ours to fix (std); the test skips itself in Debug. LOW.
-- **std workaround to drop when std is fixed:** `Reader.discard` (256 MiB steps) works around
+- *BOUNCED (waits-external):* **std workaround to drop when std is fixed:** `Reader.discard` (256 MiB steps) works around
   `std.Io.Reader.discardAll64` overflowing `seek + n` on 32-bit targets. Zig upstream takes no agent reports, so there is
   no report to file; delete the workaround when a newer std no longer overflows.
 

@@ -172,6 +172,6 @@ the test sends the signal to the test's thread and reads the same signal back.
 
 Each is new API; none is implemented.
 
-- **Windows (`SetConsoleCtrlHandler`) and macOS/BSD (`kqueue` `EVFILT_SIGNAL`).** No consumer;
+- *BOUNCED (hardware):* **Windows (`SetConsoleCtrlHandler`) and macOS/BSD (`kqueue` `EVFILT_SIGNAL`).** No consumer;
   tokio `ctrl_c` and libuv have it, so this is the one gap a user of those would hit. `init`
   returns `error.Unsupported`.

@@ -291,9 +291,9 @@ Run: `scripts/modtest xmlenc`; deterministic fuzz: `XMLENC_FUZZ=<runs>[,<first s
 
 ## Backlog / deferred
 
-- **Bulk path after the move to `aesgcm`:** AES-GCM decryption runs on the `aesgcm` module (Zig 0.17 #36256); the bulk
+- *BOUNCED (quiet-host):* **Bulk path after the move to `aesgcm`:** AES-GCM decryption runs on the `aesgcm` module (Zig 0.17 #36256); the bulk
   path was not re-measured at that move. The card says Performance is not measured, so this stays open until a bench
-  exists. BOUNCED: needs a quiet host for numbers (quiet phase).
+  exists. Needs a quiet host for numbers (quiet phase).
 
 ## Anchoring
 

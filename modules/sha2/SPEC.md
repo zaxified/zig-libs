@@ -361,12 +361,12 @@ one instruction per word.
 
 ## Backlog / deferred
 
-- **SHA512 extension (x86).** CRYPTOGAMS has had a SHA512-extension path
+- *BOUNCED (hardware):* **SHA512 extension (x86).** CRYPTOGAMS has had a SHA512-extension path
   since 2023. It needs Arrow Lake or later, and neither the development CPU
   nor QEMU 10.2's TCG runs it, so it would ship untested. Revisit when a
   runner or emulator has it.
-- **SHA-NI speed is not measured.** The path is verified for correctness
+- *BOUNCED (hardware):* **SHA-NI speed is not measured.** The path is verified for correctness
   under emulation only. Measure it on a SHA-NI machine (CI's AMD runners)
   before quoting a speed.
-- **NEON/SVE2 or SHA3-extension SHA-512 path for arm64:** RustCrypto has `aarch64-sha3` for SHA-512; here arm64
+- *BOUNCED (hardware):* **NEON/SVE2 or SHA3-extension SHA-512 path for arm64:** RustCrypto has `aarch64-sha3` for SHA-512; here arm64
   SHA-512 is scalar. Effort M, and untestable without arm64 hardware in CI (see the SHA-NI reasoning above).

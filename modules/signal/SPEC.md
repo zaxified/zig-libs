@@ -490,9 +490,9 @@ the stack pointer.
 Bounced — copyleft-only reference: the formats below exist only in libsignal (AGPL-3.0, source off limits here) with no
 published specification or permissively licensed vectors; they wait for one.
 
-- **Signal-compatible wire messages and KDF strings** (`SignalMessage`/`PreKeySignalMessage` protobufs, AES-256-CBC + truncated HMAC-SHA256, libsignal's `info` labels): without this a session cannot talk to Signal servers or clients; the module chose ChaCha20-Poly1305 over a fixed header because the spec leaves the AEAD to the application (`interop_vectors.zig` header). It is a design choice for the spec-shaped core, but a compatibility layer is what a libsignal user expects. Effort: large (protobuf codec, prekey-message flow, version handling). Fits §2 if the protobuf codec is a sibling module.
-- **Sender keys (group messaging), sealed sender, safety numbers/fingerprints**: the parts of libsignal that make it a messenger rather than a handshake; none is implemented and none has a public specification. Effort: medium each; safety numbers small. Fits §2 (`megolm`/`mls` cover other group designs).
-- **Interop of the persisted ratchet state** with other implementations: `State.toBytes` is this module's own layout, not libsignal's `SessionStructure`; it belongs with the Signal-compatible wire work above.
+- *BOUNCED (other):* **Signal-compatible wire messages and KDF strings** (`SignalMessage`/`PreKeySignalMessage` protobufs, AES-256-CBC + truncated HMAC-SHA256, libsignal's `info` labels): without this a session cannot talk to Signal servers or clients; the module chose ChaCha20-Poly1305 over a fixed header because the spec leaves the AEAD to the application (`interop_vectors.zig` header). It is a design choice for the spec-shaped core, but a compatibility layer is what a libsignal user expects. Effort: large (protobuf codec, prekey-message flow, version handling). Fits §2 if the protobuf codec is a sibling module.
+- *BOUNCED (other):* **Sender keys (group messaging), sealed sender, safety numbers/fingerprints**: the parts of libsignal that make it a messenger rather than a handshake; none is implemented and none has a public specification. Effort: medium each; safety numbers small. Fits §2 (`megolm`/`mls` cover other group designs).
+- *BOUNCED (other):* **Interop of the persisted ratchet state** with other implementations: `State.toBytes` is this module's own layout, not libsignal's `SessionStructure`; it belongs with the Signal-compatible wire work above.
 
 ## Roadmap
 

@@ -340,7 +340,7 @@ The bench binary installs `fastmem`'s `memset` and `memcpy`, as this collection'
 ## Backlog / deferred
 
 - **karlseguin as a live peer in `tools/interop.zig`, both directions** — the raw-frame half is done (below, *Anchoring*: `tools/oracle_ks.py` + `tools/ks_server.zig`, its server on the shared case table). What is left: a third family column in `interop.zig` (its client against our server, our client against its server: fragmentation, interleaved control frames, close codes, handshake rejections), which needs a peer program with a client (`ks_client.zig`, the library has one) speaking the scenarios of `go_oracle/main.go`, and the `interop.zig` rows to judge it. Effort: medium.
-- **`Conn` reads sized to the frame** — `Conn` over a `std.Io.Reader` fills its buffer greedily, so a large frame straddling
+- *BOUNCED (waits-external):* **`Conn` reads sized to the frame** — `Conn` over a `std.Io.Reader` fills its buffer greedily, so a large frame straddling
   the buffer's end is copied twice (slower than the accumulator path on 64 KiB frames). fastwebsockets reserves
   `payload + 14` bytes and reads one frame. Doing that here needs a read of an exact length into the reader's buffer,
   which `std.Io.Reader` does not offer (fills are greedy); a `Conn` over a raw stream instead of a `Reader` would.

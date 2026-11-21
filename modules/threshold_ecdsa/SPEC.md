@@ -794,7 +794,7 @@ GG20's "one-round" online signing is one round of messages, not one unit of work
 
 ## Backlog / deferred
 
-- **Independent cryptographic review** of the implemented constructions (GG18 Appendix A proofs, the Fiat-Shamir instantiations, `PdlProof`, the presigning composition) before production use: the questions A1–A9 are itemized in "Auditor brief". Signing inherits it, being built on `zkproofs.zig`'s checked MtA/MtAwc. The tests show self-consistency and the reject contract, not soundness against an unbounded malicious prover.
+- *BOUNCED (owner):* **Independent cryptographic review** of the implemented constructions (GG18 Appendix A proofs, the Fiat-Shamir instantiations, `PdlProof`, the presigning composition) before production use: the questions A1–A9 are itemized in "Auditor brief". Signing inherits it, being built on `zkproofs.zig`'s checked MtA/MtAwc. The tests show self-consistency and the reject contract, not soundness against an unbounded malicious prover.
 - **Redistribution to a new committee.** `dkg`'s reshare already takes `n'`, `t'`; a `threshold_ecdsa` wrapper needs the NEW committee's aux rounds (announcements, Πfac) alongside the old committee's dealing, and new parties that hold no `KeyShare` yet. Effort: medium.
 
 ## Verification

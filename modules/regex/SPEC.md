@@ -402,33 +402,33 @@ Consumer build options (CONVENTIONS §4.2), after Rust `regex-syntax`'s `unicode
 
 ## Backlog / deferred
 
-All open.
+Open items.
 
-- **A full forward table can stop caching two-byte steps** (perf only) — when `FindDfa` holds `limit` states and the next
+- *BOUNCED (quiet-host):* **A full forward table can stop caching two-byte steps** (perf only) — when `FindDfa` holds `limit` states and the next
   state already exists, `intern` does not empty the table, but `midAfter` has no room: every two-byte code point from that
   state is stepped uncached until some new state forces a flush. Not seen in the bench (<= 20 states). Flushing from
   `midAfter` is a few lines but thrashes where the old policy keeps the first states cached (a working set past the
   limit); a fix needs a measured bench with a working set just past 255 states and a give-up heuristic (Rust's lazy DFA
-  quits when it clears too often). *BOUNCED: needs a quiet machine; measured in the perf phase.*
-- **The backward search's per-call cost** — when the tail filter passes, each new backward state costs a closure per
+  quits when it clears too often). *needs a quiet machine; measured in the perf phase.*
+- *BOUNCED (quiet-host):* **The backward search's per-call cost** — when the tail filter passes, each new backward state costs a closure per
   consuming instruction (~100 ns) and the table starts empty on every call (no allocator, no cache between calls): ~1.2 us for
   ten states. The `tail` filter answers the common shapes in nanoseconds; a class near the end (`[A-Z]+XYZ$` on a text ending
   `…XYZ`) still runs the DFA. Precomputing each instruction's follow set at compile time would cut the per-state cost at
-  ~2 KiB per `Regex`. *BOUNCED: needs a quiet machine; measured in the perf phase.*
-- **Teddy past 32 prefixes, and on NEON** — Rust's slim Teddy takes 64 patterns and its fat variant 16 buckets; past 32
+  ~2 KiB per `Regex`. *needs a quiet machine; measured in the perf phase.*
+- *BOUNCED (quiet-host):* **Teddy past 32 prefixes, and on NEON** — Rust's slim Teddy takes 64 patterns and its fat variant 16 buckets; past 32
   here the prefixes are cut shorter, and with fewer than two bytes the first-byte set is used. Non-x86 targets look the
-  nibbles up by a select tree (AArch64 has `tbl`), unmeasured. *BOUNCED: needs a quiet machine; measured in the perf phase.*
-- **Intel JCC erratum in the prefilter scan** — `Prefilter.next`'s `cmp;jne` back-edge (31-40 % of `isMatch` samples) and a loop
+  nibbles up by a select tree (AArch64 has `tbl`), unmeasured. *needs a quiet machine; measured in the perf phase.*
+- *BOUNCED (quiet-host):* **Intel JCC erratum in the prefilter scan** — `Prefilter.next`'s `cmp;jne` back-edge (31-40 % of `isMatch` samples) and a loop
   in `runDfa` cross a 32-byte boundary in the current layout: a mitigated build ran in 0.825-0.856x the cycles. Layout luck,
   moves with any edit. Plan (user-approved): the scan loop in inline asm behind `.p2align 5`, or at least
   `asm volatile(".p2align 5")` as the FIRST statement of the loop body (never before the loop); re-check with `jcc-scan.py`
-  after each compiler bump. *BOUNCED: needs a quiet machine; measured in the perf phase.*
-- **An ASCII bitmap per class** — smaller constant factors. *BOUNCED: needs a quiet machine; measured in the perf phase.*
-- **Per-call compile + match in ReleaseSafe** — 1.1-3.7x slower than the other Zig engine measured in ReleaseSafe
+  after each compiler bump. *needs a quiet machine; measured in the perf phase.*
+- *BOUNCED (quiet-host):* **An ASCII bitmap per class** — smaller constant factors. *needs a quiet machine; measured in the perf phase.*
+- *BOUNCED (quiet-host):* **Per-call compile + match in ReleaseSafe** — 1.1-3.7x slower than the other Zig engine measured in ReleaseSafe
   (about 70 % `compiler_rt.memset`: safety fills `undefined` of the ~9 KiB `Builder` and the DFA scratch), 2-7x faster in
   ReleaseFast/ReleaseSmall. Matters only to consumers that ship ReleaseSafe and compile per call; a fix would keep those
-  scratches out of safety's `undefined` fill. Not measured here yet. *BOUNCED: needs a quiet machine; measured in the perf phase.*
-- **The next Unicode version** — `tools/ucd_unicode/fetch.sh <v>` and `gen.py --ucd data/<v> -out src`; re-run the Go replay
+  scratches out of safety's `undefined` fill. Not measured here yet. *needs a quiet machine; measured in the perf phase.*
+- *BOUNCED (waits-external):* **The next Unicode version** — `tools/ucd_unicode/fetch.sh <v>` and `gen.py --ucd data/<v> -out src`; re-run the Go replay
   (its UNICODE_VERSION count moves) and check new binary properties or property values against regex-syntax once it carries
   that version.
 - **Sibling modules that can now adopt it** — `validate` (`Pattern.matcher` takes a caller-supplied matcher today; a `regex`

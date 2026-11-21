@@ -241,7 +241,7 @@ struct for user-defined sets, as tfhe-rs's `BooleanParameters`.
 
 Against the tfhe-rs `boolean` yardstick, missing and it matters:
 
-1. **Speed**: ≈ 0.25 s per gate, ~20× behind tfhe-rs and behind zig-tfhe's claimed ≈ 40 ms. Candidates: a vectorised NTT, a 32-bit-friendly NTT prime pair, keeping the accumulator in the transform domain across CMux steps, and multi-threaded evaluation of independent gates (through `std.Io`). Medium–large. The gap a user notices first. Needs A/B numbers on a quiet host.
+1. *BOUNCED (quiet-host):* **Speed**: ≈ 0.25 s per gate, ~20× behind tfhe-rs and behind zig-tfhe's claimed ≈ 40 ms. Candidates: a vectorised NTT, a 32-bit-friendly NTT prime pair, keeping the accumulator in the transform domain across CMux steps, and multi-threaded evaluation of independent gates (through `std.Io`). Medium–large. The gap a user notices first. Needs A/B numbers on a quiet host.
 2. **tfhe-rs's own serialisation** (bincode + `tfhe-versionable`), so files, not only raw containers, can be exchanged with a tfhe-rs program. Today a bridge must re-wrap `codec.zig` payloads. Medium.
 3. **Seeded (compressed) keys**: tfhe-rs ships keys whose masks are a CSPRNG seed, ~`(k+1)×` smaller (this module's `tfhers_default` server key is ~78 MB). Needs tfhe-rs's CSPRNG reproduced. Medium.
 4. **tfhe-rs interop vectors for the public key and KS-PBS**: `tools/tfhers` does not yet emit `PublicKey` encryptions or `DEFAULT_PARAMETERS_KS_PBS` keys/gates; both are checked here only for self-consistency. Small.

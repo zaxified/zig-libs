@@ -377,11 +377,11 @@ the downloaded module and crate compared with the copies read; their provenance 
 
 ## Backlog / deferred
 
-- **x32 rules, other secondary ABIs.** x32 stays killed (`buildRules` x32 guard); an x32 block would need its own
+- *BOUNCED (hardware):* **x32 rules, other secondary ABIs.** x32 stays killed (`buildRules` x32 guard); an x32 block would need its own
   number table (`__X32_SYSCALL_BIT`, `std.os.linux.syscalls.X32`) behind the same `AUDIT_ARCH_X86_64`, plus a kernel
   with `CONFIG_X86_X32` to test it (none on the development host); no consumer asks. Other secondary ABIs (AArch32
   on aarch64, …) are `error.UnsupportedArch`, untestable on this host.
-- **Landlock ABI 10+:** UDP rights and `LANDLOCK_ADD_RULE_QUIET` (10), `LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS` (11).
+- *BOUNCED (waits-external):* **Landlock ABI 10+:** UDP rights and `LANDLOCK_ADD_RULE_QUIET` (10), `LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS` (11).
   Not in the kernel and UAPI header this was built against (7.0, ABI 8); UDP stays unrestricted on a kernel that has
   those rights. Add with one. Effort small each.
 

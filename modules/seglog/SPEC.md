@@ -663,7 +663,7 @@ authoritative for the status.
 
 ## Backlog / deferred
 
-- Non-Linux targets: `meta.targets` is `.linux64` because `Storage.allocate` / `syncData` are raw Linux syscalls in `kv`'s `FsStorage`; tidwall/wal and rosedb are portable. Belongs to `kv`; waits for it.
+- *BOUNCED (other):* Non-Linux targets: `meta.targets` is `.linux64` because `Storage.allocate` / `syncData` are raw Linux syscalls in `kv`'s `FsStorage`; tidwall/wal and rosedb are portable. Belongs to `kv`; waits for it.
 
 ## Anchoring
 

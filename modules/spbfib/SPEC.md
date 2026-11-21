@@ -237,7 +237,7 @@ unicast `Entry` or of an `egress_bmacs` element) to the caller's egress interfac
 
 ## Backlog / deferred
 
-- **Per-B-VID FIB set** (one `Fib` per ECT-VID tuple, each from its own SPF tree) (survey). Why: a real SPBM deployment uses two or more B-VIDs for path diversity; a single FIB covers only the base VID (the one congruent path per destination comes from `isis-spf`'s single deterministic ECT selection). Needs multi-algorithm ECT in `spf-ect` (see its backlog). Effort: ~3 days after that. Fits §2: yes. *BOUNCED: blocked on `spf-ect`'s 802.1aq ECT-ALGORITHM selection (its own backlog: the algorithm text is IEEE's, paywalled, and no vector exists), without which a second B-VID's tree would not agree with another vendor's bridge.*
+- *BOUNCED (paywalled):* **Per-B-VID FIB set** (one `Fib` per ECT-VID tuple, each from its own SPF tree) (survey). Why: a real SPBM deployment uses two or more B-VIDs for path diversity; a single FIB covers only the base VID (the one congruent path per destination comes from `isis-spf`'s single deterministic ECT selection). Needs multi-algorithm ECT in `spf-ect` (see its backlog). Effort: ~3 days after that. Fits §2: yes. *blocked on `spf-ect`'s 802.1aq ECT-ALGORITHM selection (its own backlog: the algorithm text is IEEE's, paywalled, and no vector exists), without which a second B-VID's tree would not agree with another vendor's bridge.*
 
 ## Open
 
