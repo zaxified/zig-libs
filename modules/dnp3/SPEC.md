@@ -377,7 +377,14 @@ Behaviour, and why:
   silent until a successful key change resets the budget. A master's own g120v7
   (AUTHENTICATE_REQUEST_NO_ACK) is counted and not answered. Unexpected or undecodable
   AUTHENTICATE_REQUESTs are counted and ignored.
-- **Statistics** (`Statistics`) count each of these events in memory.
+- **Statistics** (`Statistics`) count each of these events in memory, and READ of g121 (variation 0 or 1; all,
+  start-stop or count) returns them on the wire as the 18 security statistics, in the index order of
+  opendnp3's `SecurityStatIndex` (0 unexpected messages ... 17 rekeys due to restart) with the layout of its
+  `Group121Var1`: flags (ONLINE), association id (`Config.association_id`), 32-bit count, little-endian.
+  Statistics the outstation has no concept of (1 authorization failures, 4 and 17 rekeys, 7 critical
+  messages sent, 15 and 16 update-key changes) read 0; 5/6 count every response sent and request screened
+  while SA is attached; 8 counts the requests it challenged or took in aggressive mode. They are not
+  part of the class 0 scan and no g122 events are generated (the g121/g122 codecs are in `objects`).
 
 **Key-wrap layout.** The g120v6 wrapped data is
 AES-KW (RFC 3394) over: key length (u16 LE), control key, monitoring key, the key-status message,
@@ -572,8 +579,8 @@ foreign SA master computes the same.
 ## Backlog / deferred
 
 - **Secure Authentication, what the outstation integration leaves out:** the SAv5/SAv6
-  asymmetric update-key change (g120 v8/v10-v15), the g121/g122 security-statistic objects on
-  the wire (counted in memory only), authenticated responses in the monitoring direction,
+  asymmetric update-key change (g120 v8/v10-v15), the g122 security-statistic *events* (g121 reads
+  are served), authenticated responses in the monitoring direction,
   AES-GMAC as the challenge MAC (its IV derivation is out of scope in `sa.zig`), the master
   side.
 - **Open questions for the SA integration** (each needs the standard's text or a foreign

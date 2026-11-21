@@ -186,6 +186,43 @@ pub const Statistics = struct {
     failed_session_key_changes: u32 = 0,
     session_key_status_requests: u32 = 0,
     session_keys_expired: u32 = 0,
+    /// Requests that reached the screen, and responses the outstation sent while
+    /// SA is attached (the g121 total-messages statistics).
+    messages_received: u32 = 0,
+    messages_sent: u32 = 0,
+
+    /// The value of statistic `index` of the g121 table (IEEE 1815-2012, the
+    /// indices of opendnp3's `SecurityStatIndex`), or null past index 17.
+    /// 0 unexpected messages, 1 authorization failures, 2 authentication
+    /// failures, 3 reply timeouts, 4 rekeys due to authentication failure,
+    /// 5 total messages sent, 6 total received, 7 critical sent, 8 critical
+    /// received, 9 discarded, 10 error messages sent, 11 received, 12 successful
+    /// authentications, 13 session key changes, 14 failed session key changes,
+    /// 15 update key changes, 16 failed update key changes, 17 rekeys due to
+    /// restart. The outstation has no per-user authorization roles, never
+    /// rekeys on its own and has no update-key change (the master changes
+    /// session keys only), so 1, 4, 7, 15, 16 and 17 are always 0; critical
+    /// messages received are the requests it challenged or took in aggressive mode.
+    pub fn statistic(self: Statistics, index: u8) ?u32 {
+        return switch (index) {
+            0 => self.unexpected_messages,
+            1, 4, 7, 15, 16, 17 => 0,
+            2 => self.authentication_failures,
+            3 => self.reply_timeouts,
+            5 => self.messages_sent,
+            6 => self.messages_received,
+            8 => self.challenges_sent +| self.aggressive_mode_accepted,
+            9 => self.discarded_messages,
+            10 => self.error_messages_sent,
+            11 => self.error_messages_received,
+            12 => self.successful_authentications,
+            13 => self.session_key_changes,
+            14 => self.failed_session_key_changes,
+            else => null,
+        };
+    }
+
+    pub const statistic_count: u8 = 18;
 };
 
 /// What the outstation should do with a screened request.
@@ -1314,4 +1351,64 @@ test "SA: a recorded key change replayed after a restart is refused, however the
     try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
     try testing.expectEqual(sa.KeyStatus.not_init, second.users[0].status);
     try testing.expectEqual(@as(u8, 0), second.users[0].key_len);
+}
+
+test "g121 security statistics are readable: opendnp3's indices, the association id, counted messages" {
+    var rig = Rig{};
+    rig.setup(.{ .association_id = 0x0A0B }, true);
+    try rig.installKeys(1, 100); // a status request and a key change: 2 requests in, 2 responses out
+    var req: [8]u8 = undefined;
+    const body = try application.buildRequest(5, .read, .{
+        .group = 121,
+        .variation = 0,
+        .qualifier = .{ .prefix_code = .none, .range_code = .all_values },
+        .range = .{ .all_values = {} },
+    }, &req);
+    const reply = (try rig.send(body, 200)).?;
+    const objs = (try application.decodeResponseHeader(reply)).rest;
+    try testing.expectEqualSlices(u8, &.{ 121, 1, 0x00, 0, 17 }, objs[0..5]);
+    try testing.expectEqual(@as(usize, 5 + 18 * 7), objs.len);
+    const stat = struct {
+        fn at(o: []const u8, i: usize) !@import("objects.zig").g121.V1 {
+            return @import("objects.zig").g121.V1.decode(o[5 + i * 7 ..]);
+        }
+    }.at;
+    const sent = try stat(objs, 5);
+    try testing.expectEqual(@as(u16, 0x0A0B), sent.association_id);
+    try testing.expectEqual(@as(u8, 0x01), sent.flags);
+    try testing.expectEqual(@as(u32, 2), sent.value); // the read itself is not yet sent
+    try testing.expectEqual(@as(u32, 3), (try stat(objs, 6)).value);
+    try testing.expectEqual(@as(u32, 1), (try stat(objs, 13)).value); // one session key change
+    try testing.expectEqual(@as(u32, 0), (try stat(objs, 2)).value);
+    try testing.expectEqual(@as(u32, 0), (try stat(objs, 17)).value);
+
+    // A start-stop range reads exactly those; one past index 17 is a parameter error.
+    const one = try application.buildRequest(6, .read, .{
+        .group = 121,
+        .variation = 1,
+        .qualifier = .{ .prefix_code = .none, .range_code = .start_stop_1b },
+        .range = .{ .start_stop = .{ .start = 13, .stop = 13 } },
+    }, &req);
+    const r1 = (try application.decodeResponseHeader((try rig.send(one, 210)).?)).rest;
+    try testing.expectEqualSlices(u8, &.{ 121, 1, 0x00, 13, 13 }, r1[0..5]);
+    try testing.expectEqual(@as(usize, 5 + 7), r1.len);
+    const past = try application.buildRequest(7, .read, .{
+        .group = 121,
+        .variation = 1,
+        .qualifier = .{ .prefix_code = .none, .range_code = .start_stop_1b },
+        .range = .{ .start_stop = .{ .start = 17, .stop = 18 } },
+    }, &req);
+    try testing.expect((try application.decodeResponseHeader((try rig.send(past, 220)).?)).header.iin.parameter_error);
+
+    // Without SA attached the group does not exist.
+    var plain = Rig{};
+    plain.setup(.{}, false);
+    const again = try application.buildRequest(8, .read, .{
+        .group = 121,
+        .variation = 0,
+        .qualifier = .{ .prefix_code = .none, .range_code = .all_values },
+        .range = .{ .all_values = {} },
+    }, &req);
+    const none = (try application.decodeResponseHeader((try plain.send(again, 1)).?)).header.iin;
+    try testing.expect(none.object_unknown);
 }

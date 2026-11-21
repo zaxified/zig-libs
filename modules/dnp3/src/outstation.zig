@@ -667,6 +667,8 @@ pub const Outstation = struct {
             /// 0 means "all of them".
             limit: u32,
         },
+        /// g121: SA security statistics `start..stop` (only with SA attached).
+        security_stats: struct { start: u32, stop: u32 },
         /// g34: the reporting deadbands of analog input points `start..stop`.
         deadbands: struct {
             variation: u8,
@@ -864,15 +866,25 @@ pub const Outstation = struct {
         // refuses or ignores is not yet a request the outstation acts on, so
         // it must not abandon a response series in progress either.
         if (self.secure_auth) |auth| {
+            auth.stats.messages_received +|= 1;
             switch (try auth.screen(request, function, seq, body, peer, now_ms, self.iin(), out)) {
                 .pass => {},
                 .silent => return null,
-                .reply => |fragment| return .{ .fragment = fragment, .confirm_requested = false, .more = false },
+                .reply => |fragment| {
+                    auth.stats.messages_sent +|= 1;
+                    return .{ .fragment = fragment, .confirm_requested = false, .more = false };
+                },
                 .execute => |e| {
                     self.beginRequest(e.seq);
-                    return try self.dispatch(e.function, e.seq, e.body, peer, now_ms, out);
+                    const r = try self.dispatch(e.function, e.seq, e.body, peer, now_ms, out);
+                    if (r != null) auth.stats.messages_sent +|= 1;
+                    return r;
                 },
             }
+            self.beginRequest(seq);
+            const r = try self.dispatch(function, seq, body, peer, now_ms, out);
+            if (r != null) auth.stats.messages_sent +|= 1;
+            return r;
         }
         self.beginRequest(seq);
         return try self.dispatch(function, seq, body, peer, now_ms, out);
@@ -1074,6 +1086,25 @@ pub const Outstation = struct {
             };
         }
 
+        if (header.group == 121) {
+            const auth = self.secure_auth orelse return error.UnknownObject;
+            _ = auth;
+            if (header.variation > 1) return error.UnknownObject;
+            const n: u32 = secure_auth.Statistics.statistic_count;
+            const start: u32, const stop: u32 = switch (header.range) {
+                .all_values => .{ 0, n - 1 },
+                .start_stop => |r| blk: {
+                    if (r.stop < r.start or r.stop >= n) return error.BadParameter;
+                    break :blk .{ r.start, r.stop };
+                },
+                .count => |c| blk: {
+                    if (c == 0 or c > n) return error.BadParameter;
+                    break :blk .{ 0, c - 1 };
+                },
+            };
+            return .{ .security_stats = .{ .start = start, .stop = stop } };
+        }
+
         if (header.group == 34) {
             if (header.variation != 0 and objects.g34.recordLen(header.variation) == null) return error.UnknownObject;
             const n = self.db.analog_inputs.len;
@@ -1150,6 +1181,7 @@ pub const Outstation = struct {
                     &pos,
                     &cursor.item_pos,
                 ),
+                .security_stats => |d| self.emitSecurityStats(d.start, d.stop, out[0..limit], &pos, &cursor.item_pos),
                 .deadbands => |d| self.emitDeadbands(d.variation, d.start, d.stop, out[0..limit], &pos, &cursor.item_pos),
                 .events => |e| blk: {
                     const before = cursor.events_sent;
@@ -1327,6 +1359,38 @@ pub const Outstation = struct {
             }
             if (r.emitted == 0) return false;
             if (r.emitted < run) return false;
+        }
+        return true;
+    }
+
+    /// The g121v1 security statistics `start..stop` (indices 0..17).
+    fn emitSecurityStats(self: *Outstation, start: u32, stop: u32, out: []u8, pos: *usize, item_pos: *u64) bool {
+        const auth = self.secure_auth.?;
+        const total = stop - start + 1;
+        const each = objects.g121.V1.wire_len;
+        while (item_pos.* < total) {
+            const first: u32 = start + @as(u32, @intCast(item_pos.*));
+            const header_len: usize = 5; // 18 statistics: 1-octet start-stop
+            if (pos.* + header_len + each > out.len) return false;
+            const fit: u32 = @intCast(@min(@as(u64, stop - first + 1), (out.len - pos.* - header_len) / each));
+            const last = first + fit - 1;
+            const hdr = objects.encodeObjectHeader(.{
+                .group = 121,
+                .variation = 1,
+                .qualifier = .{ .prefix_code = .none, .range_code = .start_stop_1b },
+                .range = .{ .start_stop = .{ .start = first, .stop = last } },
+            }, out[pos.*..]) catch return false;
+            pos.* += hdr.len;
+            var i: u32 = first;
+            while (i <= last) : (i += 1) {
+                const w = (objects.g121.V1{
+                    .association_id = auth.config.association_id,
+                    .value = auth.stats.statistic(@intCast(i)).?,
+                }).encode(out[pos.*..]) catch return false;
+                pos.* += w.len;
+            }
+            item_pos.* += fit;
+            if (fit < stop - first + 1) return false;
         }
         return true;
     }

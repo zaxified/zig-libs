@@ -757,6 +757,64 @@ pub const g51 = struct {
     pub const wire_len = g50.V1.wire_len;
 };
 
+// ── g121 / g122: Security Statistic (static / event) ─────────────────────────
+
+/// An SA security statistic: quality flags, the association id the count is
+/// for, and the 32-bit count (the layout of opendnp3's `Group121Var1`, all
+/// little-endian). g122 is the event form; v2 adds a 48-bit time.
+pub const g121 = struct {
+    pub const V1 = struct {
+        flags: u8 = 0x01, // ONLINE
+        association_id: u16,
+        value: u32,
+
+        pub const wire_len = 7;
+
+        pub fn encode(self: V1, out: []u8) error{BufferTooSmall}![]u8 {
+            if (out.len < wire_len) return error.BufferTooSmall;
+            out[0] = self.flags;
+            std.mem.writeInt(u16, out[1..3], self.association_id, .little);
+            std.mem.writeInt(u32, out[3..7], self.value, .little);
+            return out[0..wire_len];
+        }
+
+        pub fn decode(bytes: []const u8) error{ShortRecord}!V1 {
+            if (bytes.len < wire_len) return error.ShortRecord;
+            return .{
+                .flags = bytes[0],
+                .association_id = std.mem.readInt(u16, bytes[1..3], .little),
+                .value = std.mem.readInt(u32, bytes[3..7], .little),
+            };
+        }
+    };
+};
+
+pub const g122 = struct {
+    pub const V1 = g121.V1;
+
+    pub const V2 = struct {
+        flags: u8 = 0x01,
+        association_id: u16,
+        value: u32,
+        time_ms: u64,
+
+        pub const wire_len = 13;
+
+        pub fn encode(self: V2, out: []u8) error{BufferTooSmall}![]u8 {
+            if (out.len < wire_len) return error.BufferTooSmall;
+            _ = (g121.V1{ .flags = self.flags, .association_id = self.association_id, .value = self.value }).encode(out) catch unreachable;
+            std.mem.writeInt(u48, out[7..13], @truncate(self.time_ms), .little);
+            return out[0..wire_len];
+        }
+
+        pub fn decode(bytes: []const u8) error{ShortRecord}!V2 {
+            if (bytes.len < wire_len) return error.ShortRecord;
+            const b = try g121.V1.decode(bytes);
+            return .{ .flags = b.flags, .association_id = b.association_id, .value = b.value, .time_ms = std.mem.readInt(u48, bytes[7..13], .little) };
+        }
+    };
+};
+
 // ── g110 / g111: Octet String (static / event) ───────────────────────────────
 
 /// An octet string point: the object's **variation is its length** (1..255)
@@ -1098,4 +1156,15 @@ test "g50v4 and g110/g111 round trip; the octet-string variation is its length" 
     try testing.expectEqualSlices(u8, "hel", try g111.decode(3, "hello"));
     try testing.expectError(error.ShortRecord, g110.decode(6, "hello"));
     try testing.expectError(error.ShortRecord, g110.decode(0, "hello"));
+}
+
+test "g121/g122 security statistic records: opendnp3's layout" {
+    var b: [16]u8 = undefined;
+    const r = g121.V1{ .association_id = 0x0102, .value = 0x0A0B0C0D };
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x01, 0x0D, 0x0C, 0x0B, 0x0A }, try r.encode(&b));
+    try testing.expectEqual(r, try g121.V1.decode(try r.encode(&b)));
+    const e = g122.V2{ .association_id = 1, .value = 2, .time_ms = 0x0000_0102_0304_0506 };
+    try testing.expectEqual(e, try g122.V2.decode(try e.encode(&b)));
+    try testing.expectEqualSlices(u8, &.{ 6, 5, 4, 3, 2, 1 }, (try e.encode(&b))[7..13]);
+    try testing.expectError(error.ShortRecord, g122.V2.decode(b[0..12]));
 }
