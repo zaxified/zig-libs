@@ -1653,7 +1653,15 @@ const Server = struct {
         };
         const status = p.handler.runInfo(srv.gpa, &info, stdin, &out, &err_out) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.CommandFailed => return error.CommandFailed,
+            // The handler failed: only its channel ends, EOF then CLOSE with
+            // no `exit-status` (a client reports a command that ended without
+            // one, as for a process killed before it could exit; Go's client:
+            // `ExitMissingError`). The connection keeps serving.
+            error.CommandFailed => {
+                try sendEofMsg(srv.t, &sc.ch);
+                try sendCloseMsg(srv.t, &sc.ch);
+                return;
+            },
         };
 
         if (!try srv.sendData(sc, out.items, null)) return;
@@ -3867,6 +3875,41 @@ fn serveWith(cfg: ServeConfig, payloads: []const []const u8, sink: *std.Io.Write
     var r: std.Io.Reader = .fixed(framed);
     var tr = transport.Transport.init(&r, sink);
     return serveConnection(&tr, std.testing.allocator, cfg);
+}
+
+test "server: a handler's CommandFailed closes only its channel (EOF, CLOSE, no exit-status); the next channel is served" {
+    const t = std.testing;
+    const Failing = struct {
+        fn run(_: *anyopaque, _: std.mem.Allocator, _: *const RequestInfo, _: []const u8, _: *std.ArrayList(u8), _: *std.ArrayList(u8)) CommandError!u32 {
+            return error.CommandFailed;
+        }
+    };
+    var b: [2][96]u8 = undefined;
+    var exec_buf: [2][64]u8 = undefined;
+    var execs: [2][]const u8 = undefined;
+    var close_buf: [2][8]u8 = undefined;
+    var closes: [2][]const u8 = undefined;
+    for (0..2) |i| {
+        var ew: std.Io.Writer = .fixed(&exec_buf[i]);
+        try writeChannelHeader(&ew, .SSH_MSG_CHANNEL_REQUEST, @intCast(i));
+        try messages.writeString(&ew, "exec");
+        try ew.writeByte(0);
+        try messages.writeString(&ew, "id");
+        execs[i] = ew.buffered();
+        var cw: std.Io.Writer = .fixed(&close_buf[i]);
+        try writeChannelHeader(&cw, .SSH_MSG_CHANNEL_CLOSE, @intCast(i));
+        closes[i] = cw.buffered();
+    }
+    const disconnect = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_DISCONNECT), 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var sink_buf: [16 * 1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    const cfg: ServeConfig = .{ .exec = .{ .runInfoFn = Failing.run }, .stdin_mode = .ignore };
+    try serveWith(cfg, &.{ openMsg(&b[0], 0), execs[0], closes[0], openMsg(&b[1], 1), execs[1], closes[1], &disconnect }, &sink);
+    const confirm = @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
+    try t.expectEqual(@as(usize, 2), try countPackets(sink.buffered(), confirm, null, t.allocator));
+    try t.expectEqual(@as(usize, 2), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_EOF), null, t.allocator));
+    try t.expectEqual(@as(usize, 2), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE), null, t.allocator));
+    try t.expect(std.mem.find(u8, sink.buffered(), "exit-status") == null);
 }
 
 test "server channels: nothing is answered after our CLOSE; stdin collection is capped at max_input; pty-req refused unless allowed" {

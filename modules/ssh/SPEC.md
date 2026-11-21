@@ -299,7 +299,9 @@ so the security properties below are in effect, not aspirational.
    1 GiB / 2^28 packets by default (and whenever the peer asks); a peer that never completes a
    re-exchange hits the per-key packet stop instead of nonce reuse.
    Server-side command execution is a pure callback (`connection.CommandHandler`) — this module
-   never spawns a process, so all sandboxing/privilege questions are the caller's.
+   never spawns a process, so all sandboxing/privilege questions are the caller's. A handler that
+   returns `error.CommandFailed` ends only its own channel (EOF, then CLOSE, no `exit-status`: the
+   client sees a command that ended without one, Go's `ExitMissingError`); the connection keeps serving.
 6. **Permanently out of scope:** TLS-anything (SSH doesn't use TLS), compression (`none` only), and
    any transport concern below the `std.Io.Reader`/`Writer` seam.
 
@@ -451,6 +453,12 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
   contradicts the §5.2 window accounting, and `elevation` is Windows-specific.
 - **Bare `ssh-rsa` (SHA-1) and the other legacy algorithms** (CBC, HMAC-SHA1, DSA) as defaults: legacy
   names would be explicit opt-ins in the `supported_*` lists, never on by default (see Backlog).
+- **Three LOW review findings, kept as Go's `x/crypto/ssh` (the reference) behaves:** `Server.sendData`
+  sees an SSH_MSG_DISCONNECT only while it waits for window space, otherwise at the next read (blocking
+  I/O on a socket this module does not own: a peer that hung up fails the next write or read, as in Go);
+  the client `Session` keeps data the server sends after its EOF (Go's `handleData` does not check EOF
+  either; OpenSSH drops it); a CHANNEL_OPEN_CONFIRMATION with a zero maximum packet size is
+  `error.ChannelOpenFailed` without a CLOSE to the server (Go returns its error the same way).
 - **`@cert-authority` known_hosts lines as trust anchors** (they need certificates), Go's
   `KeyError.Want` host-key-algorithm preference and the `CheckHostIP` second lookup by address.
 
@@ -482,11 +490,6 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
 - **SFTP client** (draft-ietf-secsh-filexfer-02 v3). File transfer is the other reason people use SSH from a
   library (russh and libssh2 have it). It would be its own module on top of `subsystem`; no sibling exists.
   Effort: large. Fits the scope.
-- **Left open from the adversarial review of the mvp -> core diff (all LOW):** `Server.sendData` notices
-  SSH_MSG_DISCONNECT only while it waits for window space (a client that disconnects mid-stream is seen at
-  the next read); a handler returning `error.CommandFailed` ends the whole `serveConnection`, not just its
-  channel; the client `Session` accepts data after the peer's EOF and keeps a channel whose
-  OPEN_CONFIRMATION named a zero maximum packet size open at the peer.
 
 ## Anchoring
 
