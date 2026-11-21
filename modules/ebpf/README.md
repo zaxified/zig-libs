@@ -421,6 +421,11 @@ Map-in-map (`ARRAY_OF_MAPS`/`HASH_OF_MAPS` with an inner definition) and
 `PROG_ARRAY` initializers (`.values = { &inner, [1] = &prog }`) are created and
 filled by `load`.
 
+Global data: `Object.initialData(".rodata")` (seed a `const volatile` before
+`load`), `Object.dataVariables`, `Object.mapData` (the live `.data`/`.bss`
+mapped into the process), and `ebpf.generateSkeleton` (a Zig skeleton with typed
+data-section structs, like `bpftool gen skeleton`).
+
 When the kernel refuses the object's BTF, `load` downgrades the kinds that
 kernel does not know (`ebpf.sanitizeBtf`, `LoadOptions.sanitize_btf`), as
 libbpf does.

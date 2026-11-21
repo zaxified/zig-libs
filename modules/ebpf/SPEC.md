@@ -754,6 +754,22 @@ that path whatever `pinning` says. Internal data maps are never auto-pinned, a `
 removing it is `unlink`). The path policy is therefore the caller's: the root directory is an option, never a guess, and
 nothing is pinned unless the object asks for it or the caller does.
 
+### Global data: seeds, mmap and the skeleton
+
+The internal `.data`/`.rodata`/`.bss` maps are created `BPF_F_MMAPABLE` (`LoadOptions.mmap_data`, as libbpf does; a kernel
+older than 5.5 answers `EINVAL` and `load` retries without the flag, leaving `MapSpec.mmapable` false). Before `load`,
+`Object.initialData(".rodata")` is a **writable** view of the seed bytes (the object's own copy of the section), which is
+how a `const volatile` configuration is set; `Object.dataVariables(".rodata")` lists a section's variables from the
+`DATASEC` with the ELF's offsets and sizes. After `load`, `Object.mapData(name)` maps the map into the process
+(`MappedData`: `bytes()`, `view(T)` for an `extern struct` mirroring the section, `variable(v)`; the `.rodata` mapping is
+read-only because the map is frozen); `deinit` unmaps. `skeleton.generate(gpa, &obj, .{ .object_path = ... }, writer)` writes a
+Zig source file (`bpftool gen skeleton`'s role): the object embedded with `@embedFile`, one `extern struct` per data
+section (explicit padding, `comptime` offset and size assertions), `Program`/`Map` enums, and a `Skeleton` wrapper with
+`open`/`load`/`deinit`, `seed<Section>()`, `map<Section>()`, `programFd`, `mapFd`. BTF types become Zig types by size and
+sign (`bool`, floats, enums by size, pointers as `u64`, arrays, nested structs/unions); a struct with a bitfield becomes an
+opaque `[size]u8` so the offsets around it still hold. The generated text is parser-checked in the tests; it has not been
+compiled against a live program here.
+
 ### BTF sanitization for older kernels (`btfsanitize.zig`)
 
 When `BPF_BTF_LOAD` rejects the object's BTF (`LoadOptions.sanitize_btf`, on by default) `load` asks the kernel which
@@ -1051,9 +1067,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
 - **kfuncs / externs / ksyms.** An `SHN_UNDEF` symbol is `error.ExternSymbolUnsupported`. Real support needs
   `BPF_PSEUDO_KFUNC_CALL` with the kfunc's BTF id resolved out of vmlinux (and out of module BTF, which the split-BTF
   parser can already read) plus an `fd_array` of module BTF fds, and, for extern variables, a synthesized `.kconfig` map.
-- **`mmap`-able global-data maps and a generated skeleton.** libbpf sets `BPF_F_MMAPABLE` on internal maps and hands
-  userspace a struct pointer into them; here they are ordinary arrays seeded through `BPF_MAP_UPDATE_ELEM`, so a caller
-  sets `const volatile` config by editing `MapSpec.initial_data` before `load`, not by writing through a mapped struct.
 - **`struct_ops` maps**: the section is classified, but populating a `struct_ops` value (function pointers resolved to
   program fds) is not implemented.
 

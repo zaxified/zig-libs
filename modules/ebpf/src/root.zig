@@ -257,6 +257,11 @@ pub const sanitizeBtf = btfsanitize.sanitize;
 pub const probeBtfFeatures = btfsanitize.probeFeatures;
 pub const BtfFeatures = btfsanitize.Features;
 
+pub const skeleton = @import("skeleton.zig");
+/// Write a Zig skeleton (typed data sections, program/map enums, a
+/// `Skeleton` wrapper) for an opened `Object`.
+pub const generateSkeleton = skeleton.generate;
+
 pub const btf = @import("btf.zig");
 /// A parsed BTF blob (kernel or program-side) — see `btf.zig`.
 pub const Btf = btf.Btf;
@@ -378,6 +383,9 @@ pub const ObjectLoadError = object.LoadError;
 pub const ObjectRelocateError = object.RelocateError;
 pub const ObjectCoreApplyError = object.CoreApplyError;
 pub const MapSpec = object.MapSpec;
+pub const MappedData = object.MappedData;
+pub const MapDataError = object.MapDataError;
+pub const DataVariable = object.Variable;
 pub const MapOrigin = object.MapOrigin;
 pub const ProgramSpec = object.ProgramSpec;
 pub const ObjectRelo = object.Relo;

@@ -399,6 +399,21 @@ pub const MapSpec = struct {
     freeze: bool = false,
     /// `-1` until `Object.load` creates it.
     fd: linux.fd_t = -1,
+    /// Set by `load` for an internal data map created with `BPF_F_MMAPABLE`
+    /// (see `Object.mapData`).
+    mmapable: bool = false,
+};
+
+/// A global variable of a `.data` / `.rodata` / `.bss` section, as the object's
+/// BTF `DATASEC` describes it.
+pub const Variable = struct {
+    name: []const u8,
+    /// Byte offset in the section's map value.
+    offset: u32,
+    size: u32,
+    /// The variable's type id in the object's BTF (the `VAR`'s own type, not
+    /// the `VAR` record).
+    type_id: u32,
 };
 
 // ── program specs ───────────────────────────────────────────────────────────
@@ -675,6 +690,60 @@ pub const Object = struct {
         self.btf_fd = -1;
     }
 
+    /// The global variables of a data section (`".rodata"`, `".data"`,
+    /// `".bss"`, or a split one like `".data.foo"`), from the BTF `DATASEC`:
+    /// name, byte offset in the map value, size and type id. Offsets and sizes
+    /// are the ELF's (`fixupDatasecs`), not clang's zeros. Empty when the
+    /// object has no BTF or no such section. The slice is arena-owned.
+    pub fn dataVariables(self: *Object, sec_name: []const u8) ParseError![]const Variable {
+        const b = &(self.btf orelse return &.{});
+        try fixupDatasecs(self);
+        const id = b.findByNameKind(sec_name, .datasec) orelse return &.{};
+        const ds = b.byId(id) catch return error.MalformedBtf;
+        const a = self.arena.allocator();
+        const out = a.alloc(Variable, ds.vlen) catch return error.OutOfMemory;
+        var n: usize = 0;
+        var i: u16 = 0;
+        while (i < ds.vlen) : (i += 1) {
+            const vsi = b.varSecInfo(ds, i) catch return error.MalformedBtf;
+            const vt = b.byId(vsi.type_id) catch return error.MalformedBtf;
+            if (vt.kind != .@"var") continue;
+            out[n] = .{
+                .name = b.typeName(vsi.type_id) orelse continue,
+                .offset = vsi.offset,
+                .size = vsi.size,
+                .type_id = vt.refType() orelse continue,
+            };
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    /// The seed contents of an internal data map, mutable, **before `load`**:
+    /// edit a `const volatile` configuration here and the program sees it
+    /// (`.rodata` is frozen after seeding). The bytes are the object's own
+    /// copy of the section, not the caller's buffer. `null` for a map that is
+    /// not an internal data map.
+    pub fn initialData(self: *Object, map_name: []const u8) ?[]u8 {
+        const m = self.findMap(map_name) orelse return null;
+        if (m.origin != .internal or m.initial_data.len == 0) return null;
+        // `initial_data` points into the arena copy of the image `open` made
+        // (see `Object.arena`): writable memory behind a const slice type.
+        return @constCast(m.initial_data);
+    }
+
+    /// Map the created internal data map `name` into this process: the live
+    /// `.data` / `.bss` of the running program, read and written without a
+    /// syscall (`.rodata` is frozen, so its mapping is read-only). Needs
+    /// `load` to have run and the map to have been created `BPF_F_MMAPABLE`.
+    pub fn mapData(self: *Object, name: []const u8) MapDataError!MappedData {
+        const m = self.findMap(name) orelse return error.NoSuchMap;
+        if (m.fd < 0) return error.NotLoaded;
+        if (!m.mmapable) return error.NotMmapable;
+        const len = std.math.mul(usize, m.value_size, m.max_entries) catch return error.NotMmapable;
+        return MappedData.map(m.fd, len, m.value_size, !m.freeze);
+    }
+
     /// `BPF_OBJ_PIN` every created map (not the internal data maps) at
     /// `<dir>/<name>`, and `unpinMaps` the reverse. `dir` is a bpffs directory.
     /// A map already pinned at its path (an explicit `pin_path`, or one that
@@ -763,6 +832,68 @@ pub const Object = struct {
         if (m.fd < 0) return null;
         defer m.fd = -1;
         return m.fd;
+    }
+};
+
+pub const MapDataError = error{
+    NoSuchMap,
+    /// `load` has not created the map yet.
+    NotLoaded,
+    /// The map was created without `BPF_F_MMAPABLE` (not an internal data
+    /// map, an older kernel, or `LoadOptions.mmap_data = false`).
+    NotMmapable,
+    PermissionDenied,
+    MmapFailed,
+    SizeMismatch,
+    Unexpected,
+};
+
+/// An internal data map mapped into this process. `deinit` unmaps; the
+/// pointers it hands out are invalid afterwards.
+pub const MappedData = struct {
+    /// The whole mapping (page-rounded).
+    mapping: []align(std.heap.page_size_min) u8,
+    /// The map value's length: the part of `mapping` that holds data.
+    len: usize,
+    writable: bool,
+
+    fn map(fd: linux.fd_t, map_bytes: usize, value_len: usize, writable: bool) MapDataError!MappedData {
+        const page = std.heap.pageSize();
+        const total = std.mem.alignForward(usize, @max(map_bytes, 1), page);
+        const prot: linux.PROT = if (writable) .{ .READ = true, .WRITE = true } else .{ .READ = true };
+        const rc = linux.mmap(null, total, prot, .{ .TYPE = .SHARED }, fd, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .ACCES, .PERM => return error.PermissionDenied,
+            .INVAL, .NODEV, .NOMEM, .AGAIN => return error.MmapFailed,
+            else => return error.Unexpected,
+        }
+        const ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(rc);
+        return .{ .mapping = ptr[0..total], .len = value_len, .writable = writable };
+    }
+
+    pub fn deinit(self: *MappedData) void {
+        _ = linux.munmap(self.mapping.ptr, self.mapping.len);
+        self.* = undefined;
+    }
+
+    /// The map value's bytes.
+    pub fn bytes(self: MappedData) []u8 {
+        return self.mapping[0..self.len];
+    }
+
+    /// The value as a `T` (an `extern struct` mirroring the section: the
+    /// variables in offset order). `T` may be smaller than the value, never
+    /// larger.
+    pub fn view(self: MappedData, comptime T: type) MapDataError!*T {
+        if (@sizeOf(T) > self.len) return error.SizeMismatch;
+        return @ptrCast(@alignCast(self.mapping.ptr));
+    }
+
+    /// One variable's bytes.
+    pub fn variable(self: MappedData, v: Variable) MapDataError![]u8 {
+        if (v.offset > self.len or v.size > self.len - v.offset) return error.SizeMismatch;
+        return self.mapping[v.offset..][0..v.size];
     }
 };
 
@@ -1885,6 +2016,11 @@ pub const LoadOptions = struct {
     /// `DATASEC`...), as libbpf does. Off: a rejected BTF is
     /// `error.BtfLoadFailed` (and `load_btf = false` the escape hatch).
     sanitize_btf: bool = true,
+    /// Create the internal data maps (`.data`, `.bss`, `.rodata`) with
+    /// `BPF_F_MMAPABLE`, so `Object.mapData` can map them (libbpf does). A
+    /// kernel older than 5.5 refuses the flag; `load` then retries without it
+    /// and `MapSpec.mmapable` stays false.
+    mmap_data: bool = true,
     /// Where `pinning = LIBBPF_PIN_BY_NAME` maps live: `<pin_root>/<map name>`.
     /// The directory must exist on a bpffs.
     pin_root: []const u8 = "/sys/fs/bpf",
@@ -1948,7 +2084,15 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
                 else => return error.PinFailed,
             }
         }
-        m.fd = try createMapWithInner(m);
+        if (m.origin == .internal and opts.mmap_data) {
+            if (createMap(m, 0, BPF_F_MMAPABLE)) |fd| {
+                m.fd = fd;
+                m.mmapable = true;
+            } else |e| {
+                if (e != error.InvalidArgument) return e;
+                m.fd = try createMap(m, 0, 0);
+            }
+        } else m.fd = try createMapWithInner(m);
         if (pin) |path| bpfsys.objPin(m.fd, path) catch return error.PinFailed;
         if (m.origin == .internal) {
             var key: [4]u8 = @splat(0);
@@ -2041,12 +2185,12 @@ fn createMapWithInner(m: *const MapSpec) LoadError!linux.fd_t {
         .array_of_maps, .hash_of_maps => true,
         else => false,
     };
-    if (!outer) return createMap(m, 0);
+    if (!outer) return createMap(m, 0, 0);
     const inner = m.inner orelse return error.InvalidArgument;
     if (inner.max_entries == 0 and needsEntries(inner.map_type)) return error.ZeroMaxEntries;
-    const tmpl = try createMap(inner, 0);
+    const tmpl = try createMap(inner, 0, 0);
     defer _ = linux.close(tmpl);
-    return createMap(m, tmpl);
+    return createMap(m, tmpl, 0);
 }
 
 /// Fill the pre-initialized slots of every map-in-map and `PROG_ARRAY`
@@ -2070,13 +2214,13 @@ fn fillInitSlots(obj: *Object) LoadError!void {
     }
 }
 
-fn createMap(m: *const MapSpec, inner_fd: linux.fd_t) LoadError!linux.fd_t {
+fn createMap(m: *const MapSpec, inner_fd: linux.fd_t, extra_flags: u32) LoadError!linux.fd_t {
     var attr: BPF.MapCreateAttr = std.mem.zeroes(BPF.MapCreateAttr);
     attr.map_type = @backingInt(m.map_type);
     attr.key_size = m.key_size;
     attr.value_size = m.value_size;
     attr.max_entries = m.max_entries;
-    attr.map_flags = m.map_flags;
+    attr.map_flags = m.map_flags | extra_flags;
     attr.inner_map_fd = inner_fd;
     if (m.numa_node) |n| {
         attr.numa_node = n;
@@ -5036,4 +5180,61 @@ test "map-in-map and prog_array: inner definitions and initial slots come out of
     try testing.expectEqual(@as(usize, 1), jumps.init_slots.len);
     try testing.expectEqual(@as(u32, 1), jumps.init_slots[0].index);
     try testing.expectEqualStrings("target", o.programs[jumps.init_slots[0].target.program].name);
+}
+
+test "dataVariables: the DATASEC's variables, with the ELF's offsets, and a writable seed" {
+    const gpa = testing.allocator;
+    var obj = try open(gpa, fx_rodata_const, .{});
+    defer obj.deinit();
+    const vars = try obj.dataVariables(".rodata");
+    try testing.expectEqual(@as(usize, 2), vars.len);
+    try testing.expectEqualStrings("threshold", vars[0].name);
+    try testing.expectEqual(@as(u32, 0), vars[0].offset);
+    try testing.expectEqual(@as(u32, 4), vars[0].size);
+    try testing.expectEqualStrings("tag", vars[1].name);
+    try testing.expectEqual(@as(u32, 8), vars[1].offset);
+    try testing.expectEqual(@as(u32, 8), vars[1].size);
+    // the type id is the variable's type (a volatile-qualified int), resolvable
+    try testing.expectEqual(@as(u64, 4), try obj.btf.?.sizeOf(vars[0].type_id));
+    try testing.expectEqual(@as(usize, 0), (try obj.dataVariables(".data")).len);
+
+    // editing the seed is how a `const volatile` is configured before load
+    const seed = obj.initialData(".rodata").?;
+    std.mem.writeInt(u32, seed[vars[0].offset..][0..4], 99, .little);
+    try testing.expectEqual(@as(u32, 99), std.mem.readInt(u32, obj.findMap(".rodata").?.initial_data[0..4], .little));
+    try testing.expectEqual(@as(?[]u8, null), obj.initialData("nope"));
+    // a map that is not an internal data map has no seed
+    var o2 = try open(gpa, fx_ringbuf_map, .{});
+    defer o2.deinit();
+    try testing.expectEqual(@as(?[]u8, null), o2.initialData(o2.maps[0].name));
+}
+
+test "mapData: refuses before load and on a map not created mmapable; the view helpers" {
+    const gpa = testing.allocator;
+    var obj = try open(gpa, fx_rodata_const, .{});
+    defer obj.deinit();
+    try testing.expectError(error.NoSuchMap, obj.mapData("nope"));
+    try testing.expectError(error.NotLoaded, obj.mapData(".rodata"));
+    obj.maps[0].fd = 5;
+    try testing.expectError(error.NotMmapable, obj.mapData(".rodata"));
+    obj.maps[0].fd = -1;
+
+    // the MappedData helpers over an anonymous mapping (no BPF needed)
+    const page = std.heap.pageSize();
+    const rc = linux.mmap(null, page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(rc);
+    var md: MappedData = .{ .mapping = ptr[0..page], .len = 16, .writable = true };
+    defer md.deinit();
+    const Cfg = extern struct { threshold: u32, _pad: u32, tag: u64 };
+    const c = try md.view(Cfg);
+    c.threshold = 7;
+    c.tag = 0x1122;
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, md.bytes()[0..4], .little));
+    const v = try md.variable(.{ .name = "tag", .offset = 8, .size = 8, .type_id = 1 });
+    try testing.expectEqual(@as(u64, 0x1122), std.mem.readInt(u64, v[0..8], .little));
+    try testing.expectError(error.SizeMismatch, md.variable(.{ .name = "x", .offset = 12, .size = 8, .type_id = 1 }));
+    try testing.expectError(error.SizeMismatch, md.variable(.{ .name = "x", .offset = 17, .size = 0, .type_id = 1 }));
+    const Big = extern struct { a: [3]u64 };
+    try testing.expectError(error.SizeMismatch, md.view(Big));
 }
