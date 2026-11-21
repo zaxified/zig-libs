@@ -276,6 +276,7 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
 fn tryOperate(h: *Host, operation: Io.Operation) ?Io.Operation.Result {
     return switch (operation) {
         .net_receive => |op| if (h.sim.net.tryReceive(h, op)) |r| .{ .net_receive = r } else null,
+        .net_read => |op| if (h.sim.net.tryRead(h, op.socket_handle, op.data)) |r| .{ .net_read = if (r) |k| .{ .data_len = k } else |e| e } else null,
         .file_read_streaming => |op| .{ .file_read_streaming = h.fs.readStreaming(op.file, op.data) },
         .file_write_streaming => |op| .{ .file_write_streaming = h.fs.writeStreaming(op.file, op.header, op.data, op.splat) },
         else => Io.failing.vtable.operate(null, operation) catch unreachable, // `failing` never cancels

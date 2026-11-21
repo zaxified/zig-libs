@@ -1035,3 +1035,52 @@ test "a SYN delayed past its retry does not open a second, ghost connection" {
     _ = sim.runFor(10 * std.time.ns_per_s);
     try testing.expectEqual(@as(u32, 1), accepted);
 }
+
+fn lateWriter(io: Io, port: u16) !void {
+    var server = try net.IpAddress.listen(&.{ .ip4 = .unspecified(port) }, io, .{});
+    defer server.deinit(io);
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    try io.sleep(.fromMilliseconds(300), .awake);
+    var wbuf: [8]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("hi");
+    try w.interface.flush();
+    try io.sleep(.fromMilliseconds(100), .awake);
+}
+
+const TimedRead = struct { first: ?anyerror = null, got: usize = 0, eof: bool = false, at_ns: i96 = 0 };
+
+fn timedReader(io: Io, server: net.IpAddress, out: *TimedRead) !void {
+    const stream = try server.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var buf: [8]u8 = undefined;
+    const t0 = Io.Timestamp.now(io, .awake);
+    var data: [1][]u8 = .{&buf};
+    const op: Io.Operation = .{ .net_read = .{ .socket_handle = stream.socket.handle, .data = &data } };
+    const short: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } };
+    const long: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } };
+    if (io.operateTimeout(op, short)) |_| {} else |err| out.first = err;
+    out.at_ns = Io.Timestamp.now(io, .awake).nanoseconds - t0.nanoseconds;
+    const r = try (try io.operateTimeout(op, long)).net_read;
+    out.got = r.data_len;
+    const e = try (try io.operateTimeout(op, long)).net_read;
+    out.eof = e.data_len == 0;
+}
+
+test "a stream read in a batch times out, then completes when data or the close arrives" {
+    var sim: Sim = undefined;
+    newSim(&sim, 61);
+    defer sim.deinit();
+    const a = try sim.addHost(.{});
+    const b = try sim.addHost(.{});
+    try sim.link(a, b, .{});
+    try b.spawn(lateWriter, .{ b.io(), 9 });
+    var out: TimedRead = .{};
+    try a.spawn(timedReader, .{ a.io(), addr4(b, 9), &out });
+    _ = sim.run();
+    try testing.expectEqual(@as(?anyerror, error.Timeout), out.first);
+    try testing.expect(out.at_ns >= 100 * ns_per_ms and out.at_ns < 150 * ns_per_ms);
+    try testing.expectEqual(@as(usize, 2), out.got);
+    try testing.expect(out.eof);
+}

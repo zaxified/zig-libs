@@ -1052,41 +1052,49 @@ pub const Net = struct {
         }
     }
 
+    /// One stream read that does not block: the bytes or error a `read` would
+    /// return now, null when it would have to wait for the peer.
+    pub fn tryRead(n: *Net, h: *Host, handle: Handle, data: [][]u8) ?(Io.Operation.NetRead.Error!usize) {
+        const s = h.handles.get(handle) orelse return error.SocketUnconnected;
+        if (s.kind != .stream) return error.SocketUnconnected;
+        const avail = s.buffered();
+        // Bytes already received come first; the error after them, as
+        // Linux reports a pending socket error only once the queue is read.
+        if (s.err) |e| if (avail == 0 or s.rx_shut) return switch (e) {
+            .reset, .refused => error.ConnectionResetByPeer,
+            .timeout => error.ConnectionTimedOut,
+        };
+        if (avail > 0 and !s.rx_shut) {
+            var cap: usize = 0;
+            for (data) |d| cap += d.len;
+            var want = @min(avail, cap);
+            if (want > 1 and n.prng.permille(n.sim.opts.net.short_read_permille)) want = 1 + n.prng.below(want);
+            var copied: usize = 0;
+            for (data) |d| {
+                if (copied == want) break;
+                const k = @min(d.len, want - copied);
+                @memcpy(d[0..k], s.rx.items[s.rx_head + copied ..][0..k]);
+                copied += k;
+            }
+            s.rx_head += copied;
+            if (s.rx_head == s.rx.items.len) {
+                s.rx.clearRetainingCapacity();
+                s.rx_head = 0;
+            }
+            if (s.tx) |p| n.pushSeg(p, .{ .at = 0, .kind = .window, .n = copied }) catch {};
+            return copied;
+        }
+        if (s.rx_fin or s.rx_shut) return 0;
+        if (s.state != .established) return error.SocketUnconnected;
+        return null;
+    }
+
     pub fn read(n: *Net, h: *Host, handle: Handle, data: [][]u8) net.Stream.Reader.Error!usize {
         const me = n.sim.running();
         try n.sim.cancelPoint(me);
         while (true) {
-            const s = h.handles.get(handle) orelse return error.SocketUnconnected;
-            if (s.kind != .stream) return error.SocketUnconnected;
-            const avail = s.buffered();
-            // Bytes already received come first; the error after them, as
-            // Linux reports a pending socket error only once the queue is read.
-            if (s.err) |e| if (avail == 0 or s.rx_shut) return switch (e) {
-                .reset, .refused => error.ConnectionResetByPeer,
-                .timeout => error.ConnectionTimedOut,
-            };
-            if (avail > 0 and !s.rx_shut) {
-                var cap: usize = 0;
-                for (data) |d| cap += d.len;
-                var want = @min(avail, cap);
-                if (want > 1 and n.prng.permille(n.sim.opts.net.short_read_permille)) want = 1 + n.prng.below(want);
-                var copied: usize = 0;
-                for (data) |d| {
-                    if (copied == want) break;
-                    const k = @min(d.len, want - copied);
-                    @memcpy(d[0..k], s.rx.items[s.rx_head + copied ..][0..k]);
-                    copied += k;
-                }
-                s.rx_head += copied;
-                if (s.rx_head == s.rx.items.len) {
-                    s.rx.clearRetainingCapacity();
-                    s.rx_head = 0;
-                }
-                if (s.tx) |p| n.pushSeg(p, .{ .at = 0, .kind = .window, .n = copied }) catch {};
-                return copied;
-            }
-            if (s.rx_fin or s.rx_shut) return 0;
-            if (s.state != .established) return error.SocketUnconnected;
+            if (n.tryRead(h, handle, data)) |r| return r;
+            const s = h.handles.get(handle).?; // tryRead found it
             switch (n.waitOn(me, s, null) catch return error.SystemResources) {
                 .canceled => {
                     me.acknowledgeCancel();
@@ -1292,6 +1300,9 @@ pub const Net = struct {
                 // Once per socket, however many operations name it: a wake
                 // takes one registration off.
                 .net_receive => |op| if (h.handles.get(op.socket_handle)) |s| {
+                    if (std.mem.findScalar(*Fiber, s.waiters.items, me) == null) try s.waiters.append(n.sim.gpa, me);
+                },
+                .net_read => |op| if (h.handles.get(op.socket_handle)) |s| {
                     if (std.mem.findScalar(*Fiber, s.waiters.items, me) == null) try s.waiters.append(n.sim.gpa, me);
                 },
                 else => {},
