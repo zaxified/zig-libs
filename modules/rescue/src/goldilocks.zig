@@ -30,6 +30,20 @@ pub const EPSILON: u64 = 0xFFFF_FFFF;
 /// A field element in canonical form; the integer is always `< P`.
 pub const Fe = u64;
 
+/// Launder a 0/1 flag through an empty inline asm so LLVM cannot recover that
+/// it is 0 or 1 and turn the `0 -% flag` mask back into a branch. Measured
+/// with ctgrind (`ctgrind_harness.zig`): without it `sboxInvLayer` and
+/// `permute` compiled `reduce128`/`condSub` to conditional jumps on the
+/// element, the same trap `k256` and `montint` hit. A no-op at comptime (the
+/// MDS inverse is derived there, where inline asm cannot run).
+inline fn blackBox(x: u64) u64 {
+    if (@inComptime()) return x;
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
+}
+
 /// Reduce an arbitrary `u64` into the field. Public inputs only — this is the
 /// "I have a number, make it an element" door.
 pub inline fn fromU64(x: u64) Fe {
@@ -41,21 +55,21 @@ pub inline fn fromU64(x: u64) Fe {
 /// always suffices for any `u64`).
 inline fn condSub(x: u64) Fe {
     // `x >= P` compiles to cmp+setae on x86-64: a flag, not a branch.
-    const mask: u64 = 0 -% @as(u64, @intFromBool(x >= P));
+    const mask: u64 = 0 -% blackBox(@intFromBool(x >= P));
     return x -% (P & mask);
 }
 
 pub inline fn add(a: Fe, b: Fe) Fe {
     const sum = a +% b;
     // A carry means the true sum is 2^64 + sum; fold 2^64 -> EPSILON.
-    const carry: u64 = 0 -% @as(u64, @intFromBool(sum < a));
+    const carry: u64 = 0 -% blackBox(@intFromBool(sum < a));
     return condSub(sum +% (carry & EPSILON));
 }
 
 pub inline fn sub(a: Fe, b: Fe) Fe {
     const diff = a -% b;
     // A borrow means the value is a - b + 2^64; unfold 2^64 -> P + EPSILON.
-    const borrow: u64 = 0 -% @as(u64, @intFromBool(a < b));
+    const borrow: u64 = 0 -% blackBox(@intFromBool(a < b));
     return diff -% (borrow & EPSILON);
 }
 
@@ -73,14 +87,14 @@ pub inline fn reduce128(x: u128) Fe {
     const h0 = hi & EPSILON; // contributes +h0 * EPSILON
 
     const d = lo -% h1;
-    const borrow: u64 = 0 -% @as(u64, @intFromBool(lo < h1));
+    const borrow: u64 = 0 -% blackBox(@intFromBool(lo < h1));
     const t0 = d -% (borrow & EPSILON);
     // h0 < 2^32 and EPSILON < 2^32, so this product never wraps; it is also
     // (h0 << 32) - h0, which is what the compiler emits.
     const t1 = h0 *% EPSILON;
 
     const sum = t0 +% t1;
-    const carry: u64 = 0 -% @as(u64, @intFromBool(sum < t0));
+    const carry: u64 = 0 -% blackBox(@intFromBool(sum < t0));
     return condSub(sum +% (carry & EPSILON));
 }
 

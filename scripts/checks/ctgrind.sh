@@ -251,6 +251,10 @@ declare -A TARGETS=(
     [sealedbox]="hexenc hexdec b64enc b64dec seal open"
     [cookies]="derive sign verify verify2 seal open tsign tverify tseal topen"
     [aaa-gate]="bearer api_key basic"
+    # rescue (2026-11-21): the field and the permutation take no branch and no
+    # index on a value; the harness taints the sponge state, the elements to
+    # hash and the two digests of a Merkle node.
+    [rescue]="permute hash merge sbox sboxinv"
     # pir: the module's central claim was never machine-checked, and
     # its sibling `fss` exposed a real defect the day IT entered the gate.
     [pir]="query reconstruct"
@@ -400,6 +404,7 @@ declare -A MODES=(
     [dkg]="ReleaseFast"
     [sealedbox]="ReleaseFast"
     [cookies]="ReleaseFast"
+    [rescue]="ReleaseFast"
     [aaa-gate]="ReleaseFast"
     [pir]="ReleaseFast"
     [opaque]="ReleaseFast"
@@ -713,6 +718,11 @@ declare -A PATTERN=(
     [aaa-gate/bearer]='root[.]zig:[1-9]|timing_safe[.]zig|sha2[.]zig'
     [aaa-gate/api_key]='root[.]zig:[1-9]|timing_safe[.]zig|sha2[.]zig'
     [aaa-gate/basic]='root[.]zig:[1-9]|timing_safe[.]zig|sha2[.]zig'
+    [rescue/permute]='goldilocks[.]zig|perm[.]zig|rpo[.]zig'
+    [rescue/hash]='goldilocks[.]zig|perm[.]zig|rpo[.]zig'
+    [rescue/merge]='goldilocks[.]zig|perm[.]zig|rpo[.]zig'
+    [rescue/sbox]='goldilocks[.]zig|perm[.]zig|rpo[.]zig'
+    [rescue/sboxinv]='goldilocks[.]zig|perm[.]zig|rpo[.]zig'
     [cookies/derive]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/sign]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/verify]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
@@ -1142,6 +1152,11 @@ declare -A LABEL=(
     [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 (CT via b64ct; verdict declassified)'
     [sealedbox/seal]='sealedbox XSalsa20-Poly1305 encrypt (CT, multi-block)'
     [sealedbox/open]='sealedbox XSalsa20-Poly1305 decrypt (CT; 1 = accept/reject)'
+    [rescue/permute]='rescue Rpo256.permute on a tainted state (CT)'
+    [rescue/hash]='rescue Rpo256.hashElements, tainted elements (CT)'
+    [rescue/merge]='rescue Rpo256.merge, tainted digests (CT)'
+    [rescue/sbox]='rescue goldilocks.sboxLayer (x^7, CT)'
+    [rescue/sboxinv]='rescue goldilocks.sboxInvLayer (x^(1/7), fixed addition chain, CT)'
     [cookies/derive]='cookies Key.deriveInto HKDF-SHA256 (CT)'
     [cookies/sign]='cookies signed.sign HMAC-SHA256 (CT)'
     [cookies/verify]='cookies signed.verify (CT; 1 = accept/reject)'

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Constant time, measured and fixed:** `ctgrind_harness.zig` (valgrind memcheck, secret state tainted) found that LLVM turned the masked selects of `goldilocks.condSub`/`add`/`sub`/`reduce128` back into conditional jumps on the element (147-168 contexts in `permute`, `hash` and `merge`, 21 in the inverse S-box layer). The 0/1 flags now pass through an empty inline-asm barrier; every target measures 0 in-file contexts. Values unchanged; the barrier costs a little speed (not measured: the card has no performance line).
+
 - **2026-10-10** — tests: deterministic fuzz driver `RESCUE_FUZZ` over the five existing harnesses (`rescue-injective`, `rescue-roundtrip`, `rescue-field`, `rescue-framings`, `rescue-xlix`), now generic over their choice source; under the driver a share of the field-element draws sits on the edges (modulus neighbours, zero, small, top of the u64 range) and the reach labels count them. No change in `src/` outside tests (no parser: every input is already a field element).
 - **2026-09-08** — `fuzzInjective` now carries a corpus, and a guard test pins
   what it reaches. It had none, so `std.testing.fuzz` replayed exactly one

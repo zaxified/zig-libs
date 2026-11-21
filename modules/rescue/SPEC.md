@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-06 · mutation 2026-11-20 (141/142, 1 eq) · src 945553a34e817335
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RESCUE_FUZZ) · ct n/a — public-input hash (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RESCUE_FUZZ) · ct 2026-11-21 (ctgrind: Rpo256 permute/hash/merge and both S-box layers, state tainted, 0 in-file contexts after the flag barrier; found 147-168 before it)
 
 **Performance:** not measured
 
@@ -233,10 +233,15 @@ the property is worth having rather than disclaiming: Merkle *membership*
 proofs where the leaf and path are secret; commitments to witness values; and
 Fiat-Shamir transcripts absorbing secret intermediates.
 
-**Caveat, stated rather than left open:** unlike `k256` and `montint`, this
-module has **not** been CT-verified in a full disassembly sweep. The claim
-rests on the source shape, a spot check of `mul`, and the absence of any
-data-dependent branch or table index in the sources.
+**Verified, not just argued** (`ctgrind_harness.zig`, `scripts/checks/ctgrind.sh rescue`, valgrind
+memcheck on ReleaseFast with the secret state, elements or digests tainted): zero contexts in
+`goldilocks.zig`, `perm.zig` and `rpo.zig` for `permute`, `hash`, `merge` and both S-box layers. The
+measurement earned its keep: LLVM recovers that the 0/1 flags behind `condSub`, `add`, `sub` and
+`reduce128`'s fold masks are 0 or 1 and lowers `0 - flag` back into a conditional jump, so before 2026-11-21
+`permute`, `hash` and `merge` had 147-168 secret-dependent branches and the inverse S-box layer 21, whatever
+the source said (the same trap `k256` and `montint` hit). The flags now go through an empty inline-asm
+barrier (`blackBox`, a no-op at comptime). Not covered: other targets than x86-64 (the harness is x86-64
+memcheck; the barrier is architecture-neutral), and optimise modes other than ReleaseFast.
 
 ## Performance notes
 
@@ -332,9 +337,8 @@ Test classes:
   turns `lo < h1` into `lo <= h1` in `reduce128`: at `lo == h1` the borrow fold yields `p` instead of `0`, which is
   the same residue, and the final conditional subtraction canonicalises it. Not mutated: `params.zig` and the
   constants tables (comptime-evaluated, pinned by `constants_test.zig` against the deployed tables), the
-  `@setEvalBranchQuota`/comptime `inv_mds` derivation, and constant-time-only differences (the module's CT claim is
-  by construction, see *Constant time*).
-- No CT disassembly sweep: see *Constant time*.
+  `@setEvalBranchQuota`/comptime `inv_mds` derivation, and constant-time-only differences (the barrier flags are
+  covered by ctgrind, see *Constant time*, not by a value test).
 
 ## Backlog / deferred
 
@@ -346,8 +350,6 @@ Test classes:
   over the same Goldilocks field plus its own vectors; miden-crypto is
   Apache-2.0, so its tests are not readable under the survey playbook's MIT
   rule and the RPX specification must come from its paper.
-- **A CT disassembly sweep**, to bring this module up to `k256`/`montint`'s
-  standard of evidence rather than argument.
 - **SIMD S-box layers**, if Rescue ever lands on a hot path here.
 
 ## Anchoring

@@ -2527,3 +2527,13 @@ threshold_ecdsa	ReleaseFast	share	1	<=508	685d9bbe92a6a6f3	3ac5880d3dc76e1e	cpu=
 threshold_ecdsa	ReleaseFast	nonce	1	<=880	685d9bbe92a6a6f3	3ac5880d3dc76e1e	cpu=x86_64 
 threshold_ecdsa	ReleaseFast	betaprime	1	<=568	685d9bbe92a6a6f3	3ac5880d3dc76e1e	cpu=x86_64 
 threshold_ecdsa	ReleaseFast	auxgen	1	88	e5a92d30db22a584	9577aa06dd1bf0e4	cpu=x86_64
+# ── rescue (2026-11-21): the Goldilocks field and the RPO permutation. ─────
+# Exact 0 in-file on every target. Before `blackBox` on the 0/1 flags of
+# goldilocks.zig (the k256/montint trap) `permute`, `hash` and `merge` had 147-168
+# contexts (`reduce128`, `condSub`) and `sboxinv` 21: LLVM turned the masks back into
+# jumps on the element. Every target prints its tainted result as the witness.
+rescue	ReleaseFast	permute	1	0	84392a52cb56cee6	8cf1a644c8fe0d12
+rescue	ReleaseFast	hash	1	0	84392a52cb56cee6	2b9038eb8f346a3a
+rescue	ReleaseFast	merge	1	0	84392a52cb56cee6	570fdc96c61a36e0
+rescue	ReleaseFast	sbox	1	0	84392a52cb56cee6	1c692cc2fb039562
+rescue	ReleaseFast	sboxinv	1	0	84392a52cb56cee6	1b4260a7113d9ce0
