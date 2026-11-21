@@ -33,6 +33,11 @@
 //!   matches. It returns a structured `Verdict` (good / revoked{time,reason} /
 //!   unknown, responder identity, validity window) or a typed failure.
 //!
+//! - `parseRequest` / `createResponse` / `errorResponse` — the responder side
+//!   (a private CA's OCSP responder): decode an `OCSPRequest`, build and sign a
+//!   successful `OCSPResponse` (RSA, ECDSA P-256/P-384, Ed25519) for the
+//!   certificates it names, or the fixed error response.
+//!
 //! ## Defensive DER posture
 //!
 //! A stapled OCSP response is fully attacker-influenceable (a MITM supplies it
@@ -583,6 +588,352 @@ fn buildRequestImpl(
     const tbs_request = try b.seq(tbs_parts[0..n]);
     const ocsp_request = try b.seq(&.{tbs_request});
     return gpa.dupe(u8, ocsp_request);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Request parsing (responder side)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A decoded `OCSPRequest` (RFC 6960 §4.1.1), views into the caller's buffer.
+/// The optional signature and `requestorName` are skipped (as Go's
+/// `ocsp.ParseRequest` does; OpenSSL's responder only checks them when
+/// configured to). Per-`Request` extensions are skipped too.
+pub const Request = struct {
+    /// Content of the `requestList` SEQUENCE OF `Request`.
+    requests: []const u8,
+    /// Buffer `requests` indexes into (the whole `OCSPRequest`).
+    source: []const u8,
+    /// The request's `id-pkix-ocsp-nonce` value, if present; echo it into
+    /// `ResponseOptions.nonce`.
+    nonce: ?[]const u8,
+
+    /// The `CertID`s in request order.
+    pub fn iterator(self: Request) CertIdIterator {
+        return .{
+            .source = self.source,
+            .pos = @intCast(@intFromPtr(self.requests.ptr) - @intFromPtr(self.source.ptr)),
+            .end = @intCast(@intFromPtr(self.requests.ptr) - @intFromPtr(self.source.ptr) + self.requests.len),
+        };
+    }
+};
+
+/// One `CertID` of a request: which certificate (of which issuer) is asked
+/// about. All slices are views into the request buffer.
+pub const CertId = struct {
+    /// `hashAlgorithm` OID content octets.
+    hash_oid: []const u8,
+    issuer_name_hash: []const u8,
+    issuer_key_hash: []const u8,
+    /// `serialNumber` INTEGER content octets (two's complement, as in the certificate).
+    serial: []const u8,
+
+    /// True when the hashes are those of `issuer_cert_der` under this CertID's
+    /// hash algorithm (SHA-1/256/384/512); false for another issuer, an
+    /// unknown hash algorithm or an unparsable issuer.
+    pub fn namesIssuer(self: CertId, issuer_cert_der: []const u8) bool {
+        const algo = hashAlgoFromOid(self.hash_oid) orelse return false;
+        const issuer = parseCert(issuer_cert_der) catch return false;
+        var nb: [64]u8 = undefined;
+        var kb: [64]u8 = undefined;
+        return std.mem.eql(u8, self.issuer_name_hash, digest(algo, issuer.subject_name, &nb)) and
+            std.mem.eql(u8, self.issuer_key_hash, digest(algo, issuer.pub_key_bits, &kb));
+    }
+};
+
+pub const CertIdIterator = struct {
+    source: []const u8,
+    pos: u32,
+    end: u32,
+
+    /// The next `CertID`, null after the last; `error.Malformed` on a bad encoding.
+    pub fn next(self: *CertIdIterator) ParseError!?CertId {
+        if (self.pos >= self.end) return null;
+        const bytes = self.source;
+        const req = try el(bytes, self.pos);
+        try wantTag(req, TAG_SEQUENCE);
+        self.pos = req.slice.end;
+        if (req.slice.end > self.end) return error.Malformed;
+        const cert_id = try el(bytes, req.slice.start);
+        try wantTag(cert_id, TAG_SEQUENCE);
+        const alg_seq = try el(bytes, cert_id.slice.start);
+        try wantTag(alg_seq, TAG_SEQUENCE);
+        const alg_oid = try el(bytes, alg_seq.slice.start);
+        try wantTag(alg_oid, TAG_OID);
+        try checkAlgParams(bytes, alg_seq, alg_oid);
+        const name_hash = try el(bytes, alg_seq.slice.end);
+        try wantTag(name_hash, TAG_OCTETSTRING);
+        const key_hash = try el(bytes, name_hash.slice.end);
+        try wantTag(key_hash, TAG_OCTETSTRING);
+        const serial = try el(bytes, key_hash.slice.end);
+        try wantTag(serial, TAG_INTEGER);
+        try closes(serial.slice.end, cert_id.slice.end);
+        // singleRequestExtensions [0] EXPLICIT, optional: nothing else may follow the CertID.
+        if (cert_id.slice.end < req.slice.end) {
+            const sx = try el(bytes, cert_id.slice.end);
+            try wantTag(sx, 0xa0);
+            try closes(sx.slice.end, req.slice.end);
+        }
+        return .{
+            .hash_oid = contentOf(bytes, alg_oid),
+            .issuer_name_hash = contentOf(bytes, name_hash),
+            .issuer_key_hash = contentOf(bytes, key_hash),
+            .serial = contentOf(bytes, serial),
+        };
+    }
+};
+
+/// Bounds-checked, allocation-free decode of an `OCSPRequest` (a responder's
+/// input; Go's `ParseRequest`, OpenSSL's `d2i_OCSP_REQUEST`). Rejects trailing
+/// garbage, an empty `requestList` and every non-DER encoding the response
+/// parser rejects; the request's `CertID`s are decoded on iteration.
+pub fn parseRequest(bytes: []const u8) ParseError!Request {
+    const outer = try el(bytes, 0);
+    try wantTag(outer, TAG_SEQUENCE);
+    if (outer.slice.end != bytes.len) return error.Malformed;
+    const tbs = try el(bytes, outer.slice.start);
+    try wantTag(tbs, TAG_SEQUENCE);
+    // optionalSignature [0] EXPLICIT, the only thing after tbsRequest.
+    if (tbs.slice.end < outer.slice.end) {
+        const sig = try el(bytes, tbs.slice.end);
+        try wantTag(sig, 0xa0);
+        try closes(sig.slice.end, outer.slice.end);
+    }
+    var pos = tbs.slice.start;
+    var e = try el(bytes, pos);
+    if (rawTag(e) == 0xa0) { // version [0] EXPLICIT INTEGER DEFAULT v1
+        const v = try el(bytes, e.slice.start);
+        try wantTag(v, TAG_INTEGER);
+        try closes(v.slice.end, e.slice.end);
+        pos = e.slice.end;
+        e = try el(bytes, pos);
+    }
+    if (rawTag(e) == 0xa1) { // requestorName [1] EXPLICIT GeneralName
+        pos = e.slice.end;
+        e = try el(bytes, pos);
+    }
+    try wantTag(e, TAG_SEQUENCE); // requestList
+    if (e.slice.start == e.slice.end) return error.Malformed;
+    var nonce: ?[]const u8 = null;
+    if (e.slice.end < tbs.slice.end) {
+        const rx = try el(bytes, e.slice.end);
+        try wantTag(rx, 0xa2); // requestExtensions [2] EXPLICIT
+        try closes(rx.slice.end, tbs.slice.end);
+        const exts_seq = try el(bytes, rx.slice.start);
+        try wantTag(exts_seq, TAG_SEQUENCE);
+        try closes(exts_seq.slice.end, rx.slice.end);
+        nonce = try findNonce(bytes, exts_seq);
+    }
+    const req: Request = .{ .requests = contentOf(bytes, e), .source = bytes, .nonce = nonce };
+    // Validate every CertID up front, so a caller's iteration cannot meet a malformed one half-way.
+    var it = req.iterator();
+    while (try it.next()) |_| {}
+    return req;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Response creation (responder side)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The key a response is signed with; the signature algorithm follows from it
+/// (RFC 6960 §4.2.1 / RFC 5758 / RFC 8410): RSA PKCS#1 v1.5 with `hash`,
+/// ECDSA P-256 with SHA-256 (RFC 6979 deterministic), ECDSA P-384 with SHA-384, Ed25519.
+pub const SigningKey = union(enum) {
+    rsa: struct {
+        key: *const rsa.SecretKey,
+        hash: enum { sha256, sha384, sha512 } = .sha256,
+    },
+    /// The 32-byte P-256 private scalar.
+    ecdsa_p256: *const [32]u8,
+    ecdsa_p384: *const std.crypto.sign.ecdsa.EcdsaP384Sha384.KeyPair,
+    ed25519: *const std.crypto.sign.Ed25519.KeyPair,
+};
+
+/// One `SingleResponse` to create: the status of one certificate.
+pub const ResponseEntry = struct {
+    /// Certificate of the issuing CA (DER); its subject name and public key
+    /// give the `CertID` hashes.
+    issuer_cert_der: []const u8,
+    /// Serial number of the certificate: INTEGER content octets, as
+    /// `CertId.serial` carries them.
+    serial: []const u8,
+    status: CertStatus,
+    this_update_unix: i64,
+    /// Absent: "newer information is available at any time" (RFC 6960 §2.4).
+    next_update_unix: ?i64 = null,
+    /// `CertID` hash algorithm; answer with what the request asked for (Go and
+    /// OpenSSL echo the request's; default SHA-1, the classic profile).
+    hash: RequestHashAlgo = .sha1,
+};
+
+pub const ResponderIdKind = enum { by_name, by_key };
+
+pub const ResponseOptions = struct {
+    /// The responder's certificate (DER): the issuing CA's own, or a delegate
+    /// carrying id-kp-OCSPSigning. Its subject name or key hash is the
+    /// `ResponderID`; its key must be the `SigningKey`'s.
+    responder_cert_der: []const u8,
+    /// OpenSSL's default is the name (`OCSP_RESPID_KEY` selects the key hash);
+    /// Go's `CreateResponse` uses the key hash. Both are verified alike.
+    responder_id: ResponderIdKind = .by_name,
+    produced_at_unix: i64,
+    /// The request's nonce (`Request.nonce`), echoed in `responseExtensions`.
+    nonce: ?[]const u8 = null,
+    /// Certificates to carry in `certs` (a delegated responder's certificate;
+    /// OpenSSL embeds the signer unless `OCSP_NOCERTS`, Go embeds
+    /// `template.Certificate`). Empty: none.
+    embed_certs: []const []const u8 = &.{},
+};
+
+pub const CreateResponseError = error{
+    /// An input certificate does not decode, no entries, a time outside
+    /// years 0..9999, or a signing key that fails.
+    Malformed,
+    OutOfMemory,
+};
+
+/// A fixed error `OCSPResponse` (RFC 6960 §2.3: no `responseBytes`), e.g.
+/// `.malformed_request`, `.try_later`, `.unauthorized` — Go's
+/// `ocsp.MalformedRequestErrorResponse` and friends. `.successful` is not an
+/// error response (`successful` without `responseBytes` is malformed).
+pub fn errorResponse(status: ResponseStatus) error{NotAnError}![5]u8 {
+    if (status == .successful) return error.NotAnError;
+    return .{ 0x30, 0x03, 0x0a, 0x01, @backingInt(status) };
+}
+
+/// Create and sign a successful `OCSPResponse` answering `entries` (one
+/// `SingleResponse` each, in order) — Go's `ocsp.CreateResponse`, OpenSSL's
+/// `OCSP_basic_sign`. `verify` accepts the result for an entry's certificate
+/// when the responder is the issuer or a delegate it signed. The bytes are
+/// owned by `gpa`.
+pub fn createResponse(
+    gpa: std.mem.Allocator,
+    entries: []const ResponseEntry,
+    key: SigningKey,
+    opts: ResponseOptions,
+) CreateResponseError![]u8 {
+    if (entries.len == 0) return error.Malformed;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: Builder = .{ .a = arena.allocator() };
+
+    var singles = std.ArrayList([]const u8).empty;
+    for (entries) |ent| {
+        const issuer = try parseCert(ent.issuer_cert_der);
+        if (ent.serial.len == 0) return error.Malformed;
+        var name_buf: [64]u8 = undefined;
+        var key_buf: [64]u8 = undefined;
+        const name_hash = digest(ent.hash.hash(), issuer.subject_name, &name_buf);
+        const key_hash = digest(ent.hash.hash(), issuer.pub_key_bits, &key_buf);
+        const cert_id = try b.seq(&.{
+            try b.seq(&.{ try b.oid(ent.hash.oid()), try b.null() }),
+            try b.octetString(name_hash),
+            try b.octetString(key_hash),
+            try b.integerRaw(ent.serial),
+        });
+        const status_der = switch (ent.status) {
+            .good => try b.implicitPrimitive(0, &.{}),
+            .unknown => try b.implicitPrimitive(2, &.{}),
+            .revoked => |r| blk: {
+                var tb: [15]u8 = undefined;
+                const info = if (r.reason) |code|
+                    try std.mem.concat(b.a, u8, &.{ try b.generalizedTime(try formatGeneralizedTime(r.revocation_time_unix, &tb)), try b.explicit(0, try b.enumerated(code)) })
+                else
+                    try b.generalizedTime(try formatGeneralizedTime(r.revocation_time_unix, &tb));
+                break :blk try b.tlv(0xa1, info); // revoked [1] IMPLICIT RevokedInfo
+            },
+        };
+        var tb1: [15]u8 = undefined;
+        var tb2: [15]u8 = undefined;
+        const this_update = try b.generalizedTime(try formatGeneralizedTime(ent.this_update_unix, &tb1));
+        const single = if (ent.next_update_unix) |nu|
+            try b.seq(&.{ cert_id, status_der, this_update, try b.explicit(0, try b.generalizedTime(try formatGeneralizedTime(nu, &tb2))) })
+        else
+            try b.seq(&.{ cert_id, status_der, this_update });
+        try singles.append(b.a, single);
+    }
+
+    const responder = try parseCert(opts.responder_cert_der);
+    const responder_id = switch (opts.responder_id) {
+        .by_name => try b.explicit(1, responder.subject_name),
+        .by_key => blk: {
+            var kh: [20]u8 = undefined;
+            Sha1.hash(responder.pub_key_bits, &kh, .{});
+            break :blk try b.explicit(2, try b.octetString(&kh));
+        },
+    };
+    var pb: [15]u8 = undefined;
+    var rd_parts = std.ArrayList([]const u8).empty;
+    try rd_parts.append(b.a, responder_id);
+    try rd_parts.append(b.a, try b.generalizedTime(try formatGeneralizedTime(opts.produced_at_unix, &pb)));
+    try rd_parts.append(b.a, try b.seq(singles.items));
+    if (opts.nonce) |n| {
+        const nonce_ext = try b.seq(&.{
+            try b.oid(&oid_ocsp_nonce),
+            try b.octetString(try b.octetString(n)),
+        });
+        try rd_parts.append(b.a, try b.explicit(1, try b.seq(&.{nonce_ext}))); // responseExtensions [1]
+    }
+    const tbs = try b.seq(rd_parts.items);
+
+    var sig_alg: []const u8 = undefined;
+    var sigval: []const u8 = undefined;
+    switch (key) {
+        .rsa => |k| {
+            var out: [rsa.max_modulus_len]u8 = undefined;
+            const sig = switch (k.hash) {
+                .sha256 => rsa.signPkcs1v15(k.key, Sha256, tbs, &out),
+                .sha384 => rsa.signPkcs1v15(k.key, Sha384, tbs, &out),
+                .sha512 => rsa.signPkcs1v15(k.key, Sha512, tbs, &out),
+            } catch return error.Malformed;
+            sigval = try b.bitString(sig);
+            const oid = switch (k.hash) {
+                .sha256 => &oid_sha256_rsa,
+                .sha384 => &oid_sha384_rsa,
+                .sha512 => &oid_sha512_rsa,
+            };
+            sig_alg = try b.seq(&.{ try b.oid(oid), try b.null() });
+        },
+        .ecdsa_p256 => |sk| {
+            const rs = p256.sign.ecdsaSignDeterministic(sk, tbs) catch return error.Malformed;
+            var buf: [p256.sign.der_max_len]u8 = undefined;
+            sigval = try b.bitString(p256.sign.rawToDer(rs, &buf));
+            sig_alg = try b.seq(&.{try b.oid(&oid_ecdsa_sha256)});
+        },
+        .ecdsa_p384 => |kp| {
+            const sig = kp.sign(tbs, null) catch return error.Malformed;
+            var buf: [@TypeOf(sig).der_encoded_length_max]u8 = undefined;
+            sigval = try b.bitString(sig.toDer(&buf));
+            sig_alg = try b.seq(&.{try b.oid(&oid_ecdsa_sha384)});
+        },
+        .ed25519 => |kp| {
+            const sig = kp.sign(tbs, null) catch return error.Malformed;
+            sigval = try b.bitString(&sig.toBytes());
+            sig_alg = try b.seq(&.{try b.oid(&oid_ed25519)});
+        },
+    }
+
+    var bor_parts = std.ArrayList([]const u8).empty;
+    try bor_parts.appendSlice(b.a, &.{ tbs, sig_alg, sigval });
+    if (opts.embed_certs.len != 0) {
+        for (opts.embed_certs) |c| _ = try parseCert(c);
+        try bor_parts.append(b.a, try b.explicit(0, try b.seq(opts.embed_certs)));
+    }
+    const bor = try b.seq(bor_parts.items);
+    const response_bytes = try b.seq(&.{ try b.oid(&oid_ocsp_basic), try b.octetString(bor) });
+    const ocsp_response = try b.seq(&.{
+        try b.enumerated(0), // successful
+        try b.explicit(0, response_bytes),
+    });
+    return gpa.dupe(u8, ocsp_response);
+}
+
+/// `YYYYMMDDHHMMSSZ` for a unix time (years 0..9999 only, the GeneralizedTime
+/// range RFC 6960 allows and the parser reads back).
+fn formatGeneralizedTime(unix: i64, buf: *[15]u8) error{Malformed}![]const u8 {
+    const p = datefmt.unixToParts(unix);
+    if (p.year < 0 or p.year > 9999) return error.Malformed;
+    _ = std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{ @as(u32, @intCast(p.year)), p.month, p.day, p.hour, p.minute, p.second }) catch return error.Malformed;
+    return buf;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1446,6 +1797,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("goldens.zig");
     _ = @import("p384_test.zig");
+    _ = @import("responder_test.zig");
 }
 
 test "derToRawN: P-384-sized encodings DER forbids are refused" {

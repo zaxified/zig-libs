@@ -54,6 +54,21 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   certID, certStatus (good [0] / revoked [1] {revocationTime, reason?} /
   unknown [2]), thisUpdate, nextUpdate?, singleExtensions? }. Decoding is
   **allocation-free** — every field is a view into the caller's buffer.
+- **Responder side** (`parseRequest`, `createResponse`, `errorResponse`; Go's `ParseRequest` / `CreateResponse`
+  and the error-response constants, OpenSSL's `OCSP_request_onereq_get0` / `OCSP_basic_sign`).
+  `parseRequest` decodes an `OCSPRequest` into views (`Request.iterator()` yields `CertId`s, `Request.nonce`),
+  skipping `requestorName`, the optional signature and per-request extensions; `CertId.namesIssuer(issuer_cert_der)`
+  recomputes the hashes under the CertID's own algorithm (SHA-1/256/384/512) to find which CA a question is about.
+  `createResponse(gpa, entries, key, opts)` builds a successful `OCSPResponse` with one `SingleResponse` per
+  `ResponseEntry` (issuer certificate, serial, `CertStatus`, thisUpdate, optional nextUpdate, CertID hash — answer with
+  the request's), `responseExtensions` carrying the request's nonce, and the signature of a `SigningKey`: RSA PKCS#1
+  v1.5 with SHA-256/384/512, ECDSA P-256 with SHA-256 (RFC 6979, no RNG), ECDSA P-384 with SHA-384, Ed25519. The
+  `ResponderID` is the responder certificate's name (OpenSSL's default) or key hash (Go's, OpenSSL's
+  `OCSP_RESPID_KEY`); `embed_certs` fills `certs` (a delegate's certificate; OpenSSL embeds the signer by default, Go
+  `template.Certificate`). `errorResponse(status)` is the five-byte `OCSPResponse` of RFC 6960 §2.3. `verify` accepts
+  what `createResponse` makes for the issuer or a delegate it signed. Not done: signing `SingleResponse` extensions,
+  `archiveCutoff` / `crlReason` extensions, RSASSA-PSS and P-521 signatures (as in the verifier), response signing
+  policy (which certificates to answer for is the caller's database).
 - **Verification** (`verify`, `verifyMany`): the security core (below).
   `verifyMany` answers several certificates from one response: `out[i]` is
   exactly what `verify` would decide for `queries[i]` (a `Verdict`, `.absent`
@@ -296,9 +311,7 @@ tests stay green, because none of them hashes a response `CertID` with SHA-1.
 
 ## Backlog / deferred
 
-- **Responder side: `CreateResponse`-style signing** (survey 2026-09-30). Go can sign a
-  response; a user running a private CA's OCSP responder cannot use this module. Effort:
-  medium. Fits §2, no consumer yet.
+None open.
 
 ## Anchoring
 

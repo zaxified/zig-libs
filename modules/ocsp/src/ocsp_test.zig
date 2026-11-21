@@ -3407,3 +3407,84 @@ test "verify: a delegate certificate whose extension block cannot be walked is M
         try testing.expectError(error.Malformed, verifyBytes(resp, fx.issuer_der, fx.subject_der));
     }
 }
+
+// ── createResponse (responder side) over this file's fixtures ───────────────
+
+fn createEntry(issuer_der: []const u8, serial: []const u8) ocsp.ResponseEntry {
+    return .{
+        .issuer_cert_der = issuer_der,
+        .serial = serial,
+        .status = .good,
+        .this_update_unix = now_2027 - 86400,
+        .next_update_unix = now_2027 + 86400,
+    };
+}
+
+test "createResponse: RSA with SHA-256, SHA-384 and SHA-512, by name and by key" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const subject = try extractBits(fx.subject_der);
+    inline for (.{ .sha256, .sha384, .sha512 }) |h| {
+        inline for (.{ ocsp.ResponderIdKind.by_name, ocsp.ResponderIdKind.by_key }) |kind| {
+            const resp = try ocsp.createResponse(gpa, &.{createEntry(fx.issuer_der, subject.serial)}, .{ .rsa = .{ .key = &fx.kp.secret_key, .hash = h } }, .{
+                .responder_cert_der = fx.issuer_der,
+                .responder_id = kind,
+                .produced_at_unix = now_2027,
+                .nonce = "n-1",
+            });
+            defer gpa.free(resp);
+            const v = try ocsp.verify(try ocsp.parseResponse(resp), fx.issuer_der, fx.subject_der, .{ .now_unix = now_2027, .expected_nonce = "n-1" });
+            try testing.expect(v.status == .good and !v.delegated);
+            try testing.expect(v.responder == (if (kind == .by_name) .by_name else .by_key));
+            // A flipped signed byte is a bad signature, not an accepted response.
+            const bad = try gpa.dupe(u8, resp);
+            defer gpa.free(bad);
+            bad[std.mem.find(u8, bad, "n-1").?] ^= 1;
+            try testing.expectError(error.SignatureInvalid, ocsp.verify(try ocsp.parseResponse(bad), fx.issuer_der, fx.subject_der, .{ .now_unix = now_2027 }));
+        }
+    }
+}
+
+test "createResponse: Ed25519" {
+    const gpa = testing.allocator;
+    var c = try makeEdCase(gpa);
+    defer c.deinit(gpa);
+    const resp = try ocsp.createResponse(gpa, &.{createEntry(c.issuer, c.serial)}, .{ .ed25519 = &c.kp }, .{
+        .responder_cert_der = c.issuer,
+        .produced_at_unix = now_2027,
+    });
+    defer gpa.free(resp);
+    const v = try ocsp.verify(try ocsp.parseResponse(resp), c.issuer, c.leaf, defaultOpts());
+    try testing.expect(v.status == .good);
+}
+
+test "createResponse: a delegated responder's certificate rides along and verify accepts it" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+    var prng = std.Random.DefaultPrng.init(0xde1e6a7e);
+    var dkp: rsa.KeyPair = undefined;
+    try rsa.generate(&dkp, prng.random(), 1024, 65537);
+    const delegate_self = try rsa.selfSignedCert(gpa, &dkp.secret_key, dkp.public_key, Sha256, .{
+        .common_name = "delegated responder",
+        .serial = 7,
+        .not_before = "200101000000Z",
+        .not_after = "400101000000Z",
+        .is_ca = false,
+    });
+    defer gpa.free(delegate_self);
+    const dbits = try extractBits(delegate_self);
+    const delegate_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, try spkiOf(delegate_self), dbits.subject_name, .ocsp_signing);
+    defer gpa.free(delegate_cert);
+    const resp = try ocsp.createResponse(gpa, &.{createEntry(fx.issuer_der, subject.serial)}, .{ .rsa = .{ .key = &dkp.secret_key } }, .{
+        .responder_cert_der = delegate_cert,
+        .produced_at_unix = now_2027,
+        .embed_certs = &.{delegate_cert},
+    });
+    defer gpa.free(resp);
+    const v = try ocsp.verify(try ocsp.parseResponse(resp), fx.issuer_der, fx.subject_der, defaultOpts());
+    try testing.expect(v.status == .good and v.delegated);
+}

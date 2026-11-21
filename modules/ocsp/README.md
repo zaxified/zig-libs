@@ -63,6 +63,10 @@ switch (verdict.status) {
   (`ResponseStatus`) and, for a successful basic response, `Response.basic`
   (`Basic`: `tbs_response_data`, `responder`, `produced_at_unix`, `responses`,
   `sig_alg_oid`, `signature`, `certs`, `nonce`).
+- Responder side: `parseRequest(der) ParseError!Request` (`Request.iterator()` over `CertId`s,
+  `Request.nonce`, `CertId.namesIssuer`), `createResponse(gpa, []const ResponseEntry, SigningKey,
+  ResponseOptions) CreateResponseError![]u8` (RSA / ECDSA P-256 / P-384 / Ed25519, by name or by key,
+  nonce echo, embedded certificates) and `errorResponse(ResponseStatus)`.
 - `verify(response, issuer_cert_der, subject_cert_der, VerifyOptions) VerifyError!Verdict`
   — `Verdict{ status: CertStatus, responder: Responder, delegated: bool,
   this_update_unix, next_update_unix, produced_at_unix }`. That
@@ -84,8 +88,8 @@ switch (verdict.status) {
 ## Not provided
 
 OCSP stapling wire integration (the TLS server's job), CRL-based revocation, full
-delegated-responder path building, P-521 responder signatures, request signing and
-responder-side signing. See SPEC *What is deliberately not done* and *Backlog / deferred*.
+delegated-responder path building, P-521 responder signatures and request signing.
+See SPEC *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from RFC 6960 (a public IETF specification). See
 `SPEC.md` and `NOTICE`.
