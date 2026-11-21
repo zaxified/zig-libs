@@ -130,6 +130,107 @@ pub const Tag = enum(u8) {
     /// read against such a peer never reaches a quorum.
     read_req = 0x17,
     read_resp = 0x18,
+    /// InstallSnapshot (Raft §7; etcd/raft `MsgSnap`, hashicorp/raft
+    /// `InstallSnapshot`): the leader sends a follower whose next entry it has
+    /// compacted away its latest snapshot, whole. The follower answers with
+    /// an `append_resp`. New tag, same caveat as PreVote: an older decoder
+    /// drops it, so a lagging server that predates it is never caught up
+    /// once the leader has compacted past its log.
+    snapshot = 0x19,
+};
+
+/// InstallSnapshot. The leader is the message's `from`.
+pub const SnapshotMsg = struct {
+    /// The leader's term.
+    term: Term,
+    /// The last index the snapshot covers, and that entry's term.
+    index: LogIndex,
+    snap_term: Term,
+    /// The membership in force at `index` (`Membership.encode`).
+    conf: []const u8,
+    /// The caller's state-machine image at `index`.
+    data: []const u8,
+};
+
+/// A cluster membership (Raft thesis §4; etcd/raft `ConfState`): who votes,
+/// and who only replicates. Carried as the data of every `config` log entry
+/// (the whole membership, not a delta, as hashicorp/raft's configuration
+/// entries) and in every snapshot.
+pub const Membership = struct {
+    /// The voters (C_new during joint consensus). Never empty.
+    voters: []const NodeId,
+    /// Non-empty only during joint consensus (§6, thesis §4.3): C_old, whose
+    /// majority is required as well as `voters`' one.
+    voters_outgoing: []const NodeId = &.{},
+    /// Non-voting members (etcd/raft learners, hashicorp/raft nonvoters):
+    /// the leader replicates to them; they never vote or campaign, and never
+    /// count toward a quorum. Disjoint from both voter lists.
+    learners: []const NodeId = &.{},
+
+    pub fn isJoint(self: Membership) bool {
+        return self.voters_outgoing.len > 0;
+    }
+
+    pub fn encodedLen(self: Membership) usize {
+        return 12 + 4 * (self.voters.len + self.voters_outgoing.len + self.learners.len);
+    }
+
+    /// Three `u32`-counted lists of `u32` ids (voters, outgoing voters,
+    /// learners), each strictly ascending. `buf` holds at least
+    /// `encodedLen()` bytes; returns the bytes written.
+    pub fn encode(self: Membership, buf: []u8) usize {
+        std.debug.assert(buf.len >= self.encodedLen());
+        var off: usize = 0;
+        for ([_][]const NodeId{ self.voters, self.voters_outgoing, self.learners }) |list| {
+            std.mem.writeInt(u32, buf[off..][0..4], @intCast(list.len), .little);
+            off += 4;
+            for (list) |id| {
+                std.mem.writeInt(u32, buf[off..][0..4], id, .little);
+                off += 4;
+            }
+        }
+        return off;
+    }
+
+    pub fn encodeAlloc(self: Membership, gpa: Allocator) Allocator.Error![]u8 {
+        const buf = try gpa.alloc(u8, self.encodedLen());
+        _ = self.encode(buf);
+        return buf;
+    }
+
+    /// Decode into slices of `ids_out` (more ids than it holds is
+    /// `InvalidEncoding`). Refused: a list not strictly ascending (so no
+    /// duplicates and one encoding), no voters, the id `types.no_vote`, a
+    /// learner that is also a voter, bytes left over.
+    pub fn decode(bytes: []const u8, ids_out: []NodeId) DecodeError!Membership {
+        var off: usize = 0;
+        var used: usize = 0;
+        var lists: [3][]const NodeId = undefined;
+        for (&lists) |*list| {
+            if (bytes.len - off < 4) return error.Truncated;
+            const count = std.mem.readInt(u32, bytes[off..][0..4], .little);
+            off += 4;
+            if ((bytes.len - off) / 4 < count) return error.Truncated;
+            if (count > ids_out.len - used) return error.InvalidEncoding;
+            const out = ids_out[used..][0..count];
+            for (out, 0..) |*id, i| {
+                id.* = std.mem.readInt(u32, bytes[off..][0..4], .little);
+                off += 4;
+                if (id.* == types.no_vote) return error.InvalidEncoding;
+                if (i > 0 and id.* <= out[i - 1]) return error.InvalidEncoding;
+            }
+            used += count;
+            list.* = out;
+        }
+        if (off != bytes.len) return error.InvalidEncoding;
+        const m: Membership = .{ .voters = lists[0], .voters_outgoing = lists[1], .learners = lists[2] };
+        if (m.voters.len == 0) return error.InvalidEncoding;
+        for (m.learners) |l| {
+            if (std.mem.findScalar(NodeId, m.voters, l) != null) return error.InvalidEncoding;
+            if (std.mem.findScalar(NodeId, m.voters_outgoing, l) != null) return error.InvalidEncoding;
+        }
+        return m;
+    }
 };
 
 /// ReadIndex probe and its echo (same layout). `term` is the sender's term;
@@ -159,6 +260,7 @@ pub const Body = union(Tag) {
     timeout_now: TimeoutNow,
     read_req: ReadProbe,
     read_resp: ReadProbe,
+    snapshot: SnapshotMsg,
 };
 
 pub const Message = struct {
@@ -171,6 +273,9 @@ pub const Message = struct {
     pub const vote_req_transfer_len = vote_req_len + 1;
     pub const timeout_now_len = 1 + 8;
     pub const read_probe_len = 1 + 8 + 8;
+    /// InstallSnapshot without its two variable parts: tag, term, index,
+    /// snapshot term, and the two `u32` lengths.
+    pub const snapshot_header_len = 1 + 8 + 8 + 8 + 4 + 4;
     pub const vote_resp_len = 1 + 8 + 1;
     pub const append_resp_len = 1 + 8 + 1 + 8;
     /// `append_resp_len` plus `conflict_term` and `conflict_index`.
@@ -187,6 +292,7 @@ pub const Message = struct {
             .vote_resp, .pre_vote_resp => vote_resp_len,
             .timeout_now => timeout_now_len,
             .read_req, .read_resp => read_probe_len,
+            .snapshot => |sn| snapshot_header_len + sn.conf.len + sn.data.len,
             .append_resp => |a| if (a.conflict_index != 0) append_resp_hint_len else append_resp_len,
             .append_req => |a| blk: {
                 var n: usize = append_header_len;
@@ -224,6 +330,18 @@ pub const Message = struct {
                 std.mem.writeInt(u64, buf[1..9], v.term, .little);
                 buf[9] = @intFromBool(v.granted);
                 return vote_resp_len;
+            },
+            .snapshot => |sn| {
+                std.mem.writeInt(u64, buf[1..9], sn.term, .little);
+                std.mem.writeInt(u64, buf[9..17], sn.index, .little);
+                std.mem.writeInt(u64, buf[17..25], sn.snap_term, .little);
+                std.mem.writeInt(u32, buf[25..29], @intCast(sn.conf.len), .little);
+                @memcpy(buf[29..][0..sn.conf.len], sn.conf);
+                var off: usize = 29 + sn.conf.len;
+                std.mem.writeInt(u32, buf[off..][0..4], @intCast(sn.data.len), .little);
+                off += 4;
+                @memcpy(buf[off..][0..sn.data.len], sn.data);
+                return off + sn.data.len;
             },
             .append_resp => |a| {
                 std.mem.writeInt(u64, buf[1..9], a.term, .little);
@@ -312,6 +430,7 @@ pub const Message = struct {
                 break :blk .{ .append_resp = r };
             },
             .append_req => .{ .append_req = try decodeAppend(bytes, entries_out) },
+            .snapshot => .{ .snapshot = try decodeSnapshot(bytes) },
             .timeout_now => blk: {
                 try exactLen(bytes, timeout_now_len);
                 break :blk .{ .timeout_now = .{ .term = try requestTermAt(bytes, 1) } };
@@ -329,6 +448,30 @@ pub const Message = struct {
             },
         };
         return .{ .from = from, .to = to, .body = body };
+    }
+
+    /// `conf` and `data` BORROW `bytes`. `conf` must be a well-formed
+    /// `Membership` (checked here; the receiver checks its ids against its
+    /// own id bound).
+    fn decodeSnapshot(bytes: []const u8) DecodeError!SnapshotMsg {
+        if (bytes.len < snapshot_header_len) return error.Truncated;
+        const term = try requestTermAt(bytes, 1);
+        const index = std.mem.readInt(u64, bytes[9..17], .little);
+        const snap_term = try termAt(bytes, 17);
+        // A snapshot covers at least one entry, of a real term no newer
+        // than the leader's.
+        if (index == 0 or snap_term == 0 or snap_term > term) return error.InvalidEncoding;
+        const conf_len = std.mem.readInt(u32, bytes[25..29], .little);
+        if (bytes.len - snapshot_header_len < conf_len) return error.Truncated;
+        const conf = bytes[29..][0..conf_len];
+        var off: usize = 29 + conf_len;
+        const data_len = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        off += 4;
+        if (bytes.len - off < data_len) return error.Truncated;
+        if (bytes.len - off != data_len) return error.InvalidEncoding;
+        var ids: [max_conf_ids]NodeId = undefined;
+        _ = try Membership.decode(conf, &ids);
+        return .{ .term = term, .index = index, .snap_term = snap_term, .conf = conf, .data = bytes[off..] };
     }
 
     fn decodeAppend(bytes: []const u8, entries_out: []Entry) DecodeError!AppendReq {
@@ -374,6 +517,10 @@ pub const Message = struct {
         };
     }
 };
+
+/// The most ids one encoded `Membership` may name (all three lists):
+/// what `decodeSnapshot` validates against without an allocator.
+pub const max_conf_ids = 2048;
 
 fn exactLen(bytes: []const u8, n: usize) DecodeError!void {
     if (bytes.len < n) return error.Truncated;
@@ -421,6 +568,14 @@ fn roundTrip(m: Message) !void {
         .timeout_now => |v| try testing.expectEqual(v, d.body.timeout_now),
         .read_req => |v| try testing.expectEqual(v, d.body.read_req),
         .read_resp => |v| try testing.expectEqual(v, d.body.read_resp),
+        .snapshot => |v| {
+            const b = d.body.snapshot;
+            try testing.expectEqual(v.term, b.term);
+            try testing.expectEqual(v.index, b.index);
+            try testing.expectEqual(v.snap_term, b.snap_term);
+            try testing.expectEqualSlices(u8, v.conf, b.conf);
+            try testing.expectEqualSlices(u8, v.data, b.data);
+        },
         .append_resp => |v| try testing.expectEqual(v, d.body.append_resp),
         .append_req => |a| {
             const b = d.body.append_req;
@@ -536,7 +691,7 @@ test "decode refuses lying lengths, trailing bytes, bad tags, bools and terms" {
     // One byte left over.
     try testing.expectError(error.InvalidEncoding, Message.decode(buf[0 .. ok.len + 1], 0, 1, &scratch));
     // Undefined tag; the old format's tags; an empty frame.
-    try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x19}, 0, 1, &scratch));
+    try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x1a}, 0, 1, &scratch));
     try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x02}, 0, 1, &scratch));
     try testing.expectError(error.Truncated, Message.decode(&.{}, 0, 1, &scratch));
 
@@ -570,6 +725,8 @@ const message_seeds = [_][]const u8{
     seed("16" ++ "0700000000000000"), // timeout_now
     seed("17" ++ "0700000000000000" ++ "0c00000000000000"), // read_req
     seed("18" ++ "0700000000000000" ++ "0c00000000000000"), // read_resp
+    seed("19" ++ "0700000000000000" ++ "0900000000000000" ++ "0600000000000000" ++ "14000000" ++
+        "02000000" ++ "00000000" ++ "01000000" ++ "00000000" ++ "00000000" ++ "03000000" ++ "616263"), // snapshot, voters {0,1}
     seed("13" ++ "0400000000000000" ++ "00" ++ "1100000000000000"), // append_resp (reject + hint)
     seed("12" ++ "0300000000000000" ++ "0500000000000000" ++ "0200000000000000" ++ "0500000000000000" ++ "00000000"), // heartbeat
     seed("12" ++ "0300000000000000" ++ "0500000000000000" ++ "0200000000000000" ++ "0500000000000000" ++ "02000000" ++
@@ -586,7 +743,7 @@ const message_seeds = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
-const MessageMark = fz.Marker(enum { vote_req, vote_resp, append_resp, append_req, pre_vote_req, pre_vote_resp, timeout_now, read_req, read_resp, refused });
+const MessageMark = fz.Marker(enum { vote_req, vote_resp, append_resp, append_req, pre_vote_req, pre_vote_resp, timeout_now, read_req, read_resp, snapshot, refused });
 
 test "fuzz: Message.decode never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &message_seeds });
@@ -624,6 +781,7 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         .timeout_now => MessageMark.mark(.timeout_now),
         .read_req => MessageMark.mark(.read_req),
         .read_resp => MessageMark.mark(.read_resp),
+        .snapshot => MessageMark.mark(.snapshot),
     }
     // Accepted ⇒ re-encodes to the same bytes (the codec has one encoding).
     var out: [160]u8 = undefined;
@@ -647,7 +805,7 @@ test "corpus: every message seed reaches the decoder, and what it accepted is pi
         if (m.body == .append_req) entries += m.body.append_req.entries.len;
     }
     try testing.expectEqual(message_seeds.len - 1, nonempty);
-    try testing.expectEqual(@as(usize, 11), accepted);
+    try testing.expectEqual(@as(usize, 12), accepted);
     // The number a heartbeat-only corpus cannot produce.
     try testing.expectEqual(@as(usize, 2), entries);
 }
@@ -739,4 +897,68 @@ test "leadership transfer on the wire: the vote flag is an optional byte, timeou
     try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.timeout_now_len], 0, 1, &scratch));
     std.mem.writeInt(u64, bad[1..9], types.max_term + 1, .little);
     try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.timeout_now_len], 0, 1, &scratch));
+}
+
+test "InstallSnapshot round-trips and refuses what an honest leader never sends" {
+    var conf_buf: [64]u8 = undefined;
+    const voters = [_]NodeId{ 0, 2, 5 };
+    const learners = [_]NodeId{7};
+    const conf_len = (Membership{ .voters = &voters, .learners = &learners }).encode(&conf_buf);
+    const conf = conf_buf[0..conf_len];
+    try roundTrip(.{ .from = 0, .to = 1, .body = .{ .snapshot = .{ .term = 7, .index = 40, .snap_term = 6, .conf = conf, .data = "state" } } });
+    try roundTrip(.{ .from = 0, .to = 1, .body = .{ .snapshot = .{ .term = 7, .index = 40, .snap_term = 7, .conf = conf, .data = "" } } });
+
+    var buf: [128]u8 = undefined;
+    var scratch: [1]Entry = undefined;
+    const good: Message = .{ .from = 0, .to = 1, .body = .{ .snapshot = .{ .term = 7, .index = 40, .snap_term = 6, .conf = conf, .data = "state" } } };
+    const n = good.encode(&buf);
+    // Truncated anywhere, or a byte too many.
+    for (0..n) |cut| try testing.expect(std.meta.isError(Message.decode(buf[0..cut], 0, 1, &scratch)));
+    buf[n] = 0;
+    try testing.expectError(error.InvalidEncoding, Message.decode(buf[0 .. n + 1], 0, 1, &scratch));
+    // Index 0, snapshot term 0, a snapshot term above the leader's, term 0.
+    inline for (.{
+        .{ .term = 7, .index = 0, .snap_term = 6 },
+        .{ .term = 7, .index = 40, .snap_term = 0 },
+        .{ .term = 7, .index = 40, .snap_term = 8 },
+    }) |bad| {
+        const m: Message = .{ .from = 0, .to = 1, .body = .{ .snapshot = .{ .term = bad.term, .index = bad.index, .snap_term = bad.snap_term, .conf = conf, .data = "" } } };
+        const k = m.encode(&buf);
+        try testing.expectError(error.InvalidEncoding, Message.decode(buf[0..k], 0, 1, &scratch));
+    }
+    // A malformed membership inside.
+    const dup = [_]NodeId{ 2, 2 };
+    var bad_conf: [64]u8 = undefined;
+    const bl = (Membership{ .voters = &dup }).encode(&bad_conf);
+    const m: Message = .{ .from = 0, .to = 1, .body = .{ .snapshot = .{ .term = 7, .index = 4, .snap_term = 6, .conf = bad_conf[0..bl], .data = "" } } };
+    const k = m.encode(&buf);
+    try testing.expectError(error.InvalidEncoding, Message.decode(buf[0..k], 0, 1, &scratch));
+}
+
+test "Membership: round-trips, and refuses every second spelling and every impossible set" {
+    var ids: [16]NodeId = undefined;
+    var buf: [128]u8 = undefined;
+    const ok: Membership = .{ .voters = &.{ 1, 2, 3 }, .voters_outgoing = &.{ 0, 1, 2 }, .learners = &.{9} };
+    const n = ok.encode(&buf);
+    try testing.expectEqual(ok.encodedLen(), n);
+    const d = try Membership.decode(buf[0..n], &ids);
+    try testing.expectEqualSlices(NodeId, ok.voters, d.voters);
+    try testing.expectEqualSlices(NodeId, ok.voters_outgoing, d.voters_outgoing);
+    try testing.expectEqualSlices(NodeId, ok.learners, d.learners);
+    try testing.expect(d.isJoint());
+    for (0..n) |cut| try testing.expect(std.meta.isError(Membership.decode(buf[0..cut], &ids)));
+    // More ids than the caller's buffer.
+    try testing.expectError(error.InvalidEncoding, Membership.decode(buf[0..n], ids[0..6]));
+    const bad = [_]Membership{
+        .{ .voters = &.{} }, // no voters
+        .{ .voters = &.{ 2, 1 } }, // not ascending
+        .{ .voters = &.{ 1, 1 } }, // duplicate
+        .{ .voters = &.{ 1, types.no_vote } }, // the "nobody" id
+        .{ .voters = &.{1}, .learners = &.{1} }, // a learner that votes
+        .{ .voters = &.{1}, .voters_outgoing = &.{2}, .learners = &.{2} }, // ... in C_old
+    };
+    for (bad) |b| {
+        const k = b.encode(&buf);
+        try testing.expectError(error.InvalidEncoding, Membership.decode(buf[0..k], &ids));
+    }
 }

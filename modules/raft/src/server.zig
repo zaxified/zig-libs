@@ -119,6 +119,22 @@ pub const RaftConfig = struct {
     /// was asked (`error.StaleRead`): a read that returned less could miss a
     /// write that had already been acknowledged.
     read_period_ticks: u32 = 0,
+    /// The bootstrap voters are servers `0 .. boot_voters - 1`; the rest of
+    /// the simulated servers start outside the membership and can be added
+    /// (`Node.Config.max_servers` is the server count). 0 = every server.
+    boot_voters: u32 = 0,
+    /// Every this many ticks, a leader proposes a random membership change
+    /// (`Node.proposeConfChange`): add a voter or a learner, promote, demote
+    /// or remove one — sometimes two at once, i.e. joint consensus — never
+    /// below `min_voters` voters. 0 = never. A refusal (`ConfChangePending`)
+    /// is counted and skipped.
+    conf_churn_ticks: u32 = 0,
+    min_voters: u32 = 3,
+    /// After every drain, a server whose applied index is this many entries
+    /// past its snapshot compacts its log there (`Node.compact`; the image is
+    /// the server's state-machine digest) and persists the snapshot, then
+    /// drops the entries it covers from its disk. 0 = never.
+    compact_every: u32 = 0,
 };
 
 /// The command a leader proposes when its next entry will be `index` while
@@ -152,8 +168,15 @@ pub fn scenario(sim: *Sim) anyerror!void {
 const Slot = struct {
     node: ?Node = null,
     disk_hs: node_mod.HardState = .{},
-    /// Persisted entries; `data` owned.
+    /// Persisted entries after `disk_snap`; `data` owned.
     disk: std.ArrayList(Entry) = .empty,
+    /// The persisted snapshot (`conf`/`data` owned), or null.
+    disk_snap: ?node_mod.Snapshot = null,
+    /// The state machine: the last index applied and a digest of every
+    /// entry applied up to it (`RaftServer.state_hashes` must agree across
+    /// servers). Volatile: rebuilt from the snapshot on a restart.
+    sm_index: LogIndex = 0,
+    sm_hash: u64 = 0,
     /// Tick-timer generation. netsim timers cannot be cancelled, so a restart
     /// starts a new chain and a timer from an older one is ignored.
     epoch: u64 = 0,
@@ -170,12 +193,41 @@ const Slot = struct {
         s.node = null;
         for (s.disk.items) |e| gpa.free(e.data);
         s.disk.clearRetainingCapacity();
+        s.dropSnap(gpa);
+        s.sm_index = 0;
+        s.sm_hash = 0;
         s.disk_hs = .{};
         s.epoch = 0;
         s.ticks = 0;
         s.dropped_before = 0;
         s.leader_recorded = 0;
         s.prev_log.clearRetainingCapacity();
+    }
+
+    fn dropSnap(s: *Slot, gpa: Allocator) void {
+        if (s.disk_snap) |sn| {
+            gpa.free(sn.conf);
+            gpa.free(sn.data);
+        }
+        s.disk_snap = null;
+    }
+
+    fn snapIndex(s: *const Slot) LogIndex {
+        return if (s.disk_snap) |sn| sn.index else 0;
+    }
+
+    fn saveSnap(s: *Slot, gpa: Allocator, sn: node_mod.Snapshot) !void {
+        const conf = try gpa.dupe(u8, sn.conf);
+        errdefer gpa.free(conf);
+        const data = try gpa.dupe(u8, sn.data);
+        s.dropSnap(gpa);
+        s.disk_snap = .{ .index = sn.index, .term = sn.term, .conf = conf, .data = data };
+    }
+
+    /// Load the state machine from a snapshot image (`smImage`).
+    fn loadImage(s: *Slot, data: []const u8) void {
+        s.sm_index = std.mem.readInt(u64, data[0..8], .little);
+        s.sm_hash = std.mem.readInt(u64, data[8..16], .little);
     }
 
     fn deinit(s: *Slot, gpa: Allocator) void {
@@ -186,6 +238,7 @@ const Slot = struct {
 };
 
 const torn_seed: u64 = 0x7011_0c4a_5eed_0001;
+const churn_seed: u64 = 0xc0f1_6c4a_5eed_0002;
 
 /// `RaftServer.commit_marks`: at `time`, `commit` became the highest commit
 /// index any node held.
@@ -226,6 +279,22 @@ pub const RaftServer = struct {
     next_read: u64 = 1,
     read_floor: std.AutoHashMapUnmanaged(u64, LogIndex) = .empty,
     reads_served: u64 = 0,
+    /// index → the committed entry (kept for the checkers: a compacted log
+    /// is checked as this prefix followed by what the node still holds).
+    committed_log: std.AutoHashMapUnmanaged(LogIndex, LogEntry) = .empty,
+    /// index → the state-machine digest after applying up to it; every
+    /// server, and every snapshot image, must agree (`error.StateMachineSafety`).
+    state_hashes: std.AutoHashMapUnmanaged(LogIndex, u64) = .empty,
+    /// Membership churn (`RaftConfig.conf_churn_ticks`): changes proposed,
+    /// refused as pending, and config entries committed, in this run.
+    conf_proposed: u64 = 0,
+    conf_refused: u64 = 0,
+    conf_committed: u64 = 0,
+    /// Snapshots taken by `compact` and installed from a leader, in this run.
+    compactions: u64 = 0,
+    installs: u64 = 0,
+    churn_prng: std.Random.DefaultPrng = .init(churn_seed),
+    full_buf: std.ArrayList(LogEntry) = .empty,
 
     /// Deliberate defect to run instead of the real rule, installed into every
     /// node. `.none` in every production path; the positive-control tests set
@@ -247,6 +316,9 @@ pub const RaftServer = struct {
         self.wire.deinit(gpa);
         self.commit_marks.deinit(gpa);
         self.read_floor.deinit(gpa);
+        self.committed_log.deinit(gpa);
+        self.state_hashes.deinit(gpa);
+        self.full_buf.deinit(gpa);
         self.* = undefined;
     }
 
@@ -297,6 +369,14 @@ pub const RaftServer = struct {
         self.next_read = 1;
         self.read_floor.clearRetainingCapacity();
         self.reads_served = 0;
+        self.committed_log.clearRetainingCapacity();
+        self.state_hashes.clearRetainingCapacity();
+        self.conf_proposed = 0;
+        self.conf_refused = 0;
+        self.conf_committed = 0;
+        self.compactions = 0;
+        self.installs = 0;
+        self.churn_prng = .init(churn_seed);
     }
 
     fn ticksOf(self: *const RaftServer, t: Time) u32 {
@@ -307,7 +387,8 @@ pub const RaftServer = struct {
         const hb = self.ticksOf(self.cfg.heartbeat_period);
         return .{
             .id = i,
-            .cluster_size = @intCast(self.node_count),
+            .cluster_size = if (self.cfg.boot_voters == 0) @intCast(self.node_count) else self.cfg.boot_voters,
+            .max_servers = @intCast(self.node_count),
             .election_ticks = @max(hb + 1, self.ticksOf(self.cfg.election_timeout + @as(Time, i) * self.cfg.election_spread)),
             .election_jitter_ticks = 0,
             .heartbeat_ticks = hb,
@@ -329,7 +410,12 @@ pub const RaftServer = struct {
             old.deinit();
             s.node = null;
         }
-        s.node = try Node.init(self.gpa, self.nodeConfig(i), .{ .hard_state = s.disk_hs, .entries = s.disk.items });
+        s.node = try Node.init(self.gpa, self.nodeConfig(i), .{ .hard_state = s.disk_hs, .snapshot = s.disk_snap, .entries = s.disk.items });
+        // The state machine comes back from the snapshot (or empty) and is
+        // rebuilt from the log as the commit index returns.
+        s.sm_index = 0;
+        s.sm_hash = 0;
+        if (s.disk_snap) |sn| s.loadImage(sn.data);
         s.node.?.injected_bug = self.bug;
         s.epoch += 1;
         s.ticks = 0;
@@ -364,9 +450,74 @@ pub const RaftServer = struct {
             try self.read_floor.put(self.gpa, token, self.max_commit);
             try n.readIndex(token);
         }
+        if (self.cfg.conf_churn_ticks != 0 and n.role == .leader and s.ticks % self.cfg.conf_churn_ticks == 0) try self.churn(n);
         try n.tick();
         try self.drain(sim, i);
         try sim.setTimer(i, self.cfg.tick, s.epoch);
+    }
+
+    /// One random membership change (`RaftConfig.conf_churn_ticks`).
+    fn churn(self: *RaftServer, n: *Node) !void {
+        const r = self.churn_prng.random();
+        var changes: [2]node_mod.ConfChange = undefined;
+        var k: usize = 0;
+        var voters: usize = 0;
+        for (0..self.node_count) |p| voters += @intFromBool(n.voters[p]);
+        const want: usize = if (r.uintLessThan(u32, 4) == 0) 2 else 1;
+        var tries: usize = 0;
+        while (k < want and tries < 8) : (tries += 1) {
+            const id: NodeId = r.uintLessThan(NodeId, @intCast(self.node_count));
+            var dup = false;
+            for (changes[0..k]) |c| dup = dup or switch (c) {
+                inline else => |x| x == id,
+            };
+            if (dup) continue;
+            if (n.voters[id]) {
+                if (voters <= self.cfg.min_voters) continue;
+                voters -= 1;
+                // Demoting inside joint consensus is refused by design.
+                changes[k] = if (want == 1 and r.boolean()) .{ .add_learner = id } else .{ .remove = id };
+            } else if (n.learners[id]) {
+                changes[k] = .{ .add_voter = id };
+                voters += 1;
+            } else if (r.boolean()) {
+                changes[k] = .{ .add_learner = id };
+            } else {
+                changes[k] = .{ .add_voter = id };
+                voters += 1;
+            }
+            k += 1;
+        }
+        if (k == 0) return;
+        _ = n.proposeConfChange(changes[0..k]) catch |err| switch (err) {
+            error.ConfChangePending, error.ProposalDropped => {
+                self.conf_refused += 1;
+                return;
+            },
+            else => |e| return e,
+        };
+        self.conf_proposed += 1;
+    }
+
+    /// The state-machine image a snapshot carries: (index, digest).
+    fn smImage(s: *const Slot) [16]u8 {
+        var b: [16]u8 = undefined;
+        std.mem.writeInt(u64, b[0..8], s.sm_index, .little);
+        std.mem.writeInt(u64, b[8..16], s.sm_hash, .little);
+        return b;
+    }
+
+    fn smStep(h: u64, fp: u64) u64 {
+        var b: [16]u8 = undefined;
+        std.mem.writeInt(u64, b[0..8], h, .little);
+        std.mem.writeInt(u64, b[8..16], fp, .little);
+        return std.hash.Wyhash.hash(0x736d, &b); // "sm"
+    }
+
+    /// Record (or compare) the digest after applying up to `index`.
+    fn recordState(self: *RaftServer, index: LogIndex, h: u64) !void {
+        const gop = try self.state_hashes.getOrPut(self.gpa, index);
+        if (!gop.found_existing) gop.value_ptr.* = h else if (gop.value_ptr.* != h) return error.StateMachineSafety;
     }
 
     fn onMessage(ctx: *anyopaque, sim: *Sim, i: NodeId, from: NodeId, payload: []const u8) anyerror!void {
@@ -388,8 +539,8 @@ pub const RaftServer = struct {
             // Steps before the crash, when this Ready is torn: hard state,
             // truncation, each entry, each message, then the apply loop (one
             // step: the checker's records are the state machine).
-            const steps = @as(usize, @intFromBool(rd.hard_state != null)) + @intFromBool(rd.truncate_after != null) +
-                rd.entries.len + rd.messages.len + 1;
+            const steps = @as(usize, @intFromBool(rd.hard_state != null)) + @intFromBool(rd.snapshot != null) +
+                @intFromBool(rd.truncate_after != null) + rd.entries.len + rd.messages.len + 1;
             var left: usize = std.math.maxInt(usize);
             if (self.cfg.torn_ready_permille != 0 and self.prng.random().uintLessThan(u32, 1000) < self.cfg.torn_ready_permille)
                 left = self.prng.random().uintLessThan(usize, steps + 1);
@@ -400,15 +551,23 @@ pub const RaftServer = struct {
                 left -= 1;
                 s.disk_hs = hs;
             }
+            if (rd.snapshot) |sn| {
+                if (left == 0) return self.tear(sim, i);
+                left -= 1;
+                // In place of the whole persisted log.
+                for (s.disk.items) |e| gpa.free(e.data);
+                s.disk.clearRetainingCapacity();
+                try s.saveSnap(gpa, sn);
+            }
             if (rd.truncate_after) |t| {
                 if (left == 0) return self.tear(sim, i);
                 left -= 1;
-                while (s.disk.items.len > t) gpa.free(s.disk.pop().?.data);
+                while (s.snapIndex() + s.disk.items.len > t) gpa.free(s.disk.pop().?.data);
             }
             for (rd.entries) |e| {
                 if (left == 0) return self.tear(sim, i);
                 left -= 1;
-                if (e.index != s.disk.items.len + 1) return error.ReadyEntriesNotContiguous;
+                if (e.index != s.snapIndex() + s.disk.items.len + 1) return error.ReadyEntriesNotContiguous;
                 var owned = e;
                 owned.data = try gpa.dupe(u8, e.data);
                 errdefer gpa.free(owned.data);
@@ -418,10 +577,27 @@ pub const RaftServer = struct {
             if (!self.cfg.unsafe_send_before_persist and try self.sendReady(sim, rd, &left)) return self.tear(sim, i);
 
             if (left == 0) return self.tear(sim, i);
+            if (rd.snapshot) |sn| {
+                // The state machine is loaded from the image: it must be the
+                // state every server reached at that index.
+                s.loadImage(sn.data);
+                if (s.sm_index != sn.index) return error.SnapshotImageMismatch;
+                try self.recordState(s.sm_index, s.sm_hash);
+                self.installs += 1;
+            }
             for (rd.committed) |e| {
                 const fp = node_mod.fingerprint(e);
+                if (e.index != s.sm_index + 1) return error.ApplyOutOfOrder;
+                s.sm_index = e.index;
+                s.sm_hash = smStep(s.sm_hash, fp);
+                try self.recordState(e.index, s.sm_hash);
                 try self.checker.recordApply(gpa, e.index, fp);
                 try self.checker.recordCommitted(gpa, .{ .index = e.index, .term = e.term, .command = fp });
+                const cl = try self.committed_log.getOrPut(gpa, e.index);
+                if (!cl.found_existing) {
+                    cl.value_ptr.* = .{ .term = e.term, .kind = e.kind, .command = fp };
+                    if (e.kind == .config) self.conf_committed += 1;
+                }
                 const gop = try self.commit_terms.getOrPut(gpa, e.index);
                 if (!gop.found_existing) gop.value_ptr.* = n.term;
                 if (e.kind == .command and e.data.len == 8)
@@ -442,9 +618,27 @@ pub const RaftServer = struct {
             if (left == 0) return self.tear(sim, i);
             try n.advance();
         }
+        if (self.cfg.compact_every != 0 and n.applied >= n.log.snap_index + self.cfg.compact_every) {
+            // The deployment's compaction: snapshot the state machine at its
+            // applied index, persist it, then drop the entries it covers
+            // from the disk (one step here; a crash between the two would
+            // leave both, which a real deployment filters on restart).
+            if (s.sm_index != n.applied) return error.ApplyOutOfOrder;
+            const img = smImage(s);
+            try n.compact(n.applied, &img);
+            const sn = n.snapshot().?;
+            const drop: usize = @intCast(@min(sn.index - s.snapIndex(), s.disk.items.len));
+            for (s.disk.items[0..drop]) |e| gpa.free(e.data);
+            const rest = s.disk.items.len - drop;
+            std.mem.copyForwards(Entry, s.disk.items[0..rest], s.disk.items[drop..]);
+            s.disk.shrinkRetainingCapacity(rest);
+            try s.saveSnap(gpa, sn);
+            self.compactions += 1;
+        }
         // The disk now holds exactly the node's log — a Ready that missed an
         // overwrite of equal length would leave them differing in content.
-        if (s.disk.items.len != n.lastIndex()) return error.DiskDiverged;
+        if (s.snapIndex() != n.log.snap_index) return error.DiskDiverged;
+        if (s.snapIndex() + s.disk.items.len != n.lastIndex()) return error.DiskDiverged;
         for (s.disk.items) |e| {
             if (n.log.get(e.index).?.command != node_mod.fingerprint(e)) return error.DiskDiverged;
         }
@@ -536,21 +730,31 @@ pub const RaftServer = struct {
         // Election Safety + State Machine Safety (incremental, already recorded).
         try self.checker.check();
 
-        // Log Matching — across every node's current log.
+        // Log Matching — across every node's current log. A compacted log is
+        // checked as the committed prefix its snapshot stands for, followed
+        // by the entries the node still holds.
         const logs = try self.gpa.alloc([]const LogEntry, self.node_count);
         defer self.gpa.free(logs);
-        for (self.slots, logs) |*s, *slot| slot.* = if (s.node) |*n| n.log.entries.items else &.{};
+        const starts = try self.gpa.alloc(usize, self.node_count + 1);
+        defer self.gpa.free(starts);
+        self.full_buf.clearRetainingCapacity();
+        for (self.slots, 0..) |*s, k| {
+            starts[k] = self.full_buf.items.len;
+            if (s.node) |*n| try self.appendFullLog(n);
+        }
+        starts[self.node_count] = self.full_buf.items.len;
+        for (logs, 0..) |*slot, k| slot.* = self.full_buf.items[starts[k]..starts[k + 1]];
         if (checks.logMatchingViolation(logs) != null) return error.LogMatching;
 
         // Committed-set workspace for Leader Completeness, re-filtered per leader.
         var committed: std.ArrayList(checks.CommitRec) = .empty;
         defer committed.deinit(self.gpa);
 
-        for (self.slots) |*s| {
+        for (self.slots, logs) |*s, full| {
             const n = if (s.node) |*x| x else continue;
             if (n.role != .leader) continue;
             // Leader Append-Only — never shrinks/overwrites its own log.
-            if (!checks.appendOnlyHolds(s.prev_log.items, n.log.entries.items)) return error.LeaderAppendOnly;
+            if (!checks.appendOnlyHolds(s.prev_log.items, full)) return error.LeaderAppendOnly;
             // Leader Completeness — Figure 3 scopes it to "the leaders of all
             // HIGHER-numbered terms" than the commit, so a stale leader (deposed
             // but unaware inside a minority partition) is only held to entries
@@ -566,13 +770,24 @@ pub const RaftServer = struct {
                 const commit_term = self.commit_terms.get(kv.key_ptr.*) orelse 0;
                 if (commit_term <= n.term) try committed.append(self.gpa, kv.value_ptr.*);
             }
-            if (!checks.leaderCompletenessHolds(n.log.entries.items, committed.items)) return error.LeaderCompleteness;
+            if (!checks.leaderCompletenessHolds(full, committed.items)) return error.LeaderCompleteness;
         }
         // Refresh the append-only witnesses AFTER the check.
-        for (self.slots) |*s| {
+        for (self.slots, logs) |*s, l| {
             s.prev_log.clearRetainingCapacity();
-            if (s.node) |*n| try s.prev_log.appendSlice(self.gpa, n.log.entries.items);
+            if (s.node != null) try s.prev_log.appendSlice(self.gpa, l);
         }
+    }
+
+    /// Node `n`'s whole log as the checkers see it: the committed entries its
+    /// snapshot covers, then its own entries.
+    fn appendFullLog(self: *RaftServer, n: *const Node) !void {
+        var i: LogIndex = 1;
+        while (i <= n.log.snap_index) : (i += 1) {
+            const e = self.committed_log.get(i) orelse return error.CompactedUncommitted;
+            try self.full_buf.append(self.gpa, e);
+        }
+        try self.full_buf.appendSlice(self.gpa, n.log.entries.items);
     }
 };
 
@@ -1902,4 +2117,88 @@ test "teeth: a leader that answers reads without a quorum round serves a stale r
     var failing = (try netsim.findFailing(gpa, template, .{}, 1, 300)) orelse return error.StaleReadUndetected;
     defer failing.deinit();
     try testing.expectEqual(error.StaleRead, failing.err);
+}
+
+// ── membership churn and log compaction (thesis §4/§6, §7) ──────────────────
+
+/// Run seeds `1..=seeds` (fuzzed faults); every run must keep all five
+/// invariants. Returns the counters summed over the runs.
+const SweepCounts = struct { conf: u64 = 0, refused: u64 = 0, compactions: u64 = 0, installs: u64 = 0, applied: u64 = 0 };
+
+fn sweepCounting(gpa: Allocator, srv: *RaftServer, seeds: u64) !SweepCounts {
+    var out: SweepCounts = .{};
+    var seed: u64 = 1;
+    while (seed <= seeds) : (seed += 1) {
+        const case = netsim.Case{ .seed = seed, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+        var gr = try netsim.run(gpa, case, .{});
+        defer gr.trace.deinit();
+        if (gr.result.outcome != .ok) {
+            const err: anyerror = if (gr.result.violation) |v| v.err else error.NotOk;
+            std.debug.print("raft: tripped {} at seed {}\n", .{ err, seed });
+            return error.HardInvariantViolated;
+        }
+        if (srv.malformedDropped() != 0) return error.MalformedInHarness;
+        out.conf += srv.conf_committed;
+        out.refused += srv.conf_refused;
+        out.compactions += srv.compactions;
+        out.installs += srv.installs;
+        out.applied += srv.applied_commands.count();
+    }
+    return out;
+}
+
+test "real: membership churn — single-server and joint changes, learners — keeps all five invariants under a fuzzed fault sweep" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |hardened| {
+        var cfg = DEFAULT_CFG;
+        cfg.boot_voters = 3;
+        cfg.conf_churn_ticks = 12;
+        cfg.pre_vote = hardened;
+        cfg.check_quorum = hardened;
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        const c = try sweepCounting(gpa, &srv, 100);
+        // The churn really happened, joint transitions and all, and the
+        // cluster kept committing through it.
+        try testing.expect(c.conf >= 100);
+        try testing.expect(c.applied >= 500);
+    }
+}
+
+test "real: log compaction and InstallSnapshot keep all five invariants under fuzzed faults, torn Readys and membership churn" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Variant = struct { torn: u16, churn: u32, batched: bool };
+    for ([_]Variant{
+        .{ .torn = 0, .churn = 0, .batched = false },
+        .{ .torn = 60, .churn = 0, .batched = true },
+        .{ .torn = 40, .churn = 12, .batched = false },
+    }) |v| {
+        var cfg = DEFAULT_CFG;
+        cfg.compact_every = 4;
+        cfg.torn_ready_permille = v.torn;
+        cfg.drain_every_event = !v.batched;
+        if (v.churn != 0) {
+            cfg.boot_voters = 3;
+            cfg.conf_churn_ticks = v.churn;
+        }
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        const c = try sweepCounting(gpa, &srv, 100);
+        // Compaction ran everywhere, and lagging servers were caught up
+        // from a snapshot rather than the log.
+        try testing.expect(c.compactions >= 1000);
+        try testing.expect(c.installs >= 20);
+        try testing.expect(c.applied >= 500);
+    }
+}
+
+test "teeth: a snapshot image that differs from the state the others reached trips State Machine Safety" {
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+    defer srv.deinit(gpa);
+    try srv.recordState(4, 0xAAAA);
+    try srv.recordState(4, 0xAAAA);
+    try testing.expectError(error.StateMachineSafety, srv.recordState(4, 0xBBBB));
 }

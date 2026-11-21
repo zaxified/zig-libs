@@ -75,7 +75,7 @@ pub const no_vote: NodeId = 0xFFFF_FFFF;
 
 /// The three log-entry kinds. `noop` is the empty entry a fresh leader appends
 /// to commit prior-term entries indirectly (the Figure-8 mechanism); `config`
-/// carries a membership change (design-only in Phase 1 — see SPEC.md §Membership).
+/// carries a whole membership (`message.Membership`; SPEC.md § Membership changes).
 pub const EntryKind = enum(u8) { noop = 0, command = 1, config = 2 };
 
 /// Why a buffer could not be decoded. Same vocabulary as the other wire

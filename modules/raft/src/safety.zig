@@ -277,21 +277,47 @@ pub fn leaderCommitIndex(current_term: Term, commit_index: LogIndex, match_index
     return commit_index;
 }
 
-// ── [FABLE-CORE, design-only] membership changes (§6) ───────────────────────
+/// `leaderCommitIndex` under a membership (§6, thesis §4): the same Figure-8
+/// rule, but "a majority" is a majority of the voters `incoming[i]` marks —
+/// and, during joint consensus, ALSO a majority of the voters `outgoing[i]`
+/// marks (`jointMajority`'s conjunction). `match_index[i]` counts only for a
+/// server that is a voter of the set being counted (a learner, or a removed
+/// server, replicates without voting). An empty set has no majority, so
+/// nothing commits under it. **[FABLE-CORE]**: the two-majority conjunction is
+/// what keeps the C_old and C_new quorums intersecting while both are in force.
+pub fn leaderCommitIndexJoint(current_term: Term, commit_index: LogIndex, match_index: []const LogIndex, incoming: []const bool, outgoing: ?[]const bool, log: *const Log) LogIndex {
+    var n: LogIndex = log.lastIndex();
+    while (n > commit_index) : (n -= 1) {
+        const t = log.termAt(n).?;
+        if (t < current_term) break; // Figure 8: only a current-term entry commits directly
+        if (t > current_term) continue;
+        if (!majorityAt(match_index, incoming, n)) continue;
+        if (outgoing) |o| if (!majorityAt(match_index, o, n)) continue;
+        return n;
+    }
+    return commit_index;
+}
+
+fn majorityAt(match_index: []const LogIndex, voters: []const bool, n: LogIndex) bool {
+    var members: usize = 0;
+    var replicas: usize = 0;
+    for (voters, match_index) |v, m| {
+        if (!v) continue;
+        members += 1;
+        if (m >= n) replicas += 1;
+    }
+    return members > 0 and replicas >= members / 2 + 1;
+}
+
+// ── [FABLE-CORE] membership changes (§6) ────────────────────────────────────
 
 /// Joint-consensus safety check (§6): during a `C_old → C_old,new → C_new`
 /// transition, an election or commit counts only if it wins majorities in BOTH
-/// the old and new configurations. **[FABLE-CORE, DESIGN-ONLY in Phase 1]** —
-/// full membership change (joint consensus, the config-entry-takes-effect-on-
-/// append rule, the no-op-in-current-term leader precondition) is designed in
-/// SPEC.md §Membership but scaffolded only: this predicate is implemented and
-/// unit-tested, but `config` log entries carry no payload yet and the harness
-/// does not fuzz membership. Wiring it into elections/commits is the natural
-/// next Fable increment now that the core five properties hold.
+/// the old and new configurations. **[FABLE-CORE]** — the id-list form of the
+/// rule `Node` applies through its per-id voter masks (`leaderCommitIndexJoint`
+/// for commits, the node's quorum check for votes, CheckQuorum and reads).
 ///
-/// Implemented (correct §6 predicate) even though Phase 1's harness does not
-/// yet fuzz membership — the gate must not leave any reachable `@panic`. The
-/// subtlety it encodes: a SINGLE combined majority over `C_old ∪ C_new` is the
+/// The subtlety it encodes: a SINGLE combined majority over `C_old ∪ C_new` is the
 /// wrong-but-plausible rule — it can be satisfied entirely by new-config nodes
 /// while a disjoint old-config majority elects a second leader (or vice versa);
 /// only the conjunction of INDEPENDENT majorities makes the two configurations'
@@ -580,6 +606,35 @@ test "§6 joint majority: needs INDEPENDENT majorities in both configs, not one 
 
     // Empty configuration: conservative false, never vacuous truth.
     try testing.expect(!jointMajority(&.{}, &c_new, &.{ 2, 3, 4 }));
+}
+
+test "§6 joint commit: an entry commits only on a majority of EACH configuration; learners never count" {
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    try log.appendSlice(gpa, &.{ .{ .term = 2, .command = 1 }, .{ .term = 2, .command = 2 } });
+    // Servers 0..5. Old config {0,1,2}, new {2,3,4}; 5 is a learner (in neither).
+    const old = [_]bool{ true, true, true, false, false, false };
+    const new = [_]bool{ false, false, true, true, true, false };
+    // Index 2 held by 0,1 (old majority) and 5: a single combined pool of
+    // {0..4} would count 2 of 5 — not a majority either — but a pool that
+    // also counted the learner would reach 3. Neither config's majority holds
+    // in the new config: not committed.
+    const m1 = [_]LogIndex{ 2, 2, 0, 0, 0, 2 };
+    try testing.expectEqual(@as(LogIndex, 0), leaderCommitIndexJoint(2, 0, &m1, &new, &old, &log));
+    // Old majority {0,1} + new majority {3,4}: both hold — committed.
+    const m2 = [_]LogIndex{ 2, 2, 0, 2, 2, 0 };
+    try testing.expectEqual(@as(LogIndex, 2), leaderCommitIndexJoint(2, 0, &m2, &new, &old, &log));
+    // Outside joint consensus only the incoming config counts.
+    try testing.expectEqual(@as(LogIndex, 2), leaderCommitIndexJoint(2, 0, &m2, &new, null, &log));
+    // The new majority alone is not enough while joint.
+    const m3 = [_]LogIndex{ 0, 0, 2, 2, 2, 0 };
+    try testing.expectEqual(@as(LogIndex, 0), leaderCommitIndexJoint(2, 0, &m3, &new, &old, &log));
+    // Figure 8 still holds: an old-term entry on both majorities does not commit.
+    try testing.expectEqual(@as(LogIndex, 0), leaderCommitIndexJoint(3, 0, &m2, &new, &old, &log));
+    // An empty voter set has no majority.
+    const none = [_]bool{ false, false, false, false, false, false };
+    try testing.expectEqual(@as(LogIndex, 0), leaderCommitIndexJoint(2, 0, &m2, &none, null, &log));
 }
 
 test "observeTerm: adopts a strictly higher term, holds otherwise (mechanical rule, real test)" {

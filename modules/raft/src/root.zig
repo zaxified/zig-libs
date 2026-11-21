@@ -15,9 +15,9 @@
 //! invariant checker, a deliberately-broken positive control and a
 //! property/shrink/teeth harness.
 //!
-//! **Status: mvp.** Not yet: snapshots / log compaction, membership changes
-//! (`jointMajority` implemented, not wired), linearizable reads (PreVote,
-//! CheckQuorum and leadership transfer are in) — see SPEC.md § Backlog / deferred.
+//! **Status: mvp.** Election, replication, PreVote, CheckQuorum, leadership
+//! transfer, linearizable reads, membership changes (single-server and joint
+//! consensus, learners) and log compaction with InstallSnapshot — see SPEC.md.
 //!
 //! **What the LIVE sweep actually catches** — stated explicitly, because a
 //! checker that cannot fail is worse than no checker:
@@ -45,7 +45,7 @@ const netsim = @import("netsim");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Raft consensus (Ongaro & Ousterhout) — a runnable server (`Node`: tick/step/propose → ready/advance over your transport and disk), model-checked in netsim against all five formal safety properties; no snapshots or membership changes yet",
+    .doc = "Raft consensus (Ongaro & Ousterhout) — a runnable server (`Node`: tick/step/propose → ready/advance over your transport and disk) with membership changes and log compaction, model-checked in netsim against all five formal safety properties",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -93,6 +93,7 @@ pub const logIsAtLeastAsUpToDate = safety.logIsAtLeastAsUpToDate;
 pub const handleRequestVote = safety.handleRequestVote;
 pub const handleAppendEntries = safety.handleAppendEntries;
 pub const leaderCommitIndex = safety.leaderCommitIndex;
+pub const leaderCommitIndexJoint = safety.leaderCommitIndexJoint;
 pub const jointMajority = safety.jointMajority;
 pub const observeTerm = safety.observeTerm;
 
@@ -118,6 +119,11 @@ pub const InitError = node_mod.InitError;
 pub const ProposeError = node_mod.ProposeError;
 pub const TransferError = node_mod.TransferError;
 pub const ReadError = node_mod.ReadError;
+pub const ConfChange = node_mod.ConfChange;
+pub const ConfChangeError = node_mod.ConfChangeError;
+pub const CompactError = node_mod.CompactError;
+pub const Snapshot = node_mod.Snapshot;
+pub const max_servers_limit = node_mod.max_servers_limit;
 pub const ReadState = node_mod.ReadState;
 pub const fingerprint = node_mod.fingerprint;
 
@@ -133,6 +139,8 @@ pub const TimeoutNow = message.TimeoutNow;
 pub const ReadProbe = message.ReadProbe;
 pub const AppendReq = message.AppendReq;
 pub const AppendResp = message.AppendResp;
+pub const SnapshotMsg = message.SnapshotMsg;
+pub const Membership = message.Membership;
 
 const server = @import("server.zig");
 pub const RaftServer = server.RaftServer;

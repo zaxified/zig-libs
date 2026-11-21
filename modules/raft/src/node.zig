@@ -53,9 +53,19 @@
 //! proposals, brings the target's log up to date and tells it to campaign at
 //! once; abandoned after one election timeout.
 //!
-//! Not here yet (see SPEC.md § Backlog / deferred): snapshots / log compaction, membership
-//! change, linearizable reads. The whole log
-//! lives in memory, and so does every entry's data.
+//! Linearizable reads (thesis §6.4; etcd/raft `ReadIndex`): `readIndex(ctx)`.
+//!
+//! Membership changes (thesis §4; etcd/raft `ConfChange`/`ConfChangeV2`,
+//! hashicorp/raft `AddVoter`/`AddNonvoter`/`RemoveServer`):
+//! `proposeConfChange` — one voter at a time as a single-server change, more
+//! at once through joint consensus (§6) that the leader leaves by itself; a
+//! configuration takes effect on every server as soon as it is in its log.
+//!
+//! Log compaction (§7): `compact(index, data)` replaces the log up to an
+//! applied index by the caller's state-machine image; a follower the leader
+//! can no longer catch up from its log is sent that snapshot
+//! (InstallSnapshot) and reports it in `Ready.snapshot`. The log after the
+//! snapshot lives in memory, and so does every entry's data.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -74,6 +84,35 @@ const no_vote = types.no_vote;
 
 pub const Entry = message.Entry;
 pub const Message = message.Message;
+pub const Membership = message.Membership;
+
+/// The most server ids a node can track (`Config.max_servers`): the bound
+/// that lets a snapshot's membership be checked without an allocator.
+pub const max_servers_limit: u32 = message.max_conf_ids / 2;
+
+/// One change of a membership change (`Node.proposeConfChange`; etcd/raft
+/// `ConfChangeSingle`).
+pub const ConfChange = union(enum) {
+    /// Make `id` a voter (a learner is promoted).
+    add_voter: NodeId,
+    /// Make `id` a learner: it replicates the log without voting (etcd/raft
+    /// `ConfChangeAddLearnerNode`, hashicorp/raft `AddNonvoter`). A voter is
+    /// demoted — only as a single-server change, not inside joint consensus.
+    add_learner: NodeId,
+    /// Remove `id` (voter or learner); a non-member is a no-op (etcd/raft).
+    remove: NodeId,
+};
+
+/// A snapshot (§7): the state machine's image after applying every entry up
+/// to `index`, the term of that entry, and the membership in force there.
+pub const Snapshot = struct {
+    index: LogIndex,
+    term: Term,
+    /// `Membership.encode`d.
+    conf: []const u8,
+    /// The caller's state-machine image.
+    data: []const u8,
+};
 
 /// `pre_candidate`: polling peers with PreVote before an election
 /// (`Config.pre_vote`; etcd/raft's `StatePreCandidate`) — its term and vote
@@ -81,10 +120,18 @@ pub const Message = message.Message;
 pub const Role = enum { follower, pre_candidate, candidate, leader };
 
 pub const Config = struct {
-    /// This server. Voters are `0 .. cluster_size - 1`; every server in the
-    /// cluster must be given the same `cluster_size`.
+    /// This server. Until the log or a snapshot holds a membership, the
+    /// voters are `0 .. cluster_size - 1` (the bootstrap membership); every
+    /// server of the cluster must be given the same `cluster_size`. A server
+    /// joining later is started with the same value and learns the real
+    /// membership from its leader.
     id: NodeId,
     cluster_size: u32,
+    /// Server ids are `0 .. max(cluster_size, max_servers) - 1`; a membership
+    /// change can add any of them. 0 = `cluster_size` (no server can be
+    /// added). At most `max_servers_limit`. Per-peer state is kept for every
+    /// id, so this sizes the node's memory.
+    max_servers: u32 = 0,
     /// A follower or candidate that hears nothing for this many ticks starts
     /// an election. The actual timeout is redrawn on every reset, uniformly
     /// from `[election_ticks, election_ticks + election_jitter_ticks)`.
@@ -169,11 +216,17 @@ pub const HardState = struct {
 /// `Ready`s.
 pub const Restore = struct {
     hard_state: HardState = .{},
-    /// The persisted log, dense from index 1. Copied.
+    /// The latest persisted snapshot (a `Ready.snapshot`, or what the caller
+    /// saved at a `compact`), or null. Copied.
+    snapshot: ?Snapshot = null,
+    /// The persisted log, dense from index 1 — or from `snapshot.index + 1`
+    /// when there is a snapshot (entries it covers must be left out). Copied.
     entries: []const Entry = &.{},
     /// Entries the caller's state machine already holds durably (0 when it
     /// is rebuilt from the log on every start). They are known committed —
     /// they were only ever handed out as committed — and are not re-delivered.
+    /// A snapshot counts as applied: the caller restores its state machine
+    /// from it.
     applied: LogIndex = 0,
 };
 
@@ -189,6 +242,11 @@ pub const Restore = struct {
 pub const Ready = struct {
     /// Non-null when term or vote changed: persist it.
     hard_state: ?HardState,
+    /// Non-null when the leader sent a snapshot this node installed (§7):
+    /// persist it in place of the WHOLE persisted log (every persisted entry
+    /// is deleted; `entries` below continue after `snapshot.index`), and load
+    /// the state machine from `snapshot.data` before applying `committed`.
+    snapshot: ?Snapshot,
     /// Non-null when entries the caller may already have persisted were
     /// overwritten by a new leader: delete every persisted entry with an index
     /// above this, BEFORE writing `entries`.
@@ -234,6 +292,9 @@ pub const InjectedBug = enum {
     /// `readIndex` is answered from the leader's commit index with no quorum
     /// round and no lease: a stale leader serves stale reads.
     unconfirmed_reads,
+    /// Joint consensus counts only the incoming configuration (C_new): the
+    /// "one majority is enough" rule §6 exists to forbid.
+    joint_incoming_only,
 };
 
 pub const InitError = error{ InvalidConfig, InvalidRestore } || Allocator.Error;
@@ -244,6 +305,17 @@ pub const ProposeError = error{ NotLeader, EntryTooLarge, ProposalDropped } || A
 pub const TransferError = error{ NotLeader, InvalidTarget } || Allocator.Error;
 /// `NotLeader`: ask the leader (`Node.leader`), as with `propose`.
 pub const ReadError = error{NotLeader} || Allocator.Error;
+/// `ConfChangePending`: an earlier change is not committed yet, the leader
+/// is still in joint consensus, or no entry of its term has committed (thesis
+/// §4.1: one change at a time, and a new leader commits its no-op first —
+/// etcd/raft drops such a proposal, hashicorp/raft refuses it).
+/// `InvalidConfChange`: an id outside `max_servers`, no voter left, no change
+/// listed, or a voter demoted to learner inside joint consensus.
+pub const ConfChangeError = error{ NotLeader, ProposalDropped, ConfChangePending, InvalidConfChange, EntryTooLarge } || Allocator.Error;
+/// `Compacted`: the log is already compacted to `index` or past it (etcd/raft
+/// `ErrSnapOutOfDate`). `NotApplied`: `index` is above what the caller has
+/// applied — a snapshot must be of the state machine as it is.
+pub const CompactError = error{ Compacted, NotApplied } || Allocator.Error;
 
 /// Upper bound on any `propose` payload: the wire carries an entry's length
 /// as a `u32`. The effective bound is lower — `Config.max_append_bytes` minus
@@ -275,9 +347,29 @@ pub const Node = struct {
     // persistent (Figure 2) — durable once an `advance` confirms it
     term: Term = 0,
     voted_for: NodeId = no_vote,
-    /// Terms, kinds and fingerprints; `data[i - 1]` is index i's bytes.
+    /// Terms, kinds and fingerprints; `data[i - log.snap_index - 1]` is
+    /// index i's bytes.
     log: Log = .{},
     data: std.ArrayList([]u8) = .empty,
+    /// The latest snapshot (§7) — `log.snap_index` / `log.snap_term` are its
+    /// position — with its membership and image. `snap_conf` is always a
+    /// valid membership: the bootstrap one before the first snapshot.
+    snap_conf: []u8 = &.{},
+    snap_data: []u8 = &.{},
+
+    // membership (thesis §4), the one in force: the newest in the log, else
+    // the snapshot's
+    /// Per id: a voter of C_new (or of the only configuration).
+    voters: []bool,
+    /// Per id: a voter of C_old during joint consensus; all false otherwise.
+    voters_out: []bool,
+    learners: []bool,
+    joint: bool = false,
+    /// The index of the config entry in force; at or below `log.snap_index`
+    /// when it came from the snapshot (or is the bootstrap membership).
+    conf_index: LogIndex = 0,
+    conf_ids: []NodeId,
+    scratch: []bool,
 
     // volatile
     role: Role = .follower,
@@ -326,6 +418,11 @@ pub const Node = struct {
     /// The server a leadership transfer is handing over to, or `no_vote`
     /// (etcd/raft's `leadTransferee`). While set, `propose` refuses.
     transferee: NodeId = no_vote,
+    /// Per follower: the snapshot index sent to it and not yet acknowledged
+    /// (0 = none; etcd/raft's `StateSnapshot`). While set the follower gets
+    /// keep-alives only, and the snapshot again after one election timeout.
+    snap_pending: []LogIndex,
+    snap_age: []u32,
 
     /// Ticks since this node last heard from a leader or granted a vote; on a
     /// leader, ticks into the current election-timeout period (the quorum
@@ -337,6 +434,8 @@ pub const Node = struct {
 
     // pending output
     hs_dirty: bool = false,
+    /// A snapshot was installed since the last `advance` (`Ready.snapshot`).
+    snap_out: bool = false,
     /// Lowest index truncated away since the last `advance` that the caller
     /// may already have persisted; null if none.
     truncated: ?LogIndex = null,
@@ -362,7 +461,8 @@ pub const Node = struct {
     injected_bug: InjectedBug = .none,
 
     pub fn init(gpa: Allocator, cfg: Config, restore: Restore) InitError!Node {
-        if (cfg.cluster_size == 0 or cfg.id >= cfg.cluster_size) return error.InvalidConfig;
+        if (cfg.cluster_size == 0 or cfg.id >= idLimit(cfg)) return error.InvalidConfig;
+        if (idLimit(cfg) > max_servers_limit) return error.InvalidConfig;
         if (cfg.election_ticks == 0 or cfg.heartbeat_ticks == 0 or cfg.max_append_entries == 0) return error.InvalidConfig;
         if (cfg.heartbeat_ticks >= cfg.election_ticks) return error.InvalidConfig;
         if (cfg.election_jitter_ticks > std.math.maxInt(u32) - cfg.election_ticks) return error.InvalidConfig;
@@ -371,17 +471,13 @@ pub const Node = struct {
         if (cfg.max_inflight_msgs == 0) return error.InvalidConfig;
         if (cfg.read_lease and !cfg.check_quorum) return error.InvalidConfig;
         if (cfg.max_inflight_bytes != 0 and cfg.max_inflight_bytes < cfg.max_append_bytes) return error.InvalidConfig;
-        try validateRestore(cfg, restore);
 
-        const n = cfg.cluster_size;
+        const n = idLimit(cfg);
         var self: Node = .{
             .gpa = gpa,
             .cfg = cfg,
             .term = restore.hard_state.term,
             .voted_for = restore.hard_state.voted_for,
-            .commit = restore.applied,
-            .applied = restore.applied,
-            .stable = restore.entries.len,
             .votes = &.{},
             .next = &.{},
             .match = &.{},
@@ -392,11 +488,20 @@ pub const Node = struct {
             .infl_bytes = &.{},
             .recent_active = &.{},
             .read_ack = &.{},
+            .voters = &.{},
+            .voters_out = &.{},
+            .learners = &.{},
+            .conf_ids = &.{},
+            .scratch = &.{},
+            .snap_pending = &.{},
+            .snap_age = &.{},
             .prng = .init(cfg.seed),
             .out_arena = .init(gpa),
             .decode_buf = &.{},
         };
         errdefer self.deinit();
+        self.conf_ids = try gpa.alloc(NodeId, 2 * @as(usize, n));
+        try self.validateRestore(restore);
         self.votes = try gpa.alloc(bool, n);
         self.next = try gpa.alloc(LogIndex, n);
         self.match = try gpa.alloc(LogIndex, n);
@@ -417,6 +522,32 @@ pub const Node = struct {
         @memset(self.votes, false);
         @memset(self.next, 1);
         @memset(self.match, 0);
+        self.voters = try gpa.alloc(bool, n);
+        self.voters_out = try gpa.alloc(bool, n);
+        self.learners = try gpa.alloc(bool, n);
+        self.scratch = try gpa.alloc(bool, n);
+        @memset(self.voters, false);
+        @memset(self.voters_out, false);
+        @memset(self.learners, false);
+        self.snap_pending = try gpa.alloc(LogIndex, n);
+        self.snap_age = try gpa.alloc(u32, n);
+        @memset(self.snap_pending, 0);
+        @memset(self.snap_age, 0);
+
+        if (restore.snapshot) |sn| {
+            self.snap_conf = try gpa.dupe(u8, sn.conf);
+            self.snap_data = try gpa.dupe(u8, sn.data);
+            self.log.restoreSnapshot(sn.index, sn.term);
+        } else {
+            // The bootstrap membership: voters 0 .. cluster_size - 1.
+            const ids = try gpa.alloc(NodeId, cfg.cluster_size);
+            defer gpa.free(ids);
+            for (ids, 0..) |*id, i| id.* = @intCast(i);
+            self.snap_conf = try (Membership{ .voters = ids }).encodeAlloc(gpa);
+        }
+        self.stable = self.log.snap_index + restore.entries.len;
+        self.applied = @max(restore.applied, self.log.snap_index);
+        self.commit = self.applied;
         try self.log.entries.ensureTotalCapacity(gpa, restore.entries.len);
         try self.data.ensureTotalCapacity(gpa, restore.entries.len);
         for (restore.entries) |e| {
@@ -424,21 +555,46 @@ pub const Node = struct {
             self.log.entries.appendAssumeCapacity(.{ .term = e.term, .kind = e.kind, .command = fingerprint(e) });
             self.data.appendAssumeCapacity(owned);
         }
+        self.reloadConf();
         self.resetElectionTimer();
         return self;
     }
 
-    fn validateRestore(cfg: Config, r: Restore) InitError!void {
+    fn idLimit(cfg: Config) u32 {
+        return @max(cfg.cluster_size, cfg.max_servers);
+    }
+
+    fn validateRestore(self: *Node, r: Restore) InitError!void {
         const hs = r.hard_state;
+        const lim = idLimit(self.cfg);
         if (hs.term > types.max_term) return error.InvalidRestore;
-        if (hs.voted_for != no_vote and hs.voted_for >= cfg.cluster_size) return error.InvalidRestore;
-        if (r.applied > r.entries.len) return error.InvalidRestore;
+        if (hs.voted_for != no_vote and hs.voted_for >= lim) return error.InvalidRestore;
+        var first: LogIndex = 1;
         var last_term: Term = 0;
-        for (r.entries, 1..) |e, i| {
+        if (r.snapshot) |sn| {
+            if (sn.index == 0 or sn.term == 0 or sn.term > hs.term) return error.InvalidRestore;
+            if (!self.confValid(sn.conf)) return error.InvalidRestore;
+            first = sn.index + 1;
+            last_term = sn.term;
+        }
+        if (r.applied > first - 1 + r.entries.len) return error.InvalidRestore;
+        for (r.entries, first..) |e, i| {
             if (e.index != i) return error.InvalidRestore;
             if (e.term < last_term or e.term > hs.term) return error.InvalidRestore;
+            if (e.kind == .config and !self.confValid(e.data)) return error.InvalidRestore;
             last_term = e.term;
         }
+    }
+
+    /// A membership this node can take: well-formed, every id below
+    /// `max_servers`.
+    fn confValid(self: *const Node, bytes: []const u8) bool {
+        const m = Membership.decode(bytes, self.conf_ids) catch return false;
+        const lim = idLimit(self.cfg);
+        for ([_][]const NodeId{ m.voters, m.voters_outgoing, m.learners }) |list| {
+            for (list) |id| if (id >= lim) return false;
+        }
+        return true;
     }
 
     pub fn deinit(self: *Node) void {
@@ -460,6 +616,15 @@ pub const Node = struct {
         gpa.free(self.infl_bytes);
         gpa.free(self.recent_active);
         gpa.free(self.read_ack);
+        gpa.free(self.voters);
+        gpa.free(self.voters_out);
+        gpa.free(self.learners);
+        gpa.free(self.conf_ids);
+        gpa.free(self.scratch);
+        gpa.free(self.snap_pending);
+        gpa.free(self.snap_age);
+        gpa.free(self.snap_conf);
+        gpa.free(self.snap_data);
         self.reads.deinit(gpa);
         self.read_out.deinit(gpa);
         self.* = undefined;
@@ -470,21 +635,60 @@ pub const Node = struct {
     }
 
     /// Index `i`'s entry (borrowing node memory until the next mutation), or
-    /// null past the end.
+    /// null past the end or at or below the snapshot's last index.
     pub fn entryAt(self: *const Node, i: LogIndex) ?Entry {
         const e = self.log.get(i) orelse return null;
-        return .{ .index = i, .term = e.term, .kind = e.kind, .data = self.data.items[@intCast(i - 1)] };
+        return .{ .index = i, .term = e.term, .kind = e.kind, .data = self.data.items[@intCast(i - self.log.snap_index - 1)] };
+    }
+
+    /// The latest snapshot (borrowing node memory until the next `compact`
+    /// or installed snapshot), or null before the first. After `compact`,
+    /// persist it, then delete the persisted entries it covers.
+    pub fn snapshot(self: *const Node) ?Snapshot {
+        if (self.log.snap_index == 0) return null;
+        return .{ .index = self.log.snap_index, .term = self.log.snap_term, .conf = self.snap_conf, .data = self.snap_data };
+    }
+
+    /// The membership in force (borrowing node memory until the next
+    /// mutation).
+    pub fn membership(self: *const Node) Membership {
+        return Membership.decode(self.confBytes(), self.conf_ids) catch unreachable; // validated before it was taken
+    }
+
+    /// `id` votes in the membership in force (C_new or C_old).
+    pub fn isVoter(self: *const Node, id: NodeId) bool {
+        return id < self.voters.len and (self.voters[id] or self.voters_out[id]);
+    }
+
+    /// `id` is a voter or a learner of the membership in force.
+    pub fn isMember(self: *const Node, id: NodeId) bool {
+        return self.isVoter(id) or (id < self.learners.len and self.learners[id]);
     }
 
     /// The largest AppendEntries frame this node accepts (`max_append_bytes`
     /// of entries plus the fixed header) — and so the largest frame of any
-    /// kind. A transport can refuse a longer frame before reading it.
+    /// kind but InstallSnapshot, whose frame is as large as the snapshot
+    /// (`message.Message.snapshot_header_len` + membership + image).
     pub fn maxFrameLen(self: *const Node) usize {
         return message.Message.append_header_len + @as(usize, self.cfg.max_append_bytes);
     }
 
-    fn majority(self: *const Node) usize {
-        return self.cfg.cluster_size / 2 + 1;
+    /// Does `set` (indexed by id) hold a majority of the voters — of both
+    /// configurations during joint consensus (§6)?
+    fn hasQuorum(self: *const Node, set: []const bool) bool {
+        if (!majorityOf(self.voters, set)) return false;
+        if (self.joint and self.injected_bug != .joint_incoming_only and !majorityOf(self.voters_out, set)) return false;
+        return true;
+    }
+
+    fn majorityOf(voters: []const bool, set: []const bool) bool {
+        var members: usize = 0;
+        var yes: usize = 0;
+        for (voters, set) |v, x| {
+            members += @intFromBool(v);
+            yes += @intFromBool(v and x);
+        }
+        return members > 0 and yes >= members / 2 + 1;
     }
 
     fn resetElectionTimer(self: *Node) void {
@@ -504,7 +708,7 @@ pub const Node = struct {
             if (self.election_elapsed >= self.cfg.election_ticks) {
                 self.election_elapsed = 0;
                 if (self.cfg.check_quorum) {
-                    if (!self.quorumActive()) {
+                    if (!self.hasQuorum(self.recent_active)) {
                         self.becomeFollower(self.term);
                         self.leader = no_vote;
                         return;
@@ -517,6 +721,9 @@ pub const Node = struct {
                 // `abortLeaderTransfer`, hashicorp's ElectionTimeout).
                 self.transferee = no_vote;
             }
+            for (self.snap_pending, self.snap_age) |p, *age| {
+                if (p != 0) age.* +|= 1;
+            }
             self.heartbeat_elapsed += 1;
             if (self.heartbeat_elapsed >= self.cfg.heartbeat_ticks) try self.bcastAppend();
             return;
@@ -524,6 +731,9 @@ pub const Node = struct {
         self.election_elapsed += 1;
         if (self.election_elapsed >= self.election_timeout) {
             if (self.injected_bug == .never_campaign) return;
+            // A learner, or a server the membership no longer (or not yet)
+            // names as a voter, never campaigns (etcd/raft `promotable`).
+            if (!self.isVoter(self.cfg.id)) return self.resetElectionTimer();
             if (self.cfg.pre_vote) try self.preCampaign() else try self.campaign(false);
         }
     }
@@ -544,6 +754,167 @@ pub const Node = struct {
         return idx;
     }
 
+    /// Change the membership (Raft thesis §4; etcd/raft `ProposeConfChange`
+    /// with `ConfChangeV2`'s automatic transition): the changes are applied
+    /// together to the membership in force and the result is appended as a
+    /// `config` entry, which takes effect on every server as soon as it is in
+    /// its log (thesis §4.1, hashicorp/raft — not when committed). When at
+    /// most one VOTER changes it is a single-server change; when more do, it
+    /// is joint consensus (§6): the entry holds C_new as `voters` and C_old as
+    /// `voters_outgoing`, every election and commit then needs a majority of
+    /// both, and once the entry commits the leader appends C_new alone by
+    /// itself (etcd/raft's auto-leave). Returns the entry's index; committed
+    /// like any entry (or lost with leadership: propose again on the new
+    /// leader). One change at a time: refused (`ConfChangePending`) until the
+    /// previous config entry, the joint transition and an entry of this
+    /// leader's term have committed. A leader that removes itself keeps
+    /// leading until the change commits, without counting itself, then steps
+    /// down (thesis §4.2.2).
+    pub fn proposeConfChange(self: *Node, changes: []const ConfChange) ConfChangeError!LogIndex {
+        std.debug.assert(!self.in_ready);
+        if (self.role != .leader) return error.NotLeader;
+        if (self.transferee != no_vote) return error.ProposalDropped;
+        if (self.joint or self.conf_index > self.commit or !self.committedInTerm()) return error.ConfChangePending;
+        if (changes.len == 0) return error.InvalidConfChange;
+        const gpa = self.gpa;
+        const n = self.voters.len;
+        const nv = try gpa.dupe(bool, self.voters);
+        defer gpa.free(nv);
+        const nl = try gpa.dupe(bool, self.learners);
+        defer gpa.free(nl);
+        for (changes) |c| switch (c) {
+            .add_voter => |id| {
+                if (id >= n) return error.InvalidConfChange;
+                nv[id] = true;
+                nl[id] = false;
+            },
+            .add_learner => |id| {
+                if (id >= n) return error.InvalidConfChange;
+                nl[id] = true;
+                nv[id] = false;
+            },
+            .remove => |id| {
+                if (id >= n) return error.InvalidConfChange;
+                nv[id] = false;
+                nl[id] = false;
+            },
+        };
+        var changed: usize = 0;
+        var left: usize = 0;
+        for (nv, self.voters) |a, b| {
+            changed += @intFromBool(a != b);
+            left += @intFromBool(a);
+        }
+        if (left == 0) return error.InvalidConfChange;
+        const joint = changed > 1;
+        // A voter demoted to learner would sit in C_old and in the learners
+        // at once; etcd/raft parks it in `LearnersNext`, this node refuses
+        // it inside joint consensus (demote it on its own).
+        if (joint) for (nl, self.voters) |l, v| {
+            if (l and v) return error.InvalidConfChange;
+        };
+        const ids = try gpa.alloc(NodeId, 3 * n);
+        defer gpa.free(ids);
+        const m: Membership = .{
+            .voters = listOf(ids[0..n], nv),
+            .voters_outgoing = if (joint) listOf(ids[n .. 2 * n], self.voters) else &.{},
+            .learners = listOf(ids[2 * n ..], nl),
+        };
+        const bytes = try m.encodeAlloc(gpa);
+        defer gpa.free(bytes);
+        if (bytes.len > self.cfg.max_append_bytes - message.Message.entry_header_len) return error.EntryTooLarge;
+        const idx = try self.appendLocal(.config, bytes);
+        self.bcast_pending = true;
+        return idx;
+    }
+
+    fn listOf(out: []NodeId, set: []const bool) []const NodeId {
+        var k: usize = 0;
+        for (set, 0..) |x, id| {
+            if (!x) continue;
+            out[k] = @intCast(id);
+            k += 1;
+        }
+        return out[0..k];
+    }
+
+    /// Compact the log up to `index` (§7; etcd/raft `Storage.CreateSnapshot`
+    /// + `Compact`, hashicorp/raft's snapshot + `DeleteRange`): `data` is the
+    /// caller's state-machine image after applying every entry up to `index`
+    /// (copied); the entries up to it are dropped from memory, and a follower
+    /// that needs one of them is sent this snapshot instead. `index` must be
+    /// applied (`NotApplied`) and above the current snapshot (`Compacted`).
+    /// Afterwards persist `snapshot()` and then delete the persisted entries
+    /// up to `index` — a crash in between leaves both, and `Restore` wants
+    /// only the entries after the snapshot.
+    pub fn compact(self: *Node, index: LogIndex, data: []const u8) CompactError!void {
+        std.debug.assert(!self.in_ready);
+        if (index <= self.log.snap_index) return error.Compacted;
+        if (index > self.applied) return error.NotApplied;
+        const gpa = self.gpa;
+        const conf = try gpa.dupe(u8, self.confAt(index));
+        errdefer gpa.free(conf);
+        const image = try gpa.dupe(u8, data);
+        gpa.free(self.snap_conf);
+        gpa.free(self.snap_data);
+        self.snap_conf = conf;
+        self.snap_data = image;
+        const drop: usize = @intCast(index - self.log.snap_index);
+        for (self.data.items[0..drop]) |d| gpa.free(d);
+        const rest = self.data.items.len - drop;
+        std.mem.copyForwards([]u8, self.data.items[0..rest], self.data.items[drop..]);
+        self.data.shrinkRetainingCapacity(rest);
+        self.log.compactTo(index);
+    }
+
+    /// The membership in force at `index` (at or above the snapshot): the
+    /// newest config entry up to it, else the snapshot's.
+    fn confAt(self: *const Node, index: LogIndex) []const u8 {
+        var i = index;
+        while (i > self.log.snap_index) : (i -= 1) {
+            if (self.log.get(i).?.kind == .config) return self.data.items[@intCast(i - self.log.snap_index - 1)];
+        }
+        return self.snap_conf;
+    }
+
+    fn confBytes(self: *const Node) []const u8 {
+        return self.confAt(self.lastIndex());
+    }
+
+    /// Take the membership in force from the log (its newest config entry)
+    /// or the snapshot; called after anything that can change which one that
+    /// is. Peers that just joined start with fresh replication state.
+    fn reloadConf(self: *Node) void {
+        var idx = self.lastIndex();
+        while (idx > self.log.snap_index) : (idx -= 1) {
+            if (self.log.get(idx).?.kind == .config) break;
+        }
+        const m = Membership.decode(self.confBytes(), self.conf_ids) catch unreachable; // validated on the way in
+        @memcpy(self.scratch, self.voters);
+        for (self.scratch, self.learners, self.voters_out) |*was, l, o| was.* = was.* or l or o;
+        @memset(self.voters, false);
+        @memset(self.voters_out, false);
+        @memset(self.learners, false);
+        for (m.voters) |id| self.voters[id] = true;
+        for (m.voters_outgoing) |id| self.voters_out[id] = true;
+        for (m.learners) |id| self.learners[id] = true;
+        self.joint = m.isJoint();
+        self.conf_index = idx;
+        for (self.scratch, 0..) |was, p| {
+            if (was or !self.isMember(@intCast(p))) continue;
+            // etcd/raft: a new peer's progress starts at the last index,
+            // active (so CheckQuorum does not count it against the leader
+            // before it could answer).
+            self.next[p] = @max(1, self.lastIndex());
+            self.match[p] = 0;
+            self.infl_count[p] = 0;
+            self.infl_bytes[p] = 0;
+            self.snap_pending[p] = 0;
+            self.recent_active[p] = true;
+            self.read_ack[p] = 0;
+        }
+    }
+
     /// Hand leadership to `target` (Raft thesis §3.10; etcd/raft
     /// `TransferLeadership`). From now on `propose` refuses
     /// (`error.ProposalDropped`); the target is sent what it is missing and,
@@ -554,11 +925,13 @@ pub const Node = struct {
     /// again, if this node is still leader one election timeout later. A
     /// second call for the same target is a no-op; for another target it
     /// restarts the transfer toward that one; for this node itself it cancels
-    /// a transfer under way (all as etcd/raft).
+    /// a transfer under way (all as etcd/raft). The target must be a voter
+    /// (`InvalidTarget`; etcd/raft ignores a transfer to a learner).
     pub fn transferLeadership(self: *Node, target: NodeId) TransferError!void {
         std.debug.assert(!self.in_ready);
-        if (target >= self.cfg.cluster_size) return error.InvalidTarget;
+        if (target >= self.voters.len) return error.InvalidTarget;
         if (self.role != .leader) return error.NotLeader;
+        if (target != self.cfg.id and !self.isVoter(target)) return error.InvalidTarget;
         if (self.transferee != no_vote) {
             if (self.transferee == target) return;
             self.transferee = no_vote;
@@ -600,16 +973,33 @@ pub const Node = struct {
 
     pub fn step(self: *Node, m: Message) Allocator.Error!void {
         std.debug.assert(!self.in_ready);
-        if (m.to != self.cfg.id or m.from >= self.cfg.cluster_size or m.from == self.cfg.id) {
+        // Any server id may send (one being added, one just removed); an id
+        // outside `max_servers` cannot exist.
+        if (m.to != self.cfg.id or m.from >= self.voters.len or m.from == self.cfg.id) {
             self.malformed_dropped += 1;
             return;
         }
-        if (m.body == .append_req and appendBytes(m.body.append_req.entries) > self.cfg.max_append_bytes) {
-            // A hostile or misconfigured leader: refused before anything is
-            // allocated for its entries. No reply (a drop is what Raft
-            // tolerates; see `malformed_dropped`).
-            self.malformed_dropped += 1;
-            return;
+        switch (m.body) {
+            .append_req => |a| {
+                if (appendBytes(a.entries) > self.cfg.max_append_bytes) {
+                    // A hostile or misconfigured leader: refused before anything
+                    // is allocated for its entries. No reply (a drop is what
+                    // Raft tolerates; see `malformed_dropped`).
+                    self.malformed_dropped += 1;
+                    return;
+                }
+                // A membership this node could not take (an id past its
+                // `max_servers`, a malformed list) is refused the same way.
+                for (a.entries) |e| if (e.kind == .config and !self.confValid(e.data)) {
+                    self.malformed_dropped += 1;
+                    return;
+                };
+            },
+            .snapshot => |sn| if (!self.confValid(sn.conf)) {
+                self.malformed_dropped += 1;
+                return;
+            },
+            else => {},
         }
         switch (m.body) {
             .vote_req => |v| try self.onVoteReq(m.from, v),
@@ -621,13 +1011,14 @@ pub const Node = struct {
             .timeout_now => |t| try self.onTimeoutNow(t),
             .read_req => |r| try self.onReadReq(m.from, r),
             .read_resp => |r| try self.onReadResp(m.from, r),
+            .snapshot => |sn| try self.onSnapshot(m.from, sn),
         }
     }
 
     // ── output ──────────────────────────────────────────────────────────────
 
     pub fn hasReady(self: *const Node) bool {
-        return self.hs_dirty or self.truncated != null or self.bcast_pending or
+        return self.hs_dirty or self.snap_out or self.truncated != null or self.bcast_pending or
             self.read_out.items.len > 0 or self.msgs.items.len > 0 or self.lastIndex() > self.stable or self.commit > self.applied;
     }
 
@@ -656,6 +1047,7 @@ pub const Node = struct {
         self.ready_commit = hi;
         return .{
             .hard_state = if (self.hs_dirty) .{ .term = self.term, .voted_for = self.voted_for } else null,
+            .snapshot = if (self.snap_out) self.snapshot() else null,
             .truncate_after = self.truncated,
             .entries = entries,
             .messages = self.msgs.items,
@@ -670,6 +1062,7 @@ pub const Node = struct {
         std.debug.assert(self.ready_last == self.lastIndex());
         self.in_ready = false;
         self.hs_dirty = false;
+        self.snap_out = false;
         self.truncated = null;
         self.stable = self.ready_last;
         self.applied = self.ready_commit;
@@ -680,7 +1073,7 @@ pub const Node = struct {
             // Only now is the leader's own log durable up to `stable`, so only
             // now may it count toward a majority.
             self.match[self.cfg.id] = self.stable;
-            self.maybeCommit();
+            try self.maybeCommit();
             try self.startReads();
         }
     }
@@ -707,10 +1100,10 @@ pub const Node = struct {
         // A set, not a counter: a duplicated grant must not count twice.
         @memset(self.votes, false);
         self.votes[self.cfg.id] = true;
-        if (self.voteCount() >= self.majority()) return self.becomeLeader();
+        if (self.hasQuorum(self.votes)) return self.becomeLeader();
         const li = self.log.info();
-        for (0..self.cfg.cluster_size) |p| {
-            if (p == self.cfg.id) continue;
+        for (0..self.voters.len) |p| {
+            if (p == self.cfg.id or !self.isVoter(@intCast(p))) continue;
             try self.send(@intCast(p), .{ .vote_req = .{
                 .term = self.term,
                 .last_log_index = li.last_index,
@@ -734,10 +1127,10 @@ pub const Node = struct {
         self.resetElectionTimer();
         @memset(self.votes, false);
         self.votes[self.cfg.id] = true;
-        if (self.voteCount() >= self.majority()) return self.campaign(false);
+        if (self.hasQuorum(self.votes)) return self.campaign(false);
         const li = self.log.info();
-        for (0..self.cfg.cluster_size) |p| {
-            if (p == self.cfg.id) continue;
+        for (0..self.voters.len) |p| {
+            if (p == self.cfg.id or !self.isVoter(@intCast(p))) continue;
             try self.send(@intCast(p), .{ .pre_vote_req = .{
                 .term = self.term + 1,
                 .last_log_index = li.last_index,
@@ -775,35 +1168,23 @@ pub const Node = struct {
         if (!v.granted and v.term > self.term) return self.becomeFollower(v.term);
         if (self.role != .pre_candidate or !v.granted or v.term != self.term + 1) return;
         self.votes[from] = true;
-        if (self.voteCount() >= self.majority()) try self.campaign(false);
+        if (self.hasQuorum(self.votes)) try self.campaign(false);
     }
 
     /// The leader asks this node to campaign now (leadership transfer). As
     /// etcd/raft's `stepFollower` → `hup(campaignTransfer)`: a higher term is
     /// adopted first; only a follower of the message's term acts (a
     /// candidate or pre-candidate ignores it, etcd's `stepCandidate`), and
-    /// never through PreVote.
+    /// never through PreVote, and never a server that is not a voter.
     fn onTimeoutNow(self: *Node, t: message.TimeoutNow) Allocator.Error!void {
         const obs = safety.observeTerm(self.term, t.term);
         if (obs.term_advanced) self.becomeFollower(obs.new_term);
-        if (t.term != self.term or self.role != .follower) return;
+        if (t.term != self.term or self.role != .follower or !self.isVoter(self.cfg.id)) return;
         try self.campaign(true);
     }
 
     fn sendTimeoutNow(self: *Node, to: NodeId) Allocator.Error!void {
         try self.send(to, .{ .timeout_now = .{ .term = self.term } });
-    }
-
-    fn quorumActive(self: *const Node) bool {
-        var n: usize = 0;
-        for (self.recent_active) |a| n += @intFromBool(a);
-        return n >= self.majority();
-    }
-
-    fn voteCount(self: *const Node) usize {
-        var n: usize = 0;
-        for (self.votes) |v| n += @intFromBool(v);
-        return n;
     }
 
     fn becomeLeader(self: *Node) Allocator.Error!void {
@@ -816,6 +1197,7 @@ pub const Node = struct {
         self.match[self.cfg.id] = self.stable;
         @memset(self.infl_count, 0);
         @memset(self.infl_bytes, 0);
+        @memset(self.snap_pending, 0);
         // CheckQuorum: the leader is always active (etcd); the first check
         // comes one election timeout from now.
         @memset(self.recent_active, false);
@@ -892,7 +1274,7 @@ pub const Node = struct {
         if (obs.term_advanced) return self.becomeFollower(obs.new_term);
         if (self.role != .candidate or v.term != self.term or !v.granted) return;
         self.votes[from] = true;
-        if (self.voteCount() >= self.majority()) try self.becomeLeader();
+        if (self.hasQuorum(self.votes)) try self.becomeLeader();
     }
 
     // ── replication ─────────────────────────────────────────────────────────
@@ -908,25 +1290,34 @@ pub const Node = struct {
             .command = fingerprint(.{ .index = idx, .term = self.term, .kind = kind, .data = bytes }),
         });
         self.data.appendAssumeCapacity(owned);
+        // Thesis §4.1: a configuration takes effect once it is in the log.
+        if (kind == .config) self.reloadConf();
         return idx;
     }
 
-    fn truncateAfter(self: *Node, keep: LogIndex) void {
+    fn truncateAfter(self: *Node, keep_in: LogIndex) void {
+        // A snapshot's entries are committed: never truncated (the kernel
+        // never asks; `naive_truncation` might).
+        const keep = @max(keep_in, self.log.snap_index);
         if (keep >= self.lastIndex()) return;
-        for (self.data.items[@intCast(keep)..]) |d| self.gpa.free(d);
-        self.data.shrinkRetainingCapacity(@intCast(keep));
+        const k: usize = @intCast(keep - self.log.snap_index);
+        for (self.data.items[k..]) |d| self.gpa.free(d);
+        self.data.shrinkRetainingCapacity(k);
         self.log.truncateAfter(keep);
         if (keep < self.stable) {
             self.stable = keep;
             self.truncated = if (self.truncated) |t| @min(t, keep) else keep;
         }
+        // The config entry in force may have gone with the tail: the one
+        // before it applies again (thesis §4.1).
+        if (self.conf_index > keep) self.reloadConf();
     }
 
     fn bcastAppend(self: *Node) Allocator.Error!void {
         self.bcast_pending = false;
         self.heartbeat_elapsed = 0;
-        for (0..self.cfg.cluster_size) |p| {
-            if (p == self.cfg.id) continue;
+        for (0..self.voters.len) |p| {
+            if (p == self.cfg.id or !self.isMember(@intCast(p))) continue;
             try self.sendAppend(@intCast(p));
         }
         // A read still waiting for its quorum asks again (a lost probe or
@@ -966,12 +1357,12 @@ pub const Node = struct {
         return self.cfg.read_lease or self.injected_bug == .unconfirmed_reads;
     }
 
-    /// Send the newest probe number to every peer, if a read is waiting for one.
+    /// Send the newest probe number to every voter, if a read is waiting for one.
     fn probeReads(self: *Node) Allocator.Error!void {
         if (self.read_seq == 0 or self.reads.items.len == 0) return;
         if (self.reads.items[self.reads.items.len - 1].seq == 0) return; // nothing numbered yet
-        for (0..self.cfg.cluster_size) |p| {
-            if (p == self.cfg.id) continue;
+        for (0..self.voters.len) |p| {
+            if (p == self.cfg.id or !self.isVoter(@intCast(p))) continue;
             try self.send(@intCast(p), .{ .read_req = .{ .term = self.term, .seq = self.read_seq } });
         }
     }
@@ -984,11 +1375,8 @@ pub const Node = struct {
         for (self.reads.items) |r| {
             if (r.index == 0) break;
             if (!self.leaseReads()) {
-                var n: usize = 1;
-                for (self.read_ack, 0..) |a, p| {
-                    if (p != self.cfg.id and a >= r.seq) n += 1;
-                }
-                if (n < self.majority()) break;
+                for (self.scratch, self.read_ack, 0..) |*x, a, p| x.* = p == self.cfg.id or a >= r.seq;
+                if (!self.hasQuorum(self.scratch)) break;
             }
             try self.read_out.append(self.gpa, .{ .ctx = r.ctx, .index = r.index });
             done += 1;
@@ -1025,8 +1413,19 @@ pub const Node = struct {
 
     fn sendAppend(self: *Node, to: NodeId) Allocator.Error!void {
         const a = self.out_arena.allocator();
+        if (self.snap_pending[to] != 0) {
+            // Waiting for the follower to install a snapshot (etcd's
+            // `StateSnapshot`): a keep-alive that holds its election timer
+            // off — prev 0 matches any log — and, after one election timeout
+            // without an answer, the snapshot again (presumed lost).
+            if (self.snap_age[to] >= self.cfg.election_ticks) return self.sendSnapshot(to);
+            return self.send(to, .{ .append_req = .{ .term = self.term, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = self.commit, .entries = &.{} } });
+        }
         const last = self.lastIndex();
         const prev = self.next[to] - 1;
+        // The entry before `nextIndex` is compacted away (§7): the follower
+        // can only be caught up from the snapshot.
+        if (prev < self.log.snap_index) return self.sendSnapshot(to);
         // A full window sends a heartbeat (no entries): it still carries the
         // commit index and holds elections off, and its ack frees a slot.
         const room: u64 = if (self.inflFull(to)) 0 else @min(last - prev, self.cfg.max_append_entries);
@@ -1035,8 +1434,9 @@ pub const Node = struct {
         // log can hold one: `propose` refuses it).
         var count: usize = 0;
         var size: u64 = 0;
+        const base: usize = @intCast(prev - self.log.snap_index);
         while (count < room) : (count += 1) {
-            const es = message.Message.entry_header_len + self.data.items[@intCast(prev + count)].len;
+            const es = message.Message.entry_header_len + self.data.items[base + count].len;
             if (count > 0 and size + es > self.cfg.max_append_bytes) break;
             size += es;
         }
@@ -1058,7 +1458,84 @@ pub const Node = struct {
         } });
     }
 
-    fn onAppendReq(self: *Node, from: NodeId, a: message.AppendReq) Allocator.Error!void {
+    /// InstallSnapshot (§7): the whole snapshot in one message (etcd/raft's
+    /// `MsgSnap`). Copied: `compact` may replace the snapshot before the
+    /// message leaves.
+    fn sendSnapshot(self: *Node, to: NodeId) Allocator.Error!void {
+        const a = self.out_arena.allocator();
+        self.snap_pending[to] = self.log.snap_index;
+        self.snap_age[to] = 0;
+        self.infl_count[to] = 0;
+        self.infl_bytes[to] = 0;
+        try self.send(to, .{ .snapshot = .{
+            .term = self.term,
+            .index = self.log.snap_index,
+            .snap_term = self.log.snap_term,
+            .conf = try a.dupe(u8, self.snap_conf),
+            .data = try a.dupe(u8, self.snap_data),
+        } });
+    }
+
+    /// InstallSnapshot receiver (§7, Figure 13; etcd/raft `handleSnapshot` /
+    /// `restore`). Answered with an `append_resp` whose index is a VERIFIED
+    /// one, like any success: the snapshot's index, or this node's commit
+    /// index when it already holds more (committed entries match the
+    /// leader's — Leader Completeness).
+    fn onSnapshot(self: *Node, from: NodeId, sn: message.SnapshotMsg) Allocator.Error!void {
+        if (sn.term < self.term) {
+            // A stale leader: tell it the term, as a refused AppendEntries does.
+            return self.send(from, .{ .append_resp = .{ .term = self.term, .success = false, .index = self.lastIndex() } });
+        }
+        self.becomeFollower(sn.term);
+        self.leader = from;
+        if (sn.index <= self.commit) {
+            // Already have it, committed (etcd: "ignored snapshot").
+            return self.send(from, .{ .append_resp = .{ .term = self.term, .success = true, .index = self.commit } });
+        }
+        if (self.log.termAt(sn.index)) |t| if (t == sn.snap_term) {
+            // The log holds the snapshot's last entry: by Log Matching it
+            // holds everything before it too, all committed now — keep the
+            // log and fast-forward the commit index (etcd/raft; Figure 13
+            // step 6, "retain log entries following it").
+            self.commit = sn.index;
+            return self.send(from, .{ .append_resp = .{ .term = self.term, .success = true, .index = sn.index } });
+        };
+        // Discard the whole log and take the snapshot (Figure 13 step 7).
+        const gpa = self.gpa;
+        const conf = try gpa.dupe(u8, sn.conf);
+        errdefer gpa.free(conf);
+        const image = try gpa.dupe(u8, sn.data);
+        gpa.free(self.snap_conf);
+        gpa.free(self.snap_data);
+        self.snap_conf = conf;
+        self.snap_data = image;
+        for (self.data.items) |d| gpa.free(d);
+        self.data.clearRetainingCapacity();
+        self.log.restoreSnapshot(sn.index, sn.snap_term);
+        self.commit = sn.index;
+        self.applied = sn.index;
+        self.stable = sn.index;
+        // The snapshot replaces every persisted entry; no truncation is left
+        // to report.
+        self.truncated = null;
+        self.snap_out = true;
+        self.reloadConf();
+        try self.send(from, .{ .append_resp = .{ .term = self.term, .success = true, .index = sn.index } });
+    }
+
+    fn onAppendReq(self: *Node, from: NodeId, a_in: message.AppendReq) Allocator.Error!void {
+        var a = a_in;
+        if (a.term >= self.term and a.prev_log_index < self.log.snap_index) {
+            // The batch starts inside this node's snapshot. Everything up to
+            // the snapshot's last index is committed here, so it matches the
+            // leader's log (Leader Completeness, Log Matching): skip those
+            // entries and check the rest against the snapshot's last entry
+            // (etcd/raft answers such a message with its commit index).
+            const covered = self.log.snap_index - a.prev_log_index;
+            a.entries = a.entries[@intCast(@min(covered, a.entries.len))..];
+            a.prev_log_index = self.log.snap_index;
+            a.prev_log_term = self.log.snap_term;
+        }
         self.kernel_buf.clearRetainingCapacity();
         try self.kernel_buf.ensureTotalCapacity(self.gpa, a.entries.len);
         for (a.entries) |e| self.kernel_buf.appendAssumeCapacity(.{ .term = e.term, .kind = e.kind, .command = fingerprint(e) });
@@ -1091,6 +1568,8 @@ pub const Node = struct {
                 try self.data.ensureUnusedCapacity(self.gpa, 1);
                 try self.log.append(self.gpa, .{ .term = e.term, .kind = e.kind, .command = fingerprint(e) });
                 self.data.appendAssumeCapacity(owned);
+                // Thesis §4.1: in force from the moment it is in the log.
+                if (e.kind == .config) self.reloadConf();
             }
             if (out.new_commit_index > self.commit) self.commit = out.new_commit_index;
         }
@@ -1111,10 +1590,11 @@ pub const Node = struct {
         try self.send(from, .{ .append_resp = resp });
     }
 
-    /// The first index of term `t` in this log, given that `hi` holds term
-    /// `t` (terms never decrease along the log: binary search, O(log n)).
+    /// The first index of term `t` in this log (not below the snapshot's
+    /// last index), given that `hi` holds term `t` (terms never decrease
+    /// along the log: binary search, O(log n)).
     fn firstIndexOfTerm(self: *const Node, hi_index: LogIndex, t: Term) LogIndex {
-        var lo: LogIndex = 1; // answer in [lo, hi]
+        var lo: LogIndex = @max(1, self.log.snap_index); // answer in [lo, hi]
         var hi: LogIndex = hi_index;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
@@ -1123,17 +1603,22 @@ pub const Node = struct {
         return lo;
     }
 
-    /// The last index holding term `t`, or null if this log has no entry of
-    /// that term (same monotonicity; O(log n)).
+    /// The last index holding term `t` (the snapshot's last index counts),
+    /// or null if this log has no entry of that term above its compacted
+    /// part (same monotonicity; O(log n)).
     fn lastIndexOfTerm(self: *const Node, t: Term) ?LogIndex {
-        var lo: LogIndex = 1; // first index whose term is > t, in [1, last+1]
-        var hi: LogIndex = self.lastIndex() + 1;
+        const base: LogIndex = @max(1, self.log.snap_index);
+        const last_i = self.lastIndex();
+        if (last_i < base) return null;
+        var lo: LogIndex = base; // first index whose term is > t, in [base, last+1]
+        var hi: LogIndex = last_i + 1;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
             if (self.log.termAt(mid).? <= t) lo = mid + 1 else hi = mid;
         }
+        if (lo == base) return null; // nothing at or below t here
         const last = lo - 1; // last index with term <= t
-        if (last == 0 or self.log.termAt(last).? != t) return null;
+        if (self.log.termAt(last).? != t) return null;
         return last;
     }
 
@@ -1152,20 +1637,25 @@ pub const Node = struct {
             }
             const progressed = a.index > self.match[from];
             if (progressed) self.match[from] = a.index;
+            // The snapshot (or more) has arrived: back to replication from
+            // the log.
+            if (self.snap_pending[from] != 0 and self.match[from] >= self.snap_pending[from]) self.snap_pending[from] = 0;
             // Everything this ack covers has arrived. If it covered nothing
             // and the window is still full, the oldest message is presumed
             // lost (etcd: `FreeFirstOne` on a heartbeat response).
             self.inflFreeLE(from, a.index);
             if (!progressed and self.inflFull(from)) self.inflFreeFirst(from);
             self.next[from] = @max(self.next[from], self.match[from] + 1);
-            self.maybeCommit();
+            try self.maybeCommit();
+            if (self.role != .leader) return; // the commit removed this leader
             try self.startReads(); // a commit may have made `commit` a valid read index
             // A transfer waits for the target to hold the whole log (etcd:
             // on the ack that brings `Match` to `lastIndex`).
             if (progressed and from == self.transferee and self.match[from] == self.lastIndex()) try self.sendTimeoutNow(from);
             // Keep streaming only on PROGRESS: a duplicated or stale ack must
-            // not fork a second stream; the heartbeat covers the rest.
-            if (progressed and self.next[from] <= self.lastIndex()) try self.sendAppend(from);
+            // not fork a second stream; the heartbeat covers the rest. A
+            // server the membership dropped is not streamed to.
+            if (progressed and self.next[from] <= self.lastIndex() and self.isMember(from)) try self.sendAppend(from);
         } else {
             // Walk back — straight past the follower's end if its hint says
             // so — but never below what it has already confirmed (a stale
@@ -1190,7 +1680,7 @@ pub const Node = struct {
             // its window — the messages after the gap are useless.
             self.infl_count[from] = 0;
             self.infl_bytes[from] = 0;
-            if (moved) try self.sendAppend(from);
+            if (moved and self.isMember(from)) try self.sendAppend(from);
         }
     }
 
@@ -1227,13 +1717,36 @@ pub const Node = struct {
         while (self.infl_count[p] > 0 and self.infl_last[self.inflSlot(p, 0)] <= index) self.inflFreeFirst(p);
     }
 
-    fn maybeCommit(self: *Node) void {
-        // THE KERNEL: the Figure-8 rule.
-        const nc = safety.leaderCommitIndex(self.term, self.commit, self.match, self.cfg.cluster_size, &self.log);
+    fn maybeCommit(self: *Node) Allocator.Error!void {
+        // THE KERNEL: the Figure-8 rule, over the membership's voters (both
+        // configurations during joint consensus).
+        const outgoing: ?[]const bool = if (self.joint and self.injected_bug != .joint_incoming_only) self.voters_out else null;
+        const nc = safety.leaderCommitIndexJoint(self.term, self.commit, self.match, self.voters, outgoing, &self.log);
         if (nc > self.commit) {
             self.commit = nc;
             // Followers learn it with the next AppendEntries.
             self.bcast_pending = true;
+        }
+        // The membership entry in force has committed (and so has an entry
+        // of this term, so the log is this leader's own).
+        if (self.conf_index > self.commit or !self.committedInTerm()) return;
+        if (self.joint) {
+            // Leave joint consensus by itself (etcd/raft's auto-leave): C_new
+            // alone, the learners kept.
+            const n = self.voters.len;
+            const ids = try self.gpa.alloc(NodeId, 2 * n);
+            defer self.gpa.free(ids);
+            const m: Membership = .{ .voters = listOf(ids[0..n], self.voters), .learners = listOf(ids[n..], self.learners) };
+            const bytes = try m.encodeAlloc(self.gpa);
+            defer self.gpa.free(bytes);
+            _ = try self.appendLocal(.config, bytes);
+            self.bcast_pending = true;
+        } else if (!self.isVoter(self.cfg.id)) {
+            // Thesis §4.2.2: a leader removed from the membership leads until
+            // that change commits, then steps down (in its term, as
+            // hashicorp/raft; it will not campaign again).
+            self.becomeFollower(self.term);
+            self.leader = no_vote;
         }
     }
 
@@ -1261,20 +1774,61 @@ const testing = std.testing;
 
 const Disk = struct {
     hs: HardState = .{},
+    /// The persisted snapshot (`conf`/`data` owned), or null.
+    snap: ?Snapshot = null,
+    /// Persisted entries after the snapshot.
     entries: std.ArrayList(Entry) = .empty,
 
     fn deinit(d: *Disk, gpa: Allocator) void {
         for (d.entries.items) |e| gpa.free(e.data);
         d.entries.deinit(gpa);
+        d.dropSnap(gpa);
+    }
+
+    fn dropSnap(d: *Disk, gpa: Allocator) void {
+        if (d.snap) |sn| {
+            gpa.free(sn.conf);
+            gpa.free(sn.data);
+        }
+        d.snap = null;
+    }
+
+    fn snapIndex(d: *const Disk) LogIndex {
+        return if (d.snap) |sn| sn.index else 0;
+    }
+
+    fn saveSnap(d: *Disk, gpa: Allocator, sn: Snapshot) !void {
+        const conf = try gpa.dupe(u8, sn.conf);
+        errdefer gpa.free(conf);
+        const data = try gpa.dupe(u8, sn.data);
+        d.dropSnap(gpa);
+        d.snap = .{ .index = sn.index, .term = sn.term, .conf = conf, .data = data };
+    }
+
+    /// After `Node.compact`: the snapshot, then the entries it covers go.
+    fn compacted(d: *Disk, gpa: Allocator, sn: Snapshot) !void {
+        const old = d.snapIndex();
+        try d.saveSnap(gpa, sn);
+        const drop: usize = @intCast(@min(sn.index - old, d.entries.items.len));
+        for (d.entries.items[0..drop]) |e| gpa.free(e.data);
+        const rest = d.entries.items.len - drop;
+        std.mem.copyForwards(Entry, d.entries.items[0..rest], d.entries.items[drop..]);
+        d.entries.shrinkRetainingCapacity(rest);
     }
 
     fn persist(d: *Disk, gpa: Allocator, rd: Ready) !void {
         if (rd.hard_state) |hs| d.hs = hs;
+        if (rd.snapshot) |sn| {
+            // Replaces the whole persisted log.
+            for (d.entries.items) |e| gpa.free(e.data);
+            d.entries.clearRetainingCapacity();
+            try d.saveSnap(gpa, sn);
+        }
         if (rd.truncate_after) |t| {
-            while (d.entries.items.len > t) gpa.free(d.entries.pop().?.data);
+            while (d.snapIndex() + d.entries.items.len > t) gpa.free(d.entries.pop().?.data);
         }
         for (rd.entries) |e| {
-            try testing.expectEqual(@as(LogIndex, d.entries.items.len + 1), e.index);
+            try testing.expectEqual(@as(LogIndex, d.snapIndex() + d.entries.items.len + 1), e.index);
             var c = e;
             c.data = try gpa.dupe(u8, e.data);
             try d.entries.append(gpa, c);
@@ -1285,6 +1839,12 @@ const Disk = struct {
 const Frame = struct { from: NodeId, to: NodeId, bytes: []u8 };
 
 fn Cluster(comptime n: u32) type {
+    return ClusterOf(n, n);
+}
+
+/// `n` servers of which the first `boot` are the bootstrap voters (the rest
+/// can be added by a membership change).
+fn ClusterOf(comptime n: u32, comptime boot: u32) type {
     return struct {
         const Self = @This();
         gpa: Allocator,
@@ -1305,13 +1865,46 @@ fn Cluster(comptime n: u32) type {
 
         fn cfg(i: NodeId) Config {
             // Deterministic and staggered: node 0 always times out first.
-            return .{ .id = i, .cluster_size = n, .election_ticks = 10 + 5 * i, .election_jitter_ticks = 0, .heartbeat_ticks = 2, .max_append_entries = 4, .seed = i };
+            return .{ .id = i, .cluster_size = boot, .max_servers = n, .election_ticks = 10 + 5 * i, .election_jitter_ticks = 0, .heartbeat_ticks = 2, .max_append_entries = 4, .seed = i };
         }
 
         fn start(c: *Self, i: NodeId) !void {
-            c.nodes[i] = try Node.init(c.gpa, cfg(i), .{ .hard_state = c.disks[i].hs, .entries = c.disks[i].entries.items });
+            c.nodes[i] = try Node.init(c.gpa, cfg(i), .{ .hard_state = c.disks[i].hs, .snapshot = c.disks[i].snap, .entries = c.disks[i].entries.items });
             for (c.applied[i].items) |b| c.gpa.free(b);
             c.applied[i].clearRetainingCapacity();
+            // The state machine comes back from the snapshot, if any.
+            if (c.disks[i].snap) |sn| try c.loadImage(i, sn.data);
+        }
+
+        /// The test state machine's image: its applied commands, each
+        /// followed by a 0 byte.
+        fn image(c: *Self, i: NodeId) ![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            for (c.applied[i].items) |b| {
+                try out.appendSlice(c.gpa, b);
+                try out.append(c.gpa, 0);
+            }
+            return out.toOwnedSlice(c.gpa);
+        }
+
+        fn loadImage(c: *Self, i: NodeId, data: []const u8) !void {
+            for (c.applied[i].items) |b| c.gpa.free(b);
+            c.applied[i].clearRetainingCapacity();
+            var it = std.mem.splitScalar(u8, data, 0);
+            while (it.next()) |b| {
+                if (it.index == null and b.len == 0) break; // after the last 0
+                try c.applied[i].append(c.gpa, try c.gpa.dupe(u8, b));
+            }
+        }
+
+        /// Snapshot node `i` at its applied index and compact both its log
+        /// and its disk.
+        fn compactAt(c: *Self, i: NodeId) !void {
+            const node = &c.nodes[i].?;
+            const img = try c.image(i);
+            defer c.gpa.free(img);
+            try node.compact(node.applied, img);
+            try c.disks[i].compacted(c.gpa, node.snapshot().?);
         }
 
         fn crash(c: *Self, i: NodeId) void {
@@ -1336,6 +1929,7 @@ fn Cluster(comptime n: u32) type {
             while (node.hasReady()) {
                 const rd = try node.ready();
                 try c.disks[i].persist(c.gpa, rd);
+                if (rd.snapshot) |sn| try c.loadImage(i, sn.data);
                 for (rd.messages) |m| {
                     try c.net.append(c.gpa, .{ .from = m.from, .to = m.to, .bytes = try m.encodeAlloc(c.gpa) });
                 }
@@ -2877,4 +3471,440 @@ test "readIndex: read_lease needs check_quorum, and then answers without a probe
     try testing.expectEqual(@as(usize, 0), countRead(rd, .read_req));
     try testing.expectEqual(ReadState{ .ctx = 3, .index = 1 }, rd.read_states[0]);
     try node.advance();
+}
+
+// ── membership changes (thesis §4, §6) ──────────────────────────────────────
+
+fn settle(c: anytype, ticks: usize) !void {
+    try c.tickAll(ticks);
+    try c.deliver();
+}
+
+test "membership: a non-member never campaigns; adding it is a single-server change in force once appended" {
+    var c = try ClusterOf(4, 3).init(testing.allocator);
+    defer c.deinit();
+    try settle(&c, 40);
+    const l = c.leaderId() orelse return error.NoLeader;
+    try testing.expectEqual(@as(NodeId, 0), l);
+    // Server 3 is outside the bootstrap membership: never a candidate, and
+    // the leader does not replicate to it.
+    try testing.expectEqual(Role.follower, c.nodes[3].?.role);
+    try testing.expectEqual(@as(Term, 0), c.nodes[3].?.term);
+    try testing.expectEqual(@as(LogIndex, 0), c.nodes[3].?.lastIndex());
+
+    const idx = try c.nodes[0].?.proposeConfChange(&.{.{ .add_voter = 3 }});
+    // In force on the leader at once, before it commits (thesis §4.1), and
+    // a single-server change (no joint consensus).
+    try testing.expect(c.nodes[0].?.isVoter(3));
+    try testing.expect(!c.nodes[0].?.membership().isJoint());
+    try testing.expectError(error.ConfChangePending, c.nodes[0].?.proposeConfChange(&.{.{ .remove = 1 }}));
+    try c.drain(0);
+    try c.deliver();
+    try settle(&c, 6);
+    for (c.nodes) |m| {
+        try testing.expect(m.?.isVoter(3));
+        try testing.expect(m.?.commit >= idx);
+    }
+    // Four voters: two of them are no longer a majority.
+    c.cut[2] = true;
+    c.cut[3] = true;
+    const before = c.nodes[0].?.commit;
+    _ = try c.nodes[0].?.propose("x");
+    try settle(&c, 4);
+    try testing.expectEqual(before, c.nodes[0].?.commit);
+    c.cut[3] = false;
+    try settle(&c, 4);
+    try testing.expect(c.nodes[0].?.commit > before);
+    for (c.applied[3].items, c.applied[0].items[0..c.applied[3].items.len]) |a, b| try testing.expectEqualStrings(b, a);
+}
+
+test "membership: refused while the no-op or an earlier change is uncommitted, and for impossible changes" {
+    const gpa = testing.allocator;
+    var c = try ClusterOf(4, 3).init(gpa);
+    defer c.deinit();
+    try testing.expectError(error.NotLeader, c.nodes[0].?.proposeConfChange(&.{.{ .add_voter = 3 }}));
+    // Elected, but its no-op has not committed yet (nothing delivered).
+    for (0..10) |_| try c.nodes[0].?.tick();
+    try c.drain(0);
+    for (c.net.items) |f| c.gpa.free(f.bytes);
+    c.net.clearRetainingCapacity();
+    try testing.expectEqual(Role.candidate, c.nodes[0].?.role);
+    try settle(&c, 30);
+    const l = &c.nodes[c.leaderId().?].?;
+    try testing.expectError(error.InvalidConfChange, l.proposeConfChange(&.{}));
+    try testing.expectError(error.InvalidConfChange, l.proposeConfChange(&.{.{ .add_voter = 4 }})); // past max_servers
+    try testing.expectError(error.InvalidConfChange, l.proposeConfChange(&.{ .{ .remove = 0 }, .{ .remove = 1 }, .{ .remove = 2 } }));
+    try testing.expectError(error.InvalidTarget, l.transferLeadership(3)); // not a voter
+    // Removing a non-member is a no-op change (etcd/raft) — still an entry.
+    _ = try l.proposeConfChange(&.{.{ .remove = 3 }});
+}
+
+test "membership: a fresh leader may not change the membership until its no-op commits" {
+    const gpa = testing.allocator;
+    var node = try Node.init(gpa, .{ .id = 0, .cluster_size = 3, .election_ticks = 3, .election_jitter_ticks = 0, .seed = 1 }, .{});
+    defer node.deinit();
+    for (0..3) |_| try node.tick();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .vote_resp = .{ .term = 1, .granted = true } } });
+    try testing.expectEqual(Role.leader, node.role);
+    try testing.expectError(error.ConfChangePending, node.proposeConfChange(&.{.{ .remove = 2 }}));
+    var rd = try node.ready();
+    _ = &rd;
+    try node.advance();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 1 } } });
+    _ = try node.proposeConfChange(&.{.{ .remove = 2 }});
+}
+
+test "membership: a leader that removes itself leads without counting itself, then steps down for good" {
+    var c = try Cluster(3).init(testing.allocator);
+    defer c.deinit();
+    try settle(&c, 20);
+    try testing.expectEqual(@as(?NodeId, 0), c.leaderId());
+    _ = try c.nodes[0].?.proposeConfChange(&.{.{ .remove = 0 }});
+    try testing.expect(!c.nodes[0].?.isVoter(0));
+    try testing.expectEqual(Role.leader, c.nodes[0].?.role); // until it commits
+    try c.drain(0);
+    try c.deliver();
+    try settle(&c, 2);
+    try testing.expect(c.nodes[0].?.role != .leader);
+    try settle(&c, 60);
+    const l = c.leaderId() orelse return error.NoLeader;
+    try testing.expect(l != 0);
+    // The removed server stays a follower however long it waits.
+    try testing.expectEqual(Role.follower, c.nodes[0].?.role);
+    _ = try c.nodes[l].?.propose("after");
+    try settle(&c, 4);
+    try testing.expectEqualStrings("after", c.applied[l].items[c.applied[l].items.len - 1]);
+}
+
+test "membership: several voters at once go through joint consensus, which needs BOTH majorities and is left by itself" {
+    inline for (.{ false, true }) |bug| {
+        var c = try ClusterOf(5, 3).init(testing.allocator);
+        defer c.deinit();
+        try settle(&c, 20);
+        try testing.expectEqual(@as(?NodeId, 0), c.leaderId());
+        // Let 3 and 4 hold the log first (as learners), so the joint entry
+        // is all that is left to replicate.
+        _ = try c.nodes[0].?.proposeConfChange(&.{ .{ .add_learner = 3 }, .{ .add_learner = 4 } });
+        try settle(&c, 6);
+        try testing.expect(c.nodes[3].?.membership().learners.len == 2);
+        // C_old {0,1,2} → C_new {0,3,4}: four voters change → joint.
+        if (bug) for (&c.nodes) |*m| {
+            m.*.?.injected_bug = .joint_incoming_only;
+        };
+        c.cut[1] = true;
+        c.cut[2] = true;
+        const before = c.nodes[0].?.commit;
+        const idx = try c.nodes[0].?.proposeConfChange(&.{ .{ .remove = 1 }, .{ .remove = 2 }, .{ .add_voter = 3 }, .{ .add_voter = 4 } });
+        const m = c.nodes[0].?.membership();
+        try testing.expect(m.isJoint());
+        try testing.expectEqualSlices(NodeId, &.{ 0, 3, 4 }, m.voters);
+        try testing.expectEqualSlices(NodeId, &.{ 0, 1, 2 }, m.voters_outgoing);
+        try settle(&c, 6);
+        if (bug) {
+            // POSITIVE CONTROL: counting C_new alone commits with no majority of C_old.
+            try testing.expect(c.nodes[0].?.commit >= idx);
+            continue;
+        }
+        // C_new's majority {0,3,4} holds the entry; C_old's does not.
+        try testing.expectEqual(before, c.nodes[0].?.commit);
+        c.cut[1] = false;
+        try settle(&c, 6);
+        // Committed, and the leader appended C_new alone after it (the
+        // removed servers are no longer replicated to, so only C_new is
+        // sure to have it).
+        try testing.expect(c.nodes[0].?.commit > idx);
+        for ([_]NodeId{ 0, 3, 4 }) |i| {
+            const mm = c.nodes[i].?.membership();
+            try testing.expect(!mm.isJoint());
+            try testing.expectEqualSlices(NodeId, &.{ 0, 3, 4 }, mm.voters);
+        }
+        try testing.expect(!c.nodes[0].?.isMember(1));
+    }
+}
+
+test "membership: a learner replicates but never votes, campaigns or counts; add_voter promotes it" {
+    var c = try ClusterOf(4, 3).init(testing.allocator);
+    defer c.deinit();
+    try settle(&c, 20);
+    _ = try c.nodes[0].?.proposeConfChange(&.{.{ .add_learner = 3 }});
+    try settle(&c, 6);
+    try testing.expect(c.nodes[0].?.isMember(3) and !c.nodes[0].?.isVoter(3));
+    _ = try c.nodes[0].?.propose("l");
+    try settle(&c, 4);
+    try testing.expectEqualStrings("l", c.applied[3].items[c.applied[3].items.len - 1]);
+    // With 1 and 2 cut away the learner does not make a majority.
+    c.cut[1] = true;
+    c.cut[2] = true;
+    const before = c.nodes[0].?.commit;
+    _ = try c.nodes[0].?.propose("m");
+    try settle(&c, 4);
+    try testing.expectEqual(before, c.nodes[0].?.commit);
+    // Cut the leader off instead: the learner never campaigns.
+    c.cut[1] = false;
+    c.cut[2] = false;
+    try settle(&c, 4);
+    c.cut[0] = true;
+    try settle(&c, 80);
+    try testing.expectEqual(Role.follower, c.nodes[3].?.role);
+    const l = c.leaderId() orelse return error.NoLeader;
+    try testing.expect(l == 1 or l == 2);
+    _ = try c.nodes[l].?.proposeConfChange(&.{.{ .add_voter = 3 }});
+    try settle(&c, 6);
+    try testing.expect(c.nodes[3].?.isVoter(3));
+}
+
+test "membership: truncating an uncommitted config entry brings the previous membership back" {
+    const gpa = testing.allocator;
+    var node = try Node.init(gpa, .{ .id = 1, .cluster_size = 3, .max_servers = 4, .election_ticks = 10, .election_jitter_ticks = 0, .seed = 1 }, .{});
+    defer node.deinit();
+    var conf: [64]u8 = undefined;
+    const cl = (Membership{ .voters = &.{ 0, 1, 2, 3 } }).encode(&conf);
+    try node.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 1, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{
+        .{ .index = 1, .term = 1, .kind = .noop },
+        .{ .index = 2, .term = 1, .kind = .config, .data = conf[0..cl] },
+    } } } });
+    try testing.expect(node.isVoter(3));
+    // A new leader that never had it overwrites index 2.
+    try node.step(.{ .from = 2, .to = 1, .body = .{ .append_req = .{ .term = 2, .prev_log_index = 1, .prev_log_term = 1, .leader_commit = 0, .entries = &.{
+        .{ .index = 2, .term = 2, .kind = .noop },
+    } } } });
+    try testing.expect(!node.isVoter(3));
+    try testing.expectEqual(@as(usize, 3), node.membership().voters.len);
+}
+
+test "membership: a config entry naming an id past max_servers, or malformed, is dropped and counted" {
+    const gpa = testing.allocator;
+    var node = try Node.init(gpa, .{ .id = 1, .cluster_size = 3, .election_ticks = 10, .election_jitter_ticks = 0, .seed = 1 }, .{});
+    defer node.deinit();
+    var conf: [64]u8 = undefined;
+    const cl = (Membership{ .voters = &.{ 0, 1, 2, 3 } }).encode(&conf);
+    try node.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 1, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{
+        .{ .index = 1, .term = 1, .kind = .config, .data = conf[0..cl] },
+    } } } });
+    try node.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 1, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{
+        .{ .index = 1, .term = 1, .kind = .config, .data = "junk" },
+    } } } });
+    try testing.expectEqual(@as(u64, 2), node.malformed_dropped);
+    try testing.expectEqual(@as(LogIndex, 0), node.lastIndex());
+    try testing.expectEqual(@as(Term, 0), node.term);
+}
+
+// ── log compaction and InstallSnapshot (§7) ────────────────────────────────
+
+test "compact: only an applied index above the snapshot; the entries go, their last term stays" {
+    var c = try Cluster(3).init(testing.allocator);
+    defer c.deinit();
+    try settle(&c, 20);
+    for ([_][]const u8{ "a", "b", "c" }) |b| _ = try c.nodes[0].?.propose(b);
+    try settle(&c, 4);
+    const n = &c.nodes[0].?;
+    try testing.expectError(error.NotApplied, n.compact(n.applied + 1, ""));
+    try testing.expectError(error.Compacted, n.compact(0, ""));
+    const at = n.applied;
+    const t = n.log.termAt(at).?;
+    try c.compactAt(0);
+    try testing.expectError(error.Compacted, n.compact(at, ""));
+    try testing.expectEqual(@as(?Entry, null), n.entryAt(at));
+    try testing.expectEqual(at, n.snapshot().?.index);
+    try testing.expectEqual(t, n.snapshot().?.term);
+    try testing.expectEqual(at, n.lastIndex());
+    try testing.expectEqual(@as(usize, 0), c.disks[0].entries.items.len);
+    // The cluster keeps going after it.
+    _ = try n.propose("d");
+    try settle(&c, 4);
+    for (c.applied) |a| try testing.expectEqualStrings("d", a.items[a.items.len - 1]);
+}
+
+test "InstallSnapshot: a follower behind the leader's snapshot is sent it, installs it and catches up" {
+    var c = try Cluster(3).init(testing.allocator);
+    defer c.deinit();
+    try settle(&c, 20);
+    c.cut[2] = true;
+    for ([_][]const u8{ "a", "b", "c", "d", "e" }) |b| _ = try c.nodes[0].?.propose(b);
+    try settle(&c, 4);
+    try c.compactAt(0);
+    const snap_at = c.nodes[0].?.snapshot().?.index;
+    _ = try c.nodes[0].?.propose("f");
+    try settle(&c, 2);
+    c.cut[2] = false;
+    // Watch the snapshot arrive: the one sent while it was cut off is
+    // presumed lost and sent again one election timeout later.
+    var saw = false;
+    for (0..16) |_| {
+        for (0..3) |i| {
+            try c.nodes[i].?.tick();
+            try c.drain(@intCast(i));
+        }
+        for (c.net.items) |f| saw = saw or (f.to == 2 and f.bytes[0] == @backingInt(message.Tag.snapshot));
+        try c.deliver();
+    }
+    try testing.expect(saw);
+    const f = &c.nodes[2].?;
+    try testing.expect(f.log.snap_index >= snap_at);
+    try testing.expectEqual(c.nodes[0].?.lastIndex(), f.lastIndex());
+    try testing.expectEqual(c.disks[2].snapIndex(), f.log.snap_index);
+    // Its state machine came back from the image, then went on.
+    try testing.expectEqual(c.applied[0].items.len, c.applied[2].items.len);
+    for (c.applied[0].items, c.applied[2].items) |a, b| try testing.expectEqualStrings(a, b);
+    // And it restarts from that disk alone.
+    c.crash(2);
+    try c.start(2);
+    try settle(&c, 4);
+    for (c.applied[0].items, c.applied[2].items) |a, b| try testing.expectEqualStrings(a, b);
+    try testing.expectEqual(c.nodes[0].?.lastIndex(), c.nodes[2].?.lastIndex());
+}
+
+test "InstallSnapshot: a server added after compaction joins through the snapshot, membership included" {
+    var c = try ClusterOf(4, 3).init(testing.allocator);
+    defer c.deinit();
+    try settle(&c, 20);
+    for ([_][]const u8{ "a", "b", "c" }) |b| _ = try c.nodes[0].?.propose(b);
+    try settle(&c, 4);
+    _ = try c.nodes[0].?.proposeConfChange(&.{.{ .add_learner = 3 }});
+    // The learner is cut off while the leader compacts past everything.
+    c.cut[3] = true;
+    try settle(&c, 4);
+    _ = try c.nodes[0].?.propose("d");
+    try settle(&c, 4);
+    try c.compactAt(0);
+    c.cut[3] = false;
+    try settle(&c, 10);
+    const n3 = &c.nodes[3].?;
+    try testing.expect(n3.log.snap_index > 0);
+    try testing.expect(n3.isMember(3) and !n3.isVoter(3));
+    for (c.applied[0].items, c.applied[3].items) |a, b| try testing.expectEqualStrings(a, b);
+}
+
+test "InstallSnapshot receiver: stale term refused, an older snapshot acked at the commit index, a held entry fast-forwards" {
+    const gpa = testing.allocator;
+    var node = try Node.init(gpa, .{ .id = 1, .cluster_size = 3, .election_ticks = 10, .election_jitter_ticks = 0, .seed = 1 }, .{});
+    defer node.deinit();
+    var conf: [64]u8 = undefined;
+    const cl = (Membership{ .voters = &.{ 0, 1, 2 } }).encode(&conf);
+    const cb = conf[0..cl];
+    try node.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 2, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 1, .entries = &.{
+        .{ .index = 1, .term = 2, .kind = .noop },
+        .{ .index = 2, .term = 2, .data = "x" },
+        .{ .index = 3, .term = 2, .data = "y" },
+    } } } });
+    try testing.expectEqual(@as(LogIndex, 1), node.commit);
+    var rd = try node.ready();
+    _ = &rd;
+    try node.advance();
+    // A stale leader's snapshot: refused with our term.
+    try node.step(.{ .from = 2, .to = 1, .body = .{ .snapshot = .{ .term = 1, .index = 9, .snap_term = 1, .conf = cb, .data = "" } } });
+    // A snapshot no newer than the commit index: acked at the commit index.
+    try node.step(.{ .from = 0, .to = 1, .body = .{ .snapshot = .{ .term = 2, .index = 1, .snap_term = 2, .conf = cb, .data = "" } } });
+    // A snapshot whose last entry the log holds: commit fast-forwards, the log stays.
+    try node.step(.{ .from = 0, .to = 1, .body = .{ .snapshot = .{ .term = 2, .index = 2, .snap_term = 2, .conf = cb, .data = "img" } } });
+    try testing.expectEqual(@as(LogIndex, 2), node.commit);
+    try testing.expectEqual(@as(LogIndex, 3), node.lastIndex());
+    try testing.expectEqual(@as(LogIndex, 0), node.log.snap_index);
+    rd = try node.ready();
+    try testing.expectEqual(@as(?Snapshot, null), rd.snapshot);
+    try testing.expectEqual(@as(usize, 3), rd.messages.len);
+    const r0 = rd.messages[0].body.append_resp;
+    try testing.expect(!r0.success and r0.term == 2);
+    const r1 = rd.messages[1].body.append_resp;
+    try testing.expect(r1.success and r1.index == 1);
+    const r2 = rd.messages[2].body.append_resp;
+    try testing.expect(r2.success and r2.index == 2);
+    try testing.expectEqual(@as(usize, 1), rd.committed.len); // index 2
+    try node.advance();
+    // A snapshot past the log: installed, the whole log replaced.
+    try node.step(.{ .from = 0, .to = 1, .body = .{ .snapshot = .{ .term = 3, .index = 7, .snap_term = 3, .conf = cb, .data = "img7" } } });
+    try testing.expectEqual(@as(LogIndex, 7), node.lastIndex());
+    try testing.expectEqual(@as(LogIndex, 7), node.commit);
+    rd = try node.ready();
+    try testing.expectEqualStrings("img7", rd.snapshot.?.data);
+    try testing.expectEqual(@as(LogIndex, 7), rd.snapshot.?.index);
+    try testing.expectEqual(@as(usize, 0), rd.entries.len);
+    try testing.expectEqual(@as(usize, 0), rd.committed.len);
+    try testing.expectEqual(@as(?LogIndex, null), rd.truncate_after);
+    try node.advance();
+    // An AppendEntries that starts inside the snapshot: the covered part is skipped.
+    try node.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 3, .prev_log_index = 5, .prev_log_term = 3, .leader_commit = 8, .entries = &.{
+        .{ .index = 6, .term = 3, .data = "6" },
+        .{ .index = 7, .term = 3, .data = "7" },
+        .{ .index = 8, .term = 3, .data = "8" },
+    } } } });
+    try testing.expectEqual(@as(LogIndex, 8), node.lastIndex());
+    try testing.expectEqual(@as(LogIndex, 8), node.commit);
+    rd = try node.ready();
+    try testing.expectEqualStrings("8", rd.entries[0].data);
+    try testing.expect(rd.messages[0].body.append_resp.success and rd.messages[0].body.append_resp.index == 8);
+    try node.advance();
+}
+
+test "InstallSnapshot: while one is pending the follower gets keep-alives, and the snapshot again after an election timeout" {
+    const gpa = testing.allocator;
+    var node = try Node.init(gpa, .{ .id = 0, .cluster_size = 2, .election_ticks = 4, .election_jitter_ticks = 0, .heartbeat_ticks = 1, .seed = 1 }, .{});
+    defer node.deinit();
+    for (0..4) |_| try node.tick();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .vote_resp = .{ .term = 1, .granted = true } } });
+    var rd = try node.ready();
+    try node.advance();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 1 } } });
+    _ = try node.propose("a");
+    rd = try node.ready();
+    try node.advance();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 2 } } });
+    rd = try node.ready();
+    try node.advance();
+    try node.compact(2, "S");
+    // The follower lost its log: it rejects with a hint below the snapshot.
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = false, .index = 0 } } });
+    _ = &rd;
+    rd = try node.ready();
+    try testing.expectEqual(@as(usize, 0), rd.messages.len); // match 2 > hint: nothing moved
+    try node.advance();
+    node.match[1] = 0; // a follower that really lost it (restarted empty)
+    node.next[1] = 1;
+    try node.tick();
+    rd = try node.ready();
+    try testing.expectEqual(message.Tag.snapshot, std.meta.activeTag(rd.messages[0].body));
+    try testing.expectEqualStrings("S", rd.messages[0].body.snapshot.data);
+    try node.advance();
+    for (0..3) |_| {
+        try node.tick();
+        rd = try node.ready();
+        const a = rd.messages[0].body.append_req;
+        try testing.expectEqual(@as(LogIndex, 0), a.prev_log_index);
+        try testing.expectEqual(@as(usize, 0), a.entries.len);
+        try node.advance();
+    }
+    try node.tick();
+    rd = try node.ready();
+    try testing.expectEqual(message.Tag.snapshot, std.meta.activeTag(rd.messages[0].body));
+    try node.advance();
+    // The ack ends it: replication from the log again.
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 2 } } });
+    try testing.expectEqual(@as(LogIndex, 0), node.snap_pending[1]);
+    _ = try node.propose("b");
+    rd = try node.ready();
+    try testing.expectEqualStrings("b", rd.messages[0].body.append_req.entries[0].data);
+    try node.advance();
+}
+
+test "restore: a snapshot plus the entries after it, checked like the rest" {
+    const gpa = testing.allocator;
+    var conf: [64]u8 = undefined;
+    const cl = (Membership{ .voters = &.{ 0, 1, 2 } }).encode(&conf);
+    const sn: Snapshot = .{ .index = 5, .term = 2, .conf = conf[0..cl], .data = "img" };
+    const cfg: Config = .{ .id = 1, .cluster_size = 3, .election_ticks = 10, .seed = 1 };
+    var node = try Node.init(gpa, cfg, .{ .hard_state = .{ .term = 3 }, .snapshot = sn, .entries = &.{.{ .index = 6, .term = 3, .data = "x" }} });
+    defer node.deinit();
+    try testing.expectEqual(@as(LogIndex, 6), node.lastIndex());
+    try testing.expectEqual(@as(LogIndex, 5), node.applied);
+    try testing.expectEqual(@as(LogIndex, 5), node.commit);
+    try testing.expectEqualStrings("x", node.entryAt(6).?.data);
+    // Entries that do not start right after it, older than it, a snapshot
+    // newer than the hard state, a membership past max_servers.
+    try testing.expectError(error.InvalidRestore, Node.init(gpa, cfg, .{ .hard_state = .{ .term = 3 }, .snapshot = sn, .entries = &.{.{ .index = 5, .term = 3 }} }));
+    try testing.expectError(error.InvalidRestore, Node.init(gpa, cfg, .{ .hard_state = .{ .term = 3 }, .snapshot = sn, .entries = &.{.{ .index = 6, .term = 1 }} }));
+    try testing.expectError(error.InvalidRestore, Node.init(gpa, cfg, .{ .hard_state = .{ .term = 1 }, .snapshot = sn }));
+    const big = (Membership{ .voters = &.{ 0, 1, 7 } }).encode(&conf);
+    var bad = sn;
+    bad.conf = conf[0..big];
+    try testing.expectError(error.InvalidRestore, Node.init(gpa, cfg, .{ .hard_state = .{ .term = 3 }, .snapshot = bad }));
 }

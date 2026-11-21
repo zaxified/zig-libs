@@ -21,14 +21,15 @@ Two ways in:
 > from persisted state, PreVote and CheckQuorum (off by default, as in
 > etcd/raft), leadership transfer (`node.transferLeadership(target)`), linearizable
 > reads (`node.readIndex(ctx)`, quorum-confirmed; `read_lease` for lease reads) and
-> flow control. Depends on `netsim`. See [`SPEC.md`](SPEC.md).
+> flow control, membership changes (`node.proposeConfChange`, single-server or
+> joint consensus, learners) and log compaction (`node.compact`, InstallSnapshot
+> to lagging followers). Depends on `netsim`. See [`SPEC.md`](SPEC.md).
 
 ## Not provided
 
-Snapshots / log compaction (the whole log is in memory) and membership changes
-(`safety.jointMajority` exists, not wired). They are open
-items: SPEC.md *Backlog / deferred*; what is refused on purpose is in *What is
-deliberately not done*.
+Chunked snapshot transfer (a snapshot travels in one message), a voter demoted
+to learner inside joint consensus, follower-forwarded reads. What is refused on
+purpose is in SPEC.md *What is deliberately not done*.
 
 ## Use
 
@@ -47,7 +48,9 @@ var node = try raft.Node.init(gpa, .{
     // Election hardening (etcd/raft's PreVote / CheckQuorum; off by default):
     // .pre_vote = true,     // a rejoining node cannot depose a healthy leader
     // .check_quorum = true, // a leader without a quorum steps down; lease
-}, .{ .hard_state = persisted_hs, .entries = persisted_entries });
+    // Servers that can ever be added by a membership change: ids 0 .. max - 1.
+    // .max_servers = 7,
+}, .{ .hard_state = persisted_hs, .snapshot = persisted_snapshot, .entries = persisted_entries });
 defer node.deinit();
 
 // Feed it: node.tick() every tick period, node.stepBytes(from, frame) for every
@@ -59,11 +62,18 @@ defer node.deinit();
 // A linearizable read on the leader: node.readIndex(token) writes nothing; the
 // token comes back in rd.read_states with an index, and the read may be served
 // once everything up to that index has been applied (SPEC § Linearizable reads).
+// Membership, on the leader: node.proposeConfChange(&.{.{ .add_voter = 3 }}) —
+// one voter at a time, or several through joint consensus; learners with
+// .add_learner (SPEC § Membership changes).
+// Log compaction: node.compact(applied_index, state_machine_image), then persist
+// node.snapshot().? and delete the stored entries it covers (SPEC § Log compaction).
 // After any of them:
 while (node.hasReady()) {
     const rd = try node.ready();
-    // 1. persist rd.hard_state, then delete stored entries > rd.truncate_after,
-    //    then write rd.entries — durably;
+    // 1. persist rd.hard_state; if rd.snapshot is set, store it in place of
+    //    every stored entry and load your state machine from rd.snapshot.?.data;
+    //    then delete stored entries > rd.truncate_after, then write rd.entries
+    //    — durably;
     // 2. send each of rd.messages (m.encode / m.encodeAlloc) to m.to;
     // 3. apply rd.committed to your state machine, in order;
     try node.advance();
