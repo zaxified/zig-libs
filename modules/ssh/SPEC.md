@@ -464,12 +464,6 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
 
 ## Backlog / deferred
 
-- **`-Dprofile=small` stopped shrinking the size probe.** `scripts/checks/small-sizes.sh --measure` found
-  the probe at 185 448 B by default and 159 120 B under `small` (it was 29 440), a gain below the floor in
-  `scripts/checks/small-size-expected.tsv`, so the `small` lane fails on ssh. The small side regressed:
-  montint's looped kernel or the 4096 cap no longer reach `GexMod`, or a new path instantiates the 8192
-  slot list. Suspects: montint's R^2-from-doublings change and the no-panic sweep. Not re-measured since;
-  bisect with `scripts/checks/small-sizes.sh --measure`.
 - **`aes*-ctr` one block at a time.** `aesCtrXor` (`src/transport.zig`) encrypts one block per call and
   carries the counter byte by byte, so it never pipelines AES-NI. `aes192.Aes192EncryptCtx.ctr` (0.96x
   OpenSSL EVP CTR at 16 KiB) is the shape for aes192, and the same counter over std's `AesEncryptCtx` for
