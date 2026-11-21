@@ -939,8 +939,8 @@ threshold_ecdsa	ReleaseFast	open7	1	2	9f8a8e4656c01dfb	e040997143d67ecf
 # rangeproof.zig, the IPA transcript replay and challenge products moved into
 # `ipa.replayChallenges`/`challengeProducts`, verifier side only). Both rows
 # re-measured unchanged.
-bulletproofs	ReleaseFast	rangeproof	1	0	389ebf56c946e165	RANDOMIZED
-bulletproofs	ReleaseFast	ipa	1	0	5030869687026e1f	2ade41bb2f418497
+bulletproofs	ReleaseFast	rangeproof	1	0	71c7b9473eba0e5c	RANDOMIZED
+bulletproofs	ReleaseFast	ipa	1	0	3f64cdea60e24639	2ade41bb2f418497
 # paillier 2026-10-02 — decrypt, gPow and the homomorphic products moved onto
 # montint.DynModint; the L-function is DynModint.divExact (Hensel) instead of
 # std.math.big.int divFloor. crt 325 -> 2, noncrt 133 -> 3, mul 9 -> 0,

@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [monero-project/monero](https://github.com/monero-project/monero) | C++ | NOASSERTION (BSD-3-Clause per Monero convention, *inferred*; source not read) | 10.9k | pushed 2026-09 | The largest production Bulletproofs(+) deployment (aggregated range proofs on ed25519 in transaction outputs). Consensus-pinned wire format. |
 | Zig ecosystem (GitHub search "bulletproofs", language Zig, 2026-09-30) | Zig | — | — | — | No Bulletproofs repository found; nothing in Zig `std`. |
 
-**Where we are ahead:** the only Zig Bulletproofs implementation found; pure Zig over `std`'s Ristretto255, wire-compatible with dalek in both directions, single and aggregated proofs (Merlin transcript over `std`'s Keccak, dalek generators and layout; `interop_test.zig`); a measured constant-time prover on secret `v`/`gamma` (`src/ctgrind_harness.zig`, 0 in-file contexts under valgrind), a Pippenger vartime MSM in the verifier (`scalarvec.multiScalarMulVartime`), a verifier that never materialises `h'`, batch verification of many proofs (mixed `m`) in one MSM, and an exhaustive per-field tamper suite. **Where we are behind:** no multi-party dealer/party protocol (aggregation needs one caller holding every witness); no R1CS/arbitrary-circuit proofs; `v` is a `u64` (`n <= 64`); not compatible with secp256k1-zkp or Monero (other curves and transcripts). `prove` draws its randomness from the caller's `std.Io`, so it builds on every target.
+**Where we are ahead:** the only Zig Bulletproofs implementation found; pure Zig over `std`'s Ristretto255, wire-compatible with dalek in both directions, single and aggregated proofs (Merlin transcript over `std`'s Keccak, dalek generators and layout; `interop_test.zig`); a measured constant-time prover on secret `v`/`gamma` (`src/ctgrind_harness.zig`, 0 in-file contexts under valgrind), a Pippenger vartime MSM in the verifier (`scalarvec.multiScalarMulVartime`), a verifier that never materialises `h'`, batch verification of many proofs (mixed `m`) in one MSM, and an exhaustive per-field tamper suite. **Where we are behind:** no R1CS/arbitrary-circuit proofs; `v` is a `u64` (`n <= 64`); not compatible with secp256k1-zkp or Monero (other curves and transcripts). `prove` draws its randomness from the caller's `std.Io`, so it builds on every target.
 
 ## Design
 
@@ -72,9 +72,30 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   the `m = 1` verifier byte-exact to its pre-B8 reference. Value `j` needs its own generators (`Generators.initParties`,
   dalek's party chains `'G'/'H' || LE32(j)`), or dalek's proofs would not
   verify. `ipa.zig`, `transcript.zig` and `scalarvec.zig` are unchanged.
-  One caller holds every witness; dalek's dealer/party MPC protocol, where
-  parties that do not trust each other build the proof together, is not
-  offered (Backlog).
+  `proveMultiple` has one caller holding every witness; `mpc.zig` is the
+  multi-party form (below).
+- **Multi-party aggregation (`mpc.zig`)** — dalek's `range_proof::{dealer,
+  party}` (paper §4.5): `Party.init` (`V_j`, `A_j`, `S_j` over party `j`'s
+  generators) → `Dealer.receiveBitCommitments` (binds `n`, `m`, every `V_j`,
+  `A = ΣA_j`, `S = ΣS_j`; draws `y`, `z`) → `Party.applyBitChallenge` (the
+  party's slice of `l(X)`/`r(X)`: offset `y^{jn}`, weight `z^{2+j}`; `T1_j`,
+  `T2_j`) → `Dealer.receivePolyCommitments` (`x`) → `Party.applyPolyChallenge`
+  (the `ProofShare`: `t_x`, `t_x_blinding`, `e_blinding`, `l_j(x)`, `r_j(x)`) →
+  `Dealer.receiveShares`: sums the shares, runs the IPA over the concatenated
+  vectors on the same transcript and returns the proof only if
+  `verifyMultiple` accepts it. Otherwise every share is audited (dalek's
+  `audit_share`: `t_x = <l, r>`, `t_x G + t_x_blinding H = z^{2+j} V_j + δ_j G
+  + x T1_j + x² T2_j`, and the vector equation over `G_j`, `H_j`) and
+  `error.MalformedProofShares` marks the failing parties in `bad` (all of them
+  if every share audits but the sum does not verify). The result is the
+  ordinary aggregated `RangeProof`, so dalek's `verify_multiple` (and
+  `verifyMultiple`) read it unchanged. Tests (`src/mpc.zig`): m = 1, 2, 4
+  proofs verify, a wrong transcript label and swapped commitments do not; a
+  corrupted share at each position is blamed on that party only; honest shares
+  audit, a share at the wrong position does not; malformed setups refused. The
+  party's secrets (`a_L`, `a_R`, `s_L`, `s_R`, `alpha`, `rho`, `tau1`, `tau2`,
+  `gamma`) are wiped by `Party.deinit`; the multi-party paths have no ctgrind row
+  or dead-stack probe yet (*Backlog / deferred*).
 - **`v` is a plain `u64`**, not a bignum. Every realistic Bulletproofs
   range width (8/16/32/64 bits — the paper's own running example is `n =
   64`, "prove a value fits in a `uint64`") fits in a `u64` witness. A
@@ -366,4 +387,5 @@ cannot see an error both sides share.
 
 ## Backlog / deferred
 
-- **Multi-party aggregation (dalek's dealer/party protocol):** parties that do not trust each other build one aggregated proof, each keeping its own value and blinding; dalek's `range_proof::{dealer, party}` with share auditing. Not needed by a single prover; no consumer asks. Effort: medium-large (state machines, share validation, blame). Fits §2.
+- **ctgrind rows and a dead-stack probe for the multi-party party side** (`mpc.Party`): the
+  single-prover rows do not cover its round functions.

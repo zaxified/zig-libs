@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — New `bulletproofs.mpc`: dalek's dealer/party multi-party aggregation (`Party`, `Dealer`, `BitCommitment`, `BitChallenge`, `PolyCommitment`, `PolyChallenge`, `ProofShare`, `MpcError`): `m` parties build one aggregated `RangeProof` (verified by `verifyMultiple` before the dealer returns it); a failing proof audits every share and reports the culprits (`error.MalformedProofShares`). `rangeproof.randomScalar` is now `pub` (the parties draw their blinding with it). Additive.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Ported to Zig 0.17.0. Test only: `IntegerBitSet(N).initEmpty()` -> `.empty`. Examples/tools ported to Zig 0.17.0 (dalek proof emitter passes `io` to `prove`/`proveMultiple` (pre-existing drift)).
 

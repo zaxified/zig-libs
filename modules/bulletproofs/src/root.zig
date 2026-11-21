@@ -145,6 +145,8 @@ pub const verify = rangeproof_mod.verify;
 /// proof over `Generators.initParties(n, >= m)`.
 pub const proveMultiple = rangeproof_mod.proveMultiple;
 pub const verifyMultiple = rangeproof_mod.verifyMultiple;
+/// Multi-party aggregation (dalek's dealer/party protocol, `mpc.zig`).
+pub const mpc = @import("mpc.zig");
 /// Several independent proofs (mixed `m`) in one vartime MSM, random
 /// weights from the caller's `std.Io` — see `rangeproof.verifyBatch`.
 pub const verifyBatch = rangeproof_mod.verifyBatch;

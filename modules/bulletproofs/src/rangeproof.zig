@@ -252,7 +252,7 @@ fn invertScalar(s: [32]u8) [32]u8 {
 /// so a failure is an error, never a weaker source: a range proof made with
 /// predictable blinding leaks the witness. (Until 2026-10-02 this was a
 /// direct Linux `getrandom(2)` and a compile error on every other target.)
-fn randomScalar(io: std.Io) error{ EntropyUnavailable, Canceled }![32]u8 {
+pub fn randomScalar(io: std.Io) error{ EntropyUnavailable, Canceled }![32]u8 {
     var wide: [64]u8 = undefined;
     defer std.crypto.secureZero(u8, &wide);
     try io.randomSecure(&wide);

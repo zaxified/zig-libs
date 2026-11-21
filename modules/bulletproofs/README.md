@@ -93,8 +93,13 @@ const all_ok = try bulletproofs.verifyBatch(gens, io, &.{
 `proveMultiple` refuses an empty batch, a length that is not a power of
 two, mismatched `gammas`, or more values than `gens` has parties
 (`error.InvalidAggregation`), and any value out of range
-(`error.ValueOutOfRange`). One caller holds every witness; dalek's
-multi-party dealer/party protocol is not offered.
+(`error.ValueOutOfRange`). One caller holds every witness there; parties
+that do not trust each other use `bp.mpc` (dalek's dealer/party protocol):
+`mpc.Party.init` → `Dealer.receiveBitCommitments` → `Party.applyBitChallenge`
+→ `Dealer.receivePolyCommitments` → `Party.applyPolyChallenge` →
+`Dealer.receiveShares` (the same aggregated `RangeProof`, checked before it is
+returned; `error.MalformedProofShares` names the parties whose shares fail
+the audit).
 
 ## Caveats
 
@@ -135,7 +140,7 @@ One sibling-module dependency, `ct25519` (`meta.deps = .{"ct25519"}`).
 
 ## Not provided
 
-No multi-party dealer/party protocol, no `n > 64` witnesses, no R1CS/circuit proofs, no secp256k1-zkp or Monero
+No `n > 64` witnesses, no R1CS/circuit proofs, no secp256k1-zkp or Monero
 compatibility; see SPEC.md *What is deliberately not done* and *Backlog / deferred*.
 
 ## Verify
