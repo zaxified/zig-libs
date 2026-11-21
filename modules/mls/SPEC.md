@@ -9,7 +9,7 @@
 **Audit:** review 2026-08-11 · mutation 2026-11-17 (53/54, 1 eq) · src b7fe37e50bdfd4ca
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean at `.scale` 8 = 25,000 runs each — a run is a whole group exchange, MLS_FUZZ) · ct 2026-10-10 (ctgrind: key schedule, secret tree + ratchets, PrivateMessage protect/decrypt; `ks` 0 / `tree` 0 / `priv` 4 in-file — std Ed25519 signing and AEAD verdicts; TreeKEM/HPKE via hpke)
-**Performance:** not measured
+**Performance:** ref 0.97–1.33× OpenMLS 0.9.0 (openmls_rust_crypto 0.6.0) · fastest ? (measured 2026-11-21; `zig build bench-mls`, suite 0x0001 application messages, wall time, two runs of 5 and 7 rounds on a shared host: protect+open of 64 B 1.29/1.33×, 1 KiB 1.21/1.30×, 16 KiB 0.99/0.98×, protect alone 64 B 1.32/1.28×, 16 KiB 0.99/0.98×; spreads 4-76 %, the small-message gap held in both)
 
 **Known defects:** none recorded
 
@@ -1501,9 +1501,18 @@ the function itself is tested directly (`group.zig`); and `parentHash`'s
 
 ## Performance
 
-No benchmark exists; the card's `**Performance:**` line is authoritative. The
-AEAD is the sibling `aesgcm`'s (std's AES-GCM bulk path is slow on Zig 0.17,
-#36256); the bulk `PrivateMessage` path has not been measured (*Backlog / deferred*).
+`tools/bench.zig` (`zig build bench-mls`, under `hw run`) times the bulk
+application-message path against OpenMLS 0.9.0 (`tools/oracle`, a Rust program
+over `openmls` + `openmls_rust_crypto` + `openmls_basic_credential`, pinned by
+its Cargo.lock; build it once with `cargo build --release --locked` there): a
+two-member group, suite 0x0001, `protectApplication` + `unprotectApplication`
+against `create_message` + TLS (de)serialisation + `process_message`, and the
+protect half alone, at 64 B, 1 KiB and 16 KiB. The wire bytes are the same
+length on both sides (checked by the bench's count). Results on the card's
+`**Performance:**` line: at 16 KiB the two are level (the AEAD is the sibling
+`aesgcm`'s); at 64 B and 1 KiB ours is about 1.2-1.3× slower, a fixed cost per
+message of roughly 15-35 µs, where the per-message Ed25519 signature and its
+verification dominate (see *Backlog / deferred*).
 
 ## What is deliberately not done
 
@@ -1589,4 +1598,7 @@ Gaps that are unverified rather than unbuilt:
 
 ## Backlog / deferred
 
-- **Measure the bulk `PrivateMessage` path** (AEAD from the sibling `aesgcm`; Zig 0.17, #36256); the card says `Performance: not measured`.
+- **The per-message fixed cost of a small `PrivateMessage`** is about 1.3×
+  OpenMLS's (`bench-mls`, *Performance*): profile it (std Ed25519 sign/verify
+  against ed25519-dalek, the 96 KiB `group_burn` per call, the
+  `groupContextAlloc` per message) and close it to the P2 bar (≤ 1.1×).
