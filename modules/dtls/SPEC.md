@@ -529,8 +529,7 @@ Deliberately not implemented in 1.2: see *What is deliberately not done*.
 
 - **Not provided — see Backlog (not silently skipped):** session resumption /
   `NewSessionTicket` (no `"res binder"`/resumption-PSK path — only `"ext
-  binder"`/externally-configured PSK), 0-RTT/early data, and 1.3 CID updates (NewConnectionId /
-  RequestConnectionId).
+  binder"`/externally-configured PSK), 0-RTT/early data.
 - **Connection ID (DTLS 1.3, RFC 9146 §3 / RFC 9147 §9).** `Config.connection_id` (≤ `max_cid_len` = 32, mbedTLS's
   default cap; `error.InvalidConnectionId`): a client offers it in the ClientHello, a server that set one answers in
   the ServerHello (a peer CID longer than 32 bytes: the server does not negotiate, a client fails `Malformed`). Once
@@ -539,8 +538,15 @@ Deliberately not implemented in 1.2: see *What is deliberately not done*.
   or none while a non-empty one is expected (RFC 9146 §3 "MUST be treated as invalid"), is `error.Malformed`. An
   empty own CID means the peer sends none. `Connection.peerConnectionId()`; the sender's records are cut into
   datagrams with `record.nextDatagramCid`. A caller that demultiplexes by CID reads it at byte 1 of the record.
-  NewConnectionId / RequestConnectionId are not sent, and a received one is refused like any unknown post-handshake
-  message. Self-interop (with fragmentation at 128 bytes) and live against wolfSSL 5.9.1 in both roles
+  **CID updates (§9):** `offerConnectionIds(cids, .immediate | .spare)` sends a NewConnectionId (up to
+  `max_new_cids` CIDs, each the length of this side's negotiated CID, which is how received records are parsed),
+  `requestConnectionIds(n)` a RequestConnectionId; one such message at a time, retransmitted by `poll` until an ACK
+  names one of its records (`connectionIdUpdatePending`). Received records may then carry the old CID or any newly
+  issued one. A received NewConnectionId with `.immediate` switches the CID this side sends at once and keeps the
+  rest as spares (`peerSpareConnectionIds`, switch with `usePeerConnectionId`; at most `max_cid_spares`, oldest
+  dropped); a received RequestConnectionId is reported by `connectionIdsRequested` until answered with `.spare`.
+  Both are ACKed and surface as `ReceivedPostHandshakeMessage`; on a connection without a CID, or malformed, they are
+  `error.Malformed` (RFC 9147 §9: unexpected_message). The CID updates are self-interop only. Self-interop (with fragmentation at 128 bytes) and live against wolfSSL 5.9.1 in both roles
   (`psk-client-cid`, `psk-server-cid`, live-only: not in the committed transcript).
 
 - **Post-quantum key exchange.** `X25519MLKEM768`
@@ -873,11 +879,12 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   `wolfssl_replay.zig`'s `recorded_cases_floor` 22 → 26 and `fuzz_corpus.zig`'s pinned frame counts.
 - **Session tickets / resumption and 0-RTT**, for both engines. Saves a handshake on constrained links; pion has it for
   1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.
-- **Connection ID, the rest (RFC 9147 §9).** Both engines negotiate and use one CID per direction. Still open:
-  1.3 CID updates (NewConnectionId / RequestConnectionId, §9), and a live peer for the 1.2 form (mbedTLS; see the
-  second-stack item). Effort: medium.
 - **`CertificateEntry` extensions** (OCSP stapling `status_request`, SCT): wolfSSL and OpenSSL offer stapling.
   Framed empty on send, length-validated-but-discarded on receive. Needs an OCSP response verifier (the `x509`
   module checks CRLs). Effort: medium.
 - **A second independent stack.** wolfSSL agreeing with us rules out the wire defects listed under *What it found*, but a
-  bug the two happen to share would still pass; mbedTLS or picotls would be the natural cross-check.
+  bug the two happen to share would still pass. OpenSSL 3.5 now covers 1.2 plain PSK (it has no DTLS 1.3). The next
+  one is Mbed TLS 3.6 (DTLS 1.2, RFC 9146 connection ID — the 1.2 CID's missing live peer, since Debian's wolfSSL
+  5.9.1 fails it): its `ssl_server2` / `ssl_client2` from the sha256-pinned release tarball, built outside `modules/`
+  (dual Apache-2.0 / GPL), driven as black boxes from `tools/interop.zig`. Not built yet: fetching and building it
+  needs the owner's approval in this environment.

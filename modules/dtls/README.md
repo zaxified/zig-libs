@@ -200,8 +200,7 @@ the middle of an incomplete one — see `handleFlight`'s "KNOWN LIMIT".
 
 ## Not provided
 
-Resumption and tickets, 0-RTT, 1.3 connection ID updates (NewConnectionId / RequestConnectionId; the
-negotiated CID itself, `Config.connection_id`, works in both versions) and `CertificateEntry` extensions (OCSP stapling) are not built (RFC 5280 path building is
+Resumption and tickets, 0-RTT and `CertificateEntry` extensions (OCSP stapling) are not built (RFC 5280 path building is
 `PeerVerify.chain`; `.trust_anchor` stays one-hop); DTLS 1.2 CBC suites, static-RSA key exchange,
 compression, renegotiation and DTLS 1.0 are refused on purpose. See [SPEC.md](SPEC.md) *Backlog /
 deferred* and *What is deliberately not done*.

@@ -948,7 +948,8 @@ pub const SendError = error{
     /// `handshake` (22) on the application epoch — a post-handshake message
     /// other than a KeyUpdate (that is `ReceivedKeyUpdate`): a
     /// NewSessionTicket, which is ACKed (queued for `poll`) and ignored since
-    /// resumption is not implemented, or a message ahead of the expected
+    /// resumption is not implemented, a NewConnectionId / RequestConnectionId
+    /// (RFC 9147 §9, applied and ACKed), or a message ahead of the expected
     /// `message_seq`, dropped for the peer to retransmit. The caller reads
     /// the next datagram.
     ReceivedPostHandshakeMessage,
@@ -1069,6 +1070,23 @@ const key_update_requested: u8 = 1;
 /// engine reads on the application epoch.
 const hs_type_new_session_ticket: u8 = 4;
 const hs_type_key_update: u8 = 24;
+/// RFC 9147 §9 / §13: the two CID-management messages.
+const hs_type_request_connection_id: u8 = 9;
+const hs_type_new_connection_id: u8 = 10;
+/// How many CIDs one NewConnectionId carries here, how many further own CIDs
+/// stay accepted, and how many spare peer CIDs are kept (oldest dropped).
+pub const max_new_cids = 4;
+pub const max_cid_spares = 4;
+/// header + `cids<0..2^16-1>` + usage.
+const max_cid_msg = handshake.header_len + 2 + max_new_cids * (1 + max_cid_len) + 1;
+
+/// RFC 9147 §9 `ConnectionIdUsage`.
+pub const ConnectionIdUsage = enum(u8) {
+    /// The peer switches to the first new CID for every record from now on.
+    immediate = 0,
+    /// Spares, for the peer to switch to later.
+    spare = 1,
+};
 
 const KeyUpdateState = enum { idle, queued, in_flight };
 
@@ -1774,6 +1792,25 @@ pub const Connection = struct {
     cid_own_len: u8 = 0,
     cid_peer: [max_cid_len]u8 = undefined,
     cid_peer_len: u8 = 0,
+    /// RFC 9147 §9: further CIDs this side issued with NewConnectionId,
+    /// accepted on received records besides `cid_own` (same length).
+    cid_own_extra: [max_new_cids][max_cid_len]u8 = undefined,
+    cid_own_extra_len: u8 = 0,
+    /// Spare CIDs the peer offered (`cid_spare`), oldest first.
+    cid_spares: [max_cid_spares][max_cid_len]u8 = undefined,
+    cid_spare_lens: [max_cid_spares]u8 = undefined,
+    cid_spares_len: u8 = 0,
+    /// The `num_cids` of the peer's last RequestConnectionId (0 = none).
+    cid_requested: u8 = 0,
+    /// One NewConnectionId / RequestConnectionId of ours in flight,
+    /// retransmitted by `poll` until an ACK names one of its records.
+    cm_state: KeyUpdateState = .idle,
+    cm_msg: [max_cid_msg]u8 = undefined,
+    cm_msg_len: u16 = 0,
+    cm_records: [max_ku_records]flight.RecordNumber = undefined,
+    cm_records_len: u8 = 0,
+    cm_records_next: u8 = 0,
+    cm_timer: flight.RetransmitTimer = flight.RetransmitTimer.init(1000, 60_000),
 
     // ── handshake-in-progress state (RFC 9147 §5 flight engine) ─────────
     /// Running transcript hash (RFC 8446 §4.4.1, TLS-style 4-byte-header
@@ -2328,6 +2365,25 @@ pub const Connection = struct {
             }
             return rec;
         }
+        const send_cm = switch (self.cm_state) {
+            .idle => false,
+            .queued => true,
+            .in_flight => self.cm_timer.isExpired(now_ms),
+        };
+        if (send_cm) {
+            const rn: flight.RecordNumber = .{ .epoch = self.write_epoch, .sequence_number = self.send_seq };
+            const rec = try self.protectRecord(content_type_handshake, self.cm_msg[0..self.cm_msg_len], out);
+            self.cm_records[self.cm_records_next] = rn;
+            self.cm_records_next = (self.cm_records_next + 1) % max_ku_records;
+            if (self.cm_records_len < max_ku_records) self.cm_records_len += 1;
+            if (self.cm_state == .queued) {
+                self.cm_state = .in_flight;
+                self.cm_timer.arm(now_ms);
+            } else {
+                self.cm_timer.onTimeout(now_ms);
+            }
+            return rec;
+        }
         return null;
     }
 
@@ -2339,6 +2395,21 @@ pub const Connection = struct {
     /// (e.g. the handshake's final flight, re-ACKed) are ignored.
     fn processAck(self: *Connection, body: []const u8) SendError!void {
         try checkAckBody(body);
+        if (self.cm_state == .in_flight) {
+            var j: usize = 2;
+            outer: while (j < body.len) : (j += flight.record_number_len) {
+                const rn = flight.decodeRecordNumber(body[j..][0..flight.record_number_len]);
+                for (self.cm_records[0..self.cm_records_len]) |sent| {
+                    if (sent.epoch == rn.epoch and sent.sequence_number == rn.sequence_number) {
+                        self.cm_state = .idle;
+                        self.cm_records_len = 0;
+                        self.cm_records_next = 0;
+                        self.cm_timer.reset();
+                        break :outer;
+                    }
+                }
+            }
+        }
         if (self.ku_state != .in_flight) return;
         var i: usize = 2;
         while (i < body.len) : (i += flight.record_number_len) {
@@ -2438,6 +2509,20 @@ pub const Connection = struct {
                     // fragment is ACKed (its bytes are not needed here).
                     if (@as(u32, hdr.fragment_offset) + hdr.fragment_length == hdr.length)
                         self.peer_message_seq = expected +% 1;
+                    ack = true;
+                },
+                // RFC 9147 §9, one fragment each (the messages are small).
+                hs_type_new_connection_id => {
+                    if (hdr.fragment_offset != 0 or hdr.fragment_length != hdr.length) return error.Malformed;
+                    try self.takeNewConnectionIds(frag);
+                    self.peer_message_seq = expected +% 1;
+                    ack = true;
+                },
+                hs_type_request_connection_id => {
+                    if (hdr.length != 1 or hdr.fragment_offset != 0 or hdr.fragment_length != 1) return error.Malformed;
+                    if (!self.cid_negotiated or frag[0] == 0) return error.Malformed;
+                    self.cid_requested = frag[0];
+                    self.peer_message_seq = expected +% 1;
                     ack = true;
                 },
                 else => return error.Malformed,
@@ -2749,8 +2834,146 @@ pub const Connection = struct {
     /// MUST be treated as invalid").
     fn checkRxCid(self: *const Connection, cid: ?[]const u8) error{Malformed}!void {
         if (cid) |c| {
-            if (!std.mem.eql(u8, c, self.cid_own[0..self.cid_own_len])) return error.Malformed;
+            if (std.mem.eql(u8, c, self.cid_own[0..self.cid_own_len])) return;
+            for (self.cid_own_extra[0..self.cid_own_extra_len]) |*x| {
+                if (std.mem.eql(u8, c, x[0..self.cid_own_len])) return;
+            }
+            return error.Malformed;
         } else if (self.rxCidLen() != 0) return error.Malformed;
+    }
+
+    /// RFC 9147 §9: sends a NewConnectionId with `cids` (at most
+    /// `max_new_cids`, each the length of this side's negotiated CID, which
+    /// is how a receiver parses its records), retransmitted by `poll` until
+    /// ACKed. Received records may carry any of them, or the old CID, from
+    /// now on. `.immediate` asks the peer to switch to `cids[0]` at once.
+    /// One CID message at a time (`error.ConnectionIdUpdatePending`).
+    pub fn offerConnectionIds(self: *Connection, cids: []const []const u8, usage: ConnectionIdUsage) error{ NotConnected, ConnectionIdNotNegotiated, ConnectionIdUpdatePending, InvalidConnectionId }!void {
+        if (self.state != .connected) return error.NotConnected;
+        if (!self.cid_negotiated or self.cid_own_len == 0) return error.ConnectionIdNotNegotiated;
+        if (self.cm_state != .idle) return error.ConnectionIdUpdatePending;
+        if (cids.len == 0 or cids.len > max_new_cids) return error.InvalidConnectionId;
+        for (cids) |c| if (c.len != self.cid_own_len) return error.InvalidConnectionId;
+        var body: [2 + max_new_cids * (1 + max_cid_len) + 1]u8 = undefined;
+        var n: usize = 2;
+        for (cids) |c| {
+            body[n] = @intCast(c.len);
+            @memcpy(body[n + 1 ..][0..c.len], c);
+            n += 1 + c.len;
+        }
+        std.mem.writeInt(u16, body[0..2], @intCast(n - 2), .big);
+        body[n] = @backingInt(usage);
+        n += 1;
+        // Accepted on receive from now on (the oldest extras make room).
+        for (cids) |c| {
+            if (self.cid_own_extra_len == max_new_cids) {
+                std.mem.copyForwards([max_cid_len]u8, self.cid_own_extra[0 .. max_new_cids - 1], self.cid_own_extra[1..max_new_cids]);
+                self.cid_own_extra_len -= 1;
+            }
+            @memcpy(self.cid_own_extra[self.cid_own_extra_len][0..c.len], c);
+            self.cid_own_extra_len += 1;
+        }
+        if (usage == .spare) self.cid_requested = 0;
+        self.queueCidMessage(hs_type_new_connection_id, body[0..n]);
+    }
+
+    /// RFC 9147 §9: asks the peer for `num_cids` spare CIDs
+    /// (RequestConnectionId), retransmitted by `poll` until ACKed; they
+    /// arrive as a NewConnectionId (`peerSpareConnectionIds`).
+    pub fn requestConnectionIds(self: *Connection, num_cids: u8) error{ NotConnected, ConnectionIdNotNegotiated, ConnectionIdUpdatePending, InvalidConnectionId }!void {
+        if (self.state != .connected) return error.NotConnected;
+        if (!self.cid_negotiated) return error.ConnectionIdNotNegotiated;
+        if (self.cm_state != .idle) return error.ConnectionIdUpdatePending;
+        if (num_cids == 0) return error.InvalidConnectionId;
+        self.queueCidMessage(hs_type_request_connection_id, &.{num_cids});
+    }
+
+    fn queueCidMessage(self: *Connection, msg_type: u8, body: []const u8) void {
+        handshake.encodeHeader(.{
+            .msg_type = msg_type,
+            .length = @intCast(body.len),
+            .message_seq = self.message_seq,
+            .fragment_offset = 0,
+            .fragment_length = @intCast(body.len),
+        }, self.cm_msg[0..handshake.header_len]);
+        @memcpy(self.cm_msg[handshake.header_len..][0..body.len], body);
+        self.cm_msg_len = @intCast(handshake.header_len + body.len);
+        self.message_seq +%= 1;
+        self.cm_state = .queued;
+        self.cm_records_len = 0;
+        self.cm_records_next = 0;
+        self.cm_timer.reset();
+    }
+
+    /// Whether a NewConnectionId / RequestConnectionId of ours awaits its ACK.
+    pub fn connectionIdUpdatePending(self: *const Connection) bool {
+        return self.cm_state != .idle;
+    }
+
+    /// The spare CIDs the peer offered (`.spare`), oldest first; switch to one
+    /// with `usePeerConnectionId`.
+    pub fn peerSpareConnectionIds(self: *const Connection, out: *[max_cid_spares][]const u8) []const []const u8 {
+        for (0..self.cid_spares_len) |i| out[i] = self.cid_spares[i][0..self.cid_spare_lens[i]];
+        return out[0..self.cid_spares_len];
+    }
+
+    /// Sends every later record with spare CID number `index` (of
+    /// `peerSpareConnectionIds`), which leaves the spare list.
+    pub fn usePeerConnectionId(self: *Connection, index: usize) error{InvalidConnectionId}!void {
+        if (index >= self.cid_spares_len) return error.InvalidConnectionId;
+        const len = self.cid_spare_lens[index];
+        @memcpy(self.cid_peer[0..len], self.cid_spares[index][0..len]);
+        self.cid_peer_len = len;
+        self.dropSpare(index);
+    }
+
+    fn dropSpare(self: *Connection, index: usize) void {
+        var i = index;
+        while (i + 1 < self.cid_spares_len) : (i += 1) {
+            self.cid_spares[i] = self.cid_spares[i + 1];
+            self.cid_spare_lens[i] = self.cid_spare_lens[i + 1];
+        }
+        self.cid_spares_len -= 1;
+    }
+
+    /// The `num_cids` of the peer's last RequestConnectionId, 0 when none is
+    /// outstanding; `offerConnectionIds(…, .spare)` answers it.
+    pub fn connectionIdsRequested(self: *const Connection) u8 {
+        return self.cid_requested;
+    }
+
+    /// A received NewConnectionId body (RFC 9147 §9).
+    fn takeNewConnectionIds(self: *Connection, body: []const u8) error{Malformed}!void {
+        if (!self.cid_negotiated) return error.Malformed; // RFC 9147 §9: unexpected_message
+        if (body.len < 3) return error.Malformed;
+        const list_len: usize = std.mem.readInt(u16, body[0..2], .big);
+        if (body.len != 2 + list_len + 1) return error.Malformed;
+        const usage = body[2 + list_len];
+        if (usage > 1) return error.Malformed;
+        var cids: [16][]const u8 = undefined;
+        var n: usize = 0;
+        var pos: usize = 2;
+        while (pos < 2 + list_len) {
+            const l = body[pos];
+            if (l > max_cid_len or pos + 1 + l > 2 + list_len) return error.Malformed;
+            if (n == cids.len) return error.Malformed;
+            cids[n] = body[pos + 1 ..][0..l];
+            n += 1;
+            pos += 1 + l;
+        }
+        if (n == 0) return error.Malformed;
+        var first: usize = 0;
+        if (usage == @backingInt(ConnectionIdUsage.immediate)) {
+            @memcpy(self.cid_peer[0..cids[0].len], cids[0]);
+            self.cid_peer_len = @intCast(cids[0].len);
+            first = 1;
+        }
+        for (cids[first..n]) |c| {
+            if (self.cid_spares_len == max_cid_spares) self.dropSpare(0);
+            @memcpy(self.cid_spares[self.cid_spares_len][0..c.len], c);
+            self.cid_spare_lens[self.cid_spares_len] = @intCast(c.len);
+            self.cid_spares_len += 1;
+        }
     }
 
     /// Client: the ClientHello's `connection_id`, or null.
@@ -11258,4 +11481,93 @@ test "connection ID: not negotiated unless both offer; an empty own CID means th
     try testing.expectEqualStrings("with cid", try server.recv(to_s, &plain));
     const long: [max_cid_len + 1]u8 = @splat(1);
     try testing.expectError(error.InvalidConnectionId, (Config{ .role = .client, .psk_identity = "id", .psk = "k", .connection_id = &long }).validate());
+}
+
+test "connection ID updates (RFC 9147 §9): NewConnectionId immediate and spare, RequestConnectionId, ACKs and retransmission" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try cidPair("cli-1", "srv-1", 0, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x88)));
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    try driveHandshake(&client, &server, seededForTest(&csprng), &b1, &b2);
+    // Drain the server's ACK of the client's Finished.
+    var store: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    var wire: [256]u8 = undefined;
+    while (try pollOne(&server, 0, &store)) |rec| _ = client.recv(rec, &plain) catch {};
+
+    // The client asks for spares; the server is told how many.
+    try client.requestConnectionIds(2);
+    try testing.expectError(error.ConnectionIdUpdatePending, client.requestConnectionIds(1));
+    const req = (try pollOne(&client, 0, &store)).?;
+    try testing.expectError(error.ReceivedPostHandshakeMessage, server.recv(req, &plain));
+    try testing.expectEqual(@as(u8, 2), server.connectionIdsRequested());
+    // Not ACKed yet: the request is retransmitted when its timer runs out.
+    try testing.expect((try pollOne(&client, 500, &store)) == null);
+    const req2 = (try pollOne(&client, 1500, &store)).?;
+    try testing.expectError(error.ReceivedPostHandshakeMessage, server.recv(req2, &plain)); // re-ACKed only
+    const ack = (try pollOne(&server, 1500, &store)).?;
+    try testing.expectError(error.ReceivedAck, client.recv(ack, &plain));
+    try testing.expect(!client.connectionIdUpdatePending());
+
+    // The server answers with two spares of its CID's length.
+    try testing.expectError(error.InvalidConnectionId, server.offerConnectionIds(&.{"too-long-cid"}, .spare));
+    try server.offerConnectionIds(&.{ "srv-2", "srv-3" }, .spare);
+    const nci = (try pollOne(&server, 0, &store)).?;
+    try testing.expectError(error.ReceivedPostHandshakeMessage, client.recv(nci, &plain));
+    try testing.expectEqual(@as(u8, 0), server.connectionIdsRequested()); // answered
+    var spares_buf: [max_cid_spares][]const u8 = undefined;
+    const spares = client.peerSpareConnectionIds(&spares_buf);
+    try testing.expectEqual(@as(usize, 2), spares.len);
+    try testing.expectEqualStrings("srv-2", spares[0]);
+    try testing.expectEqualStrings("srv-1", client.peerConnectionId().?);
+    const ack2 = (try pollOne(&client, 0, &store)).?;
+    try testing.expectError(error.ReceivedAck, server.recv(ack2, &plain));
+    try testing.expect(!server.connectionIdUpdatePending());
+
+    // The client moves to a spare; the server accepts it (and still the old one).
+    const old = try client.send("old cid", &wire);
+    var old_copy: [256]u8 = undefined;
+    @memcpy(old_copy[0..old.len], old);
+    try client.usePeerConnectionId(1);
+    const moved = try client.send("new cid", &wire);
+    try testing.expectEqualStrings("srv-3", moved[1..6]);
+    try testing.expectEqualStrings("new cid", try server.recv(moved, &plain));
+    try testing.expectEqualStrings("old cid", try server.recv(old_copy[0..old.len], &plain));
+    try testing.expectError(error.InvalidConnectionId, client.usePeerConnectionId(1));
+
+    // Immediate: the server's next records carry the client's new CID at once.
+    try client.offerConnectionIds(&.{"cli-2"}, .immediate);
+    const nci2 = (try pollOne(&client, 0, &store)).?;
+    try testing.expectError(error.ReceivedPostHandshakeMessage, server.recv(nci2, &plain));
+    const down = try server.send("to cli-2", &wire);
+    try testing.expectEqualStrings("cli-2", down[1..6]);
+    try testing.expectEqualStrings("to cli-2", try client.recv(down, &plain));
+}
+
+test "connection ID updates: refused without a negotiated CID, malformed bodies are Malformed" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try cidPair(null, null, 0, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x89)));
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    try driveHandshake(&client, &server, seededForTest(&csprng), &b1, &b2);
+    try testing.expectError(error.ConnectionIdNotNegotiated, client.requestConnectionIds(1));
+    try testing.expectError(error.ConnectionIdNotNegotiated, client.offerConnectionIds(&.{"x"}, .spare));
+    // A NewConnectionId on a connection without CIDs is RFC 9147 §9's unexpected_message.
+    try testing.expectError(error.Malformed, client.takeNewConnectionIds(&.{ 0, 2, 1, 'a', 1 }));
+    var c2 = client;
+    c2.cid_negotiated = true;
+    try testing.expectError(error.Malformed, c2.takeNewConnectionIds(&.{ 0, 2, 1, 'a' })); // no usage byte
+    try testing.expectError(error.Malformed, c2.takeNewConnectionIds(&.{ 0, 2, 1, 'a', 2 })); // usage 2
+    try testing.expectError(error.Malformed, c2.takeNewConnectionIds(&.{ 0, 2, 5, 'a', 0 })); // CID past the list
+    try testing.expectError(error.Malformed, c2.takeNewConnectionIds(&.{ 0, 0, 0 })); // empty list
+    try c2.takeNewConnectionIds(&.{ 0, 4, 1, 'a', 1, 'b', 0 });
+    try testing.expectEqualStrings("a", c2.peerConnectionId().?);
 }
