@@ -7684,6 +7684,17 @@ const errtab_want = [_][3][]const u8{
     .{ "InvalidUnicodeClass", "InvalidEscape", "InvalidUnicodeClass" },
 };
 
+/// Whether this is a `-Dregex-unicode=go` build (what `-Dprofile=small` selects).
+const go_unicode = @import("zl_options").regex_unicode == .go;
+
+/// A `-Dregex-unicode=go` build (also `-Dprofile=small`) has no table for a Rust-only property and cannot tell
+/// one from an unknown name: the Rust grammar's `\p{...}` then fails with `UnicodeTableNotBuilt`, where the
+/// full build compiles it (a real property) or says `InvalidUnicodeClass` (an unknown one).
+fn goBuildRefusal(got: []const u8, want: []const u8, syn: Syntax) bool {
+    if (!go_unicode or syn != .rust or !std.mem.eql(u8, got, "UnicodeTableNotBuilt")) return false;
+    return std.mem.eql(u8, want, "ok") or std.mem.eql(u8, want, "InvalidUnicodeClass");
+}
+
 test "error table: each bad pattern reports the error it did, under each syntax" {
     const gpa = testing.allocator;
     const syns = [_]Syntax{ .perl, .posix, .rust };
@@ -7700,7 +7711,7 @@ test "error table: each bad pattern reports the error it did, under each syntax"
             std.debug.print("    .{{ \"{s}\", \"{s}\", \"{s}\" }},\n", .{ got[0], got[1], got[2] });
             continue;
         }
-        for (got, errtab_want[i], syns) |g, w, s| if (!std.mem.eql(u8, g, w)) {
+        for (got, errtab_want[i], syns) |g, w, s| if (!std.mem.eql(u8, g, w) and !goBuildRefusal(g, w, s)) {
             std.debug.print("/{f}/ ({t}): {s}, want {s}\n", .{ std.zig.fmtString(p), s, g, w });
             return error.TestUnexpectedResult;
         };
@@ -7732,6 +7743,9 @@ test "mutation M: each Rust flag has its own bit (no false duplicate)" {
     try testing.expectError(error.InvalidPerlOp, Regex.compileOptions(gpa, "(?UU)a", .{ .syntax = .rust }));
 }
 
+/// What a `\p{name=value}` the build has no table for answers (see `goBuildRefusal`).
+const unknown_property: anyerror = if (go_unicode) error.UnicodeTableNotBuilt else error.InvalidUnicodeClass;
+
 test "mutation M: error sites of the Go and Rust escapes, groups, classes and properties" {
     const gpa = testing.allocator;
     const cases = [_]struct { p: []const u8, s: Syntax, e: anyerror }{
@@ -7746,8 +7760,8 @@ test "mutation M: error sites of the Go and Rust escapes, groups, classes and pr
         .{ .p = "\\x{1g}", .s = .rust, .e = error.InvalidEscape },
         .{ .p = "\\p\\", .s = .rust, .e = error.InvalidUnicodeClass },
         .{ .p = "(?-u)\\pL", .s = .rust, .e = error.InvalidUnicodeClass },
-        .{ .p = "\\p{Foo=Bar}", .s = .rust, .e = error.InvalidUnicodeClass },
-        .{ .p = "\\p{Script=Foo}", .s = .rust, .e = error.InvalidUnicodeClass },
+        .{ .p = "\\p{Foo=Bar}", .s = .rust, .e = unknown_property },
+        .{ .p = "\\p{Script=Foo}", .s = .rust, .e = unknown_property },
         .{ .p = "[^", .s = .rust, .e = error.MissingBracket },
         .{ .p = "[-", .s = .rust, .e = error.MissingBracket },
         .{ .p = "(?-u)[^a]", .s = .rust, .e = error.InvalidUtf8 },

@@ -37,7 +37,12 @@ fn sizeLimited(pattern: []const u8) bool {
     return false;
 }
 
-const Tally = struct { patterns: usize = 0, cases: usize = 0, capacity: usize = 0, size_limit: usize = 0, shortest_earlier: usize = 0, bad_verdict: usize = 0, bad_names: usize = 0, bad_cases: usize = 0, printed: usize = 0 };
+/// A `-Dregex-unicode=go` build (what `-Dprofile=small` selects) has no table for a Rust-only property
+/// (`\p{Emoji}`, `\p{sc=Greek}`, `\p{Age=15.0}`, ...): the crate compiles those, it answers
+/// `error.UnicodeTableNotBuilt`, and that is the knob's documented behaviour, not a verdict to count.
+const go_unicode = @import("zl_options").regex_unicode == .go;
+
+const Tally = struct { patterns: usize = 0, cases: usize = 0, capacity: usize = 0, size_limit: usize = 0, shortest_earlier: usize = 0, bad_verdict: usize = 0, bad_names: usize = 0, bad_cases: usize = 0, printed: usize = 0, not_built: usize = 0 };
 
 const max_print = 60;
 
@@ -84,6 +89,8 @@ fn replay(set: []const v.Pattern, bytes: bool, want_size_limit: usize, want_capa
         var re = regex.Regex.compileOptions(testing.allocator, p.pattern, .{ .syntax = .rust, .utf8 = !bytes }) catch |e| {
             if (p.ok and (e == error.PatternTooLarge or e == error.NestingDepth or e == error.InvalidRepeatSize)) {
                 t.capacity += 1;
+            } else if (p.ok and go_unicode and e == error.UnicodeTableNotBuilt) {
+                t.not_built += 1;
             } else if (p.ok) {
                 t.bad_verdict += 1;
                 note(&t, "/{s}/: Rust compiles it, here {t}\n", .{ p.pattern, e });
@@ -149,6 +156,8 @@ fn replay(set: []const v.Pattern, bytes: bool, want_size_limit: usize, want_capa
     // Pinned, so a drift either way shows.
     try testing.expectEqual(want_size_limit, t.size_limit);
     try testing.expectEqual(want_capacity, t.capacity);
+    // Only the go build leaves a table out.
+    if (!go_unicode) try testing.expectEqual(@as(usize, 0), t.not_built);
 }
 
 test "rust oracle: RegexSet" {
@@ -159,6 +168,8 @@ test "rust oracle: RegexSet" {
         var rs = regex.RegexSet.compile(testing.allocator, set.patterns, .{ .syntax = .rust, .utf8 = !set.bytes }) catch |e| {
             if (set.ok and (e == error.PatternTooLarge or e == error.InvalidRepeatSize or e == error.NestingDepth)) {
                 capacity += 1; // CAPACITY (`a{1001}`)
+            } else if (set.ok and go_unicode and e == error.UnicodeTableNotBuilt) {
+                // a table the go build leaves out (see `go_unicode`)
             } else if (set.ok) {
                 bad += 1;
                 std.debug.print("set {any}: Rust compiles it, here {t}\n", .{ set.patterns, e });

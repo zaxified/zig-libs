@@ -38,10 +38,52 @@ const std = @import("std");
 const testing = std.testing;
 const regex = @import("root.zig");
 const v = @import("go_vectors.zig");
+const full_tables = @import("unicode_tables.zig");
+
+/// `-Dregex-unicode=go` (what `-Dprofile=small` selects) leaves the Age tables out of the build.
+const go_unicode = @import("zl_options").regex_unicode == .go;
+
+/// The ranges of one table of the full tables (`unicode_tables.zig`, which is in every build whatever
+/// the knob), by its key: `cp` is in it. A walk over the stored varints, as the engine reads them.
+fn inFullTable(key: []const u8, cp: u21) bool {
+    const t = for (full_tables.names) |nm| {
+        if (std.mem.eql(u8, nm.name, key)) break full_tables.bases[nm.base];
+    } else unreachable;
+    const bytes = full_tables.data[t.offset..][0..t.size];
+    var i: usize = 0;
+    var next_lo: u32 = 0;
+    for (0..t.count) |_| {
+        var vals: [2]u32 = undefined;
+        for (&vals) |*val| {
+            var x: u32 = 0;
+            var shift: u5 = 0;
+            while (true) {
+                const b = bytes[i];
+                i += 1;
+                x |= @as(u32, b & 0x7f) << shift;
+                if (b & 0x80 == 0) break;
+                shift += 7;
+            }
+            val.* = x;
+        }
+        const lo = next_lo + vals[0];
+        const hi = lo + vals[1];
+        if (cp >= lo and cp <= hi) return true;
+        next_lo = hi + 1;
+    }
+    return false;
+}
 
 /// UNICODE_VERSION above: the input holds a code point assigned after Go's
-/// 15.0 — asked of this module's own Age tables.
+/// 15.0 — asked of this module's own Age tables (in a go build, of the full tables' data).
 fn newSinceGo(input: []const u8) bool {
+    if (go_unicode) {
+        var it = std.unicode.Utf8Iterator{ .bytes = input, .i = 0 };
+        while (it.nextCodepoint()) |cp| {
+            if (inFullTable("assigned", cp) and !inFullTable("age=15.0", cp)) return true;
+        }
+        return false;
+    }
     const S = struct {
         var re: ?regex.Regex = null;
     };

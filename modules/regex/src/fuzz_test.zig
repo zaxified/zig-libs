@@ -529,9 +529,11 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 }
 
 /// Limits the two grammars count differently (Rust's nest height counts
-/// concatenations): a twin refused for one of these says nothing.
+/// concatenations), and a `-Dregex-unicode=go` build has no table for a Rust-only property
+/// (`UnicodeTableNotBuilt`, where the Go grammar's twin of `\p{sc:Greek}` compiles): a twin refused
+/// for one of these says nothing.
 fn isLimit(e: anyerror) bool {
-    return e == error.NestingDepth or e == error.PatternTooLarge;
+    return e == error.NestingDepth or e == error.PatternTooLarge or e == error.UnicodeTableNotBuilt;
 }
 
 /// The drawn pattern was refused: its twin must be refused too.

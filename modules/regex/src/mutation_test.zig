@@ -29,6 +29,10 @@ fn compiles(pattern: []const u8, syn: regex.Syntax) !void {
     re.deinit(testing.allocator);
 }
 
+/// A `-Dregex-unicode=go` build (what `-Dprofile=small` selects) has no table for a Rust-only property and
+/// cannot tell one from an unknown name: such a `\\p{...}` fails with `UnicodeTableNotBuilt`.
+const go_unicode = @import("zl_options").regex_unicode == .go;
+
 fn refuses(want: anyerror, pattern: []const u8, syn: regex.Syntax) !void {
     try testing.expectError(want, Regex.compileOptions(testing.allocator, pattern, .{ .syntax = syn }));
 }
@@ -358,11 +362,15 @@ test "Rust grammar: CRLF mode, look-around, property queries, limits" {
     try refuses(error.InvalidPerlOp, "(?<!a)b", .rust);
     try refusesAny("(?=a)b", .rust);
     try refusesAny("(?", .rust);
-    // `!=` negates a property query.
-    try testing.expect(try rustFull("\\p{Script!=Greek}", false, "a"));
-    try testing.expect(!try rustFull("\\p{Script!=Greek}", false, "\u{3b1}"));
-    try testing.expect(!try rustFull("\\P{Script!=Greek}", false, "a"));
-    try testing.expect(try rustFull("\\P{Script!=Greek}", false, "\u{3b1}"));
+    // `!=` negates a property query (a `-Dregex-unicode=go` build has no `Script=` table).
+    if (go_unicode) {
+        try refuses(error.UnicodeTableNotBuilt, "\\p{Script!=Greek}", .rust);
+    } else {
+        try testing.expect(try rustFull("\\p{Script!=Greek}", false, "a"));
+        try testing.expect(!try rustFull("\\p{Script!=Greek}", false, "\u{3b1}"));
+        try testing.expect(!try rustFull("\\P{Script!=Greek}", false, "a"));
+        try testing.expect(try rustFull("\\P{Script!=Greek}", false, "\u{3b1}"));
+    }
     // An over-long query is refused, not copied past its buffer.
     try refuses(error.InvalidUnicodeClass, "\\p{" ++ rep("a", 300) ++ "}", .rust);
     // An over-long `\b{...}` name is refused.
