@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Rust ecosystem | Rust | — | — | — | No established HQC crate found; a GitHub search returned only 0–2-star personal projects (e.g. `NicsTr/hqc-kem`, MIT, not read). |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | ML-KEM only; no code-based KEM. |
 
-**Where we are ahead:** the only HQC in pure Zig; byte-exact to the authors' v5.0.0 KAT for all three sets, with no allocation anywhere, and the codec ported without C. Std has nothing comparable. **Where we are behind:** no run-time CPU dispatch (the CLMUL multiply is comptime-gated on `x86_64 + pclmul`, `clmul_supported`, `gf2x.zig:51-55`; every other target runs the portable code); ctgrind is only partially clean (see *Threat model / limits* — an anchor/audit matter, not scope); the module is pinned to a tag that upstream has already left, and NIST has not published its HQC standard yet (→ *Backlog / deferred*).
+**Where we are ahead:** the only HQC in pure Zig; byte-exact to the authors' v5.0.0 KAT for all three sets, with no allocation anywhere, and the codec ported without C. Std has nothing comparable. Run-time CPU dispatch as in liboqs: a portable x86_64 build takes the CLMUL multiply on a CPU that has PCLMULQDQ (`clmulAvailable`). **Where we are behind:** ctgrind is only partially clean (see *Threat model / limits* — an anchor/audit matter, not scope); the module is pinned to a tag that upstream has already left, and NIST has not published its HQC standard yet (→ *Backlog / deferred*).
 
 ## Structure
 
@@ -113,7 +113,9 @@ byte-exact against the official NIST KAT. See [README.md](README.md) for purpose
   by folding bits [n, 2n−2] back onto [0, n−2] (X^{n+j} ≡ X^j; `reduceProduct`, shared by both multiply paths,
   folding a `u64` word at a time). There are two multiply paths in `gf2x.zig`, producing bit-identical output (pinned
   by differential tests, see Verification):
-  - **`mulClmul`**, comptime-selected whenever the target is `x86_64 + pclmul` (`clmul_supported`, `Ring.mul`,
+  - **`mulClmul`**, selected at compile time when the target guarantees PCLMULQDQ (`clmul_static`), else at run
+    time on any x86_64 CPU that has it (`clmulAvailable`: CPUID once, cached; the asm is emitted for every x86_64
+    target under LLVM, `clmul_emittable`) — a CPU property, so the branch is not secret-dependent (`Ring.mul`,
     `gf2x.zig`): a recursive Karatsuba multiply over a `pclmulqdq`-based 64×64→127-bit carryless base
     multiply (`clmul64`, `karatsuba_base = 8`), the same structural shape as the reference's word-aligned
     Toom-Cook/Karatsuba + `pclmul` elementary multiply (§3.3, Table 2): O(L^1.58) CLMULs instead of O(L²). The
@@ -427,9 +429,6 @@ Bench: `zig build bench-hqc` (`tools/bench.zig`, ReleaseFast, the authors' code 
   `v5.0.0` in sampler and GF(2^8) polynomial (see *Spec version*), and liboqs will move with it; a consumer that
   interoperates with liboqs after that point needs the new bytes. Effort: moderate (constants and sampler, plus new
   KATs), pure Zig, fits CONVENTIONS §2. Blocked on the published standard/tag, not on us.
-- **Run-time CPU dispatch (CLMUL on/off).** liboqs picks its accelerated paths at run time; here the choice is at
-  compile time, so a portable build never gets CLMUL. Same Zig limitation as `zstd`'s Z22. Small once Zig allows it;
-  pure Zig.
 
 ## Anchoring
 

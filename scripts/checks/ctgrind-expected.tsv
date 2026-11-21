@@ -458,9 +458,9 @@ ed448	ReleaseFast	ladder	1	0	14e16f4ac1ea18f3	43db8426e0d6c6e7
 # context would go and the timing signal would stay -- a prettier measurement of
 # the same defect. See SPEC.md.
 # ⭐ encaps' 0 means something only because the row carries an output pin.
-hqc	ReleaseFast	decaps	1	2	5b49e16d3ab73296	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	4	5b49e16d3ab73296	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	0	5b49e16d3ab73296	e91a390cf03fd6ad
+hqc	ReleaseFast	decaps	1	2	901d2772e6faa8a1	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	901d2772e6faa8a1	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	0	901d2772e6faa8a1	e91a390cf03fd6ad
 hqc	ReleaseFast	sampler	1	2	13e551c4fb95e099	b93fa60c89578576
 # k256 2026-11-13: source pins re-pinned for field.zig (reduceLimbs split into foldLimbs + finish,
 # same computation; new mulWeak/sqWeak used only by the public ecmult) and ecmult.zig (weak field

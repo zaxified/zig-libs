@@ -15,8 +15,9 @@
 //! (X^n - 1). Like the reference (spec §3.3) it computes the full
 //! carryless polynomial product with word-aligned **Karatsuba** recursion
 //! over a **`pclmulqdq`** (CLMUL) base multiply, then reduces mod
-//! (X^n - 1). This path is comptime-gated on `x86_64 + pclmul`
-//! (`clmul_supported`); every other target uses the portable schoolbook
+//! (X^n - 1). This path is taken on x86_64 when the CPU has PCLMULQDQ —
+//! fixed at compile time when the target guarantees it, else asked once at
+//! run time (`clmulAvailable`); every other target uses the portable schoolbook
 //! shift-and-mask-xor multiply (`mulPortable`), which is also the
 //! correctness oracle the differential test pins the CLMUL path against
 //! (they must agree bit-for-bit — the NIST KEM KAT stays byte-exact
@@ -36,8 +37,8 @@ const params = @import("params.zig");
 // carry chains, every combination step is an XOR. The performance path is
 // a recursive Karatsuba over the u64-limb arrays bottoming out at a
 // `pclmulqdq`-based 64×64→127-bit base multiply — reducing the CLMUL count
-// from schoolbook O(L²) to O(L^1.58). It is comptime-gated on
-// `x86_64 + pclmul`; every other target keeps the portable schoolbook
+// from schoolbook O(L²) to O(L^1.58). It runs on x86_64 CPUs with
+// PCLMULQDQ (`clmulAvailable`); every other target keeps the portable schoolbook
 // shift-XOR path (`Ring.mulPortable`), which also serves as the correctness
 // oracle the `gf2x.zig` differential test pins the CLMUL path against.
 //
@@ -48,11 +49,51 @@ const params = @import("params.zig");
 // as constant-time as the schoolbook it replaces (both iterate a fixed,
 // data-independent instruction schedule).
 
-/// True at comptime iff this target can host the `pclmulqdq` base multiply.
-/// On every other target the ring `mul` stays on the portable schoolbook
-/// path forever (and the CLMUL functions below are never analyzed).
-const clmul_supported = builtin.cpu.arch == .x86_64 and
+/// True at comptime iff the build target guarantees `pclmulqdq`: `mul` then
+/// takes the CLMUL path with no run-time check.
+const clmul_static = builtin.cpu.arch == .x86_64 and
     std.Target.x86.featureSetHas(builtin.cpu.features, .pclmul);
+
+/// True at comptime iff this build can EMIT the `pclmulqdq` asm: any x86_64
+/// target under LLVM (which assembles it whatever the target CPU model), or a
+/// target that has the feature under the self-hosted backend. Where the target
+/// does not guarantee the instruction, `mul` asks the CPU once (CPUID, cached)
+/// and takes the CLMUL path when it has it — liboqs's run-time dispatch. On
+/// every other target the CLMUL functions below are never analyzed.
+const clmul_emittable = builtin.cpu.arch == .x86_64 and
+    (builtin.zig_backend != .stage2_x86_64 or clmul_static);
+
+/// 0 = not yet asked, 1 = no PCLMULQDQ, 2 = PCLMULQDQ.
+var clmul_detected: std.atomic.Value(u8) = .init(0);
+
+/// Whether the CLMUL path runs on this CPU. A CPU property, not a secret:
+/// branching on it is constant-time with respect to every operand.
+pub fn clmulAvailable() bool {
+    if (comptime clmul_static) return true;
+    if (comptime !clmul_emittable) return false;
+    const cached = clmul_detected.load(.monotonic);
+    if (cached != 0) return cached == 2;
+    const has = cpuidPclmul();
+    clmul_detected.store(if (has) 2 else 1, .monotonic);
+    return has;
+}
+
+fn cpuidPclmul() bool {
+    if (builtin.cpu.arch != .x86_64) return false;
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [_] "={eax}" (eax),
+          [_] "={ebx}" (ebx),
+          [_] "={ecx}" (ecx),
+          [_] "={edx}" (edx),
+        : [_] "{eax}" (@as(u32, 1)),
+          [_] "{ecx}" (@as(u32, 0)),
+    );
+    return (ecx >> 1) & 1 == 1; // CPUID.01H:ECX.PCLMULQDQ[bit 1]
+}
 
 /// Carryless 64×64 → 127-bit product a·b over GF(2)[X] via one `pclmulqdq`
 /// (result low/high 64-bit halves; bit 127 is always 0). Zig has no CLMUL
@@ -389,8 +430,9 @@ pub fn Ring(comptime n: u32) type {
 
         /// Ring product a*b via the CLMUL + Karatsuba carryless multiply
         /// (`clmulKar`) followed by the mod-(X^n-1) fold. Bit-for-bit equal
-        /// to `mulPortable`. Only referenced when `clmul_supported`, so its
-        /// `pclmulqdq` asm is never analyzed on a non-x86 target.
+        /// to `mulPortable`. Only referenced when `clmul_emittable`, so its
+        /// `pclmulqdq` asm is never analyzed on a non-x86 target. The caller
+        /// must have checked `clmulAvailable()`.
         pub fn mulClmul(a: Elem, b: Elem) Elem {
             var acc: [ext_words]u64 = undefined; // fully written by clmulKar
             var scratch: [scratch_words]u64 = undefined;
@@ -402,7 +444,10 @@ pub fn Ring(comptime n: u32) type {
         /// the `pclmulqdq`+Karatsuba path where available, else the
         /// portable schoolbook multiply — same result on every input.
         pub fn mul(a: Elem, b: Elem) Elem {
-            if (comptime clmul_supported) return mulClmul(a, b);
+            if (comptime clmul_static) return mulClmul(a, b);
+            if (comptime clmul_emittable) {
+                if (clmulAvailable()) return mulClmul(a, b);
+            }
             return mulPortable(a, b);
         }
     };
@@ -484,7 +529,8 @@ fn testDistributivity(comptime R: type, seed: u64) !void {
 /// target without CLMUL it comptime-skips (the two are the same code, and
 /// `mulClmul`'s asm must not be analyzed).
 fn testClmulDifferential(comptime R: type, seed: u64) !void {
-    if (comptime !clmul_supported) return;
+    if (comptime !clmul_emittable) return;
+    if (!clmulAvailable()) return;
     const t = std.testing;
     var rng = std.Random.DefaultPrng.init(seed);
     const random = rng.random();
@@ -528,7 +574,8 @@ fn clmulBitwiseRef(r: []u64, a: []const u64, b: []const u64) void {
 /// every trial. The leaf no longer zeroes it, so any output word it stopped
 /// writing would keep that junk and fail. Scratch is re-randomised too.
 fn testKaratsubaLength(comptime len: usize, random: std.Random, trials: usize) !void {
-    if (comptime !clmul_supported) return;
+    if (comptime !clmul_emittable) return;
+    if (!clmulAvailable()) return;
     const t = std.testing;
     var a: [len]u64 = undefined;
     var b: [len]u64 = undefined;
