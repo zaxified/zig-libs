@@ -47,10 +47,10 @@
 //!   - `crt`    — decrypt's CRT path (`SecretKey.crt != null`, the path
 //!                every `fromPrimes`/`generate`-derived key actually takes).
 //!                Taints `lambda`, `mu`, and the ENTIRE `crt` block
-//!                (`p_sq`/`q_sq`/`p_sq_mont`/`q_sq_mont`/`dp`/`dq`/
-//!                `p_sq_inv`; all but the montint slot, see
+//!                (`p_sq_mont`/`q_sq_mont`/`dp`/`dq`/`p_sq_inv`; all but
+//!                the montint slot, see
 //!                there) — per `SecretKey.deinit`'s own doc
-//!                comment, `p_sq`/`q_sq` are factorization-equivalent to
+//!                comment, `p²`/`q²` are factorization-equivalent to
 //!                `p`/`q` (a square root away), so leaving them untainted
 //!                would let the ladder consume the secret factors through a
 //!                channel the taint never reached. `n`/`n_sq`/`n_sq_mont`
@@ -254,7 +254,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.assert(sk.crt != null);
             taintBytes(taint, std.mem.asBytes(&sk.lambda));
             taintBytes(taint, std.mem.asBytes(&sk.mu));
-            // Entire CRT block: p_sq/q_sq are factorization-equivalent to
+            // Entire CRT block: p²/q² are factorization-equivalent to
             // p/q (SecretKey.deinit's own doc comment), so every field
             // derived from them is secret material too.
             taintBytes(taint, std.mem.asBytes(&sk.crt.?));

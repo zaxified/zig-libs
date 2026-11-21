@@ -81,6 +81,8 @@ try paillier.decrypt(&sk, c, &plaintext); // rejects c=0/non-units as InvalidCip
 const c_sum = paillier.addCiphertexts(pk, c1, c2);       // E(m1+m2 mod n)
 const c_sum2 = try paillier.addPlaintext(pk, c1, &m2);    // E(m1+m2 mod n)
 const c_scaled = try paillier.mulPlaintext(pk, c1, &k);   // E(k*m1 mod n)
+// Several small values in one plaintext (rust-paillier's packing): component-wise add.
+const packed = try paillier.pack(pk, &.{ 7, 11, 13 }, 40);   // unpack(pk, &m, 40, out)
 const c_fresh = paillier.rerandomize(pk, c1, random);     // same plaintext, unlinkable ciphertext
 // Signed values (python-paillier convention: -x is n - x, |x| <= n/3 - 1):
 //   paillier.negate(pk, c) / paillier.subCiphertexts(pk, c1, c2) -> E(-m) / E(m1 - m2)
@@ -104,5 +106,5 @@ all — see SPEC.md).
 
 The zero-knowledge proofs and MtA that GG20/CMP threshold-ECDSA builds on this
 core PKE are in the sibling `threshold_ecdsa` module, not here; no
-malicious-ciphertext robustness, no packed or fixed-point/float encoding. See
+malicious-ciphertext robustness, no fixed-point/float encoding. See
 SPEC *What is deliberately not done* and *Backlog / deferred*.

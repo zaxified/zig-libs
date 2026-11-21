@@ -113,8 +113,7 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   extra-reduction bit). The ctgrind rows for `decrypt` (`crt`, `noncrt`) therefore hold only
   `decrypt`'s own rejection verdicts (`x = 0`, `x − 1` not a multiple of `n`, and for `noncrt` the
   malformed-key `λ = 0` check). `feFromMontBytes` passes each CRT half's raw modexp output straight to
-  `Fe.fromBytes`: `Fe`'s backing `Uint(max_bits)` is one comptime type shared by `n`, `n_sq`, `p_sq` and
-  `q_sq`, so its length gate checks against the global `Fe.encoded_bytes = max_bits/8` and a
+  `Fe.fromBytes`: `Fe`'s backing `Uint(max_bits)` is one comptime type shared by `n` and `n_sq`, so its length gate checks against the global `Fe.encoded_bytes = max_bits/8` and a
   leading-zero strip (a loop whose iteration count would depend on the secret-derived value) is
   never needed.
 - `encrypt`'s `r^n` term uses montint too (the `pk.n_sq_mont` params `mulPlaintext` shares), sized to
@@ -125,8 +124,9 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   `gcd(n, φ(n)) = 1` check); CRT exponents `λ mod p(p−1) = (p−1)·((λ/(p−1)) mod p)` (`nt.divExact` by
   the even `p − 1`); Garner `(p²)⁻¹ mod q²` (`inverse`); factor checks by montint Miller-Rabin and a
   borrow-based closeness compare. The ctgrind `keygen` target (p, q tainted) has no context in that
-  arithmetic; what is left is the `ff` carriers of `p²`, `q²` and of the public `n`, `n²` (Backlog),
-  the public `n` tainted by derivation in the harness, `factorIsPrime`'s sieve and its factor-keyed
+  arithmetic; the CRT block is montint only (`p_sq_mont`/`q_sq_mont`, the Garner coefficient as
+  montint limbs), so no `ff` carrier of a secret is built; what is left is the `ff` carriers of the public
+  `n`, `n²`, the public `n` tainted by derivation in the harness, `factorIsPrime`'s sieve and its factor-keyed
   witness stream, length verdicts and the reject verdicts — each class named in
   `ctgrind-expected.tsv`.
 - **The L-function is constant-time.** `decrypt`'s exact `(x−1)/n` is `DynModint.divExact`: Hensel
@@ -136,7 +136,11 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
 - Prime generation (`generate`) is variable-time in how *long* the search takes (every
   implementation's is), which is about rejected candidates; all candidate buffers are
   `secureZero`ed. Along a kept prime's path Miller-Rabin is `DynModint.isProbablePrime`
-  (constant-time in the value); observable: `s = v2(p − 1)` and the sieve's `%` (Backlog).
+  (constant-time in the value). The trial-division pre-sieve computes its remainders by multiplying with
+  a precomputed reciprocal (`bytesModCt`, exact for the 40-bit step dividends; the same construction as
+  `rsa`'s), not with `%`, whose latency depends on its operands. Still observable: `s = v2(p − 1)`
+  inside `montint`'s Miller-Rabin (its loop over the squarings), as in the Go and BoringSSL tests this
+  follows.
 - The instrument is `src/ctgrind_harness.zig` + `scripts/checks/ctgrind-expected.tsv` (targets
   `crt`/`noncrt`/`mul`/`addm`/`keygen`).
 
@@ -157,6 +161,17 @@ silently assumed.
 ## Signed plaintexts
 
 Reference `phe` (python-paillier) 1.5.1, checked against its documented behaviour (the source was not read, per the survey note above): a negative `-x` is carried as `n - x`; `max_int = n // 3 - 1`; decoding a residue `r` gives `+r` for `r <= max_int`, `r - n` for `r >= n - max_int`, and raises `OverflowError` in between (and for `r >= n`); encoding a magnitude above `max_int` is an error; `-c` is `c * -1`, `a - b` is `a + (b * -1)`, the scalar `-1` carried as `n - 1`. This module follows it exactly: `maxSigned(pk)` is `n / 3 - 1` (integer division), `fromSigned(pk, negative, &magnitude)` is `n - magnitude` or `magnitude` (a negative zero stays `0`) and refuses `magnitude > maxSigned` with `error.Overflow`, `toSigned(pk, &m)` returns `Signed{negative, magnitude}` and refuses the gap and `m >= n` with `error.Overflow`. `negate(pk, c)` is `mulPlaintext(c, n - 1)` (a valid encryption of `-m`, numerically what `phe` computes; not the modular inverse of `c`) and `subCiphertexts` is `addCiphertexts(c1, negate(c2))`. `fromSigned`/`toSigned` are variable-time in the value (they handle a number the caller is about to read or has decrypted; `decrypt` itself is unchanged); `negate`/`subCiphertexts` keep `mulPlaintext`'s posture (the exponent is public). Not done, as in `phe`'s own scope: fixed-point/float encoding.
+
+## Packed plaintexts
+
+rust-paillier's packed encoding: `pack(pk, values, component_bits)` puts value `i` in bits
+`[i·component_bits, (i+1)·component_bits)` of one plaintext, `unpack` reads them back, and
+`packCapacity(pk, component_bits) = (bitLen(n) − 1) / component_bits` components fit (the packed value
+stays `< 2^(bitLen(n)−1) < n`, so it is always canonical). `addCiphertexts` then adds component-wise and
+`mulPlaintext` by a small scalar scales each component, provided no component overflows its width: the
+caller leaves headroom (32-bit values in 40-bit components survive 2^8 additions). A component wider than
+64 bits, a value that does not fit, or more components than fit are refused (`PackError`). Bits are set
+and read without a branch on any value.
 
 ## Re-randomisation
 
@@ -285,11 +300,7 @@ range proofs and MtA (and `dkg` builds on both):
 
 ## Backlog / deferred
 
-- **Key generation: the last `std.crypto.ff` carriers and the sieve.** The `ff` `Modulus` carriers of
-  `p²`, `q²` (`crt.p_sq`/`crt.q_sq`, used to reduce `c` before the montint path — replaceable by
-  `p_sq_mont`/`q_sq_mont` alone; Effort S–M) and the sieve's `bytesMod` `%` plus the observable `s`
-  (as `rsa`'s Backlog item) remain. Fits §2.
-- **Packed encoding of several small values in one ciphertext** (survey 2026-09-30): in rust-paillier; an efficiency feature for vector-valued aggregation (federated learning style), not needed by `threshold_ecdsa`. Effort: small-medium. Fits §2. Add only on request.
+None open.
 
 ## Anchoring
 

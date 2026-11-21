@@ -2448,10 +2448,14 @@ test "MtaProofWc: toBytesAlloc/fromBytesAlloc round-trip on hand-built values" {
 
 // -- honest accept / reject: the real Phase-2c security net --
 
-/// `p²` as an `Fe` canonical mod `n²` (paillier's `CrtParams.p_sq_fe`, deleted there as unused; rebuilt from `crt.p_sq`, `p² < n²`).
-fn pSqFe(nsq: anytype, p_sq: anytype) !@TypeOf(nsq).Fe {
-    var buf: [paillier.modulus_sq_bytes]u8 = undefined;
-    try p_sq.toBytes(&buf, .big);
+/// `p²` as an `Fe` canonical mod `n²`, rebuilt from the montint limbs of
+/// paillier's `crt.p_sq_mont` (`p² < n²`).
+fn pSqFe(nsq: anytype, p_sq_mont: anytype) !@TypeOf(nsq).Fe {
+    var buf: [paillier.modulus_sq_bytes]u8 = @splat(0);
+    for (p_sq_mont.m, 0..) |w, i| {
+        if (8 * (i + 1) > buf.len) break;
+        std.mem.writeInt(u64, buf[buf.len - 8 * (i + 1) ..][0..8], w, .big);
+    }
     return @TypeOf(nsq).Fe.fromBytes(nsq, &buf, .big);
 }
 
@@ -2607,7 +2611,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     const pk = setup.kp.public;
     const nsq = pk.n_sq;
     const nt = setup.aux.n_tilde;
-    const p_sq = try pSqFe(nsq, setup.kp.secret.crt.?.p_sq);
+    const p_sq = try pSqFe(nsq, setup.kp.secret.crt.?.p_sq_mont);
 
     var prng = std.Random.DefaultPrng.init(0x6e6f6e756e6974); // "nonunit"
     const random = prng.random();
@@ -2870,7 +2874,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): a non-unit s with a matching non-unit
     const pk = setup.kp.public;
     const nsq = pk.n_sq;
     const nt = setup.aux.n_tilde;
-    const p_sq = try pSqFe(nsq, setup.kp.secret.crt.?.p_sq);
+    const p_sq = try pSqFe(nsq, setup.kp.secret.crt.?.p_sq_mont);
 
     var prng = std.Random.DefaultPrng.init(0x62_6f62_6e6f_6e75); // "bobnonu"
     const random = prng.random();

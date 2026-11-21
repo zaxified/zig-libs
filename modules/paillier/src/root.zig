@@ -359,13 +359,9 @@ const CrtParams = struct {
     dp: [modulus_bytes]u8,
     /// `λ mod q(q-1)`, the reduced CRT exponent, big-endian.
     dq: [modulus_bytes]u8,
-    /// `p²` as an `ff` modulus — used to reduce `c` into the mod-`p²` domain.
-    p_sq: Modulus,
-    /// `q²` as an `ff` modulus — the domain of the Garner recombination step
-    /// (and to reduce `c` into the mod-`q²` domain).
-    q_sq: Modulus,
-    /// `(p²)⁻¹ mod q²`, canonical mod `q_sq` — the Garner coefficient.
-    p_sq_inv: Fe,
+    /// `(p²)⁻¹ mod q²`, canonical montint limbs mod `q²` — the Garner
+    /// coefficient. `p²` and `q²` themselves are `p_sq_mont.m`/`q_sq_mont.m`.
+    p_sq_inv: MontElem,
 };
 
 /// Paillier secret key: `lambda` = Carmichael function λ(n) = lcm(p-1, q-1)
@@ -482,9 +478,9 @@ pub const SecretKey = struct {
     }
 
     /// Zero this key's SECRET material: `lambda`/`mu`, and (when present)
-    /// the entire `crt` block. `crt.p_sq`/`crt.q_sq` are `p²`/`q²` — from
-    /// which the factorization `p`,`q` is directly recoverable (a square
-    /// root over the integers) — so every field derived from them
+    /// the entire `crt` block. `crt.p_sq_mont`/`crt.q_sq_mont` carry `p²`/`q²` —
+    /// from which the factorization `p`,`q` is directly recoverable (a square
+    /// root over the integers) — so every field of the block
     /// (`p_sq_mont`/`q_sq_mont`/`dp`/`dq`/`p_sq_inv`) is
     /// factorization-equivalent secret material too (see `CrtParams`'s doc
     /// comment). `n`/`n_sq`/`n_sq_mont` are PUBLIC — the same values the
@@ -605,8 +601,8 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
     // The derivation runs on montint limbs, constant-time in p, q
     // (until then std.math.big.int — gcd, divFloor and an
     // extended Euclid on secrets). The verdicts are the only branches on
-    // them; building the `std.crypto.ff` carriers of p², q² (`crt.p_sq`,
-    // `crt.q_sq`) is the one variable-time step left (SPEC Backlog).
+    // them. (`std.crypto.ff` carriers of p², q² are no longer built: the CRT
+    // block is montint only.)
     const L = MontParams.max_limbs;
     var pv = MontParams.loadBE(pb) catch return error.InvalidPrimes;
     defer std.crypto.secureZero(u64, &pv);
@@ -681,14 +677,6 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
     var qsq_w: [2 * L]u64 = undefined;
     defer std.crypto.secureZero(u64, &qsq_w);
     montint.limbs.mulSchoolbook(&qsq_w, &qv, &qv);
-    var psq_buf: [modulus_sq_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, &psq_buf);
-    limbsToBe(psq_w[0..L], &psq_buf);
-    const p_sq = Modulus.fromBytes(&psq_buf, .big) catch return error.InvalidPrimes;
-    var qsq_buf: [modulus_sq_bytes]u8 = undefined;
-    defer std.crypto.secureZero(u8, &qsq_buf);
-    limbsToBe(qsq_w[0..L], &qsq_buf);
-    const q_sq = Modulus.fromBytes(&qsq_buf, .big) catch return error.InvalidPrimes;
 
     // Reduced CRT exponents: dp = λ mod p(p-1), dq = λ mod q(q-1). Valid to
     // reduce because a well-formed ciphertext is a unit mod p²/q² and
@@ -708,10 +696,9 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
     const q_sq_mont = try montFromSquare(qsq_w[0..L], 2 * (8 * qb.len - @clz(qb[0])));
     var psq_mod = q_sq_mont.reduceLimbs(psq_w[0..L]);
     defer std.crypto.secureZero(u64, &psq_mod);
-    var pinv: MontElem = undefined;
-    defer std.crypto.secureZero(u64, &pinv);
-    if (!q_sq_mont.inverse(&psq_mod, &pinv)) return error.InvalidPrimes;
-    const p_sq_inv = elemToFe(q_sq, &pinv);
+    var p_sq_inv: MontElem = undefined;
+    defer std.crypto.secureZero(u64, &p_sq_inv); // after the copy into the key below
+    if (!q_sq_mont.inverse(&psq_mod, &p_sq_inv)) return error.InvalidPrimes;
 
     const n_sq_mont = montParamsFromModulus(n_sq);
 
@@ -729,8 +716,6 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origi
                 .q_sq_mont = q_sq_mont,
                 .dp = dp_buf,
                 .dq = dq_buf,
-                .p_sq = p_sq,
-                .q_sq = q_sq,
                 .p_sq_inv = p_sq_inv,
             },
         },
@@ -802,8 +787,9 @@ fn limbsToBe(v: []const u64, out: []u8) void {
 // are secureZero'ed. Along a kept prime's path Miller-Rabin is
 // constant-time in its value (`montint.DynModint.isProbablePrime`; `ff`'s
 // pow, used until then, branches on the exponent windows in ReleaseFast).
-// Still observable: the squaring count `s` (the 2-adic valuation of `p −
-// 1`) and the sieve's `%` on the candidate (`bytesMod`).
+// The pre-sieve's remainders are computed without a division instruction
+// (`bytesModCt`). Still observable: the squaring count `s` (the 2-adic
+// valuation of `p − 1`) inside `montint`'s Miller-Rabin.
 
 /// Miller-Rabin rounds per candidate — see the section comment above.
 const mr_rounds = 64;
@@ -834,14 +820,26 @@ const sieve_primes = blk: {
     break :blk list;
 };
 
-/// Big-endian unsigned `bytes` mod `divisor` (u128 intermediate: safe for
-/// any u64 divisor). Pre-sieve only — variable-time, never touches a kept
-/// secret in a data-dependent way beyond the reject/accept decision itself.
-fn bytesMod(bytes: []const u8, divisor: u64) u64 {
-    std.debug.assert(divisor != 0);
+/// `⌊2^80 / d⌋ + 1` for every sieve prime `d` — `bytesModCt`'s reciprocals.
+const sieve_reciprocals: [sieve_primes.len]u128 = blk: {
+    var r: [sieve_primes.len]u128 = undefined;
+    for (&r, sieve_primes) |*x, sp| x.* = (@as(u128, 1) << 80) / sp + 1;
+    break :blk r;
+};
+
+/// Big-endian unsigned `bytes` mod `d` (`d < 2^32`, `m = sieve_reciprocals[i]`
+/// for `d = sieve_primes[i]`) with no division instruction: each step's
+/// quotient is `(x·m) >> 80` for `x = 256·r + byte < 2^40`, exact because
+/// `m·d − 2^80 ≤ d` and `x·d < 2^80`. The candidate prime goes through here,
+/// so a `%` — whose latency depends on its operands — would time a kept
+/// prime's residues; a multiplication does not. (`rsa`'s prime search uses
+/// the same construction.)
+fn bytesModCt(bytes: []const u8, d: u64, m: u128) u64 {
     var r: u64 = 0;
     for (bytes) |b| {
-        r = @intCast(((@as(u128, r) << 8) | b) % divisor);
+        const x: u128 = (@as(u128, r) << 8) | b;
+        const q = (x * m) >> 80;
+        r = @intCast(x - q * d);
     }
     return r;
 }
@@ -884,8 +882,8 @@ fn generatePrime(random: std.Random, prime_bits: usize, out: []u8) void {
 
         // Trial-division pre-sieve. Candidates are >= 2^127, so a zero
         // remainder always means a proper factor, never candidate == prime.
-        for (sieve_primes) |sp| {
-            if (bytesMod(out, sp) == 0) continue :candidates;
+        for (sieve_primes, sieve_reciprocals) |sp, m| {
+            if (bytesModCt(out, sp, m) == 0) continue :candidates;
         }
 
         // Odd, exactly prime_bits bits (both set above).
@@ -923,8 +921,8 @@ fn factorIsPrime(bytes: []const u8) bool {
         }
         return true;
     }
-    for (sieve_primes) |sp| {
-        if (bytesMod(bytes, sp) == 0) return false;
+    for (sieve_primes, sieve_reciprocals) |sp, m| {
+        if (bytesModCt(bytes, sp, m) == 0) return false;
     }
     var v = MontParams.loadBE(bytes) catch return false;
     defer std.crypto.secureZero(u64, &v);
@@ -1230,9 +1228,7 @@ fn decryptCrtX(n_sq: *const MontParams, crt: *const CrtParams, c: *const MontEle
     var xq = qs.pow(&qs.reduceLimbs(c[0..n_sq.L]), &dq);
     defer std.crypto.secureZero(u64, &xq);
     // Garner: u = (x_q − x_p)·(p²)⁻¹ mod q²;  x = x_p + p²·u   (0 ≤ x < n²).
-    var p_sq_inv = feToElem(&crt.p_sq_inv);
-    defer std.crypto.secureZero(u64, &p_sq_inv);
-    var u = qs.mul(&qs.sub(&xq, &qs.reduceLimbs(xp[0..ps.L])), &p_sq_inv);
+    var u = qs.mul(&qs.sub(&xq, &qs.reduceLimbs(xp[0..ps.L])), &crt.p_sq_inv);
     defer std.crypto.secureZero(u64, &u);
     // x_p < p², u < q² and p² < n² are all already canonical mod n².
     return n_sq.add(&xp, &n_sq.mul(&ps.m, &u));
@@ -1537,6 +1533,67 @@ pub fn negate(pk: PublicKey, c: Ciphertext) HomomorphicError!Ciphertext {
     k.addScalar(&n, -1) catch unreachable;
     const k_fe = feFromBig(pk, &k);
     return mulPlaintext(pk, c, &k_fe);
+}
+
+// ── packed encoding (several small values in one plaintext) ──────────────
+
+pub const PackError = error{
+    /// `component_bits` is outside `1..64`.
+    InvalidComponentBits,
+    /// `values.len · component_bits` does not fit below `n` (at most
+    /// `bitLen(n) − 1` bits are used, so the packed value is always `< n`).
+    TooManyComponents,
+    /// A value does not fit in `component_bits` bits.
+    ValueTooLarge,
+};
+
+/// How many `component_bits`-bit components one plaintext of `pk` holds.
+pub fn packCapacity(pk: PublicKey, component_bits: u8) usize {
+    if (component_bits == 0) return 0;
+    return (pk.n.bits() - 1) / component_bits;
+}
+
+/// Pack `values` into one plaintext, value `i` in bits
+/// `[i·component_bits, (i+1)·component_bits)` (rust-paillier's packed
+/// encoding). Homomorphic addition of packed ciphertexts then adds
+/// component-wise, and `mulPlaintext` by a small scalar scales every component,
+/// as long as no component overflows its `component_bits`: leave headroom
+/// (e.g. 32-bit values in 40-bit components allow 2^8 additions). The bits are
+/// set without a branch on any value.
+pub fn pack(pk: PublicKey, values: []const u64, component_bits: u8) PackError!Fe {
+    if (component_bits == 0 or component_bits > 64) return error.InvalidComponentBits;
+    if (values.len > packCapacity(pk, component_bits)) return error.TooManyComponents;
+    var buf: [modulus_bytes]u8 = @splat(0);
+    defer std.crypto.secureZero(u8, &buf);
+    for (values, 0..) |v, i| {
+        if (component_bits < 64 and v >> @intCast(component_bits) != 0) return error.ValueTooLarge;
+        for (0..component_bits) |b| {
+            const pos = i * component_bits + b;
+            const bit: u8 = @truncate(v >> @intCast(b) & 1);
+            buf[buf.len - 1 - pos / 8] |= bit << @intCast(pos % 8);
+        }
+    }
+    // < 2^(bitLen(n)−1) ≤ n: always canonical.
+    return Fe.fromBytes(pk.n, &buf, .big) catch unreachable;
+}
+
+/// The inverse of `pack`: component `i` of `m` into `out[i]`, for
+/// `out.len` components (`≤ packCapacity`, else `error.TooManyComponents`).
+pub fn unpack(pk: PublicKey, m: *const Fe, component_bits: u8, out: []u64) PackError!void {
+    if (component_bits == 0 or component_bits > 64) return error.InvalidComponentBits;
+    if (out.len > packCapacity(pk, component_bits)) return error.TooManyComponents;
+    var buf: [modulus_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    m.toBytes(&buf, .big) catch unreachable; // m < n < 2^modulus_bits
+    for (out, 0..) |*o, i| {
+        var v: u64 = 0;
+        for (0..component_bits) |b| {
+            const pos = i * component_bits + b;
+            const bit: u64 = (buf[buf.len - 1 - pos / 8] >> @intCast(pos % 8)) & 1;
+            v |= bit << @intCast(b);
+        }
+        o.* = v;
+    }
 }
 
 /// Ciphertext subtraction: `E(m1 - m2 mod n)`, computed as
@@ -3702,4 +3759,70 @@ test "sampleNonzeroLtN redraws a draw equal to n and a draw equal to zero" {
     const r = sampleNonzeroLtN(kp.public, s.random());
     try testing.expectEqual(@as(u32, 5), try r.toPrimitive(u32));
     try testing.expectEqual(@as(usize, 3), s.pos);
+}
+
+test "bytesModCt equals % for every sieve prime, at the step bounds and on random candidates" {
+    var prng = std.Random.DefaultPrng.init(0x51e7e);
+    const rnd = prng.random();
+    var buf: [modulus_bytes / 2]u8 = undefined;
+    for (0..64) |round| {
+        switch (round) {
+            0 => @memset(&buf, 0xff),
+            1 => @memset(&buf, 0),
+            else => rnd.bytes(&buf),
+        }
+        for (sieve_primes, sieve_reciprocals) |sp, m| {
+            var want: u64 = 0;
+            for (buf) |b| want = @intCast(((@as(u128, want) << 8) | b) % sp);
+            try testing.expectEqual(want, bytesModCt(&buf, sp, m));
+        }
+    }
+}
+
+test "pack/unpack: round trip, component-wise homomorphic add and scalar multiply, and the refusals" {
+    var prng = std.Random.DefaultPrng.init(0xbac);
+    const rnd = prng.random();
+    var kp: KeyPair = undefined;
+    try generate(rnd, 512, &kp);
+    defer kp.secret.deinit();
+    const pk = kp.public;
+    const cap = packCapacity(pk, 40);
+    try testing.expectEqual(@as(usize, 511 / 40), cap);
+    var a: [64]u64 = undefined;
+    var b: [64]u64 = undefined;
+    const k = @min(cap, a.len);
+    for (a[0..k], b[0..k]) |*x, *y| {
+        x.* = rnd.int(u32);
+        y.* = rnd.int(u32);
+    }
+    const ma = try pack(pk, a[0..k], 40);
+    const mb = try pack(pk, b[0..k], 40);
+    var back: [64]u64 = undefined;
+    try unpack(pk, &ma, 40, back[0..k]);
+    try testing.expectEqualSlices(u64, a[0..k], back[0..k]);
+    const ca = try encryptRandom(pk, &ma, rnd);
+    const cb = try encryptRandom(pk, &mb, rnd);
+    var m: Fe = undefined;
+    try decrypt(&kp.secret, addCiphertexts(pk, ca, cb), &m);
+    try unpack(pk, &m, 40, back[0..k]);
+    for (a[0..k], b[0..k], back[0..k]) |x, y, z| try testing.expectEqual(x + y, z);
+    const three = try Fe.fromPrimitive(u64, pk.n, 3);
+    try decrypt(&kp.secret, try mulPlaintext(pk, ca, &three), &m);
+    try unpack(pk, &m, 40, back[0..k]);
+    for (a[0..k], back[0..k]) |x, z| try testing.expectEqual(3 * x, z);
+    // Full-width components.
+    const full = [_]u64{ std.math.maxInt(u64), 0, 0x8000_0000_0000_0001 };
+    if (packCapacity(pk, 64) >= full.len) {
+        const mf = try pack(pk, &full, 64);
+        var fb: [3]u64 = undefined;
+        try unpack(pk, &mf, 64, &fb);
+        try testing.expectEqualSlices(u64, &full, &fb);
+    }
+    try testing.expectError(error.InvalidComponentBits, pack(pk, a[0..1], 0));
+    try testing.expectError(error.InvalidComponentBits, pack(pk, a[0..1], 65));
+    try testing.expectError(error.ValueTooLarge, pack(pk, &.{1 << 40}, 40));
+    var many: [4096]u64 = @splat(0);
+    try testing.expectError(error.TooManyComponents, pack(pk, many[0 .. cap + 1], 40));
+    try testing.expectError(error.TooManyComponents, unpack(pk, &ma, 40, many[0 .. cap + 1]));
+    try testing.expectEqual(@as(usize, 0), packCapacity(pk, 0));
 }

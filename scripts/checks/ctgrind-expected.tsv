@@ -939,10 +939,10 @@ bulletproofs	ReleaseFast	ipa	1	0	5030869687026e1f	2ade41bb2f418497
 # error.InvalidCiphertext: decrypt's `x = 0` and `x - 1` not a multiple of n
 # (both rows), plus noncrt's malformed-key `lambda = 0`. mul lost its
 # `k.isZero()` short-circuit (montint gives c^0 = 1).
-paillier	ReleaseFast	crt	1	2	2107ca0ceacab757	ca16fc01b4ebb44c
-paillier	ReleaseFast	noncrt	1	3	2107ca0ceacab757	ca16fc01b4ebb44c
-paillier	ReleaseFast	mul	1	0	2107ca0ceacab757	b2221403ad3dad41
-paillier	ReleaseFast	addm	1	0	2107ca0ceacab757	526f0de009c0cbfb
+paillier	ReleaseFast	crt	1	2	14b7f5ff2a91b536	ca16fc01b4ebb44c
+paillier	ReleaseFast	noncrt	1	3	14b7f5ff2a91b536	ca16fc01b4ebb44c
+paillier	ReleaseFast	mul	1	0	14b7f5ff2a91b536	b2221403ad3dad41
+paillier	ReleaseFast	addm	1	0	14b7f5ff2a91b536	526f0de009c0cbfb
 # paillier keygen (2026-10-03) — fromPrimes (checked factors) on the harness's
 # 1024-bit p, q, tainted. λ = montint.nt.lcm, µ = λ⁻¹ mod n (inverse), the CRT
 # exponents by nt.divExact + reduction, the Garner coefficient by inverse,
@@ -978,7 +978,7 @@ paillier	ReleaseFast	addm	1	0	2107ca0ceacab757	526f0de009c0cbfb
 # 0.17 memset is `memsetSmallPowerOf2`/`shortMemset` recursion, more distinct addresses for the
 # same calls. Every class is one listed above; no new source line, no limb-value branch. Bound
 # tightened to the measurement (output pin unchanged, the run is deterministic).
-paillier	ReleaseFast	keygen	1	<=314	2107ca0ceacab757	61a35e2d95a376cf
+paillier	ReleaseFast	keygen	1	<=314	14b7f5ff2a91b536	61a35e2d95a376cf
 # tlock/ibe re-pinned 2026-09-16, after 32e751ad (inversion-free Miller loop):
 # tlock fp12pow 8 -> 2, tlock decrypt 11 -> 3, ibe decrypt 14 -> 7. The counts
 # FELL because the Miller loop stopped inverting -- 32e751ad dropped
