@@ -1138,6 +1138,21 @@ pub const Model = struct {
         const v = n.value orelse return null;
         return control.CtlModel.parseScl(v) catch null;
     }
+
+    /// The `sboClass` of a control object (`GGIO1$CO$SPCSO4` →
+    /// `GGIO1$CF$SPCSO4$sboClass`), when the file gives one; an object that does
+    /// not is `operate-once`, which is the schema default.
+    pub fn sboClass(self: *const Model, domain: []const u8, item_prefix: []const u8) ?control.SboClass {
+        var buf: [acsi.max_reference_len]u8 = undefined;
+        const dollar = std.mem.findScalar(u8, item_prefix, '$') orelse return null;
+        const rest = std.mem.findScalarPos(u8, item_prefix, dollar + 1, '$') orelse return null;
+        const name = std.mem.print(&buf, "{s}$CF{s}$sboClass", .{
+            item_prefix[0..dollar],
+            item_prefix[rest..],
+        }) catch return null;
+        const n = self.find(domain, name) orelse return null;
+        return control.SboClass.parseScl(n.value orelse return null);
+    }
 };
 
 // ── parsing ─────────────────────────────────────────────────────────────────
@@ -3576,4 +3591,28 @@ test "a PhyComAddr and an array attribute are each one name with the members the
     }
     try testing.expect(m.find("TESTIEDLD", "GGIO1$ST$X$arr").?.leaf);
     try testing.expect(!m.has("TESTIEDLD", "GGIO1$ST$X$arr$q"));
+}
+
+test "Model.sboClass reads the configured value, and an object without one has none" {
+    const src = hdr ++
+        \\<IED name="A"><AccessPoint name="P"><Server><LDevice inst="LD">
+        \\  <LN0 lnClass="LLN0" lnType="L"/>
+        \\  <LN lnClass="GGIO" inst="1" lnType="G">
+        \\    <DOI name="SPCSO1"><DAI name="sboClass"><Val>operate-many</Val></DAI></DOI>
+        \\  </LN>
+        \\</LDevice></Server></AccessPoint></IED>
+        \\<DataTypeTemplates>
+        \\  <LNodeType id="L" lnClass="LLN0"/>
+        \\  <LNodeType id="G" lnClass="GGIO"><DO name="SPCSO1" type="SPC"/><DO name="SPCSO2" type="SPC"/></LNodeType>
+        \\  <DOType id="SPC" cdc="SPC"><DA name="sboClass" fc="CF" bType="Enum" type="SboClasses"/></DOType>
+        \\  <EnumType id="SboClasses"><EnumVal ord="0">operate-once</EnumVal><EnumVal ord="1">operate-many</EnumVal></EnumType>
+        \\</DataTypeTemplates></SCL>
+    ;
+    var s = try parse(testing.allocator, src, .{});
+    defer s.deinit();
+    var m = try resolve(&s, testing.allocator, "A");
+    defer m.deinit();
+    try testing.expectEqual(@as(?control.SboClass, .operate_many), m.sboClass("ALD", "GGIO1$CO$SPCSO1"));
+    try testing.expectEqual(@as(?control.SboClass, null), m.sboClass("ALD", "GGIO1$CO$SPCSO2"));
+    try testing.expectEqual(@as(?control.SboClass, null), m.sboClass("ALD", "GGIO1"));
 }

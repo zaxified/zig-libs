@@ -180,6 +180,27 @@ shape and say so.
   the `TypeSpecification` from `ctlModel`, and its output for a
   select-before-operate object is **byte-identical** to the one a real IED sent.
 
+- **A timed operate is accepted now and runs at its `operTm`** (IEC 61850-7-2 time-activated
+  operate), but only on an object whose `Point.oper_tm` says its control structure has the member;
+  for any other the field is ignored, as before. An `Oper` whose `operTm` lies in the future moves
+  the point to `executing` at once (so nothing else gets in), keeps the value (16 octets, a longer
+  `ctlVal` is `inconsistent-parameters`) and answers success; `Server.tick` applies it when the
+  caller's clock reaches `operTm`, then ends it like any execution (an enhanced-security model queues
+  its `CommandTermination` then, not before). A zero or past `operTm` executes immediately. The clock
+  is therefore **UTC milliseconds**, as `CommandTermination` already assumed. A `Cancel` aborts a
+  waiting operate (negative termination `abortion-by-cancel` under enhanced security, none under
+  normal); a dropped association does **not**: the command was accepted and runs.
+- **`sboClass`** (`Point.sbo_class`, read from SCL with `scl.Model.sboClass`): `operate-once` (the
+  default) releases the object after the operate; `operate-many` leaves the select armed for the next
+  operate, with the window restarted at each operate and no `ctlNum` carried over (an enhanced-security
+  object returns to `selected` when the termination completes it); a `Cancel` or the window expiring
+  ends it. It means nothing to a direct model.
+- **`opRcvd`, `opOk` and `tOpOk`** (edition 2, constraint `OR`): a `Point` names the variable indices
+  that hold them (`op_rcvd`, `op_ok`, `t_op_ok`), and `Server` drives them. An `Oper` raises `opRcvd`
+  whether or not it is accepted; an accepted one also raises `opOk` and stamps `tOpOk`; both fall back
+  after `op_hold_ms` (default 1000, 0 keeps them until the next command), on `Server.tick`. Each change
+  of the two booleans is reported as a data change.
+
 ### Reporting, logging and setting groups
 
 - **`BufTm` coalesces, it does not delay.** A trigger opens an entry with a deadline `BufTm`
@@ -380,7 +401,7 @@ Gaps in the evidence: what the oracle's model or the reference clients never exe
 - **Codec-only, never driven against a peer:** `Identify` (the captured server does not implement it), `DefineNamedVariableList`/`DeleteNamedVariableList`, the successful `FileOpen`/`FileRead`/`FileClose`/`FileDirectory` responses (the example server had no file store; the requests and the `confirmed-ErrorPDU` are byte-exact), `GetJournalStatus` (served by reading the LCB against a third party, but the MMS `[68]` service itself was never observed), `GetVariableAccessAttributes` for anything that is not a control object, the `Data` alternatives `array`, `bcd`, `booleanArray`, `objId`, `mMSString`, `generalized-time` and `real`, indefinite-length BER (never emitted), SV in both directions beyond one captured frame, the 802.1Q GOOSE path (round-tripped and read by Wireshark off our frames; no third-party tagged publisher), and the alternate-access sub-specification (preserved verbatim, not interpreted).
 - **Segmented reports and `data_reference`:** the reference clients never *ask* for `OptFlds.segmentation` or `data_reference`; this server's own configuration turns them on, and a third-party client was shown to decode the result.
 - **GOOSE retransmission timing:** the captured publisher was observed at its heartbeat only; the ladder, derived TAL, state-change reset and TAL-expiry detection follow the standard with an injected clock and are cross-checked by Wireshark reading the TAL values; no third-party subscriber was driven through a real outage.
-- **Control paths the oracle's model lacks:** `operTm`, `Cancel` (driven against our own server only), every `AddCause` other than `Object-not-selected`, a `ctlVal` other than `BOOLEAN`: encoded and unit-tested, never captured.
+- **Control paths the oracle's model lacks:** `operTm` (encoding; scheduling is tested against this module's own server only), `sboClass`, `opRcvd`/`opOk`/`tOpOk`, `Cancel` (driven against our own server only), every `AddCause` other than `Object-not-selected`, a `ctlVal` other than `BOOLEAN`: encoded and unit-tested, never captured.
 - **BRCB `BufOvfl` and `EntryID` resume:** driven against this module's own client and a bounded buffer; the overflow flag was never observed arriving at a third party.
 - **Readings of IEC 61850-7-2 no peer confirmed:** the `ResvTms` semantics (a BRCB reservation with `ResvTms > 0` outlives the association by that many seconds, `-1` holds it until released, the SGCB's `ResvTms` is an inactivity timeout), and the `Owner` octets (the four big-endian octets of the caller's association id; an unowned block emits a zero-length octet string, this module's own choice). Both are unit-tested against an injected clock.
 - **SCL schema validation:** an emitted document is checked for well-formedness and accepted by a third-party model generator, which is weaker than validity against the IEC 61850-6 schema (not redistributable, not present here).
@@ -452,6 +473,7 @@ Where the module is deliberately partial, with the boundary stated.
 - **SV publisher/subscriber timing:** SV runs at 4000 or 4800 frames a second against a hard jitter budget; that belongs with a real-time scheduler, not a codec. Only the frame codec is here.
 - **MMS services outside the IEC 61850 profile:** domain download/upload, program invocations, semaphores, event conditions/actions/enrollments, scattered access, named types, `Status`, `Cancel`. Their tags are named in `mms.Service` and nothing more.
 - **Validating an emitted SCL document against the IEC 61850-6 XSD:** the schema is not redistributable and is not present here; validation is `xmllint` well-formedness plus acceptance by a third-party model generator, a weaker claim that is stated as such.
+- **Multi-client `1-of-n` control across several objects:** a group of objects of which only one may be selected at a time has no representation in SCL (nothing says which objects form the group), and no implementation surveyed offers it (libiec61850: README only, no source read; not verified further), so it is left to the application, which can refuse a second select by keeping its own table.
 - **Raw sockets for GOOSE:** the module opens no `AF_PACKET` socket; the `Link` seam takes whole Ethernet frames (README).
 
 ## Anchoring
@@ -480,4 +502,3 @@ are checked against this module's own client decoders, not against a third-party
 
 - **R-GOOSE / R-SMV (IEC 61850-90-5, UDP)**: libiec61850's R-Session; growing use in wide-area protection; medium, fits §2.
 - **GOOSE subscriber-side redundancy (PRP/HSR duplicate discard) and GSSE** (the pre-2003 `0x88B9` framing).
-- **Control extras:** `Time-activated operate` beyond carrying `operTm` on the wire (nothing schedules it), `sboClass` (`operate-once` vs `operate-many`: a select is always released by the operate here), `opRcvd`/`opOk`/`tOpOk` under the `OR` constraint (resolved as names, not driven), and multi-client `1-of-n` control across several objects.

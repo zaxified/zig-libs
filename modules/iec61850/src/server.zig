@@ -1160,6 +1160,22 @@ pub const Server = struct {
     pub fn tick(self: *Server, now_ms: u64) void {
         self.now_ms = now_ms;
         for (self.model.controls, 0..) |*p, i| {
+            // The `opRcvd`/`opOk` pulse ends.
+            if (p.op_reset_at_ms != 0 and now_ms >= p.op_reset_at_ms) {
+                p.op_reset_at_ms = 0;
+                self.setOrFlag(p.op_rcvd, false);
+                self.setOrFlag(p.op_ok, false);
+            }
+            // A time-activated operate whose `operTm` has come executes now.
+            if (p.activate(now_ms)) |a| {
+                self.applyValue(p, a.ctl_val, a.test_mode);
+                if (!a.terminate) {
+                    _ = p.completed();
+                } else if (self.config.auto_complete_control) {
+                    _ = p.completed();
+                    self.queueTermination(i, null, a.ctl_num);
+                }
+            }
             const was_executing = p.state == .executing;
             // `Point.tick` resets the object, so the ctlNum the termination
             // must echo has to be taken before it runs.
@@ -1299,6 +1315,8 @@ pub const Server = struct {
         const cmd = control.Command.decode(d) catch return .{ .failure = .type_inconsistent };
 
         const p = &self.model.controls[index];
+        const is_oper = std.mem.eql(u8, split.attribute, "Oper");
+        if (is_oper) self.setOrFlag(p.op_rcvd, true);
         const outcome = if (std.mem.eql(u8, split.attribute, "SBOw")) blk: {
             self.selects += 1;
             break :blk p.select(self.peer, cmd, self.now_ms);
@@ -1309,6 +1327,7 @@ pub const Server = struct {
             break :blk p.operate(self.peer, cmd, self.now_ms);
         };
 
+        if (is_oper) self.armOrReset(p);
         switch (outcome) {
             .rejected => |cause| {
                 self.control_rejections += 1;
@@ -1316,7 +1335,14 @@ pub const Server = struct {
                 return .{ .failure = .object_access_denied };
             },
             .accepted => |a| {
-                if (std.mem.eql(u8, split.attribute, "Oper")) self.applyControlValue(p, cmd);
+                if (is_oper) {
+                    self.setOrFlag(p.op_ok, true);
+                    self.setOrTime(p.t_op_ok, self.now_ms);
+                    // A time-activated operate moves nothing yet; `tick` applies
+                    // it at its `operTm`.
+                    if (!a.scheduled) self.applyControlValue(p, cmd);
+                }
+                if (a.scheduled and !std.mem.eql(u8, split.attribute, "Cancel")) return .success;
                 if (a.terminate) {
                     if (std.mem.eql(u8, split.attribute, "Cancel")) {
                         self.queueTermination(index, .abortion_by_cancel, cmd.ctl_num);
@@ -1333,16 +1359,55 @@ pub const Server = struct {
     /// A `Test` command must not move the plant — that distinction is the
     /// whole reason the flag is on the wire.
     fn applyControlValue(self: *Server, p: *ControlPoint, cmd: control.Command) void {
-        if (cmd.test_mode) return;
+        self.applyValue(p, cmd.ctl_val, cmd.test_mode);
+    }
+
+    fn applyValue(self: *Server, p: *ControlPoint, ctl_val: []const u8, test_mode: bool) void {
+        if (test_mode) return;
         const idx = p.st_val orelse return;
         if (idx >= self.model.variables.len) return;
         const v = &self.model.variables[idx];
-        if (cmd.ctl_val.len > v.storage.len) return;
-        @memcpy(v.storage[0..cmd.ctl_val.len], cmd.ctl_val);
-        v.len = cmd.ctl_val.len;
+        if (ctl_val.len > v.storage.len) return;
+        @memcpy(v.storage[0..ctl_val.len], ctl_val);
+        v.len = ctl_val.len;
         // Operating a breaker moves a status point, and a status point in a
         // reported data set is exactly what a client subscribed for.
         self.signal(idx, .data_change);
+    }
+
+    /// Starts the clock on the `opRcvd`/`opOk` pulse of a point that models them.
+    fn armOrReset(self: *Server, p: *ControlPoint) void {
+        if (p.op_hold_ms == 0 or (p.op_rcvd == null and p.op_ok == null)) return;
+        p.op_reset_at_ms = self.now_ms + p.op_hold_ms;
+    }
+
+    /// Sets one of the `OR` boolean attributes and reports the change.
+    fn setOrFlag(self: *Server, index: ?usize, value: bool) void {
+        const i = index orelse return;
+        if (i >= self.model.variables.len) return;
+        const v = &self.model.variables[i];
+        var buf: [8]u8 = undefined;
+        var w = ber.Writer.init(&buf);
+        mmsdata.Emit.boolean(&w, value) catch return;
+        const enc = w.done();
+        if (enc.len > v.storage.len or std.mem.eql(u8, v.value(), enc)) return;
+        @memcpy(v.storage[0..enc.len], enc);
+        v.len = enc.len;
+        self.signal(i, .data_change);
+    }
+
+    /// Sets `tOpOk`.
+    fn setOrTime(self: *Server, index: ?usize, ms: u64) void {
+        const i = index orelse return;
+        if (i >= self.model.variables.len) return;
+        const v = &self.model.variables[i];
+        var buf: [16]u8 = undefined;
+        var w = ber.Writer.init(&buf);
+        mmsdata.Emit.utcTime(&w, mmsdata.UtcTime.fromMillis(ms, null)) catch return;
+        const enc = w.done();
+        if (enc.len > v.storage.len) return;
+        @memcpy(v.storage[0..enc.len], enc);
+        v.len = enc.len;
     }
 
     /// Handles a read of `…$CO$<DO>$SBO` — the `sbo-with-normal-security`
@@ -4700,4 +4765,111 @@ test "client getNameList follows moreFollows with the last name as continuation 
         try testing.expectEqual(@as(usize, 0), n);
         try testing.expectEqual(@as(usize, 256), link.requests);
     }
+}
+
+// ── time-activated operate and the `OR` attributes, driven through the server ─
+
+test "a timed operate executes at its operTm, and opRcvd/opOk pulse around it" {
+    var st: [8]u8 = undefined;
+    var rcvd: [8]u8 = undefined;
+    var ok: [8]u8 = undefined;
+    var t_ok: [16]u8 = undefined;
+    var vars = [_]Variable{
+        .{ .domain = domain, .item = "GGIO1$ST$SPCSO1$stVal", .storage = &st, .len = try emitBool(&st, false) },
+        .{ .domain = domain, .item = "GGIO1$OR$SPCSO1$opRcvd", .storage = &rcvd, .len = try emitBool(&rcvd, false) },
+        .{ .domain = domain, .item = "GGIO1$OR$SPCSO1$opOk", .storage = &ok, .len = try emitBool(&ok, false) },
+        .{ .domain = domain, .item = "GGIO1$OR$SPCSO1$tOpOk", .storage = &t_ok, .len = 0 },
+    };
+    var points = [_]ControlPoint{.{
+        .domain = domain,
+        .item = "GGIO1$CO$SPCSO1",
+        .ctl_model = .direct_with_enhanced_security,
+        .oper_tm = true,
+        .st_val = 0,
+        .op_rcvd = 1,
+        .op_ok = 2,
+        .t_op_ok = 3,
+        .op_hold_ms = 1000,
+    }};
+    const doms = [_][]const u8{domain};
+    var srv = Server.init(.{}, .{ .variables = &vars, .controls = &points, .domains = &doms });
+    srv.tick(10_000);
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{
+        .ctl_val = vw.done(),
+        .oper_tm = mmsdata.UtcTime.fromMillis(15_000, null),
+        .ctl_num = 3,
+        .t = mmsdata.UtcTime.fromMillis(10_000, null),
+        .check = .{},
+    };
+    var enc: [control.Command.max_encoded_len]u8 = undefined;
+    const name = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "GGIO1$CO$SPCSO1$Oper" } };
+    try testing.expect(srv.controlWrite(name, try cmd.encode(&enc)).? == .success);
+
+    const bool_of = struct {
+        fn f(v: *const Variable) !bool {
+            return (try mmsdata.Data.decode(v.value())).boolean();
+        }
+    }.f;
+    // Accepted: received and ok are up, the time is stamped, the breaker has not moved,
+    // and no termination is owed yet.
+    try testing.expect(try bool_of(&vars[1]));
+    try testing.expect(try bool_of(&vars[2]));
+    try testing.expectEqual(@as(u64, 10_000), (try (try mmsdata.Data.decode(vars[3].value())).utcTime()).millis());
+    try testing.expect(!try bool_of(&vars[0]));
+    try testing.expect(points[0].scheduled());
+    try testing.expectEqual(@as(usize, 0), srv.notify_count);
+
+    // The pulse ends after the hold; the operation is still waiting.
+    srv.tick(11_500);
+    try testing.expect(!try bool_of(&vars[1]));
+    try testing.expect(!try bool_of(&vars[2]));
+    try testing.expect(!try bool_of(&vars[0]));
+    try testing.expect(points[0].scheduled());
+
+    // At operTm the value lands and the CommandTermination is queued.
+    srv.tick(14_999);
+    try testing.expect(!try bool_of(&vars[0]));
+    srv.tick(15_000);
+    try testing.expect(try bool_of(&vars[0]));
+    try testing.expectEqual(@as(usize, 1), srv.notify_count);
+    try testing.expectEqual(control.PointState.unselected, points[0].state);
+}
+
+test "a refused operate still raises opRcvd but never opOk" {
+    var st: [8]u8 = undefined;
+    var rcvd: [8]u8 = undefined;
+    var ok: [8]u8 = undefined;
+    var vars = [_]Variable{
+        .{ .domain = domain, .item = "GGIO1$ST$SPCSO1$stVal", .storage = &st, .len = try emitBool(&st, false) },
+        .{ .domain = domain, .item = "GGIO1$OR$SPCSO1$opRcvd", .storage = &rcvd, .len = try emitBool(&rcvd, false) },
+        .{ .domain = domain, .item = "GGIO1$OR$SPCSO1$opOk", .storage = &ok, .len = try emitBool(&ok, false) },
+    };
+    var points = [_]ControlPoint{.{
+        .domain = domain,
+        .item = "GGIO1$CO$SPCSO1",
+        .ctl_model = .direct_with_normal_security,
+        .interlocked = true,
+        .st_val = 0,
+        .op_rcvd = 1,
+        .op_ok = 2,
+        .op_hold_ms = 0,
+    }};
+    const doms = [_][]const u8{domain};
+    var srv = Server.init(.{}, .{ .variables = &vars, .controls = &points, .domains = &doms });
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{ .ctl_val = vw.done(), .ctl_num = 1, .t = mmsdata.UtcTime.fromMillis(0, null) };
+    var enc: [control.Command.max_encoded_len]u8 = undefined;
+    const name = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "GGIO1$CO$SPCSO1$Oper" } };
+    try testing.expect(srv.controlWrite(name, try cmd.encode(&enc)).? == .failure);
+    try testing.expect(try (try mmsdata.Data.decode(vars[1].value())).boolean());
+    try testing.expect(!try (try mmsdata.Data.decode(vars[2].value())).boolean());
+    // With no hold, they stay until the next command (nothing resets them on a tick).
+    srv.tick(100_000);
+    try testing.expect(try (try mmsdata.Data.decode(vars[1].value())).boolean());
 }

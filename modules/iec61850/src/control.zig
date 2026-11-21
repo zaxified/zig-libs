@@ -134,6 +134,45 @@ pub const CtlModel = enum(u8) {
     }
 };
 
+/// `sboClass` — IEC 61850-7-3 `SboClasses`, under `CF` of a select-before-operate
+/// object: whether a select is consumed by the operate that follows it.
+pub const SboClass = enum(u8) {
+    /// The default: one select, one operate; the object is released afterwards.
+    operate_once = 0,
+    /// The select stays armed after an operate, so further operates may follow
+    /// until the select times out or is cancelled.
+    operate_many = 1,
+
+    /// Null for a value outside 0..1.
+    pub fn fromInt(v: i64) ?SboClass {
+        return switch (v) {
+            0 => .operate_once,
+            1 => .operate_many,
+            else => null,
+        };
+    }
+
+    pub fn fromData(d: mmsdata.Data) Error!?SboClass {
+        return fromInt(try d.asInt());
+    }
+
+    /// The SCL spelling, i.e. the `EnumVal` text of the `SboClasses` enum type.
+    pub fn sclName(self: SboClass) []const u8 {
+        return switch (self) {
+            .operate_once => "operate-once",
+            .operate_many => "operate-many",
+        };
+    }
+
+    /// Null for a spelling that is neither one.
+    pub fn parseScl(s: []const u8) ?SboClass {
+        if (std.mem.eql(u8, s, "operate-once")) return .operate_once;
+        if (std.mem.eql(u8, s, "operate-many")) return .operate_many;
+        const v = std.fmt.parseInt(i64, s, 10) catch return null;
+        return fromInt(v);
+    }
+};
+
 // ── originator ──────────────────────────────────────────────────────────────
 
 /// `orCat` — *who* issued the command. It is not a credential (IEC 61850 has
@@ -810,7 +849,13 @@ pub const PointState = enum { unselected, selected, executing };
 pub const Outcome = union(enum) {
     /// Accepted. `terminate` is true when the model owes a
     /// `CommandTermination` once execution finishes.
-    accepted: struct { terminate: bool = false },
+    accepted: struct {
+        terminate: bool = false,
+        /// A time-activated operate: accepted now, executed at its `operTm`.
+        /// The caller applies the value when `Point.activate` hands it out,
+        /// not now.
+        scheduled: bool = false,
+    },
     /// Refused, with the reason the IED must put in `LastApplError`.
     rejected: AddCause,
 };
@@ -842,8 +887,21 @@ pub const Point = struct {
     st_val: ?usize = null,
     /// The type of `ctlVal`.
     value_type: ValueType = .boolean,
-    /// Whether the control structures carry `operTm` (a timed operate).
+    /// Whether the control structures carry `operTm` (a timed operate). Only
+    /// such an object schedules an `Oper` whose `operTm` lies in the future;
+    /// for any other the field is ignored, as it always was.
     oper_tm: bool = false,
+    /// `sboClass` of a select-before-operate object.
+    sbo_class: SboClass = .operate_once,
+    /// Indices into the server's variable table of the edition-2 `OR`
+    /// attributes of this object: `opRcvd` (an `Oper` arrived, accepted or not),
+    /// `opOk` (it was accepted) and `tOpOk` (when). Null: not modelled.
+    op_rcvd: ?usize = null,
+    op_ok: ?usize = null,
+    t_op_ok: ?usize = null,
+    /// How long `opRcvd` and `opOk` stay true before the server resets them; 0
+    /// keeps them until the next command.
+    op_hold_ms: u32 = 1000,
 
     // Interlocks the application raises. `Check` asks the IED to *skip* a
     // check; whether it is allowed to is the IED's decision, not the client's,
@@ -862,6 +920,29 @@ pub const Point = struct {
     owner: u32 = 0,
     select_deadline_ms: u64 = 0,
     execution_deadline_ms: u64 = 0,
+    /// Non-zero while a time-activated operate waits: the UTC instant (ms) it
+    /// executes at. The state is `executing` meanwhile, so nothing else gets in.
+    activate_at_ms: u64 = 0,
+    /// The waiting command's value, copied because the request buffer it came
+    /// from is gone by the time it is due.
+    pending_val: [16]u8 = undefined,
+    pending_len: u8 = 0,
+    pending_test: bool = false,
+    /// Where the `opRcvd`/`opOk` reset is due (0: nothing pending).
+    op_reset_at_ms: u64 = 0,
+    /// The select window an `operate-many` object returns to after an operate.
+    renew_deadline_ms: u64 = 0,
+
+    /// A time-activated operate that has come due, see `activate`.
+    pub const Activated = struct {
+        /// The `ctlVal` to apply: a slice of the point's own storage, valid
+        /// until the next command.
+        ctl_val: []const u8,
+        ctl_num: u8,
+        test_mode: bool,
+        /// The model owes a `CommandTermination` (enhanced security).
+        terminate: bool,
+    };
 
     /// Common gate for select and operate: everything that blocks the object
     /// regardless of who asked.
@@ -917,8 +998,14 @@ pub const Point = struct {
                 return .{ .rejected = .inconsistent_parameters };
             }
         }
+        if (self.oper_tm) {
+            if (cmd.oper_tm) |tm| {
+                if (tm.millis() > now_ms) return self.schedule(owner, cmd, tm.millis());
+            }
+        }
         self.ctl_num = cmd.ctl_num;
         self.owner = owner;
+        self.renew_deadline_ms = if (self.sbo_timeout_ms == 0) 0 else now_ms + self.sbo_timeout_ms;
         if (self.ctl_model.isEnhanced()) {
             self.state = .executing;
             self.select_deadline_ms = 0;
@@ -928,7 +1015,8 @@ pub const Point = struct {
                 now_ms + self.execution_timeout_ms;
             return .{ .accepted = .{ .terminate = true } };
         }
-        // ⭐ `reset`, not a hand-clear of two of the five fields. This path used
+        // ⭐ `finish` (a `reset` unless the select stays armed), not a
+        // hand-clear of two of the five fields. This path used
         // to set `state` and `select_deadline_ms` and leave `owner` and
         // `ctl_num` holding the finished command's values, so a
         // direct-with-normal-security point came to rest `unselected` while
@@ -936,8 +1024,48 @@ pub const Point = struct {
         // happen — and never caught it, because its draws collapsed to the
         // range minimum and `ctl_model` was therefore always `status_only`,
         // where every command is refused before it gets here.
-        self.reset();
+        self.finish();
         return .{ .accepted = .{} };
+    }
+
+    /// Accepts a time-activated operate: the object is `executing` from now, with
+    /// the value kept for `activate`.
+    fn schedule(self: *Point, owner: u32, cmd: Command, at_ms: u64) Outcome {
+        if (cmd.ctl_val.len > self.pending_val.len) return .{ .rejected = .inconsistent_parameters };
+        @memcpy(self.pending_val[0..cmd.ctl_val.len], cmd.ctl_val);
+        self.pending_len = @intCast(cmd.ctl_val.len);
+        self.pending_test = cmd.test_mode;
+        self.ctl_num = cmd.ctl_num;
+        self.owner = owner;
+        self.state = .executing;
+        self.select_deadline_ms = 0;
+        self.execution_deadline_ms = 0;
+        self.activate_at_ms = at_ms;
+        return .{ .accepted = .{ .terminate = self.ctl_model.isEnhanced(), .scheduled = true } };
+    }
+
+    /// The waiting time-activated operate, once its `operTm` has come: the value to
+    /// apply, or null while it is not due (or nothing waits). From here the
+    /// execution is an ordinary one — the enhanced models' execution deadline
+    /// starts now, and the caller ends it with `completed`.
+    pub fn activate(self: *Point, now_ms: u64) ?Activated {
+        if (self.state != .executing or self.activate_at_ms == 0 or now_ms < self.activate_at_ms) return null;
+        self.activate_at_ms = 0;
+        self.execution_deadline_ms = if (self.execution_timeout_ms == 0 or !self.ctl_model.isEnhanced())
+            0
+        else
+            now_ms + self.execution_timeout_ms;
+        return .{
+            .ctl_val = self.pending_val[0..self.pending_len],
+            .ctl_num = self.ctl_num,
+            .test_mode = self.pending_test,
+            .terminate = self.ctl_model.isEnhanced(),
+        };
+    }
+
+    /// Whether a time-activated operate is waiting for its `operTm`.
+    pub fn scheduled(self: *const Point) bool {
+        return self.state == .executing and self.activate_at_ms != 0;
     }
 
     /// A `Cancel` may arrive at any point: it deselects an armed select and
@@ -953,7 +1081,7 @@ pub const Point = struct {
                 }
                 const was_executing = self.state == .executing;
                 self.reset();
-                return .{ .accepted = .{ .terminate = was_executing } };
+                return .{ .accepted = .{ .terminate = was_executing and self.ctl_model.isEnhanced() } };
             },
         }
     }
@@ -962,7 +1090,7 @@ pub const Point = struct {
     /// `CommandTermination`.
     pub fn completed(self: *Point) bool {
         const owed = self.state == .executing;
-        self.reset();
+        self.finish();
         return owed;
     }
 
@@ -991,6 +1119,22 @@ pub const Point = struct {
         self.ctl_num = 0;
         self.select_deadline_ms = 0;
         self.execution_deadline_ms = 0;
+        self.activate_at_ms = 0;
+    }
+
+    /// A command ran to completion. The object is released, except under
+    /// `operate-many`, where the select stays armed (with a fresh window) for the
+    /// next operate, whose `ctlNum` is not tied to the select's.
+    fn finish(self: *Point) void {
+        if (self.ctl_model.needsSelect() and self.sbo_class == .operate_many and self.owner != 0) {
+            self.state = .selected;
+            self.ctl_num = 0;
+            self.select_deadline_ms = self.renew_deadline_ms;
+            self.execution_deadline_ms = 0;
+            self.activate_at_ms = 0;
+            return;
+        }
+        self.reset();
     }
 
     /// The association holding this point went away. A select that outlives its
@@ -1000,6 +1144,9 @@ pub const Point = struct {
     pub fn release(self: *Point, owner: u32) void {
         if (self.state == .unselected) return;
         if (self.owner != owner) return;
+        // A time-activated operate was accepted and runs at its time whether or
+        // not the client that asked is still there.
+        if (self.scheduled()) return;
         self.reset();
     }
 
@@ -2158,4 +2305,137 @@ test "controlName: a reference that already has max_components is refused" {
     var buf: [256]u8 = undefined;
     _ = try controlName("LD/LN.a.b.c.d.e.f.g", .CO, "Oper", &buf);
     try testing.expectError(error.TooManyComponents, controlName("LD/LN.a.b.c.d.e.f.g.h", .CO, "Oper", &buf));
+}
+
+// ── time-activated operate, sboClass ────────────────────────────────────────
+
+fn timedCmd(at_ms: u64) Command {
+    var c = audit_cmd;
+    c.oper_tm = mmsdata.UtcTime.fromMillis(at_ms, null);
+    return c;
+}
+
+test "Point: an operate with a future operTm is accepted now and executes at its time" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .direct_with_enhanced_security, .oper_tm = true };
+    const out = p.operate(1, timedCmd(5000), 1000);
+    try testing.expect(out.accepted.scheduled);
+    try testing.expect(out.accepted.terminate);
+    try testing.expect(p.scheduled());
+    try testing.expectEqual(PointState.executing, p.state);
+    // Nothing else gets in while it waits, and nothing is due early.
+    try testing.expectEqual(AddCause.command_already_in_execution, p.operate(2, audit_cmd, 2000).rejected);
+    try testing.expect(p.activate(4999) == null);
+    try testing.expect(!p.tick(60_000));
+    const a = p.activate(5000).?;
+    try testing.expectEqualSlices(u8, audit_cmd.ctl_val, a.ctl_val);
+    try testing.expectEqual(@as(u8, 1), a.ctl_num);
+    try testing.expect(a.terminate and !a.test_mode);
+    // From here it is an ordinary execution, with its own deadline.
+    try testing.expect(!p.scheduled());
+    try testing.expect(p.activate(5001) == null);
+    try testing.expect(p.tick(5000 + p.execution_timeout_ms));
+    try testing.expectEqual(PointState.unselected, p.state);
+}
+
+test "Point: a past or zero operTm executes at once, and an object without operTm ignores it" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .direct_with_normal_security, .oper_tm = true };
+    try testing.expect(!p.operate(1, timedCmd(500), 1000).accepted.scheduled);
+    try testing.expect(!p.operate(1, timedCmd(1000), 1000).accepted.scheduled);
+    try testing.expect(!p.operate(1, timedCmd(0), 1000).accepted.scheduled);
+    try testing.expectEqual(PointState.unselected, p.state);
+    var q = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .direct_with_normal_security };
+    try testing.expect(!q.operate(1, timedCmd(9000), 1000).accepted.scheduled);
+}
+
+test "Point: a Cancel aborts a waiting operate; a dropped association does not" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .sbo_with_enhanced_security, .oper_tm = true };
+    _ = p.select(1, audit_cmd, 0);
+    _ = p.operate(1, timedCmd(5000), 100);
+    p.release(1);
+    try testing.expect(p.scheduled());
+    try testing.expectEqual(AddCause.locked_by_other_client, p.cancel(2, audit_cmd, 200).rejected);
+    const c = p.cancel(1, audit_cmd, 300);
+    try testing.expect(c.accepted.terminate);
+    try testing.expectEqual(PointState.unselected, p.state);
+    try testing.expect(p.activate(6000) == null);
+}
+
+test "Point: normal security owes no termination for a waiting operate, cancelled or not" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .sbo_with_normal_security, .oper_tm = true };
+    _ = p.select(1, null, 0);
+    const o = p.operate(1, timedCmd(5000), 100);
+    try testing.expect(o.accepted.scheduled and !o.accepted.terminate);
+    try testing.expect(!p.cancel(1, audit_cmd, 200).accepted.terminate);
+    _ = p.select(1, null, 300);
+    _ = p.operate(1, timedCmd(5000), 400);
+    const a = p.activate(5000).?;
+    try testing.expect(!a.terminate);
+    // Nothing is owed after it completes, and the select is consumed.
+    try testing.expect(p.completed());
+    try testing.expectEqual(PointState.unselected, p.state);
+}
+
+test "Point: a value too long to keep for a waiting operate is refused, not truncated" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .direct_with_normal_security, .oper_tm = true };
+    var c = timedCmd(5000);
+    const long: [17]u8 = @splat(0);
+    c.ctl_val = &long;
+    try testing.expectEqual(AddCause.inconsistent_parameters, p.operate(1, c, 0).rejected);
+    try testing.expectEqual(PointState.unselected, p.state);
+}
+
+test "Point: operate-once releases the select, operate-many keeps it armed" {
+    var once = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .sbo_with_normal_security, .sbo_timeout_ms = 1000 };
+    _ = once.select(1, null, 0);
+    try testing.expect(once.operate(1, audit_cmd, 10) == .accepted);
+    try testing.expectEqual(PointState.unselected, once.state);
+    try testing.expectEqual(AddCause.object_not_selected, once.operate(1, audit_cmd, 20).rejected);
+
+    var many = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .sbo_with_normal_security, .sbo_class = .operate_many, .sbo_timeout_ms = 1000 };
+    _ = many.select(1, null, 0);
+    try testing.expect(many.operate(1, audit_cmd, 10) == .accepted);
+    try testing.expectEqual(PointState.selected, many.state);
+    try testing.expectEqual(@as(u32, 1), many.owner);
+    // Still owned by the selecting client, and with a fresh window.
+    try testing.expectEqual(AddCause.locked_by_other_client, many.operate(2, audit_cmd, 500).rejected);
+    var next = audit_cmd;
+    next.ctl_num = 7;
+    try testing.expect(many.operate(1, next, 900) == .accepted);
+    try testing.expectEqual(PointState.selected, many.state);
+    // The window runs from the last operate, then the object is released.
+    try testing.expect(!many.tick(1899));
+    try testing.expect(many.tick(1900));
+    try testing.expectEqual(PointState.unselected, many.state);
+    try testing.expectEqual(AddCause.object_not_selected, many.operate(1, audit_cmd, 2000).rejected);
+}
+
+test "Point: operate-many with enhanced security returns to the select after the termination" {
+    var p = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .sbo_with_enhanced_security, .sbo_class = .operate_many, .sbo_timeout_ms = 1000 };
+    _ = p.select(1, audit_cmd, 0);
+    try testing.expect(p.operate(1, audit_cmd, 10).accepted.terminate);
+    try testing.expectEqual(PointState.executing, p.state);
+    try testing.expect(p.completed());
+    try testing.expectEqual(PointState.selected, p.state);
+    try testing.expect(p.operate(1, audit_cmd, 20).accepted.terminate);
+    // A Cancel ends the select outright.
+    _ = p.cancel(1, audit_cmd, 30);
+    try testing.expectEqual(PointState.unselected, p.state);
+    // sboClass means nothing to a direct model.
+    var d = Point{ .item = "GGIO1$CO$SPCSO1", .domain = "LD", .ctl_model = .direct_with_normal_security, .sbo_class = .operate_many };
+    _ = d.operate(1, audit_cmd, 0);
+    try testing.expectEqual(PointState.unselected, d.state);
+}
+
+test "SboClass: ordinals and SCL spellings, anything else is null" {
+    try testing.expectEqual(@as(?SboClass, .operate_once), SboClass.fromInt(0));
+    try testing.expectEqual(@as(?SboClass, .operate_many), SboClass.fromInt(1));
+    try testing.expectEqual(@as(?SboClass, null), SboClass.fromInt(2));
+    try testing.expectEqual(@as(?SboClass, null), SboClass.fromInt(-1));
+    try testing.expectEqual(@as(?SboClass, .operate_many), SboClass.parseScl("operate-many"));
+    try testing.expectEqual(@as(?SboClass, .operate_once), SboClass.parseScl("operate-once"));
+    try testing.expectEqual(@as(?SboClass, .operate_many), SboClass.parseScl("1"));
+    try testing.expectEqual(@as(?SboClass, null), SboClass.parseScl("sometimes"));
+    try testing.expectEqualStrings("operate-many", SboClass.operate_many.sclName());
+    const d = try mmsdata.Data.decode(&[_]u8{ 0x85, 0x01, 0x01 });
+    try testing.expectEqual(@as(?SboClass, .operate_many), try SboClass.fromData(d));
 }
