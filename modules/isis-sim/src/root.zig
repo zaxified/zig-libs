@@ -47,7 +47,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .single_owner,
     .model_after = "netsim Protocol harness driving the isis-lsdb/flood/spf stack",
-    .deps = .{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf", "isis-dis" },
+    .deps = .{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf", "isis-dis", "isis-adj" },
 };
 
 const fabric = @import("fabric.zig");
@@ -65,6 +65,7 @@ pub const Outcome = fabric.Outcome;
 pub const Options = fabric.Options;
 pub const LinkOverride = fabric.LinkOverride;
 pub const Aging = fabric.Aging;
+pub const AdjOptions = fabric.AdjOptions;
 pub const Stats = fabric.Stats;
 pub const SystemId = fabric.SystemId;
 pub const systemIdForNode = fabric.systemIdForNode;

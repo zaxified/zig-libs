@@ -72,6 +72,7 @@ const isis_lsdb = @import("isis-lsdb");
 const isis_flood = @import("isis-flood");
 const isis_spf = @import("isis-spf");
 const isis_dis = @import("isis-dis");
+const isis_adj = @import("isis-adj");
 
 const NodeId = netsim.NodeId;
 const Time = netsim.Time;
@@ -192,6 +193,9 @@ const timer_restart: u64 = 1;
 /// "Age this node's LSDB now" (`Options.aging`): `tick` the database, refresh the
 /// node's own LSP if it is due, and re-arm.
 const timer_age: u64 = 2;
+/// "Run this node's adjacency timers" (`Options.adjacency`): hold-timer
+/// expiry and the periodic hellos.
+const timer_hello: u64 = 3;
 /// Failure-reaction timer ids start here (distinct from `timer_poll`); the
 /// failure index is added on.
 const fail_timer_base: u64 = 1 << 32;
@@ -244,6 +248,10 @@ const NodeState = struct {
     link_failed: []bool,
     lsdb: isis_lsdb.Lsdb,
     sched: isis_flood.Scheduler,
+    /// `Options.adjacency`: one adjacency machine per point-to-point circuit.
+    adjs: []isis_adj.Adjacency = &.{},
+    /// Time of the flooding poll armed for this node, if any (`setPoll`).
+    poll_due: ?Time = null,
     /// Sequence number of this node's own LSP; bumped on each (re-)origination.
     seq: u32,
     /// The keys this node signs with (`[0]`) and verifies against; empty = no authentication.
@@ -348,11 +356,25 @@ pub const Options = struct {
     /// `false` is the negative control of the LAN path: the DIS never transmits a
     /// CSNP on a LAN circuit, so a database summary can no longer repair loss.
     lan_csnp: bool = true,
+    /// Run the `isis-adj` point-to-point adjacency machine on every circuit
+    /// (SPEC §14): a circuit carries no LSP, SNP or neighbour entry until its
+    /// adjacency is Up, and a severed link is noticed when the hold timer runs
+    /// out instead of by a scheduled re-origination. `null` (the default) is
+    /// the harness where a netsim link IS the adjacency.
+    adjacency: ?AdjOptions = null,
     /// IS-IS authentication (RFC 5304 / RFC 5310) on every circuit: every node
     /// signs what it originates (LSPs, pseudonode LSPs, purges) and its CSNPs/
     /// PSNPs with `keys[0]` and its `isis-lsdb` verifies what it receives.
     /// `null` (the default) is the unauthenticated fabric, byte for byte.
     auth: ?Auth = null,
+};
+
+/// See `Options.adjacency`.
+pub const AdjOptions = struct {
+    /// Hello cadence and timer granularity, in netsim ticks.
+    hello_interval: Time = 10,
+    /// The holding time advertised is `hello_interval * hold_multiplier`.
+    hold_multiplier: u16 = 3,
 };
 
 /// See `Options.auth`.
@@ -425,6 +447,11 @@ pub const Stats = struct {
     /// PDUs a node's `isis-lsdb` refused for authentication (`Options.auth`):
     /// LSPs and SNPs with a missing or wrong #10.
     auth_refused: u64 = 0,
+    /// `Options.adjacency`: hellos handed to the medium, and adjacencies that
+    /// reached Up / left Up (summed over all nodes).
+    hello_tx: u64 = 0,
+    adj_up: u64 = 0,
+    adj_down: u64 = 0,
 };
 
 // ── the Fabric (the Protocol context) ────────────────────────────────────────
@@ -554,6 +581,7 @@ pub const Fabric = struct {
             gpa.free(ns.neighbours);
             gpa.free(ns.lan_circuits);
             gpa.free(ns.link_failed);
+            gpa.free(ns.adjs);
         };
 
         if (opts.aging) |a| {
@@ -671,6 +699,8 @@ pub const Fabric = struct {
             const link_failed = try gpa.alloc(bool, degree + lan_count);
             errdefer gpa.free(link_failed);
             @memset(link_failed, false);
+            const adjs = try gpa.alloc(isis_adj.Adjacency, if (opts.adjacency != null) degree else 0);
+            errdefer gpa.free(adjs);
 
             const sys = systemIdForNode(node);
             ns.* = .{
@@ -678,6 +708,7 @@ pub const Fabric = struct {
                 .neighbours = neighbours,
                 .lan_circuits = lan_circuits,
                 .link_failed = link_failed,
+                .adjs = adjs,
                 .lsdb = undefined,
                 .sched = undefined,
                 .seq = 0,
@@ -685,6 +716,7 @@ pub const Fabric = struct {
             };
             ns.sched = isis_flood.Scheduler.init(gpa, schedConfig(ns, opts));
             ns.lsdb = isis_lsdb.Lsdb.init(gpa, lsdbConfig(ns, lsdb_capacity, opts));
+            resetAdjacencies(ns, opts);
             initialized += 1;
         }
 
@@ -725,6 +757,7 @@ pub const Fabric = struct {
             self.gpa.free(ns.neighbours);
             self.gpa.free(ns.lan_circuits);
             self.gpa.free(ns.link_failed);
+            self.gpa.free(ns.adjs);
         }
         self.gpa.free(self.seen_seq);
         self.gpa.free(self.seen_purge);
@@ -751,6 +784,24 @@ pub const Fabric = struct {
             .snpa = m.snpa.?,
             .pseudonode_id = @intCast(lan + 1),
         };
+    }
+
+    /// `Options.adjacency`: a fresh machine per point-to-point circuit, every
+    /// circuit counted as down until its adjacency reaches Up.
+    fn resetAdjacencies(ns: *NodeState, opts: Options) void {
+        const a = opts.adjacency orelse return;
+        for (ns.adjs, 0..) |*adj, i| {
+            adj.* = isis_adj.Adjacency.init(.{
+                .system_id = ns.system_id,
+                .extended_local_circuit_id = @intCast(i + 1),
+                .local_circuit_id = @intCast(i + 1),
+                .circuit_type = .level1,
+                .holding_time = @intCast(a.hello_interval * a.hold_multiplier),
+                .hello_interval = a.hello_interval,
+                .auth_keys = ns.auth_keys,
+            });
+            ns.link_failed[i] = true;
+        }
     }
 
     fn lsdbConfig(ns: *const NodeState, capacity: u32, opts: Options) isis_lsdb.Config {
@@ -840,7 +891,9 @@ pub const Fabric = struct {
             ns.sched.deinit();
             ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns, self.opts));
             ns.seq = 0;
+            ns.poll_due = null;
             @memset(ns.link_failed, false);
+            resetAdjacencies(ns, self.opts);
             for (ns.lan_circuits) |*c| self.resetLanCircuit(c);
         }
         // Per-run invariant state (netsim calls `reset` at the top of every
@@ -882,18 +935,27 @@ pub const Fabric = struct {
             }
         }
         try self.originate(node, now);
+        if (self.opts.adjacency) |a| {
+            for (self.nodes[node].adjs, 0..) |*adj, iface| {
+                const eff = adj.start(now);
+                try self.applyAdjEffect(sim, node, @intCast(iface), eff, now);
+            }
+            if (a.hello_interval <= self.horizon) try sim.setTimer(node, a.hello_interval, timer_hello);
+        }
         for (self.lan_run.items, 0..) |ev, k| {
             if (ev.time > self.horizon) continue;
             for (self.nodes[node].lan_circuits) |c| {
                 if (c.lan == ev.lan) try sim.setTimer(node, ev.time, lan_timer_base + k);
             }
         }
-        try sim.setTimer(node, poll_delay, timer_poll);
+        try self.setPoll(sim, node, poll_delay);
         if (self.opts.aging) |a| {
             if (a.tick_interval <= self.horizon) try sim.setTimer(node, a.tick_interval, timer_age);
         }
         // Pre-arm the failure-reaction timers for links this node terminates.
         for (self.failures.items, 0..) |f, k| {
+            // With adjacencies the hold timer notices the severed link itself.
+            if (self.opts.adjacency != null) break;
             if (f.a == node or f.b == node) {
                 try sim.setTimer(node, f.time, fail_timer_base + k);
             }
@@ -945,6 +1007,22 @@ pub const Fabric = struct {
         const now = sim.timeNow();
 
         const pdu = isis.decode(payload) catch return; // hostile/short bytes: ignore
+        if (self.opts.adjacency != null and iface < ns.neighbours.len) {
+            // A point-to-point circuit speaks hellos, and nothing else until its
+            // adjacency is Up.
+            switch (pdu) {
+                .p2p_hello => {
+                    const eff = ns.adjs[iface].rxHelloBytes(payload, now) catch return;
+                    try self.applyAdjEffect(sim, node, iface, eff, now);
+                    // A hello that changes nothing needs no flooding poll; one
+                    // poll chain per message would multiply without bound.
+                    if (eff.adjacency_up or eff.adjacency_down != null) try self.armPoll(sim, node);
+                    return;
+                },
+                .lsp, .csnp, .psnp => if (ns.link_failed[iface]) return,
+                else => {},
+            }
+        }
         switch (pdu) {
             .lsp => {
                 const r = ns.lsdb.insert(payload, iface, now) catch |e| switch (e) {
@@ -1037,15 +1115,57 @@ pub const Fabric = struct {
         try self.armPoll(sim, node);
     }
 
+    /// Act on what an adjacency machine returned: send its hello, count an
+    /// authentication refusal, and on a state change re-originate the node's LSP
+    /// (the circuit's neighbour appears or disappears) and let flooding resume.
+    fn applyAdjEffect(self: *Fabric, sim: *netsim.Sim, node: NodeId, iface: u8, eff: isis_adj.Effect, now: Time) anyerror!void {
+        const ns = &self.nodes[node];
+        if (eff.rejected) |r| switch (r) {
+            .auth_missing, .auth_failed => self.stats.auth_refused += 1,
+            else => {},
+        };
+        if (eff.send_hello) |hf| {
+            var buf: [256]u8 = undefined;
+            const bytes = try isis_adj.buildHello(&buf, hf);
+            self.stats.hello_tx += 1;
+            try sim.send(node, ns.neighbours[iface].node, bytes);
+        }
+        if (eff.adjacency_up) {
+            ns.link_failed[iface] = false;
+            self.stats.adj_up += 1;
+            try self.originate(node, now);
+        }
+        if (eff.adjacency_down != null) {
+            ns.link_failed[iface] = true;
+            self.stats.adj_down += 1;
+            try self.originate(node, now);
+        }
+    }
+
+    /// Arm a flooding poll `delay` ticks from now unless one is already armed for
+    /// that time or earlier: every message used to start its own poll chain, and
+    /// the chains never merged (each re-arms itself while work remains), so a run
+    /// with many messages ended with thousands of them.
+    fn setPoll(self: *Fabric, sim: *netsim.Sim, node: NodeId, delay: Time) anyerror!void {
+        const due = sim.timeNow() + delay;
+        const ns = &self.nodes[node];
+        if (ns.poll_due) |d| {
+            if (d >= sim.timeNow() and d <= due) return;
+        }
+        ns.poll_due = due;
+        try sim.setTimer(node, delay, timer_poll);
+    }
+
     fn armPoll(self: *Fabric, sim: *netsim.Sim, node: NodeId) anyerror!void {
         // Positive control: skipping this arm leaves SRM/SSN undrained forever.
         if (self.broken_no_drain) return;
-        try sim.setTimer(node, poll_delay, timer_poll);
+        try self.setPoll(sim, node, poll_delay);
     }
 
     fn onTimer(ctx: *anyopaque, sim: *netsim.Sim, node: NodeId, timer_id: u64) anyerror!void {
         const self = cast(ctx);
         const now = sim.timeNow();
+        if (timer_id == timer_poll) self.nodes[node].poll_due = null;
 
         if (timer_id >= lan_timer_base) {
             try self.onLanEvent(node, self.lan_run.items[@intCast(timer_id - lan_timer_base)], now);
@@ -1053,6 +1173,12 @@ pub const Fabric = struct {
             try self.coldRestart(node, now);
         } else if (timer_id == timer_age) {
             try self.ageNode(sim, node, now);
+        } else if (timer_id == timer_hello) {
+            const a = self.opts.adjacency.?;
+            for (self.nodes[node].adjs, 0..) |*adj, iface| {
+                try self.applyAdjEffect(sim, node, @intCast(iface), adj.tick(now), now);
+            }
+            if (now + a.hello_interval <= self.horizon) try sim.setTimer(node, a.hello_interval, timer_hello);
         } else if (timer_id >= fail_timer_base) {
             const ns = &self.nodes[node];
             // `timer_id` is `u64` because `fail_timer_base = 1 << 32` is used
@@ -1365,9 +1491,9 @@ pub const Fabric = struct {
         // retransmit path run at all, and it is still self-terminating because
         // `poll` returns `next_wakeup == null` once SRM/SSN have drained.
         if (r.truncated) {
-            if (now + 1 <= self.horizon) try sim.setTimer(node, 1, timer_poll);
+            if (now + 1 <= self.horizon) try self.setPoll(sim, node, 1);
         } else if (r.next_wakeup) |w| {
-            if (w > now and w <= self.horizon) try sim.setTimer(node, w - now, timer_poll);
+            if (w > now and w <= self.horizon) try self.setPoll(sim, node, w - now);
         }
     }
 
@@ -3310,6 +3436,9 @@ test "a poll truncated at 64 effects re-arms itself one tick later" {
     };
     const before = Count.hubPollsAt1(&d.sim); // the one `onStart` armed
     fab.horizon = 1_000;
+    // The poll `onStart` armed would absorb the re-arm (`setPoll` keeps one per
+    // node); forget it so the truncation's own re-arm is what is counted.
+    fab.nodes[0].poll_due = null;
     try fab.pollAndSend(&d.sim, 0, 0);
     try testing.expectEqual(before + 1, Count.hubPollsAt1(&d.sim));
 }
@@ -3556,4 +3685,157 @@ test "auth: with auth_snp off a node's CSNPs leave unsigned while its LSPs stay 
         try testing.expectEqual(@as(usize, 4), (after.signed + after.unsigned) - (before.signed + before.unsigned));
         try testing.expectEqual(if (snp_on) @as(usize, 4) else 2, after.signed - before.signed);
     }
+}
+
+// ── Options.adjacency: the isis-adj machine in the run (SPEC §14) ───────────
+
+const adj_opts: Options = .{ .adjacency = .{} };
+
+test "adjacency: a 4-node line forms every adjacency by hello exchange and converges" {
+    var edges: [3]Edge = undefined;
+    var fab = try Fabric.initWithOptions(testing.allocator, lineTopology(&edges), 5, adj_opts);
+    defer fab.deinit();
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(step_cap));
+    try testing.expect(fab.lsdbsAgree());
+    // Three links, two ends each, each brought Up once.
+    try testing.expectEqual(@as(u64, 6), fab.stats.adj_up);
+    try testing.expectEqual(@as(u64, 0), fab.stats.adj_down);
+    try testing.expect(fab.stats.hello_tx > 6);
+    try testing.expectEqual(isis_adj.State.up, fab.nodes[1].adjs[0].currentState());
+    try testing.expectEqual(isis_adj.State.up, fab.nodes[1].adjs[1].currentState());
+    // Every node reaches every other, with the exact next hops of the static run.
+    var from: NodeId = 0;
+    while (from < 4) : (from += 1) {
+        var to: NodeId = 0;
+        while (to < 4) : (to += 1) {
+            if (from != to) try testing.expect((try fab.reaches(testing.allocator, from, to)) != null);
+        }
+    }
+    // The LSPs list a neighbour only once its adjacency is Up: the first copy of
+    // each is the empty one, so every node re-originated at least once.
+    try testing.expect(fab.selfSequence(1) >= 2);
+}
+
+test "adjacency: a severed link is noticed by the hold timer, not by a scheduled re-origination" {
+    const edges = [_]Edge{
+        .{ .a = 0, .b = 1 }, .{ .a = 1, .b = 2 }, .{ .a = 2, .b = 3 }, .{ .a = 3, .b = 0 },
+    };
+    const topo = Topology{ .node_count = 4, .edges = &edges };
+    // The shim run: both ends re-originate at the failure time itself.
+    var shim = try Fabric.init(testing.allocator, topo, 42);
+    defer shim.deinit();
+    try shim.failLinkAt(0, 1, 5_000);
+    try testing.expectEqual(Outcome.converged, try shim.runToConvergence(step_cap));
+    try testing.expect(shim.stats.last_change < 5_020);
+
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 42, adj_opts);
+    defer fab.deinit();
+    try fab.failLinkAt(0, 1, 5_000);
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(step_cap));
+    // Hold = 3 x 10: the adjacency expires between 20 and 40 ticks after the cut
+    // (the last hello may have arrived just before it, and the timer is polled on
+    // the hello interval).
+    try testing.expect(fab.stats.last_change >= 5_020);
+    try testing.expect(fab.stats.last_change <= 5_060);
+    try testing.expectEqual(@as(u64, 2), fab.stats.adj_down);
+    try testing.expect(fab.lsdbsAgree());
+    // The same reroute as the shim run: A reaches B the long way, metric 30.
+    var ta = try fab.routes(testing.allocator, 0);
+    defer ta.deinit();
+    const rb = ta.lookup(systemIdForNode(1)).?;
+    try testing.expectEqual(systemIdForNode(3), rb.next_hop);
+    try testing.expectEqual(@as(u64, 30), rb.metric);
+}
+
+test "adjacency: a crashed router is detected by its neighbours and drops out of SPF; the static harness never notices" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var stat = try Fabric.init(testing.allocator, topo, 8);
+    defer stat.deinit();
+    stat.crash = .{ .node = 2, .time = 3_000 };
+    _ = try stat.runToConvergence(step_cap);
+    // Nobody tells B that C is gone: it still lists C, so A still "reaches" C.
+    try testing.expect((try stat.reaches(testing.allocator, 0, 2)) != null);
+
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 8, adj_opts);
+    defer fab.deinit();
+    fab.crash = .{ .node = 2, .time = 3_000 };
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(step_cap));
+    try testing.expect((try fab.reaches(testing.allocator, 0, 2)) == null);
+    try testing.expect((try fab.reaches(testing.allocator, 0, 1)) != null);
+    try testing.expect(fab.stats.adj_down >= 2); // B and D each lost C
+}
+
+test "adjacency: a lossy medium still forms every adjacency and converges, across seeds" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        var fab = try Fabric.initWithOptions(testing.allocator, topo, seed, .{
+            .adjacency = .{},
+            .link = .{ .latency = link_latency, .loss_permille = 100 },
+            .retransmit_interval = 40,
+            .csnp_interval = 20,
+        });
+        defer fab.deinit();
+        try testing.expectEqual(Outcome.converged, try fab.runToConvergence(3_000));
+        try testing.expect(fab.lsdbsAgree());
+        try testing.expect(fab.stats.adj_up >= 6);
+    }
+}
+
+test "adjacency: a wrong key refuses the HELLO — the adjacency never forms, and no LSP crosses the link" {
+    var edges: [3]Edge = undefined;
+    var fab = try Fabric.initWithOptions(testing.allocator, lineTopology(&edges), 0xA11CE, .{
+        .adjacency = .{},
+        .auth = .{ .keys = &auth_keys, .mismatched = .{ .node = 3, .keys = &wrong_keys } },
+    });
+    defer fab.deinit();
+    _ = try fab.runToConvergence(step_cap);
+    try testing.expect(fab.stats.auth_refused > 0);
+    // The two links among A, B, C came up (4 ends); C-D never did.
+    try testing.expectEqual(@as(u64, 4), fab.stats.adj_up);
+    try testing.expectEqual(isis_adj.State.down, fab.nodes[3].adjs[0].currentState());
+    try testing.expect(!fab.holds(3, 0) and !fab.holds(0, 3));
+    try testing.expect((try fab.reaches(testing.allocator, 0, 3)) == null);
+    try testing.expect((try fab.reaches(testing.allocator, 0, 2)) != null);
+    // Nothing but hellos was refused: no node ever saw an LSP of the other key.
+    try testing.expect(fab.stats.lsp_tx > 0);
+}
+
+test "adjacency: a run replays byte for byte and a re-run of the same Fabric matches" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var a = try Fabric.initWithOptions(testing.allocator, topo, 77, adj_opts);
+    defer a.deinit();
+    var b = try Fabric.initWithOptions(testing.allocator, topo, 77, adj_opts);
+    defer b.deinit();
+    _ = try a.runToConvergence(step_cap);
+    _ = try b.runToConvergence(step_cap);
+    try testing.expectEqual(a.stats.hello_tx, b.stats.hello_tx);
+    try testing.expectEqual(a.stats.last_change, b.stats.last_change);
+    const first = a.stats;
+    _ = try a.runToConvergence(step_cap);
+    try testing.expectEqual(first.hello_tx, a.stats.hello_tx);
+    try testing.expectEqual(first.adj_up, a.stats.adj_up);
+}
+
+test "adjacency: LSPs from a circuit whose adjacency is not Up are ignored" {
+    var edges: [3]Edge = undefined;
+    var fab = try Fabric.initWithOptions(testing.allocator, lineTopology(&edges), 9, adj_opts);
+    defer fab.deinit();
+    // Hand a well-formed foreign LSP to node 0 before any hello: refused.
+    var d: Direct = .{};
+    try d.start(&fab);
+    defer d.deinit();
+    var buf: [128]u8 = undefined;
+    var b = try isis.pdu.LspBuilder.init(&buf, .{
+        .remaining_lifetime = 1000,
+        .lsp_id = lspIdOf(systemIdForNode(1), 0),
+        .sequence_number = 5,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    const wire = b.finishStamped();
+    try Fabric.onMessage(&fab, &d.sim, 0, 1, wire);
+    try testing.expect(!fab.holds(0, 1));
 }
