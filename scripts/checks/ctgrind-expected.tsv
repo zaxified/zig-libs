@@ -1714,7 +1714,7 @@ aeskw	ReleaseFast	wrap	1	12	88dac35c72f0539b	23036d19c2656c6a
 # aesccm (2026-11-21) — aead: key + plaintext tainted, AES-128/256 with tags
 # 8/16 (12-byte nonce): seal, open, tampered open. 8 = the tag verdict after
 # the timing-safe compare (root.zig `open`), accept + reject per profile.
-aesccm	ReleaseFast	aead	1	8	53ad584409f5c6a1	d38f305d54b5a2c3
+aesccm	ReleaseFast	aead	1	8	e36c5e8d79e2c281	d38f305d54b5a2c3
 # wireguard (2026-11-03) — messages and public keys declassified where they leave the
 # function that made them (they go on the wire). Read off the --stacks log:
 # keyb64 1, keyhex 1 = the codec's accept/reject. handshake 4 = three AEAD tag
