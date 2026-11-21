@@ -248,7 +248,7 @@ pub const module_list = [_]Module{
     .{ .name = "aeadframe", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
     .{ .name = "tenantkex", .libs = &.{"crypto"}, .deps = &.{"noise"}, .test_deps = &.{"testkit"} },
     .{ .name = "netsim", .libs = &.{"net"} },
-    .{ .name = "simio", .libs = &.{"net"}, .deps = &.{ "netsim", "clock", "icmp" }, .test_deps = &.{ "testkit", "sntp", "dns", "netaddr", "mqtt", "ssh", "kv", "http", "modbus", "whois", "stun", "ocspcache", "llmclient", "staticfiles", "iec104", "iec61850" }, .loopback = true },
+    .{ .name = "simio", .libs = &.{"net"}, .deps = &.{ "netsim", "clock", "icmp" }, .test_deps = &.{ "testkit", "sntp", "dns", "netaddr", "mqtt", "ssh", "kv", "http", "modbus", "whois", "stun", "ocspcache", "llmclient", "staticfiles", "iec104", "iec61850", "s7comm" }, .loopback = true },
     .{ .name = "loopfree-reconv", .libs = &.{"net"}, .deps = &.{ "netsim", "spf-ect" } },
     .{ .name = "df-elect", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{"testkit"} },
     .{ .name = "raft", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{"testkit"} },

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** a pilot for `s7comm` (client and responder under loss, duplication and partitions) joins the pilots; `s7comm` is a new test dependency.
 - **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** a pilot for `iec61850` (MMS client and server under loss, duplication and partitions) joins the pilots; `iec61850` is a new test dependency.
 - **2026-11-21** — **BEHAVIOURAL, not breaking:** a SYN retried after the server closed the connection it had opened for the first one (the SYN-ACK was lost and the server's task gave up) is answered with a reset, so the client's `connect` fails with `error.ConnectionResetByPeer` at once and can try again. Before, the retry was dropped as a ghost and `connect` hung until the 127 s SYN timeout. A late duplicate SYN reaching a client that is already connected is still ignored.
 - **2026-11-21** — **FEATURE:** a stream read (`Operation.net_read`) can now be submitted in an `Io.Batch` and bounded with `io.operateTimeout`, as `net_receive` already could: it completes when bytes, a close or a reset arrive and reports `error.Timeout` on the deadline. Before, it fell through to the failing implementation. This is what lets a transport bound a stream read without `poll(2)`.
