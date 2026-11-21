@@ -668,6 +668,69 @@ test "typed: negative integer keys, as COSE labels use them (derived by hand)" {
     try testing.expectEqualSlices(u8, "\xaa\xbb", p.value.x);
 }
 
+test "typed: integers past 64 bits are bignums (RFC 8949 Appendix A values)" {
+    const a = testing.allocator;
+    // 2^64, -2^64 (still major type 1), -2^64 - 1, u128 max, i128 min.
+    const cases = .{
+        .{ @as(u128, 18446744073709551616), "c249010000000000000000" },
+        .{ @as(i128, -18446744073709551616), "3bffffffffffffffff" },
+        .{ @as(i128, -18446744073709551617), "c349010000000000000000" },
+        .{ @as(u128, std.math.maxInt(u128)), "c250" ++ strRepeat("ff", 16) },
+        .{ @as(i128, std.math.minInt(i128)), "c350" ++ "7f" ++ strRepeat("ff", 15) },
+        .{ @as(u128, 5), "05" },
+        .{ @as(i128, -1), "20" },
+    };
+    inline for (cases) |c| {
+        const T = @TypeOf(c[0]);
+        const bytes = try cbor.typed.encode(a, c[0], .{});
+        defer a.free(bytes);
+        try testing.expectEqualSlices(u8, &unhex(c[1]), bytes);
+        const p = try cbor.typed.decode(T, a, bytes, .{});
+        defer p.deinit();
+        try testing.expectEqual(c[0], p.value);
+    }
+    // A bignum with leading zero bytes is read; one past the target is Overflow;
+    // a negative bignum into an unsigned type is Overflow too; a non-string body is WrongType.
+    const small = try cbor.typed.decode(u32, a, &unhex("c24300000" ++ "1"), .{});
+    defer small.deinit();
+    try testing.expectEqual(@as(u32, 1), small.value);
+    try testing.expectError(error.Overflow, cbor.typed.decode(u64, a, &unhex("c249010000000000000000"), .{}));
+    try testing.expectError(error.Overflow, cbor.typed.decode(u128, a, &unhex("c34101"), .{}));
+    try testing.expectError(error.WrongType, cbor.typed.decode(u128, a, &unhex("c201"), .{}));
+    try testing.expectError(error.WrongType, cbor.typed.decode(u128, a, &unhex("c4820120"), .{}));
+    try testing.expectError(error.Overflow, cbor.typed.decode(u128, a, &unhex("c251" ++ "01" ++ strRepeat("00", 16)), .{}));
+}
+
+test "typed: tags, as a type's cbor_tag and as Tagged(N, T)" {
+    const a = testing.allocator;
+    const Epoch = cbor.typed.Tagged(1, i64);
+    const e = try cbor.typed.decode(Epoch, a, &unhex("c11a514b67b0"), .{});
+    defer e.deinit();
+    try testing.expectEqual(@as(i64, 1363896240), e.value.value);
+    const wire = try cbor.typed.encode(a, Epoch{ .value = 1363896240 }, .{});
+    defer a.free(wire);
+    try testing.expectEqualSlices(u8, &unhex("c11a514b67b0"), wire);
+    // Missing tag, another tag.
+    try testing.expectError(error.WrongTag, cbor.typed.decode(Epoch, a, &unhex("1a514b67b0"), .{}));
+    try testing.expectError(error.WrongTag, cbor.typed.decode(Epoch, a, &unhex("c21a514b67b0"), .{}));
+    // A struct that declares its tag; inside a struct field and a slice.
+    const Item = struct {
+        a: u8,
+        pub const cbor_tag: u64 = 42;
+    };
+    const Doc = struct { items: []const Item, when: ?Cbor1 = null };
+    const bytes = unhex("a1" ++ "65" ++ "6974656d73" ++ "81" ++ "d82a" ++ "a1" ++ "6161" ++ "01");
+    const d = try cbor.typed.decode(Doc, a, &bytes, .{});
+    defer d.deinit();
+    try testing.expectEqual(@as(u8, 1), d.value.items[0].a);
+    const back = try cbor.typed.encode(a, d.value, .{});
+    defer a.free(back);
+    try testing.expectEqualSlices(u8, &bytes, back);
+    try testing.expectError(error.WrongTag, cbor.typed.decode(Doc, a, &unhex("a1" ++ "65" ++ "6974656d73" ++ "81" ++ "a1" ++ "6161" ++ "01"), .{}));
+}
+
+const Cbor1 = cbor.typed.Tagged(1, i64);
+
 test "typed: the allocation cap stops a small input from becoming a huge T" {
     const a = testing.allocator;
     // Each `a0` (one byte, an empty map) becomes a whole Fat of defaults:

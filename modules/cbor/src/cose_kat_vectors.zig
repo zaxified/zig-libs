@@ -161,3 +161,99 @@ pub const rfc9964_a2 = struct {
 
     pub const all = [_]Vector{ ml_dsa_44, ml_dsa_65, ml_dsa_87 };
 };
+
+// ── COSE_Mac0 / COSE_Encrypt0 / COSE_Sign (RFC 9052 §5.2, §6.2, §4.1) ───────
+//
+// All from the `cose-wg/Examples` repository (the COSE working group's own
+// example data, fetched 2026-11-21): the wire bytes (`output.cbor`) and the
+// published intermediates (`ToMac_hex`, `AAD_hex`, `ToBeSign_hex`); keys as
+// the files give them (`k` / `x`,`y`, base64url decoded). Data only, no
+// source code, same standing as the vectors above.
+pub const mac_pass_01 = struct {
+    /// `cose-wg/Examples` `mac0-tests/mac-pass-01.json` ("Direct key + HMAC-SHA256").
+    pub const tagged_hex =
+        "D18441A0A1010554546869732069732074686520636F6E74656E742E5820176D" ++
+        "CE14C1E57430C13658233F41DC89AA4FA0FF9B8783F23B0EF51CA6B026BC";
+    pub const external_aad_hex = "";
+    pub const mac_structure_hex =
+        "84644D414330404054546869732069732074686520636F6E74656E742E";
+    pub const key_hex =
+        "849B57219DAE48DE646D07DBB533566E976686457C1491BE3A76DCEA6C427188";
+};
+
+pub const mac_pass_02 = struct {
+    /// `cose-wg/Examples` `mac0-tests/mac-pass-02.json` ("External Data").
+    pub const tagged_hex =
+        "D18440A1010554546869732069732074686520636F6E74656E742E58200FECAE" ++
+        "C59BB46CC8A488AACA4B205E322DD52696B75A45768D3C302DD4BAE2F7";
+    pub const external_aad_hex =
+        "FF00EE11DD22CC33BB44AA559966";
+    pub const mac_structure_hex =
+        "84644D414330404EFF00EE11DD22CC33BB44AA55996654546869732069732074" ++
+        "686520636F6E74656E742E";
+    pub const key_hex =
+        "849B57219DAE48DE646D07DBB533566E976686457C1491BE3A76DCEA6C427188";
+};
+
+pub const enc_pass_01 = struct {
+    /// `cose-wg/Examples` `encrypted-tests/enc-pass-01.json` ("Failure tests").
+    pub const tagged_hex =
+        "D08341A0A20101054C02D1F7E6F26C43D4868D87CE582460973A94BB2898009E" ++
+        "E52ECFD9AB1DD25867374B24BEE54AA5D797C8DC845929ACAA47EF";
+    pub const external_aad_hex = "";
+    pub const enc_structure_hex =
+        "8368456E6372797074304040";
+    pub const key_hex =
+        "849B57219DAE48DE646D07DBB533566E";
+};
+
+pub const enc_pass_02 = struct {
+    /// `cose-wg/Examples` `encrypted-tests/enc-pass-02.json` ("Add external data").
+    pub const tagged_hex =
+        "D08343A10101A1054C02D1F7E6F26C43D4868D87CE582460973A94BB2898009E" ++
+        "E52ECFD9AB1DD25867374B1DC3A143880CA2883A5630DA08AE1E6E";
+    pub const external_aad_hex =
+        "0011BBCC22DD4455DD220099";
+    pub const enc_structure_hex =
+        "8368456E63727970743043A101014C0011BBCC22DD4455DD220099";
+    pub const key_hex =
+        "849B57219DAE48DE646D07DBB533566E";
+};
+
+pub const multi_sign_pass_01 = struct {
+    /// `cose-wg/Examples` `sign-tests/sign-pass-01.json` ("Redo protected"): one signer, ES256.
+    /// The wire carries the body protected header as `h'A0'` (an encoded empty
+    /// map) while the published ToBeSign uses the zero-length `h''`, so
+    /// the structure test uses `multi_sign_pass_02` only.
+    pub const tagged_hex =
+        "D8628441A0A054546869732069732074686520636F6E74656E742E818343A101" ++
+        "26A1044231315840E2AEAFD40D69D19DFE6E52077C5D7FF4E408282CBEFB5D06" ++
+        "CBF414AF2E19D982AC45AC98B8544C908B4507DE1E90B717C3D34816FE926A2B" ++
+        "98F53AFD2FA0F30A";
+    pub const external_aad_hex = "";
+    pub const to_be_signed_hex =
+        "85695369676E61747572654043A101264054546869732069732074686520636F" ++
+        "6E74656E742E";
+    pub const x_hex =
+        "BAC5B11CAD8F99F9C72B05CF4B9E26D244DC189F745228255A219A86D6A09EFF";
+    pub const y_hex =
+        "20138BF82DC1B6D562BE0FA54AB7804A3A64B6D72CCFED6B6FB6ED28BBFC117E";
+};
+
+pub const multi_sign_pass_02 = struct {
+    /// `cose-wg/Examples` `sign-tests/sign-pass-02.json` ("External"): one signer, ES256.
+    pub const tagged_hex =
+        "D8628440A054546869732069732074686520636F6E74656E742E818343A10126" ++
+        "A1044231315840CBB8DAD9BEAFB890E1A414124D8BFBC26BEDF2A94FCB5A8824" ++
+        "32BFF6D63E15F574EEB2AB51D83FA2CBF62672EBF4C7D993B0F4C2447647D831" ++
+        "BA57CCA86B930A";
+    pub const external_aad_hex =
+        "11AA22BB33CC44DD55006699";
+    pub const to_be_signed_hex =
+        "85695369676E61747572654043A101264C11AA22BB33CC44DD55006699545468" ++
+        "69732069732074686520636F6E74656E742E";
+    pub const x_hex =
+        "BAC5B11CAD8F99F9C72B05CF4B9E26D244DC189F745228255A219A86D6A09EFF";
+    pub const y_hex =
+        "20138BF82DC1B6D562BE0FA54AB7804A3A64B6D72CCFED6B6FB6ED28BBFC117E";
+};

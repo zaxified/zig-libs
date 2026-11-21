@@ -11,6 +11,8 @@
 //!   - no crash, no hang, no leak (the driver's DebugAllocator);
 //!   - `Reader.skipValue` reaches the same verdict as `decodePrefix` — same
 //!     length on success, same error otherwise;
+//!   - `stream.PushDecoder`, fed in random pieces, emits the pull reader's
+//!     tokens and reaches `skipValue`'s verdict (`push_test.checkAgainstSkip`);
 //!   - an accepted input re-encodes, and `Writer.value` gives `encode`'s bytes;
 //!   - `deterministic` accepts an input iff it equals the canonical encoding
 //!     of its own value (an equal-key map aside, which is `DuplicateKey`);
@@ -28,6 +30,7 @@ const cbor = @import("root.zig");
 const Value = cbor.Value;
 const MapEntry = cbor.MapEntry;
 const fuzz_driver = @import("testkit").fuzz.driver;
+const push_test = @import("push_test.zig");
 const hit = fuzz_driver.hit;
 
 const max_input = 2048;
@@ -248,6 +251,12 @@ fn checkInput(gpa: std.mem.Allocator, input: []const u8, max_depth: u32, plain_i
         if (e == error.OutOfMemory) return e;
         if (skipped) |_| return error.ReaderAcceptedWhatDecodeRefused else |se| if (se != e) return error.ReaderErrorDiffers;
         if (r.pos != 0) return error.ReaderMovedOnError;
+    }
+
+    // The push decoder reaches the same verdict, whatever the chunking.
+    {
+        const verdict: cbor.DecodeError!usize = if (skipped) |_| r.pos else |e| e;
+        try push_test.checkAgainstSkip(input, max_depth, verdict, input.len *% 0x9e37_79b9 +% max_depth);
     }
 
     // A sequence reads until the end or an error, and frees what it gave.

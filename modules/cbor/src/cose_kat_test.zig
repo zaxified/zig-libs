@@ -195,3 +195,128 @@ test "AKP without alg is rejected: RFC 9964 makes it REQUIRED" {
     entries[1] = .{ .key = .{ .negint = 0 }, .value = .{ .bytes = pk_raw } }; // pub: CBOR negint 0 encodes -1
     try testing.expectError(error.MissingField, cose.parseKey(.{ .map = entries }));
 }
+
+// ── COSE_Mac0, COSE_Encrypt0, COSE_Sign against cose-wg/Examples ────────────
+
+fn decodeHex(a: std.mem.Allocator, hex: []const u8) !cbor.Value {
+    return try cbor.decode(a, try hexDecode(a, hex), .{});
+}
+
+fn checkMac0(comptime v: type) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wire = try hexDecode(a, v.tagged_hex);
+    const decoded = try cbor.decode(a, wire, .{});
+    try testing.expectEqual(cose.tag_mac0, decoded.tag.number);
+    const m = try cose.parseMac0(decoded);
+    const aad = try hexDecode(a, v.external_aad_hex);
+    const tbm = try cose.macStructure(a, m.protected, aad, m.payload.?);
+    try testing.expectEqualSlices(u8, try hexDecode(a, v.mac_structure_hex), tbm);
+    // The tag is HMAC-SHA-256 over the MAC_structure under the published key.
+    const key = try hexDecode(a, v.key_hex);
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, tbm, key);
+    try testing.expectEqualSlices(u8, &mac, m.tag);
+    // Re-encoding gives the bare array, the wire without its tag byte.
+    try testing.expectEqualSlices(u8, wire[1..], try cose.encodeMac0(a, m));
+}
+
+test "COSE_Mac0: cose-wg/Examples mac-pass-01 and -02 (MAC_structure, HMAC tag, re-encode)" {
+    try checkMac0(kat.mac_pass_01);
+    try checkMac0(kat.mac_pass_02);
+}
+
+fn checkEncrypt0(comptime v: type) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wire = try hexDecode(a, v.tagged_hex);
+    const decoded = try cbor.decode(a, wire, .{});
+    try testing.expectEqual(cose.tag_encrypt0, decoded.tag.number);
+    const e = try cose.parseEncrypt0(decoded);
+    const aad = try hexDecode(a, v.external_aad_hex);
+    const enc_struct = try cose.encStructure(a, e.protected, aad);
+    try testing.expectEqualSlices(u8, try hexDecode(a, v.enc_structure_hex), enc_struct);
+    // The ciphertext is AES-128-GCM under the published key, the IV from the
+    // unprotected header, the Enc_structure as AAD.
+    var iv: ?[]const u8 = null;
+    for (e.unprotected) |kv| {
+        if (kv.key == .uint and kv.key.uint == cose.label_iv) iv = kv.value.bytes;
+    }
+    const ct = e.ciphertext.?;
+    const Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    try testing.expectEqual(Gcm.nonce_length, iv.?.len);
+    const body = ct[0 .. ct.len - Gcm.tag_length];
+    var plain: [64]u8 = undefined;
+    try Gcm.decrypt(plain[0..body.len], body, ct[body.len..][0..Gcm.tag_length].*, enc_struct, iv.?[0..Gcm.nonce_length].*, (try hexDecode(a, v.key_hex))[0..16].*);
+    try testing.expectEqualStrings("This is the content.", plain[0..body.len]);
+    try testing.expectEqualSlices(u8, wire[1..], try cose.encodeEncrypt0(a, e));
+}
+
+test "COSE_Encrypt0: cose-wg/Examples enc-pass-01 and -02 (Enc_structure, AES-GCM, re-encode)" {
+    try checkEncrypt0(kat.enc_pass_01);
+    try checkEncrypt0(kat.enc_pass_02);
+}
+
+fn checkSign(comptime v: type, comptime structure: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const wire = try hexDecode(a, v.tagged_hex);
+    const decoded = try cbor.decode(a, wire, .{});
+    try testing.expectEqual(cose.tag_sign, decoded.tag.number);
+    const s = try cose.parseSign(decoded);
+    try testing.expectEqual(@as(usize, 1), s.signatures.len);
+    const sg = try cose.parseSignature(s.signatures[0]);
+    if (structure) {
+        const aad = try hexDecode(a, v.external_aad_hex);
+        const tbs = try cose.signStructure(a, s.protected, sg.protected, aad, s.payload.?);
+        try testing.expectEqualSlices(u8, try hexDecode(a, v.to_be_signed_hex), tbs);
+        // The signature verifies (ES256) under the published public key.
+        const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+        var sec1: [65]u8 = undefined;
+        sec1[0] = 4;
+        @memcpy(sec1[1..33], try hexDecode(a, v.x_hex));
+        @memcpy(sec1[33..65], try hexDecode(a, v.y_hex));
+        const pk = try Ecdsa.PublicKey.fromSec1(&sec1);
+        try Ecdsa.Signature.fromBytes(sg.signature[0..64].*).verify(tbs, pk);
+    }
+    const parts: cose.SignParts = .{
+        .protected = s.protected,
+        .unprotected = s.unprotected,
+        .payload = s.payload,
+        .signatures = &.{sg},
+    };
+    // Re-encoding gives the bare array: the wire without its two tag bytes.
+    try testing.expectEqualSlices(u8, wire[2..], try cose.encodeSign(a, parts));
+}
+
+test "COSE_Sign: cose-wg/Examples sign-pass-01 and -02 (parse, Sig_structure, ES256 verify, re-encode)" {
+    try checkSign(kat.multi_sign_pass_01, false);
+    try checkSign(kat.multi_sign_pass_02, true);
+}
+
+test "COSE_Sign, Mac0, Encrypt0: wrong shapes are refused with their own error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const three = try decodeHex(a, "8340a040"); // [h'', {}, h'']
+    try testing.expectError(error.NotMac0, cose.parseMac0(three));
+    try testing.expectError(error.NotSign, cose.parseSign(three));
+    _ = try cose.parseEncrypt0(three);
+    try testing.expectError(error.NotEncrypt0, cose.parseEncrypt0(try decodeHex(a, "8440a04040")));
+    // No signatures at all, or a signature that is not a 3-array.
+    try testing.expectError(error.NotSign, cose.parseSign(try decodeHex(a, "8440a04080")));
+    try testing.expectError(error.NotSign, cose.parseSignature(try decodeHex(a, "8240a0")));
+    try testing.expectError(error.WrongType, cose.parseSign(try decodeHex(a, "8440a04040")));
+    // Ciphertext of the wrong type; a duplicated label in the unprotected header.
+    try testing.expectError(error.WrongType, cose.parseEncrypt0(try decodeHex(a, "8340a0f5")));
+    try testing.expectError(error.DuplicateLabel, cose.parseMac0(try decodeHex(a, "8440a20101010240" ++ "40")));
+    // A detached payload / ciphertext is `null` and round-trips.
+    const m = try cose.parseMac0(try decodeHex(a, "8440a0f640"));
+    try testing.expect(m.payload == null);
+    const e = try cose.parseEncrypt0(try decodeHex(a, "8340a0f6"));
+    try testing.expect(e.ciphertext == null);
+    try testing.expectEqualSlices(u8, try hexDecode(a, "8340a0f6"), try cose.encodeEncrypt0(a, e));
+}

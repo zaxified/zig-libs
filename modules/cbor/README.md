@@ -114,6 +114,9 @@ fn writeDiagnostic(w: *std.Io.Writer, value: Value) std.Io.Writer.Error!void;
 
 // ── streaming (no allocation) ──
 var r = cbor.Reader.init(bytes); // r.next() -> ?Token, r.peek(), r.skipValue(max_depth), r.rawValue(max_depth)
+// Chunks of any size, e.g. a socket's reads: h.event(cbor.stream.Event) is called as items complete,
+// strings in parts, text parts never split a code point; finish() says whether the input ended on an item.
+var pd = cbor.PushDecoder(64).init(); // try pd.feed(chunk, &handler); ... try pd.finish();
 const cw = cbor.Writer.init(w);  // uint int negint bytes text beginArray(?n) beginMap(?n) beginBytes
                                  // beginText end tag boolean null_ undefined_ simple float float16/32/64 value
 fn shortestFloat(x: f64) cbor.FloatWidth; fn head(major: u3, arg: u64) cbor.Head;
@@ -124,6 +127,7 @@ fn typed.decodeLeaky(comptime T: type, arena: Allocator, bytes: []const u8, o: t
 fn typed.fromValue(comptime T: type, arena: Allocator, v: Value, o: typed.Options) typed.Error!T;
 fn typed.toValue(arena: Allocator, x: anytype) Allocator.Error!Value;
 fn typed.encode(gpa: Allocator, x: anytype, o: cbor.EncodeOptions) Allocator.Error![]u8;
+// integers to 128 bits (bignums beyond 64); typed.Tagged(N, T) and `pub const cbor_tag = N;` carry a tag (error.WrongTag)
 
 // ── COSE ──
 const cose = cbor.cose;
@@ -134,6 +138,8 @@ fn cose.encodeOkpKey(a: Allocator, k: cose.OkpKey) Allocator.Error!Value;
 fn cose.parseSign1(value: Value) cose.Sign1Error!cose.Sign1;
 fn cose.encodeSign1(a: Allocator, s: cose.Sign1) Allocator.Error![]u8;
 fn cose.sigStructure(a: Allocator, protected: []const u8, external_aad: []const u8, payload: []const u8) Allocator.Error![]u8;
+// COSE_Sign / COSE_Mac0 / COSE_Encrypt0: parseSign/parseSignature/encodeSign/signStructure,
+// parseMac0/encodeMac0/macStructure, parseEncrypt0/encodeEncrypt0/encStructure (tags tag_sign, tag_mac0, tag_encrypt0)
 ```
 
 Everything `decode` returns is allocated via the `allocator` you pass (arena-friendly, not
@@ -157,8 +163,9 @@ trees, duplicate-key and indefinite-length verdicts).
 
 ## Not provided
 
-No bignum arithmetic (preferred serialization of tag-2/3 bignums is done), no COSE beyond `COSE_Key` (EC2/OKP/AKP, public
-material only) and `COSE_Sign1`, no diagnostic-notation parser, no callback decoder for input that never sits in
-memory whole, no recording of definite versus indefinite length in `Value`, no NaN payloads under `canonical`, and
-typed mapping stops at 64-bit integers and untagged unions. Reasons and plans: SPEC.md *What is deliberately not
-done* and *Backlog / deferred*.
+No bignum arithmetic (preferred serialization of tag-2/3 bignums is done, and the typed mapping reads and writes them for
+integers up to 128 bits), no COSE beyond `COSE_Key` (EC2/OKP/AKP, public material only), `COSE_Sign1`, `COSE_Sign`,
+`COSE_Mac0` and `COSE_Encrypt0` (the recipient-carrying `COSE_Mac`/`COSE_Encrypt` and every crypto primitive are not
+here), no diagnostic-notation parser, no recording of definite versus indefinite length in `Value`, no NaN payloads
+under `canonical`, and typed mapping stops at 128-bit integers and untagged unions. Reasons and plans: SPEC.md *What is
+deliberately not done*.

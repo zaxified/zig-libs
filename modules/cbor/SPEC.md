@@ -44,9 +44,10 @@ pre-allocation from a declared length, UTF-8 check, closed error set, fuzz test)
 `reject_indefinite`, `deterministic` = "is the canonical encoding of its own value"), full Core Deterministic
 Encoding (floats shrunk, NaN canonical), CBOR Sequences, diagnostic notation matching RFC 8949 Appendix A, a
 zero-allocation token reader (incremental at token granularity) and push writer, and comptime typed mapping with
-integer keys — the libcbor/fxamacker feature set a typical user reaches for. **Where we are behind:** no callback/push decoder for input that never sits in memory whole (the reader needs a slice; it
-retries a cut token, it does not keep partial-string state); no bignum helpers; typed mapping has no field-level tag mapping or >64-bit integers; no diagnostic-notation *parser*;
-no `COSE_Mac0`/`Encrypt0`/`Sign` (libcbor has no COSE at all).
+integer keys — the libcbor/fxamacker feature set a typical user reaches for. **Where we are behind:** no diagnostic-notation *parser*; no `COSE_Mac` / `COSE_Encrypt` (the recipient-carrying
+forms) and no COSE crypto (libcbor has no COSE at all); no bignum arithmetic. The streaming layer is complete: a pull
+`Reader` over a slice, and `PushDecoder` for input that arrives in chunks and never sits in memory whole (the
+libcbor callback decoder's role). Typed mapping covers integers to 128 bits (bignums) and tags (`cbor_tag`, `Tagged`).
 Items refused on purpose are in *What is deliberately not done*; the open ones in *Backlog / deferred*.
 
 ## Design & invariants
@@ -238,26 +239,25 @@ Run: `scripts/modtest cbor` (`zig build test-cbor`; add `-Doptimize=ReleaseFast`
   indefinite-length encoding byte for byte is not served (`reject_indefinite` refuses them instead).
 - **NaN payloads are dropped** under `canonical` / `shortest_floats`: every NaN is written as `f97e00` (RFC 8949
   §4.2.2 leaves NaN to the protocol; dCBOR and cbor2 make the same choice).
-- **No bignum arithmetic.** Tags 2/3 decode structurally like any tag (tag number plus the byte-string payload);
-  consumers that need the numeric value convert the byte string themselves.
+- **No bignum arithmetic.** In a `Value`, tags 2/3 decode structurally like any tag (tag number plus the byte-string
+  payload); consumers that need the numeric value convert the byte string themselves. The typed mapping converts them
+  for Zig integers up to 128 bits.
 - **No private-key material in COSE.** `d` (label -4, EC2/OKP) and `priv` (label -2, AKP) are never parsed or
   emitted; the layer is for verifiers and public-key consumers, not key storage. RSA and symmetric key types return
   `error.UnsupportedKty`.
-- **Typed mapping refuses at compile time** what it cannot map faithfully: integers wider than 64 bits,
-  sentinel-terminated slices, untagged unions (`typed.zig` `@compileError`s); tags are not mapped to Zig types (use a
-  `Value` field).
+- **Typed mapping refuses at compile time** what it cannot map faithfully: integers wider than 128 bits,
+  sentinel-terminated slices, untagged unions (`typed.zig` `@compileError`s).
+- **No diagnostic-notation parser** (EDN to CBOR, for writing test vectors by hand). The reference (libcbor) has none,
+  nor do cbor2 or fxamacker/cbor (they print it, `diag` does too); the Rust `cbor-diag` crate parses it. A second
+  grammar to fuzz for a tool no consumer asks for.
+- **No `COSE_Mac` / `COSE_Encrypt` with recipients** (RFC 9052 §5.1, §6.1): the recipient structures carry key
+  agreement and key wrap, which are protocols over the sibling crypto modules, not wire shape. `COSE_Sign`,
+  `COSE_Mac0` and `COSE_Encrypt0` are provided (`cose.zig`); a recipient is a nested `[protected, unprotected,
+  ciphertext, [recipients]]` the caller can build from the same header helpers.
 
 ## Backlog / deferred
 
-- **Push decoder with partial-string state** for input that never sits in memory whole: the reader needs an item's
-  bytes in one slice (it retries a cut token). Deferred: every in-collection consumer holds the whole message, and a
-  callback decoder is a second parser to keep in step with `decode`.
-- **Diagnostic-notation parser** (EDN to CBOR, for writing test vectors by hand): no consumer, and a second grammar
-  to fuzz.
-- **`COSE_Mac0` / `COSE_Encrypt0` / multi-signer `COSE_Sign`:** wait for a consumer beyond WebAuthn/attestation (the
-  reference, libcbor, has no COSE at all). Effort: medium each; fits CONVENTIONS §2 (the primitives exist as
-  siblings).
-- **Typed mapping: tag to Zig type mapping and integers wider than 64 bits.** No consumer.
+None open.
 
 ## Anchoring
 

@@ -979,6 +979,8 @@ pub const stream = @import("stream.zig");
 pub const Reader = stream.Reader;
 pub const Writer = stream.Writer;
 pub const Token = stream.Token;
+/// Callback decoder for input that arrives in chunks: `PushDecoder(max_depth)`.
+pub const PushDecoder = stream.PushDecoder;
 
 /// RFC 8949 §8 diagnostic notation.
 pub const diag = @import("diag.zig");
@@ -995,6 +997,7 @@ test {
     _ = stream;
     _ = diag;
     _ = typed;
+    _ = @import("push_test.zig");
     _ = @import("core_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("kat_test.zig");

@@ -7,7 +7,7 @@
 //! | Zig type                    | CBOR                                                   |
 //! |-----------------------------|--------------------------------------------------------|
 //! | `bool`                      | `true` / `false`                                       |
-//! | integers (≤ 64 bits)        | major type 0/1, range-checked (`error.Overflow`)        |
+//! | integers (≤ 128 bits)       | major type 0/1; beyond 64 bits a bignum (tag 2/3, preferred serialization on encode, leading zeros tolerated on decode); range-checked (`error.Overflow`) |
 //! | `f16` / `f32` / `f64`       | any float width; decode refuses a value the target cannot hold exactly (`error.Overflow`) |
 //! | `[]const u8`                | text string (UTF-8) — or a byte string, see `bytes` below |
 //! | `[N]u8`                     | byte string of exactly N bytes (`error.LengthMismatch`) |
@@ -19,6 +19,7 @@
 //! | `union(enum)`               | a one-entry map `{field-key: payload}` (`void` payload ↔ `null`) |
 //! | `*const T`                  | the `T` it points to                                    |
 //! | `cbor.Value`                | the item as is                                          |
+//! | a type with `cbor_tag`, `Tagged(N, T)` | the item under tag N (`error.WrongTag` when absent or another) |
 //! | `void`                      | `null`                                                  |
 //!
 //! A struct (or tagged union) may declare how it maps:
@@ -99,6 +100,9 @@ pub const Error = root.DecodeError || error{
     InvalidEnum,
     /// Mapping would allocate more than `Options.max_alloc_bytes`.
     TooLarge,
+    /// A type that declares `cbor_tag` met an item without that tag, or with
+    /// another tag number.
+    WrongTag,
 };
 
 pub const Options = struct {
@@ -112,6 +116,21 @@ pub const Options = struct {
     /// would be a 128 GiB request. Past the cap: `error.TooLarge`.
     max_alloc_bytes: usize = 64 << 20,
 };
+
+/// `T` carried under tag `number` wherever it appears (a struct field, a
+/// slice item, the top-level item): `Tagged(1, i64)` is an epoch time (RFC
+/// 8949 §3.4.2), `Tagged(0, []const u8)` a date/time string. Decoding without
+/// that tag, or with another, is `error.WrongTag`. The wrapped value is
+/// `.value`. A struct, enum or tagged union of your own does the same with
+/// `pub const cbor_tag: u64 = N;`.
+pub fn Tagged(comptime number: u64, comptime T: type) type {
+    return struct {
+        value: T,
+
+        pub const cbor_tag = number;
+        pub const cbor_transparent = true;
+    };
+}
 
 /// A decoded `T` and the arena that holds it.
 pub fn Parsed(comptime T: type) type {
@@ -212,7 +231,50 @@ fn keyValue(comptime k: Key) Value {
 
 // ── decode ─────────────────────────────────────────────────────────────────
 
+/// The tag number a type declares with `pub const cbor_tag`, if any.
+fn tagOf(comptime T: type) ?u64 {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union" => if (@hasDecl(T, "cbor_tag")) @as(u64, T.cbor_tag) else null,
+        else => null,
+    };
+}
+
 fn valueInto(comptime T: type, comptime as_bytes: bool, arena: Allocator, v: Value, options: Options, budget: *usize) Error!T {
+    if (comptime tagOf(T)) |number| {
+        const t = switch (v) {
+            .tag => |t| t,
+            else => return error.WrongTag,
+        };
+        if (t.number != number) return error.WrongTag;
+        return valueIntoRaw(T, as_bytes, arena, t.value.*, options, budget);
+    }
+    return valueIntoRaw(T, as_bytes, arena, v, options, budget);
+}
+
+/// An integer item for `T`: major type 0/1, or a bignum (tag 2/3, RFC 8949 §3.4.3; leading zero bytes tolerated).
+fn intInto(comptime T: type, v: Value) Error!T {
+    switch (v) {
+        .uint => |u| return std.math.cast(T, u) orelse error.Overflow,
+        .negint => |n| return std.math.cast(T, -1 - @as(i256, n)) orelse error.Overflow,
+        .tag => |t| {
+            if (t.number != 2 and t.number != 3) return error.WrongType;
+            const b = switch (t.value.*) {
+                .bytes => |b| b,
+                else => return error.WrongType,
+            };
+            var i: usize = 0;
+            while (i < b.len and b[i] == 0) i += 1;
+            if (b.len - i > 16) return error.Overflow;
+            var n: u128 = 0;
+            for (b[i..]) |x| n = (n << 8) | x;
+            const val: i256 = if (t.number == 2) @as(i256, n) else -1 - @as(i256, n);
+            return std.math.cast(T, val) orelse error.Overflow;
+        },
+        else => return error.WrongType,
+    }
+}
+
+fn valueIntoRaw(comptime T: type, comptime as_bytes: bool, arena: Allocator, v: Value, options: Options, budget: *usize) Error!T {
     if (T == Value) return v;
     switch (@typeInfo(T)) {
         .bool => return switch (v) {
@@ -224,12 +286,8 @@ fn valueInto(comptime T: type, comptime as_bytes: bool, arena: Allocator, v: Val
             else => error.WrongType,
         },
         .int => |info| {
-            if (info.bits > 64) @compileError("cbor.typed: integers wider than 64 bits are not mapped");
-            return switch (v) {
-                .uint => |u| std.math.cast(T, u) orelse error.Overflow,
-                .negint => |n| std.math.cast(T, -1 - @as(i128, n)) orelse error.Overflow,
-                else => error.WrongType,
-            };
+            if (info.bits > 128) @compileError("cbor.typed: integers wider than 128 bits are not mapped");
+            return intInto(T, v);
         },
         .float => {
             const x: f64 = switch (v) {
@@ -305,6 +363,11 @@ fn valueInto(comptime T: type, comptime as_bytes: bool, arena: Allocator, v: Val
             else => @compileError("cbor.typed: only one-item pointers and slices are mapped, not " ++ @typeName(T)),
         },
         .@"struct" => |info| {
+            if (@hasDecl(T, "cbor_transparent")) {
+                var out: T = undefined;
+                out.value = try valueInto(@FieldType(T, "value"), false, arena, v, options, budget);
+                return out;
+            }
             if (info.is_tuple) {
                 const items = switch (v) {
                     .array => |a| a,
@@ -371,13 +434,44 @@ fn intValue(x: anytype) Value {
     return .{ .uint = @intCast(x) };
 }
 
+/// An integer of up to 128 bits: major type 0/1 when it fits 64 bits, else a bignum (tag 2/3, preferred serialization).
+fn bigIntValue(arena: Allocator, x: anytype) Allocator.Error!Value {
+    const v: i256 = x;
+    if (v >= 0 and v <= std.math.maxInt(u64)) return .{ .uint = @intCast(v) };
+    if (v < 0 and -1 - v <= std.math.maxInt(u64)) return .{ .negint = @intCast(-1 - v) };
+    const mag: u128 = @intCast(if (v < 0) -1 - v else v);
+    const len = (128 - @clz(mag) + 7) / 8;
+    const bytes = try arena.alloc(u8, len);
+    var m = mag;
+    var i = len;
+    while (i > 0) {
+        i -= 1;
+        bytes[i] = @truncate(m);
+        m >>= 8;
+    }
+    const inner = try arena.create(Value);
+    inner.* = .{ .bytes = bytes };
+    return .{ .tag = .{ .number = if (v < 0) 3 else 2, .value = inner } };
+}
+
 fn valueFrom(comptime T: type, comptime as_bytes: bool, arena: Allocator, x: T) Allocator.Error!Value {
+    const inner = try valueFromRaw(T, as_bytes, arena, x);
+    if (comptime tagOf(T)) |number| {
+        const p = try arena.create(Value);
+        p.* = inner;
+        return .{ .tag = .{ .number = number, .value = p } };
+    }
+    return inner;
+}
+
+fn valueFromRaw(comptime T: type, comptime as_bytes: bool, arena: Allocator, x: T) Allocator.Error!Value {
     if (T == Value) return x;
     switch (@typeInfo(T)) {
         .bool => return .{ .bool = x },
         .void, .null => return .null_value,
         .int => |info| {
-            if (info.bits > 64) @compileError("cbor.typed: integers wider than 64 bits are not mapped");
+            if (info.bits > 128) @compileError("cbor.typed: integers wider than 128 bits are not mapped");
+            if (info.bits > 64) return bigIntValue(arena, x);
             return intValue(x);
         },
         .comptime_int => return comptime intValue(@as(i65, x)),
@@ -415,6 +509,7 @@ fn valueFrom(comptime T: type, comptime as_bytes: bool, arena: Allocator, x: T) 
             else => @compileError("cbor.typed: only one-item pointers and slices are mapped, not " ++ @typeName(T)),
         },
         .@"struct" => |info| {
+            if (@hasDecl(T, "cbor_transparent")) return valueFrom(@FieldType(T, "value"), false, arena, x.value);
             if (info.is_tuple) {
                 const out = try arena.alloc(Value, info.field_names.len);
                 inline for (fieldRecs(info), 0..) |f, i| out[i] = try valueFrom(f.type, false, arena, x[i]);

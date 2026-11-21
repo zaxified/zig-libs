@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! cose — minimal RFC 9052 (CBOR Object Signing and Encryption) layer over
 //! the sibling `cbor` codec: parse a `COSE_Key` (EC2, OKP or AKP) into a typed
-//! struct, parse/build `COSE_Sign1`, and build the `Sig_structure` bytes a
-//! signer/verifier feeds to its signature algorithm. This is exactly the
+//! struct, parse/build `COSE_Sign1`, `COSE_Sign` (multi-signer), `COSE_Mac0`
+//! and `COSE_Encrypt0`, and build the `Sig_structure`/`MAC_structure`/
+//! `Enc_structure` bytes a signer, MAC or AEAD feeds its algorithm. This is exactly the
 //! slice WebAuthn/FIDO2 needs to pull an authenticator's public key out of
 //! an attestation object and verify a signature over it — the actual
 //! ECDSA/EdDSA math stays in the sibling `p256`/`ed448`/etc. modules; this
@@ -14,8 +15,8 @@
 //! material is never parsed or emitted — `d` at COSE label -4 for EC2/OKP
 //! and `priv` at label -2 for AKP, which is the SAME NUMBER that means `x`
 //! under a different `kty`. This is a verifier/public-key-consumer layer,
-//! not a key-storage format; COSE_Mac0/COSE_Encrypt0/full COSE_Sign
-//! (multi-signer) are not implemented; RSA and symmetric COSE key types are
+//! not a key-storage format; the recipient-carrying `COSE_Mac` and
+//! `COSE_Encrypt` are not implemented; RSA and symmetric COSE key types are
 //! not modeled (`parseKey` returns `error.UnsupportedKty` for anything but
 //! EC2, OKP and AKP). There is no `encodeAkpKey` — this module parses AKP
 //! keys, it does not emit them.
@@ -403,6 +404,14 @@ pub fn encodeOkpKey(a: Allocator, k: OkpKey) Allocator.Error!Value {
     return .{ .map = try list.toOwnedSlice(a) };
 }
 
+/// The protected header as the to-be-signed/MAC/AAD structures carry it
+/// (RFC 9052 §4.4, §5.3, §6.3): an empty header is the zero-length bstr, so
+/// the serialized empty map `a0` that some encoders put on the wire stands
+/// for it. Anything else is verbatim.
+fn structProtected(protected: []const u8) []const u8 {
+    return if (protected.len == 1 and protected[0] == 0xa0) "" else protected;
+}
+
 // ── COSE_Sign1 (RFC 9052 §4.2) ──────────────────────────────────────────────
 
 pub const Sign1Error = error{
@@ -485,6 +494,10 @@ pub fn encodeSign1(a: Allocator, s: Sign1) Allocator.Error![]u8 {
 
 /// Build the `Sig_structure` bytes (RFC 9052 §4.4) that get hashed/signed
 /// or hashed/verified — `context` is `"Signature1"` for `COSE_Sign1`.
+/// `protected` is the serialized header as it sits on the wire; an empty
+/// one (zero-length, or the encoded empty map `a0`) is carried as a
+/// zero-length bstr, as the `cose-wg/Examples` "Redo protected" vectors
+/// have it.
 /// `external_aad` is normally empty (`&.{}`) unless the application defines
 /// additional authenticated data. This is as far as this module goes: the
 /// caller feeds the returned bytes to their signature algorithm's
@@ -492,9 +505,281 @@ pub fn encodeSign1(a: Allocator, s: Sign1) Allocator.Error![]u8 {
 pub fn sigStructure(a: Allocator, protected: []const u8, external_aad: []const u8, payload: []const u8) Allocator.Error![]u8 {
     const arr = [_]Value{
         .{ .text = "Signature1" },
-        .{ .bytes = protected },
+        .{ .bytes = structProtected(protected) },
         .{ .bytes = external_aad },
         .{ .bytes = payload },
+    };
+    return try cbor.encode(a, .{ .array = &arr }, .{});
+}
+
+// ── COSE_Sign, COSE_Mac0, COSE_Encrypt0 (RFC 9052 §4.1, §6.2, §5.2) ─────────
+//
+// Like `COSE_Sign1` above these are the wire structures and the byte strings
+// to authenticate (`signStructure`, `macStructure`, `encStructure`); the
+// signature, MAC and AEAD primitives are the caller's (sibling modules). A
+// message may be the bare array or wrapped in its tag (`tag_sign` 98,
+// `tag_mac0` 17, `tag_encrypt0` 16); the tag number is not checked.
+
+/// COSE message tags (RFC 9052 §2, Table 1).
+pub const tag_encrypt0: u64 = 16;
+pub const tag_mac0: u64 = 17;
+pub const tag_sign1: u64 = 18;
+pub const tag_sign: u64 = 98;
+
+/// Header parameter labels used with these messages (RFC 9052 §3.1).
+pub const label_kid: i64 = 4;
+pub const label_iv: i64 = 5;
+pub const label_partial_iv: i64 = 6;
+
+/// Content-encryption and MAC algorithm identifiers (RFC 9053 §3, §4).
+pub const alg_a128gcm: i64 = 1;
+pub const alg_a192gcm: i64 = 2;
+pub const alg_a256gcm: i64 = 3;
+pub const alg_hmac_256_256: i64 = 5;
+pub const alg_hmac_384_384: i64 = 6;
+pub const alg_hmac_512_512: i64 = 7;
+pub const alg_chacha20_poly1305: i64 = 24;
+
+pub const SignError = error{
+    /// Not a 4-element array whose last element is an array of at least one
+    /// signature, or a signature that is not a 3-element array.
+    NotSign,
+    WrongType,
+    DuplicateLabel,
+    TooManyEntries,
+};
+pub const Mac0Error = error{
+    /// Not a 4-element array (after optionally unwrapping a tag).
+    NotMac0,
+    WrongType,
+    DuplicateLabel,
+    TooManyEntries,
+};
+pub const Encrypt0Error = error{
+    /// Not a 3-element array (after optionally unwrapping a tag).
+    NotEncrypt0,
+    WrongType,
+    DuplicateLabel,
+    TooManyEntries,
+};
+
+/// One `COSE_Signature` (RFC 9052 §4.1): `[protected, unprotected, signature]`.
+pub const Signature = struct {
+    /// Serialized protected header, verbatim (see `Sign1.protected`).
+    protected: []const u8,
+    unprotected: []const MapEntry,
+    signature: []const u8,
+};
+
+/// A parsed `COSE_Sign` (RFC 9052 §4.1): `[protected, unprotected, payload,
+/// signatures]`. The signatures stay `Value`s of the decoded tree; read each
+/// with `parseSignature`.
+pub const Sign = struct {
+    /// The body protected header, verbatim.
+    protected: []const u8,
+    unprotected: []const MapEntry,
+    /// `null` for a detached payload.
+    payload: ?[]const u8,
+    signatures: []const Value,
+};
+
+/// The parts of a `COSE_Sign` to build (`encodeSign`).
+pub const SignParts = struct {
+    protected: []const u8,
+    unprotected: []const MapEntry,
+    payload: ?[]const u8,
+    signatures: []const Signature,
+};
+
+/// A parsed `COSE_Mac0` (RFC 9052 §6.2): `[protected, unprotected, payload, tag]`.
+pub const Mac0 = struct {
+    protected: []const u8,
+    unprotected: []const MapEntry,
+    /// `null` for a detached payload.
+    payload: ?[]const u8,
+    tag: []const u8,
+};
+
+/// A parsed `COSE_Encrypt0` (RFC 9052 §5.2): `[protected, unprotected, ciphertext]`.
+pub const Encrypt0 = struct {
+    protected: []const u8,
+    unprotected: []const MapEntry,
+    /// `null` for a detached ciphertext.
+    ciphertext: ?[]const u8,
+};
+
+fn untag(value: Value) Value {
+    return switch (value) {
+        .tag => |t| t.value.*,
+        else => value,
+    };
+}
+
+fn bstrOf(v: Value) error{WrongType}![]const u8 {
+    return switch (v) {
+        .bytes => |b| b,
+        else => error.WrongType,
+    };
+}
+
+fn bstrOrNil(v: Value) error{WrongType}!?[]const u8 {
+    return switch (v) {
+        .bytes => |b| b,
+        .null_value => null,
+        else => error.WrongType,
+    };
+}
+
+fn headerMap(v: Value) error{ WrongType, DuplicateLabel, TooManyEntries }![]const MapEntry {
+    const m = switch (v) {
+        .map => |m| m,
+        else => return error.WrongType,
+    };
+    try checkLabels(m);
+    return m;
+}
+
+fn bytesOrNil(p: ?[]const u8) Value {
+    return if (p) |b| .{ .bytes = b } else .null_value;
+}
+
+/// Parse a `COSE_Sign` (RFC 9052 §4.1), bare or tag-98 wrapped.
+pub fn parseSign(value: Value) SignError!Sign {
+    const arr = switch (untag(value)) {
+        .array => |a| a,
+        else => return error.NotSign,
+    };
+    if (arr.len != 4) return error.NotSign;
+    const sigs = switch (arr[3]) {
+        .array => |a| a,
+        else => return error.WrongType,
+    };
+    if (sigs.len == 0) return error.NotSign;
+    return .{
+        .protected = try bstrOf(arr[0]),
+        .unprotected = try headerMap(arr[1]),
+        .payload = try bstrOrNil(arr[2]),
+        .signatures = sigs,
+    };
+}
+
+/// Parse one `COSE_Signature` out of `Sign.signatures`.
+pub fn parseSignature(value: Value) SignError!Signature {
+    const arr = switch (value) {
+        .array => |a| a,
+        else => return error.NotSign,
+    };
+    if (arr.len != 3) return error.NotSign;
+    return .{
+        .protected = try bstrOf(arr[0]),
+        .unprotected = try headerMap(arr[1]),
+        .signature = try bstrOf(arr[2]),
+    };
+}
+
+/// Build the wire bytes of a `COSE_Sign` (the bare array, see `encodeSign1`).
+pub fn encodeSign(a: Allocator, s: SignParts) Allocator.Error![]u8 {
+    const sig_vals = try a.alloc(Value, s.signatures.len);
+    defer a.free(sig_vals);
+    const inner = try a.alloc([3]Value, s.signatures.len);
+    defer a.free(inner);
+    for (s.signatures, inner, sig_vals) |sg, *slot, *out| {
+        slot.* = .{ .{ .bytes = sg.protected }, .{ .map = sg.unprotected }, .{ .bytes = sg.signature } };
+        out.* = .{ .array = slot };
+    }
+    const arr = [_]Value{
+        .{ .bytes = s.protected },
+        .{ .map = s.unprotected },
+        bytesOrNil(s.payload),
+        .{ .array = sig_vals },
+    };
+    return try cbor.encode(a, .{ .array = &arr }, .{});
+}
+
+/// The `Sig_structure` (RFC 9052 §4.4) of one `COSE_Signature` of a
+/// `COSE_Sign`: context `"Signature"`, the body and the signer protected
+/// headers (verbatim bytes), `external_aad`, the payload.
+pub fn signStructure(a: Allocator, body_protected: []const u8, sign_protected: []const u8, external_aad: []const u8, payload: []const u8) Allocator.Error![]u8 {
+    const arr = [_]Value{
+        .{ .text = "Signature" },
+        .{ .bytes = structProtected(body_protected) },
+        .{ .bytes = structProtected(sign_protected) },
+        .{ .bytes = external_aad },
+        .{ .bytes = payload },
+    };
+    return try cbor.encode(a, .{ .array = &arr }, .{});
+}
+
+/// Parse a `COSE_Mac0` (RFC 9052 §6.2), bare or tag-17 wrapped.
+pub fn parseMac0(value: Value) Mac0Error!Mac0 {
+    const arr = switch (untag(value)) {
+        .array => |a| a,
+        else => return error.NotMac0,
+    };
+    if (arr.len != 4) return error.NotMac0;
+    return .{
+        .protected = try bstrOf(arr[0]),
+        .unprotected = try headerMap(arr[1]),
+        .payload = try bstrOrNil(arr[2]),
+        .tag = try bstrOf(arr[3]),
+    };
+}
+
+/// Build the wire bytes of a `COSE_Mac0` (the bare array).
+pub fn encodeMac0(a: Allocator, m: Mac0) Allocator.Error![]u8 {
+    const arr = [_]Value{
+        .{ .bytes = m.protected },
+        .{ .map = m.unprotected },
+        bytesOrNil(m.payload),
+        .{ .bytes = m.tag },
+    };
+    return try cbor.encode(a, .{ .array = &arr }, .{});
+}
+
+/// The `MAC_structure` (RFC 9052 §6.3) a `COSE_Mac0` tag covers: context
+/// `"MAC0"`, the protected header (verbatim bytes), `external_aad`, payload.
+pub fn macStructure(a: Allocator, protected: []const u8, external_aad: []const u8, payload: []const u8) Allocator.Error![]u8 {
+    const arr = [_]Value{
+        .{ .text = "MAC0" },
+        .{ .bytes = structProtected(protected) },
+        .{ .bytes = external_aad },
+        .{ .bytes = payload },
+    };
+    return try cbor.encode(a, .{ .array = &arr }, .{});
+}
+
+/// Parse a `COSE_Encrypt0` (RFC 9052 §5.2), bare or tag-16 wrapped.
+pub fn parseEncrypt0(value: Value) Encrypt0Error!Encrypt0 {
+    const arr = switch (untag(value)) {
+        .array => |a| a,
+        else => return error.NotEncrypt0,
+    };
+    if (arr.len != 3) return error.NotEncrypt0;
+    return .{
+        .protected = try bstrOf(arr[0]),
+        .unprotected = try headerMap(arr[1]),
+        .ciphertext = try bstrOrNil(arr[2]),
+    };
+}
+
+/// Build the wire bytes of a `COSE_Encrypt0` (the bare array).
+pub fn encodeEncrypt0(a: Allocator, e: Encrypt0) Allocator.Error![]u8 {
+    const arr = [_]Value{
+        .{ .bytes = e.protected },
+        .{ .map = e.unprotected },
+        bytesOrNil(e.ciphertext),
+    };
+    return try cbor.encode(a, .{ .array = &arr }, .{});
+}
+
+/// The `Enc_structure` (RFC 9052 §5.3), the AEAD's additional authenticated
+/// data: context `"Encrypt0"`, the protected header (verbatim bytes),
+/// `external_aad`.
+pub fn encStructure(a: Allocator, protected: []const u8, external_aad: []const u8) Allocator.Error![]u8 {
+    const arr = [_]Value{
+        .{ .text = "Encrypt0" },
+        .{ .bytes = structProtected(protected) },
+        .{ .bytes = external_aad },
     };
     return try cbor.encode(a, .{ .array = &arr }, .{});
 }
