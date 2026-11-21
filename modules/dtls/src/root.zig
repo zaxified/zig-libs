@@ -465,8 +465,8 @@ test {
     _ = @import("fuzz12_test.zig");
 }
 
-test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\", \"aesgcm\", \"aesccm\", \"tls13\", \"mlkem\"} (certauth.zig's RSA SPKI + cert parsing + the ChaCha20-Poly1305, AES-GCM and AES-CCM suites + the shared key schedule, certverify and kex; the PSK flight engine itself needs no other sibling modules)" {
-    try std.testing.expectEqual(@as(usize, 7), meta.deps.len);
+test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\", \"aesgcm\", \"aesccm\", \"tls13\", \"mlkem\", \"tlsresume\"} (certauth.zig's RSA SPKI + cert parsing + the ChaCha20-Poly1305, AES-GCM and AES-CCM suites + the shared key schedule, certverify and kex + the session-ticket pieces; the PSK flight engine itself needs no other sibling modules)" {
+    try std.testing.expectEqual(@as(usize, 8), meta.deps.len);
     try std.testing.expectEqualStrings("rsa", meta.deps[0]);
     try std.testing.expectEqualStrings("x509", meta.deps[1]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
@@ -474,6 +474,7 @@ test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\", \"aesgcm\", \"aesccm\", \
     try std.testing.expectEqualStrings("aesccm", meta.deps[4]);
     try std.testing.expectEqualStrings("tls13", meta.deps[5]);
     try std.testing.expectEqualStrings("mlkem", meta.deps[6]);
+    try std.testing.expectEqualStrings("tlsresume", meta.deps[7]);
 }
 
 test "keyschedule.hkdfExpandLabel: uses the DTLS \"dtls13\" prefix (RFC 9147 §5.9)" {
