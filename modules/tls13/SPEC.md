@@ -200,7 +200,10 @@ received binder or Finished is the caller's, with `timing_safe.eql` (documented 
 
 `certverify`: the secret is the signing key. Signing is the collection's ECDSA (`p256`:
 std's nonce construction on an asm field with a fixed-base comb; `p384`: RFC 6979 with the noise
-as §3.6 additional data), std's Ed25519, and `rsa.signPss` (CRT with a fault check); their
+as §3.6 additional data; `p521`'s signer, RFC 6979 likewise), std's Ed25519, and `rsa.signPss` (CRT with a
+fault check). Every ECDSA arm signs from the secret scalar alone, with no `d·G` per signature (P-521's
+`KeyPair` route computed one: 32 % of a P-521 signature, paired ratio 0.681, IQR 0.67–0.71, ReleaseFast,
+2026-11-21); their
 constant-time behaviour is theirs (each module's own ctgrind rows). The public key types stay
 std's; a key crosses into `p256`/`p384` as its octets. The only comparison here is the Ed25519 public-half check
 (`timing_safe.eql`, pinned in `scripts/checks/ct-compare-expected.tsv`). Verification handles
@@ -393,10 +396,6 @@ benchmark `zig build bench-tls13` (see *Performance*), the example `zig build ru
   `tlsclient`/`dtls`) must offer and accept the groups; only then does a real Go 1.26 / rustls
   handshake anchor them beyond the composition oracle. `tlsserver` sizes buffers from
   `kex.max_*_share_len` (1665); the engines' group policy is theirs.
-- **Signing without re-deriving the public key:** `sign` gets a secret key and recomputes
-  `d·G` before every ECDSA signature (the public half is not used by the signature): ~7 % of a
-  `tlsserver` P-256 handshake (profile). A `SecretKey` variant holding the
-  collection's `KeyPair` would drop it — an API change for `dtls` and `tlsserver`.
 - **SHA-384 HMAC state caching in the key schedule:** 18 % of a `tlsserver`
   TLS_AES_256_GCM_SHA384 handshake is SHA-384 (profile), mostly lone-block HMACs
   that recompute the ipad/opad blocks of the same secret; `sha2` does not help lone blocks.

@@ -790,17 +790,19 @@ fn verifyEcdsaP521(pk: EcdsaP521.PublicKey, content: []const u8, signature: []co
 
 fn signEcdsaP521(sk: *const EcdsaP521.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
     // RFC 6979 nonces with the noise as §3.6 additional data (`p521`'s
-    // `sign`); `fromSecretKeyInto` refuses a scalar outside [1, n − 1].
-    var key_pair: EcdsaP521.KeyPair = undefined;
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&key_pair.secret_key));
-    EcdsaP521.KeyPair.fromSecretKeyInto(&key_pair, sk) catch return error.KeyMismatch;
-    var noise_buf: [EcdsaP521.noise_length]u8 = undefined;
-    defer std.crypto.secureZero(u8, &noise_buf);
-    const noise: ?[EcdsaP521.noise_length]u8 = if (random) |rnd| blk: {
-        rnd.bytes(&noise_buf);
-        break :blk noise_buf;
-    } else null; // null => RFC 6979 deterministic
-    const sig = key_pair.sign(content, noise) catch return error.KeyMismatch;
+    // signer); the secret scalar alone, as the P-256/P-384 arms: no `d·G`
+    // per signature (a `KeyPair` computed it, unused by the signature).
+    // `finalize` refuses a scalar outside [1, n − 1] and wipes the signer.
+    var signer: EcdsaP521.Signer = .{ .h = .init(.{}), .secret_key = sk.*, .noise = null };
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&signer));
+    if (random) |rnd| {
+        var noise: [EcdsaP521.noise_length]u8 = undefined;
+        rnd.bytes(&noise);
+        signer.noise = noise;
+        std.crypto.secureZero(u8, &noise);
+    } // null => RFC 6979 deterministic
+    signer.update(content);
+    const sig = signer.finalize() catch return error.KeyMismatch;
     return sig.toDer(out[0..EcdsaP521.Signature.der_encoded_length_max]);
 }
 
