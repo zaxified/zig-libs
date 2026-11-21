@@ -924,9 +924,12 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   decrypted content, none a branch on a key.
 - **Dead stack:** `src/stackprobe_test.zig`, `src/stackprobe2_test.zig` drive the burned entry points through full
   in-memory handshakes (PSK, cert X25519, cert P-256 with mutual auth, cert X25519MLKEM768; GCM, ChaCha20 and CCM;
-  a server flight-2 retransmission through `poll`), and the HelloRetryRequest cookie flow (PSK and cert X25519: the
-  first server's stateless retry, ClientHello2, a second fresh server; the cookie secret and its HMAC state are
-  needles). The ECDSA nonce of each CertificateVerify a live handshake sent is a needle too: the probe opens the
+  a server flight-2 retransmission through `poll`; the certificate handshakes carry an OCSP staple and SCT list), the
+  HelloRetryRequest cookie flow (PSK and cert X25519: the first server's stateless retry, ClientHello2, a second fresh
+  server; the cookie secret and its HMAC state are needles), and a 1.3 resumption with 0-RTT and ALPN (cert X25519,
+  SHA-256 and SHA-384 suites: the client's ClientHello with early records, the server opening the ticket and reading
+  them, the fresh ticket sealed and taken; the ticket PSK, its early secret and binder key, the STEK and its AES-256
+  round keys, the early traffic keys and the new ticket's PSK are needles). The ECDSA nonce of each CertificateVerify a live handshake sent is a needle too: the probe opens the
   sender's epoch-2 records with its handshake keys, rebuilds the transcript, checks the signature and solves `k`
   from it. By design and not dead stack: the standalone helpers `keyschedule.*`, `aead.Protection`, `record.*`
   return secrets by value into the CALLER's frame, and the live `Connection` keeps `pending_ap_*`, `hs_*` keys and

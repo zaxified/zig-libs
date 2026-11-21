@@ -791,6 +791,9 @@ const sets = [_]Set{
     .{ .name = "cert x25519 aes128ccm", .psk = false, .group = .x25519, .suite = .aes_128_ccm_sha256 },
 };
 
+const probe_staple = "\x30\x03\x0a\x01\x00"; // OCSPResponse { successful }
+const probe_scts = "\x00\x06\x00\x04\x05\x06\x07\x08";
+
 var psk_store: [32]u8 = undefined;
 var sk_server: Ecdsa.EcdsaP256Sha256.SecretKey = undefined;
 var sk_client: Ecdsa.EcdsaP256Sha256.SecretKey = undefined;
@@ -820,6 +823,12 @@ fn configs(comptime set: Set) !struct { c: dtls.Config, s: dtls.Config } {
         .cipher_suites = &suites,
         .cert = .{ .chain = &.{&cert_kat.server_cert_der}, .private_key = .{ .ecdsa_p256 = &sk_server } },
     };
+    // OCSP stapling and SCTs (public data) ride the leaf's CertificateEntry:
+    // the encoder/decoder paths run inside the probed steps.
+    c.request_ocsp = true;
+    c.request_scts = true;
+    s.cert.?.ocsp_response = probe_staple;
+    s.cert.?.sct_list = probe_scts;
     if (set.mutual) {
         c.cert = .{ .chain = &.{&cert_kat.client_cert_der}, .private_key = .{ .ecdsa_p256 = &sk_client } };
         s.request_client_cert = true;
@@ -1279,6 +1288,232 @@ test "STACKPROBE: no cookie-secret, ECDHE, traffic-secret or record-key residue 
         inline for (comptime std.meta.tags(HStep)) |st| {
             h_cur = st;
             bad += try runProbe("hrr " ++ set.name ++ " " ++ @tagName(st), hCallStep, &needles_store);
+        }
+        prep_fn = noPrep;
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Session resumption with 0-RTT (RFC 8446 §2.2, §2.3 over RFC 9147)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// A ticket from an unprobed full handshake (server `Config.tickets` over a
+// STEK ring, ALPN negotiated), then a resumption that sends early data: the
+// client's ClientHello + epoch-1 records (binder, early traffic keys), the
+// server's flight (ticket opened, binder checked, early records read), the
+// client's Finished, the server's last step (a fresh ticket sealed) and the
+// client taking that ticket. Needles: the ticket PSK, its early secret and
+// binder key, the STEK and its AES-256 round keys, the entropy not on the
+// wire, the ECDHE secret and shared value, the early, handshake and
+// application traffic secrets and record keys, and the new ticket's PSK.
+
+const tlsresume = @import("tlsresume");
+const Aes256 = std.crypto.core.aes.Aes256;
+
+const RStep = enum(u8) { c_start, s_hello, c_flight2, s_fin, c_ticket };
+const r_n = 5;
+var r_pre: [r_n]Connection = undefined;
+var r_in: [r_n][6144]u8 = undefined;
+var r_in_len: [r_n]usize = @splat(0);
+var r_rec: [r_n]Rec = undefined;
+var r_cur: RStep = .c_start;
+var r_ring: tlsresume.stek.DefaultRing = undefined;
+var r_tkr: dtls.StekTicketer(tlsresume.stek.DefaultRing) = undefined;
+var r_ticket: dtls.SessionTicket = undefined;
+var stek_key_store: [32]u8 = undefined;
+const r_early = "dtls 0-RTT probe early data";
+
+fn admitAll(_: ?*anyopaque, _: []const u8, _: i64) bool {
+    return true;
+}
+
+fn rConn(st: RStep) *Connection {
+    return switch (st) {
+        .c_start, .c_flight2, .c_ticket => &live_client,
+        .s_hello, .s_fin => &live_server,
+    };
+}
+
+fn rIn(i: usize) []const u8 {
+    return r_in[i][0..r_in_len[i]];
+}
+
+/// The records of `bytes`, one `recv` each; ACKs and post-handshake messages
+/// are what arrives here.
+fn deliverRecords(to: *Connection, bytes: []const u8) bool {
+    var rest = bytes;
+    while (rest.len != 0) {
+        const sp = record.nextDatagram(rest, 1);
+        rest = sp.rest;
+        if (to.recv(sp.datagram, &plain_buf)) |_| return false else |e| switch (e) {
+            error.ReceivedAck, error.ReceivedPostHandshakeMessage => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// API adapter for the resumption flow.
+fn rDoStep(st: RStep) void {
+    const ent: dtls.Entropy = .{ .seeded_for_test = rec.random() };
+    switch (st) {
+        .c_start => {
+            const o = live_client.startHandshake(ent, 0, &out_buf) catch return failStep();
+            out_len = o.len;
+        },
+        .c_ticket => {
+            if (!deliverRecords(&live_client, rIn(@backingInt(st)))) return failStep();
+            out_len = 0;
+        },
+        else => {
+            const r = rConn(st).handleFlight(rIn(@backingInt(st)), ent, 0, &out_buf) catch return failStep();
+            out_len = r.out.len;
+        },
+    }
+}
+
+noinline fn rCallStep() void {
+    rDoStep(r_cur);
+}
+
+fn rPrep() void {
+    @memcpy(std.mem.asBytes(rConn(r_cur)), std.mem.asBytes(&r_pre[@backingInt(r_cur)]));
+    rec.reset(cur_seed +% @backingInt(r_cur));
+}
+
+/// The unprobed full handshake that issues `r_ticket`.
+fn rTicketHandshake(cfg_c: dtls.Config, cfg_s: dtls.Config) !void {
+    live_client = try Connection.clientInit(cfg_c);
+    live_server = try Connection.serverInit(cfg_s);
+    rec.reset(cur_seed +% 0x100);
+    const ent: dtls.Entropy = .{ .seeded_for_test = rec.random() };
+    var b1: [6144]u8 = undefined;
+    var b2: [6144]u8 = undefined;
+    const ch = try live_client.startHandshake(ent, 0, &b1);
+    const f2 = try live_server.handleFlight(ch, ent, 0, &b2);
+    const cf = try live_client.handleFlight(f2.out, ent, 0, &b1);
+    const sr = try live_server.handleFlight(cf.out, ent, 0, &b2);
+    try std.testing.expect(sr.done and deliverRecords(&live_client, sr.out));
+    r_ticket = (live_client.sessionTicket() orelse return error.TestNoTicket).*;
+}
+
+/// Walk the resumption once; each step's output is the next one's input.
+fn rReference(cfg_c: dtls.Config, cfg_s: dtls.Config) !void {
+    live_client = try Connection.clientInit(cfg_c);
+    live_server = try Connection.serverInit(cfg_s);
+    r_in_len = @splat(0);
+    for (0..r_n) |i| {
+        const st: RStep = @fromBackingInt(@intCast(i));
+        r_cur = st;
+        @memcpy(std.mem.asBytes(&r_pre[i]), std.mem.asBytes(rConn(st)));
+        rPrep();
+        step_failed = false;
+        rDoStep(st);
+        try std.testing.expect(!step_failed);
+        r_rec[i] = rec;
+        if (i + 1 < r_n) {
+            @memcpy(r_in[i + 1][0..out_len], out_buf[0..out_len]);
+            r_in_len[i + 1] = out_len;
+        }
+    }
+    try std.testing.expectEqual(dtls.connection.State.connected, live_client.state);
+    try std.testing.expectEqual(dtls.connection.State.connected, live_server.state);
+    try std.testing.expect(live_server.resumed() and live_client.resumed());
+    try std.testing.expect(live_server.earlyDataAccepted() and live_client.earlyDataAccepted());
+    try std.testing.expectEqualSlices(u8, r_early, live_server.earlyData());
+    const fresh = live_client.sessionTicket() orelse return error.TestNoTicket;
+    try std.testing.expect(!std.mem.eql(u8, fresh.identity(), r_ticket.identity()));
+}
+
+fn rOnWire(chunk: []const u8) bool {
+    for (0..r_n) |i| {
+        if (std.mem.find(u8, rIn(i), chunk) != null) return true;
+    }
+    return false;
+}
+
+fn rBuildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
+    n.len = 0;
+    n.n_names = 0;
+    const aes = set.suite == .aes_128_gcm_sha256 or set.suite == .aes_128_ccm_sha256 or set.suite == .aes_128_ccm_8_sha256;
+    const alg = comptime set.suite.hash();
+    const L = comptime alg.len();
+    for (0..r_n) |i| {
+        const r = &r_rec[i];
+        for (0..r.n_ent) |e| {
+            const chunk = r.log[r.ent_off[e]..][0..r.ent_len[e]];
+            if (rOnWire(chunk)) continue;
+            n.addBig("entropy", chunk);
+            if (chunk.len == 32) {
+                var cl: [32]u8 = chunk[0..32].*;
+                cl[0] &= 248;
+                cl[31] &= 127;
+                cl[31] |= 64;
+                n.addBig("x25519 scalar", &cl);
+            }
+        }
+    }
+    n.addBig("ticket psk", r_ticket.psk[0..L]);
+    var es: suitehash.Secret = undefined;
+    suitehash.earlySecret(alg, &es, r_ticket.psk[0..L]);
+    n.addBig("early secret", es[0..L]);
+    var bk: suitehash.Secret = undefined;
+    suitehash.resumptionBinderKey(alg, &bk, &es);
+    n.addBig("binder key", bk[0..L]);
+    n.addBig("stek", &stek_key_store);
+    const stek_aes = Aes256.initEnc(stek_key_store);
+    n.addImage("stek round keys", std.mem.asBytes(&stek_aes));
+    const cl = &r_pre[@backingInt(RStep.c_flight2)];
+    const sv = &r_pre[@backingInt(RStep.s_fin)];
+    n.addBig("ecdhe secret", cl.ecdhe_secret[0..32]);
+    const ss = try X25519.scalarmult(cl.ecdhe_secret[0..32].*, sv.ecdhe_public[0..32].*);
+    n.addBig("dh shared", &ss);
+    n.addBig("hs traffic c", sv.hs_traffic_client[0..L]);
+    n.addBig("hs traffic s", sv.hs_traffic_server[0..L]);
+    n.addBig("ap traffic c", sv.pending_ap_client[0..L]);
+    n.addBig("ap traffic s", sv.pending_ap_server[0..L]);
+    n.addBig("resumption master", live_server.resumption_master[0..L]);
+    n.addBig("new ticket psk", live_client.sessionTicket().?.psk[0..L]);
+    addDir(n, cl.early_keys, aes);
+    addDir(n, sv.early_keys, aes);
+    addDir(n, sv.hs_write_keys, aes);
+    addDir(n, sv.hs_read_keys, aes);
+    addDir(n, live_client.write_keys, aes);
+    addDir(n, live_client.read_keys, aes);
+    addDir(n, live_server.write_keys, aes);
+    addDir(n, live_server.read_keys, aes);
+    var ctl: [LEAK]u8 = undefined;
+    Sha256.hash("resume " ++ set.name, &ctl, .{});
+    n.addBig("control", &ctl);
+    n.sort();
+    return ctl;
+}
+
+test "STACKPROBE: no ticket-PSK, STEK, early-traffic, ECDHE or record-key residue on the dead stack through a 0-RTT resumption" {
+    try skipUnlessOptimized();
+    const r_sets = [_]Set{ sets[2], sets[6] }; // cert x25519 aes128gcm, cert x25519 aes256gcm sha384
+    var bad: usize = 0;
+    inline for (r_sets, 0..) |set, si| {
+        Sha256.hash("stek " ++ set.name, &stek_key_store, .{});
+        r_ring = .init();
+        r_ring.rotate(1, &stek_key_store, cert_kat.valid_now_sec);
+        r_tkr = .{ .ring = &r_ring };
+        cur_seed = 0x0E77_0000 + si * 64;
+        var cfg = try configs(set);
+        cfg.s.now_sec = cert_kat.valid_now_sec;
+        cfg.s.tickets = .{ .ticketer = r_tkr.ticketer(), .max_early_data = 1024, .replay = .{ .admit = admitAll } };
+        cfg.c.alpn_protocols = &.{"coap"};
+        cfg.s.alpn_protocols = &.{"coap"};
+        try rTicketHandshake(cfg.c, cfg.s);
+        cfg.c.resumption = &r_ticket;
+        cfg.c.early_data = r_early;
+        try rReference(cfg.c, cfg.s);
+        leak_src = try rBuildNeedles(&needles_store, set);
+        prep_fn = rPrep;
+        inline for (comptime std.meta.tags(RStep)) |st| {
+            r_cur = st;
+            bad += try runProbe("resume " ++ set.name ++ " " ++ @tagName(st), rCallStep, &needles_store);
         }
         prep_fn = noPrep;
     }
