@@ -157,9 +157,8 @@ is implemented end to end:
   `spend_type = 2` (`ext_flag = 1`, `+1` with an annex), the `sha_annex` commitment when an annex
   is present, and the appended `tapleaf_hash || key_version(0x00) || codesep_pos`. `codesep_pos` is
   the opcode position of the last executed `OP_CODESEPARATOR` (or `0xffffffff`), counting every
-  parsed opcode (executed or not). Because `bitcointx.bip341.sigMsg` is key-path-only (hard-coded
-  `spend_type = 0x00`, no extension), this module rebuilds the common message; its `ext_flag = 0`
-  prefix is cross-checked byte-for-byte against that KAT-backed function (`tapscript.zig`).
+  parsed opcode (executed or not). The common message comes from `bitcointx.bip341.commonSigMsg` (the same
+  code as the key-path `sigMsg`, parameterised by `spend_type` and the annex hash); this module appends only the BIP342 extension.
 
 **Verification honesty**: the taproot *commitment* math and the SigMsg *common prefix* are backed by
 external BIP341 vectors / `bitcointx`'s KAT-backed key-path sigMsg respectively. The end-to-end
@@ -500,4 +499,3 @@ verifier.
 ## Backlog / deferred
 
 - **Pin the full `script_tests.json` and `script_assets_test.json`** (survey 2026-09-30) — the non-witness rows are a sample by design; from the BIP342 corpus (`script_assets_test.json`) only the 5-transaction slice in `consensus_kat_vectors.zig` is pinned. Effort M (vendoring size). Fits §2.
-- **Shared `commonSigMsg` in `bitcointx`.** `tapscript.sigMsg` rebuilds the BIP341 common signature message because `bitcointx.bip341.sigMsg` is key-path-only (`spend_type = 0x00`, no extension); lifting one shared implementation into `bitcointx` would remove the duplicate (the `ext_flag = 0` prefix is cross-checked byte for byte today).
