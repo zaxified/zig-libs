@@ -148,6 +148,8 @@ const Outcome = struct {
     peer: ?[]u8 = null,
     /// Offloaded signatures made.
     signed: usize = 0,
+    /// The server accepted the client's ECH offer.
+    ech: bool = false,
 
     fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
         gpa.free(o.echoed);
@@ -170,6 +172,8 @@ const ClientOffer = struct {
     request_scts: bool = true,
     /// The client's wall clock, ms past 2030-03-17 (`tlsclient` only).
     clock_ms: i64 = 0,
+    /// Encrypted Client Hello (`tlsclient` only).
+    ech_config_list: ?[]const u8 = null,
 };
 
 const ServerSide = struct {
@@ -180,6 +184,7 @@ const ServerSide = struct {
     client_auth: ?*const server_mod.ClientAuth = null,
     /// Signs for a certificate whose key is offloaded.
     offload_key: ?tls13.certverify.SecretKey = null,
+    ech: ?*const server_mod.ech.Ech = null,
 };
 
 /// One handshake of client type `C` against the server, then a request, a
@@ -194,6 +199,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .random = prng.random(),
         .tickets = srv.tickets,
         .client_auth = srv.client_auth,
+        .ech = srv.ech,
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
@@ -203,9 +209,13 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
     // are then built on the stack), not written past.
     const peer = try gpa.alloc(u8, if (srv.client_auth) |ca| server_mod.peerBufferLen(ca.max_leaf_len) else 16);
     defer gpa.free(peer);
+    // Freed after `server.deinit`, which wipes it.
+    const ech_buf = try gpa.alloc(u8, if (srv.ech) |e| server_mod.ech.bufferLen(e.max_client_hello_len) else 0);
+    defer gpa.free(ech_buf);
     var server: Server = .init(&config, joiner, out);
     server.setPeerBuffer(peer);
     defer server.deinit();
+    if (srv.ech != null) server.setEchBuffer(ech_buf);
 
     const pipe = try gpa.create(Pipe);
     defer gpa.destroy(pipe);
@@ -236,6 +246,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .client_auth_select = offer.client_auth_select,
         .request_ocsp = offer.request_ocsp,
         .request_scts = offer.request_scts,
+        .ech_config_list = offer.ech_config_list,
     }) else StdClient.init(&pipe.reader, &pipe.client_out, .{
         .host = .{ .explicit = "localhost" },
         .ca = .self_signed,
@@ -306,6 +317,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .echoed = try gpa.dupe(u8, got[0..n]),
         .peer = if (server.peerCertificate()) |p| try gpa.dupe(u8, p) else null,
         .signed = pipe.signed,
+        .ech = server.echAccepted(),
     };
 }
 
@@ -1490,4 +1502,144 @@ test "wave 3: a ticket lifetime over 7 days still holds a client certificate's p
         defer o.deinit(testing.allocator);
         try testing.expectEqual(step[1], o.resumed);
     }
+}
+
+// ── tlsclient's Encrypted Client Hello (RFC 9849) against this server's ──
+
+const ech_mod = server_mod.ech;
+
+/// An ECHConfig for `pk` offering HKDF-SHA256 with one AEAD.
+fn echConfig(buf: []u8, id: u8, pk: *const [32]u8, aead: u16, public_name: []const u8) []u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeInt(u16, ech_mod.version, .big) catch unreachable;
+    w.writeInt(u16, @intCast(1 + 2 + 2 + 32 + 2 + 4 + 1 + 1 + public_name.len + 2), .big) catch unreachable;
+    w.writeByte(id) catch unreachable;
+    w.writeInt(u16, ech_mod.kem_x25519, .big) catch unreachable;
+    w.writeInt(u16, 32, .big) catch unreachable;
+    w.writeAll(pk) catch unreachable;
+    w.writeInt(u16, 4, .big) catch unreachable;
+    w.writeInt(u16, ech_mod.kdf_hkdf_sha256, .big) catch unreachable;
+    w.writeInt(u16, aead, .big) catch unreachable;
+    w.writeByte(32) catch unreachable;
+    w.writeByte(@intCast(public_name.len)) catch unreachable;
+    w.writeAll(public_name) catch unreachable;
+    w.writeInt(u16, 0, .big) catch unreachable;
+    return w.buffered();
+}
+
+/// An Ed25519 self-signed certificate for `public.example` (made with
+/// `openssl req -x509 -subj /CN=tlsserver-ech-public -addext
+/// subjectAltName=DNS:public.example`, valid 2026..2099) and its seed: the
+/// client-facing server's own name, which a declined offer is checked
+/// against.
+const public_cert = hexBytes("3082017030820122a00302010202145e44dca95b142d668f9fd5178c6362605e9feac2300506032b6570301f311d301b06035504030c14746c737365727665722d6563682d7075626c69633020170d3236303130313030303030305a180f32303939313233313233353935395a301f311d301b06035504030c14746c737365727665722d6563682d7075626c6963302a300506032b65700321003e7292091888a56ee609a9d3738b42c1c11b7d22f13d01c6ce06052a7c036135a36e306c301d0603551d0e04160414fb92e44de78b5563e54c7514a2dc11e36ca71794301f0603551d23041830168014fb92e44de78b5563e54c7514a2dc11e36ca71794300f0603551d130101ff040530030101ff30190603551d1104123010820e7075626c69632e6578616d706c65300506032b65700341000d16db0798277f4e0e69a307ff85897058ff0614725e7d01f4ddaa9a57bb12cf9ae134feac28216f18c16b50dffc4edd7f71c9bc0d608eb43297e6a3f7bdef05");
+const public_seed = hexBytes("9c07612553b05dcdd3786e7e621b5604626d95834b251d06d7be4f2a2a57cef6");
+
+fn hexBytes(comptime h: []const u8) [h.len / 2]u8 {
+    @setEvalBranchQuota(10_000);
+    var out: [h.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
+    return out;
+}
+
+test "tlsclient ↔ Server: ECH accepted — each AEAD of the config, every suite; the handshake is the inner hello's" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(0x45));
+    for ([_]u16{ ech_mod.aead_aes128_gcm, ech_mod.aead_aes256_gcm, ech_mod.aead_chacha20_poly1305 }) |aead| {
+        var cb: [128]u8 = undefined;
+        const cfg = echConfig(&cb, 7, &kp.public_key, aead, "public.example");
+        const keys = [_]ech_mod.Key{.{ .config = cfg, .private_key = &kp.secret_key }};
+        const e: ech_mod.Ech = .{ .keys = &keys };
+        var lb: [256]u8 = undefined;
+        const list = try ech_mod.configList(&lb, &.{cfg});
+        for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+            var storage: [16 * 1024]u8 = undefined;
+            var info: ZlClient.ConnectionInfo = .init(&storage);
+            // The harness checks the server saw the inner SNI ("localhost")
+            // and the certificate is checked against it.
+            const o = try handshake(ZlClient, testing.allocator, &ck, .{ .suites = &.{suite}, .ech = &e }, .{ .info = &info, .ech_config_list = list });
+            defer o.deinit(testing.allocator);
+            try testing.expect(o.ech);
+            try testing.expect(info.ech_accepted);
+            try testing.expectEqual(@as(usize, 0), info.ech_retry_configs.len);
+            try testing.expectEqual(suite, o.suite);
+            try testing.expectEqualStrings("hello there", o.echoed);
+        }
+    }
+}
+
+test "tlsclient ↔ Server: ECH accepted after a HelloRetryRequest (the second outer hello sealed under the same context)" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(0x46));
+    var cb: [256]u8 = undefined;
+    const cfg = try ech_mod.makeConfig(&cb, 3, &kp.public_key, "public.example", 0);
+    const keys = [_]ech_mod.Key{.{ .config = cfg, .private_key = &kp.secret_key }};
+    const e: ech_mod.Ech = .{ .keys = &keys };
+    var lb: [512]u8 = undefined;
+    const list = try ech_mod.configList(&lb, &.{cfg});
+    for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 }) |suite| {
+        var storage: [16 * 1024]u8 = undefined;
+        var info: ZlClient.ConnectionInfo = .init(&storage);
+        const o = try handshake(ZlClient, testing.allocator, &ck, .{ .suites = &.{suite}, .groups = &.{tls13.kex.secp256r1_group}, .ech = &e }, .{ .info = &info, .ech_config_list = list });
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.retried and info.hello_retry_request);
+        try testing.expect(o.ech and info.ech_accepted);
+        try testing.expectEqualStrings("hello there", o.echoed);
+    }
+}
+
+test "tlsclient ↔ Server: ECH declined — the public name's certificate, retry_configs, EchRejected; also after a HelloRetryRequest" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ed = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(public_seed);
+    const chain = [_][]const u8{&public_cert};
+    const ck: server_mod.CertifiedKey = .{ .chain = &chain, .key = .{ .ed25519 = &ed.secret_key } };
+    // The client holds a stale config (another key under the same id); the
+    // server's current one comes back as retry_configs.
+    const old = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(0x47));
+    const cur = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(0x48));
+    var ob: [256]u8 = undefined;
+    const old_cfg = try ech_mod.makeConfig(&ob, 5, &old.public_key, "public.example", 0);
+    var cb: [256]u8 = undefined;
+    const cur_cfg = try ech_mod.makeConfig(&cb, 5, &cur.public_key, "public.example", 0);
+    const keys = [_]ech_mod.Key{.{ .config = cur_cfg, .private_key = &cur.secret_key }};
+    const e: ech_mod.Ech = .{ .keys = &keys };
+    var lb: [512]u8 = undefined;
+    const stale = try ech_mod.configList(&lb, &.{old_cfg});
+    var rb: [512]u8 = undefined;
+    const retry = try ech_mod.configList(&rb, &.{cur_cfg});
+    for ([_]?[]const u16{ null, &.{tls13.kex.secp256r1_group} }) |groups| {
+        var storage: [16 * 1024]u8 = undefined;
+        var info: ZlClient.ConnectionInfo = .init(&storage);
+        var srv: ServerSide = .{ .ech = &e };
+        if (groups) |g| srv.groups = g;
+        try testing.expectError(error.EchRejected, handshake(ZlClient, testing.allocator, &ck, srv, .{ .info = &info, .ech_config_list = stale }));
+        try testing.expect(!info.ech_accepted);
+        try testing.expectEqualSlices(u8, retry, info.ech_retry_configs);
+        try testing.expectEqual(groups != null, info.hello_retry_request);
+    }
+    // A server without ECH keys: declined with no retry_configs.
+    var storage: [16 * 1024]u8 = undefined;
+    var info: ZlClient.ConnectionInfo = .init(&storage);
+    try testing.expectError(error.EchRejected, handshake(ZlClient, testing.allocator, &ck, .{}, .{ .info = &info, .ech_config_list = stale }));
+    try testing.expectEqual(@as(usize, 0), info.ech_retry_configs.len);
+}
+
+test "tlsclient ↔ Server: ECH declined by a server whose certificate is not the public name's: CertificateHostMismatch" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    // The certificate is for "localhost" (the inner name), the config's
+    // public name another: a declined offer must not be authenticated by
+    // the inner name.
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(0x49));
+    var cb: [256]u8 = undefined;
+    const cfg = try ech_mod.makeConfig(&cb, 1, &kp.public_key, "public.example", 0);
+    var lb: [512]u8 = undefined;
+    const list = try ech_mod.configList(&lb, &.{cfg});
+    try testing.expectError(error.CertificateHostMismatch, handshake(ZlClient, testing.allocator, &ck, .{}, .{ .ech_config_list = list }));
 }

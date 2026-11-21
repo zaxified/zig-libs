@@ -30,6 +30,7 @@ package main
 import (
 	"bufio"
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -55,12 +56,14 @@ import (
 const (
 	host       = "srv.interop.test"
 	ekmLabel   = "EXPERIMENTAL-zl-interop"
-	header     = "id\tfamily\texpect\tport\thost\tmin\tmax\tgroups\tshares\talpn\tccert\troot\ttwice\tbulk\tstaple\tscts\tgo\tgo_line\twhy"
+	header     = "id\tfamily\texpect\tport\thost\tmin\tmax\tgroups\tshares\talpn\tccert\troot\ttwice\tbulk\tstaple\tscts\tgo\tgo_line\twhy\tech"
 	pattern    = 31
 	bulkMiB    = 1 << 20
 	tls12      = tls.VersionTLS12
 	tls13      = tls.VersionTLS13
 	clientRoot = "client_root"
+	// echPublicName is the client-facing name of the ECH rows.
+	echPublicName = "public.interop.test"
 )
 
 var dir string
@@ -179,6 +182,46 @@ func tlv(tag byte, body []byte) []byte {
 	}
 }
 
+// echConfig marshals an ECHConfig (RFC 9849 §4, version 0xfe0d) for an
+// X25519 public key with HKDF-SHA256 and the given AEADs.
+func echConfig(id uint8, pub []byte, aeads []uint16, publicName string) []byte {
+	var c []byte
+	c = append(c, id, 0x00, 0x20) // config_id, DHKEM(X25519, HKDF-SHA256)
+	c = append(c, byte(len(pub)>>8), byte(len(pub)))
+	c = append(c, pub...)
+	c = append(c, byte(4*len(aeads)>>8), byte(4*len(aeads)))
+	for _, a := range aeads {
+		c = append(c, 0x00, 0x01, byte(a>>8), byte(a))
+	}
+	c = append(c, 0) // maximum_name_length
+	c = append(c, byte(len(publicName)))
+	c = append(c, publicName...)
+	c = append(c, 0, 0) // no extensions
+	return append([]byte{0xfe, 0x0d, byte(len(c) >> 8), byte(len(c))}, c...)
+}
+
+// echList wraps configs as an ECHConfigList.
+func echList(configs ...[]byte) []byte {
+	var n int
+	for _, c := range configs {
+		n += len(c)
+	}
+	out := []byte{byte(n >> 8), byte(n)}
+	for _, c := range configs {
+		out = append(out, c...)
+	}
+	return out
+}
+
+// echKey is a fresh X25519 ECH key and its config.
+func echKey(id uint8, aeads []uint16) tls.EncryptedClientHelloKey {
+	k, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		die(err)
+	}
+	return tls.EncryptedClientHelloKey{Config: echConfig(id, k.PublicKey().Bytes(), aeads, echPublicName), PrivateKey: k.Bytes(), SendAsRetry: true}
+}
+
 // ── cases ────────────────────────────────────────────────────────────────
 
 type ccase struct {
@@ -194,6 +237,8 @@ type ccase struct {
 	bulk                    int
 	staple                  string
 	scts                    []string
+	ech                     string // ECH: <ech>.list is the client's ECHConfigList, <ech>.retry the retry_configs expected; "" none
+	echList                 []byte
 	// filled in
 	port            int
 	goVerdict, line string
@@ -250,9 +295,9 @@ func answer(conn net.Conn, c *ccase) {
 	if len(st.VerifiedChains) > 0 {
 		peer = len(st.PeerCertificates)
 	}
-	line := fmt.Sprintf("v=%04x cs=%04x g=%04x hrr=%d alpn=%s res=%d peer=%d sn=%s ekm=%s\n",
+	line := fmt.Sprintf("v=%04x cs=%04x g=%04x hrr=%d alpn=%s res=%d peer=%d sn=%s ech=%d ekm=%s\n",
 		st.Version, st.CipherSuite, uint16(st.CurveID), b2i[st.HelloRetryRequest], orDash(st.NegotiatedProtocol),
-		b2i[st.DidResume], peer, orDash(st.ServerName), ekmHex)
+		b2i[st.DidResume], peer, orDash(st.ServerName), b2i[st.ECHAccepted], ekmHex)
 	if _, err := io.WriteString(tc, line); err != nil {
 		return
 	}
@@ -281,6 +326,9 @@ func goClient(c *ccase, roots *x509.CertPool) (string, string) {
 	}
 	if c.twice {
 		cfg.ClientSessionCache = cache
+	}
+	if c.echList != nil {
+		cfg.EncryptedClientHelloConfigList = c.echList
 	}
 	n := 1
 	if c.twice {
@@ -622,6 +670,45 @@ func main() {
 			server: &tls.Config{Certificates: []tls.Certificate{sc}, MinVersion: v, MaxVersion: v}})
 	}
 
+	// ech: Encrypted Client Hello (RFC 9849). The leaf carries the inner
+	// name and the public one (a declined offer is authenticated by the
+	// public name). Accepted with each AEAD, after a HelloRetryRequest; a
+	// stale config declined with retry_configs.
+	echLeaf := leafOf("p256", inter, leafTmpl(host, echPublicName))
+	for _, a := range []struct {
+		name string
+		id   uint16
+	}{{"aes128gcm", 1}, {"aes256gcm", 2}, {"chacha20poly1305", 3}} {
+		k := echKey(1, []uint16{a.id})
+		add(&ccase{id: "ech-accept-" + a.name, family: "ech", min: tls13, ech: "ech-accept-" + a.name, echList: echList(k.Config),
+			server: cfg(echLeaf, func(c *tls.Config) { c.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{k} })})
+	}
+	{
+		k := echKey(2, []uint16{1, 2, 3})
+		add(&ccase{id: "ech-accept-hrr", family: "ech", min: tls13, ech: "ech-accept-hrr", echList: echList(k.Config),
+			server: cfg(echLeaf, func(c *tls.Config) {
+				c.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{k}
+				c.CurvePreferences = []tls.CurveID{tls.CurveP256}
+			})})
+		stale, cur := echKey(3, []uint16{1}), echKey(3, []uint16{1})
+		write("ech-reject-retry.retry", echList(cur.Config))
+		add(&ccase{id: "ech-reject-retry", family: "ech", min: tls13, ech: "ech-reject-retry", echList: echList(stale.Config),
+			server: cfg(echLeaf, func(c *tls.Config) { c.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{cur} })})
+		write("ech-reject-hrr.retry", echList(cur.Config))
+		add(&ccase{id: "ech-reject-hrr", family: "ech", min: tls13, ech: "ech-reject-hrr", echList: echList(stale.Config),
+			server: cfg(echLeaf, func(c *tls.Config) {
+				c.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{cur}
+				c.CurvePreferences = []tls.CurveID{tls.CurveP256}
+			})})
+		write("ech-reject-nokeys.retry", []byte{})
+		add(&ccase{id: "ech-reject-nokeys", family: "ech", min: tls13, ech: "ech-reject-nokeys", echList: echList(stale.Config), server: cfg(echLeaf, nil)})
+	}
+	for _, c := range cases {
+		if c.echList != nil {
+			write(c.ech+".list", c.echList)
+		}
+	}
+
 	// Serve, judge with Go's client, write the table.
 	pools := map[string]*x509.CertPool{}
 	for name, n := range map[string]*node{"root": root, "rsa_root": rsaRoot, "ed_root": edRoot} {
@@ -652,9 +739,13 @@ func main() {
 		if c.twice {
 			twice = 1
 		}
-		fmt.Fprintf(&b, "%s\t%s\t%s\t%d\t%s\t%04x\t%04x\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
+		ech := c.ech
+		if ech == "" {
+			ech = "-"
+		}
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%d\t%s\t%04x\t%04x\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			c.id, c.family, c.expect, c.port, c.host, c.min, c.max, hexList(c.groups), hexList(c.shares), orDash(c.alpn),
-			ccert, c.root, twice, c.bulk, staple, orDash(c.scts), c.goVerdict, c.line, why)
+			ccert, c.root, twice, c.bulk, staple, orDash(c.scts), c.goVerdict, c.line, why, ech)
 	}
 	write("cases.tsv", []byte(b.String()))
 	fmt.Printf("READY %s %d\n", strings.TrimPrefix(runtime.Version(), "go"), len(cases))

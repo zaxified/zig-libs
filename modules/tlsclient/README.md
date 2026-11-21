@@ -63,7 +63,7 @@ std's ClientHello stays reachable: `.groups = &tls.Client.std_groups,
 ecdsa_secp521r1_sha512).
 
 The behaviour is checked live against Go's: `zig build interop-tlsclient`
-runs 90 cases against Go's crypto/tls server and compares with Go's client.
+runs 104 cases against Go's crypto/tls server and compares with Go's client.
 
 ```zig
 var storage: [16 * 1024]u8 = undefined;
@@ -82,6 +82,7 @@ var client = try tls.Client.init(&r.interface, &w.interface, .{
     .connection_info = &info,                           // Go ConnectionState
     .verify_connection = .{ .context = ctx, .verify = check }, // Go VerifyConnection
     .session_cache = &cache,                            // TLS 1.3 and 1.2 resumption (Go ClientSessionCache)
+    .ech_config_list = ech_configs,                     // RFC 9849 ECH (Go EncryptedClientHelloConfigList)
 });
 const proto = client.alpn_protocol;                     // ?[]const u8, one of ours
 var km: [32]u8 = undefined;
@@ -107,13 +108,24 @@ try client.exportKeyingMaterial("EXPERIMENTAL-my-proto", null, &km); // RFC 8446
   a full handshake's NewSessionTicket replaces the entry, an empty one (a
   withdrawal) or any failure after a session was offered drops it. Not by
   server-assigned session IDs (Go does not either). Tickets over 2 KiB are not
-  cached. ECH is not supported (deferred).
+  cached.
 - **KeyUpdate:** answered when the server asks, and sent on our own after
   2^23 records.
+- **Encrypted Client Hello** (RFC 9849, as Go's client): `ech_config_list` is
+  the `ECHConfigList` from the server's DNS HTTPS record. The real hello
+  (with `host`) is sealed to the first usable config (DHKEM X25519,
+  HKDF-SHA256, AES-128/256-GCM or ChaCha20-Poly1305) inside an outer hello
+  naming the config's public name; only TLS 1.3 is offered.
+  `ConnectionInfo.ech_accepted` says whether the server took it. A server that
+  declines is authenticated against the public name, then `init` sends
+  `ech_required` and fails with `error.EchRejected`, the server's
+  `retry_configs` in `ConnectionInfo.ech_retry_configs` (connect again with
+  them; Go `ECHRejectionError`). `verify_connection` does not run on a
+  declined offer.
 
 ## Not provided
 
-ECH, revocation checking (OCSP/CRL) and certificate-transparency verification, TLS 1.2 CBC suites, client
+Revocation checking (OCSP/CRL) and certificate-transparency verification, TLS 1.2 CBC suites, client
 renegotiation, 0-RTT, and Ed25519 client keys in TLS 1.2. SPEC.md has the reasons (*What is deliberately
 not done*) and the open items (*Backlog / deferred*).
 

@@ -69,6 +69,9 @@ const Case = struct {
     go_ok: bool,
     go_line: []const u8,
     why: []const u8,
+    /// ECH: the file stem of the client's `ECHConfigList` (`.list`) and the
+    /// `retry_configs` a declining server sends (`.retry`); null: no ECH.
+    ech: ?[]const u8,
 };
 
 const Outcome = struct {
@@ -95,7 +98,7 @@ fn parseCases(arena: std.mem.Allocator, text: []const u8) ![]Case {
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         const f = try split(arena, line, '\t');
-        if (f.len != 19) return error.BadCaseRow;
+        if (f.len != 20) return error.BadCaseRow;
         var groups: std.ArrayList(tls.NamedGroup) = .empty;
         for (try split(arena, f[7], ',')) |g| try groups.append(arena, @fromBackingInt(try std.fmt.parseInt(u16, g, 16)));
         try out.append(arena, .{
@@ -117,6 +120,7 @@ fn parseCases(arena: std.mem.Allocator, text: []const u8) ![]Case {
             .go_ok = std.mem.eql(u8, f[16], "ok"),
             .go_line = f[17],
             .why = f[18],
+            .ech = if (std.mem.eql(u8, f[19], "-")) null else f[19],
         });
     }
     return out.items;
@@ -177,8 +181,9 @@ fn connectOnceInner(env: *Env, c: *const Case, bundle: *std.crypto.Certificate.B
     var storage: [16 * 1024]u8 = undefined;
     var info: Client.ConnectionInfo = .init(&storage);
 
+    const ech_list: ?[]const u8 = if (c.ech) |stem| try env.dir.readFileAlloc(io, try env.arena.print("{s}.list", .{stem}), env.arena, .limited(65536)) else null;
     var client: Client = undefined;
-    try Client.initInto(&client, &sr.interface, &sw.interface, .{
+    Client.initInto(&client, &sr.interface, &sw.interface, .{
         .host = .{ .explicit = c.host },
         .ca = .{ .bundle = .{ .gpa = env.arena, .io = io, .lock = &env.lock, .bundle = bundle } },
         .read_buffer = &tls_in,
@@ -193,7 +198,16 @@ fn connectOnceInner(env: *Env, c: *const Case, bundle: *std.crypto.Certificate.B
         .client_auth = auth,
         .connection_info = &info,
         .session_cache = if (c.twice) cache else null,
-    });
+        .ech_config_list = ech_list,
+    }) catch |e| {
+        // ECH declined: the server's retry_configs must be the ones it holds.
+        if (e == error.EchRejected) if (c.ech) |stem| {
+            const want = try env.dir.readFileAlloc(io, try env.arena.print("{s}.retry", .{stem}), env.arena, .limited(65536));
+            if (!std.mem.eql(u8, want, info.ech_retry_configs))
+                return .{ .ok = false, .text = "EchRejected", .inconsistent = try env.arena.print("retry_configs {d} octets, the server holds {d}", .{ info.ech_retry_configs.len, want.len }) };
+        };
+        return e;
+    };
     const raw_line = try client.reader.takeDelimiterExclusive('\n');
     const line = try env.arena.dupe(u8, raw_line);
     client.reader.toss(1);
@@ -201,16 +215,17 @@ fn connectOnceInner(env: *Env, c: *const Case, bundle: *std.crypto.Certificate.B
     // This client's view against the server's.
     var km: [32]u8 = undefined;
     try client.exportKeyingMaterial(ekm_label, null, &km);
-    const mine = try env.arena.print("v={x:0>4} cs={x:0>4} g={x:0>4} hrr={d} alpn={s} res={d} ekm={x}", .{
+    const mine = try env.arena.print("v={x:0>4} cs={x:0>4} g={x:0>4} hrr={d} alpn={s} res={d} ech={d} ekm={x}", .{
         @backingInt(info.version),
         @backingInt(info.cipher_suite),
         if (info.negotiated_group) |g| @backingInt(g) else 0,
         @intFromBool(info.hello_retry_request),
         info.alpn_protocol orelse "-",
         @intFromBool(info.did_resume),
+        @intFromBool(info.ech_accepted),
         &km,
     });
-    const names = [_][]const u8{ "v", "cs", "g", "hrr", "alpn", "res", "ekm" };
+    const names = [_][]const u8{ "v", "cs", "g", "hrr", "alpn", "res", "ech", "ekm" };
     for (names) |n| {
         const theirs = field(line, n) orelse return .{ .ok = true, .text = line, .inconsistent = "server line lacks a field" };
         if (!std.mem.eql(u8, theirs, field(mine, n).?))
@@ -406,6 +421,9 @@ pub fn main(init: std.process.Init) !u8 {
             switch (c.expect) {
                 .agree => {
                     if (o.ok != c.go_ok) break :blk try arena.print("Go {s}, ours {s}", .{ if (c.go_ok) "ok" else "err", if (o.ok) "ok" else "err" });
+                    // A declined ECH offer: Go's ECHRejectionError is ours EchRejected.
+                    if (c.ech != null and !o.ok and !std.mem.eql(u8, o.text, "EchRejected"))
+                        break :blk try arena.print("ECH row: ours failed with {s}, not EchRejected", .{o.text});
                     if (o.ok and !std.mem.eql(u8, withoutEkm(o.text), withoutEkm(c.go_line)))
                         break :blk try arena.print("server saw Go: {s} | ours: {s}", .{ withoutEkm(c.go_line), withoutEkm(o.text) });
                     break :blk null;

@@ -92,6 +92,9 @@ pub const Params = struct {
     session_ticket: ?[]const u8 = null,
     /// A HelloRetryRequest's cookie to echo (RFC 8446 §4.2.2), or "".
     cookie: []const u8 = "",
+    /// A prebuilt encrypted_client_hello extension (type, length, data;
+    /// RFC 9849 §5), or "".
+    ech_ext: []const u8 = "",
     psk: ?Psk = null,
 };
 
@@ -183,6 +186,7 @@ pub fn write(buf: []u8, p: Params) Error![]u8 {
         try w.bytes(p.cookie);
         w.close(e);
     }
+    try w.bytes(p.ech_ext);
     if (p.psk) |psk| {
         const e = try w.ext(@backingInt(tls.ExtensionType.pre_shared_key));
         try w.int(u16, @intCast(2 + psk.identity.len + 4)); // identities

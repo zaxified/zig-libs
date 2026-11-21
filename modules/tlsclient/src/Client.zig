@@ -18,6 +18,8 @@ const p521 = @import("p521");
 const ct25519 = @import("ct25519");
 const mlkem = @import("mlkem");
 const hello = @import("hello.zig");
+// zig-libs tlsclient: Encrypted Client Hello (RFC 9849).
+const ech = @import("ech.zig");
 const session = @import("session.zig");
 const tlsresume = @import("tlsresume");
 const keygen = @import("keygen.zig");
@@ -281,6 +283,20 @@ pub const Options = struct {
     /// `Client` made with it (NewSessionTickets are stored into it while
     /// reading), and clients on several threads need its `lock`.
     session_cache: ?*SessionCache = null,
+    /// Encrypted Client Hello (RFC 9849; Go
+    /// `EncryptedClientHelloConfigList`): an `ECHConfigList` as a DNS HTTPS
+    /// record's `ech` parameter carries it. Set, the real ClientHello (the
+    /// "inner", naming `host`) is sealed to the first usable config's key
+    /// inside an "outer" one naming the config's public name; only TLS 1.3
+    /// is offered (as Go: `max_version` 1.2 is `error.VersionsInvalid`, a
+    /// `min_version` of 1.2 is raised). A server that declines is
+    /// authenticated against the public name, the handshake completes, an
+    /// `ech_required` alert is sent and `init` fails with
+    /// `error.EchRejected`; the server's retry configs, if any, are in
+    /// `ConnectionInfo.ech_retry_configs` (Go `ECHRejectionError`). Usable
+    /// configs: DHKEM(X25519, HKDF-SHA256) with HKDF-SHA256 and AES-128-GCM,
+    /// AES-256-GCM or ChaCha20-Poly1305. Borrowed during `init`.
+    ech_config_list: ?[]const u8 = null,
 
     pub const entropy_len = 240;
 };
@@ -308,6 +324,13 @@ pub const ConnectionInfo = struct {
     did_resume: bool = false,
     /// TLS 1.2: the server agreed to the extended master secret.
     extended_master_secret: bool = false,
+    /// ECH was offered and the server accepted it (Go
+    /// `ConnectionState.ECHAccepted`).
+    ech_accepted: bool = false,
+    /// ECH declined (`error.EchRejected`): the server's `retry_configs`, an
+    /// `ECHConfigList` to connect again with, or empty (Go
+    /// `ECHRejectionError.RetryConfigList`).
+    ech_retry_configs: []const u8 = "",
     peer_certificates_buf: [verify.max_chain_len][]const u8 = undefined,
     peer_certificates_len: usize = 0,
     verified_chain_buf: [verify.max_path_len][]const u8 = undefined,
@@ -701,6 +724,13 @@ pub const InitError = error{
     /// `realtime_now` past what an i64 of milliseconds holds (about 292
     /// million years either side of 1970).
     RealtimeInvalid,
+    /// `ech_config_list` is not a well-formed `ECHConfigList`.
+    EchConfigInvalid,
+    /// `ech_config_list` holds no config this client can use.
+    EchConfigUnsupported,
+    /// The server declined ECH (`Options.ech_config_list`); the handshake
+    /// with the public name completed and `ech_required` was sent.
+    EchRejected,
 } || std.Io.Writer.Error || std.Io.Reader.ShortError || std.Io.Cancelable;
 
 /// Initiates a TLS handshake and establishes a TLSv1.2 or TLSv1.3 session.
@@ -710,7 +740,7 @@ pub const InitError = error{
 /// `input` and `output` need buffer capacity of at least `min_buffer_len`
 /// (see the fields); a smaller one is `error.BufferTooSmall`.
 ///
-/// Stack: the handshake runs about 302 KiB deep (TLS 1.2 resumption added ~6 KiB, 2026-11-13, estimated from the new locals: ticket and master-secret copies, not measured) and the dead-stack burn then
+/// Stack: the handshake runs about 302 KiB deep (TLS 1.2 resumption added ~6 KiB, 2026-11-13, estimated from the new locals: ticket and master-secret copies, not measured; ECH adds about 34 KiB, estimated from the outer-hello buffers, not measured) and the dead-stack burn then
 /// zeroes 384 KiB below the caller (`burn.init_burn`), so the calling thread
 /// needs roughly 400 KiB of free stack; a smaller one (a fibre, a thread
 /// spawned with a small `stack_size`) overflows it.
@@ -790,13 +820,38 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
     // from the options; std's comptime shape is `std_groups` with every addition off.
     try checkVersions(options.min_version, options.max_version);
     try checkGroups(options.groups, options.key_share_groups);
+    // zig-libs tlsclient: ECH (RFC 9849) forces TLS 1.3, as Go's client does.
+    if (options.ech_config_list != null and options.max_version != .tls_1_3) return error.VersionsInvalid;
+    const min_version: tls.ProtocolVersion = if (options.ech_config_list != null) .tls_1_3 else options.min_version;
+    var ech_picked: ?ech.Picked = null;
+    var ech_sealer: ech.Sealer = undefined;
+    defer if (ech_picked != null) ech_sealer.wipe();
+    var ech_outer_random: [32]u8 = undefined;
+    if (options.ech_config_list) |list| {
+        ech_picked = try ech.pick(list);
+        // The outer random and the HPKE ephemeral key from the secret part
+        // of the entropy (as the client-auth CSPRNG below).
+        const Hkdf = crypto.kdf.hkdf.HkdfSha256;
+        var prk = Hkdf.extract("zig-libs tlsclient ech", options.entropy[64..240]);
+        defer crypto.secureZero(u8, &prk);
+        var ikm: [32]u8 = undefined;
+        defer crypto.secureZero(u8, &ikm);
+        Hkdf.expand(&ech_outer_random, "outer random", prk);
+        Hkdf.expand(&ikm, "hpke ephemeral", prk);
+        try ech_sealer.setup(&ech_picked.?, &ikm);
+    }
+    // ECH state: decided at the HelloRetryRequest or the ServerHello.
+    var ech_accepted = false;
+    var ech_rejected = false;
+    var ech_outer_buf: [hello.max_len]u8 = undefined;
+    var ech_outer_msg: []const u8 = "";
     if (options.verify_connection != null and options.connection_info == null) return error.ConnectionInfoRequired;
     const info: ?*ConnectionInfo = options.connection_info;
     if (info) |ci| ci.reset();
-    const offer_12 = options.min_version == .tls_1_2;
+    const offer_12 = min_version == .tls_1_2;
     var key_share = KeyShare.init(options.entropy[64..240]);
     var versions_buf: [2]tls.ProtocolVersion = undefined;
-    const versions = offeredVersions(&versions_buf, options.min_version, options.max_version);
+    const versions = offeredVersions(&versions_buf, min_version, options.max_version);
     var alpn_ext_buf: [4 + 2 + max_alpn_len]u8 = undefined;
     const alpn_ext = try alpnExtension(&alpn_ext_buf, options.alpn_protocols);
     // zig-libs tlsclient: an IP literal is not a server name -- RFC 6066 §3
@@ -883,6 +938,8 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
         shares_buf[i] = .{ .group = g, .key = key_share.publicKey(g) };
     }
     hello_params.shares = shares_buf[0..share_groups.len];
+    // zig-libs tlsclient: with ECH these are the inner hello's parameters.
+    if (ech_picked != null) hello_params.ech_ext = &ech.inner_ext;
     var hello_buf: [hello.max_len]u8 = undefined;
     var hello_msg: []const u8 = hello.write(&hello_buf, hello_params) catch return error.ClientHelloTooLarge;
     // RFC 8446 §4.2.11.2: the binder over the ClientHello truncated before
@@ -890,7 +947,12 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
     if (offer) |*o| switch (o.hash) {
         inline else => |k| fillBinder(HashOf(k), hello_buf[0..hello_msg.len], &o.psk, &HashOf(k).init(.{})),
     };
-    try writeHelloRecord(output, .tls_1_0, hello_msg);
+    // zig-libs tlsclient: ECH -- the outer hello goes on the wire.
+    if (ech_picked) |*pk| ech_outer_msg = try echOuter(&ech_outer_buf, hello_msg, &hello_params, pk, &ech_sealer, &ech_outer_random, true);
+    try writeHelloRecord(output, .tls_1_0, if (ech_picked != null) ech_outer_msg else hello_msg);
+    // The name the certificate is checked against: the public name once ECH
+    // is declined (RFC 9849 §6.1.6).
+    var cert_host: []const u8 = host;
     // zig-libs tlsclient: client authentication -- RSA-PSS salts and the
     // `rsa` module's blinding come from a CSPRNG keyed from the secret part
     // of the entropy; TLS 1.2's CertificateVerify needs the messages' hashes.
@@ -1229,6 +1291,8 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                         var hrr_cookie: ?[]const u8 = null;
                         var sh_group: ?tls.NamedGroup = null;
                         var tls12_only_ext = false;
+                        // zig-libs tlsclient: ECH -- the HelloRetryRequest's confirmation.
+                        var sh_ech: ?[]const u8 = null;
                         if (!hsd.eof()) {
                             try hsd.ensure(2);
                             const extensions_size = hsd.decode(u16);
@@ -1319,6 +1383,10 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                         hello.ext_renegotiation_info => if (!is_hrr and options.renegotiation_info) {
                                             if (ext_size != 1 or extd.rest()[0] != 0) return error.TlsIllegalParameter;
                                         },
+                                        ech.ext_encrypted_client_hello => if (ech_picked != null) {
+                                            if (sh_ech != null) return error.TlsIllegalParameter;
+                                            sh_ech = extd.rest();
+                                        },
                                         else => {},
                                     },
                                 }
@@ -1353,6 +1421,21 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                 for (hello_params.shares) |sh| if (sh.group == g) return error.TlsIllegalParameter;
                             } else if (hrr_cookie == null) return error.TlsIllegalParameter; // "would not result in any change"
                             try initHandshakeCipher(&handshake_cipher, cipher_suite_tag);
+                            // zig-libs tlsclient: ECH (RFC 9849 §6.1.5) -- the
+                            // HelloRetryRequest confirms acceptance in its
+                            // extension; without one, ECH is declined.
+                            if (ech_picked != null) {
+                                if (sh_ech) |conf| {
+                                    if (conf.len != 8) return error.TlsDecodeError;
+                                    ech_accepted = switch (handshake_cipher) {
+                                        inline else => |*p| echHrrConfirmed(@TypeOf(p.*).A, p.transcript_hash, hello_msg, wrapped_handshake, conf, &client_hello_rand),
+                                    };
+                                }
+                                if (!ech_accepted) {
+                                    ech_rejected = true;
+                                    hello_msg = ech_outer_msg;
+                                }
+                            }
                             switch (handshake_cipher) {
                                 inline else => |*p| {
                                     // Transcript: message_hash(Hash(ClientHello1)), HRR.
@@ -1385,16 +1468,33 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                             if (offer) |*o| switch (handshake_cipher) {
                                 inline else => |*p| fillBinder(@TypeOf(p.transcript_hash), hello_buf[0..hello_msg.len], &o.psk, &p.transcript_hash),
                             };
+                            // zig-libs tlsclient: ECH -- the second outer hello,
+                            // sealed under the same context with an empty enc
+                            // (§6.1.5); the transcript follows the hello chosen.
+                            var wire_msg = hello_msg;
+                            if (ech_picked) |*pk| {
+                                ech_outer_msg = try echOuter(&ech_outer_buf, hello_msg, &hello_params, pk, &ech_sealer, &ech_outer_random, false);
+                                wire_msg = ech_outer_msg;
+                                if (!ech_accepted) hello_msg = ech_outer_msg;
+                            }
                             switch (handshake_cipher) {
                                 inline else => |*p| p.transcript_hash.update(hello_msg),
                             }
-                            try writeHelloRecord(output, .tls_1_2, hello_msg);
+                            try writeHelloRecord(output, .tls_1_2, wire_msg);
                             hrr_seen = true;
                             hrr_suite = cipher_suite_tag;
                         } else {
                             if (hrr_seen) {
                                 // The ServerHello after an HRR keeps its suite and version.
                                 if (tls_version != .tls_1_3 or cipher_suite_tag != hrr_suite) return error.TlsIllegalParameter;
+                                // zig-libs tlsclient: ECH accepted at the HRR -- the
+                                // ServerHello must confirm it too (RFC 9849 §6.1.5).
+                                if (ech_accepted) {
+                                    const ok = switch (handshake_cipher) {
+                                        inline else => |*p| echShConfirmed(@TypeOf(p.*).A, p.transcript_hash, "", wrapped_handshake, &client_hello_rand),
+                                    };
+                                    if (!ok) return error.TlsIllegalParameter;
+                                }
                             } else {
                                 switch (cipher_suite_tag) {
                                     .AES_128_GCM_SHA256,
@@ -1412,9 +1512,34 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                     else => return error.TlsIllegalParameter,
                                 }
                                 try initHandshakeCipher(&handshake_cipher, cipher_suite_tag);
+                                // zig-libs tlsclient: ECH (RFC 9849 §6.1.4) -- the
+                                // last 8 random octets confirm acceptance over the
+                                // inner hello; otherwise the outer one is the
+                                // transcript's.
+                                if (ech_picked != null) {
+                                    ech_accepted = switch (handshake_cipher) {
+                                        inline else => |*p| echShConfirmed(@TypeOf(p.*).A, p.transcript_hash, hello_msg, wrapped_handshake, &client_hello_rand),
+                                    };
+                                    if (!ech_accepted) {
+                                        ech_rejected = true;
+                                        hello_msg = ech_outer_msg;
+                                    }
+                                }
                                 switch (handshake_cipher) {
                                     inline else => |*p| p.transcript_hash.update(hello_msg),
                                 }
+                            }
+                            if (ech_picked != null) {
+                                // Accepted: no ECH extension in the ServerHello
+                                // (Go: unsupported_extension). Declined: the outer
+                                // hello carried no PSK, and the certificate is the
+                                // public name's.
+                                if (ech_accepted and sh_ech != null) return error.TlsIllegalParameter;
+                                if (ech_rejected) {
+                                    if (psk_accepted) return error.TlsIllegalParameter;
+                                    cert_host = ech_picked.?.public_name;
+                                }
+                                if (info) |ci| ci.ech_accepted = ech_accepted;
                             }
                             switch (handshake_cipher) {
                                 inline else => |*p| p.transcript_hash.update(wrapped_handshake),
@@ -1456,7 +1581,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                         const client_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "c hs traffic", &hello_hash, P.Hash.digest_length);
                                         const server_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "s hs traffic", &hello_hash, P.Hash.digest_length);
                                         if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
-                                            .client_random = &client_hello_rand,
+                                            .client_random = if (ech_rejected) &ech_outer_random else &client_hello_rand,
                                         }, .{
                                             .SERVER_HANDSHAKE_TRAFFIC_SECRET = &server_secret,
                                             .CLIENT_HANDSHAKE_TRAFFIC_SECRET = &client_secret,
@@ -1551,6 +1676,12 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                         try hsd.ensure(2);
                         const total_ext_size = hsd.decode(u16);
                         var all_extd = try hsd.sub(total_ext_size);
+                        // zig-libs tlsclient: ECH (RFC 9849 §6.1.6) -- retry
+                        // configs come only with a declined offer.
+                        if (ech_picked != null) if (try encryptedExtensionsEch(all_extd)) |retry| {
+                            if (ech_accepted) return error.TlsIllegalParameter;
+                            if (info) |ci| ci.ech_retry_configs = try ci.keep(retry);
+                        };
                         // zig-libs tlsclient: ALPN (TLS 1.3 answers in
                         // EncryptedExtensions); std's loop read nothing.
                         if (try encryptedExtensionsAlpn(&all_extd, options.alpn_protocols)) |sel| {
@@ -1632,11 +1763,18 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                 // not match at all.
                                 switch (options.host) {
                                     .no_verification => {},
-                                    .explicit => x509.hostname.verify(der, host) catch |e| return switch (e) {
+                                    .explicit => x509.hostname.verify(der, cert_host) catch |e| return switch (e) {
                                         error.CertificateHostMismatch => error.CertificateHostMismatch,
                                         else => error.TlsCertificateNotVerified,
                                     },
                                 }
+                                // zig-libs tlsclient: ECH declined -- the public
+                                // name is checked even without host verification
+                                // (Go checks it whatever InsecureSkipVerify says).
+                                if (ech_rejected and options.host == .no_verification) x509.hostname.verify(der, cert_host) catch |e| return switch (e) {
+                                    error.CertificateHostMismatch => error.CertificateHostMismatch,
+                                    else => error.TlsCertificateNotVerified,
+                                };
 
                                 // Keep track of the public key for the
                                 // certificate_verify message later.
@@ -1742,6 +1880,12 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                         else
                             try parseCertRequest12(&hsd, &cas, &cas_len);
                         req.choose(&options, tls_version, cas[0..cas_len]);
+                        // zig-libs tlsclient: ECH declined -- an empty
+                        // Certificate (RFC 9849 §6.1.6, Go).
+                        if (ech_rejected) {
+                            req.auth = null;
+                            req.scheme_ok = false;
+                        }
                         cert_request = req;
                     },
                     // zig-libs tlsclient: TLS 1.2 stapled OCSP (RFC 6066 §8),
@@ -1868,7 +2012,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                     } };
                                 }
                                 if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
-                                    .client_random = &client_hello_rand,
+                                    .client_random = if (ech_rejected) &ech_outer_random else &client_hello_rand,
                                 }, .{
                                     .CLIENT_RANDOM = &master_secret,
                                 });
@@ -1991,10 +2135,11 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                             },
                         }
                         handshake_state = .finished;
-                        // zig-libs tlsclient: authenticated -- the hook.
+                        // zig-libs tlsclient: authenticated -- the hook (not
+                        // for a declined ECH offer's public name, as Go).
                         if (info) |ci| {
                             fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, false);
-                            if (options.verify_connection) |vc| vc.verify(vc.context, ci) catch return error.TlsConnectionRejected;
+                            if (!ech_rejected) if (options.verify_connection) |vc| vc.verify(vc.context, ci) catch return error.TlsConnectionRejected;
                         }
                     },
                     .finished => {
@@ -2071,7 +2216,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                     // (RFC 8446 §7.1, transcript through the client
                                     // Finished) goes into the cache entry the
                                     // NewSessionTickets will fill.
-                                    if (options.session_cache) |cache| if (host.len != 0) {
+                                    if (options.session_cache) |cache| if (host.len != 0 and !ech_rejected) {
                                         var t = p.transcript_hash;
                                         t.update(out_cleartext[0 .. out_cleartext.len - 1]);
                                         var res = hkdfExpandLabel(P.Hkdf, pv.master_secret, "res master", &t.peek(), P.Hash.digest_length);
@@ -2105,7 +2250,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                     const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &handshake_hash, P.Hash.digest_length);
                                     if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
                                         .counter = key_seq,
-                                        .client_random = &client_hello_rand,
+                                        .client_random = if (ech_rejected) &ech_outer_random else &client_hello_rand,
                                     }, .{
                                         .SERVER_TRAFFIC_SECRET = &server_secret,
                                         .CLIENT_TRAFFIC_SECRET = &client_secret,
@@ -2199,7 +2344,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                             .client_random = client_hello_rand,
                             .writer = ssl_key_log.writer,
                         };
-                        return .{
+                        var result: Client = .{
                             .input = input,
                             .reader = .{
                                 .buffer = options.read_buffer,
@@ -2244,6 +2389,18 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                             .session_generation = session_generation,
                             .handshake_time_ms = now_ms,
                         };
+                        // zig-libs tlsclient: ECH declined (RFC 9849 §6.1.6):
+                        // the handshake is complete, then `ech_required`
+                        // (Go: `ECHRejectionError` after the client Finished).
+                        if (ech_rejected) {
+                            defer crypto.secureZero(u8, mem.asBytes(&result.application_cipher));
+                            const buf = try outputSlice(output);
+                            const prepared = prepareCiphertextRecord(&result, buf, &.{ 2, ech_required_alert }, .alert);
+                            output.advance(prepared.ciphertext_end);
+                            try output.flush();
+                            return error.EchRejected;
+                        }
+                        return result;
                     },
                     else => return error.TlsUnexpectedMessage,
                 }
@@ -2624,6 +2781,86 @@ fn alpnExtension(buf: *[4 + 2 + max_alpn_len]u8, protocols: []const []const u8) 
 /// The ALPN choice in an EncryptedExtensions block (null: none, or none
 /// offered -- then a server's answer is ignored, as std ignores it). The
 /// extension twice is `TlsIllegalParameter` (RFC 8446 §4.2).
+/// zig-libs tlsclient: the `ech_required` alert (RFC 9849 §11.2).
+const ech_required_alert: u8 = 121;
+
+/// zig-libs tlsclient: ECH -- the outer ClientHello for the inner one
+/// (`inner_msg`, written from `inner`) into `out`: the public name, the
+/// outer random, no PSK, and the `encrypted_client_hello` extension whose
+/// payload is the sealed `EncodedClientHelloInner` (RFC 9849 §6.1.1), the
+/// additional data being the outer hello with the payload zero (§5.2).
+/// `first`: the first hello carries the HPKE `enc`; the second (after a
+/// HelloRetryRequest) an empty one.
+fn echOuter(out: []u8, inner_msg: []const u8, inner: *const hello.Params, p: *const ech.Picked, sealer: *ech.Sealer, outer_random: *const [32]u8, first: bool) InitError![]const u8 {
+    var enc_buf: [hello.max_len + 512]u8 = undefined;
+    const encoded = ech.encodeInner(&enc_buf, inner_msg, inner.host.len, p.maximum_name_length) catch return error.ClientHelloTooLarge;
+    const payload_len = encoded.len + ech.tag_len;
+    var ext_buf: [hello.max_len + 600]u8 = undefined;
+    const ext = ech.outerExt(&ext_buf, p, if (first) sealer.enc() else "", payload_len) catch return error.ClientHelloTooLarge;
+    var params = inner.*;
+    params.random = outer_random;
+    params.host = p.public_name;
+    params.psk = null;
+    params.ech_ext = ext;
+    const msg = hello.write(out, params) catch return error.ClientHelloTooLarge;
+    const data = ech.findExt(msg, ech.ext_encrypted_client_hello) orelse return error.ClientHelloTooLarge;
+    const at = @intFromPtr(data.ptr) - @intFromPtr(msg.ptr) + data.len - payload_len;
+    var ct_buf: [hello.max_len + 512]u8 = undefined;
+    sealer.seal(msg[4..], encoded, ct_buf[0..payload_len]) catch return error.ClientHelloTooLarge;
+    @memcpy(msg[at..][0..payload_len], ct_buf[0..payload_len]);
+    return msg;
+}
+
+/// zig-libs tlsclient: ECH -- whether the ServerHello `sh` (a whole
+/// message) confirms acceptance (RFC 9849 §7.2): its last 8 random octets
+/// over `transcript` (empty, or through the second ClientHelloInner),
+/// `inner` and `sh` with those octets zero.
+fn echShConfirmed(comptime P: type, transcript: P.Hash, inner: []const u8, sh: []const u8, inner_random: *const [32]u8) bool {
+    if (sh.len < 4 + 2 + 32) return false;
+    var t = transcript;
+    t.update(inner);
+    t.update(sh[0 .. 4 + 2 + 24]);
+    t.update(&@as([8]u8, @splat(0)));
+    t.update(sh[4 + 2 + 32 ..]);
+    const want = ech.confirmation(P.Hkdf, inner_random, "ech accept confirmation", &t.peek());
+    return crypto.timing_safe.eql([8]u8, want, sh[4 + 2 + 24 ..][0..8].*);
+}
+
+/// zig-libs tlsclient: ECH -- whether the HelloRetryRequest `hrr` confirms
+/// acceptance (RFC 9849 §7.2.1): `conf` (8 octets inside `hrr`) over
+/// message_hash(ClientHelloInner1) and `hrr` with `conf` zero.
+fn echHrrConfirmed(comptime P: type, fresh: P.Hash, inner1: []const u8, hrr: []const u8, conf: []const u8, inner_random: *const [32]u8) bool {
+    const H = P.Hash;
+    var h1: [H.digest_length]u8 = undefined;
+    H.hash(inner1, &h1, .{});
+    var t = fresh;
+    t.update(&.{ @backingInt(tls.HandshakeType.message_hash), 0, 0, H.digest_length });
+    t.update(&h1);
+    const at = @intFromPtr(conf.ptr) - @intFromPtr(hrr.ptr);
+    t.update(hrr[0..at]);
+    t.update(&@as([8]u8, @splat(0)));
+    t.update(hrr[at + 8 ..]);
+    const want = ech.confirmation(P.Hkdf, inner_random, "hrr ech accept confirmation", &t.peek());
+    return crypto.timing_safe.eql([8]u8, want, conf[0..8].*);
+}
+
+/// zig-libs tlsclient: ECH -- the `encrypted_client_hello` extension's
+/// data in EncryptedExtensions (the `retry_configs`), or null.
+fn encryptedExtensionsEch(exts: tls.Decoder) !?[]const u8 {
+    var all_extd = exts;
+    var found: ?[]const u8 = null;
+    while (!all_extd.eof()) {
+        try all_extd.ensure(4);
+        const et = all_extd.decode(u16);
+        const ext_size = all_extd.decode(u16);
+        const extd = try all_extd.sub(ext_size);
+        if (et != ech.ext_encrypted_client_hello) continue;
+        if (found != null) return error.TlsIllegalParameter;
+        found = extd.rest();
+    }
+    return found;
+}
+
 fn encryptedExtensionsAlpn(all_extd: *tls.Decoder, offered: []const []const u8) !?[]const u8 {
     var selected: ?[]const u8 = null;
     while (!all_extd.eof()) {
@@ -4589,6 +4826,54 @@ test "init: a realtime_now outside i64 milliseconds is RealtimeInvalid (sweep 20
         const opts: Options = .{ .host = .no_verification, .ca = .no_verification, .write_buffer = &buf, .read_buffer = &rbuf, .entropy = &entropy, .realtime_now = .{ .nanoseconds = ns } };
         try std.testing.expectError(error.RealtimeInvalid, init(&input, &dw.writer, opts));
     }
+}
+
+test "init with ech_config_list: TLS 1.3 only, the list checked; the outer hello names the public name and carries the offer" {
+    var entropy: [Options.entropy_len]u8 = @splat(7);
+    var in_buf: [min_buffer_len]u8 = undefined;
+    var out_buf: [min_buffer_len]u8 = undefined;
+    var buf: [64]u8 = undefined;
+    var rbuf: [max_ciphertext_len]u8 = undefined;
+    // An ECHConfigList of one X25519 config (HKDF-SHA256, AES-128-GCM),
+    // public name "public.example".
+    const pk = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(3)).public_key;
+    const contents = [_]u8{ 9, 0x00, 0x20, 0, 32 } ++ pk ++ [_]u8{ 0, 4, 0, 1, 0, 1, 0, 14 } ++ "public.example".* ++ [_]u8{ 0, 0 };
+    const config = [_]u8{ 0xfe, 0x0d, 0, contents.len } ++ contents;
+    const list = [_]u8{ 0, config.len } ++ config;
+    var base: Options = .{ .host = .{ .explicit = "inner.example" }, .ca = .no_verification, .write_buffer = &buf, .read_buffer = &rbuf, .entropy = &entropy, .realtime_now = .zero, .ech_config_list = &list };
+    {
+        var input: Reader = .fixed(&in_buf);
+        input.end = 0;
+        var w: Writer = .fixed(&out_buf);
+        var o = base;
+        o.max_version = .tls_1_2;
+        try std.testing.expectError(error.VersionsInvalid, init(&input, &w, o));
+        o = base;
+        o.ech_config_list = list[0 .. list.len - 1];
+        try std.testing.expectError(error.EchConfigInvalid, init(&input, &w, o));
+        // A config of another KEM only.
+        var other = list;
+        other[2 + 4 + 2] = 0x10;
+        o.ech_config_list = &other;
+        try std.testing.expectError(error.EchConfigUnsupported, init(&input, &w, o));
+    }
+    // The hello on the wire (the server never answers).
+    var input: Reader = .fixed(&in_buf);
+    input.end = 0;
+    var w: Writer = .fixed(&out_buf);
+    try std.testing.expectError(error.TlsConnectionTruncated, init(&input, &w, base));
+    const msg = w.buffered()[tls.record_header_len..];
+    const sni = ech.findExt(msg, @backingInt(tls.ExtensionType.server_name)).?;
+    try std.testing.expectEqualStrings("public.example", sni[5..]);
+    const offer = ech.findExt(msg, ech.ext_encrypted_client_hello).?;
+    // Outer, HKDF-SHA256, AES-128-GCM, config_id 9, a 32-octet enc, then the payload.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 1, 9, 0, 32 }, offer[0..8]);
+    try std.testing.expect(ech.findExt(msg, @backingInt(tls.ExtensionType.pre_shared_key)) == null);
+    // Only TLS 1.3 offered, though min_version is 1.2 by default.
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0x03, 0x04 }, ech.findExt(msg, @backingInt(tls.ExtensionType.supported_versions)).?);
+    // The outer random is not the inner one (entropy[0..32]).
+    try std.testing.expect(!mem.eql(u8, msg[6..38], entropy[0..32]));
+    base.ech_config_list = null;
 }
 
 test "encryptedExtensionsAlpn: one answer, or none; twice is refused" {
