@@ -226,7 +226,7 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   (`BytesReader`: what `bytesBefore` and the sequence decoder look at), so the same engines
   serve a slice and a reader.
 - **Unicode tables** (`unicode_tables.zig`, 94 KB, every property the Rust grammar names) are built in
-  whole by default. `-Dregex_unicode=go` builds in only the tables Go's `regexp` lists plus the Perl
+  whole by default. `-Dregex-unicode=go` (or `-Dprofile=small`) builds in only the tables Go's `regexp` lists plus the Perl
   classes and the few the engine looks up itself (`\w \s \d`, `l`, `n`, `nd`, `alphabetic`), compacted at
   compile time (`reduced_tables`, a fraction of the size); a Rust-grammar property that is then missing
   — `\p{Emoji}`, `\p{scx=Grek}` — fails with `error.UnicodeTableNotBuilt` (that build cannot tell a
@@ -312,6 +312,21 @@ Run with `scripts/modtest regex`; the interop lane re-takes the oracles with `zi
 `zig build bench-regex [-Djcc-safe]` (`tools/bench.zig`) compares against Go `regexp` and Rust `regex`; the card's
 `**Performance:**` line carries the figures and is authoritative. Optimisations are judged by counters (min cycles of
 several runs), not single timings, which swing 5-10 % with code layout and load.
+
+## Build options
+
+Consumer build options (CONVENTIONS §4.2), after Rust `regex-syntax`'s `unicode-*` crate features:
+
+| option | values | default | `-Dprofile=small` |
+|---|---|---|---|
+| `regex-unicode` | `full` / `go` | `full` (graded) | `go` |
+
+- **`go`:** the Unicode property tables are compacted to what Go's `regexp` lists plus the Perl classes and the engine's own
+  lookups (see *Unicode tables*); a Rust-grammar property outside them is `error.UnicodeTableNotBuilt`. Case folding is
+  unaffected.
+- **Gain** (read-only probe `tools/sizeprobe.zig`, ReleaseSmall, native x86_64): 415,264 -> 301,960 B (floor row in
+  `scripts/checks/small-size-expected.tsv`).
+- **Independent of the option:** matching, every Go-grammar property name, `\w \s \d`.
 
 ## What is deliberately not done
 

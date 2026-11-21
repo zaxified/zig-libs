@@ -15,7 +15,7 @@ const casefold = @import("casefold.zig");
 const full_tables = @import("unicode_tables.zig");
 const zl_options = @import("zl_options");
 
-/// `-Dregex_unicode=go`: build in only the tables Go's `regexp` names plus
+/// `-Dregex-unicode=go` (also `-Dprofile=small`): build in only the tables Go's `regexp` names plus
 /// the ones the engine itself uses — as Rust's `regex-syntax` lets a build
 /// drop its `unicode-*` features (`unicode-script`, `unicode-age`,
 /// `unicode-bool`, `unicode-segment`, …), shrinking the tables. A Rust-only

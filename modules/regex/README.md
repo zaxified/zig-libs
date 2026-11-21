@@ -162,7 +162,7 @@ pointer to its `Regex`: do not move the `Regex` while a `Matcher` uses it.
 
 ## Build option
 
-`-Dregex_unicode=go` leaves out the Unicode property tables only the Rust grammar uses (Go's names
+`-Dregex-unicode=go` (also `-Dprofile=small`) leaves out the Unicode property tables only the Rust grammar uses (Go's names
 and `\w \s \d` stay); a missing property is `error.UnicodeTableNotBuilt`. Default `full`.
 
 ## Not provided

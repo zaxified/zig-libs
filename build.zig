@@ -582,19 +582,25 @@ pub fn build(b: *std.Build) void {
     // build options". Per-module knobs are `<module>-<knob>`; `null` = the
     // module derives the value from `profile`.
     const zl_options = b.addOptions();
-    zl_options.addOption(Profile, "profile", b.option(
+    const profile = b.option(
         Profile,
         "profile",
         "Consumer build profile: default (speed+security, as graded) | small (code size)",
-    ) orelse .default);
-    zl_options.addOption(RegexUnicode, "regex_unicode", b.option(
-        RegexUnicode,
-        "regex_unicode",
-        "regex: Unicode tables built in, full (default: every property of the Rust grammar) | go (only what Go's regexp lists and the Perl classes need; the rest of the tables is left out, a Rust-only property fails with error.UnicodeTableNotBuilt)",
-    ) orelse .full);
+    ) orelse .default;
+    zl_options.addOption(Profile, "profile", profile);
     // Knobs: fingerprint-exempt because each is null unless a `-D` sets it (the
     // lane key carries those), and only a module's own source gives it meaning.
     // fingerprint-exempt: begin
+    // An enum option cannot be optional in the generated module, so the
+    // profile default is resolved here, not in the module.
+    zl_options.addOption(RegexUnicode, "regex_unicode", b.option(
+        RegexUnicode,
+        "regex-unicode",
+        "regex: Unicode tables built in, full (default: every property of the Rust grammar) | go (only what Go's regexp lists and the Perl classes need, a Rust-only property fails with error.UnicodeTableNotBuilt; profile=small go)",
+    ) orelse switch (profile) {
+        .default => .full,
+        .small => .go,
+    });
     zl_options.addOption(?u32, "rsa_max_modulus_bits", b.option(
         u32,
         "rsa-max-modulus-bits",
@@ -2007,7 +2013,7 @@ var selected_modules: []const []const u8 = &.{};
 /// trade-off ignores it. See CONVENTIONS.md § "Consumer build options".
 pub const Profile = enum { default, small };
 
-/// `-Dregex_unicode`: how much of the Unicode property data `regex` builds in.
+/// `-Dregex-unicode`: how much of the Unicode property data `regex` builds in.
 pub const RegexUnicode = enum { full, go };
 
 /// The `zl_options` module: the consumer's build options as comptime values.
