@@ -305,6 +305,8 @@ pub const ConnectionInfo = struct {
     extended_master_secret: bool = false,
     peer_certificates_buf: [verify.max_chain_len][]const u8 = undefined,
     peer_certificates_len: usize = 0,
+    verified_chain_buf: [verify.max_path_len][]const u8 = undefined,
+    verified_chain_len: usize = 0,
     /// The stapled OCSP response (DER), or empty.
     ocsp_response: []const u8 = "",
     scts_buf: [max_scts][]const u8 = undefined,
@@ -319,6 +321,29 @@ pub const ConnectionInfo = struct {
     /// The server's certificates as sent, leaf first (DER).
     pub fn peerCertificates(ci: *const ConnectionInfo) []const []const u8 {
         return ci.peer_certificates_buf[0..ci.peer_certificates_len];
+    }
+
+    /// The path the chain was verified along, leaf first, the trust anchor
+    /// from the bundle last (Go `ConnectionState.VerifiedChains`, its first
+    /// chain: `x509.verifyChainPath` builds one). Empty without `.bundle`
+    /// verification. On a resumption, the kept chain verified again under
+    /// the current bundle (as at offer time).
+    pub fn verifiedChain(ci: *const ConnectionInfo) []const []const u8 {
+        return ci.verified_chain_buf[0..ci.verified_chain_len];
+    }
+
+    /// Records a verified path whose certificates are `peerCertificates`
+    /// entries (pointer-equal to `sent`'s, already kept) or bundle bytes
+    /// (kept now).
+    fn keepPath(ci: *ConnectionInfo, path: []const []const u8, sent: []const []const u8) error{ConnectionInfoTooSmall}!void {
+        ci.verified_chain_len = 0;
+        for (path) |der| {
+            const kept = for (sent, 0..) |s, i| {
+                if (s.ptr == der.ptr and s.len == der.len and i < ci.peer_certificates_len) break ci.peer_certificates_buf[i];
+            } else try ci.keep(der);
+            ci.verified_chain_buf[ci.verified_chain_len] = kept;
+            ci.verified_chain_len += 1;
+        }
     }
 
     /// The SignedCertificateTimestamps, each one SCT as RFC 6962 encodes it.
@@ -1487,7 +1512,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                         if (psk_accepted) {
                             handshake_state = .finished;
                             if (info) |ci| {
-                                try copyKeptChain(ci, options.session_cache.?, offer.?.entry, offer.?.generation);
+                                try copyKeptChainVerified(ci, options.session_cache.?, offer.?.entry, offer.?.generation, &options, now_sec);
                                 fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, false);
                                 ci.did_resume = true;
                                 if (options.verify_connection) |vc| vc.verify(vc.context, ci) catch return error.TlsConnectionRejected;
@@ -1591,7 +1616,10 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                             .bundle => |ca| {
                                 try ca.lock.lockShared(ca.io);
                                 defer ca.lock.unlockShared(ca.io);
-                                try verify.verifyAgainstBundle(peer_chain[0..peer_chain_len], ca.bundle, now_sec);
+                                if (info) |ci| {
+                                    var path: [verify.max_path_len][]const u8 = undefined;
+                                    try ci.keepPath(try verify.verifyPath(peer_chain[0..peer_chain_len], ca.bundle, now_sec, &path), peer_chain[0..peer_chain_len]);
+                                } else try verify.verifyAgainstBundle(peer_chain[0..peer_chain_len], ca.bundle, now_sec);
                                 handshake_state = .trust_chain_established;
                             },
                         }
@@ -2055,7 +2083,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                         // transcript through the server's.
                                         p.transcript_hash.update(wrapped_handshake);
                                         if (info) |ci| {
-                                            try copyKeptChain(ci, options.session_cache.?, offer12.?.entry, offer12.?.generation);
+                                            try copyKeptChainVerified(ci, options.session_cache.?, offer12.?.entry, offer12.?.generation, &options, now_sec);
                                             fillInfo(ci, tls_version, negotiated_suite, negotiated_group, alpn_selected, hrr_seen, ems_negotiated);
                                             ci.did_resume = true;
                                             if (options.verify_connection) |vc| vc.verify(vc.context, ci) catch return error.TlsConnectionRejected;
@@ -2362,6 +2390,21 @@ fn fillBinder(comptime H: type, msg: []u8, psk: *const [64]u8, prefix: *const H)
     defer crypto.secureZero(u8, &bk);
     tlsresume.psk.binderKey(Hkdf, &bk, &early, &empty);
     tlsresume.psk.computeBinder(Hkdf, Hmac, msg[msg.len - n ..][0..n], &bk, &th);
+}
+
+/// A resumed session's view: the certificates kept with the ticket and,
+/// under `.bundle`, the path they verify along now (`verifiedChain`).
+fn copyKeptChainVerified(ci: *ConnectionInfo, cache: *SessionCache, entry: *ClientSession, generation: u64, options: *const Options, now_s: i64) (error{ ConnectionInfoTooSmall, SessionReplaced } || verify.Error || std.Io.Cancelable)!void {
+    try copyKeptChain(ci, cache, entry, generation);
+    switch (options.ca) {
+        .bundle => |ca| {
+            try ca.lock.lockShared(ca.io);
+            defer ca.lock.unlockShared(ca.io);
+            var path: [verify.max_path_len][]const u8 = undefined;
+            try ci.keepPath(try verify.verifyPath(ci.peerCertificates(), ca.bundle, now_s, &path), ci.peerCertificates());
+        },
+        else => {},
+    }
 }
 
 /// A resumed session's view: the certificates kept with the ticket.

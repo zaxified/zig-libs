@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Added:** `ConnectionInfo.verifiedChain()` (Go `ConnectionState.VerifiedChains`, one path): the path `x509.verifyChainPath` verified under `.bundle`, leaf first, the bundle's anchor last (kept in the info storage); on a resumption the kept chain is verified again under the current bundle for it. `verify.verifyPath` / `verify.max_path_len` return the path. Empty without `.bundle`.
 - **2026-11-20** — **Behaviour change:** a handshake budget, as Go's `crypto/tls` (`maxUselessRecords` = 16): during `init`, a 17th consecutive record that carries no handshake bytes and changes no cipher state (a TLS 1.3 ChangeCipherSpec, an empty record) ends the handshake with `error.TlsUnexpectedMessage`; before, a server could trickle them for as long as the transport allowed. A record with handshake bytes restarts the count. No error set change.
 - **2026-11-13** — **BEHAVIOURAL:** a TLS 1.3 ServerHello or HelloRetryRequest carrying an extension only TLS 1.2 defines there (ALPN, status_request, SCT, extended_master_secret, SessionTicket, renegotiation_info) ends the handshake with `error.TlsIllegalParameter`, as Go's client refuses it; before, the ALPN answer there was taken and the others ignored. No real TLS 1.3 server sends them (interop with Go unchanged).
 

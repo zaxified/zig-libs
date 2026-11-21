@@ -52,6 +52,18 @@ pub fn checkWellFormed(der: []const u8) Error!void {
 /// Verify `chain` (leaf first, as the server sent it, each one already
 /// through `checkWellFormed`) against `bundle` at `now_sec`.
 pub fn verifyAgainstBundle(chain: []const []const u8, bundle: *const Certificate.Bundle, now_sec: i64) Error!void {
+    _ = try verifyPath(chain, bundle, now_sec, null);
+}
+
+/// The most certificates a verified path holds: the chain and an anchor.
+pub const max_path_len = max_chain_len + 1;
+
+/// `verifyAgainstBundle` that also returns the path it verified (Go
+/// `ConnectionState.VerifiedChains`, one chain): leaf first, the bundle's
+/// anchor last, each a slice of `chain` or of `bundle.bytes` (valid while
+/// those are, so copy under the bundle's lock). With `path_out` null only
+/// the verdict.
+pub fn verifyPath(chain: []const []const u8, bundle: *const Certificate.Bundle, now_sec: i64, path_out: ?*[max_path_len][]const u8) Error![]const []const u8 {
     if (chain.len == 0 or chain.len > max_chain_len) return error.TlsCertificateNotVerified;
     // Trust anchors: the bundle's certificate for every issuer name the chain
     // mentions. `Bundle` keys one certificate per subject, which is all a
@@ -73,10 +85,16 @@ pub fn verifyAgainstBundle(chain: []const []const u8, bundle: *const Certificate
 
     var scratch: [scratch_len]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&scratch);
-    _ = x509.verifyChain(fba.allocator(), chain, anchors[0..n], .{
-        .now_sec = now_sec,
-        .required_eku = .server_auth,
-    }) catch return error.TlsCertificateNotVerified;
+    const opts: x509.Options = .{ .now_sec = now_sec, .required_eku = .server_auth };
+    const out = path_out orelse {
+        _ = x509.verifyChain(fba.allocator(), chain, anchors[0..n], opts) catch return error.TlsCertificateNotVerified;
+        return &.{};
+    };
+    var vp = x509.verifyChainPath(fba.allocator(), chain, anchors[0..n], opts) catch return error.TlsCertificateNotVerified;
+    defer vp.deinit(fba.allocator());
+    if (vp.certs.len > out.len) return error.TlsCertificateNotVerified;
+    for (vp.certs, out[0..vp.certs.len]) |c, *o| o.* = c;
+    return out[0..vp.certs.len];
 }
 
 /// The whole DER of the bundle certificate starting at `at`. The bundle's
@@ -167,6 +185,23 @@ test "a leaf restricted to clientAuth is no server" {
     var c: Chain = .{};
     const chain = try c.of(&.{ @embedFile("testdata/leaf-client.pem"), @embedFile("testdata/inter.pem") });
     try testing.expectError(error.TlsCertificateNotVerified, verifyAgainstBundle(chain, &bundle, now));
+}
+
+test "verifyPath: the path is the chain sent and the bundle's root, leaf first" {
+    var bundle = try rootBundle(testing.allocator);
+    defer bundle.deinit(testing.allocator);
+    var c: Chain = .{};
+    const chain = try c.of(&.{ @embedFile("testdata/leaf.pem"), @embedFile("testdata/inter.pem") });
+    var path: [max_path_len][]const u8 = undefined;
+    const p = try verifyPath(chain, &bundle, now, &path);
+    try testing.expectEqual(@as(usize, 3), p.len);
+    try testing.expectEqual(chain[0].ptr, p[0].ptr);
+    try testing.expectEqual(chain[1].ptr, p[1].ptr);
+    var buf: [4096]u8 = undefined;
+    try testing.expectEqualSlices(u8, try pemToDer(@embedFile("testdata/root.pem"), &buf), p[2]);
+    // The verdict alone returns no path.
+    try testing.expectEqual(@as(usize, 0), (try verifyPath(chain, &bundle, now, null)).len);
+    try testing.expectError(error.TlsCertificateNotVerified, verifyPath(chain[0..1], &bundle, now, &path));
 }
 
 test "a chain to a root the bundle does not hold is refused" {

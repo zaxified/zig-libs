@@ -648,6 +648,11 @@ test "interop: ConnectionInfo -- chain, version, group; stapled OCSP in TLS 1.3 
         try testing.expectEqual(@as(usize, 2), ci.peerCertificates().len);
         try testing.expectEqualSlices(u8, derFromPem(@embedFile("testdata/leaf.pem")), ci.peerCertificates()[0]);
         try testing.expectEqualSlices(u8, derFromPem(@embedFile("testdata/inter.pem")), ci.peerCertificates()[1]);
+        // The verified path: the sent chain and the bundle's root (Go VerifiedChains[0]).
+        try testing.expectEqual(@as(usize, 3), ci.verifiedChain().len);
+        try testing.expectEqual(ci.peerCertificates()[0].ptr, ci.verifiedChain()[0].ptr);
+        try testing.expectEqual(ci.peerCertificates()[1].ptr, ci.verifiedChain()[1].ptr);
+        try testing.expectEqualSlices(u8, derFromPem(@embedFile("testdata/root.pem")), ci.verifiedChain()[2]);
         try testing.expectEqualSlices(u8, ocsp_der, ci.ocsp_response);
         try testing.expectEqual(s.version, ci.version);
         try testing.expectEqual(s.group, ci.negotiated_group);
@@ -980,6 +985,8 @@ test "interop: TLS 1.3 resumption -- the second connection resumes on openssl's 
         // No Certificate on the wire, the kept chain in the view, the hook ran.
         try testing.expectEqual(@as(usize, 2), ci.peerCertificates().len);
         try testing.expectEqualSlices(u8, derFromPem(@embedFile("testdata/leaf.pem")), ci.peerCertificates()[0]);
+        try testing.expectEqual(@as(usize, 3), ci.verifiedChain().len);
+        try testing.expectEqualSlices(u8, derFromPem(@embedFile("testdata/root.pem")), ci.verifiedChain()[2]);
         try testing.expectEqual(@as(usize, 1), h.calls);
         if (extra.len == 3) try testing.expect(second.hrr); // HRR to P-256, the PSK re-bound
     }

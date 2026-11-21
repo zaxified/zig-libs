@@ -89,7 +89,8 @@ try client.exportKeyingMaterial("EXPERIMENTAL-my-proto", null, &km); // RFC 8446
 ```
 
 - **ConnectionInfo:** version, suite, group, ALPN, HRR, resumption, EMS, the
-  peer's certificates, the stapled OCSP response and the SCTs, copied into
+  peer's certificates, the verified path to the bundle's root (`verifiedChain`),
+  the stapled OCSP response and the SCTs, copied into
   your storage (`ConnectionInfoTooSmall` rather than truncation).
 - **verify_connection** runs once the server is authenticated (also on a
   resumed session, with the chain kept from the first one), before the

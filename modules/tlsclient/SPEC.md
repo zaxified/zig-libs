@@ -22,13 +22,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [Go `crypto/tls`](https://pkg.go.dev/crypto/tls) — **reference** | Go | BSD-3-Clause | — | go1.26.0 | The Scope's yardstick (owner 2026-10-13: Go's defaults). Everything its client offers is here (identifier by identifier) except ECH (deferred) and `VerifiedChains` (both in *Backlog / deferred*). The handshake bench runs against its client. |
+| [Go `crypto/tls`](https://pkg.go.dev/crypto/tls) — **reference** | Go | BSD-3-Clause | — | go1.26.0 | The Scope's yardstick (owner 2026-10-13: Go's defaults). Everything its client offers is here (identifier by identifier) except ECH (in *Backlog / deferred*); `VerifiedChains` is one chain here (`ConnectionInfo.verifiedChain`, the path `x509.verifyChainPath` built), Go's every valid one. The handshake bench runs against its client. |
 | [rustls/rustls](https://github.com/rustls/rustls) | Rust | Apache-2.0 OR ISC OR MIT (GitHub API says NOASSERTION; source not read) | 7.6k | v0.23.45 (2026-09-14) | ALPN, client certificates, session resumption, ECH, post-quantum key exchange *(inferred from README)*; certificate compression (RFC 8879), which Go lacks too. |
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | Everything, including OCSP stapling requests and renegotiation; links a large C library. |
 | Zig `std.crypto.tls.Client` | Zig | MIT | — | Zig 0.16.0 | What this module is copied from. std accepts a leaf signed by another leaf (ziglang/zig #35877), aborts on any HelloRetryRequest, has no ALPN, client certificates, resumption, exporter or session view, cannot verify Ed25519 server certificates or IP hosts, desynchronises on a server's KeyUpdate request, and has five server-triggerable crashes -- all fixed or added here. |
 | [ianic/tls.zig](https://github.com/ianic/tls.zig) | Zig | MIT | 174 | push 2026-09-01, no releases | Ecosystem alternative: TLS 1.2/1.3 client, TLS 1.3 server, client authentication, cipher-suite selection (README, read). Whether it checks basicConstraints on the chain: not verified. |
 
-**Where we are ahead:** of Zig `std` -- see its row; RFC 5280 path validation with EKU and name/path-length constraints via `x509` instead of a link-by-link walk; each certificate's DER proven in bounds before std's parser sees it. Of Go: client CPU per handshake below Go's (the card's Performance line has the figures; same key-share offer). Of rustls + aws-lc-rs (the fastest client measured): behind it. **Where we are behind Go**: ECH (deferred by the owner), `ConnectionState.VerifiedChains` (both in *Backlog / deferred*), TLS 1.2 CBC suites and Ed25519 client keys in TLS 1.2 (PureEdDSA cannot sign the 1.2 transcript hash), each refused with its reason under *What is deliberately not done*.
+**Where we are ahead:** of Zig `std` -- see its row; RFC 5280 path validation with EKU and name/path-length constraints via `x509` instead of a link-by-link walk; each certificate's DER proven in bounds before std's parser sees it. Of Go: client CPU per handshake below Go's (the card's Performance line has the figures; same key-share offer). Of rustls + aws-lc-rs (the fastest client measured): behind it. **Where we are behind Go**: ECH (in *Backlog / deferred*), `ConnectionState.VerifiedChains` as one path rather than every valid one, TLS 1.2 CBC suites and Ed25519 client keys in TLS 1.2 (PureEdDSA cannot sign the 1.2 transcript hash), each refused with its reason under *What is deliberately not done*.
 ## What this module is, and what it is not
 
 A copy of Zig 0.16.0's `std.crypto.tls.Client` whose handling of the
@@ -423,8 +423,6 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
 - **ECH (Encrypted Client Hello)**: deferred by the owner ("deliberately not now"). Go's client has it
   (`EncryptedClientHelloConfigList`, configs from DNS HTTPS records); it would pull `hpke` (grade 3) into
   this module's closure, which then has to reach grade 2.
-- **`VerifiedChains`**: the path `x509.verifyChain` built is not exposed (`ConnectionInfo` has the chain as
-  sent). Needs `verifyChain` to return its path.
 - **Dead-stack probe for TLS 1.2 resumption**: `stackprobe_test.zig` drives TLS 1.3 only, and the +6 KiB of
   `init` depth for TLS 1.2 resumption is an estimate against the 384 KiB burn. Add a TLS 1.2 resumed
   handshake to the probe.
