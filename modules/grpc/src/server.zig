@@ -94,6 +94,7 @@ const pb = @import("protobuf");
 
 const frame = @import("frame.zig");
 const compress = @import("compress.zig");
+const pool_mod = @import("pool.zig");
 const status_mod = @import("status.zig");
 const metadata = @import("metadata.zig");
 const call_mod = @import("call.zig");
@@ -112,6 +113,8 @@ const Entry = metadata.Entry;
 pub const Clock = clock_lib.Clock;
 
 // ── options ─────────────────────────────────────────────────────────────────
+
+pub const HandlerPool = pool_mod.HandlerPool;
 
 pub const Options = struct {
     /// Hard ceiling on a single **received** message, enforced against the
@@ -233,6 +236,11 @@ pub const Router = struct {
     /// Passed to every handler as `Call.context` — the seam for server
     /// state, since a `Method` is a plain function pointer.
     context: ?*anyopaque = null,
+    /// Run handlers on this pool (`HandlerPool`) instead of one after another
+    /// on the connection's task: `httpOptions` and `h2ServerOptions` install
+    /// it as the HTTP/2 dispatcher (unless `base` already has one). Null: the
+    /// historical sequential behaviour. The pool must outlive the server.
+    pool: ?*pool_mod.HandlerPool = null,
 
     /// `http.Server.Options` wired for gRPC: the handler, the context and
     /// the streaming predicate all have to agree about which router they
@@ -249,6 +257,9 @@ pub const Router = struct {
         o.context = r;
         o.h2_stream_request = streamRequest;
         o.enable_h2c = true;
+        if (r.pool) |p| if (o.h2_dispatcher == null) {
+            o.h2_dispatcher = p.dispatcher();
+        };
         return o;
     }
 
@@ -259,6 +270,9 @@ pub const Router = struct {
         o.handler = handleHttp;
         o.context = r;
         o.stream_request = streamRequest;
+        if (r.pool) |p| if (o.dispatcher == null) {
+            o.dispatcher = p.dispatcher();
+        };
         return o;
     }
 

@@ -38,8 +38,7 @@ Trailers-Only vs Trailers distinction; a decoded-size bound on every message (de
 never sizes an allocation), pure Zig with no C core, typed struct messages with no codegen step.
 **Where we are behind:** no retries, name resolution/load balancing, interceptors,
 keepalive, `grpc-status-details-bin`, gRPC-Web, and no reflection service (the standard
-`grpc.health.v1` health service is provided, `src/health.zig`); the server is sequential per connection unless the application installs
-the `http` dispatcher (→ Backlog).
+`grpc.health.v1` health service is provided, `src/health.zig`); the server is sequential per connection unless the application sets `Router.pool` (a `HandlerPool`) or installs the `http` dispatcher itself.
 
 See [README.md](README.md) for what this module is and how to use it.
 
@@ -97,13 +96,13 @@ a no-op.
 
 ### What the server does not do
 
-- **Concurrent handlers.** `h2_server` has an
-  injectable dispatch seam (`h2_server.Options.dispatcher` / `Server.Options.h2_dispatcher`):
-  with one installed, a connection's streams run on a bounded worker pool and a slow handler no
-  longer holds up the others. `grpc.Server` does not install one — it passes the `http` options
-  through, so the choice (and the thread pool) belongs to the application. **The
-  default is sequential**: one connection's streams are served on the connection's task,
-  and only multiple *connections* run in parallel via the accept engine.
+- **Concurrent handlers by default.** `Router.pool` (`HandlerPool`, over `workerpool`) moves each
+  stream's handler onto a bounded worker pool (`per_connection` 8, `global_cap` 4 per CPU; a stream
+  over the global cap is refused with `REFUSED_STREAM`, never queued), and a slow handler no longer
+  holds up the others. Without it (the default: `Router` owns no threads and has no `deinit`) a
+  connection's streams are served one after another on the connection's task, and only multiple
+  *connections* run in parallel via the accept engine; `Server.Options.h2_dispatcher` still takes
+  any other dispatcher.
 - **Preemptive deadlines.** `grpc-timeout` is enforced at every engine boundary, but a handler
   blocked in a body read cannot be interrupted — there is no deadline hook on the h2 request-body
   reader. `http`'s `read_timeout_ms`/`request_timeout_ms` are the transport-level backstop.
@@ -409,8 +408,8 @@ Each item is refused with its reason here; the ones that are open work are also 
   is the reusable half and the rest is a different transport.
 - **Reflection and channelz services.** Ordinary services, expressible with what is
   here; not protocol. (`grpc.health.v1` is provided: `health.zig`.)
-- **Concurrent server handlers** and **preemptive deadline cancellation.** Both are properties of
-  `h2_server`'s scheduling, not of this module; see "What the server does not do" above.
+- **Preemptive deadline cancellation.** A property of `h2_server`'s scheduling, not of this module;
+  see "What the server does not do" above.
 
 ## Anchoring
 
@@ -426,5 +425,4 @@ Each item is refused with its reason here; the ones that are open work are also 
 Reasons for each are under *What is deliberately not done*; the first four are what a typical grpc-go/tonic user hits in ordinary use.
 
 - **Interceptors / middleware hooks** (auth, logging, metrics on client and server) — a grpc-go/tonic staple; absent, every caller wraps calls by hand. Effort: medium (needs an API decision). Fits §2: yes.
-- **Default server concurrency** — a connection's streams run sequentially unless the application installs the `h2_server` dispatcher; a slow handler blocks the connection. Effort: small–medium (wire a pool option into `grpc.Server`). Fits §2: yes.
 - **Retries/hedging, name resolution and load balancing, keepalive, `grpc-status-details-bin`, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.

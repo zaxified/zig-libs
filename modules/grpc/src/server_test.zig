@@ -830,6 +830,64 @@ test "server: a request compressed with an encoding that is not enabled is UNIMP
     try testing.expectEqualStrings("gzip,deflate,identity", r.header("grpc-accept-encoding").?);
 }
 
+// ── concurrent handlers ─────────────────────────────────────────────────────
+
+var pool_gate: std.atomic.Value(bool) = .init(false);
+
+fn gateWaitImpl(c: *server.Call) anyerror!void {
+    var spins: u32 = 0;
+    while (!pool_gate.load(.acquire)) {
+        spins += 1;
+        if (spins > 20_000_000) return error.TimedOut;
+        std.Thread.yield() catch {};
+    }
+    try c.send("waited");
+}
+
+fn gateOpenImpl(c: *server.Call) anyerror!void {
+    pool_gate.store(true, .release);
+    try c.send("opened");
+}
+
+const pool_service: server.Service = .{
+    .name = "pool.Svc",
+    .methods = &.{ server.Method.raw("Wait", gateWaitImpl), server.Method.raw("Open", gateOpenImpl) },
+};
+
+test "server: with Router.pool a handler that waits does not hold up the stream behind it" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var hp = try server.HandlerPool.init(gpa, threaded.io(), .{ .workers = 2 });
+    defer hp.deinit();
+
+    pool_gate.store(false, .release);
+    var peer: TestPeer = .init(gpa);
+    defer peer.deinit();
+    var router: server.Router = .{ .gpa = gpa, .services = &.{pool_service}, .pool = hp };
+    try peer.conn.sendPreface(&peer.wire);
+    // `Wait` first: sequentially it would spin until it gives up, and `Open`
+    // behind it would never run.
+    const waiting = try startCall(&peer, "/pool.Svc/Wait", &.{"go"});
+    const opening = try startCall(&peer, "/pool.Svc/Open", &.{"go"});
+    try runOffline(&peer, &router);
+    try testing.expectEqualStrings("0", peer.resp(opening).trailer("grpc-status").?);
+    try testing.expectEqualStrings("0", peer.resp(waiting).trailer("grpc-status").?);
+}
+
+test "server: Router.pool is installed unless the caller brought a dispatcher" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var hp = try server.HandlerPool.init(gpa, threaded.io(), .{ .workers = 1, .per_connection = 3 });
+    defer hp.deinit();
+    var router: server.Router = .{ .gpa = gpa, .services = &.{}, .pool = hp };
+    const o = router.h2ServerOptions(.{ .handler = server.handleHttp });
+    try testing.expectEqual(@as(u32, 3), o.dispatcher.?.max_concurrent_handlers);
+    var plain: server.Router = .{ .gpa = gpa, .services = &.{} };
+    try testing.expect(plain.h2ServerOptions(.{ .handler = server.handleHttp }).dispatcher == null);
+}
+
 // ── message compression ─────────────────────────────────────────────────────
 
 /// A request with `grpc-encoding: enc` (and `accept` as `grpc-accept-encoding`

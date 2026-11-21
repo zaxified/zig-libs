@@ -70,12 +70,13 @@ pub const meta = .{
     .role = .both,
     .concurrency = .single_owner, // one task drives a Channel's session
     .model_after = "the grpc-over-http2 protocol specification; verified live against Python grpcio (the reference implementation), in both directions",
-    .deps = .{ "http", "protobuf", "b64ct", "clock" },
+    .deps = .{ "http", "protobuf", "b64ct", "clock", "workerpool" },
 };
 
 const call_mod = @import("call.zig");
 const frame_mod = @import("frame.zig");
 const compress_mod = @import("compress.zig");
+const pool_mod = @import("pool.zig");
 const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");
 const server_mod = @import("server.zig");
@@ -121,6 +122,11 @@ pub const default_max_recv_message_size = frame_mod.default_max_recv_message_siz
 /// `gzip` and `deflate` message compression with a bound on the inflated size
 /// (`grpc-encoding`); see `compress.zig`.
 pub const compression = compress_mod;
+
+// ── concurrency ─────────────────────────────────────────────────────────────
+
+/// A bounded worker pool for handlers (`Router.pool`); see `pool.zig`.
+pub const HandlerPool = pool_mod.HandlerPool;
 
 // ── metadata ────────────────────────────────────────────────────────────────
 
@@ -301,6 +307,7 @@ test {
     _ = status_mod;
     _ = frame_mod;
     _ = compress_mod;
+    _ = pool_mod;
     _ = metadata_mod;
     _ = call_mod;
     _ = @import("call_test.zig");

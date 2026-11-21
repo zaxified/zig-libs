@@ -322,6 +322,5 @@ Trailers-Only distinction, since both shapes use the same field names.
 
 Message compression other than `gzip`/`deflate` (`snappy`, `zstd`). **Retries**, **channel load balancing
 / name resolution**, **`grpc-status-details-bin`** (the `google.rpc.Status` detail payload),
-**gRPC-Web** framing, and **reflection** services (the standard health service is provided, see Server). On the server: concurrent handlers (`h2_server`
-has the dispatch seam, but `grpc.Server` installs no pool of its own — the default stays
-sequential per connection) and preemptive deadline cancellation. See SPEC.md *What is deliberately not done* for why each, and *Backlog / deferred* for the ones that are open work.
+**gRPC-Web** framing, and **reflection** services (the standard health service is provided, see Server). On the server: preemptive deadline cancellation, and concurrent handlers unless you set `Router.pool` (a `grpc.HandlerPool`; the default stays
+sequential per connection). See SPEC.md *What is deliberately not done* for why each, and *Backlog / deferred* for the ones that are open work.

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Added:** `grpc.HandlerPool` (new `src/pool.zig`, over `workerpool`; new dependency) and `Router.pool`: `httpOptions`/`h2ServerOptions` install it as the HTTP/2 dispatcher, so one connection's streams run concurrently on a bounded pool instead of one after another. Default (`pool = null`) unchanged.
+
 - **2026-11-21** — **Added, with a behaviour change:** message compression (`gzip`, `deflate`; `grpc.compression`, new `src/compress.zig`). Request messages are inflated against `max_recv_message_size` while inflating (`RESOURCE_EXHAUSTED` past it, `INTERNAL` for a corrupt stream or checksum); `Server.Options.accept_encodings` and `send_encoding`, `Options.request_encoding` on the client, `Deframer.last_compressed`. Behaviour change: the client now advertises `grpc-accept-encoding: gzip,deflate,identity` (was `identity`) and the server answers with the same list, and a `grpc-encoding: gzip` or `deflate` request that used to be `UNIMPLEMENTED` is now served; a client that must stay identity-only sets `accept_encoding = "identity"`, a server `accept_encodings = .{ .gzip = false, .deflate = false }`. Nothing is compressed unless asked for.
 
 - **2026-11-16** — New: standard `grpc.health.v1.Health` service (`Check`, `Watch`) with the `grpc.Health` status registry (`set`/`remove`/`get`/`shutdown`), `grpc.health.Service(getFn)` and `grpc.health.service_from_context` (new `src/health.zig`).
