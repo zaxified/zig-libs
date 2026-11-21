@@ -78,12 +78,20 @@ marked `zig-libs tlsclient` in `Client.zig`:
   caller's I/O timeout.
 - **TLS 1.2 ECDHE_ECDSA suites** (AES-GCM, ChaCha20); the suite must match the
   certificate's key type.
+- **AES-GCM records from `aesgcm`** (`src/cipher.zig`: std's `HandshakeCipher` /
+  `ApplicationCipher` unions, same shape and tags, AES-GCM swapped): Zig 0.17
+  lowers std's CTR and GHASH `u128` arithmetic to per-byte loops (codeberg
+  ziglang/zig #36256). Measured 2026-11-21 (ReleaseFast, rdtsc, 8 interleaved
+  rounds of 2000 × seal+open of a 16 KiB record): AES-128-GCM 100.4 k → 23.6 k
+  cycles (4.2×), AES-256-GCM 110.1 k → 29.5 k (3.7×), min/max of each well
+  apart. ChaCha20-Poly1305 and AEGIS stay std's.
 - **Ed25519 server certificates** (TLS 1.3 CertificateVerify, TLS 1.2
   ECDHE_ECDSA): std carried the verifier but its scheme→key mapping never
   reached it.
 - **Session view** `Options.connection_info` → `ConnectionInfo` (Go
   `ConnectionState`): version, suite, group, ALPN, HRR, EMS, the peer's
-  certificates as sent, the stapled OCSP response and SCTs, all copied into
+  certificates as sent, the verified path to the bundle's anchor
+  (`verifiedChain`), the stapled OCSP response and SCTs, all copied into
   caller storage (`ConnectionInfoTooSmall` rather than truncation). Also
   `Client.cipher_suite`, `negotiated_group`, `hello_retry_request`.
 - **OCSP / SCT requests** on by default as in Go (`request_ocsp`,
@@ -436,17 +444,11 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
 - **Stack requirement checked at run time**: `init` documents about 400 KiB; a caller on a small fibre stack
   overflows. A check needs the thread's stack bounds (no std API); revisit if a consumer runs clients on
   small stacks.
-- **Zig 0.17: std AES-GCM is 2.6x slower, move to zig-libs `aesgcm`**: 0.17 lowers `writeInt(u128, ...)` in
-  `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig
-  #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G -> 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages.
-  This module uses std's AES-GCM for every AES-GCM record; `aesgcm` (AES-NI stitched kernel, std-shaped API)
-  is unaffected. Not a drop-in: the record layer is `std.crypto.tls.ApplicationCipher` /
-  `HandshakeCipher` (every `P.AEAD`), whose member types are std's own AES-GCM, so switching means
-  replacing those unions with module-owned cipher states over `aesgcm`/`chachapoly` (`ctgrind_harness`,
-  `fuzz_test` and `stackprobe_test` mirror the production type and move with it). Owner decision: a
-  separate task, natural to do together with the `tlsserver` record layer (one shared record-protection
-  layer for both), and only with the bulk path measured before and after. `aesgcm` is not in `.deps` until
-  the sources use it.
+- **One record-protection layer with `tlsserver`**: both now seal AES-GCM with `aesgcm`, but through two
+  layers — `tlsserver`'s `record.Protection` and this module's std-shaped cipher unions (`src/cipher.zig`),
+  which the std-copied handshake reads field by field. Sharing one means moving this record layer off the
+  std shape (the handshake's every `P.AEAD` use), a refactor with no measured gain left once both are on
+  `aesgcm`.
 - **Build option: algorithm set**: every cipher suite, group and client-auth signer is linked (`p384` and
   `p521` are imported unconditionally, TLS 1.2 suites, AEGIS, client certificates, `tlsresume`). A `.small`
   "modern web" set could drop P-521, AEGIS and client auth; a peer that insists on a dropped algorithm

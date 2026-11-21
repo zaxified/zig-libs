@@ -27,6 +27,11 @@ pub const rsa = @import("rsa");
 // zig-libs tlsclient: dead-stack burn around the client-certificate signature.
 const burn = @import("burn.zig");
 const tls = std.crypto.tls;
+/// AES-GCM record protection from zig-libs `aesgcm` (std's shape; `cipher.zig`).
+const cipher = @import("cipher.zig");
+/// The application traffic state (`application_cipher`): std's
+/// `tls.ApplicationCipher` with zig-libs AES-GCM.
+pub const ApplicationCipher = cipher.ApplicationCipher;
 const Client = @This();
 const mem = std.mem;
 const crypto = std.crypto;
@@ -72,7 +77,7 @@ write_seq: u64,
 /// may be data in the input buffer.
 received_close_notify: bool,
 allow_truncation_attacks: bool,
-application_cipher: tls.ApplicationCipher,
+application_cipher: cipher.ApplicationCipher,
 
 /// If non-null, ssl secrets are logged to a stream. Creating such a log file
 /// allows other programs with access to that file to decrypt all traffic over
@@ -949,7 +954,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
     var handshake_state: HandshakeState = .hello;
     // zig-libs tlsclient: ALPN -- the server's choice, one of ours.
     var alpn_selected: ?[]const u8 = null;
-    var handshake_cipher: tls.HandshakeCipher = undefined;
+    var handshake_cipher: cipher.HandshakeCipher = undefined;
     var main_cert_pub_key: CertificatePublicKey = undefined;
     var tls12_negotiated_group: ?tls.NamedGroup = null;
     // zig-libs tlsclient: session view.
@@ -1114,7 +1119,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                         const pv = &p.version.tls_1_2;
                         const P = @TypeOf(p.*).A;
                         if (record_len < P.record_iv_length + P.mac_length) return error.TlsRecordOverflow;
-                        const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
+                        const message_len: u16 = record_len - @as(u16, P.record_iv_length + P.mac_length);
                         const cleartext_fragment_buf = cleartext_buf[cleartext_fragment_end..];
                         if (message_len > cleartext_fragment_buf.len) return error.TlsRecordOverflow;
                         const cleartext = cleartext_fragment_buf[0..message_len];
@@ -2106,7 +2111,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                         .CLIENT_TRAFFIC_SECRET = &client_secret,
                                     });
                                     key_seq += 1;
-                                    break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_3 = .{
+                                    break :app_cipher @unionInit(cipher.ApplicationCipher, @tagName(tag), .{ .tls_1_3 = .{
                                         .client_secret = client_secret,
                                         .server_secret = server_secret,
                                         .client_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length),
@@ -2148,7 +2153,7 @@ fn initBodyImpl(input: *Reader, output: *Writer, options: Options, track: *u64) 
                                         try output.flush();
                                         write_seq += 1;
                                     }
-                                    break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_2 = pv.app_cipher });
+                                    break :app_cipher @unionInit(cipher.ApplicationCipher, @tagName(tag), .{ .tls_1_2 = pv.app_cipher });
                                 },
                                 else => unreachable,
                             },
@@ -2341,7 +2346,7 @@ fn writeHelloRecord(output: *Writer, record_version: tls.ProtocolVersion, msg: [
 
 /// A fresh transcript for `suite` (std's ServerHello code, factored out so
 /// a HelloRetryRequest can start it).
-fn initHandshakeCipher(hc: *tls.HandshakeCipher, suite: tls.CipherSuite) error{TlsIllegalParameter}!void {
+fn initHandshakeCipher(hc: *cipher.HandshakeCipher, suite: tls.CipherSuite) error{TlsIllegalParameter}!void {
     switch (suite) {
         inline .AES_128_GCM_SHA256,
         .AES_256_GCM_SHA384,
@@ -2354,7 +2359,7 @@ fn initHandshakeCipher(hc: *tls.HandshakeCipher, suite: tls.CipherSuite) error{T
         .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
         .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
         .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        => |tag| hc.* = @unionInit(tls.HandshakeCipher, @tagName(tag.with()), .{
+        => |tag| hc.* = @unionInit(cipher.HandshakeCipher, @tagName(tag.with()), .{
             .transcript_hash = .init(.{}),
             .version = undefined,
         }),
@@ -3150,7 +3155,7 @@ fn prepareCiphertextRecord(
                     const ad = ciphertext_buf[ciphertext_end..][0..tls.record_header_len];
                     ad.* = .{@backingInt(tls.ContentType.application_data)} ++
                         int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
-                        int(u16, ciphertext_len + P.AEAD.tag_length);
+                        int(u16, @intCast(ciphertext_len + P.AEAD.tag_length));
                     ciphertext_end += ad.len;
                     const ciphertext = ciphertext_buf[ciphertext_end..][0..ciphertext_len];
                     ciphertext_end += ciphertext_len;
@@ -3189,7 +3194,7 @@ fn prepareCiphertextRecord(
                     ciphertext_end += tls.record_header_len;
                     record_header.* = .{@backingInt(inner_content_type)} ++
                         int(u16, @backingInt(tls.ProtocolVersion.tls_1_2)) ++
-                        int(u16, P.record_iv_length + message_len + P.mac_length);
+                        int(u16, @intCast(P.record_iv_length + message_len + P.mac_length));
                     const ad = mem.toBytes(big(c.write_seq)) ++ record_header[0 .. 1 + 2] ++ int(u16, message_len);
                     const record_iv = ciphertext_buf[ciphertext_end..][0..P.record_iv_length];
                     ciphertext_end += P.record_iv_length;
@@ -3320,7 +3325,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 const P = @TypeOf(p.*);
                 // zig-libs tlsclient: checked, as the handshake path already was.
                 if (record_len < P.record_iv_length + P.mac_length) return failRead(c, error.TlsBadLength);
-                const message_len: u16 = record_len - P.record_iv_length - P.mac_length;
+                const message_len: u16 = record_len - @as(u16, P.record_iv_length + P.mac_length);
                 const ad_header = input.take(tls.record_header_len) catch unreachable; // already peeked
                 const ad = mem.toBytes(big(c.read_seq)) ++
                     ad_header[0 .. 1 + 2] ++

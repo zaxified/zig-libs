@@ -1066,7 +1066,7 @@ test "a handshake record shorter than a message header or empty is a decode_erro
 
 fn makeTls12() void {
     // The 1.3 session `sink` becomes a TLS 1.2 AES-128-GCM one with known keys.
-    const Cipher = @FieldType(tls.ApplicationCipher, "AES_128_GCM_SHA256");
+    const Cipher = @FieldType(Client.ApplicationCipher, "AES_128_GCM_SHA256");
     sink.application_cipher = .{ .AES_128_GCM_SHA256 = @unionInit(Cipher, "tls_1_2", .{
         .client_write_MAC_key = @splat(0),
         .server_write_MAC_key = @splat(0),
