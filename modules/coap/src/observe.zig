@@ -31,8 +31,10 @@
 //! Which type a notification goes out as is not the caller's free choice:
 //! RFC 7641 §7 requires non-confirmable notifications to be interspersed with
 //! confirmable ones, and §4.5 a confirmable one at least every 24 hours. The
-//! push path asks `Registry.notificationType` before each notification and
-//! reports each ACK with `Registry.acknowledged`.
+//! push path asks `Registry.notificationType` before each notification, records
+//! a confirmable one's Message ID with `Registry.confirmableSent` and reports
+//! each ACK, with the id it carries, to `Registry.acknowledged`, which resets the
+//! budget only for the id that is outstanding.
 //! (An RST correlates by message id, so the caller maps the notification's id
 //! back to its `(token, resource)` — a few lines in its own loop.)
 //!
@@ -235,6 +237,11 @@ pub const Registry = struct {
         /// When the client last confirmed its interest: the registration, or
         /// the last `acknowledged` call. Drives §4.5's 24-hour rule.
         last_ack_ms: u64 = 0,
+        /// Message ID of the confirmable notification currently outstanding
+        /// (`confirmableSent`), cleared by the matching `acknowledged`. Only
+        /// the latest one is remembered: RFC 7641 §4.5 lets a newer
+        /// notification supersede an unacknowledged one.
+        con_mid: ?u16 = null,
 
         pub fn token(e: *const Entry) []const u8 {
             return e.token_buf[0..e.token_len];
@@ -364,18 +371,31 @@ pub const Registry = struct {
         return .non_confirmable;
     }
 
-    /// The client acknowledged a confirmable notification on `(tok, resource)`
-    /// — its interest is confirmed, so the §7 budget and the §4.5 clock start
-    /// over. Returns whether such a subscription exists.
-    ///
-    /// ⚠ The registry does not check that a confirmable notification was
-    /// outstanding: call this only for an ACK whose Message ID matches the
-    /// CON notification the caller is retransmitting for `(tok, resource)` —
-    /// never for an id that went out non-confirmable, and never off the token
-    /// alone (an empty ACK carries none). A forged ACK resets the §7 budget, so
-    /// the notification ids must be unpredictable: see `server.Server.init`.
-    pub fn acknowledged(self: *Registry, tok: []const u8, resource: u64, now_ms: u64) bool {
+    /// Records that a confirmable notification with Message ID `mid` went out
+    /// on `(tok, resource)`; call it right after `notificationType` answered
+    /// `.confirmable` and the notification was sent. Replaces an earlier
+    /// outstanding id (a newer notification supersedes it, RFC 7641 §4.5).
+    /// Returns whether such a subscription exists.
+    pub fn confirmableSent(self: *Registry, tok: []const u8, resource: u64, mid: u16) bool {
         const e = self.find(tok, resource) orelse return false;
+        e.con_mid = mid;
+        return true;
+    }
+
+    /// The client acknowledged the confirmable notification with Message ID
+    /// `mid` on `(tok, resource)` — its interest is confirmed, so the §7 budget
+    /// and the §4.5 clock start over. Returns true only when a subscription
+    /// exists **and** `mid` is the id `confirmableSent` recorded: an ACK for
+    /// anything else (a non-confirmable notification, an id never sent, a
+    /// notification a newer one superseded, a second ACK of the same id)
+    /// changes nothing and returns false, so a forged or stray ACK cannot
+    /// reset the budget. The id is also what keeps the stream unpredictable
+    /// for a spoofer: seed `server.Server.init` from a CSPRNG.
+    pub fn acknowledged(self: *Registry, tok: []const u8, resource: u64, mid: u16, now_ms: u64) bool {
+        const e = self.find(tok, resource) orelse return false;
+        const out = e.con_mid orelse return false;
+        if (out != mid) return false;
+        e.con_mid = null;
         e.non_since_ack = 0;
         e.last_ack_ms = now_ms;
         return true;
@@ -671,16 +691,54 @@ test "TEETH: RFC 7641 §7 — non-confirmable notifications are interspersed wit
     try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, t0).?);
     try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, t0).?);
 
-    try testing.expect(reg.acknowledged("t", 1, t0));
+    try testing.expect(reg.confirmableSent("t", 1, 0x1001));
+    try testing.expect(reg.acknowledged("t", 1, 0x1001, t0));
     try testing.expectEqual(coap.Type.non_confirmable, reg.notificationType("t", 1, t0).?);
 
     // Zero means every notification is confirmable.
     reg.max_non_between_acks = 0;
-    try testing.expect(reg.acknowledged("t", 1, t0));
     try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, t0).?);
+    try testing.expect(reg.confirmableSent("t", 1, 0x1002));
+    try testing.expect(reg.acknowledged("t", 1, 0x1002, t0));
 
     try testing.expect(reg.notificationType("absent", 1, t0) == null);
-    try testing.expect(!reg.acknowledged("absent", 1, t0));
+    try testing.expect(!reg.confirmableSent("absent", 1, 1));
+    try testing.expect(!reg.acknowledged("absent", 1, 1, t0));
+}
+
+test "an ACK resets the budget only for the outstanding confirmable notification's Message ID" {
+    var store: [2]Registry.Entry = undefined;
+    var reg = Registry.init(&store);
+    reg.max_non_between_acks = 1;
+    _ = reg.register("t", 1, 0, t0);
+    _ = reg.register("u", 1, 0, t0);
+    try testing.expectEqual(coap.Type.non_confirmable, reg.notificationType("t", 1, t0).?);
+    try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, t0).?);
+
+    // Nothing outstanding yet: an ACK (forged, or for a non-confirmable id)
+    // changes nothing, and the budget stays spent.
+    try testing.expect(!reg.acknowledged("t", 1, 0x2000, t0 + 1));
+    try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, t0).?);
+
+    try testing.expect(reg.confirmableSent("t", 1, 0x2000));
+    // A different id, or the right id on another subscription: refused.
+    try testing.expect(!reg.acknowledged("t", 1, 0x2001, t0 + 2));
+    try testing.expect(!reg.acknowledged("u", 1, 0x2000, t0 + 2));
+    try testing.expectEqual(@as(u32, 1), reg.find("t", 1).?.non_since_ack);
+    try testing.expectEqual(t0, reg.find("t", 1).?.last_ack_ms);
+
+    // A newer confirmable notification supersedes the older id.
+    try testing.expect(reg.confirmableSent("t", 1, 0x2002));
+    try testing.expect(!reg.acknowledged("t", 1, 0x2000, t0 + 3));
+    try testing.expect(reg.acknowledged("t", 1, 0x2002, t0 + 4));
+    try testing.expectEqual(@as(u32, 0), reg.find("t", 1).?.non_since_ack);
+    try testing.expectEqual(t0 + 4, reg.find("t", 1).?.last_ack_ms);
+    // The same ACK twice counts once.
+    try testing.expect(!reg.acknowledged("t", 1, 0x2002, t0 + 5));
+    try testing.expectEqual(t0 + 4, reg.find("t", 1).?.last_ack_ms);
+    // A message id of 0 is as good as any other.
+    try testing.expect(reg.confirmableSent("t", 1, 0));
+    try testing.expect(reg.acknowledged("t", 1, 0, t0 + 6));
 }
 
 test "TEETH: RFC 7641 §4.5 — a confirmable notification at least every 24 hours, budget off or not" {
@@ -696,7 +754,8 @@ test "TEETH: RFC 7641 §4.5 — a confirmable notification at least every 24 hou
         try testing.expectEqual(coap.Type.non_confirmable, reg.notificationType("t", 1, start + max_con_interval_ms - 1).?);
     }
     try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, start + max_con_interval_ms).?);
-    try testing.expect(reg.acknowledged("t", 1, start + max_con_interval_ms));
+    try testing.expect(reg.confirmableSent("t", 1, 7));
+    try testing.expect(reg.acknowledged("t", 1, 7, start + max_con_interval_ms));
     try testing.expectEqual(coap.Type.non_confirmable, reg.notificationType("t", 1, start + max_con_interval_ms + 1).?);
 }
 

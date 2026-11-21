@@ -142,12 +142,13 @@ server pushes a notification on each change (C7):
   7641 §7: without client authentication, non-confirmable notifications MUST
   be interspersed with confirmable ones. Ask `notificationType` before each
   notification: after `max_non_between_acks` NONs (default 5) it answers
-  `.confirmable` until you report the client's ACK with `acknowledged`, and it
-  also forces a CON every 24 hours (§4.5). `max_non_between_acks = null` turns
-  the budget off — only for an authenticated (DTLS) client. Report only an ACK
-  whose Message ID matches the outstanding CON notification, and seed
-  `Server.init` from a CSPRNG: an empty ACK carries no token, so a predictable
-  notification id is all a spoofer needs to reset the budget.
+  `.confirmable` until the client's ACK is reported, and it also forces a CON
+  every 24 hours (§4.5). `max_non_between_acks = null` turns the budget off —
+  only for an authenticated (DTLS) client. Record each CON notification's
+  Message ID with `confirmableSent` and report an ACK with
+  `acknowledged(tok, resource, mid, now_ms)`: it resets the budget only for the
+  outstanding id. Seed `Server.init` from a CSPRNG: an empty ACK carries no
+  token, so a predictable notification id is all a spoofer needs to forge one.
 - **Admission (`Registry.tryRegister`, `AdmitFn`)** — on plain UDP, anyone can
   send an Observe registration, and unconditional FIFO eviction lets an
   attacker evict legitimate subscribers by registering enough new ones. Use
@@ -178,13 +179,32 @@ server pushes a notification on each change (C7):
   token lengths (`parseExtended` / `serializeExtended` / `encodedLenExtended`,
   opt-in: plain `parse`/`serialize` refuse TKL 9..15).
 
+## More RFC pieces
+
+- **Block-wise answers and discovery** — `Resource.blockwise` serves a handler's
+  payload in Block2 blocks, and `/.well-known/core` goes out block-wise when it
+  exceeds `DispatchOptions.max_payload` (give `DispatchOptions.scratch` to
+  generate it per block, so it may be larger than `doc_buf`). `Resource.observe_hook`
+  and `Reply.observe/block1/block2/size2` wire Observe and Block options into
+  the dispatcher.
+- **Combined Block1+Block2 and size renegotiation** — `block.Transfer` is the
+  client state machine of one exchange with a blocked request body and a blocked
+  response; `block.Sender` and `Assembler` follow a smaller SZX mid-transfer.
+- **`coap.tcp`** — RFC 8323 framing for TCP/TLS (`serialize`, `decode`,
+  `frameLen`) and signaling (`Csm`, Ping/Pong, Release, Abort, `Session`). TLS
+  is the caller's seam.
+- **`coap.echo`** — RFC 9175 server logic: `EchoVerifier` / `challenge` (the Echo
+  freshness challenge, stateless) and `RequestTagTracker` (block-wise request
+  operations told apart by Request-Tag).
+- **`coap.multicast`** — RFC 7252 §8: Non-confirmable requests, Leisure and the
+  random answer delay, error suppression, the "All CoAP Nodes" addresses.
+
 ## Not provided
 
-CoAP over TCP/TLS/WebSockets (RFC 8323), multicast group helpers (RFC 7390),
-combined Block1+Block2 in one exchange and mid-transfer SZX renegotiation, the
-RFC 9175 server-side Echo/Request-Tag logic, and block-wise discovery answers:
-see `SPEC.md` "Backlog / deferred". Congestion control beyond the §4.8
-transmission parameters is out of scope (`SPEC.md` "Threat model").
+CoAP over WebSockets (RFC 8323 §4) and RFC 7390 group-management resources are
+not implemented; `SPEC.md` "What is deliberately not done" gives the reasons.
+Congestion control beyond the §4.8 transmission parameters is out of scope
+(`SPEC.md` "Threat model").
 
 ## Verify
 

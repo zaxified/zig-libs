@@ -65,7 +65,8 @@ pub const Server = struct {
     /// (RFC 7252 §4.4: the initial Message ID "SHOULD be randomized"). The
     /// counter advances by one per separate response, so every later id is
     /// arithmetic on the seed. That matters most for Observe: the ACK that
-    /// resets RFC 7641 §7's notification budget (`observe.Registry.acknowledged`)
+    /// resets RFC 7641 §7's notification budget (`observe.Registry.acknowledged`,
+    /// which now also requires the id of the outstanding notification)
     /// is normally an EMPTY message that echoes only the confirmable
     /// notification's Message ID — no token — and in the attack §7 is about the
     /// spoofer chose the token itself in the forged registration. A predictable

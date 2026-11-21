@@ -85,6 +85,20 @@ pub const linkformat = @import("linkformat.zig");
 /// discovery over `linkformat`.
 pub const resource = @import("resource.zig");
 
+/// CoAP over reliable transports (RFC 8323): the stream framing and the
+/// signaling messages and connection state machine (CSM, Ping/Pong, Release,
+/// Abort).
+pub const tcp = @import("tcp.zig");
+
+/// RFC 9175 server state: the Echo freshness challenge (`EchoVerifier`,
+/// `challenge`) and block-wise request-body tracking by Request-Tag
+/// (`RequestTagTracker`).
+pub const echo = @import("echo.zig");
+
+/// Multicast rules of RFC 7252 §8 (Non-confirmable requests, Leisure and the
+/// random answer delay, error suppression).
+pub const multicast = @import("multicast.zig");
+
 const external_goldens = @import("external_goldens.zig");
 
 // Flat convenience re-exports of the extensions' primary types.
@@ -105,6 +119,9 @@ test {
     _ = observe;
     _ = linkformat;
     _ = resource;
+    _ = tcp;
+    _ = echo;
+    _ = multicast;
     _ = external_goldens;
 }
 
@@ -318,6 +335,25 @@ fn parseImpl(bytes: []const u8, options_buf: []Option, comptime extended: bool) 
     const token = bytes[pos .. pos + token_len];
     pos += token_len;
 
+    const body = try parseBody(bytes[pos..], options_buf);
+    return .{
+        .type = typ,
+        .code = code,
+        .message_id = message_id,
+        .token = token,
+        .options = body.options,
+        .payload = body.payload,
+    };
+}
+
+/// The options and payload of a message: everything after the token. The
+/// codec shared by every framing (this file's UDP one, `tcp.zig`'s): delta
+/// encoded options in ascending number order, then an optional 0xFF marker and
+/// the payload, which runs to the end of `bytes`.
+pub const Body = struct { options: []const Option, payload: []const u8 };
+
+pub fn parseBody(bytes: []const u8, options_buf: []Option) ParseError!Body {
+    var pos: usize = 0;
     var n_opts: usize = 0;
     var number: u32 = 0;
     var payload: []const u8 = &.{};
@@ -339,15 +375,7 @@ fn parseImpl(bytes: []const u8, options_buf: []Option, comptime extended: bool) 
         n_opts += 1;
         pos += len;
     }
-
-    return .{
-        .type = typ,
-        .code = code,
-        .message_id = message_id,
-        .token = token,
-        .options = options_buf[0..n_opts],
-        .payload = payload,
-    };
+    return .{ .options = options_buf[0..n_opts], .payload = payload };
 }
 
 /// Resolve one option nibble (delta or length) to its value, consuming any
@@ -452,8 +480,15 @@ fn serializeImpl(msg: Message, out: []u8, comptime extended: bool) SerializeErro
     @memcpy(out[pos..][0..tlen], msg.token);
     pos += tlen;
 
+    return serializeBody(msg.options, msg.payload, out, pos);
+}
+
+/// Writes `options` (ascending by number) and `payload` into `out` from `start`
+/// on and returns the end position; the counterpart of `parseBody`.
+pub fn serializeBody(opts: []const Option, payload: []const u8, out: []u8, start: usize) SerializeError!usize {
+    var pos = start;
     var last_number: u16 = 0;
-    for (msg.options) |opt| {
+    for (opts) |opt| {
         if (opt.number < last_number) return error.OptionsNotSorted;
         const delta: u32 = opt.number - last_number;
         last_number = opt.number;
@@ -467,29 +502,34 @@ fn serializeImpl(msg: Message, out: []u8, comptime extended: bool) SerializeErro
         @memcpy(out[pos..][0..opt.value.len], opt.value);
         pos += opt.value.len;
     }
-
-    if (msg.payload.len != 0) {
-        if (out.len - pos < 1 + msg.payload.len) return error.BufferTooSmall;
+    if (payload.len != 0) {
+        if (out.len - pos < 1 + payload.len) return error.BufferTooSmall;
         out[pos] = 0xff;
         pos += 1;
-        @memcpy(out[pos..][0..msg.payload.len], msg.payload);
-        pos += msg.payload.len;
+        @memcpy(out[pos..][0..payload.len], payload);
+        pos += payload.len;
     }
     return pos;
+}
+
+/// The serialized length of `options` and `payload` (what `serializeBody`
+/// writes).
+pub fn bodyLen(opts: []const Option, payload: []const u8) usize {
+    var total: usize = 0;
+    var last_number: u16 = 0;
+    for (opts) |opt| {
+        const delta = opt.number -| last_number;
+        last_number = opt.number;
+        total += 1 + extBytesFor(delta) + extBytesFor(opt.value.len) + opt.value.len;
+    }
+    if (payload.len != 0) total += 1 + payload.len;
+    return total;
 }
 
 /// The exact serialized length of `msg` in bytes (header + token + options +
 /// optional payload marker + payload). Handy for sizing the `serialize` buffer.
 pub fn encodedLen(msg: Message) usize {
-    var total: usize = 4 + msg.token.len;
-    var last_number: u16 = 0;
-    for (msg.options) |opt| {
-        const delta = opt.number -| last_number;
-        last_number = opt.number;
-        total += 1 + extBytesFor(delta) + extBytesFor(opt.value.len) + opt.value.len;
-    }
-    if (msg.payload.len != 0) total += 1 + msg.payload.len;
-    return total;
+    return 4 + msg.token.len + bodyLen(msg.options, msg.payload);
 }
 
 // ── tests ──

@@ -23,14 +23,16 @@
 //! to carve block N out of a full payload, and `Assembler` to gather arriving
 //! blocks into a caller-provided buffer.
 //!
-//! ## Deferred (documented, not built)
+//! `Sender` is the sending half (carve the blocks of a payload, adopting a smaller
+//! block size when the peer asks for one), and `Transfer` combines both for the
+//! client side of one exchange whose request body is sent in Block1 blocks and
+//! whose response body arrives in Block2 blocks (RFC 7959 §3.3).
 //!
-//! - **Combined Block1+Block2 in one exchange** (RFC 7959 §3.3) — a large
-//!   request whose large response is itself blocked. Each direction works here
-//!   in isolation; interleaving the two option streams is left to the caller.
-//! - **SZX renegotiation mid-transfer** (a peer answering a smaller block size
-//!   than requested). `Assembler` positions each block by its own SZX, so it
-//!   tolerates a *constant* size only; a size change partway is not stitched.
+//! **SZX renegotiation (RFC 7959 §2.3).** A peer may answer with a block size
+//! smaller than the one in use; the transfer continues at the smaller size with
+//! NUM counted in the new size (`offset = NUM * size`). `Assembler` and `Sender`
+//! take a *smaller* size at any block; a *larger* one mid-transfer is refused
+//! (`error.SzxChanged` / `error.SzxIncrease`): only a decrease is negotiable.
 
 const std = @import("std");
 const coap = @import("root.zig");
@@ -140,10 +142,9 @@ pub const Assembler = struct {
     len: usize = 0,
     /// Set once the final (M==0) block has been accepted.
     done: bool = false,
-    /// SZX of the first accepted block; a later block with a different SZX is
-    /// a mid-transfer size renegotiation, which this assembler does not
-    /// support (see the module doc comment) and rejects rather than silently
-    /// mis-assembling.
+    /// SZX in use: the first accepted block's, lowered by a later block that
+    /// renegotiates a smaller size (RFC 7959 §2.3). A block with a *larger*
+    /// SZX than the one in use is refused rather than silently mis-assembled.
     szx: ?u3 = null,
 
     pub const Error = error{
@@ -157,7 +158,8 @@ pub const Assembler = struct {
         /// block on a fresh assembler). Rejected so `payload()`/`isComplete()`
         /// can never expose never-written bytes.
         NonContiguousBlock,
-        /// This block's SZX differs from the first accepted block's SZX.
+        /// This block's SZX is larger than the one in use (only a decrease is a
+        /// valid renegotiation).
         SzxChanged,
     };
 
@@ -174,12 +176,12 @@ pub const Assembler = struct {
     /// offset exceeds the current contiguous coverage (`error.NonContiguousBlock`
     /// — closes a gap that would otherwise let a single high-`num`, `more=false`
     /// block mark the transfer complete over never-written buffer bytes) and a
-    /// block whose SZX differs from the first accepted block's (`error.SzxChanged`).
+    /// block whose SZX is larger than the one in use (`error.SzxChanged`). A smaller
+    /// SZX is a renegotiation: the block is placed at `num * its own size` and
+    /// the smaller size is used from then on.
     pub fn accept(self: *Assembler, blk: Block, data: []const u8) Error!void {
         if (self.szx) |s| {
-            if (blk.szx != s) return error.SzxChanged;
-        } else {
-            self.szx = blk.szx;
+            if (blk.szx > s) return error.SzxChanged;
         }
         const start = std.math.mul(usize, blk.num, blk.size()) catch return error.Overflow;
         if (start > self.len) return error.NonContiguousBlock;
@@ -188,6 +190,14 @@ pub const Assembler = struct {
         @memcpy(self.buf[start..end], data);
         if (end > self.len) self.len = end;
         if (!blk.more) self.done = true;
+        self.szx = blk.szx;
+    }
+
+    /// The Block2/Block1 NUM of the next block to ask for / expect, in the
+    /// size now in use (`len / size`); 0 before the first block.
+    pub fn nextNum(self: *const Assembler) u32 {
+        const s = self.szx orelse return 0;
+        return @intCast(self.len / sizeForSzx(s));
     }
 
     /// The reassembled payload so far (a prefix of `buf`).
@@ -198,6 +208,175 @@ pub const Assembler = struct {
     /// Whether the final block has been accepted.
     pub fn isComplete(self: *const Assembler) bool {
         return self.done;
+    }
+};
+
+/// The sending half of a block-wise transfer: carves a payload into blocks, one
+/// at a time, and follows the peer when it asks for a smaller block size
+/// (RFC 7959 §2.3). `current` is the block to send now; `acknowledged` moves
+/// past it once the peer confirmed it; `adopt` takes the size the peer's answer
+/// names.
+pub const Sender = struct {
+    payload: []const u8,
+    szx: u3,
+    /// Bytes confirmed so far. Always a multiple of the block size in use: it
+    /// only advances by whole blocks and the size only shrinks by powers of two.
+    offset: usize = 0,
+
+    pub const Error = error{
+        /// The peer answered a larger block size than the one in use.
+        SzxIncrease,
+    };
+
+    pub fn init(payload: []const u8, szx: u3) Sender {
+        return .{ .payload = payload, .szx = szx };
+    }
+
+    /// The block to send now (an empty final block when the payload is empty).
+    pub fn current(self: *const Sender) Chunk {
+        const bs = sizeForSzx(self.szx);
+        const end = @min(self.offset + bs, self.payload.len);
+        return .{
+            .data = self.payload[self.offset..end],
+            .descriptor = .{ .num = @intCast(self.offset / bs), .more = end < self.payload.len, .szx = self.szx },
+        };
+    }
+
+    /// The peer's answer to the block just sent named `peer` (its Block1
+    /// option): continue at its size if that is smaller. A larger size is
+    /// `error.SzxIncrease` and changes nothing.
+    pub fn adopt(self: *Sender, peer: Block) Error!void {
+        if (peer.szx > self.szx) return error.SzxIncrease;
+        self.szx = peer.szx;
+    }
+
+    /// The block `sent` (what `current` returned, at the size it was sent in)
+    /// is confirmed: move on to the next one. A no-op for the final block.
+    pub fn acknowledged(self: *Sender, sent: Block) void {
+        if (sent.more) self.offset += sent.size();
+    }
+};
+
+/// One client exchange whose request body is sent in Block1 blocks and whose
+/// response body arrives in Block2 blocks (RFC 7959 §3.3), over caller storage.
+///
+/// Drive it as `request` -> send -> receive -> `response`, until `response`
+/// answers `.done`. The caller owns everything else: option assembly, the Token
+/// and message ids, retransmission, and checking the response code (a 4.xx/5.xx
+/// ends the exchange; this type only sees successful answers).
+///
+/// - While the request body is sent, every request carries the next Block1 block
+///   (none at all when the body fits one block) and the server answers each with
+///   2.31 Continue and the Block1 option, which `response` checks (NUM echoed)
+///   and from which it adopts a smaller size if the server named one.
+/// - The request that carries the last Block1 block also carries Block2 `0`
+///   at the preferred size (when one was given): the answer to it is the first
+///   block of the response (Block2 NUM 0), or the whole, unblocked, response.
+/// - The remaining response blocks are fetched with requests carrying only a
+///   Block2 option (NUM = next block in the size now in use) and no body, as RFC
+///   7959 §3.3 allows; a server that answers a smaller size is followed.
+pub const Transfer = struct {
+    sender: Sender,
+    assembler: Assembler,
+    /// Preferred Block2 size for the response; null: no preference expressed.
+    szx2: ?u3,
+    phase: Phase = .sending,
+    /// The Block1 descriptor of the request in flight, null when it carried none.
+    in_flight: ?Block = null,
+
+    pub const Phase = enum { sending, receiving, done };
+
+    pub const Error = error{
+        /// `response` after the exchange is done.
+        UnexpectedPhase,
+        /// The answer to a Block1 request lacks the Block1 option or echoes a
+        /// different NUM.
+        BadBlock1Ack,
+        /// A Block2 option where none is acceptable (NUM other than 0 in the
+        /// first answer, or none while the response is being fetched in blocks).
+        UnexpectedBlock2,
+        /// The peer named a larger Block1 size than the one in use.
+        SzxIncrease,
+    } || Assembler.Error;
+
+    /// What the next request carries.
+    pub const Request = struct {
+        block1: ?Block,
+        body: []const u8,
+        block2: ?Block,
+    };
+
+    pub fn init(request_body: []const u8, szx1: u3, response_buf: []u8, szx2: ?u3) Transfer {
+        return .{ .sender = Sender.init(request_body, szx1), .assembler = Assembler.init(response_buf), .szx2 = szx2 };
+    }
+
+    /// The options and body of the next request.
+    pub fn request(self: *Transfer) Request {
+        switch (self.phase) {
+            .sending => {
+                const chunk = self.sender.current();
+                const single = chunk.descriptor.num == 0 and !chunk.descriptor.more;
+                self.in_flight = if (single) null else chunk.descriptor;
+                return .{
+                    .block1 = self.in_flight,
+                    .body = chunk.data,
+                    .block2 = if (!chunk.descriptor.more) self.firstBlock2() else null,
+                };
+            },
+            .receiving => {
+                self.in_flight = null;
+                const szx = self.assembler.szx orelse self.szx2 orelse 6;
+                return .{ .block1 = null, .body = &.{}, .block2 = .{ .num = self.assembler.nextNum(), .szx = szx } };
+            },
+            .done => return .{ .block1 = null, .body = &.{}, .block2 = null },
+        }
+    }
+
+    fn firstBlock2(self: *const Transfer) ?Block {
+        const z = self.szx2 orelse return null;
+        return .{ .num = 0, .szx = z };
+    }
+
+    /// Takes the answer to the request `request` returned: its Block1 and Block2
+    /// options (null when absent) and payload. Returns the phase to continue in.
+    pub fn response(self: *Transfer, block1: ?Block, block2: ?Block, payload: []const u8) Error!Phase {
+        switch (self.phase) {
+            .done => return error.UnexpectedPhase,
+            .sending => {
+                if (self.in_flight) |sent| {
+                    const ack = block1 orelse return error.BadBlock1Ack;
+                    if (ack.num != sent.num) return error.BadBlock1Ack;
+                    self.sender.adopt(ack) catch return error.SzxIncrease;
+                    if (sent.more) {
+                        self.sender.acknowledged(sent);
+                        return .sending;
+                    }
+                }
+                // The request body is delivered: this is the first answer of the
+                // response.
+                if (block2) |b2| {
+                    if (b2.num != 0) return error.UnexpectedBlock2;
+                    try self.assembler.accept(b2, payload);
+                    self.phase = if (b2.more) .receiving else .done;
+                } else {
+                    // Not blocked: the payload is the whole response.
+                    try self.assembler.accept(.{ .num = 0, .more = false, .szx = 0 }, payload);
+                    self.phase = .done;
+                }
+                return self.phase;
+            },
+            .receiving => {
+                const b2 = block2 orelse return error.UnexpectedBlock2;
+                try self.assembler.accept(b2, payload);
+                if (!b2.more) self.phase = .done;
+                return self.phase;
+            },
+        }
+    }
+
+    /// The response body assembled so far (complete once `.done`).
+    pub fn responseBody(self: *const Transfer) []const u8 {
+        return self.assembler.payload();
     }
 };
 
@@ -341,6 +520,203 @@ test "Assembler: rejects a mid-transfer SZX change instead of mis-assembling" {
     var asm_ = Assembler.init(&store);
     try asm_.accept(.{ .num = 0, .more = true, .szx = 0 }, "0123456789abcdef"); // szx 0 ⇒ 16-byte blocks
     try testing.expectError(error.SzxChanged, asm_.accept(.{ .num = 1, .more = false, .szx = 1 }, "x"));
+}
+
+test "Assembler: a smaller SZX mid-transfer is a renegotiation, a larger one is refused" {
+    var store: [4096]u8 = undefined;
+    var asm_ = Assembler.init(&store);
+    const src = strRepeat("0123456789abcdefghijklmnopqrstuvwxyz", 3); // 108 bytes
+    // Two blocks of 32 (szx 1), then the peer drops to 16 (szx 0): NUM counts in 16s.
+    try asm_.accept(.{ .num = 0, .more = true, .szx = 1 }, src[0..32]);
+    try testing.expectEqual(@as(u32, 1), asm_.nextNum());
+    try asm_.accept(.{ .num = 1, .more = true, .szx = 1 }, src[32..64]);
+    try testing.expectEqual(@as(u32, 2), asm_.nextNum());
+    try asm_.accept(.{ .num = 4, .more = true, .szx = 0 }, src[64..80]); // offset 4 * 16
+    try testing.expectEqual(@as(?u3, 0), asm_.szx);
+    try testing.expectEqual(@as(u32, 5), asm_.nextNum());
+    // Back to the larger size: refused, and nothing changes.
+    try testing.expectError(error.SzxChanged, asm_.accept(.{ .num = 3, .more = true, .szx = 1 }, src[96..]));
+    try testing.expectEqual(@as(usize, 80), asm_.payload().len);
+    try testing.expectEqual(@as(?u3, 0), asm_.szx);
+    // A block of the smaller size that leaves a gap is still a gap.
+    try testing.expectError(error.NonContiguousBlock, asm_.accept(.{ .num = 6, .more = false, .szx = 0 }, src[96..]));
+    try asm_.accept(.{ .num = 5, .more = true, .szx = 0 }, src[80..96]);
+    try asm_.accept(.{ .num = 6, .more = false, .szx = 0 }, src[96..]);
+    try testing.expect(asm_.isComplete());
+    try testing.expectEqualStrings(src, asm_.payload());
+    // A refused block does not even set the first size.
+    var fresh = Assembler.init(&store);
+    try testing.expectEqual(@as(u32, 0), fresh.nextNum());
+}
+
+test "Sender: blocks, acknowledgement, and following a smaller size" {
+    const src = strRepeat("0123456789abcdefghijklmnopqrstuvwxyz", 3); // 108 bytes
+    var tx = Sender.init(src, 1); // 32-byte blocks
+    const b0 = tx.current();
+    try testing.expectEqual(@as(u32, 0), b0.descriptor.num);
+    try testing.expect(b0.descriptor.more);
+    try testing.expectEqualStrings(src[0..32], b0.data);
+    tx.acknowledged(b0.descriptor);
+    const b1 = tx.current();
+    try testing.expectEqual(@as(u32, 1), b1.descriptor.num);
+    // The peer asks for 16 after block 1: the next block is NUM 4 of size 16.
+    try tx.adopt(.{ .num = 1, .more = true, .szx = 0 });
+    tx.acknowledged(b1.descriptor);
+    const b2 = tx.current();
+    try testing.expectEqual(@as(u32, 4), b2.descriptor.num);
+    try testing.expectEqual(@as(u3, 0), b2.descriptor.szx);
+    try testing.expectEqualStrings(src[64..80], b2.data);
+    try testing.expectError(error.SzxIncrease, tx.adopt(.{ .num = 4, .more = true, .szx = 2 }));
+    try testing.expectEqual(@as(u3, 0), tx.szx);
+    tx.acknowledged(b2.descriptor);
+    tx.acknowledged(tx.current().descriptor);
+    const last = tx.current();
+    try testing.expectEqual(@as(u32, 6), last.descriptor.num);
+    try testing.expect(!last.descriptor.more);
+    try testing.expectEqualStrings(src[96..], last.data);
+    tx.acknowledged(last.descriptor); // a no-op
+    try testing.expectEqual(@as(usize, 96), tx.offset);
+
+    // An empty payload is one empty final block.
+    const empty = Sender.init("", 2).current();
+    try testing.expectEqual(@as(usize, 0), empty.data.len);
+    try testing.expect(!empty.descriptor.more);
+    try testing.expectEqual(@as(u32, 0), empty.descriptor.num);
+}
+
+/// A scripted server for the `Transfer` tests: assembles Block1 requests into
+/// `got`, answers each with 2.31 and the Block1 option (lowering the size to
+/// `lower_to` after the first block when set), and serves `response` in Block2
+/// blocks (lowering to `lower2_to` from its second block on).
+const MiniServer = struct {
+    got: [512]u8 = undefined,
+    asm_: Assembler = undefined,
+    lower_to: ?u3 = null,
+    lower2_to: ?u3 = null,
+    response: []const u8,
+    requests: usize = 0,
+
+    const Answer = struct { block1: ?Block, block2: ?Block, payload: []const u8 };
+
+    fn handle(self: *MiniServer, req: Transfer.Request) !Answer {
+        if (self.requests == 0) self.asm_ = Assembler.init(&self.got);
+        self.requests += 1;
+        var ack: ?Block = null;
+        if (req.block1) |b1| {
+            try self.asm_.accept(b1, req.body);
+            ack = b1;
+            if (self.lower_to) |z| if (b1.more and b1.num == 0) {
+                ack.?.szx = z;
+            };
+        } else if (req.body.len != 0) {
+            try self.asm_.accept(.{ .num = 0, .more = false, .szx = 0 }, req.body);
+        }
+        const delivered = if (req.block1) |b1| !b1.more else true;
+        if (!delivered) return .{ .block1 = ack, .block2 = null, .payload = "" };
+        const want = req.block2 orelse return .{ .block1 = ack, .block2 = null, .payload = self.response };
+        var szx = want.szx;
+        if (self.lower2_to) |z| if (want.num > 0) {
+            szx = @min(szx, z);
+        };
+        // NUM was counted in the size the client used; convert to bytes first.
+        const start = want.offset();
+        const bs = sizeForSzx(szx);
+        const num: u32 = @intCast(start / bs);
+        const chunk = try split(self.response, szx, num);
+        return .{ .block1 = ack, .block2 = chunk.descriptor, .payload = chunk.data };
+    }
+};
+
+test "Transfer: combined Block1+Block2 in one exchange (RFC 7959 §3.3)" {
+    var body: [100]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i *% 5 +% 1);
+    var resp_body: [200]u8 = undefined;
+    for (&resp_body, 0..) |*b, i| b.* = @truncate(i *% 11 +% 9);
+    var out: [256]u8 = undefined;
+
+    var srv: MiniServer = .{ .response = &resp_body };
+    var t = Transfer.init(&body, 1, &out, 2); // 32-byte request blocks, 64-byte response blocks
+    var guard: usize = 0;
+    while (t.phase != .done) : (guard += 1) {
+        try testing.expect(guard < 20);
+        const req = t.request();
+        // Block2 rides only on the request with the last Block1 block, and on
+        // the follow-up fetches (which carry no Block1 and no body).
+        if (t.phase == .sending) try testing.expectEqual(req.block2 != null, !(req.block1.?.more));
+        if (t.phase == .receiving) {
+            try testing.expect(req.block1 == null);
+            try testing.expectEqual(@as(usize, 0), req.body.len);
+        }
+        const a = try srv.handle(req);
+        _ = try t.response(a.block1, a.block2, a.payload);
+    }
+    try testing.expectEqualSlices(u8, &body, srv.asm_.payload());
+    try testing.expectEqualSlices(u8, &resp_body, t.responseBody());
+    // 4 Block1 requests (32+32+32+4); the last carries Block2 0, then 200 = 64+64+64+8: 3 more.
+    try testing.expectEqual(@as(usize, 7), srv.requests);
+}
+
+test "Transfer: both directions follow a renegotiated smaller size" {
+    var body: [100]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i *% 7 +% 2);
+    var resp_body: [200]u8 = undefined;
+    for (&resp_body, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    var out: [256]u8 = undefined;
+
+    // The server drops the request size to 16 after block 0 and the response
+    // size to 32 from the second response block on.
+    var srv: MiniServer = .{ .response = &resp_body, .lower_to = 0, .lower2_to = 1 };
+    var t = Transfer.init(&body, 1, &out, 2);
+    var guard: usize = 0;
+    while (t.phase != .done) : (guard += 1) {
+        try testing.expect(guard < 40);
+        const a = try srv.handle(t.request());
+        _ = try t.response(a.block1, a.block2, a.payload);
+    }
+    try testing.expectEqualSlices(u8, &body, srv.asm_.payload());
+    try testing.expectEqualSlices(u8, &resp_body, t.responseBody());
+    try testing.expectEqual(@as(u3, 0), t.sender.szx);
+    try testing.expectEqual(@as(?u3, 1), t.assembler.szx);
+}
+
+test "Transfer: a body that fits one block sends no Block1; an unblocked response is the whole" {
+    var out: [64]u8 = undefined;
+    var t = Transfer.init("small", 2, &out, null);
+    const req = t.request();
+    try testing.expect(req.block1 == null);
+    try testing.expect(req.block2 == null);
+    try testing.expectEqualStrings("small", req.body);
+    try testing.expectEqual(Transfer.Phase.done, try t.response(null, null, "all of it"));
+    try testing.expectEqualStrings("all of it", t.responseBody());
+    try testing.expectError(error.UnexpectedPhase, t.response(null, null, "x"));
+}
+
+test "Transfer: protocol violations are typed errors" {
+    var out: [64]u8 = undefined;
+    const body = strRepeat("x", 40);
+    // The ack of a Block1 request must carry the Block1 option with the same NUM.
+    var t = Transfer.init(body, 0, &out, null); // 16-byte blocks
+    const r0 = t.request();
+    try testing.expectError(error.BadBlock1Ack, t.response(null, null, ""));
+    try testing.expectError(error.BadBlock1Ack, t.response(.{ .num = 1, .more = true, .szx = 0 }, null, ""));
+    // A larger size than in use is refused.
+    try testing.expectError(error.SzxIncrease, t.response(.{ .num = r0.block1.?.num, .more = true, .szx = 1 }, null, ""));
+    // The first answer after the last Block1 block must start the response at 0.
+    var t2 = Transfer.init("abc", 0, &out, 0);
+    _ = t2.request();
+    try testing.expectError(error.UnexpectedBlock2, t2.response(null, .{ .num = 2, .more = false, .szx = 0 }, "zz"));
+    // While fetching in blocks, an answer without Block2 is refused.
+    var t3 = Transfer.init("abc", 0, &out, 0);
+    _ = t3.request();
+    try testing.expectEqual(Transfer.Phase.receiving, try t3.response(null, .{ .num = 0, .more = true, .szx = 0 }, "0123456789abcdef"));
+    const fetch = t3.request();
+    try testing.expectEqual(@as(u32, 1), fetch.block2.?.num);
+    try testing.expectError(error.UnexpectedBlock2, t3.response(null, null, "zz"));
+    // The response buffer bounds the transfer.
+    var tiny: [8]u8 = undefined;
+    var t4 = Transfer.init("abc", 0, &tiny, 0);
+    _ = t4.request();
+    try testing.expectError(error.BufferTooSmall, t4.response(null, .{ .num = 0, .more = true, .szx = 0 }, "0123456789abcdef"));
 }
 
 test "C6 end-to-end: Block2 GET transfers a 3000-byte body block by block" {
