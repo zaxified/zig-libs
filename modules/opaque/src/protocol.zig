@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! RFC 9807 OPAQUE-3DH, generic over the configuration (RFC 9807 §7):
 //! `Opaque(C)` with `C.Oprf` a `voprf` suite instance and `C.Hash`/`C.Hmac`/
-//! `C.Hkdf` the matching std SHA-2 family. The AKE group is the OPRF group
-//! (§6.4.1.1 ristretto255, §6.4.1.2 P-256: `DiffieHellman` = the group's
-//! constant-time multiply, output through the OPRF group's SerializeElement).
+//! `C.Hkdf` the matching std SHA-2 family. The AKE group is `C.Ake` when the
+//! configuration names one (`X25519Ake`, §6.4.1.3 curve25519), else the OPRF
+//! group (`OprfAke`: §6.4.1.1 ristretto255, §6.4.1.2 P-256: `DiffieHellman` =
+//! the group's constant-time multiply, output through the OPRF group's
+//! SerializeElement).
 //! `root.zig` instantiates it and re-exports the ristretto255-SHA512 instance
 //! at top level; see `root.zig`'s module doc comment for the design notes.
 //! Every declaration is `pub` so `root.zig`'s tests reach the internals; the
@@ -13,9 +15,68 @@ const std = @import("std");
 const timing_safe = std.crypto.timing_safe;
 const burn = @import("burn.zig");
 const voprf = @import("voprf"); // error sets only; the suite is `C.Oprf`
+const ct25519 = @import("ct25519");
+
+/// The 3DH group of §6.4.1.1/§6.4.1.2: the OPRF group itself.
+/// `DeriveDiffieHellmanKeyPair(seed)` = RFC 9497 `DeriveKeyPair(seed,
+/// "OPAQUE-DeriveDiffieHellmanKeyPair")`; `DiffieHellman` = decode with input
+/// validation (canonical, non-identity) then the group's constant-time multiply.
+pub fn OprfAke(comptime Oprf: type) type {
+    return struct {
+        pub const Npk: usize = Oprf.Ne;
+        pub const Nsk: usize = Oprf.Ns;
+
+        pub fn deriveKeyPair(seed: *const [32]u8, sk: *[Nsk]u8, pk: *[Npk]u8) error{DeriveKeyPairFailed}!void {
+            var kp: Oprf.KeyPair = undefined;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+            // The info string is a constant, so voprf's `InputTooLong` cannot occur.
+            Oprf.deriveKeyPair(.oprf, seed, "OPAQUE-DeriveDiffieHellmanKeyPair", &kp) catch return error.DeriveKeyPairFailed;
+            sk.* = kp.sk;
+            pk.* = kp.pk.toBytes();
+        }
+
+        pub fn validatePublicKey(pk: [Npk]u8) error{InvalidPublicKey}!void {
+            _ = Oprf.Element.fromBytes(pk) catch return error.InvalidPublicKey;
+        }
+
+        pub fn dh(sk: [Nsk]u8, pk: [Npk]u8) error{InvalidPublicKey}![Npk]u8 {
+            const point = Oprf.Element.fromBytes(pk) catch return error.InvalidPublicKey;
+            return Oprf.Group.encode(Oprf.Group.mulSecret(point.p, &sk));
+        }
+    };
+}
+
+/// RFC 9807 §6.4.1.3 3DH over Curve25519 (RFC 7748): the private key IS the
+/// 32-byte seed (clamped at use), the public key `X25519(k, 9)`,
+/// `DiffieHellman` the raw X25519 output. Every 32-byte string is a valid
+/// public key (RFC 7748 §5); §10.7's "the shared secret is not the point at
+/// infinity" is the all-zero X25519 output, refused as `InvalidPublicKey` (a
+/// low-order peer key). The constant-time ladder is the sibling `ct25519`'s.
+pub const X25519Ake = struct {
+    pub const Npk: usize = 32;
+    pub const Nsk: usize = 32;
+
+    pub fn deriveKeyPair(seed: *const [32]u8, sk: *[Nsk]u8, pk: *[Npk]u8) error{DeriveKeyPairFailed}!void {
+        sk.* = seed.*;
+        ct25519.X25519.recoverPublicKeyInto(pk, seed) catch return error.DeriveKeyPairFailed;
+    }
+
+    pub fn validatePublicKey(pk: [Npk]u8) error{InvalidPublicKey}!void {
+        _ = pk;
+    }
+
+    pub fn dh(sk: [Nsk]u8, pk: [Npk]u8) error{InvalidPublicKey}![Npk]u8 {
+        var out: [Npk]u8 = undefined;
+        ct25519.X25519.scalarmultInto(&out, &sk, pk) catch return error.InvalidPublicKey;
+        return out;
+    }
+};
 
 pub fn Opaque(comptime C: type) type {
     return struct {
+        /// The 3DH group (`C.Ake`, or the OPRF group).
+        pub const Ake = if (@hasDecl(C, "Ake")) C.Ake else OprfAke(C.Oprf);
+
         // ── configuration constants (RFC 9807 §2 / §7, ristretto255-SHA-512) ─────
 
         /// `Nn` (§2): nonce length (envelope, masking, client/server nonces).
@@ -28,10 +89,10 @@ pub fn Opaque(comptime C: type) type {
         pub const Nh: usize = C.Hash.digest_length;
 
         /// `Npk` (§7): encoded AKE public key length (ristretto255 element).
-        pub const Npk: usize = C.Oprf.Ne;
+        pub const Npk: usize = Ake.Npk;
 
         /// `Nsk` (§7): encoded AKE private key length (ristretto255 scalar).
-        pub const Nsk: usize = C.Oprf.Ns;
+        pub const Nsk: usize = Ake.Nsk;
 
         /// `Nm` (§2.2): MAC output length (HMAC-SHA-512).
         pub const Nm: usize = Nh;
@@ -160,7 +221,7 @@ pub fn Opaque(comptime C: type) type {
             /// like a wrong password. Checks exactly what `diffieHellman` would
             /// have checked anyway: canonical ristretto255 encoding.
             pub fn validate(r: RegistrationRecord) error{InvalidPublicKey}!void {
-                _ = C.Oprf.Element.fromBytes(r.client_public_key) catch return error.InvalidPublicKey;
+                try Ake.validatePublicKey(r.client_public_key);
             }
         };
 
@@ -365,10 +426,9 @@ pub fn Opaque(comptime C: type) type {
 
         /// The by-value form for callers that already run inside a burned frame.
         pub fn akeKeyPair(seed: *const [Nseed]u8) error{DeriveKeyPairFailed}!AkeKeyPair {
-            var kp: C.Oprf.KeyPair = undefined;
-            // The info string is a constant, so voprf's `InputTooLong` cannot occur.
-            C.Oprf.deriveKeyPair(.oprf, seed, "OPAQUE-DeriveDiffieHellmanKeyPair", &kp) catch return error.DeriveKeyPairFailed;
-            return .{ .private_key = kp.sk, .public_key = kp.pk.toBytes() };
+            var kp: AkeKeyPair = undefined;
+            try Ake.deriveKeyPair(seed, &kp.private_key, &kp.public_key);
+            return kp;
         }
 
         /// §6.3.2.2 / §10.9 fake `RegistrationRecord` for unregistered users:
@@ -430,8 +490,7 @@ pub fn Opaque(comptime C: type) type {
         /// long-term server key held to the same rule. There is nothing left for
         /// a runtime check to catch that a branch on `k` would not simply leak.
         pub fn diffieHellman(private_key: [Nsk]u8, public_key: [Npk]u8) error{InvalidPublicKey}![Npk]u8 {
-            const point = C.Oprf.Element.fromBytes(public_key) catch return error.InvalidPublicKey;
-            return C.Oprf.Group.encode(C.Oprf.Group.mulSecret(point.p, &private_key));
+            return Ake.dh(private_key, public_key);
         }
 
         /// A pluggable Key Stretching Function (RFC 9807 §7 `KSF`). RFC 9807

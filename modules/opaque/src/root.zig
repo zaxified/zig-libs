@@ -183,6 +183,18 @@ pub const P256Sha256 = Opaque(struct {
     pub const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
 });
 
+/// ristretto255-SHA512 OPRF with the curve25519 3DH group (RFC 9807 §6.4.1.3:
+/// `DeriveDiffieHellmanKeyPair(seed)` = the seed as X25519 private key,
+/// `DiffieHellman` = X25519) — the configuration of RFC 9807 C.1.3/C.1.4/C.2.2.
+/// `Npk = Nsk = 32`, `Noe = Nok = 32`, `Nh = 64`.
+pub const Ristretto255Sha512X25519 = Opaque(struct {
+    pub const Oprf = voprf.Ristretto255Sha512;
+    pub const Ake = @import("protocol.zig").X25519Ake;
+    pub const Hash = Sha512;
+    pub const Hmac = HmacSha512;
+    pub const Hkdf = HkdfSha512;
+});
+
 const Default = Ristretto255Sha512;
 
 pub const Nn = Default.Nn;
@@ -266,6 +278,8 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("kat_p256_test.zig");
+    _ = @import("kat_x25519_test.zig");
+    _ = @import("kat_vectors_x25519.zig");
     _ = @import("mutation_test.zig");
 }
 

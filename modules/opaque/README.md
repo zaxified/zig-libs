@@ -2,7 +2,9 @@
 
 RFC 9807 OPAQUE — an augmented password-authenticated key exchange
 (aPAKE), 3DH key exchange, **ristretto255-SHA-512 configuration** (top
-level) and **P256-SHA256** (`opaque.P256Sha256`, same function names). The server never sees the password (not even at
+level), **P256-SHA256** (`opaque.P256Sha256`) and **ristretto255-SHA512 with
+the curve25519 3DH group** (`opaque.Ristretto255Sha512X25519`, RFC 9807
+C.1.3/C.1.4), same function names. The server never sees the password (not even at
 registration) and stores a record that resists precomputation attacks;
 each login yields a mutually authenticated `session_key` (both sides)
 plus a client-only `export_key`. OPRF layer reused from the sibling
@@ -63,7 +65,7 @@ the 3DH schedule.
 
 ## Not provided
 
-The curve25519 3DH configuration (RFC 9807 C.1.3/C.1.4), a bundled scrypt KSF, HMQV/SIGMA-I and the
+The P-384/P-521 configurations (no RFC vectors), a bundled scrypt KSF, HMQV/SIGMA-I and the
 `randomized_password` backup login: see `SPEC.md`
 *What is deliberately not done* and *Backlog / deferred*.
 

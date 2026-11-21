@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — New configuration `Ristretto255Sha512X25519`: ristretto255-SHA512 OPRF with the curve25519 3DH group (RFC 9807 §6.4.1.3; private key = seed, public key `X25519(sk, 9)`, raw X25519 DH on `ct25519`; an all-zero shared secret is `InvalidPublicKey`). `Opaque(C)` takes an optional `C.Ake` (`X25519Ake`, or `OprfAke(C.Oprf)` when absent, which keeps the two existing configurations byte-identical). Byte-exact against RFC 9807 C.1.3, C.1.4 and C.2.2. Additive.
 - **2026-11-20** — **New:** `fakeRecord(key_seed, masking_key, &out)` — the §6.3.2.2 fake `RegistrationRecord` (public key from `DeriveDiffieHellmanKeyPair(key_seed)`, zero envelope), like bytemare/opaque's `GetFakeRecord`; and `Argon2idKsf` — opt-in RFC 9807 §7 Argon2id `Ksf` over a zero 16-byte salt with `rfc9807_params` / `rfc9807_low_memory_params`, like opaque-ke's `argon2` feature (the caller's allocator and `Io`). Both on every `Opaque(C)` configuration. No existing behaviour changes.
 - **2026-11-17** — Whole-module mutation of `src/protocol.zig` and `src/burn.zig` (271 mutants, 247 killed, 24 EQUIVALENT wipes measured by the ReleaseFast stack probe; card now carries whole-module counts). 5 tests added (`src/mutation_test.zig`: wire regions with non-repeating bytes, `I2OSP`, identity/context bound at its edge, KE3 identity check, malformed evaluated element is `InvalidMessage`); no behaviour change. ctgrind source digests re-pinned (counts 4/11/2 and output digests unchanged).
 

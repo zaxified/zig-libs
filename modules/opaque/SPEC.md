@@ -16,12 +16,20 @@
 
 **Downstream consumer:** no
 
-RFC 9807 OPAQUE aPAKE with the 3DH key exchange, **two configurations**:
-ristretto255-SHA-512 (`opaque.Ristretto255Sha512`, the top-level API) and
+RFC 9807 OPAQUE aPAKE with the 3DH key exchange, **three configurations**:
+ristretto255-SHA-512 (`opaque.Ristretto255Sha512`, the top-level API),
 **P256-SHA256** (`opaque.P256Sha256`: OPRF P256-SHA256, HKDF/HMAC/SHA-256,
 3DH over P-256, `Npk = 33`, `Nh = 32`; RFC 9807 Appendix C.1.5/C.1.6/C.2.3
-byte-exact, `src/kat_p256_test.zig`). The code is one generic
-`Opaque(C)` (`src/protocol.zig`) over the configuration; the
+byte-exact, `src/kat_p256_test.zig`) and **ristretto255-SHA512 with the
+curve25519 3DH group** (`opaque.Ristretto255Sha512X25519`, §6.4.1.3: the AKE
+private key is the 32-byte seed itself, the public key `X25519(sk, 9)`,
+`DiffieHellman` the raw X25519 output on `ct25519`'s ladder; every 32-byte
+public key is admitted (RFC 7748 §5) and an all-zero shared secret, a low-order
+peer key, is `InvalidPublicKey` (§10.7); RFC 9807 C.1.3/C.1.4/C.2.2 byte-exact,
+`src/kat_x25519_test.zig`). The code is one generic `Opaque(C)`
+(`src/protocol.zig`) over the configuration, its 3DH group `C.Ake`
+(`X25519Ake`) or, when the configuration names none, the OPRF group
+(`OprfAke`); the
 ristretto255 configuration in detail (OPRF: ristretto255-SHA512 / RFC 9497
 modeOPRF via the sibling `voprf` module, KDF: HKDF-SHA-512, MAC:
 HMAC-SHA-512, Hash: SHA-512, KSF: pluggable (`Ksf`, mandatory — no
@@ -42,7 +50,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [cloudflare/circl](https://github.com/cloudflare/circl) | Go | BSD-3-Clause | 1.7k | v1.6.5 (2026-08-05) | Checked: the repository root listing has `oprf` but no OPAQUE package. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | Ristretto255, HKDF, HMAC, Argon2 and P-256/P-384 exist; no OPAQUE (checked `lib/std/crypto`). |
 
-**Where we are ahead:** byte-exact against the RFC's registration and login vectors *including* the fake-credential-response case; a pluggable, mandatory KSF with no default (the Identity KSF cannot be reached by omission — the READMEs read this run of the others do not say what their default is *(inferred: unverified)*); secret-scalar DH through `ct25519` for ristretto255 (std's ladder ends in a branch on the result); no allocation, no `Io`, no internal RNG outside the opt-in `Argon2idKsf`. **Where we are behind:** two configurations only (ristretto255 and P-256, both 3DH) — not the curve25519 AKE suites (C.1.3/C.1.4); no server-key-material or record-store helpers (→ Backlog items).
+**Where we are ahead:** byte-exact against the RFC's registration and login vectors *including* the fake-credential-response case; a pluggable, mandatory KSF with no default (the Identity KSF cannot be reached by omission — the READMEs read this run of the others do not say what their default is *(inferred: unverified)*); secret-scalar DH through `ct25519` for ristretto255 (std's ladder ends in a branch on the result); no allocation, no `Io`, no internal RNG outside the opt-in `Argon2idKsf`. **Where we are behind:** three configurations only (ristretto255, P-256, ristretto255 OPRF + curve25519 3DH), not opaque-ke's generic cipher suites; no server-key-material or record-store helpers (→ Backlog items).
 
 
 ## What an aPAKE is (and why OPAQUE)
@@ -302,8 +310,8 @@ design); registers and the red zone below the stack pointer.
 
 ## What is deliberately not done
 
-- **Other ciphersuites than the two built:** the curve25519 3DH configuration
-  (C.1.3/C.1.4, with C.2.2) is the open Backlog item; nothing else of RFC 9807 §7 is planned.
+- **Other ciphersuites than the three built:** RFC 9807 §7's P-384/P-521 rows have no
+  Appendix C vectors; nothing else is planned.
 - **A bundled scrypt KSF** and any default KSF: the concrete algorithm and
   parameters are the consumer's (§7's scrypt row has no adapter; opaque-ke ships
   only Argon2). The seam is the public `Ksf` callback (see above).
@@ -331,7 +339,10 @@ Offline. Run `scripts/modtest opaque`.
 - **Anchors:** RFC 9807 Appendix C official vectors, byte-exact through the public API: ristretto255 C.1.1 and C.1.2
   (registration record, KE1/KE2/KE3, `session_key`, `export_key`, both sides) and the C.2.1 fake credential response
   (`src/kat_test.zig`); P-256 C.1.5, C.1.6 (alice/bob identities) and C.2.3, plus the C.1.5.1 sizes
-  (`src/kat_p256_test.zig`, vectors `src/kat_vectors_p256.zig` generated from the RFC text by `tools/gen_p256_vectors.py`).
+  (`src/kat_p256_test.zig`, vectors `src/kat_vectors_p256.zig` generated from the RFC text by `tools/gen_p256_vectors.py`);
+  ristretto255 OPRF + curve25519 3DH C.1.3, C.1.4 and C.2.2, the C.1.3.1 sizes, the fake vector's
+  `DeriveDiffieHellmanKeyPair` and low-order peer keys refused (`src/kat_x25519_test.zig`, vectors
+  `src/kat_vectors_x25519.zig` from the same script with `x25519`).
 - **Fail-closed classes:** tampered `server_mac` / `client_mac`, wrong password and mismatched identities
   (`EnvelopeRecovery`), identity-element keyshares, every byte of `auth_tag`, `server_mac` and `client_mac` checked,
   identity/context past 0xffff bytes a typed error, a degenerate `client_public_key` caught by
@@ -350,14 +361,10 @@ Offline. Run `scripts/modtest opaque`.
 
 ## Backlog / deferred
 
-- **The curve25519 configuration (C.1.3/C.1.4):** ristretto255 OPRF with an
-  X25519 AKE: `Opaque(C)` assumes the AKE group is the OPRF group, so this needs a
-  separate `C.Ake` (keygen = `DeriveDiffieHellmanKeyPair` §6.4.1.3, DH = X25519).
-  Moderate; pure Zig (`std.crypto.dh.X25519`).
-- **P256-SHA256 hardening rows:** the ctgrind harness, the dead-stack probe and the fuzz harnesses
+- **P256-SHA256 and curve25519-3DH hardening rows:** the ctgrind harness, the dead-stack probe and the fuzz harnesses
   drive the ristretto255 configuration only; the P-256 one runs
   through the same code with `voprf`'s P-256 suite (whose own ctgrind rows are
-  pinned) but has no opaque-level row yet.
+  pinned), the curve25519 one with `ct25519`'s X25519 (pinned there), but neither has an opaque-level row yet.
 
 
 ## Anchoring
