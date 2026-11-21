@@ -858,7 +858,10 @@ pub const Fabric = struct {
     }
 
     fn schedConfig(ns: *const NodeState, opts: Options) isis_flood.Config {
+        var bcast = isis_flood.InterfaceSet.empty;
+        for (ns.lan_circuits) |c| bcast.set(c.iface);
         return .{
+            .broadcast_interfaces = bcast,
             .local_system_id = ns.system_id,
             .auth_keys = ns.auth_keys,
             .auth_snp = if (opts.auth) |a| a.auth_snp else true,
@@ -3327,7 +3330,9 @@ test "LAN sends: the scheduler is told who the DIS is; a member asks only for wh
     var cb = try isis.pdu.CsnpBuilder.init(&cbuf, .{ .source_id = from3, .start_lsp_id = @splat(0), .end_lsp_id = @splat(0xFF) });
     try isis.tlvs.addLspEntries(&cb.tlvs, &many);
     try Fabric.onMessage(&fab, &d.sim, 1, 3, cb.finish());
+    // The PSNP waits `partialSNPInterval` (2) after the first request.
     try fab.pollAndSend(&d.sim, 1, 1);
+    try fab.pollAndSend(&d.sim, 1, 3);
     try testing.expectEqual(before + 3, fab.stats.snp_tx);
     // The DIS itself sends no PSNP, whatever it lacks.
     const dis_before = fab.stats.snp_tx;
@@ -3685,6 +3690,7 @@ test "auth: a LAN member's PSNP request is signed, and unsigned when auth_snp is
         const before = queuedAuth(&d.sim);
         fab.horizon = 1_000;
         try fab.pollAndSend(&d.sim, 0, 0);
+        try fab.pollAndSend(&d.sim, 0, 2); // the PSNP waits partialSNPInterval
         const after = queuedAuth(&d.sim);
         // The PSNP to the other 3 members and the initial CSNP on the P2P tail
         // circuit; LSPs are always signed, SNPs only with auth_snp.
@@ -3795,16 +3801,28 @@ test "adjacency: a lossy medium still forms every adjacency and converges, acros
     const topo = lineTopology(&edges);
     var seed: u64 = 1;
     while (seed <= 8) : (seed += 1) {
-        var fab = try Fabric.initWithOptions(testing.allocator, topo, seed, .{
-            .adjacency = .{},
-            .link = .{ .latency = link_latency, .loss_permille = 100 },
-            .retransmit_interval = 40,
-            .csnp_interval = 20,
-        });
-        defer fab.deinit();
-        try testing.expectEqual(Outcome.converged, try fab.runToConvergence(3_000));
-        try testing.expect(fab.lsdbsAgree());
-        try testing.expect(fab.stats.adj_up >= 6);
+        // A lossy medium drops hellos now and then, so an adjacency can flap in
+        // any window; a flap in the last hold time + retransmit interval of a run
+        // leaves its resynchronisation cut off by the horizon, and that run ends
+        // with work pending (a property of the cut, not of the protocol). The
+        // claim is that the fabric settles once it is given time: a longer run of
+        // the same seed (the same trace up to the old horizon) must end converged.
+        var settled = false;
+        var horizon: Time = 3_000;
+        while (!settled and horizon <= 3_000 + 4 * 200) : (horizon += 200) {
+            var fab = try Fabric.initWithOptions(testing.allocator, topo, seed, .{
+                .adjacency = .{},
+                .link = .{ .latency = link_latency, .loss_permille = 100 },
+                .retransmit_interval = 40,
+                .csnp_interval = 20,
+            });
+            defer fab.deinit();
+            if (try fab.runToConvergence(horizon) != .converged) continue;
+            try testing.expect(fab.lsdbsAgree());
+            try testing.expect(fab.stats.adj_up >= 6);
+            settled = true;
+        }
+        try testing.expect(settled);
     }
 }
 

@@ -94,7 +94,7 @@ it relies on retransmission until the ack path clears it. This is the P2P
 acknowledgement and so no retransmit pacing record; the periodic CSNP goes out only while this system is the
 circuit's DIS (`Scheduler.setDis`, fed from the `isis-dis` election; a new DIS sends its first CSNP on the next poll
 and then every `complete_snp_interval`); a system that is not the DIS learns what it lacks from the DIS's CSNP and
-asks for it with a PSNP (`isis-lsdb` sets SSN on a broadcast circuit only for requests, never as an acknowledgement).
+asks for it with a PSNP (`isis-lsdb` sets SSN on a broadcast circuit only for requests, never as an acknowledgement: for an LSP it receives and for a CSNP entry that is newer than its copy or missing). The DIS sends no PSNP on its circuit (ISO 10589 §7.3.15.2; FRR `send_psnp` skips the DR), so SSN flags it holds there stay unsent.
 
 **Inter-LSP gap.** With `lsp_transmit_gap` non-zero, a poll sends at most one LSP per circuit and `next_wakeup` names
 the instant the next may go (ISO 10589 `minimumLSPTransmissionInterval`, 33 ms in the standard; the unit is the
