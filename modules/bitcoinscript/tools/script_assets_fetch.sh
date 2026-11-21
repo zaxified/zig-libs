@@ -3,12 +3,13 @@
 #
 # Fetches Bitcoin Core's BIP341/342 consensus corpus `script_assets_test.json`
 # (bitcoin-core/qa-assets, MIT, 2244 entries, 9.2 MB) into
-# `modules/bitcoinscript/tools/script_assets/`, a gitignored directory of its
-# own: too big to vendor, and re-fetchable. `src/script_assets_test.zig` runs
+# `tools/script-assets/` at the repo root, a gitignored directory of its own
+# (not under modules/: check-copyleft reads every file of a module directory):
+# too big to vendor, and re-fetchable. `src/script_assets_test.zig` runs
 # every entry when `BITCOINSCRIPT_SCRIPT_ASSETS` names the file:
 #
 #   modules/bitcoinscript/tools/script_assets_fetch.sh
-#   BITCOINSCRIPT_SCRIPT_ASSETS=$PWD/modules/bitcoinscript/tools/script_assets/script_assets_test.json \
+#   BITCOINSCRIPT_SCRIPT_ASSETS=$PWD/tools/script-assets/script_assets_test.json \
 #     hw run --slots 1 -- scripts/modtest bitcoinscript --fresh
 #
 # The file is pinned by sha256; a mismatch deletes the download and fails.
@@ -19,7 +20,7 @@ URL="https://raw.githubusercontent.com/bitcoin-core/qa-assets/main/unit_test_dat
 SHA256="cd789a58ec45916e1721cdd14e82ca4c93100959f1cef4e229b22e3bf539f095"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEST="$HERE/script_assets"
+DEST="$HERE/../../../tools/script-assets"
 FILE="$DEST/script_assets_test.json"
 
 if [ -f "$FILE" ] && [ "$(sha256sum "$FILE" | cut -d' ' -f1)" = "$SHA256" ] && [ "${FORCE:-0}" != 1 ]; then
