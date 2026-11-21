@@ -1010,9 +1010,12 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
                     .SUCCESS => return true,
                     .INTR => continue,
                     .OPNOTSUPP, .NOSYS => return false,
+                    // A file of a simulated `Io` (simio) has no kernel descriptor:
+                    // nothing to preallocate, and `Storage.allocate` says so with `false`.
+                    .BADF => return false,
                     .NOSPC, .DQUOT, .FBIG => return error.NoSpaceLeft,
                     .IO => return error.InputOutput,
-                    .BADF, .PERM, .ACCES, .ROFS, .TXTBSY => return error.AccessDenied,
+                    .PERM, .ACCES, .ROFS, .TXTBSY => return error.AccessDenied,
                     else => return error.Unexpected,
                 }
             }
@@ -1022,11 +1025,15 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         /// `sync`.
         fn vSyncData(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
             const self = cast(ctx);
-            const fd = (try self.fileOf(h)).handle;
+            const file = try self.fileOf(h);
+            const fd = file.handle;
             while (true) {
                 switch (linux.errno(linux.fdatasync(fd))) {
                     .SUCCESS => return,
                     .INTR => continue,
+                    // A file of a simulated `Io` (simio) has no kernel descriptor: the
+                    // full `sync`, which is what a backend without `syncData` does.
+                    .BADF => return file.sync(self.io) catch |e| mapErr(e),
                     .IO => return error.InputOutput,
                     .NOSPC, .DQUOT => return error.NoSpaceLeft,
                     else => return error.Unexpected,

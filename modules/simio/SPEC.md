@@ -253,8 +253,7 @@ Run `scripts/modtest simio` (loopback-dependent tests skip where binding is unav
   cannot be simulated. Each needs its socket waits and clocks moved behind the `Io` it is given — the same
   change `sntp`, `mqtt` and the `http` Server got for their pilots — and then a pilot in `src/pilots/`. Their
   loopback tests stay as the real-kernel half.
-- **`kv` `FsStorage`:** `allocate` and `syncData` call `fallocate`/`fdatasync` directly (std.Io has neither)
-  and get `EBADF` under simio; `Db` never calls them.
+
 
 ## Anchoring
 

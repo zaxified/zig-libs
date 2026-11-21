@@ -286,3 +286,25 @@ test "pilot kv: two tasks of one thread share a Db without starving each other" 
         try testing.expectEqual(@as(u32, 2), done);
     }
 }
+
+fn dataSync(io: Io) !void {
+    var fs_store = kv.FsStorage.init(io, Io.Dir.cwd());
+    const st = fs_store.storage();
+    const h = try st.open("seg", .open_or_create);
+    defer st.close(h);
+    // A simulated file has no kernel descriptor, so `fallocate` / `fdatasync`
+    // answer EBADF: no preallocation, and the full `sync` instead.
+    try testing.expect(!try st.allocate(h, 4096));
+    try st.writeAll(h, "abc", 0);
+    try st.syncData(h);
+}
+
+test "pilot kv: FsStorage.allocate and syncData work on a simulated file" {
+    var sim: Sim = undefined;
+    sim.init(testing.allocator, .{ .seed = 3, .stack_size = 512 * 1024 });
+    defer sim.deinit();
+    const h = try sim.addHost(.{});
+    try h.spawn(dataSync, .{h.io()});
+    try testing.expectEqual(sched.Outcome.quiescent, sim.runFor(ns_per_s).outcome);
+    try testing.expectEqual(@as(?anyerror, null), h.failure);
+}
