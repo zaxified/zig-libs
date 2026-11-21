@@ -184,7 +184,8 @@ outside the root.
 - **Not a validating parser** — no DTD content-model validation; no
   attribute-default or ID/IDREF typing from a DTD (the ID heuristic above stands
   in for the SAML/dsig use case).
-- **No XML 1.1** yet (`version` must be `1.` and digits, `1.1` itself and anything else is `UnsupportedVersion`; every other `1.x` is read as 1.0, like libxml2; deferred, see Backlog).
+- **No XML 1.1** (`version` must be `1.` and digits, `1.1` itself and anything else is `UnsupportedVersion`; every other `1.x` is read as 1.0, like libxml2). Only libxml2 and an optional normalisation switch of quick-xml implement it; expat, roxmltree, Go's `encoding/xml` and the Zig parsers read 1.0 only, and 1.1 documents are rare (its only visible changes are the extra name and line-end characters). An opt-in `1.1` reading would be the owner's call.
+- **Entities with markup in their replacement text** — libxml2 and expat re-enter the parser on a replacement text, with amplification limits; roxmltree, quick-xml, Go's `encoding/xml` and the Zig parsers do not expand such entities. Every consumer here (`xmldsig`, `saml`, `xmlenc`, `netconf`, `iec61850`) reads untrusted input where a DTD entity is the classic XXE / billion-laughs hazard, so the refusal (an entity whose replacement text holds markup, `<`, is is `UnsupportedEntity`; see *Encodings, internal entities, writer*) is the behaviour kept.
 - **No XPath** — the `xmldsig`/`saml` layers navigate the tree directly.
 - **Encodings beyond UTF-8/UTF-16/ISO-8859-1/US-ASCII** are rejected
   (`UnsupportedEncoding`); those four are transcoded to UTF-8.
@@ -299,16 +300,17 @@ Run with `scripts/modtest xml` (`zig build test-xml`).
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - **Streaming (pull/SAX) reader** — expat, quick-xml and zig-xml are
   stream-first; a user with a large document, or one arriving in chunks, cannot
   use a whole-document tree. A resumable tokenizer is a second parser with its
-  own conformance surface; the tree parser is the one the libxml2-anchored
-  vectors cover, and every consumer in the collection (`xmldsig`, `saml`,
-  `xmlenc`, `netconf`, `iec61850`) needs the tree. Effort medium-large (the
-  parser is one pass already; it needs a resumable state machine); fits
-  CONVENTIONS §2. Next step when a consumer needs it.
-- **Entities with markup in their replacement text** — needs the parser
-  re-entered on replacement text, with spans that cannot index the source;
-  libxml2/expat do it; no consumer needs it.
-- **XML 1.1** — quick-xml and libxml2 have it; rare in practice; effort
-  small-medium; fits CONVENTIONS §2. Low priority.
+  own conformance surface (the xmlconf suite again, the entity and namespace
+  rules, UTF-16 across chunk boundaries); the tree parser is the one the
+  libxml2-anchored vectors cover, and every consumer in the collection
+  (`xmldsig`, `saml`, `xmlenc`, `netconf`, `iec61850`) needs the tree. Size:
+  weeks (a second parser of the same grammar, resumable, with its own fuzz and
+  conformance runs); fits CONVENTIONS §2; needs a consumer that cannot hold the
+  document.
