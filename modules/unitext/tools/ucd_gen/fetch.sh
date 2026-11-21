@@ -17,7 +17,11 @@ curl -sfL --max-time 300 -o "$tmp/UCD.zip" "https://www.unicode.org/Public/$v/uc
 (cd "$tmp" && unzip -q -o UCD.zip UnicodeData.txt SpecialCasing.txt CaseFolding.txt CompositionExclusions.txt \
     DerivedNormalizationProps.txt DerivedCoreProperties.txt NormalizationTest.txt PropList.txt \
     Scripts.txt Blocks.txt EastAsianWidth.txt \
-    extracted/DerivedNumericType.txt extracted/DerivedNumericValues.txt extracted/DerivedGeneralCategory.txt)
+    extracted/DerivedNumericType.txt extracted/DerivedNumericValues.txt extracted/DerivedGeneralCategory.txt \
+    extracted/DerivedJoiningType.txt)
 cp "$tmp"/*.txt "$dir/"
 cp "$tmp"/extracted/*.txt "$dir/extracted/"
+# UTS #46 (idna_gen.py): the mapping table and Unicode's conformance file.
+curl -sfL --max-time 300 -o "$dir/IdnaMappingTable.txt" "https://www.unicode.org/Public/$v/idna/IdnaMappingTable.txt"
+curl -sfL --max-time 300 -o "$dir/IdnaTestV2.txt" "https://www.unicode.org/Public/$v/idna/IdnaTestV2.txt"
 echo "fetched UCD $v into $dir"

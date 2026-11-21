@@ -47,6 +47,9 @@ const norm = @import("norm.zig");
 const props = @import("props.zig");
 const unaccent_mod = @import("unaccent.zig");
 
+/// UTS #46 domain-name processing (`toAscii`, `toUnicode`); see `idna.zig`.
+pub const idna = @import("idna.zig");
+
 // case mapping
 pub const lower = case.lower;
 pub const lowerTo = case.lowerTo;
@@ -132,5 +135,7 @@ test {
     _ = unaccent_mod;
     _ = @import("unit_test.zig");
     _ = @import("vectors_test.zig");
+    _ = @import("idna.zig");
+    _ = @import("idna_test.zig");
     _ = @import("fuzz_test.zig");
 }

@@ -30,8 +30,11 @@ UTF-8; `Options.invalid_utf8` is `.reject` (the default, `error.InvalidUtf8`),
 allocate (`error.TooLarge`). The behaviour is CPython's `str` and `unicodedata`
 (compared code point by code point), Rust's `to_lowercase` / `to_uppercase` and
 `unicode-normalization`, Go's `x/text/unicode/norm`; each function's doc comment says
-which and where they differ. Not here: collation, grapheme / word segmentation, bidi,
-IDNA, East Asian width, language-tailored case rules — SPEC.md says why.
+which and where they differ. `unitext.idna` is UTS #46 domain-name processing
+(`toAscii`, `toUnicode`: map, NFC, Punycode, validity criteria, ContextJ, Bidi rule;
+WHATWG defaults; checked against Unicode's `IdnaTestV2.txt`). Not here: collation,
+grapheme / word segmentation, the bidi algorithm, East Asian width, language-tailored
+case rules — SPEC.md says why.
 
 Status: gap (no zig-libs module had case mapping or normalization; `regex` has only
 simple case-fold orbits for `(?i)`, `validate` only the sets of code points that change
