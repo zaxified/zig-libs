@@ -51,6 +51,8 @@ pub const meta = .{
 };
 
 const fabric = @import("fabric.zig");
+pub const spec = @import("spec.zig");
+pub const Spec = spec.Spec;
 
 // ── the harness surface, re-exported ─────────────────────────────────────────
 pub const Fabric = fabric.Fabric;
@@ -70,4 +72,5 @@ pub const systemIdForNode = fabric.systemIdForNode;
 test {
     std.testing.refAllDecls(@This());
     _ = fabric;
+    _ = spec;
 }
