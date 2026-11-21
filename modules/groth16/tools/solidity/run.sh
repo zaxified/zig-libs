@@ -35,7 +35,8 @@ opt=$repo/$(cd "$repo" && grep -l montint_asm_unroll .zig-cache/o/*/options.zig 
 (cd "$repo" && "${ZIG:-zig}" build-exe -OReleaseFast -fllvm \
   --dep groth16 -Mroot=modules/groth16/tools/snarkjs/g16.zig \
   --dep bn254 -Mgroth16=modules/groth16/src/root.zig \
-  --dep montint -Mbn254=modules/bn254/src/root.zig \
+  --dep montint --dep sha2 -Mbn254=modules/bn254/src/root.zig \
+  -Msha2=modules/sha2/src/root.zig \
   --dep zl_options -Mmontint=modules/montint/src/root.zig \
   -Mzl_options="$opt" \
   --cache-dir .zig-cache -femit-bin=.zig-cache/sol/g16)
