@@ -55,6 +55,7 @@ const lnwire = @import("lnwire");
 const bip340 = @import("bip340");
 const bech32raw = @import("bech32_raw.zig");
 const bitpack = @import("bitpack.zig");
+const blinded = @import("blinded.zig");
 
 // ── `offer` TLV field types (BOLT#12 "TLV Fields for Offers") ────────────
 
@@ -98,6 +99,12 @@ pub const Offer = struct {
     quantity_max: ?u64,
     /// `offer_issuer_id` — 33-byte compressed SEC1 pubkey.
     issuer_id: ?[33]u8,
+
+    /// The blinded paths of `offer_paths`, typed (see `blinded.zig`): an iterator over the array in the
+    /// record (empty without `offer_paths`). Each path is validated as it is read.
+    pub fn blindedPaths(self: Offer) blinded.PathIterator {
+        return .{ .bytes = if (self.paths.len > 0) self.paths[0] else &.{} };
+    }
 
     pub fn deinit(self: *Offer, allocator: Allocator) void {
         allocator.free(self.chains);
@@ -396,6 +403,12 @@ const known_invreq_types = known_offer_types ++ [_]u64{
 /// borrows from it (so `deinit` frees only `raw`). Point/signature fields
 /// are copied by value. Fields not listed here (paths, features detail) are
 /// left in `raw`; see the module doc comment for the deferred set.
+fn recordOf(allocator: Allocator, raw: []const u8, known: []const u64, t: u64) (lnwire.tlv.StreamError || Allocator.Error)!?[]const u8 {
+    var parsed = try lnwire.parseTlvStream(allocator, raw, known);
+    defer parsed.deinit(allocator);
+    return parsed.find(t); // the value borrows `raw`, not the parsed list
+}
+
 pub const InvoiceRequest = struct {
     raw: []u8,
     invreq_metadata: ?[]const u8,
@@ -413,6 +426,16 @@ pub const InvoiceRequest = struct {
     pub fn deinit(self: *InvoiceRequest, allocator: Allocator) void {
         allocator.free(self.raw);
         self.* = undefined;
+    }
+
+    /// The value of the TLV record `t` of the request (borrowed from `raw`), if present.
+    pub fn record(self: InvoiceRequest, allocator: Allocator, t: u64) (lnwire.tlv.StreamError || Allocator.Error)!?[]const u8 {
+        return recordOf(allocator, self.raw, &known_invreq_types, t);
+    }
+
+    /// The blinded paths of `invreq_paths` (type 90), typed; empty without the record.
+    pub fn blindedPaths(self: InvoiceRequest, allocator: Allocator) (lnwire.tlv.StreamError || Allocator.Error)!blinded.PathIterator {
+        return .{ .bytes = (try self.record(allocator, INVREQ_PATHS)) orelse &.{} };
     }
 
     /// Verify the `signature` (type 240) as a BOLT#12 BIP-340 signature by
@@ -614,6 +637,22 @@ pub const Invoice = struct {
     pub fn deinit(self: *Invoice, allocator: Allocator) void {
         allocator.free(self.raw);
         self.* = undefined;
+    }
+
+    /// The value of the TLV record `t` of the invoice (borrowed from `raw`), if present.
+    pub fn record(self: Invoice, allocator: Allocator, t: u64) (lnwire.tlv.StreamError || Allocator.Error)!?[]const u8 {
+        return recordOf(allocator, self.raw, &known_invoice_types, t);
+    }
+
+    /// The blinded paths of `invoice_paths` (type 160), typed; empty without the record.
+    pub fn blindedPaths(self: Invoice, allocator: Allocator) (lnwire.tlv.StreamError || Allocator.Error)!blinded.PathIterator {
+        return .{ .bytes = (try self.record(allocator, INVOICE_PATHS)) orelse &.{} };
+    }
+
+    /// The `blinded_payinfo` array of `invoice_blindedpay` (type 162), typed; one entry per path
+    /// (BOLT#12: "exactly one `blinded_payinfo` for each `blinded_path`").
+    pub fn blindedPayInfo(self: Invoice, allocator: Allocator) (lnwire.tlv.StreamError || Allocator.Error)!blinded.PayInfoIterator {
+        return .{ .bytes = (try self.record(allocator, INVOICE_BLINDEDPAY)) orelse &.{} };
     }
 
     /// Verify the `signature` (type 240) as a BOLT#12 BIP-340 signature by

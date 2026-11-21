@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ACINQ/eclair](https://github.com/ACINQ/eclair) | Scala | Apache-2.0 | 1.3k | v0.14.3 (2026-09-14) | BOLT#11 and BOLT#12 offers *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | GitHub search for Lightning/BOLT Zig repositories (2026-09-30) found none besides this collection. |
 
-**Where we are ahead:** BOLT#11 covers every tagged field the spec lists (`p s d h m x c n f r 9`), signature recovery *and* the low-S rule when `n` is present; BOLT#12 core is byte-exact against the spec's own vectors incl. the `payer-proof` invoice; pure Zig with bech32 length cap correctly waived. **Where we are behind:** typed blinded paths / payment info, offer builders (refunds are offer-less `invoice_request`s and `invoice_error` has its own codec), semantic validity checks a BOLT#12 payer needs (currency/amount/quantity/chains matching).
+**Where we are ahead:** BOLT#11 covers every tagged field the spec lists (`p s d h m x c n f r 9`), signature recovery *and* the low-S rule when `n` is present; BOLT#12 core is byte-exact against the spec's own vectors incl. the `payer-proof` invoice; pure Zig with bech32 length cap correctly waived. **Where we are behind:** no `invoice` against `invoice_request` rules, no onion-message transport (refunds are offer-less `invoice_request`s and `invoice_error` has its own codec).
 
 ## Design & invariants
 
@@ -171,10 +171,22 @@ builds+signs+encodes from caller-supplied ascending signature-free records.
 `Invoice.verify` checks the signature by `invoice_node_id` (type 176).
 `encodeSignedInvoice` builds+signs+encodes.
 
-**Raw (not typed) fields:** `offer_paths`/`invreq_paths`/`invoice_paths` (`blinded_path` entries, BOLT#4 route-blinding —
-a distinct spec), and `invoice`'s optional `invoice_blindedpay`/`invoice_fallbacks` sub-structures. These stay in the record
-stream / `raw` buffer and are not decoded; the signed-blob correctness (Merkle root + BIP-340 signature) and mandatory
-scalar fields are modelled fully.
+**Typed blinded paths, payment info, offer rules and builder** (`blinded.zig`, `offer.zig`). `blinded.PathIterator` walks the
+array of `blinded_path`s of `offer_paths` / `invreq_paths` / `invoice_paths` (BOLT#4 "Route Blinding": `sciddir_or_pubkey`
+first node, `first_path_key`, `num_hops`, hops of `blinded_node_id` + opaque `encrypted_recipient_data`; the accessors
+`Offer.blindedPaths`, `InvoiceRequest.blindedPaths`, `Invoice.blindedPaths`), validating as it goes: first-node kind 0..3,
+every `point` a curve point (prefix 02/03 and an x that lifts), `num_hops` non-zero, no truncation. `blinded.PayInfoIterator`
+walks `invoice_blindedpay` (`Invoice.blindedPayInfo`, one `blinded_payinfo` per path). `appendPath` / `appendPayInfo` build
+them. `offer.readOffer` = `decodeOffer` plus the reader rules of BOLT#12 "A reader of an offer" (`checkOffer`): TLV types outside
+1..79 / 1000000000..1999999999, unknown even or non-minimal `offer_features`, non-UTF-8 description / issuer / currency (well-formed
+UTF-8 only: BOLT#1's "Other"/Zl/Zp categories are not checked), amount without description or zero, currency without amount, neither
+`offer_issuer_id` nor paths, malformed or empty paths, an `offer_issuer_id` that is not a curve point, and (with a clock) expiry;
+all 53 rows of `offers-test.json` are read as the file says (20 valid, 33 not). `offer.encodeOffer` builds an unsigned `lno1...`
+offer from typed fields under the writer rules (the same errors), byte-exact against every valid row that has only known fields.
+`offer.checkInvoiceRequest` is the issuer's check of an `invoice_request` against its own offer: copied offer fields equal,
+chain offered, `invreq_quantity` against `offer_quantity_max`, `invreq_amount` at least offer amount times quantity (or present when
+the offer has no amount; a currency-priced offer needs the caller's converted per-item msat), offer not expired. `invoice_fallbacks`
+stays raw.
 
 **Signature slot and stream order.** `encodeSignedInvoice`/`encodeSignedInvoiceRequest` assemble the output with the shared
 `appendSignedStream` (`bolt12.zig`): the caller's records with type < 240, then the `signature` record, then the records
@@ -249,9 +261,7 @@ string, and the same rows are DECODED and their recovered TLV records compared f
 list. The wire-malformed `"valid": false` rows (out-of-order fields, truncated at type / in length / after length / in
 description, a non-32-byte or empty `offer_chains`, TLV type ≥ 80, an unknown even type, TLV type > 1999999999, and five-plus-bit
 bech32 padding) are asserted rejected with the SPECIFIC error each names, not just "some error". The remaining `"valid": false`
-rows exercise UTF-8 validation, `offer_paths`/`blinded_path` internal structure, `offer_issuer_id` curve-point validity,
-`offer_features` bit semantics and reader "MUST NOT respond to the offer" business policy — all out of this module's scope
-(`bolt12.zig` enumerates each in a comment before its Merkle/signature test section) and not asserted against.
+rows (UTF-8, `blinded_path` structure, `offer_issuer_id` validity, `offer_features`, reader policy) are asserted by `offer.zig`'s `readOffer` (see above).
 `bolt12/format-string-test.json` (the `+`-continuation / upper-vs-lowercase acceptance rules) is likewise fully vendored and
 driven through `decodeOffer`. The rule on `+` (only between two ordinary characters) and the five-plus-bit padding limit
 are held by these rows.
@@ -310,11 +320,7 @@ public TLV/bech32 buffers).
 
 ## Backlog / deferred
 
-- **Typed BOLT#12 blinded paths and payment info** *(survey)* — `offer_paths`/`invoice_paths`/`invoice_blindedpay` are raw; paying an
-  offer over a blinded path needs them decoded (LDK does). Effort: medium (needs BOLT#4 route-blinding structure, sibling `sphinx`
-  gap); fits §2.
-- **Offer builder and BOLT#12 validity rules** *(survey)* — encode an unsigned `offer`, check that an `invoice_request`/`invoice`
-  matches its offer (currency, amount, quantity, chain, expiry). Users who issue offers need it. Effort: medium; fits §2.
+None open.
 
 ## Anchoring
 

@@ -26,6 +26,8 @@ pub const bitpack = @import("bitpack.zig");
 pub const ecdsa_recover = @import("ecdsa_recover.zig");
 pub const bolt11 = @import("bolt11.zig");
 pub const bolt12 = @import("bolt12.zig");
+pub const blinded = @import("blinded.zig");
+pub const offer = @import("offer.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -97,6 +99,8 @@ test {
     _ = ecdsa_recover;
     _ = bolt11;
     _ = bolt12;
+    _ = blinded;
+    _ = offer;
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
 }

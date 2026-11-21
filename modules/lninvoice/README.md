@@ -30,6 +30,9 @@ file where the obligation lives.
 
 Implemented — see `SPEC.md` for the full design/threat-model writeup and exactly what's deferred:
 
+- **BOLT#12 blinded paths, offer rules and builder** (`blinded`, `offer`): typed `blinded_path` / `blinded_payinfo` iterators, `readOffer` (the reader rules), `encodeOffer`, `checkInvoiceRequest`.
+
+
 - **BOLT#11 decode** (`decode`) — full tagged-field decode (`p`/`s`/`d`/`h`/`m`/`x`/`c`/`n`/`f`/
   `r`/`9`) + amount/network HRP parse + signature verification: recovers the payee's node ID from
   the signature when no `n` field is present, or verifies directly against `n` (requiring low-S)
@@ -112,6 +115,4 @@ against a node id you already trust; `decode` cannot do that for you.
 
 ## Not provided
 
-Typed BOLT#12 blinded paths and payment info (`offer_paths`/`invoice_paths`/`invoice_blindedpay` stay raw), an offer builder
-and the BOLT#12 validity rules a payer needs (currency/amount/quantity/chain matching) are open (SPEC *Backlog / deferred*);
-interpreting `f` (fallback) addresses and `r` (route-hint) semantics beyond BOLT#11's wire layout is left to the caller.
+`invoice_fallbacks` stay raw, and onion-message transport is not here; interpreting `f` (fallback) addresses and `r` (route-hint) semantics beyond BOLT#11's wire layout is left to the caller.
