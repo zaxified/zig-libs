@@ -93,7 +93,10 @@ and a join key run over the codes: a single categorical key column factorizes it
 their own), a join does so when both sides are one categorical key with no null and the same dictionary, else it reads the
 texts; sort has always compared the codes (measured over 1 M rows and 1 000 categories, `group_cat` 15 ms against 64 ms
 over the text path, `join_cat` 34 ms against `join_txt`'s 77 ms; `window`'s `cummin` and `rank` over a categorical keep
-reading the text: the answer is the same, only the speed is not an encoded key's). A duration is ISO 8601 in CSV and JSON
+reading the text: the answer is the same, only the speed is not an encoded key's). A struct key column groups through its fields' factors combined (and its own null as one more), without boxing each row
+as a record: `group_nested` (a two-field struct, 10 000 groups over 1 M rows) 18 ms against 139 ms over the encoded rows
+(pandas over a column of tuples 184 ms, polars 70 ms). A list key, a struct holding a list or a struct, and the join and sort
+of a nested key keep the encoded-row path (no measurement asked for a faster one; the answers are the same). A duration is ISO 8601 in CSV and JSON
 (`formatIsoDuration`, polars' JSON form, delegating to `datefmt`'s ISO 8601 duration functions; polars refuses a duration in CSV, pandas writes
 `1 days 02:03:04`, which `parseDurationCell` reads too) and polars' `1d 2h` in `format`.
 `mutate` gives an expression the temporal type it keeps (`expr.temporalType`: `ts - ts` a
@@ -1209,5 +1212,4 @@ the end cell with 0).
 Open items only; everything here is LOW unless marked, and none is a known wrong answer without a refusal or a note in the sections above.
 
 - **Build size knobs (CONVENTIONS §4.2; owner decision):** `regex` brings its Unicode tables and `unitext` adds 158,056 B (+15%) to a ReleaseSmall binary that calls `mutate` with one `add`; a `dataframe-regex` and a `dataframe-unicode` option (default on, off = the former ASCII behaviour) would remove them: measure with a size probe, the owner decides.
-- **Nested keys:** group/join/sort keys over list and struct columns take the encoded-row path with no typed fast path (measure first).
 - **Time zones:** `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until it is made a zoned column before 1970 shows the zone's state at the epoch.

@@ -417,8 +417,45 @@ fn factorColumn(a: std.mem.Allocator, f: Frame, ci: usize) Error!keys.Factors {
         if (try intsWithMissing(a, col, f.len)) |xs| return keys.factorizeInts(a, xs);
         if (try plainTexts(a, col, f.len)) |xs| return keys.factorizeTexts(a, xs);
         if (try categoricalCodes(a, col, f.len)) |xs| return keys.factorizeInts(a, xs);
+        if (try structFactors(a, col, f.len)) |fz| return fz;
     }
     return keys.factorize(a, try keyRows(a, f, &.{ci}), &pos_zero, .as_null);
+}
+
+/// A struct key column as its fields' factors combined (with the struct's own null as one more
+/// factor): the same groups as the encoded rows, without boxing each row as a record. null
+/// (the row path decides) for a field that is a list or a struct, for no field, and for a column
+/// whose shape the typed arrays do not state (a length other than the frame's, a null row whose
+/// fields hold a value).
+fn structFactors(a: std.mem.Allocator, col: ColumnData, rows: usize) Error!?keys.Factors {
+    if (col != .@"struct") return null;
+    const sc = col.@"struct".*;
+    if (sc.len != rows or sc.children.len == 0 or sc.children.len != sc.names.len) return null;
+    for (sc.children) |ch| switch (ch) {
+        .list, .@"struct" => return null,
+        else => {},
+    };
+    if (sc.valid != null) {
+        for (0..rows) |ri| {
+            if (sc.isValid(ri)) continue;
+            for (sc.children) |ch| if (!keys.isMissing(ch.get(ri))) return null;
+        }
+    }
+    const extra: usize = if (sc.valid != null) 1 else 0;
+    const parts = try a.alloc(keys.Factors, sc.children.len + extra);
+    defer a.free(parts);
+    for (sc.children, parts[0..sc.children.len]) |ch, *p| {
+        const one: Frame = .{ .columns = &.{.{ .name = "", .type = .text }}, .data = &.{ch}, .len = rows };
+        p.* = try factorColumn(a, one, 0);
+    }
+    if (extra == 1) {
+        const flags = try a.alloc(i64, rows);
+        defer a.free(flags);
+        for (flags, 0..) |*x, ri| x.* = @intFromBool(!sc.isValid(ri));
+        parts[sc.children.len] = try keys.factorizeInts(a, flags);
+    }
+    if (parts.len == 1) return parts[0];
+    return try keys.combine(a, parts[0].ids, parts[0].groups(), parts[1..]);
 }
 
 /// Dense group ids, first-seen order, as `keys.factorizeMany` gives a row verb.

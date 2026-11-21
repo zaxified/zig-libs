@@ -310,3 +310,31 @@ test "group, distinct, join and pivot keyed on a categorical's codes give the te
         try testing.expectEqualStrings(col.name, pg.columns[ci].name);
     }
 }
+
+test "group by a struct key: the fields' factors give the groups of the flat key columns" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nan = std.math.nan(f64);
+    const raw = try st.mk(a, &.{ .{ .name = "i", .type = .int }, .{ .name = "x", .type = .float }, .{ .name = "t", .type = .text }, .{ .name = "v", .type = .int } }, &.{
+        &.{ int(1), .{ .float = 0.5 }, txt("a"), int(1) }, &.{ int(2), .{ .float = 0.5 }, txt("a"), int(2) },
+        &.{ .null, .{ .float = nan }, .null, int(3) },     &.{ int(1), .{ .float = 0.5 }, txt("a"), int(4) },
+        &.{ .null, .null, .null, int(5) },                 &.{ int(2), .{ .float = 1.5 }, txt("b"), int(6) },
+        &.{ int(1), .{ .float = 0.5 }, txt("b"), int(7) },
+    });
+    const withs = try df.mutate(a, raw, &.{.{ .out = "k", .expr = .{ .struct_of = &.{
+        .{ .name = "i", .x = .{ .col = "i" } }, .{ .name = "x", .x = .{ .col = "x" } }, .{ .name = "t", .x = .{ .col = "t" } },
+    } } }});
+    const aggs: []const df.AggCol = &.{.{ .src = "v", .out = "s", .func = .sum }};
+    const g = try df.aggregate(a, withs, .{ .group_by = &.{"k"}, .aggs = aggs });
+    const flat = try df.aggregate(a, raw, .{ .group_by = &.{ "i", "x", "t" }, .aggs = aggs });
+    try testing.expectEqual(flat.len, g.len);
+    try testing.expectEqual(@as(usize, 5), g.len);
+    for (0..g.len) |ri| try testing.expect(st.same(flat.cell(ri, "s").?, g.cell(ri, "s").?));
+    // a struct of one field
+    const one = try df.mutate(a, raw, &.{.{ .out = "k", .expr = .{ .struct_of = &.{.{ .name = "t", .x = .{ .col = "t" } }} } }});
+    const g1 = try df.aggregate(a, one, .{ .group_by = &.{"k"}, .aggs = aggs });
+    const f1 = try df.aggregate(a, raw, .{ .group_by = &.{"t"}, .aggs = aggs });
+    try testing.expectEqual(f1.len, g1.len);
+    for (0..g1.len) |ri| try testing.expect(st.same(f1.cell(ri, "s").?, g1.cell(ri, "s").?));
+}

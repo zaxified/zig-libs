@@ -37,7 +37,7 @@
 //!
 //! `group_cat` (wave 14): `group_txt` over L with `k_txt` a categorical column (1 000
 //! categories; pandas `category`, polars `Categorical`), built outside the clock; count as
-//! `group_txt`. `join_cat`: `join_txt` with both sides categorical (T's dictionary equals L's). No DuckDB row.
+//! `group_txt`. `join_cat`: `join_txt` with both sides categorical (T's dictionary equals L's). `group_nested`: `group_int` over the struct key (`k_int`, `k2`) (10 000 groups; pandas groups a column of tuples, polars a Struct). No DuckDB row.
 
 const std = @import("std");
 const bench = @import("benchkit");
@@ -49,9 +49,14 @@ const rows_l: usize = 1_000_000;
 const rows_r: usize = 100_000;
 const rows_t: usize = 1_000;
 
-const Op = enum { fill_null, join_asof, top_k, win_shift, win_rank, value_counts, describe, concat, str_contains, strptime, read_csv, write_csv, write_json, write_ndjson, group_int, group_null, group_hi, group_txt, group_two, group_cat, group_stats, join_inner, join_left, join_txt, join_cat, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum };
+const Op = enum { fill_null, join_asof, top_k, win_shift, win_rank, value_counts, describe, concat, str_contains, strptime, read_csv, write_csv, write_json, write_ndjson, group_int, group_null, group_hi, group_txt, group_two, group_cat, group_nested, group_stats, join_inner, join_left, join_txt, join_cat, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum };
 
-const Ctx = struct { op: Op = .group_int, l: Frame, r: Frame, t: Frame, csv: []const u8, a: Frame, d: Frame, cat: Frame, tcat: Frame };
+const Ctx = struct { op: Op = .group_int, l: Frame, r: Frame, t: Frame, csv: []const u8, a: Frame, d: Frame, cat: Frame, tcat: Frame, nest: Frame };
+
+/// L with a struct key `k_st` = (`k_int`, `k2`), 10 000 distinct keys.
+fn nestFrame(a: std.mem.Allocator, l: Frame) !Frame {
+    return df.mutate(a, l, &.{.{ .out = "k_st", .expr = .{ .struct_of = &.{ .{ .name = "a", .x = .{ .col = "k_int" } }, .{ .name = "b", .x = .{ .col = "k2" } } } } }});
+}
 
 fn frameSum(f: Frame, name: []const u8) f64 {
     const c = f.column(name).?;
@@ -226,6 +231,10 @@ fn run(a: std.mem.Allocator, c: *Ctx) !u64 {
         },
         .group_cat => {
             const o = try df.aggregate(a, c.cat, .{ .group_by = &.{"k_txt"}, .aggs = &.{ s_v, m_w } });
+            return cnt(o.len, frameSum(o, "s"));
+        },
+        .group_nested => {
+            const o = try df.aggregate(a, c.nest, .{ .group_by = &.{"k_st"}, .aggs = &.{ s_v, m_w } });
             return cnt(o.len, frameSum(o, "s"));
         },
         .group_stats => {
@@ -435,7 +444,7 @@ fn wrapper(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, abs: []const u8, p
 /// The rows DuckDB has no like-for-like form of (or none worth an unfair sort/format).
 fn noDuck(op: Op) bool {
     return switch (op) {
-        .mutate, .rolling, .cumsum, .pivot, .read_csv, .write_csv, .write_json, .write_ndjson, .fill_null, .win_shift, .win_rank, .describe, .strptime, .group_cat, .join_cat => true,
+        .mutate, .rolling, .cumsum, .pivot, .read_csv, .write_csv, .write_json, .write_ndjson, .fill_null, .win_shift, .win_rank, .describe, .strptime, .group_cat, .join_cat, .group_nested => true,
         else => false,
     };
 }
@@ -463,7 +472,7 @@ pub fn main(init: std.process.Init) !void {
     huge_always = if (env.get("BENCH_HUGE")) |v| std.mem.eql(u8, v, "always") else false;
     if (env.get("BENCH_RETAIN") != null) retained = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const tb = try makeTables(a, io, dir);
-    var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t, .csv = tb.csv, .a = tb.a, .d = tb.d, .cat = try df.cast(a, tb.l, .{ .col = "k_txt", .to = .categorical }), .tcat = try df.cast(a, tb.t, .{ .col = "k_txt", .to = .categorical }) };
+    var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t, .csv = tb.csv, .a = tb.a, .d = tb.d, .cat = try df.cast(a, tb.l, .{ .col = "k_txt", .to = .categorical }), .tcat = try df.cast(a, tb.t, .{ .col = "k_txt", .to = .categorical }), .nest = try nestFrame(a, tb.l) };
 
     const pandas_exe = try wrapper(a, io, dir, abs, py, "pandas");
     const alt_exe = try wrapper(a, io, dir, abs, py, alt);

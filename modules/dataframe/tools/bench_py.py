@@ -118,6 +118,12 @@ def pandas_ops(c, r, t, a, d):
         o = LCj.merge(TCj, on="k_txt", how="inner", sort=False)
         return cnt(len(o), o["tv"].sum())
 
+    LN = L.assign(k_st=list(zip(c["k_int"].tolist(), c["k2"].tolist())))
+
+    def g6():
+        o = LN.groupby("k_st", sort=False).agg(s=("v", "sum"), m=("w", "mean"))
+        return cnt(len(o), o["s"].sum())
+
     def g4():
         o = L.groupby(["k_int", "k2"], sort=False).agg(s=("v", "sum"))
         return cnt(len(o), o["s"].sum())
@@ -238,7 +244,7 @@ def pandas_ops(c, r, t, a, d):
 
     return dict(fill_null=fn, join_asof=ja, top_k=tk, win_shift=ws, win_rank=wr, value_counts=vc,
                 describe=de, concat=cc, str_contains=sc, strptime=sp,
-                read_csv=rc, write_csv=wc, write_json=wj, write_ndjson=wn, group_int=g1, group_null=g1n, group_hi=g2, group_txt=g3, group_two=g4, group_cat=g3c, group_stats=g5,
+                read_csv=rc, write_csv=wc, write_json=wj, write_ndjson=wn, group_int=g1, group_null=g1n, group_hi=g2, group_txt=g3, group_two=g4, group_cat=g3c, group_nested=g6, group_stats=g5,
                 join_inner=j("inner"), join_left=j("left"), join_txt=j3, join_cat=j3c, sort_float=s1,
                 sort_two=s2, sort_txt=s3, filter=fl, pivot=pv, distinct=ds, melt=ml,
                 mutate=mu, rolling=ro, cumsum=cs)
@@ -379,13 +385,19 @@ def polars_ops(c, r, t, a, d):
         o = LC.join(TC, on="k_txt", how="inner")
         return cnt(o.height, o["tv"].sum())
 
+    LN = L.with_columns(pl.struct(["k_int", "k2"]).alias("k_st"))
+
+    def g6():
+        o = LN.group_by("k_st").agg([s, m])
+        return cnt(o.height, o["s"].sum())
+
     def g3c():
         o = LC.group_by("k_txt").agg([s, m])
         return cnt(o.height, o["s"].sum())
 
     return dict(fill_null=fn, join_asof=ja, top_k=tk, win_shift=ws, win_rank=wr, value_counts=vc,
                 describe=de, concat=cc, str_contains=sc, strptime=sp, read_csv=rc, write_csv=wc, write_json=wj, write_ndjson=wn, group_int=g("k_int", [s, m], "s"), group_null=g("k_nul", [s, m], "s"), group_hi=g("k_hi", [s], "s"),
-                group_txt=g("k_txt", [s, m], "s"), group_two=g(["k_int", "k2"], [s], "s"), group_cat=g3c, join_cat=j3c,
+                group_txt=g("k_txt", [s, m], "s"), group_two=g(["k_int", "k2"], [s], "s"), group_cat=g3c, group_nested=g6, join_cat=j3c,
                 group_stats=g("k_int", [pl.col("v").count().alias("c"), pl.col("w").std().alias("sd"),
                                         pl.col("w").median().alias("md")], "c"),
                 join_inner=j("inner"), join_left=j("left"), join_txt=j3, sort_float=srt("v", False),
