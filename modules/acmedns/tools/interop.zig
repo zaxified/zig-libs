@@ -2,6 +2,9 @@
 
 //! `zig build interop-acmedns -- --scratch DIR --dns-port N --http-port N
 //! --exec PATH`, run by `tools/interop.sh`: `acmedns` against live peers.
+//! `zig build interop-acmedns -- --real-api URL --real-dns N --scratch DIR`, run by
+//! `tools/real_acmedns.sh`: the `AcmeDns` publisher, its account `Store` and the solver
+//! against the real joohoi/acme-dns server (see `realAcmeDns`).
 //!
 //! 1. The DNS questions (`zone.zig`) against an authoritative server with
 //!    two zones (`tools/peer.py`, built on `dns`'s `update_server.py`): the
@@ -40,6 +43,96 @@ const Noop = struct {
     fn cleanup(_: ?*anyopaque, _: *const acmedns.Record) void {}
 };
 
+/// The real acme-dns server (joohoi/acme-dns, Go, MIT; started by `tools/real_acmedns.sh` with its
+/// own DNS listener for `auth.delegated.test` at `dns_port`): the account registered through
+/// `AcmeDns.Store`, the update the publisher sends, what the server's DNS then answers (the two newest
+/// values are kept, as acme-dns does), a refused key or subdomain, the account file round trip and the
+/// solver end to end (propagation checked against the server's own DNS listener).
+fn realAcmeDns(io: std.Io, gpa: std.mem.Allocator, api: []const u8, dns_port: u16, scratch: []const u8) !void {
+    const zone_name = "auth.delegated.test";
+    var store = acmedns.AcmeDns.Store.init(gpa);
+    defer store.deinit();
+    const acct = store.register(io, "real.example.org", api, .{}, &.{}) catch |err| {
+        check(false, "register against the real server: {t}", .{err});
+        return;
+    };
+    check(std.mem.endsWith(u8, acct.fulldomain, "." ++ zone_name) and acct.username.len != 0 and acct.password.len != 0, "register: an account with fulldomain {s}", .{acct.fulldomain});
+
+    var pub_ = acmedns.AcmeDns.init(io, gpa, .{ .server_url = api, .accounts = store.accounts() });
+    defer pub_.deinit();
+    const p = pub_.publisher();
+    const v1 = "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0";
+    const v2 = "Z9YqZKXkq1f0b2n3c4d5e6f7g8h9i0j1k2l3m4n5o6p";
+    const v3 = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0U1v";
+    const rec = struct {
+        fn of(a: acmedns.AcmeDns.Account, v: []const u8) acmedns.Record {
+            return .{ .domain = a.domain, .fqdn = a.fulldomain, .zone = zone_name, .value = v, .token = "t", .key_authorization = "t.k" };
+        }
+    }.of;
+    var has: [3]bool = undefined;
+    const ask = struct {
+        fn all(i: std.Io, g: std.mem.Allocator, port: u16, fqdn: []const u8, out: *[3]bool) !void {
+            for ([3][]const u8{ v1, v2, v3 }, out) |v, *o| o.* = try acmedns.zone.serverHasTxt(i, g, loopback, port, 2000, fqdn, v);
+        }
+    }.all;
+    p.present(p.ctx, &rec(acct, v1)) catch |err| check(false, "update 1: {t} ({s})", .{ err, pub_.note });
+    try ask(io, gpa, dns_port, acct.fulldomain, &has);
+    check(pub_.last_status == 200 and has[0] and !has[1], "update 1: HTTP {d}, the server's DNS answers the value", .{pub_.last_status});
+    p.present(p.ctx, &rec(acct, v2)) catch |err| check(false, "update 2: {t}", .{err});
+    p.present(p.ctx, &rec(acct, v3)) catch |err| check(false, "update 3: {t}", .{err});
+    try ask(io, gpa, dns_port, acct.fulldomain, &has);
+    check(!has[0] and has[1] and has[2], "three updates leave the two newest values (acme-dns keeps two)", .{});
+
+    // A wrong key and a subdomain that is not the account's are refused by the server.
+    var bad = acct;
+    bad.password = "not-the-password";
+    var pub_bad = acmedns.AcmeDns.init(io, gpa, .{ .server_url = api, .accounts = &.{bad} });
+    defer pub_bad.deinit();
+    const pb = pub_bad.publisher();
+    check(if (pb.present(pb.ctx, &rec(bad, v1))) |_| false else |e| e == error.PublishFailed, "a wrong API key is refused (HTTP {d}: {s})", .{ pub_bad.last_status, pub_bad.note });
+    check(pub_bad.last_status == 401, "... with 401", .{});
+    var other = acct;
+    other.subdomain = "00000000-0000-4000-8000-000000000000";
+    var pub_sub = acmedns.AcmeDns.init(io, gpa, .{ .server_url = api, .accounts = &.{other} });
+    defer pub_sub.deinit();
+    const ps = pub_sub.publisher();
+    check(if (ps.present(ps.ctx, &rec(other, v1))) |_| false else |e| e == error.PublishFailed, "another account's subdomain is refused (HTTP {d})", .{pub_sub.last_status});
+
+    // The account file: written at mode 0600, read back, and the read-back account still publishes.
+    var dir = try std.Io.Dir.cwd().createDirPathOpen(io, scratch, .{});
+    defer dir.close(io);
+    try store.save(io, dir, "acme-dns-accounts.json");
+    var back = try acmedns.AcmeDns.Store.load(io, gpa, dir, "acme-dns-accounts.json");
+    defer back.deinit();
+    const again = back.find("real.example.org");
+    check(again != null and std.mem.eql(u8, again.?.password, acct.password) and std.mem.eql(u8, again.?.fulldomain, acct.fulldomain), "the account file round-trips", .{});
+
+    // The solver end to end: the value is published through acme-dns and the check asks the
+    // server's own DNS listener until it answers with it.
+    var solver = acmedns.Dns01Solver.init(io, gpa, .{
+        .publisher = p,
+        .follow_cname = false,
+        .override_name = acct.fulldomain,
+        .zone = zone_name,
+        .port = dns_port,
+        .authoritative = &.{loopback},
+        .query_timeout_ms = 1000,
+        .propagation_timeout_ms = 10_000,
+        .propagation_interval_ms = 200,
+    });
+    defer solver.deinit();
+    const key_auth = "tok.thumb";
+    solver.present("real.example.org", "tok", key_auth) catch |err| {
+        check(false, "solver.present: {t} ({s})", .{ err, solver.note });
+        return;
+    };
+    const val = acme.jws.dns01TxtValueFromKeyAuthorization(key_auth);
+    const seen = try acmedns.zone.serverHasTxt(io, gpa, loopback, dns_port, 2000, acct.fulldomain, &val);
+    check(seen and solver.pendingCount() == 1, "the solver published and waited for the value", .{});
+    solver.cleanup("real.example.org", &val);
+    check(solver.pendingCount() == 0, "cleanup leaves nothing pending (acme-dns has no delete)", .{});
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -54,6 +147,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var dns_port: u16 = 0;
     var http_port: u16 = 0;
     var exec_path: []const u8 = "";
+    var real_api: []const u8 = "";
+    var real_dns: u16 = 0;
     var args = init.args.iterate();
     _ = args.skip();
     while (args.next()) |a| {
@@ -61,6 +156,17 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         if (std.mem.eql(u8, a, "--dns-port")) dns_port = std.fmt.parseInt(u16, args.next() orelse return 2, 10) catch return 2;
         if (std.mem.eql(u8, a, "--http-port")) http_port = std.fmt.parseInt(u16, args.next() orelse return 2, 10) catch return 2;
         if (std.mem.eql(u8, a, "--exec")) exec_path = args.next() orelse return 2;
+        if (std.mem.eql(u8, a, "--real-api")) real_api = args.next() orelse return 2;
+        if (std.mem.eql(u8, a, "--real-dns")) real_dns = std.fmt.parseInt(u16, args.next() orelse return 2, 10) catch return 2;
+    }
+    if (real_api.len != 0) {
+        if (real_dns == 0 or scratch.len == 0) {
+            std.debug.print("usage: interop-acmedns --real-api URL --real-dns PORT --scratch DIR (run by tools/real_acmedns.sh)\n", .{});
+            return 2;
+        }
+        try realAcmeDns(io, gpa, real_api, real_dns, scratch);
+        std.debug.print("real acme-dns interop: {d} failure(s)\n", .{failures});
+        return if (failures == 0) 0 else 1;
     }
     if (scratch.len == 0 or dns_port == 0 or http_port == 0 or exec_path.len == 0) {
         std.debug.print("usage: interop-acmedns --scratch DIR --dns-port N --http-port N --exec PATH (run by tools/interop.sh)\n", .{});

@@ -82,6 +82,9 @@ pub const Publisher = struct {
     present: *const fn (ctx: ?*anyopaque, rec: *const Record) PublishError!void,
     /// Remove exactly that value. Best effort: nothing is reported back.
     cleanup: *const fn (ctx: ?*anyopaque, rec: *const Record) void,
+    /// Why the last `present` failed, a static string (the four built-in publishers' `note`); empty
+    /// when there is none. `Dns01Solver.note` carries it after a failed publish.
+    note: ?*const fn (ctx: ?*anyopaque) []const u8 = null,
 };
 
 test {

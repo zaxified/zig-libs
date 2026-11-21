@@ -730,3 +730,104 @@ test "AcmeDns.deinitRegistration: the password is wiped before the arena goes ba
     try testing.expect(scan.frees_seen >= 1);
     try testing.expect(!scan.leaked);
 }
+
+test "AcmeDns.Store: put, find (as DNS names), replace, the file in go-acmedns' format, the file round trip at mode 0600" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Store = publishers.AcmeDns.Store;
+    var st = Store.init(testing.allocator);
+    defer st.deinit();
+    try st.put("b.example", .{ .username = "u2", .password = "p2", .fulldomain = "f2.auth.test", .subdomain = "s2" });
+    try st.put("a.example", .{ .username = "u1", .password = "p\"1\\", .fulldomain = "f1.auth.test", .subdomain = "s1" });
+    try testing.expectEqual(@as(usize, 2), st.accounts().len);
+    try testing.expectEqualStrings("u1", st.find("A.Example.").?.username);
+    try testing.expect(st.find("c.example") == null);
+    try st.put("a.example.", .{ .username = "u1b", .password = "pw", .fulldomain = "f1.auth.test", .subdomain = "s1" });
+    try testing.expectEqual(@as(usize, 2), st.accounts().len);
+    try testing.expectEqualStrings("u1b", st.find("a.example").?.username);
+    try testing.expectError(error.InvalidDomain, st.put("", .{ .username = "", .password = "", .fulldomain = "", .subdomain = "" }));
+
+    const json = try st.toJson(testing.allocator);
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings(
+        "{\n  \"a.example.\": {\"username\":\"u1b\",\"password\":\"pw\",\"fulldomain\":\"f1.auth.test\",\"subdomain\":\"s1\"},\n" ++
+            "  \"b.example\": {\"username\":\"u2\",\"password\":\"p2\",\"fulldomain\":\"f2.auth.test\",\"subdomain\":\"s2\"}\n}\n",
+        json,
+    );
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // a missing file is an empty store
+    var none = try Store.load(io, testing.allocator, tmp.dir, "accounts.json");
+    try testing.expectEqual(@as(usize, 0), none.accounts().len);
+    none.deinit();
+    try st.save(io, tmp.dir, "accounts.json");
+    try st.save(io, tmp.dir, "accounts.json"); // over the first one
+    var back = try Store.load(io, testing.allocator, tmp.dir, "accounts.json");
+    defer back.deinit();
+    try testing.expectEqual(@as(usize, 2), back.accounts().len);
+    try testing.expectEqualStrings("p2", back.find("b.example").?.password);
+    try testing.expectEqualStrings("f2.auth.test", back.find("b.example").?.fulldomain);
+    const stat = try tmp.dir.statFile(io, "accounts.json", .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+    // no temporary is left behind
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "accounts.json.part", .{}));
+}
+
+test "AcmeDns.Store.parse: lego's file (unknown fields ignored), hostile files, the bounds" {
+    const Store = publishers.AcmeDns.Store;
+    var st = try Store.parse(testing.allocator,
+        \\{"example.com":{"username":"u","password":"p","fulldomain":"f.auth.test","subdomain":"s","extra":1}}
+    );
+    defer st.deinit();
+    try testing.expectEqualStrings("s", st.find("example.com").?.subdomain);
+    var empty = try Store.parse(testing.allocator, "{}");
+    empty.deinit();
+    for ([_][]const u8{ "", "[]", "{\"a\":1}", "{\"a\":{\"username\":\"u\"}}", "{\"a\":{", "null", "{\"\":{\"username\":\"u\",\"password\":\"p\",\"fulldomain\":\"f\",\"subdomain\":\"s\"}}" }) |bad| {
+        if (Store.parse(testing.allocator, bad)) |*s| {
+            var x = s.*;
+            x.deinit();
+            return error.ExpectedAnError;
+        } else |_| {}
+    }
+    const big = try testing.allocator.alloc(u8, Store.max_file_bytes + 1);
+    defer testing.allocator.free(big);
+    @memset(big, ' ');
+    try testing.expectError(error.StreamTooLong, Store.parse(testing.allocator, big));
+    // an allocation failure at every step leaks nothing
+    var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        if (Store.parse(fa.allocator(),
+            \\{"a.test":{"username":"u","password":"p","fulldomain":"f","subdomain":"s"},"b.test":{"username":"u","password":"p","fulldomain":"f","subdomain":"s"}}
+        )) |*s| {
+            var x = s.*;
+            x.deinit();
+            break;
+        } else |err| try testing.expect(err == error.OutOfMemory);
+    }
+}
+
+test "AcmeDns.Store.register: the account of a domain, kept and ready for Options.accounts" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const reply =
+        \\{"username":"u","password":"p","fulldomain":"f.auth.test","subdomain":"s","allowfrom":[]}
+    ;
+    var peer: Peer = undefined;
+    peer = .{ .io = io, .listener = undefined, .serve = 1, .status = 201, .body = reply };
+    try peer.start(io);
+    defer peer.finish();
+    var ub: [64]u8 = undefined;
+    const url = try peer.url(&ub, "/");
+    var st = publishers.AcmeDns.Store.init(testing.allocator);
+    defer st.deinit();
+    const acct = try st.register(io, "www.example.org", url, httpOpts(), &.{});
+    try testing.expectEqualStrings("f.auth.test", acct.fulldomain);
+    try testing.expectEqualStrings("www.example.org", acct.domain);
+    try testing.expectEqual(@as(usize, 1), st.accounts().len);
+    peer.finish();
+}

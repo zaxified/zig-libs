@@ -136,6 +136,52 @@ test "present: a failing publisher leaves nothing pending and says why" {
     try testing.expectEqual(@as(usize, 1), f.cleaned.items.len);
 }
 
+test "present: a publisher's own note replaces the generic one (and an empty note does not)" {
+    const Noted = struct {
+        why: []const u8,
+        fn noteOf(ctx: ?*anyopaque) []const u8 {
+            const n: *@This() = @ptrCast(@alignCast(ctx.?));
+            return n.why;
+        }
+        fn present(_: ?*anyopaque, _: *const root.Record) root.PublishError!void {
+            return error.PublishFailed;
+        }
+        fn cleanup(_: ?*anyopaque, _: *const root.Record) void {}
+    };
+    var n: Noted = .{ .why = "the endpoint refused /present (see last_status)" };
+    var o: Dns01Solver.Options = .{
+        .publisher = .{ .ctx = &n, .present = Noted.present, .cleanup = Noted.cleanup, .note = Noted.noteOf },
+        .zone = "example.org.",
+        .follow_cname = false,
+        .check_propagation = false,
+    };
+    var s = Dns01Solver.init(std.testing.io, testing.allocator, o);
+    defer s.deinit();
+    try testing.expectError(error.PublishFailed, s.present("example.org", "t", "t.k"));
+    try testing.expectEqualStrings("the endpoint refused /present (see last_status)", s.note);
+    n.why = "";
+    try testing.expectError(error.PublishFailed, s.present("example.org", "t", "t.k"));
+    try testing.expectEqualStrings("the publisher failed", s.note);
+    o.publisher.note = null;
+    s.options = o;
+    try testing.expectError(error.PublishFailed, s.present("example.org", "t", "t.k"));
+    try testing.expectEqualStrings("the publisher failed", s.note);
+}
+
+test "present: the built-in publishers hand their note to the solver" {
+    var rfc = root.Rfc2136.init(std.testing.io, testing.allocator, .{ .server = .{ .v4 = .{ 127, 0, 0, 1 } } });
+    rfc.note = "the server did not answer";
+    var o: Dns01Solver.Options = .{ .publisher = rfc.publisher(), .zone = "example.org.", .follow_cname = false, .check_propagation = false };
+    try testing.expectEqualStrings("the server did not answer", o.publisher.note.?(o.publisher.ctx));
+    var acct = root.AcmeDns.init(std.testing.io, testing.allocator, .{ .server_url = "http://127.0.0.1:1", .accounts = &.{} });
+    defer acct.deinit();
+    o.publisher = acct.publisher();
+    var s = Dns01Solver.init(std.testing.io, testing.allocator, o);
+    defer s.deinit();
+    try testing.expectError(error.PublishFailed, s.present("example.org", "t", "t.k"));
+    try testing.expectEqualStrings("no acme-dns account for this domain", s.note);
+}
+
 test "solver(): the acme.Client.Solver maps errors and cleans up through the vtable" {
     var f: Fake = .{};
     defer f.deinit();

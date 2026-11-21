@@ -10,7 +10,7 @@ setup without a vendor API:
 | publisher | what it does | the same thing elsewhere |
 |---|---|---|
 | `Rfc2136` | RFC 2136 dynamic update to the zone's primary, TSIG-signed (`dns.update`, `dns.tsig`) | lego `rfc2136`, certbot `dns-rfc2136`; BIND, Knot, PowerDNS, Windows DNS |
-| `AcmeDns` | joohoi/acme-dns: `POST /update` with `X-Api-User`/`X-Api-Key`; `AcmeDns.register` for a new account (free it with `AcmeDns.deinitRegistration`, which wipes the key) | lego `acme-dns`, certbot `acme-dns-auth` |
+| `AcmeDns` | joohoi/acme-dns: `POST /update` with `X-Api-User`/`X-Api-Key`; `AcmeDns.register` for a new account (free it with `AcmeDns.deinitRegistration`, which wipes the key), `AcmeDns.Store` keeps the accounts of several domains in lego's JSON account file (`register`, `find`, `load`, `save` at mode 0600) | lego `acme-dns`, certbot `acme-dns-auth` |
 | `HttpReq` | `POST <endpoint>/present` and `/cleanup`, JSON `{fqdn, value}` or RAW `{domain, token, keyAuth}`, optional basic auth | lego `httpreq` |
 | `Exec` | runs `<program> present|cleanup <fqdn.> <value>` (or RAW `-- <domain> <token> <keyAuth>`), exit 0 = done | lego `exec` |
 
@@ -77,12 +77,13 @@ matcher, basic auth against RFC 7617's example.
 `modules/acmedns/tools/interop.sh` (under `hw run`): live, against a DNS server
 with two zones and RFC 2136 + TSIG (dnspython), an acme-dns API stand-in, an
 httpreq endpoint, and Pebble resolving through that DNS server — one issued
-certificate per publisher, see [`tools/README.md`](tools/README.md).
+certificate per publisher, see [`tools/README.md`](tools/README.md). `tools/real_acmedns.sh` runs the
+real joohoi/acme-dns server (own DNS listener and database) against `AcmeDns`, its `Store` and the solver.
 
 Provenance: original work of the zig-libs authors (MIT). Design references,
 behaviour only, no source read or copied: lego (MIT) — the `dns01` flow and the
 `rfc2136`/`acmedns`/`httpreq`/`exec` provider protocols as its documentation
 describes them; certmagic (Apache-2.0) — `DNS01Solver`'s options; joohoi/acme-dns
 (MIT) — the `/register` and `/update` API from its README. Committed data: none
-but our own tooling — `tools/peer.py`, `tools/interop.sh` and `tools/exec_nsupdate.sh` were
-written here; Pebble, dnspython and BIND's `nsupdate` are run as black-box oracles, never vendored.
+but our own tooling — `tools/peer.py`, `tools/interop.sh`, `tools/real_acmedns.sh` and `tools/exec_nsupdate.sh` were
+written here; Pebble, acme-dns, dnspython and BIND's `nsupdate` are run as black-box oracles, never vendored.

@@ -60,7 +60,12 @@ pub const Rfc2136 = struct {
     }
 
     pub fn publisher(p: *Rfc2136) root.Publisher {
-        return .{ .ctx = p, .present = present, .cleanup = cleanup };
+        return .{ .ctx = p, .present = present, .cleanup = cleanup, .note = noteOf };
+    }
+
+    fn noteOf(ctx: ?*anyopaque) []const u8 {
+        const p: *Rfc2136 = @ptrCast(@alignCast(ctx.?));
+        return p.note;
     }
 
     fn present(ctx: ?*anyopaque, rec: *const Record) PublishError!void {
@@ -158,7 +163,12 @@ pub const AcmeDns = struct {
     }
 
     pub fn publisher(p: *AcmeDns) root.Publisher {
-        return .{ .ctx = p, .present = present, .cleanup = cleanup };
+        return .{ .ctx = p, .present = present, .cleanup = cleanup, .note = noteOf };
+    }
+
+    fn noteOf(ctx: ?*anyopaque) []const u8 {
+        const p: *AcmeDns = @ptrCast(@alignCast(ctx.?));
+        return p.note;
     }
 
     fn present(ctx: ?*anyopaque, rec: *const Record) PublishError!void {
@@ -254,6 +264,179 @@ pub const AcmeDns = struct {
         fulldomain: []const u8,
         subdomain: []const u8,
     };
+
+    /// The accounts of several domains, kept in the file format of lego's `acme-dns` provider
+    /// (go-acmedns' storage): one JSON object, the domain as the key and `username`, `password`,
+    /// `fulldomain`, `subdomain` as the value. `register` makes an account and stores it, `save` writes
+    /// the file (atomically, mode 0600: the passwords are API keys), `accounts()` is
+    /// `Options.accounts`. The store owns its strings and wipes each password when it lets it go.
+    /// One owner at a time, no locking: two processes saving the same file overwrite each other.
+    pub const Store = struct {
+        gpa: std.mem.Allocator,
+        list: std.ArrayList(Account) = .empty,
+
+        /// The largest account file `load` reads.
+        pub const max_file_bytes: usize = 1 << 20;
+        /// Accounts a file may hold.
+        pub const max_accounts: usize = 4096;
+
+        pub fn init(gpa: std.mem.Allocator) Store {
+            return .{ .gpa = gpa };
+        }
+
+        pub fn deinit(st: *Store) void {
+            for (st.list.items) |a| freeAccount(st.gpa, a);
+            st.list.deinit(st.gpa);
+            st.* = undefined;
+        }
+
+        fn freeAccount(gpa: std.mem.Allocator, a: Account) void {
+            gpa.free(a.domain);
+            gpa.free(a.username);
+            std.crypto.secureZero(u8, @constCast(a.password));
+            gpa.free(a.password);
+            gpa.free(a.subdomain);
+            gpa.free(a.fulldomain);
+        }
+
+        /// The stored accounts, for `Options.accounts` (valid until the next `put`/`register`).
+        pub fn accounts(st: *const Store) []const Account {
+            return st.list.items;
+        }
+
+        /// The account of `domain` (compared as DNS names are), or null.
+        pub fn find(st: *const Store, domain: []const u8) ?Account {
+            for (st.list.items) |a| if (zone.eqlName(a.domain, domain)) return a;
+            return null;
+        }
+
+        /// Keep `reg` as the account of `domain`, replacing the one it had. The strings are copied.
+        pub fn put(st: *Store, domain: []const u8, reg: Registration) !void {
+            if (domain.len == 0) return error.InvalidDomain;
+            const idx: ?usize = for (st.list.items, 0..) |a, i| {
+                if (zone.eqlName(a.domain, domain)) break i;
+            } else null;
+            if (idx == null and st.list.items.len >= max_accounts) return error.TooManyAccounts;
+            try st.list.ensureUnusedCapacity(st.gpa, 1);
+            const gpa = st.gpa;
+            const d = try gpa.dupe(u8, domain);
+            errdefer gpa.free(d);
+            const u = try gpa.dupe(u8, reg.username);
+            errdefer gpa.free(u);
+            const pw = try gpa.dupe(u8, reg.password);
+            errdefer {
+                std.crypto.secureZero(u8, pw);
+                gpa.free(pw);
+            }
+            const sub = try gpa.dupe(u8, reg.subdomain);
+            errdefer gpa.free(sub);
+            const full = try gpa.dupe(u8, reg.fulldomain);
+            const acct: Account = .{ .domain = d, .username = u, .password = pw, .subdomain = sub, .fulldomain = full };
+            if (idx) |i| {
+                freeAccount(gpa, st.list.items[i]);
+                st.list.items[i] = acct;
+            } else st.list.appendAssumeCapacity(acct);
+        }
+
+        /// `AcmeDns.register` at `server_url`, kept as the account of `domain`; the caller still has to
+        /// make `_acme-challenge.<domain>` a CNAME to the account's `fulldomain` (the `Account` returned
+        /// says where), and to `save`.
+        pub fn register(st: *Store, io: std.Io, domain: []const u8, server_url: []const u8, http_options: http.Client.Options, allow_from: []const []const u8) !Account {
+            var parsed = try AcmeDns.register(io, st.gpa, server_url, http_options, allow_from);
+            defer AcmeDns.deinitRegistration(&parsed);
+            try st.put(domain, parsed.value);
+            return st.find(domain).?;
+        }
+
+        /// Read an account file; one that does not exist is an empty store. Unknown fields are ignored; a
+        /// file over `max_file_bytes` or holding more than `max_accounts` accounts is an error.
+        pub fn load(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8) !Store {
+            // `readFileAlloc` refuses a file that reaches its limit: + 1 lets one of exactly `max_file_bytes` in.
+            const bytes = dir.readFileAlloc(io, sub_path, gpa, .limited(max_file_bytes + 1)) catch |err| switch (err) {
+                error.FileNotFound => return Store.init(gpa),
+                else => |e| return e,
+            };
+            defer {
+                std.crypto.secureZero(u8, bytes);
+                gpa.free(bytes);
+            }
+            return parse(gpa, bytes);
+        }
+
+        /// The accounts of a file's bytes (see `load`).
+        pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Store {
+            if (bytes.len > max_file_bytes) return error.StreamTooLong;
+            var parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(Registration), gpa, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+            defer {
+                for (parsed.value.map.values()) |r| std.crypto.secureZero(u8, @constCast(r.password));
+                parsed.deinit();
+            }
+            var st = Store.init(gpa);
+            errdefer st.deinit();
+            for (parsed.value.map.keys(), parsed.value.map.values()) |k, r| try st.put(k, r);
+            return st;
+        }
+
+        /// The file's bytes, the domains in name order. The buffer holds the passwords: wipe it before
+        /// freeing (`save` does).
+        pub fn toJson(st: *const Store, gpa: std.mem.Allocator) ![]u8 {
+            const order = try gpa.alloc(usize, st.list.items.len);
+            defer gpa.free(order);
+            for (order, 0..) |*o, i| o.* = i;
+            const items = st.list.items;
+            std.mem.sort(usize, order, items, struct {
+                fn less(it: []const Account, x: usize, y: usize) bool {
+                    return std.mem.lessThan(u8, it[x].domain, it[y].domain);
+                }
+            }.less);
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            errdefer {
+                std.crypto.secureZero(u8, out.written());
+                out.deinit();
+            }
+            const w = &out.writer;
+            try w.writeAll("{");
+            for (order, 0..) |oi, n| {
+                const a = items[oi];
+                if (n != 0) try w.writeAll(",");
+                try w.writeAll("\n  ");
+                try std.json.Stringify.value(a.domain, .{}, w);
+                try w.writeAll(": ");
+                try std.json.Stringify.value(.{ .username = a.username, .password = a.password, .fulldomain = a.fulldomain, .subdomain = a.subdomain }, .{}, w);
+            }
+            try w.writeAll(if (order.len == 0) "}\n" else "\n}\n");
+            return out.toOwnedSlice();
+        }
+
+        /// Write the file: a temporary next to it (mode 0600), renamed over `sub_path`, so a crash leaves
+        /// the old file or the new one. The directory of `sub_path` must exist.
+        pub fn save(st: *const Store, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !void {
+            const bytes = try st.toJson(st.gpa);
+            defer {
+                std.crypto.secureZero(u8, bytes);
+                st.gpa.free(bytes);
+            }
+            var tmp_buf: [1024]u8 = undefined;
+            const tmp = std.mem.print(&tmp_buf, "{s}.part", .{sub_path}) catch return error.NameTooLong;
+            {
+                const f = try dir.createFile(io, tmp, .{ .truncate = true, .permissions = .fromMode(0o600) });
+                errdefer {
+                    f.close(io);
+                    dir.deleteFile(io, tmp) catch {};
+                }
+                var wbuf: [4096]u8 = undefined;
+                var fw = f.writer(io, &wbuf);
+                try fw.interface.writeAll(bytes);
+                try fw.interface.flush();
+                try f.sync(io);
+                f.close(io);
+            }
+            dir.rename(tmp, dir, sub_path, io) catch |e| {
+                dir.deleteFile(io, tmp) catch {};
+                return e;
+            };
+        }
+    };
 };
 
 // ── httpreq ─────────────────────────────────────────────────────────────────
@@ -292,7 +475,12 @@ pub const HttpReq = struct {
     }
 
     pub fn publisher(p: *HttpReq) root.Publisher {
-        return .{ .ctx = p, .present = present, .cleanup = cleanup };
+        return .{ .ctx = p, .present = present, .cleanup = cleanup, .note = noteOf };
+    }
+
+    fn noteOf(ctx: ?*anyopaque) []const u8 {
+        const p: *HttpReq = @ptrCast(@alignCast(ctx.?));
+        return p.note;
     }
 
     fn present(ctx: ?*anyopaque, rec: *const Record) PublishError!void {
@@ -430,7 +618,12 @@ pub const Exec = struct {
     }
 
     pub fn publisher(p: *Exec) root.Publisher {
-        return .{ .ctx = p, .present = present, .cleanup = cleanup };
+        return .{ .ctx = p, .present = present, .cleanup = cleanup, .note = noteOf };
+    }
+
+    fn noteOf(ctx: ?*anyopaque) []const u8 {
+        const p: *Exec = @ptrCast(@alignCast(ctx.?));
+        return p.note;
     }
 
     fn present(ctx: ?*anyopaque, rec: *const Record) PublishError!void {

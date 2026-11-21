@@ -25,16 +25,15 @@ here: the owner chose the generic ones (acme survey 2026-10-16, Q2).
 | Project | Language | Licence | What a user notices against this module |
 |---|---|---|---|
 | [go-acme/lego](https://github.com/go-acme/lego) `challenge/dns01` — **reference** | Go | MIT | CNAME following of `_acme-challenge` (default on), zone by SOA, propagation check against every authoritative NS (`--dns.disable-cp` for one), optional check of the recursive resolvers (`--dns.propagation-rns`), fixed wait instead (`--dns.propagation-wait`), custom resolvers, TTL. All here: `follow_cname`, `findZone`, `require_all_authoritative`, `check_resolvers`, `check_propagation = false` + `delay_ms`, `resolvers`, `Rfc2136.Options.ttl`. |
-| lego providers `rfc2136`, `acme-dns`, `httpreq`, `exec` | Go | MIT | TSIG-signed updates (HMAC-SHA*); acme-dns with a per-domain account and a CNAME check (lego also writes the registration to a JSON file — here `AcmeDns.register` returns it, storage is the caller's); httpreq default and RAW with basic auth; exec default and RAW. All four here. |
+| lego providers `rfc2136`, `acme-dns`, `httpreq`, `exec` | Go | MIT | TSIG-signed updates (HMAC-SHA*); acme-dns with a per-domain account and a CNAME check (lego also writes the registration to a JSON file; `AcmeDns.Store` reads and writes that file format); httpreq default and RAW with basic auth; exec default and RAW. All four here. |
 | [caddyserver/certmagic](https://github.com/caddyserver/certmagic) `DNS01Solver` | Go | Apache-2.0 | `PropagationDelay`, `PropagationTimeout` (−1 = no check), `Resolvers`, `OverrideDomain`, `TTL`; providers through libdns. Here as `delay_ms`, `propagation_timeout_ms` / `check_propagation`, `resolvers`, `override_name`, `ttl`. |
 | [certbot](https://github.com/certbot/certbot) `dns-rfc2136`, `acme-dns-auth` hook | Python | Apache-2.0 | RFC 2136 with TSIG and a propagation delay (seconds, no check); acme-dns through a hook script. Covered. |
 | Zig | — | — | Nothing found: `acme` is the only maintained Zig ACME client (its survey), and DNS-01 there was the caller's publisher until this module. |
 
 **Where we are ahead:** the only Zig implementation; propagation is checked against the
 authoritative servers by default and, with `check_resolvers`, against the recursive ones too.
-**Where we are behind:** no vendor APIs (by decision, see *What is deliberately not done*); `AcmeDns` keeps no
-registration store of its own; GSS-TSIG (Windows "secure only" zones) is not supported (`dns.tsig` is HMAC
-only; see *Backlog / deferred*).
+**Where we are behind:** no vendor APIs (by decision) and no GSS-TSIG for Windows "secure only" zones (`dns.tsig`
+is HMAC only), both in *What is deliberately not done*.
 
 ## Design & invariants
 
@@ -65,7 +64,11 @@ only; see *Backlog / deferred*).
   `propagation_interval_ms` until `propagation_timeout_ms`. The NS list and each name's address list come
   off the network, so the budget is checked before every query, not between passes (the first query is
   always made, so a zero timeout still asks once).
-- **Publishers** keep their configuration and a static `note`; `Rfc2136` adds the value (never
+- **Publishers** keep their configuration and a static `note` (also reachable through `Publisher.note`, a function the four
+  built-ins set: after a failed publish `Dns01Solver.note` is the publisher's own note, `the publisher failed` when it has
+  none); `AcmeDns.Store` holds the accounts of several domains in go-acmedns' JSON file (`{"<domain>": {username, password,
+  fulldomain, subdomain}}`; `register` makes and keeps one, `save` writes it atomically at mode 0600, `load` reads it, a
+  missing file is an empty store, at most 1 MiB and 4096 accounts, passwords wiped when let go); `Rfc2136` adds the value (never
   replaces the RRset: a wildcard and its base validate at one name) and deletes exactly that value;
   `AcmeDns` refuses when the account's `fulldomain` is not where the CNAME leads (the usual setup
   error, which acme-dns itself would not report) and has no cleanup (acme-dns keeps the two newest
@@ -111,13 +114,18 @@ authoritative servers answering with `require_all_authoritative` off; and three 
 before the CA is asked (the same two servers with it on, a wrong TSIG secret reported as BADSIG, a
 publisher that never publishes). After each: nothing pending, no TXT left behind. Also the zone
 questions alone: SOA walk in both zones and for a name in neither, a cross-zone CNAME, a CNAME
-loop, NS lookup. ⚠ The acme-dns side is a STAND-IN written from joohoi/acme-dns's README
-(`tools/peer.py`), not the Go server.
+loop, NS lookup. The Pebble flow's acme-dns side is a STAND-IN written from joohoi/acme-dns's README
+(`tools/peer.py`); `tools/real_acmedns.sh` (2026-11-21) runs the real Go server (own DNS listener, own database) against
+`AcmeDns`, its `Store` and `Dns01Solver`: register, three updates (the server keeps the two newest and its DNS answers
+them), a wrong key and another account's subdomain refused with 401, the account file round trip, the solver end to end.
 
 ## What is deliberately not done
 
 - **Vendor-API providers** (lego has 200+, libdns several dozen). The owner chose the four generic
   publishers (acme survey, Q2): a vendor API is a `Publisher` of the caller's own.
+- **GSS-TSIG** for Windows "secure only" zones: none of the references has it (lego's `rfc2136`, certbot's
+  `dns-rfc2136` and libdns' rfc2136 sign with TSIG HMAC keys, from their documentation) and it needs a Kerberos
+  stack; `dns.tsig` is HMAC only.
 
 ## Verification
 
@@ -128,10 +136,14 @@ loop, NS lookup. ⚠ The acme-dns side is a STAND-IN written from joohoi/acme-dn
   `zone_test.zig` — the CNAME and SOA walks, NS lookup and the propagation check against a scripted DNS
   server on loopback (bounds, wrong class / owner / type answers, partial address failures, the RD bit,
   allocation failures); `publishers_test.zig` — each publisher's wire (acme-dns and httpreq requests against a
-  recording HTTP peer, the RFC 2136 update against a UDP stub, `Exec` argv / exit / stderr / timeout against
+  recording HTTP peer (and `AcmeDns.Store`: the file format, the 0600 write, hostile files, allocation failures), the RFC 2136 update against a UDP stub, `Exec` argv / exit / stderr / timeout against
   shell scripts); basic auth against RFC 7617's example (in `publishers.zig`); `hostile_test.zig` — a peer that sends its head and stalls.
 - **Fuzz:** `fuzz_test.zig`, run by testkit's deterministic driver as `ACMEDNS_FUZZ`: the acme-dns `/register`
-  reply and a TXT reply through `zone.txtPresent`, with reach checks in every test run.
+  reply, a TXT reply through `zone.txtPresent`, and the zone walks (`followCname`, `findZone`, `nameservers`,
+  `nameserverIps`) against a scripted hostile DNS server on loopback (CNAME loops and a CNAME to the root, SOA/NS/A
+  records of the wrong owner, class or type, junk rdata, error codes; one found defect: a CNAME to the root ended the walk
+  at an empty name, now `error.ResolverFailed`), with reach checks in every test run (60 seeds for the walks, which cost
+  a loopback server each).
 - **Interop:** Pebble validates every DNS-01 challenge through a dnspython RFC 2136 + TSIG server, one
   certificate per publisher (see *Anchoring*).
 - **Not observable here:** the system-resolver branch needs a controlled `/etc/resolv.conf` (the interop lane
@@ -140,12 +152,6 @@ loop, NS lookup. ⚠ The acme-dns side is a STAND-IN written from joohoi/acme-dn
 
 ## Backlog / deferred
 
-- **L2** `presentFn` maps `Canceled` to `SolverFailed` (acme's `SolverError` has no `Canceled`).
-- **N5** publisher notes are not surfaced through the solver (`solver.note` says only that the publisher
-  failed).
-- **Zone walks on hostile replies** are not fuzzed (only the `/register` reply and the TXT match are).
-- **acme-dns against the real server** (joohoi/acme-dns, Go, MIT): it brings its own DNS listener and
-  database; the interop stand-in covers the two calls `AcmeDns` makes.
-- **A registration store for `AcmeDns`** (lego writes accounts to a JSON file and registers on first use):
-  `register` returns the account and the caller keeps it.
-- **GSS-TSIG** for Windows "secure only" zones — needs Kerberos; `dns.tsig` is HMAC only.
+- **L2** `presentFn` maps `Canceled` to `SolverFailed`: `acme.Client.SolverError` is `{OutOfMemory, SolverFailed}`, so
+  the solver cannot hand a cancellation to the client. Needs `Canceled` in `acme`'s error set (source-breaking there:
+  every exhaustive switch over it); `Dns01Solver.present` itself returns `error.Canceled`.

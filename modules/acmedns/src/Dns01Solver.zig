@@ -34,7 +34,8 @@ io: std.Io,
 gpa: std.mem.Allocator,
 options: Options,
 pending: std.ArrayList(*Pending) = .empty,
-/// Why the last `present` failed (a static string), for the caller's log.
+/// Why the last `present` failed (a static string), for the caller's log; after a failed publish it
+/// is the publisher's own note when it has one.
 note: []const u8 = "",
 
 pub const Options = struct {
@@ -194,6 +195,10 @@ pub fn present(s: *Dns01Solver, domain: []const u8, token: []const u8, key_autho
     try s.pending.ensureUnusedCapacity(s.gpa, 1);
     s.options.publisher.present(s.options.publisher.ctx, &p.record) catch |err| {
         s.note = "the publisher failed";
+        if (s.options.publisher.note) |own| {
+            const why = own(s.options.publisher.ctx);
+            if (why.len != 0) s.note = why;
+        }
         // The update may have been applied before the failure showed (a lost
         // reply, a read error after the endpoint acted): remove it, best
         // effort, as lego cleans up after a failed Present. Publishers treat
