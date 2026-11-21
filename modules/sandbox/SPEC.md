@@ -377,8 +377,6 @@ the downloaded module and crate compared with the copies read; their provenance 
 
 ## Backlog / deferred
 
-- **`SECCOMP_RET_TRACE`, `USER_NOTIF`.** A supervisor process answering syscalls is a different module's worth of
-  protocol (the notify fd, `SECCOMP_IOCTL_NOTIF_*`); no consumer asks. Effort large.
 - **x32 rules, other secondary ABIs.** x32 stays killed (`buildRules` x32 guard); an x32 block would need its own
   number table (`__X32_SYSCALL_BIT`, `std.os.linux.syscalls.X32`) behind the same `AUDIT_ARCH_X86_64`, plus a kernel
   with `CONFIG_X86_X32` to test it (none on the development host); no consumer asks. Other secondary ABIs (AArch32
@@ -386,6 +384,13 @@ the downloaded module and crate compared with the copies read; their provenance 
 - **Landlock ABI 10+:** UDP rights and `LANDLOCK_ADD_RULE_QUIET` (10), `LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS` (11).
   Not in the kernel and UAPI header this was built against (7.0, ABI 8); UDP stays unrestricted on a kernel that has
   those rights. Add with one. Effort small each.
+
+## Roadmap
+
+- **`SECCOMP_RET_TRACE`, `USER_NOTIF`.** A supervisor process answering syscalls is a different module's worth of
+  protocol (the notify fd, `SECCOMP_IOCTL_NOTIF_*`); no consumer asks. Effort large.
+  Size: weeks (a notify-fd supervisor with `SECCOMP_IOCTL_NOTIF_RECV/SEND/ID_VALID/ADDFD`, its race rules and a child-process test rig).
+  libseccomp offers it (`seccomp_notify_*`); needs a privileged-free test environment with a second process.
 
 ## Anchoring
 

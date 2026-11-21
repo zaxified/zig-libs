@@ -338,9 +338,27 @@ The bench binary installs `fastmem`'s `memset` and `memcpy`, as this collection'
 
 ## Backlog / deferred
 
-- **Differential oracle against karlseguin's library** — IDEA, not scheduled. `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
-- **Context-takeover mode for permessage-deflate** — better ratio on small repetitive messages; costs a persistent 32 KiB window per connection and direction plus a compressor kept per connection (std's `flate.Compress` cannot be reset without forgetting history). Only if a consumer asks.
-- **`Conn` reads sized to the frame** — `Conn` over a `std.Io.Reader` fills its buffer greedily, so a large frame straddling the buffer's end is copied twice (slower than the accumulator path on 64 KiB frames). fastwebsockets reserves `payload + 14` bytes and reads one frame. Doing that here needs a read of an exact length into the reader's buffer, which `std.Io.Reader` does not offer (fills are greedy); a `Conn` over a raw stream instead of a `Reader` would.
+- **Differential oracle against karlseguin's library** — `karlseguin/websocket.zig` (MIT, README says Zig 0.17.0; cloning it
+  and reading its API works) has a client and a server. Run it over the wire in both directions next to coder and
+  gorilla: its client against our server, our client against its server. Cover fragmentation, interleaved control
+  frames, close codes and handshake rejections. Needs a peer program (echo server and scripted client, outside the
+  repository, as the Go peers are) and a third family column in `tools/interop.zig` (970 lines, the scenarios of
+  `go_oracle/main.go`); it would live in `tools/` (CONVENTIONS §9). Not started.
+- **`Conn` reads sized to the frame** — `Conn` over a `std.Io.Reader` fills its buffer greedily, so a large frame straddling
+  the buffer's end is copied twice (slower than the accumulator path on 64 KiB frames). fastwebsockets reserves
+  `payload + 14` bytes and reads one frame. Doing that here needs a read of an exact length into the reader's buffer,
+  which `std.Io.Reader` does not offer (fills are greedy); a `Conn` over a raw stream instead of a `Reader` would.
+  Blocked by that std interface; a rewrite of `conn.zig`'s input path is not worth it without a measured need.
+
+## Roadmap
+
+- **Context-takeover mode for permessage-deflate** — better ratio on small repetitive messages (ws, coder with
+  `CompressionContextTakeover`, gorilla's decompression); costs a persistent 32 KiB window per connection and
+  direction plus a compressor kept per connection (std's `flate.Compress` cannot be reset without forgetting
+  history). Size: weeks. It changes the module's allocation-free per-message model (`deflate.zig` is pure, the
+  caller owns every buffer): per-connection compressor and decompressor state in `Connection`, the offer/response
+  negotiation of the four parameters including `*_max_window_bits`, a sliding-window decompressor that is still
+  bounded (bomb cap), and differential rows against coder/gorilla/ws for the takeover payloads (RFC 7692 §7.2.3.2).
 
 ## Anchoring
 
