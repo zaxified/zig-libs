@@ -67,8 +67,7 @@ and `GroupInfo` that go with them. The two §7.3 rules that need only the leaf a
 the tree are applied, in both directions.
 
 **What it cannot** (details in `SPEC.md`'s "What is deliberately not done" and
-"Backlog / deferred"): follow through on a `ReInit` (§11.2)
-or branch (§11.3), or decide by itself whether a credential is acceptable (that
+"Backlog / deferred"): decide by itself whether a credential is acceptable (that
 is the application's `credential_validator`).
 
 | File | Provides |
@@ -115,7 +114,7 @@ is the application's `credential_validator`).
 
 ## Not provided
 
-No transport, no ReInit or branch, no credential authority, no
+No transport, no credential authority, no
 suite negotiation inside a group (the suite is a compile-time parameter). The
 reasons are in `SPEC.md`'s "What is deliberately not done"; what is planned is
 in its "Backlog / deferred".
@@ -569,7 +568,11 @@ uniqueness, a KeyPackage's lifetime (`createCommit` against `io`'s clock,
 `policy.credential_validator` (`error.CredentialRejected`) — switches in
 `mls.GroupPolicy`, all ON.
 
-**What it does not do:** follow through on a `ReInit` (§11.2) or branch (§11.3).
+**ReInit and branch.** After a Commit carrying a ReInit, `g.reinit` is set and
+the group sends nothing more; `g.reinitialize(S2, …)` creates the new group
+(any member may), `g.branch(…)` a subgroup, and members join either with
+`old.joinSuccessor(S2, .reinit | .branch, welcome_params, &new_group)`, which
+checks the Welcome against the predecessor (`error.InvalidSuccessor`).
 
 **Memory:** a `Group` keeps one epoch's state (deep-copied on every adopted
 Commit, the previous epoch's released) plus one small resumption-PSK entry per

@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [wireapp/core-crypto](https://github.com/wireapp/core-crypto) | Rust (on openmls) | GPL-3.0 (docs only) | 51 | v10.5.3 (2026-09-23) | Wire's production MLS layer over OpenMLS; shows what a deployed client needs on top: key-package pools, credential management, persistence *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | No MLS in Zig found on GitHub (searched `mls messaging layer security` language:zig). `std.crypto` has none. |
 
-**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** no ReInit/branch (→ Backlog).
+**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** no measured performance of the bulk `PrivateMessage` path (→ Backlog).
 
 ## What this is, in one paragraph
 
@@ -552,9 +552,9 @@ joined epoch; the `ratchet_tree`/`external_pub` extension accessors;
 - **Installing the joiner's private keys from `path_secret`.** `welcome.zig`
   decodes and returns the `path_secret`; deriving node keys up the tree needs
   the mutable group state, which is `Group.fromWelcome`'s.
-- **Group-id uniqueness and §12.4.3.1's closing reinit/branch rules.** Both are
-  checks against state outside this module (the client's other groups; the
-  previous group's last Commit).
+- **Group-id uniqueness.** A check against state outside this module (the
+  client's other groups). §12.4.3.1's closing reinit/branch rules are run by
+  `joinSuccessor` (Part 8, *ReInit and branch*).
 
 ### The PSK-list check is stricter than "resolve what you have"
 
@@ -954,9 +954,35 @@ the reference implementation uses.
   before anything is sent), and `processCommit` applies the same rule to every
   committer's path leaf. The Commit is signed with the key the group knows; the
   new leaf with the new key.
-- **No `ReInit` follow-through** (§11.2) and no branching (§11.3). A `ReInit`
-  proposal can be committed — §12.2's "a ReInit proposal together with any other
-  proposal" rule is enforced — but nothing creates the successor group.
+
+### ReInit and branch (§11.2, §11.3)
+
+- **A committed ReInit ends the group's sending.** When an adopted Commit
+  carries a ReInit proposal, `Group.reinit` holds it (deep-copied) and
+  `createCommit`/`createProposal`/`protectApplication` return
+  `error.GroupReinitialized`; incoming Commits are still processed.
+- **Creating the successor.** `reinitialize(S2, …)` (§11.2 step 3; any member,
+  not only the ReInit's committer) and `branch(…)` (§11.3) both go through
+  `createSuccessor`: `create` the new group from this member's NEW KeyPackage,
+  then its first Commit adds the members and carries a PreSharedKey proposal of
+  type resumption, usage `reinit`/`branch`, naming the predecessor's group id
+  and current epoch, with a fresh `KDF.Nh` nonce. §12.1.4 admits that PSK in
+  exactly this Commit (`successor_usage`, cleared afterwards); anywhere else it
+  stays `error.ResumptionPskUsageNotAllowed`. `reinitialize` refuses
+  (`error.NotReinitialized`) a group with no committed ReInit, or a group id,
+  suite (`S2`, a comptime type, so a ReInit may change the suite) or extension
+  list other than the ReInit's.
+- **Joining it.** `joinSuccessor(S2, usage, WelcomeParams)` on the predecessor
+  resolves the predecessor PSK from its current epoch (`successorPsk`) and
+  runs the receiver checks (`error.InvalidSuccessor`): epoch 1; a resumption
+  PSK of that usage naming the predecessor's group and epoch; for `reinit` the
+  ReInit's version, suite, group id and extensions; for `branch` the
+  predecessor's version and suite, and every leaf of the new group matching a
+  member of the predecessor — by equal credential, the narrowest reading of the
+  RFC's "identifiers ... considered equivalent by the application".
+- **Anchors.** Self-interop only (`group.zig`'s §11 tests: branch, a branch
+  with a non-member refused, reinit by a member other than the committer,
+  reinit from 0x0001 to 0x0003); no published vector covers either flow.
 
 ## Part 9 — External Commits
 
@@ -1127,12 +1153,11 @@ the choice, and no vector exercises it.
   went through. What exposes it is the external-join path, where one side's
   value is caller-supplied and the other's is not; see the "naming ANOTHER
   group" test.
-- **No resumption PSKs in a WELCOME.** `fromWelcome` resolves the
-  `GroupSecrets` PSK list with no resumption source at all: the client has
-  lived through no epoch of a group it is only now joining, and the
-  `GroupInfo` naming that group has not been decrypted yet. §11.2/§11.3's
-  reinit and branch flows are the ones that would need it, and neither is
-  built.
+- **Resumption PSKs in a WELCOME only through `joinSuccessor`.** A plain
+  `fromWelcome` resolves the `GroupSecrets` PSK list with no resumption source:
+  the client has lived through no epoch of a group it is only now joining.
+  §11.2/§11.3's successor groups name the predecessor's epoch, which
+  `joinSuccessor` supplies.
 - **The resync flavor is built but only partly exercised.** §12.2's "at
   most one Remove, with which the joiner removes an old version of
   themselves" is enforced, and a Remove in an external Commit is applied by
@@ -1513,12 +1538,7 @@ AEAD is the sibling `aesgcm`'s (std's AES-GCM bulk path is slow on Zig 0.17,
   `validateExternalProposalList` follows it literally and permits a repeated
   `PreSharedKeyID` (§8.4's chain is position-dependent and both sides derive the
   same `psk_secret`). Nothing depends on the choice and no vector exercises it.
-- **Resumption PSKs in a `Welcome` join.** `fromWelcome` resolves the
-  `GroupSecrets` PSK list with no resumption source: the client has lived through
-  no epoch of the group it is only now joining. (§11.2/§11.3 reinit and branch
-  would need it: *Backlog / deferred*.)
-- **Group-id uniqueness and §12.4.3.1's closing reinit/branch rules**, which are
-  checks against state outside the module.
+- **Group-id uniqueness**, a check against state outside the module.
 - **Following §12.4.2's bullet over §12.4 for "path required".** Not a refusal but
   a decision recorded under Part 8: the module follows §12.4's `pathRequiredTypes`.
 - **Relaxing the receive side to §12.4.2's narrower "path required" bullet** — mls-rs's `path_update_required` (message processing and commit creation alike) requires a path for an empty list, Update, Remove, ExternalInit and GroupContextExtensions, i.e. §12.4's `pathRequiredTypes` as this module does; following the majority and the registry's "Path Required" column, the receive side is not relaxed.
@@ -1569,6 +1589,4 @@ Gaps that are unverified rather than unbuilt:
 
 ## Backlog / deferred
 
-- **ReInit and subgroup branch (§11.2/§11.3).** Effort: small-medium; the
-  resumption PSKs they need exist.
 - **Measure the bulk `PrivateMessage` path** (AEAD from the sibling `aesgcm`; Zig 0.17, #36256); the card says `Performance: not measured`.

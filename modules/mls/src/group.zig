@@ -147,10 +147,10 @@ pub const Error = error{
     /// reinit" (likewise `branch`) outside the one operation that admits
     /// it — §11.2's reinitialization, §11.3's subgroup branching. Both
     /// sections restate it as a flat MUST ("A PreSharedKey proposal with
-    /// type resumption and usage reinit MUST be considered invalid"), and
-    /// neither operation is built here, so in this module the rule is
-    /// unconditional. See `joinByExternalCommit` for the one place where
-    /// §12.4.3.2 appears to advise otherwise.
+    /// type resumption and usage reinit MUST be considered invalid"). Here
+    /// the one exception is `createSuccessor`'s first Commit. See
+    /// `joinByExternalCommit` for the one place where §12.4.3.2 appears to
+    /// advise otherwise.
     ResumptionPskUsageNotAllowed,
     /// §12.1.4: "A PreSharedKey proposal is invalid if ... the psk_nonce is
     /// not of length KDF.Nh."
@@ -174,6 +174,21 @@ pub const Error = error{
     LeafNodeInvalid,
     /// §5.3.1: `Policy.credential_validator` refused a leaf's credential.
     CredentialRejected,
+    /// §11.2: a Commit carrying a ReInit proposal was adopted, so this
+    /// group is not used to send any more (`Group.reinit` holds the
+    /// proposal; `reinitialize` creates the successor).
+    GroupReinitialized,
+    /// §11.2: `reinitialize` on a group with no committed ReInit, or with
+    /// parameters (group id, cipher suite, version, extensions) that do not
+    /// match it.
+    NotReinitialized,
+    /// §11.2/§11.3: a `Welcome` joined through `joinSuccessor` does not
+    /// describe the successor the predecessor group allows — not epoch 1,
+    /// no resumption PSK of that usage naming the predecessor's epoch, a
+    /// reinit's parameters that differ from the ReInit, a branch of another
+    /// cipher suite or version, or a branch leaf matching no member of the
+    /// predecessor.
+    InvalidSuccessor,
     /// §7.3/§12.4.3.1: two nodes of the ratchet tree carry the same
     /// `encryption_key`, or two leaves the same `signature_key`.
     DuplicateKeyInTree,
@@ -659,6 +674,18 @@ pub fn Group(comptime S: type) type {
         /// is consumed once its children are derived; the tree holds it).
         secret_tree: ?*SecretTree = null,
 
+        /// §11.2: the ReInit proposal the last adopted Commit carried, deep-
+        /// copied into the epoch's arena. Once set, this group sends nothing
+        /// more (`error.GroupReinitialized`); `reinitialize` creates the
+        /// successor group.
+        reinit: ?content.ReInit = null,
+
+        /// Set only for the duration of `createSuccessor`'s first Commit:
+        /// the one resumption-PSK usage (`reinit` or `branch`) §12.1.4
+        /// admits there, and the predecessor's secret that resolves it.
+        successor_usage: ?keyschedule.ResumptionPskUsage = null,
+        successor_psks: []const ResumptionPsk = &.{},
+
         /// Handshake messages this member sent as a `PrivateMessage` during
         /// the current epoch: the wire bytes and the `AuthenticatedContent`
         /// inside them. Its own ratchet consumed the key on sending, so
@@ -904,6 +931,7 @@ pub fn Group(comptime S: type) type {
         }
 
         fn protectApplicationBody(self: *Self, allocator: std.mem.Allocator, params: ApplicationParams) ![]u8 {
+            if (self.reinit != null) return error.GroupReinitialized;
             const gc = try self.groupContextAlloc(self.gpa);
             defer self.gpa.free(gc);
             const fc: framing.FramedContent = .{
@@ -1057,6 +1085,12 @@ pub fn Group(comptime S: type) type {
             const st = &f.state;
             st.ratchet_tree = try deepCloneTree(ta, &st.ratchet_tree);
             st.extensions = try dupExtensions(ta, st.extensions);
+            if (st.reinit) |ri| st.reinit = .{
+                .group_id = try ta.dupe(u8, ri.group_id),
+                .version = ri.version,
+                .cipher_suite = ri.cipher_suite,
+                .extensions = try dupExtensions(ta, ri.extensions),
+            };
             const ps = try ta.alloc(treekem.PathSecretEntry, st.my_path_secrets.items.len);
             for (st.my_path_secrets.items, ps) |e, *slot| slot.* = .{ .node = e.node, .path_secret = try ta.dupe(u8, e.path_secret) };
             st.my_path_secrets = .empty;
@@ -1288,6 +1322,27 @@ pub fn Group(comptime S: type) type {
             /// PSK list.
             external_psks: []const ExternalPsk = &.{},
             policy: Policy = .{},
+            /// §11.2/§11.3: set by `joinSuccessor` on the predecessor group
+            /// (leave `null`): the predecessor's resumption PSK and what the
+            /// successor must look like.
+            successor: ?Successor = null,
+        };
+
+        /// What a reinit or branch `Welcome` is checked against (§11.2,
+        /// §11.3). Suite-independent, so a predecessor of another suite can
+        /// fill it in.
+        pub const Successor = struct {
+            /// The predecessor's `resumption_psk` for the epoch the
+            /// successor names, with the usage (`reinit` or `branch`).
+            psk: ResumptionPsk,
+            /// `reinit`: the committed ReInit proposal.
+            reinit: ?content.ReInit = null,
+            /// `branch`: the predecessor's cipher suite and version.
+            predecessor_suite: suite.CipherSuiteId,
+            predecessor_version: keyschedule.ProtocolVersion = .mls10,
+            /// `branch`: the predecessor's tree, whose members every leaf of
+            /// the new group must match.
+            predecessor_tree: ?*const tree.RatchetTree = null,
         };
 
         /// RFC 9420 §12.4.3.1's receiving procedure, run to completion and
@@ -1373,7 +1428,9 @@ pub fn Group(comptime S: type) type {
             // resumption `PreSharedKeyID` in the `GroupSecrets` is therefore
             // `error.PskNotAvailable` here — §11.2/§11.3's reinit and branch
             // flows are the ones that would need it, and neither is built.
-            const psks = try resolvePsksFromIds(gpa, group_secrets.psks, params.external_psks, .{});
+            // `joinSuccessor` supplies the predecessor's PSK (§11.2/§11.3).
+            const supplied: []const ResumptionPsk = if (params.successor) |*sc| (&sc.psk)[0..1] else &.{};
+            const psks = try resolvePsksFromIds(gpa, group_secrets.psks, params.external_psks, .{ .supplied = supplied });
             defer gpa.free(psks);
             var psk_secret: [S.Nh]u8 = undefined;
             try keyschedule.pskSecret(S, gpa, psks, &psk_secret);
@@ -1474,6 +1531,167 @@ pub fn Group(comptime S: type) type {
                 defer gpa.free(re);
                 if (!std.mem.eql(u8, gc_bytes, re)) return error.Malformed;
             }
+            if (params.successor) |sc| try self.checkSuccessor(gpa, sc, group_secrets.psks);
+        }
+
+        /// §11.2's and §11.3's receiver checks on a successor group just
+        /// joined.
+        fn checkSuccessor(self: *const Self, gpa: std.mem.Allocator, sc: Successor, psk_ids: []const keyschedule.PreSharedKeyId) !void {
+            // Both: "The epoch field in the GroupContext of the new group is 1".
+            if (self.epoch != 1) return error.InvalidSuccessor;
+            // Both: the Welcome carries the resumption PSK of that usage
+            // naming the predecessor's epoch.
+            for (psk_ids) |id| switch (id.id) {
+                .resumption => |r| if (r.usage == sc.psk.usage and r.psk_epoch == sc.psk.epoch and
+                    std.mem.eql(u8, r.psk_group_id, sc.psk.group_id)) break,
+                .external => {},
+            } else return error.InvalidSuccessor;
+            switch (sc.psk.usage) {
+                .reinit => {
+                    // "version, cipher_suite, group_id and extensions ... MUST
+                    // match the ReInit proposal".
+                    const ri = sc.reinit orelse return error.InvalidSuccessor;
+                    if (ri.version != .mls10 or ri.cipher_suite != S.id) return error.InvalidSuccessor;
+                    if (!std.mem.eql(u8, ri.group_id, self.group_id)) return error.InvalidSuccessor;
+                    if (!try sameExtensions(gpa, ri.extensions, self.extensions)) return error.InvalidSuccessor;
+                },
+                .branch => {
+                    // "The version and cipher_suite values in the Welcome are
+                    // the same as those used by the old group", and "Each
+                    // LeafNode in a new subgroup MUST match some LeafNode in
+                    // the original group" — matched here by credential (the
+                    // RFC leaves "equivalent identifiers" to the application;
+                    // equal credentials are its narrowest reading).
+                    if (sc.predecessor_suite != S.id or sc.predecessor_version != .mls10) return error.InvalidSuccessor;
+                    const old = sc.predecessor_tree orelse return error.InvalidSuccessor;
+                    for (0..self.ratchet_tree.nLeaves()) |i| {
+                        const leaf = self.ratchet_tree.leafNode(@intCast(i)) orelse continue;
+                        for (0..old.nLeaves()) |j| {
+                            const o = old.leafNode(@intCast(j)) orelse continue;
+                            if (try sameCredential(gpa, leaf.credential, o.credential)) break;
+                        } else return error.InvalidSuccessor;
+                    }
+                },
+                else => return error.InvalidSuccessor,
+            }
+        }
+
+        // ── §11.2/§11.3: successor groups ────────────────────────────────
+
+        /// What `createSuccessor` needs: the new group (`create`'s
+        /// parameters: its group id, this member's NEW KeyPackage for it,
+        /// its extensions), the members to add, and the predecessor's PSK.
+        pub const SuccessorParams = struct {
+            create: CreateParams,
+            signature_key_pair: *const S.Sig.KeyPair,
+            /// The KeyPackages (for this suite) of every member to add.
+            members: []const keypackage_mod.KeyPackage,
+            /// The predecessor's resumption PSK, usage `reinit` or `branch`
+            /// (`Group.successorPsk` on the predecessor).
+            predecessor: ResumptionPsk,
+            include_ratchet_tree: bool = true,
+        };
+
+        /// §11.2 step 3 / §11.3 steps 1-3: create the successor group and
+        /// its first Commit — adding `members` and carrying a PreSharedKey
+        /// proposal of type resumption with the predecessor's usage, group
+        /// id and epoch and a fresh `KDF.Nh` `psk_nonce` — the one Commit in
+        /// which §12.1.4 admits such a PSK. `out` lands at epoch 1; the
+        /// returned `Welcome` goes to the members. Usually called through
+        /// the predecessor's `reinitialize` or `branch`.
+        pub fn createSuccessor(gpa: std.mem.Allocator, allocator: std.mem.Allocator, params: SuccessorParams, out: *Self) !Created {
+            const usage = params.predecessor.usage;
+            if (usage != .reinit and usage != .branch) return error.InvalidSuccessor;
+            try create(gpa, params.create, out);
+            errdefer out.deinit();
+            var nonce: [S.Nh]u8 = undefined;
+            try params.create.io.randomSecure(&nonce);
+            const sources = try gpa.alloc(CommitSource, params.members.len + 1);
+            defer gpa.free(sources);
+            for (params.members, sources[0..params.members.len]) |kp, *slot| slot.* = .{ .by_value = .{ .add = kp } };
+            sources[params.members.len] = .{ .by_value = .{ .psk = .{
+                .id = .{ .resumption = .{
+                    .usage = usage,
+                    .psk_group_id = params.predecessor.group_id,
+                    .psk_epoch = params.predecessor.epoch,
+                } },
+                .psk_nonce = &nonce,
+            } } };
+            out.successor_usage = usage;
+            out.successor_psks = (&params.predecessor)[0..1];
+            defer {
+                out.successor_usage = null;
+                out.successor_psks = &.{};
+            }
+            return out.createCommit(allocator, .{
+                .io = params.create.io,
+                .signature_key_pair = params.signature_key_pair,
+                .proposals = sources,
+                .include_ratchet_tree = params.include_ratchet_tree,
+            });
+        }
+
+        /// This member's resumption PSK for the current epoch, with
+        /// `usage` — what a successor group names (§11.2, §11.3). Aliases
+        /// this group's state.
+        pub fn successorPsk(self: *const Self, usage: keyschedule.ResumptionPskUsage) ResumptionPsk {
+            const last = &self.resumption_history.items[self.resumption_history.items.len - 1];
+            std.debug.assert(last.epoch == self.epoch);
+            return .{ .usage = usage, .group_id = self.group_id, .epoch = self.epoch, .secret = &last.secret };
+        }
+
+        /// §11.2 step 3, from a group whose last adopted Commit carried a
+        /// ReInit: create the reinitialized group, of suite `S2` (the
+        /// ReInit's), whose group id and extensions must be the ReInit's
+        /// (`error.NotReinitialized` otherwise).
+        pub fn reinitialize(
+            self: *const Self,
+            comptime S2: type,
+            gpa: std.mem.Allocator,
+            allocator: std.mem.Allocator,
+            params: Group(S2).SuccessorParams,
+            out: *Group(S2),
+        ) !Group(S2).Created {
+            const ri = self.reinit orelse return error.NotReinitialized;
+            if (ri.cipher_suite != S2.id or ri.version != .mls10) return error.NotReinitialized;
+            if (!std.mem.eql(u8, ri.group_id, params.create.group_id)) return error.NotReinitialized;
+            if (!try sameExtensions(gpa, ri.extensions, params.create.extensions)) return error.NotReinitialized;
+            var p = params;
+            p.predecessor = self.successorPsk(.reinit);
+            return Group(S2).createSuccessor(gpa, allocator, p, out);
+        }
+
+        /// §11.3: branch a subgroup off this group's current epoch: a new
+        /// group (same suite) adding `params.members`, linked by a
+        /// resumption PSK with usage `branch`.
+        pub fn branch(self: *const Self, gpa: std.mem.Allocator, allocator: std.mem.Allocator, params: SuccessorParams, out: *Self) !Created {
+            var p = params;
+            p.predecessor = self.successorPsk(.branch);
+            return createSuccessor(gpa, allocator, p, out);
+        }
+
+        /// Join the successor of THIS group from its `Welcome` (§11.2's or
+        /// §11.3's receiver side): resolves the predecessor PSK from this
+        /// group's current epoch and runs the receiver checks
+        /// (`error.InvalidSuccessor`). `usage` is `reinit` (this group
+        /// adopted a ReInit) or `branch`.
+        pub fn joinSuccessor(
+            self: *const Self,
+            comptime S2: type,
+            gpa: std.mem.Allocator,
+            usage: keyschedule.ResumptionPskUsage,
+            params: Group(S2).WelcomeParams,
+            out: *Group(S2),
+        ) !void {
+            var p = params;
+            p.successor = .{
+                .psk = self.successorPsk(usage),
+                .reinit = self.reinit,
+                .predecessor_suite = S.id,
+                .predecessor_tree = &self.ratchet_tree,
+            };
+            if (usage == .reinit and self.reinit == null) return error.NotReinitialized;
+            return Group(S2).fromWelcome(gpa, p, out);
         }
 
         /// §12.4.3.3's "the tree, from the extension or from out of band"
@@ -1747,6 +1965,10 @@ pub fn Group(comptime S: type) type {
             var txn = try self.fork(arena);
             defer txn.discard();
             const w = &txn.state;
+            // §11.2: a Commit carrying a ReInit ends this group's sending.
+            for (resolved) |rp| if (rp.proposal == .reinit) {
+                w.reinit = rp.proposal.reinit;
+            };
 
             // Bullets 5-6 (§12.3): apply the proposals, in §12.3's order,
             // and resolve the PSKs they name. No caller-supplied resumption
@@ -1980,6 +2202,7 @@ pub fn Group(comptime S: type) type {
         }
 
         fn createProposalBody(self: *Self, allocator: std.mem.Allocator, params: ProposeParams) ![]u8 {
+            if (self.reinit != null) return error.GroupReinitialized;
             const gpa = self.gpa;
             const gc = try self.groupContextAlloc(gpa);
             defer gpa.free(gc);
@@ -2271,6 +2494,7 @@ pub fn Group(comptime S: type) type {
             defer msgs.destroy(gpa);
             const arena = msgs.allocator();
             const external = mode == .external;
+            if (self.reinit != null) return error.GroupReinitialized;
 
             const old_gc = try self.groupContextAlloc(gpa);
             defer gpa.free(old_gc);
@@ -2317,6 +2541,10 @@ pub fn Group(comptime S: type) type {
             var txn = try self.fork(arena);
             defer txn.discard();
             const w = &txn.state;
+            // §11.2: a Commit carrying a ReInit ends this group's sending.
+            for (resolved) |rp| if (rp.proposal == .reinit) {
+                w.reinit = rp.proposal.reinit;
+            };
 
             // ── §12.4.1 bullet 3 (§12.3): apply the proposals.
             // §7.3: a sender MUST check the lifetime of what it sends —
@@ -2327,7 +2555,7 @@ pub fn Group(comptime S: type) type {
                 null;
             var applied = try w.applyProposals(arena, gpa, resolved, params.external_psks, switch (mode) {
                 .external => |e| e.resumption_psks,
-                .member => &.{},
+                .member => self.successor_psks,
             }, now);
             defer applied.deinit(gpa);
 
@@ -3428,7 +3656,7 @@ pub fn Group(comptime S: type) type {
                 },
                 .psk => |id| {
                     // §12.1.4's own three conditions, before §12.2's.
-                    try validatePskProposal(id);
+                    try self.validatePskProposal(id);
                     // "multiple PreSharedKey proposals that reference the
                     // same PreSharedKeyID" — compared by ENCODED bytes so a
                     // future arm cannot be silently skipped.
@@ -3543,7 +3771,7 @@ pub fn Group(comptime S: type) type {
                     // proposals"; §12.1.4's per-proposal conditions are
                     // stated about the proposal itself and so apply to both
                     // procedures.
-                    .psk => |id| try validatePskProposal(id),
+                    .psk => |id| try self.validatePskProposal(id),
                     else => return error.ProposalNotAllowedInExternalCommit,
                 }
             }
@@ -3611,7 +3839,7 @@ pub fn Group(comptime S: type) type {
             if (self.ratchet_tree.nodes[node_index] == null) return error.UnknownMember;
         }
 
-        fn validatePskProposal(id: keyschedule.PreSharedKeyId) !void {
+        fn validatePskProposal(self: *const Self, id: keyschedule.PreSharedKeyId) !void {
             // "The psk_nonce is not of length KDF.Nh." §8.4's reason: the
             // nonce is what stops a re-used PSK from producing a re-used
             // `psk_input`, and a short one is a caller that skipped it.
@@ -3619,7 +3847,10 @@ pub fn Group(comptime S: type) type {
             switch (id.id) {
                 .external => {},
                 .resumption => |r| switch (r.usage) {
-                    .reinit, .branch => return error.ResumptionPskUsageNotAllowed,
+                    // §12.1.4: invalid unless "processed as part of a
+                    // reinitialization" (§11.2) / "a subgroup branching
+                    // operation" (§11.3) — `createSuccessor`'s first Commit.
+                    .reinit, .branch => if (self.successor_usage != r.usage) return error.ResumptionPskUsageNotAllowed,
                     // `application`, and the open enum's unassigned values:
                     // §12.1.4 names exactly two usages and this follows it
                     // literally rather than inventing a rule for codepoints
@@ -4218,6 +4449,29 @@ fn deepCloneTree(allocator: std.mem.Allocator, t: *const tree.RatchetTree) !tree
         } else null;
     }
     return .{ .allocator = allocator, .nodes = nodes };
+}
+
+fn sameExtensions(gpa: std.mem.Allocator, a: []const tree.Extension, b: []const tree.Extension) !bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.extension_type != y.extension_type or !std.mem.eql(u8, x.extension_data, y.extension_data)) return false;
+    }
+    _ = gpa;
+    return true;
+}
+
+fn sameCredential(gpa: std.mem.Allocator, a: tree.Credential, b: tree.Credential) !bool {
+    _ = gpa;
+    if (a.credentialType() != b.credentialType()) return false;
+    return switch (a) {
+        .basic => |x| std.mem.eql(u8, x, b.basic),
+        .x509 => |xs| blk: {
+            const ys = b.x509;
+            if (xs.len != ys.len) break :blk false;
+            for (xs, ys) |x, y| if (!std.mem.eql(u8, x, y)) break :blk false;
+            break :blk true;
+        },
+    };
 }
 
 fn dupCredential(arena: std.mem.Allocator, cred: tree.Credential) !tree.Credential {
@@ -5009,6 +5263,217 @@ test "memory: a receiver's retained state does not grow with the epoch count bey
         std.debug.print("retained growth over 55 epochs: {d} bytes\n", .{growth});
         return error.TestUnexpectedResult;
     }
+}
+
+test "§11.3: a branch lands its members in a subgroup linked by a branch PSK, and a joiner checks it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    const carol = try TestClient.init(aa, "carol", 3);
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "old", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    var b: Group(TestSuite) = undefined;
+    var c_grp: Group(TestSuite) = undefined;
+    {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{ .{ .by_value = .{ .add = bob.kp } }, .{ .by_value = .{ .add = carol.kp } } } });
+        defer c.deinit(gpa);
+        b = try bob.join(gpa, c.welcome.?, &.{});
+        c_grp = try carol.join(gpa, c.welcome.?, &.{});
+    }
+    defer b.deinit();
+    defer c_grp.deinit();
+
+    // Alice branches with bob only, on fresh KeyPackages.
+    const alice2 = try TestClient.init(aa, "alice", 11);
+    const bob2 = try TestClient.init(aa, "bob", 12);
+    var sub: Group(TestSuite) = undefined;
+    const created = try a.branch(gpa, gpa, .{
+        .create = .{ .io = io, .group_id = "sub", .key_package_msg = alice2.kp_msg, .encryption_priv = &alice2.enc_priv },
+        .signature_key_pair = &alice2.sig,
+        .members = &.{bob2.kp},
+        .predecessor = undefined,
+    }, &sub);
+    defer created.deinit(gpa);
+    defer sub.deinit();
+    try testing.expectEqual(@as(u64, 1), sub.epoch);
+
+    const wp: Group(TestSuite).WelcomeParams = .{
+        .welcome_msg = created.welcome.?,
+        .key_package_msg = bob2.kp_msg,
+        .init_priv = &bob2.init_priv,
+        .encryption_priv = &bob2.enc_priv,
+    };
+    // Without the predecessor's PSK the Welcome cannot be opened.
+    try testing.expectError(error.PskNotAvailable, tFromWelcome(gpa, wp));
+    // As a reinit it is refused: bob's group has no ReInit.
+    var tmp: Group(TestSuite) = undefined;
+    try testing.expectError(error.NotReinitialized, b.joinSuccessor(TestSuite, gpa, .reinit, wp, &tmp));
+    var sub_b: Group(TestSuite) = undefined;
+    try b.joinSuccessor(TestSuite, gpa, .branch, wp, &sub_b);
+    defer sub_b.deinit();
+    try expectSameEpoch(&sub, &sub_b);
+
+    // A branch whose leaf matches no member of the predecessor is refused
+    // by the joiner: carol's view, with a "mallory" leaf in the subgroup.
+    const mallory = try TestClient.init(aa, "mallory", 13);
+    const carol2 = try TestClient.init(aa, "carol", 14);
+    var sub2: Group(TestSuite) = undefined;
+    const created2 = try a.branch(gpa, gpa, .{
+        .create = .{ .io = io, .group_id = "sub2", .key_package_msg = alice2.kp_msg, .encryption_priv = &alice2.enc_priv },
+        .signature_key_pair = &alice2.sig,
+        .members = &.{ carol2.kp, mallory.kp },
+        .predecessor = undefined,
+    }, &sub2);
+    defer created2.deinit(gpa);
+    defer sub2.deinit();
+    try testing.expectError(error.InvalidSuccessor, c_grp.joinSuccessor(TestSuite, gpa, .branch, .{
+        .welcome_msg = created2.welcome.?,
+        .key_package_msg = carol2.kp_msg,
+        .init_priv = &carol2.init_priv,
+        .encryption_priv = &carol2.enc_priv,
+    }, &tmp));
+
+    // Outside `createSuccessor` a branch/reinit PSK proposal stays invalid.
+    var nonce: [TestSuite.Nh]u8 = @splat(7);
+    try testing.expectError(error.ResumptionPskUsageNotAllowed, a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .psk = .{
+        .id = .{ .resumption = .{ .usage = .branch, .psk_group_id = "old", .psk_epoch = a.epoch } },
+        .psk_nonce = &nonce,
+    } } }} }));
+}
+
+test "§11.2: a committed ReInit stops the group; the reinitialized group matches it, and a joiner checks that" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "old", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }} });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    // Bob proposes the ReInit, alice commits it; both groups stop sending.
+    var gid = "renewed".*;
+    const prop = try b.createProposal(gpa, .{ .signature_key_pair = &bob.sig, .proposal = .{ .reinit = .{ .group_id = &gid, .cipher_suite = TestSuite.id } } });
+    defer gpa.free(prop);
+    {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_reference = prop }} });
+        defer c.deinit(gpa);
+        try b.processCommit(.{ .commit_msg = c.commit, .proposal_msgs = &.{prop} });
+    }
+    @memset(&gid, 0); // the groups hold their own copy
+    try testing.expectEqualSlices(u8, "renewed", a.reinit.?.group_id);
+    try testing.expectEqualSlices(u8, "renewed", b.reinit.?.group_id);
+    try testing.expectError(error.GroupReinitialized, a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig }));
+    try testing.expectError(error.GroupReinitialized, b.protectApplication(gpa, .{ .io = io, .signature_key_pair = &bob.sig, .data = "x" }));
+
+    const alice2 = try TestClient.init(aa, "alice", 21);
+    const bob2 = try TestClient.init(aa, "bob", 22);
+    var r: Group(TestSuite) = undefined;
+    // Parameters other than the ReInit's are refused.
+    try testing.expectError(error.NotReinitialized, a.reinitialize(TestSuite, gpa, gpa, .{
+        .create = .{ .io = io, .group_id = "other", .key_package_msg = alice2.kp_msg, .encryption_priv = &alice2.enc_priv },
+        .signature_key_pair = &alice2.sig,
+        .members = &.{bob2.kp},
+        .predecessor = undefined,
+    }, &r));
+    // Bob — not the committer — creates the successor (§11.2: the steps
+    // may be done by different members).
+    const created = try b.reinitialize(TestSuite, gpa, gpa, .{
+        .create = .{ .io = io, .group_id = "renewed", .key_package_msg = bob2.kp_msg, .encryption_priv = &bob2.enc_priv },
+        .signature_key_pair = &bob2.sig,
+        .members = &.{alice2.kp},
+        .predecessor = undefined,
+    }, &r);
+    defer created.deinit(gpa);
+    defer r.deinit();
+    var ra: Group(TestSuite) = undefined;
+    try a.joinSuccessor(TestSuite, gpa, .reinit, .{
+        .welcome_msg = created.welcome.?,
+        .key_package_msg = alice2.kp_msg,
+        .init_priv = &alice2.init_priv,
+        .encryption_priv = &alice2.enc_priv,
+    }, &ra);
+    defer ra.deinit();
+    try expectSameEpoch(&r, &ra);
+    // The new group sends.
+    const m = try ra.protectApplication(gpa, .{ .io = io, .signature_key_pair = &alice2.sig, .data = "hi" });
+    defer gpa.free(m);
+    const got = try r.unprotectApplication(gpa, m);
+    defer got.deinit(gpa);
+    try testing.expectEqualSlices(u8, "hi", got.data);
+}
+
+test "§11.2: a ReInit may change the cipher suite — 0x0001 reinitialized as 0x0003" {
+    const S2 = suite.Mls128X25519ChaCha20Poly1305Sha256Ed25519;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "old", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }} });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+    {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .reinit = .{ .group_id = "chacha", .cipher_suite = S2.id } } }} });
+        defer c.deinit(gpa);
+        try b.processCommit(.{ .commit_msg = c.commit });
+    }
+    const alice2 = try SuiteClient(S2).init(aa, "alice", 31);
+    const bob2 = try SuiteClient(S2).init(aa, "bob", 32);
+    // The wrong suite for the ReInit is refused.
+    var wrong: Group(TestSuite) = undefined;
+    try testing.expectError(error.NotReinitialized, a.reinitialize(TestSuite, gpa, gpa, .{
+        .create = .{ .io = io, .group_id = "chacha", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv },
+        .signature_key_pair = &alice.sig,
+        .members = &.{},
+        .predecessor = undefined,
+    }, &wrong));
+    var r: Group(S2) = undefined;
+    const created = try a.reinitialize(S2, gpa, gpa, .{
+        .create = .{ .io = io, .group_id = "chacha", .key_package_msg = alice2.kp_msg, .encryption_priv = &alice2.enc_priv },
+        .signature_key_pair = &alice2.sig,
+        .members = &.{bob2.kp},
+        .predecessor = undefined,
+    }, &r);
+    defer created.deinit(gpa);
+    defer r.deinit();
+    var rb: Group(S2) = undefined;
+    try b.joinSuccessor(S2, gpa, .reinit, .{
+        .welcome_msg = created.welcome.?,
+        .key_package_msg = bob2.kp_msg,
+        .init_priv = &bob2.init_priv,
+        .encryption_priv = &bob2.enc_priv,
+    }, &rb);
+    defer rb.deinit();
+    var x: [S2.Nh]u8 = undefined;
+    var y: [S2.Nh]u8 = undefined;
+    r.epochAuthenticator(&x);
+    rb.epochAuthenticator(&y);
+    try testing.expectEqualSlices(u8, &x, &y);
 }
 
 test "§6.3/§9.2: a forged generation far ahead is GenerationTooFarAhead, within the bound it decrypts" {
