@@ -321,6 +321,12 @@ few samples gains little (the block key dominates, and a 1-sample block costs mo
   ONE transaction (all or nothing across a crash; crash-swept in all four modes). A straddling block is
   decoded, stripped and re-encoded. The result counts a timestamp held both raw and in a block twice.
   The transaction holds the affected keys and rewritten blocks in memory (see Limits).
+  **`deleteRangeChunked(series, from, to, opts)`** does the same in steps of about `chunk_points` samples
+  (default 4096), each its own transaction, so memory is one chunk, not the window. Not atomic as a whole:
+  a crash or error leaves a consistent store with a prefix of the window (in time order) gone, and calling
+  it again finishes the job (crash-swept in all four modes, with the prefix property checked). A step takes
+  at least one whole block, so it can exceed `chunk_points` by less than one block. Opt-in: `deleteRange`
+  keeps its single-transaction contract (Prometheus deletes by tombstone and has no equivalent bound).
 - **`aggregate(series, from, to, step, func, out)`** reduces `[from, to)` into fixed `step` buckets over
   the streaming `range` (`min`, `max`, `sum`, `count`, `last`, `avg`); an empty bucket is null for every
   function (also `count`), NaN is ignored by `min`/`max` unless a bucket holds only NaNs and propagates
@@ -355,7 +361,7 @@ few samples gains little (the block key dominates, and a 1-sample block costs mo
 - **`deleteRange` memory.** It holds every affected key and each straddling block's suffix in memory
   (17 B per raw sample), so a window over a very large series is O(window). Kept because the
   one-transaction atomicity is the contract and kvtree's transaction holds the deletes anyway; for a
-  very large window prefer `sweep` or several smaller calls.
+  very large window use `deleteRangeChunked`.
 - **`sweepToBudget` memory.** The picked entries (17 B each) are committed every `chunk_deletes` inside the
   pop loop (`unitAt` re-probes by the successor of the popped key, so a committed delete is never seen
   again), so the call holds one chunk of keys whatever `max_deletes` is (test: a 4 KB allocator deletes
@@ -476,9 +482,6 @@ section is its citation.
 - **Coalescing small compacted blocks.** A sparse series gains only 25 → 20 bytes per sample; an
   internal space optimisation with no API change.
 - **Thread-safe `Db`** (cache synchronisation; readers are already MVCC). Today `single_owner`.
-- **Bounded `deleteRange` memory.** `deleteRange` holds every affected key and each straddling block's
-  suffix (17 B per raw sample); a bounded entry point would be a new chunked, non-atomic one (cf.
-  `deleteSeries`).
 
 ## Anchoring
 

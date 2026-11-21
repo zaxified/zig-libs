@@ -228,6 +228,9 @@ defer it.deinit();
 // Delete [from, to) of one series, raw and compacted, in ONE transaction;
 // straddling blocks are decoded, stripped and re-encoded.
 _ = try db.deleteRange(id, from, to);
+// The same in steps, one transaction each, for a window too large to hold at once
+// (not atomic as a whole: an interruption leaves a prefix gone; call again to finish).
+_ = try db.deleteRangeChunked(id, from, to, .{ .chunk_points = 4096 });
 
 // Per-bucket reduction over the range iterator; empty buckets are null.
 var buf: [60]?f64 = undefined;

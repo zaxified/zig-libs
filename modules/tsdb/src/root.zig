@@ -1402,57 +1402,138 @@ pub const Db = struct {
     /// and re-encoded. Returns the number of samples removed (a timestamp
     /// held both raw and in a block counts twice). The transaction holds the
     /// affected keys and straddling blocks in memory: for a very large window
-    /// prefer `sweep` (by age) or several smaller calls.
+    /// use `deleteRangeChunked`.
     pub fn deleteRange(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp) Error!usize {
         if (from >= to) return 0;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        const a = arena.allocator();
-        var keys: std.ArrayList([codec.point_key_len]u8) = .empty;
-        const Rewrite = struct { samples: []const Sample };
-        var rewrites: std.ArrayList(Rewrite) = .empty;
-        var removed: usize = 0;
-        {
-            var cur = try self.tree.cursor();
-            defer cur.deinit();
-            try cur.seek(&codec.pointKey(series, from));
-            while (try cur.next()) |e| {
-                const p = codec.decodePointKey(e.key) orelse break;
-                if (p.series != series or p.ts >= to) break;
-                try keys.append(a, e.key[0..codec.point_key_len].*);
-                removed += 1;
+        const w = try self.collectRange(arena.allocator(), series, from, to, std.math.maxInt(usize));
+        if (w.removed == 0) return 0;
+        try self.commitRange(series, w);
+        return w.removed;
+    }
+
+    pub const DeleteRangeOptions = struct {
+        /// Samples removed per committed transaction (raw samples, or the
+        /// samples dropped from the blocks of one chunk; a chunk always takes
+        /// at least one whole block, so it can exceed this by less than one
+        /// block, `chunk.max_block_samples`). 0 means "the default" (4096).
+        chunk_points: usize = 4096,
+    };
+
+    pub const DeleteRangeResult = struct {
+        /// Samples removed, counted as `deleteRange` counts them.
+        removed: usize = 0,
+        /// Transactions committed.
+        chunks: usize = 0,
+    };
+
+    /// `deleteRange` in bounded steps, for a window too large to hold in one
+    /// transaction: each step removes the window's samples below some bound
+    /// (about `opts.chunk_points` of them) in its own transaction and the next
+    /// step continues above it, so memory is one chunk, not the window.
+    /// **Not atomic as a whole**: a crash or an error leaves a consistent
+    /// store from which a prefix of the window (in time order) is gone;
+    /// calling it again with the same window finishes the job (idempotent,
+    /// like `deleteSeries`). Every step is atomic, and a reader sees each
+    /// step's result as a whole.
+    pub fn deleteRangeChunked(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp, opts: DeleteRangeOptions) Error!DeleteRangeResult {
+        var res: DeleteRangeResult = .{};
+        const cap = orDefault(opts.chunk_points, (DeleteRangeOptions{}).chunk_points);
+        var pos = from;
+        while (pos < to) {
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const w = try self.collectRange(arena.allocator(), series, pos, to, cap);
+            if (w.removed != 0) {
+                try self.commitRange(series, w);
+                res.removed += w.removed;
+                res.chunks += 1;
             }
-            try cur.seek(&codec.blockKey(series, from));
-            while (try cur.next()) |e| {
-                const bk = codec.decodeBlockKey(e.key) orelse break;
-                if (bk.series != series) break;
-                const first = chunk.firstTs(e.val) catch return error.CorruptPoint;
-                if (first >= to) break;
-                var keep: std.ArrayList(Sample) = .empty;
-                var dropped: usize = 0;
-                var rd = chunk.Reader.init(e.val) catch return error.CorruptPoint;
-                while (rd.next() catch return error.CorruptPoint) |bs| {
-                    if (bs.ts >= from and bs.ts < to) {
-                        dropped += 1;
-                    } else try keep.append(a, .{ .ts = bs.ts, .value = bs.value });
-                }
-                if (dropped == 0) continue;
-                try keys.append(a, e.key[0..codec.point_key_len].*);
-                if (keep.items.len != 0) try rewrites.append(a, .{ .samples = keep.items });
-                removed += dropped;
-            }
+            if (w.end >= to) break;
+            pos = w.end;
         }
-        if (removed == 0) return 0;
+        return res;
+    }
+
+    const RangeWork = struct {
+        keys: []const [codec.point_key_len]u8,
+        rewrites: []const []const Sample,
+        removed: usize,
+        /// The window actually covered: `[from, end)`. Below `to` only when
+        /// the cap stopped the scan; everything in the window below `end` is
+        /// in `keys` / `rewrites`.
+        end: Timestamp,
+    };
+
+    /// Scan `[from, to)` of `series` and collect what a delete of it must do,
+    /// stopping early (and lowering `end`) once about `cap` samples are
+    /// gathered. Reads only; allocates on `a`.
+    fn collectRange(self: *Db, a: Allocator, series: SeriesId, from: Timestamp, to: Timestamp, cap: usize) Error!RangeWork {
+        var raw: std.ArrayList([codec.point_key_len]u8) = .empty;
+        var block_keys: std.ArrayList([codec.point_key_len]u8) = .empty;
+        var rewrites: std.ArrayList([]const Sample) = .empty;
+        var end = to;
+        var removed: usize = 0;
+        var cur = try self.tree.cursor();
+        defer cur.deinit();
+        try cur.seek(&codec.pointKey(series, from));
+        while (try cur.next()) |e| {
+            const p = codec.decodePointKey(e.key) orelse break;
+            if (p.series != series or p.ts >= to) break;
+            if (raw.items.len >= cap) {
+                end = p.ts; // the next raw sample starts the next chunk
+                break;
+            }
+            try raw.append(a, e.key[0..codec.point_key_len].*);
+            removed += 1;
+        }
+        try cur.seek(&codec.blockKey(series, from));
+        var block_removed: usize = 0;
+        while (try cur.next()) |e| {
+            const bk = codec.decodeBlockKey(e.key) orelse break;
+            if (bk.series != series) break;
+            const first = chunk.firstTs(e.val) catch return error.CorruptPoint;
+            if (first >= end) break;
+            if (block_removed >= cap) {
+                end = first; // blocks never overlap (B1): nothing of this one is below `end`
+                break;
+            }
+            var keep: std.ArrayList(Sample) = .empty;
+            var dropped: usize = 0;
+            var rd = chunk.Reader.init(e.val) catch return error.CorruptPoint;
+            while (rd.next() catch return error.CorruptPoint) |bs| {
+                if (bs.ts >= from and bs.ts < end) {
+                    dropped += 1;
+                } else try keep.append(a, .{ .ts = bs.ts, .value = bs.value });
+            }
+            if (dropped == 0) continue;
+            try block_keys.append(a, e.key[0..codec.point_key_len].*);
+            if (keep.items.len != 0) try rewrites.append(a, keep.items);
+            block_removed += dropped;
+            removed += dropped;
+        }
+        // A block cap may have lowered `end` below raw samples already taken.
+        while (raw.items.len != 0) {
+            const last = codec.decodePointKey(&raw.items[raw.items.len - 1]) orelse break;
+            if (last.ts < end) break;
+            _ = raw.pop();
+            removed -= 1;
+        }
+        try raw.appendSlice(a, block_keys.items);
+        return .{ .keys = raw.items, .rewrites = rewrites.items, .removed = removed, .end = end };
+    }
+
+    fn commitRange(self: *Db, series: SeriesId, w: RangeWork) Error!void {
         var txn = try self.tree.begin();
         {
             errdefer txn.rollback();
-            for (keys.items) |*k| try txn.del(k);
+            for (w.keys) |*k| try txn.del(k);
             // Deleted first: a rewrite whose last piece keeps the old key re-puts it.
-            for (rewrites.items) |rw| _ = try putBlocks(&txn, series, rw.samples);
+            for (w.rewrites) |rw| _ = try putBlocks(&txn, series, rw);
         }
         try txn.commit();
         self.noteOwnCommit(0);
-        return removed;
     }
 
     // ── per-bucket aggregation ───────────────────────────────────────────────
@@ -4231,6 +4312,143 @@ test "deleteRange: model check against a map, random windows over a partly compa
             try testing.expectEqual(model.get(k).?, g.value);
         }
         _ = try checkBlockInvariants(&fx.db);
+    }
+}
+
+test "deleteRangeChunked: model check against a map, random windows and chunk sizes over a partly compacted series" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("s", &.{});
+    var prng = std.Random.DefaultPrng.init(0xc4a2);
+    const rnd = prng.random();
+    var model = std.AutoHashMap(Timestamp, f64).init(gpa);
+    defer model.deinit();
+    var multi_chunk: usize = 0;
+    for (0..60) |round| {
+        for (0..40) |_| {
+            const ts = rnd.intRangeAtMost(Timestamp, -200, 800);
+            const v: f64 = @floatFromInt(rnd.int(u16));
+            try fx.db.append(s, ts, v);
+            try model.put(ts, v);
+        }
+        if (round % 5 == 0) _ = try fx.db.compact(rnd.intRangeAtMost(Timestamp, 0, 800), .{ .min_run = 1 + rnd.uintLessThan(usize, 8) });
+        const a = rnd.intRangeAtMost(Timestamp, -250, 850);
+        const b = a + rnd.intRangeAtMost(Timestamp, 0, 300);
+        var expected: usize = 0;
+        var drop: std.ArrayList(Timestamp) = .empty;
+        defer drop.deinit(gpa);
+        var it = model.iterator();
+        while (it.next()) |kv| if (kv.key_ptr.* >= a and kv.key_ptr.* < b) {
+            expected += 1;
+            try drop.append(gpa, kv.key_ptr.*);
+        };
+        const res = try fx.db.deleteRangeChunked(s, a, b, .{ .chunk_points = 1 + rnd.uintLessThan(usize, 12) });
+        try testing.expect(res.removed >= expected); // double counts shadowed block samples
+        if (res.chunks > 1) multi_chunk += 1;
+        for (drop.items) |k| _ = model.remove(k);
+
+        var klist: std.ArrayList(Timestamp) = .empty;
+        defer klist.deinit(gpa);
+        var kit = model.keyIterator();
+        while (kit.next()) |k| try klist.append(gpa, k.*);
+        std.mem.sort(Timestamp, klist.items, {}, std.sort.asc(Timestamp));
+        const got = try collect(gpa, &fx.db, s, all_lo, all_hi);
+        defer gpa.free(got);
+        try testing.expectEqual(klist.items.len, got.len);
+        for (klist.items, got) |k, g| {
+            try testing.expectEqual(k, g.ts);
+            try testing.expectEqual(model.get(k).?, g.value);
+        }
+        _ = try checkBlockInvariants(&fx.db);
+    }
+    try testing.expect(multi_chunk > 10); // the test really chunks
+}
+
+test "deleteRangeChunked: a window of 3000 samples fits an allocator that deleteRange cannot use" {
+    // Kills: collecting the whole window before the first commit.
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    var batch: std.ArrayList(Sample) = .empty;
+    defer batch.deinit(gpa);
+    for (0..3000) |i| try batch.append(gpa, .{ .ts = @intCast(i), .value = 1 });
+    var off: usize = 0;
+    while (off < batch.items.len) : (off += 500) try fx.db.appendMany(s, batch.items[off..@min(off + 500, batch.items.len)]);
+
+    var buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    fx.db.gpa = fba.allocator();
+    defer fx.db.gpa = gpa;
+    try testing.expectError(error.OutOfMemory, fx.db.deleteRange(s, 0, 3000));
+    fba.reset();
+    const r = try fx.db.deleteRangeChunked(s, 0, 3000, .{ .chunk_points = 16 });
+    try testing.expectEqual(@as(usize, 3000), r.removed);
+    try testing.expectEqual(@as(usize, 188), r.chunks); // ceil(3000 / 16)
+    try testing.expectEqual(@as(u64, 0), try fx.db.liveSize());
+}
+
+test "deleteRangeChunked: a crash at any storage effect leaves a consistent store and a prefix of the window gone" {
+    const gpa = testing.allocator;
+    const CrashMode = @FieldType(kvtree.SimStorage, "crash_mode");
+    const modes = [_]CrashMode{ .lose_unsynced, .torn_tail, .reorder_unsynced, .keep_unsynced };
+    for (modes) |mode| {
+        var crash_at: usize = 0;
+        var survived = false;
+        while (!survived) : (crash_at += 1) {
+            try testing.expect(crash_at < 800);
+            var fx = try Fixture.init(gpa);
+            defer fx.deinit();
+            fx.sim.crash_mode = mode;
+            fx.sim.reorder_seed = 0x7a11 +% @as(u64, crash_at) *% 0x9e3779b97f4a7c15;
+            const ids = try seedGrid(&fx, 2, 300);
+            defer gpa.free(ids);
+            _ = try fx.db.compact(200, .{ .min_run = 1 });
+            const full = try collectAll(gpa, &fx.db, ids);
+            defer freeAll(gpa, full);
+
+            fx.sim.ops_until_crash = crash_at;
+            if (fx.db.deleteRangeChunked(ids[0], 50, 250, .{ .chunk_points = 40 })) |_| survived = true else |_| {}
+            fx.sim.reboot();
+            try fx.reopen();
+
+            const now = try collectAll(gpa, &fx.db, ids);
+            defer freeAll(gpa, now);
+            try testing.expectEqualSlices(Sample, full[1], now[1]); // neighbour untouched
+            // Outside the window nothing moved; inside it what remains is a suffix of what was there.
+            var in_full: usize = 0;
+            var in_now: usize = 0;
+            for (full[0]) |sm| if (sm.ts >= 50 and sm.ts < 250) {
+                in_full += 1;
+            };
+            for (now[0]) |sm| if (sm.ts >= 50 and sm.ts < 250) {
+                in_now += 1;
+            };
+            try testing.expectEqual(full[0].len - in_full, now[0].len - in_now);
+            var seen_in_window: usize = 0;
+            var first_kept: ?Timestamp = null;
+            for (now[0]) |sm| if (sm.ts >= 50 and sm.ts < 250) {
+                if (first_kept == null) first_kept = sm.ts;
+                seen_in_window += 1;
+            };
+            if (first_kept) |fk| {
+                // a suffix: every sample of the original at or above `fk` in the window is still there
+                var expect_n: usize = 0;
+                for (full[0]) |sm| if (sm.ts >= fk and sm.ts < 250) {
+                    expect_n += 1;
+                };
+                try testing.expectEqual(expect_n, seen_in_window);
+            }
+            _ = try checkBlockInvariants(&fx.db);
+            // Finishing the job from whatever state the crash left.
+            _ = try fx.db.deleteRangeChunked(ids[0], 50, 250, .{ .chunk_points = 40 });
+            const fin = try collectAll(gpa, &fx.db, ids);
+            defer freeAll(gpa, fin);
+            for (fin[0]) |sm| try testing.expect(sm.ts < 50 or sm.ts >= 250);
+            try testing.expectEqualSlices(Sample, full[1], fin[1]);
+            if (survived) try testing.expectEqual(now[0].len, fin[0].len);
+        }
     }
 }
 
