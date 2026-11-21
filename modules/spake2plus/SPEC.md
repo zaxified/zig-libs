@@ -397,6 +397,9 @@ modules/spake2plus/`; constant time `scripts/checks/ctgrind.sh spake2plus --chec
 - **No failed-attempt counting.** The module is stateless; rate limiting is the caller's.
 - **No PBKDF.** `computeW0W1` takes the caller's 80-byte PBKDF output.
 - **No prover/verifier state objects**, only the eight functions.
+- **The other RFC 9383 §4 ciphersuites** (P-256/SHA-512, P-384/SHA-512, P-521/SHA-512, edwards25519/SHA-256,
+  edwards448/SHA-512, the AES-CMAC MAC): the module's references, BoringSSL `spake2plus` and the Matter SDK, ship only
+  P-256/SHA-256/HMAC (the Matter suite), and no consumer asks for another.
 
 ## Anchoring
 
@@ -409,4 +412,5 @@ modules/spake2plus/`; constant time `scripts/checks/ctgrind.sh spake2plus --chec
 
 ## Backlog / deferred
 
-- **Other RFC 9383 §4 ciphersuites:** P-256/SHA-512, P-384/SHA-512, P-521/SHA-512, edwards25519/SHA-256, edwards448/SHA-512, and the AES-CMAC MAC variant. Only a user whose peer picked one of them notices (Matter/Thread use the first); each needs its own `M`/`N` and vectors. Effort: medium each. Fits §2 (std has P-384 and edwards25519; P-521 and edwards448 would need own curves).
+None open.
+
