@@ -142,11 +142,11 @@ deterministic driver, harnesses `linkheader-parse`, `linkheader-roundtrip`, `lin
   percent-encoding is the caller's.
 - **Parsing the whole `Link:` header line** — the module works on the header value.
 - **Ext-value charsets other than UTF-8** (`UnsupportedCharset`) — RFC 8187 §3.2.1 requires recipients to support only UTF-8 (RFC 8187 dropped RFC 5987's ISO-8859-1 requirement); Go's `mime.ParseMediaType` likewise decodes only `us-ascii` and `utf-8` in RFC 2231 values, and no reference found decodes more.
+- **A keyed-by-rel map** (the `links` dict of Python's requests) — `rel` may hold several space-separated types and repeat across links, so a map needs either an allocator or a caller-sized table and still has to pick a winner for duplicates; `find(rel)` and the link iterator answer the same question without either.
 
 ## Backlog / deferred
 
-- **A keyed-by-rel map** (requests' `links` shape): needs an allocator or a caller-sized table; `find` and the
-  iterator cover the use without either.
+None open.
 
 ## Anchoring
 
