@@ -64,6 +64,15 @@ pub const ObjAttr = extern struct {
     path_fd: i32,
 };
 
+/// Bytes of `ObjAttr` the syscall is given: up to the end of `path_fd`, NOT
+/// `@sizeOf(ObjAttr)` (24). The struct has 4 bytes of trailing padding that a
+/// union initializer leaves undefined, and the kernel's `CHECK_ATTR` answers
+/// EINVAL for a non-zero byte after the last field it knows; a shorter size
+/// makes it zero-fill the rest itself. (Found 2026-11-21: object.zig's
+/// pinning refusal test saw `InvalidArgument` instead of `PermissionDenied`
+/// whenever the stack held garbage there, i.e. depending on test order.)
+pub const obj_attr_len: usize = @offsetOf(ObjAttr, "path_fd") + @sizeOf(i32);
+
 /// `bpf_attr.query` including the fields 6.6+ appended (`link_ids`,
 /// `revision`); `BPF.QueryAttr` in std stops at `prog_cnt`.
 pub const QueryAttr = extern struct {
@@ -125,7 +134,7 @@ pub fn objPin(fd: linux.fd_t, path: []const u8) Error!void {
     if (comptime builtin.os.tag != .linux) @compileError("ebpf.bpfsys is Linux-only (bpf() raw syscall)");
     var pb: [4096]u8 = undefined;
     var buf: AttrBuf = .{ .obj = buildObjAttr(try pathZ(&pb, path), fd, 0) };
-    const rc = linux.bpf(.obj_pin, @ptrCast(&buf), @sizeOf(ObjAttr));
+    const rc = linux.bpf(.obj_pin, @ptrCast(&buf), obj_attr_len);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         else => |e| return mapErrno(e),
@@ -138,7 +147,7 @@ pub fn objGet(path: []const u8, file_flags: u32) Error!linux.fd_t {
     if (comptime builtin.os.tag != .linux) @compileError("ebpf.bpfsys is Linux-only (bpf() raw syscall)");
     var pb: [4096]u8 = undefined;
     var buf: AttrBuf = .{ .obj = buildObjAttr(try pathZ(&pb, path), 0, file_flags) };
-    const rc = linux.bpf(.obj_get, @ptrCast(&buf), @sizeOf(ObjAttr));
+    const rc = linux.bpf(.obj_get, @ptrCast(&buf), obj_attr_len);
     return switch (linux.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => |e| mapErrno(e),
@@ -343,6 +352,11 @@ test "layouts match <linux/bpf.h> (tools/uapi_layout.c)" {
     try testing.expectEqual(@as(usize, 28), @offsetOf(BtfInfo, "kernel_btf"));
     // the attr union must be at least as large as the kernel's own
     try testing.expect(@sizeOf(AttrBuf) >= 64);
+}
+
+test "obj commands pass the length up to path_fd, never the padded struct size" {
+    try testing.expectEqual(@as(usize, 20), obj_attr_len);
+    try testing.expect(obj_attr_len < @sizeOf(ObjAttr));
 }
 
 test "buildObjAttr and buildQueryAttr: the exact fields the kernel reads" {
