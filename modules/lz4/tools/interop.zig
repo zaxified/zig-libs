@@ -121,6 +121,9 @@ const our_frame_opts = [_]struct { name: []const u8, o: lz4.EncodeOptions }{
     .{ .name = "indep-4M-all-checks", .o = .{ .block_size = .max4MB, .independent_blocks = true, .block_checksum = true, .content_checksum = true, .content_size = true } },
     .{ .name = "linked-256K-bsum", .o = .{ .block_size = .max256KB, .block_checksum = true } },
     .{ .name = "linked-1M-accel8", .o = .{ .block_size = .max1MB, .acceleration = 8, .content_checksum = true } },
+    .{ .name = "hc9-linked-256K", .o = .{ .block_size = .max256KB, .hc_level = 9, .content_checksum = true } },
+    .{ .name = "hc10-linked-1M", .o = .{ .block_size = .max1MB, .hc_level = 10, .content_checksum = true } },
+    .{ .name = "hc12-indep-64K-bsum", .o = .{ .independent_blocks = true, .hc_level = 12, .block_checksum = true } },
 };
 
 const cli_flags = [_][]const []const u8{

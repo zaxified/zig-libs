@@ -63,7 +63,7 @@ const zn = try lz4.compressBlock(data, &zbuf, .{});
 
 ## Not provided
 
-No optimal parser for HC levels 10..12, no writing of legacy frames, no `lz4` command-line program. See SPEC.md
+No writing of legacy frames, no `lz4` command-line program. See SPEC.md
 *What is deliberately not done* and *Backlog / deferred*.
 
 Tests: `zig build test-lz4` (hand-built frames, CLI goldens, a byte-at-a-time block model the

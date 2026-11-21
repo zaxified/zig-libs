@@ -58,9 +58,9 @@ for flags in ([], ["--no-frame-crc"], ["-BD"], ["-BI"], ["-B5"]):
     run("fd", "dictfile", "clifr", "back")
     print("frame lz4 CLI %s -> ours:" % (" ".join(flags) or "default"), open("back", "rb").read() == data)
 
-# HC levels: our output decodes with liblz4, and its size against `lz4 -N` (liblz4 runs an optimal
-# parser at 10..12, so ours is larger there).
-for lv in (3, 6, 9, 12):
+# HC levels: our output decodes with liblz4, and its size against `lz4 -N` (both run an optimal
+# parser at 10..12).
+for lv in (3, 6, 9, 10, 11, 12):
     run("hb", "dictfile", "data", "hcb", str(lv))
     ours = open("hcb", "rb").read()
     ok = lz4.block.decompress(ours, uncompressed_size=len(data)) == data

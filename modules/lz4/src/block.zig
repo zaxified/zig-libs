@@ -594,7 +594,16 @@ fn hcLongest(t: *const HcTable, buf: []const u8, ip: usize, extend_limit: usize,
     var best_len = min_len;
     var cand: usize = t.head[hcHash(v)];
     var left = attempts;
-    while (left > 0 and cand >= low and cand < ip) : (left -= 1) {
+    while (left > 0 and cand >= low) {
+        if (cand >= ip) {
+            // Positions at or past `ip` can be in the table when a parse looked
+            // ahead and came back; step over them without spending an attempt.
+            const delta: usize = t.chain[cand & 0xFFFF];
+            if (delta == 0 or cand < delta) break;
+            cand -= delta;
+            continue;
+        }
+        left -= 1;
         // A longer match must also agree at `best_len`; a cheap reject first.
         if (ip + best_len < extend_limit and buf[cand + best_len] == buf[ip + best_len] and read32(buf, cand) == v) {
             var e = ip + min_match;
@@ -616,11 +625,10 @@ fn hcLongest(t: *const HcTable, buf: []const u8, ip: usize, extend_limit: usize,
     return best;
 }
 
-/// The HC counterpart of `encodeRange`: hash chains and lazy matching. A match
-/// at `ip` is replaced by a longer one a byte later (up to two bytes of
-/// lookahead), then written. `level` 3..9 follows 2^(level+1) links; 10..12
-/// follow 2048, 4096 and 16384 (liblz4 runs an optimal parser there; this is
-/// the same chain search with lazy matching, see SPEC).
+/// The HC counterpart of `encodeRange`: hash chains and lazy matching for
+/// `level` 3..9 (2^(level+1) links); from level 10 on, the optimal parser
+/// `encodeOpt`. A match at `ip` is replaced by a longer one a byte later (up
+/// to two bytes of lookahead), then written.
 pub fn encodeHc(
     buf: []const u8,
     start: usize,
@@ -632,13 +640,9 @@ pub fn encodeHc(
 ) error{NoSpaceLeft}!usize {
     std.debug.assert(history_start <= start and start <= end and end <= buf.len);
     std.debug.assert(end <= std.math.maxInt(u32));
+    if (level >= opt_min_level) return encodeOpt(buf, start, end, history_start, t, level, dst);
     var s: Sink = .{ .dst = dst };
-    const attempts: u32 = switch (level) {
-        10 => 2048,
-        11 => 4096,
-        12 => 16384,
-        else => hcAttempts(level),
-    };
+    const attempts = hcAttempts(level);
     var anchor = start;
     if (t.next < history_start) t.next = history_start;
     if (end - start >= mf_limit + 1) {
@@ -674,6 +678,183 @@ pub fn encodeHc(
             try s.matchSequence(buf, anchor, ip - anchor, @intCast(ip - cand), len);
             ip += len;
             anchor = ip;
+        }
+    }
+    try s.sequence(buf[anchor..end], null, 0);
+    return s.at;
+}
+
+// ── optimal parser (levels 10..12) ──────────────────────────────────────
+
+pub const opt_min_level = 10;
+/// How far the parse looks ahead before it commits what it has.
+const opt_window = 2048;
+/// A match this long is taken without weighing it (liblz4's `targetLength` of
+/// the level: 64, 128 and its `LZ4_OPT_NUM` of 4096).
+fn optTarget(level: u8) usize {
+    return switch (level) {
+        10 => 64,
+        11 => 128,
+        else => 4096,
+    };
+}
+/// Chain links followed per position. liblz4 follows 96, 512 and 16384 at
+/// levels 10..12 with a finder that gets more out of each link; this chain
+/// search needs more links to match the size liblz4 reaches at the level
+/// (measured on 400 KB of generated text: 384 links stand for liblz4's 96, 1024
+/// for 512, and past 1024 the size stops falling).
+fn optAttempts(level: u8) u32 {
+    return switch (level) {
+        10 => 384,
+        11 => 1024,
+        else => 16384,
+    };
+}
+
+/// Bytes the literals of a run of `ll` take: themselves and the length bytes
+/// past the token's 15.
+inline fn litPrice(ll: u32) u32 {
+    return ll + (if (ll >= 15) 1 + (ll - 15) / 255 else 0);
+}
+
+/// Bytes of a whole sequence: token, two offset bytes, the literals, the
+/// match length bytes past the token's 15 (the match length minus 4).
+inline fn seqPrice(ll: u32, ml: u32) u32 {
+    return 3 + litPrice(ll) + (if (ml >= 19) (ml - 19) / 255 + 1 else 0);
+}
+
+const OptNode = struct {
+    /// Bytes to code everything before this position, the pending literals
+    /// (`litlen`) included but not the token that will follow them.
+    price: u32,
+    litlen: u32,
+    /// The match that ends here (0: this position was reached by a literal).
+    mlen: u16,
+    off: u16,
+};
+
+const OptSeq = struct { start: u32, len: u32, off: u32 };
+
+/// Write one sequence of the chosen path, taking the match back into the
+/// literals before it as far as they agree (every byte so saved is a byte
+/// fewer to write).
+fn emitOptSeq(s: *Sink, buf: []const u8, anchor: *usize, history_start: usize, sq: OptSeq) error{NoSpaceLeft}!void {
+    var st: usize = sq.start;
+    var cand: usize = st - sq.off;
+    var len: usize = sq.len;
+    if (st > anchor.* and cand > history_start) {
+        const k = backExtend(buf, st, cand, @min(st - anchor.*, cand - history_start));
+        st -= k;
+        cand -= k;
+        len += k;
+    }
+    try s.matchSequence(buf, anchor.*, st - anchor.*, @intCast(st - cand), len);
+    anchor.* = st + len;
+}
+
+/// Optimal parsing for levels 10..12: a dynamic programme over the next
+/// `opt_window` positions that prices every way to reach each one (a literal
+/// from the previous position, or a match of any length from an earlier one)
+/// in the bytes the format spends, and commits the cheapest path. The match
+/// finder is the chain search of `encodeHc` (`optAttempts` links); a match at
+/// least `optTarget` long is taken at once. Offsets all cost two bytes, so one
+/// longest match per position stands for every shorter length at it.
+fn encodeOpt(
+    buf: []const u8,
+    start: usize,
+    end: usize,
+    history_start: usize,
+    t: *HcTable,
+    level: u8,
+    dst: []u8,
+) error{NoSpaceLeft}!usize {
+    var s: Sink = .{ .dst = dst };
+    var anchor = start;
+    if (t.next < history_start) t.next = history_start;
+    if (end - start >= mf_limit + 1) {
+        const attempts = optAttempts(level);
+        const target = optTarget(level);
+        const match_limit = end - mf_limit; // a match starts at or before this
+        const extend_limit = end - last_literals; // and ends at or before this
+        var nodes: [opt_window + 4096 + 2]OptNode = undefined;
+        var path: [(opt_window + 4096) / min_match + 2]OptSeq = undefined;
+        var ip = start;
+        while (ip <= match_limit) {
+            hcInsert(t, buf, ip);
+            const first = hcLongest(t, buf, ip, extend_limit, @max(history_start, ip -| max_offset), attempts, min_match - 1) orelse {
+                ip += 1;
+                continue;
+            };
+            var npath: usize = 0;
+            const ll0: u32 = @intCast(ip - anchor);
+            nodes[0] = .{ .price = litPrice(ll0), .litlen = ll0, .mlen = 0, .off = 0 };
+            var last_pos: usize = 0;
+            var cur: usize = 0;
+            var end_pos: usize = 0; // where the committed path ends (relative to ip)
+            var forced: ?OptSeq = null; // a match taken without weighing it
+            var m: ?HcMatch = first;
+            while (true) {
+                const p = ip + cur;
+                if (cur > 0) {
+                    m = null;
+                    if (p <= match_limit) {
+                        hcInsert(t, buf, p);
+                        m = hcLongest(t, buf, p, extend_limit, @max(history_start, p -| max_offset), attempts, min_match - 1);
+                    }
+                }
+                const n = nodes[cur];
+                if (m) |mm| {
+                    if (mm.len >= target) {
+                        forced = .{ .start = @intCast(p), .len = @intCast(mm.len), .off = @intCast(p - mm.cand) };
+                        end_pos = cur;
+                        break;
+                    }
+                    const base = n.price - litPrice(n.litlen);
+                    var ml: usize = min_match;
+                    while (ml <= mm.len) : (ml += 1) {
+                        const price = base + seqPrice(n.litlen, @intCast(ml));
+                        const at = cur + ml;
+                        if (at > last_pos) {
+                            // Positions this match skips over are reached by literals only.
+                            var q = last_pos + 1;
+                            while (q < at) : (q += 1) nodes[q] = .{ .price = std.math.maxInt(u32), .litlen = 0, .mlen = 0, .off = 0 };
+                            nodes[at] = .{ .price = price, .litlen = 0, .mlen = @intCast(ml), .off = @intCast(p - mm.cand) };
+                            last_pos = at;
+                        } else if (price < nodes[at].price) {
+                            nodes[at] = .{ .price = price, .litlen = 0, .mlen = @intCast(ml), .off = @intCast(p - mm.cand) };
+                        }
+                    }
+                }
+                if (cur >= last_pos or cur + 1 >= opt_window) {
+                    end_pos = last_pos;
+                    break;
+                }
+                // The literal way to the next position.
+                const lit = n.price + litPrice(n.litlen + 1) - litPrice(n.litlen);
+                if (lit < nodes[cur + 1].price) {
+                    nodes[cur + 1] = .{ .price = lit, .litlen = n.litlen + 1, .mlen = 0, .off = 0 };
+                }
+                cur += 1;
+            }
+            // Walk back from the end to the sequences, newest first.
+            var pos = end_pos;
+            while (pos > 0) {
+                const nd = nodes[pos];
+                if (nd.mlen > 0) {
+                    path[npath] = .{ .start = @intCast(ip + pos - nd.mlen), .len = nd.mlen, .off = nd.off };
+                    npath += 1;
+                    pos -= nd.mlen;
+                } else pos -= 1;
+            }
+            // Emit oldest first, the match taken without weighing last.
+            const before = anchor;
+            var i = npath;
+            while (i > 0) {
+                i -= 1;
+                try emitOptSeq(&s, buf, &anchor, history_start, path[i]);
+            }
+            if (forced) |f| try emitOptSeq(&s, buf, &anchor, history_start, f);
+            if (anchor > before) ip = anchor else ip += 1;
         }
     }
     try s.sequence(buf[anchor..end], null, 0);

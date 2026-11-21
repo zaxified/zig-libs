@@ -103,10 +103,10 @@ pub const EncodeOptions = struct {
     acceleration: u32 = 1,
     /// 3..12: the HC matcher (liblz4's `compressionLevel` 3..12: smaller
     /// output, several times slower; `lz4 -9`); 0..2 are the fast matcher and
-    /// `acceleration` applies; above 12 is 12. Levels 10..12 use the same
-    /// chain search as 9 and deeper, not liblz4's optimal parser. Without an
-    /// allocator (`compressInto`) the matcher's tables, about 192 KiB, are on
-    /// the stack.
+    /// `acceleration` applies; above 12 is 12. Levels 10..12 run an optimal
+    /// parser (liblz4's idea; slower still, a few percent smaller). Without an
+    /// allocator (`compressInto`) the matcher's tables, about 192 KiB (300 KiB
+    /// at levels 10..12), are on the stack.
     hc_level: u8 = 0,
 };
 

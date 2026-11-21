@@ -34,8 +34,7 @@ from their own documentation.
 | [allyourcodebase/lz4](https://github.com/allyourcodebase/lz4) | Zig build + C | MIT | 11 | push 2026-10-20 | liblz4 packaged for `build.zig`: liblz4 itself, linked. |
 | Zig `std.compress` | Zig | MIT | — | Zig 0.17.1 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; no LZ4. `std.hash.XxHash32` is there and is what this module uses. |
 
-**Where we are ahead:** nothing measured. **Where we are behind:** no optimal parser for
-HC levels 10..12 (B2: ours is about 10 % larger than `lz4 -12` there); speed is level with liblz4 when both are measured padded
+**Where we are ahead:** nothing measured. **Where we are behind:** speed is level with liblz4 when both are measured padded
 against the JCC erratum and behind in an unlucky code layout (the card's Performance line, Speed, B6).
 
 ## What this module is, and what it is not
@@ -48,13 +47,13 @@ skippable frames, legacy frames, concatenated in any order — into a fresh allo
 caller's buffer whose length caps the output (`decompressInto`), and writes one LZ4 frame with the
 options liblz4's `LZ4F_preferences_t` offers (the compression level is `acceleration` for the fast matcher, `hc_level` for HC).
 
-**HC levels.** `CompressOptions.hc_level` / `EncodeOptions.hc_level` 3..12 select a hash-chain matcher with lazy matching (a longer match one or two bytes on replaces the one found; the skipped bytes become literals): `2^(level+1)` chain links per probe at levels 3..9, 2048, 4096 and 16384 at 10..12 (liblz4 runs an optimal parser there; this is the chain search of level 9 made deeper, so level 12 is about 10 % larger than `lz4 -12` while 3..9 are within a few percent of `lz4 -3..-9`, measured on a 320 KB text sample by `tools/dict_oracle.py`). 0..2 are the fast matcher, above 12 is 12. The tables (about 192 KiB) live on the stack for `compressBlock` / `compressInto` and in an allocation for the `gpa` forms. The output is the ordinary block format: every decoder reads it.
+**HC levels.** `CompressOptions.hc_level` / `EncodeOptions.hc_level` 3..12 select a hash-chain matcher: levels 3..9 with lazy matching (a longer match one or two bytes on replaces the one found; the skipped bytes become literals), `2^(level+1)` chain links per probe; levels 10..12 with an optimal parser (liblz4's `LZ4HC_compress_optimal` idea): a dynamic programme over the next 2048 positions prices every way to reach each one (a literal from the previous position, or a match of any length from an earlier one) in the bytes the format spends (token, two offset bytes, literals, the length bytes past 15) and commits the cheapest path; offsets all cost two bytes, so one longest match per position stands for every shorter length at it; a match of 64 / 128 / 4096 bytes (liblz4's target lengths) is taken without weighing it; 384, 1024 and 16384 chain links per position (liblz4 uses 96, 512 and 16384 with a finder that gets more out of each link; these counts reach the size it reaches, measured on a 320 KB and a 400 KB text sample by `tools/dict_oracle.py`: our block 49984 / 49079 / 49073 bytes against `lz4 -10/-11/-12` frames of 51449 / 49156 / 49033, a size within 0.2 % at level 12 and smaller at 10 and 11, while 3..9 are within a few percent of `lz4 -3..-9`). 0..2 are the fast matcher, above 12 is 12. The tables (about 192 KiB, and about 100 KiB more of parse state at levels 10..12) live on the stack for `compressBlock` / `compressInto` and in an allocation for the `gpa` forms. The output is the ordinary block format: every decoder reads it.
 
 **Dictionaries.** `compressBlockDict` / `decompressBlockDict` take the bytes before the block (the last 64 KiB - 1 count, as in liblz4's `LZ4_loadDict`; the encoder seeds its table with every third byte of it as liblz4 does, the HC matcher inserts all of it); `compressDict` / `decompressDict` do the same for frames: the header carries an optional 4-byte Dictionary ID, linked blocks use the dictionary as the history of the first block of each frame, independent blocks each start from it (liblz4's `LZ4F_compressBegin_usingDict` semantics, `lz4 -D`). The id is written, never compared: knowing which dictionary a frame needs is the caller's job, as in liblz4. They allocate scratch (dictionary tail plus the block or input) and `decompressInto` takes no dictionary. Checked in both directions against python-lz4 `dict=` and `lz4 -D` (`tools/dict_oracle.py`).
 
 **Streaming.** `Compressor` is a `std.Io.Writer` (`init(gpa, out, options)`, `finish`) that writes one frame block by block, its `writer.buffer` being the block: memory is the history window plus one block of input and one compressed block, linked blocks slide the window, HC rebuilds its chain table per block from the history. `flush` on the writer emits a short block. `Decompressor` is a `std.Io.Reader` (`init(gpa, input, buffer, options)`) over concatenated LZ4 frames and skippable frames: one compressed block, one decoded block and the history window; a malformed stream is `error.ReadFailed` with `err` holding the `DecodeError`; `max_output`, `verify_checksums` and `dictionary` as in the one-shot decoder. Legacy frames are not read by the streaming decoder (`BadMagic`; the one-shot decoder reads them).
 
-**Not here (expected by some, deliberately absent):** an optimal parser for HC levels 10..12, writing legacy
+**Not here (expected by some, deliberately absent):** writing legacy
 frames, the `lz4` command-line program.
 
 ## Wire format / algorithm
@@ -235,8 +234,6 @@ and python3 with python-lz4, `tools/README.md`) and `zig build bench-lz4` are th
 
 ## Backlog / deferred
 
-- **B2 (rest)** The optimal parser of HC levels 10..12 (liblz4's `LZ4HC_compress_optimal`): ours
-  is the chain search with lazy matching, about 10 % larger than `lz4 -12` on the text sample.
 - **B6** Speed, what is left (not attempted in wave 14: a perf claim needs interleaved ReleaseFast A/B runs
   with a spread below the effect, and the benchmark queue was shared with other agents' jobs, so a spread
   that small could not be had): (a) the decoder's loop is a JCC-erratum layout lottery on

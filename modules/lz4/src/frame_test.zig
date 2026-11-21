@@ -897,3 +897,62 @@ test "hc levels with a dictionary: block and frame, linked and independent" {
         try testing.expectEqualSlices(u8, data, b2);
     }
 }
+
+test "optimal parser (levels 10..12): smaller than the lazy matcher, deeper never worse, every shape and the awkward ones round-trip" {
+    const data = try dictText(gpa, 400_000, 11);
+    defer gpa.free(data);
+    const dst = try gpa.alloc(u8, lz4.compressBlockBound(data.len));
+    defer gpa.free(dst);
+    const back = try gpa.alloc(u8, data.len);
+    defer gpa.free(back);
+    const l9 = try lz4.compressBlock(data, dst, .{ .hc_level = 9 });
+    var prev = l9;
+    for ([_]u8{ 10, 11, 12 }) |lv| {
+        const n = try lz4.compressBlock(data, dst, .{ .hc_level = lv });
+        try testing.expect(n < l9);
+        try testing.expect(n <= prev); // more links and a longer target: never larger here
+        prev = n;
+        try testing.expectEqual(data.len, try lz4.decompressBlock(dst[0..n], back));
+        try testing.expectEqualSlices(u8, data, back);
+    }
+    // Inputs that stress the parse: runs, short periods, a period near the
+    // window, random bytes, tiny and block-end-sized inputs.
+    var prng = std.Random.DefaultPrng.init(7);
+    const awkward = try gpa.alloc(u8, 200_000);
+    defer gpa.free(awkward);
+    const out = try gpa.alloc(u8, lz4.compressBlockBound(awkward.len));
+    defer gpa.free(out);
+    const dec = try gpa.alloc(u8, awkward.len);
+    defer gpa.free(dec);
+    const periods = [_]usize{ 0, 1, 2, 3, 5, 7, 4093, 65535, 70000 }; // 0: random
+    for (periods) |per| {
+        if (per == 0) prng.random().bytes(awkward) else for (awkward, 0..) |*b, i| {
+            b.* = if (i < per) prng.random().int(u8) else awkward[i - per];
+        }
+        for ([_]u8{ 10, 12 }) |lv| {
+            for ([_]usize{ 0, 1, 11, 12, 13, 17, 64, 4097, awkward.len }) |len| {
+                const n = try lz4.compressBlock(awkward[0..len], out, .{ .hc_level = lv });
+                try testing.expectEqual(len, try lz4.decompressBlock(out[0..n], dec));
+                try testing.expectEqualSlices(u8, awkward[0..len], dec[0..len]);
+            }
+        }
+    }
+    // With a dictionary and as frames of several blocks, linked and independent.
+    const dict = try dictText(gpa, 30_000, 5);
+    defer gpa.free(dict);
+    const piece = data[0..100_000];
+    for ([_]u8{ 10, 12 }) |lv| {
+        const n = try lz4.compressBlockDict(gpa, piece, dict, out, .{ .hc_level = lv });
+        const r = try gpa.alloc(u8, piece.len);
+        defer gpa.free(r);
+        try testing.expectEqual(piece.len, try lz4.decompressBlockDict(gpa, out[0..n], dict, r));
+        try testing.expectEqualSlices(u8, piece, r);
+        for ([_]bool{ false, true }) |indep| {
+            const z = try lz4.compress(gpa, piece, .{ .hc_level = lv, .independent_blocks = indep, .block_checksum = true, .content_checksum = true });
+            defer gpa.free(z);
+            const b2 = try lz4.decompress(gpa, z, .{});
+            defer gpa.free(b2);
+            try testing.expectEqualSlices(u8, piece, b2);
+        }
+    }
+}
