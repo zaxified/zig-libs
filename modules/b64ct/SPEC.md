@@ -159,6 +159,10 @@ non-LLVM backends and on the error paths, which ctgrind has not measured.
 - **Password-hash alphabets** (bcrypt `./A–Za–z0–9`, crypt, sha-crypt) — not
   now: public data in those formats; a new `Alphabet` value if a hash module
   wants constant time anyway.
+- **A vector encode step** (12 to 16 bytes like the decoder's): not done. Encoding is scalar here and in the reference
+  (libsodium's `sodium_bin2base64` is scalar too, and the bench's ratio is against it); the encoded text is public-length
+  key and credential material, encoded once. Nothing the module is compared with does it, and no consumer encodes a volume
+  where the scalar rate shows.
 - **"Skip everything outside the alphabet"** (MIME decoders' lenient mode) —
   never, for this module.
 
@@ -197,5 +201,4 @@ Bench: `zig build bench-b64ct` (`tools/bench.zig`, `BENCH_ROUNDS=5`, ReleaseFast
 
 ## Backlog / deferred
 
-- **Vector encode step.** Encoding is scalar; a 12→16 vector step like the decoder's would roughly quadruple it. No
-  consumer needs it, so it is deferred.
+None open.
