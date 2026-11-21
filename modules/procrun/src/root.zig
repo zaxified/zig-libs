@@ -579,8 +579,10 @@ fn deliver(child: *std.process.Child, kind: SigKind, raw: u8) void {
 const PidfdTable = struct {
     const cap = 256;
     lock: std.atomic.Mutex = .unlocked,
-    pids: [cap]std.posix.pid_t = @splat(0),
-    fds: [cap]std.posix.fd_t = @splat(-1),
+    /// `i32` is `pid_t` and `fd_t` on Linux; on Windows both are handles (pointers, with no zero or -1 to
+    /// `@splat`), where the table stays empty: every method returns before touching it off Linux.
+    pids: [cap]i32 = @splat(0),
+    fds: [cap]i32 = @splat(-1),
 
     fn acquire(t: *PidfdTable) void {
         while (!t.lock.tryLock()) std.atomic.spinLoopHint();
