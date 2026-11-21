@@ -251,7 +251,11 @@ pub const module_list = [_]Module{
     .{ .name = "simio", .libs = &.{"net"}, .deps = &.{ "netsim", "clock", "icmp" }, .test_deps = &.{ "testkit", "sntp", "dns", "netaddr", "mqtt", "ssh", "kv", "http", "modbus", "whois", "stun", "ocspcache", "llmclient", "staticfiles", "iec104", "iec61850", "s7comm", "opcua", "probe" }, .loopback = true },
     .{ .name = "loopfree-reconv", .libs = &.{"net"}, .deps = &.{ "netsim", "spf-ect" } },
     .{ .name = "df-elect", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{"testkit"} },
-    .{ .name = "raft", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{"testkit"} },
+    // Heavy: the netsim model-check sweeps (membership churn, log compaction,
+    // torn Readys, 100-300 seeds each) took the Debug lane to 7.4 min; at
+    // ReleaseSafe every safety check stays armed and the lane runs in a
+    // fraction of that.
+    .{ .name = "raft", .libs = &.{"net"}, .deps = &.{"netsim"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "liveness-hyst", .libs = &.{"net"}, .deps = &.{ "netsim", "latency-stats" } },
     .{ .name = "loopix", .libs = &.{"net"}, .deps = &.{ "netsim", "sphinx" }, .test_deps = &.{"testkit"} },
     .{ .name = "lockfree", .libs = &.{"net"} },

@@ -502,7 +502,7 @@ The extended paper §7 (Figure 13) and the thesis §5; etcd/raft (`Storage.Creat
 
 ## Verification
 
-`scripts/modtest raft` (LLVM Debug; the harness ticks every 10 time units); `-Doptimize=ReleaseSafe` as well. Pure-logic plus model-checking (CONVENTIONS.md §7).
+`scripts/modtest raft` (the harness ticks every 10 time units). The module is `heavy` in `build.zig`: the default lane builds it at ReleaseSafe (every safety check armed), because the model-check sweeps took LLVM Debug to 7.4 min; `-Dstrict-debug` forces real Debug. Pure-logic plus model-checking (CONVENTIONS.md §7).
 
 - **Unit tests:** codecs (`types.zig`, `message.zig`), the log container (`log.zig`), the five invariant checkers (`checks.zig`) and the safety kernel (`safety.zig`): one test per documented wrong-but-plausible implementation, including the Figure-8 counterexample and the duplicated-AppendEntries rollback trap. `node.zig` drives an in-memory cluster: election, replication, crash and restart from disk, truncation reaching the disk, hint walk-back, the step-down cases (the stale-broadcast test above), persistence-before-commit, `max_term`.
 - **Teeth tests:** each checker has a test that feeds it a hand-built violating state and asserts it is caught (`checks.zig`); `BrokenRaft` must trip Election Safety on a clean run, and the index-only §5.4.1 injection (`srv.bug = .index_only_up_to_date`) must trip Leader Completeness on a directed schedule. The `naive_truncation` injection is not caught by the sweep (an entry's identity is `(creating term, index)`); its teeth are `safety.zig`'s "the trap" test and `node.zig`'s duplicated-AppendEntries test.

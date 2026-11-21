@@ -101,8 +101,8 @@ The safety-decision kernel is exposed on its own too (`handleRequestVote`,
 ## Verify
 
 ```
-scripts/modtest raft                         # LLVM Debug
-scripts/modtest raft -Doptimize=ReleaseSafe
+scripts/modtest raft                         # heavy: ReleaseSafe in place of Debug
+scripts/modtest raft -Dstrict-debug          # real LLVM Debug (several minutes)
 ```
 
 The model-check drives N real `Node`s through two fuzzed fault sweeps (300
