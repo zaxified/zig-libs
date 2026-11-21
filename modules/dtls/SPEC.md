@@ -529,6 +529,11 @@ Deliberately not implemented in 1.2: see *What is deliberately not done*. Not ye
   Live-proven against wolfSSL 5.9.1 in three shapes: offered directly,
   reached via HRR upgrade, and a wolfSSL client's share answered by our
   server's encapsulation path.
+  - **Server-side groups beyond the offer (2026-11-21):** a server also takes a client's share in
+    secp384r1, secp521r1, ML-KEM-512/768/1024 and the SecP256r1MLKEM768 / SecP384r1MLKEM1024 hybrids
+    (`accepted_groups`, after `advertised_groups` in preference), all computed by `tls13.kex` as for
+    `tlsserver`; wolfSSL's DTLS 1.3 serves the same set. A client still offers only `advertised_groups`. The
+    ServerHello bound grew to 1792 bytes for the largest server share (1665). Self-interop per group.
   - ⚠ The combiner trap `ssh` documents turned out to have a SECOND instance,
     in std itself: `std.crypto.kem.hybrid.MlKem768X25519` has exactly these
     share sizes but is **X-Wing** — a SHA3-256 combiner over

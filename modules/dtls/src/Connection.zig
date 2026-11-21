@@ -1288,6 +1288,22 @@ const hybrid_server_share_len = kex.hybrid_server_share_len;
 /// its share costs 1216, and the two decisions are deliberately separate.
 const advertised_groups = [_]u16{ x25519_mlkem768_group, x25519_group, secp256r1_group };
 
+/// What a SERVER takes a client's share in: `advertised_groups` first (its
+/// preference), then the other groups `tls13.kex` computes and wolfSSL's
+/// DTLS 1.3 / the `tlsserver` module serve — secp384r1, secp521r1, pure
+/// ML-KEM-512/768/1024 and the SecP256r1MLKEM768 / SecP384r1MLKEM1024
+/// hybrids (draft-ietf-tls-mlkem, draft-ietf-tls-ecdhe-mlkem). The client's
+/// own offer stays `advertised_groups` (its ClientHello is unchanged).
+const accepted_groups = advertised_groups ++ [_]u16{
+    kex.secp384r1_group,
+    kex.secp521r1_group,
+    kex.secp256r1_mlkem768_group,
+    kex.secp384r1_mlkem1024_group,
+    kex.mlkem768_group,
+    kex.mlkem1024_group,
+    kex.mlkem512_group,
+};
+
 /// Room for the longest `KeyShareEntry.key_exchange` `tls13.kex` computes:
 /// 1568 since its ML-KEM-1024, which dtls does not advertise —
 /// its own longest is the hybrid's 1216-octet client share. The extra 352
@@ -1309,8 +1325,8 @@ const max_client_hello_body: usize = 2048;
 
 /// Same bound for a ServerHello BODY: fixed fields ~40 B + supported_versions
 /// (6) + either `pre_shared_key` (6) or the key_share extension, whose server
-/// form peaks at the hybrid's 4+4+`hybrid_server_share_len` ≈ 1128 B ⇒ ~1180.
-const max_server_hello_body: usize = 1216;
+/// form peaks at SecP384r1MLKEM1024's 4+4+1665 B (`accepted_groups`) ⇒ ~1720.
+const max_server_hello_body: usize = 1792;
 
 /// Is `group` one this side advertised in `supported_groups`? RFC 8446
 /// §4.2.8 check (1): a client MUST abort on a HelloRetryRequest whose
@@ -3107,7 +3123,7 @@ pub const Connection = struct {
             if (e.ext_type != @backingInt(messages.ExtensionType.key_share)) continue;
             var entries: [8]messages.KeyShareEntry = undefined;
             const shares = messages.decodeKeyShareClientHello(e.data, &entries) catch return error.Malformed;
-            for (advertised_groups) |want| {
+            for (accepted_groups) |want| {
                 for (shares) |s| {
                     if (s.group != want) continue;
                     if (s.key_exchange.len != expectedShareLen(want)) continue;
@@ -11012,4 +11028,22 @@ test "PeerVerify.chain: the existing one-hop fixtures verify the same way" {
     try chainHandshake(certDheServerConfig(), cc);
     cc.peer_verify = .{ .chain = .{ .trust_anchors = &.{&cert_kat.evil_anchor_cert_der} } };
     try testing.expectError(error.CertificateRejected, chainHandshake(certDheServerConfig(), cc));
+}
+
+test "server: a client share in every accepted group (secp384r1/521r1, pure and hybrid ML-KEM) completes cert-DHE" {
+    for (accepted_groups) |g| {
+        var client = try Connection.clientInit(certDheClientConfig());
+        defer client.deinit();
+        // The client offers only `advertised_groups`; stand in for a peer
+        // that offers `g` by setting its share group after `validate`.
+        client.config.key_share_group = @fromBackingInt(g);
+        var server = try Connection.serverInit(certDheServerConfig());
+        defer server.deinit();
+        var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x85)));
+        var b1: [8192]u8 = undefined;
+        var b2: [8192]u8 = undefined;
+        try driveHandshake(&client, &server, seededForTest(&csprng), &b1, &b2);
+        try testing.expectEqual(g, server.ecdhe_group);
+        try expectSameKeys(&client, &server);
+    }
 }
