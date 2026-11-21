@@ -292,6 +292,22 @@ pub const HelloRetryConfig = struct {
     ///
     /// Must be non-empty (`error.EmptyPeerBinding`).
     peer_binding: []const u8,
+    /// Refuse a ClientHello that does not arrive as ONE whole fragment
+    /// (`error.FragmentedClientHello`) instead of reassembling it, so an
+    /// unverified peer can make this server hold no reassembly state at all
+    /// (SPEC *Threat model*, "The cookie exchange is not stateless against a
+    /// FRAGMENTED ClientHello"). What the field does: OpenSSL's
+    /// `DTLSv1_listen` never reassembles a ClientHello ("it is unable to
+    /// process fragmented messages"; it reads the cookie from the first
+    /// fragment only), mbedTLS's cookie check does not understand a
+    /// fragmented one, and wolfSSL accepts a fragmented first DTLS 1.3
+    /// ClientHello only with cookies disabled. Off by default: a DTLS 1.3
+    /// HelloRetryRequest cookie commits to `Hash(ClientHello1)`, so unlike
+    /// 1.2's HelloVerifyRequest it cannot be minted from a first fragment,
+    /// and this server's ClientHello2 also arrives at a fresh, stateless
+    /// `Connection` — turning it on refuses every client whose hello
+    /// exceeds the path MTU (an X25519MLKEM768 ClientHello is ~1.4 KB).
+    refuse_fragmented_client_hello: bool = false,
 };
 
 /// This side's certificate identity for certificate-mode authentication
@@ -774,6 +790,10 @@ pub const HandshakeError = messages.MessageError || handshake.FrameError || hand
     /// (they are ordinary retransmission), so this names only the
     /// genuinely-interleaved case, which no conforming sender produces.
     InterleavedFragments,
+    /// `HelloRetryConfig.refuse_fragmented_client_hello` is set and the
+    /// datagram's ClientHello is not one whole fragment: refused before any
+    /// reassembly state is kept (drop the `Connection`).
+    FragmentedClientHello,
     /// RFC 7301 §3.2: this server has `Config.alpn_protocols`, the client
     /// offered ALPN, and no protocol is on both lists
     /// (`no_application_protocol`).
@@ -2055,6 +2075,11 @@ pub const Connection = struct {
     /// peer simply keeps its old keys and retransmits.
     pub fn poll(self: *Connection, now_ms: u64, out: []u8) HandshakeError!?[]const u8 {
         if (self.state == .connected) return burn.run(burn.record_burn, SendError!?[]const u8, pollConnected, .{ self, now_ms, out });
+        // Dead-stack hygiene: a retransmission re-seals under the handshake keys.
+        return burn.run(burn.flight_burn, HandshakeError!?[]const u8, pollHandshake, .{ self, now_ms, out });
+    }
+
+    fn pollHandshake(self: *Connection, now_ms: u64, out: []u8) HandshakeError!?[]const u8 {
         if (self.state == .start) return null;
         if (self.flight_rns_len == 0) return null;
         if (!self.retransmit_timer.isExpired(now_ms)) return null;
@@ -3934,6 +3959,9 @@ pub const Connection = struct {
     /// keys). Derives (but does not yet install) the application traffic
     /// secrets. Transitions `.start` -> `.wait_finished`.
     fn serverProcessClientHello(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
+        if (self.config.hello_retry) |hr| {
+            if (hr.refuse_fragmented_client_hello) try checkWholeClientHello(datagram);
+        }
         var msg_buf: [max_client_hello_body]u8 = undefined;
         var received_buf: [max_client_hello_body]bool = undefined;
         var ch_pos: usize = 0;
@@ -4925,6 +4953,20 @@ fn decodeSingleFragmentMessage(
 /// step a cursor over a datagram carrying several coalesced records. This
 /// engine always encodes an explicit `length` (never the
 /// "rest of the datagram" form), so a missing length is malformed input.
+/// `HelloRetryConfig.refuse_fragmented_client_hello`: the first record of
+/// the accumulation must be an epoch-0 handshake record whose ClientHello
+/// fragment is the whole message. Anything else that is not a ClientHello
+/// is left to the normal parse (which refuses it on its own terms).
+fn checkWholeClientHello(datagram: []const u8) HandshakeError!void {
+    const rec = record.decodePlaintext(datagram) catch return;
+    if (rec.content_type != content_type_handshake) return;
+    const start = record.plaintext_header_len;
+    if (datagram.len < start + rec.length) return;
+    const hh = handshake.decodeHeader(datagram[start..][0..rec.length]) catch return;
+    if (hh.msg_type != @backingInt(messages.HandshakeType.client_hello)) return;
+    if (hh.fragment_offset != 0 or hh.fragment_length != hh.length) return error.FragmentedClientHello;
+}
+
 fn recordWireLen(buf: []const u8) HandshakeError!usize {
     const dec = record.decodeUnified(buf, 0) catch return error.Malformed;
     const len = dec.hdr.length orelse return error.Malformed;
@@ -10699,4 +10741,36 @@ test "partial retransmission: an ACK naming part of the flight re-sends the rest
     try testing.expectEqual(@as(usize, 0), dup.out.len);
     const sf = try server.handleFlight(cf, rnd, 5000, &b2);
     try testing.expect(sf.done);
+}
+
+test "hello_retry.refuse_fragmented_client_hello: a fragmented ClientHello is refused before reassembly; a whole one still gets its HelloRetryRequest" {
+    var cc = hrrClientConfig("hrr-psk");
+    cc.max_datagram_len = min_max_datagram_len;
+    var client = try Connection.clientInit(cc);
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x80)));
+    const rnd = seededForTest(&csprng);
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    try testing.expect(countRecords(ch) > 1);
+    const first = record.nextDatagram(ch, min_max_datagram_len).datagram;
+
+    var strict = hrrServerConfig("peer-a");
+    strict.hello_retry.?.refuse_fragmented_client_hello = true;
+    var s1 = try Connection.serverInit(strict);
+    defer s1.deinit();
+    try testing.expectError(error.FragmentedClientHello, s1.handleFlight(first, rnd, 0, &b2));
+    try testing.expectEqual(@as(usize, 0), s1.rx_flight_len);
+    // The default keeps reassembling.
+    var s2 = try Connection.serverInit(hrrServerConfig("peer-a"));
+    defer s2.deinit();
+    try testing.expect((try s2.handleFlight(first, rnd, 0, &b2)).need_more_data);
+    // A whole ClientHello under the strict setting is answered as before.
+    var c2 = try Connection.clientInit(hrrClientConfig("hrr-psk"));
+    defer c2.deinit();
+    const whole = try c2.startHandshake(rnd, 0, &b1);
+    var s3 = try Connection.serverInit(strict);
+    defer s3.deinit();
+    _ = try expectHelloRetryRequest((try s3.handleFlight(whole, rnd, 0, &b2)).out);
 }

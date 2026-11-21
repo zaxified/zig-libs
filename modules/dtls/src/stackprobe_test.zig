@@ -578,13 +578,13 @@ const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Aes128 = std.crypto.core.aes.Aes128;
 const NamedGroup = dtls.messages.NamedGroup;
 
-const Step = enum(u8) { c_start, s_hello, c_flight2, s_fin, c_send, s_recv, s_send, c_recv, c_install };
-const n_steps = 9;
+const Step = enum(u8) { c_start, s_hello, s_poll, c_flight2, s_fin, c_send, s_recv, s_send, c_recv, c_install };
+const n_steps = 10;
 
 fn isClient(st: Step) bool {
     return switch (st) {
         .c_start, .c_flight2, .c_send, .c_recv, .c_install => true,
-        .s_hello, .s_fin, .s_recv, .s_send => false,
+        .s_hello, .s_poll, .s_fin, .s_recv, .s_send => false,
     };
 }
 
@@ -667,6 +667,12 @@ fn doStep(st: Step) void {
             const r = live_server.handleFlight(stepIn(st), ent, 0, &out_buf) catch return failStep();
             out_len = r.out.len;
         },
+        .s_poll => {
+            // The retransmission timer: flight 2 re-sealed under the
+            // handshake keys in new records (`retransmitFlight`).
+            const o = (live_server.poll(5000, &out_buf) catch return failStep()) orelse return failStep();
+            out_len = o.len;
+        },
         .c_flight2 => {
             const r = live_client.handleFlight(stepIn(st), ent, 0, &out_buf) catch return failStep();
             out_len = r.out.len;
@@ -732,7 +738,7 @@ fn reference(cfg_c: dtls.Config, cfg_s: dtls.Config) !void {
             .c_flight2 => setIn(.s_fin),
             .c_send => setIn(.s_recv),
             .s_send => setIn(.c_recv),
-            .s_fin, .s_recv, .c_recv, .c_install => {},
+            .s_poll, .s_fin, .s_recv, .c_recv, .c_install => {},
         }
     }
     try std.testing.expectEqual(dtls.connection.State.connected, live_client.state);
@@ -740,7 +746,7 @@ fn reference(cfg_c: dtls.Config, cfg_s: dtls.Config) !void {
 }
 
 fn onWire(chunk: []const u8) bool {
-    for ([_]Step{ .s_hello, .c_flight2, .s_fin }) |st| {
+    for ([_]Step{ .s_hello, .s_poll, .c_flight2, .s_fin }) |st| {
         if (std.mem.find(u8, stepIn(st), chunk) != null) return true;
     }
     return false;
@@ -780,6 +786,9 @@ const sets = [_]Set{
     // the SHA-384 schedule (48-byte secrets, larger SHA-384 frames).
     .{ .name = "psk aes256gcm sha384", .psk = true, .group = .x25519, .suite = .aes_256_gcm_sha384 },
     .{ .name = "cert x25519 aes256gcm sha384", .psk = false, .group = .x25519, .suite = .aes_256_gcm_sha384 },
+    // the CCM suites (the `aesccm` module's CBC-MAC and CTR frames).
+    .{ .name = "psk aes128ccm8", .psk = true, .group = .x25519, .suite = .aes_128_ccm_8_sha256 },
+    .{ .name = "cert x25519 aes128ccm", .psk = false, .group = .x25519, .suite = .aes_128_ccm_sha256 },
 };
 
 var psk_store: [32]u8 = undefined;
@@ -826,7 +835,7 @@ fn configs(comptime set: Set) !struct { c: dtls.Config, s: dtls.Config } {
 fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
     n.len = 0;
     n.n_names = 0;
-    const aes = set.suite == .aes_128_gcm_sha256;
+    const aes = set.suite == .aes_128_gcm_sha256 or set.suite == .aes_128_ccm_sha256 or set.suite == .aes_128_ccm_8_sha256;
     // The suite's hash: SHA-256, or SHA-384 (48-byte secrets) for AES-256-GCM.
     const alg = comptime set.suite.hash();
     const T = suitehash.Types(alg);

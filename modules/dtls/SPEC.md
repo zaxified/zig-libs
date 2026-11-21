@@ -556,6 +556,16 @@ Deliberately not implemented in 1.2: see *What is deliberately not done*. Not ye
   `sendHelloRetryRequest`'s "stores nothing" claim is true once reached — the gap is everything upstream of
   it. A real design tension: a legitimate peer with a large (e.g. PQ-hybrid) ClientHello genuinely needs to
   fragment, and `max_flight_bytes` bounds one connection's growth, not how many a caller ends up holding.
+  **Opt-in refusal:** `HelloRetryConfig.refuse_fragmented_client_hello = true` refuses a ClientHello whose first
+  record does not carry the whole message (`error.FragmentedClientHello`, before any reassembly), which closes the
+  gap at the price of every client whose hello exceeds the path MTU. Reference behaviour: OpenSSL's `DTLSv1_listen`
+  never reassembles a ClientHello (it reads the cookie from the first fragment only, `SSL_R_FRAGMENTED_CLIENT_HELLO`
+  otherwise), mbedTLS's cookie check does not understand a fragmented one (Mbed-TLS issue #7549), and wolfSSL
+  accepts a fragmented first DTLS 1.3 ClientHello only with cookies disabled (wolfSSL PR #11475). It is off by
+  default because DTLS 1.3 differs from the 1.2 listen path those describe: a HelloRetryRequest cookie commits to
+  `Hash(ClientHello1)` (RFC 8446 §4.4.1), so it cannot be minted from a first fragment, and here ClientHello2 also
+  lands on a fresh stateless `Connection`, so the switch refuses fragmented hellos in both rounds — including a PQ
+  hybrid ClientHello (~1.4 KB) on a 1280-byte path.
 - **Cookie rotation.** RFC 9147 §5.1 RECOMMENDS accepting the previous `cookie_secret` for a period.
   `HelloRetryConfig` takes one secret; a caller wanting the overlap retries ClientHello2 under a second
   `Connection` configured with the older secret — caller policy.
@@ -768,7 +778,8 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   `scripts/checks/ctgrind-expected.tsv`. The reported sites are the Finished / AEAD tag verdicts and the parsing of
   decrypted content, none a branch on a key.
 - **Dead stack:** `src/stackprobe_test.zig`, `src/stackprobe2_test.zig` drive the burned entry points through full
-  in-memory handshakes (PSK, cert X25519, cert P-256 with mutual auth, cert X25519MLKEM768; both AEADs).
+  in-memory handshakes (PSK, cert X25519, cert P-256 with mutual auth, cert X25519MLKEM768; GCM, ChaCha20 and CCM;
+  a server flight-2 retransmission through `poll`).
 
 ## Anchoring
 
@@ -796,16 +807,12 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   `negotiated_cid_len` passed in); there is no negotiation and no CID in the engines.
 - **Certification-path building** (RFC 5280 §6: multi-hop chains, name constraints, `basicConstraints`/`keyUsage`
   policy, revocation) and **`CertificateEntry` extensions** (OCSP stapling/SCT); `.trust_anchor` is a minimal one-hop check.
-- **A stateless cookie exchange against a fragmented ClientHello** (see *Threat model*): a fix would need either a
-  lightweight pre-reassembly return-routability check independent of the cookie, or accepting the amplification as the
-  cost of the fragmentation this module also needs to support.
 - **A second independent stack.** wolfSSL agreeing with us rules out the wire defects listed under *What it found*, but a
   bug the two happen to share would still pass; mbedTLS or picotls would be the natural cross-check.
-- **Dead-stack hygiene, what the sweep did not cover.** `Connection.startHandshake`/`handleFlight`/`installApplicationKeys`/
-  `send`/`recv` are burned and probed through a full in-memory handshake. Not covered: (a) the standalone public helpers
-  `keyschedule.*`, `aead.Protection`, `record.*` called directly by a consumer return/take secrets by value in the CALLER's
-  frame (the engine's own uses are inside the entry-point burns); (b) secrets that stay in the live `Connection` after the
-  handshake (`pending_ap_*` on the server, `hs_*` keys and traffic secrets until `deinit`) are by design, not dead stack;
-  (c) HelloRetryRequest/cookie flows and the retransmission path (`poll`) are not driven by the probe; (d) the signature noise
-  and nonce of the client/server CertificateVerify are measured only as far as the entropy draw and `certverify.sign`'s own
-  probe, not the ECDSA nonce itself inside a live connection. Effort: small.
+- **Dead-stack hygiene, what the sweep does not cover yet.** The full-handshake probe drives `poll`'s handshake
+  retransmission (step `s_poll`, burned since 2026-11-21) and the CCM suites; still not driven: the
+  HelloRetryRequest/cookie flows (the probe's step table is the plain four-flight handshake; a retry needs a second
+  server `Connection`), and the ECDSA nonce of a live CertificateVerify (measured only by `certverify.sign`'s own
+  probe). By design and not dead stack: the standalone helpers `keyschedule.*`, `aead.Protection`, `record.*` return
+  secrets by value into the CALLER's frame, and the live `Connection` keeps `pending_ap_*`, `hs_*` keys and traffic
+  secrets until `deinit`. Effort: small.
