@@ -137,6 +137,7 @@ test {
     _ = Manager;
     _ = storage;
     _ = @import("manager_test.zig");
+    _ = @import("signing_ca_test.zig");
     // External anchor: Pebble's answers, replayed (tools/pebble.sh).
     _ = @import("pebble_replay_test.zig");
     _ = @import("stackprobe_test.zig");

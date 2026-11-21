@@ -3349,6 +3349,8 @@ test "Responder middleware: serves tokens, 404s unknowns, passes the rest throug
 
 // ── tests (mock-ACME integration — full RFC 8555 round on loopback) ─────────
 
+const signing_ca = @import("signing_ca_test.zig");
+
 /// A fake ACME CA on `http.Server` + `router`: canned RFC 8555 responses,
 /// but real verification — every JWS signature is checked server-side,
 /// nonces must be issued-and-unused, the HTTP-01 key authorization is
@@ -3455,6 +3457,12 @@ const MockCa = struct {
     authz_polls: u32 = 0,
     challenge_ok: bool = false,
     csr_ok: bool = false,
+    /// Signing mode (`signing_ca_test.zig`): the certificate endpoint issues a leaf for the finalize CSR's key and
+    /// names (valid `leaf_not_before .. leaf_not_after`) instead of the canned chain. `csr_der` is the last CSR.
+    signer: ?*signing_ca.SigningCa = null,
+    leaf_not_before: i64 = 0,
+    leaf_not_after: i64 = 0,
+    csr_der: ?[]u8 = null,
     finalized: bool = false,
     served_processing: bool = false,
     /// W3: the client deactivated the authorization (RFC 8555 §7.5.2).
@@ -3525,6 +3533,8 @@ const MockCa = struct {
     }
 
     fn deinitUrls(m: *MockCa) void {
+        if (m.csr_der) |c| m.gpa.free(c);
+        m.csr_der = null;
         inline for (.{
             m.dir_url,      m.new_nonce_url, m.new_account_url, m.new_order_url,
             m.account_url,  m.order_url,     m.authz_url,       m.challenge_url,
@@ -4188,6 +4198,10 @@ fn mcFinalize(ctx: *router.Ctx) anyerror!void {
     m.csr_ok = sans_ok and fresh_key;
     m.csr_alg = parsed.public_key.alg();
     m.finalized = true;
+    if (m.signer != null) {
+        if (m.csr_der) |old| m.gpa.free(old);
+        m.csr_der = m.gpa.dupe(u8, csr_der) catch null;
+    }
     m.lock.unlock();
 
     var buf: [1024]u8 = undefined;
@@ -4213,6 +4227,19 @@ fn mcCert(ctx: *router.Ctx) anyerror!void {
         try lw.print("<{s}>;rel=\"index\"", .{m.dir_url});
         for (0..m.alt_link_count) |_| try lw.print(", <{s}>;rel=\"alternate\"", .{target});
         try ctx.res.setHeader("Link", lw.buffered());
+    }
+    if (m.signer) |signer| {
+        const csr = m.csr_der orelse {
+            m.fail("signing mode without a CSR");
+            return;
+        };
+        const chain = signer.issue(m.gpa, csr, m.leaf_not_before, m.leaf_not_after) catch {
+            m.fail("the signing CA could not issue");
+            return;
+        };
+        defer m.gpa.free(chain);
+        try ctx.res.writeAll(chain);
+        return;
     }
     for (0..m.chain_copies) |_| try ctx.res.writeAll(x509.test_cert_pem ++ x509.test_root_cert_pem);
 }
@@ -7872,4 +7899,95 @@ test "mutation 2026-11-12: the built-in DNS-01 solver refuses an identifier whos
     try testing.expect(!zone.live and !zone.bad_cleanup);
     try testing.expectEqual(@as(u32, 1), zone.presents);
     try testing.expectEqual(@as(u32, 1), zone.cleanups);
+}
+
+// ── the Manager's full path against a CA that signs the CSR's key ───────────
+
+test "Manager over AcmeIssuer against the signing mock CA: issues for the minted key, serves it, renews with a fresh key" {
+    const Manager_ = @import("Manager.zig");
+    const storage_mod = @import("storage.zig");
+    const gpa = testing.allocator;
+    const day_s: i64 = std.time.s_per_day;
+    const nb: i64 = 1767225600; // 2026-01-01T00:00:00Z
+
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 81, &account_key);
+    defer c.deinit();
+
+    var ca = try signing_ca.SigningCa.init(gpa, 5, 1735689600, 2051222400);
+    defer ca.deinit(gpa);
+    lab.mock.signer = &ca;
+    lab.mock.leaf_not_before = nb;
+    lab.mock.leaf_not_after = nb + 90 * day_s;
+
+    const Hooks = struct {
+        t: i64,
+        issued: u32 = 0,
+        failed: u32 = 0,
+        fn clock(h: *@This()) Manager_.Clock {
+            return .{ .ctx = h, .now = now };
+        }
+        fn now(ctx: ?*anyopaque) i64 {
+            const h: *@This() = @ptrCast(@alignCast(ctx.?));
+            return h.t;
+        }
+        fn hook(h: *@This()) Manager_.EventHook {
+            return .{ .ctx = h, .call = call };
+        }
+        fn call(ctx: ?*anyopaque, ev: *const Manager_.Event) void {
+            const h: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (ev.*) {
+                .installed => |i| if (i.source == .issued) {
+                    h.issued += 1;
+                },
+                .failed, .storage_failed => h.failed += 1,
+            }
+        }
+    };
+    var hooks: Hooks = .{ .t = nb + 3600 };
+    var mem = storage_mod.MemStorage.init(gpa);
+    defer mem.deinit();
+    var m = try Manager_.init(lab.threaded.io(), gpa, .{
+        .storage = mem.storage(),
+        .trust_anchors = &.{ca.ca_der},
+        .clock = hooks.clock(),
+        .on_event = hooks.hook(),
+        .random_seed = 3,
+        .use_ari = false,
+    });
+    defer m.deinit();
+    var issuer: Manager_.AcmeIssuer = .{ .client = &c, .name = "mock" };
+    try m.addIssuer(issuer.issuer());
+    try m.manage(&.{MockCa.domain});
+    _ = m.maintain();
+
+    try testing.expectEqual(@as(u32, 1), hooks.issued);
+    try testing.expectEqual(@as(u32, 0), hooks.failed);
+    try testing.expect(lab.mock.csr_ok and lab.mock.finalized);
+    var first = (try m.certificate(gpa, MockCa.domain)).?;
+    defer first.deinit(gpa);
+    // The chain is the signing CA's (leaf + CA), not the canned one, and the Manager verified it against the CA anchor.
+    try testing.expect(std.mem.endsWith(u8, first.chain_pem, ca.ca_pem));
+    try testing.expect(!std.mem.startsWith(u8, first.chain_pem, x509.test_cert_pem));
+    try testing.expectEqual(nb + 90 * day_s, first.not_after);
+    const leaf_der = try x509.pemDecode(gpa, "CERTIFICATE", first.chain_pem);
+    defer gpa.free(leaf_der);
+    const parsed = try (std.crypto.Certificate{ .buffer = leaf_der, .index = 0 }).parse();
+    try testing.expectEqualStrings(MockCa.domain, parsed.commonName());
+
+    // Past the renewal point: a second order, a fresh certificate key, the new leaf carries it.
+    hooks.t = nb + 80 * day_s;
+    _ = m.maintain();
+    try testing.expectEqual(@as(u32, 2), hooks.issued);
+    try testing.expectEqual(@as(u32, 0), hooks.failed);
+    var second = (try m.certificate(gpa, MockCa.domain)).?;
+    defer second.deinit(gpa);
+    try testing.expect(!std.mem.eql(u8, first.chain_pem, second.chain_pem));
+    try testing.expect(!std.mem.eql(u8, first.key_pem, second.key_pem));
+    try lab.expectClean();
 }

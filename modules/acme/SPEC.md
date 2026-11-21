@@ -247,6 +247,14 @@ and its offline replay inside the lane (see *Anchoring*); `zig build interop-acm
   against the account key's value, checks the CSR's SAN is the wildcard, and the test pins one `present` and one
   matching `cleanup` at the base name. DNS-01 TXT value: KAT against `openssl dgst | base64` and Python
   `base64.urlsafe_b64encode`. Skips only if the loopback bind fails.
+- **Manager, full path against a signing mock CA** (`src/signing_ca_test.zig`, the test at the end of `Client.zig`):
+  `SigningCa` is a fixed-seed ECDSA P-256 CA and a minimal DER writer; with `MockCa.signer` set, the certificate endpoint issues a
+  leaf for the finalize CSR's own key and names (SAN, authorityKeyIdentifier, serverAuth) under that CA, so the chain's leaf carries the
+  key the Manager minted, which `checkPair` requires and a canned chain never does. The Manager then runs the whole path in the
+  lane: `AcmeIssuer` -> `Client.obtain` (DNS-01) -> CSR -> mock CA -> chain verified against the CA anchor -> stored -> served by
+  `certificate`, and, with the injected clock past the renewal point, a second order with a fresh key and a different chain.
+  Pebble (`tools/pebble.sh --check`) remains the only foreign CA for the `manager` scenario: a recorded Pebble chain still never
+  carries a fresh key, so the replay transcript does not cover it, and does not need to.
 - **Lifecycle (same mock CA):** EAB (the CA checks kid, url, no nonce, payload = account JWK and the MAC; a separate
   test recomputes the MAC with std's HMAC-SHA256 over the RFC 8555 §7.3.4 layout; a wrong key and a missing binding
   are refused), rollover ES256 → ES384 → ES384 (outer and inner JWS, `oldKey`, `account`, no inner nonce; the previous
@@ -303,11 +311,6 @@ and its offline replay inside the lane (see *Anchoring*); `zig build interop-acm
 - **dns-persist-01** *(owner: backlog)*: draft-ietf-acme-dns-persist, lego only; wait for Pebble / a production CA.
 - **A scheduled run against Let's Encrypt STAGING itself** (Boulder, a public name, port 80): out of scope for a
   loopback lane; Pebble is the only CA the module has run against.
-- **Replay transcript for the `manager` scenario:** the offline replay does not carry it (`tools/pebble.sh --check`
-  only). It cannot until the signing mock below exists: the Manager mints a fresh key per issuance and `checkPair`
-  requires the chain's leaf to carry it, which a recorded Pebble chain never does.
-- **Mock CA that signs the CSR's key:** the mock issues a fixed chain whatever the CSR, so the Manager's full path is
-  exercised only by Pebble; a signing mock would bring it into the lane.
 
 ## Anchoring
 
