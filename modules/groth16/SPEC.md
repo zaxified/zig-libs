@@ -71,6 +71,7 @@ field, curve, or pairing arithmetic.
 | Scalar field `Fr` (`add`/`mul`/`inv`/`pow`/`fromBytes`) | `bn254.Fr` (`scalar.zig`) |
 | Groups `G1`/`G2` (Jacobian add/double/`scalarMul`, affine codec) | `bn254.G1`/`bn254.G2` |
 | Optimal-ate pairing + `pairingCheck` | `bn254.pairing` |
+| `Fp2.sqrt`, `twistB`, ψ's coefficients (`g2.psi_gamma_x/y`) for hash-to-G2 | `bn254.Fp2`, `bn254.g2` |
 | **Groth16 VERIFIER** — `VerifyingKey`/`Proof` types + `verify` | `bn254.groth16Verify` (`groth16.zig`) |
 | A REAL accepting proof (Dark Forest v0.3 snarkjs KAT) | embedded in `bn254/src/groth16.zig` |
 
@@ -85,7 +86,10 @@ root-of-unity machinery, just powers of the known generator `5`.
 repo to reuse: `bfv`'s NTT is over word-size NTT primes (`Z_q`), not `Fr`;
 `falcon`'s FFT is over ℂ; `bn254`'s verifier has only a private public-input
 accumulation loop, not an exported MSM. All four (`poly`/`domain`/`fft`/`msm`
-+ `r1cs`/`qap`) are new here, built clean-room from the construction.
++ `r1cs`/`qap`) are new here, built clean-room from the construction. `hash_to_g2.zig` (RFC 9380 SVDW onto BN254's
+G2) is new here too: `bn254` has no hash-to-curve, and the RFC 9380 code in the repository is for other curves
+(`bls12_381`, `voprf`, `bbs`); its 20-line `expand_message_xmd` is a copy of that shape rather than a dependency on a
+heavy curve module for one function.
 
 ## 3. Scope
 
@@ -143,8 +147,8 @@ prints, or from testing a hypothesis against the files. The non-obvious ones:
   here. `groth16 prove`, `zkey export verificationkey` and the verifier do not
   care.
 - **Contribution proof.** snarkjs's proof of knowledge uses a hash-to-G2 point
-  this module does not reproduce (ours: `phase2.hashToG2`, § 5b item 6), so `verifyContribution` cannot check a
-  snarkjs record and snarkjs's `zkey verify` cannot check one of ours
+  this module does not reproduce (ours: `phase2.hashToG2`, RFC 9380 SVDW under this module's tag, § 5b item 6), so
+  `verifyContribution` cannot check a snarkjs record and snarkjs's `zkey verify` cannot check one of ours
   ("Inconsistent transcript"). `phase2.verify` does not depend on either: it
   checks the key itself.
 ### 4c. Reading snarkjs's JSON
@@ -293,14 +297,16 @@ scope; use a published one (e.g. the Hermez/Polygon files) whose transcript
 others have checked.
 
 **6. A contribution record is a proof of knowledge of the contributor's `x`.**
-`g2_sp = phase2.hashToG2(transcript)`: try-and-increment over Fp2 (blake2b-512 under a module tag, `y` from
-`Fp2.sqrt`, sign from a hash bit), then the cofactor `h₂ = 2p − r` multiplied out, so the point is in the order-r
-subgroup and its discrete log is unknown. `g2_spx = [x]·g2_sp` can then only be written by someone who knows `x` (the
-knowledge-of-exponent argument of the Bowe–Gabizon–Miers MPC, IACR ePrint 2017/1050, which snarkjs and Zcash's
-Sapling ceremony follow). Majority practice for the map itself is RFC 9380's SVDW (gnark's `HashToG2`); try-and-
-increment is chosen because the input is public (its variable attempt count leaks nothing), it needs only `Fp2.sqrt`,
-and no foreign party has to reproduce the point — snarkjs derives its own, so records stay unverifiable across the two
-either way (§ 4b). A record written with the earlier `g2_sp = [h]₂` construction fails `verifyContribution`.
+`g2_sp = phase2.hashToG2(transcript)`: RFC 9380 `hash_to_curve` onto G2 with the Shallue–van de Woestijne map —
+`expand_message_xmd` (SHA-256), two `Fp2` elements, SVDW with `Z = 1`, their sum's cofactor cleared by the ψ-endomorphism
+formula of Fuentes-Castañeda–Knapp–Rodríguez-Henríquez (SAC 2011) — under the tag `phase2.hash_to_g2_dst`. That is
+gnark-crypto's `bn254.HashToG2` (suite `BN254G2_XMD:SHA-256_SVDW_RO_`, the majority practice for BN254 G2; RFC 9380 itself
+defines no BN254 suite), and `groth16.hash_to_g2.hashToG2(msg, dst)` with gnark's test tag reproduces its published
+vectors (`src/hash_to_g2.zig`). The point is in the order-r subgroup and its discrete log is unknown, so
+`g2_spx = [x]·g2_sp` can only be written by someone who knows `x` (the knowledge-of-exponent argument of the
+Bowe–Gabizon–Miers MPC, IACR ePrint 2017/1050, which snarkjs and Zcash's Sapling ceremony follow). snarkjs derives its
+own `g2_sp`, so records stay unverifiable across the two either way (§ 4b). A record written by an earlier version
+(`g2_sp = [h]₂`, then try-and-increment under a blake2b tag) fails `verifyContribution`.
 `verify` checks neither the circuit hash nor the records before the last; it checks the key.
 
 **7. Readers refuse before they allocate.** `.r1cs` requires section 3, which pays 8 bytes per wire and so bounds
@@ -344,6 +350,11 @@ stderr). Test classes:
   files read and round-tripped byte for byte, both proving directions, `newZkey` (including the domain-size boundary:
   `b8`/`b9`, 8 and 9 rows, get snarkjs's domains 8 and 16 and its bytes outside the circuit hash), `phase2.verify` verdicts per
   tampering, the JSON exporter (`snarkjs_export.zig`) and importer (`snarkjs_import.zig`, round trip, snarkjs's own files, refusals).
+- **Hash to G2** (`hash_to_g2.zig`): gnark-crypto v0.19.2's five `BN254G2_XMD:SHA-256_SVDW_RO_` vectors
+  (`ecc/bn254/hash_vectors_test.go`: `u0`, `u1`, `Q0`, `Q1` and the output each), which an RFC 9380 model in Python
+  reproduced independently; the SVDW constants re-derived from their definitions; the exceptional inputs of the map;
+  the raw map point outside G2 and the cleared one inside. `phase2.hashToG2` under the module tag is pinned to the
+  Python model's output.
 - **Audit tests** (`audit_test.zig`, and in `phase2.zig`, `qap.zig`, `msm.zig`): the `2^28`-th root of unity pinned to
   the ark-bn254 / snarkjs constant (generators 5 and 7 give the same root for every domain up to `2^5`, so small
   fixtures cannot tell them apart); every reader refusal reached through its own guard; the contribution transcript
@@ -379,6 +390,11 @@ external datum, the generator `5` and 2-adicity 28, is a property of BN254's
 transcribed. The anchor's KAT (Dark Forest v0.3 proof) lives in and is
 accounted for by the `bn254` module, not restated here.
 
+**Design reference (record only, no condition).** `hash_to_g2.zig` follows RFC 9380 and, for the two choices the RFC
+leaves to a suite on this curve, gnark-crypto (Apache-2.0, `ecc/bn254/hash_to_g2.go`, v0.19.2, read): the cofactor
+clearing by `[x]Q + ψ([3x]Q) + ψ²([x]Q) + ψ³(Q)` and `L = 48`. No code was ported; the SVDW constants were derived
+from the RFC's formulas, and the five test vectors are gnark-crypto's (test data, cited at the table).
+
 **Data.** `src/testdata/snarkjs/` is OUTPUT of third-party binaries run as
 black-box oracles — circom 2.2.3 (`t.r1cs`, `t.wtns`) and snarkjs@0.7.6
 (`pot.ptau`, `t0.zkey`, `t1.zkey`, `vk.json`, `proof.json`, `public.json`; `b8.r1cs`/`b8.zkey`, `b9.r1cs`/`b9.zkey`
@@ -396,7 +412,7 @@ computed from those inputs, not code or text of either project.
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** Foreign: real snarkjs@0.7.6 / circom 2.2.3 files in `src/testdata/snarkjs` (made by `tools/snarkjs/gen.sh`); snarkjs's own proof verifies under our parsed key; our proof from snarkjs's key is pinned byte for byte and was accepted by snarkjs's verifier (a one-limb tamper rejected); `newZkey` equals `groth16 setup` byte for byte outside the circuit hash; `phase2.verify` accepts snarkjs's keys and names what each of seven tamperings broke. Self: the QAP/R1CS layer of hand-built circuits (`qap.checkDivisible == r1cs.isSatisfied`) and our own contribution proof.
+**What the tests actually contain.** Foreign: real snarkjs@0.7.6 / circom 2.2.3 files in `src/testdata/snarkjs` (made by `tools/snarkjs/gen.sh`); snarkjs's own proof verifies under our parsed key; our proof from snarkjs's key is pinned byte for byte and was accepted by snarkjs's verifier (a one-limb tamper rejected); `newZkey` equals `groth16 setup` byte for byte outside the circuit hash; `phase2.verify` accepts snarkjs's keys and names what each of seven tamperings broke; `hash_to_g2` reproduces gnark-crypto's published hash-to-G2 vectors. Self: the QAP/R1CS layer of hand-built circuits (`qap.checkDivisible == r1cs.isSatisfied`) and our own contribution proof.
 
 ## What is deliberately not done
 

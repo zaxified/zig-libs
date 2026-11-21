@@ -32,6 +32,7 @@ anchored by the `bn254` verifier and by real `snarkjs`/`circom` files (see [SPEC
 | `ptau.zig` | snarkjs powers-of-tau (`.ptau`) reader, points decoded on demand; `readCut(gpa, io, file, power)` reads by position only what a smaller power needs (a ceremony file too large for memory) |
 | `zkprove.zig` | **the real prover**: `.zkey` + witness → proof, quotient on a coset; Pippenger MSM (variable-time in the witness, the default) or `proveWith(…, .{ .msm = .constant_time })` (~21× slower) |
 | `phase2.zig` | phase-2 ceremony: `newZkey(r1cs, ptau)`, `contribute`, `verifyContribution`, `verify` |
+| `hash_to_g2.zig` | `hashToG2(msg, dst)`: RFC 9380 hash to BN254's G2 with the SVDW map (gnark-crypto's `HashToG2`, its vectors reproduced); `phase2.hashToG2` uses it for a contribution record's `g2_sp` |
 | `solidity.zig` | `verifier(vk, name)`: a Solidity verifier contract for a key (snarkjs's `verifyProof` signature, EVM precompiles 0x06–0x08); the matching calldata is `snarkjs_export.solidityCalldata(proof, public)` |
 
 ## The anchor
@@ -157,6 +158,7 @@ Provenance: pure clean-room-from-spec (Groth 2016) — no third-party source
 ported. The test data in `src/testdata/snarkjs/` is output of circom 2.2.3 and
 snarkjs@0.7.6 run as black-box oracles by `tools/snarkjs/gen.sh` (their GPL
 source was not read; the files hold points and field elements of our own
-circuit, see SPEC.md § 8). See [SPEC.md](SPEC.md) for the design, the Fable-vs-Opus tier call, and
+circuit, see SPEC.md § 8). `hash_to_g2.zig` follows RFC 9380 with gnark-crypto (Apache-2.0) as the design reference
+for its cofactor clearing; its vectors are gnark-crypto's (SPEC.md § 8). See [SPEC.md](SPEC.md) for the design, the Fable-vs-Opus tier call, and
 the anchor plan. Depends on the sibling `bn254` module for `Fr`/`G1`/`G2`/the
 pairing/the verifier.

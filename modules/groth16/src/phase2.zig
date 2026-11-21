@@ -31,11 +31,12 @@
 //! `e(g1_s, g2_spx) = e(g1_sx, g2_sp)` and `e(δ_before, g2_spx) =
 //! e(δ_after, g2_sp)`: δ moved by the same `x` in G1 and G2, and the record
 //! (name included) is the one its transcript names. `g2_sp` is hashed to the
-//! curve (try-and-increment, cofactor cleared), so its discrete log is
-//! unknown and `g2_spx` cannot be written without `x` — the knowledge-of-
-//! exponent argument of the Bowe–Gabizon–Miers MPC (IACR ePrint 2017/1050).
-//! The hash is this module's own (snarkjs derives its `g2_sp` differently),
-//! so a record written with the earlier `g2_sp = [h]₂` fails here.
+//! curve (RFC 9380 SVDW, `hash_to_g2.zig`), so its discrete log is unknown
+//! and `g2_spx` cannot be written without `x` — the knowledge-of-exponent
+//! argument of the Bowe–Gabizon–Miers MPC (IACR ePrint 2017/1050). The tag
+//! is this module's own (snarkjs derives its `g2_sp` differently), so a
+//! record written by an earlier version (`[h]₂`, then try-and-increment)
+//! fails here.
 
 const std = @import("std");
 const bn254 = @import("bn254");
@@ -45,6 +46,7 @@ const zkey_mod = @import("zkey.zig");
 const circom = @import("circom.zig");
 const ptau_mod = @import("ptau.zig");
 const msm = @import("msm.zig");
+const hash_to_g2 = @import("hash_to_g2.zig");
 
 const Fr = bn254.Fr;
 const G1 = bn254.G1;
@@ -367,58 +369,18 @@ fn g2Sp(transcript: [64]u8) G2.Affine {
 // ── hash-to-G2 ──────────────────────────────────────────────────────────────
 //
 // `g2_sp` must be a G2 point whose discrete log nobody knows, or `[x]₂` can be
-// read off a record (§ 5b item 6). Try-and-increment (Boneh–Lynn–Shacham's
-// MapToGroup): `x = H(tag ‖ msg ‖ ctr ‖ 0) + H(… ‖ 1)·u` over Fp2, `y` the
-// square root of `x³ + b'` if there is one (sign from `H(… ‖ 2)`), then the
-// cofactor `h₂ = 2p − r` is multiplied out. Public input, so the variable
-// number of attempts leaks nothing; each attempt succeeds with probability
-// about 1/2. The result is in the order-r subgroup and never the identity.
+// read off a record (§ 5b item 6). RFC 9380 `hash_to_curve` with the SVDW map
+// (`hash_to_g2.zig`: gnark-crypto's `BN254G2_XMD:SHA-256_SVDW_RO_` suite) under
+// this module's own domain separation tag.
 
-const fp_modulus: u256 = 21888242871839275222246405745257275088696311157297823662689037894645226208583;
-const fr_modulus: u256 = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
-/// `#E'(Fp2) = r · (2p − r)` (`bn254/src/g2.zig`, `subgroupCheck`).
-const g2_cofactor: [32]u8 = blk: {
-    var b: [32]u8 = undefined;
-    std.mem.writeInt(u256, &b, 2 * fp_modulus - fr_modulus, .big);
-    break :blk b;
-};
-const hash_to_g2_tag = "zig-libs groth16 phase2 hash-to-G2 v1";
-
-fn hashPart(msg: []const u8, ctr: u32, part: u8) [64]u8 {
-    var h = Blake2b512.init(.{});
-    h.update(hash_to_g2_tag);
-    h.update(msg);
-    var tail: [5]u8 = undefined;
-    std.mem.writeInt(u32, tail[0..4], ctr, .little);
-    tail[4] = part;
-    h.update(&tail);
-    var out: [64]u8 = undefined;
-    h.final(&out);
-    return out;
-}
-
-/// 512 hash bits reduced mod p (bias below 2⁻²⁵⁸).
-fn fpFromWide(wide: [64]u8) bn254.Fp {
-    const v: u256 = @intCast(std.mem.readInt(u512, &wide, .big) % fp_modulus);
-    var b: [32]u8 = undefined;
-    std.mem.writeInt(u256, &b, v, .big);
-    return bn254.Fp.fromBytes(b) catch unreachable; // v < p
-}
+/// The domain separation tag of `hashToG2` (RFC 9380 §3.1 shape).
+pub const hash_to_g2_dst = "ZIG-LIBS-GROTH16-PHASE2-V2-CS01-with-BN254G2_XMD:SHA-256_SVDW_RO_";
 
 /// A point of the order-r subgroup of G2 determined by `msg`, with a discrete
-/// log nobody knows (in the random-oracle model).
+/// log nobody knows (in the random-oracle model): `hash_to_g2.hashToG2(msg,
+/// hash_to_g2_dst)`.
 pub fn hashToG2(msg: []const u8) G2.Affine {
-    const Fp2 = bn254.Fp2;
-    var ctr: u32 = 0;
-    while (true) : (ctr += 1) {
-        const x: Fp2 = .{ .c0 = fpFromWide(hashPart(msg, ctr, 0)), .c1 = fpFromWide(hashPart(msg, ctr, 1)) };
-        const rhs = x.square().mul(x).add(bn254.g2.twistB());
-        var y = rhs.sqrt() orelse continue;
-        if (hashPart(msg, ctr, 2)[0] & 1 == 1) y = y.neg();
-        const p = G2.Jacobian.fromAffine(.{ .x = x, .y = y, .infinity = false }).scalarMulBytes(&g2_cofactor);
-        if (p.isIdentity()) continue;
-        return p.toAffine();
-    }
+    return hash_to_g2.hashToG2(msg, hash_to_g2_dst);
 }
 
 // ── rescaling C and H by 1/x ────────────────────────────────────────────────
@@ -734,14 +696,20 @@ test "hashToG2: on the curve, in the order-r subgroup, never the identity, deter
         try testing.expect(again.x.eql(pt.x) and again.y.eql(pt.y));
         for (seen[0..i]) |q| try testing.expect(!q.x.eql(pt.x));
     }
-    // The cofactor really is needed: the raw try-and-increment point (before
-    // the multiply) of the first message is not in the subgroup.
-    const x: bn254.Fp2 = .{ .c0 = fpFromWide(hashPart("m\x00", 0, 0)), .c1 = fpFromWide(hashPart("m\x00", 0, 1)) };
-    if (x.square().mul(x).add(bn254.g2.twistB()).sqrt()) |y| {
-        try testing.expect(!G2.Jacobian.fromAffine(.{ .x = x, .y = y, .infinity = false }).subgroupCheck());
-    }
-    // h₂ = 2p − r (bn254/src/g2.zig: #E'(Fp2) = r·(2p − r)), as a number.
-    try testing.expectEqual(@as(u256, 21888242871839275222246405745257275088844257914179612981679871602714643921549), std.mem.readInt(u256, &g2_cofactor, .big));
+}
+
+test "hashToG2: pinned under this module's tag (independent RFC 9380 model in Python)" {
+    const testing = std.testing;
+    var t: [64]u8 = undefined;
+    for (&t, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+    const got = bn254.g2.toBytes(hashToG2(&t));
+    var want: [128]u8 = undefined;
+    // EIP-197 order: x.c1 ‖ x.c0 ‖ y.c1 ‖ y.c0.
+    _ = try std.fmt.hexToBytes(&want, "0883b96e1ab5bb828fcf893949740758f6145ba2735fb87263c90717c84c9257" ++
+        "11bd384f53dc134b3b5869b1bbba412e498dff04bc39d01e6965a0336b19dbcf" ++
+        "2f87fad00505331f5474f6667b88a2a39738aeaf80b1d057619a1a02043733ea" ++
+        "1cb813966970251042fd7c6d9ab6c2b6e8ae3cd5f36de41ce6fac818863ec640");
+    try testing.expectEqualSlices(u8, &want, &got);
 }
 
 test "a contribution record's g2_sp is the hashed point, not [h]₂ (the old, knowable construction fails)" {
