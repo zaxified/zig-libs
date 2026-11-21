@@ -1575,10 +1575,10 @@ test "a failed split frees the fields it had already allocated" {
     // failure on the second. Without the errdefer the first one's bytes are
     // unreachable: the caller never receives the slice
     // (W2 re-audit 2026-09-02, `csvstream` F7).
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
-    // 0.17: the testing allocator (SafeAllocator) shrinks in place on `remap`, so
-    // `toOwnedSlice` no longer allocates a second time: one allocation per field,
-    // and index 1 is the second field (it was index 2 with two allocations per field).
+    // Every resize/remap is refused (whether `toOwnedSlice` shrinks in place depends on the
+    // heap's layout, which differs between builds): each field is two allocations, the list
+    // and its exact-size copy, so index 2 is the second field's first allocation.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2, .resize_fail_index = 0 });
     const a = failing.allocator();
     var buf: [4][]const u8 = undefined;
     try std.testing.expectError(
@@ -1613,8 +1613,9 @@ test "a failed split frees ALL the fields it allocated, past any fixed bookkeepi
     try std.testing.expectEqual(@as(usize, 200), countFields(rec, ',', '"'));
 
     // Fail an allocation well past the old ceiling, so the copies already made
-    // span both sides of it.
-    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 150 });
+    // span both sides of it. Resizes are refused so a field is always two
+    // allocations (list, exact-size copy): index 300 is field 150's first.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 300, .resize_fail_index = 0 });
     const a = failing.allocator();
     const buf = try gpa.alloc([]const u8, 256);
     defer gpa.free(buf);
