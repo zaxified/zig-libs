@@ -1142,6 +1142,7 @@ pub fn build(b: *std.Build) void {
             // grows a hand-kept list of which ones are safe -- a declaration
             // that would drift the way `.example` did.
             const run_example = b.addRunArtifact(example);
+            run_example.addPassthruArgs(); // `-- <args>` reach an example that takes some (fleetsim's CLI)
             // Same cache hole as the module tests (`-Dfresh-run` above): an
             // example run step is cached on binary + args, not on the
             // environment it ran in.

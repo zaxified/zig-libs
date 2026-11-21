@@ -17,7 +17,11 @@ const std = @import("std");
 const fleetsim = @import("fleetsim");
 const modbus = @import("modbus");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    // `fleetsim-example serve fleet.zon [--host 127.0.0.1] [--run-ms N]` starts a declared
+    // fleet on TCP; `check fleet.zon` only parses it. No arguments: the poll demo below.
+    if (args.len >= 3) return cli(init, args);
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     // Running the published surface under a leak-checking allocator is the
     // only leak check this module has OUTSIDE its own test suite (the suite
@@ -85,4 +89,59 @@ pub fn main() !void {
     std.debug.print("node stats: delivered={d} replied={d} responder_errors={d}\n", .{
         stats.delivered, stats.replied, stats.responder_errors,
     });
+}
+
+const usage =
+    \\usage: fleetsim-example serve <fleet.zon> [--host A.B.C.D] [--run-ms N]
+    \\       fleetsim-example check <fleet.zon>
+    \\
+    \\A fleet.zon describes Modbus devices, their link faults and a fault schedule
+    \\(see `fleetsim.declare`). `serve` listens on each node's `listen_port`
+    \\(default host 127.0.0.1) until every master has gone, or N ms have passed.
+    \\
+;
+
+/// The declarative CLI: parse a description, report it, optionally serve it.
+fn cli(init: std.process.Init, args: []const [:0]const u8) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const serve = std.mem.eql(u8, args[1], "serve");
+    if (!serve and !std.mem.eql(u8, args[1], "check")) {
+        std.debug.print("{s}", .{usage});
+        return error.BadArguments;
+    }
+    var host: [4]u8 = .{ 127, 0, 0, 1 };
+    var run_ms: u64 = 0;
+    var i: usize = 3;
+    while (i + 1 < args.len) : (i += 2) {
+        if (std.mem.eql(u8, args[i], "--host")) {
+            var it = std.mem.splitScalar(u8, args[i + 1], '.');
+            for (&host) |*b| b.* = try std.fmt.parseInt(u8, it.next() orelse return error.BadArguments, 10);
+        } else if (std.mem.eql(u8, args[i], "--run-ms")) {
+            run_ms = try std.fmt.parseInt(u64, args[i + 1], 10);
+        } else {
+            std.debug.print("{s}", .{usage});
+            return error.BadArguments;
+        }
+    }
+    const source = try std.Io.Dir.cwd().readFileAllocOptions(io, args[2], gpa, .limited(1 << 20), .of(u8), 0);
+    defer gpa.free(source);
+    var text: []u8 = &.{};
+    defer gpa.free(text);
+    const declared = fleetsim.declare.Declared.parse(gpa, source, &text) catch |err| {
+        if (text.len > 0) std.debug.print("{s}\n", .{text});
+        return err;
+    };
+    defer declared.deinit();
+    for (declared.description.nodes) |n| {
+        std.debug.print("node {s}: unit {d}, port {?d}\n", .{ n.name, n.unit_id, n.listen_port });
+    }
+    if (!serve) return;
+    const bindings = try declared.bindings(host);
+    if (bindings.len == 0) {
+        std.debug.print("no node declares a listen_port\n", .{});
+        return error.NothingToServe;
+    }
+    const report = try fleetsim.serveTcpMulti(gpa, io, &declared.fleet, bindings, .{ .run_ms = run_ms });
+    std.debug.print("served {d} peer(s), {d} frames in\n", .{ report.peers_accepted, report.frames_in });
 }

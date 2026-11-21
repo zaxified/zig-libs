@@ -1,0 +1,24 @@
+// A fleet for `zig build run-example-fleetsim -- serve modules/fleetsim/example/fleet.zon`.
+.{
+    .seed = 1,
+    .nodes = .{
+        .{
+            .name = "tank",
+            .unit_id = 1,
+            .listen_port = 5020,
+            .holding = .{ .base = 0, .values = .{ 4200, 0, 0, 0 } },
+            .coils = .{ .values = .{ true, false } },
+            .link = .{ .delay_ms = 5 },
+        },
+        .{
+            .name = "pump",
+            .unit_id = 2,
+            .listen_port = 5021,
+            .input = .{ .base = 10, .values = .{ 1, 2, 3 } },
+        },
+    },
+    .faults = .{
+        .{ .at_ms = 60000, .node = "tank", .kind = .{ .trouble = .{ .on = true } } },
+        .{ .at_ms = 90000, .node = "tank", .kind = .heal },
+    },
+}

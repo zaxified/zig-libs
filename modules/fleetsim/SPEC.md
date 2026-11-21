@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [open62541/open62541](https://github.com/open62541/open62541) | C | MPL-2.0 | 3.2k | v1.5.8 (2026-09-06) | A full OPC UA stack that can host a simulated server; a stack, not a fleet. |
 | Zig ecosystem | Zig | — | — | — | Nothing comparable found (`gh search repos 'modbus simulator'` and `'industrial protocol device simulator'`: no Zig result). |
 
-**Where we are ahead:** seven device-side protocols (Modbus, DNP3, IEC 104, S7comm, BACnet, ENIP, OPC UA) in one deterministic fleet: one injected clock, one seed, total event order, byte-exact replay, per-node link faults (delay, jitter, loss, duplication, reordering) and node faults, `netsim` fault-trace mapping and shrinking, a fixed-memory scale measurement, and evidence against real third-party masters (*Evidence against third-party masters*). **Where we are behind:** no GUI or declarative config file for building a fleet (fleets are built in Zig code), and a TCP/UDP binding that is a lab fixture (no TLS, no rate limiting) (→ *Backlog / deferred*).
+**Where we are ahead:** seven device-side protocols (Modbus, DNP3, IEC 104, S7comm, BACnet, ENIP, OPC UA) in one deterministic fleet: one injected clock, one seed, total event order, byte-exact replay, per-node link faults (delay, jitter, loss, duplication, reordering) and node faults, `netsim` fault-trace mapping and shrinking, a fixed-memory scale measurement, and evidence against real third-party masters (*Evidence against third-party masters*). **Where we are behind:** no GUI, a declarative file that describes Modbus devices only (*Declarative fleets*), and a TCP/UDP binding that is a lab fixture (no TLS, no rate limiting) (→ *Backlog / deferred*).
 
 ## Design & invariants
 
@@ -184,6 +184,28 @@ than a refusal.
 `serveTcp` restarts its clock at every accept (each `serveTcpOn` measures from
 its own accept), so a fault at t=15 s means something different to every
 session, while `serveTcpMulti` keeps one clock for the whole run.
+
+## Declarative fleets (`declare.zig`, `fleetsim.declare`)
+
+ModbusPal and the pymodbus simulator are used by people who do not write code: describe the register map, start it, point a master
+at it. `declare.Declared.parse(gpa, zon_source, &error_text)` reads a ZON description (`std.zon`, no parser of ours; the schema is
+`Description` / `NodeDesc` / `FaultDesc`) and builds a heap-pinned `Declared` holding the `Fleet` and the Modbus responders: per node a
+unique `name`, `unit_id`, `framing` (`.tcp` / `.rtu`), `accept_any_unit`, `holding` / `input` registers and `coils` / `discrete`
+bits (each `{ base, values }`), `link` (the `LinkFaults`), `listen_port`; plus a `faults` schedule naming nodes and using every
+`FaultKind` by its own name; `seed`. Refused: ZON that is not a `Description` (the rendered diagnostics are returned in `error_text`),
+duplicate names, a fault naming an unknown node, an area past address 65 535. `Declared.bindings(host)` gives the `serveTcpMulti`
+bindings of the nodes with a `listen_port`. The CLI is the module's example: `zig build run-example-fleetsim -- serve
+modules/fleetsim/example/fleet.zon [--host A.B.C.D] [--run-ms N]` (and `check`), with the file beside it; a live master
+(a raw Modbus/TCP read over a socket) read 4200 from the described `tank`. Only Modbus is described (Backlog).
+
+## Shrinking the fleet's own inputs (`shrink.zig`, `fleetsim.shrink`)
+
+`vopr.shrinkTrace` minimises a netsim fault schedule; it cannot express a failure that needs a submitted frame or a fleet-level fault
+(`silent`, `trouble`, `restart` ...). `shrink.Input` is a `Fault` or a `Submit` (node, time, frame); `shrink.apply(fleet, inputs)`
+schedules a list; `shrink.shrinkInputs(gpa, inputs, ctx)` runs Zeller's ddmin (`netsim.ddmin`, the core `shrinkTrace` uses too) with the
+caller's oracle `ctx.fails(subset) !bool` (build a fresh fleet, `apply`, run, did it fail again) and returns a 1-minimal list; an
+input-independent failure shrinks to the empty list. Inputs keep their times, so a subset replays at the same simulated instants.
+Test: a Modbus run with five noise faults, a `trouble` fault and eight reads shrinks to the `trouble` fault and one later read.
 
 ## Serial RTU framing (`rtu.zig`, `fleetsim.serial_rtu`)
 
@@ -532,11 +554,7 @@ two programs exchanging messages defined by public specifications (MODBUS Applic
 
 ## Backlog / deferred
 
-- **A fleet-native shrinker (idea):** delta-debugging over a netsim `FaultTrace` works end to end on a fleet, so a failing run comes
-  back as a minimised fault trace. What does not exist is a shrinker over the fleet's own inputs (`Fault` lists and submitted frames),
-  which a failure that a netsim schedule cannot express would need.
-- **A declarative fleet description plus a small CLI that starts a fleet (idea, survey 2026-09-30):** ModbusPal and the pymodbus simulator are
-  used by people who do not write code. Effort: medium; fits CONVENTIONS §2 (parser over `std`, no deps).
+- **Declarative descriptions of the six other protocols** (DNP3 point tables, IEC 104 points, BACnet objects, S7 data blocks, OPC UA nodes, ENIP assemblies): ModbusPal and the pymodbus simulator describe register maps; the other responders keep their state in caller-owned object models that need a schema of their own per protocol. Not started; each is its own schema.
 
 ## Anchoring
 

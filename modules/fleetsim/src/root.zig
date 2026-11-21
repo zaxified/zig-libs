@@ -77,6 +77,12 @@ pub const fleet = @import("fleet.zig");
 pub const adapters = @import("adapters.zig");
 pub const tcp = @import("tcp.zig");
 
+/// A ZON description of a Modbus fleet and its fault schedule (`declare.Declared.parse`).
+pub const declare = @import("declare.zig");
+
+/// ddmin over a fleet's own inputs: faults and submitted frames (`shrink.shrinkInputs`).
+pub const shrink = @import("shrink.zig");
+
 /// Modbus RTU framing by silence (t1.5 / t3.5) for serial-gateway style tests; see `rtu.zig`.
 pub const serial_rtu = @import("rtu.zig");
 
@@ -3016,6 +3022,8 @@ test {
     _ = @import("adapters.zig");
     _ = @import("tcp.zig");
     _ = @import("rtu.zig");
+    _ = @import("declare.zig");
+    _ = @import("shrink.zig");
     _ = @import("shim.zig");
     _ = @import("goldens.zig");
     _ = @import("master_goldens.zig");
