@@ -1805,6 +1805,9 @@ cmd_changed() {
     # the ctgrind gate. This disassembly check is the only thing that fails when
     # the emulation is bypassed. See the script header.
     closure_has falcon && step "check-fp-freedom" ./scripts/checks/check-fp-freedom.sh
+    # fastmem is the memset/memcpy of a libc-free binary: a dropped `volatile` turns it into a
+    # self-call that only an optimised build shows. See the script header.
+    closure_has fastmem && step "check-fastmem-nolibcall" ./scripts/checks/check-fastmem-nolibcall.sh
     # Strips comments before it scans, so a fingerprint change is its signal.
     (( mc )) && step "check-ct-compare" ./scripts/checks/check-ct-compare.py "--modules=${closure// /,}"
     (( mt )) && step "check-skip-as-pass" ./scripts/checks/check-skip-as-pass.py
@@ -2065,6 +2068,7 @@ phase_checks() {
     # the ctgrind gate. This disassembly check is the only thing that fails when
     # the emulation is bypassed. See the script header.
     step "check-fp-freedom" ./scripts/checks/check-fp-freedom.sh
+    step "check-fastmem-nolibcall" ./scripts/checks/check-fastmem-nolibcall.sh
     # check-ct-compare moved to the fast checks (D3, see there).
 
     step "check-ctgrind" zig build check-ctgrind
