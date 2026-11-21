@@ -287,6 +287,16 @@ noinline fn callMnemonicToSeed() void {
     std.crypto.secureZero(u8, &out);
 }
 
+/// Static, so the normalised copies are never on the scanned stack.
+var normalize_heap: [64 * 1024]u8 = undefined;
+
+noinline fn callMnemonicToSeedNormalized() void {
+    var out: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&normalize_heap);
+    bip39.mnemonicToSeedNormalized(fba.allocator(), mnemonic, "probe passphrase", &out) catch unreachable;
+    std.crypto.secureZero(u8, &out);
+}
+
 /// `skip`: a needle this entry point is not held to. `neuter` returns the
 /// chain code by value (`ExtendedPubKey.chain_code`), so the copy of the result
 /// in its own frame, above any burn, is a copy of an OUTPUT the caller holds
@@ -309,6 +319,7 @@ const probes = [_]struct { name: []const u8, call: *const fn () void, skip: []co
     .{ .name = "validateMnemonic", .call = callValidateMnemonic },
     .{ .name = "entropyToMnemonic", .call = callEntropyToMnemonic },
     .{ .name = "mnemonicToSeed", .call = callMnemonicToSeed },
+    .{ .name = "mnemonicToSeedNormalized", .call = callMnemonicToSeedNormalized },
 };
 
 fn buildNeedles(n: *Needles) !void {

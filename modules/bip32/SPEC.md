@@ -318,7 +318,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   against the private side, serialization round trip; scaled to half the budget), each with a
   reach test that every outcome is hit.
 - **Dead-stack probe** (`src/stackprobe_test.zig`): see *Threat model*; it needs a ReleaseFast
-  build and is usable in a schemata ReleaseFast build.
+  build and is usable in a schemata ReleaseFast build. It covers `mnemonicToSeedNormalized` (an ASCII mnemonic and passphrase, through the normalisation copies).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
   whole-module mutation run and the delta runs after it.
 

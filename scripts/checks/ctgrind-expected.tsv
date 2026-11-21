@@ -1029,6 +1029,15 @@ frost	ReleaseFast	sign	1	13	c58795725fdff352	1da8c496388f45b0
 # because the harness derives them from the secrets. One group.add context in mulPublicGlv gone
 # (inlining). musig2 SPEC.md CT note.
 musig2	ReleaseFast	sign	1	<=103	6ff8d1818a669821	2a2f275cd0c5c7c5
+# musig2 detsign (2026-11-21, new row): `deterministicSign` with the secret key and `rand` tainted (the nonces are derived
+# inside, so there is no SecNonce to taint). 194 total, 192 in-file, 2 witness, 0 unattributed. The in-file contexts are the
+# `sign` row's classes (the mandatory self-verify, 4 `Fe.fromBytes`/`sqrt` re-parses of the published pubnonce and key,
+# variable-time `mulPublic` on the partial signature, scalar canonicality) PLUS what `deterministicSign` adds: the nonce
+# derivation's `reduceToScalar` (4: std's canonicality compare inside the 48-byte wide reduction, outcome never varies),
+# the `isZero` verdict on each derived nonce (2, root.zig `if (k[0].isZero() or k[1].isZero()) return error.InvalidNonce`,
+# fail-closed at 2^-256) and the re-parse of the published pubnonce and the aggregate of the other signers' nonces (public).
+# No branch on the key or a nonce that is not a final verdict. musig2 SPEC.md CT note.
+musig2	ReleaseFast	detsign	1	<=192	6ff8d1818a669821	220709ea2784e7e8
 # taproot secret 10 -> 9 (re-pin 2026-09-15). The row was already stale at
 # 0c0ef527: a --stacks run of that tree reads 9, with the SAME context set as
 # today. The source pin never moved, so the drop came from a dependency before

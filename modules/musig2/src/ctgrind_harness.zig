@@ -232,11 +232,12 @@ fn reloadVolatile(comptime n: usize, s: *const [n]u8) [n]u8 {
     return out;
 }
 
-const Target = enum { sign };
+const Target = enum { sign, detsign };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "sign")) return .sign;
+    if (std.mem.eql(u8, s, "detsign")) return .detsign;
     return error.UnknownTarget;
 }
 
@@ -255,7 +256,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = it.next(); // argv[0]
     const target = try parseTarget(it.next() orelse return error.MissingTarget);
     const tainted = (try parseTaint(it.next() orelse return error.MissingTaint)) == .yes;
-    _ = target; // only one target exists today; kept for parity with every other harness's CLI shape
 
     std.debug.print("valgrind_support={}\n", .{builtin.valgrind_support});
 
@@ -306,6 +306,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .tweaks = &.{}, // untweaked session: keeps the measured call graph to Sign's own core
         .msg = msg,
     };
+
+    if (target == .detsign) {
+        // `deterministicSign` (BIP327 §"Deterministic Signing"): the secret key and the optional `rand` are
+        // tainted; the nonces are derived inside from them, so there is no `SecNonce` to taint. The other
+        // signer's published nonce pair is the aggregate of "the other nonces"; everything else is public.
+        var sk_det = sk_a_bytes;
+        taintIf(tainted, &sk_det);
+        const sk_det_reloaded = reloadVolatile(32, &sk_det);
+        const sk_d = bip340.SecretKey.fromBytes(sk_det_reloaded) catch return error.BadSecretKey;
+        var rand_bytes = secretBytes(32, "musig2-ctgrind-detsign-rand-v1");
+        taintIf(tainted, &rand_bytes);
+        const rand_reloaded = reloadVolatile(32, &rand_bytes);
+        var det: musig2.DeterministicSignResult = undefined;
+        musig2.deterministicSign(&det, &sk_d, &pubnonce_b_bytes, &pubkeys, &.{}, msg, &rand_reloaded) catch |err| {
+            std.debug.print("deterministicSign failed: {t}\n", .{err});
+            return err;
+        };
+        std.debug.print("psig={x}\n", .{det.psig.bytes});
+        return;
+    }
 
     // ── Phase 2: the tainted call ──────────────────────────────────────
     //

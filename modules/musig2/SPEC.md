@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-11-14 (85/92, 7 eq) · src 1a1ff26b26224430
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MUSIG2_FUZZ; psig at 1/4, session at 1/20 of it) · ct 2026-09-09 (ctgrind; `sign` <=103 in-file since Zig 0.17.0, 2026-10-18: +2 = k256 `Fe.fromBytes`'s canonicity test inside `cpoint`'s `lift`, no longer folded into the identical check of `XOnlyPublicKey.fromBytes`, over the signer's own public key and public nonce that partial-signature self-verification parses -- public values)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MUSIG2_FUZZ; psig at 1/4, session at 1/20 of it) · ct 2026-09-09 (ctgrind; `detsign` <=192 in-file 2026-11-21, the `sign` classes plus the nonce-derivation verdicts; `sign` <=103 in-file since Zig 0.17.0, 2026-10-18: +2 = k256 `Fe.fromBytes`'s canonicity test inside `cpoint`'s `lift`, no longer folded into the identical check of `XOnlyPublicKey.fromBytes`, over the signer's own public key and public nonce that partial-signature self-verification parses -- public values)
 
 **Performance:** not measured
 
@@ -270,14 +270,19 @@ zkp's `musig_nonce_parity`, `_adapt` and `_extract_adaptor`; tested end to end i
   second `sign` is `InvalidSecNonce`); `SecretKeyMismatch`; the signer's x listed with the other parity prefix; a
   secnonce scalar of `n` or `n + 1`; aggnonce infinity is exactly 33 zero bytes; empty inputs to `keyAgg`,
   `nonceAgg`, `partialSigAgg`; an out-of-range `signer_index`; `getSecondKey` on an empty list; `SecNonce.deinit`.
-- **Stack probes**: `src/stackprobe_test.zig` (after `sign`) and `src/stackprobe2_test.zig` (after `nonceGen`) scan the
+- **Stack probes**: `src/stackprobe_test.zig` (after `sign` and after `deterministicSign`, which also scans for the masked key and the two nonces it derives, with and without `rand`) and `src/stackprobe2_test.zig` (after `nonceGen`) scan the
   dead stack in ReleaseFast for the secret key, both nonces and their negations, with a positive control.
 - **Fuzz**: `MUSIG2_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver) over two harnesses in
   `src/fuzz_test.zig`: `musig2-psig` (`partialSigVerify` never panics, only the published signature verifies; weight
   1/4) and `musig2-session` (a genuine session verifies and every damaged part is refused; weight 1/20). Each has an
   in-suite reach check.
-- **Constant time**: `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh`, module row `musig2/sign`); the card's
-  `ct` entry names the current context count and what the remainder is.
+- **Constant time**: `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh`, module rows `musig2/sign` and `musig2/detsign`); the card's
+  `ct` entry names the current context count and what the remainder is. `detsign` taints the secret key and `rand` of
+  `deterministicSign` (194 contexts, 192 in the module's files, 2 the printing witness, 0 unattributed): the `sign` row's
+  classes (the mandatory self-verify and the scalar canonicality checks) plus the nonce derivation's `reduceToScalar`
+  canonicality compare (std, outcome never varies), the `isZero` verdict on each derived nonce (fail-closed, 2^-256)
+  and the re-parse of the published pubnonce and the other signers' nonce aggregate. No branch on the key or a
+  nonce other than a final verdict.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
 

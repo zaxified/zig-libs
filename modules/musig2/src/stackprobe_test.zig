@@ -271,3 +271,105 @@ test "STACKPROBE (audit 2026-10-08): no key or nonce residue on the dead stack a
         try std.testing.expectEqual(@as(usize, 0), sum);
     }
 }
+
+// ── deterministicSign ───────────────────────────────────────────
+
+var det_agg_other: [66]u8 = undefined;
+var det_rand: ?[32]u8 = null;
+var det_result: musig2.DeterministicSignResult = undefined;
+
+noinline fn callDeterministicSign() void {
+    const rand_ptr: ?*const [32]u8 = if (det_rand) |*r| r else null;
+    musig2.deterministicSign(&det_result, &probe_sk, &det_agg_other, &probe_pks, &.{}, msg, rand_ptr) catch unreachable;
+    std.mem.doNotOptimizeAway(&det_result);
+}
+
+/// The two nonces `deterministicSign` derives for `sk` (the recipe of BIP327 `DeterministicSign`, rebuilt from public pieces).
+fn detNonces(sk_prime: [32]u8, aggothernonce: [66]u8, aggpk: [32]u8) [2]Scalar {
+    var k: [2]Scalar = undefined;
+    for (&k, 0..) |*ki, i| {
+        var h = bip340.hash.taggedHasher(musig2.det_nonce_tag);
+        h.update(&sk_prime);
+        h.update(&aggothernonce);
+        h.update(&aggpk);
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, msg.len, .big);
+        h.update(&len_buf);
+        h.update(msg);
+        h.update(&[_]u8{@intCast(i)});
+        var wide: [48]u8 = @splat(0);
+        wide[16..48].* = h.finalResult();
+        ki.* = Scalar.fromBytes48(wide, .big);
+    }
+    return k;
+}
+
+test "STACKPROBE (w15-k): no key, masked key or derived-nonce residue on the dead stack after deterministicSign()" {
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
+    const partner_sk = @as([32]u8, @splat(0x6B));
+    const partner_pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(partner_sk, .big)).toCompressedSec1() };
+    // The other signer's published nonce pair: two fixed public points.
+    const r1 = try k256.Secp256k1.combMulBase(@as([32]u8, @splat(0x31)), .big);
+    const r2 = try k256.Secp256k1.combMulBase(@as([32]u8, @splat(0x32)), .big);
+    det_agg_other[0..33].* = r1.toCompressedSec1();
+    det_agg_other[33..66].* = r2.toCompressedSec1();
+
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |with_rand| {
+            probe_sk = try bip340.SecretKey.fromBytes(case.sk);
+            const pk = musig2.PlainPublicKey{ .bytes = (try k256.Secp256k1.combMulBase(case.sk, .big)).toCompressedSec1() };
+            probe_pks = .{ pk, partner_pk };
+            musig2.keySort(&probe_pks);
+            det_rand = if (with_rand) case.rand else null;
+            var sk_prime = case.sk;
+            if (with_rand) {
+                const aux = bip340.taggedHash(musig2.aux_tag, &case.rand);
+                for (&sk_prime, aux) |*b, a| b.* ^= a;
+            }
+            const agg = try musig2.keyAgg(&probe_pks);
+            const k = detNonces(sk_prime, det_agg_other, agg.getXonlyPubkey());
+            const d = try Scalar.fromBytes(case.sk, .big);
+            const sp = try Scalar.fromBytes(sk_prime, .big);
+            const parts = [_][3][32]u8{ three(d), three(d.neg()), three(sp), three(k[0]), three(k[0].neg()), three(k[1]), three(k[1].neg()) };
+            var needles: [7 * 3][32]u8 = undefined;
+            for (parts, 0..) |pt, i| needles[3 * i ..][0..3].* = pt;
+
+            cur_rand = case.rand;
+            leak_src = needles[0];
+            var scratch: [needles.len]usize = @splat(0);
+            measure(callInnocent);
+            var neg: usize = 0;
+            for (&needles, &scratch) |*nd, *h| {
+                const c = countIn(nd);
+                h.* += c;
+                neg += c;
+            }
+            measure(callLeaky);
+            const pos = countIn(&needles[0]);
+
+            var total: [needles.len]usize = @splat(0);
+            var sum: usize = 0;
+            resetDepths();
+            for (0..5) |_| {
+                measure(callDeterministicSign);
+                for (&needles, &total) |*nd, *h| {
+                    const c = countIn(nd);
+                    h.* += c;
+                    sum += c;
+                }
+            }
+            measure(callDeterministicSign);
+            const depth = dirtyDepth();
+            errdefer {
+                std.debug.print("\n=== STACKPROBE musig2 deterministicSign ({t}, rand={}) ===\n", .{ builtin.mode, with_rand });
+                std.debug.print("  key ..{x:0>2}: NEG={d} POS(d')={d} dirty below the call={d} B, hits {d}..{d} B\n", .{ case.sk[31], neg, pos, depth, hit_min_depth, hit_max_depth });
+                for (total, 0..) |h, i| {
+                    if (h != 0) std.debug.print("    RESIDUE needle {d} (d', n-d', masked, k1, -k1, k2, -k2 x3 images): {d} (5 calls)\n", .{ i, h });
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), neg);
+            try std.testing.expect(pos >= 1);
+            try std.testing.expectEqual(@as(usize, 0), sum);
+        }
+    }
+}

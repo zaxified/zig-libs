@@ -224,7 +224,7 @@ declare -A TARGETS=(
     # 74/90. That ratio is a property of the family, not of any one module, and
     # it is why these rows are pinned as bounds.
     [frost]="commit sign"
-    [musig2]="sign"
+    [musig2]="sign detsign"
     [taproot]="secret"
     [adaptor]="presign adapt extract"
     # ── rounds 5-7, 2026-09-09: the queue completes at 28 ──────────────────
@@ -641,6 +641,7 @@ declare -A PATTERN=(
     # (GLV splitScalar, findPubkeyIndex's mem.eql) -- without them those
     # contexts fall into `unattr`, which is always a --check failure.
     [musig2/sign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig|scalar[.]zig|mem[.]zig'
+    [musig2/detsign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig|scalar[.]zig|mem[.]zig'
     [taproot/secret]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
     [adaptor/presign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
     [adaptor/adapt]='root[.]zig|common[.]zig'
@@ -995,6 +996,7 @@ declare -A LABEL=(
     [frost/commit]='frost round1Commit+k256'
     [frost/sign]='frost round2Sign+k256'
     [musig2/sign]='musig2 sign (d,k1,k2)+bip340+k256'
+    [musig2/detsign]='musig2 deterministicSign (d,rand)+bip340+k256'
     [taproot/secret]='taproot tweakSecretKey+bip340+k256'
     [adaptor/presign]='adaptor preSign (sk+nonce)+bip340+k256'
     [adaptor/adapt]='adaptor adapt (t)'
