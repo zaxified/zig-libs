@@ -550,6 +550,13 @@ pub const Server = struct {
         return self.conn.isStarted();
     }
 
+    /// Stop data transfer on this connection without a frame: another connection
+    /// of its redundancy group took the activation over (`redundancy.Arbiter`).
+    /// What is queued stays queued and is sent if this connection starts again.
+    pub fn deactivate(self: *Server) void {
+        self.conn.deactivate();
+    }
+
     pub fn nextDeadline(self: *const Server) ?u64 {
         return self.conn.nextDeadline();
     }

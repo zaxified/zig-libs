@@ -232,6 +232,14 @@ pub const Connection = struct {
         self.state = .closed;
     }
 
+    /// Data transfer stops without a frame in either direction: the connection
+    /// was deactivated from outside (a redundancy group gave the activation to
+    /// another connection, `redundancy.zig`). The link stays up, the sequence
+    /// numbers and timers go on, and a `STARTDT act` starts data transfer again.
+    pub fn deactivate(self: *Connection) void {
+        if (self.state == .started) self.state = .stopped;
+    }
+
     fn resetLink(self: *Connection) void {
         self.send_seq = 0;
         self.ack_seq = 0;

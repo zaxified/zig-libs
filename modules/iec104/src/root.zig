@@ -93,6 +93,10 @@ pub const transport = @import("transport.zig");
 pub const client = @import("client.zig");
 /// A controlled station (outstation/RTU), and a complete peer built on it.
 pub const outstation = @import("outstation.zig");
+/// Redundancy groups of a controlled station: which connection is active.
+pub const redundancy = @import("redundancy.zig");
+/// The IEC 60870-5-101 serial link layer frame format FT1.2.
+pub const ft12 = @import("ft12.zig");
 /// Byte-exact goldens captured from third-party traffic.
 pub const goldens = @import("goldens.zig");
 
@@ -146,6 +150,8 @@ test {
     _ = client;
     _ = outstation;
     _ = goldens;
+    _ = redundancy;
+    _ = ft12;
     _ = @import("mutation_test.zig");
 }
 

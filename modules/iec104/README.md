@@ -150,10 +150,15 @@ deterministic fuzz sweeps over the APCI decoder, the stream framer, the ASDU
 decoder, `CP56Time2a` and the outstation's request handler. See SPEC.md for
 what is third-party-validated versus self-derived.
 
+## Redundancy and serial framing
+
+`redundancy.Arbiter` decides which of a controlled station's connections is active (one per redundancy group, the most
+recent `STARTDT` wins; groups by client address); `ft12` frames and splits IEC 60870-5-101 serial link frames (FT1.2).
+See SPEC *Redundancy groups and the serial link layer*.
+
 ## Not provided
 
-IEC 101 serial link layer, redundancy groups and file transfer (type ids
-120–127) are open (SPEC *Backlog / deferred*); typed parameter loading (the
+File transfer (type ids 120–127) is open (SPEC *Backlog / deferred*); typed parameter loading (the
 QPM/QPA qualifiers are raw octets, the outstation has no parameter store),
 `C_CD_NA_1` on the outstation and automatic background scan are limits (SPEC
 *Known limits*); TLS is bring-your-own and a few third-party quirks are
