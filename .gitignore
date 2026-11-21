@@ -52,3 +52,4 @@ tools/zstd-silesia/
 
 # Foreign test suite fetched by modules/xml/tools/xmlconf_fetch.sh (sha256-pinned; never committed or redistributed).
 modules/xml/tools/xmlconf-suite/
+tools/arrow-venv/

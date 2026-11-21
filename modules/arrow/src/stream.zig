@@ -935,6 +935,9 @@ const Reader = struct {
     /// Whether a non-delta DictionaryBatch may replace a dictionary: in a stream yes; the
     /// file format forbids it.
     replace: bool = false,
+    /// The schema says Big endian: every numeric buffer is swapped after it is read
+    /// (`swapBody`).
+    big: bool = false,
 
     /// Counts `n` array slots against `ReadOptions.max_cells`.
     fn charge(r: *Reader, n: u64) Error!void {
@@ -1233,8 +1236,60 @@ const Reader = struct {
         const rb = ipc.decodeRecordBatch(r.a, h, body.len) catch |e| return noEos(e);
         try r.checkBatch(rb, top.ctr, top.fields, top.need, true);
         var c = try r.prepare(rb, body, top.ctr, if (top.need) |n| n.bufs else null);
+        if (r.big) c.body = try r.swapBody(c, top.fields);
         c.seq = r.seq;
         return c;
+    }
+
+    /// A copy of a batch's (inflated) body with every numeric buffer of `fields` turned
+    /// from big endian to little: what Arrow C++, arrow-rs, Go and nanoarrow do on read.
+    /// Validity bitmaps, bytes, booleans and the variadic data of views have no byte order.
+    fn swapBody(r: *Reader, c: Chunk, fields: []const RField) Error![]const u8 {
+        const body = try r.a.dupe(u8, c.body);
+        for (fields) |*f| swapField(body, c.rb.buffers, f);
+        return body;
+    }
+
+    fn swapBuf(body: []u8, locs: []const ipc.BufferLoc, ix: usize, w: usize) void {
+        if (ix >= locs.len) return;
+        // `decodeRecordBatch` checked every location against the body.
+        const b = body[@intCast(locs[ix].offset)..][0..@intCast(locs[ix].length)];
+        var i: usize = 0;
+        while (i + w <= b.len) : (i += w) std.mem.reverse(u8, b[i..][0..w]);
+    }
+
+    fn swapField(body: []u8, locs: []const ipc.BufferLoc, rf: *const RField) void {
+        const d = rf.buf_ix + 1; // the data buffer, after the validity bitmap
+        switch (rf.kind) {
+            .null_, .i8, .u8, .bool_, .fsb, .fsl, .struct_, .ree => {},
+            .i16, .u16, .f16 => swapBuf(body, locs, d, 2),
+            .i32, .u32, .f32, .date32, .time32, .var32, .list32 => swapBuf(body, locs, d, 4),
+            .i64, .u64, .f64, .date64, .time64, .ts, .dur, .var64, .list64 => swapBuf(body, locs, d, 8),
+            .dec => swapBuf(body, locs, d, rf.dec_bits / 8),
+            .dict => swapBuf(body, locs, d, rf.index.bits / 8),
+            .lview32 => {
+                swapBuf(body, locs, d, 4);
+                swapBuf(body, locs, d + 1, 4);
+            },
+            .lview64 => {
+                swapBuf(body, locs, d, 8);
+                swapBuf(body, locs, d + 1, 8);
+            },
+            .view => if (d < locs.len) {
+                // 16-byte views: length, then the inline bytes (length <= 12) or a prefix,
+                // a buffer index and an offset.
+                const b = body[@intCast(locs[d].offset)..][0..@intCast(locs[d].length)];
+                var i: usize = 0;
+                while (i + 16 <= b.len) : (i += 16) {
+                    std.mem.reverse(u8, b[i..][0..4]);
+                    if (std.mem.readInt(u32, b[i..][0..4], .little) > 12) {
+                        std.mem.reverse(u8, b[i + 8 ..][0..4]);
+                        std.mem.reverse(u8, b[i + 12 ..][0..4]);
+                    }
+                }
+            },
+        }
+        for (rf.children) |*k| swapField(body, locs, k);
     }
 
     fn takeDict(r: *Reader, msg: schema.Message, body: []const u8) Error!void {
@@ -1264,6 +1319,7 @@ const Reader = struct {
         d.gens.items[d.gens.items.len - 1].len += n;
         if (!d.used) return;
         var c = try r.prepare(db.data, body, d.ctr, null);
+        if (r.big) c.body = try r.swapBody(c, (&d.value)[0..1]);
         c.seq = r.seq;
         try d.chunks.append(r.a, c);
     }
@@ -2347,6 +2403,7 @@ pub fn readStream(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!
     const first = ipc.readMessage(bytes, &pos) catch |e| return noEos(e); // no schema
     if (first.msg.header_type != .schema) return error.Malformed;
     const s = try schema.decodeSchema(arena, first.msg.header orelse return error.Malformed);
+    r.big = s.big_endian;
     const top = try r.planAll(s);
     if (opts.metadata) |m| m.* = try copyMetadata(arena, s, top.pick, &.{});
 
@@ -2414,6 +2471,7 @@ pub fn openFile(arena: Allocator, bytes: []const u8, opts: ReadOptions) Error!Fi
     try schema.checkVersion(try footer.scalar(schema.MetadataVersion, 0, .v1));
     var r: Reader = .{ .a = arena, .opts = opts };
     const s = try schema.decodeSchema(arena, try footer.table(1) orelse return error.Malformed);
+    r.big = s.big_endian;
     const top = try r.planAll(s);
     if (opts.metadata) |m| m.* = try copyMetadata(arena, s, top.pick, try schema.decodeKeyValues(arena, footer, 4));
 

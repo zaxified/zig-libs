@@ -64,4 +64,5 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("guards_test.zig");
     _ = @import("dict_test.zig");
+    _ = @import("sweep_test.zig");
 }

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; again after Map on read and the run-end metadata fold: 200k seeds in 35 s ReleaseSafe, clean, the Map golden reached; again after dictionary replacement and nested dictionaries: 200k seeds in 28 s ReleaseSafe, clean, the nested and shared dictionary goldens and a replacement stream reached; again after LZ4_FRAME and the dictionary-before-batch rule: 200k seeds in 19 s ReleaseSafe, clean, both LZ4 goldens and lz4-written streams in the corpus, the LZ4 stream and file goldens reached; again after the LZ4 level mapping and the ZSTD declared-0 rule: 200k seeds in 20 s ReleaseSafe, clean; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View, ListView, Map, nested and shared dictionary goldens, a dictionary replacement stream, LZ4 stream and file goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · ct n/a — parses and writes data files, holds no secret
 
-**Performance:** not measured
+**Performance:** ref 8.86–12.84× pyarrow 26.0.1 (`zig build bench-arrow`, 1 M rows Int64/Float64/Utf8, IPC stream of 65 536-row batches, wall time, single-threaded pyarrow, 3 rounds; `write` 12.84×, `read` into contiguous columns 8.86×: slower, spread 8–34% on a loaded machine) · fastest ? (measured 2026-11-21)
 
 **Known defects:** none recorded
 
@@ -57,8 +57,8 @@ arrow-rs and polars 2.x keep a map type of their own); the view types, RunEndEnc
 read but never written; LZ4_FRAME is written only at LZ4's fast levels (liblz4's
 levels 3..12, LZ4 HC, are refused: the `lz4` module has no HC); there is no
 zero-copy or memory-mapped read, no incremental reader or writer over `std.Io` (the input and the
-output are whole byte slices), no big-endian byte swap; the writer's output has not been read by a foreign Arrow
-implementation (its LZ4 buffer frames have, by the lz4 CLI and python-lz4) and no speed was measured.
+output are whole byte slices); the writer's output is read by pyarrow (`tools/interop.zig`, 12 files agree) and it is
+9-13x slower than pyarrow on a 1 M-row table (`tools/bench.zig`).
 
 ## What this module is, and what it is not
 
@@ -304,7 +304,7 @@ hostile shape with `fb.Builder` and reads it under a byte-capped allocator; `src
   its batch's variadic buffers or whose 4-byte prefix is not the data's start, and a list view's offset or size outside
   its batch's child are `error.Malformed` (see *View types and ListView*).
 - Refused on read (`Unsupported`): Interval, Union,
-  tensors, big-endian data. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
+  tensors. Every structural defect — a buffer shorter than its node, offsets running backwards or past the data, an
   index outside its dictionary, node or buffer counts not matching the schema, a column length not the batch's —
   is `error.Malformed`.
 
@@ -330,9 +330,10 @@ Stream and file read equal, each file batch has its JSON batch's length, and the
 (plain, zstd and lz4, stream and file) reads equal, its metadata too (in the frame's shape: a run-end encoded field's
 children are its values'). `interval` and `union` are asserted `Unsupported`, lossy
 or not. No integration golden replaces a dictionary (the integration JSON cannot express one), so replacement is
-anchored on the behaviour cited under "Dictionaries" and hand-built streams (`src/dict_test.zig`). The writer's bytes are anchored
-only through the reader (no foreign Arrow reader runs here); its LZ4 buffer frames were also decoded by the lz4 CLI
-and python-lz4 (see "LZ4_FRAME").
+anchored on the behaviour cited under "Dictionaries" and hand-built streams (`src/dict_test.zig`). The writer's bytes are anchored through
+the reader and through pyarrow (`tools/interop.zig`: twelve files, stream and file, uncompressed, ZSTD and LZ4_FRAME,
+one batch and several, every column type of the sample frame; `tools/check_ours.py` compares each column's Arrow type
+and values); its LZ4 buffer frames were also decoded by the lz4 CLI and python-lz4 (see "LZ4_FRAME").
 
 **Anchor grade:** class A · oracle EXTERNAL
 
@@ -373,7 +374,19 @@ reads one batch on its own.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it (schemata over `fb.zig`, `schema.zig`, `ipc.zig`, `stream.zig`; the coverage-guided
   `testing.fuzz` entry point is skipped in the mutation copy).
-- **Bench:** none; Performance is `not measured` (→ Backlog).
+- **Bench** (`zig build bench-arrow`, needs the pyarrow venv of `tools/interop.zig`'s header): `tools/bench.zig` against pyarrow 26.0.1
+  on a 1 M-row table (Int64 with a null in every 13th row, Float64, Utf8), IPC stream of 65 536-row batches, single-threaded,
+  alternating rounds, best of five: `write` 12.8x and `read` (chunks combined into contiguous columns, as a Frame holds them)
+  8.9x of pyarrow's time, spread 8-34% under a loaded machine; pyarrow's zero-copy `read_all` is 536x (information only).
+  Ours is slower; the card says so.
+- **Foreign reader over our bytes** (`zig build interop-arrow`, `tools/interop.zig` + `tools/check_ours.py`): the sample frame
+  written as stream and as file, uncompressed / ZSTD / LZ4_FRAME, one batch and three, 12 files, each read by pyarrow 26.0.1 and
+  compared column by column (Arrow type string and values); needs `python3 -m venv tools/arrow-venv && tools/arrow-venv/bin/pip install pyarrow`.
+- **Big endian** (`src/golden_test.zig`, `1.0.0-bigendian`): 18 sets and a refused one (Interval), the same data as the little-endian
+  sets stored big endian, read and compared with the same integration JSON.
+- **No-panic sweep** (`src/sweep_test.zig`): every reading entry point (`readStream`, `readFile`, `openFile` + `readBatch`) over every
+  single-byte damage (0x00, 0xff, 0x80) of the first 2 KB and last 512 bytes of 12 written inputs, checked and lossy, and every
+  prefix of four inputs. It is evidence for the reading half of the sweep, not the card's `panic` record (see Backlog).
 
 ## What is deliberately not done
 
@@ -392,9 +405,6 @@ reads one batch on its own.
 
 ## Open
 
-- The writer is anchored only through our own reader: no foreign implementation reads our bytes (a live pyarrow
-  round trip needs a venv + wheel — owner decision). Its LZ4 buffer frames have been decoded by the lz4 CLI and
-  python-lz4.
 - `openFile` reads the schema from the footer only; it does not compare it with the stream schema at offset 8.
 - RunEndEncoded requires `values.length == run_ends.length` per batch (Arrow C++ is believed to refuse only
   fewer values than runs). Relaxing it needs a per-batch values base in the run index, or another batch's
@@ -403,7 +413,6 @@ reads one batch on its own.
   differential oracle should carry one metadata case, footer included.
 - Compressed view batches (`prepare` splitting variadic buffers before an `inflate`) are tested only with
   raw-prefixed (-1) buffers: the writer never emits views and the `cpp-21.0.0` view goldens are uncompressed.
-- Performance is not measured (→ Backlog).
 
 ## Backlog / deferred
 
@@ -415,14 +424,17 @@ reads one batch on its own.
 - **Interval (YEAR_MONTH, DAY_TIME, MONTH_DAY_NANO).** No `dataframe` column; reading as an int or a struct would lose
   the type. Needs a column kind first.
 - **Incremental IO over `std.Io.Reader` / `std.Io.Writer`** (a batch-at-a-time reader, a `StreamWriter` that takes
-  frames as they are produced). The reader holds the whole input and the writer returns a `[]u8`; a streaming shape
-  changes `Reader` (it borrows `bytes` for dictionaries and footers) and needs dictionary-delta bookkeeping on the
-  writer. Own design wave; do it with a consumer that needs files larger than memory.
-- **Big-endian streams (byte swap on read).** C++, Go and nanoarrow convert; the producer is s390x-class hardware only
-  and the case is refused as `Unsupported`. Cheap but nobody on common hardware writes it.
-- **A foreign reader over our bytes.** The writer is anchored through our own reader only (pyarrow round trip, owner
-  decision, see Open).
-- **Performance.** Never measured; a bench against arrow-rs `arrow-ipc` and pyarrow (alternating sides, best of
-  several rounds, `tools/`) is the prerequisite for any `fastest` claim and for Performance leaving `not measured`.
-- **No-panic sweep** (CONVENTIONS §8) of every public entry point: not recorded; the card's Hardening line has no
-  `panic` item, which caps the Hardening axis.
+  frames as they are produced; Arrow C++, arrow-rs and Go all have one). Not a mechanical split of what is here: the
+  writer decides types from the whole frame (a Decimal128's precision is the widest value's, Large offsets start where
+  a frame's text reaches 2^31 bytes, a dictionary is the frame's), so a streaming writer needs the types declared up
+  front and a rule for a frame whose dictionary differs (a replacement batch, legal in a stream); the reader decodes
+  dictionaries after the last batch (`RDict.gens`), so a batch-at-a-time reader needs per-batch dictionary state and
+  must stop borrowing `bytes` for dictionaries and footers. Needs a decision on the declared-type API first.
+- **Performance.** The bench (`tools/bench.zig`) shows this module 9-13x behind pyarrow on write and on a materialising
+  read of a 1 M-row Int64/Float64/Utf8 table; a profile of `write` and `read` comes before any rewrite.
+- **No-panic sweep record** (CONVENTIONS section 8): the card's Hardening line has no `panic` item, which caps the Hardening
+  axis. Done toward it: the reading entry points over every single-byte damage (`src/sweep_test.zig`), the 350k-seed fuzz, and
+  the guards the decoder rests on (`ipc.decodeRecordBatch` refuses negative lengths and counts and buffers outside the body
+  before any cast; run ends are checked before they are sized). Missing for the record: an independent reviewer's pass over
+  the writer entry points on a caller-supplied frame (the class 2 questions: `array_width`, offsets and validity bitmaps of
+  hand-built storage) and over every `@intCast` / `.?` / `unreachable` on a consumer path.

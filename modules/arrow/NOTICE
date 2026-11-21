@@ -18,7 +18,9 @@ https://github.com/apache/arrow-testing at commit
 `data/arrow-ipc-stream/integration/`. The files are the Arrow integration
 "golden" files written by Arrow C++: an IPC stream (`.stream`), an IPC file
 (`.arrow_file`) and the Arrow integration JSON describing the same data
-(`.json.gz`). 91 files, 758 545 bytes in all:
+(`.json.gz`). 148 files, 1 337 631 bytes in all (91 files, 758 545 bytes
+fetched 2026-11-17; 57 files, 579 086 bytes added 2026-11-21 from the same
+commit, verified byte-identical against it):
 
   - `src/testdata/1.0.0-littleendian/` — from `1.0.0-littleendian/`:
       * all three files of `generated_<set>` for the sets custom_metadata,
@@ -32,6 +34,15 @@ https://github.com/apache/arrow-testing at commit
         `.arrow_file`, 256 KB, is not taken);
       * only the `.stream` of interval and union (sets whose types this
         module refuses; the test asserts the refusal).
+  - `src/testdata/1.0.0-bigendian/` — from `1.0.0-bigendian/` (taken
+    2026-11-21, same commit): all three files of `generated_<set>` for the
+    sets custom_metadata, datetime, dictionary, dictionary_unsigned,
+    duplicate_fieldnames, extension, map, map_non_canonical, nested,
+    nested_dictionary, nested_large_offsets, null, null_trivial, primitive,
+    primitive_large_offsets, primitive_no_batches, primitive_zerolength,
+    recursive_nested; `generated_decimal.stream` and `generated_decimal.json.gz`
+    (its `.arrow_file` is not taken); only the `.stream` of interval. The same
+    data as the little-endian sets, stored big endian.
   - `src/testdata/2.0.0-compression/` — from `2.0.0-compression/`: all three
     files of `generated_zstd`, `generated_uncompressible_zstd`,
     `generated_lz4` and `generated_uncompressible_lz4` (the lz4 sets'

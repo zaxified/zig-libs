@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const J = std.json.Value;
 
 const v1 = "testdata/1.0.0-littleendian/generated_";
+const vbe = "testdata/1.0.0-bigendian/generated_";
 const v2 = "testdata/2.0.0-compression/generated_";
 const c21 = "testdata/cpp-21.0.0/generated_";
 const v4 = "testdata/4.0.0-shareddict/generated_";
@@ -54,7 +55,35 @@ fn set(comptime dir: []const u8, comptime name: []const u8, comptime file: bool,
     };
 }
 
+/// The same data as the little-endian set of that name, written big endian
+/// (apache/arrow-testing `1.0.0-bigendian`): the reader swaps every numeric buffer, and
+/// the result must match the very same JSON.
+fn beSet(comptime name: []const u8, comptime file: bool, want: Want) Set {
+    var out = set(vbe, name, file, want);
+    out.name = "bigendian " ++ name;
+    return out;
+}
+
 const sets = [_]Set{
+    beSet("custom_metadata", true, .exact),
+    beSet("dictionary", true, .exact),
+    beSet("dictionary_unsigned", true, .exact),
+    beSet("duplicate_fieldnames", true, .exact),
+    beSet("extension", true, .exact),
+    beSet("nested", true, .exact),
+    beSet("nested_large_offsets", true, .exact),
+    beSet("null", true, .exact),
+    beSet("null_trivial", true, .exact),
+    beSet("primitive", true, .exact),
+    beSet("primitive_large_offsets", true, .exact),
+    beSet("primitive_no_batches", true, .exact),
+    beSet("primitive_zerolength", true, .exact),
+    beSet("recursive_nested", true, .exact),
+    beSet("map", true, .exact),
+    beSet("map_non_canonical", true, .exact),
+    beSet("nested_dictionary", true, .exact),
+    beSet("datetime", true, .lossy),
+    beSet("decimal", false, .lossy),
     set(v1, "custom_metadata", true, .exact),
     set(v1, "dictionary", true, .exact),
     set(v1, "dictionary_unsigned", true, .exact),
@@ -104,6 +133,7 @@ const sets = [_]Set{
 const refused = [_]struct { []const u8, []const u8 }{
     .{ "interval", @embedFile(v1 ++ "interval.stream") },
     .{ "union", @embedFile(v1 ++ "union.stream") },
+    .{ "bigendian interval", @embedFile(vbe ++ "interval.stream") },
 };
 
 fn gunzip(a: Allocator, gz: []const u8) ![]u8 {

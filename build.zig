@@ -323,7 +323,7 @@ pub const module_list = [_]Module{
     .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"datefmt"}, .test_deps = &.{"testkit"} },
     .{ .name = "indicators", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{ "datefmt", "csvstream", "regex", "tz", "unitext" }, .test_deps = &.{ "testkit", "encoding", "bzip2" } }, // columnar dataframe
-    .{ .name = "arrow", .libs = &.{"storage"}, .deps = &.{ "dataframe", "zstd", "lz4" }, .test_deps = &.{"testkit"} }, // Apache Arrow IPC over dataframe, ZSTD and LZ4_FRAME body compression
+    .{ .name = "arrow", .libs = &.{"storage"}, .deps = &.{ "dataframe", "zstd", "lz4" }, .test_deps = &.{"testkit"}, .interop_deps = &.{"benchkit"} }, // Apache Arrow IPC over dataframe, ZSTD and LZ4_FRAME body compression
     .{ .name = "filestore", .libs = &.{"storage"}, .deps = &.{"clock"}, .test_deps = &.{"testkit"} },
     .{ .name = "jsontext", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "unitext", .libs = &.{"format"}, .test_deps = &.{"testkit"} },

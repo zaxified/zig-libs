@@ -80,6 +80,9 @@ pub const Field = struct {
 pub const Schema = struct {
     fields: []const Field,
     metadata: []const KeyValue = &.{},
+    /// `Schema.endianness` is Big: the buffers of its record batches hold big-endian
+    /// numbers (the reader swaps them). Always false for what this module writes.
+    big_endian: bool = false,
 };
 
 // Union ids of `Type` in Schema.fbs.
@@ -147,9 +150,10 @@ const Decoder = struct {
 /// children cannot make the decoder do more work than its bytes could describe.
 pub fn decodeSchema(arena: std.mem.Allocator, t: fb.Table) Error!Schema {
     const endianness = try t.scalar(i16, 0, 0);
-    if (endianness != 0) return error.Unsupported; // big-endian data
+    if (endianness != 0 and endianness != 1) return error.Malformed; // Little = 0, Big = 1
     var d: Decoder = .{ .arena = arena, .left = budgetFor(t.buf.len) };
     return .{
+        .big_endian = endianness == 1,
         .fields = try decodeFields(&d, try t.vector(1), 0),
         .metadata = try decodeMetadata(&d, try t.vector(2)),
     };
@@ -623,18 +627,21 @@ test "decoder: the budget refuses exactly what it cannot pay" {
     try testing.expectError(error.Malformed, d.charge(1));
 }
 
-test "decoder: big-endian schemas, type parameters the format does not allow, absent type tables" {
+test "decoder: endianness, type parameters the format does not allow, absent type tables" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    {
+    for ([_]i16{ 0, 1, 2, -1 }) |endian| {
         var b = fb.Builder.init(testing.allocator);
         defer b.deinit();
         const empty = try b.createOffsetVector(&.{});
         b.startTable();
-        try b.addScalar(0, i16, 1, 0); // endianness Big
+        try b.addScalarForce(0, i16, endian); // 1 = Big
         try b.addOffset(1, empty);
         const buf = try b.finish(try b.endTable());
-        try testing.expectError(error.Unsupported, decodeSchema(arena_state.allocator(), try fb.root(buf)));
+        if (endian == 0 or endian == 1) {
+            const got = try decodeSchema(arena_state.allocator(), try fb.root(buf));
+            try testing.expectEqual(endian == 1, got.big_endian);
+        } else try testing.expectError(error.Malformed, decodeSchema(arena_state.allocator(), try fb.root(buf)));
     }
     const Bad = struct { id: u8, field: u16, value: i32 };
     for ([_]Bad{
