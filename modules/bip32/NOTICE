@@ -106,3 +106,14 @@ Implementation vs. test-data distinction: the BIP-32 derivation and the BIP-39
 mnemonic/seed code in this module are its own clean-room work from the public
 specifications, which needs no attribution per root `NOTICE` §0. What is
 reproduced, and only here, is the published VECTOR DATA.
+
+## BIP-39 wordlists — `src/wordlist.zig`, `src/wordlist_<language>.zig`
+
+The ten 2048-word lists are `bip-0039/<language>.txt` of the `bitcoin/bips` repository, transcribed
+verbatim and in order (the nine non-English ones by `tools/gen_wordlists.py`, which refuses a word
+that is not NFKD). BIP-39 is MIT-licensed (`License: MIT` in its header, authors Marek Palatinus,
+Pavol Rusnak, Aaron Voisine and Sean Bowe); the MIT text is reproduced above for the vectors.
+`src/bip39_lang_vectors.zig` holds no third-party data: it is computed by
+`tools/gen_bip39_lang_vectors.py` with Python's standard library, after the script has checked its
+algorithm against the official Japanese BIP-39 vectors (bip32JP/bip32JP.github.io
+`test_JP_BIP39.json`, which carries no licence and is therefore only read, never copied here).

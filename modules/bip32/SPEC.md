@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [btcsuite/btcd (`btcutil/hdkeychain`)](https://github.com/btcsuite/btcd/tree/master/btcutil) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | HD keychain with network params; BIP39 lives in third-party `go-bip39` (not surveyed). |
 | [vrischmann/zig-bip39, loftafi/bip39](https://github.com/loftafi/bip39) | Zig | MIT | 0–1 | 2022-12 / 2025-04 | Mnemonic-only Zig packages, one push each and little activity. Zig `std` has neither BIP32 nor BIP39. |
 
-**Where we are ahead:** BIP32 and BIP39 in one pure-Zig, allocation-free module with all five BIP32 vector sets and the Trezor BIP39 corpus; ctgrind-measured wordlist lookup (`wordIndex` is a masked linear scan) and wiped scratch buffers — rust-bip39/bitcoinjs make no such statement; SLIP-0132 prefixes (`ypub`/`zpub`/…) as a separate pair of calls. **Where we are behind:** English wordlist only and no NFKD normalisation of passphrase/mnemonic (both open, see *Backlog / deferred*), no WIF export here (WIF lives in the sibling `btcaddr` module).
+**Where we are ahead:** BIP32 and BIP39 in one pure-Zig, allocation-free module with all five BIP32 vector sets and the Trezor BIP39 corpus; all ten BIP-39 wordlists with NFKD-normalised mnemonic and passphrase (through the sibling `unitext`), ctgrind-measured wordlist lookup (`wordIndex` is a masked linear scan) and wiped scratch buffers — rust-bip39/bitcoinjs make no such statement; SLIP-0132 prefixes (`ypub`/`zpub`/…) as a separate pair of calls. **Where we are behind:** no WIF export here (WIF lives in the sibling `btcaddr` module).
 
 ## Design
 
@@ -272,14 +272,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `xpub` for watch-only use from a non-hardened branch, and later has any
   single descendant private key exposed, has exposed every private key
   under that `xpub`.
-- **Unicode normalization not implemented**: BIP-39 mandates NFKD
-  normalization of both the mnemonic and the passphrase before PBKDF2. The
-  English wordlist is pure ASCII, where NFKD is the identity — so this is a
-  no-op for every mnemonic this module itself produces and for any ASCII
-  passphrase. A caller mixing in non-ASCII passphrase text, or mnemonic text
-  sourced from elsewhere that isn't already NFKD-normalized, must
-  pre-normalize it themselves. Multi-language wordlists (BIP-39 defines ten)
-  are out of scope entirely — English only.
+- **NFKD is the caller's choice on the plain entry points.** `mnemonicToSeed` hashes the bytes it is given
+  (BIP-39 requires NFKD of mnemonic and passphrase first): for an ASCII mnemonic and passphrase, which is every
+  English mnemonic this module writes, that is the identity. `mnemonicToSeedNormalized` and `mnemonicToEntropyIn` /
+  `validateMnemonicIn` apply NFKD (`unitext`) first, need an allocator for the normalised copy (zeroized before it is
+  freed) and take any of the ten languages. ASCII text is copied without touching the normalisation tables;
+  **the tables are not constant-time**, so a non-ASCII passphrase or mnemonic leaks its characters to a cache
+  observer (the module's other secret handling is unchanged). The other nine wordlists are searched with the same
+  masked linear scan as English (`wordIndexT`), at the language's longest word length.
 - **`parsePath` is not a BIP-44 purpose-field validator** — see above.
 
 ## Verification
@@ -345,5 +345,4 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Backlog / deferred
 
-- **BIP39 wordlists for the nine other languages** (survey 2026-09-30) — a user with a Japanese, Spanish, … seed cannot restore it; rust-bip39 and bitcoinjs both ship them. Effort S per language (2048 words data each, machine-transcribed from `bitcoin/bips`, embedded). Fits §2.
-- **NFKD normalisation of mnemonic and passphrase (BIP39)** (survey 2026-09-30) — a non-ASCII passphrase silently derives a different seed than every other wallet; today the caller must pre-normalise (see Threat model). Needs Unicode NFKD tables (`rg -i 'nfkd|unicode'` over `README.md` catalog finds no sibling). Effort M (generated tables + tests). Fits §2 if the tables are generated Zig data.
+None open.

@@ -456,7 +456,7 @@ pub const module_list = [_]Module{
     .{ .name = "keycodec", .libs = &.{ "crypto", "web" }, .deps = &.{ "b64ct", "aescbc", "aes192" }, .test_deps = &.{ "testkit", "p521", "mlkem" } }, // PKCS#8/SEC1/PKCS#1/SPKI + PEM, type-agnostic
     .{ .name = "sha2", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"}, .test_deps = &.{"testkit"} },
-    .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" }, .test_deps = &.{"testkit"} },
+    .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32", "unitext" }, .test_deps = &.{"testkit"} },
     .{ .name = "btcaddr", .libs = &.{"crypto"}, .deps = &.{ "bech32", "ripemd160" }, .test_deps = &.{"testkit"} },
     .{ .name = "lms", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md

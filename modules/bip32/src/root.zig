@@ -85,7 +85,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant, // pure functions over caller-owned buffers; no shared state
     .model_after = "BIP-39 (Mnemonic code for generating deterministic keys) + BIP-32 (Hierarchical Deterministic Wallets), bitcoin/bips",
-    .deps = .{ "k256", "ripemd160", "bech32" },
+    .deps = .{ "k256", "ripemd160", "bech32", "unitext" },
 };
 
 // Dark-tests aggregator: a bare `pub const`/`@import` re-export does NOT

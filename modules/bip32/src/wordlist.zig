@@ -267,3 +267,64 @@ pub const english: [count][]const u8 = .{
     "wrap",     "wreck",    "wrestle",  "wrist",    "write",    "wrong",    "yard",     "year",
     "yellow",   "you",      "young",    "youth",    "zebra",    "zero",     "zone",     "zoo",
 };
+
+/// The ten BIP-39 languages (the `bitcoin/bips` `bip-0039/*.txt` files).
+pub const Language = enum {
+    english,
+    japanese,
+    spanish,
+    chinese_simplified,
+    chinese_traditional,
+    french,
+    italian,
+    korean,
+    czech,
+    portuguese,
+};
+
+const lists = struct {
+    const japanese = @import("wordlist_japanese.zig");
+    const spanish = @import("wordlist_spanish.zig");
+    const chinese_simplified = @import("wordlist_chinese_simplified.zig");
+    const chinese_traditional = @import("wordlist_chinese_traditional.zig");
+    const french = @import("wordlist_french.zig");
+    const italian = @import("wordlist_italian.zig");
+    const korean = @import("wordlist_korean.zig");
+    const czech = @import("wordlist_czech.zig");
+    const portuguese = @import("wordlist_portuguese.zig");
+};
+
+/// The 2048 words of `lang`, all in NFKD (BIP-39), in index order.
+pub fn table(comptime lang: Language) *const [count][]const u8 {
+    return switch (lang) {
+        .english => &english,
+        .japanese => &lists.japanese.words,
+        .spanish => &lists.spanish.words,
+        .chinese_simplified => &lists.chinese_simplified.words,
+        .chinese_traditional => &lists.chinese_traditional.words,
+        .french => &lists.french.words,
+        .italian => &lists.italian.words,
+        .korean => &lists.korean.words,
+        .czech => &lists.czech.words,
+        .portuguese => &lists.portuguese.words,
+    };
+}
+
+/// Longest word of `lang` in bytes (UTF-8, NFKD).
+pub fn maxWordLen(comptime lang: Language) usize {
+    return switch (lang) {
+        .english => 8,
+        .japanese => lists.japanese.max_word_len,
+        .spanish => lists.spanish.max_word_len,
+        .chinese_simplified => lists.chinese_simplified.max_word_len,
+        .chinese_traditional => lists.chinese_traditional.max_word_len,
+        .french => lists.french.max_word_len,
+        .italian => lists.italian.max_word_len,
+        .korean => lists.korean.max_word_len,
+        .czech => lists.czech.max_word_len,
+        .portuguese => lists.portuguese.max_word_len,
+    };
+}
+
+/// Longest word of any language.
+pub const max_word_len_any = 33;

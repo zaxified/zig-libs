@@ -1361,8 +1361,8 @@ opaque	ReleaseFast	serverke2	1	2	f6df055304ede5e6	4ef279b842b3cb55
 # derive run none of that: same counts (2 / 25), same contexts, digest only.
 bip32	ReleaseFast	master	1	2	b13e4a4f0823039c	7e14466ed98567fa
 bip32	ReleaseFast	derive	1	20	b13e4a4f0823039c	8b410bdbd3955f08
-bip32	ReleaseFast	seed	1	0	317acff51b37e9b1	9e74b23db4ad7bdc
-bip32	ReleaseFast	mnemonic	1	3	317acff51b37e9b1	d42db8cf9cdc2200
+bip32	ReleaseFast	seed	1	0	4c347baa4689cdcb	9e74b23db4ad7bdc
+bip32	ReleaseFast	mnemonic	1	3	4c347baa4689cdcb	d42db8cf9cdc2200
 # bip32 xprv, new 2026-10-18: the master scalar tainted through serializePriv
 # and back through parseExtended (PATTERN base58.zig|bip32.zig). Measured
 # before the switch, on the variable-time checkEncode/checkDecode: 12 in-file,

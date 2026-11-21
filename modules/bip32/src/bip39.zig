@@ -19,6 +19,9 @@
 
 const std = @import("std");
 const wordlist = @import("wordlist.zig");
+const unitext = @import("unitext");
+
+pub const Language = wordlist.Language;
 
 /// Entropy byte lengths BIP-39 defines (128/160/192/224/256 bits).
 pub const min_entropy_bytes = 16;
@@ -48,11 +51,20 @@ pub const Error = error{
 /// Writes the space-separated lowercase mnemonic into `out` (no allocation)
 /// and returns the written slice.
 pub fn entropyToMnemonic(entropy: []const u8, out: []u8) Error![]const u8 {
-    defer burnStack();
-    return entropyToMnemonicBody(entropy, out);
+    return entropyToMnemonicIn(.english, entropy, out);
 }
 
-noinline fn entropyToMnemonicBody(entropy: []const u8, out: []u8) Error![]const u8 {
+/// `entropyToMnemonic` in `lang`: the words are the NFKD forms of the
+/// official list, joined by `separator(lang)` (ASCII space, except the
+/// ideographic space U+3000 for Japanese, as BIP-39 displays it).
+pub fn entropyToMnemonicIn(lang: Language, entropy: []const u8, out: []u8) Error![]const u8 {
+    defer burnStack();
+    return switch (lang) {
+        inline else => |l| entropyToMnemonicBody(l, entropy, out),
+    };
+}
+
+noinline fn entropyToMnemonicBody(comptime lang: Language, entropy: []const u8, out: []u8) Error![]const u8 {
     switch (entropy.len) {
         16, 20, 24, 28, 32 => {},
         else => return error.InvalidEntropyLength,
@@ -69,11 +81,12 @@ noinline fn entropyToMnemonicBody(entropy: []const u8, out: []u8) Error![]const 
     var first = true;
     while (bit_pos < total_bits) : (bit_pos += 11) {
         const idx = readBits11(entropy, &checksum, ent_bits, bit_pos);
-        const word = wordlist.english[idx];
+        const word = wordlist.table(lang)[idx];
         if (!first) {
-            if (out_len >= out.len) return error.BufferTooSmall;
-            out[out_len] = ' ';
-            out_len += 1;
+            const sep = comptime separator(lang);
+            if (out.len - out_len < sep.len) return error.BufferTooSmall;
+            @memcpy(out[out_len..][0..sep.len], sep);
+            out_len += sep.len;
         }
         if (out_len + word.len > out.len) return error.BufferTooSmall;
         @memcpy(out[out_len..][0..word.len], word);
@@ -89,10 +102,10 @@ noinline fn entropyToMnemonicBody(entropy: []const u8, out: []u8) Error![]const 
 /// never a best-effort partial result.
 pub fn mnemonicToEntropy(mnemonic: []const u8, out: []u8) Error![]const u8 {
     defer burnStack();
-    return mnemonicToEntropyBody(mnemonic, out);
+    return mnemonicToEntropyBody(.english, mnemonic, out);
 }
 
-noinline fn mnemonicToEntropyBody(mnemonic: []const u8, out: []u8) Error![]const u8 {
+noinline fn mnemonicToEntropyBody(comptime lang: Language, mnemonic: []const u8, out: []u8) Error![]const u8 {
     var idxs: [max_words]u11 = undefined;
     var count: usize = 0;
     // `splitScalar`, not `tokenizeScalar`: tokenize silently collapses
@@ -109,7 +122,7 @@ noinline fn mnemonicToEntropyBody(mnemonic: []const u8, out: []u8) Error![]const
     var it = std.mem.splitScalar(u8, mnemonic, ' ');
     while (it.next()) |w| {
         if (count >= max_words) return error.InvalidWordCount;
-        idxs[count] = wordIndex(w) orelse return error.WordNotInList;
+        idxs[count] = wordIndexT(lang, w) orelse return error.WordNotInList;
         count += 1;
     }
     switch (count) {
@@ -170,10 +183,10 @@ noinline fn mnemonicToEntropyBody(mnemonic: []const u8, out: []u8) Error![]const
 /// returning the entropy.
 pub fn validateMnemonic(mnemonic: []const u8) Error!void {
     defer burnStack();
-    return validateMnemonicBody(mnemonic);
+    return validateMnemonicBody(.english, mnemonic);
 }
 
-noinline fn validateMnemonicBody(mnemonic: []const u8) Error!void {
+noinline fn validateMnemonicBody(comptime lang: Language, mnemonic: []const u8) Error!void {
     var buf: [max_entropy_bytes]u8 = undefined;
     // CONVENTIONS §2.1 Z1 / audit finding `bip32` H2: `buf` holds the
     // reconstructed BIP-39 entropy — the value the whole key tree is
@@ -183,7 +196,7 @@ noinline fn validateMnemonicBody(mnemonic: []const u8) Error!void {
     // derived bytes is wiped; this one was not. `defer` runs whether
     // `mnemonicToEntropy` succeeds or returns an error.
     defer std.crypto.secureZero(u8, &buf);
-    _ = try mnemonicToEntropyBody(mnemonic, &buf);
+    _ = try mnemonicToEntropyBody(lang, mnemonic, &buf);
 }
 
 /// Generous bound on the passphrase `mnemonicToSeed` accepts (real BIP-39
@@ -214,6 +227,88 @@ noinline fn mnemonicToSeedBody(mnemonic: []const u8, passphrase: []const u8, out
     // only two failure modes are structurally unreachable with these fixed
     // parameters.
     std.crypto.pwhash.pbkdf2(out, mnemonic, salt, 2048, std.crypto.auth.hmac.sha2.HmacSha512) catch unreachable;
+}
+
+// ── other languages and Unicode normalisation ────────────────────────────
+
+/// The word separator `entropyToMnemonicIn` writes: ASCII space, except for
+/// Japanese the ideographic space U+3000 (BIP-39). NFKD maps U+3000 to a
+/// space, so `mnemonicToEntropyIn` and `mnemonicToSeedNormalized` accept both.
+pub fn separator(lang: Language) []const u8 {
+    return if (lang == .japanese) "\u{3000}" else " ";
+}
+
+/// Upper bound of a rendered mnemonic in any language (24 words of at most
+/// 33 bytes, each followed by a 3-byte separator).
+pub const max_mnemonic_len_any = max_words * (wordlist.max_word_len_any + 3);
+
+pub const NormalizeError = error{
+    /// The text is not well-formed UTF-8 (NFKD is defined on text only).
+    InvalidUtf8,
+    OutOfMemory,
+    /// The normalized text is larger than the allocation cap allows.
+    TooLarge,
+};
+
+fn isAscii(s: []const u8) bool {
+    for (s) |c| if (c >= 0x80) return false;
+    return true;
+}
+
+/// `s` in Unicode NFKD (BIP-39 mandates it for the mnemonic and the
+/// passphrase), newly allocated; the caller zeroizes and frees it. ASCII text
+/// is its own NFKD and is copied without touching the normalisation tables.
+fn nfkd(allocator: std.mem.Allocator, s: []const u8) NormalizeError![]u8 {
+    if (isAscii(s)) return allocator.dupe(u8, s);
+    return unitext.normalize(allocator, s, .nfkd, .{}) catch |e| switch (e) {
+        error.InvalidUtf8 => error.InvalidUtf8,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.TooLarge,
+    };
+}
+
+/// `mnemonicToEntropy` for `lang`: `mnemonic` is NFKD-normalised first (so
+/// the Japanese ideographic space, and any composed form of an accented
+/// word, are accepted), then split on single spaces and matched against the
+/// language's wordlist exactly as the English path does. `allocator` holds
+/// only the normalised copy, zeroized before it is freed. Normalisation is
+/// not constant-time in non-ASCII text (SPEC threat model).
+pub fn mnemonicToEntropyIn(allocator: std.mem.Allocator, lang: Language, mnemonic: []const u8, out: []u8) (Error || NormalizeError)![]const u8 {
+    const norm = try nfkd(allocator, mnemonic);
+    defer {
+        std.crypto.secureZero(u8, norm);
+        allocator.free(norm);
+    }
+    defer burnStack();
+    return switch (lang) {
+        inline else => |l| mnemonicToEntropyBody(l, norm, out),
+    };
+}
+
+/// `validateMnemonic` for `lang` (see `mnemonicToEntropyIn`).
+pub fn validateMnemonicIn(allocator: std.mem.Allocator, lang: Language, mnemonic: []const u8) (Error || NormalizeError)!void {
+    var buf: [max_entropy_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    _ = try mnemonicToEntropyIn(allocator, lang, mnemonic, &buf);
+}
+
+/// `mnemonicToSeed` with BIP-39's mandatory NFKD applied to the mnemonic AND
+/// the passphrase (`mnemonicToSeed` itself hashes the bytes it is given). Any
+/// language; a non-ASCII passphrase now derives the seed every other wallet
+/// derives. The passphrase limit (`max_passphrase_len`) applies to the
+/// normalised bytes. Both normalised copies are zeroized before they are freed.
+pub fn mnemonicToSeedNormalized(allocator: std.mem.Allocator, mnemonic: []const u8, passphrase: []const u8, out: *[64]u8) (SeedError || NormalizeError)!void {
+    const m = try nfkd(allocator, mnemonic);
+    defer {
+        std.crypto.secureZero(u8, m);
+        allocator.free(m);
+    }
+    const p = try nfkd(allocator, passphrase);
+    defer {
+        std.crypto.secureZero(u8, p);
+        allocator.free(p);
+    }
+    return mnemonicToSeed(m, p, out);
 }
 
 // ── internal helpers ─────────────────────────────────────────────────────
@@ -284,18 +379,23 @@ const max_word_len = 8;
 /// the return value regardless of timing — same "verdict is public, the
 /// path to it is not" posture as the checksum-compare fix (M9).
 fn wordIndex(w: []const u8) ?u11 {
+    return wordIndexT(.english, w);
+}
+
+fn wordIndexT(comptime lang: Language, w: []const u8) ?u11 {
+    const lang_max = comptime wordlist.maxWordLen(lang);
     // `w` copied once into a fixed, zero-padded buffer so every candidate
     // is compared against the same `max_word_len` bytes. Bounding the copy
     // at `max_word_len` cannot misclassify a too-long `w` as a match: any
     // real wordlist entry has `word.len <= max_word_len`, so `cond` below
     // is false for a truncated `w` on the `word.len == w.len` term alone.
-    var wbuf = @as([max_word_len]u8, @splat(0));
-    const copy_len = @min(w.len, max_word_len);
+    var wbuf = @as([lang_max]u8, @splat(0));
+    const copy_len = @min(w.len, lang_max);
     @memcpy(wbuf[0..copy_len], w[0..copy_len]);
 
     var found_mask: u32 = 0;
     var result: u32 = 0;
-    for (wordlist.english, 0..) |word, i| {
+    for (wordlist.table(lang), 0..) |word, i| {
         var diff: u8 = 0;
         for (word, 0..) |b, j| diff |= b ^ wbuf[j];
         const cond = word.len == w.len and diff == 0;
@@ -553,4 +653,77 @@ test "mutation: a passphrase of exactly max_passphrase_len is accepted" {
     var want: [64]u8 = undefined;
     try std.crypto.pwhash.pbkdf2(&want, "abandon", "mnemonic" ++ pass, 2048, std.crypto.auth.hmac.sha2.HmacSha512);
     try testing.expectEqualSlices(u8, &want, &got);
+}
+
+// ── other languages (BIP-39 wordlists, NFKD) ─────────────────────────────
+
+const lang_vectors = @import("bip39_lang_vectors.zig");
+
+fn hexBytes(comptime n: usize, hex: []const u8) ![n]u8 {
+    var out: [n]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&out, hex);
+    return out;
+}
+
+test "every language list: 2048 distinct NFKD words, within max_word_len, every word found at its index" {
+    inline for (@typeInfo(Language).@"enum".field_names) |name| {
+        const lang = @field(Language, name);
+        const t = wordlist.table(lang);
+        var longest: usize = 0;
+        for (t, 0..) |w, i| {
+            try testing.expect(w.len > 0 and w.len <= wordlist.maxWordLen(lang));
+            longest = @max(longest, w.len);
+            try testing.expectEqual(@as(?u11, @intCast(i)), wordIndexT(lang, w));
+        }
+        try testing.expectEqual(wordlist.maxWordLen(lang), longest);
+        try testing.expect(wordIndexT(lang, "zzzz-not-a-word") == null);
+        try testing.expect(wordIndexT(lang, "") == null);
+        for (t, 0..) |w, i| for (t[i + 1 ..]) |v| try testing.expect(!std.mem.eql(u8, w, v));
+    }
+}
+
+test "cross-language vectors (independent Python implementation): mnemonic, entropy and seed" {
+    const a = testing.allocator;
+    for (lang_vectors.cross) |v| {
+        const lang = std.meta.stringToEnum(Language, v.language).?;
+        const ent_len = v.entropy.len / 2;
+        var ent_buf: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(ent_buf[0..ent_len], v.entropy);
+        var out: [max_mnemonic_len_any]u8 = undefined;
+        try testing.expectEqualStrings(v.mnemonic, try entropyToMnemonicIn(lang, ent_buf[0..ent_len], &out));
+        var got: [32]u8 = undefined;
+        try testing.expectEqualSlices(u8, ent_buf[0..ent_len], try mnemonicToEntropyIn(a, lang, v.mnemonic, &got));
+        // The composed spelling (original separators) is the same mnemonic after NFKD.
+        try testing.expectEqualSlices(u8, ent_buf[0..ent_len], try mnemonicToEntropyIn(a, lang, v.mnemonic_composed, &got));
+        var seed: [64]u8 = undefined;
+        const want = try hexBytes(64, v.seed);
+        try mnemonicToSeedNormalized(a, v.mnemonic, v.passphrase, &seed);
+        try testing.expectEqualSlices(u8, &want, &seed);
+        try mnemonicToSeedNormalized(a, v.mnemonic_composed, v.passphrase, &seed);
+        try testing.expectEqualSlices(u8, &want, &seed);
+    }
+}
+
+test "a language's mnemonic is refused by another language's list; errors are typed" {
+    const a = testing.allocator;
+    var out: [max_mnemonic_len_any]u8 = undefined;
+    const m = try entropyToMnemonicIn(.spanish, &@as([16]u8, @splat(0x42)), &out);
+    var got: [32]u8 = undefined;
+    try testing.expectError(error.WordNotInList, mnemonicToEntropyIn(a, .french, m, &got));
+    try testing.expectError(error.BufferTooSmall, entropyToMnemonicIn(.korean, &@as([16]u8, @splat(0x42)), out[0..20]));
+    try testing.expectError(error.InvalidUtf8, mnemonicToEntropyIn(a, .spanish, "\xff\xfe", &got));
+    var seed: [64]u8 = undefined;
+    try testing.expectError(error.InvalidUtf8, mnemonicToSeedNormalized(a, "abandon", "\xc0\xaf", &seed));
+    // 40 x U+FDFA is 120 bytes in UTF-8 but 18 code points (over 400 bytes) in NFKD.
+    var big: [120]u8 = undefined;
+    for (0..40) |i| big[i * 3 ..][0..3].* = "\u{FDFA}".*;
+    try testing.expectError(error.PassphraseTooLong, mnemonicToSeedNormalized(a, "abandon", &big, &seed));
+}
+
+test "ASCII text takes no detour: the normalised seed equals mnemonicToSeed" {
+    var s1: [64]u8 = undefined;
+    var s2: [64]u8 = undefined;
+    try mnemonicToSeed("abandon abandon about", "TREZOR", &s1);
+    try mnemonicToSeedNormalized(testing.allocator, "abandon abandon about", "TREZOR", &s2);
+    try testing.expectEqualSlices(u8, &s1, &s2);
 }
