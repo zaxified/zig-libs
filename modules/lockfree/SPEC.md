@@ -985,21 +985,25 @@ bench did not change it.
 - **`unprotected()` and guard-tied `Shared` pointers** — Zig has no lifetimes to
   tie them to (§4a.1).
 - **Detecting a double `release` of an inner guard** — no per-guard state (§4a.1).
+- **A lock-free hash map.** crossbeam (the reference) has none (`crossbeam-skiplist` is a separate ordered map); no consumer
+  needs keyed concurrent state. Reopen with one.
+- **Hazard-pointer reclamation.** crossbeam offers EBR only (§2 weighs the two); of the surveyed libraries only `ck` and
+  `folly` have hazard pointers. A consumer needing bounded per-node reclamation latency would add them beside `ebr.zig`
+  behind the same `Retired` callback shape.
+- **Per-worker deques with stealing in `workerpool`.** `workerpool`'s reference (a fire-and-forget pool) has one queue, and
+  rayon's stealing solves fork-join, a different problem; the `Deque` and `Injector` here are the parts a stealing pool
+  would be built from, and `workerpool`'s own SPEC tracks it.
 
 ## Backlog / deferred
 
-- **Lock-free hash map** (the third structure of the family) — a split-ordered or
-  open-addressing map over the same EBR domain. Deliberately not scaffolded; the
-  next increment once a consumer needs keyed concurrent state.
-- **Hazard-pointer reclamation** — the alternative to EBR for a consumer needing
-  bounded per-node reclamation latency (§2); would slot in beside `ebr.zig` behind
-  the same `Retired` callback shape.
-- **A litmus pair for `SegQueue`'s retire/scan shape** — the consumer's `read`
-  store → the scanner's acquire load is message passing, already shape 2; the
-  pending stack is a Treiber push plus swap-all. Effort: small-medium.
-- **Dynamic weak-memory stress on real ARM/RISC-V hardware** (§7).
-- **Per-worker deques with stealing in `workerpool`** — the pool still shares one
-  queue; this is its own change there.
+- **A litmus pair for `SegQueue`'s retire/scan shape** — blocked on tooling: `litmus/run.sh` needs `herd7`, which this
+  machine does not have (an OCaml + libgmp toolchain, not installable here without root). The encoding is settled: the
+  consumer's item copy then its `read` release store against the scanner's acquire load of `read` then the recycle
+  write (load buffering, bug = the copy sees the recycled value; control = a plain `read` store), and the `pending`
+  stack's release CAS push against the acquire swap-all then the load of `pending_next` (message passing, as
+  `msqueue-*`, with an RMW on the flag). Four files per shape (`aarch64`/`riscv` × `rel-acq`/`relaxed`) plus the
+  `run.sh` rows, each to be run for its verdict before it is committed.
+- **Dynamic weak-memory stress on real ARM/RISC-V hardware** (§7) — needs the hardware.
 
 ## Anchoring
 
