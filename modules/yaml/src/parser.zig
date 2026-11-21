@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const scanner = @import("scanner.zig");
+const encoding = @import("encoding.zig");
 
 const Scanner = scanner.Scanner;
 const Token = scanner.Token;
@@ -120,6 +121,10 @@ pub const Parser = struct {
 
     problem: []const u8 = "",
     problem_mark: Mark = .{},
+    /// Where the faulty construct began, when the scanner knew ("while
+    /// scanning a quoted scalar", its opening quote); empty otherwise.
+    context: []const u8 = "",
+    context_mark: Mark = .{},
 
     const Self = @This();
 
@@ -136,6 +141,12 @@ pub const Parser = struct {
     pub fn next(self: *Self) Error!?Event {
         if (!self.started) {
             self.arena = self.arena_state.allocator();
+            // UTF-16 and UTF-32 streams (§5.2) are read as the UTF-8 the scanner
+            // takes; marks then count bytes of that UTF-8 text.
+            self.src = encoding.toUtf8(self.arena, self.src, &self.problem) catch |e| {
+                self.done = true;
+                return e;
+            };
             self.scan = Scanner.init(self.arena, self.src);
             self.started = true;
         }
@@ -167,6 +178,8 @@ pub const Parser = struct {
             if (self.problem.len == 0) {
                 self.problem = self.scan.problem;
                 self.problem_mark = self.scan.problem_mark;
+                self.context = self.scan.context;
+                self.context_mark = self.scan.context_mark;
             }
             return e;
         };

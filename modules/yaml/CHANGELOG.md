@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — New: `Diagnostic` (`fromParser`, `write`: the problem, the source line with a caret, the construct's start) and `ComposeOptions.diagnostic`, which `compose`/`composeAll` fill on failure; `Parser.context` / `context_mark` (libyaml's fields: "while scanning a quoted scalar" and where that construct began, set for quoted, plain and block scalars, anchors, aliases, tags and directives). Behaviour change: UTF-16 and UTF-32 streams (YAML 1.2 §5.2, by byte order mark or by the NUL pattern of the first ASCII character) are converted to UTF-8 by the `Parser` and parsed; they were `error.InvalidYaml`. A stream whose UTF-16/UTF-32 is malformed (lone surrogate, cut unit, scalar above U+10FFFF) is `InvalidYaml` with a `problem`. `Mark.index` of such a stream counts bytes of the converted text.
 - **2026-11-20** — New `ComposeOptions.schema` (`Schema`: `.core` default, `.json`, `.failsafe`, YAML 1.2 §10) selects how an untagged plain scalar is resolved; the default is the old behaviour.
 - **2026-11-16** — Explicit `!!set` (mapping, all values null) and `!!omap` (sequence of single-pair mappings, no repeated key) are validated; malformed is `error.BadTaggedScalar`. The composed value is unchanged (mapping / sequence). **Behaviour change:** these tags with a wrong shape used to load silently.
 - **2026-11-16** — `!!binary` keeps its base64 text as the `.string` value (validated on load), as yaml-test-suite 565N

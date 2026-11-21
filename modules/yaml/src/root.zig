@@ -89,6 +89,9 @@ pub const Event = parser.Event;
 pub const ScalarStyle = parser.ScalarStyle;
 pub const CollectionStyle = parser.CollectionStyle;
 pub const Mark = parser.Mark;
+/// Where a malformed stream went wrong, for a caret diagnostic: filled by
+/// `ComposeOptions.diagnostic`, or built from a `Parser` after an error.
+pub const Diagnostic = @import("diagnostic.zig").Diagnostic;
 
 /// `error.InvalidYaml` for every malformed input; `Parser.problem` /
 /// `Parser.problem_mark` carry the human-readable detail.
@@ -154,6 +157,8 @@ test {
     _ = parser;
     _ = events;
     _ = compose_mod;
+    _ = @import("diagnostic.zig");
+    _ = @import("encoding.zig");
     _ = @import("suite_test.zig");
     _ = emit;
     _ = typed;

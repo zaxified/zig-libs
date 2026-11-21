@@ -52,7 +52,7 @@ documents. Also an emitter (its output composes back to every suite `in.json`, a
 to the same JSON), typed mapping onto Zig structs, and opt-in `<<` merge keys checked against PyYAML. **Where we are
 behind:** the emitter writes one style (block, double-quoted scalars) — no style
 round trip, no comments; the core schema by default (`Options.schema` selects the JSON or failsafe schema of §10; an explicit `!!binary` / `!!timestamp` is validated and kept as text, `!!set` / `!!omap` are validated and keep their mapping / sequence value); integers outside
-`i64` stay strings (*What is deliberately not done*); UTF-8 input only; error marks are best-effort.
+`i64` stay strings (*What is deliberately not done*); UTF-8, UTF-16 and UTF-32 input (converted up front); errors carry libyaml's four fields (`problem`, `problem_mark`, `context`, `context_mark`).
 
 ## 1. Why the stages are separate
 
@@ -475,14 +475,6 @@ Both are 1.1 parsers so most divergence is expected-and-bucketed, not a module d
 
 ## Backlog / deferred
 
-- **`problem` / `problem_mark` are best-effort.** The first error wins, and marks
-  point at the scanner cursor rather than always at the offending construct's
-  start. Good enough to debug with, not yet good enough to render a caret
-  diagnostic against.
-- **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; this module reads
-  UTF-8 only. A leading UTF-16/UTF-32 BOM is rejected (`error.InvalidYaml`,
-  `Scanner.fetchStreamStart`) rather than silently misread as content. Decoding the other
-  encodings is not done.
 - **Comment-preserving round trip.** eemeli/yaml, goccy/go-yaml and go-yaml keep comments for edit-in-place tools. Needs
   comment tokens through scanner, parser and `Value`, plus an emitter: a large change for tools no consumer has. Effort:
   large. Low priority.

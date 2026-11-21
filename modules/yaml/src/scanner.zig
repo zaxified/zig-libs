@@ -146,6 +146,14 @@ pub const Scanner = struct {
 
     problem: []const u8 = "",
     problem_mark: Mark = .{},
+    /// What was being scanned when the problem arose ("while scanning a
+    /// quoted scalar"; empty when none of the constructs below was) and where
+    /// that construct began: libyaml's `context` / `context_mark`. Together with
+    /// `problem_mark` they bracket the fault for a caret diagnostic.
+    context: []const u8 = "",
+    context_mark: Mark = .{},
+    /// The construct being scanned, for `context`.
+    ctx: ?struct { what: []const u8, mark: Mark } = null,
 
     const Self = @This();
 
@@ -157,6 +165,7 @@ pub const Scanner = struct {
         if (self.problem.len == 0) {
             self.problem = msg;
             self.problem_mark = self.mark();
+            self.recordContext();
         }
         return error.InvalidYaml;
     }
@@ -165,8 +174,16 @@ pub const Scanner = struct {
         if (self.problem.len == 0) {
             self.problem = msg;
             self.problem_mark = m;
+            self.recordContext();
         }
         return error.InvalidYaml;
+    }
+
+    fn recordContext(self: *Self) void {
+        if (self.ctx) |c| {
+            self.context = c.what;
+            self.context_mark = c.mark;
+        }
     }
 
     // ── character-level helpers ─────────────────────────────────────────────
@@ -873,6 +890,8 @@ pub const Scanner = struct {
 
     fn scanDirective(self: *Self) Error!Token {
         const start = self.mark();
+        self.ctx = .{ .what = "while scanning a directive", .mark = start };
+        defer self.ctx = null;
         self.skip(); // '%'
         const name = try self.scanDirectiveName();
         var tok: Token = undefined;
@@ -937,6 +956,8 @@ pub const Scanner = struct {
 
     fn scanAnchor(self: *Self, kind: TokenKind) Error!Token {
         const start = self.mark();
+        self.ctx = .{ .what = if (kind == .alias) "while scanning an alias" else "while scanning an anchor", .mark = start };
+        defer self.ctx = null;
         self.skip(); // '&' or '*'
         const s = self.pos;
         // ns-anchor-char = ns-char − c-flow-indicator
@@ -955,6 +976,8 @@ pub const Scanner = struct {
 
     fn scanTag(self: *Self) Error!Token {
         const start = self.mark();
+        self.ctx = .{ .what = "while scanning a tag", .mark = start };
+        defer self.ctx = null;
         var handle: []const u8 = "";
         var suffix: []const u8 = "";
 
@@ -1047,6 +1070,8 @@ pub const Scanner = struct {
     fn scanBlockScalar(self: *Self, style: ScalarStyle) Error!Token {
         const literal = style == .literal;
         const start = self.mark();
+        self.ctx = .{ .what = "while scanning a block scalar", .mark = start };
+        defer self.ctx = null;
         self.skip(); // '|' or '>'
 
         // Header: an optional explicit indentation digit and chomping sign, in
@@ -1211,6 +1236,8 @@ pub const Scanner = struct {
     fn scanFlowScalar(self: *Self, style: ScalarStyle) Error!Token {
         const single = style == .single_quoted;
         const start = self.mark();
+        self.ctx = .{ .what = "while scanning a quoted scalar", .mark = start };
+        defer self.ctx = null;
         self.skip(); // opening quote
 
         var out: std.ArrayList(u8) = .empty;
@@ -1368,6 +1395,8 @@ pub const Scanner = struct {
 
     fn scanPlainScalar(self: *Self) Error!Token {
         const start = self.mark();
+        self.ctx = .{ .what = "while scanning a plain scalar", .mark = start };
+        defer self.ctx = null;
         var end = start;
         const indent: i64 = self.indent + 1;
 

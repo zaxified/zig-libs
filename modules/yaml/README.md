@@ -62,7 +62,10 @@ while (try p.next()) |ev| switch (ev) {
     .scalar => |s| std.debug.print("scalar {s}\n", .{s.value}),
     else => {},
 };
-// On error.InvalidYaml, p.problem / p.problem_mark carry the detail.
+// On error.InvalidYaml, p.problem / p.problem_mark carry the detail; p.context / p.context_mark
+// name the construct being scanned and where it began (libyaml's four fields). For a message with the
+// source line and a caret: `yaml.Diagnostic.fromParser(&p, err).write(w, source)`, or pass
+// `.diagnostic = &d` in `ComposeOptions` to `compose`/`composeAll`.
 
 // Or render the whole stream in yaml-test-suite `test.event` form:
 const text = try yaml.dumpEvents(gpa, source);
@@ -150,8 +153,8 @@ suite's documents, so nothing of yaml-test-suite is vendored here.
 The core schema is the default (`ComposeOptions.schema = .json` / `.failsafe` select the other two of §10: JSON resolves only `null`, `true`/`false` and JSON-shaped numbers, failsafe keeps every plain scalar a string; an explicit `!!binary`, `!!timestamp`, `!!set`
 or `!!omap` is validated and kept as text or as its mapping / sequence value, malformed is `error.BadTaggedScalar`:
 `yaml.decodeBinary` returns a `!!binary` scalar's bytes, `yaml.parseTimestamp` a `!!timestamp`'s fields). Integers
-outside `i64` stay strings holding their exact text (SPEC.md §9). Input is UTF-8 only: a UTF-16/UTF-32 BOM is
-rejected. The emitter writes one style and no comments. See SPEC.md *What is deliberately not done* and
+outside `i64` stay strings holding their exact text (SPEC.md §9). Input may be UTF-8, UTF-16 or UTF-32 (a byte order mark or the
+NUL pattern of §5.2 tells; converted to UTF-8 before scanning, so marks count bytes of that text). The emitter writes one style and no comments. See SPEC.md *What is deliberately not done* and
 *Backlog / deferred*.
 
 ## Verification

@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const parser = @import("parser.zig");
+const Diagnostic = @import("diagnostic.zig").Diagnostic;
 
 const Event = parser.Event;
 
@@ -356,6 +357,10 @@ pub const Options = struct {
     /// with a producer that emits them on purpose) than have the parse fail
     /// out from under it.
     reject_duplicate_keys: bool = true,
+    /// Filled when the stream is malformed (`error.InvalidYaml`) or another
+    /// error ends the composing: what went wrong and where, for
+    /// `Diagnostic.write`. Left untouched on success.
+    diagnostic: ?*Diagnostic = null,
     /// Resolve YAML 1.1 merge keys (yaml.org/type/merge.html): a plain,
     /// untagged `<<` (or one tagged `!!merge`) whose value is a mapping, or a
     /// sequence of mappings, contributes their pairs to the enclosing
@@ -507,6 +512,7 @@ pub fn composeAllLeaky(alloc: std.mem.Allocator, source: []const u8, options: Op
 
     var c: Composer = .{ .alloc = a, .p = &p, .options = options };
     return c.run() catch |e| {
+        if (options.diagnostic) |d| d.* = Diagnostic.fromParser(&p, e);
         // An allocation the budget refused surfaces as whatever the failing
         // layer made of it; name the real cause.
         if (budget.exceeded) return error.HeapBudgetExceeded;
@@ -1558,20 +1564,32 @@ test "F4/F11 (A1/yaml.md): an invalid UTF-8 lead byte (0xF5-0xFF) fails the stre
     try testing.expectEqualStrings("v", r.root.mapping[0].value.string);
 }
 
-test "F6 (A1/yaml.md): a UTF-16/UTF-32 BOM is rejected, not silently folded into one scalar" {
-    // YAML 1.2 §5.2 lets a leading BOM select an encoding other than UTF-8,
-    // but this module only ever reads UTF-8. Before this fix, a non-UTF-8
-    // BOM was not recognised as a BOM at all: it read as ordinary (mostly
-    // NUL-interleaved) content, and the whole document folded into one
-    // nonsense scalar -- `doc.get("enabled")` on the wrong root silently
-    // returns `null`, indistinguishable from a caller's own missing-key
-    // default. A BOM anywhere but the very start of the stream was already
-    // rejected (see the sibling `anchors do not cross documents`-style
-    // tests above); this closes the one spot that was not covered.
-    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\xff\xfea\x00:\x00 \x001\x00\n\x00", .{}));
-    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\xfe\xff\x00a\x00:\x00 \x001", .{}));
-    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\x00\x00\xfe\xff\x00\x00\x00a", .{}));
-    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\xff\xfe\x00\x00a\x00\x00\x00", .{}));
+test "UTF-16 and UTF-32 streams (YAML 1.2 §5.2) read as the UTF-8 they spell; a broken one is refused" {
+    // F6 (A1 audit): these used to fold into one NUL-riddled scalar, then were
+    // refused; the encoding is now converted up front. With a byte order mark,
+    // and (spec table) without one.
+    const docs = [_][]const u8{
+        "\xff\xfea\x00:\x00 \x001\x00\n\x00", // UTF-16LE, mark
+        "\xfe\xff\x00a\x00:\x00 \x001\x00\n", // UTF-16BE, mark
+        "\x00\x00\xfe\xff\x00\x00\x00a\x00\x00\x00:\x00\x00\x00 \x00\x00\x001\x00\x00\x00\n", // UTF-32BE, mark
+        "\xff\xfe\x00\x00a\x00\x00\x00:\x00\x00\x00 \x00\x00\x001\x00\x00\x00\n\x00\x00\x00", // UTF-32LE, mark
+        "a\x00:\x00 \x001\x00\n\x00", // UTF-16LE, no mark
+        "\x00a\x00:\x00 \x001\x00\n", // UTF-16BE, no mark
+    };
+    for (docs) |d| {
+        const r = try compose(testing.allocator, d, .{});
+        defer r.deinit();
+        try testing.expectEqual(@as(i64, 1), r.root.get("a").?.int);
+    }
+    // A non-ASCII key and an astral character survive the conversion.
+    const r2 = try compose(testing.allocator, "\xff\xfe\xe9\x00:\x00 \x00\x3d\xd8\x00\xde\n\x00", .{});
+    defer r2.deinit();
+    try testing.expectEqualStrings("\xf0\x9f\x98\x80", r2.root.get("\xc3\xa9").?.string);
+    // A lone surrogate, and a cut code unit, are InvalidYaml with a reason.
+    var d: Diagnostic = .{};
+    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\xff\xfea\x00\x3d\xd8", .{ .diagnostic = &d }));
+    try testing.expect(std.mem.indexOf(u8, d.problem, "surrogate") != null);
+    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\xff\xfea\x00:", .{}));
     // Control: the UTF-8 BOM this module has always handled still works.
     const r = try compose(testing.allocator, "\xef\xbb\xbfa: 1\n", .{});
     defer r.deinit();
