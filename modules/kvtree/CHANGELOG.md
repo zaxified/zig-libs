@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** `Txn.get` / `getRef`, `Bucket.get` and the bucket lookups find a key's latest buffered change through a lazily built hash index once a tree holds more than 16 buffered changes (was a scan of all of them: n puts then n gets in one transaction was O(n²)). Same answers; the index is scratch and an allocation failure falls back to the scan.
+
 
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `Prng.next` (duplicate-code pass) runs `std.Random.SplitMix64` (same constants, same sequence); a known-answer test pins the stream.
 - **2026-10-29** — **Fix:** `Bucket.bucket` / `Txn.bucket` under a bucket at the deepest legal level (`max_bucket_depth` = 16) returned `error.Corrupt` for every name, even a missing one or a plain key, on a healthy file: the sweep's depth check (KT-4) ran before the lookup. It now runs only when a nested bucket is found there (which only rot can make) and a miss is `null`. Found by the delta audit. Test.

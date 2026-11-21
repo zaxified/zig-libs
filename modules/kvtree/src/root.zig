@@ -453,7 +453,7 @@ pub const Db = struct {
         return .{
             .db = self,
             .base = self.meta_rec,
-            .changes = .empty,
+            .changes = .{},
             .arena = std.heap.ArenaAllocator.init(self.gpa),
             .buckets = .empty,
         };
@@ -550,11 +550,72 @@ pub const LockPolicy = enum {
 
 // ── Txn ──────────────────────────────────────────────────────────────────────
 
+/// A transaction's buffered puts and deletes of one tree, in call order, with a
+/// lazily built index of the latest change per key: a lookup in a log of more
+/// than `linear_max` entries goes through it (n puts then n gets in one
+/// transaction is O(n), not O(n^2)); a short log is scanned from the end, as
+/// before. Keys are slices into the transaction's arena. The index is plain
+/// scratch: an allocation failure while building it falls back to the scan.
+const ChangeLog = struct {
+    list: std.ArrayList(core.Change) = .empty,
+    /// key -> position in `list` of its LATEST change, for `list[0..indexed]`.
+    index: std.StringHashMapUnmanaged(usize) = .empty,
+    indexed: usize = 0,
+
+    const linear_max = 16;
+
+    fn append(self: *ChangeLog, gpa: Allocator, c: core.Change) Allocator.Error!void {
+        try self.list.append(gpa, c);
+    }
+
+    fn clearRetainingCapacity(self: *ChangeLog) void {
+        self.list.clearRetainingCapacity();
+        self.index.clearRetainingCapacity();
+        self.indexed = 0;
+    }
+
+    fn deinit(self: *ChangeLog, gpa: Allocator) void {
+        self.list.deinit(gpa);
+        self.index.deinit(gpa);
+    }
+
+    fn keyOf(c: core.Change) []const u8 {
+        return switch (c) {
+            .put => |p| p.key,
+            .del => |k| k,
+        };
+    }
+
+    /// The latest buffered change of `key`, or null. The pointer is good until
+    /// the next `append`.
+    fn latest(self: *ChangeLog, gpa: Allocator, key: []const u8) ?*const core.Change {
+        const items = self.list.items;
+        if (items.len > linear_max and self.syncIndex(gpa)) {
+            const i = self.index.get(key) orelse return null;
+            return &items[i];
+        }
+        var i = items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, keyOf(items[i]), key)) return &items[i];
+        }
+        return null;
+    }
+
+    /// Bring the index up to `list.len`; false when it could not (out of memory).
+    fn syncIndex(self: *ChangeLog, gpa: Allocator) bool {
+        while (self.indexed < self.list.items.len) : (self.indexed += 1) {
+            self.index.put(gpa, keyOf(self.list.items[self.indexed]), self.indexed) catch return false;
+        }
+        return true;
+    }
+};
+
 pub const Txn = struct {
     db: *Db,
     base: format.Meta,
     /// Buffered mutations (last-writer-wins per key is resolved at commit).
-    changes: std.ArrayList(core.Change),
+    changes: ChangeLog,
     /// Owns the buffered keys/values until commit or rollback.
     arena: std.heap.ArenaAllocator,
     /// Every bucket this transaction has opened, created or deleted; a
@@ -581,14 +642,10 @@ pub const Txn = struct {
     /// Read within the transaction: buffered changes shadow the base tree.
     pub fn get(self: *Txn, gpa: Allocator, key: []const u8) GetError!?[]u8 {
         // Latest buffered change for this key wins.
-        var i: usize = self.changes.items.len;
-        while (i > 0) {
-            i -= 1;
-            switch (self.changes.items[i]) {
-                .put => |p| if (std.mem.eql(u8, p.key, key)) return try gpa.dupe(u8, p.val),
-                .del => |k| if (std.mem.eql(u8, k, key)) return null,
-            }
-        }
+        if (self.changes.latest(self.db.gpa, key)) |c| switch (c.*) {
+            .put => |p| return try gpa.dupe(u8, p.val),
+            .del => return null,
+        };
         return lookup(&self.db.pager, self.base.root, gpa, key);
     }
 
@@ -600,15 +657,10 @@ pub const Txn = struct {
     /// whether a call borrows never depends on what the batch holds.
     pub fn getRef(self: *Txn, key: []const u8) GetRefError!?ValueRef {
         if (!self.db.pager.store.canLend()) return error.CannotLend;
-        var i: usize = self.changes.items.len;
-        while (i > 0) {
-            i -= 1;
-            switch (self.changes.items[i]) {
-                .put => |p| if (std.mem.eql(u8, p.key, key))
-                    return .{ .bytes = p.val, .pager = &self.db.pager, .ref = null },
-                .del => |k| if (std.mem.eql(u8, k, key)) return null,
-            }
-        }
+        if (self.changes.latest(self.db.gpa, key)) |c| switch (c.*) {
+            .put => |p| return .{ .bytes = p.val, .pager = &self.db.pager, .ref = null },
+            .del => return null,
+        };
         return lookupRef(&self.db.pager, self.base.root, key);
     }
 
@@ -680,7 +732,7 @@ pub const Txn = struct {
 
     /// The tree a parent's buffered work goes to: the store's own (`root_parent`)
     /// or a bucket's.
-    fn changesOf(self: *Txn, parent: u32) *std.ArrayList(core.Change) {
+    fn changesOf(self: *Txn, parent: u32) *ChangeLog {
         return if (parent == root_parent) &self.changes else &self.buckets.items[parent].changes;
     }
 
@@ -711,14 +763,7 @@ pub const Txn = struct {
 
     /// Did this transaction buffer a plain put or delete of `key` in `parent`?
     fn hasPlainChange(self: *Txn, parent: u32, key: []const u8) bool {
-        for (self.changesOf(parent).items) |c| {
-            const k = switch (c) {
-                .put => |p| p.key,
-                .del => |d| d,
-            };
-            if (std.mem.eql(u8, k, key)) return true;
-        }
-        return false;
+        return self.changesOf(parent).latest(self.db.gpa, key) != null;
     }
 
     fn addState(self: *Txn, parent: u32, name: []const u8, base_root: ?PageId, seq: u64) BucketError!u32 {
@@ -729,7 +774,7 @@ pub const Txn = struct {
             .base_root = base_root,
             .base_seq = seq,
             .seq = seq,
-            .changes = .empty,
+            .changes = .{},
         });
         return @intCast(self.buckets.items.len - 1);
     }
@@ -844,7 +889,7 @@ pub const Txn = struct {
                 .keep = .{ .base_root = b.base_root, .seq = b.seq, .tree = sub_tree },
             });
         }
-        return .{ .changes = self.changesOf(parent).items, .subs = subs.items };
+        return .{ .changes = self.changesOf(parent).list.items, .subs = subs.items };
     }
 };
 
@@ -870,7 +915,7 @@ const BucketState = struct {
     /// A bucket above it was deleted: gone for good, invisible to lookups.
     dead: bool = false,
     /// Its buffered puts and deletes.
-    changes: std.ArrayList(core.Change),
+    changes: ChangeLog,
 };
 
 /// A bucket inside a read-write `Txn` (bbolt's `*Bucket` in an `Update`): a
@@ -908,14 +953,10 @@ pub const Bucket = struct {
     /// absent or a bucket.
     pub fn get(self: Bucket, gpa: Allocator, key: []const u8) BucketError!?[]u8 {
         const st = try self.state();
-        var i: usize = st.changes.items.len;
-        while (i > 0) {
-            i -= 1;
-            switch (st.changes.items[i]) {
-                .put => |p| if (std.mem.eql(u8, p.key, key)) return try gpa.dupe(u8, p.val),
-                .del => |k| if (std.mem.eql(u8, k, key)) return null,
-            }
-        }
+        if (st.changes.latest(self.txn.db.gpa, key)) |c| switch (c.*) {
+            .put => |p| return try gpa.dupe(u8, p.val),
+            .del => return null,
+        };
         const root = st.base_root orelse return null;
         return lookup(&self.txn.db.pager, root, gpa, key);
     }
@@ -2291,6 +2332,86 @@ test "retention on a forward-moving key range keeps the file bounded (emptied le
     while (try cur.next()) |e| : (want += 1)
         try testing.expectEqual(want, std.mem.readInt(u64, e.key[0..8], .big));
     try testing.expectEqual(@as(u64, 90 * block), want);
+}
+
+test "Txn.get / Bucket.get over a long change log (the key index) agree with a model, before and after the base is committed" {
+    var prng = std.Random.DefaultPrng.init(0x1d3c5e7a);
+    const r = prng.random();
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "idx.kvt", .{});
+    defer db.close();
+
+    const keys = 60;
+    // A committed base for half of the keys, so a lookup that finds no buffered
+    // change must fall through to the tree.
+    {
+        var t0 = try db.begin();
+        var kb: [8]u8 = undefined;
+        for (0..keys) |id| {
+            if (id % 2 == 0) try t0.put(std.mem.print(&kb, "k{d:0>2}", .{id}) catch unreachable, "base");
+        }
+        try t0.commit();
+    }
+    var model: [keys]?u32 = undefined;
+    for (&model, 0..) |*m, id| m.* = if (id % 2 == 0) std.math.maxInt(u32) else null; // maxInt = "base"
+    var bmodel: [keys]?u32 = @splat(null);
+
+    var txn = try db.begin();
+    errdefer txn.rollback();
+    var vb: [600][8]u8 = undefined;
+    const bkt = try txn.createBucket("b");
+    // Cross the linear threshold gradually: check after every few changes.
+    for (0..600) |i| {
+        const id = r.uintLessThan(usize, keys);
+        var kb: [8]u8 = undefined;
+        const k = std.mem.print(&kb, "k{d:0>2}", .{id}) catch unreachable;
+        const v = std.mem.print(&vb[i], "{d:0>8}", .{i}) catch unreachable;
+        const to_bucket = r.boolean();
+        if (r.uintLessThan(u8, 4) == 0) {
+            if (to_bucket) {
+                try bkt.del(k);
+                bmodel[id] = null;
+            } else {
+                try txn.del(k);
+                model[id] = null;
+            }
+        } else if (to_bucket) {
+            try bkt.put(k, v);
+            bmodel[id] = @intCast(i);
+        } else {
+            try txn.put(k, v);
+            model[id] = @intCast(i);
+        }
+        if (i % 7 != 0 and i < 590) continue;
+        for (0..keys) |q| {
+            var qb: [8]u8 = undefined;
+            const qk = std.mem.print(&qb, "k{d:0>2}", .{q}) catch unreachable;
+            const got = try txn.get(testing.allocator, qk);
+            defer if (got) |g| testing.allocator.free(g);
+            try expectModel(model[q], got);
+            // SimStorage cannot lend, so a buffered key is the only getRef answer.
+            if (txn.getRef(qk)) |ref| {
+                if (ref) |rf| {
+                    try testing.expect(got != null);
+                    try testing.expectEqualStrings(got.?, rf.bytes);
+                } else try testing.expect(got == null);
+            } else |e| try testing.expectEqual(error.CannotLend, e);
+            const bgot = try bkt.get(testing.allocator, qk);
+            defer if (bgot) |g| testing.allocator.free(g);
+            try expectModel(bmodel[q], bgot);
+        }
+    }
+    txn.rollback();
+}
+
+fn expectModel(want: ?u32, got: ?[]u8) !void {
+    if (want) |w| {
+        var buf: [8]u8 = undefined;
+        const text = if (w == std.math.maxInt(u32)) "base" else std.mem.print(&buf, "{d:0>8}", .{w}) catch unreachable;
+        try testing.expectEqualStrings(text, got.?);
+    } else try testing.expect(got == null);
 }
 
 test "one transaction, many changes per key: the last change of each key wins" {

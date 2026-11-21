@@ -223,6 +223,12 @@ deleted; every call is `BucketNotFound`). A bucket created where this
 transaction put or deleted a plain key is refused (`IncompatibleValue`): commit
 the delete first.
 
+A tree's buffered changes are a `ChangeLog`: the calls in order, plus a hash index of the
+latest change per key that `get`, `getRef` and the bucket lookups build lazily once the
+log passes 16 entries (shorter logs are scanned from the end), so n puts then n gets in one
+transaction cost O(n). The index is scratch; an allocation failure while building it falls
+back to the scan.
+
 **Read.** `get` of a bucket's name is null; cursors yield it with `KV.bucket`
 and an empty value; `Snapshot.bucket` / `ReadBucket.bucket` open it. A
 `ReadBucket` is pinned by its snapshot. `recover` walks nested trees under the
@@ -400,7 +406,6 @@ library). Cross-process: one writer per store (an exclusive `flock` on `<path>.l
 **Known limits.**
 - Rot in a node page after a successful open is bounded, not detected: pages carry no checksum (only the meta pages carry a CRC32), so a flipped byte in a node can read as a wrong value; what is guaranteed is `Corrupt` or a wrong answer, never a crash (*Damaged files*). Owner choice: bounds at the point of use, the SQLite model, no per-page CRC.
 - A long-lived reader (`Db.cursor`, `Snapshot`) keeps every page the writer frees on the freelist, which each commit then reads and each allocation scans: time per commit grows with the commits made since, and the file grows too. Not measured; the remedy is a short-lived reader (documented at `Db.cursor`).
-- `Txn.get`, `Bucket.get` and the bucket lookup scan the transaction's buffered changes linearly: n puts then n gets in one transaction is O(n²).
 - `kvtree.FsStorage.initMmap` reads through a mapping: a file truncated by someone else below a page in use is a SIGBUS (the store's lock keeps other writers out).
 
 ## Performance
@@ -413,13 +418,13 @@ library). Cross-process: one writer per store (an exclusive `flock` on `<path>.l
 - **Readers while a writer holds the store** (LMDB's reader table): not built. bbolt's model is the one followed (`Options.read_only`, a shared lock, several readers and no writer at the same time); LMDB's would need a cross-process reader table feeding the reclaim gate.
 - **`Tx.WriteTo` to an arbitrary byte stream:** not built; a caller copies to a temp path with `copyTo` and streams that file.
 - **Overflow keys:** keys stay inline (LMDB does the same): a separator is a copy of a key, and a branch that had to chase overflow chains to route a lookup would pay a page read per comparison. A key whose cell does not fit is `EntryTooLarge`.
+- **In-place compaction** (moving live pages down so a free page BELOW a live one can leave the file too): not built. `copyTo` plus swapping the copy in compacts offline, the way bbolt's `Compact` does (LMDB's `mdb_copy -c` likewise); the lowest-page-first allocation makes live pages drift down on their own as commits rewrite them, so a store that keeps writing ends up with a free tail, and a store that stops writing keeps its holes.
+- **A freelist ordered by `free_txn`.** A commit rewrites the whole freelist chain (COW, every page of the old chain dies), so what a long-lived reader costs is the chain's length, and ordering would not shorten the chain; a structure that avoids it is a format change. bbolt rewrites its freelist per commit and warns against long read transactions the same way (see Known limits).
 - **Per-page checksums:** see Known limits (SQLite model, no format change).
 
 ## Backlog / deferred
 
-- **In-place compaction** (moving live pages down so a free page BELOW a live one can leave the file too) — not built; `copyTo` + swapping the copy in does it offline, the way bbolt's `Compact` does. The lowest-page-first allocation makes live pages drift down on their own as commits rewrite them, so a store that keeps writing ends up with a free tail; a store that stops writing keeps its holes.
-- **Freelist ordered by `free_txn`** so a commit under a long-lived reader need not scan a list that only grows (Known limits); not measured.
-- **Hash index over a transaction's buffered changes** so n puts then n gets in one transaction is not O(n²) (Known limits); a change of data structure, not a sweep fix.
+None open.
 
 ## Anchoring
 
