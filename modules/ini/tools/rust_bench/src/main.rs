@@ -7,6 +7,7 @@
 // (tab-separated). See bench.zig for what each workload does.
 
 use configparser::ini::{Ini, IniDefault, WriteOptions};
+use ini::{Ini as RIni, ParseOption, WriteOption, EscapePolicy, LineSeparator};
 use std::time::{Duration, Instant};
 
 fn time_it<F: FnMut() -> u64>(mut f: F) -> (f64, u64) {
@@ -73,6 +74,22 @@ fn parse_probes(text: &str, probes: &[Probe]) -> u64 {
     t
 }
 
+// rust-ini 0.21.3 with quote and escape handling off: the same reading as the
+// other sides (see bench.zig). Its default comment set is `;` and `#`, and its
+// separators `=` and `:`; the bench texts use neither inside values.
+fn ri_opt() -> ParseOption {
+    ParseOption { enabled_quote: false, enabled_escape: false, ..Default::default() }
+}
+
+fn ri_parse_probes(text: &str, probes: &[Probe]) -> u64 {
+    let ini = RIni::load_from_str_opt(text, ri_opt()).unwrap();
+    let mut t = 0u64;
+    for p in probes {
+        t += ini.get_from(Some(p.section.as_str()), &p.key).unwrap().len() as u64;
+    }
+    t
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (dir, name) = (&args[1], args[2].as_str());
@@ -83,7 +100,32 @@ fn main() {
     let mut doc = new_ini();
     doc.read(large.clone()).unwrap();
 
+    let ri_doc = RIni::load_from_str_opt(&large, ri_opt()).unwrap();
     let (ns, count) = match name {
+        "rustini_parse_small" => time_it(|| ri_parse_probes(&small, &small_probes)),
+        "rustini_parse_large" => time_it(|| ri_parse_probes(&large, &probes[..16])),
+        "rustini_get_hit" => time_it(|| {
+            let mut t = 0u64;
+            for p in &probes {
+                t += ri_doc.get_from(Some(p.section.as_str()), &p.key).unwrap().len() as u64;
+            }
+            t
+        }),
+        "rustini_get_miss" => time_it(|| {
+            let mut t = 0u64;
+            for p in &probes {
+                if ri_doc.get_from(Some(p.section.as_str()), &p.miss).is_none() {
+                    t += 1;
+                }
+            }
+            t
+        }),
+        "rustini_write" => time_it(|| {
+            let mut out: Vec<u8> = Vec::new();
+            let opt = WriteOption { escape_policy: EscapePolicy::Nothing, line_separator: LineSeparator::SystemDefault, kv_separator: "=" };
+            ri_doc.write_to_opt(&mut out, opt).unwrap();
+            out.iter().filter(|&&b| b == b'=').count() as u64
+        }),
         "parse_small" => time_it(|| parse_probes(&small, &small_probes)),
         "parse_large" => time_it(|| parse_probes(&large, &probes[..16])),
         "get_hit" => time_it(|| {
@@ -119,6 +161,6 @@ fn main() {
         }),
         other => panic!("no workload {other}"),
     };
-    eprintln!("configparser 3.3.0 / ini_core 0.2.0");
+    eprintln!("configparser 3.3.0 / ini_core 0.2.0 / rust-ini 0.21.3");
     println!("{name}\t{ns:.1}\t{count}");
 }

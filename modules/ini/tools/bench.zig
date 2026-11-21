@@ -257,6 +257,11 @@ pub fn main(init: std.process.Init) !u8 {
         .{ .name = "get_miss", .op = .get_miss, .ref = "get_miss", .alt = "get_miss", .alt_exe = 1, .wall_only = true },
         .{ .name = "write", .op = .write, .ref = "write", .alt = "write", .alt_exe = 1, .wall_only = true },
         .{ .name = "edit", .op = .edit, .ref = "edit", .wall_only = true },
+        .{ .name = "rustini_parse_small", .op = .parse_small, .ref = "rustini_parse_small", .ref_exe = 1, .fast_only = true, .wall_only = true },
+        .{ .name = "rustini_parse_large", .op = .parse_large, .ref = "rustini_parse_large", .ref_exe = 1, .fast_only = true, .wall_only = true },
+        .{ .name = "rustini_get_hit", .op = .get_hit, .ref = "rustini_get_hit", .ref_exe = 1, .fast_only = true, .wall_only = true },
+        .{ .name = "rustini_get_miss", .op = .get_miss, .ref = "rustini_get_miss", .ref_exe = 1, .fast_only = true, .wall_only = true },
+        .{ .name = "rustini_write", .op = .write, .ref = "rustini_write", .ref_exe = 1, .fast_only = true, .wall_only = true },
         .{ .name = "scan_ini_core", .op = .scan, .ref = "scan_ini_core", .ref_exe = 1, .fast_only = true, .wall_only = true },
         .{ .name = "scan_inih", .op = .scan, .ref = "scan_inih", .ref_exe = 2, .fast_only = true, .wall_only = true },
     };

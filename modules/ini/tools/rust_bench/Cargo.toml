@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 configparser = { version = "=3.3.0", default-features = false }
 ini_core = "=0.2.0"
+rust-ini = { version = "=0.21.3", default-features = false }
 
 [profile.release]
 lto = "fat"
