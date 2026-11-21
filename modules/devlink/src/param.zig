@@ -306,6 +306,17 @@ pub fn appendGetByName(
     try appendName(gpa, list, param_name);
 }
 
+/// Attributes of a `DEVLINK_CMD_PORT_PARAM_GET` for one named parameter of a port.
+pub fn appendGetPortByName(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    p: handle.PortHandle,
+    param_name: []const u8,
+) BuildError!void {
+    try handle.appendPort(gpa, list, p);
+    try appendName(gpa, list, param_name);
+}
+
 fn appendName(gpa: std.mem.Allocator, list: *std.ArrayList(u8), param_name: []const u8) BuildError!void {
     if (param_name.len == 0 or param_name.len > uapi.name_max) return error.InvalidRequest;
     if (std.mem.findScalar(u8, param_name, 0) != null) return error.InvalidRequest;
@@ -333,6 +344,30 @@ pub fn appendSet(
     value: Value,
 ) BuildError!void {
     try handle.append(gpa, list, h);
+    try appendSetBody(gpa, list, param_name, cmode, value);
+}
+
+/// Attributes of a `DEVLINK_CMD_PORT_PARAM_SET`: the port handle (device and port index), name, type, cmode and
+/// value. Needs **CAP_NET_ADMIN**; the value rules are `appendSet`'s.
+pub fn appendSetPort(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    p: handle.PortHandle,
+    param_name: []const u8,
+    cmode: uapi.ParamCmode,
+    value: Value,
+) BuildError!void {
+    try handle.appendPort(gpa, list, p);
+    try appendSetBody(gpa, list, param_name, cmode, value);
+}
+
+fn appendSetBody(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    param_name: []const u8,
+    cmode: uapi.ParamCmode,
+    value: Value,
+) BuildError!void {
     try appendName(gpa, list, param_name);
     try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_TYPE, @backingInt(value.paramType()));
     try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_VALUE_CMODE, @backingInt(cmode));
@@ -398,6 +433,46 @@ pub fn buildSetParam(
     var b = try request.begin(gpa, family_id, seq, uapi.CMD.PARAM_SET, false);
     errdefer b.deinit();
     try appendSet(gpa, &b.list, h, param_name, cmode, value);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_PORT_PARAM_GET` **dump** — every per-port parameter on the system (what
+/// `Devlink.portParams` sends); the filter is applied to the replies.
+pub fn buildPortParams(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+) request.Error![]u8 {
+    return request.buildSimple(gpa, family_id, seq, uapi.CMD.PORT_PARAM_GET, true, null);
+}
+
+/// Build a `DEVLINK_CMD_PORT_PARAM_GET` for one named parameter of one port.
+pub fn buildPortParam(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    p: handle.PortHandle,
+    param_name: []const u8,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_PARAM_GET, false);
+    errdefer b.deinit();
+    try appendGetPortByName(gpa, &b.list, p, param_name);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_PORT_PARAM_SET` — what `Devlink.setPortParam` sends. Needs **CAP_NET_ADMIN**.
+pub fn buildSetPortParam(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    p: handle.PortHandle,
+    param_name: []const u8,
+    cmode: uapi.ParamCmode,
+    value: Value,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_PARAM_SET, false);
+    errdefer b.deinit();
+    try appendSetPort(gpa, &b.list, p, param_name, cmode, value);
     return b.finish();
 }
 
@@ -1015,4 +1090,48 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "port parameter requests carry the port index; the set body is the device parameter's" {
+    if (@import("builtin").cpu.arch.endian() != .little) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const ph: handle.PortHandle = .{ .handle = .pci("0000:65:00.0"), .index = 3 };
+
+    const dump = try buildPortParams(gpa, 0x19, 1);
+    defer gpa.free(dump);
+    try testing.expectEqual(uapi.CMD.PORT_PARAM_GET, (try genl.splitPayload(dump[16..])).cmd);
+    try testing.expect(std.mem.readInt(u16, dump[6..8], .little) & codec.NLM_F_DUMP != 0);
+
+    const get = try buildPortParam(gpa, 0x19, 2, ph, "enable_roce");
+    defer gpa.free(get);
+    const gp = try genl.splitPayload(get[16..]);
+    try testing.expectEqual(uapi.CMD.PORT_PARAM_GET, gp.cmd);
+    var it: codec.AttrIterator = .{ .buf = gp.attrs };
+    var saw_index = false;
+    var saw_name = false;
+    while (try it.next()) |a| switch (a.type) {
+        uapi.ATTR.PORT_INDEX => {
+            saw_index = true;
+            try testing.expectEqual(@as(u32, 3), try a.asU32());
+        },
+        uapi.ATTR.PARAM_NAME => {
+            saw_name = true;
+            try testing.expectEqualStrings("enable_roce", a.asString());
+        },
+        else => {},
+    };
+    try testing.expect(saw_index and saw_name);
+
+    // The set message is the device one with the port index after the handle: the same attributes follow.
+    const port_set = try buildSetPortParam(gpa, 0x19, 3, ph, "enable_roce", .driverinit, .{ .flag = true });
+    defer gpa.free(port_set);
+    const pp = try genl.splitPayload(port_set[16..]);
+    try testing.expectEqual(uapi.CMD.PORT_PARAM_SET, pp.cmd);
+    var jt: codec.AttrIterator = .{ .buf = pp.attrs };
+    var types: [8]u16 = undefined;
+    var n: usize = 0;
+    while (try jt.next()) |a| : (n += 1) types[n] = a.type;
+    try testing.expectEqualSlices(u16, &.{ uapi.ATTR.BUS_NAME, uapi.ATTR.DEV_NAME, uapi.ATTR.PORT_INDEX, uapi.ATTR.PARAM_NAME, uapi.ATTR.PARAM_TYPE, uapi.ATTR.PARAM_VALUE_CMODE, uapi.ATTR.PARAM_VALUE_DATA }, types[0..n]);
+
+    try testing.expectError(error.InvalidRequest, buildPortParam(gpa, 0x19, 2, ph, ""));
 }

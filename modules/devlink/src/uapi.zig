@@ -228,6 +228,17 @@ pub const ATTR = struct {
     pub const INFO_VERSION_NAME: u16 = 103; // string
     pub const INFO_VERSION_VALUE: u16 = 104; // string
 
+    /// The health reporter's self-describing message (`diagnose`, `dump`): one nest of flat items, see
+    /// `health.Fmsg`.
+    pub const FMSG: u16 = 106; // nested
+    pub const FMSG_OBJ_NEST_START: u16 = 107; // flag
+    pub const FMSG_PAIR_NEST_START: u16 = 108; // flag
+    pub const FMSG_ARR_NEST_START: u16 = 109; // flag
+    pub const FMSG_NEST_END: u16 = 110; // flag
+    pub const FMSG_OBJ_NAME: u16 = 111; // string
+    pub const FMSG_OBJ_VALUE_TYPE: u16 = 112; // u8 (an NLA_* type)
+    pub const FMSG_OBJ_VALUE_DATA: u16 = 113; // dynamic
+
     pub const HEALTH_REPORTER: u16 = 114; // nested
     pub const HEALTH_REPORTER_NAME: u16 = 115; // string
     pub const HEALTH_REPORTER_STATE: u16 = 116; // u8
@@ -284,8 +295,42 @@ pub const ATTR = struct {
 
     pub const REGION_DIRECT: u16 = 179; // flag
 
+    pub const HEALTH_REPORTER_BURST_PERIOD: u16 = 181; // u64
+
     pub const PARAM_VALUE_DEFAULT: u16 = 182; // dynamic
     pub const PARAM_RESET_DEFAULT: u16 = 183; // flag
+};
+
+/// `enum devlink_port_function_attr`: the attributes inside `DEVLINK_ATTR_PORT_FUNCTION`.
+pub const FN_ATTR = struct {
+    pub const HW_ADDR: u16 = 1; // binary
+    pub const STATE: u16 = 2; // u8
+    pub const OPSTATE: u16 = 3; // u8
+    pub const CAPS: u16 = 4; // bitfield32
+    pub const DEVLINK: u16 = 5; // nested
+    pub const MAX_IO_EQS: u16 = 6; // u32
+};
+
+/// `DEVLINK_PORT_FN_CAP_*`: the capability bits of a port function (`FN_ATTR.CAPS`).
+pub const FN_CAP = struct {
+    pub const ROCE: u32 = 1 << 0;
+    pub const MIGRATABLE: u32 = 1 << 1;
+    pub const IPSEC_CRYPTO: u32 = 1 << 2;
+    pub const IPSEC_PACKET: u32 = 1 << 3;
+};
+
+/// `enum devlink_port_fn_state`: the administrative state of a function.
+pub const FnState = enum(u8) {
+    inactive = 0,
+    active = 1,
+    _,
+};
+
+/// `enum devlink_port_fn_opstate`: whether the driver is attached to the function.
+pub const FnOpstate = enum(u8) {
+    detached = 0,
+    attached = 1,
+    _,
 };
 
 // ── enums ──────────────────────────────────────────────────────────────────

@@ -60,6 +60,8 @@ pub const Reporter = struct {
     graceful_period: ?u64 = null,
     auto_recover: ?bool = null,
     auto_dump: ?bool = null,
+    /// The window, in milliseconds, in which errors count as one burst (one recovery).
+    burst_period: ?u64 = null,
 
     pub fn name(r: *const Reporter) []const u8 {
         return r.name_buf[0..r.name_len];
@@ -103,6 +105,7 @@ pub fn parseNest(nest_bytes: []const u8) codec.Error!Reporter {
         uapi.ATTR.HEALTH_REPORTER_GRACEFUL_PERIOD => r.graceful_period = try uapi.asU64(a),
         uapi.ATTR.HEALTH_REPORTER_AUTO_RECOVER => r.auto_recover = (try a.asU8()) != 0,
         uapi.ATTR.HEALTH_REPORTER_AUTO_DUMP => r.auto_dump = (try a.asU8()) != 0,
+        uapi.ATTR.HEALTH_REPORTER_BURST_PERIOD => r.burst_period = try uapi.asU64(a),
         else => {},
     };
     return r;
@@ -130,6 +133,150 @@ pub fn parse(attr_bytes: []const u8) codec.Error!Reporter {
     };
     return out;
 }
+
+// ── the reporter's message (diagnose, dump) ────────────────────────────────
+
+/// A value in a reporter's message.
+pub const FmsgValue = union(enum) {
+    flag,
+    u8: u8,
+    u16: u16,
+    u32: u32,
+    u64: u64,
+    /// A string (`NLA_STRING` / `NLA_NUL_STRING`), without the terminator; borrowed from the message.
+    string: []const u8,
+    /// Anything else (`NLA_BINARY`, a type this decoder does not know); borrowed.
+    binary: []const u8,
+};
+
+/// One element of a reporter's message, in wire order.
+pub const FmsgItem = union(enum) {
+    /// `{`
+    obj_start,
+    /// A named pair opens: its `name` and `value` (or a nested object/array) follow, then `end`.
+    pair_start,
+    /// `[`
+    arr_start,
+    /// Closes the innermost open object, pair or array.
+    end,
+    name: []const u8,
+    value: FmsgValue,
+};
+
+pub const FmsgError = codec.Error || error{
+    /// More `end` items than starts, or the message ends inside an open nest.
+    Unbalanced,
+    /// Nesting deeper than `Fmsg.max_depth`.
+    TooDeep,
+};
+
+/// A reporter's `diagnose` or `dump` answer: `DEVLINK_ATTR_FMSG`, a self-describing message — objects, arrays and
+/// named pairs whose values carry a type tag — sent as one flat run of attributes (a nest-start flag, a nest-end
+/// flag, a name, a type, a value) that may be split over several netlink messages. `bytes` is that run: the
+/// payloads of every `FMSG` nest, concatenated in order.
+pub const Fmsg = struct {
+    /// Deepest nesting `iterator` follows.
+    pub const max_depth = 64;
+
+    bytes: []const u8,
+
+    pub fn iterator(f: Fmsg) FmsgIterator {
+        return .{ .it = .{ .buf = f.bytes } };
+    }
+
+    /// Walks the whole message once: the nesting balances and every value decodes.
+    pub fn validate(f: Fmsg) FmsgError!void {
+        var it = f.iterator();
+        while (try it.next()) |_| {}
+    }
+
+    /// The value of the first pair named `pair_name`, at any depth; null when there is none or its value is a
+    /// nest rather than a plain value.
+    pub fn find(f: Fmsg, pair_name: []const u8) FmsgError!?FmsgValue {
+        var it = f.iterator();
+        var want = false;
+        while (try it.next()) |item| switch (item) {
+            .name => |n| want = std.mem.eql(u8, n, pair_name),
+            .value => |v| {
+                if (want) return v;
+            },
+            .pair_start, .obj_start, .arr_start, .end => want = false,
+        };
+        return null;
+    }
+};
+
+pub const FmsgIterator = struct {
+    it: codec.AttrIterator,
+    depth: usize = 0,
+    value_type: ?u8 = null,
+
+    pub fn next(self: *FmsgIterator) FmsgError!?FmsgItem {
+        while (try self.it.next()) |a| switch (a.type) {
+            uapi.ATTR.FMSG_OBJ_NEST_START => return self.open(.obj_start),
+            uapi.ATTR.FMSG_PAIR_NEST_START => return self.open(.pair_start),
+            uapi.ATTR.FMSG_ARR_NEST_START => return self.open(.arr_start),
+            uapi.ATTR.FMSG_NEST_END => {
+                if (self.depth == 0) return error.Unbalanced;
+                self.depth -= 1;
+                return .end;
+            },
+            uapi.ATTR.FMSG_OBJ_NAME => return .{ .name = a.asString() },
+            uapi.ATTR.FMSG_OBJ_VALUE_TYPE => self.value_type = try a.asU8(),
+            uapi.ATTR.FMSG_OBJ_VALUE_DATA => {
+                const t = self.value_type orelse 11;
+                self.value_type = null;
+                return .{ .value = switch (t) {
+                    6 => .flag,
+                    1 => .{ .u8 = try a.asU8() },
+                    2 => .{ .u16 = try a.asU16() },
+                    3 => .{ .u32 = try a.asU32() },
+                    4 => .{ .u64 = try uapi.asU64(a) },
+                    5, 10 => .{ .string = a.asString() },
+                    else => .{ .binary = a.data },
+                } };
+            },
+            else => {},
+        };
+        if (self.depth != 0) return error.Unbalanced;
+        return null;
+    }
+
+    fn open(self: *FmsgIterator, item: FmsgItem) FmsgError!?FmsgItem {
+        if (self.depth >= Fmsg.max_depth) return error.TooDeep;
+        self.depth += 1;
+        return item;
+    }
+};
+
+/// Gathers a reporter's message from the replies of a `diagnose` or `dump`: `feed` each reply's attributes,
+/// then `finish`.
+pub const FmsgCollector = struct {
+    list: std.ArrayList(u8) = .empty,
+
+    pub fn deinit(c: *FmsgCollector, gpa: std.mem.Allocator) void {
+        c.list.deinit(gpa);
+    }
+
+    /// Appends the payload of every `DEVLINK_ATTR_FMSG` nest among `attr_bytes`. `max_bytes` bounds what is kept
+    /// (`error.BadLength` past it).
+    pub fn feed(c: *FmsgCollector, gpa: std.mem.Allocator, attr_bytes: []const u8, max_bytes: usize) (codec.Error || error{OutOfMemory})!void {
+        var it: codec.AttrIterator = .{ .buf = attr_bytes };
+        while (try it.next()) |a| {
+            if (a.type != uapi.ATTR.FMSG) continue;
+            if (a.data.len > max_bytes -| c.list.items.len) return error.BadLength;
+            try c.list.appendSlice(gpa, a.data);
+        }
+    }
+
+    /// The message, owned by the caller (`gpa.free(f.bytes)`).
+    pub fn finish(c: *FmsgCollector, gpa: std.mem.Allocator) error{OutOfMemory}!Fmsg {
+        return .{ .bytes = try c.list.toOwnedSlice(gpa) };
+    }
+};
+
+/// Largest reporter message `Devlink.healthDiagnose`/`healthDump` keep.
+pub const max_fmsg_bytes = 4 << 20;
 
 // ── request builders ───────────────────────────────────────────────────────
 
@@ -178,7 +325,84 @@ pub fn appendPortGet(
     try appendReporterName(gpa, list, reporter);
 }
 
+/// What `HEALTH_REPORTER_SET` can change. At least one field.
+pub const ReporterSet = struct {
+    /// Minimum time between automatic recoveries, in milliseconds.
+    graceful_period: ?u64 = null,
+    auto_recover: ?bool = null,
+    auto_dump: ?bool = null,
+    /// The window in which errors count as one burst, in milliseconds.
+    burst_period: ?u64 = null,
+};
+
+/// Attributes of a `DEVLINK_CMD_HEALTH_REPORTER_SET`. Needs **CAP_NET_ADMIN**. Refused when nothing is set.
+pub fn appendSet(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    h: handle.Handle,
+    reporter: []const u8,
+    s: ReporterSet,
+) BuildError!void {
+    if (s.graceful_period == null and s.auto_recover == null and s.auto_dump == null and s.burst_period == null)
+        return error.InvalidRequest;
+    try handle.append(gpa, list, h);
+    try appendReporterName(gpa, list, reporter);
+    if (s.graceful_period) |v| try uapi.appendAttrU64(gpa, list, uapi.ATTR.HEALTH_REPORTER_GRACEFUL_PERIOD, v);
+    if (s.auto_recover) |v| try codec.appendAttrU8(gpa, list, uapi.ATTR.HEALTH_REPORTER_AUTO_RECOVER, @intFromBool(v));
+    if (s.auto_dump) |v| try codec.appendAttrU8(gpa, list, uapi.ATTR.HEALTH_REPORTER_AUTO_DUMP, @intFromBool(v));
+    if (s.burst_period) |v| try uapi.appendAttrU64(gpa, list, uapi.ATTR.HEALTH_REPORTER_BURST_PERIOD, v);
+}
+
 // ── complete requests ──────────────────────────────────────────────────────
+
+/// Build one of the commands that take a reporter name and nothing else: `DIAGNOSE`, `DUMP_GET` (a dump),
+/// `DUMP_CLEAR`, `TEST`.
+fn buildNamed(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    cmd: u8,
+    dump: bool,
+    h: handle.Handle,
+    reporter: []const u8,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, cmd, dump);
+    errdefer b.deinit();
+    try appendGet(gpa, &b.list, h, reporter);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_HEALTH_REPORTER_DIAGNOSE` — what `Devlink.healthDiagnose` sends. Read-only on the driver
+/// side, but needs **CAP_NET_ADMIN**.
+pub fn buildDiagnoseHealthReporter(gpa: std.mem.Allocator, family_id: u16, seq: u32, h: handle.Handle, reporter: []const u8) request.Error![]u8 {
+    return buildNamed(gpa, family_id, seq, uapi.CMD.HEALTH_REPORTER_DIAGNOSE, false, h, reporter);
+}
+
+/// Build a `DEVLINK_CMD_HEALTH_REPORTER_DUMP_GET` (a dump, as the kernel registers it) — what `Devlink.healthDump`
+/// sends: the dump the driver took when the reporter last tripped. Needs **CAP_NET_ADMIN**.
+pub fn buildDumpHealthReporter(gpa: std.mem.Allocator, family_id: u16, seq: u32, h: handle.Handle, reporter: []const u8) request.Error![]u8 {
+    return buildNamed(gpa, family_id, seq, uapi.CMD.HEALTH_REPORTER_DUMP_GET, true, h, reporter);
+}
+
+/// Build a `DEVLINK_CMD_HEALTH_REPORTER_DUMP_CLEAR` — what `Devlink.clearHealthDump` sends. Needs
+/// **CAP_NET_ADMIN**.
+pub fn buildClearHealthDump(gpa: std.mem.Allocator, family_id: u16, seq: u32, h: handle.Handle, reporter: []const u8) request.Error![]u8 {
+    return buildNamed(gpa, family_id, seq, uapi.CMD.HEALTH_REPORTER_DUMP_CLEAR, false, h, reporter);
+}
+
+/// Build a `DEVLINK_CMD_HEALTH_REPORTER_TEST` — what `Devlink.testHealthReporter` sends: the driver raises a test
+/// error on the reporter, which may run its recovery. Needs **CAP_NET_ADMIN**.
+pub fn buildTestHealthReporter(gpa: std.mem.Allocator, family_id: u16, seq: u32, h: handle.Handle, reporter: []const u8) request.Error![]u8 {
+    return buildNamed(gpa, family_id, seq, uapi.CMD.HEALTH_REPORTER_TEST, false, h, reporter);
+}
+
+/// Build a `DEVLINK_CMD_HEALTH_REPORTER_SET` — what `Devlink.setHealthReporter` sends. Needs **CAP_NET_ADMIN**.
+pub fn buildSetHealthReporter(gpa: std.mem.Allocator, family_id: u16, seq: u32, h: handle.Handle, reporter: []const u8, s: ReporterSet) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.HEALTH_REPORTER_SET, false);
+    errdefer b.deinit();
+    try appendSet(gpa, &b.list, h, reporter, s);
+    return b.finish();
+}
 
 /// Build a `DEVLINK_CMD_HEALTH_REPORTER_GET` **dump** — every reporter on the
 /// system, which is what `Devlink.healthReporters` sends. The `filter` that
@@ -590,4 +814,206 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+fn flagAttr(gpa: std.mem.Allocator, list: *std.ArrayList(u8), t: u16) !void {
+    try codec.appendAttr(gpa, list, t, &.{});
+}
+
+fn valueAttrs(gpa: std.mem.Allocator, list: *std.ArrayList(u8), type_tag: u8, data: []const u8) !void {
+    try codec.appendAttrU8(gpa, list, uapi.ATTR.FMSG_OBJ_VALUE_TYPE, type_tag);
+    try codec.appendAttr(gpa, list, uapi.ATTR.FMSG_OBJ_VALUE_DATA, data);
+}
+
+/// One pair `name: u32 value`.
+fn u32Pair(gpa: std.mem.Allocator, list: *std.ArrayList(u8), name: []const u8, v: u32) !void {
+    try flagAttr(gpa, list, uapi.ATTR.FMSG_PAIR_NEST_START);
+    try codec.appendAttrString(gpa, list, uapi.ATTR.FMSG_OBJ_NAME, name);
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, @import("builtin").cpu.arch.endian());
+    try valueAttrs(gpa, list, 3, &b);
+    try flagAttr(gpa, list, uapi.ATTR.FMSG_NEST_END);
+}
+
+test "Fmsg decodes objects, pairs, arrays and every value type, across two messages" {
+    const gpa = testing.allocator;
+    const endian = @import("builtin").cpu.arch.endian();
+
+    // First message: the start of the object and its first pair.
+    var m1: std.ArrayList(u8) = .empty;
+    defer m1.deinit(gpa);
+    try handle.append(gpa, &m1, .pci("0000:65:00.0"));
+    {
+        const nest = try codec.nestBegin(gpa, &m1, uapi.ATTR.FMSG);
+        try flagAttr(gpa, &m1, uapi.ATTR.FMSG_OBJ_NEST_START);
+        try u32Pair(gpa, &m1, "events", 7);
+        try codec.nestEnd(&m1, nest);
+    }
+    // Second message: a string, a flag, an array of u64, a nested object, and the closing of the object.
+    var m2: std.ArrayList(u8) = .empty;
+    defer m2.deinit(gpa);
+    try handle.append(gpa, &m2, .pci("0000:65:00.0"));
+    {
+        const nest = try codec.nestBegin(gpa, &m2, uapi.ATTR.FMSG);
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_PAIR_NEST_START);
+        try codec.appendAttrString(gpa, &m2, uapi.ATTR.FMSG_OBJ_NAME, "state");
+        try valueAttrs(gpa, &m2, 10, "healthy\x00");
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_NEST_END);
+
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_PAIR_NEST_START);
+        try codec.appendAttrString(gpa, &m2, uapi.ATTR.FMSG_OBJ_NAME, "armed");
+        try valueAttrs(gpa, &m2, 6, &.{});
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_NEST_END);
+
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_PAIR_NEST_START);
+        try codec.appendAttrString(gpa, &m2, uapi.ATTR.FMSG_OBJ_NAME, "counters");
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_ARR_NEST_START);
+        var q: [8]u8 = undefined;
+        std.mem.writeInt(u64, &q, 5, endian);
+        try valueAttrs(gpa, &m2, 4, &q);
+        std.mem.writeInt(u64, &q, 1 << 40, endian);
+        try valueAttrs(gpa, &m2, 4, &q);
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_NEST_END);
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_NEST_END);
+
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_PAIR_NEST_START);
+        try codec.appendAttrString(gpa, &m2, uapi.ATTR.FMSG_OBJ_NAME, "blob");
+        try valueAttrs(gpa, &m2, 11, &.{ 0xde, 0xad });
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_NEST_END);
+        try valueAttrs(gpa, &m2, 1, &.{9}); // an array element outside a pair, as the kernel writes them
+        try valueAttrs(gpa, &m2, 2, &.{ 1, 0 });
+        try flagAttr(gpa, &m2, uapi.ATTR.FMSG_NEST_END); // closes the object
+        try codec.nestEnd(&m2, nest);
+    }
+
+    var c: FmsgCollector = .{};
+    defer c.deinit(gpa);
+    try c.feed(gpa, m1.items, max_fmsg_bytes);
+    try c.feed(gpa, m2.items, max_fmsg_bytes);
+    const f = try c.finish(gpa);
+    defer gpa.free(f.bytes);
+    try f.validate();
+
+    var it = f.iterator();
+    try testing.expectEqual(FmsgItem.obj_start, (try it.next()).?);
+    try testing.expectEqual(FmsgItem.pair_start, (try it.next()).?);
+    try testing.expectEqualStrings("events", (try it.next()).?.name);
+    try testing.expectEqual(@as(u32, 7), (try it.next()).?.value.u32);
+    try testing.expectEqual(FmsgItem.end, (try it.next()).?);
+
+    try testing.expectEqual(@as(u32, 7), (try f.find("events")).?.u32);
+    try testing.expectEqualStrings("healthy", (try f.find("state")).?.string);
+    try testing.expect((try f.find("armed")).? == .flag);
+    try testing.expectEqualSlices(u8, &.{ 0xde, 0xad }, (try f.find("blob")).?.binary);
+    try testing.expect((try f.find("nothing")) == null);
+    // `counters` holds an array, not a plain value: `find` does not guess.
+    try testing.expect((try f.find("counters")) == null);
+
+    // Depth: the walk of the whole message ends at depth zero, a lone end or an unclosed start does not.
+    var items: usize = 0;
+    var walk = f.iterator();
+    while (try walk.next()) |_| items += 1;
+    try testing.expectEqual(@as(usize, 27), items);
+}
+
+test "Fmsg refuses an unbalanced or too deep message and a nest of the wrong width" {
+    const gpa = testing.allocator;
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+    try flagAttr(gpa, &l, uapi.ATTR.FMSG_NEST_END);
+    try testing.expectError(error.Unbalanced, (Fmsg{ .bytes = l.items }).validate());
+
+    var open: std.ArrayList(u8) = .empty;
+    defer open.deinit(gpa);
+    try flagAttr(gpa, &open, uapi.ATTR.FMSG_OBJ_NEST_START);
+    try testing.expectError(error.Unbalanced, (Fmsg{ .bytes = open.items }).validate());
+
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(gpa);
+    for (0..Fmsg.max_depth + 1) |_| try flagAttr(gpa, &deep, uapi.ATTR.FMSG_ARR_NEST_START);
+    try testing.expectError(error.TooDeep, (Fmsg{ .bytes = deep.items }).validate());
+
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(gpa);
+    try valueAttrs(gpa, &wide, 3, &.{ 1, 2 }); // a u32 with two bytes
+    try testing.expectError(error.BadLength, (Fmsg{ .bytes = wide.items }).validate());
+
+    // A value without a type tag is kept as bytes, not guessed at.
+    var untyped: std.ArrayList(u8) = .empty;
+    defer untyped.deinit(gpa);
+    try codec.appendAttr(gpa, &untyped, uapi.ATTR.FMSG_OBJ_VALUE_DATA, &.{ 1, 2, 3 });
+    var it = (Fmsg{ .bytes = untyped.items }).iterator();
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, (try it.next()).?.value.binary);
+
+    // The collector's bound.
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    const nest = try codec.nestBegin(gpa, &m, uapi.ATTR.FMSG);
+    try u32Pair(gpa, &m, "x", 1);
+    try codec.nestEnd(&m, nest);
+    var c: FmsgCollector = .{};
+    defer c.deinit(gpa);
+    try testing.expectError(error.BadLength, c.feed(gpa, m.items, 8));
+}
+
+test "diagnose, dump, clear, test and set requests" {
+    if (@import("builtin").cpu.arch.endian() != .little) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const h: handle.Handle = .pci("0000:65:00.0");
+
+    const cases = [_]struct { build: *const fn (std.mem.Allocator, u16, u32, handle.Handle, []const u8) request.Error![]u8, cmd: u8, dump: bool }{
+        .{ .build = buildDiagnoseHealthReporter, .cmd = uapi.CMD.HEALTH_REPORTER_DIAGNOSE, .dump = false },
+        .{ .build = buildDumpHealthReporter, .cmd = uapi.CMD.HEALTH_REPORTER_DUMP_GET, .dump = true },
+        .{ .build = buildClearHealthDump, .cmd = uapi.CMD.HEALTH_REPORTER_DUMP_CLEAR, .dump = false },
+        .{ .build = buildTestHealthReporter, .cmd = uapi.CMD.HEALTH_REPORTER_TEST, .dump = false },
+    };
+    for (cases) |c| {
+        const msg = try c.build(gpa, 0x19, 2, h, "fw");
+        defer gpa.free(msg);
+        const flags = std.mem.readInt(u16, msg[6..8], .little);
+        try testing.expectEqual(c.dump, flags & codec.NLM_F_DUMP != 0);
+        const pl = try genl.splitPayload(msg[16..]);
+        try testing.expectEqual(c.cmd, pl.cmd);
+        const r = try parse(pl.attrs);
+        try testing.expectEqualStrings("0000:65:00.0", r.handle.dev());
+        // The name is a top-level attribute, as in `recover`, not a nest.
+        var it: codec.AttrIterator = .{ .buf = pl.attrs };
+        var named = false;
+        while (try it.next()) |a| {
+            if (a.type == uapi.ATTR.HEALTH_REPORTER_NAME) {
+                named = true;
+                try testing.expectEqualStrings("fw", a.asString());
+            }
+        }
+        try testing.expect(named);
+        try testing.expectError(error.InvalidRequest, c.build(gpa, 0x19, 2, h, ""));
+    }
+
+    const set = try buildSetHealthReporter(gpa, 0x19, 3, h, "fw", .{ .graceful_period = 1500, .auto_recover = true, .auto_dump = false, .burst_period = 600 });
+    defer gpa.free(set);
+    const sp = try genl.splitPayload(set[16..]);
+    try testing.expectEqual(uapi.CMD.HEALTH_REPORTER_SET, sp.cmd);
+    var it: codec.AttrIterator = .{ .buf = sp.attrs };
+    var seen: u8 = 0;
+    while (try it.next()) |a| switch (a.type) {
+        uapi.ATTR.HEALTH_REPORTER_GRACEFUL_PERIOD => {
+            seen |= 1;
+            try testing.expectEqual(@as(u64, 1500), try uapi.asU64(a));
+        },
+        uapi.ATTR.HEALTH_REPORTER_AUTO_RECOVER => {
+            seen |= 2;
+            try testing.expectEqual(@as(u8, 1), try a.asU8());
+        },
+        uapi.ATTR.HEALTH_REPORTER_AUTO_DUMP => {
+            seen |= 4;
+            try testing.expectEqual(@as(u8, 0), try a.asU8());
+        },
+        uapi.ATTR.HEALTH_REPORTER_BURST_PERIOD => {
+            seen |= 8;
+            try testing.expectEqual(@as(u64, 600), try uapi.asU64(a));
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(u8, 15), seen);
+    try testing.expectError(error.InvalidRequest, buildSetHealthReporter(gpa, 0x19, 3, h, "fw", .{}));
 }

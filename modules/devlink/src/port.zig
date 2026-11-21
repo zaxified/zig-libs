@@ -53,6 +53,57 @@ const testkit = @import("testkit");
 
 pub const Error = error{ OutOfMemory, InvalidRequest };
 
+/// Longest hardware address a function carries (`MAX_ADDR_LEN`).
+pub const max_hw_addr = 32;
+
+/// The contents of a port's `DEVLINK_ATTR_PORT_FUNCTION` nest: the PCI function (VF or subfunction) behind the
+/// port. Every field is optional; the kernel reports what the driver implements.
+pub const Function = struct {
+    hw_addr_buf: [max_hw_addr]u8 = @splat(0),
+    hw_addr_len: u8 = 0,
+    has_hw_addr: bool = false,
+    state: ?uapi.FnState = null,
+    opstate: ?uapi.FnOpstate = null,
+    /// The capability bits that are set (`uapi.FN_CAP`); the selector the kernel echoes is not kept.
+    caps: ?u32 = null,
+    max_io_eqs: ?u32 = null,
+    /// The function has a devlink instance of its own (a subfunction's auxiliary device).
+    has_devlink: bool = false,
+
+    pub fn hwAddr(f: *const Function) ?[]const u8 {
+        return if (f.has_hw_addr) f.hw_addr_buf[0..f.hw_addr_len] else null;
+    }
+
+    pub fn hasCap(f: Function, cap: u32) bool {
+        return ((f.caps orelse 0) & cap) != 0;
+    }
+};
+
+/// Decode the contents of a `DEVLINK_ATTR_PORT_FUNCTION` nest. Unknown attributes are skipped.
+pub fn parseFunction(nest_bytes: []const u8) codec.Error!Function {
+    var f: Function = .{};
+    var it: codec.AttrIterator = .{ .buf = nest_bytes };
+    while (try it.next()) |a| switch (a.type) {
+        uapi.FN_ATTR.HW_ADDR => {
+            if (a.data.len > max_hw_addr) return error.BadLength;
+            @memcpy(f.hw_addr_buf[0..a.data.len], a.data);
+            f.hw_addr_len = @intCast(a.data.len);
+            f.has_hw_addr = true;
+        },
+        uapi.FN_ATTR.STATE => f.state = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.FN_ATTR.OPSTATE => f.opstate = @fromBackingInt(@intCast(try a.asU8())),
+        uapi.FN_ATTR.CAPS => {
+            // struct nla_bitfield32 { u32 value; u32 selector; }
+            if (a.data.len != 8) return error.BadLength;
+            f.caps = std.mem.readInt(u32, a.data[0..4], native_endian);
+        },
+        uapi.FN_ATTR.MAX_IO_EQS => f.max_io_eqs = try a.asU32(),
+        uapi.FN_ATTR.DEVLINK => f.has_devlink = true,
+        else => {},
+    };
+    return f;
+}
+
 /// One devlink port. Self-contained; no allocation.
 pub const Port = struct {
     handle: handle.Owned = .{},
@@ -80,9 +131,10 @@ pub const Port = struct {
     pci_sf_number: ?u32 = null,
     controller_number: ?u32 = null,
     external: ?bool = null,
-    /// The port carries a `DEVLINK_ATTR_PORT_FUNCTION` nest (hardware address,
-    /// admin state, capabilities). Not decoded — see SPEC.md.
+    /// The port carries a `DEVLINK_ATTR_PORT_FUNCTION` nest.
     has_function: bool = false,
+    /// The decoded nest (hardware address, state, capabilities, ...), when the port has one.
+    function: ?Function = null,
 
     pub fn netdevName(p: *const Port) []const u8 {
         return p.netdev_name_buf[0..p.netdev_name_len];
@@ -130,7 +182,10 @@ pub fn parse(attr_bytes: []const u8) codec.Error!Port {
         uapi.ATTR.PORT_PCI_SF_NUMBER => p.pci_sf_number = try a.asU32(),
         uapi.ATTR.PORT_CONTROLLER_NUMBER => p.controller_number = try a.asU32(),
         uapi.ATTR.PORT_EXTERNAL => p.external = (try a.asU8()) != 0,
-        uapi.ATTR.PORT_FUNCTION => p.has_function = true,
+        uapi.ATTR.PORT_FUNCTION => {
+            p.has_function = true;
+            p.function = try parseFunction(a.data);
+        },
         else => {},
     };
     return p;
@@ -176,6 +231,82 @@ pub fn appendUnsplit(
     p: handle.PortHandle,
 ) Error!void {
     try handle.appendPort(gpa, list, p);
+}
+
+/// What a `PORT_SET` can change in a port's function (`devlink port function set`). At least one field.
+pub const FunctionSet = struct {
+    /// The function's hardware (MAC) address, 1..32 bytes.
+    hw_addr: ?[]const u8 = null,
+    /// Activate or deactivate the function (`.active`, `.inactive`).
+    state: ?uapi.FnState = null,
+    /// Capability bits to change: the bits of `selector` are set to the matching bits of `value`.
+    caps: ?struct { value: u32, selector: u32 } = null,
+    /// How many IO event queues the function may use.
+    max_io_eqs: ?u32 = null,
+};
+
+/// Attributes of a `DEVLINK_CMD_PORT_SET` that changes the port's function: the port handle and a
+/// `DEVLINK_ATTR_PORT_FUNCTION` nest. Needs **CAP_NET_ADMIN**. Refused when nothing is set, when a state is not
+/// `inactive`/`active`, when the address is empty or longer than 32 bytes, or when `caps.value` has bits outside
+/// `caps.selector` (the kernel's bitfield32 validation).
+pub fn appendSetFunction(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    p: handle.PortHandle,
+    f: FunctionSet,
+) Error!void {
+    if (f.hw_addr == null and f.state == null and f.caps == null and f.max_io_eqs == null) return error.InvalidRequest;
+    if (f.hw_addr) |a| if (a.len == 0 or a.len > max_hw_addr) return error.InvalidRequest;
+    if (f.state) |s| if (s != .inactive and s != .active) return error.InvalidRequest;
+    if (f.caps) |c| if (c.value & ~c.selector != 0) return error.InvalidRequest;
+    try handle.appendPort(gpa, list, p);
+    const nest = try codec.nestBegin(gpa, list, uapi.ATTR.PORT_FUNCTION);
+    if (f.hw_addr) |a| try appendBytes(gpa, list, uapi.FN_ATTR.HW_ADDR, a);
+    if (f.state) |s| try codec.appendAttrU8(gpa, list, uapi.FN_ATTR.STATE, @backingInt(s));
+    if (f.caps) |c| {
+        var bf: [8]u8 = undefined;
+        std.mem.writeInt(u32, bf[0..4], c.value, native_endian);
+        std.mem.writeInt(u32, bf[4..8], c.selector, native_endian);
+        try appendBytes(gpa, list, uapi.FN_ATTR.CAPS, &bf);
+    }
+    if (f.max_io_eqs) |n| try codec.appendAttrU32(gpa, list, uapi.FN_ATTR.MAX_IO_EQS, n);
+    codec.nestEnd(list, nest) catch return error.InvalidRequest;
+}
+
+fn appendBytes(gpa: std.mem.Allocator, list: *std.ArrayList(u8), attr_type: u16, bytes: []const u8) Error!void {
+    codec.appendAttr(gpa, list, attr_type, bytes) catch |e| switch (e) {
+        error.AttrTooLong => return error.InvalidRequest,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// A new subfunction port (`devlink port add <dev> flavour pcisf pfnum N [sfnum M] [controller C]`).
+pub const NewPort = struct {
+    /// The PCI physical function the subfunction belongs to.
+    pf_number: u16,
+    /// The subfunction number; null lets the driver pick one when it can.
+    sf_number: ?u32 = null,
+    /// The controller (0 = the local host).
+    controller: ?u32 = null,
+    /// The wanted port index; null lets the kernel assign it.
+    index: ?u32 = null,
+};
+
+/// Attributes of a `DEVLINK_CMD_PORT_NEW`: the device handle and the port's flavour (always a PCI subfunction, the
+/// one flavour the kernel's `port_new` creates), PF number and optional SF number, controller and index. Needs
+/// **CAP_NET_ADMIN**; the reply is the new port.
+pub fn appendNewPort(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    h: handle.Handle,
+    n: NewPort,
+) Error!void {
+    try handle.append(gpa, list, h);
+    try codec.appendAttrU16(gpa, list, uapi.ATTR.PORT_FLAVOUR, @backingInt(uapi.PortFlavour.pci_sf));
+    try codec.appendAttrU16(gpa, list, uapi.ATTR.PORT_PCI_PF_NUMBER, n.pf_number);
+    if (n.sf_number) |s| try codec.appendAttrU32(gpa, list, uapi.ATTR.PORT_PCI_SF_NUMBER, s);
+    if (n.controller) |c| try codec.appendAttrU32(gpa, list, uapi.ATTR.PORT_CONTROLLER_NUMBER, c);
+    if (n.index) |i| try codec.appendAttrU32(gpa, list, uapi.ATTR.PORT_INDEX, i);
 }
 
 // ── complete requests ──────────────────────────────────────────────────────
@@ -247,6 +378,49 @@ pub fn buildUnsplitPort(
     var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_UNSPLIT, false);
     errdefer b.deinit();
     try appendUnsplit(gpa, &b.list, p);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_PORT_SET` that changes the port's function — what `Devlink.setPortFunction` sends. Needs
+/// **CAP_NET_ADMIN**.
+pub fn buildSetPortFunction(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    p: handle.PortHandle,
+    f: FunctionSet,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_SET, false);
+    errdefer b.deinit();
+    try appendSetFunction(gpa, &b.list, p, f);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_PORT_NEW` — what `Devlink.newPort` sends. Needs **CAP_NET_ADMIN**.
+pub fn buildNewPort(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    n: NewPort,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_NEW, false);
+    errdefer b.deinit();
+    try appendNewPort(gpa, &b.list, h, n);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_PORT_DEL` — what `Devlink.delPort` sends. Needs **CAP_NET_ADMIN**; the port must be a
+/// subfunction in the inactive, detached state.
+pub fn buildDelPort(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    p: handle.PortHandle,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_DEL, false);
+    errdefer b.deinit();
+    try handle.appendPort(gpa, &b.list, p);
     return b.finish();
 }
 
@@ -621,4 +795,117 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "parse decodes a subfunction's function nest" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try handle.append(gpa, &list, .pci("0000:65:00.0"));
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.PORT_INDEX, 0x10001);
+    try codec.appendAttrU16(gpa, &list, uapi.ATTR.PORT_FLAVOUR, @backingInt(uapi.PortFlavour.pci_sf));
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.PORT_PCI_SF_NUMBER, 88);
+    const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.PORT_FUNCTION);
+    try codec.appendAttr(gpa, &list, uapi.FN_ATTR.HW_ADDR, &.{ 0x00, 0x00, 0x00, 0x00, 0x88, 0x88 });
+    try codec.appendAttrU8(gpa, &list, uapi.FN_ATTR.STATE, 1);
+    try codec.appendAttrU8(gpa, &list, uapi.FN_ATTR.OPSTATE, 1);
+    var bf: [8]u8 = undefined;
+    std.mem.writeInt(u32, bf[0..4], uapi.FN_CAP.ROCE | uapi.FN_CAP.IPSEC_CRYPTO, native_endian);
+    std.mem.writeInt(u32, bf[4..8], 0xf, native_endian);
+    try codec.appendAttr(gpa, &list, uapi.FN_ATTR.CAPS, &bf);
+    try codec.appendAttrU32(gpa, &list, uapi.FN_ATTR.MAX_IO_EQS, 12);
+    const dl = try codec.nestBegin(gpa, &list, uapi.FN_ATTR.DEVLINK);
+    try codec.nestEnd(&list, dl);
+    try codec.nestEnd(&list, nest);
+
+    const p = try parse(list.items);
+    try testing.expect(p.has_function);
+    const f = p.function.?;
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0x88, 0x88 }, f.hwAddr().?);
+    try testing.expectEqual(@as(?uapi.FnState, .active), f.state);
+    try testing.expectEqual(@as(?uapi.FnOpstate, .attached), f.opstate);
+    try testing.expect(f.hasCap(uapi.FN_CAP.ROCE));
+    try testing.expect(!f.hasCap(uapi.FN_CAP.MIGRATABLE));
+    try testing.expect(f.hasCap(uapi.FN_CAP.IPSEC_CRYPTO));
+    try testing.expectEqual(@as(?u32, 12), f.max_io_eqs);
+    try testing.expect(f.has_devlink);
+
+    // An empty nest decodes to an empty function; a malformed one is an error, never a panic.
+    try testing.expect((try parseFunction(&.{})).state == null);
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    try codec.appendAttr(gpa, &bad, uapi.FN_ATTR.CAPS, &.{ 1, 2, 3 });
+    try testing.expectError(error.BadLength, parseFunction(bad.items));
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(gpa);
+    try codec.appendAttr(gpa, &long, uapi.FN_ATTR.HW_ADDR, &@as([33]u8, @splat(1)));
+    try testing.expectError(error.BadLength, parseFunction(long.items));
+}
+
+test "buildSetPortFunction sends the port handle and a function nest; refusals never reach the wire" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const ph: handle.PortHandle = .{ .handle = .pci("0000:65:00.0"), .index = 0x10001 };
+    const msg = try buildSetPortFunction(gpa, 0x19, 3, ph, .{
+        .hw_addr = &.{ 0x02, 0, 0, 0, 0, 1 },
+        .state = .active,
+        .caps = .{ .value = uapi.FN_CAP.ROCE, .selector = uapi.FN_CAP.ROCE | uapi.FN_CAP.MIGRATABLE },
+        .max_io_eqs = 8,
+    });
+    defer gpa.free(msg);
+    const pl = try genl.splitPayload(msg[16..]);
+    try testing.expectEqual(uapi.CMD.PORT_SET, pl.cmd);
+    var it: codec.AttrIterator = .{ .buf = pl.attrs };
+    var saw_fn = false;
+    while (try it.next()) |a| {
+        if (a.type == uapi.ATTR.PORT_INDEX) try testing.expectEqual(@as(u32, 0x10001), try a.asU32());
+        if (a.type != uapi.ATTR.PORT_FUNCTION) continue;
+        saw_fn = true;
+        const f = try parseFunction(a.data);
+        try testing.expectEqualSlices(u8, &.{ 0x02, 0, 0, 0, 0, 1 }, f.hwAddr().?);
+        try testing.expectEqual(@as(?uapi.FnState, .active), f.state);
+        try testing.expectEqual(@as(?u32, uapi.FN_CAP.ROCE), f.caps);
+        try testing.expectEqual(@as(?u32, 8), f.max_io_eqs);
+        // The selector is on the wire next to the value.
+        var jt = a.nested();
+        while (try jt.next()) |x| if (x.type == uapi.FN_ATTR.CAPS) {
+            try testing.expectEqual(uapi.FN_CAP.ROCE | uapi.FN_CAP.MIGRATABLE, std.mem.readInt(u32, x.data[4..8], native_endian));
+        };
+    }
+    try testing.expect(saw_fn);
+
+    try testing.expectError(error.InvalidRequest, buildSetPortFunction(gpa, 0x19, 3, ph, .{}));
+    try testing.expectError(error.InvalidRequest, buildSetPortFunction(gpa, 0x19, 3, ph, .{ .hw_addr = &.{} }));
+    try testing.expectError(error.InvalidRequest, buildSetPortFunction(gpa, 0x19, 3, ph, .{ .hw_addr = &@as([33]u8, @splat(1)) }));
+    try testing.expectError(error.InvalidRequest, buildSetPortFunction(gpa, 0x19, 3, ph, .{ .state = @fromBackingInt(@intCast(2)) }));
+    try testing.expectError(error.InvalidRequest, buildSetPortFunction(gpa, 0x19, 3, ph, .{ .caps = .{ .value = 2, .selector = 1 } }));
+}
+
+test "buildNewPort asks for a pci_sf port and buildDelPort names the port" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const msg = try buildNewPort(gpa, 0x19, 4, .pci("0000:06:00.0"), .{ .pf_number = 0, .sf_number = 88, .controller = 1 });
+    defer gpa.free(msg);
+    const pl = try genl.splitPayload(msg[16..]);
+    try testing.expectEqual(uapi.CMD.PORT_NEW, pl.cmd);
+    const p = try parse(pl.attrs);
+    try testing.expectEqualStrings("0000:06:00.0", p.handle.dev());
+    try testing.expectEqual(@as(?uapi.PortFlavour, .pci_sf), p.flavour);
+    try testing.expectEqual(@as(?u16, 0), p.pci_pf_number);
+    try testing.expectEqual(@as(?u32, 88), p.pci_sf_number);
+    try testing.expectEqual(@as(?u32, 1), p.controller_number);
+    try testing.expectEqual(@as(?u32, null), p.index);
+
+    const bare = try buildNewPort(gpa, 0x19, 4, .pci("0000:06:00.0"), .{ .pf_number = 2, .index = 77 });
+    defer gpa.free(bare);
+    const bp = try parse((try genl.splitPayload(bare[16..])).attrs);
+    try testing.expectEqual(@as(?u32, null), bp.pci_sf_number);
+    try testing.expectEqual(@as(?u32, 77), bp.index);
+
+    const del = try buildDelPort(gpa, 0x19, 5, .{ .handle = .pci("0000:06:00.0"), .index = 0x10058 });
+    defer gpa.free(del);
+    const dpl = try genl.splitPayload(del[16..]);
+    try testing.expectEqual(uapi.CMD.PORT_DEL, dpl.cmd);
+    try testing.expectEqual(@as(?u32, 0x10058), (try parse(dpl.attrs)).index);
+    try testing.expectError(error.InvalidRequest, buildNewPort(gpa, 0x19, 4, .{ .bus = "", .dev = "x" }, .{ .pf_number = 0 }));
 }

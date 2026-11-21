@@ -276,7 +276,93 @@ pub const Devlink = struct {
         return cl.sendAndAck(seq, port_mod.buildUnsplitPort(cl.allocator(), cl.family_id, seq, p));
     }
 
+    /// `DEVLINK_CMD_PORT_SET` with a function nest — change a subfunction's or VF's hardware address, state,
+    /// capabilities or IO event queues. Needs **CAP_NET_ADMIN**.
+    pub fn setPortFunction(cl: *Devlink, p: handle_mod.PortHandle, f: port_mod.FunctionSet) RequestError!void {
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, port_mod.buildSetPortFunction(cl.allocator(), cl.family_id, seq, p, f));
+    }
+
+    /// `DEVLINK_CMD_PORT_NEW` — create a subfunction port; returns it as the kernel reports it. Needs
+    /// **CAP_NET_ADMIN** and a driver that supports subfunctions.
+    pub fn newPort(cl: *Devlink, h: handle_mod.Handle, n: port_mod.NewPort) RequestError!port_mod.Port {
+        const gpa = cl.allocator();
+        try validate(h);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(port_mod.buildNewPort(gpa, cl.family_id, seq, h, n));
+        var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
+        defer reply.deinit(gpa);
+        const out = port_mod.parse(reply.attrs) catch return error.MalformedReply;
+        try checkHandleEcho(h, out.handle);
+        return out;
+    }
+
+    /// `DEVLINK_CMD_PORT_DEL` — delete a subfunction port (inactive and detached). Needs **CAP_NET_ADMIN**.
+    pub fn delPort(cl: *Devlink, p: handle_mod.PortHandle) RequestError!void {
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, port_mod.buildDelPort(cl.allocator(), cl.family_id, seq, p));
+    }
+
     // ── parameters ─────────────────────────────────────────────────────────
+
+    /// `DEVLINK_CMD_PORT_PARAM_GET` (dump) — the per-port parameters. Unprivileged. `filter` is applied
+    /// client-side. Free with `param.freeAll`.
+    pub fn portParams(cl: *Devlink, filter: ?handle_mod.Handle) RequestError![]param_mod.Param {
+        const gpa = cl.allocator();
+        if (filter) |h| try validate(h);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(param_mod.buildPortParams(gpa, cl.family_id, seq));
+
+        var out: std.ArrayList(param_mod.Param) = .empty;
+        errdefer {
+            for (out.items) |*p| p.deinit(gpa);
+            out.deinit(gpa);
+        }
+        var walk: Walk = .{ .cl = cl, .seq = seq };
+        while (try walk.next()) |m| {
+            var p = param_mod.parse(gpa, m.attrs) catch |e| return mapParse(e);
+            if (p.name_len == 0 or !p.handle.isComplete()) {
+                p.deinit(gpa);
+                continue;
+            }
+            if (filter) |h| if (!p.handle.eql(h)) {
+                p.deinit(gpa);
+                continue;
+            };
+            out.append(gpa, p) catch |e| {
+                p.deinit(gpa);
+                return e;
+            };
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// `DEVLINK_CMD_PORT_PARAM_GET` for one named parameter of one port. Unprivileged. Free with `Param.deinit`.
+    pub fn portParam(cl: *Devlink, p: handle_mod.PortHandle, name: []const u8) RequestError!param_mod.Param {
+        const gpa = cl.allocator();
+        const seq = cl.startRequest();
+        try cl.sendBuilt(param_mod.buildPortParam(gpa, cl.family_id, seq, p, name));
+
+        var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
+        defer reply.deinit(gpa);
+        var out = param_mod.parse(gpa, reply.attrs) catch |e| return mapParse(e);
+        errdefer out.deinit(gpa);
+        try checkPortHandleEcho(p, out.handle, out.port_index);
+        if (!std.mem.eql(u8, out.name(), name)) return error.UnexpectedHandle;
+        return out;
+    }
+
+    /// `DEVLINK_CMD_PORT_PARAM_SET`. Needs **CAP_NET_ADMIN**; see `setParam` for the value rules.
+    pub fn setPortParam(
+        cl: *Devlink,
+        p: handle_mod.PortHandle,
+        name: []const u8,
+        cmode: uapi.ParamCmode,
+        value: param_mod.Value,
+    ) RequestError!void {
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, param_mod.buildSetPortParam(cl.allocator(), cl.family_id, seq, p, name, cmode, value));
+    }
 
     /// `DEVLINK_CMD_PARAM_GET` (dump). Unprivileged. `filter` is applied
     /// client-side. Free with `param.freeAll`.
@@ -573,6 +659,62 @@ pub const Devlink = struct {
             h,
             name,
         ));
+    }
+
+    /// `DEVLINK_CMD_HEALTH_REPORTER_DIAGNOSE` — the reporter's own account of its state (what the driver chooses to
+    /// show), as a `health.Fmsg`. Needs **CAP_NET_ADMIN**. Free with `gpa.free(f.bytes)`.
+    pub fn healthDiagnose(cl: *Devlink, h: handle_mod.Handle, name: []const u8) RequestError!health_mod.Fmsg {
+        const gpa = cl.allocator();
+        const seq = cl.startRequest();
+        try cl.sendBuilt(health_mod.buildDiagnoseHealthReporter(gpa, cl.family_id, seq, h, name));
+        return cl.collectFmsg(seq);
+    }
+
+    /// `DEVLINK_CMD_HEALTH_REPORTER_DUMP_GET` — the dump the driver took when the reporter last tripped, as a
+    /// `health.Fmsg` (empty when none was taken). Needs **CAP_NET_ADMIN**. Free with `gpa.free(f.bytes)`.
+    pub fn healthDump(cl: *Devlink, h: handle_mod.Handle, name: []const u8) RequestError!health_mod.Fmsg {
+        const gpa = cl.allocator();
+        const seq = cl.startRequest();
+        try cl.sendBuilt(health_mod.buildDumpHealthReporter(gpa, cl.family_id, seq, h, name));
+        return cl.collectFmsg(seq);
+    }
+
+    /// `DEVLINK_CMD_HEALTH_REPORTER_DUMP_CLEAR` — discard the stored dump. Needs **CAP_NET_ADMIN**.
+    pub fn clearHealthDump(cl: *Devlink, h: handle_mod.Handle, name: []const u8) RequestError!void {
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, health_mod.buildClearHealthDump(cl.allocator(), cl.family_id, seq, h, name));
+    }
+
+    /// `DEVLINK_CMD_HEALTH_REPORTER_TEST` — make the reporter raise a test error. That can run its recovery, which
+    /// on many drivers resets part of the device. Needs **CAP_NET_ADMIN**.
+    pub fn testHealthReporter(cl: *Devlink, h: handle_mod.Handle, name: []const u8) RequestError!void {
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, health_mod.buildTestHealthReporter(cl.allocator(), cl.family_id, seq, h, name));
+    }
+
+    /// `DEVLINK_CMD_HEALTH_REPORTER_SET` — graceful period, auto recovery, auto dump, burst period. Needs
+    /// **CAP_NET_ADMIN**.
+    pub fn setHealthReporter(cl: *Devlink, h: handle_mod.Handle, name: []const u8, s: health_mod.ReporterSet) RequestError!void {
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, health_mod.buildSetHealthReporter(cl.allocator(), cl.family_id, seq, h, name, s));
+    }
+
+    /// Read a request's replies to the end and gather their `DEVLINK_ATTR_FMSG` nests.
+    fn collectFmsg(cl: *Devlink, seq: u32) RequestError!health_mod.Fmsg {
+        const gpa = cl.allocator();
+        var c: health_mod.FmsgCollector = .{};
+        errdefer c.deinit(gpa);
+        var walk: Walk = .{ .cl = cl, .seq = seq };
+        while (try walk.next()) |m| {
+            c.feed(gpa, m.attrs, health_mod.max_fmsg_bytes) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.MalformedReply,
+            };
+        }
+        const f = try c.finish(gpa);
+        errdefer gpa.free(f.bytes);
+        f.validate() catch return error.MalformedReply;
+        return f;
     }
 
     // ── eswitch ────────────────────────────────────────────────────────────
@@ -990,6 +1132,49 @@ pub const EventSocket = struct {
         var rest = groups;
         while (rest.len != 0) {
             // One nlctrl round trip per 16 names (`genetlink.Socket.resolveMcastGroups`), not one per name.
+            const n = @min(rest.len, 16);
+            var ids: [16]?u32 = undefined;
+            cmd.sock.resolveMcastGroups(uapi.family_name, rest[0..n], ids[0..n]) catch |e| return mapResolve(e);
+            for (ids[0..n]) |id| try ev.joinGroup(id orelse return error.GroupNotFound);
+            rest = rest[n..];
+        }
+        return ev;
+    }
+
+    /// `openWith`, with a notification filter in place before the first group is joined, so nothing slips past
+    /// it: the kernel then sends only the notifications about the filter's device (or port). The filter is the
+    /// socket's own state; the answer to it is read here, before any notification can be in flight.
+    pub fn openFiltered(
+        cmd: *Devlink,
+        groups: []const []const u8,
+        filter: request.NotifyFilter,
+    ) (OpenError || SubscribeError || RequestError)!EventSocket {
+        var ev: EventSocket = .{
+            .sock = try genl.Socket.open(cmd.allocator()),
+            .family_id = cmd.family_id,
+        };
+        errdefer ev.sock.close();
+        const seq = ev.sock.nextSeq();
+        const built = request.buildNotifyFilter(cmd.allocator(), ev.family_id, seq, filter);
+        const msg = built catch |e| return mapBuild(e);
+        defer cmd.allocator().free(msg);
+        ev.sock.send(msg) catch |e| return switch (e) {
+            error.AccessDenied => error.AccessDenied,
+            error.SystemResources => error.SystemResources,
+            error.SendFailed => error.SendFailed,
+        };
+        const Shim = struct {
+            sock: *genl.Socket,
+            family_id: u16,
+            fn noteErrorMessage(_: @This(), _: codec.Message) void {}
+        };
+        const shim: Shim = .{ .sock = &ev.sock, .family_id = ev.family_id };
+        var it: codec.MessageIterator = .{ .buf = &.{} };
+        var finished = false;
+        var msgs: u32 = 0;
+        while (try walkStep(shim, seq, &it, &finished, &msgs)) |_| {}
+        var rest = groups;
+        while (rest.len != 0) {
             const n = @min(rest.len, 16);
             var ids: [16]?u32 = undefined;
             cmd.sock.resolveMcastGroups(uapi.family_name, rest[0..n], ids[0..n]) catch |e| return mapResolve(e);

@@ -103,6 +103,25 @@ pub fn buildSimple(
     return b.finish();
 }
 
+/// Which notifications a subscriber wants (`DEVLINK_CMD_NOTIFY_FILTER_SET`): those about one device, or one port of
+/// it. With no handle everything passes.
+pub const NotifyFilter = struct {
+    handle: ?handle.Handle = null,
+    /// Needs a `handle`: a port index means nothing without its device.
+    port_index: ?u32 = null,
+};
+
+/// Build a `DEVLINK_CMD_NOTIFY_FILTER_SET`. The filter belongs to the socket that sends it, so it is the event
+/// socket's message (`EventSocket.openFiltered`), not the command socket's.
+pub fn buildNotifyFilter(gpa: std.mem.Allocator, family_id: u16, seq: u32, f: NotifyFilter) Error![]u8 {
+    if (f.port_index != null and f.handle == null) return error.InvalidRequest;
+    var b = try beginFlags(gpa, family_id, seq, uapi.CMD.NOTIFY_FILTER_SET, codec.NLM_F_REQUEST | codec.NLM_F_ACK, uapi.family_version);
+    errdefer b.deinit();
+    if (f.handle) |h| try handle.append(gpa, &b.list, h);
+    if (f.port_index) |i| try codec.appendAttrU32(gpa, &b.list, uapi.ATTR.PORT_INDEX, i);
+    return b.finish();
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -176,4 +195,29 @@ test "buildSimple carries the handle when it is given one" {
         false,
         .{ .bus = "", .dev = "x" },
     ));
+}
+
+test "buildNotifyFilter names a device, a port of it, or nothing" {
+    const gpa = testing.allocator;
+    const none = try buildNotifyFilter(gpa, 0x19, 1, .{});
+    defer gpa.free(none);
+    try testing.expectEqual(@as(usize, 20), none.len);
+    try testing.expectEqual(uapi.CMD.NOTIFY_FILTER_SET, none[16]);
+
+    const dev = try buildNotifyFilter(gpa, 0x19, 1, .{ .handle = .pci("0000:65:00.0") });
+    defer gpa.free(dev);
+    const o = try handle.parse(dev[20..]);
+    try testing.expectEqualStrings("0000:65:00.0", o.dev());
+
+    const port = try buildNotifyFilter(gpa, 0x19, 1, .{ .handle = .pci("0000:65:00.0"), .port_index = 9 });
+    defer gpa.free(port);
+    var it: codec.AttrIterator = .{ .buf = port[20..] };
+    var idx: ?u32 = null;
+    while (try it.next()) |a| if (a.type == uapi.ATTR.PORT_INDEX) {
+        idx = try a.asU32();
+    };
+    try testing.expectEqual(@as(?u32, 9), idx);
+
+    try testing.expectError(error.InvalidRequest, buildNotifyFilter(gpa, 0x19, 1, .{ .port_index = 9 }));
+    try testing.expectError(error.InvalidRequest, buildNotifyFilter(gpa, 0x19, 1, .{ .handle = .{ .bus = "", .dev = "x" } }));
 }

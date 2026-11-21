@@ -54,7 +54,7 @@ in this module are written for that case and pass on it.
 ## Not provided
 
 Rate objects, traps / trap groups / trap policers, DPIPE, shared buffers (`SB_*`), flash update, selftests, linecards, port
-functions, `PORT_NEW`/`PORT_DEL`, health diagnose/dump, the reload counters and `NOTIFY_FILTER_SET` are not modelled; all are
+the reload counters are not modelled; all are
 reachable through `raw` (reasons and order in SPEC *Backlog / deferred*). No test issues a write, even under privilege.
 
 ## API
@@ -131,6 +131,17 @@ const reporters = try dl.healthReporters(h);
 defer gpa.free(reporters);
 for (reporters) |r| _ = .{ r.name(), r.isHealthy(), r.err_count, r.unrecoveredCount(), r.hasDump() };
 try dl.recoverHealthReporter(h, "fw");    // CAP_NET_ADMIN — usually resets the device
+const msg = try dl.healthDiagnose(h, "fw"); // the reporter's own account, a self-describing message
+defer gpa.free(msg.bytes);
+var items = msg.iterator();               // objects, pairs, arrays, typed values; msg.find("name") for one
+while (try items.next()) |item| _ = item;
+try dl.setHealthReporter(h, "fw", .{ .auto_recover = true, .graceful_period = 5000 });
+
+// ── port functions, subfunctions, per-port parameters ────────────────────
+const sf = try dl.newPort(h, .{ .pf_number = 0, .sf_number = 88 });   // CAP_NET_ADMIN, driver support needed
+if (sf.function) |f| _ = .{ f.hwAddr(), f.state, f.opstate, f.hasCap(devlink.FN_CAP.ROCE) };
+try dl.setPortFunction(sf.portHandle().?, .{ .state = .active });
+const roce = try dl.portParam(sf.portHandle().?, "enable_roce");
 
 // ── eswitch ──────────────────────────────────────────────────────────────
 const es = try dl.eswitch(h);             // privileged read (GENL_ADMIN_PERM)
