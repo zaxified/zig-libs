@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [armon/go-radix](https://github.com/armon/go-radix) | Go | MIT | 946 | no release; push 2024-07 | Mutable in-memory radix tree, ordered walk-prefix; not frozen, not serializable, no ranking. This module is ahead on frozen zero-copy load and top-N. |
 | [hedzr/trie.zig](https://github.com/hedzr/trie.zig) | Zig | Apache-2.0 | 1 | push 2025-04 | The only Zig trie found by `gh search` (few stars, others 0): in-memory, not frozen, no untrusted-buffer story *(inferred from name and description; source not read)*. Zig `std` has no trie. |
 
-**Where we are ahead:** the only frozen, zero-copy, self-describing (magic, version, CRC) trie in Zig found; **top-N by stored score with a node budget** (`max_visited`) and an `after` cursor for the next page, which none of the above offers; a never-panic/never-loop loader over untrusted buffers (corrupt-buffer fuzz, seeded sweep, bounded iterators). **On par:** range iteration (fst's `range`), common-prefix and longest-prefix search (marisa/darts), reverse lookup key ↔ rank (marisa, via optional per-edge counts), a streaming build from sorted input to any writer (fst's build model), automaton search over the index with the fst built-ins (`Str`, `Subsequence`, `AlwaysMatch`, `StartsWith`, `Union`, `Intersection`, `Complement`) or any caller type that satisfies the `automaton` interface, and union / intersection / difference / symmetric difference over up to 64 indexes with the contributing values per key. **Where we are behind:** nothing a fst user notices beyond two consciously rejected items, no suffix minimization (still several times marisa's ~5 B/key) and `u32` values only (fst stores `u64`); both are named, with their reasons, in *What is deliberately not done*. Regular expressions and Levenshtein distance are not built-in automata: Levenshtein is the sibling `fuzzysearch` module, which already walks this index with its own Levenshtein automaton (`fuzzysearch/src/search.zig`); the `regex` module exposes no byte-stepping DFA state to plug in, so a regex automaton has to wait for one (any type with the five `automaton` functions is searched as is).
+**Where we are ahead:** the only frozen, zero-copy, self-describing (magic, version, CRC) trie in Zig found; **top-N by stored score with a node budget** (`max_visited`) and an `after` cursor for the next page, which none of the above offers; a never-panic/never-loop loader over untrusted buffers (corrupt-buffer fuzz, seeded sweep, bounded iterators). **On par:** range iteration (fst's `range`), common-prefix and longest-prefix search (marisa/darts), reverse lookup key ↔ rank (marisa, via optional per-edge counts), a streaming build from sorted input to any writer (fst's build model), automaton search over the index with the fst built-ins (`Str`, `Subsequence`, `AlwaysMatch`, `StartsWith`, `Union`, `Intersection`, `Complement`) or any caller type that satisfies the `automaton` interface, and union / intersection / difference / symmetric difference over up to 64 indexes with the contributing values per key. **Where we are behind:** nothing a fst user notices beyond two consciously rejected items, no suffix minimization (still several times marisa's ~5 B/key) and `u32` values only (fst stores `u64`); both are named, with their reasons, in *What is deliberately not done*. Regular expressions and Levenshtein distance are not built-in automata: Levenshtein is the sibling `fuzzysearch` module, which already walks this index with its own Levenshtein automaton (`fuzzysearch/src/search.zig`); a regex automaton is `regex.ByteAutomaton` (a `Regex` as a byte-stepping automaton over whole keys; it has `State`, `start`, `accept`, `isMatch`, `canMatch` and `willAlwaysMatch`, so `Frozen.search` takes it as is; `regex` has no dependency on this module and this one none on `regex`, the caller wires the two).
 
 ## Performance
 
@@ -424,9 +424,10 @@ stride returns `error.KeyTooLong`. Callers must therefore size `key_buf` as
 **`results.len × longest-expected-completion`**, not just one key. (The single
 `prefixIterator` `next(buf)` path has no such multiplier — one key at a time.)
 
-`topN` also needs about 0.46 MB of the caller's stack per call (a `max_depth` array of
-frames and two `max_depth` byte arrays), whatever the input (`query.zig`); do not call
-it on a small thread stack.
+`topN` needs about 40 KB of the caller's stack per call (a `max_depth` array of 8-byte
+frames, each holding a node offset, and two `max_depth` byte arrays), whatever the input
+(`query.zig`); only the top node is held decoded, and a node that comes back to the top
+after a pop is decoded again from its offset.
 
 ## What is deliberately not done
 
@@ -443,16 +444,14 @@ it on a small thread stack.
 - **Approximate / typo-tolerant matching.** That is the sibling `fuzzysearch` module's
   job; `trie` stays exact-prefix (an automaton can be searched, but no Levenshtein
   automaton is built in).
-- **A regex automaton.** Waits for a byte-stepping DFA in the `regex` module (any type with
-  the five `automaton` functions is searched as is).
+- **A built-in regex automaton.** `regex.ByteAutomaton` already has the shape `Frozen.search`
+  takes; a built-in one would make `trie` depend on `regex` for no gain.
 
 ## Backlog / deferred
 
 - **Dense table for the first levels** of a lookup (idea): the first levels cost a large
   share of a miss lookup's time (measured on the version-3 layout); a 256-entry jump table at the root and the next level
   would cut it. Only if lookup speed against darts-clone ever matters again.
-- **`topN` stack use** (LOW): about 0.46 MB per call; shrink the frame (an offset instead
-  of a `NodeView`) or take caller scratch.
 
 ## Anchoring
 

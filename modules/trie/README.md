@@ -152,7 +152,7 @@ while (try op.next(&kb, &vals)) |item| { /* item.key, item.values[i].index / .va
 stops feeding bytes below a point; the budget of `opIterator` is the total over
 all inputs. Output is in key order, so a union can be written straight into a
 `SortedBuilder`. Levenshtein distance is the sibling `fuzzysearch`; a regex
-automaton is not built in (any conforming type is searched as is).
+automaton is `regex.ByteAutomaton` (any conforming type is searched as is).
 
 `Builder.freezeTo(writer, opts)` streams an unsorted in-memory build the same
 way. `freezeWith(gpa, .v1)` still writes version 1 for a reader built against

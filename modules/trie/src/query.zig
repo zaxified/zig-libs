@@ -146,6 +146,13 @@ pub const Frozen = struct {
         return format.nodeAt(self.buf, self.header.root_offset);
     }
 
+    /// Decode the node at `off` the way this buffer's version stores nodes.
+    fn nodeAtOffset(self: Frozen, off: u32) format.DecodeError!format.NodeView {
+        if (format.hasFooter(self.header.version))
+            return format.nodeAtFooter(self.buf, off, self.header.version, self.header.hasOrdinals());
+        return format.nodeAt(self.buf, off);
+    }
+
     const Seek = struct {
         node: format.NodeView,
         /// The part of `node`'s incoming tail AFTER the end of the prefix: a
@@ -282,9 +289,8 @@ pub const Frozen = struct {
     /// Top-N completions under `prefix`, ranked best-first, into the caller's
     /// `results` and `key_buf`. See `topNInto` for the full contract.
     ///
-    /// Stack: one call uses about 0.46 MB of the caller's stack (a `max_depth`
-    /// frame array and two `max_depth` byte arrays), whatever the input. Do not
-    /// call it from a thread with a small stack (no-panic sweep 2026-10-28, T-4).
+    /// Stack: one call uses about 40 KB of the caller's stack (a `max_depth`
+    /// array of 8-byte frames and two `max_depth` byte arrays), whatever the input.
     pub fn topN(
         self: Frozen,
         prefix: []const u8,
@@ -550,10 +556,15 @@ fn topNInto(
     @memcpy(path_store[prefix.len..][0..s.rest.len], s.rest);
     var path_len: usize = prefix.len + s.rest.len;
 
-    const Frame = struct { node: format.NodeView, edge_idx: u16, mark: usize };
+    // A frame keeps the node's offset, not its decoded `NodeView` (about 100
+    // bytes): only the top node is held decoded (`cur`), and a node coming back
+    // to the top after a pop is decoded again from its offset (it decoded once
+    // already, so it cannot fail on the same buffer). 8 bytes a frame.
+    const Frame = struct { offset: u32, edge_idx: u16, mark: u16 };
     var stack: [max_depth]Frame = undefined;
     var sp: usize = 0;
-    stack[sp] = .{ .node = sub, .edge_idx = 0, .mark = path_len };
+    var cur = sub;
+    stack[sp] = .{ .offset = sub.offset, .edge_idx = 0, .mark = @intCast(path_len) };
     sp += 1;
     if (sub.terminal) try sel.consider(sub.value, path_store[0..path_len]);
 
@@ -562,8 +573,8 @@ fn topNInto(
 
     outer: while (sp > 0) {
         const top = &stack[sp - 1];
-        if (top.edge_idx < top.node.edge_count) {
-            const e = top.node.edge(top.edge_idx);
+        if (top.edge_idx < cur.edge_count) {
+            const e = cur.edge(top.edge_idx);
             top.edge_idx += 1;
 
             if (opts.max_visited != 0 and visited >= opts.max_visited) {
@@ -573,7 +584,7 @@ fn topNInto(
             // (no-panic sweep 2026-10-28, T-2) implicit cap, see the "implicit work cap" note above `QueryError`.
             if (opts.max_visited == 0 and visited >= self.buf.len) return error.Corrupt;
             visited += 1;
-            const child = try format.follow(top.node, e.child);
+            const child = try format.follow(cur, e.child);
 
             // Prune whole subtrees that cannot beat the current worst kept value
             // (strict: ties are still explored so the key tie-break is exact).
@@ -587,11 +598,13 @@ fn topNInto(
             @memcpy(path_store[path_len + 1 ..][0..child.tail.len], child.tail);
             path_len += 1 + child.tail.len;
             if (child.terminal) try sel.consider(child.value, path_store[0..path_len]);
-            stack[sp] = .{ .node = child, .edge_idx = 0, .mark = mark };
+            stack[sp] = .{ .offset = child.offset, .edge_idx = 0, .mark = @intCast(mark) };
             sp += 1;
+            cur = child;
         } else {
             path_len = top.mark;
             sp -= 1;
+            if (sp > 0) cur = try self.nodeAtOffset(stack[sp - 1].offset);
         }
     }
 
