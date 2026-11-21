@@ -14,9 +14,10 @@
 //! Build (see `tools/README.md` for the full recipe and measured result):
 //!   zig build-exe -OReleaseFast -femit-bin=<scratch>/driver \
 //!     --dep sealedbox -Mroot=modules/sealedbox/tools/driver.zig \
-//!     --dep ct25519 --dep b64ct -Msealedbox=modules/sealedbox/src/root.zig \
+//!     --dep ct25519 --dep b64ct --dep chachapoly -Msealedbox=modules/sealedbox/src/root.zig \
 //!     --dep entropy --dep zl_options -Mct25519=modules/ct25519/src/root.zig \
 //!     -Mb64ct=modules/b64ct/src/root.zig -Mentropy=modules/entropy/src/root.zig \
+//!     -Mchachapoly=modules/chachapoly/src/root.zig \
 //!     -Mzl_options=$OPT --cache-dir <scratch>     (OPT: see tools/README.md)
 
 const std = @import("std");
