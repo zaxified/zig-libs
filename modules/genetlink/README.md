@@ -59,7 +59,7 @@ Socket: `open`/`close`, `handle` (= the `fd` field, for poll/epoll and
 `setsockopt`), `setRecvTimeout`, `nextSeq`, `send`, `recvDatagram` /
 `recvDatagramStrict`, `wipeRecvBuffer` (zero the receive buffer after a secret-carrying reply; `wipe_on_close` does it at `close`), `lastErrorMessage`, `resolveFamily`,
 `resolveMcastGroup`, `resolveMcastGroups` (several group names over one round trip), `getFamily` (id, name, version, header size, max attribute),
-`listFamilies` (every registered family; free the slice with `gpa.free`).
+`listFamilies` (every registered family; free the slice with `gpa.free`), `getPolicy` (the kernel's attribute policy of a family: kinds and bounds per command; `Policy.deinit`).
 Pure: `Family`, `parseFamily`, `buildListFamiliesRequest`,
 `CTRL_ATTR_VERSION`/`HDRSIZE`/`MAXATTR`.
 

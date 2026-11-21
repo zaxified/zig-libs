@@ -32,8 +32,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 **Where we are ahead:** the only Zig genl transport; hardened reply loop (identity check on
 portid/seq, message budget, `NLM_F_DUMP_INTR` handling), batch multicast-group resolution in one round trip, extended-ACK text kept fresh
-per request, `listFamilies` and per-family metadata (`getFamily`: id, name, version, header size, max attribute); four real families (ethtool, devlink, nl80211, wireguard) are built on it. **Where we are
-behind:** no policy introspection (`CTRL_CMD_GETPOLICY`, see *Backlog / deferred*). Joining a group stays with the caller by design.
+per request, `listFamilies`, `getPolicy` and per-family metadata (`getFamily`: id, name, version, header size, max attribute); four real families (ethtool, devlink, nl80211, wireguard) are built on it. **Where we are
+behind:** nothing the surveyed libraries offer. Joining a group stays with the caller by design. Policy introspection (`getPolicy`, `CTRL_CMD_GETPOLICY`) is here although none of the surveyed libraries appears to expose it *(inferred)*.
 
 ## Design & invariants
 `genetlink` is the generic-netlink counterpart to the `netlink` module's rtnetlink client, and it
@@ -116,6 +116,8 @@ matching hardening for its own two axes: a matching group entry whose id is 0 is
 `ctrlGetFamilyOver` bounds its receive loop at `max_reply_messages` (65536, `root.zig`) datagrams,
 returning `error.TooManyMessages` (a member of `ResolveError`) when a peer never reaches `NLMSG_DONE`
 (a missing terminator, an endless `NLM_F_DUMP_INTR` stream, or a flood of foreign-`seq` datagrams).
+**Policy introspection.** `Socket.getPolicy(family, op)` sends `CTRL_CMD_GETPOLICY` as a dump (kernel 5.2+; before that the controller answers an errno that maps to `error.Unexpected`) and returns a `Policy`: `ops` (the policy index each command's doit / dump validates with) and `attrs` (one `PolicyAttr` per attribute of each policy: `NL_ATTR_TYPE_*` kind, signed/unsigned value bounds, length bounds, the nested policy index and its highest attribute, bitfield32 / mask). `op` restricts the answer to one command. Entries are merged across the messages of the dump; it has the reply budget of the other engines, restarts a dump flagged `NLM_F_DUMP_INTR`, and caps the answer at 65536 entries per list (`error.TooManyMessages`). A kind newer than `PolicyKind` is kept as its raw number. `parsePolicyRecord` and `buildGetPolicyRequest` are the pure halves.
+
 The collecting engine behind `getFamily`/`listFamilies` has the same budget and also caps the family
 count at `GENL_MAX_ID`. `listFamilies` restarts a dump flagged `NLM_F_DUMP_INTR` up to
 `max_dump_attempts` (3) times, then reports `error.DumpInterrupted`.
@@ -244,10 +246,7 @@ attributes and request/reply shapes) and multicast *membership* (see above).
 
 ## Backlog / deferred
 
-- **Adopt `resolveMcastGroups` in the consumers.** `nl80211`, `ethtool` and `devlink` resolve one name per
-  call through `resolveMcastGroup`; the batch entry point exists (one round trip for N names) but is not
-  used by them. Mechanical, in their own modules.
-- **Policy introspection** (survey 2026-09-30) — `CTRL_CMD_GETPOLICY` (kernel 5.2+), letting a client validate attribute types against the kernel's own policy. None of the surveyed libraries appears to expose it *(inferred)*; nice-to-have. Effort: medium.
+None open.
 
 ## Anchoring
 

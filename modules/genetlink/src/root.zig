@@ -82,6 +82,8 @@ pub const GENL_ID_CTRL: u16 = 0x10;
 /// notification or another control message can't be mistaken for one.
 pub const CTRL_CMD_NEWFAMILY: u8 = 1;
 pub const CTRL_CMD_GETFAMILY: u8 = 3;
+/// `CTRL_CMD_GETPOLICY` (kernel 5.2+): the policy of a family's attributes.
+pub const CTRL_CMD_GETPOLICY: u8 = 10;
 
 /// nlctrl attributes (CTRL_ATTR_*).
 pub const CTRL_ATTR_FAMILY_ID: u16 = 1;
@@ -93,6 +95,12 @@ pub const CTRL_ATTR_HDRSIZE: u16 = 4;
 pub const CTRL_ATTR_MAXATTR: u16 = 5;
 /// Nest of one sub-nest per multicast group the family publishes.
 pub const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+/// Nest of the attribute policies of a `CTRL_CMD_GETPOLICY` reply, keyed by policy index.
+pub const CTRL_ATTR_POLICY: u16 = 8;
+/// Nest of the per-operation policy indices of a `CTRL_CMD_GETPOLICY` reply, keyed by command.
+pub const CTRL_ATTR_OP_POLICY: u16 = 9;
+/// Request attribute of `CTRL_CMD_GETPOLICY`: restrict the answer to one command (`u32`).
+pub const CTRL_ATTR_OP: u16 = 10;
 
 /// Attributes inside one entry of `CTRL_ATTR_MCAST_GROUPS`
 /// (`CTRL_ATTR_MCAST_GRP_*`).
@@ -577,6 +585,19 @@ pub const Socket = struct {
         return listFamiliesOver(&t);
     }
 
+    /// The kernel's own attribute policy of `family` (`CTRL_CMD_GETPOLICY`,
+    /// kernel 5.2+; an older kernel answers `error.Unexpected` or
+    /// `error.FamilyNotFound`): which policy each command validates with and, per
+    /// attribute, its kind and bounds, so a client can check what it is about to
+    /// send. `op` restricts the answer to one command. Unprivileged. Caller
+    /// frees with `Policy.deinit(gpa)`. A dump flagged `NLM_F_DUMP_INTR` is
+    /// restarted like `listFamilies`.
+    pub fn getPolicy(self: *Socket, family: []const u8, op: ?u32) ListFamiliesError!Policy {
+        var t = self.transport();
+        defer self.sync(t);
+        return getPolicyOver(&t, family, op);
+    }
+
     /// What one `CTRL_CMD_GETFAMILY` round trip is being asked to extract
     /// from the resolved family's reply, besides the family's own identity
     /// (name and id), which `ctrlGetFamilyOver` verifies unconditionally.
@@ -854,6 +875,275 @@ fn listFamiliesOver(t: anytype) ListFamiliesError![]Family {
             continue;
         }
         return list.toOwnedSlice(t.gpa);
+    }
+    return error.DumpInterrupted;
+}
+
+// ── policy introspection (CTRL_CMD_GETPOLICY) ──────────────────────────────
+
+/// The `NL_ATTR_TYPE_*` of an attribute in a family's policy (linux/netlink.h).
+/// Non-exhaustive: a kernel newer than this module may report a kind it does not know.
+pub const PolicyKind = enum(u32) {
+    invalid = 0,
+    flag = 1,
+    u8 = 2,
+    u16 = 3,
+    u32 = 4,
+    u64 = 5,
+    s8 = 6,
+    s16 = 7,
+    s32 = 8,
+    s64 = 9,
+    binary = 10,
+    string = 11,
+    nul_string = 12,
+    nested = 13,
+    nested_array = 14,
+    bitfield32 = 15,
+    sint = 16,
+    uint = 17,
+    _,
+};
+
+/// `NL_POLICY_TYPE_ATTR_*`, the attributes of one attribute's policy.
+const NL_POLICY_TYPE_ATTR_TYPE: u16 = 1;
+const NL_POLICY_TYPE_ATTR_MIN_VALUE_S: u16 = 2;
+const NL_POLICY_TYPE_ATTR_MAX_VALUE_S: u16 = 3;
+const NL_POLICY_TYPE_ATTR_MIN_VALUE_U: u16 = 4;
+const NL_POLICY_TYPE_ATTR_MAX_VALUE_U: u16 = 5;
+const NL_POLICY_TYPE_ATTR_MIN_LENGTH: u16 = 6;
+const NL_POLICY_TYPE_ATTR_MAX_LENGTH: u16 = 7;
+const NL_POLICY_TYPE_ATTR_POLICY_IDX: u16 = 8;
+const NL_POLICY_TYPE_ATTR_POLICY_MAXTYPE: u16 = 9;
+const NL_POLICY_TYPE_ATTR_BITFIELD32_MASK: u16 = 10;
+const NL_POLICY_TYPE_ATTR_MASK: u16 = 12;
+
+/// `CTRL_ATTR_POLICY_DO` / `_DUMP`: the policy index of a command's doit / dumpit.
+const CTRL_ATTR_POLICY_DO: u16 = 1;
+const CTRL_ATTR_POLICY_DUMP: u16 = 2;
+
+/// What the kernel's policy says about one attribute of one policy.
+pub const PolicyAttr = struct {
+    /// Index of the policy this attribute belongs to (see `Policy.ops`, `nested_policy`).
+    policy: u32,
+    /// The attribute type the entry is about.
+    attr: u16,
+    kind: PolicyKind = .invalid,
+    /// Value bounds, present only when the kernel reports them: signed for the
+    /// signed kinds, unsigned for the unsigned ones.
+    min_signed: ?i64 = null,
+    max_signed: ?i64 = null,
+    min_unsigned: ?u64 = null,
+    max_unsigned: ?u64 = null,
+    /// Length bounds of a binary / string attribute.
+    min_len: ?u32 = null,
+    max_len: ?u32 = null,
+    /// For a nested attribute: the policy index of its content and its highest attribute type.
+    nested_policy: ?u32 = null,
+    nested_maxattr: ?u32 = null,
+    /// `bitfield32`: the valid bits; `mask`: the accepted bit mask of an integer.
+    bitfield32_mask: ?u32 = null,
+    mask: ?u64 = null,
+};
+
+/// The policy index a command's two entry points validate with.
+pub const OpPolicy = struct {
+    cmd: u32,
+    do_policy: ?u32 = null,
+    dump_policy: ?u32 = null,
+};
+
+/// The answer to `Socket.getPolicy`: which policy each command uses, and every
+/// attribute of every policy the kernel sent. Free with `deinit`.
+pub const Policy = struct {
+    family_id: u16,
+    ops: []OpPolicy,
+    attrs: []PolicyAttr,
+
+    pub fn deinit(p: Policy, gpa: std.mem.Allocator) void {
+        gpa.free(p.ops);
+        gpa.free(p.attrs);
+    }
+
+    /// The entry of attribute `attr` in policy `policy`, or null.
+    pub fn find(p: Policy, policy: u32, attr: u16) ?PolicyAttr {
+        for (p.attrs) |a| if (a.policy == policy and a.attr == attr) return a;
+        return null;
+    }
+
+    /// The `OpPolicy` of command `cmd`, or null.
+    pub fn op(p: Policy, cmd: u32) ?OpPolicy {
+        for (p.ops) |o| if (o.cmd == cmd) return o;
+        return null;
+    }
+};
+
+/// Most attribute entries and commands one `getPolicy` answer may hold (each
+/// 65536); a stream past it is `error.TooManyMessages`.
+const max_policy_entries: usize = 65536;
+
+/// Build a `CTRL_CMD_GETPOLICY` dump request for `family` (by name), optionally
+/// restricted to one command (`op`). Caller frees the buffer.
+pub fn buildGetPolicyRequest(gpa: std.mem.Allocator, seq: u32, family: []const u8, op: ?u32) (std.mem.Allocator.Error || error{NameTooLong})![]u8 {
+    if (family.len >= GENL_NAMSIZ) return error.NameTooLong;
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, GENL_ID_CTRL, codec.NLM_F_REQUEST | codec.NLM_F_DUMP, seq, 0);
+    try appendHeader(gpa, &list, CTRL_CMD_GETPOLICY, 1);
+    codec.appendAttrString(gpa, &list, CTRL_ATTR_FAMILY_NAME, family) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AttrTooLong => return error.NameTooLong, // unreachable below GENL_NAMSIZ
+    };
+    if (op) |o| try codec.appendAttrU32(gpa, &list, CTRL_ATTR_OP, o);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+fn attrU64OrU32(a: codec.Attr) codec.Error!u64 {
+    return switch (a.data.len) {
+        4 => try a.asU32(),
+        8 => std.mem.readInt(u64, a.data[0..8], native_endian),
+        else => error.BadLength,
+    };
+}
+
+fn attrS64OrS32(a: codec.Attr) codec.Error!i64 {
+    return switch (a.data.len) {
+        4 => try a.asI32(),
+        8 => std.mem.readInt(i64, a.data[0..8], native_endian),
+        else => error.BadLength,
+    };
+}
+
+/// Fold the attributes of one `CTRL_CMD_GETPOLICY` reply record (past its
+/// `genlmsghdr`) into the lists. Pure: bytes in, entries out. One kernel
+/// message may carry the family id, command policies and attribute policies;
+/// a family may spread one answer over many messages.
+pub fn parsePolicyRecord(
+    gpa: std.mem.Allocator,
+    attr_bytes: []const u8,
+    family_id: *?u16,
+    ops: *std.ArrayList(OpPolicy),
+    attrs: *std.ArrayList(PolicyAttr),
+) (ResolveError)!void {
+    var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    while (it.next() catch return error.MalformedReply) |a| switch (a.type) {
+        CTRL_ATTR_FAMILY_ID => family_id.* = a.asU16() catch return error.MalformedReply,
+        CTRL_ATTR_OP_POLICY => {
+            var oi = a.nested();
+            while (oi.next() catch return error.MalformedReply) |o| {
+                if (ops.items.len >= max_policy_entries) return error.TooManyMessages;
+                var entry: OpPolicy = .{ .cmd = o.type };
+                var xi = o.nested();
+                while (xi.next() catch return error.MalformedReply) |x| switch (x.type) {
+                    CTRL_ATTR_POLICY_DO => entry.do_policy = x.asU32() catch return error.MalformedReply,
+                    CTRL_ATTR_POLICY_DUMP => entry.dump_policy = x.asU32() catch return error.MalformedReply,
+                    else => {},
+                };
+                try ops.append(gpa, entry);
+            }
+        },
+        CTRL_ATTR_POLICY => {
+            // The policy index is the nested attribute's type, which the
+            // 16-bit type field keeps below NLA_F_*; the kernel numbers
+            // policies from 0 and a family has a handful.
+            var pi = a.nested();
+            while (pi.next() catch return error.MalformedReply) |pol| {
+                var ai = pol.nested();
+                while (ai.next() catch return error.MalformedReply) |attr| {
+                    if (attrs.items.len >= max_policy_entries) return error.TooManyMessages;
+                    var e: PolicyAttr = .{ .policy = pol.type, .attr = attr.type };
+                    var xi = attr.nested();
+                    while (xi.next() catch return error.MalformedReply) |x| {
+                        switch (x.type) {
+                            NL_POLICY_TYPE_ATTR_TYPE => e.kind = @fromBackingInt(@intCast(x.asU32() catch return error.MalformedReply)),
+                            NL_POLICY_TYPE_ATTR_MIN_VALUE_S => e.min_signed = attrS64OrS32(x) catch return error.MalformedReply,
+                            NL_POLICY_TYPE_ATTR_MAX_VALUE_S => e.max_signed = attrS64OrS32(x) catch return error.MalformedReply,
+                            NL_POLICY_TYPE_ATTR_MIN_VALUE_U => e.min_unsigned = attrU64OrU32(x) catch return error.MalformedReply,
+                            NL_POLICY_TYPE_ATTR_MAX_VALUE_U => e.max_unsigned = attrU64OrU32(x) catch return error.MalformedReply,
+                            NL_POLICY_TYPE_ATTR_MIN_LENGTH => e.min_len = x.asU32() catch return error.MalformedReply,
+                            NL_POLICY_TYPE_ATTR_MAX_LENGTH => e.max_len = x.asU32() catch return error.MalformedReply,
+                            NL_POLICY_TYPE_ATTR_POLICY_IDX => e.nested_policy = x.asU32() catch return error.MalformedReply,
+                            NL_POLICY_TYPE_ATTR_POLICY_MAXTYPE => e.nested_maxattr = x.asU32() catch return error.MalformedReply,
+                            NL_POLICY_TYPE_ATTR_BITFIELD32_MASK => e.bitfield32_mask = x.asU32() catch return error.MalformedReply,
+                            NL_POLICY_TYPE_ATTR_MASK => e.mask = attrU64OrU32(x) catch return error.MalformedReply,
+                            else => {},
+                        }
+                    }
+                    try attrs.append(gpa, e);
+                }
+            }
+        },
+        else => {},
+    };
+}
+
+/// One dump attempt of `getPolicyOver`: the loop of `collectFamilies` over
+/// `CTRL_CMD_GETPOLICY` records. Returns true when the kernel flagged the dump
+/// interrupted.
+fn collectPolicy(
+    transport: anytype,
+    gpa: std.mem.Allocator,
+    seq: u32,
+    family_id: *?u16,
+    ops: *std.ArrayList(OpPolicy),
+    attrs: *std.ArrayList(PolicyAttr),
+) ResolveError!bool {
+    var interrupted = false;
+    var msgs: u32 = 0;
+    while (true) {
+        if (msgs >= max_reply_messages) return error.TooManyMessages;
+        const dgram = try transport.recvDatagram();
+        msgs += 1;
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            switch (codec.classifyDumpMessage(m, transport.portId(), seq)) {
+                .skip => {},
+                .restart => interrupted = true,
+                .done => return interrupted,
+                .failed => |code| {
+                    transport.captureExtAck(m);
+                    return resolveErrorFromCode(code);
+                },
+                .overrun => return error.SystemResources,
+                .malformed => return error.MalformedReply,
+                .record => |rec| {
+                    if (rec.type != GENL_ID_CTRL) continue;
+                    const p = splitPayload(rec.payload) catch return error.MalformedReply;
+                    if (p.cmd != CTRL_CMD_GETPOLICY) return error.MalformedReply;
+                    try parsePolicyRecord(gpa, p.attrs, family_id, ops, attrs);
+                },
+            }
+        }
+    }
+}
+
+/// The body of `Socket.getPolicy` (transport shape as `getFamilyOver`): one
+/// dump per attempt, restarted when the kernel flags it `NLM_F_DUMP_INTR`.
+fn getPolicyOver(t: anytype, family: []const u8, op: ?u32) ListFamiliesError!Policy {
+    if (family.len >= GENL_NAMSIZ) return error.NameTooLong;
+    var attempt: u8 = 0;
+    while (attempt < max_dump_attempts) : (attempt += 1) {
+        t.ext_ack_len = 0;
+        const seq = t.nextSeq();
+        const req = buildGetPolicyRequest(t.gpa, seq, family, op) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NameTooLong => return error.NameTooLong,
+        };
+        defer t.gpa.free(req);
+        try t.send(req);
+
+        var fid: ?u16 = null;
+        var ops: std.ArrayList(OpPolicy) = .empty;
+        defer ops.deinit(t.gpa);
+        var attrs: std.ArrayList(PolicyAttr) = .empty;
+        defer attrs.deinit(t.gpa);
+        if (try collectPolicy(t, t.gpa, seq, &fid, &ops, &attrs)) continue;
+        const id = fid orelse return error.MalformedReply;
+        const ops_owned = try ops.toOwnedSlice(t.gpa);
+        errdefer t.gpa.free(ops_owned);
+        const attrs_owned = try attrs.toOwnedSlice(t.gpa);
+        return .{ .family_id = id, .ops = ops_owned, .attrs = attrs_owned };
     }
     return error.DumpInterrupted;
 }
@@ -2746,4 +3036,205 @@ test "Socket: resolveMcastGroups clears an out slot whose group the family does 
     try sock.resolveMcastGroups("nlctrl", &.{ "notify", "zig-libs-nope" }, &out);
     try testing.expect(out[0] != null and out[0].? != 99);
     try testing.expectEqual(@as(?u32, null), out[1]);
+}
+
+// ── CTRL_CMD_GETPOLICY ──────────────────────────────────────────────────────
+
+/// Append one attribute policy entry `attr` {kind, then `extra` appended by the caller} inside the open `policy` nest.
+fn policyEntry(gpa: std.mem.Allocator, list: *std.ArrayList(u8), attr: u16, kind: PolicyKind) !usize {
+    const n = try codec.nestBegin(gpa, list, attr);
+    try codec.appendAttrU32(gpa, list, NL_POLICY_TYPE_ATTR_TYPE, @backingInt(kind));
+    return n;
+}
+
+/// One GETPOLICY reply record: family id, two command policies and policy 0 with four attributes.
+fn buildPolicyReply(gpa: std.mem.Allocator, list: *std.ArrayList(u8), seq: u32, with_ids: bool) !void {
+    const h = try codec.appendHeader(gpa, list, GENL_ID_CTRL, 0, seq, 7);
+    try appendHeader(gpa, list, CTRL_CMD_GETPOLICY, 2);
+    if (with_ids) {
+        try codec.appendAttrU16(gpa, list, CTRL_ATTR_FAMILY_ID, 0x21);
+        const ops = try codec.nestBegin(gpa, list, CTRL_ATTR_OP_POLICY);
+        const o1 = try codec.nestBegin(gpa, list, 1);
+        try codec.appendAttrU32(gpa, list, CTRL_ATTR_POLICY_DO, 0);
+        try codec.appendAttrU32(gpa, list, CTRL_ATTR_POLICY_DUMP, 1);
+        try codec.nestEnd(list, o1);
+        const o2 = try codec.nestBegin(gpa, list, 5);
+        try codec.appendAttrU32(gpa, list, CTRL_ATTR_POLICY_DO, 0);
+        try codec.nestEnd(list, o2);
+        try codec.nestEnd(list, ops);
+    }
+    const pol = try codec.nestBegin(gpa, list, CTRL_ATTR_POLICY);
+    const p0 = try codec.nestBegin(gpa, list, 0);
+    var e = try policyEntry(gpa, list, 1, .u32);
+    try codec.appendAttrU64(gpa, list, NL_POLICY_TYPE_ATTR_MIN_VALUE_U, 5);
+    try codec.appendAttrU64(gpa, list, NL_POLICY_TYPE_ATTR_MAX_VALUE_U, 1 << 40);
+    try codec.nestEnd(list, e);
+    e = try policyEntry(gpa, list, 2, .string);
+    try codec.appendAttrU32(gpa, list, NL_POLICY_TYPE_ATTR_MIN_LENGTH, 1);
+    try codec.appendAttrU32(gpa, list, NL_POLICY_TYPE_ATTR_MAX_LENGTH, 16);
+    try codec.nestEnd(list, e);
+    e = try policyEntry(gpa, list, 3, .nested);
+    try codec.appendAttrU32(gpa, list, NL_POLICY_TYPE_ATTR_POLICY_IDX, 1);
+    try codec.appendAttrU32(gpa, list, NL_POLICY_TYPE_ATTR_POLICY_MAXTYPE, 4);
+    try codec.nestEnd(list, e);
+    e = try policyEntry(gpa, list, 4, .s32);
+    var neg: [8]u8 = undefined;
+    std.mem.writeInt(i64, &neg, -3, native_endian);
+    try codec.appendAttr(gpa, list, NL_POLICY_TYPE_ATTR_MIN_VALUE_S, &neg);
+    std.mem.writeInt(i64, &neg, 7, native_endian);
+    try codec.appendAttr(gpa, list, NL_POLICY_TYPE_ATTR_MAX_VALUE_S, &neg);
+    try codec.nestEnd(list, e);
+    try codec.nestEnd(list, p0);
+    try codec.nestEnd(list, pol);
+    codec.finishHeader(list, h);
+}
+
+test "golden: CTRL_CMD_GETPOLICY request bytes, with and without a command" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const req = try buildGetPolicyRequest(testing.allocator, 7, "ab", 5);
+    defer testing.allocator.free(req);
+    try testing.expectEqualSlices(u8, &.{
+        0x24, 0x00, 0x00, 0x00, // nlmsg_len = 36
+        0x10, 0x00, // GENL_ID_CTRL
+        0x01, 0x03, // REQUEST | ROOT | MATCH (dump)
+        0x07, 0x00, 0x00, 0x00, // seq
+        0x00, 0x00, 0x00, 0x00, // pid
+        0x0a, 0x01, 0x00, 0x00, // genlmsghdr: GETPOLICY, version 1
+        0x07, 0x00, 0x02, 0x00, 'a', 'b', 0x00, 0x00, // FAMILY_NAME "ab"
+        0x08, 0x00, 0x0a, 0x00, 0x05, 0x00, 0x00, 0x00, // CTRL_ATTR_OP = 5
+    }, req);
+    const bare = try buildGetPolicyRequest(testing.allocator, 7, "ab", null);
+    defer testing.allocator.free(bare);
+    try testing.expectEqual(@as(usize, 28), bare.len);
+    try testing.expectError(error.NameTooLong, buildGetPolicyRequest(testing.allocator, 7, strRepeat("a", GENL_NAMSIZ), null));
+}
+
+test "getPolicyOver: ops, kinds, bounds and nested policies decode; a second record adds to the first" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try buildPolicyReply(gpa, &list, 1, true);
+    try buildPolicyReply(gpa, &list, 1, false); // a later message carrying more of the same policy
+    try appendDone(gpa, &list, 1, 7);
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    const p = try getPolicyOver(&t, "demo", null);
+    defer p.deinit(gpa);
+    try testing.expectEqual(@as(u16, 0x21), p.family_id);
+    try testing.expectEqual(@as(usize, 2), p.ops.len);
+    try testing.expectEqual(@as(?u32, 1), p.op(1).?.dump_policy);
+    try testing.expectEqual(@as(?u32, 0), p.op(5).?.do_policy);
+    try testing.expectEqual(@as(?u32, null), p.op(5).?.dump_policy);
+    try testing.expectEqual(@as(?OpPolicy, null), p.op(9));
+    try testing.expectEqual(@as(usize, 8), p.attrs.len);
+    const a1 = p.find(0, 1).?;
+    try testing.expectEqual(PolicyKind.u32, a1.kind);
+    try testing.expectEqual(@as(?u64, 5), a1.min_unsigned);
+    try testing.expectEqual(@as(?u64, 1 << 40), a1.max_unsigned);
+    try testing.expectEqual(@as(?i64, null), a1.min_signed);
+    const a2 = p.find(0, 2).?;
+    try testing.expectEqual(PolicyKind.string, a2.kind);
+    try testing.expectEqual(@as(?u32, 1), a2.min_len);
+    try testing.expectEqual(@as(?u32, 16), a2.max_len);
+    const a3 = p.find(0, 3).?;
+    try testing.expectEqual(PolicyKind.nested, a3.kind);
+    try testing.expectEqual(@as(?u32, 1), a3.nested_policy);
+    try testing.expectEqual(@as(?u32, 4), a3.nested_maxattr);
+    const a4 = p.find(0, 4).?;
+    try testing.expectEqual(@as(?i64, -3), a4.min_signed);
+    try testing.expectEqual(@as(?i64, 7), a4.max_signed);
+    try testing.expectEqual(@as(?PolicyAttr, null), p.find(1, 1));
+    try testing.expectEqual(@as(usize, 1), t.sends);
+}
+
+test "getPolicyOver: an unknown kind is kept, a reply without a family id and a wrong command are malformed, errno maps" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    // Unknown kind 99, no family id anywhere.
+    var h = try codec.appendHeader(gpa, &list, GENL_ID_CTRL, 0, 1, 7);
+    try appendHeader(gpa, &list, CTRL_CMD_GETPOLICY, 2);
+    const pol = try codec.nestBegin(gpa, &list, CTRL_ATTR_POLICY);
+    const p0 = try codec.nestBegin(gpa, &list, 0);
+    const e = try policyEntry(gpa, &list, 1, @fromBackingInt(@intCast(99)));
+    try codec.nestEnd(&list, e);
+    try codec.nestEnd(&list, p0);
+    try codec.nestEnd(&list, pol);
+    codec.finishHeader(&list, h);
+    try appendDone(gpa, &list, 1, 7);
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, getPolicyOver(&t, "demo", null));
+
+    var ops: std.ArrayList(OpPolicy) = .empty;
+    defer ops.deinit(gpa);
+    var attrs: std.ArrayList(PolicyAttr) = .empty;
+    defer attrs.deinit(gpa);
+    var fid: ?u16 = null;
+    const split = try splitPayload(list.items[codec.header_len..]);
+    try parsePolicyRecord(gpa, split.attrs, &fid, &ops, &attrs);
+    try testing.expectEqual(@as(usize, 1), attrs.items.len);
+    try testing.expectEqual(@as(u32, 99), @backingInt(attrs.items[0].kind));
+
+    // A record of another command.
+    list.clearRetainingCapacity();
+    h = try codec.appendHeader(gpa, &list, GENL_ID_CTRL, 0, 1, 7);
+    try appendHeader(gpa, &list, CTRL_CMD_NEWFAMILY, 2);
+    codec.finishHeader(&list, h);
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, getPolicyOver(&t, "demo", null));
+
+    // The kernel without GETPOLICY.
+    list.clearRetainingCapacity();
+    try appendErrno(gpa, &list, 1, .OPNOTSUPP);
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.Unexpected, getPolicyOver(&t, "demo", null));
+    list.clearRetainingCapacity();
+    try appendErrno(gpa, &list, 1, .NOENT);
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.FamilyNotFound, getPolicyOver(&t, "demo", null));
+}
+
+test "getPolicyOver: damaged nested lengths are MalformedReply, never a read past the buffer" {
+    const gpa = testing.allocator;
+    var ops: std.ArrayList(OpPolicy) = .empty;
+    defer ops.deinit(gpa);
+    var attrs: std.ArrayList(PolicyAttr) = .empty;
+    defer attrs.deinit(gpa);
+    var fid: ?u16 = null;
+    // Every prefix of a valid record's attributes either parses or is MalformedReply.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try buildPolicyReply(gpa, &list, 1, true);
+    const attrs_bytes = list.items[codec.header_len + 4 ..];
+    var cut: usize = 0;
+    while (cut < attrs_bytes.len) : (cut += 1) {
+        ops.clearRetainingCapacity();
+        attrs.clearRetainingCapacity();
+        parsePolicyRecord(gpa, attrs_bytes[0..cut], &fid, &ops, &attrs) catch |e| try testing.expectEqual(error.MalformedReply, e);
+    }
+    // A wrong-width value is malformed.
+    list.clearRetainingCapacity();
+    const pol = try codec.nestBegin(gpa, &list, CTRL_ATTR_POLICY);
+    const p0 = try codec.nestBegin(gpa, &list, 0);
+    const e = try codec.nestBegin(gpa, &list, 1);
+    try codec.appendAttr(gpa, &list, NL_POLICY_TYPE_ATTR_MIN_VALUE_U, &.{ 1, 2, 3 });
+    try codec.nestEnd(&list, e);
+    try codec.nestEnd(&list, p0);
+    try codec.nestEnd(&list, pol);
+    try testing.expectError(error.MalformedReply, parsePolicyRecord(gpa, list.items, &fid, &ops, &attrs));
+}
+
+test "Socket: getPolicy of nlctrl on the live kernel, when it has GETPOLICY" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+    const p = sock.getPolicy("nlctrl", null) catch |e| switch (e) {
+        error.Unexpected, error.AccessDenied => return error.SkipZigTest, // before 5.2, or a sandbox
+        else => return e,
+    };
+    defer p.deinit(testing.allocator);
+    try testing.expectEqual(GENL_ID_CTRL, p.family_id);
+    // nlctrl's GETFAMILY validates FAMILY_NAME as a NUL-terminated string.
+    const op = p.op(CTRL_CMD_GETFAMILY) orelse return error.TestUnexpectedResult;
+    const name = p.find(op.do_policy orelse return error.TestUnexpectedResult, CTRL_ATTR_FAMILY_NAME) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(PolicyKind.nul_string, name.kind);
 }
