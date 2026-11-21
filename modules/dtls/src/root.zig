@@ -372,6 +372,10 @@ pub const Ticketer = connection.Ticketer;
 pub const StekTicketer = connection.StekTicketer;
 pub const SessionTicket = connection.SessionTicket;
 pub const max_ticket_len = connection.max_ticket_len;
+/// 0-RTT (DTLS 1.3): `Tickets.max_early_data` / `Tickets.replay`, `Config.early_data`, `Connection.earlyData`.
+pub const ReplayGuard = connection.ReplayGuard;
+pub const strikeRegisterGuard = connection.strikeRegisterGuard;
+pub const max_early_data_len = connection.max_early_data_len;
 /// DTLS 1.2 (RFC 5077): `Config.session_tickets12` / `Config.resumption12`, `Connection12.sessionTicket`.
 pub const SessionTicket12 = connection.SessionTicket12;
 

@@ -477,9 +477,49 @@ pub const Tickets = struct {
     /// discard it).
     lifetime_s: u32 = 12 * 3600,
     /// The `max_early_data_size` advertised in the ticket (RFC 8446
-    /// §4.2.10): 0 (the default) offers no 0-RTT. See `Config.early_data`.
+    /// §4.2.10, capped at `max_early_data_len`): 0 (the default) offers no
+    /// 0-RTT. Early data is taken on a resumption only with `replay` set.
     max_early_data: u32 = 0,
+    /// Single use for the tickets that carry early data (RFC 8446 §8.1),
+    /// as `tlsserver.EarlyData.replay`: asked last, once every other
+    /// condition holds; null takes no early data (fail closed).
+    replay: ?ReplayGuard = null,
+    /// The largest gap, in whole seconds, between the client's idea of the
+    /// ticket's age and the server's for which early data is taken
+    /// (BoringSSL / rustls: 60). A recorded ClientHello stays usable for up
+    /// to twice this long.
+    max_age_skew_s: u32 = 60,
 };
+
+/// Single use for the tickets that carry early data (RFC 8446 §8.1): the
+/// shape `tlsserver.ReplayGuard` has.
+pub const ReplayGuard = struct {
+    ctx: ?*anyopaque = null,
+    /// True the first time `ticket` (the PSK identity as sent) asks for
+    /// early data; false for one seen before, or when the guard cannot tell
+    /// (fail closed). `now_ms` is `Config.now_sec` in milliseconds.
+    admit: *const fn (ctx: ?*anyopaque, ticket: []const u8, now_ms: i64) bool,
+};
+
+/// A `ReplayGuard` over a `tlsresume.replay.StrikeRegister` (its window at
+/// least twice `Tickets.max_age_skew_s` plus one second; full or out of
+/// memory refuses). Not locked: share it across threads behind a guard of
+/// your own.
+pub fn strikeRegisterGuard(register: *tlsresume.replay.StrikeRegister) ReplayGuard {
+    return .{ .ctx = register, .admit = StrikeRegisterAdmit.admit };
+}
+
+const StrikeRegisterAdmit = struct {
+    fn admit(ctx: ?*anyopaque, ticket: []const u8, now_ms: i64) bool {
+        const register: *tlsresume.replay.StrikeRegister = @ptrCast(@alignCast(ctx.?));
+        return register.checkAndMark(ticket, now_ms) catch false;
+    }
+};
+
+/// The most 0-RTT plaintext a server keeps (`Connection.earlyData`) and a
+/// client sends; `Tickets.max_early_data` is capped at it.
+pub const max_early_data_len = 4096;
+const ext_early_data: u16 = 42;
 
 /// The longest ticket blob a client keeps (`SessionTicket.ticket`); a
 /// NewSessionTicket with a longer one is ACKed and not stored.
@@ -781,6 +821,14 @@ pub const Config = struct {
     /// default (as wolfSSL's `wolfSSL_UseSessionTicket` and pion's
     /// `SessionStore`): the ClientHello is unchanged without it.
     session_tickets12: bool = false,
+    /// DTLS 1.3 client: application data to send as 0-RTT early data (RFC
+    /// 8446 §2.3 / §4.2.10, RFC 9147 epoch 1) with `resumption` when the
+    /// ticket allows that much (`SessionTicket.max_early_data`, at most
+    /// `max_early_data_len`); `startHandshake` returns it in records after
+    /// the ClientHello. Not sent after a HelloRetryRequest. Early data is not
+    /// replay-protected by the protocol and not retransmitted: check
+    /// `Connection.earlyDataAccepted` and send it again when false.
+    early_data: []const u8 = &.{},
     /// DTLS 1.2 client: a ticket to resume (RFC 5077 §3.4: offered in the
     /// SessionTicket extension with a fresh session ID); a server that takes
     /// it answers with an abbreviated handshake (`Connection12.resumed`).
@@ -2158,6 +2206,20 @@ pub const Connection = struct {
     /// Client: the last NewSessionTicket received (`sessionTicket`).
     ticket: SessionTicket = undefined,
     ticket_live: bool = false,
+    // ── 0-RTT (RFC 8446 §2.3 over RFC 9147's epoch 1)
+    /// The server took the early data (`earlyDataAccepted`).
+    early_accepted: bool = false,
+    /// Client: the ClientHello offered early data.
+    early_offered: bool = false,
+    /// Epoch-1 keys from `client_early_traffic_secret` (client: write,
+    /// server: read).
+    early_keys: DirKeys = .{},
+    early_seq: EpochSeqState = .{},
+    early_send_seq: u48 = 0,
+    /// Server: the early data received (`earlyData`).
+    early_buf: [max_early_data_len]u8 = undefined,
+    early_len: usize = 0,
+    early_limit: u32 = 0,
 
     pub const InitError = ConfigError;
 
@@ -2262,7 +2324,124 @@ pub const Connection = struct {
         try self.cacheFlight(now_ms);
 
         self.state = .wait_server_hello;
-        return record_bytes;
+        if (!self.early_offered) return record_bytes;
+        // 0-RTT: the early data under `client_early_traffic_secret`, epoch 1,
+        // after the ClientHello (not part of the cached flight).
+        const t = self.config.resumption.?;
+        const alg = t.suite.hash();
+        const params = suiteParams(t.suite) orelse return error.UnsupportedSuite;
+        var es: Secret = undefined;
+        var cets: Secret = undefined;
+        defer std.crypto.secureZero(u8, &es);
+        defer std.crypto.secureZero(u8, &cets);
+        suitehash.earlySecret(alg, &es, t.psk[0..alg.len()]);
+        var th_buf: Secret = undefined;
+        suitehash.clientEarlyTrafficSecret(alg, &cets, &es, self.transcript.currentHash(alg, &th_buf));
+        self.early_keys = deriveDir(alg, params, &cets);
+        var cursor = record_bytes.len;
+        var rest = self.config.early_data;
+        while (rest.len > 0) {
+            const n = @min(rest.len, 1024);
+            const rec = try self.protectEarly(t.suite, content_type_application_data, rest[0..n], out[cursor..]);
+            cursor += rec.len;
+            rest = rest[n..];
+        }
+        return out[0..cursor];
+    }
+
+    /// One epoch-1 (0-RTT) record under `early_keys` (RFC 9147 §4: no CID
+    /// yet, the unified header with epoch bits 1).
+    fn protectEarly(self: *Connection, suite: CipherSuite, inner_type: u8, payload: []const u8, out: []u8) HandshakeError![]const u8 {
+        const params = suiteParams(suite) orelse return error.UnsupportedSuite;
+        var inner_buf: [1024 + 1 + 16]u8 = undefined;
+        if (payload.len + 1 > inner_buf.len) return error.BufferTooShort;
+        @memcpy(inner_buf[0..payload.len], payload);
+        inner_buf[payload.len] = inner_type;
+        const inner_len = @max(payload.len + 1, minInnerLen(params));
+        @memset(inner_buf[payload.len + 1 .. inner_len], 0);
+        const inner = inner_buf[0..inner_len];
+        const ct_len = inner.len + params.tag_len;
+        const seq_len: record.SeqNumLen = if (self.early_send_seq <= 0xff) .short else .long;
+        const seq_bytes_n: usize = if (seq_len == .short) 1 else 2;
+        const hdr_slice = record.encodeUnified(.{
+            .epoch_low = 1,
+            .seq_len = seq_len,
+            .seq_wire = @truncate(self.early_send_seq),
+            .cid = null,
+            .length = @intCast(ct_len),
+        }, out) catch return error.BufferTooShort;
+        const hdr_len = hdr_slice.len;
+        if (out.len < hdr_len + ct_len) return error.BufferTooShort;
+        const n = protectDispatch(suite, &self.early_keys, 1, self.early_send_seq, inner, out[0..hdr_len], out[hdr_len..]) catch
+            return error.BufferTooShort;
+        std.debug.assert(n == ct_len);
+        try snMaskDispatch(suite, &self.early_keys, out[hdr_len..][0..16], out[1..][0..seq_bytes_n]);
+        self.early_send_seq +%= 1;
+        return out[0 .. hdr_len + ct_len];
+    }
+
+    /// Server: takes the epoch-1 (0-RTT) records out of `datagram`: with
+    /// early data accepted each is opened under `early_keys` and its
+    /// application data appended to `early_buf` (up to `early_limit`; more is
+    /// `error.UnexpectedMessage`, as rustls' TooMuchEarlyDataReceived), and
+    /// one that does not open is dropped (RFC 9147 §4.5.2); refused early
+    /// data is dropped unread (RFC 8446 §4.2.10). The other records are
+    /// copied to `rest_buf`; returns them.
+    fn takeEarlyRecords(self: *Connection, datagram: []const u8, rest_buf: []u8) HandshakeError![]const u8 {
+        var pos: usize = 0;
+        var kept: usize = 0;
+        while (pos < datagram.len) {
+            const first = datagram[pos];
+            const n = if (first & 0xe0 == 0x20) blk: {
+                // Unified header (RFC 9147 §4). Early records carry no CID.
+                const dec = record.decodeUnified(datagram[pos..], 0) catch return error.Malformed;
+                const len = dec.hdr.length orelse datagram.len - pos - dec.consumed;
+                if (datagram.len - pos - dec.consumed < len) return error.Malformed;
+                const total = dec.consumed + len;
+                if (dec.hdr.epoch_low == 1 and dec.hdr.cid == null) {
+                    if (self.early_accepted) try self.openEarly(datagram[pos..][0..total]);
+                    pos += total;
+                    continue;
+                }
+                break :blk total;
+            } else blk: {
+                const rec = record.decodePlaintext(datagram[pos..]) catch return error.Malformed;
+                if (datagram.len - pos - record.plaintext_header_len < rec.length) return error.Malformed;
+                break :blk record.plaintext_header_len + rec.length;
+            };
+            if (rest_buf.len - kept < n) return error.FlightTooLarge;
+            @memcpy(rest_buf[kept..][0..n], datagram[pos..][0..n]);
+            kept += n;
+            pos += n;
+        }
+        return rest_buf[0..kept];
+    }
+
+    fn openEarly(self: *Connection, rec_bytes: []const u8) HandshakeError!void {
+        const dec = record.decodeUnified(rec_bytes, 0) catch return error.Malformed;
+        const hdr_len = dec.consumed;
+        const ct = rec_bytes[hdr_len..];
+        if (ct.len < 16) return;
+        const seq_bytes_n: usize = if (dec.hdr.seq_len == .short) 1 else 2;
+        var hdr_buf: [5]u8 = undefined;
+        @memcpy(hdr_buf[0..hdr_len], rec_bytes[0..hdr_len]);
+        try snMaskDispatch(self.suite, &self.early_keys, ct[0..16], hdr_buf[1..][0..seq_bytes_n]);
+        const wire_low: u16 = if (dec.hdr.seq_len == .short) hdr_buf[1] else std.mem.readInt(u16, hdr_buf[1..3], .big);
+        const largest = if (self.early_seq.recv_seen_any) self.early_seq.recv_max_seq else 0;
+        const full_seq = record.reconstructSequenceNumber(largest, dec.hdr.seq_len, wire_low);
+        var plain: [max_record_plaintext]u8 = undefined;
+        defer std.crypto.secureZero(u8, &plain);
+        const body_len = unprotectDispatch(self.suite, &self.early_keys, 1, full_seq, ct, hdr_buf[0..hdr_len], &plain) catch return;
+        if (!replayCheckAndUpdate(&self.early_seq.recv_seen_any, &self.early_seq.recv_max_seq, &self.early_seq.recv_window, full_seq)) return;
+        var end = body_len;
+        while (end > 0 and plain[end - 1] == 0) end -= 1;
+        if (end == 0) return error.Malformed;
+        // RFC 8446 §4.2.10: only application data travels as early data.
+        if (plain[end - 1] != content_type_application_data) return error.UnexpectedMessage;
+        const data = plain[0 .. end - 1];
+        if (data.len > @as(usize, self.early_limit) - self.early_len) return error.UnexpectedMessage;
+        @memcpy(self.early_buf[self.early_len..][0..data.len], data);
+        self.early_len += data.len;
     }
 
     /// Both roles: feeds an incoming (possibly multi-record-coalesced)
@@ -3034,6 +3213,20 @@ pub const Connection = struct {
         return self.did_resume;
     }
 
+    /// Whether the server took this handshake's 0-RTT early data (client:
+    /// the EncryptedExtensions said so; server: it accepted it). A client
+    /// whose early data was refused sends it again after the handshake.
+    pub fn earlyDataAccepted(self: *const Connection) bool {
+        return self.early_accepted;
+    }
+
+    /// Server: the 0-RTT early data received so far, in arrival order (RFC
+    /// 9147: early records are not retransmitted; lost ones are gone).
+    /// Replayable: see `Tickets.replay`. Aliases this `Connection`.
+    pub fn earlyData(self: *const Connection) []const u8 {
+        return self.early_buf[0..self.early_len];
+    }
+
     /// The last NewSessionTicket the server sent this client, ready for
     /// `Config.resumption` on a later connection; null until one arrived (a
     /// server sends it right after the handshake: `recv` reports it as
@@ -3065,6 +3258,9 @@ pub const Connection = struct {
         std.crypto.secureZero(u8, &self.ap_read_secret);
         std.crypto.secureZero(u8, &self.exporter_master);
         std.crypto.secureZero(u8, &self.offered_psk);
+        secureZeroDirKeys(&self.early_keys);
+        std.crypto.secureZero(u8, &self.early_buf);
+        self.early_len = 0;
         std.crypto.secureZero(u8, &self.master_secret);
         std.crypto.secureZero(u8, &self.resumption_master);
         std.crypto.secureZero(u8, &self.ticket.psk);
@@ -3356,6 +3552,13 @@ pub const Connection = struct {
         for (exts) |e| {
             if (e.ext_type == messages.ext_use_srtp) {
                 try self.clientAcceptSrtp(e.data);
+                continue;
+            }
+            if (e.ext_type == ext_early_data) {
+                // RFC 8446 §4.2.10: empty, and only for early data offered
+                // on a resumption that happened.
+                if (e.data.len != 0 or !self.early_offered or !self.did_resume) return error.Malformed;
+                self.early_accepted = true;
                 continue;
             }
             if (e.ext_type != @backingInt(messages.ExtensionType.application_layer_protocol_negotiation)) continue;
@@ -3659,7 +3862,7 @@ pub const Connection = struct {
         const srtp_ext = try self.srtpOffer(&srtp_buf);
 
         var cid_buf: [1 + max_cid_len]u8 = undefined;
-        var exts_buf: [10 + dual12_extensions.len]messages.Extension = undefined;
+        var exts_buf: [11 + dual12_extensions.len]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -3708,6 +3911,14 @@ pub const Connection = struct {
         if (ticket) |t| {
             exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.psk_key_exchange_modes), .data = try messages.encodePskKeyExchangeModes(&.{.psk_dhe_ke}, &modes_buf) };
             n_exts += 1;
+            // RFC 8446 §4.2.10: early data only in a first ClientHello, of
+            // no more than the ticket allows.
+            self.early_offered = !self.saw_hello_retry_request and self.config.early_data.len > 0 and
+                self.config.early_data.len <= @min(t.max_early_data, max_early_data_len);
+            if (self.early_offered) {
+                exts_buf[n_exts] = .{ .ext_type = ext_early_data, .data = &.{} };
+                n_exts += 1;
+            }
             // RFC 8446 §4.2.11.1: the age in milliseconds plus `ticket_age_add`, mod 2^32.
             const age_s: i64 = @max(0, self.config.now_sec - t.received_at_s);
             const age_ms: u32 = @truncate(@as(u64, @intCast(age_s)) *% 1000);
@@ -4569,7 +4780,14 @@ pub const Connection = struct {
     fn handleFlightServer(self: *Connection, datagram: []const u8, entropy: Entropy, now_ms: u64, out: []u8) HandshakeError!HandshakeResult {
         return switch (self.state) {
             .start => self.serverProcessClientHello(datagram, entropy, now_ms, out),
-            .wait_finished => self.serverProcessClientFinished(datagram, entropy, now_ms, out),
+            .wait_finished => blk: {
+                // 0-RTT records between the ClientHello and the client's
+                // Finished (epoch 1) are taken out first; refused ones dropped.
+                var rest_buf: [max_flight_bytes]u8 = undefined;
+                const rest = try self.takeEarlyRecords(datagram, &rest_buf);
+                if (rest.len == 0) break :blk error.FlightIncomplete;
+                break :blk self.serverProcessClientFinished(rest, entropy, now_ms, out);
+            },
             else => error.WrongState,
         };
     }
@@ -4933,6 +5151,22 @@ pub const Connection = struct {
         self.transcript.select(alg);
         self.transcript.append(@backingInt(messages.HandshakeType.client_hello), ch_body);
         self.suite = suite;
+        if (resume_state) |*r| {
+            if (self.acceptEarlyData(r, dec.extensions, suite, retry_suite != null)) {
+                // RFC 8446 §7.1: `client_early_traffic_secret` over the
+                // ClientHello; the epoch-1 records behind it in this datagram
+                // are read now, later ones by `handleFlightServer`.
+                const params = suiteParams(suite) orelse return error.UnsupportedSuite;
+                var cets: Secret = undefined;
+                defer std.crypto.secureZero(u8, &cets);
+                var th_ch: Secret = undefined;
+                suitehash.clientEarlyTrafficSecret(alg, &cets, &es, self.transcript.currentHash(alg, &th_ch));
+                self.early_keys = deriveDir(alg, params, &cets);
+                self.early_accepted = true;
+                var scratch: [max_flight_bytes]u8 = undefined;
+                _ = try self.takeEarlyRecords(datagram[ch_pos..], &scratch);
+            }
+        }
 
         var random_bytes: [32]u8 = undefined;
         entropy.source().bytes(&random_bytes);
@@ -5029,8 +5263,13 @@ pub const Connection = struct {
         // EncryptedExtensions: empty, or the RFC 7301 selection (a list of
         // exactly one name).
         var alpn_sel_buf: [2 + 1 + 255]u8 = undefined;
-        var ee_ext_arr: [2]messages.Extension = undefined;
+        var ee_ext_arr: [3]messages.Extension = undefined;
         var n_ee: usize = 0;
+        // RFC 8446 §4.2.10: an accepted 0-RTT is announced here.
+        if (self.early_accepted) {
+            ee_ext_arr[n_ee] = .{ .ext_type = ext_early_data, .data = &.{} };
+            n_ee += 1;
+        }
         if (self.negotiatedAlpn()) |name| {
             ee_ext_arr[n_ee] = .{ .ext_type = @backingInt(messages.ExtensionType.application_layer_protocol_negotiation), .data = try messages.encodeAlpn(&.{name}, &alpn_sel_buf) };
             n_ee += 1;
@@ -5201,6 +5440,36 @@ pub const Connection = struct {
         return .{ .out = out[0..cursor], .done = true };
     }
 
+    /// RFC 8446 §4.2.10 / §8 on the server: the client offered early data on
+    /// a resumption without a HelloRetryRequest, the ticket allows it, the
+    /// suite is the ticket's, no ALPN was negotiated (the ticket does not
+    /// record the original one, which §4.2.10 requires to match), the
+    /// reported ticket age is within `max_age_skew_s` of the server's, and
+    /// `Tickets.replay` admits the ticket — asked last.
+    fn acceptEarlyData(self: *Connection, st: *const TicketState, exts: []const messages.Extension, suite: CipherSuite, retried: bool) bool {
+        const tk = self.config.tickets orelse return false;
+        const guard = tk.replay orelse return false;
+        if (retried or st.max_early_data == 0 or st.suite != suite or self.alpn_len != 0) return false;
+        var offered = false;
+        var psk_data: []const u8 = &.{};
+        for (exts) |e| {
+            if (e.ext_type == ext_early_data) offered = true;
+            if (e.ext_type == @backingInt(messages.ExtensionType.pre_shared_key)) psk_data = e.data;
+        }
+        if (!offered) return false;
+        var ids_buf: [4]messages.PskIdentity = undefined;
+        var binders_buf: [4][]const u8 = undefined;
+        const ids = messages.decodeOfferedPsks(psk_data, &ids_buf, &binders_buf) catch return false;
+        const id = ids.identities[0];
+        // §4.2.11.1: the client's age, against the server's own view.
+        const client_age_ms: i64 = id.obfuscated_ticket_age -% st.age_add;
+        const server_age_ms: i64 = (self.config.now_sec -| st.issued_s) *| 1000;
+        if (@abs(client_age_ms - server_age_ms) > @as(u64, tk.max_age_skew_s) * 1000) return false;
+        if (!guard.admit(guard.ctx, id.identity, self.config.now_sec *| 1000)) return false;
+        self.early_limit = @min(st.max_early_data, max_early_data_len);
+        return true;
+    }
+
     /// Opens an offered ticket (`serverProcessClientHello`): `psk_dhe_ke`
     /// offered, identity 0 a blob `tk.ticketer` opens under a key it still
     /// accepts at `Config.now_sec`, its state well-formed and not older than
@@ -5278,7 +5547,7 @@ pub const Connection = struct {
             .issued_s = self.config.now_sec,
             .age_add = entropy.source().int(u32),
             .lifetime_s = @min(tk.lifetime_s, tlsresume.ticket.max_ticket_lifetime_s),
-            .max_early_data = tk.max_early_data,
+            .max_early_data = @min(tk.max_early_data, max_early_data_len),
             .psk = undefined,
         };
         defer std.crypto.secureZero(u8, &st.psk);
@@ -5291,7 +5560,7 @@ pub const Connection = struct {
         var blob_buf: [max_sealed_ticket]u8 = undefined;
         const blob = tk.ticketer.seal(tk.ticketer.ctx, plain, aead_nonce, &blob_buf) orelse return false;
         var ed_buf: [4]u8 = undefined;
-        const ed_ext = [_]tlsresume.ticket.Extension{tlsresume.ticket.earlyDataExtension(tk.max_early_data, &ed_buf)};
+        const ed_ext = [_]tlsresume.ticket.Extension{tlsresume.ticket.earlyDataExtension(st.max_early_data, &ed_buf)};
         const nst: tlsresume.ticket.NewSessionTicket = .{
             .ticket_lifetime = st.lifetime_s,
             .ticket_age_add = st.age_add,
@@ -12312,4 +12581,99 @@ test "resumption: behind the server's HelloRetryRequest cookie, ClientHello2 car
     try testing.expect(cf.done and client.resumed() and client.sawHelloRetryRequest());
     _ = try server.handleFlight(cf.out, rnd, 0, &buf2);
     try expectRoundTrip(&client, &server, "resumed after a retry");
+}
+
+// ── 0-RTT early data (DTLS 1.3) ───────────────────────────────────────────
+
+fn earlyServerConfig(tkr: *const TestTicketer, guard: ?ReplayGuard) Config {
+    var c = resumptionServerConfig(tkr);
+    c.tickets.?.max_early_data = 1000;
+    c.tickets.?.replay = guard;
+    return c;
+}
+
+/// A resumption offering `early` as 0-RTT; returns whether the server took it
+/// and checks what it received.
+fn earlyHandshake(scfg: Config, t: *const SessionTicket, early: []const u8, seed: u8, split: bool) !bool {
+    var ccfg = certDheClientConfig();
+    ccfg.resumption = t;
+    ccfg.early_data = early;
+    var client = try Connection.clientInit(ccfg);
+    defer client.deinit();
+    var server = try Connection.serverInit(scfg);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(seed)));
+    const rnd = seededForTest(&csprng);
+    var buf1: [4096]u8 = undefined;
+    var buf2: [4096]u8 = undefined;
+    const first = try client.startHandshake(rnd, 0, &buf1);
+    try testing.expect(client.early_offered);
+    // The ClientHello record, then the epoch-1 record(s).
+    const ch_len = record.plaintext_header_len + (try record.decodePlaintext(first)).length;
+    try testing.expect(first.len > ch_len);
+    var held: [2048]u8 = undefined;
+    const f2 = if (split) blk: {
+        // Early data in a datagram of its own, after the ClientHello.
+        @memcpy(held[0 .. first.len - ch_len], first[ch_len..]);
+        const r = try server.handleFlight(first[0..ch_len], rnd, 0, &buf2);
+        var copy: [4096]u8 = undefined;
+        @memcpy(copy[0..r.out.len], r.out);
+        const more = try server.handleFlight(held[0 .. first.len - ch_len], rnd, 0, &buf2);
+        try testing.expect(more.need_more_data and more.out.len == 0);
+        @memcpy(buf2[0..r.out.len], copy[0..r.out.len]);
+        break :blk Connection.HandshakeResult{ .out = buf2[0..r.out.len], .done = false };
+    } else try server.handleFlight(first, rnd, 0, &buf2);
+    try testing.expect(server.resumed());
+    const cf = try client.handleFlight(f2.out, rnd, 0, &buf1);
+    try testing.expect(cf.done and client.resumed());
+    _ = try server.handleFlight(cf.out, rnd, 0, &buf2);
+    try testing.expectEqual(client.earlyDataAccepted(), server.earlyDataAccepted());
+    if (server.earlyDataAccepted()) {
+        try testing.expectEqualSlices(u8, early, server.earlyData());
+    } else try testing.expectEqual(@as(usize, 0), server.earlyData().len);
+    try expectRoundTrip(&client, &server, "after 0-RTT");
+    return server.earlyDataAccepted();
+}
+
+test "0-RTT: early data on a resumption is taken once (strike register), refused without a replay guard, after the skew, or over the limit" {
+    var ring = ticketRing();
+    const tkr: TestTicketer = .{ .ring = &ring };
+    var reg = tlsresume.replay.StrikeRegister.init(testing.allocator, 16, 121_000);
+    defer reg.deinit();
+    const guard = strikeRegisterGuard(&reg);
+    const scfg = earlyServerConfig(&tkr, guard);
+    var t = try ticketHandshake(scfg, certDheClientConfig(), 0xa0);
+    defer t.wipe();
+    try testing.expectEqual(@as(u32, 1000), t.max_early_data);
+
+    const early = "0-RTT: hello before the handshake completes";
+    try testing.expect(try earlyHandshake(scfg, &t, early, 0xa1, false));
+    // The same ticket again: the strike register refuses it (RFC 8446 §8.1),
+    // the handshake still resumes in 1-RTT.
+    try testing.expect(!try earlyHandshake(scfg, &t, early, 0xa2, false));
+
+    var t2 = try ticketHandshake(scfg, certDheClientConfig(), 0xa3);
+    defer t2.wipe();
+    // Early data in a datagram after the ClientHello's.
+    try testing.expect(try earlyHandshake(scfg, &t2, "split", 0xa4, true));
+
+    var t3 = try ticketHandshake(scfg, certDheClientConfig(), 0xa5);
+    defer t3.wipe();
+    // No replay guard: fail closed.
+    try testing.expect(!try earlyHandshake(earlyServerConfig(&tkr, null), &t3, early, 0xa6, false));
+    // The client's age far from the server's view: refused.
+    var skewed = earlyServerConfig(&tkr, guard);
+    skewed.now_sec += 3600;
+    try testing.expect(!try earlyHandshake(skewed, &t3, early, 0xa7, false));
+
+    // More than the ticket allows is not offered at all.
+    var ccfg = certDheClientConfig();
+    ccfg.resumption = &t3;
+    ccfg.early_data = &(@as([1001]u8, @splat('x')));
+    var client = try Connection.clientInit(ccfg);
+    defer client.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0xa8)));
+    var buf: [4096]u8 = undefined;
+    _ = try client.startHandshake(seededForTest(&csprng), 0, &buf);
+    try testing.expect(!client.early_offered);
 }
