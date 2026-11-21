@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **API addition:** `MavpStream(T)` (and `MavpIn`), the streaming MAVP: a bank of one moving average per period in `min_period..max_period` as in TA-Lib 0.8's `TA_MAVP_Update`, `update(.{ .close, .period })`, bit for bit the batch `mavp`, `peek`, `clone`. Its buffer holds the bank (one `MaCore` per period): `bufLen` is megabytes for a wide range. Every one of the 237 functions now has a streaming type.
 - **2026-11-16** — Batch speed (third round, bit for bit unchanged): MINMAX (period <= 256) takes both extremes from one block
   scan (`window.hiLoBlocks`, `extBatch`'s comparisons) instead of two `extBatch` passes — 1.59x TA-Lib before, 0.77x now.
 - **2026-11-16** — Batch speed (third round, bit for bit unchanged): FRAMA (f64, no NaN skipping) runs its four extremum

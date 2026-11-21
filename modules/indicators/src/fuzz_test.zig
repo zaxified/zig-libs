@@ -89,7 +89,7 @@ const rows = .{
     .{ "midprice", "iiop", ind.midprice, ind.midpriceLookback, ind.MidpriceStream },
     .{ "frama", "iiop", ind.frama, ind.framaLookback, ind.FramaStream },
     .{ "vwma", "iiop", ind.vwma, ind.vwmaLookback, ind.VwmaStream },
-    .{ "mavp", "iiop", ind.mavp, ind.mavpLookback, void },
+    .{ "mavp", "iiop", ind.mavp, ind.mavpLookback, ind.MavpStream },
     .{ "sar", "iiop", ind.sar, ind.sarLookback, ind.SarStream },
     .{ "sarext", "iiop", ind.sarext, ind.sarextLookback, ind.SarextStream },
     .{ "supertrend", "iiio8p", ind.supertrend, ind.supertrendLookback, ind.SupertrendStream },
@@ -1033,7 +1033,7 @@ test "fuzz: the table covers the public surface" {
     const st_count: usize = streams;
     const ts_count: usize = table_streams;
     try testing.expectEqual(@as(usize, n_rows), lb_count);
-    try testing.expectEqual(@as(usize, n_rows - 1), st_count); // MAVP has no stream
+    try testing.expectEqual(@as(usize, n_rows), st_count);
     try testing.expectEqual(st_count, ts_count);
     try testing.expectEqual(@as(usize, 237), n_entries);
 }
@@ -1051,7 +1051,7 @@ test "fuzz: every function, six forced runs each, and they get everywhere" {
     if (findings != 0) return error.FuzzFinding;
     var missing: usize = 0;
     for (reach_table, 0..) |c, i| {
-        if (c.ok == 0 or c.ok32 == 0 or (c.stream == 0 and !std.mem.eql(u8, entry_names[i], "mavp"))) {
+        if (c.ok == 0 or c.ok32 == 0 or c.stream == 0) {
             std.debug.print("reach: {s} ok={d} ok32={d} stream={d}\n", .{ entry_names[i], c.ok, c.ok32, c.stream });
             missing += 1;
         }

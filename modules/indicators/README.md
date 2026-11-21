@@ -75,7 +75,7 @@ code is vendored or linked.
 
 ## Not provided
 
-A streaming MAVP; TA-Lib's `startIdx` / `endIdx` range arguments and in-place calls (`out` must not alias `in`); process-global
+TA-Lib's `startIdx` / `endIdx` range arguments and in-place calls (`out` must not alias `in`); process-global
 settings (the unstable period and the candle settings are per call). The libm-dependent functions (LINEARREG_ANGLE, PSO, the
 math transforms, the Hilbert family, MAMA) carry a 2-ULP / 1e-13 bound against TA-Lib and RSI answers NaN where TA-Lib's
 poisoned state reads 50. See SPEC.md *What is deliberately not done* and *Backlog / deferred*.

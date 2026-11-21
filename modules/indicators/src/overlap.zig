@@ -478,3 +478,114 @@ pub fn mavp(comptime T: type, in: []const T, periods: []const T, out: []T, p: Ma
     }
     return lb;
 }
+
+/// A bar of MAVP's streaming input: the price and the period for this bar.
+pub fn MavpIn(comptime T: type) type {
+    return struct { close: T, period: T };
+}
+
+/// Streaming MAVP as TA-Lib 0.8's `TA_MAVP_Update` does it: a bank of one
+/// moving average per period in `min_period..max_period`, each stepped on
+/// every bar from the bar its own lookback allows (the start the batch gives
+/// it), all reading one ring of the last bars; the bar's output is the average
+/// of the period the bar asks for. The bank lives in the caller's buffer
+/// (`scratchLen`), the ring in the stream's, so a stream of a wide range is
+/// large (one `MaCore` per period) and costs one step per period per bar.
+/// `peek` steps a copy of the one selected average.
+pub const MavpCore = struct {
+    pub const In = struct { close: f64, period: f64 };
+    pub const Out = f64;
+    pub fn InOf(comptime T: type) type {
+        return MavpIn(T);
+    }
+    pub fn OutOf(comptime T: type) type {
+        return T;
+    }
+
+    const Entry = struct { c: smooth.MaCore, skip: usize };
+
+    p: MavpParams,
+    lb: usize,
+    n: usize = 0,
+    bank: []Entry = &.{},
+    raw: []f64 = &.{},
+
+    pub fn validate(p: MavpParams) Error!void {
+        try mavpCheck(p);
+        // The batch starts the average of period `k` at bar `lookback(max) -
+        // lookback(k)`; that has to be a bar.
+        const lb = smooth.MaCore.lookback(mavpMa(p, p.max_period));
+        for (p.min_period..p.max_period + 1) |k| {
+            if (smooth.MaCore.lookback(mavpMa(p, k)) > lb) return error.BadParam;
+        }
+    }
+    pub fn ringLen(p: MavpParams) usize {
+        var r: usize = 0;
+        for (p.min_period..p.max_period + 1) |k| r = @max(r, smooth.MaCore.ringLen(mavpMa(p, k)));
+        return r;
+    }
+    pub fn lookback(p: MavpParams) usize {
+        return smooth.MaCore.lookback(mavpMa(p, p.max_period));
+    }
+    /// f64 slots for the bank (`bind` takes this many).
+    pub fn scratchLen(p: MavpParams) usize {
+        const bytes = (p.max_period - p.min_period + 1) * @sizeOf(Entry);
+        return (bytes + @sizeOf(f64) - 1) / @sizeOf(f64);
+    }
+    pub fn init(p: MavpParams) Error!MavpCore {
+        try validate(p);
+        return .{ .p = p, .lb = lookback(p) };
+    }
+    /// Hand the core its bank storage. A fresh core (`n == 0`) builds the
+    /// averages; a clone's copy of the bank is only re-pointed.
+    pub fn bind(self: *MavpCore, s: []f64) void {
+        const cnt = self.p.max_period - self.p.min_period + 1;
+        self.raw = s;
+        const bytes = std.mem.sliceAsBytes(s)[0 .. cnt * @sizeOf(Entry)];
+        const ptr: [*]Entry = @ptrCast(@alignCast(bytes.ptr));
+        self.bank = ptr[0..cnt];
+        if (self.n != 0) return;
+        for (self.bank, self.p.min_period..) |*e, k| {
+            const mp = mavpMa(self.p, k);
+            // `validate` has run, so the period and the unstable count are in range.
+            e.* = .{ .c = smooth.MaCore.init(mp) catch unreachable, .skip = self.lb - smooth.MaCore.lookback(mp) };
+        }
+    }
+    pub fn scratchSlice(self: *const MavpCore) []f64 {
+        return self.raw;
+    }
+
+    fn Src(comptime H: type) type {
+        return struct {
+            h: H,
+            off: usize,
+            pub fn at(self: @This(), i: usize) f64 {
+                return self.h.at(i + self.off).close;
+            }
+        };
+    }
+
+    pub fn step(self: *MavpCore, h: anytype, x: In) ?f64 {
+        const g = self.n;
+        self.n += 1;
+        const sel = mavpPeriod(self.p, x.period) - self.p.min_period;
+        var res: ?f64 = null;
+        if (@TypeOf(h).dry) {
+            // A peek: only the selected average, as a copy, leaves the bank untouched.
+            var e = self.bank[sel];
+            if (g >= e.skip) res = e.c.step(Src(@TypeOf(h)){ .h = h, .off = e.skip }, x.close);
+        } else {
+            for (self.bank, 0..) |*e, j| {
+                if (g < e.skip) continue;
+                const r = e.c.step(Src(@TypeOf(h)){ .h = h, .off = e.skip }, x.close);
+                if (j == sel) res = r;
+            }
+        }
+        if (g < self.lb) return null;
+        return res orelse std.math.nan(f64);
+    }
+};
+
+pub fn MavpStream(comptime T: type) type {
+    return hist.Stream(T, MavpParams, MavpCore);
+}

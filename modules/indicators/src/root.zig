@@ -238,6 +238,8 @@ pub const VwmaStream = overlap.VwmaStream;
 pub const MavpParams = overlap.MavpParams;
 pub const mavp = overlap.mavp;
 pub const mavpLookback = overlap.mavpLookback;
+pub const MavpIn = overlap.MavpIn;
+pub const MavpStream = overlap.MavpStream;
 
 pub const SarParams = trend_.SarParams;
 pub const sar = trend_.sar;

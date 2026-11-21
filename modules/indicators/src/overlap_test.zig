@@ -462,6 +462,63 @@ test "mavp: equals the fixed-period average when every period is the same; per-b
     _ = try ind.mavp(f64, &xs, &per, &a, .{ .kind = .mama });
 }
 
+test "mavp stream: bitwise the batch for every average type; peek == update; clone; buffers" {
+    const kinds = [_]ind.MaType{ .sma, .ema, .wma, .dema, .tema, .trima, .kama, .t3, .zlema, .hma, .alma, .vidya, .rma, .mama, .disabled };
+    var xs: [n_bars]f64 = undefined;
+    th.walk(&xs, 52);
+    var per: [n_bars]f64 = undefined;
+    for (&per, 0..) |*p, i| p.* = @floatFromInt(1 + (i * 7) % 11); // 1..11, spans a clamp at both ends
+    per[20] = std.math.nan(f64);
+    per[21] = 1e9;
+    for (kinds) |kind| {
+        const p: ind.MavpParams = .{ .min_period = 2, .max_period = 9, .kind = kind };
+        var want: [n_bars]f64 = undefined;
+        const lb = try ind.mavp(f64, &xs, &per, &want, p);
+        const S = ind.MavpStream(f64);
+        const buf = try testing.allocator.alloc(f64, try S.bufLen(p));
+        defer testing.allocator.free(buf);
+        var s = try S.init(p, buf);
+        const dst = try testing.allocator.alloc(f64, buf.len);
+        defer testing.allocator.free(dst);
+        var cl: ?S = null;
+        for (xs, per, 0..) |x, q, i| {
+            const bar: S.InT = .{ .close = x, .period = q };
+            const pk = s.peek(bar);
+            const got = s.update(bar);
+            if (i == n_bars / 2) cl = try s.clone(dst);
+            if (i < lb) {
+                try testing.expect(got == null and pk == null);
+                continue;
+            }
+            try testing.expect(th.sameBits(got.?, want[i]));
+            try testing.expect(th.sameBits(pk.?, want[i]));
+            if (cl) |*c| {
+                if (i > n_bars / 2) try testing.expect(th.sameBits(c.update(bar).?, want[i]));
+            }
+        }
+    }
+    // f32 in and out: the f64 result rounded once
+    const p: ind.MavpParams = .{ .min_period = 3, .max_period = 6, .kind = .ema };
+    const S = ind.MavpStream(f32);
+    const buf = try testing.allocator.alloc(f64, try S.bufLen(p));
+    defer testing.allocator.free(buf);
+    var s = try S.init(p, buf);
+    var x32: [n_bars]f32 = undefined;
+    var p32: [n_bars]f32 = undefined;
+    var want32: [n_bars]f32 = undefined;
+    for (&x32, xs) |*d, v| d.* = @floatCast(v);
+    for (&p32, 0..) |*d, i| d.* = @floatFromInt(3 + i % 4);
+    const lb = try ind.mavp(f32, &x32, &p32, &want32, p);
+    for (x32, p32, 0..) |x, q, i| {
+        const got = s.update(.{ .close = x, .period = q });
+        if (i >= lb) try testing.expect(th.sameBits(got.?, want32[i]));
+    }
+    // a short buffer, an out-of-range parameter
+    try testing.expectError(error.BadParam, S.init(p, buf[0 .. buf.len - 1]));
+    try testing.expectError(error.BadParam, S.bufLen(.{ .min_period = 5, .max_period = 4 }));
+    try testing.expectError(error.BadParam, S.bufLen(.{ .max_period = 10001 }));
+}
+
 test "f32 path of the multi-output functions rounds the f64 result once" {
     const s = Series.make(46);
     var h32: [n_bars]f32 = undefined;
