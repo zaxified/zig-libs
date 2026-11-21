@@ -156,3 +156,33 @@ test "Test Case 2: tampering and length changes are rejected" {
     try std.testing.expect(!lms.hssVerify(&tc2_pub, &tc1_msg, &tc1_sig));
     try std.testing.expect(!lms.hssVerify(&tc1_pub, &tc2_msg, &tc2_sig));
 }
+
+// ── hash-sigs (black-box oracle): LMOTS W1 and W2 ───────────────────────────
+
+const hs_msg = kat.bytes(kat.hs_msg);
+const hs_w1_pub = kat.bytes(kat.hs_w1_pub);
+const hs_w1_sig = kat.bytes(kat.hs_w1_sig);
+const hs_w2_pub = kat.bytes(kat.hs_w2_pub);
+const hs_w2_sig = kat.bytes(kat.hs_w2_sig);
+
+test "hash-sigs: its LMS_SHA256_N32_H5 / LMOTS W1 and W2 signatures verify here; a flipped bit does not" {
+    for ([_]struct { pub_bytes: []const u8, sig: []const u8, ots: lms.OtsParamSet }{
+        .{ .pub_bytes = &hs_w1_pub, .sig = &hs_w1_sig, .ots = .sha256_n32_w1 },
+        .{ .pub_bytes = &hs_w2_pub, .sig = &hs_w2_sig, .ots = .sha256_n32_w2 },
+    }) |c| {
+        const pk = try lms.HssPublicKey.parse(c.pub_bytes);
+        try std.testing.expectEqual(@as(u8, 1), pk.levels);
+        try std.testing.expectEqual(lms.ParamSet.sha256_m32_h5, pk.top.lms);
+        try std.testing.expectEqual(c.ots, pk.top.ots);
+        try std.testing.expectEqual(lms.hssSignatureLength(&.{.{ .lms = .sha256_m32_h5, .ots = c.ots }}), c.sig.len);
+        try std.testing.expect(lms.hssVerify(c.pub_bytes, &hs_msg, c.sig));
+        try std.testing.expect(!lms.hssVerify(c.pub_bytes, "another message", c.sig));
+        var bent: [hs_w1_sig.len]u8 = undefined;
+        @memcpy(bent[0..c.sig.len], c.sig);
+        for ([_]usize{ 4 + 8 + 5, c.sig.len / 2, c.sig.len - 1 }) |at| {
+            bent[at] ^= 0x01;
+            try std.testing.expect(!lms.hssVerify(c.pub_bytes, &hs_msg, bent[0..c.sig.len]));
+            bent[at] ^= 0x01;
+        }
+    }
+}

@@ -154,11 +154,14 @@ RFC 8554 Appendix F, transcribed by script from the RFC text into `src/kat_vecto
    type, all authentication-path nodes) when the RFC's own randomizer `C` is supplied.
    That pins Appendix A, `Cksm`/`coef` at W4 and W8, the chain layout, the leaf and
    interior hashes and the path order against an external answer.
-3. **LM-OTS W1 and W2 have no RFC vector.** They share every code path with W4/W8 (only
-   `w`, `p`, `ls` differ, and those are checked against Appendix B's formulas); they are
-   covered by round trips, the recursive-definition test and the fuzz harness, not by an
-   external answer. **H15/H20/H25 are not built in the tests** (cost); their `Tree`
-   differs from H5/H10 in constants and the cache height only.
+3. **LM-OTS W1 and W2 have no RFC vector**; they are anchored to cisco/hash-sigs (BSD-3-Clause,
+   commit 7768828), run as a black box through its `demo` program and the wire formats
+   (`tools/hashsigs_oracle.sh`): a hash-sigs key and signature each for H5/W1 and H5/W2
+   verify here, and a flipped bit, another message do not (`kat_test.zig`); in the other
+   direction hash-sigs verified our signatures for H5/W1, H5/W2, H5/W4 and HSS
+   H10/W8 + H5/W2 (`tools/emit.zig`), and refused one with a flipped bit (2026-11-21).
+   **H15/H20/H25 are not built in the tests** (cost); their `Tree` differs from H5/H10 in
+   constants and the cache height only.
 
 Round trips and the stateful discipline (`src/unit_test.zig`; the audit-2026-10-03 tests
 are described under Verification): every `w` at H5, H10 at
@@ -262,8 +265,9 @@ and every cached node against §5.3's recursive definition.
 
 ## Backlog / deferred
 
-- **SHA-256/192 and SHAKE256 parameter sets (NIST SP 800-208; the later additional-sets RFC
-  named in the task brief, not fetched here)** *(survey 2026-09-30)*. hbs-lms-rust and
+- **SHA-256/192 and SHAKE256 parameter sets (NIST SP 800-208; RFC 9858, October 2025, whose
+  Appendix A has four test cases with SEED and I: SHA-256/192 W8 and W4, SHAKE256/192,
+  SHAKE256/256)** *(survey 2026-09-30)*. hbs-lms-rust and
   cisco/hash-sigs offer sets beyond the RFC 8554 SHA-256/256 ones *(inferred)*; a policy
   that mandates 192-bit or SHAKE cannot use this module. Moderate: `n`, `m` and the hash
   are module constants (`params.zig`, `core.zig`) and would become parameters; needs the
@@ -272,11 +276,6 @@ and every cached node against §5.3's recursive definition.
   threads key generation *(inferred)*; here H20 takes hours. Splitting `subtreeRoot` per
   worker is straightforward (each height-`c` subtree is independent) and `std.Io` group
   primitives fit; SHA-NI use is already up to `std.crypto`. Moderate.
-- **A foreign black-box oracle** (a differential run against cisco/hash-sigs's built binary
-  through the wire format, not its source), not done for this first version.
-- **W1/W2 external vectors:** the RFC has none; a foreign implementation's output (as
-  oracle) would give them.
-
 ## Anchoring
 
 **Anchor grade:** class B · oracle MIXED
@@ -288,8 +287,9 @@ and every cached node against §5.3's recursive definition.
 **What the tests actually contain.** External (RFC 8554 Appendix F): verification of both
 HSS signatures, regeneration of Test Case 2's two public keys from its SEED/I, and
 byte-exact reproduction of both of its LMS signatures — LM-OTS W4 and W8, LMS H5 and H10,
-HSS L = 2. Self (round trip, differential, recursive definition): W1 and W2, H15-H25, HSS
-L = 3..8, mixed sets, the stateful discipline, the cache heights.
+HSS L = 2. External (cisco/hash-sigs as a black-box oracle): W1 and W2 both ways, W4 and a
+mixed L = 2 key in our direction. Self (round trip, differential, recursive definition):
+H15-H25, HSS L = 3..8, the stateful discipline, the cache heights.
 
 **How it got there.** RFC text only; the vectors were extracted by script from the RFC
 and the hex sizes asserted against the format. No foreign implementation was run.
