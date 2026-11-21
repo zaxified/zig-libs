@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [wireapp/core-crypto](https://github.com/wireapp/core-crypto) | Rust (on openmls) | GPL-3.0 (docs only) | 51 | v10.5.3 (2026-09-23) | Wire's production MLS layer over OpenMLS; shows what a deployed client needs on top: key-package pools, credential management, persistence *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | No MLS in Zig found on GitHub (searched `mls messaging layer security` language:zig). `std.crypto` has none. |
 
-**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** no ReInit/branch, and a long-lived `Group`'s retained memory grows with every adopted Commit (about 5 KB per epoch measured; an arena per epoch is kept until `deinit`) (→ Backlog).
+**Where we are ahead:** the only Zig MLS and unusually thorough against the official mlswg vectors: tree math, TreeKEM, key schedule, secret tree, framing, welcome and three recorded `passive-client-*` sessions replayed epoch by epoch (one of 200 Commits); atomic Commit processing with allocation-failure sweeps; both directions of external Commits; send *and* receive of proposals, commits and welcomes. **Where we are behind:** no ReInit/branch (→ Backlog).
 
 ## What this is, in one paragraph
 
@@ -702,16 +702,19 @@ re-encoded form, would silently diverge from the first.
 
 ### Memory model
 
-One arena for retained state, the caller's allocator for scratch. This module's
-decoders alias their input buffers, and a group's tree accumulates leaves
-aliasing a DIFFERENT buffer per epoch (the Welcome's `GroupInfo`, then each
-Commit's `UpdatePath`, then each Add's `KeyPackage`). Deep-copying every
-`LeafNode` would mean a second implementation of `tree.zig`'s decode layer, so
-`Group` copies each message it retains state from into its own arena
-(`epoch_arenas`, one per adopted Commit; a REFUSED Commit keeps nothing) and
-decodes from that copy. Group state is retained wholesale and dropped wholesale,
-which is how MLS treats it too. The cost is a limit stated under *Threat model*:
-the arenas grow monotonically with session length until `deinit`.
+One arena for the current epoch's state, the caller's allocator for scratch.
+This module's decoders alias their input buffers, so a Commit is decoded from
+a copy in its own arena (`msgs`). Before it is adopted, `reserveAdoption`
+deep-copies the state the new epoch keeps — the ratchet tree with every byte
+field (`deepCloneTree`), the GroupContext extensions, the held path secrets —
+into a fresh arena (`tree_arena`), which replaces the previous epoch's;
+`msgs` is released when the Commit returns, adopted or refused. The creation
+arena (`arena`) keeps what the group was created from. A long-lived group's
+retained memory is therefore one epoch's state plus the resumption-PSK history
+(one 8 + `Nh`-byte entry per epoch, on `gpa`, needed because §8.4 resumption
+PSKs may name any earlier epoch); a pending Update (`updateLeaf`) lives in the
+epoch's arena and dies with the epoch. Pinned by a test: 60 Commits grow a
+receiver's live memory by the history alone. Every arena wipes on release.
 
 ### `PrivateMessage` through the group (§6.3, §9, §9.2)
 
@@ -1312,15 +1315,12 @@ byte).
   round-trips `EncryptWithLabel`→`DecryptWithLabel` through the real
   `io`-backed path to confirm the non-deterministic entry point itself
   works, not just the deterministic-input decrypt half.
-- **Retained memory of a long-lived `Group`.** Every adopted Commit keeps its
-  own arena (`epoch_arenas`, `group.zig`) until `deinit`, because the tree
-  aliases those bytes (`tree.zig`'s stated convention). Measured on a receiver in
-  an eight-member group taking Update-only Commits: about 5.2 KB per epoch (21.7
-  KB at epoch 1, 335 KB at epoch 61); each small arena's unused tail is the
-  difference from a single shared arena, because `std.heap.ArenaAllocator` grows
-  every new chunk to half again the previous one plus the request. Irrelevant for
-  the 200-Commit vector; for a long-lived group it is a leak in all but name. A
-  REFUSED Commit keeps nothing. The plan is under *Backlog / deferred*.
+- **Retained memory of a long-lived `Group`.** Bounded by one epoch's state:
+  each adopted Commit's state is deep-copied into a fresh epoch arena and the
+  previous one released (see Part 7's memory model). Until 2026-11-21 every
+  Commit's arena was kept until `deinit` (about 5.2 KB per epoch measured). The
+  one part that still grows is the resumption-PSK history, one small entry per
+  epoch lived through.
 - **`createCommit` and `processCommit` are not a transport-level
   authentication.** The identity in a joiner's leaf and the credential in any
   `LeafNode` are vouched for by nothing in this module (§5.3.1's
@@ -1571,7 +1571,4 @@ Gaps that are unverified rather than unbuilt:
 
 - **ReInit and subgroup branch (§11.2/§11.3).** Effort: small-medium; the
   resumption PSKs they need exist.
-- **`Group`'s retained state grows with session length** (Threat model). The fix
-  is owning leaf bytes rather than aliasing them, which would let an epoch's
-  arena go once nothing in the tree points into it.
 - **Measure the bulk `PrivateMessage` path** (AEAD from the sibling `aesgcm`; Zig 0.17, #36256); the card says `Performance: not measured`.

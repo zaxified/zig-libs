@@ -571,9 +571,10 @@ uniqueness, a KeyPackage's lifetime (`createCommit` against `io`'s clock,
 
 **What it does not do:** follow through on a `ReInit` (§11.2) or branch (§11.3).
 
-**Memory:** a `Group` keeps an arena per adopted Commit until `deinit` (about
-5 KB per epoch measured in an eight-member group), so a long-lived group's
-retained memory grows with its epoch count; a refused Commit keeps nothing.
+**Memory:** a `Group` keeps one epoch's state (deep-copied on every adopted
+Commit, the previous epoch's released) plus one small resumption-PSK entry per
+epoch; a refused Commit keeps nothing. A leaf returned by `updateLeaf` is valid
+until the next Commit is adopted.
 
 
 

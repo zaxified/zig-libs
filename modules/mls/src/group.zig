@@ -78,13 +78,18 @@
 //! mean a second, parallel implementation of `tree.zig`'s whole decode
 //! layer. So `Group` copies each message it retains state from into an
 //! arena and decodes from that copy, and group state is dropped wholesale
-//! by `deinit`, which is also how MLS itself treats it. Three kinds of
-//! arena: `arena`, for what the group was created from; `epoch_arenas`, one
-//! per adopted Commit, holding what that Commit contributed; `tree_arena`,
-//! owning the current tree's containers and replaced by every Commit. A
-//! refused Commit's arenas are released instead of joining them, and every
-//! arena wipes its memory on release (`WipingArena`), because group state
-//! carries key material. Verification scratch (transcript inputs, TBS
+//! by `deinit`, which is also how MLS itself treats it. Two kinds of
+//! arena: `arena`, for what the group was created from; `tree_arena`, owning
+//! EVERYTHING the current epoch's state points into — the ratchet tree, deep
+//! (every leaf and parent byte field), the GroupContext extensions, the held
+//! path secrets, the epoch's pending Updates — and replaced by every adopted
+//! Commit: `reserveAdoption` deep-copies the new epoch's state into a fresh
+//! one, so a Commit's own arena (`msgs`) is released when the Commit returns,
+//! adopted or not, and a long session's retained memory stays the size of
+//! one epoch's state (the resumption-PSK history, one entry per epoch, is
+//! the only part that grows; it lives on `gpa`). Every arena wipes its
+//! memory on release (`WipingArena`), because group state carries key
+//! material. Verification scratch (transcript inputs, TBS
 //! buffers, resolutions) uses `gpa` and is freed immediately.
 //!
 //! Model: RFC 9420 §12.2, §12.3, §12.4.2, and the receiving half of
@@ -596,16 +601,11 @@ pub fn Group(comptime S: type) type {
         /// so `arena.allocator()` stays valid when a `Group` value is moved
         /// (returned from `fromWelcome`, stored in a struct).
         arena: *WipingArena,
-        /// One arena per ADOPTED Commit: the message copy the tree's new
-        /// leaves alias, the decoded structures, the path secrets it handed
-        /// down. Retained until `deinit`, like `arena` (see `SPEC.md`'s
-        /// Backlog on growth with session length).
-        epoch_arenas: std.ArrayList(*WipingArena) = .empty,
-        /// Owner of `ratchet_tree`'s containers — the node array and the
-        /// lists `RatchetTree.deinit` would free — since the last adopted
-        /// Commit, or `null` while they are still in `arena`. Every Commit
-        /// builds its tree in a fresh one (`fork`) and `adopt` releases the
-        /// previous one, so the tree costs one copy, not one per epoch.
+        /// Owner of everything the current epoch's state points into (see
+        /// this file's memory model) since the last adopted Commit, or
+        /// `null` while that is still `arena`. Every Commit builds its state
+        /// in a fresh one (`fork`, `reserveAdoption`) and `adopt` releases
+        /// the previous one.
         tree_arena: ?*WipingArena = null,
 
         policy: Policy = .{},
@@ -707,9 +707,9 @@ pub fn Group(comptime S: type) type {
 
         pub fn deinit(self: *Self) void {
             const gpa = self.gpa;
-            for (self.epoch_arenas.items) |a| a.destroy(gpa);
-            self.epoch_arenas.deinit(gpa);
             if (self.tree_arena) |t| t.destroy(gpa);
+            for (self.resumption_history.items) |*e| std.crypto.secureZero(u8, &e.secret);
+            self.resumption_history.deinit(gpa);
             self.arena.destroy(gpa);
             dropSecretTree(gpa, self.secret_tree);
             freeSentPrivate(gpa, &self.sent_private);
@@ -1035,33 +1035,48 @@ pub fn Group(comptime S: type) type {
             return .{ .state = state, .tree = tree_arena };
         }
 
-        /// The last fallible step of a Commit: the two allocations `adopt`
-        /// needs — room for this epoch in `epoch_arenas`, and room for one
-        /// more entry in the working copy's `resumption_history`.
+        /// The last fallible step of a Commit: everything `adopt` needs.
         ///
-        /// The history is never grown IN PLACE. With spare capacity, `adopt`
-        /// writes the entry past the live length, where the live object never
-        /// reads; without it, the working copy moves to a fresh buffer in
-        /// `msgs`. `ArrayList.append` would `realloc` the shared buffer
-        /// instead — and a realloc that has to move paints the old buffer
-        /// `undefined` in safe builds: the LIVE object's buffer, before the
-        /// Commit is known to have succeeded.
+        /// 1. The new epoch's state is deep-copied into the working copy's
+        ///    own arena (`f.tree`): the ratchet tree with every byte field,
+        ///    the GroupContext extensions and the held path secrets. Until
+        ///    here they alias the Commit's message copy (`msgs`), the
+        ///    creation arena or the previous epoch's arena; afterwards only
+        ///    `f.tree`, so `msgs` and the previous epoch's arena can go.
+        /// 2. Room for one more `resumption_history` entry. The history is
+        ///    never grown IN PLACE: with spare capacity `adopt` writes past
+        ///    the live length, where the live object never reads; without
+        ///    it the working copy moves to a fresh `gpa` buffer, and `adopt`
+        ///    frees the old one. `ArrayList.append` would `realloc` the
+        ///    shared buffer instead — and a realloc that moves paints the old
+        ///    buffer `undefined` in safe builds: the LIVE object's buffer,
+        ///    before the Commit is known to have succeeded.
         fn reserveAdoption(self: *Self, f: *Fork, msgs: std.mem.Allocator) !void {
-            const h = &f.state.resumption_history;
+            _ = msgs;
+            const ta = f.tree.allocator();
+            const st = &f.state;
+            st.ratchet_tree = try deepCloneTree(ta, &st.ratchet_tree);
+            st.extensions = try dupExtensions(ta, st.extensions);
+            const ps = try ta.alloc(treekem.PathSecretEntry, st.my_path_secrets.items.len);
+            for (st.my_path_secrets.items, ps) |e, *slot| slot.* = .{ .node = e.node, .path_secret = try ta.dupe(u8, e.path_secret) };
+            st.my_path_secrets = .empty;
+            st.my_path_secrets.items = ps;
+            st.my_path_secrets.capacity = ps.len;
+            const h = &st.resumption_history;
             if (h.items.len == h.capacity) {
-                const buf = try msgs.alloc(ResumptionEntry, @max(8, 2 * h.capacity));
+                const buf = try self.gpa.alloc(ResumptionEntry, @max(8, 2 * h.capacity));
                 @memcpy(buf[0..h.items.len], h.items);
                 h.items = buf[0..h.items.len];
                 h.capacity = buf.len;
             }
-            try self.epoch_arenas.ensureUnusedCapacity(self.gpa, 1);
         }
 
         /// Swaps a finished working copy in. Cannot fail — `reserveAdoption`
         /// made the only allocations it needs — so a Commit is adopted whole
-        /// or not at all. `msgs` is the Commit's own arena; it joins
-        /// `epoch_arenas`.
+        /// or not at all. `msgs`, the Commit's own arena, is released by the
+        /// caller when the Commit returns: nothing adopted points into it.
         fn adopt(self: *Self, f: *Fork, msgs: *WipingArena) void {
+            _ = msgs;
             const gpa = self.gpa;
             const next = &f.state;
             next.resumption_history.appendAssumeCapacity(.{ .epoch = next.epoch, .secret = next.secrets.resumption_psk });
@@ -1069,10 +1084,9 @@ pub fn Group(comptime S: type) type {
             // epoch it was sent in, so any that this Commit did not apply can
             // never be applied, and their private keys are dead — wiped here
             // rather than merely forgotten.
+            // Their list and leaves live in the previous epoch's arena.
             for (next.pending_updates.items) |*p| std.crypto.secureZero(u8, &p.encryption_priv);
-            next.pending_updates.clearRetainingCapacity();
-            next.epoch_arenas = self.epoch_arenas;
-            next.epoch_arenas.appendAssumeCapacity(msgs);
+            next.pending_updates = .empty;
             next.tree_arena = f.tree;
             // The new epoch starts without a secret tree (created on first
             // use from its own `encryption_secret`) and without sent
@@ -1081,7 +1095,7 @@ pub fn Group(comptime S: type) type {
             next.sent_private = .empty;
 
             const old_tree = self.tree_arena;
-            const old_history = self.resumption_history.items;
+            const old_history = self.resumption_history;
             const old_secret_tree = self.secret_tree;
             var old_sent = self.sent_private;
             self.* = next.*;
@@ -1092,8 +1106,10 @@ pub fn Group(comptime S: type) type {
             // What the previous epoch held that nothing reads any more: its
             // tree containers, and — if the history moved — the superseded
             // copy of every remembered resumption PSK.
-            if (old_history.ptr != self.resumption_history.items.ptr) {
-                for (old_history) |*e| std.crypto.secureZero(u8, &e.secret);
+            if (old_history.items.ptr != self.resumption_history.items.ptr) {
+                for (old_history.items) |*e| std.crypto.secureZero(u8, &e.secret);
+                var h = old_history;
+                h.deinit(gpa);
             }
             if (old_tree) |t| t.destroy(gpa);
         }
@@ -1234,7 +1250,8 @@ pub fn Group(comptime S: type) type {
             // point at caller memory the group outlives — so this is a DEEP
             // copy, not a `dupe` of the list alone.
             self.extensions = try dupExtensions(arena, params.extensions);
-            try self.resumption_history.append(arena, .{ .epoch = 0, .secret = secrets.resumption_psk });
+            try self.resumption_history.append(gpa, .{ .epoch = 0, .secret = secrets.resumption_psk });
+            errdefer self.resumption_history.deinit(gpa);
 
             // Same self-check `fromWelcome` runs: a re-encoded GroupContext
             // must equal the bytes the key schedule just consumed, or every
@@ -1445,7 +1462,8 @@ pub fn Group(comptime S: type) type {
             self.confirmed_len = conf.len;
             @memcpy(&self.tree_hash, group_info.group_context.tree_hash);
             @memcpy(self.confirmed_transcript_hash[0..conf.len], conf);
-            try self.resumption_history.append(arena, .{ .epoch = self.epoch, .secret = secrets.resumption_psk });
+            try self.resumption_history.append(gpa, .{ .epoch = self.epoch, .secret = secrets.resumption_psk });
+            errdefer self.resumption_history.deinit(gpa);
 
             // The re-encoded GroupContext must equal the bytes the key
             // schedule just consumed. If it does not, every later epoch
@@ -1577,8 +1595,7 @@ pub fn Group(comptime S: type) type {
             // a missing PSK, a failed allocation — releases it, wiped (by
             // bullet 8 it holds decrypted path secrets).
             const msgs = try WipingArena.create(gpa);
-            var adopted = false;
-            defer if (!adopted) msgs.destroy(gpa);
+            defer msgs.destroy(gpa);
             const arena = msgs.allocator();
 
             // The Commit's UpdatePath contributes a LeafNode the tree keeps,
@@ -1606,13 +1623,13 @@ pub fn Group(comptime S: type) type {
                 if (prm.epoch != self.epoch) return error.WrongEpoch;
                 if (prm.content_type != .commit) return error.WrongContentType;
                 const pac = try self.openPrivate(arena, gpa, prm, old_gc, .peek);
-                return self.processCommitContent(params, msgs, &adopted, pac, null, old_gc);
+                return self.processCommitContent(params, msgs, pac, null, old_gc);
             }
             const pm = switch (msg) {
                 .public_message => |m| m,
                 else => return error.WrongContentType,
             };
-            return self.processCommitContent(params, msgs, &adopted, pm.authenticatedContent(), pm, old_gc);
+            return self.processCommitContent(params, msgs, pm.authenticatedContent(), pm, old_gc);
         }
 
         /// `processCommit` from the decoded `AuthenticatedContent` on. `pm` is
@@ -1622,7 +1639,6 @@ pub fn Group(comptime S: type) type {
             self: *Self,
             params: CommitParams,
             msgs: *WipingArena,
-            adopted: *bool,
             ac: framing.AuthenticatedContent,
             pm_opt: ?framing.PublicMessage,
             old_gc: []const u8,
@@ -1908,7 +1924,6 @@ pub fn Group(comptime S: type) type {
             // The last step that can fail; `adopt` cannot.
             try self.reserveAdoption(&txn, arena);
             self.adopt(&txn, msgs);
-            adopted.* = true;
         }
 
         /// RFC 9420 §8.3's RECEIVING half, wired to this epoch: recover the
@@ -2026,15 +2041,17 @@ pub fn Group(comptime S: type) type {
         ///
         /// The credential, capabilities and extensions are carried over from
         /// this member's current leaf unchanged (the identity content is not
-        /// what an Update rotates). Every allocation is made in the group's
-        /// own arena, so the returned leaf stays valid for as long as the
-        /// group does and needs no `deinit`.
+        /// what an Update rotates). Every allocation is made in the current
+        /// epoch's arena, so the returned leaf needs no `deinit` and stays
+        /// valid until the next Commit is adopted (an Update is bound to its
+        /// epoch, §12.1).
         pub fn updateLeaf(self: *Self, params: UpdateLeafParams) @TypeOf(updateLeafBody(self, params)) {
             return burn.run(burn.group_burn, @TypeOf(updateLeafBody(self, params)), updateLeafBody, .{ self, params });
         }
 
         fn updateLeafBody(self: *Self, params: UpdateLeafParams) !tree.LeafNode {
-            const arena = self.arena.allocator();
+            // The current epoch's arena: a pending Update dies with its epoch.
+            const arena = (self.tree_arena orelse self.arena).allocator();
             const current = try self.ownLeaf();
             const new_pub = params.encryption_key_pair.public_key;
             if (std.mem.eql(u8, current.encryption_key, &new_pub)) return error.LeafNodeInvalid;
@@ -2251,8 +2268,7 @@ pub fn Group(comptime S: type) type {
             // allocations — the copied proposals, the staged path and its
             // secrets — join the group only if the Commit is adopted.
             const msgs = try WipingArena.create(gpa);
-            var adopted = false;
-            defer if (!adopted) msgs.destroy(gpa);
+            defer msgs.destroy(gpa);
             const arena = msgs.allocator();
             const external = mode == .external;
 
@@ -2603,7 +2619,6 @@ pub fn Group(comptime S: type) type {
             // The last step that can fail; `adopt` cannot.
             try self.reserveAdoption(&txn, arena);
             self.adopt(&txn, msgs);
-            adopted = true;
 
             return .{ .commit = commit_bytes, .welcome = welcome_bytes, .group_info = group_info_bytes };
         }
@@ -4175,6 +4190,36 @@ fn findOwnLeaf(gpa: std.mem.Allocator, t: *const tree.RatchetTree, want_encoded:
 /// exactly the aliasing bug this module's decode convention makes easy —
 /// so the only place a caller's extensions enter retained group state uses
 /// this instead.
+/// A copy of `t` that aliases nothing: containers AND every byte field are
+/// fresh allocations from `allocator` (compare `cloneTree`). What lets an
+/// epoch's state outlive the messages it was built from (`reserveAdoption`).
+fn deepCloneTree(allocator: std.mem.Allocator, t: *const tree.RatchetTree) !tree.RatchetTree {
+    const nodes = try allocator.alloc(?tree.Node, t.nodes.len);
+    for (t.nodes, nodes) |src, *dst| {
+        dst.* = if (src) |n| switch (n) {
+            .leaf => |l| .{ .leaf = blk: {
+                var c = l;
+                c.encryption_key = try allocator.dupe(u8, l.encryption_key);
+                c.signature_key = try allocator.dupe(u8, l.signature_key);
+                c.credential = try dupCredential(allocator, l.credential);
+                c.capabilities = try dupCapabilities(allocator, l.capabilities);
+                c.parent_hash = if (l.parent_hash) |ph| try allocator.dupe(u8, ph) else null;
+                c.extensions = try dupExtensions(allocator, l.extensions);
+                c.signature = try allocator.dupe(u8, l.signature);
+                break :blk c;
+            } },
+            .parent => |p| .{ .parent = blk: {
+                var q = p;
+                q.encryption_key = try allocator.dupe(u8, p.encryption_key);
+                q.parent_hash = try allocator.dupe(u8, p.parent_hash);
+                q.unmerged_leaves = try allocator.dupe(u32, p.unmerged_leaves);
+                break :blk q;
+            } },
+        } else null;
+    }
+    return .{ .allocator = allocator, .nodes = nodes };
+}
+
 fn dupCredential(arena: std.mem.Allocator, cred: tree.Credential) !tree.Credential {
     return switch (cred) {
         .basic => |b| .{ .basic = try arena.dupe(u8, b) },
@@ -4898,6 +4943,72 @@ test "§7.2/§7.3: a default extension type in a leaf needs no capabilities entr
     leaf.extensions = &.{.{ .extension_type = 0xff00, .extension_data = "" }};
     try testing.expectError(error.LeafNodeInvalid, Group(TestSuite).checkLeafPolicy(.{}, leaf));
     try Group(TestSuite).checkLeafPolicy(.{ .check_leaf_extensions_supported = false }, leaf);
+}
+
+/// Counts the bytes live through it, for the retained-memory test.
+const CountingAllocator = struct {
+    child: std.mem.Allocator,
+    live: usize = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, a, ra) orelse return null;
+        self.live += len;
+        return p;
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(m, a, n, ra)) return false;
+        self.live = self.live - m.len + n;
+        return true;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.live -= m.len;
+        self.child.rawFree(m, a, ra);
+    }
+};
+
+test "memory: a receiver's retained state does not grow with the epoch count beyond the resumption history" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "mem", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    var counting: CountingAllocator = .{ .child = gpa };
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }} });
+        defer c.deinit(gpa);
+        break :blk try bob.join(counting.allocator(), c.welcome.?, &.{});
+    };
+    defer b.deinit();
+    var live_at_5: usize = 0;
+    for (0..60) |i| {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
+        defer c.deinit(gpa);
+        try b.processCommit(.{ .commit_msg = c.commit });
+        if (i == 4) live_at_5 = counting.live;
+    }
+    try expectSameEpoch(&a, &b);
+    // 55 more epochs: before 2026-11-21 about 5 KB each (~280 KB); now only
+    // the history (8 + Nh bytes per epoch, doubling capacity).
+    const growth = counting.live -| live_at_5;
+    if (growth >= 8 * 1024) {
+        std.debug.print("retained growth over 55 epochs: {d} bytes\n", .{growth});
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "§6.3/§9.2: a forged generation far ahead is GenerationTooFarAhead, within the bound it decrypts" {
