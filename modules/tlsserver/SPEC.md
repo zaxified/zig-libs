@@ -372,8 +372,12 @@ out everywhere. Allocation-free; a hello with more than 512 suites or extensions
 `fingerprint.ja4` on the `ClientHello` it gets and refuse the client before anything is sent.
 `hello.ClientHello.extensions_raw` is the checked extension block. Anchored on the
 specification's worked example (`t13d1516h2_8daaf6152771_e5627efa2ab1`, its two hashes
-recomputed independently), with GREASE and shuffled order added. A differential check against
-Wireshark's JA4 field is open (*Backlog*).
+recomputed independently), with GREASE and shuffled order added, and differentially: every
+recorded TCP client hello of `interop_vectors.zig` (OpenSSL 3.5, Go 1.26, ECH outer hellos)
+fingerprints as github.com/exaring/ja4plus (MIT, an independent implementation over Go's
+`ClientHelloInfo`) does (`tools/ja4_oracle` writes `src/ja4_vectors.zig`). Wireshark's JA4 field
+(FoxIO's reference reads it through `tshark`) is not the oracle: `tshark` cannot be installed
+without root on the development host.
 
 **Offloaded signing** (BoringSSL `SSL_PRIVATE_KEY_METHOD`, s2n `s2n_async_pkey`, picotls
 `ptls_async_job_t`; rustls signs synchronously inside the handshake, `Signer::sign`). A
@@ -1003,7 +1007,6 @@ records (the per-record 4 KiB burn).
   buffer, `Connection.reader()`/`writer()` in place, `Server.writeSlot`/`commitWrite`, rekey bound
   `max_records_per_key`); the run itself — same traffic through the fork and through this server, outputs and
   throughput compared — has not been done.
-- **JA4 differential check** against Wireshark's JA4 field (`tshark` is not installed on the development host).
 
 ## Open
 

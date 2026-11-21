@@ -346,3 +346,24 @@ test "mutation run 2026-11-06 wave 2: JA4 version codes of every legacy_version"
         try testing.expectEqualStrings(t[1], out[1..3]);
     }
 }
+
+test "JA4: every recorded client's ClientHello as an independent implementation fingerprints it (tools/ja4_oracle)" {
+    // github.com/exaring/ja4plus over Go's crypto/tls, on the OpenSSL, Go and
+    // ECH-outer hellos of `interop_vectors.zig` (TCP cases).
+    const vectors = @import("ja4_vectors.zig").vectors;
+    const cases = @import("interop_vectors.zig").cases;
+    try testing.expect(vectors.len >= 40);
+    for (vectors) |v| {
+        errdefer std.debug.print("case {s}\n", .{v.name});
+        const c = for (cases) |c| {
+            if (std.mem.eql(u8, c.name, v.name)) break c;
+        } else return error.MissingCase;
+        const n = std.mem.readInt(u16, c.client[3..5], .big);
+        const msg = c.client[5..][0..n];
+        try testing.expectEqual(@as(u8, 1), msg[0]);
+        const ch = try hello.parseClientHello(msg[4..][0..std.mem.readInt(u24, msg[1..4], .big)]);
+        var out: [ja4_len]u8 = undefined;
+        try ja4(&ch, .tcp, &out);
+        try testing.expectEqualStrings(v.ja4, &out);
+    }
+}
