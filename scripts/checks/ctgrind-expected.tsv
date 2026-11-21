@@ -1098,8 +1098,9 @@ hpke	ReleaseFast	p521_authdecap	1	0	5e01e253fa45faa6	f00506c9b354a23b
 # PUBLIC input; z_2 derives from the scalar, so memcheck flags it -- the class ct25519 removed for
 # X25519), (2) dhkem.zig `X448Kem.dh`'s RFC 9180 §7.1.4 all-zero verdict, the `try dh(...)` in
 # decapBody (:462) / authDecapBody (:498, :499). decap: 2 in-file = the verdict + the invert test
-# (its stack runs through dhkem.zig), 1 unattributed = the harness's own `try Kem.decap` branch
-# (ctgrind_harness.zig:210); authdecap: 4 in-file = both contexts for each of its two DHs. Witness
+# (its stack runs through dhkem.zig); the harness's own `try Kem.decap` branch on that verdict was
+# a third, unattributed context (ctgrind_harness.zig:210, full CI 44922862032) until the harness
+# declassified the returned error code (2026-11-21); authdecap: 4 in-file = both contexts for each of its two DHs. Witness
 # 2 each: the hex print of the shared secret. No branch on a scalar bit.
 hpke	ReleaseFast	x448_decap	1	2	5e01e253fa45faa6	c94ae9fab2a935ca
 hpke	ReleaseFast	x448_authdecap	1	4	5e01e253fa45faa6	da63850068c269fd
@@ -2392,6 +2393,14 @@ oscore	ReleaseFast	unprotect	1	81	5348e0af1901ba83	ed85db89e3d7e9fd	cpu=x86_64 c
 fss	ReleaseFast	gen	1	0	04a4f7caf30f2695	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
 fss	ReleaseFast	eval	1	0	04a4f7caf30f2695	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
 aesgcm	ReleaseFast	generic	1	226	96d433b8d464dac1	b60805fea700d105	cpu=x86_64 control=8 trap=8
+# aesccm on x86_64 (2026-11-21, full CI 44922862032 ctgrind-portable; read with --stacks and
+# valgrind --track-origins): claim 192 in-file = 184 A1 (std soft.zig `expandKey` masked S-box loads
+# via root.zig `init`, key tainted; native AES-NI has none) + 8 the tag verdict (root.zig `open`
+# :108, as native). control=16 / trap=32 are totals: 8 in-file are that same verdict (A2: its
+# `expected` tag comes from std soft `encrypt` of the counter block, whose stack-allocated padding
+# lanes are `undefined`, origin soft.zig:610, so the compare branches on them without any taint)
+# + 8 witness (the printed tag/plaintext), trap +16 more witness prints (nothing declassified).
+aesccm	ReleaseFast	aead	1	192	e36c5e8d79e2c281	d38f305d54b5a2c3	cpu=x86_64 control=16 trap=32
 dtls	ReleaseFast	hs	1	302	d7c2e55489ff8a76	61a204df8edf79a0	cpu=x86_64 control=177 trap=179
 dtls	ReleaseFast	app	1	278	d7c2e55489ff8a76	70da17057fd7a044	cpu=x86_64 control=279 trap=279
 # 2026-11-21 (connection ID work): ku +1 in the tainted, the untainted and the no-fvalgrind rows alike (296/299/299 ->
