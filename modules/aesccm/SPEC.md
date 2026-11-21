@@ -8,7 +8,7 @@
 
 **Audit:** review none · mutation none · src ?
 
-**Hardening:** fuzz none (harness `aesccm-open` added 2026-11-21, not yet budget-run) · ct 2026-11-21 (ctgrind `aead`: key and plaintext tainted through seal / open / tampered open, AES-128 and AES-256, tags 8 and 16)
+**Hardening:** fuzz none — harness `aesccm-open` exists, not yet budget-run · ct 2026-11-21 (ctgrind `aead`: key and plaintext tainted through seal / open / tampered open, AES-128 and AES-256, tags 8 and 16)
 
 **Performance:** not measured
 
