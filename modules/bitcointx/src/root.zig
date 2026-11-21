@@ -127,6 +127,8 @@ test {
     _ = @import("bip143_kat_test.zig");
     _ = @import("bip341_kat_vectors.zig");
     _ = @import("bip341_kat_test.zig");
+    _ = @import("bip341_annex_kat_vectors.zig");
+    _ = @import("bip341_annex_kat_test.zig");
     _ = @import("fuzz_test.zig");
 }
 

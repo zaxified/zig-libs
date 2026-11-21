@@ -115,7 +115,7 @@ parameter is caller-supplied (typically the spent output's `scriptPubKey`, or a 
   What this module does carry is the annex commitment: `sighash_bip341.zig` implements taproot key-path
   spending in full (`buildCommonSigMsg`), and `CommonOptions.spend_type`/`annex_hash` let a caller signal an
   annex, whereupon `sha_annex` is emitted into `SigMsg` per BIP341; `bitcoinscript` uses this for tapscript
-  spends that carry an annex. The key-path wrapper (`sigMsg`/`sighash`) never sets one.
+  spends that carry an annex. The key-path wrapper (`sigMsg`/`sighash`) never sets one; `keyPathSighash` is the key-path sighash with an optional annex (`spend_type = 1`), `annexHash` the `sha_annex` of an annex item.
 - **Bitcoin Script interpretation, `Amount`/`LockTime` types, a transaction builder** — see *Threat model /
   out of scope* and *Compared with*.
 
@@ -228,14 +228,9 @@ committed to a Zig test, i.e. this is what that process is for, not a hypothetic
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** BIP143/BIP341 official vectors, Bitcoin Core's `sighash.json` (all 500 rows) and `tx_valid`/`tx_invalid` EXTERNAL; the annex commitment and the Merkle/witness-commitment rules follow Core and are checked against explorer data, with no official annex vector in this module.
+**What the tests actually contain.** BIP143/BIP341 official vectors, Bitcoin Core's `sighash.json` (all 500 rows) and `tx_valid`/`tx_invalid` EXTERNAL, as is the annex commitment (31 key-path spends with an annex from Core's `script_assets_test.json`, `bip341_annex_kat_vectors.zig`: real signatures that verify only over the annex sighash); the Merkle/witness-commitment rules follow Core and are checked against explorer data.
 
 
 ## Backlog / deferred
 
-- **Official annex vector for the BIP341 sighash** — `CommonOptions.annex_hash` is cross-checked for internal
-  consistency (`error.SpendTypeAnnexMismatch`), but the byte layout of the annex commitment has no vector-anchored
-  test in this module: the official `bip-0341/wallet-test-vectors.json` `keyPathSpending` fixture contains no
-  annex case and this module's tests never set `annex_hash`. `bitcoinscript`'s `sighash_annex` case anchors it one
-  level up. Plan: get an official script-path/annex vector into this module, or build one.
-
+None open.

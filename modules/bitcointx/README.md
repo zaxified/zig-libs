@@ -50,7 +50,7 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup:
   hashType combinations (`DEFAULT`/`ALL`/`NONE`/`SINGLE` × plain/`ANYONECANPAY`). `commonSigMsg`
   exposes the same layout with a caller-chosen `spend_type` and optional annex commitment, so
   `bitcoinscript`'s BIP342 script-path message appends its extension to this one rather than
-  reproducing a consensus-critical byte order a second time.
+  reproducing a consensus-critical byte order a second time. `keyPathSighash` is the key-path sighash with an optional annex.
 - **`PrecomputedTransactionData`** (`precomputed.zig`) — the per-transaction commitment hashes
   (BIP143's three midstates, BIP341's five) computed **once per transaction** and reused for every
   input and every `CHECKSIG`, matching Bitcoin Core's struct of the same name. "Reusable" above is

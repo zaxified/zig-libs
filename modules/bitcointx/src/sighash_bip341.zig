@@ -28,14 +28,15 @@
 //! `bip340.taggedHash("TapSighash", sigMsg(...))` with no separate
 //! epoch-prepending step.
 //!
-//! ## Scope: the common SigMsg, including the annex — BIP342 tapscript itself deferred
+//! ## Scope: the common SigMsg, including the annex — BIP342 tapscript itself one layer up
 //!
 //! `commonSigMsg`/`commonSigMsgWith` build BIP341's SigMsg through the
 //! SINGLE-output commitment for BOTH key-path (`spend_type` even, `ext_flag
 //! = 0`) and script-path (`ext_flag = 1`) callers — including the annex
 //! commitment (`sha_annex`, `CommonOptions.annex_hash`), which is emitted
 //! whenever the caller sets it, regardless of path. `sigMsg`/`sighash` below
-//! are the key-path convenience wrapper (`spend_type = 0`, no annex).
+//! are the key-path convenience wrapper (`spend_type = 0`, no annex);
+//! `keyPathSighash` is the key-path sighash with an optional annex.
 //! `bitcoinscript` calls `commonSigMsg{,With}` directly for BIP342 tapscript
 //! spends, including ones that carry an annex, and appends its own
 //! `ext_flag = 1` fields (tapleaf hash / `key_version` /
@@ -46,14 +47,13 @@
 //! — that is a distinct, self-contained extension built one layer up, in
 //! `bitcoinscript`, not a partial/half-built version of this function.
 //!
-//! ⚠ Coverage gap, not a scope cut: no published, official key-path test
-//! vector exercises an annex (`bip341_kat_vectors.zig`'s source JSON has
-//! none), and this module's own tests never set `annex_hash`, so the annex
-//! wire layout below is reviewed rather than vector-anchored *here* —
-//! `bitcoinscript`'s `sighash_annex` case anchors it one level up. What IS
-//! checked in this module is `CommonOptions`'s internal consistency
-//! (`spend_type`'s annex bit vs. `annex_hash != null`,
-//! `error.SpendTypeAnnexMismatch`).
+//! The annex layout is vector-anchored: `bip341_annex_kat_vectors.zig` holds
+//! key-path spends carrying an annex from Bitcoin Core's
+//! `script_assets_test.json`, each with a real signature that verifies only
+//! over the `keyPathSighash` of this module (official
+//! `bip-0341/wallet-test-vectors.json` has no annex case). `CommonOptions`'s
+//! internal consistency (`spend_type`'s annex bit vs. `annex_hash != null`) is
+//! `error.SpendTypeAnnexMismatch`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -351,19 +351,7 @@ fn buildCommonSigMsg(
         try appendU32LE(&buf, allocator, idx_u32);
     }
 
-    // Annex commitment: IMPLEMENTED here — `opts.annex_hash`, when the caller
-    // sets it, is emitted right here per BIP341. What is deferred (SPEC.md
-    // §"Deferred") is a HIGHER-layer concern: no caller in this module ever
-    // constructs an annex-carrying `CommonOptions` (every call site here
-    // leaves `annex_hash = null`), there is no annex-parsing/witness-stack-
-    // inspection helper to derive one from a real witness, and (per SPEC.md)
-    // the official test-vector fixture this module's KATs are pinned against
-    // contains no annex case to verify the presence path against. The
-    // wire-layout primitive below is straightforward and reviewed, but is
-    // NOT covered by a byte-exact test with `annex_hash != null` — do not
-    // read its existence as meaning that path is anchored the way the rest
-    // of this file is.
-
+    // Annex commitment (BIP341 `sha_annex`), anchored by `bip341_annex_kat_vectors.zig`.
     if (opts.annex_hash) |h| try buf.appendSlice(allocator, &h);
 
     if (base == SIGHASH_SINGLE) {
@@ -452,6 +440,56 @@ pub fn sighashWith(
     spent_outputs: []const tx.TxOut,
 ) Bip341Error![32]u8 {
     const msg = try sigMsgWith(allocator, pre, transaction, input_index, hash_type, spent_outputs);
+    defer allocator.free(msg);
+    return bip340.taggedHash("TapSighash", msg);
+}
+
+/// BIP341 `sha_annex`: `SHA256(compact_size(annex.len) || annex)`; `annex`
+/// is the whole witness item, including its leading `0x50`.
+pub fn annexHash(annex: []const u8) [32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var prefix: [9]u8 = undefined;
+    const n = annex.len;
+    const prefix_len: usize = if (n < 0xfd) blk: {
+        prefix[0] = @intCast(n);
+        break :blk 1;
+    } else if (n <= 0xffff) blk: {
+        prefix[0] = 0xfd;
+        std.mem.writeInt(u16, prefix[1..3], @intCast(n), .little);
+        break :blk 3;
+    } else if (n <= 0xffff_ffff) blk: {
+        prefix[0] = 0xfe;
+        std.mem.writeInt(u32, prefix[1..5], @intCast(n), .little);
+        break :blk 5;
+    } else blk: {
+        prefix[0] = 0xff;
+        std.mem.writeInt(u64, prefix[1..9], n, .little);
+        break :blk 9;
+    };
+    h.update(prefix[0..prefix_len]);
+    h.update(annex);
+    return h.finalResult();
+}
+
+/// The taproot **key-path** sighash of a spend whose witness may carry an
+/// annex (BIP341: the last of at least two witness items, when it starts with
+/// `0x50`): `sighash` with `spend_type = 1` and the `sha_annex` commitment
+/// when `annex` is non-null, identical to `sighash` / `sighashWith` when it is
+/// null. `pre` is the optional per-transaction cache (`precompute`).
+pub fn keyPathSighash(
+    allocator: Allocator,
+    pre: ?Precomputed,
+    transaction: tx.Transaction,
+    input_index: usize,
+    hash_type: u8,
+    spent_outputs: []const tx.TxOut,
+    annex: ?[]const u8,
+) Bip341Error![32]u8 {
+    const opts: CommonOptions = if (annex) |a| .{ .spend_type = 1, .annex_hash = annexHash(a) } else .{};
+    const msg = if (pre) |p|
+        try commonSigMsgWith(allocator, p, transaction, input_index, hash_type, spent_outputs, opts)
+    else
+        try commonSigMsg(allocator, transaction, input_index, hash_type, spent_outputs, opts);
     defer allocator.free(msg);
     return bip340.taggedHash("TapSighash", msg);
 }
