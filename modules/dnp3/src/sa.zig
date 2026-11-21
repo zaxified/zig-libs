@@ -270,27 +270,21 @@ pub const ChallengeReason = enum(u8) {
     _,
 };
 
-/// SA-layer error codes (`SaError` / g120v7).
+/// SA-layer error codes (`SaError` / g120v7), the IEEE 1815-2012 Error Code
+/// table as opendnp3's `AuthErrorCode` (Apache-2.0) lists it. Codes 2 and 3
+/// (unexpected response, no response; deprecated in the standard) are not
+/// named; a received value outside this list is carried as a raw value.
 pub const ErrorCode = enum(u8) {
     authentication_failed = 1,
-    unexpected_reply = 2,
-    no_available_session_key = 3,
-    unknown_user = 4,
-    unknown_association = 5,
-    unknown_sequence_number = 6,
-    unknown_key_change_method = 7,
-    unsupported_security_algorithm = 8,
-    unsupported_mac_algorithm = 9,
-    mac_algorithm_not_permitted = 10,
-    key_wrap_algorithm_not_permitted = 11,
-    authentication_method_not_permitted = 12,
-    key_status_not_ok = 13,
-    no_available_configuration_signature = 14,
-    invalid_certification_data = 15,
-    invalid_signature = 16,
-    message_swap_detected = 17,
-    excessive_delay = 18,
-    unexpected_key_change_sequence_number = 19,
+    aggressive_mode_unsupported = 4,
+    mac_algorithm_not_supported = 5,
+    key_wrap_algorithm_not_supported = 6,
+    authorization_failed = 7,
+    update_key_method_not_permitted = 8,
+    invalid_signature = 9,
+    invalid_certification_data = 10,
+    unknown_user = 11,
+    max_session_key_status_requests_exceeded = 12,
     _,
 };
 
@@ -1247,6 +1241,16 @@ test "g120v7 Error corrected layout round-trip (seq, user, assoc, code, time)" {
     const back = try SaError.decode(bytes);
     try testing.expectEqual(ErrorCode.authentication_failed, back.error_code);
     try testing.expectEqualSlices(u8, "denied", back.error_text);
+}
+
+test "ErrorCode follows the 1815-2012 table: values on the wire and a raw value survives decode" {
+    try testing.expectEqual(@as(u8, 4), @backingInt(ErrorCode.aggressive_mode_unsupported));
+    try testing.expectEqual(@as(u8, 11), @backingInt(ErrorCode.unknown_user));
+    try testing.expectEqual(@as(u8, 12), @backingInt(ErrorCode.max_session_key_status_requests_exceeded));
+    var e: [64]u8 = undefined;
+    const enc = try (SaError{ .sequence_number = 7, .user_number = 1, .association_id = 0, .error_code = @fromBackingInt(3), .time_of_error = 5, .error_text = &.{} }).encode(&e);
+    const back = try SaError.decode(enc);
+    try testing.expectEqual(@as(u8, 3), @backingInt(back.error_code));
 }
 
 test "g120 v3/v4/v6/v9 round-trips" {

@@ -304,7 +304,12 @@ Behaviour, and why:
   (default 30 min) or `session_key_max_messages` (default 2000). Both defaults are twice the
   standard's expected change interval and count. A zero limit disables that axis.
 - **Errors**: every authentication failure is answered with a g120v7, code 1 (authentication
-  failed), until `max_error_messages` (default 2) have gone out. After that the outstation is
+  failed), until `max_error_messages` (default 2) have gone out. `sa.ErrorCode` follows the
+  IEEE 1815-2012 error-code table as opendnp3's `AuthErrorCode` (Apache-2.0) numbers it: 1
+  authentication failed, 4 aggressive mode unsupported, 5 MAC algorithm not supported, 6 key-wrap
+  algorithm not supported, 7 authorization failed, 8 update-key method not permitted, 9 invalid
+  signature, 10 invalid certification data, 11 unknown user, 12 max session-key-status requests
+  exceeded; a value outside it is kept raw. After that the outstation is
   silent until a successful key change resets the budget. A master's own g120v7
   (AUTHENTICATE_REQUEST_NO_ACK) is counted and not answered. Unexpected or undecodable
   AUTHENTICATE_REQUESTs are counted and ignored.
@@ -511,21 +516,6 @@ foreign SA master computes the same.
   monitoring key, only in the confirmation); (c) the exact default critical-function table;
   (d) whether a reply may carry a sequence number other than the challenged request's; (e) the
   aggressive-mode MAC input (here: last challenge message || request up to g120v9).
-- **FINDING (open): `sa.ErrorCode` values past 1 may be wrong.** `sa.zig` has
-  1 authentication_failed, 2 unexpected_reply, 3 no_available_session_key, 4 unknown_user,
-  5 unknown_association, 6 unknown_sequence_number, 7 unknown_key_change_method,
-  8 unsupported_security_algorithm, 9 unsupported_mac_algorithm, 10 mac_algorithm_not_permitted,
-  11 key_wrap_algorithm_not_permitted, 12 authentication_method_not_permitted,
-  13 key_status_not_ok, 14 no_available_configuration_signature, 15 invalid_certification_data,
-  16 invalid_signature, 17 message_swap_detected, 18 excessive_delay,
-  19 unexpected_key_change_sequence_number. The IEEE 1815-2012 table as recalled during the
-  integration (same names as opendnp3 2.x's `AuthErrorCode`) is 1 authentication failed,
-  2 unexpected response (deprecated), 3 no response, 4 aggressive mode not supported, 5 MAC
-  algorithm not supported, 6 key-wrap algorithm not supported, 7 authorization failed, 8
-  update-key change method not permitted, 9 invalid signature, 10 invalid certification data,
-  11 unknown user, 12 max session-key-status requests exceeded. Neither table has been checked
-  against the standard. The two agree only on code 1, so the outstation emits only code 1.
-  Check against the standard's table, then renumber (a behaviour change of `sa.ErrorCode`).
 - **Data-link confirmed user data on the send path.** The outstation answers RESET_LINK_STATES,
   TEST_LINK_STATES and REQUEST_LINK_STATUS and accepts both confirmed and unconfirmed user data,
   but always *sends* unconfirmed user data; the FCB/FCV toggle is decoded, not enforced.
