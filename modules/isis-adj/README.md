@@ -8,11 +8,12 @@ no allocation on the steady path. The caller supplies a monotonic `now`, feeds
 it received IIHs, and acts on the `Effect` it returns — send an IIH, raise the
 adjacency, tear it down.
 
-Status: **gap** — first increment. Implements the P2P three-way FSM + the
-hold/hello timing + TLV 240 (the RFC 5303 Three-Way Adjacency TLV, which `isis`
-does not model typed). LAN adjacency (the DIS election is the sibling
-`isis-dis`), graceful-restart, and area-address matching on L1/L2 circuits
-are left out — see `SPEC.md` (*What is deliberately not done*, *Backlog / deferred*).
+Status: the P2P three-way FSM + the hold/hello timing + TLV 240 (the RFC 5303
+Three-Way Adjacency TLV, which `isis` does not model typed), the LAN adjacency
+(`lan.zig`: neighbour table, IS Neighbours two-way check; the DIS election is the
+sibling `isis-dis`), split L1/L2 usage, the Protocols Supported check, hello
+padding, ISO 10589 counters, the RFC 5306 restart helper and the RFC 8667 Adj-SID.
+What is left out is in `SPEC.md` (*What is deliberately not done*).
 
 **Authentication** (TLV #10, RFC 5304 HMAC-MD5, RFC 5310 HMAC-SHA family,
 cleartext): set `Config.auth_keys` and `rxHelloBytes` refuses an IIH without
@@ -29,6 +30,9 @@ Model after: **ISO/IEC 10589 §8.2** (the P2P adjacency lifecycle) and
 | Layer | Covers |
 |-------|--------|
 | `three_way` | The RFC 5303 Point-to-Point Three-Way Adjacency TLV (type 240) value codec: `ThreeWayState` (the `up=0`/`init=1`/`down=2` wire byte), `ThreeWayTlv` (state + extended-local-circuit-id + optional neighbour block), bounds-checked `decode`/`encode` of the 1/5/11/15-octet forms (Wireshark-anchored — the 11-octet shape, neighbour system-id without its extended-circuit-id, was a gap in an earlier revision of this codec; see `three_way.zig`). `isis` exposes 240 only as a raw TLV, so this file parses/emits its value with the same discipline. |
+| `lan` | `LanCircuit`: one broadcast circuit at one level, a neighbour table in caller storage, `rxHello`/`rxHelloBytes(bytes, snpa, now)`, `tick(now, events)`, `buildHello`/`buildAck`, `setDis`/`setLanId`; per-neighbour state, hold, priority and LAN ID (the DIS candidate set). |
+| `restart` | The RFC 5306 Restart TLV (211) codec and the helper state shared by both machines (`Config.graceful_restart_helper`, off by default). |
+| `adj_sid` | The RFC 8667 Adj-SID / LAN Adj-SID sub-TLV (31/32) codec; `Adjacency.adjSid`. |
 | `fsm` | The `Adjacency` state machine: `start`/`stop`, `rxHello`/`rxHelloBytes`, `tick`, the derived hold timer + hello cadence, the acceptance rejects, and the `Effect` result. Plus `buildHello`, a convenience that serializes an outgoing IIH via the `isis` P2P builder + a raw TLV 240. |
 
 ## State table

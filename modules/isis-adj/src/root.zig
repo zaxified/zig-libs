@@ -4,8 +4,9 @@
 //! one P2P neighbour Down → Initializing → Up from received IIH PDUs (decoded
 //! by the sibling `isis` codec) and hold-timer expiry. No threads, no owned
 //! timers, no sockets — the caller supplies `now` and the received PDUs and
-//! acts on the emitted transitions/effects. LAN adjacency + DIS election are a
-//! later increment (E-Line/P2P is the current fabric phase).
+//! acts on the emitted transitions/effects. `lan.zig` is the broadcast-circuit
+//! counterpart (neighbour table, two-way check via IS Neighbours); the DIS
+//! election itself is `isis-dis`.
 //!
 //! ## Layers
 //! - `three_way` — the RFC 5303 Point-to-Point Three-Way Adjacency TLV (type
@@ -47,6 +48,7 @@ pub const meta = .{
 pub const three_way = @import("three_way.zig");
 pub const fsm = @import("fsm.zig");
 pub const restart = @import("restart.zig");
+pub const lan = @import("lan.zig");
 pub const adj_sid = @import("adj_sid.zig");
 
 // ── the most-used surface, re-exported ───────────────────────────────────────
@@ -58,6 +60,7 @@ pub const Transition = fsm.Transition;
 pub const DownReason = fsm.DownReason;
 pub const RejectReason = fsm.RejectReason;
 pub const HelloFields = fsm.HelloFields;
+pub const LanCircuit = lan.LanCircuit;
 pub const Usage = fsm.Usage;
 pub const HelloPadding = fsm.HelloPadding;
 pub const Counters = fsm.Counters;
@@ -513,6 +516,8 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("auth_test.zig");
     _ = @import("extra_test.zig");
+    _ = @import("lan.zig");
+    _ = @import("lan_test.zig");
     _ = @import("restart.zig");
     _ = @import("adj_sid.zig");
 }

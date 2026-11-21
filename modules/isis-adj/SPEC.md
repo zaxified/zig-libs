@@ -31,12 +31,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) | Go | Apache-2.0 (LICENSE file) — README/design doc only, source not read | 0 | v0.9.0 (2026-09-25) | LAN + P2P, HMAC auth of hellos, RFC 5306 graceful-restart *helper*; BFD and MT deferred (README). |
 | [mdlayher/isis](https://github.com/mdlayher/isis) | Go | MIT | 0 | no release; pushed 2026-09-29 | `Circuit` runs one P2P adjacency over the RFC 5303 three-way handshake plus an Ethernet transport (Linux `AF_PACKET`); LAN and auth not covered (README). The closest like-for-like, and it does I/O, which this module deliberately does not. |
 
-**Where we are ahead:** the most thoroughly specified pure RFC 5303 table in the survey: neighbour-block mismatch discard, stale-Up refusal, third-neighbour lock, Area/Max-Area mismatch, hold floor, circuit-id-change detection — each with an audit regression (SPEC §5) — and two adjacencies converge byte-for-byte through the real codec; time-injected and I/O-free, so it is testable without a clock or a socket; TLV 240 anchored on Wireshark's dissector including the 11-octet shape that exposed a bug. **Where we are behind:** no LAN adjacency (IS-Neighbours #6 SNPA two-way check, per-neighbour hold timers) — `rg -i 'lan_hello|LanHello' isis-adj/src` finds nothing, and `isis-dis` takes the neighbour set as input rather than forming it; no graceful-restart helper (goisis has it); no Protocols-Supported (#129) / IP-address compatibility check (`rg -i 'protocols_supported|nlpid' isis-adj/src` empty); no BFD trigger. The LAN adjacency, graceful restart and the #129 check are in the Backlog. IIH authentication (TLV #10, RFC 5304/5310) is at parity with holo and FRR (§5 "Authentication").
+**Where we are ahead:** the most thoroughly specified pure RFC 5303 table in the survey: neighbour-block mismatch discard, stale-Up refusal, third-neighbour lock, Area/Max-Area mismatch, hold floor, circuit-id-change detection — each with an audit regression (SPEC §5) — and two adjacencies converge byte-for-byte through the real codec; time-injected and I/O-free, so it is testable without a clock or a socket; TLV 240 anchored on Wireshark's dissector including the 11-octet shape that exposed a bug. **Where we are behind:** no BFD trigger. The LAN adjacency (§6), the RFC 5306 helper (§7), the Protocols Supported check, hello padding, counters and the Adj-SID (§8) are implemented; the restarting-router half of RFC 5306 is not (*What is deliberately not done*). IIH authentication (TLV #10, RFC 5304/5310) is at parity with holo and FRR (§5 "Authentication").
 
 ## 1. Scope
 
 One **point-to-point** IS-IS adjacency (ISO/IEC 10589 §8.2) using the
-**RFC 5303** three-way handshake. Pure, time-injected, single-owner: the caller
+**RFC 5303** three-way handshake, and (`lan.zig`, §6) one **broadcast**
+circuit at one level with its neighbour table. Pure, time-injected, single-owner: the caller
 supplies `now`, feeds received P2P IIH PDUs (types decoded by `isis`), and reacts
 to the returned `Effect`. Out of scope: everything under *What is deliberately not done* and *Backlog / deferred*.
 
@@ -197,21 +198,27 @@ Implemented (cheap, and they gate adjacency formation):
   receive, so a locally configured 0 does not reject every real (3-advertising)
   neighbour; a genuine non-shorthand disagreement is still
   rejected.
-- **Area-address mismatch (Level 1 only)** — ISO 10589 §8.2.2/§7.2.4: a Level 1
-  adjacency requires the neighbour's Area Addresses (#1) TLV to name at least
-  one area in common with `Config.local_areas` → `rejected = .area_mismatch`.
-  Enforced only when the circuit is pure `.level1` **and** `local_areas` is
-  non-empty (opt-in: this module has no configuration source of its own, so an
-  unconfigured area list is treated as "matching not wanted", not "reject
-  everyone"). `.level1_2` circuits are intentionally left unchecked — this FSM
-  tracks one combined state per circuit rather than split L1/L2 sub-states, so
-  rejecting a `.level1_2` circuit on an area mismatch would also block the L2
-  component ISO 10589 says must still form regardless of area. A malformed or
-  absent Area Addresses TLV on an enforced circuit is treated as "no shared
-  area" (fail closed), not skipped. A neighbour may split its announced areas
-  across more than one #1 TLV; `rxHelloBytes` walks the whole stream and
-  consults every instance (up to 8; beyond that, fail closed rather than open),
-  not just the first `findFirst` would have returned.
+- **Area-address mismatch and adjacency usage** — ISO 10589 §8.2.2/§7.2.4: the
+  adjacency usage is the levels both sides run (`circuit_type` masks), less Level 1
+  when `Config.local_areas` is set and the neighbour's Area Addresses (#1) TLVs
+  share no area with it. `Adjacency.usage` is `level1`, `level2` or `level1_2`
+  (null at Down) and `Effect.usage_changed` flags a change, also while Up. A
+  `.level1_2` circuit with a disjoint-area neighbour that runs Level 2 is a Level 2
+  adjacency; with a Level-1-only neighbour no level is left and the IIH is refused
+  (`rejected = .area_mismatch`). A pure `.level1` circuit behaves as before.
+  Enforced only when `local_areas` is non-empty (opt-in: this module has no
+  configuration source of its own). A malformed or absent Area Addresses TLV counts
+  as "no shared area" (fail closed). A neighbour may split its areas across more
+  than one #1 TLV; `rxHelloBytes` walks the stream and consults every instance (up
+  to 8; beyond that, fail closed).
+- **Protocols Supported (#129)** — with `Config.protocols` non-empty the neighbour
+  must share at least one NLPID, else `rejected = .no_common_protocol` (RFC 1195
+  §2.2: no adjacency without a common protocol; FRR and holo-isis do the same).
+  A neighbour that sends no #129 is taken to support CLNP only (0x81, ISO 10589).
+  Our hellos carry the TLV when the list is set. Empty (the default): nothing sent,
+  nothing enforced, so pure SPB circuits and the golden hellos are unchanged. The
+  IP-subnet half of the check is a LAN matter (§6): a point-to-point link may be
+  unnumbered.
 
 - **Holding time too short** — `rx.holding_time < Config.min_neighbor_holding_time`
   → `rejected = .holding_time_too_short`, before any mutation. A hold of 0
@@ -254,6 +261,79 @@ every error case the FSM mutates nothing (the decode happens before any state
 change) — a hostile PDU cannot corrupt the machine. The fuzz test pins this
 "errored ⇒ state unchanged" invariant.
 
+## 6. LAN adjacency (`lan.zig`)
+
+`LanCircuit` runs one broadcast circuit at one level (a circuit that runs both runs
+two, one per LAN IIH type, 15 and 16, as ISO 10589 does) over a neighbour table in
+caller-supplied storage; a neighbour is keyed by the SNPA of its hello, not by a
+circuit id. States: `initializing` once a hello is accepted, `up` once the
+neighbour's IS Neighbours (#6) lists OUR SNPA (ISO 10589 §8.4.2: the LAN's two-way
+check, the role of the three-way TLV on a point-to-point link); a neighbour that stops
+listing us falls back to `initializing` (`down`, reason `neighbor_restarted`); one
+whose own advertised holding time runs out is deleted (`down` when it was Up, then
+`deleted`). Another system answering from a known SNPA replaces the entry. Priority
+and the advertised LAN ID are tracked and reported as `dis_input_changed`, and the
+table is the candidate set for `isis-dis` (`system_id`, `priority`, `snpa`, and the
+pseudonode id in `lan_id`; this module does not depend on `isis-dis`). The DIS sends
+hellos at a third of the interval (`setDis`, ISO 10589 §8.4.1).
+
+Acceptance is that of §5: the IIH must be this level's PDU type and the neighbour must
+run the level, loopback (system id or SNPA), Maximum Area Addresses, the holding-time
+floor, a shared area at Level 1, Protocols Supported, authentication (`rxHelloBytes`,
+RFC 5304/5310, the signature covers the padding), plus `Config.ipv4_subnets`: when set,
+a neighbour needs an IPv4 interface address (#132) in one of them (RFC 1195 §2.2;
+`rejected = .ip_subnet_mismatch`), and a full table refuses (`.neighbor_table_full`).
+`buildHello` writes our hello: our areas, every neighbour's SNPA (Initializing or Up,
+42 per TLV), protocols, addresses, the Restart TLV when helping, padding, then signs.
+Every per-circuit option of §5/§8 (padding, counters, helper) applies here too.
+
+## 7. RFC 5306 restart helper
+
+Off by default (`Config.graceful_restart_helper`): RFC 5306 §3.2 requires a Restart
+TLV in EVERY hello of a router with the capability, which would change the bytes of
+hellos that were never built for it. On, for a P2P `Adjacency` and per neighbour of a
+`LanCircuit` (keyed by SNPA):
+
+- An IIH with RR from the **Up** neighbour with the recorded system id changes no
+  adjacency state, whatever else it says (it may carry Down, or no longer list us: the
+  neighbour lost its state, which is the point). The first RR marks the adjacency in
+  restart mode and refreshes the hold to the IIH's holding time; later ones do not, so
+  a neighbour that keeps restarting cannot keep the adjacency forever and the hold
+  still ends the help (§3.2.1 a). On P2P the recorded extended circuit id follows the
+  restarted neighbour (§3.2.1 b).
+- The answer is an IIH with RA, RR clear and the time left on the hold (P2P:
+  `Effect.send_hello`; LAN: `Effect.ack` and `LanCircuit.buildAck`, with the
+  restarting neighbour's system id). On P2P the caller also sends the complete CSNP set
+  and sets SRM (`Effect.send_csnp`); on a LAN only the router with the highest priority
+  (then highest MAC) among the Up neighbours not in restart mode, itself included,
+  does (§3.2.1 c). The DIS is not changed.
+- SA suppresses the adjacency: `Effect.suppress_adjacency` (LAN: `Effect.suppress`)
+  says when to stop advertising it in LSPs and to keep it out of SPF, and
+  `Adjacency.adjSid` is null meanwhile. It lasts until an IIH with SA clear.
+- A hello without RR ends the restart mode and is processed normally (§3.3.2). An RR
+  with no Up adjacency is processed normally and answered with an RA anyway (remaining
+  time: our own holding time; the RFC does not fix it).
+
+The restarting side (T1/T2/T3 timers, the CSNP wait, SPF holdoff) is not here.
+
+## 8. Counters, padding, Adj-SID
+
+- **Counters** (`Adjacency.counters`, `LanCircuit.counters`): changes into or out of
+  Up, initialization failures (Initializing to Down), accepted hellos, hold
+  expirations, refused hellos in total and per `RejectReason`: the circuit counters
+  of ISO 10589 §8.2 and §8.4 that an NMS reads.
+- **Hello padding** (`Config.hello_padding`, `mtu`): `never` (default), `always`
+  (ISO 10589 §8.4.1) or `during_formation` (RFC 3787 §4.2: until Up, then plain). The
+  hello is brought to `mtu` octets with Padding (#8) TLVs (`HelloFields.pad_to`,
+  `addPadding`) BEFORE it is signed (RFC 5310 §3.2). A missing single octet cannot be
+  filled (a TLV is two octets at least). The MTU check is the neighbour not hearing a
+  padded hello: the adjacency stays Initializing.
+- **Adj-SID** (`adj_sid.zig`, RFC 8667 §2.2): the sub-TLV 31 (P2P) and 32 (LAN, with
+  the neighbour id) codec, label (V=L=1, 20 bits) and index (V=L=0) forms, and
+  `Adjacency.adjSid`: the label from `Config.adj_sid_label` while the adjacency is Up
+  and not suppressed, P flag from `adj_sid_persistent`. The caller allocates labels
+  and puts the sub-TLV into the neighbour's IS reachability entry.
+
 ## Verification
 
 Run: `scripts/modtest isis-adj`. The module is pure logic, so the tests are unit and round-trip, plus an external anchor for the one wire format it owns.
@@ -264,6 +344,8 @@ Run: `scripts/modtest isis-adj`. The module is pure logic, so the tests are unit
 - **Three-way guard:** a neighbour whose 240 omits the neighbour block, or gives only a bare system-id (the 11-octet shape), holds us at Initializing; only a full echo (system-id plus extended circuit id, neighbour past Down) reaches Up. Permanent positive control: with the guard dropped (`three_way_required = false`) the half-open hello wrongly reaches Up, so removing the guard in `rxHello` turns the test red.
 - **Rejects and errors:** loopback, level mismatch, not started, third neighbour, neighbour-block mismatch, stale Up, Maximum Area Addresses, area mismatch (a missing or malformed Area Addresses TLV, a shared area only in the third #1 TLV, no matching on L2 and L1/L2 circuits), holding-time floor, circuit-id change; the 1/5/11/15-octet 240 forms round-trip, `encode` refuses a buffer one octet short of every form; malformed bytes and a bad-length 240 are typed errors with the state unchanged; a TLV lying about its length behind the 240 fails the PDU; `tick` does nothing before `start` or after `stop`. Determinism: identical `(event, now)` streams yield identical transitions.
 - **Authentication** (`src/auth_test.zig`): two keyed adjacencies reach Up through the real encode and `rxHelloBytes` path for every algorithm (cleartext, HMAC-MD5, HMAC-SHA-1/224/256/384/512) and with strict RFC 5310 keying on both sides; a keyed receiver refuses an unauthenticated hello and mutates nothing; an unkeyed one accepts an authenticated hello; a wrong secret, Key ID, algorithm, cleartext password or keying mode is refused; a key rollover; one flipped octet anywhere is refused; a malformed or private-type #10 is `auth_failed` while a broken TLV stream stays a decode error; an unsigned copy of the neighbour's hello carrying holding time 65535 does not refresh an Up adjacency's hold; `buildHello` needs room for #10 and refuses an oversize password.
+- **Options** (`src/extra_test.zig`): usage in every circuit-type pairing, #129 (match, no match, missing TLV, on the wire), padding to every length from natural size to 600 (and signed), counters, the helper (RR kept Up, ack and remaining time, second RR does not refresh, RR clear, helper off, SA and Adj-SID, RR with no Up adjacency, on the wire, malformed TLV).
+- **LAN** (`src/lan_test.zig`): three circuits reach Up through real hellos; the two-way check and fall-back; per-neighbour holds; DIS cadence; priority/LAN-ID events; SNPA replacement and table full; every acceptance check; type-16 refusal on the wire; subnet and protocol checks; authentication; the LAN helper with the CSNP-router rule and the ack bytes; SA; IS Neighbours split at 42 and exact padding.
 - **Fuzz:** `ISIS_ADJ_FUZZ` (deterministic driver, `src/fuzz_test.zig`; harnesses `isis-adj-rx` and `isis-adj-handshake`, each with a reach test) and `std.testing.fuzz` targets: hostile bytes through `rxHelloBytes` never panic, the walk terminates, an errored decode is inert ("errored implies state unchanged"); two adjacencies handshake to Up while damaged frames never corrupt the FSM. The rx corpus is seeded with Wireshark-anchored hellos plus a foreign-neighbour-block and a stale-Up PDU, because unseeded runs never produced a TLV 240.
 - **Mutation:** the TLV 240 codec's length and state checks, `start` / `stop` / `tick`, every `rxHello` refusal path, the three-way decision, `applyState`, the defaulted options, and the authentication lines of `fsm.zig`. The equivalent mutants: dropping `tlv.count` (the Area Addresses walk right after it iterates the whole stream with `try` and fails the same PDU with the same error), the circuit-id-change check's `state != .down` and its `hold_deadline = 0` (every way into Down clears the recorded neighbour and a Down hold is never consulted), and the echo's extended-circuit-id equality (a block naming another id was already discarded as `neighbor_mismatch`). Not mutated: the `UnsupportedPduType` arm and the `else` propagation after it (the PDU already decoded), and `buildHello`'s `sign` error mapping (own PDU, own key).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
@@ -275,15 +357,13 @@ Clean-room from ISO/IEC 10589 §8.2 and RFC 5303; no third-party implementation 
 ## What is deliberately not done
 
 - **Anything but one point-to-point adjacency per `Adjacency`:** the caller owns timers, sockets and the circuit set; the FSM is time-injected and single-owner.
-- **Area-address matching on `.level1_2` circuits:** this FSM tracks one combined state per circuit, so rejecting a `.level1_2` circuit on an area mismatch would also block the L2 component ISO 10589 says must still form regardless of area. Matching is enforced only on pure `.level1` circuits with `Config.local_areas` set.
+- **The restarting side of RFC 5306** (T1/T2/T3, waiting for CSNPs, the SPF holdoff): a restarting router is the whole routing process, not a circuit machine.
+- **Allocating Adj-SID labels:** `Adjacency.adjSid` returns the configured label; a pool across circuits is the caller's.
+- **BFD:** a trigger from another protocol, which the caller wires to `stop`.
 
 ## Backlog / deferred
 
-- **LAN adjacency FSM** (LAN IIH types 15/16: IS-Neighbours #6 two-way check, per-neighbour hold, priority tracking feeding `isis-dis`). Why: every FRR/holo/goisis user runs broadcast circuits; without it `isis-dis` has no producer of its candidate set anywhere in the stack. The LAN Hello body is already decoded by `isis`, so it is additive; the DIS election itself is `isis-dis`. Effort: ~1 week. Fits CONVENTIONS §2: yes.
-- **Protocols-Supported (#129) NLPID and IP-subnet compatibility check.** Why: RFC 1195 adjacencies must refuse a neighbour with no common protocol; FRR and holo do. Irrelevant for pure SPB. Effort: ~1 day. Priority low.
-- **Graceful-restart helper (RFC 5306)** and **adjacency-SID** (segment routing). Why: keeps adjacencies up across a neighbour's planned restart; goisis has the helper half. Effort: ~3 days.
-- **MTU / padding negotiation** beyond the basics, and full ISO 10589 §8.2 timer/counter accounting (adjacencyStateChange counters and so on).
-- **Split L1/L2 sub-states** (would allow the area check on `.level1_2` circuits, see *What is deliberately not done*): a separate increment.
+None.
 
 ## Anchoring
 

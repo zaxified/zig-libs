@@ -166,6 +166,12 @@ pub const RejectReason = enum {
     /// A neighbour that sends no #129 is taken to support CLNP only (0x81,
     /// ISO 10589).
     no_common_protocol,
+    /// LAN circuits (`lan.zig`) with `ipv4_subnets` set: none of the neighbour's
+    /// IPv4 interface addresses (#132) lies in a subnet of ours (RFC 1195
+    /// section 2.2: IP adjacencies on a broadcast circuit need a common subnet).
+    ip_subnet_mismatch,
+    /// LAN circuits: the neighbour table is full.
+    neighbor_table_full,
 };
 
 /// Which levels an adjacency is used for (ISO/IEC 10589 section 8.2.2: the
