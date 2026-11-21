@@ -100,6 +100,9 @@ pub const tagpath = @import("tagpath.zig");
 /// The standard objects the adapter serves (TCP/IP Interface, Ethernet Link).
 pub const stdobj = @import("stdobj.zig");
 /// The byte-stream seam and its adapters.
+/// Implicit (Class 0/1) I/O messaging: the cyclic UDP datagram, its timers
+/// and its watchdog, over an injected clock.
+pub const implicit = @import("implicit.zig");
 pub const transport = @import("transport.zig");
 /// An EtherNet/IP client.
 pub const client = @import("client.zig");
@@ -166,6 +169,7 @@ test {
     _ = types;
     _ = tagpath;
     _ = stdobj;
+    _ = implicit;
     _ = transport;
     _ = client;
     _ = adapter;
