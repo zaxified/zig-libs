@@ -987,7 +987,15 @@ pub const EventSocket = struct {
             .family_id = cmd.family_id,
         };
         errdefer ev.sock.close();
-        for (groups) |g| try ev.joinGroup(try cmd.resolveMulticastGroup(g));
+        var rest = groups;
+        while (rest.len != 0) {
+            // One nlctrl round trip per 16 names (`genetlink.Socket.resolveMcastGroups`), not one per name.
+            const n = @min(rest.len, 16);
+            var ids: [16]?u32 = undefined;
+            cmd.sock.resolveMcastGroups(uapi.family_name, rest[0..n], ids[0..n]) catch |e| return mapResolve(e);
+            for (ids[0..n]) |id| try ev.joinGroup(id orelse return error.GroupNotFound);
+            rest = rest[n..];
+        }
         return ev;
     }
 
