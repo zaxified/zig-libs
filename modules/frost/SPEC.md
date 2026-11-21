@@ -166,9 +166,16 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   FROST provides no robustness — one dishonest signer contributing a bad
   share can only be detected (via `verifySignatureShare`), not tolerated.
   This module exposes `verifySignatureShare` precisely so a Coordinator
-  CAN implement this detection; it does not itself decide what to do
-  about a misbehaving participant (out of scope, same as the RFC's own
-  stance).
+  CAN implement this detection, and `aggregateVerified` does it the way
+  frost-core's `aggregate` does: verify the aggregate, and only when it
+  fails, check every share and name the first bad signer (`culprit`). It
+  does not itself decide what to do about a misbehaving participant (out
+  of scope, same as the RFC's own stance). `verifySignatureShare` keeps
+  the RFC's separate `comm_i` parameter but checks it is `identifier`'s
+  entry in `commitment_list` (frost-core reads it from the signing
+  package): a different pair is `error.InvalidCommitmentList`, so a share
+  is never verified against commitments the binding factors were not
+  computed over.
 - **Trusted dealer** (RFC 9591 Appendix C, `trustedDealerKeygen`): the
   dealer must generate good randomness, delete `secret_key`/
   `secret_key_shares` after distribution, and keep them confidential
@@ -215,7 +222,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 ## Out of scope
 
 - Ristretto255/Ed25519/Ed448/P-256 ciphersuites (RFC 9591 §6.1-§6.4) —
-  not yet, see Backlog; each needs its own module (different
+  not yet, see Roadmap; each needs its own module (different
   group/hash/`Ne`/`Ns`).
 - Distributed key generation (an alternative to Appendix C's trusted
   dealer) — RFC 9591 does not specify one, so the first version left it
@@ -243,7 +250,9 @@ construction (`vssVerify`, Appendix C.2, is documented under *Design*):
   `hiding_nonce + binding_nonce*binding_factor + lambda_i*sk_i*challenge`.
 - `aggregate` (§5.3) — `R = computeGroupCommitment(...)`,
   `z = sum(sig_shares)`.
-- `verifySignatureShare` (§5.3) — the per-share verification equation.
+- `verifySignatureShare` (§5.3) — the per-share verification equation;
+  `aggregateVerified` (§5.3/§5.4) — `aggregate`, `verify`, and on failure
+  the share that does not verify.
 - `verify` (Appendix B `prime_order_verify`) — the aggregate-signature
   verification equation (NOT `bip340.verify` — see "BIP340 compatibility"
   above).
@@ -299,12 +308,13 @@ Run `scripts/modtest frost` (the dead-stack probe runs in ReleaseFast only; Debu
 
 ## Backlog / deferred
 
-- **Relation checks (LOW):** `verifySignatureShare` takes `comm_i` separately and never
-  checks it is the entry for participant `i` in the commitment list the binding factors were
-  computed over; `aggregate` does not verify its output (RFC 9591 §5.3 lets the coordinator do
-  so to identify a cheater). Look the commitment up from the list; offer a verifying aggregate.
-- **ristretto255 and Ed25519 ciphersuites (RFC 9591 §6.2 / §6.1)** — ristretto255 is the RFC's recommended suite and Ed25519 is what most FROST deployments (and `frost-ed25519` users) run; today a non-secp256k1 user has nothing. SPEC "Out of scope" says a separate module per suite; effort: medium each (different `H1`..`H5`, `Ne`/`Ns`), `ct25519` supplies the group. Fits CONVENTIONS §2.
 - **Distributed key generation for FROST** — the trusted dealer sees the whole key; frost-core ships a DKG (README: "as specified in the original paper FROST20"). RFC 9591 leaves it out, which is why the first version did too, but every maintained competitor provides it. Effort: medium. Fits §2. Note the sibling `dkg` is GJKR for ECDSA, not reusable as is.
-- **BIP-340-compatible (Taproot) secp256k1 variant** — `frost-secp256k1-tr` and multi-party-sig produce signatures a Bitcoin node accepts; ours are explicitly not BIP-340 (65-byte, 33-byte points). Effort: medium (x-only key/nonce parity handling and BIP-340 challenge). Fits §2.
-- **Share refresh / repair / re-randomized FROST** — available in frost-core; needed for long-lived custody keys. Effort: medium each. Fits §2. Lower priority than the four items above.
 
+## Roadmap
+
+- **ristretto255 and Ed25519 ciphersuites (RFC 9591 §6.2 / §6.1)** — ristretto255 is the RFC's recommended suite and Ed25519 is what most FROST deployments (and `frost-ed25519` users) run; today a non-secp256k1 user has nothing. SPEC "Out of scope" says a separate module per suite; effort: medium each (different `H1`..`H5`, `Ne`/`Ns`), `ct25519` supplies the group. Fits CONVENTIONS §2.
+  Size: a new module per suite (one week each with RFC 9591 Appendix E.1/E.2 KATs); needs a group abstraction over `ct25519`.
+- **BIP-340-compatible (Taproot) secp256k1 variant** — `frost-secp256k1-tr` and multi-party-sig produce signatures a Bitcoin node accepts; ours are explicitly not BIP-340 (65-byte, 33-byte points). Effort: medium (x-only key/nonce parity handling and BIP-340 challenge). Fits §2.
+  Size: one to two weeks (x-only keys, even-y nonce/key negation through both rounds, BIP-340 challenge, frost-secp256k1-tr vectors).
+- **Share refresh / repair / re-randomized FROST** — available in frost-core; needed for long-lived custody keys. Effort: medium each. Fits §2. Lower priority than the four items above.
+  Size: weeks (three sub-protocols, each with frost-core vectors).

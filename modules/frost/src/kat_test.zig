@@ -570,6 +570,87 @@ test "verifySignatureShare rejects a corrupted P1 share" {
     try std.testing.expect(!ok);
 }
 
+test "verifySignatureShare: a comm_i that is not identifier's entry in the list is InvalidCommitmentList" {
+    const gpa = std.testing.allocator;
+    const group_public_key = elementFromHex(v.group.public_key);
+    const commitment_list = vectorCommitmentList();
+    const msg = hexN(4, v.group.message);
+    const p1_scalar = signingShareFromHex(v.participant_shares.p1).scalar();
+    const verifying_share_1 = try frost.Element.fromPoint(try frost.Secp256k1.basePoint.mul(p1_scalar.toBytes(.big), .big));
+    // P3's pair passed as P1's, and P1's pair with hiding and binding swapped.
+    const wrong = [_]frost.NonceCommitmentPair{
+        .{ .hiding = elementFromHex(v.round1_p3.hiding_nonce_commitment), .binding = elementFromHex(v.round1_p3.binding_nonce_commitment) },
+        .{ .hiding = elementFromHex(v.round1_p1.binding_nonce_commitment), .binding = elementFromHex(v.round1_p1.hiding_nonce_commitment) },
+    };
+    for (wrong) |comm| {
+        try std.testing.expectError(error.InvalidCommitmentList, frost.verifySignatureShare(
+            gpa,
+            identifierFromU16(1),
+            verifying_share_1,
+            comm,
+            signatureShareFromHex(v.round2.p1_sig_share),
+            &commitment_list,
+            group_public_key,
+            &msg,
+        ));
+    }
+}
+
+fn vectorVerifyingShares() ![2]frost.VerifyingShare {
+    var out: [2]frost.VerifyingShare = undefined;
+    for (&out, [_][]const u8{ v.participant_shares.p1, v.participant_shares.p3 }) |*o, hex| {
+        const sk = signingShareFromHex(hex).scalar();
+        o.* = try frost.Element.fromPoint(try frost.Secp256k1.basePoint.mul(sk.toBytes(.big), .big));
+    }
+    return out;
+}
+
+test "aggregateVerified: the published shares give the published signature" {
+    const gpa = std.testing.allocator;
+    const commitment_list = vectorCommitmentList();
+    const msg = hexN(4, v.group.message);
+    const shares = [_]frost.SignatureShare{ signatureShareFromHex(v.round2.p1_sig_share), signatureShareFromHex(v.round2.p3_sig_share) };
+    const vs = try vectorVerifyingShares();
+    var culprit: frost.Identifier = undefined;
+    const sig = try frost.aggregateVerified(gpa, &commitment_list, &msg, elementFromHex(v.group.public_key), &shares, &vs, &culprit);
+    try std.testing.expectEqualSlices(u8, &hexN(65, v.final_signature), &sig.toBytes());
+}
+
+test "aggregateVerified: a corrupted share is named; wrong verifying shares; length mismatch" {
+    const gpa = std.testing.allocator;
+    const commitment_list = vectorCommitmentList();
+    const msg = hexN(4, v.group.message);
+    const gpk = elementFromHex(v.group.public_key);
+    const vs = try vectorVerifyingShares();
+    for (0..2) |who| {
+        var shares = [_]frost.SignatureShare{ signatureShareFromHex(v.round2.p1_sig_share), signatureShareFromHex(v.round2.p3_sig_share) };
+        var b = shares[who].toBytes();
+        b[31] ^= 0x01;
+        shares[who] = try frost.SignatureShare.fromBytes(b);
+        var culprit: frost.Identifier = undefined;
+        try std.testing.expectError(error.InvalidSignatureShare, frost.aggregateVerified(gpa, &commitment_list, &msg, gpk, &shares, &vs, &culprit));
+        try std.testing.expectEqualSlices(u8, &commitment_list[who].identifier.toBytes(), &culprit.toBytes());
+        // A null culprit is allowed.
+        try std.testing.expectError(error.InvalidSignatureShare, frost.aggregateVerified(gpa, &commitment_list, &msg, gpk, &shares, &vs, null));
+    }
+    const good = [_]frost.SignatureShare{ signatureShareFromHex(v.round2.p1_sig_share), signatureShareFromHex(v.round2.p3_sig_share) };
+    // Signers handed another group key (here P1's verifying share): each share
+    // is consistent with its own verifying share under that key, so every one
+    // verifies, but the shares do not interpolate to it: InvalidSignature.
+    const other_gpk = vs[0];
+    const nonces = [_]frost.SigningNonces{
+        .{ .hiding = scalarFromHex(v.round1_p1.hiding_nonce), .binding = scalarFromHex(v.round1_p1.binding_nonce) },
+        .{ .hiding = scalarFromHex(v.round1_p3.hiding_nonce), .binding = scalarFromHex(v.round1_p3.binding_nonce) },
+    };
+    const forged = [_]frost.SignatureShare{
+        try frost.round2Sign(gpa, identifierFromU16(1), &signingShareFromHex(v.participant_shares.p1), other_gpk, &nonces[0], &msg, &commitment_list),
+        try frost.round2Sign(gpa, identifierFromU16(3), &signingShareFromHex(v.participant_shares.p3), other_gpk, &nonces[1], &msg, &commitment_list),
+    };
+    try std.testing.expectError(error.InvalidSignature, frost.aggregateVerified(gpa, &commitment_list, &msg, other_gpk, &forged, &vs, null));
+    try std.testing.expectError(error.InvalidCommitmentList, frost.aggregateVerified(gpa, &commitment_list, &msg, gpk, good[0..1], &vs, null));
+    try std.testing.expectError(error.InvalidCommitmentList, frost.aggregateVerified(gpa, &commitment_list, &msg, gpk, &good, vs[0..1], null));
+}
+
 // ── end-to-end (2,3) round trip, FRESH random key material ───────────────
 //
 // Not a published vector — exercises the full protocol shape

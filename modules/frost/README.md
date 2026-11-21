@@ -97,6 +97,7 @@ frost.computeGroupCommitment(commitment_list, binding_factor_list) !Element
 frost.round1Commit(nonces: *const SigningNonces) !NonceCommitmentPair
 frost.round2Sign(allocator, identifier, signing_share: *const SigningShare, group_public_key, nonces: *const SigningNonces, msg, commitment_list) !SignatureShare
 frost.aggregate(allocator, commitment_list, msg, group_public_key, sig_shares) !Signature
+frost.aggregateVerified(allocator, commitment_list, msg, group_public_key, sig_shares, verifying_shares, culprit: ?*Identifier) !Signature
 frost.verifySignatureShare(allocator, identifier, verifying_share, comm_i, sig_share_i, commitment_list, group_public_key, msg) !bool
 frost.verify(msg, sig: Signature, group_public_key: GroupPublicKey) bool
 frost.trustedDealerKeygen(allocator, secret_key: Scalar, coefficients: []const Scalar, max_participants: u16, min_participants: u16) !TrustedDealerKeygenResult

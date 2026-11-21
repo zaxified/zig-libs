@@ -1135,10 +1135,13 @@ pub const VerifySignatureShareError = error{
 /// Returns `false` on every failure path (malformed input, mismatched
 /// equation) — like `bip340.verify`, NEVER panics/errors for "signature
 /// doesn't verify"; the `!Error` union here is reserved for allocator
-/// failure and a `commitment_list`/`identifier` inconsistency that makes
-/// the equation impossible to even evaluate (e.g. `identifier` absent
-/// from `commitment_list`), which are implementation-environment
-/// failures distinct from "the share is invalid."
+/// failure and a `commitment_list`/`identifier`/`comm_i` inconsistency
+/// (`identifier` absent from `commitment_list`, or `comm_i` not the pair
+/// `commitment_list` holds for `identifier`, the commitments the binding
+/// factors are computed over): implementation-environment failures
+/// distinct from "the share is invalid." frost-core reads `comm_i` from
+/// the signing package itself; here the RFC's parameter is kept and
+/// checked against the list.
 ///
 /// Byte-exact target: accepts RFC 9591 Appendix E.5's `P1`/`P3`
 /// `sig_share` against their own `hiding_nonce_commitment`/
@@ -1162,6 +1165,15 @@ pub fn verifySignatureShare(
     // evaluated) — an error, not `false`.
     const binding_factor = bindingFactorForParticipant(binding_factor_list, identifier) catch
         return error.InvalidCommitmentList;
+    // `comm_i` must be `identifier`'s entry in the list the binding factors
+    // and the group commitment are computed over.
+    for (commitment_list) |entry| {
+        if (!std.mem.eql(u8, &entry.identifier.toBytes(), &identifier.toBytes())) continue;
+        if (!std.mem.eql(u8, &entry.hiding.toBytes(), &comm_i.hiding.toBytes()) or
+            !std.mem.eql(u8, &entry.binding.toBytes(), &comm_i.binding.toBytes()))
+            return error.InvalidCommitmentList;
+        break;
+    }
     // A malformed commitment element / degenerate sum is "the share
     // doesn't verify" territory: false, never a panic.
     const group_commitment = computeGroupCommitment(commitment_list, binding_factor_list) catch
@@ -1186,6 +1198,52 @@ pub fn verifySignatureShare(
     const pk_scaled = pk_i.mul(challenge.mul(lambda_i).toBytes(.big), .big) catch return false;
     const r = comm_share.add(pk_scaled);
     return l.equivalent(r);
+}
+
+pub const AggregateVerifiedError = AggregateError || error{
+    /// The share of the participant written to `culprit` fails
+    /// `verifySignatureShare`.
+    InvalidSignatureShare,
+    /// Every share verifies, yet the aggregate does not: the verifying
+    /// shares do not belong to `group_public_key`.
+    InvalidSignature,
+};
+
+/// `aggregate`, then the RFC 9591 §5.3 checks a Coordinator runs on the
+/// result: the signature is verified under `group_public_key`, and if it
+/// fails, every share is checked with `verifySignatureShare` (§5.4,
+/// identifiable abort) and the first signer whose share fails is written
+/// to `culprit` (when not null) with `error.InvalidSignatureShare`. What
+/// frost-core's `aggregate` does (its cheater detection).
+///
+/// Here `sig_shares[i]` and `verifying_shares[i]` belong to
+/// `commitment_list[i].identifier` (index-aligned with the sorted list);
+/// a length mismatch is `error.InvalidCommitmentList`.
+pub fn aggregateVerified(
+    allocator: std.mem.Allocator,
+    commitment_list: []const SigningCommitments,
+    msg: []const u8,
+    group_public_key: GroupPublicKey,
+    sig_shares: []const SignatureShare,
+    verifying_shares: []const VerifyingShare,
+    culprit: ?*Identifier,
+) AggregateVerifiedError!Signature {
+    if (sig_shares.len != commitment_list.len or verifying_shares.len != commitment_list.len)
+        return error.InvalidCommitmentList;
+    const sig = try aggregate(allocator, commitment_list, msg, group_public_key, sig_shares);
+    if (verify(msg, sig, group_public_key)) return sig;
+    for (commitment_list, sig_shares, verifying_shares) |entry, share, vs| {
+        const pair: NonceCommitmentPair = .{ .hiding = entry.hiding, .binding = entry.binding };
+        const ok = verifySignatureShare(allocator, entry.identifier, vs, pair, share, commitment_list, group_public_key, msg) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidCommitmentList => return error.InvalidCommitmentList,
+        };
+        if (!ok) {
+            if (culprit) |c| c.* = entry.identifier;
+            return error.InvalidSignatureShare;
+        }
+    }
+    return error.InvalidSignature;
 }
 
 /// RFC 9591 Appendix B `prime_order_verify` (via §6.5's "Signature
