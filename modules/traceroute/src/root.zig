@@ -2154,16 +2154,26 @@ pub const LinuxTransport = struct {
             _ = linux.ppoll(&fds, n, &ts, null);
             for (fds[0..n], from[0..n]) |pfd, a| {
                 if (pfd.revents == 0) continue;
-                const e = lt.tcpOutcome(a, pfd.revents);
+                const out = lt.tcpOutcome(a, pfd.revents);
+                // `.keep`: an ICMP error that says nothing about the handshake
+                // (Packet Too Big, redirect, parameter problem): the connect goes on.
+                if (out == .keep) continue;
                 a.end();
-                if (e) |ev| return ev;
+                if (out == .event) return out.event;
             }
         }
     }
 
-    /// What a socket `ppoll` woke for has to say; null when it failed for a
-    /// reason that says nothing about the path.
-    fn tcpOutcome(lt: *const LinuxTransport, a: *const TcpAttempt, revents: i16) ?TcpEvent {
+    const TcpOutcome = union(enum) {
+        event: TcpEvent,
+        /// The attempt ended for a reason that says nothing about the path.
+        none,
+        /// An ICMP error that is not an answer: the attempt stays open.
+        keep,
+    };
+
+    /// What a socket `ppoll` woke for has to say.
+    fn tcpOutcome(lt: *const LinuxTransport, a: *const TcpAttempt, revents: i16) TcpOutcome {
         const sock: icmp.Socket = .{ .fd = a.fd, .kind = .dgram, .family = lt.sock.family, .ident = 0 };
         var quote: [64]u8 = undefined;
         if (sock.recvErr(&quote)) |info| {
@@ -2172,21 +2182,36 @@ pub const LinuxTransport = struct {
                 .v6 => .v6,
             };
             const want_origin = if (family == .v4) icmp.Socket.origin_icmp else icmp.Socket.origin_icmp6;
-            if (info.origin != want_origin) return null;
-            const exceeded = if (family == .v4) echo.v4.time_exceeded else echo.v6.time_exceeded;
-            const unreachable_type = if (family == .v4) echo.v4.dest_unreachable else echo.v6.dest_unreachable;
-            if (info.err_type == exceeded) return .{ .wire = a.wire, .kind = .time_exceeded, .from = ipOf(info.offender) };
-            if (info.err_type == unreachable_type) return .{ .wire = a.wire, .kind = .unreachable_, .from = ipOf(info.offender), .code = info.err_code };
-            return null;
+            if (info.origin != want_origin) return .none;
+            return switch (tcpIcmpVerdict(family, info.err_type)) {
+                .time_exceeded => .{ .event = .{ .wire = a.wire, .kind = .time_exceeded, .from = ipOf(info.offender) } },
+                .unreachable_ => .{ .event = .{ .wire = a.wire, .kind = .unreachable_, .from = ipOf(info.offender), .code = info.err_code } },
+                .keep => .keep,
+            };
         }
         var err: u32 = 0;
         var len: linux.socklen_t = @sizeOf(u32);
-        if (linux.errno(linux.getsockopt(a.fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&err), &len)) != .SUCCESS) return null;
+        if (linux.errno(linux.getsockopt(a.fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&err), &len)) != .SUCCESS) return .none;
         // Connected is writable and nothing else: a socket that signalled an
         // error which then could not be read has not reached anyone.
-        if (err == 0) return if (revents & (linux.POLL.ERR | linux.POLL.HUP) == 0) .{ .wire = a.wire, .kind = .syn_ack } else null;
-        if (err == @backingInt(linux.E.CONNREFUSED)) return .{ .wire = a.wire, .kind = .rst };
-        return null;
+        if (err == 0) return if (revents & (linux.POLL.ERR | linux.POLL.HUP) == 0) .{ .event = .{ .wire = a.wire, .kind = .syn_ack } } else .none;
+        if (err == @backingInt(linux.E.CONNREFUSED)) return .{ .event = .{ .wire = a.wire, .kind = .rst } };
+        return .none;
+    }
+
+    const TcpVerdict = enum { time_exceeded, unreachable_, keep };
+
+    /// What an ICMP error queued on a TCP probe's socket means for the attempt:
+    /// Time Exceeded and Destination Unreachable are a hop's answer; anything
+    /// else (ICMPv6 Packet Too Big, a redirect, a parameter problem) does not
+    /// end the handshake (the kernel lowers its path MTU and retransmits the
+    /// SYN), so the attempt stays open and can still be answered.
+    fn tcpIcmpVerdict(family: echo.Family, err_type: u8) TcpVerdict {
+        const exceeded = if (family == .v4) echo.v4.time_exceeded else echo.v6.time_exceeded;
+        const unreachable_type = if (family == .v4) echo.v4.dest_unreachable else echo.v6.dest_unreachable;
+        if (err_type == exceeded) return .time_exceeded;
+        if (err_type == unreachable_type) return .unreachable_;
+        return .keep;
     }
 
     fn sendUdpImpl(ctx: *anyopaque, ttl: u8, dst_port: u16, payload: []const u8) TransportError!void {
@@ -3254,6 +3279,20 @@ const TcpFake = struct {
         return e;
     }
 };
+
+test "TCP method: an ICMP error that is not an answer keeps the attempt open" {
+    const V = LinuxTransport.TcpVerdict;
+    try testing.expectEqual(V.time_exceeded, LinuxTransport.tcpIcmpVerdict(.v4, echo.v4.time_exceeded));
+    try testing.expectEqual(V.time_exceeded, LinuxTransport.tcpIcmpVerdict(.v6, echo.v6.time_exceeded));
+    try testing.expectEqual(V.unreachable_, LinuxTransport.tcpIcmpVerdict(.v4, echo.v4.dest_unreachable));
+    try testing.expectEqual(V.unreachable_, LinuxTransport.tcpIcmpVerdict(.v6, echo.v6.dest_unreachable));
+    // Packet Too Big (ICMPv6 type 2), parameter problem (4), v4 redirect (5): not a hop's answer.
+    try testing.expectEqual(V.keep, LinuxTransport.tcpIcmpVerdict(.v6, echo.v6.packet_too_big));
+    try testing.expectEqual(V.keep, LinuxTransport.tcpIcmpVerdict(.v6, echo.v6.param_problem));
+    try testing.expectEqual(V.keep, LinuxTransport.tcpIcmpVerdict(.v4, 5));
+    // the v6 type numbers are not the v4 ones: v6 type 3 is Time Exceeded, v4 type 3 Unreachable
+    try testing.expectEqual(V.unreachable_, LinuxTransport.tcpIcmpVerdict(.v4, 3));
+}
 
 test "TCP method: routers' errors, then the destination's answer, each in its slot" {
     for ([_]@FieldType(TcpEvent, "kind"){ .syn_ack, .rst }) |last| {

@@ -398,7 +398,7 @@ Run with `scripts/modtest traceroute` (`zig build test-traceroute`).
 
 ## Backlog / deferred
 
-- **A TCP attempt that gets an ICMP error other than Time Exceeded or Destination Unreachable** (Packet Too Big) ends there as a `*`, although the handshake could still complete.
+None open.
 
 ## Anchoring
 
