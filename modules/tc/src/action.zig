@@ -1738,6 +1738,10 @@ pub const Stats = struct {
     /// `TCA_STATS_QUEUE`.
     drops: u32 = 0,
     overlimits: u32 = 0,
+    /// The rate estimator (`TCA_STATS_RATE_EST` / `RATE_EST64`): bytes and
+    /// packets per second; 0 when the action has none.
+    bps: u64 = 0,
+    pps: u64 = 0,
 };
 
 /// `struct tcf_t` — the per-action timestamps, in kernel jiffies-derived
@@ -1811,6 +1815,7 @@ fn parseTm(data: []const u8) ?Tm {
 
 fn parseStats(data: []const u8) codec.Error!Stats {
     var s: Stats = .{};
+    var rate64 = false;
     var it: codec.AttrIterator = .{ .buf = data };
     while (try it.next()) |a| switch (a.type) {
         // struct gnet_stats_basic { __u64 bytes; __u32 packets; } — the
@@ -1823,6 +1828,17 @@ fn parseStats(data: []const u8) codec.Error!Stats {
         TCA_STATS.QUEUE => if (a.data.len >= 20) {
             s.drops = std.mem.readInt(u32, a.data[8..12], native_endian);
             s.overlimits = std.mem.readInt(u32, a.data[16..20], native_endian);
+        },
+        // struct gnet_stats_rate_est { u32 bps; u32 pps; } and its 64-bit form;
+        // the 64-bit one wins whichever comes first.
+        TCA_STATS.RATE_EST => if (a.data.len >= 8 and !rate64) {
+            s.bps = std.mem.readInt(u32, a.data[0..4], native_endian);
+            s.pps = std.mem.readInt(u32, a.data[4..8], native_endian);
+        },
+        TCA_STATS.RATE_EST64 => if (a.data.len >= 16) {
+            s.bps = std.mem.readInt(u64, a.data[0..8], native_endian);
+            s.pps = std.mem.readInt(u64, a.data[8..16], native_endian);
+            rate64 = true;
         },
         // 64-bit packet counter, authoritative when present.
         TCA_STATS.PKT64 => if (a.data.len >= 8) {
@@ -3118,4 +3134,35 @@ test "corpus: every action seed reaches the parsers, and the decoded counts are 
     try testing.expectEqual(@as(usize, 6), walked);
     try testing.expectEqual(@as(usize, 8), counters);
     try testing.expectEqual(@as(usize, 2), iterated);
+}
+
+test "action statistics: the rate estimator, 32-bit and 64-bit, in either order" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    var r32: [8]u8 = undefined;
+    std.mem.writeInt(u32, r32[0..4], 1000, native_endian);
+    std.mem.writeInt(u32, r32[4..8], 7, native_endian);
+    var r64: [16]u8 = undefined;
+    std.mem.writeInt(u64, r64[0..8], 5_000_000_000, native_endian);
+    std.mem.writeInt(u64, r64[8..16], 9, native_endian);
+    try codec.appendAttr(gpa, &list, TCA_STATS.RATE_EST, &r32);
+    var s = try parseStats(list.items);
+    try testing.expectEqual(@as(u64, 1000), s.bps);
+    try testing.expectEqual(@as(u64, 7), s.pps);
+    // The 64-bit form wins, whichever comes first.
+    try codec.appendAttr(gpa, &list, TCA_STATS.RATE_EST64, &r64);
+    s = try parseStats(list.items);
+    try testing.expectEqual(@as(u64, 5_000_000_000), s.bps);
+    var rev: std.ArrayList(u8) = .empty;
+    defer rev.deinit(gpa);
+    try codec.appendAttr(gpa, &rev, TCA_STATS.RATE_EST64, &r64);
+    try codec.appendAttr(gpa, &rev, TCA_STATS.RATE_EST, &r32);
+    s = try parseStats(rev.items);
+    try testing.expectEqual(@as(u64, 9), s.pps);
+    // A short attribute is skipped.
+    var short: std.ArrayList(u8) = .empty;
+    defer short.deinit(gpa);
+    try codec.appendAttr(gpa, &short, TCA_STATS.RATE_EST, &@as([4]u8, @splat(1)));
+    try testing.expectEqual(@as(u64, 0), (try parseStats(short.items)).bps);
 }

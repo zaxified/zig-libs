@@ -163,6 +163,15 @@ pub const Qdisc = qdisc.Qdisc;
 pub const Class = qdisc.Class;
 pub const Stats = qdisc.Stats;
 pub const FqCodelXstats = qdisc.FqCodelXstats;
+pub const Xstats = qdisc.Xstats;
+pub const HtbXstats = qdisc.HtbXstats;
+pub const HfscXstats = qdisc.HfscXstats;
+pub const RedXstats = qdisc.RedXstats;
+pub const CodelXstats = qdisc.CodelXstats;
+pub const FqCodelClassXstats = qdisc.FqCodelClassXstats;
+pub const CakeStats = qdisc.CakeStats;
+pub const CakeTinStats = qdisc.CakeTinStats;
+pub const parseXstats = qdisc.parseXstats;
 pub const TCA = qdisc.TCA;
 pub const TCA_NETEM = qdisc.TCA_NETEM;
 pub const TCA_HTB = qdisc.TCA_HTB;
@@ -1976,4 +1985,138 @@ test {
     _ = message;
     _ = @import("goldens.zig");
     _ = @import("bench.zig");
+}
+
+test "xstats: each kind's struct decodes at the kernel's field offsets" {
+    const le = native_endian;
+    var buf: [64]u8 = @splat(0);
+    // tc_htb_xstats: lends borrows giants tokens ctokens
+    for ([_]u32{ 1, 2, 3 }, 0..) |v, i| std.mem.writeInt(u32, buf[i * 4 ..][0..4], v, le);
+    std.mem.writeInt(i32, buf[12..16], -4, le);
+    std.mem.writeInt(i32, buf[16..20], 5, le);
+    const h = (try qdisc.parseXstats("htb", true, buf[0..20])).?.htb;
+    try testing.expectEqual(@as(u32, 2), h.borrows);
+    try testing.expectEqual(@as(i32, -4), h.tokens);
+    try testing.expectEqual(@as(i32, 5), h.ctokens);
+    try testing.expectEqual(@as(?qdisc.Xstats, null), try qdisc.parseXstats("htb", true, buf[0..19]));
+    // tc_hfsc_stats: work rtwork period level
+    std.mem.writeInt(u64, buf[0..8], 10, le);
+    std.mem.writeInt(u64, buf[8..16], 11, le);
+    std.mem.writeInt(u32, buf[16..20], 12, le);
+    std.mem.writeInt(u32, buf[20..24], 13, le);
+    const hf = (try qdisc.parseXstats("hfsc", true, buf[0..24])).?.hfsc;
+    try testing.expectEqual(@as(u64, 11), hf.rtwork);
+    try testing.expectEqual(@as(u32, 13), hf.level);
+    // tc_red_xstats: early pdrop other marked
+    for ([_]u32{ 21, 22, 23, 24 }, 0..) |v, i| std.mem.writeInt(u32, buf[i * 4 ..][0..4], v, le);
+    const r = (try qdisc.parseXstats("red", false, buf[0..16])).?.red;
+    try testing.expectEqual(@as(u32, 22), r.pdrop);
+    try testing.expectEqual(@as(u32, 24), r.marked);
+    // tc_codel_xstats
+    for (0..9) |i| std.mem.writeInt(u32, buf[i * 4 ..][0..4], @intCast(100 + i), le);
+    std.mem.writeInt(i32, buf[16..20], -7, le);
+    const c = (try qdisc.parseXstats("codel", false, buf[0..36])).?.codel;
+    try testing.expectEqual(@as(u32, 100), c.maxpacket);
+    try testing.expectEqual(@as(i32, -7), c.drop_next);
+    try testing.expectEqual(@as(u32, 108), c.ce_mark);
+    // fq_codel: the class layout starts with its type word, 1.
+    std.mem.writeInt(u32, buf[0..4], 1, le);
+    std.mem.writeInt(i32, buf[4..8], -9, le);
+    for (2..7) |i| std.mem.writeInt(u32, buf[i * 4 ..][0..4], @intCast(i), le);
+    const fc = (try qdisc.parseXstats("fq_codel", true, buf[0..28])).?.fq_codel_class;
+    try testing.expectEqual(@as(i32, -9), fc.deficit);
+    try testing.expectEqual(@as(u32, 2), fc.ldelay);
+    try testing.expectEqual(@as(i32, 6), fc.drop_next);
+    try testing.expectEqual(@as(?qdisc.Xstats, null), try qdisc.parseXstats("fq_codel", false, buf[0..28]));
+    try testing.expectEqual(@as(?qdisc.Xstats, null), try qdisc.parseXstats("netem", false, buf[0..28]));
+}
+
+test "xstats: cake's nested statistics, tin by tin" {
+    const gpa = testing.allocator;
+    var tin: std.ArrayList(u8) = .empty;
+    defer tin.deinit(gpa);
+    try codec.appendAttrU32(gpa, &tin, qdisc.TCA_CAKE_TIN_STATS.SENT_PACKETS, 7);
+    try codec.appendAttrU64(gpa, &tin, qdisc.TCA_CAKE_TIN_STATS.SENT_BYTES64, 9_000_000_000);
+    try codec.appendAttrU64(gpa, &tin, qdisc.TCA_CAKE_TIN_STATS.THRESHOLD_RATE64, 125_000);
+    try codec.appendAttrU32(gpa, &tin, qdisc.TCA_CAKE_TIN_STATS.TARGET_US, 5000);
+    try codec.appendAttrU32(gpa, &tin, qdisc.TCA_CAKE_TIN_STATS.SPARSE_FLOWS, 3);
+    // A wrong-sized attribute is skipped.
+    try codec.appendAttr(gpa, &tin, qdisc.TCA_CAKE_TIN_STATS.AVG_DELAY_US, &@as([3]u8, @splat(1)));
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(gpa);
+    try codec.appendAttrU64(gpa, &all, qdisc.TCA_CAKE_STATS.CAPACITY_ESTIMATE64, 123);
+    try codec.appendAttrU32(gpa, &all, qdisc.TCA_CAKE_STATS.MEMORY_USED, 4096);
+    const nest = try codec.nestBegin(gpa, &all, qdisc.TCA_CAKE_STATS.TIN_STATS);
+    for (1..3) |ord| {
+        const e = try codec.nestBegin(gpa, &all, @intCast(ord));
+        try all.appendSlice(gpa, tin.items);
+        try codec.nestEnd(&all, e);
+    }
+    try codec.nestEnd(&all, nest);
+    const st = (try qdisc.parseXstats("cake", false, all.items)).?.cake;
+    try testing.expectEqual(@as(u64, 123), st.capacity_estimate);
+    try testing.expectEqual(@as(u32, 4096), st.memory_used);
+    try testing.expectEqual(@as(usize, 2), st.tinSlice().len);
+    try testing.expectEqual(@as(u64, 9_000_000_000), st.tins[1].sent_bytes);
+    try testing.expectEqual(@as(u32, 7), st.tins[0].sent_packets);
+    try testing.expectEqual(@as(u64, 125_000), st.tins[0].threshold_rate);
+    try testing.expectEqual(@as(u32, 0), st.tins[0].avg_delay_us);
+    try testing.expectEqual(@as(u32, 3), st.tins[1].sparse_flows);
+}
+
+test "integration (netns/root): kernel xstats of a cake qdisc and an htb class" {
+    var sock = try openOrSkip();
+    defer sock.close();
+    const lo = try loIndex(&sock);
+
+    sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+    sock.qdiscAdd(
+        .{ .ifindex = lo, .handle = .init(7, 0), .parent = Handle.root },
+        .{ .cake = .{ .bandwidth = 125_000_000, .diffserv = .diffserv3 } },
+    ) catch |e| switch (e) {
+        error.AccessDenied, error.NotSupported, error.NotFound => return skip("cake qdisc add"),
+        else => return e,
+    };
+    {
+        const list = try sock.qdiscs(lo);
+        defer testing.allocator.free(list);
+        var seen = false;
+        for (list) |q| {
+            if (!std.mem.eql(u8, q.kind(), "cake")) continue;
+            seen = true;
+            const st = q.xstats.?.cake;
+            // The figures `tc -s qdisc` prints for the same qdisc.
+            try testing.expectEqual(@as(u64, 125_000_000), st.capacity_estimate);
+            try testing.expectEqual(@as(u32, 50_000_000), st.memory_limit);
+            try testing.expectEqual(@as(u32, 65535), st.min_netlen);
+            try testing.expectEqual(@as(u32, 0), st.max_netlen);
+            try testing.expectEqual(@as(usize, 3), st.tinSlice().len);
+            try testing.expectEqual(@as(u64, 125_000_000), st.tins[1].threshold_rate);
+            try testing.expectEqual(@as(u32, 5000), st.tins[1].target_us);
+            try testing.expectEqual(@as(u32, 100_000), st.tins[1].interval_us);
+        }
+        try testing.expect(seen);
+    }
+    sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+
+    try sock.qdiscAdd(
+        .{ .ifindex = lo, .handle = .init(1, 0), .parent = Handle.root },
+        .{ .htb = .{ .defcls = 0x10 } },
+    );
+    defer sock.qdiscDel(.{ .ifindex = lo, .parent = Handle.root }) catch {};
+    try sock.classAdd(
+        .{ .ifindex = lo, .handle = .init(1, 0x10), .parent = .init(1, 0) },
+        .{ .htb = .{ .rate = 125_000, .ceil = 125_000 } },
+    );
+    const cls = try sock.classes(lo, null);
+    defer testing.allocator.free(cls);
+    var seen = false;
+    for (cls) |c| {
+        if (c.handle.raw != Handle.init(1, 0x10).raw) continue;
+        seen = true;
+        const hx = c.xstats.?.htb;
+        try testing.expectEqual(@as(u32, 0), hx.lends);
+        try testing.expect(hx.tokens > 0 and hx.ctokens > 0);
+    }
+    try testing.expect(seen);
 }

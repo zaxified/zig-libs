@@ -2204,6 +2204,7 @@ pub const FqCodelXstats = struct {
 };
 
 const fq_codel_xstats_qdisc: u32 = 0; // TCA_FQ_CODEL_XSTATS_QDISC
+const fq_codel_xstats_class: u32 = 1; // TCA_FQ_CODEL_XSTATS_CLASS
 const fq_codel_xstats_len = 4 + 9 * 4; // type + tc_fq_codel_qd_stats
 const tc_stats_len = 36; // struct tc_stats, without its tail padding
 
@@ -2287,6 +2288,317 @@ fn pickStats(stats2: ?[]const u8, legacy: ?[]const u8) codec.Error!?Stats {
     return null;
 }
 
+/// `struct tc_htb_xstats` — an htb class's borrowing counters.
+pub const HtbXstats = struct {
+    lends: u32,
+    borrows: u32,
+    giants: u32,
+    tokens: i32,
+    ctokens: i32,
+};
+
+/// `struct tc_hfsc_stats` — an hfsc class's service counters.
+pub const HfscXstats = struct {
+    work: u64,
+    rtwork: u64,
+    period: u32,
+    level: u32,
+};
+
+/// `struct tc_red_xstats`.
+pub const RedXstats = struct {
+    early: u32,
+    pdrop: u32,
+    other: u32,
+    marked: u32,
+};
+
+/// `struct tc_codel_xstats`.
+pub const CodelXstats = struct {
+    maxpacket: u32,
+    count: u32,
+    lastcount: u32,
+    ldelay: u32,
+    drop_next: i32,
+    drop_overlimit: u32,
+    ecn_mark: u32,
+    dropping: u32,
+    ce_mark: u32,
+};
+
+/// `struct tc_fq_codel_cl_stats` — one fq_codel flow (the class half of
+/// `TCA_XSTATS`, type `TCA_FQ_CODEL_XSTATS_CLASS`).
+pub const FqCodelClassXstats = struct {
+    deficit: i32,
+    ldelay: u32,
+    count: u32,
+    lastcount: u32,
+    dropping: u32,
+    drop_next: i32,
+};
+
+/// `TCA_CAKE_STATS_*`, the figures nested in `TCA_STATS2`'s `TCA_STATS_APP`
+/// (attribute 0 is unused, 1 is the 64-bit alignment pad).
+pub const TCA_CAKE_STATS = struct {
+    pub const PAD: u16 = 1;
+    pub const CAPACITY_ESTIMATE64: u16 = 2;
+    pub const MEMORY_LIMIT: u16 = 3;
+    pub const MEMORY_USED: u16 = 4;
+    pub const AVG_NETOFF: u16 = 5;
+    pub const MIN_NETLEN: u16 = 6;
+    pub const MAX_NETLEN: u16 = 7;
+    pub const MIN_ADJLEN: u16 = 8;
+    pub const MAX_ADJLEN: u16 = 9;
+    pub const TIN_STATS: u16 = 10;
+    pub const DEFICIT: u16 = 11;
+    pub const COBALT_COUNT: u16 = 12;
+    pub const DROPPING: u16 = 13;
+    pub const DROP_NEXT_US: u16 = 14;
+    pub const P_DROP: u16 = 15;
+    pub const BLUE_TIMER_US: u16 = 16;
+};
+
+/// `TCA_CAKE_TIN_STATS_*` (nested per tin in `TCA_CAKE_STATS_TIN_STATS`).
+pub const TCA_CAKE_TIN_STATS = struct {
+    pub const PAD: u16 = 1;
+    pub const SENT_PACKETS: u16 = 2;
+    pub const SENT_BYTES64: u16 = 3;
+    pub const DROPPED_PACKETS: u16 = 4;
+    pub const DROPPED_BYTES64: u16 = 5;
+    pub const ACKS_DROPPED_PACKETS: u16 = 6;
+    pub const ACKS_DROPPED_BYTES64: u16 = 7;
+    pub const ECN_MARKED_PACKETS: u16 = 8;
+    pub const ECN_MARKED_BYTES64: u16 = 9;
+    pub const BACKLOG_PACKETS: u16 = 10;
+    pub const BACKLOG_BYTES: u16 = 11;
+    pub const THRESHOLD_RATE64: u16 = 12;
+    pub const TARGET_US: u16 = 13;
+    pub const INTERVAL_US: u16 = 14;
+    pub const WAY_INDIRECT_HITS: u16 = 15;
+    pub const WAY_MISSES: u16 = 16;
+    pub const WAY_COLLISIONS: u16 = 17;
+    pub const PEAK_DELAY_US: u16 = 18;
+    pub const AVG_DELAY_US: u16 = 19;
+    pub const BASE_DELAY_US: u16 = 20;
+    pub const SPARSE_FLOWS: u16 = 21;
+    pub const BULK_FLOWS: u16 = 22;
+    pub const UNRESPONSIVE_FLOWS: u16 = 23;
+    pub const MAX_SKBLEN: u16 = 24;
+    pub const FLOW_QUANTUM: u16 = 25;
+};
+
+/// One cake tin's counters (`TCA_CAKE_TIN_STATS_*`); an attribute the kernel
+/// did not send stays 0.
+pub const CakeTinStats = struct {
+    sent_packets: u32 = 0,
+    sent_bytes: u64 = 0,
+    dropped_packets: u32 = 0,
+    dropped_bytes: u64 = 0,
+    acks_dropped_packets: u32 = 0,
+    acks_dropped_bytes: u64 = 0,
+    ecn_marked_packets: u32 = 0,
+    ecn_marked_bytes: u64 = 0,
+    backlog_packets: u32 = 0,
+    backlog_bytes: u32 = 0,
+    /// The tin's rate threshold in bytes per second.
+    threshold_rate: u64 = 0,
+    target_us: u32 = 0,
+    interval_us: u32 = 0,
+    way_indirect_hits: u32 = 0,
+    way_misses: u32 = 0,
+    way_collisions: u32 = 0,
+    peak_delay_us: u32 = 0,
+    avg_delay_us: u32 = 0,
+    base_delay_us: u32 = 0,
+    sparse_flows: u32 = 0,
+    bulk_flows: u32 = 0,
+    unresponsive_flows: u32 = 0,
+    max_skblen: u32 = 0,
+    flow_quantum: u32 = 0,
+};
+
+/// The most tins cake has (`CAKE_MAX_TINS`).
+pub const cake_max_tins = 8;
+
+/// `TCA_CAKE_STATS` as dumped in `TCA_XSTATS`: the qdisc-wide figures and one
+/// `CakeTinStats` per tin. An attribute the kernel did not send stays 0.
+pub const CakeStats = struct {
+    /// The estimated link capacity in bytes per second.
+    capacity_estimate: u64 = 0,
+    memory_limit: u32 = 0,
+    memory_used: u32 = 0,
+    avg_netoff: u32 = 0,
+    min_netlen: u32 = 0,
+    max_netlen: u32 = 0,
+    min_adjlen: u32 = 0,
+    max_adjlen: u32 = 0,
+    tins: [cake_max_tins]CakeTinStats = @splat(.{}),
+    /// How many entries of `tins` are filled.
+    tin_count: u8 = 0,
+
+    pub fn tinSlice(c: *const CakeStats) []const CakeTinStats {
+        return c.tins[0..c.tin_count];
+    }
+};
+
+/// What a dump's `TCA_XSTATS` held, by the kind it came from.
+pub const Xstats = union(enum) {
+    fq_codel: FqCodelXstats,
+    fq_codel_class: FqCodelClassXstats,
+    htb: HtbXstats,
+    hfsc: HfscXstats,
+    red: RedXstats,
+    codel: CodelXstats,
+    cake: CakeStats,
+};
+
+fn rdi32(d: []const u8, off: usize) i32 {
+    return std.mem.readInt(i32, d[off..][0..4], native_endian);
+}
+
+fn parseCakeStats(data: []const u8) codec.Error!CakeStats {
+    var c: CakeStats = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_CAKE_STATS.CAPACITY_ESTIMATE64 => if (a.data.len == 8) {
+            c.capacity_estimate = rd64(a.data, 0);
+        },
+        TCA_CAKE_STATS.MEMORY_LIMIT => if (a.data.len == 4) {
+            c.memory_limit = rd32(a.data, 0);
+        },
+        TCA_CAKE_STATS.MEMORY_USED => if (a.data.len == 4) {
+            c.memory_used = rd32(a.data, 0);
+        },
+        TCA_CAKE_STATS.AVG_NETOFF => if (a.data.len == 4) {
+            c.avg_netoff = rd32(a.data, 0);
+        },
+        TCA_CAKE_STATS.MIN_NETLEN => if (a.data.len == 4) {
+            c.min_netlen = rd32(a.data, 0);
+        },
+        TCA_CAKE_STATS.MAX_NETLEN => if (a.data.len == 4) {
+            c.max_netlen = rd32(a.data, 0);
+        },
+        TCA_CAKE_STATS.MIN_ADJLEN => if (a.data.len == 4) {
+            c.min_adjlen = rd32(a.data, 0);
+        },
+        TCA_CAKE_STATS.MAX_ADJLEN => if (a.data.len == 4) {
+            c.max_adjlen = rd32(a.data, 0);
+        },
+        TCA_CAKE_STATS.TIN_STATS => {
+            var tit: codec.AttrIterator = .{ .buf = a.data };
+            while (try tit.next()) |tin| {
+                if (c.tin_count >= cake_max_tins) break;
+                c.tins[c.tin_count] = try parseCakeTin(tin.data);
+                c.tin_count += 1;
+            }
+        },
+        else => {},
+    };
+    return c;
+}
+
+fn parseCakeTin(data: []const u8) codec.Error!CakeTinStats {
+    var t: CakeTinStats = .{};
+    const T = TCA_CAKE_TIN_STATS;
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| {
+        const v32: ?u32 = if (a.data.len == 4) rd32(a.data, 0) else null;
+        const v64: ?u64 = if (a.data.len == 8) rd64(a.data, 0) else null;
+        switch (a.type) {
+            T.SENT_PACKETS => t.sent_packets = v32 orelse t.sent_packets,
+            T.SENT_BYTES64 => t.sent_bytes = v64 orelse t.sent_bytes,
+            T.DROPPED_PACKETS => t.dropped_packets = v32 orelse t.dropped_packets,
+            T.DROPPED_BYTES64 => t.dropped_bytes = v64 orelse t.dropped_bytes,
+            T.ACKS_DROPPED_PACKETS => t.acks_dropped_packets = v32 orelse t.acks_dropped_packets,
+            T.ACKS_DROPPED_BYTES64 => t.acks_dropped_bytes = v64 orelse t.acks_dropped_bytes,
+            T.ECN_MARKED_PACKETS => t.ecn_marked_packets = v32 orelse t.ecn_marked_packets,
+            T.ECN_MARKED_BYTES64 => t.ecn_marked_bytes = v64 orelse t.ecn_marked_bytes,
+            T.BACKLOG_PACKETS => t.backlog_packets = v32 orelse t.backlog_packets,
+            T.BACKLOG_BYTES => t.backlog_bytes = v32 orelse t.backlog_bytes,
+            T.THRESHOLD_RATE64 => t.threshold_rate = v64 orelse t.threshold_rate,
+            T.TARGET_US => t.target_us = v32 orelse t.target_us,
+            T.INTERVAL_US => t.interval_us = v32 orelse t.interval_us,
+            T.WAY_INDIRECT_HITS => t.way_indirect_hits = v32 orelse t.way_indirect_hits,
+            T.WAY_MISSES => t.way_misses = v32 orelse t.way_misses,
+            T.WAY_COLLISIONS => t.way_collisions = v32 orelse t.way_collisions,
+            T.PEAK_DELAY_US => t.peak_delay_us = v32 orelse t.peak_delay_us,
+            T.AVG_DELAY_US => t.avg_delay_us = v32 orelse t.avg_delay_us,
+            T.BASE_DELAY_US => t.base_delay_us = v32 orelse t.base_delay_us,
+            T.SPARSE_FLOWS => t.sparse_flows = v32 orelse t.sparse_flows,
+            T.BULK_FLOWS => t.bulk_flows = v32 orelse t.bulk_flows,
+            T.UNRESPONSIVE_FLOWS => t.unresponsive_flows = v32 orelse t.unresponsive_flows,
+            T.MAX_SKBLEN => t.max_skblen = v32 orelse t.max_skblen,
+            T.FLOW_QUANTUM => t.flow_quantum = v32 orelse t.flow_quantum,
+            else => {},
+        }
+    }
+    return t;
+}
+
+/// Decode a `TCA_XSTATS` payload by the qdisc or class kind it came from;
+/// null for a kind this module has no struct for or a payload shorter than
+/// the kernel's. `is_class` picks the class layout where the kind has both
+/// (`fq_codel`).
+pub fn parseXstats(kind_name: []const u8, is_class: bool, data: []const u8) codec.Error!?Xstats {
+    if (std.mem.eql(u8, kind_name, kind_htb)) {
+        if (data.len < 20) return null;
+        return .{ .htb = .{
+            .lends = rd32(data, 0),
+            .borrows = rd32(data, 4),
+            .giants = rd32(data, 8),
+            .tokens = rdi32(data, 12),
+            .ctokens = rdi32(data, 16),
+        } };
+    } else if (std.mem.eql(u8, kind_name, kind_hfsc)) {
+        if (data.len < 24) return null;
+        return .{ .hfsc = .{ .work = rd64(data, 0), .rtwork = rd64(data, 8), .period = rd32(data, 16), .level = rd32(data, 20) } };
+    } else if (std.mem.eql(u8, kind_name, kind_red)) {
+        if (data.len < 16) return null;
+        return .{ .red = .{ .early = rd32(data, 0), .pdrop = rd32(data, 4), .other = rd32(data, 8), .marked = rd32(data, 12) } };
+    } else if (std.mem.eql(u8, kind_name, kind_codel)) {
+        if (data.len < 36) return null;
+        return .{ .codel = .{
+            .maxpacket = rd32(data, 0),
+            .count = rd32(data, 4),
+            .lastcount = rd32(data, 8),
+            .ldelay = rd32(data, 12),
+            .drop_next = rdi32(data, 16),
+            .drop_overlimit = rd32(data, 20),
+            .ecn_mark = rd32(data, 24),
+            .dropping = rd32(data, 28),
+            .ce_mark = rd32(data, 32),
+        } };
+    } else if (std.mem.eql(u8, kind_name, kind_fq_codel)) {
+        if (is_class) {
+            if (data.len < 28 or rd32(data, 0) != fq_codel_xstats_class) return null;
+            return .{ .fq_codel_class = .{
+                .deficit = rdi32(data, 4),
+                .ldelay = rd32(data, 8),
+                .count = rd32(data, 12),
+                .lastcount = rd32(data, 16),
+                .dropping = rd32(data, 20),
+                .drop_next = rdi32(data, 24),
+            } };
+        }
+        const q = parseFqCodelXstats(data) orelse return null;
+        return .{ .fq_codel = q };
+    } else if (std.mem.eql(u8, kind_name, kind_cake)) {
+        return .{ .cake = try parseCakeStats(data) };
+    }
+    return null;
+}
+
+/// The `TCA_STATS_APP` payload of a `TCA_STATS2` nest: the kind's own
+/// statistics, as it dumps them there.
+fn appStats(stats2: ?[]const u8) codec.Error!?[]const u8 {
+    const d = stats2 orelse return null;
+    var it: codec.AttrIterator = .{ .buf = d };
+    while (try it.next()) |a| {
+        if (a.type == TCA_STATS2.APP) return a.data;
+    }
+    return null;
+}
+
 fn parseFqCodelXstats(data: []const u8) ?FqCodelXstats {
     if (data.len < fq_codel_xstats_len or rd32(data, 0) != fq_codel_xstats_qdisc) return null;
     return .{
@@ -2331,6 +2643,10 @@ pub const Qdisc = struct {
     /// `TCA_XSTATS` of an `fq_codel` qdisc. Other kinds' private statistics
     /// are not decoded (their raw bytes are not kept either).
     fq_codel_xstats: ?FqCodelXstats = null,
+    /// `TCA_XSTATS` decoded for whichever kind this is (`htb`, `hfsc`, `red`,
+    /// `codel`, `fq_codel`, `cake`); null when none came or the kind has no
+    /// decoder. `fq_codel_xstats` stays for the fq_codel qdisc.
+    xstats: ?Xstats = null,
 
     /// The qdisc kind string ("netem", "noqueue", "fq_codel", …).
     pub fn kind(q: *const Qdisc) []const u8 {
@@ -2348,6 +2664,8 @@ pub const Class = struct {
     htb: ?HtbClassWire = null,
     /// Service curves, when `kind() == "hfsc"`.
     hfsc: ?HfscClassWire = null,
+    /// `TCA_XSTATS` for an htb, hfsc or fq_codel class (see `Qdisc.xstats`).
+    xstats: ?Xstats = null,
     /// Counters (`tc -s`); null when the kernel sent none (API addition).
     stats: ?Stats = null,
 
@@ -2389,9 +2707,12 @@ pub fn parseQdisc(payload: []const u8) codec.Error!Qdisc {
         else => {},
     };
     q.stats = try pickStats(stats2, legacy);
-    if (xstats) |x| if (std.mem.eql(u8, q.kind(), kind_fq_codel)) {
-        q.fq_codel_xstats = parseFqCodelXstats(x);
-    };
+    // Most kinds also send the legacy `TCA_XSTATS`; cake nests its figures
+    // only in `TCA_STATS2`'s `TCA_STATS_APP`.
+    if (xstats orelse try appStats(stats2)) |x| {
+        if (std.mem.eql(u8, q.kind(), kind_fq_codel)) q.fq_codel_xstats = parseFqCodelXstats(x);
+        q.xstats = try parseXstats(q.kind(), false, x);
+    }
     if (options_data) |opt| {
         const k = q.kind();
         if (std.mem.eql(u8, k, kind_netem)) {
@@ -2439,15 +2760,18 @@ pub fn parseClass(payload: []const u8) codec.Error!Class {
     var options_data: ?[]const u8 = null;
     var stats2: ?[]const u8 = null;
     var legacy: ?[]const u8 = null;
+    var xstats: ?[]const u8 = null;
     var it: codec.AttrIterator = .{ .buf = payload[tcmsg_len..] };
     while (try it.next()) |a| switch (a.type) {
         TCA.KIND => try copyKind(&c.kind_buf, &c.kind_len, a.asString()),
         TCA.OPTIONS => options_data = a.data,
         TCA.STATS2 => stats2 = a.data,
         TCA.STATS => legacy = a.data,
+        TCA.XSTATS => xstats = a.data,
         else => {},
     };
     c.stats = try pickStats(stats2, legacy);
+    if (xstats orelse try appStats(stats2)) |x| c.xstats = try parseXstats(c.kind(), true, x);
     if (options_data) |opt| {
         if (std.mem.eql(u8, c.kind(), kind_htb)) {
             c.htb = try parseHtbClassOptions(opt);
