@@ -91,6 +91,10 @@ fn validate(p: DateParts) bool;
 
 // Token I/O
 fn parse(input, fmt) ParseError!DateParts;
+fn parseOpts(input, fmt, ParseOptions) ParseError!DateParts;  // .flexible_width (1..width digits), .strict (end, ii 1..12, weekday)
+fn parseStrftime(input, fmt) ParseError!DateParts;           // %Y-%m-%d %H:%M:%S ...; flexible width (chrono)
+fn formatStrftime(alloc, parts, fmt) ![]u8;                  // same directives; others InvalidFormatString
+fn Layout.compileStrftime(fmt) ParseError!Layout;
 fn format(alloc, parts, fmt) ![]u8;              // caller frees
 
 // The same with the format tokenized once (hot paths; comptime works):
@@ -113,6 +117,7 @@ fn bufImfFixdate(buf: *[imf_fixdate_len]u8, parts) !void;  // "Sun, 06 Nov 1994 
 fn formatImfFixdate(alloc, parts) ![]u8;
 fn parseImfFixdate(s) ParseError!DateParts;      // fixdate only, weekday checked
 fn parseHttpDate(s) ParseError!DateParts;        // RFC 9110: fixdate, RFC 850, asctime
+fn parseHttpDateLenient(s) ParseError!DateParts; // as a server reads: weekday not checked, :60 kept
 fn bufRfc2822(buf: *[rfc2822_len]u8, parts) !void;  // "Fri, 21 Nov 1997 09:55:06 -0600" (Go RFC1123Z)
 fn formatRfc2822(alloc, parts) ![]u8;
 fn parseRfc2822(s) ParseError!DateParts;         // RFC 5322 Date:, obsolete forms + comments, off_min set
@@ -131,6 +136,11 @@ fn truncateNs(ns: i64, unit: i64) i64;           // Go Time.Truncate: down, also
 fn roundNs(ns: i64, unit: i64) i64;              // Go Time.Round: halfway up
 
 // Arithmetic (pre-1970 safe)
+const Weekday = enum { mon ... sun };              // number/fromNumber/of/name/short/parse/next/prev/daysUntil
+const Month = enum { jan ... dec };                // number/fromNumber/of/name/short/parse/next/prev/days
+const WeekdaySet = struct { bits: u8 };            // of/contains/containsDate/with/without/unionWith/intersect/difference/len/firstFrom
+const Week = struct { first_epoch_day: i64 };      // Week.of(parts, first_weekday): firstDay/lastDay/day(i) (chrono NaiveWeek)
+fn addTimeOfDay(parts, ns: i64) TimeOfDaySum;      // wraps at midnight; .days carries the whole days
 fn addDays(parts, n: i64) DateParts;
 fn addMonths(parts, n: i32) DateParts;           // clamps day (Jan 31 +1mo → Feb 28/29)
 fn addYears(parts, n: i32) DateParts;

@@ -345,122 +345,13 @@ const TagList = struct {
 
 /// Parse an HTTP-date (RFC 9110 §5.6.7) to epoch seconds, or null if invalid.
 /// A conformant parser MUST accept all three formats, though only IMF-fixdate
-/// is ever generated:
-///  - IMF-fixdate:  `Sun, 06 Nov 1994 08:49:37 GMT`
-///  - RFC 850 (obs): `Sunday, 06-Nov-94 08:49:37 GMT`
-///  - asctime (obs): `Sun Nov  6 08:49:37 1994`
+/// is ever generated: IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), RFC 850
+/// (`Sunday, 06-Nov-94 08:49:37 GMT`) and asctime (`Sun Nov  6 08:49:37 1994`).
+/// This is `datefmt.parseHttpDateLenient`: the weekday name must be
+/// well-formed but is not checked against the date, and `:60` is tolerated.
 pub fn parseHttpDate(s: []const u8) ?i64 {
-    // Dispatch: IMF-fixdate has its comma right after the 3-letter day name;
-    // RFC 850 after the full day name; asctime has no comma at all.
-    if (std.mem.findScalar(u8, s, ',')) |comma| {
-        if (comma == 3) return parseImfFixdate(s);
-        return parseRfc850(s, comma);
-    }
-    return parseAsctime(s);
-}
-
-/// `Sun, 06 Nov 1994 08:49:37 GMT` — fixed 29-byte layout.
-fn parseImfFixdate(s: []const u8) ?i64 {
-    if (s.len != 29) return null;
-    if (!isDayName(s[0..3])) return null;
-    if (s[3] != ',' or s[4] != ' ') return null;
-    const day = parseDigits(s[5..7]) orelse return null;
-    if (s[7] != ' ') return null;
-    const month = monthFromName(s[8..11]) orelse return null;
-    if (s[11] != ' ') return null;
-    const year = parseDigits(s[12..16]) orelse return null;
-    if (s[16] != ' ') return null;
-    if (!std.mem.eql(u8, s[25..29], " GMT")) return null;
-    return epochFrom(year, month, day, s[17..25]);
-}
-
-/// `Sunday, 06-Nov-94 08:49:37 GMT` — full day name, two-digit year. The
-/// two-digit year uses a fixed pivot: 00–69 → 20xx, 70–99 → 19xx (we only
-/// ever compare dates and never generate RFC 850, so a sliding window is
-/// unnecessary).
-fn parseRfc850(s: []const u8, comma: usize) ?i64 {
-    if (!isFullDayName(s[0..comma])) return null;
-    const rest = s[comma + 1 ..];
-    // " 06-Nov-94 08:49:37 GMT"
-    if (rest.len != 23 or rest[0] != ' ') return null;
-    const day = parseDigits(rest[1..3]) orelse return null;
-    if (rest[3] != '-') return null;
-    const month = monthFromName(rest[4..7]) orelse return null;
-    if (rest[7] != '-') return null;
-    const yy = parseDigits(rest[8..10]) orelse return null;
-    if (rest[10] != ' ') return null;
-    if (!std.mem.eql(u8, rest[19..23], " GMT")) return null;
-    const year: i64 = if (yy >= 70) 1900 + @as(i64, yy) else 2000 + @as(i64, yy);
-    return epochFrom(year, month, day, rest[11..19]);
-}
-
-/// `Sun Nov  6 08:49:37 1994` — fixed 24-byte layout, day space-padded.
-fn parseAsctime(s: []const u8) ?i64 {
-    if (s.len != 24) return null;
-    if (!isDayName(s[0..3]) or s[3] != ' ') return null;
-    const month = monthFromName(s[4..7]) orelse return null;
-    if (s[7] != ' ') return null;
-    const day_text = if (s[8] == ' ') s[9..10] else s[8..10];
-    const day = parseDigits(day_text) orelse return null;
-    if (s[10] != ' ' or s[19] != ' ') return null;
-    const year = parseDigits(s[20..24]) orelse return null;
-    return epochFrom(year, month, day, s[11..19]);
-}
-
-/// Validate ranges (1..31 day, 0..23 h, 0..59 min, 0..60 s for leap-second
-/// tolerance) and convert a broken-down UTC time + `HH:MM:SS` to epoch
-/// seconds.
-fn epochFrom(year: i64, month: u32, day: u32, tod: []const u8) ?i64 {
-    // The month's own length, not 31: `31 Feb` used to parse as 2 March
-    // (Go oracle, 2026-10-05) -- an invalid date must be ignored.
-    if (year > std.math.maxInt(i32)) return null;
-    const y: i32 = @intCast(year);
-    if (day < 1 or day > datefmt.daysInMonth(y, month)) return null;
-    if (tod.len != 8 or tod[2] != ':' or tod[5] != ':') return null;
-    const hour = parseDigits(tod[0..2]) orelse return null;
-    const min = parseDigits(tod[3..5]) orelse return null;
-    const sec = parseDigits(tod[6..8]) orelse return null;
-    if (hour > 23 or min > 59 or sec > 60) return null;
-    return datefmt.ymdToEpochDay(y, month, day) * std.time.s_per_day +
-        @as(i64, hour) * 3600 + @as(i64, min) * 60 + sec;
-}
-
-/// Strictly numeric, no sign, no whitespace.
-fn parseDigits(s: []const u8) ?u32 {
-    if (s.len == 0) return null;
-    var n: u32 = 0;
-    for (s) |c| {
-        if (c < '0' or c > '9') return null;
-        n = n * 10 + (c - '0');
-    }
-    return n;
-}
-
-const day_names = [7][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-const full_day_names = [7][]const u8{
-    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
-};
-const month_names = [12][]const u8{
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-};
-
-/// The weekday name must be well-formed, but is NOT cross-checked against
-/// the date (a "wrong" weekday on a valid date is tolerated).
-fn isDayName(s: []const u8) bool {
-    for (day_names) |n| if (std.mem.eql(u8, s, n)) return true;
-    return false;
-}
-
-fn isFullDayName(s: []const u8) bool {
-    for (full_day_names) |n| if (std.mem.eql(u8, s, n)) return true;
-    return false;
-}
-
-/// 1-based month from its 3-letter name, or null.
-fn monthFromName(s: []const u8) ?u32 {
-    for (month_names, 1..) |n, i| if (std.mem.eql(u8, s, n)) return @intCast(i);
-    return null;
+    const p = datefmt.parseHttpDateLenient(s) catch return null;
+    return datefmt.partsToUnix(p);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────

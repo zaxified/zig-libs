@@ -506,3 +506,31 @@ test "audit MED3: endOf* is never earlier than any instant of its period" {
     try testing.expectEqual(@as(u32, 999_999_999), dt.endOfMonth(t).nanosecond);
     try testing.expectEqual(@as(u32, 999_999_999), dt.endOfYear(t).nanosecond);
 }
+
+test "parseHttpDateLenient: weekday not checked, leap second kept, the rest strict" {
+    const wrong_day = [_][]const u8{
+        "Mon, 06 Nov 1994 08:49:37 GMT",
+        "Monday, 06-Nov-94 08:49:37 GMT",
+        "Mon Nov  6 08:49:37 1994",
+    };
+    for (wrong_day) |t| {
+        try testing.expectError(error.InvalidDate, dt.parseHttpDate(t));
+        const p = try dt.parseHttpDateLenient(t);
+        try testing.expectEqual(@as(i64, 784111777), dt.partsToUnix(p));
+    }
+    const leap = try dt.parseHttpDateLenient("Thu, 30 Jun 2016 23:59:60 GMT");
+    try testing.expectEqual(@as(u32, 60), leap.second);
+    try testing.expectEqual(@as(i64, 1467331200), dt.partsToUnix(leap));
+    try testing.expectError(error.InvalidTime, dt.parseHttpDate("Thu, 30 Jun 2016 23:59:60 GMT"));
+    // A name that is not a name, a 61st second, a day the month lacks, a lower-case name: still refused.
+    const bad = [_][]const u8{
+        "Xyz, 06 Nov 1994 08:49:37 GMT",
+        "Sun, 06 Nov 1994 08:49:61 GMT",
+        "Sun, 31 Nov 1994 08:49:37 GMT",
+        "sun, 06 Nov 1994 08:49:37 GMT",
+        "Sunx, 06-Nov-94 08:49:37 GMT",
+        "Sun Nov  6 08:49:37 1994x",
+        "Sun, 06 Nov 1994 08:49:37 UTC",
+    };
+    for (bad) |t| try testing.expect(std.meta.isError(dt.parseHttpDateLenient(t)));
+}

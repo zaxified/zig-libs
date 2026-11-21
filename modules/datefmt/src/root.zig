@@ -412,16 +412,40 @@ pub const Layout = struct {
         return formatLayout(alloc, parts, l);
     }
 
+    /// Tokenize a strftime format (`%Y-%m-%d`), see `parseStrftime`. The
+    /// layout holds the tokens of the equivalent native format (`%m` is `MM`),
+    /// so `format` writes zero-padded fields and `parse` reads them at full
+    /// width; `parseOpts(.., .{ .flexible_width = true })` reads them the way
+    /// `parseStrftime` does. A directive that has no token is
+    /// `InvalidFormatString`.
+    pub fn compileStrftime(fmt: []const u8) ParseError!Layout {
+        var l: Layout = undefined;
+        try tokenizeStrftime(fmt, &l);
+        return l;
+    }
+
     /// `datefmt.parse` with this layout's format.
     pub fn parse(l: *const Layout, input: []const u8) ParseError!DateParts {
+        return l.parseOpts(input, .{});
+    }
+
+    /// `datefmt.parseOpts` with this layout's format.
+    pub fn parseOpts(l: *const Layout, input: []const u8, opts: ParseOptions) ParseError!DateParts {
         var end: usize = undefined;
-        return parseTokens(input, l.toks[0..l.n], &end);
+        const parts = try parseTokens(input, l.toks[0..l.n], &end, opts);
+        if (opts.strict and end != input.len) return ParseError.InvalidFormat;
+        return parts;
     }
 
     /// `datefmt.parsePrefix` with this layout's format.
     pub fn parsePrefix(l: *const Layout, input: []const u8) ParseError!PrefixMatch {
+        return l.parsePrefixOpts(input, .{});
+    }
+
+    /// `datefmt.parsePrefixOpts` with this layout's format.
+    pub fn parsePrefixOpts(l: *const Layout, input: []const u8, opts: ParseOptions) ParseError!PrefixMatch {
         var end: usize = undefined;
-        const parts = try parseTokens(input, l.toks[0..l.n], &end);
+        const parts = try parseTokens(input, l.toks[0..l.n], &end, opts);
         return .{ .parts = parts, .len = end };
     }
 
@@ -592,7 +616,143 @@ fn tokenize(fmt: []const u8, out: *Layout) ParseError!void {
         out.toks[out.n] = .{ .literal = fmt[start..pos] };
         out.n += 1;
     }
+    finishLayout(out);
+}
 
+fn push(out: *Layout, t: Token) ParseError!void {
+    if (out.n >= MAX_TOKENS) return ParseError.TooManyTokens;
+    out.toks[out.n] = t;
+    out.n += 1;
+}
+
+/// Tokenize a strftime format into the same tokens `tokenize` makes for the
+/// equivalent native format. See `parseStrftime` for the vocabulary.
+fn tokenizeStrftime(fmt: []const u8, out: *Layout) ParseError!void {
+    out.n = 0;
+    var i: usize = 0;
+    while (i < fmt.len) {
+        if (fmt[i] != '%') {
+            const start = i;
+            while (i < fmt.len and fmt[i] != '%') i += 1;
+            try push(out, .{ .literal = fmt[start..i] });
+            continue;
+        }
+        i += 1;
+        if (i >= fmt.len) return ParseError.InvalidFormatString; // a lone `%`
+        var unpadded = false;
+        if (fmt[i] == '-') {
+            unpadded = true;
+            i += 1;
+            if (i >= fmt.len) return ParseError.InvalidFormatString;
+        }
+        const c = fmt[i];
+        i += 1;
+        if (unpadded) {
+            const t: Token = switch (c) {
+                'm' => .month_short,
+                'd' => .day_short,
+                'H' => .hour_24_short,
+                'I' => .hour_12_short,
+                'M' => .minute_short,
+                'S' => .second_short,
+                else => return ParseError.InvalidFormatString,
+            };
+            try push(out, t);
+            continue;
+        }
+        switch (c) {
+            'Y' => try push(out, .year_full),
+            'y' => try push(out, .year_short),
+            'm' => try push(out, .month_full),
+            'd' => try push(out, .day_full),
+            'H' => try push(out, .hour_24_full),
+            'I' => try push(out, .hour_12_full),
+            'M' => try push(out, .minute_full),
+            'S' => try push(out, .second_full),
+            'p' => try push(out, .ampm_upper),
+            'P' => try push(out, .ampm_lower),
+            'B' => try push(out, .month_name_long),
+            'b', 'h' => try push(out, .month_name_short),
+            'A' => try push(out, .day_name_long),
+            'a' => try push(out, .day_name_short),
+            'j' => try push(out, .day_of_year),
+            'z' => try push(out, .tz_offset_compact),
+            'u' => try push(out, .day_of_week),
+            'G' => try push(out, .iso_year),
+            'V' => try push(out, .iso_week_full),
+            'f' => try push(out, .{ .fraction = 9 }),
+            '3', '6', '9' => {
+                if (i >= fmt.len or fmt[i] != 'f') return ParseError.InvalidFormatString;
+                i += 1;
+                try push(out, .{ .fraction = c - '0' });
+            },
+            '.' => {
+                // `%.3f` `%.6f` `%.9f`: the dot and a fixed fraction. (`%.f`,
+                // chrono's 0/3/6/9-digit automatic width, has no token.)
+                if (i + 1 >= fmt.len or fmt[i + 1] != 'f') return ParseError.InvalidFormatString;
+                const d = fmt[i];
+                if (d != '3' and d != '6' and d != '9') return ParseError.InvalidFormatString;
+                i += 2;
+                try push(out, .{ .literal = "." });
+                try push(out, .{ .fraction = d - '0' });
+            },
+            ':' => {
+                if (i >= fmt.len or fmt[i] != 'z') return ParseError.InvalidFormatString;
+                i += 1;
+                try push(out, .tz_offset);
+            },
+            'F' => {
+                try push(out, .year_full);
+                try push(out, .{ .literal = "-" });
+                try push(out, .month_full);
+                try push(out, .{ .literal = "-" });
+                try push(out, .day_full);
+            },
+            'T', 'X' => {
+                try push(out, .hour_24_full);
+                try push(out, .{ .literal = ":" });
+                try push(out, .minute_full);
+                try push(out, .{ .literal = ":" });
+                try push(out, .second_full);
+            },
+            'R' => {
+                try push(out, .hour_24_full);
+                try push(out, .{ .literal = ":" });
+                try push(out, .minute_full);
+            },
+            'D', 'x' => {
+                try push(out, .month_full);
+                try push(out, .{ .literal = "/" });
+                try push(out, .day_full);
+                try push(out, .{ .literal = "/" });
+                try push(out, .year_short);
+            },
+            'r' => {
+                try push(out, .hour_12_full);
+                try push(out, .{ .literal = ":" });
+                try push(out, .minute_full);
+                try push(out, .{ .literal = ":" });
+                try push(out, .second_full);
+                try push(out, .{ .literal = " " });
+                try push(out, .ampm_upper);
+            },
+            'n' => try push(out, .{ .literal = "\n" }),
+            't' => try push(out, .{ .literal = "\t" }),
+            '%' => try push(out, .{ .literal = "%" }),
+            else => return ParseError.InvalidFormatString,
+        }
+    }
+    finishLayout(out);
+}
+
+fn dayNameNumber(name: []const u8) ?u32 {
+    for (full_day_names, 1..) |n, i| if (std.ascii.eqlIgnoreCase(name, n)) return @intCast(i);
+    for (short_day_names, 1..) |n, i| if (std.ascii.eqlIgnoreCase(name, n)) return @intCast(i);
+    return null;
+}
+
+/// Fill `out.bound` / `out.needs_dow` from its tokens.
+fn finishLayout(out: *Layout) void {
     out.bound = 0;
     out.needs_dow = false;
     for (out.toks[0..out.n]) |t| switch (t) {
@@ -820,25 +980,92 @@ fn parseFraction(input: []const u8, p: usize, digits: u8) ParseError!u32 {
 /// does not exist in that week-year (0, or 53 in a 52-week year) is
 /// `InvalidDate`.
 pub fn parse(input: []const u8, fmt: []const u8) ParseError!DateParts {
+    return parseOpts(input, fmt, .{});
+}
+
+/// Options of `parseOpts` (and `Layout.parseOpts`); the default is `parse`.
+pub const ParseOptions = struct {
+    /// A fixed-width numeric field (`MM`, `DD`, `hh`, `ii`, `mm`, `ss`, `WW`,
+    /// the `SSS` fractions, the `ZZ` offset's minutes) reads 1 to its width
+    /// in digits when the next token does not start with a digit, as chrono's
+    /// `%m` and Python's `strptime` do: `2021-3-4` under `YYYY-MM-DD`, `+09`
+    /// under `ZZ`, `.5` under `.SSS`. A field followed by a digit keeps its
+    /// full width (`YYYYMMDD`), as does `YYYY`. Output is unaffected.
+    flexible_width: bool = false,
+    /// The checks `parse` leaves out: the whole input is consumed (trailing
+    /// text is `InvalidFormat`), a 12-hour field is 1..12 (`InvalidTime`), and
+    /// a weekday (`EEE`/`EEEE`/`e`) is the date's real weekday (`InvalidDate`).
+    strict: bool = false,
+};
+
+/// `parse` with options.
+pub fn parseOpts(input: []const u8, fmt: []const u8, opts: ParseOptions) ParseError!DateParts {
     var tk: Layout = undefined;
     try tokenize(fmt, &tk);
+    return tk.parseOpts(input, opts);
+}
+
+/// `parse` with a strftime format: the C99 / POSIX directives plus the common
+/// chrono and Python ones that this module's tokens can say (`%Y %y %m %d %H
+/// %I %M %S %p %P %B %b %h %A %a %j %z %:z %F %T %R %D %r %x %X %G %V %u %f
+/// %3f %6f %9f %.3f %.6f %.9f %n %t %%`, and `%-d %-m %-H %-I %-M %-S` for
+/// unpadded). A field reads 1 to its width in digits unless a digit follows
+/// (`ParseOptions.flexible_width`), the way chrono, Python and polars read
+/// them. A directive without a token (`%e %k %l %_d` space padding, `%Z`
+/// zone names, `%s`, `%c`, `%U %W %w %C %g`, `%.f`, ...) is
+/// `InvalidFormatString`. Trailing input is ignored, as in `parse`.
+pub fn parseStrftime(input: []const u8, fmt: []const u8) ParseError!DateParts {
+    var tk: Layout = undefined;
+    try tokenizeStrftime(fmt, &tk);
     var end: usize = undefined;
-    return parseTokens(input, tk.toks[0..tk.n], &end);
+    return parseTokens(input, tk.toks[0..tk.n], &end, .{ .flexible_width = true });
+}
+
+/// `format` with a strftime format (the directives of `parseStrftime`).
+/// Fields are zero-padded as strftime does; `%-d` and friends are unpadded.
+pub fn formatStrftime(alloc: std.mem.Allocator, parts: DateParts, fmt: []const u8) ![]u8 {
+    var tk: Layout = undefined;
+    try tokenizeStrftime(fmt, &tk);
+    return formatLayout(alloc, parts, &tk);
 }
 
 /// `parse`, also returning where the format ended in `input` (chrono
 /// `parse_and_remainder`): `input[m.len..]` is what `parse` would ignore.
 /// A trailing `[*]` consumes the rest.
 pub fn parsePrefix(input: []const u8, fmt: []const u8) ParseError!PrefixMatch {
-    var tk: Layout = undefined;
-    try tokenize(fmt, &tk);
-    var end: usize = undefined;
-    const parts = try parseTokens(input, tk.toks[0..tk.n], &end);
-    return .{ .parts = parts, .len = end };
+    return parsePrefixOpts(input, fmt, .{});
 }
 
-fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseError!DateParts {
+/// `parsePrefix` with options (`opts.strict` is the whole-input check, which
+/// a prefix parse cannot have: it is ignored here).
+pub fn parsePrefixOpts(input: []const u8, fmt: []const u8, opts: ParseOptions) ParseError!PrefixMatch {
+    var tk: Layout = undefined;
+    try tokenize(fmt, &tk);
+    return tk.parsePrefixOpts(input, opts);
+}
+
+/// How many bytes a numeric field of `width` digits takes at `input[p..]`:
+/// `width` (the caller checks the length), or with `flexible_width` 1..`width`
+/// digits when the next token cannot start with a digit.
+fn fieldLen(input: []const u8, p: usize, width: usize, toks: []const Token, idx: usize, opts: ParseOptions) usize {
+    if (!opts.flexible_width or startsWithDigit(toks, idx + 1)) return width;
+    return findNumberEnd(input, p, width) - p;
+}
+
+/// The token at `toks[i]` can start with an ASCII digit (a number, a fraction,
+/// a literal that begins with one).
+fn startsWithDigit(toks: []const Token, i: usize) bool {
+    if (i >= toks.len) return false;
+    return switch (toks[i]) {
+        .literal => |lit| lit.len > 0 and std.ascii.isDigit(lit[0]),
+        .month_name_short, .month_name_long, .day_name_long, .day_name_short, .ampm_upper, .ampm_lower, .tz_offset, .tz_offset_compact, .wildcard => false,
+        else => true,
+    };
+}
+
+fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize, opts: ParseOptions) ParseError!DateParts {
     var b = Builder{};
+    var dow_seen: ?u32 = null; // weekday read from a name or `e`, for `opts.strict`
     var p: usize = 0;
     var skip_trim = false; // the separator before a `FFF` was absent
 
@@ -866,9 +1093,10 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                 p += 2;
             },
             .month_full => {
-                if (p + 2 > input.len) return ParseError.InvalidFormat;
-                b.month = try parseUint(u32, input[p .. p + 2], ParseError.InvalidDate);
-                p += 2;
+                const w = fieldLen(input, p, 2, toks, idx, opts);
+                if (p + w > input.len) return ParseError.InvalidFormat;
+                b.month = try parseUint(u32, input[p .. p + w], ParseError.InvalidDate);
+                p += w;
             },
             .month_short => {
                 const end = findNumberEnd(input, p, 2);
@@ -885,9 +1113,10 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                 p += r.len;
             },
             .day_full => {
-                if (p + 2 > input.len) return ParseError.InvalidFormat;
-                b.day = try parseUint(u32, input[p .. p + 2], ParseError.InvalidDate);
-                p += 2;
+                const w = fieldLen(input, p, 2, toks, idx, opts);
+                if (p + w > input.len) return ParseError.InvalidFormat;
+                b.day = try parseUint(u32, input[p .. p + w], ParseError.InvalidDate);
+                p += w;
             },
             .day_short => {
                 const end = findNumberEnd(input, p, 2);
@@ -895,7 +1124,9 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                 p = end;
             },
             .day_name_long, .day_name_short => {
-                p += try parseDayName(input[p..]); // informational, not stored
+                const used = try parseDayName(input[p..]);
+                dow_seen = dayNameNumber(input[p .. p + used]); // checked only under `opts.strict`
+                p += used;
             },
             .day_of_week => {
                 const end = findNumberEnd(input, p, 1);
@@ -904,10 +1135,18 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                 if (dow < 1 or dow > 7) return ParseError.InvalidDate;
                 p = end;
                 b.iso_dow = dow; // informational unless a week token is present
+                dow_seen = dow;
             },
             .fraction => |n| {
-                b.nanosecond = try parseFraction(input, p, n);
-                p += n;
+                if (opts.flexible_width and !startsWithDigit(toks, idx + 1)) {
+                    const end = findNumberEnd(input, p, n);
+                    if (end == p) return ParseError.InvalidTime;
+                    b.nanosecond = try parseFraction(input[0..end], p, @intCast(end - p));
+                    p = end;
+                } else {
+                    b.nanosecond = try parseFraction(input, p, n);
+                    p += n;
+                }
             },
             .fraction_trim => |n| {
                 const end = if (skip_trim) p else findNumberEnd(input, p, n);
@@ -926,9 +1165,10 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                 p += 4;
             },
             .iso_week_full => {
-                if (p + 2 > input.len) return ParseError.InvalidFormat;
-                b.iso_week = try parseUint(u32, input[p .. p + 2], ParseError.InvalidDate);
-                p += 2;
+                const w = fieldLen(input, p, 2, toks, idx, opts);
+                if (p + w > input.len) return ParseError.InvalidFormat;
+                b.iso_week = try parseUint(u32, input[p .. p + w], ParseError.InvalidDate);
+                p += w;
             },
             .iso_week_short => {
                 const end = findNumberEnd(input, p, 2);
@@ -936,19 +1176,23 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                 p = end;
             },
             .hour_24_full, .hour_12_full => {
-                if (p + 2 > input.len) return ParseError.InvalidFormat;
-                b.hour = try parseUint(u32, input[p .. p + 2], ParseError.InvalidTime);
-                p += 2;
+                const w = fieldLen(input, p, 2, toks, idx, opts);
+                if (p + w > input.len) return ParseError.InvalidFormat;
+                b.hour = try parseUint(u32, input[p .. p + w], ParseError.InvalidTime);
+                p += w;
+                if (opts.strict and token == .hour_12_full and (b.hour < 1 or b.hour > 12)) return ParseError.InvalidTime;
             },
             .hour_24_short, .hour_12_short => {
                 const end = findNumberEnd(input, p, 2);
                 b.hour = try parseUint(u32, input[p..end], ParseError.InvalidTime);
                 p = end;
+                if (opts.strict and token == .hour_12_short and (b.hour < 1 or b.hour > 12)) return ParseError.InvalidTime;
             },
             .minute_full => {
-                if (p + 2 > input.len) return ParseError.InvalidFormat;
-                b.minute = try parseUint(u32, input[p .. p + 2], ParseError.InvalidTime);
-                p += 2;
+                const w = fieldLen(input, p, 2, toks, idx, opts);
+                if (p + w > input.len) return ParseError.InvalidFormat;
+                b.minute = try parseUint(u32, input[p .. p + w], ParseError.InvalidTime);
+                p += w;
             },
             .minute_short => {
                 const end = findNumberEnd(input, p, 2);
@@ -956,9 +1200,10 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                 p = end;
             },
             .second_full => {
-                if (p + 2 > input.len) return ParseError.InvalidFormat;
-                b.second = try parseUint(u32, input[p .. p + 2], ParseError.InvalidTime);
-                p += 2;
+                const w = fieldLen(input, p, 2, toks, idx, opts);
+                if (p + w > input.len) return ParseError.InvalidFormat;
+                b.second = try parseUint(u32, input[p .. p + w], ParseError.InvalidTime);
+                p += w;
             },
             .second_short => {
                 const end = findNumberEnd(input, p, 2);
@@ -990,10 +1235,17 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                     if (p + 2 > input.len) return ParseError.InvalidTime;
                     const oh = try parseUint(i32, input[p .. p + 2], ParseError.InvalidTime);
                     p += 2;
-                    if (p < input.len and input[p] == ':') p += 1; // optional colon
-                    if (p + 2 > input.len) return ParseError.InvalidTime;
-                    const om = try parseUint(i32, input[p .. p + 2], ParseError.InvalidTime);
-                    p += 2;
+                    // `+hh` alone (no minutes) under `flexible_width`: nothing, or
+                    // something that is not the start of minutes, follows the hour.
+                    const hour_only = opts.flexible_width and (p >= input.len or
+                        (input[p] != ':' and !(p + 1 < input.len and std.ascii.isDigit(input[p]) and std.ascii.isDigit(input[p + 1]))));
+                    var om: i32 = 0;
+                    if (!hour_only) {
+                        if (p < input.len and input[p] == ':') p += 1; // optional colon
+                        if (p + 2 > input.len) return ParseError.InvalidTime;
+                        om = try parseUint(i32, input[p .. p + 2], ParseError.InvalidTime);
+                        p += 2;
+                    }
                     if (oh > 23 or om > 59) return ParseError.InvalidTime;
                     b.off_min = sign * (oh * 60 + om);
                 }
@@ -1066,6 +1318,9 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
         if (result.hour > 23 or result.minute > 59 or result.second > 59 or result.nanosecond > 999_999_999) return ParseError.InvalidTime;
         return ParseError.InvalidDate;
     }
+    if (opts.strict) if (dow_seen) |dow| {
+        if (isoWeekday(ymdToEpochDay(result.year, result.month, result.day)) != dow) return ParseError.InvalidDate;
+    };
     consumed.* = @min(p, input.len);
     return result;
 }
@@ -1347,6 +1602,258 @@ pub fn nthWeekdayOfMonth(year: i32, month: i32, weekday: i32, n: i32) ?DateParts
     return .{ .year = year, .month = m, .day = @intCast(day) };
 }
 
+/// An ISO weekday, Monday first (chrono `Weekday`). The numeric helpers
+/// (`isoWeekday`, `DateParts`) stay `u32` (Mon = 1 ... Sun = 7); `number` and
+/// `fromNumber` convert.
+pub const Weekday = enum(u8) {
+    mon = 1,
+    tue,
+    wed,
+    thu,
+    fri,
+    sat,
+    sun,
+
+    /// 1 (Monday) ... 7 (Sunday).
+    pub fn number(d: Weekday) u32 {
+        return @backingInt(d);
+    }
+
+    /// The weekday of ISO number `n` (1..7), null outside it.
+    pub fn fromNumber(n: u32) ?Weekday {
+        if (n < 1 or n > 7) return null;
+        return @fromBackingInt(@intCast(n));
+    }
+
+    /// The weekday of `parts`' date.
+    pub fn of(parts: DateParts) Weekday {
+        return @fromBackingInt(@intCast(isoWeekday(ymdToEpochDay(parts.year, parts.month, parts.day))));
+    }
+
+    /// `"Monday"`.
+    pub fn name(d: Weekday) []const u8 {
+        return full_day_names[@backingInt(d) - 1];
+    }
+
+    /// `"Mon"`.
+    pub fn short(d: Weekday) []const u8 {
+        return short_day_names[@backingInt(d) - 1];
+    }
+
+    /// A weekday by its English name, full or three-letter, in any ASCII case
+    /// (chrono `FromStr`); null for anything else.
+    pub fn parse(text: []const u8) ?Weekday {
+        const n = dayNameNumber(text) orelse return null;
+        return fromNumber(n);
+    }
+
+    /// The next day of the week (Sunday wraps to Monday).
+    pub fn next(d: Weekday) Weekday {
+        return @fromBackingInt(@intCast(@backingInt(d) % 7 + 1));
+    }
+
+    /// The previous day of the week (Monday wraps to Sunday).
+    pub fn prev(d: Weekday) Weekday {
+        return @fromBackingInt(@intCast((@backingInt(d) + 5) % 7 + 1));
+    }
+
+    /// Days from `d` forward to `other`, 0..6 (chrono `days_since`, reversed).
+    pub fn daysUntil(d: Weekday, other: Weekday) u32 {
+        return (@as(u32, @backingInt(other)) + 7 - @backingInt(d)) % 7;
+    }
+};
+
+/// A month of the year (chrono `Month`).
+pub const Month = enum(u8) {
+    jan = 1,
+    feb,
+    mar,
+    apr,
+    may,
+    jun,
+    jul,
+    aug,
+    sep,
+    oct,
+    nov,
+    dec,
+
+    /// 1 (January) ... 12 (December).
+    pub fn number(m: Month) u32 {
+        return @backingInt(m);
+    }
+
+    /// The month of number `n` (1..12), null outside it.
+    pub fn fromNumber(n: u32) ?Month {
+        if (n < 1 or n > 12) return null;
+        return @fromBackingInt(@intCast(n));
+    }
+
+    /// The month of `parts`; null when `parts.month` is not 1..12.
+    pub fn of(parts: DateParts) ?Month {
+        return fromNumber(parts.month);
+    }
+
+    /// `"January"`.
+    pub fn name(m: Month) []const u8 {
+        return full_month_names[@backingInt(m) - 1];
+    }
+
+    /// `"Jan"`.
+    pub fn short(m: Month) []const u8 {
+        return short_month_names[@backingInt(m) - 1];
+    }
+
+    /// A month by its English name, full or three-letter, in any ASCII case
+    /// (chrono `FromStr`); null for anything else (`"Sept"` included).
+    pub fn parse(text: []const u8) ?Month {
+        for (full_month_names, 1..) |n, i| if (std.ascii.eqlIgnoreCase(text, n)) return @fromBackingInt(@intCast(i));
+        for (short_month_names, 1..) |n, i| if (std.ascii.eqlIgnoreCase(text, n)) return @fromBackingInt(@intCast(i));
+        return null;
+    }
+
+    /// The next month (December wraps to January).
+    pub fn next(m: Month) Month {
+        return @fromBackingInt(@intCast(@backingInt(m) % 12 + 1));
+    }
+
+    /// The previous month (January wraps to December).
+    pub fn prev(m: Month) Month {
+        return @fromBackingInt(@intCast((@backingInt(m) + 10) % 12 + 1));
+    }
+
+    /// Days in this month of `year`.
+    pub fn days(m: Month, year: i32) u32 {
+        return daysInMonth(year, @backingInt(m));
+    }
+};
+
+/// A set of weekdays (chrono `WeekdaySet`): a bit per day, one byte.
+pub const WeekdaySet = struct {
+    bits: u8 = 0,
+
+    pub const empty: WeekdaySet = .{};
+    pub const all: WeekdaySet = .{ .bits = 0b0111_1111 };
+    /// Monday to Friday.
+    pub const weekdays: WeekdaySet = .{ .bits = 0b0001_1111 };
+    /// Saturday and Sunday.
+    pub const weekend: WeekdaySet = .{ .bits = 0b0110_0000 };
+
+    fn bit(d: Weekday) u8 {
+        return @as(u8, 1) << @intCast(@backingInt(d) - 1);
+    }
+
+    pub fn of(days: []const Weekday) WeekdaySet {
+        var s: WeekdaySet = .{};
+        for (days) |d| s.bits |= bit(d);
+        return s;
+    }
+
+    pub fn contains(s: WeekdaySet, d: Weekday) bool {
+        return s.bits & bit(d) != 0;
+    }
+
+    /// Whether `parts`' date falls on a weekday of the set.
+    pub fn containsDate(s: WeekdaySet, parts: DateParts) bool {
+        return s.contains(Weekday.of(parts));
+    }
+
+    /// The set with `d` added (the argument is not changed).
+    pub fn with(s: WeekdaySet, d: Weekday) WeekdaySet {
+        return .{ .bits = s.bits | bit(d) };
+    }
+
+    /// The set without `d`.
+    pub fn without(s: WeekdaySet, d: Weekday) WeekdaySet {
+        return .{ .bits = s.bits & ~bit(d) };
+    }
+
+    pub fn unionWith(s: WeekdaySet, o: WeekdaySet) WeekdaySet {
+        return .{ .bits = s.bits | o.bits };
+    }
+
+    pub fn intersect(s: WeekdaySet, o: WeekdaySet) WeekdaySet {
+        return .{ .bits = s.bits & o.bits };
+    }
+
+    pub fn difference(s: WeekdaySet, o: WeekdaySet) WeekdaySet {
+        return .{ .bits = s.bits & ~o.bits };
+    }
+
+    pub fn len(s: WeekdaySet) u32 {
+        return @popCount(s.bits);
+    }
+
+    pub fn isEmpty(s: WeekdaySet) bool {
+        return s.bits == 0;
+    }
+
+    /// The first day of the set at or after `d` going forward through the
+    /// week (wrapping), null for the empty set.
+    pub fn firstFrom(s: WeekdaySet, d: Weekday) ?Weekday {
+        var x = d;
+        for (0..7) |_| {
+            if (s.contains(x)) return x;
+            x = x.next();
+        }
+        return null;
+    }
+};
+
+/// The seven days of the week that holds a date, for a chosen first day
+/// (chrono `NaiveWeek`; `isoWeek` is the ISO-numbered counterpart).
+pub const Week = struct {
+    /// Epoch day (`ymdToEpochDay`) of the week's first day.
+    first_epoch_day: i64,
+
+    /// The week of `parts`' date that starts on `first`.
+    pub fn of(parts: DateParts, first: Weekday) Week {
+        const ed = ymdToEpochDay(parts.year, parts.month, parts.day);
+        const since: i64 = first.daysUntil(Weekday.fromNumber(isoWeekday(ed)).?);
+        return .{ .first_epoch_day = ed - since };
+    }
+
+    /// The `i`-th day (0..6) as a date at 00:00:00.
+    pub fn day(w: Week, i: u32) DateParts {
+        return epochDayToYmd(w.first_epoch_day +| @as(i64, @min(i, 6)));
+    }
+
+    pub fn firstDay(w: Week) DateParts {
+        return w.day(0);
+    }
+
+    pub fn lastDay(w: Week) DateParts {
+        return w.day(6);
+    }
+};
+
+/// Result of `addTimeOfDay`.
+pub const TimeOfDaySum = struct {
+    /// `parts` with the time of day wrapped into 00:00:00 ... 23:59:59.999999999
+    /// (the date fields are `parts`' own, untouched).
+    parts: DateParts,
+    /// Whole days the sum passed (negative when it went back): add them with
+    /// `addDays` to carry them into the date (chrono `overflowing_add_signed`).
+    days: i64,
+};
+
+/// Add `ns` nanoseconds to `parts`' time of day, wrapping at midnight
+/// instead of touching the date. Exact for every `i64`.
+pub fn addTimeOfDay(parts: DateParts, ns: i64) TimeOfDaySum {
+    const day_ns: i128 = 86_400 * 1_000_000_000;
+    const tod: i128 = (@as(i128, parts.hour) * 3600 + @as(i128, parts.minute) * 60 + parts.second) * 1_000_000_000 + parts.nanosecond;
+    const total = tod + ns;
+    const days: i64 = @intCast(@divFloor(total, day_ns));
+    const w: u64 = @intCast(@mod(total, day_ns));
+    var r = parts;
+    const secs: u32 = @intCast(w / 1_000_000_000);
+    r.hour = secs / 3600;
+    r.minute = secs % 3600 / 60;
+    r.second = secs % 60;
+    r.nanosecond = @intCast(w % 1_000_000_000);
+    return .{ .parts = r, .days = days };
+}
+
 pub fn startOfYear(parts: DateParts) DateParts {
     return .{ .year = parts.year, .month = 1, .day = 1 };
 }
@@ -1533,6 +2040,10 @@ pub fn formatImfFixdate(alloc: std.mem.Allocator, parts: DateParts) ![]u8 {
 /// must be the date's real weekday. RFC 9110's obsolete forms (RFC 850,
 /// asctime) are not accepted here; `parseHttpDate` takes all three.
 pub fn parseImfFixdate(s: []const u8) ParseError!DateParts {
+    return parseImfFixdateMode(s, false);
+}
+
+fn parseImfFixdateMode(s: []const u8, lenient: bool) ParseError!DateParts {
     if (s.len != imf_fixdate_len) return ParseError.InvalidFormat;
     if (!std.mem.eql(u8, s[3..5], ", ") or s[7] != ' ' or s[11] != ' ' or s[16] != ' ' or
         s[19] != ':' or s[22] != ':' or !std.mem.eql(u8, s[25..29], " GMT")) return ParseError.InvalidFormat;
@@ -1548,9 +2059,8 @@ pub fn parseImfFixdate(s: []const u8) ParseError!DateParts {
         .second = try parseUint(u32, s[23..25], ParseError.InvalidTime),
         .off_min = 0,
     };
-    try checkParsed(p);
-    const dow = isoWeekday(ymdToEpochDay(p.year, p.month, p.day));
-    if (!std.mem.eql(u8, s[0..3], short_day_names[dow - 1])) return ParseError.InvalidDate;
+    try checkHttp(p, lenient);
+    try checkDayName(s[0..3], &short_day_names, p, lenient);
     return p;
 }
 
@@ -1564,13 +2074,51 @@ pub fn parseImfFixdate(s: []const u8) ParseError!DateParts {
 /// 20xx, 70..99 → 19xx, like httpdate) instead of RFC 9110's "more than 50
 /// years in the future" rule, which needs a clock.
 pub fn parseHttpDate(s: []const u8) ParseError!DateParts {
-    if (s.len == imf_fixdate_len and s[3] == ',') return parseImfFixdate(s);
-    if (s.len == 24 and s[3] == ' ') return parseAsctime(s);
-    return parseRfc850(s);
+    return parseHttpDateMode(s, false);
+}
+
+/// `parseHttpDate` as a server reads what clients send (what the `http`
+/// module's conditional-request headers accept; RFC 9110 §5.6.7 says a
+/// recipient SHOULD be liberal here): the day name must still be a
+/// well-formed name of its form (exact case; three letters, or the full name
+/// in RFC 850) but is **not** checked against the date, and the leap second
+/// `:60` is accepted -- it comes back as `second == 60` (so `validate` says
+/// false for it; `partsToUnix` gives the first second of the next minute).
+/// Everything else is `parseHttpDate`'s (fixed widths, `GMT`, real day of
+/// the month, the RFC 850 `YY` pivot).
+pub fn parseHttpDateLenient(s: []const u8) ParseError!DateParts {
+    return parseHttpDateMode(s, true);
+}
+
+fn parseHttpDateMode(s: []const u8, lenient: bool) ParseError!DateParts {
+    if (s.len == imf_fixdate_len and s[3] == ',') return parseImfFixdateMode(s, lenient);
+    if (s.len == 24 and s[3] == ' ') return parseAsctime(s, lenient);
+    return parseRfc850(s, lenient);
+}
+
+/// `checkParsed`, with the leap second `:60` allowed when `lenient`.
+fn checkHttp(p: DateParts, lenient: bool) ParseError!void {
+    if (lenient and p.second == 60) {
+        var q = p;
+        q.second = 59;
+        return checkParsed(q);
+    }
+    return checkParsed(p);
+}
+
+/// The day name of an HTTP date: strict -- the date's real weekday;
+/// lenient -- any of the form's names.
+fn checkDayName(name: []const u8, names: []const []const u8, p: DateParts, lenient: bool) ParseError!void {
+    if (lenient) {
+        for (names) |n| if (std.mem.eql(u8, name, n)) return;
+        return ParseError.InvalidFormat;
+    }
+    const dow = isoWeekday(ymdToEpochDay(p.year, p.month, p.day));
+    if (!std.mem.eql(u8, name, names[dow - 1])) return ParseError.InvalidDate;
 }
 
 /// `Sunday, 06-Nov-94 08:49:37 GMT`.
-fn parseRfc850(s: []const u8) ParseError!DateParts {
+fn parseRfc850(s: []const u8, lenient: bool) ParseError!DateParts {
     const comma = std.mem.indexOfScalar(u8, s, ',') orelse return ParseError.InvalidFormat;
     const dow_name = s[0..comma];
     const r = s[comma..];
@@ -1587,14 +2135,13 @@ fn parseRfc850(s: []const u8) ParseError!DateParts {
         .second = try parseUint(u32, r[18..20], ParseError.InvalidTime),
         .off_min = 0,
     };
-    try checkParsed(p);
-    const dow = isoWeekday(ymdToEpochDay(p.year, p.month, p.day));
-    if (!std.mem.eql(u8, dow_name, full_day_names[dow - 1])) return ParseError.InvalidDate;
+    try checkHttp(p, lenient);
+    try checkDayName(dow_name, &full_day_names, p, lenient);
     return p;
 }
 
 /// `Sun Nov  6 08:49:37 1994`.
-fn parseAsctime(s: []const u8) ParseError!DateParts {
+fn parseAsctime(s: []const u8, lenient: bool) ParseError!DateParts {
     if (s[7] != ' ' or s[10] != ' ' or s[13] != ':' or s[16] != ':' or s[19] != ' ') return ParseError.InvalidFormat;
     // date3 day = 2DIGIT / ( SP DIGIT )
     const day_field = if (s[8] == ' ') s[9..10] else s[8..10];
@@ -1607,9 +2154,8 @@ fn parseAsctime(s: []const u8) ParseError!DateParts {
         .second = try parseUint(u32, s[17..19], ParseError.InvalidTime),
         .off_min = 0,
     };
-    try checkParsed(p);
-    const dow = isoWeekday(ymdToEpochDay(p.year, p.month, p.day));
-    if (!std.mem.eql(u8, s[0..3], short_day_names[dow - 1])) return ParseError.InvalidDate;
+    try checkHttp(p, lenient);
+    try checkDayName(s[0..3], &short_day_names, p, lenient);
     return p;
 }
 
@@ -3390,6 +3936,7 @@ test {
     _ = @import("lead_test.zig");
     _ = @import("model_fuzz_test.zig");
     _ = @import("parity_test.zig");
+    _ = @import("flex_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

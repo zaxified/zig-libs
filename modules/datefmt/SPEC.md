@@ -88,7 +88,11 @@ written without its separator and followed by a literal that starts with the oth
 (`parseImfFixdate`), the obsolete RFC 850 form and C's asctime form (day space-padded or two digits). UTC `DateParts`
 (`off_min` 0); names case-sensitive; the day name must be the date's real weekday in every form (as the httpdate
 crate checks). The RFC 850 two-digit year uses the `YY` pivot (00..69 → 20xx, 70..99 → 19xx, like httpdate)
-instead of RFC 9110's "more than 50 years in the future" rule, which needs a clock. It is strict (see Backlog for a lenient option).
+instead of RFC 9110's "more than 50 years in the future" rule, which needs a clock. It is strict; `parseHttpDateLenient` is what a server reads off the wire: the day name must still be a well-formed name of its form (exact case) but is not checked against the date, and the leap second `:60` is kept (`second == 60`, so `partsToUnix` gives the next minute's first second). Everything else is the strict parser's. The `http` module's conditional-request headers use it (chrono has no HTTP-date form; Go's `http.ParseTime` checks neither the weekday nor the leap second, which is the majority reading).
+
+**Parse options and strftime.** `parseOpts(input, fmt, .{ .flexible_width, .strict })` (also `parsePrefixOpts`, `Layout.parseOpts`/`parsePrefixOpts`). `flexible_width` reads a fixed-width numeric field (`MM DD hh ii mm ss WW`, the `SSS` fractions, the minutes of a `ZZ` offset) as 1 to its width in digits when the next token cannot start with a digit -- chrono's `%m` (it scans 1..2 digits), Python's `strptime` and polars -- so `2021-3-4` reads under `YYYY-MM-DD`, `.5` under `.SSS` and `+09` under `ZZ`; a field followed by a digit keeps its full width (`YYYYMMDD`), `YYYY` is always four digits, and the default stays the zero-padded full width (Go's `01` rule; `M`/`D`/`h`... are the per-field 1..2 digit tokens). `strict` is the checks the lenient `parse` leaves out: trailing input is `InvalidFormat`, a 12-hour field outside 1..12 is `InvalidTime`, a weekday name or `e` that is not the date's weekday is `InvalidDate` (chrono's `parse_from_str` does all three). Both are opt-in: the default `parse` is unchanged, so no consumer's accepted inputs move. The strftime syntax is a second spelling of the same tokens: `parseStrftime(input, fmt)` (flexible width, as chrono), `formatStrftime(alloc, parts, fmt)` and `Layout.compileStrftime(fmt)` take `%Y %y %m %d %H %I %M %S %p %P %B %b %h %A %a %j %z %:z %F %T %R %D %r %x %X %G %V %u %f %3f %6f %9f %.3f %.6f %.9f %n %t %%` and `%-d %-m %-H %-I %-M %-S` (unpadded); any other directive (`%e %k %l %_d` space padding, `%Z` zone names, `%s`, `%c`, `%U %W %w %C %g`, `%.f`, ...) is `InvalidFormatString`, so a format string that needs it is not silently misread. `%f` is chrono's nine digits (Python's `%f` is six: use `%6f`); `%x`/`%X` are the C locale (`%m/%d/%y`, `%T`).
+
+**Weekday, Month, WeekdaySet, Week.** `Weekday` (`mon = 1` ... `sun = 7`) and `Month` (`jan = 1` ... `dec = 12`) are enums beside the `u32` fields of `DateParts` (which stay `u32`: no source break): `number`/`fromNumber`, `of(parts)`, `name`/`short`, `parse` (English name, full or three letters, any ASCII case, as chrono's `FromStr`; `Sept` is not a name), `next`/`prev` (wrapping), `Weekday.daysUntil`, `Month.days(year)`. `WeekdaySet` is one byte (`of`, `contains`, `containsDate`, `with`/`without`, `unionWith`/`intersect`/`difference`, `len`, `firstFrom`; constants `empty`, `all`, `weekdays`, `weekend`). `Week.of(parts, first)` is chrono's `NaiveWeek`: the seven days from the last `first` weekday on or before the date (`firstDay`, `lastDay`, `day(i)`). `addTimeOfDay(parts, ns)` wraps the time of day at midnight and returns the carried whole days (chrono's `overflowing_add_signed`), exact for every `i64`.
 
 **Fractional seconds.** `DateParts.nanosecond: u32 = 0` (0..999_999_999; `validate` rejects more). Tokens
 `SSS`/`SSSSSS`/`SSSSSSSSS` (3/6/9 digits = ms/µs/ns) are fixed-width in `parse` (digits only, no sign, no
@@ -122,7 +126,7 @@ a config value) and are covered by the mutated/random-input test in `go_oracle_t
 locale names, timezone-aware values and calendar periods (reasons in *What is deliberately not done*).
 
 Known limits a consumer relies on:
-- `parse` is lenient where the canned `parse*` functions are not: trailing input is ignored, `ii` is neither
+- `parse` is lenient where the canned `parse*` functions are not (`ParseOptions.strict` is the strict reading): trailing input is ignored, `ii` is neither
   range-checked nor tied to `a` (`13 AM` → 13:00), a weekday name is not checked against the date, `MM`/`DD` are
   ignored when a week token is present, an unterminated `[` makes the rest literal, `SSSS` is `SSS` plus a literal `S`.
   Short and long month-name errors differ (`InvalidFormat` vs `InvalidDate`).
@@ -168,7 +172,7 @@ engine with a layout Go does not special-case (`fmt_rfc3339_tokens`).
   that is the separate `tz` module (`toUtc`/`partsToUnix` give the arithmetic; composing them is the caller's).
 - **Calendar periods in duration text** (`PnYnMnD`) — durations are exact nanoseconds; month/year counts go to
   `addMonths`/`addYears`. `TimeDelta` range beyond ±292 years: durations are Go's `i64` nanoseconds.
-- **Space-padded fields and per-field padding modifiers** (`%e`, `%k`, `%l`, Go `_2`, `%-d`, `%_d`), **Sunday-first week
+- **Space-padded fields** (`%e`, `%k`, `%l`, `%_d`, Go `_2`) and **per-field padding modifiers other than strftime's `%-d`/`%-m`/`%-H`/`%-I`/`%-M`/`%-S`** (the native token syntax has no spelling for them; the strftime syntax refuses them by name), **Sunday-first week
   numbers** (`%U`, `%W`), 2-digit ISO week-year (`%g`), century (`%C`), Sunday-0 weekday (`%w`), a quarter token (`%q`;
   `quarter()` exists) — no spelling is free: `_` is a common literal separator (`YYYY_MM_DD`) and format strings reach
   users through a consumer's expression language, so a new meaning for an existing byte would silently change their
@@ -183,22 +187,7 @@ engine with a layout Go does not special-case (`fmt_rfc3339_tokens`).
 - **Leap-second `:60` in RFC 3339 / RFC 5322** — refused by design (the grammar leads on the card).
 
 ## Backlog / deferred
-- **HTTP-date leniency.** The `http` module keeps its own `parseHttpDate` because it accepts what clients send (no
-  weekday check, second 60) while `datefmt.parseHttpDate` is strict. A `lenient` option here would let http drop its copy.
-- **Non-padded numeric fields in `parse`** (from a pandas/polars strptime comparison in the `dataframe` module's oracle):
-  pandas and polars (chrono) read `2021-3-4`, a one-digit hour, a fraction shorter than its token and a `+hh` offset
-  under a zero-padded format; this parser needs every numeric field at full width. Ideal: a field reads 1..width digits
-  when the next layout byte is not a digit (chrono's rule), strict width behind an option for the fixed-width formats.
-- **strftime `%` directives as an alternative layout syntax** (the `dataframe` module's `translateFormat` works around
-  it): chrono, zeit, Python and polars take `%Y-%m-%d %H:%M:%S`; this module takes only its own token vocabulary, so
-  every consumer that accepts a user's format string translates it. Ideal API: `parseStrftime(fmt, text)` /
-  `formatStrftime(fmt, parts, buf)` (or a `Syntax.strftime` switch on `parse`/`format`) covering the C99 + POSIX
-  directives the token vocabulary can already express, the rest refused by name. The space-padding question above is
-  moot inside a strftime string: there the letters already have meanings.
-- **Opt-in strict mode for `parse`** (end of input, `ii` 1..12, weekday check) instead of a behaviour change, for the
-  leniencies listed under Limits. Idea, no consumer yet.
-- **`Weekday`/`Month` enums with names and parsing, `WeekdaySet`, `NaiveWeek`**: an API change (`u32` fields today);
-  edge. **Wrapping time-of-day arithmetic**: edge.
+- none.
 
 ## Anchoring
 
