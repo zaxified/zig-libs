@@ -773,6 +773,14 @@ pub const CombineError = UnsignedTxError || error{
     DifferentTransactions,
 };
 
+/// Static storage for a merged `PSBT_GLOBAL_TX_MODIFIABLE` byte: records borrow their value, so the combined flags
+/// point into this table (every byte value, one entry each) instead of an allocation.
+const modifiable_bytes: [256]u8 = blk: {
+    var t: [256]u8 = undefined;
+    for (&t, 0..) |*e, i| e.* = @intCast(i);
+    break :blk t;
+};
+
 fn keysEqual(a: Record, b: Record) bool {
     return a.keytype == b.keytype and std.mem.eql(u8, a.keydata, b.keydata);
 }
@@ -858,6 +866,20 @@ pub fn combine(allocator: Allocator, a: Psbt, b: Psbt) CombineError!Psbt {
 
     var global = try mergeMaps(allocator, a.global, b.global);
     errdefer global.deinit(allocator);
+    if (a.psbtVersion() == 2) {
+        // BIP370 leaves the flags open; Bitcoin Core's `Merge` ANDs them (an absent field counts as 0, so a
+        // PSBT that allows nothing stays closed) and ORs bit 2 (some signature uses SIGHASH_SINGLE).
+        const fa = v2.txModifiable(a);
+        const fb = v2.txModifiable(b);
+        if (fa != null or fb != null) {
+            const x = fa orelse 0;
+            const y = fb orelse 0;
+            const merged: u8 = (x & y & ~v2.has_sighash_single) | ((x | y) & v2.has_sighash_single);
+            for (global.records) |*r| {
+                if (r.keytype == global_key.TX_MODIFIABLE and r.keydata.len == 0) r.value = modifiable_bytes[merged..][0..1];
+            }
+        }
+    }
 
     var inputs: std.ArrayList(Map) = .empty;
     errdefer {

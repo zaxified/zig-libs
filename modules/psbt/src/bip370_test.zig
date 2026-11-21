@@ -316,6 +316,48 @@ test "combine on version 2: same unique id merges (sequences may differ), differ
     try testing.expectError(error.DifferentTransactions, psbt.combine(a, v0, p1));
 }
 
+/// Sets the flags byte of `p`, or drops the field when `flags` is null.
+fn withFlags(a: std.mem.Allocator, p: *psbt.Psbt, flags: ?u8) !void {
+    if (flags) |f| return v2.setTxModifiable(a, p, f);
+    var keep: std.ArrayList(psbt.Record) = .empty;
+    for (p.global.records) |r| {
+        if (r.keytype != psbt.global_key.TX_MODIFIABLE) try keep.append(a, r);
+    }
+    p.global.records = try keep.toOwnedSlice(a);
+}
+
+test "combine on version 2 merges TX_MODIFIABLE as Bitcoin Core does: AND, except bit 2 which is OR" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cases = [_]struct { x: ?u8, y: ?u8, want: ?u8 }{
+        .{ .x = 3, .y = 1, .want = 1 },
+        .{ .x = 3, .y = 3, .want = 3 },
+        .{ .x = 1, .y = 2, .want = 0 },
+        .{ .x = 3, .y = 4, .want = 4 }, // bit 2 from either side
+        .{ .x = 3 | 4, .y = 1, .want = 1 | 4 },
+        .{ .x = 0x0b, .y = 0x03, .want = 3 }, // undefined bit 3 needs both
+        .{ .x = null, .y = 3, .want = 0 }, // an absent field counts as 0
+        .{ .x = 3, .y = null, .want = 0 },
+        .{ .x = null, .y = 4, .want = 4 },
+        .{ .x = null, .y = null, .want = null },
+    };
+    for (cases) |c| {
+        var p1 = try v2.create(a, 2, null, 3);
+        try v2.addInput(a, &p1, .{ .txid = txid_a, .vout = 0 });
+        try withFlags(a, &p1, c.x);
+        var p2 = try v2.create(a, 2, null, 3);
+        try v2.addInput(a, &p2, .{ .txid = txid_a, .vout = 0 });
+        try withFlags(a, &p2, c.y);
+        const m = try psbt.combine(a, p1, p2);
+        try testing.expectEqual(c.want, v2.txModifiable(m));
+        // The result is symmetric.
+        const m2 = try psbt.combine(a, p2, p1);
+        try testing.expectEqual(c.want, v2.txModifiable(m2));
+    }
+}
+
 // ── finalize / extract on version 2 ─────────────────────────────────────
 
 test "a version 2 PSBT of BIP174's finalize example finalizes and extracts to the same transaction" {

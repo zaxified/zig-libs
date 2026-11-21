@@ -267,8 +267,9 @@ locktime on any input gives the fallback (default 0); otherwise the kind every c
 (height when both are possible) and the value is the maximum of that kind. `finalize` keeps `PREVIOUS_TXID`,
 `OUTPUT_INDEX`, `SEQUENCE` and the required locktimes when it clears an input (BIP370 §Input Finalizer). `combine`
 compares version 2 PSBTs by their unique id (`psbt.v2.uniqueId`: the txid of the transaction with every sequence
-zeroed, BIP370 §"Unique Identification"; a different version is `DifferentTransactions`), merges first-wins like
-every conflicting value, including the `TX_MODIFIABLE` byte. The version 2 **Creator and Constructor** are
+zeroed, BIP370 §"Unique Identification"; a different version is `DifferentTransactions`), merges first-wins on every
+conflicting value except the `TX_MODIFIABLE` byte, which follows Bitcoin Core's `Merge` (BIP370 is silent): bits 0, 1 and
+the undefined bits are ANDed (an absent field counts as 0), bit 2 (SIGHASH_SINGLE) is ORed. The version 2 **Creator and Constructor** are
 `psbt.v2.create` (no inputs, no outputs), `addInput` and `addOutput` (they check the `TX_MODIFIABLE` flag, an
 absent flag meaning nothing may be added, keep the count fields in step, refuse an input whose locktime kind
 cannot be combined with the existing inputs' (`ConflictingLocktimes`) or that would move the locktime of a PSBT
