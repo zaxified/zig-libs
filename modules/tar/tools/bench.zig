@@ -8,7 +8,10 @@
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-tar` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs go 1.26, the
-//! standard library only (`GOPROXY=off`). Run from the repository root.
+//! standard library only (`GOPROXY=off`), and cargo for tar-rs 0.4.46 (MIT OR
+//! Apache-2.0, `tools/rust_bench`, built `--offline --locked`: run one
+//! `cargo build --release` in that directory once to fill the registry cache).
+//! Run from the repository root.
 //!
 //! Corpora, fixed seed, written by this driver into `.zig-cache/bench-tar/`
 //! with this module's Writer (Go reads the same files):
@@ -50,6 +53,7 @@ const ref_card = "Go 1.26.8 archive/tar";
 const bench_name = "bench-tar";
 const work_dir = ".zig-cache/bench-tar";
 const go_dir = "modules/tar/tools/go_bench";
+const cargo_manifest = "modules/tar/tools/rust_bench/Cargo.toml";
 // global-alloc-ok: bench driver, one per-member allocation pair per entry as any consumer would pay.
 const bench_gpa = std.heap.smp_allocator;
 
@@ -236,20 +240,40 @@ pub fn main(init: std.process.Init) !u8 {
     try setup(arena, io, dir, ctx);
 
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
+    // tar-rs (`tools/rust_bench`, pinned) is the second foreign side, for the
+    // `fastest` ratio. It needs `cargo`; the crates come from the registry
+    // cache (one online `cargo build --release` in the crate dir fills it).
+    var env = try init.environ_map.clone(arena);
+    const target = try arena.print("{s}/target", .{abs});
+    try env.put("CARGO_TARGET_DIR", target);
+    try env.put("RUSTFLAGS", "-C target-cpu=native");
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const cres = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--locked", "--offline", "--quiet", "--manifest-path", cargo_manifest },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- the benchmark needs it\n", .{ bench_name, e });
+        return 1;
+    };
+    if (cres.term != .exited or cres.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, cres.stderr });
+        return 1;
+    }
+    const rexe = try arena.print("{s}/release/rust_bench", .{target});
     const W = bench.Work(Op);
     const ws = [_]W{
-        .{ .name = "read_many", .op = .read_many, .ref = "read_many", .wall_only = true },
-        .{ .name = "read_pax", .op = .read_pax, .ref = "read_pax", .wall_only = true },
-        .{ .name = "read_big", .op = .read_big, .ref = "read_big", .wall_only = true },
-        .{ .name = "write_many", .op = .write_many, .ref = "write_many", .wall_only = true },
-        .{ .name = "write_big", .op = .write_big, .ref = "write_big", .wall_only = true },
+        .{ .name = "read_many", .op = .read_many, .ref = "read_many", .alt = "read_many", .alt_exe = 1, .wall_only = true },
+        .{ .name = "read_pax", .op = .read_pax, .ref = "read_pax", .alt = "read_pax", .alt_exe = 1, .wall_only = true },
+        .{ .name = "read_big", .op = .read_big, .ref = "read_big", .alt = "read_big", .alt_exe = 1, .wall_only = true },
+        .{ .name = "write_many", .op = .write_many, .ref = "write_many", .alt = "write_many", .alt_exe = 1, .wall_only = true },
+        .{ .name = "write_big", .op = .write_big, .ref = "write_big", .alt = "write_big", .alt_exe = 1, .wall_only = true },
     };
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     const s = bench.drive(io, arena, .{
         .name = bench_name,
-        .exes = &.{exe},
+        .exes = &.{ exe, rexe },
         .abs = abs,
         .filters = if (args.len > 1) args[1..] else &.{},
         .rounds = rounds,

@@ -1,0 +1,21 @@
+[package]
+name = "rust_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Second foreign side of `zig build bench-tar` (modules/tar/tools/bench.zig):
+# tar-rs 0.4.46 (MIT OR Apache-2.0), pinned exactly. Go's archive/tar stays the
+# reference; this one feeds the `fastest` ratio. Build once with network
+# (`cargo build --release` in this directory), the bench then builds it
+# `--offline --locked`.
+[dependencies]
+tar = "=0.4.46"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-11-04 (`TAR_FUZZ`: `reader`/`mutated` 30,000 runs and the new `sparse` harness 100,000 runs clean, Debug; `sparse` reach: `sparse_entry` 67,599 and `after_sparse` 58,793 of 100,000, i.e. past the sparse member to the one behind it) · ct n/a — archive reading (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: iterative `packDir` walk, unopenable files skipped before the header, short reads zero-padded and counted in `skipped`, `writeEntry` checked panic; delta audit 18/24 + 5 eq, 1 unkillable (needs a truncation race))
 
-**Performance:** ref 0.15–1.01× Go 1.26.8 `archive/tar` (`zig build bench-tar -Djcc-safe`, final code, 2026-11-04, two runs of 11 and 15 rounds, worst ratio 0.99 and 1.01: `read_many` 0.19× (2048 members, 4 MB), `read_pax` 0.15–0.16× (1024 pax long-path members), `read_big` 0.99–1.01× (one 32 MiB member, copy-bound: both sides are memcpy-limited, so about 1.0 with 9–18 % spread, inside 1.1× but not distinguishable from parity), `write_many` 0.17× (0.10× in an earlier run before owner names were added to the header path and without `-Djcc-safe`), `write_big` 0.43×; memory to memory, a counting sink, same bytes both sides; shared machine, spreads 5–35 %; the Go side cannot be JCC-padded) · fastest ? (Zig `std.tar` reads `read_many`/`read_pax` in 0.66–0.86× our time while surfacing no uid/gid/mtime, i.e. less work, informational; tar-rs, libarchive and GNU/busybox tar not measured: no foreign build, see Compared with) (measured 2026-11-04)
+**Performance:** ref 0.15–1.01× Go 1.26.8 `archive/tar` (`zig build bench-tar -Djcc-safe`, final code, 2026-11-04, two runs of 11 and 15 rounds, worst ratio 0.99 and 1.01: `read_many` 0.19× (2048 members, 4 MB), `read_pax` 0.15–0.16× (1024 pax long-path members), `read_big` 0.99–1.01× (one 32 MiB member, copy-bound: both sides are memcpy-limited, so about 1.0 with 9–18 % spread, inside 1.1× but not distinguishable from parity), `write_many` 0.17× (0.10× in an earlier run before owner names were added to the header path and without `-Djcc-safe`), `write_big` 0.43×; memory to memory, a counting sink, same bytes both sides; shared machine, spreads 5–35 %; the Go side cannot be JCC-padded) · fastest ? (Zig `std.tar` reads `read_many`/`read_pax` in 0.66–0.86× our time while surfacing no uid/gid/mtime, i.e. less work, informational; tar-rs 0.4.46 is timed too (`tools/rust_bench`, third run of 15 rounds, ours/tar-rs 0.46–0.51 on `read_many`/`read_pax`/`write_many`/`write_big`, 1.0 on `read_big`) but the spreads were 20–70 % on a loaded machine, so no `fastest` claim; libarchive and GNU/busybox tar not measured, see Compared with) (measured 2026-11-04)
 
 **Known defects:** none recorded
 
@@ -25,7 +25,7 @@ Surveyed 2026-09-30, re-surveyed for S2 on 2026-11-04 per `SURVEY-PLAYBOOK.md` a
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [Go `archive/tar`](https://pkg.go.dev/archive/tar) — **reference** (measured, `tools/go_bench`) | Go | BSD-3-Clause *(Go stdlib; [I])* | — | Go 1.26.8 | Reads and writes ustar, pax (path/linkpath/size/uid/gid/uname/mtime, arbitrary records), GNU long names, GNU and pax sparse on read [V: `go doc`, and Go read our four GNU tar sparse fixtures to the same SHA-256]; `Header`/`FileInfoHeader`; `ErrInsecurePath` for non-local names under `GODEBUG=tarinsecurepath=0` [V]. Pax 'g' headers are parsed and composed but "not persisted across files" [V]. Here: all of the above except arbitrary records and sparse writing; `checkEntry` is the explicit form of `ErrInsecurePath` and also covers link targets and special files. |
-| [alexcrichton/tar-rs](https://github.com/alexcrichton/tar-rs) | Rust | MIT OR Apache-2.0 (LICENSE-MIT + LICENSE-APACHE present) | 739 | 0.4.46 (2026-05) | Reader/Builder, `unpack` to disk with path-safety handling, pax long paths, GNU extensions *[I]*. Not benchmarked: no pinned crate in the offline cargo cache and no download was made. We have no extraction-to-disk helper (see *What is deliberately not done*). |
+| [alexcrichton/tar-rs](https://github.com/alexcrichton/tar-rs) | Rust | MIT OR Apache-2.0 (LICENSE-MIT + LICENSE-APACHE present) | 739 | 0.4.46 (2026-05) | Reader/Builder, `unpack` to disk with path-safety handling, pax long paths, GNU extensions *[I]*. Benchmarked as the second foreign side of `bench-tar` (`tools/rust_bench`, pinned `=0.4.46`, header built from the fields for each member as the other sides do, count formula equal): about 2× our time on the small-member rows, equal on one 32 MiB member; the run was too noisy to claim it (see the Performance line). We have no extraction-to-disk helper (see *What is deliberately not done*). |
 | [libarchive/libarchive](https://github.com/libarchive/libarchive) | C | BSD-2-Clause (COPYING; API says NOASSERTION) | 3.6k | v3.8.9 (2026-07) | Every tar dialect, pax, sparse, many other formats and filters. The de-facto everything-archive library; different scale. Not benchmarked (C build and no `bsdtar` on this host). |
 | GNU tar 1.35 / busybox 1.37 tar | C | GPL-3.0-or-later / GPL-2.0 *[I]*; source never read | — | — | Black-box oracles only: the goldens, the four sparse fixtures (`tar --sparse`) and the live `tar tvf`/`xf` cross-checks. Full feature set incl. `--sparse`, pax global headers, xattrs/ACLs, `--one-top-level`, `-P`. |
 | [Zig `std.tar`](https://ziglang.org/documentation/master/std/#std.tar) — **fastest measured** (partial) | Zig | MIT | — | Zig 0.17.0 | Iterator, `extract` to a directory; understands pax path/linkpath/size, skips GNU sparse extension blocks without expanding them [V: source of the toolchain, public API]; drops uid/gid/mtime. Reads `read_many`/`read_pax` faster than we do because it parses less; informational, the figures are the card's `**Performance:**` line. |
@@ -142,7 +142,7 @@ extractor: path-escape checks belong to whoever extracts.
 
 ## Verification
 
-`scripts/modtest tar` (`zig build test-tar`); `zig build bench-tar` (needs go); `zig build interop-tar` re-takes the Go
+`scripts/modtest tar` (`zig build test-tar`); `zig build bench-tar` (needs go and cargo; tar-rs is built offline from the registry cache, one online `cargo build --release` in `tools/rust_bench` fills it); `zig build interop-tar` re-takes the Go
 oracle (below). Size and 32-bit: see *Build options*.
 
 - **Writer and reader goldens.** Header bytes captured from GNU tar 1.35 pinned (read side) and field-compared
@@ -239,9 +239,6 @@ of a member to disk and a sparse header of a few hundred bytes can declare a lar
 - **std workaround to drop when std is fixed:** `Reader.discard` (256 MiB steps) works around
   `std.Io.Reader.discardAll64` overflowing `seek + n` on 32-bit targets. Zig upstream takes no agent reports, so there is
   no report to file; delete the workaround when a newer std no longer overflows.
-- **Not measured:** tar-rs, libarchive and GNU/busybox tar throughput (no `bsdtar`; no pinned crate in the offline cargo
-  cache; CLI timing is process-bound). To add tar-rs: a `tools/rust_bench` crate pinned to `tar = "=0.4.46"` built with
-  `cargo build --release` in its own `target/`.
 
 ## Anchoring
 
