@@ -1079,6 +1079,24 @@ coconut	ReleaseFast	user_issue	1	21	01094de468b4fd8b	af24664cb307a403
 # proveBody < run@burn.zig) except the Fr.fromBytes rejection-sampler context
 # reached from Entropy.scalar, 5 -> 4 distinct chains. No new site.
 coconut	ReleaseFast	user_show	1	26	03ce935337b645ec	286e5ea12d924b29
+# coconut blind issuance (2026-11-21): three targets over blind.zig (paper section 4.3), read
+# context by context from a --stacks run.
+# blind_prepare 45 = user's private attributes + every random draw (o, k_i, witnesses) tainted:
+#   7 `Fr.fromBytes` canonicality verdicts on the raw draws (keys.zig Entropy.scalar, the same
+#   class as user_show; the harness's top byte 0 makes every draw pass); 11 `toAffine` identity
+#   verdicts (g1.zig:159) on cm, Cw, each a_i, b_i, Aw_i, Bw_i and h; 17 in hash-to-curve of cm
+#   (fp.zig sqrt/inv, sswuG1, isogenyMap11, the user_issue class) -- cm is the blinded commitment
+#   the request publishes; 10 `toBytesCompressed` sign-bit comparisons (fp.zig gtLimbs): cm's
+#   (1), the challenge transcript's points (7), all published or recomputed by the authority from
+#   the published proof, and the harness's own output encoding (2). No context reads a private
+#   attribute, `o`, a `k_i` or a witness other than through those verdicts and published points.
+# blind_sign 4 = authority key share tainted: `toAffine` identity verdicts of the two output
+#   points (blindSignBody's a, b) + the harness's encoding of them (2). The proof check runs
+#   before the share is read.
+# unblind 2 = ElGamal secret d tainted: `toAffine` identity verdict of s + the harness's encoding.
+coconut	ReleaseFast	blind_prepare	1	45	966e28a34bfb344b	053f2af7fbd7948d
+coconut	ReleaseFast	blind_sign	1	4	966e28a34bfb344b	3bfff44503633af4
+coconut	ReleaseFast	unblind	1	2	966e28a34bfb344b	77d4ab19fd73fe6f
 # hpke x25519 (2026-11-01): X25519 moved from std to ct25519 -- std's curve25519.zig isZero context is gone (ct25519's identity check is constant time): x25519 1->0 / 2->0 in-file, xwing 2->1.
 hpke	ReleaseFast	x25519_decap	1	0	988bf797e9128852	c0cee0a8c6bf72c3
 hpke	ReleaseFast	x25519_authdecap	1	0	988bf797e9128852	05af25d1d0e3943d
@@ -2515,6 +2533,9 @@ tls13	ReleaseFast	x25519mlkem768_server	1	1	4115b347f0c1b95d	3335c00d4dcdf9e5	cp
 # into the vartime addAffineVt (-2); coconut user_issue +6 at bls12_381 fp.zig sqrt (a
 # site the native row already counts); tlsserver hs also has B.
 coconut	ReleaseFast	user_issue	1	27	01094de468b4fd8b	af24664cb307a403	cpu=x86_64
+# coconut blind_prepare +6 on the portable lane (2026-11-21): the same bls12_381 fp.zig sqrt shape as
+# user_issue above, reached through hash-to-curve of the published cm.
+coconut	ReleaseFast	blind_prepare	1	51	966e28a34bfb344b	053f2af7fbd7948d	cpu=x86_64
 # voprf p384-server (+4 at p384 field.zig, objdump of the x86_64 harness, 2026-11-18): all 4 are
 # `Use of uninitialised value of size 8` at 0x10d9c0d `mov (%rsi),%r12`, the first load of the out-of-
 # line `mulPortable` through a pointer to the wNAF table point. Callers: group.zig addAffineVt

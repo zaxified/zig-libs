@@ -15,7 +15,8 @@
 //!         zig-out/ctgrind/ctgrind-coconut <target> <yes|no>
 //!
 //! Usage: ctgrind-coconut <target> <yes|no>
-//!   targets: authority_sign | user_issue | user_show
+//!   targets: authority_sign | user_issue | user_show | blind_prepare |
+//!            blind_sign | unblind
 //!
 //! ## Existing constant-time claim: NONE
 //!
@@ -40,12 +41,9 @@
 //!   harness starts AT the point the share already exists (an established
 //!   authority key), matching every real `signPartial` call site — there
 //!   is no `keys.keygenFrom` dealer step to taint here. The attribute
-//!   vector passed alongside it is left PUBLIC/untainted: blind issuance
-//!   (ElGamal blinding + NIZK π_s, `SPEC.md`'s "deferred increments") does
-//!   not exist yet in this module, so in the CURRENT implementation the
-//!   attributes genuinely do reach the authority in the clear — tainting
-//!   them here would be evidence for a threat model this code does not yet
-//!   implement.
+//!   vector passed alongside it is left PUBLIC/untainted: on this path
+//!   (public issuance) the attributes reach the authority in the clear.
+//!   Blind issuance, where they do not, has its own three targets below.
 //! * `user_issue` — the USER's own private attribute vector `m_1..m_q`
 //!   entering `Parameters.commonBase` (`params.zig`), i.e. the commitment
 //!   `cm = Σ [m_i] h_i` the user computes LOCALLY before ever contacting an
@@ -65,6 +63,11 @@
 //!   (`credential.zig`'s own doc comment on the two-transcript extraction
 //!   risk if the blinding stream ever repeats — the same property a timing
 //!   leak would defeat by a different route).
+//! * `blind_prepare` / `blind_sign` / `unblind` — blind issuance
+//!   (`blind.zig`, §4.3): the user's private attributes and the request's
+//!   randomness in `prepareBlindSign`; an authority's key share in
+//!   `blindSign`; the user's ElGamal secret `d` in `unblind`. Each function's
+//!   doc comment below says what is tainted and what is public.
 //!
 //! ## Two taint techniques, and why they differ
 //!
@@ -262,8 +265,8 @@ const TaintedRandom = struct {
 
 /// `authority_sign`: an authority's Shamir key share entering `signPartial`
 /// (§4.2 `Sign`). TAINTED: `x(j)`, `y_1(j)..y_q(j)`. PUBLIC: the attribute
-/// vector and the common base `h` (blind issuance is not implemented yet —
-/// see the module doc comment).
+/// vector and the common base `h` (public issuance; see the module doc
+/// comment).
 fn runAuthoritySign(allocator: std.mem.Allocator, tainted: bool) !void {
     const q = 3;
     const p = try coconut.params.Parameters.generate(allocator, q);
@@ -343,13 +346,118 @@ fn runUserShow(allocator: std.mem.Allocator, tainted: bool) !void {
     for (proof.responses_m, 0..) |m, i| std.debug.print("responses_m[{d}]={x}\n", .{ i, m.toBytes() });
 }
 
-const Target = enum { authority_sign, user_issue, user_show };
+/// `blind_prepare`: the user's side of blind issuance, `prepareBlindSign`
+/// (§4.3 `PrepareBlindSign`). TAINTED: the private attributes `m_1..m_p` and
+/// every draw of the request's randomness (`o`, each `k_i`, every witness)
+/// via `TaintedRandom`. PUBLIC: the public attributes and the user's ElGamal
+/// public key `γ` (made from an untainted key). `cm`, `h`, the ciphertexts
+/// and the responses are values the request publishes, so whatever branches
+/// on them downstream is a branch on a published value tainted by
+/// derivation; the row's comment in ctgrind-expected.tsv names each one.
+fn runBlindPrepare(allocator: std.mem.Allocator, tainted: bool) !void {
+    const q = 4;
+    const p = try coconut.params.Parameters.generate(allocator, q);
+    defer p.deinit(allocator);
+
+    var kp_rng = std.Random.DefaultPrng.init(0xB11D_0001);
+    var kp: coconut.ElGamalKeyPair = undefined;
+    coconut.blind.elgamalKeyGenSeededForTest(kp_rng.random(), &kp);
+    defer kp.deinit();
+
+    var priv: [2]Fr = undefined;
+    for (&priv, 0..) |*m, i| m.* = try secretFr("ctgrind-coconut-blind-prepare-attr-v1", @as(u64, i), tainted);
+    const publ = [_]Fr{ frOf(33), frOf(44) };
+
+    var rnd = TaintedRandom{ .domain = "ctgrind-coconut-blind-prepare-rand-v1", .tainted = tainted };
+    var req = try coconut.blind.prepareBlindSignSeededForTest(allocator, rnd.random(), p, kp.gamma, &priv, &publ);
+    defer req.deinit(allocator);
+
+    std.debug.print("cm={x}\n", .{bls.g1.toBytesCompressed(req.cm)});
+    for (req.ciphertexts, 0..) |c, i| std.debug.print("ct[{d}].b={x}\n", .{ i, bls.g1.toBytesCompressed(c.b) });
+    std.debug.print("challenge={x}\n", .{req.proof.challenge.toBytes()});
+    for (req.proof.rm, 0..) |m, i| std.debug.print("rm[{d}]={x}\n", .{ i, m.toBytes() });
+}
+
+/// A request for `blind_sign` and `unblind`, built UNTAINTED (2 private, 2
+/// public attributes) — the secrets those two targets measure are the
+/// authority's share and the user's ElGamal key, not the request's.
+const BlindFixture = struct {
+    params: coconut.params.Parameters,
+    kp: coconut.ElGamalKeyPair,
+    req: coconut.BlindSignRequest,
+    publ: [2]Fr,
+
+    fn init(allocator: std.mem.Allocator) !BlindFixture {
+        const params = try coconut.params.Parameters.generate(allocator, 4);
+        errdefer params.deinit(allocator);
+        var kp_rng = std.Random.DefaultPrng.init(0xB11D_0002);
+        var kp: coconut.ElGamalKeyPair = undefined;
+        coconut.blind.elgamalKeyGenSeededForTest(kp_rng.random(), &kp);
+        const priv = [_]Fr{ frOf(11), frOf(22) };
+        const publ = [_]Fr{ frOf(33), frOf(44) };
+        var req_rng = std.Random.DefaultPrng.init(0xB11D_0003);
+        const req = try coconut.blind.prepareBlindSignSeededForTest(allocator, req_rng.random(), params, kp.gamma, &priv, &publ);
+        return .{ .params = params, .kp = kp, .req = req, .publ = publ };
+    }
+
+    fn deinit(self: *BlindFixture, allocator: std.mem.Allocator) void {
+        self.req.deinit(allocator);
+        self.kp.deinit();
+        self.params.deinit(allocator);
+    }
+};
+
+/// `blind_sign`: an authority's Shamir key share entering `blindSign`
+/// (§4.3 `BlindSign`). TAINTED: `x(j)`, `y_1(j)..y_q(j)`. PUBLIC: the
+/// request (its proof check runs on public values only) and `γ`.
+fn runBlindSign(allocator: std.mem.Allocator, tainted: bool) !void {
+    var fx = try BlindFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    var ys: [4]Fr = undefined;
+    for (&ys, 0..) |*y, i| y.* = try secretFr("ctgrind-coconut-blind-sign-y-v1", @as(u64, i), tainted);
+    const x = try secretFr("ctgrind-coconut-blind-sign-x-v1", 0, tainted);
+    // Stack array, not allocator-owned: no `deinit` (see `runAuthoritySign`).
+    const share = coconut.SecretKeyShare{ .index = 1, .x = x, .ys = &ys };
+    const sig = try coconut.blindSign(allocator, &share, fx.params, fx.kp.gamma, &fx.req, &fx.publ);
+
+    std.debug.print("a={x}\n", .{bls.g1.toBytesCompressed(sig.a)});
+    std.debug.print("b={x}\n", .{bls.g1.toBytesCompressed(sig.b)});
+}
+
+/// `unblind`: the user's ElGamal secret `d` entering `unblind` (§4.3
+/// `Unblind`). TAINTED: `d`. PUBLIC: the authority's blinded signature
+/// (made from an untainted share).
+fn runUnblind(allocator: std.mem.Allocator, tainted: bool) !void {
+    var fx = try BlindFixture.init(allocator);
+    defer fx.deinit(allocator);
+
+    var ys = [_]Fr{ frOf(5), frOf(6), frOf(7), frOf(8) };
+    const share = coconut.SecretKeyShare{ .index = 1, .x = frOf(4), .ys = &ys };
+    const sig = try coconut.blindSign(allocator, &share, fx.params, fx.kp.gamma, &fx.req, &fx.publ);
+
+    var kp = fx.kp;
+    kp.d = try secretFr("ctgrind-coconut-unblind-d-v1", 0, false);
+    // `γ` is not recomputed: `unblind` reads only `d`, and the output under
+    // a different `d` is still a function of the secret, which is all the
+    // propagation witness needs.
+    if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&kp.d));
+    defer kp.deinit();
+    const partial = coconut.unblind(&kp, &sig);
+
+    std.debug.print("s={x}\n", .{bls.g1.toBytesCompressed(partial.s)});
+}
+
+const Target = enum { authority_sign, user_issue, user_show, blind_prepare, blind_sign, unblind };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "authority_sign")) return .authority_sign;
     if (std.mem.eql(u8, s, "user_issue")) return .user_issue;
     if (std.mem.eql(u8, s, "user_show")) return .user_show;
+    if (std.mem.eql(u8, s, "blind_prepare")) return .blind_prepare;
+    if (std.mem.eql(u8, s, "blind_sign")) return .blind_sign;
+    if (std.mem.eql(u8, s, "unblind")) return .unblind;
     return error.UnknownTarget;
 }
 
@@ -372,6 +480,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .authority_sign => try runAuthoritySign(allocator, taint),
         .user_issue => try runUserIssue(allocator, taint),
         .user_show => try runUserShow(allocator, taint),
+        .blind_prepare => try runBlindPrepare(allocator, taint),
+        .blind_sign => try runBlindSign(allocator, taint),
+        .unblind => try runUnblind(allocator, taint),
     }
 }
 
