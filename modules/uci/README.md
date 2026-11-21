@@ -94,10 +94,11 @@ const shown = try ed.show(gpa, "network", .{}); // `uci show` text
 drives the real `uci` (built from OpenWrt's tree, used only through its command
 line) through every operation and records the delta file it writes and what
 `uci show` / `uci -X show` then print; the tests replay those deltas and must
-print the same text byte for byte. Two cases real `uci` accepts are refused:
-a rename onto a section name or option key already in use (`uci` then holds
-two of one name, which `parse` refuses and `serialize` cannot write) —
-`error.DuplicateSection` / `error.DuplicateOption`.
+print the same text byte for byte. A rename onto a section name or option key
+already in use is held as `uci` holds it (two of one name; `toPackage` merges
+them as a reload of the committed file would); onto a section of another type
+or an option of the other kind it is refused (`error.DuplicateSection` /
+`error.DuplicateOption`), where `uci` writes a file it cannot read back.
 
 ## Files, commit, batch, import (POSIX)
 
@@ -241,8 +242,7 @@ builds from a source copy (`LIBUCI_SRC`), whose source is never kept here.
 
 ## Not provided
 
-A rename onto a section name or option key already in use (the binary holds two of
-one name), ucimap typed schemas and plugins, hooks and `reload_config`, `-S`,
+A rename onto a section of another type or an option of the other kind (the binary then writes a file it cannot read), ucimap typed schemas and plugins, hooks and `reload_config`, `-S`,
 `-q`, `changes`, `-n`/`-N`, following a symlink chain out of the config
 directory. SPEC.md *What is deliberately not done* has the reasons and
 *Backlog / deferred* what may still come.

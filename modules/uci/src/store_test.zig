@@ -628,6 +628,48 @@ test "-C and -p: an override file replaces the base for reading; extra delta dir
     try t.expectEqualStrings("static", c.section("iface", "lan").?.get("proto").?);
 }
 
+test "-p with several directories: replayed in the order given, then save's (as measured with three directories)" {
+    // The `uci` binary run with `-p d1 -p d2 -p d3` and `-t save` over `config s 'a'` holding x=0, y=0 printed
+    // x='d3' l='d2' z='s' (d3 deleted y); with `-p d3 -p d2 -p d1` it printed x='d1' l='d2' y='d1' z='s'; the same
+    // directory twice changes nothing. Each directory held the delta the binary wrote for its own `set`/`delete`.
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "t", "config s 'a'\n\toption x '0'\n\toption y '0'\n");
+    var dirs: [3]std.Io.Dir = undefined;
+    const names = [_][]const u8{ "d1", "d2", "d3" };
+    const deltas = [_][]const u8{ "t.a.x='d1'\nt.a.y='d1'\n", "t.a.x='d2'\n|t.a.l='d2'\n", "t.a.x='d3'\n-t.a.y\n" };
+    var opened: usize = 0;
+    defer for (dirs[0..opened]) |*d| d.close(t.io);
+    for (names, deltas) |n, delta| {
+        try fx.tmp.dir.createDir(t.io, n, .default_dir);
+        dirs[opened] = try fx.tmp.dir.openDir(t.io, n, .{});
+        opened += 1;
+        try fx.put(dirs[opened - 1], "t", delta);
+    }
+    try fx.put(fx.save, "t", "t.a.z='s'\n");
+
+    const Case = struct { order: [3]usize, n: usize, x: []const u8, y: ?[]const u8, l: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .order = .{ 0, 1, 2 }, .n = 3, .x = "d3", .y = null, .l = "d2" },
+        .{ .order = .{ 2, 1, 0 }, .n = 3, .x = "d1", .y = "d1", .l = "d2" },
+        .{ .order = .{ 1, 2, 0 }, .n = 2, .x = "d3", .y = null, .l = "d2" },
+        .{ .order = .{ 0, 0, 0 }, .n = 2, .x = "d1", .y = "d1", .l = null },
+    };
+    for (cases) |c| {
+        var order: [3]std.Io.Dir = undefined;
+        for (c.order[0..c.n], 0..) |i, k| order[k] = dirs[i];
+        var st = fx.store();
+        st.extra_save = order[0..c.n];
+        var staged = try st.loadStaged(t.allocator, "t", null);
+        defer staged.deinit(t.allocator);
+        const a = staged.section("s", "a").?;
+        try t.expectEqualStrings(c.x, a.get("x").?);
+        try t.expectEqualStrings("s", a.get("z").?);
+        if (c.y) |y| try t.expectEqualStrings(y, a.get("y").?) else try t.expect(a.get("y") == null);
+        if (c.l) |l| try t.expectEqualStrings(l, a.get("l").?) else try t.expect(a.get("l") == null);
+    }
+}
+
 test "merge: a refused merge changes nothing" {
     var base = try uci.parse(t.allocator, base_conf);
     defer base.deinit(t.allocator);

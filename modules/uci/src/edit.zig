@@ -42,12 +42,12 @@ pub const EditError = error{
     /// A section/option name, section type or option key that `parse` would
     /// refuse (`root.validNameChars` / `root.validTypeChars`), or empty.
     InvalidName,
-    /// A rename (or a staged `add`) onto a section name already in use.
-    /// Real `uci` then holds two sections of one name — a state `parse`
-    /// refuses and `serialize` cannot write — so it is refused here.
+    /// A staged `add` onto a section name already in use, a rename onto the name of a section of ANOTHER type, or a
+    /// package (`toPackage`) in which two sections of one name have different types. Real `uci` writes such a
+    /// file and then cannot read it back ("section of different type overwrites prior section with same name").
     DuplicateSection,
-    /// A rename onto an option key already in the section, refused for the
-    /// same reason (real `uci` keeps both; `uci get` then answers the first).
+    /// A rename onto the key of an option of the other kind (single against list), or two options of one key
+    /// and different kinds meeting in `toPackage`: `parse` refuses mixed kinds as well.
     DuplicateOption,
     /// The result would exceed `root.max_total_items`.
     MemoryLimitExceeded,
@@ -89,6 +89,9 @@ pub const Editor = struct {
     /// id -> first index with that id; valid only while `id_ok`.
     id_map: std.StringHashMapUnmanaged(usize) = .empty,
     id_ok: bool = false,
+    /// A rename put two sections of one name, or two options of one key, into the model (as `uci` allows): the
+    /// lookups answer the first, `toPackage` merges them as a reload of the written file would.
+    dups: bool = false,
 
     pub const Opt = struct { key: []const u8, kind: Option.Kind, values: std.ArrayList([]const u8) };
     pub const Sec = struct {
@@ -428,7 +431,12 @@ pub const Editor = struct {
         const i = try self.must(ref);
         try checkName(new_name);
         if (self.findCounted(new_name)) |j| {
-            if (j != i) return error.DuplicateSection;
+            if (j != i) {
+                // Two sections of one name are what `uci` holds after this (a reload merges them), but only
+                // when the types agree: otherwise the file it writes cannot be read again.
+                if (!std.mem.eql(u8, self.sections.items[j].type, self.sections.items[i].type)) return error.DuplicateSection;
+                self.dups = true;
+            }
         }
         const n = try self.al().dupe(u8, new_name);
         self.sections.items[i].name = n;
@@ -442,7 +450,10 @@ pub const Editor = struct {
         try checkName(new_key);
         const oi = self.optIndex(sec, key) orelse return;
         if (self.optIndex(sec, new_key)) |other| {
-            if (other != oi) return error.DuplicateOption;
+            if (other != oi) {
+                if (sec.options.items[other].kind != sec.options.items[oi].kind) return error.DuplicateOption;
+                self.dups = true;
+            }
         }
         sec.options.items[oi].key = try self.al().dupe(u8, new_key);
         sec.omap_ok = false;
@@ -556,7 +567,14 @@ pub const Editor = struct {
 
     /// The edited package, as an independent `Package` (free with
     /// `Package.deinit(gpa)`); the editor stays usable.
+    ///
+    /// After a rename onto a name or key already in use (`uci` allows it and holds both, answering the first)
+    /// the package is what reloading the file `uci` writes gives: sections of one name become one, at the
+    /// first one's place, options of one key become one at the first one's place, a later single value
+    /// replacing the earlier and list entries appended. `DuplicateSection`/`DuplicateOption` when the types or
+    /// kinds disagree (a later `set` can change one of the pair).
     pub fn toPackage(self: *const Editor, gpa: Allocator) EditError!Package {
+        if (self.dups) return self.toPackageMerged(gpa);
         var items: usize = 0;
         for (self.sections.items) |s| {
             items += 1 + s.options.items.len;
@@ -582,6 +600,61 @@ pub const Editor = struct {
                 .options = opts,
             };
         }
+        return .{
+            .name = if (self.name) |n| try a.dupe(u8, n) else null,
+            .sections = secs,
+            .arena_state = arena.state,
+        };
+    }
+
+    fn toPackageMerged(self: *const Editor, gpa: Allocator) EditError!Package {
+        var items: usize = 0;
+        for (self.sections.items) |s| {
+            items += 1 + s.options.items.len;
+            for (s.options.items) |o| items += o.values.items.len;
+        }
+        if (items > root.max_total_items) return error.MemoryLimitExceeded;
+
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const Out = struct {
+            type: []const u8,
+            name: ?[]const u8,
+            opts: std.ArrayList(Option) = .empty,
+            omap: std.StringHashMapUnmanaged(usize) = .empty,
+        };
+        var outs: std.ArrayList(Out) = .empty;
+        var by_name: std.StringHashMapUnmanaged(usize) = .empty;
+        for (self.sections.items) |s| {
+            var at: usize = outs.items.len;
+            if (s.name) |n| {
+                if (by_name.get(n)) |lead| {
+                    if (!std.mem.eql(u8, outs.items[lead].type, s.type)) return error.DuplicateSection;
+                    at = lead;
+                } else try by_name.put(a, try a.dupe(u8, n), at);
+            }
+            if (at == outs.items.len) try outs.append(a, .{
+                .type = try a.dupe(u8, s.type),
+                .name = if (s.name) |n| try a.dupe(u8, n) else null,
+            });
+            const out = &outs.items[at];
+            for (s.options.items) |o| {
+                const vals = try a.alloc([]const u8, o.values.items.len);
+                for (o.values.items, vals) |v, *vv| vv.* = try a.dupe(u8, v);
+                const gop = try out.omap.getOrPut(a, o.key);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = out.opts.items.len;
+                    try out.opts.append(a, .{ .key = try a.dupe(u8, o.key), .kind = o.kind, .values = vals });
+                    continue;
+                }
+                const prev = &out.opts.items[gop.value_ptr.*];
+                if (prev.kind != o.kind) return error.DuplicateOption;
+                prev.values = if (o.kind == .single) vals else try std.mem.concat(a, []const u8, &.{ prev.values, vals });
+            }
+        }
+        const secs = try a.alloc(Section, outs.items.len);
+        for (outs.items, secs) |o, *sec| sec.* = .{ .type = o.type, .name = o.name, .anonymous = o.name == null, .options = o.opts.items };
         return .{
             .name = if (self.name) |n| try a.dupe(u8, n) else null,
             .sections = secs,
@@ -998,16 +1071,119 @@ test "applyDelta: missing targets and other packages are skipped; malformed reco
     }
 }
 
+const dup_conf = "config s 'a'\n\toption x '1'\n\toption k 'a'\nconfig s 'b'\n\toption y '2'\n\toption k 'b'\nconfig u 'c'\n\toption z '3'\n";
+
+fn showEd(ed: *const Editor) ![]u8 {
+    return ed.show(testing.allocator, "t", .{ .extended = false });
+}
+
+fn showMerged(ed: *const Editor) ![]u8 {
+    var pkg = try ed.toPackage(testing.allocator);
+    defer pkg.deinit(testing.allocator);
+    return show(testing.allocator, &pkg, "t", .{ .extended = false });
+}
+
+test "Editor: a rename onto a name or key in use is held and merged on toPackage, as the real uci's file reloads (measured)" {
+    const gpa = testing.allocator;
+    var pkg = try root.parse(gpa, dup_conf);
+    defer pkg.deinit(gpa);
+
+    // Sections of one name and type: both are held (the lookups answer the first), the merge is a reload's.
+    var ed = try Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    try ed.rename("a", "b");
+    const staged = try showEd(&ed);
+    defer gpa.free(staged);
+    try testing.expectEqualStrings("t.b=s\nt.b.x='1'\nt.b.k='a'\nt.b=s\nt.b.y='2'\nt.b.k='b'\nt.c=u\nt.c.z='3'\n", staged);
+    try ed.set("b", "q", "1"); // the first one
+    const merged = try showMerged(&ed);
+    defer gpa.free(merged);
+    try testing.expectEqualStrings("t.b=s\nt.b.x='1'\nt.b.k='b'\nt.b.q='1'\nt.b.y='2'\nt.c=u\nt.c.z='3'\n", merged);
+    // A later `set` that changes the first one's type leaves a file nobody can read: refused at toPackage.
+    try ed.setSection("b", "other");
+    try testing.expectError(error.DuplicateSection, ed.toPackage(gpa));
+
+    // Another type is refused at the rename.
+    var ed2 = try Editor.init(gpa, &pkg);
+    defer ed2.deinit();
+    try testing.expectError(error.DuplicateSection, ed2.rename("a", "c"));
+    try testing.expect(!ed2.dups);
+
+    // `delete` takes the first of the pair, `rename` the first, as `uci` does.
+    var ed3 = try Editor.init(gpa, &pkg);
+    defer ed3.deinit();
+    try ed3.rename("a", "b");
+    try ed3.delete("b");
+    const after_delete = try showEd(&ed3);
+    defer gpa.free(after_delete);
+    try testing.expectEqualStrings("t.b=s\nt.b.y='2'\nt.b.k='b'\nt.c=u\nt.c.z='3'\n", after_delete);
+    var ed4 = try Editor.init(gpa, &pkg);
+    defer ed4.deinit();
+    try ed4.rename("a", "b");
+    try ed4.rename("b", "zz");
+    const after_rename = try showEd(&ed4);
+    defer gpa.free(after_rename);
+    try testing.expectEqualStrings("t.zz=s\nt.zz.x='1'\nt.zz.k='a'\nt.b=s\nt.b.y='2'\nt.b.k='b'\nt.c=u\nt.c.z='3'\n", after_rename);
+}
+
+test "Editor: options of one key after a rename: single values are replaced at the first place, lists appended, kinds never mixed" {
+    const gpa = testing.allocator;
+    var pkg = try root.parse(gpa, dup_conf);
+    defer pkg.deinit(gpa);
+    var ed = try Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    try ed.renameOption("a", "x", "k");
+    const staged = try showEd(&ed);
+    defer gpa.free(staged);
+    try testing.expect(std.mem.startsWith(u8, staged, "t.a=s\nt.a.k='1'\nt.a.k='a'\nt.b=s\n"));
+    const merged = try showMerged(&ed);
+    defer gpa.free(merged);
+    try testing.expectEqualStrings("t.a=s\nt.a.k='a'\nt.b=s\nt.b.y='2'\nt.b.k='b'\nt.c=u\nt.c.z='3'\n", merged);
+
+    // The first place wins, not the later one: x, m, k -> k, m.
+    var p2 = try root.parse(gpa, "config s 'a'\n\toption x '1'\n\toption m 'M'\n\toption k 'a'\n");
+    defer p2.deinit(gpa);
+    var e2 = try Editor.init(gpa, &p2);
+    defer e2.deinit();
+    try e2.renameOption("a", "x", "k");
+    const m2 = try showMerged(&e2);
+    defer gpa.free(m2);
+    try testing.expectEqualStrings("t.a=s\nt.a.k='a'\nt.a.m='M'\n", m2);
+
+    // Lists append; sections that meet carry their lists along.
+    var p3 = try root.parse(gpa, "config s 'a'\n\tlist x '1'\n\tlist x '2'\n\toption m 'M'\n\tlist k 'a'\n");
+    defer p3.deinit(gpa);
+    var e3 = try Editor.init(gpa, &p3);
+    defer e3.deinit();
+    try e3.renameOption("a", "x", "k");
+    const m3 = try showMerged(&e3);
+    defer gpa.free(m3);
+    try testing.expectEqualStrings("t.a=s\nt.a.k='1' '2' 'a'\nt.a.m='M'\n", m3);
+    var p4 = try root.parse(gpa, "config s 'a'\n\tlist l '1'\n\toption m 'M'\nconfig s 'b'\n\tlist l '2'\n\toption n 'N'\n");
+    defer p4.deinit(gpa);
+    var e4 = try Editor.init(gpa, &p4);
+    defer e4.deinit();
+    try e4.rename("a", "b");
+    const m4 = try showMerged(&e4);
+    defer gpa.free(m4);
+    try testing.expectEqualStrings("t.b=s\nt.b.l='1' '2'\nt.b.m='M'\nt.b.n='N'\n", m4);
+
+    // A single against a list is refused (the file would not parse).
+    var p5 = try root.parse(gpa, "config s 'a'\n\toption x '1'\n\tlist k 'a'\n");
+    defer p5.deinit(gpa);
+    var e5 = try Editor.init(gpa, &p5);
+    defer e5.deinit();
+    try testing.expectError(error.DuplicateOption, e5.renameOption("a", "x", "k"));
+    try testing.expect(!e5.dups);
+}
+
 test "Editor: refusals keep the model one that parse could have produced" {
     const gpa = testing.allocator;
     var pkg = try root.parse(gpa, "config a 'n1'\n\toption o 'x'\n\toption k 'K'\nconfig a 'n2'\nconfig b\n");
     defer pkg.deinit(gpa);
     var ed = try Editor.init(gpa, &pkg);
     defer ed.deinit();
-    // Real uci accepts both and ends up with two sections / two options of
-    // one name (measured); this module refuses.
-    try testing.expectError(error.DuplicateSection, ed.rename("n1", "n2"));
-    try testing.expectError(error.DuplicateOption, ed.renameOption("n1", "k", "o"));
+    // (Renames onto a name or key in use are in the test below.)
     try testing.expectError(error.DuplicateSection, ed.applyDelta("p", "+p.n2='t'\n", null));
     try ed.rename("n1", "n1"); // onto itself: fine
     try ed.renameOption("n1", "k", "k");
