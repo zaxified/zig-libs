@@ -742,7 +742,7 @@ prime factors of `Ñ` also has Jacobi symbol `+1`, and order dividing 2 is
 exactly that residual case restricted to `{Ñ-1}` and its cousins — the check
 closes that case, but the general non-residue-mod-both-factors gap A6 describes
 is untouched. **This is deliberately a floor, not the fix**: closing the
-general gap needs Πprm (`h2 ∉ ⟨h1⟩` detection) on the online path (Backlog).
+general gap needs Πprm (`h2 ∉ ⟨h1⟩` detection) on the online path (not done, as in tss-lib: see *What is deliberately not done*).
 See `root.AuxParams.validate`'s doc comment and the regression test
 `"AuxParams.validate rejects an order-2 generator (audit F1 HIGH, 2026-09-10
 fix)"` in `root.zig`.
@@ -789,13 +789,13 @@ GG20's "one-round" online signing is one round of messages, not one unit of work
 - **The `N > q⁷` floor on generic codec paths.** The `AuxParams`/`PublicKeys`/`KeyShare`/`paillier` `fromBytes*` codecs parse generic wire values, including the small toy moduli the serialization tests round-trip, and deliberately do not floor. The floor is a checked-path precondition applied where the parameters are consumed by a range proof (`root.paillierNMeetsFloor` / `nTildeMeetsFloor`, fail-closed at prove and verify entry points); `paillier` stays a general-purpose module and does not impose this threshold-ECDSA-specific floor.
 - **Retaining `lambda` in `generateAuxParams`.** The tuple's owner is a verifier of its own tuple, not a prover under its `N_tilde`; a party that needs to prove it well-formed uses `generateAuxParamsWithTrapdoor`.
 - **Opening `σ_i`, `w_i` or the Bob masks `ν'` in the §4.3 opening.** They stay closed; the opening proves what it must by DLEQ and by derived points (see "Design notes by feature").
+- **Πprm/Πmod on the online path** (Auditor brief A6). The setup proofs are verified once, when keys are announced (`aux_info.verifyAnnouncement`), and each signing session enforces the structural floor; they are not re-verified against the tuple of every session. That is what the reference does: tss-lib verifies its `Ñ`/`h1`/`h2` proofs in key generation and stores the verified parameters for signing, which does not prove them again. Re-verifying per session would be a protocol change of our own with no reference to match; the general non-residue gap it would close is A6's open question for the auditor.
 - **A durable presignature store, a transport, a reliable-broadcast channel, timeouts.** The module defines the `PresignatureStore` contract and the signed, attested messages; delivery, timeouts and a store that deletes durably before reading are the caller's (see `presign.zig`'s module doc comment).
 
 ## Backlog / deferred
 
 - **Independent cryptographic review** of the implemented constructions (GG18 Appendix A proofs, the Fiat-Shamir instantiations, `PdlProof`, the presigning composition) before production use: the questions A1–A9 are itemized in "Auditor brief". Signing inherits it, being built on `zkproofs.zig`'s checked MtA/MtAwc. The tests show self-consistency and the reject contract, not soundness against an unbounded malicious prover.
 - **Redistribution to a new committee.** `dkg`'s reshare already takes `n'`, `t'`; a `threshold_ecdsa` wrapper needs the NEW committee's aux rounds (announcements, Πfac) alongside the old committee's dealing, and new parties that hold no `KeyShare` yet. Effort: medium.
-- **Πprm/Πmod on the online path** (Auditor brief A6): re-verifying the setup proofs against the tuple used in each signing session would close the general non-residue-mod-both-factors gap the structural floor cannot. A protocol change (a setup-phase proof exchange); deferred until a consumer needs it.
 
 ## Verification
 
