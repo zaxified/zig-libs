@@ -43,8 +43,8 @@ switches and overlay daemons. Only docs/READMEs were read.
 **Where we are ahead:** an embeddable, allocation-bounded, clock-injected E-LAN table that gives what the
 fabrics above keep inside their daemons: per-tenant (I-SID) isolation, learning refused for tenants the data plane did not
 provision, a per-tenant MAC cap that degrades to flooding, and EVPN-style move quarantine. **Where we are behind:**
-no local-port dimension (only remote PEs are learned; access-side delivery is the caller's), no event hook
-(the per-call `LearnOutcome`, the `learnStats` totals and `fdbIterator` are what exists), no ARP/ND suppression or IGMP snooping (see *What is deliberately not done* and *Backlog / deferred*).
+the local-port dimension is learned but access-side delivery itself (the frame, port state) is the caller's, no event hook
+(the per-call `LearnOutcome`, the `learnStats` totals and `fdbIterator` are what exists), no ARP/ND suppression or IGMP snooping (see *What is deliberately not done* and *Roadmap*).
 
 ## Data model
 
@@ -83,12 +83,19 @@ Concurrency is `.single_owner`: one thread/loop owns the table, no internal lock
 customer circuit) or `.core = pe` (out of the fabric, ingress-replicated by
 remote PE `pe`):
 
-0. If `ingress` is `.core` → `Decision.local_only`, before any table lookup.
-   Nothing received from the core re-enters the fabric (see Split-horizon).
+0. If `ingress` is `.core` → never into the fabric (see Split-horizon): `Decision.local_only`, except that a known unicast
+   whose MAC is learned behind a local access port (step 2a) is `Decision.local_port(port)`. A MAC bound to a remote PE is
+   not consulted.
 1. If `dst` is a **broadcast or multicast** address (`isBumAddress` — the I/G
    bit, LSB of the first octet; broadcast all-ones is its special case) → BUM.
 2. Else look `dst` up in `isid`'s FDB. A **fresh hit** → `Decision.unicast(pe)`.
    A **miss or an over-age entry** → unknown-unicast → BUM.
+2a. A hit may also be a **local access port** (`learnPort` / `learnStaticPort`; `Location` is `.pe` or `.port`):
+   `Decision.local_port(port)` (deliver to that one circuit, nothing into the fabric); when the caller passed
+   `.access_port = p` as ingress and `p` is the destination port, `Decision.filtered` (a bridge never sends a frame back
+   out of its ingress port). A port binding needs no membership check. `.access` (port not identified) never gets
+   `filtered`. A MAC moving between a PE and a port, or between ports, is a move for duplicate-MAC detection; a
+   quarantined or over-age port binding floods like any other.
 3. For any BUM case → `Decision.flood(set)`, `set` = `replicationSet`.
 
 A fresh hit is honoured only if the learned PE is still a **member** of the I-SID; otherwise it is treated as
@@ -366,7 +373,7 @@ Offline only — pure logic, no live-interop surface. `scripts/modtest l2forward
 - **Capacity:** the per-tenant MAC-flood bound (`FdbFull` after reclaim, existing entries and moves still served), the
   once-per-tick futile sweep, the I-SID and member caps, the documented default footprint (`SELF` test), an allocator
   failure inside `learn` returned and counted.
-- **Observation:** `fdbIterator` (every entry once with `pe` / `age` / `static` / `quarantined` / `expired`; empty and
+- **Observation:** `fdbIterator` (every entry once with `location` / `age` / `static` / `quarantined` / `expired`; empty and
   unknown I-SID) and `learnStats` counting every outcome and refusal.
 - **Determinism and leaks:** identical `(ops, now)` give identical decisions with a sorted flood set; a
   `testing.allocator` check that `deinit` frees every nested map.
@@ -386,9 +393,7 @@ Offline only — pure logic, no live-interop surface. `scripts/modtest l2forward
 
 ## Backlog / deferred
 
-- **Local-port dimension** — learning which *access* port a MAC sits behind, so a PE with several customer ports can
-  unicast locally instead of delivering to all access circuits; a bridge does this natively. Effort: medium; changes the
-  `Decision` shape (ask before starting).
+None open.
 
 ## Roadmap
 

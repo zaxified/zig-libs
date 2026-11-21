@@ -53,9 +53,14 @@
 //!
 //! ## Forward decision
 //! `forward(isid, dst_mac, ingress, now, out)` classifies `dst_mac` and returns:
-//!   * `.core` ingress → **`Decision.local_only`**, always: a frame received
-//!     from the core is delivered to local access circuits and never re-enters
-//!     the fabric (the split-horizon rule above). No FDB lookup is made.
+//!   * `.core` ingress → **`Decision.local_only`**: a frame received from the
+//!     core is delivered to local access circuits and never re-enters the
+//!     fabric (the split-horizon rule above). The one refinement is a unicast
+//!     to a MAC learned behind a local access port (`learnPort`):
+//!     `Decision.local_port`. A MAC bound to a remote PE is never consulted.
+//!   * `.access` / `.access_port` ingress, known unicast behind a **local
+//!     port** → `Decision.local_port(port)`, or `Decision.filtered` when it is
+//!     the ingress port itself.
 //!   * `.access` ingress, **known unicast** — `dst_mac` is a fresh FDB hit in
 //!     `isid` → `Decision.unicast(pe)`: send to that one remote PE.
 //!   * `.access` ingress, **BUM** (Broadcast, Unknown-unicast, or Multicast) →
@@ -143,6 +148,17 @@ pub const Isid = u24;
 /// Fabric-scoped remote-PE id — 16-bit, the same width as `l2encap`'s ingress
 /// PE id (its SPB source nickname / EVPN ingress-PE identity).
 pub const PeId = u16;
+
+/// Opaque id of a local access circuit (a customer-facing port of this PE), chosen by the caller. The table
+/// never interprets it; it is what `learnPort` binds a MAC to and what `Decision.local_port` hands back.
+pub const Port = u16;
+
+/// Where a customer MAC sits: behind a remote PE (learned from a core frame) or behind one of this PE's own
+/// access circuits (learned from an access frame, as a bridge learns the source port).
+pub const Location = union(enum) {
+    pe: PeId,
+    port: Port,
+};
 
 /// A customer Ethernet MAC address (6 octets, on-wire order). The I/G bit — the
 /// least-significant bit of the first octet — distinguishes group (multicast)
@@ -237,9 +253,12 @@ pub const Options = struct {
 /// access circuit, or the fabric-facing core (in which case `l2encap.decode`
 /// already yielded the `ingress_pe` that replicated it).
 pub const Ingress = union(enum) {
-    /// A local access circuit (customer-facing port). The frame may be
+    /// A local access circuit (customer-facing port), not identified. The frame may be
     /// replicated into the fabric.
     access,
+    /// A local access circuit, identified by `Port`. Same as `.access`, and in addition `forward` can tell
+    /// that the destination sits behind the very port the frame came in on (`Decision.filtered`).
+    access_port: Port,
     /// The core, ingress-replicated by remote PE `pe`. RFC 4762 §4.4 /
     /// RFC 7432 §8.3.1: it must not be forwarded back into the fabric at all.
     core: PeId,
@@ -259,6 +278,14 @@ pub const Decision = union(enum) {
     /// (RFC 4762 §4.4, RFC 7432 §8.3.1). Local delivery is the caller's job;
     /// this module models the fabric side, and the fabric side is empty.
     local_only,
+    /// Known unicast to a MAC learned behind a local access circuit (`learnPort` / `learnStaticPort`): deliver
+    /// to that one port; nothing goes into the fabric. Given for `.access`, `.access_port` and (instead of
+    /// `local_only`) `.core` ingress, so a PE with several customer ports need not deliver to all of them.
+    local_port: Port,
+    /// The destination MAC is learned behind the very access port the frame arrived on
+    /// (`Ingress.access_port`): forward nowhere, as a bridge does for a frame whose destination port equals
+    /// its source port.
+    filtered,
 };
 
 pub const AddMemberError = error{
@@ -353,7 +380,7 @@ pub const ForwardError = error{
 // ── table ─────────────────────────────────────────────────────────────────────
 
 const FdbEntry = struct {
-    pe: PeId,
+    loc: Location,
     /// The `now` this entry was last learned/refreshed at; ageing is
     /// `now - learned_at > aging_ticks`. Ignored when `static`.
     learned_at: Time,
@@ -489,7 +516,7 @@ pub const Table = struct {
         defer victims.deinit(self.alloc);
         var it = ie.fdb.iterator();
         while (it.next()) |kv| {
-            if (kv.value_ptr.pe == pe)
+            if (kv.value_ptr.loc == .pe and kv.value_ptr.loc.pe == pe)
                 victims.append(self.alloc, kv.key_ptr.*) catch break;
         }
         for (victims.items) |mac| _ = ie.fdb.remove(mac);
@@ -530,8 +557,20 @@ pub const Table = struct {
     /// The returned `LearnOutcome` is the caller's only notification of a MAC
     /// hijack; ignoring it (`_ = try …`) is choosing to run without one.
     pub fn learn(self: *Table, isid: Isid, src_mac: Mac, src_pe: PeId, now: Time) LearnError!LearnOutcome {
+        return self.learnLocation(isid, src_mac, .{ .pe = src_pe }, now);
+    }
+
+    /// `learn` for a frame received on a local access circuit: MAC `src_mac` in `isid` is behind `port`. Same
+    /// rules, outcomes, counters and caps as `learn`; a MAC that changes between a remote PE and a port, or
+    /// between two ports, is a move (`LearnOutcome.moved`, counted for duplicate-MAC detection). `forward`
+    /// then answers a unicast to it with `Decision.local_port`.
+    pub fn learnPort(self: *Table, isid: Isid, src_mac: Mac, port: Port, now: Time) LearnError!LearnOutcome {
+        return self.learnLocation(isid, src_mac, .{ .port = port }, now);
+    }
+
+    fn learnLocation(self: *Table, isid: Isid, src_mac: Mac, loc: Location, now: Time) LearnError!LearnOutcome {
         const st = &self.learn_stats;
-        const outcome = self.learnInner(isid, src_mac, src_pe, now) catch |e| {
+        const outcome = self.learnInner(isid, src_mac, loc, now) catch |e| {
             switch (e) {
                 error.InvalidSourceMac => st.invalid_source_mac +|= 1,
                 error.UnknownIsid => st.unknown_isid +|= 1,
@@ -553,7 +592,7 @@ pub const Table = struct {
         self.learn_stats = .{};
     }
 
-    fn learnInner(self: *Table, isid: Isid, src_mac: Mac, src_pe: PeId, now: Time) LearnError!LearnOutcome {
+    fn learnInner(self: *Table, isid: Isid, src_mac: Mac, loc: Location, now: Time) LearnError!LearnOutcome {
         // IEEE 802.1D's learning process, and the Linux bridge
         // (`is_valid_ether_addr` in `br_handle_frame`), both refuse a frame
         // whose SOURCE is a group or all-zero address — the kernel drops it
@@ -575,10 +614,10 @@ pub const Table = struct {
                 // from scratch; an unlapsed one refuses without touching a
                 // thing, so the quarantine cannot be extended by sending more.
                 if (!self.quarantineLapsed(e.*, now)) return .denied_duplicate;
-                e.* = .{ .pe = src_pe, .learned_at = now };
+                e.* = .{ .loc = loc, .learned_at = now };
                 return .learned;
             }
-            if (e.pe == src_pe) {
+            if (std.meta.eql(e.loc, loc)) {
                 e.learned_at = now;
                 return .refreshed;
             }
@@ -596,11 +635,11 @@ pub const Table = struct {
                 e.move_window_start = now;
                 return .duplicate_detected;
             }
-            e.pe = src_pe;
+            e.loc = loc;
             e.learned_at = now;
             return .moved;
         }
-        try self.insertNewMac(ie, src_mac, .{ .pe = src_pe, .learned_at = now }, now);
+        try self.insertNewMac(ie, src_mac, .{ .loc = loc, .learned_at = now }, now);
         return .learned;
     }
 
@@ -619,12 +658,22 @@ pub const Table = struct {
     /// administrative pin with `FdbFull` even when a `learn` at the same
     /// instant would have reclaimed the space and succeeded.
     pub fn learnStatic(self: *Table, isid: Isid, mac: Mac, pe: PeId, now: Time) LearnStaticError!void {
+        return self.learnStaticLocation(isid, mac, .{ .pe = pe }, now);
+    }
+
+    /// `learnStatic` for a MAC pinned behind a local access circuit `port` (a static `bridge fdb` entry on a
+    /// port).
+    pub fn learnStaticPort(self: *Table, isid: Isid, mac: Mac, port: Port, now: Time) LearnStaticError!void {
+        return self.learnStaticLocation(isid, mac, .{ .port = port }, now);
+    }
+
+    fn learnStaticLocation(self: *Table, isid: Isid, mac: Mac, loc: Location, now: Time) LearnStaticError!void {
         const ie = try self.getOrCreateIsid(isid);
         if (ie.fdb.getPtr(mac)) |e| {
-            e.* = .{ .pe = pe, .learned_at = 0, .static = true };
+            e.* = .{ .loc = loc, .learned_at = 0, .static = true };
             return;
         }
-        try self.insertNewMac(ie, mac, .{ .pe = pe, .learned_at = 0, .static = true }, now);
+        try self.insertNewMac(ie, mac, .{ .loc = loc, .learned_at = 0, .static = true }, now);
     }
 
     /// Delete a learned MAC (static or dynamic) from `isid`. Returns true if an
@@ -641,6 +690,16 @@ pub const Table = struct {
     /// Read-only: does not mutate or reclaim (an expired entry is simply
     /// reported as a miss; `tick` reclaims it later).
     pub fn lookup(self: *const Table, isid: Isid, dst_mac: Mac, now: Time) ?PeId {
+        const loc = self.lookupLocation(isid, dst_mac, now) orelse return null;
+        return switch (loc) {
+            .pe => |pe| pe,
+            .port => null,
+        };
+    }
+
+    /// `lookup` that also reports a MAC learned behind a local access port: the fresh `Location` of `dst_mac`
+    /// in `isid`, or null (unknown, expired, quarantined). Read-only.
+    pub fn lookupLocation(self: *const Table, isid: Isid, dst_mac: Mac, now: Time) ?Location {
         const ie = self.isids.getPtr(isid) orelse return null;
         const e = ie.fdb.getPtr(dst_mac) orelse return null;
         // A quarantined MAC has no trusted binding: report a miss so the frame
@@ -648,7 +707,7 @@ pub const Table = struct {
         // than being unicast to whoever won the last move race.
         if (e.duplicate) return null;
         if (self.isExpired(e.*, now)) return null;
-        return e.pe;
+        return e.loc;
     }
 
     /// Moves of `mac` counted in the current mobility window (0 if unknown).
@@ -685,23 +744,39 @@ pub const Table = struct {
         // Full-mesh split horizon, decided BEFORE any table lookup: every other
         // PE already received its own copy from the ingress PE, so relaying —
         // unicast or BUM — would multiply the frame, not deliver it.
-        if (ingress == .core) return .local_only;
-        if (!isBumAddress(dst_mac)) {
-            if (self.lookup(isid, dst_mac, now)) |pe| {
-                // The learned PE must still be a member of this I-SID. `src_pe`
-                // reaches `learn` from `l2encap`'s `ingress_pe` — a plain
-                // unauthenticated header field this module already refuses to
-                // trust in `replicationSet` — so one spoofed frame could
-                // otherwise point a victim's entire unicast flow at a PE
-                // outside the tenant for a full `aging_ticks`, and if that id
-                // named a real PE the customer's frame left the I-SID's member
-                // set entirely. Membership is control-plane, so `learn` stays
-                // permissive (an entry may be learned before membership
-                // converges); the binding happens here, at the decision. A
-                // non-member answer is treated as unknown-unicast, which
-                // floods — and flooding still reaches the real station.
-                if (self.isMember(isid, pe)) return .{ .unicast = pe };
+        if (ingress == .core) {
+            // Nothing re-enters the fabric, but a unicast to a MAC learned behind a local port is delivered to
+            // that port alone instead of to every access circuit. A MAC bound to a remote PE is not consulted.
+            if (!isBumAddress(dst_mac)) {
+                if (self.lookupLocation(isid, dst_mac, now)) |loc| {
+                    if (loc == .port) return .{ .local_port = loc.port };
+                }
             }
+            return .local_only;
+        }
+        if (!isBumAddress(dst_mac)) {
+            const loc = self.lookupLocation(isid, dst_mac, now);
+            if (loc) |l| switch (l) {
+                .port => |port| {
+                    if (ingress == .access_port and ingress.access_port == port) return .filtered;
+                    return .{ .local_port = port };
+                },
+                .pe => |pe| {
+                    // The learned PE must still be a member of this I-SID. `src_pe`
+                    // reaches `learn` from `l2encap`'s `ingress_pe` — a plain
+                    // unauthenticated header field this module already refuses to
+                    // trust in `replicationSet` — so one spoofed frame could
+                    // otherwise point a victim's entire unicast flow at a PE
+                    // outside the tenant for a full `aging_ticks`, and if that id
+                    // named a real PE the customer's frame left the I-SID's member
+                    // set entirely. Membership is control-plane, so `learn` stays
+                    // permissive (an entry may be learned before membership
+                    // converges); the binding happens here, at the decision. A
+                    // non-member answer is treated as unknown-unicast, which
+                    // floods — and flooding still reaches the real station.
+                    if (self.isMember(isid, pe)) return .{ .unicast = pe };
+                },
+            };
             // fall through: unknown unicast is BUM relative to this FDB
         }
         return .{ .flood = try self.replicationSet(isid, ingress, out) };
@@ -756,7 +831,8 @@ pub const Table = struct {
     /// One FDB entry as reported by `fdbIterator`.
     pub const FdbInfo = struct {
         mac: Mac,
-        pe: PeId,
+        /// The remote PE or local access port the MAC is bound to.
+        location: Location,
         /// `now - learned_at` as of the iterator's `now`, clamped to 0 for a
         /// non-monotonic clock; always 0 for a static entry (never aged).
         age: Time,
@@ -786,7 +862,7 @@ pub const Table = struct {
             const e = kv.value_ptr.*;
             return .{
                 .mac = kv.key_ptr.*,
-                .pe = e.pe,
+                .location = e.loc,
                 .age = if (e.static or self.now < e.learned_at) 0 else self.now - e.learned_at,
                 .static = e.static,
                 .quarantined = e.duplicate,
@@ -1026,6 +1102,7 @@ test "no BUM storm: a relayed copy in a converged 4-PE fabric dies at hop 1" {
                         n_len += 1;
                     }
                 },
+                .local_port, .filtered => {}, // delivered to one local port (or dropped); nothing re-enters the fabric
             }
         }
         @memcpy(queue[0..n_len], next[0..n_len]);
@@ -1473,12 +1550,12 @@ test "fdbIterator: every entry exactly once with pe/age/static; empty and unknow
         seen[k] += 1;
         switch (k) {
             1 => {
-                try testing.expectEqual(@as(PeId, 2), f.pe);
+                try testing.expectEqual(@as(PeId, 2), f.location.pe);
                 try testing.expectEqual(@as(Time, 101), f.age);
                 try testing.expect(!f.static and f.expired and !f.quarantined);
             },
             2 => {
-                try testing.expectEqual(@as(PeId, 8), f.pe);
+                try testing.expectEqual(@as(PeId, 8), f.location.pe);
                 try testing.expectEqual(@as(Time, 51), f.age);
                 try testing.expect(!f.static and !f.expired);
             },
@@ -1773,6 +1850,70 @@ test "external anchor: our default aging_ticks matches a live kernel bridge's de
     try testing.expectEqual(kernel_bridge_default_ageing_time_seconds, default_options.aging_ticks);
 }
 
+test "local port: a MAC learned behind an access port is delivered to that port, never into the fabric" {
+    var t = testTable();
+    defer t.deinit();
+    try t.addMember(5, 2);
+    try t.addMember(5, 3);
+    var buf: [16]PeId = undefined;
+    try testing.expectEqual(LearnOutcome.learned, try t.learnPort(5, macOf(0x10), 7, 0));
+    try testing.expectEqual(LearnOutcome.refreshed, try t.learnPort(5, macOf(0x10), 7, 1));
+    try testing.expectEqual(Location{ .port = 7 }, t.lookupLocation(5, macOf(0x10), 2).?);
+    try testing.expectEqual(@as(?PeId, null), t.lookup(5, macOf(0x10), 2)); // not a PE destination
+    // From another access port, from an unidentified access ingress and from the core: that one port.
+    try testing.expectEqual(Decision{ .local_port = 7 }, try t.forward(5, macOf(0x10), .{ .access_port = 8 }, 2, &buf));
+    try testing.expectEqual(Decision{ .local_port = 7 }, try t.forward(5, macOf(0x10), .access, 2, &buf));
+    try testing.expectEqual(Decision{ .local_port = 7 }, try t.forward(5, macOf(0x10), .{ .core = 2 }, 2, &buf));
+    // Same port in and out: filtered, as a bridge does.
+    try testing.expectEqual(Decision.filtered, try t.forward(5, macOf(0x10), .{ .access_port = 7 }, 2, &buf));
+    // An unknown MAC and a broadcast still flood the members; a core frame to a PE-bound MAC stays local_only.
+    try testing.expectEqual(@as(usize, 2), (try t.forward(5, macOf(0x11), .{ .access_port = 7 }, 2, &buf)).flood.len);
+    try testing.expectEqual(@as(usize, 2), (try t.forward(5, broadcast, .{ .access_port = 7 }, 2, &buf)).flood.len);
+    _ = try t.learn(5, macOf(0x12), 2, 0);
+    try testing.expectEqual(Decision.local_only, try t.forward(5, macOf(0x12), .{ .core = 2 }, 2, &buf));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(5, macOf(0x12), .{ .access_port = 7 }, 2, &buf));
+    // Ageing: an over-age port binding floods again; a static one never ages.
+    try testing.expectEqual(@as(usize, 2), (try t.forward(5, macOf(0x10), .{ .access_port = 8 }, 500, &buf)).flood.len);
+    try t.learnStaticPort(5, macOf(0x13), 9, 0);
+    try testing.expectEqual(Decision{ .local_port = 9 }, try t.forward(5, macOf(0x13), .access, 100000, &buf));
+    // A group source address is refused as for `learn`.
+    try testing.expectError(error.InvalidSourceMac, t.learnPort(5, broadcast, 1, 0));
+    try testing.expectError(error.UnknownIsid, t.learnPort(6, macOf(0x20), 1, 0));
+}
+
+test "local port: moves between ports and PEs are counted; the FDB iterator reports the location" {
+    var t = testTable();
+    defer t.deinit();
+    try t.addMember(5, 2);
+    var buf: [16]PeId = undefined;
+    _ = try t.learnPort(5, macOf(0x10), 7, 0);
+    try testing.expectEqual(LearnOutcome.moved, try t.learnPort(5, macOf(0x10), 8, 1)); // port -> port
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(5, macOf(0x10), 2, 2)); // port -> PE
+    try testing.expectEqual(@as(u8, 2), t.moveCount(5, macOf(0x10)));
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(5, macOf(0x10), .{ .access_port = 8 }, 3, &buf));
+    _ = try t.learnPort(5, macOf(0x11), 4, 0);
+    var seen_port = false;
+    var seen_pe = false;
+    var it = t.fdbIterator(5, 3);
+    while (it.next()) |f| switch (f.location) {
+        .port => |p| {
+            seen_port = p == 4;
+        },
+        .pe => |pe| {
+            seen_pe = pe == 2;
+        },
+    };
+    try testing.expect(seen_port and seen_pe);
+    // Quarantine floods a port-bound MAC like any other.
+    var q = Table.init(testing.allocator, .{ .max_isids = 4, .max_pes_per_isid = 4, .max_macs_per_isid = 4, .aging_ticks = 100, .max_mac_moves = 2 });
+    defer q.deinit();
+    try q.addMember(1, 2);
+    _ = try q.learnPort(1, macOf(0x30), 1, 0);
+    _ = try q.learnPort(1, macOf(0x30), 2, 1);
+    try testing.expectEqual(LearnOutcome.duplicate_detected, try q.learnPort(1, macOf(0x30), 1, 2));
+    try testing.expectEqual(@as(usize, 1), (try q.forward(1, macOf(0x30), .access, 3, &buf)).flood.len);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
@@ -2036,7 +2177,7 @@ fn driveOpsWith(gpa: std.mem.Allocator, cur: *testkit.fuzz.Cursor) !usize {
                             if (t.isMember(isid, dst)) return error.KnownUnicastFlooded;
                         };
                     },
-                    .local_only => return error.AccessFrameLocalOnly,
+                    .local_only, .local_port, .filtered => return error.AccessFrameLocalOnly,
                 }
             },
             .forward_core => {

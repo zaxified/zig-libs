@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — ADDED the local-port dimension (a bridge learns the source port; Linux bridge FDB and Open vSwitch learn per port): `Port`, `Location` (`.pe` / `.port`), `Table.learnPort`, `learnStaticPort`, `lookupLocation`, `Ingress.access_port`, `Decision.local_port` and `Decision.filtered`. **Source-breaking:** `Decision` has two new variants (an exhaustive `switch` over it needs them) and `Table.FdbInfo.pe: PeId` is replaced by `location: Location`. Behaviour of existing calls is unchanged until a port is learned; then a unicast (also from the core) to that MAC is `local_port` instead of `unicast` / `local_only`.
 - **2026-11-16** — `Table.learnStats()` / `resetLearnStats()` and `LearnStats`: saturating totals of every `learn` outcome
   (learned, refreshed, moved, duplicate_detected, denied_duplicate, static_pinned) and refusal (invalid source, unknown
   I-SID, FDB full, out of memory) — the FDB-change counters a bridge/EVPN daemon exports.

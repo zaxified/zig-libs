@@ -51,15 +51,17 @@ chains them.
 ## The forward decision
 
 `forward(isid, dst_mac, ingress, now, out) → Decision`, where `ingress` is
-`.access` (a local customer port) or `.core = pe` (out of the fabric, replicated
+`.access` / `.access_port = p` (a local customer port) or `.core = pe` (out of the fabric, replicated
 by remote PE `pe` — `l2encap.decode` supplies that id):
 
-- **from the core** → `Decision.local_only`, always, whatever the destination:
-  deliver to local access circuits and put nothing back into the fabric. The
+- **from the core** → `Decision.local_only`, whatever the destination: deliver to local access circuits and put
+  nothing back into the fabric (only a unicast to a MAC learned behind a local port, see below, is `local_port`). The
   full mesh means every other member already got its own copy from the ingress
   PE (RFC 4762 §4.4, RFC 7432 §8.3.1).
 - **from access, known unicast** — `dst_mac` is a fresh FDB hit in `isid` →
   `Decision.unicast(pe)`: send to that one remote PE.
+- **from access, known unicast behind a local port** (`learnPort` / `learnStaticPort`) → `Decision.local_port(port)`;
+  with `Ingress.access_port` equal to that port → `Decision.filtered`. The same `local_port` answers a core frame.
 - **from access, BUM** → `Decision.flood(set)`: the I-SID's member PEs, written
   into the caller-supplied `out` buffer, ascending by PE id (deterministic).
   Members are the *remote* PEs, so there is nothing to exclude. The set may be
@@ -149,11 +151,13 @@ order — both pinned by permanent tests.
 - `learnStats() LearnStats` / `resetLearnStats()` — saturating totals of every `learn` outcome (`LearnStats.count`)
   and refusal (`invalid_source_mac`, `unknown_isid`, `fdb_full`, `out_of_memory`), for an operator who does not log
   every `LearnOutcome`.
-- `lookup(isid, mac, now) ?PeId` — the PE a known unicast would take, or null.
+- `learnPort(isid, mac, port, now) !LearnOutcome` / `learnStaticPort(...)` — bind a MAC to a local access circuit.
+- `lookup(isid, mac, now) ?PeId` — the PE a known unicast would take, or null; `lookupLocation(...) ?Location`
+  also reports a local port.
 - `forward(isid, dst, ingress, now, out) !Decision` — the forward decision;
   `replicationSet(isid, ingress, out) ![]const PeId` — the replication set
   directly, for a pre-classified BUM frame.
-- `fdbIterator(isid, now)` — allocation-free walk over `{mac, pe, age, static, quarantined, expired}`
+- `fdbIterator(isid, now)` — allocation-free walk over `{mac, location, age, static, quarantined, expired}`
   of one I-SID (each entry once, unspecified order; invalidated by any table mutation).
 - `tick(now)` — reclaim aged entries. `fdbCount(isid)` / `isidCount()` — sizes.
 - `isBroadcast(mac)` / `isMulticast(mac)` / `isBumAddress(dst)` — pure BUM
@@ -163,8 +167,8 @@ order — both pinned by permanent tests.
 
 A `Table` is `single_owner`: one thread or loop owns it and there is no internal lock, so two threads must not call
 into one table. Designated-forwarder election, loop-free BUM trees, inter-PE MAC-mobility signalling, ARP/ND
-suppression, port state and the frame itself are out of scope by design; a local-port dimension and IGMP/MLD snooping
-are open. See SPEC *What is deliberately not done* and *Backlog / deferred*.
+suppression, port state and the frame itself are out of scope by design; IGMP/MLD snooping
+is on the roadmap. See SPEC *What is deliberately not done* and *Roadmap*.
 
 ## Test
 
