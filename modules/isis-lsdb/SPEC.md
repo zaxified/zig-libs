@@ -115,7 +115,7 @@ bounds the "set on all" loops; `Config.broadcast_interfaces` marks LAN circuits.
 
 "Point-to-point" ≡ `C` ∉ `Config.broadcast_interfaces`. On a broadcast circuit an
 LSP is not SSN-acked (the DIS's periodic CSNP synchronises), so SSN is suppressed
-there — the only ISO LAN-vs-P2P distinction the flag matrix needs. A newer LSP
+there, but a CSNP entry we lack or that is newer than our copy still sets SSN (a LAN member asks the DIS for it, ISO 10589 §7.3.15.2) — the only ISO LAN-vs-P2P distinction the flag matrix needs. A newer LSP
 that **replaces** an existing entry resets both flag sets before applying the
 matrix (the old version's flags are superseded).
 
