@@ -177,8 +177,10 @@ message — a certificate chain routinely exceeds the path MTU, so a real peer
 fragments it. `handleFlight` therefore buffers a flight's datagrams and
 reassembles by `fragment_offset` (never by arrival order), tolerating
 out-of-order and duplicate fragments. While a flight is incomplete it returns
-`HandshakeResult.need_more_data` with an empty `out` and the connection
-**rolled back** to exactly its pre-call state, so a half-processed flight
+`HandshakeResult.need_more_data` and the connection **rolled back** to its
+pre-call state (`out` is empty, except for an RFC 9147 §7 ACK a server sends
+for the part of the client's final flight that arrived, and the re-sent rest
+of our own flight after an ACK that named only part of it), so a half-processed flight
 never leaves the state machine, transcript, key schedule or anti-replay
 windows half-advanced.
 
@@ -190,10 +192,9 @@ bytes with *different* content is `error.OverlappingFragment` — byte-identical
 re-delivery is fine, contradiction is not, because "last writer wins" would
 let an off-path attacker steer what ends up in the transcript hash.
 
-Sending is single-fragment in the 1.3 engine: it never splits a message it
-emits, so it needs a peer MTU that fits the messages it sends (bounded by
-`max_cert_message_body` and friends); the 1.2 engine does split, see
-`Config.max_datagram_len` below. And what the accumulator tolerates is a
+Both engines split what they send when `Config.max_datagram_len` is set (see
+*Small MTUs* below). A lost 1.3 flight is re-sent in new records (RFC 9147
+§5.2), without the records a peer ACK already named (§7.2). And what the accumulator tolerates is a
 peer that *fragments*, not one that retransmits a whole flight verbatim into
 the middle of an incomplete one — see `handleFlight`'s "KNOWN LIMIT".
 
@@ -242,9 +243,9 @@ also serves a client that does not offer it (as OpenSSL, wolfSSL and mbedTLS
 servers do). Renegotiation, CBC suites, static-RSA key exchange and
 compression are deliberately absent; resumption is not built.
 
-**Small MTUs.** `Config.max_datagram_len` (1.2 only, default 0 = off) splits
-every handshake message whose record would exceed it into RFC 6347 §4.2.3
-fragments; the bytes a call returns are then several datagrams, which
+**Small MTUs.** `Config.max_datagram_len` (default 0 = off) splits every
+handshake message whose record would exceed it into fragments (RFC 6347
+§4.2.3, RFC 9147 §5.5; both engines); the bytes a call returns are then several datagrams, which
 `dtls.record.nextDatagram` cuts:
 
 ```zig

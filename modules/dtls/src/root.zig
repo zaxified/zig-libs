@@ -118,12 +118,12 @@
 //!   the connection rolled back to its pre-call state while the flight is
 //!   still incomplete (`HandshakeResult.need_more_data`). Because those
 //!   buffered bytes are UNAUTHENTICATED at handshake time, the surface is
-//!   explicitly bounded: `max_flight_bytes` (4 KiB) buffered per flight,
+//!   explicitly bounded: `max_flight_bytes` (5.5 KiB) buffered per flight,
 //!   exactly ONE in-progress message, and a fragment that contradicts bytes
 //!   already received is rejected (`error.OverlappingFragment`) rather than
 //!   overwriting them — see `Connection.zig`'s "incoming-flight reassembly
-//!   bounds" section for the sizing argument. SENDING is still
-//!   single-fragment: this engine never splits a message it emits.
+//!   bounds" section for the sizing argument. SENDING splits a message at
+//!   `Config.max_datagram_len` (RFC 9147 §5.5).
 //!
 //!   Certificate mode is ALSO live now: `tools/interop.zig` drives a
 //!   PSK-less `.cert_dhe` handshake (X25519 (EC)DHE + an ECDSA P-256 chain

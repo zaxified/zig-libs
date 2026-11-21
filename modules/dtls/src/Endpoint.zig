@@ -92,14 +92,11 @@ pub const Endpoint = union(enum) {
         const old = &self.v13;
         switch (old.role) {
             .client => {
-                // The ClientHello is the cached last flight: one epoch-0
-                // record holding one unfragmented handshake message.
-                const rec = old.last_flight[0..old.last_flight_len];
-                if (rec.len < record.plaintext_header_len + handshake.header_len) return error.Malformed;
-                const hh = try handshake.decodeHeader(rec[record.plaintext_header_len..]);
-                const body_start = record.plaintext_header_len + handshake.header_len;
-                if (rec.len - body_start < hh.length) return error.Malformed;
-                const next = try Connection12.fromDualClientHello(old.config, rec[body_start..][0..hh.length], old.hs0.send_seq, now_ms);
+                // The ClientHello is the cached last flight (one epoch-0
+                // message, in one or several fragments).
+                var ch_buf: [2048]u8 = undefined; // the 1.3 engine's `max_client_hello_body`
+                const ch = old.cachedClientHello(&ch_buf) orelse return error.Malformed;
+                const next = try Connection12.fromDualClientHello(old.config, ch, old.hs0.send_seq, now_ms);
                 old.deinit();
                 self.* = .{ .v12 = next };
                 return self.v12.handleFlight(datagram, entropy, now_ms, out);

@@ -538,19 +538,18 @@ pub const Config = struct {
     /// ServerKeyExchange. Empty = no hint (and, for plain PSK, no
     /// ServerKeyExchange at all).
     psk_identity_hint: []const u8 = &.{},
-    /// DTLS 1.2 only: the largest datagram this side emits (the path MTU
-    /// minus the IP and UDP headers). Non-zero makes `Connection12` split
-    /// every handshake message whose record would be larger into RFC 6347
-    /// §4.2.3 fragments, so no record exceeds it; the records of one
+    /// The largest datagram this side emits (the path MTU minus the IP and
+    /// UDP headers). Non-zero makes both engines split every handshake
+    /// message whose record would be larger into fragments (RFC 6347
+    /// §4.2.3, RFC 9147 §5.5), so no record exceeds it; the records of one
     /// `handleFlight` / `poll` result are then meant to go out as several
     /// datagrams, which `record.nextDatagram` cuts from the returned bytes.
     /// 0 (the default) keeps one record per message and leaves datagram
     /// sizing to the caller — the behaviour before this field existed.
     /// pion/dtls defaults to 1200, wolfSSL and OpenSSL take the socket's MTU
     /// (about 1400 / 1472 on Ethernet), mbedTLS defaults to 0 like this one:
-    /// a non-zero default would oblige every caller to split. The 1.3
-    /// engine does not fragment on send yet and ignores this field (SPEC
-    /// Backlog). Values below `min_max_datagram_len` are a config error.
+    /// a non-zero default would oblige every caller to split. Values below
+    /// `min_max_datagram_len` are a config error.
     max_datagram_len: u16 = 0,
 
     pub fn allows(self: Config, v: ProtocolVersion) bool {
@@ -967,11 +966,23 @@ fn sameFlightTable(now: *const Connection, before: *const Connection) bool {
     return std.mem.eql(u8, std.mem.sliceAsBytes(now.flight_rns[0..n]), std.mem.sliceAsBytes(before.flight_rns[0..n]));
 }
 
-/// Records one cached flight may hold for ACK matching (`flight_rns`); the
-/// largest flight this engine sends, a certificate-mode server flight 2,
-/// has six (ServerHello, EncryptedExtensions, CertificateRequest,
-/// Certificate, CertificateVerify, Finished).
-const max_flight_records = 8;
+/// The ACK marks a rolled-back parse may hand to the restored flight: its
+/// own when the table is the one it started from, none when the handler had
+/// begun recording a new flight (`beginFlight`) before failing — those
+/// marks would index the new table. Dropping them only costs a
+/// retransmission.
+fn carriedFlightAcks(now: *const Connection, before: *const Connection) u64 {
+    return if (sameFlightTable(now, before)) now.flight_rns_acked else 0;
+}
+
+/// Records one cached flight may hold (`tx_pieces`, `flight_rns`): the
+/// largest flight this engine sends, a certificate-mode server flight 2, has
+/// six messages, and fragmented at `min_max_datagram_len` about forty
+/// records (a hybrid ServerHello alone is twelve). The ACK bitmap is a u64.
+const max_flight_records = 64;
+
+/// One handshake fragment of the cached flight (`Connection.tx_pieces`).
+const TxPiece = struct { off: u16, len: u16, kind: RecordKind };
 /// `Connection.ku_records` capacity (records that carried our KeyUpdate).
 const max_ku_records = 8;
 
@@ -1054,7 +1065,7 @@ const TakenMessage = struct {
 /// collecting past its capacity: an ACK naming a prefix of the flight is
 /// valid, and a peer must not be able to size this side's bookkeeping.
 const AckCollector = struct {
-    buf: [4]flight.RecordNumber = undefined,
+    buf: [max_ack_records]flight.RecordNumber = undefined,
     len: usize = 0,
 
     fn add(self: *AckCollector, sequence_number: u64) void {
@@ -1068,6 +1079,10 @@ const AckCollector = struct {
     }
 };
 
+/// `AckCollector` capacity: a client's final flight is three messages, and
+/// sixteen records leaves room for them fragmented.
+const max_ack_records = 16;
+
 /// RFC 9147 §5.2 `message_seq` ordering, wrap-aware: is `a` strictly BEHIND
 /// `b`? A handshake uses a handful of consecutive values, so the only thing
 /// that matters is that the comparison does not misread `0` as newer than
@@ -1080,17 +1095,21 @@ fn messageSeqOlderThan(a: u16, b: u16) bool {
 
 // ── certificate-mode sizing constants ────────────────────────────────────
 //
-// `protectHandshakeMessage`'s own `inner_buf` is a fixed 1500 bytes, and
-// this engine only ever SENDS single-fragment messages (it never fragments
-// on transmit — see `frameHandshakeMessage`), so every certificate-mode
-// message this engine sends must fit that ceiling; these constants stay
-// comfortably under it while covering realistic single/short chains (proven
-// by the ECDSA P-256 chains in `Connection.zig`'s own cert-mode tests, and
-// the RSA-2048 leaf in `certauth.zig`'s standalone bridge tests). Note the
-// asymmetry: RECEIVING a fragmented message IS supported (see
-// `max_flight_bytes` above); it is only the sending side that still emits
-// one fragment per message, which needs a peer MTU that fits it.
+// These bound the message bodies this engine builds; they cover realistic
+// single/short chains (proven by the ECDSA P-256 chains in `Connection.zig`'s
+// own cert-mode tests, and the RSA-2048 leaf in `certauth.zig`'s standalone
+// bridge tests) and keep the flight inside `max_flight_bytes`. A message
+// larger than one record (`max_send_fragment_inner`, or the record that
+// `Config.max_datagram_len` allows) is sent as several fragments
+// (`writeFragmented`).
 const max_cert_message_body: usize = 1200;
+/// The largest DTLSInnerPlaintext (fragment + content-type byte) one sealed
+/// handshake record carries, and the largest epoch-0 fragment piece.
+const max_send_fragment_inner: usize = 1500;
+/// Worst-case bytes a sealed epoch-2 handshake record adds to its fragment:
+/// the unified header with a 2-byte sequence number and a length field (5),
+/// the inner content type (1) and the AEAD tag (16, every wired suite).
+const max_epoch2_record_overhead: usize = 5 + 1 + 16;
 const max_certverify_body: usize = 600;
 const max_certreq_body: usize = 128;
 /// Upper bound on a CertificateVerify signature across every scheme
@@ -1719,26 +1738,37 @@ pub const Connection = struct {
     /// `deinit` only wipes real bytes, and a double-wipe after the in-handshake
     /// zeroization is harmless).
     ecdhe_secret_live: bool = false,
-    /// RFC 9147 §5.7 retransmission: the last flight WE sent, cached
-    /// verbatim so `poll` can resend it unchanged on timeout. Sized like the
-    /// RECEIVING side's flight buffer (`max_flight_bytes`) — the largest
-    /// flight this engine can emit is the same certificate-mode server
-    /// flight 2 that bound dictates, and with a hybrid ServerHello it no
-    /// longer fits the 1500 bytes this used to be (a cert-mode flight could
-    /// already exceed that; `cacheFlight` then failed the handshake with
-    /// `BufferTooShort` AFTER the flight went out on the wire).
-    last_flight: [max_flight_bytes]u8 = undefined,
-    last_flight_len: usize = 0,
+    /// RFC 9147 §5.7 retransmission: the last flight WE sent, cached as the
+    /// handshake fragments its records carried (`tx_pieces[k]` is a slice of
+    /// `tx_buf` and the record kind it went out in), so `poll` can re-seal
+    /// each in a NEW record (§5.2: "the retransmission is a new record. This
+    /// record will have a new DTLSPlaintext.sequence_number value") and leave
+    /// out what an ACK already named (§7.2). Sized like the RECEIVING side's
+    /// flight buffer (`max_flight_bytes`): the largest flight this engine can
+    /// emit is the same certificate-mode server flight 2 that bound dictates.
+    tx_buf: [max_flight_bytes]u8 = undefined,
+    tx_len: usize = 0,
+    tx_pieces: [max_flight_records]TxPiece = undefined,
+    /// Set by `beginFlight`, cleared by `cacheFlight`: only the records of a
+    /// flight that will be cached are remembered by the record writers.
+    tx_recording: bool = false,
+    /// The flight being recorded did not fit `tx_buf`/`tx_pieces`;
+    /// `cacheFlight` then fails the handshake.
+    tx_overflow: bool = false,
     retransmit_timer: flight.RetransmitTimer = flight.RetransmitTimer.init(1000, 60_000),
-    /// RFC 9147 §7.2: the (epoch, sequence_number) of each record of
-    /// `last_flight` (`recordFlightNumbers`) and which of them a peer ACK
-    /// has named (bit `i` for `flight_rns[i]`). Once every one has been
-    /// ACKed the flight's retransmission is cancelled (`noteFlightAck`).
-    /// Empty when the flight could not be described, which only means an
-    /// ACK can never cancel it.
+    /// RFC 9147 §7.2: the (epoch, sequence_number) of the record that last
+    /// carried `tx_pieces[k]` and which of them a peer ACK has named (bit
+    /// `k`). Acknowledged pieces are left out of every later retransmission,
+    /// and once all are ACKed the flight's retransmission is cancelled
+    /// (`noteFlightAck`). Zero length = no flight cached.
     flight_rns: [max_flight_records]flight.RecordNumber = undefined,
     flight_rns_len: u8 = 0,
-    flight_rns_acked: u8 = 0,
+    flight_rns_acked: u64 = 0,
+    /// The epoch-2 records of the client's final flight a parse that ran out
+    /// of records had read (`takeHandshakeMessage`), for `handleFlight`'s
+    /// partial-flight ACK. Meaningful only between that parse and its
+    /// rollback.
+    partial_acks: AckCollector = .{},
 
     // ── incoming-flight accumulation (RFC 9147 §5.2 reassembly) ─────────
     /// Datagrams received for the flight currently being consumed,
@@ -1780,13 +1810,18 @@ pub const Connection = struct {
         done: bool,
         /// `true` when the datagram was CONSUMED BUT the flight is still
         /// incomplete — a handshake message is split across datagrams (RFC
-        /// 9147 §5.2) and the rest has not arrived. `out` is empty and the
-        /// connection is byte-for-byte unchanged apart from the buffered
-        /// bytes; feed the next datagram to the same `Connection`.
+        /// 9147 §5.2) and the rest has not arrived. The connection is
+        /// unchanged apart from the buffered bytes, ACK marks on this side's
+        /// own flight and the sending sequence numbers; feed the next
+        /// datagram to the same `Connection`. `out` is usually empty; it
+        /// holds records to send when the datagram carried an ACK naming
+        /// only part of this side's last flight (the rest, re-sent at once,
+        /// RFC 9147 §7.2) or, on a server, part of the client's final flight
+        /// (an ACK of what arrived so far, §7.1).
         ///
         /// A caller that ignores this field still behaves correctly — it
-        /// sees an empty `out` and a not-`done` result, which is exactly
-        /// "send nothing, read again" — so it exists to be ASSERTED on
+        /// sends `out` and reads again, as for any not-`done` result — so it
+        /// exists to be ASSERTED on
         /// (a test that wants to prove reassembly really happened, rather
         /// than that the handshake merely completed).
         need_more_data: bool = false,
@@ -1850,8 +1885,9 @@ pub const Connection = struct {
         const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
         self.message_seq +%= 1;
 
+        self.beginFlight();
         const record_bytes = try self.writeEpoch0Record(fragment, out);
-        try self.cacheFlight(record_bytes, now_ms);
+        try self.cacheFlight(now_ms);
 
         self.state = .wait_server_hello;
         return record_bytes;
@@ -1930,6 +1966,7 @@ pub const Connection = struct {
         }
         @memcpy(self.rx_flight[self.rx_flight_len..][0..datagram.len], datagram);
         self.rx_flight_len += datagram.len;
+        self.partial_acks = .{};
 
         // Taken AFTER the append, so a rollback keeps the newly-buffered
         // bytes while undoing everything the parse below did.
@@ -1947,10 +1984,29 @@ pub const Connection = struct {
             .client => self.handleFlightClient(input, entropy, now_ms, out),
         } catch |err| switch (err) {
             error.FlightIncomplete => {
-                const acked = self.flight_rns_acked;
-                std.debug.assert(sameFlightTable(self, &saved));
+                const acked = carriedFlightAcks(self, &saved);
+                const partial = self.partial_acks;
                 self.* = saved;
                 self.keepFlightAcks(acked);
+                // RFC 9147 §7.2: "Upon receipt of an ACK that leaves it with
+                // only some messages from a flight having been acknowledged,
+                // an implementation SHOULD retransmit the unacknowledged
+                // messages or fragments" — at once, in new records.
+                if (acked & ~saved.flight_rns_acked != 0 and self.retransmit_timer.isArmed()) {
+                    const resent = try self.retransmitFlight(out);
+                    return .{ .out = resent, .done = false, .need_more_data = true };
+                }
+                // §7.1: a receiver that "detects a disruption in the receipt
+                // of the current incoming flight ... SHOULD generate an ACK
+                // that covers the messages from that flight which it has
+                // received and processed so far". Only the server can: it
+                // holds the handshake keys before the client's final flight
+                // arrives, while a client commits the ServerHello (and so its
+                // keys) only with a complete flight 2.
+                if (self.role == .server and self.state == .wait_finished and partial.len != 0) {
+                    const ack = try self.handshakeAckRecord(partial.items(), out);
+                    return .{ .out = ack, .done = false, .need_more_data = true };
+                }
                 return .{ .out = out[0..0], .done = false, .need_more_data = true };
             },
             // A real protocol/crypto failure ends this flight: drop the
@@ -1976,8 +2032,7 @@ pub const Connection = struct {
             // preserving the association" — which means the association must
             // still be the one that existed before the record arrived.
             else => {
-                const acked = self.flight_rns_acked;
-                std.debug.assert(sameFlightTable(self, &saved));
+                const acked = carriedFlightAcks(self, &saved);
                 self.* = saved;
                 self.keepFlightAcks(acked);
                 self.rx_flight_len = 0;
@@ -2009,12 +2064,11 @@ pub const Connection = struct {
     pub fn poll(self: *Connection, now_ms: u64, out: []u8) HandshakeError!?[]const u8 {
         if (self.state == .connected) return burn.run(burn.record_burn, SendError!?[]const u8, pollConnected, .{ self, now_ms, out });
         if (self.state == .start) return null;
-        if (self.last_flight_len == 0) return null;
+        if (self.flight_rns_len == 0) return null;
         if (!self.retransmit_timer.isExpired(now_ms)) return null;
-        if (out.len < self.last_flight_len) return error.BufferTooShort;
-        @memcpy(out[0..self.last_flight_len], self.last_flight[0..self.last_flight_len]);
+        const bytes = try self.retransmitFlight(out);
         self.retransmit_timer.onTimeout(now_ms);
-        return out[0..self.last_flight_len];
+        return bytes;
     }
 
     /// Installs the negotiated suite's application-data record-protection
@@ -2964,7 +3018,41 @@ pub const Connection = struct {
     /// `content_type_handshake`, epoch 0 — the format ClientHello/
     /// ServerHello use, before any record protection exists) and appends
     /// it to `out`. Advances `hs0.send_seq`.
+    /// With `Config.max_datagram_len` set, a message whose record would be
+    /// larger is split into RFC 9147 §5.5 fragments first, one record each
+    /// (`writeFragmented`).
     fn writeEpoch0Record(self: *Connection, fragment_bytes: []const u8, out: []u8) HandshakeError![]const u8 {
+        const limit: usize = self.config.max_datagram_len;
+        if (limit != 0 and record.plaintext_header_len + fragment_bytes.len > limit)
+            return self.writeFragmented(fragment_bytes, limit - record.plaintext_header_len - handshake.header_len, .epoch0_plaintext, out);
+        return self.writeEpoch0One(fragment_bytes, out);
+    }
+
+    /// Re-frames the single-fragment message `fragment_bytes` (12-byte
+    /// header + whole body, from `frameHandshakeMessage`) as consecutive
+    /// fragments of at most `frag_cap` body bytes (RFC 9147 §5.5: same
+    /// `message_seq` and `length`, increasing `fragment_offset`) and writes
+    /// each as its own record of `kind`. The transcript is unaffected — it
+    /// hashes the unfragmented message (RFC 9147 §5.2) — and so is the
+    /// receiver, which reassembles either form.
+    fn writeFragmented(self: *Connection, fragment_bytes: []const u8, frag_cap: usize, kind: RecordKind, out: []u8) HandshakeError![]const u8 {
+        const hh = handshake.decodeHeader(fragment_bytes) catch return error.BufferTooShort;
+        if (fragment_bytes.len < handshake.header_len + hh.fragment_length) return error.BufferTooShort;
+        var fr = handshake.Fragmenter.init(hh.msg_type, hh.message_seq, fragment_bytes[handshake.header_len..][0..hh.fragment_length]);
+        var piece_buf: [max_send_fragment_inner]u8 = undefined;
+        const cap = @min(frag_cap, piece_buf.len - handshake.header_len);
+        var cursor: usize = 0;
+        while (fr.next(cap, &piece_buf)) |piece| {
+            const rec = switch (kind) {
+                .epoch0_plaintext => try self.writeEpoch0One(piece, out[cursor..]),
+                .epoch2_protected => try self.protectHandshakeOne(piece, out[cursor..]),
+            };
+            cursor += rec.len;
+        }
+        return out[0..cursor];
+    }
+
+    fn writeEpoch0One(self: *Connection, fragment_bytes: []const u8, out: []u8) HandshakeError![]const u8 {
         const hdr = record.PlaintextHeader{
             .content_type = content_type_handshake,
             .epoch = 0,
@@ -2974,6 +3062,7 @@ pub const Connection = struct {
         const hdr_slice = record.encodePlaintext(hdr, out) catch return error.BufferTooShort;
         if (out.len < hdr_slice.len + fragment_bytes.len) return error.BufferTooShort;
         @memcpy(out[hdr_slice.len..][0..fragment_bytes.len], fragment_bytes);
+        self.recordPiece(.epoch0_plaintext, fragment_bytes, .{ .epoch = 0, .sequence_number = self.hs0.send_seq });
         self.hs0.send_seq +%= 1;
         return out[0 .. hdr_slice.len + fragment_bytes.len];
     }
@@ -2982,13 +3071,38 @@ pub const Connection = struct {
     /// `fragment_bytes` (content_type = handshake = 22) with `hs_write_keys`
     /// under a `record.UnifiedHeader`, using and advancing `hs2.send_seq`.
     /// Used for {EncryptedExtensions, Finished}.
+    /// A message whose sealed record would exceed `Config.max_datagram_len`
+    /// (or, with no limit, the 1500-byte record buffer) is first split into
+    /// RFC 9147 §5.5 fragments, one record each (`writeFragmented`).
     fn protectHandshakeMessage(self: *Connection, fragment_bytes: []const u8, out: []u8) HandshakeError![]const u8 {
+        const limit: usize = self.config.max_datagram_len;
+        if (limit != 0 and max_epoch2_record_overhead + fragment_bytes.len > limit)
+            return self.writeFragmented(fragment_bytes, limit - max_epoch2_record_overhead - handshake.header_len, .epoch2_protected, out);
+        if (fragment_bytes.len + 1 > max_send_fragment_inner)
+            return self.writeFragmented(fragment_bytes, max_send_fragment_inner - 1 - handshake.header_len, .epoch2_protected, out);
+        return self.protectHandshakeOne(fragment_bytes, out);
+    }
+
+    fn protectHandshakeOne(self: *Connection, fragment_bytes: []const u8, out: []u8) HandshakeError![]const u8 {
+        return self.protectEpoch2(content_type_handshake, fragment_bytes, out);
+    }
+
+    /// An RFC 9147 §7 ACK naming `rns`, sealed in a handshake-epoch record
+    /// (§7: an ACK travels in an epoch equal to or higher than the records
+    /// it names).
+    fn handshakeAckRecord(self: *Connection, rns: []const flight.RecordNumber, out: []u8) HandshakeError![]const u8 {
+        var body_buf: [2 + max_ack_records * flight.record_number_len]u8 = undefined;
+        const body = flight.encodeAck(rns, &body_buf) catch return error.BufferTooShort;
+        return self.protectEpoch2(content_type_ack, body, out);
+    }
+
+    fn protectEpoch2(self: *Connection, inner_type: u8, fragment_bytes: []const u8, out: []u8) HandshakeError![]const u8 {
         const params = suiteParams(self.suite) orelse return error.UnsupportedSuite;
 
-        var inner_buf: [1500]u8 = undefined;
+        var inner_buf: [max_send_fragment_inner]u8 = undefined;
         if (fragment_bytes.len + 1 > inner_buf.len) return error.BufferTooShort;
         @memcpy(inner_buf[0..fragment_bytes.len], fragment_bytes);
-        inner_buf[fragment_bytes.len] = content_type_handshake;
+        inner_buf[fragment_bytes.len] = inner_type;
         const inner = inner_buf[0 .. fragment_bytes.len + 1];
 
         const ct_len = inner.len + params.tag_len;
@@ -3013,6 +3127,8 @@ pub const Connection = struct {
         const seq_off: usize = 1;
         try snMaskDispatch(self.suite, &self.hs_write_keys, out[hdr_len..][0..16], out[seq_off..][0..seq_bytes_n]);
 
+        if (inner_type == content_type_handshake)
+            self.recordPiece(.epoch2_protected, fragment_bytes, .{ .epoch = handshake_epoch, .sequence_number = self.hs2.send_seq });
         self.hs2.send_seq +%= 1;
         return out[0 .. hdr_len + ct_len];
     }
@@ -3127,7 +3243,10 @@ pub const Connection = struct {
         var reasm_live = false;
 
         while (true) {
-            if (pos.* >= datagram.len) return error.FlightIncomplete;
+            if (pos.* >= datagram.len) {
+                if (acks) |a| self.partial_acks = a.*;
+                return error.FlightIncomplete;
+            }
 
             var plain_buf: [max_record_plaintext]u8 = undefined;
             const fragment = switch (kind) {
@@ -3199,54 +3318,95 @@ pub const Connection = struct {
         }
     }
 
-    /// Caches `bytes` as the last flight WE sent (for `poll` to retransmit)
-    /// and (re)arms `retransmit_timer` from `now_ms`.
-    fn cacheFlight(self: *Connection, bytes: []const u8, now_ms: u64) HandshakeError!void {
-        if (bytes.len > self.last_flight.len) return error.BufferTooShort;
-        @memcpy(self.last_flight[0..bytes.len], bytes);
-        self.last_flight_len = bytes.len;
-        self.recordFlightNumbers(bytes);
+    /// Starts recording the flight about to be written: every record the
+    /// handshake writers emit until `cacheFlight` becomes part of it. Call
+    /// before the flight's first record; the previous flight is dropped
+    /// (a failed handler is rolled back by `handleFlight`, restoring it).
+    fn beginFlight(self: *Connection) void {
+        self.tx_len = 0;
+        self.flight_rns_len = 0;
+        self.flight_rns_acked = 0;
+        self.tx_recording = true;
+        self.tx_overflow = false;
+    }
+
+    /// Remembers one handshake fragment of the flight being recorded and the
+    /// record number it went out under. A no-op outside `beginFlight` /
+    /// `cacheFlight` (retransmissions, the stateless HelloRetryRequest).
+    fn recordPiece(self: *Connection, kind: RecordKind, fragment_bytes: []const u8, rn: flight.RecordNumber) void {
+        if (!self.tx_recording or self.tx_overflow) return;
+        const k = self.flight_rns_len;
+        if (k == max_flight_records or fragment_bytes.len > self.tx_buf.len - self.tx_len) {
+            self.tx_overflow = true;
+            return;
+        }
+        @memcpy(self.tx_buf[self.tx_len..][0..fragment_bytes.len], fragment_bytes);
+        self.tx_pieces[k] = .{ .off = @intCast(self.tx_len), .len = @intCast(fragment_bytes.len), .kind = kind };
+        self.flight_rns[k] = rn;
+        self.tx_len += fragment_bytes.len;
+        self.flight_rns_len = k + 1;
+    }
+
+    /// Ends the recording `beginFlight` started: the flight is now the one
+    /// `poll` retransmits, and `retransmit_timer` is (re)armed from `now_ms`.
+    fn cacheFlight(self: *Connection, now_ms: u64) HandshakeError!void {
+        self.tx_recording = false;
+        if (self.tx_overflow) {
+            self.flight_rns_len = 0;
+            return error.BufferTooShort;
+        }
         self.retransmit_timer.reset();
         self.retransmit_timer.arm(now_ms);
     }
 
-    /// Fills `flight_rns` with the record numbers of `bytes`, the flight
-    /// just cached. An epoch-0 record carries its number in the clear; the
-    /// epoch-2 records are sealed consecutively, so they are the last `n`
-    /// numbers `hs2.send_seq` handed out. Anything else — a record this
-    /// cannot read, an epoch other than 0/2, more than `max_flight_records`
-    /// records — leaves the table empty: such a flight is never cancelled
-    /// by an ACK and keeps its (conforming) timer-driven resend.
-    fn recordFlightNumbers(self: *Connection, bytes: []const u8) void {
+    /// Drops the cached flight (nothing left to retransmit).
+    fn dropFlight(self: *Connection) void {
         self.flight_rns_len = 0;
         self.flight_rns_acked = 0;
-        var rns: [max_flight_records]flight.RecordNumber = undefined;
-        var n: usize = 0;
-        var n2: u48 = 0;
-        var pos: usize = 0;
-        while (pos < bytes.len) : (n += 1) {
-            if (n == rns.len) return;
-            const rest = bytes[pos..];
-            if (rest[0] == content_type_handshake) {
-                const h = record.decodePlaintext(rest) catch return;
-                if (h.epoch != 0 or rest.len - record.plaintext_header_len < h.length) return;
-                rns[n] = .{ .epoch = 0, .sequence_number = h.sequence_number };
-                pos += record.plaintext_header_len + h.length;
-            } else {
-                const dec = record.decodeUnified(rest, 0) catch return;
-                if (dec.hdr.epoch_low != 2) return;
-                rns[n] = .{ .epoch = 2, .sequence_number = n2 };
-                n2 += 1;
-                pos += recordWireLen(rest) catch return;
-            }
+        self.tx_len = 0;
+    }
+
+    /// Re-seals every piece of the cached flight no ACK has named, each in a
+    /// NEW record (fresh `hs0`/`hs2` sequence number, RFC 9147 §5.2), into
+    /// `out`, and moves `flight_rns` to the new numbers. An ACK naming the
+    /// record a piece used before is then no longer matched — it only costs
+    /// one more retransmission of that piece.
+    fn retransmitFlight(self: *Connection, out: []u8) HandshakeError![]const u8 {
+        var cursor: usize = 0;
+        for (self.tx_pieces[0..self.flight_rns_len], 0..) |pc, k| {
+            if (self.flight_rns_acked & (@as(u64, 1) << @intCast(k)) != 0) continue;
+            const frag = self.tx_buf[pc.off..][0..pc.len];
+            const rec = switch (pc.kind) {
+                .epoch0_plaintext => blk: {
+                    self.flight_rns[k] = .{ .epoch = 0, .sequence_number = self.hs0.send_seq };
+                    break :blk try self.writeEpoch0One(frag, out[cursor..]);
+                },
+                .epoch2_protected => blk: {
+                    self.flight_rns[k] = .{ .epoch = handshake_epoch, .sequence_number = self.hs2.send_seq };
+                    break :blk try self.protectHandshakeOne(frag, out[cursor..]);
+                },
+            };
+            cursor += rec.len;
         }
-        if (n2 > self.hs2.send_seq) return;
-        const first2 = self.hs2.send_seq - n2;
-        for (rns[0..n]) |*rn| {
-            if (rn.epoch == 2) rn.sequence_number += first2;
+        return out[0..cursor];
+    }
+
+    /// The cached ClientHello's body (for `Endpoint`'s hand-over to DTLS
+    /// 1.2), reassembled from its pieces into `buf`; null unless the cached
+    /// flight is exactly one epoch-0 ClientHello.
+    pub fn cachedClientHello(self: *const Connection, buf: []u8) ?[]const u8 {
+        var total: ?usize = null;
+        for (self.tx_pieces[0..self.flight_rns_len]) |pc| {
+            if (pc.kind != .epoch0_plaintext) return null;
+            const frag = self.tx_buf[pc.off..][0..pc.len];
+            const hh = handshake.decodeHeader(frag) catch return null;
+            if (hh.msg_type != @backingInt(messages.HandshakeType.client_hello)) return null;
+            if (frag.len < handshake.header_len + hh.fragment_length) return null;
+            if (hh.length > buf.len or @as(usize, hh.fragment_offset) + hh.fragment_length > hh.length) return null;
+            if (total) |t| (if (t != hh.length) return null) else total = hh.length;
+            @memcpy(buf[hh.fragment_offset..][0..hh.fragment_length], frag[handshake.header_len..][0..hh.fragment_length]);
         }
-        @memcpy(self.flight_rns[0..n], rns[0..n]);
-        self.flight_rns_len = @intCast(n);
+        return buf[0 .. total orelse return null];
     }
 
     /// RFC 9147 §7.2, for an ACK that arrived in an AUTHENTICATED handshake
@@ -3263,7 +3423,7 @@ pub const Connection = struct {
             const rn = flight.decodeRecordNumber(body[i..][0..flight.record_number_len]);
             for (self.flight_rns[0..self.flight_rns_len], 0..) |sent, k| {
                 if (sent.epoch == rn.epoch and sent.sequence_number == rn.sequence_number)
-                    self.flight_rns_acked |= @as(u8, 1) << @intCast(k);
+                    self.flight_rns_acked |= @as(u64, 1) << @intCast(k);
             }
         }
         self.keepFlightAcks(0);
@@ -3271,20 +3431,16 @@ pub const Connection = struct {
 
     /// Adds `acked` to the marks and cancels the retransmission when every
     /// record of the flight is marked. `handleFlight` calls it with the
-    /// marks a rolled-back parse collected: an ACK is authenticated before
-    /// it is noted, and no handler caches a new flight and then fails, so
-    /// the marks still name the restored table.
-    ///
-    /// ⚠ That makes `cacheFlight` the LAST effectful step of every caller
-    /// (`startHandshake`, `serverProcessClientHello`,
-    /// `handleHelloRetryRequest`): a handler that cached a new flight and
-    /// then failed would hand back marks indexed against the NEW table, and
-    /// OR-ing them onto the restored old one could cancel the wrong flight.
-    /// `handleFlight` asserts the table is unchanged before it carries them.
-    fn keepFlightAcks(self: *Connection, acked: u8) void {
+    /// marks a rolled-back parse collected (an ACK is authenticated before
+    /// it is noted), and only when the parse left the table as it found it
+    /// (`carriedFlightAcks`): a handler that began recording a new flight
+    /// (`beginFlight`) and then failed would hand back marks indexed against
+    /// the NEW table, and OR-ing them onto the restored old one could cancel
+    /// the wrong flight.
+    fn keepFlightAcks(self: *Connection, acked: u64) void {
         self.flight_rns_acked |= acked;
         if (self.flight_rns_len == 0) return;
-        const all: u8 = @truncate((@as(u16, 1) << @intCast(self.flight_rns_len)) - 1);
+        const all: u64 = if (self.flight_rns_len == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(self.flight_rns_len)) - 1;
         if (self.flight_rns_acked == all) self.retransmit_timer.reset();
     }
 
@@ -3658,7 +3814,7 @@ pub const Connection = struct {
     /// distinguish that from a legitimately fragmenting client: an empty
     /// `out` is what both produce. Each such source address then costs the
     /// server one live `Connection` (~13 KB, dominated by `rx_flight`/
-    /// `last_flight`/`ecdhe_public`) held until `max_flight_bytes` forces
+    /// `tx_buf`/`ecdhe_public`) held until `max_flight_bytes` forces
     /// `FlightTooLarge` — a ~500x memory amplification against a 26-byte
     /// packet, on the exact path the cookie exchange exists to keep
     /// stateless. This is a real design tension, not a coding error: the
@@ -4006,6 +4162,7 @@ pub const Connection = struct {
         const sh_fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.server_hello), self.message_seq, sh_body, &sh_frag_buf);
         self.message_seq +%= 1;
         var cursor: usize = 0;
+        self.beginFlight();
         {
             const sh_record = try self.writeEpoch0Record(sh_fragment, out[cursor..]);
             cursor += sh_record.len;
@@ -4099,7 +4256,7 @@ pub const Connection = struct {
         const th_through_server_finished = self.transcript.currentHash(alg, &th_buf);
         suitehash.deriveApplicationSecrets(alg, &self.pending_ap_client, &self.pending_ap_server, &self.exporter_master, &ms, th_through_server_finished);
 
-        try self.cacheFlight(out[0..cursor], now_ms);
+        try self.cacheFlight(now_ms);
         self.state = .wait_finished;
         return .{ .out = out[0..cursor], .done = false };
     }
@@ -4139,7 +4296,7 @@ pub const Connection = struct {
 
         try self.installApplicationSecrets(self.suite, self.pending_ap_client[0..alg.len()], self.pending_ap_server[0..alg.len()]);
         self.retransmit_timer.reset();
-        self.last_flight_len = 0;
+        self.dropFlight();
 
         // RFC 9147 §7.1: "In general, flights MUST be ACKed unless they are
         // implicitly acknowledged", and the list of implicitly-acknowledged
@@ -4154,7 +4311,7 @@ pub const Connection = struct {
         // just above, so the ACK goes out on epoch 3 while naming epoch-2
         // records, which §7 explicitly allows (the ACK's epoch must be equal
         // to or higher than the records it acknowledges).
-        var ack_body_buf: [2 + 4 * flight.record_number_len]u8 = undefined;
+        var ack_body_buf: [2 + max_ack_records * flight.record_number_len]u8 = undefined;
         const ack_body = flight.encodeAck(cert_result.acks.items(), &ack_body_buf) catch
             return error.BufferTooShort;
         const ack_record = try self.protectRecord(content_type_ack, ack_body, out);
@@ -4287,8 +4444,9 @@ pub const Connection = struct {
         const fragment = try frameHandshakeMessage(@backingInt(messages.HandshakeType.client_hello), self.message_seq, ch_body, &frag_buf);
         self.message_seq +%= 1;
 
+        self.beginFlight();
         const record_bytes = try self.writeEpoch0Record(fragment, out);
-        try self.cacheFlight(record_bytes, now_ms);
+        try self.cacheFlight(now_ms);
 
         // Still waiting for a ServerHello — just for the real one this time.
         return .{ .out = record_bytes, .done = false };
@@ -4716,9 +4874,10 @@ fn cipherSuiteFromU16(v: u16) ?CipherSuite {
 }
 
 /// Frames `body` as a single-fragment `handshake.zig` message (12-byte
-/// header + the whole body in one fragment — every message this engine
-/// sends comfortably fits `frag_out`, so `Fragmenter.next` always succeeds
-/// on its first call). Does not touch the record layer.
+/// header + the whole body in one fragment, so `Fragmenter.next` always
+/// succeeds on its first call). The record writers split it further when
+/// it does not fit one record (`writeFragmented`). Does not touch the
+/// record layer.
 fn frameHandshakeMessage(msg_type: u8, message_seq: u16, body: []const u8, frag_out: []u8) HandshakeError![]const u8 {
     var fragmenter = handshake.Fragmenter.init(msg_type, message_seq, body);
     const max_len = if (frag_out.len > handshake.header_len) frag_out.len - handshake.header_len else 0;
@@ -4728,7 +4887,7 @@ fn frameHandshakeMessage(msg_type: u8, message_seq: u16, body: []const u8, frag_
 /// Decodes ONE self-contained (single-fragment) handshake message from
 /// `fragment_bytes`. Used only where the message is known to be complete in
 /// one fragment because THIS engine produced it — `frameHandshakeMessage`
-/// never fragments on transmit. Receiving is the general case and goes
+/// does not split it while `Config.max_datagram_len` is unset. Receiving is the general case and goes
 /// through `Connection.takeHandshakeMessage` instead.
 fn decodeSingleFragmentMessage(
     fragment_bytes: []const u8,
@@ -5237,7 +5396,7 @@ fn splitSourceFromEpoch0(record_bytes: []const u8) !SplitSource {
         .body_len = hdr.fragment_length,
     };
     // Only a message this engine emitted is used as a splitting source, and
-    // it never fragments on transmit — so the one fragment IS the message.
+    // (without `max_datagram_len`) it sends one fragment per message — so the one fragment IS the message.
     try testing.expectEqual(hdr.length, hdr.fragment_length);
     @memcpy(out.body[0..out.body_len], fragment[handshake.header_len..][0..out.body_len]);
     return out;
@@ -5485,7 +5644,7 @@ test "reassembly: a ClientHello split across two datagrams, delivered OUT OF ORD
     try testing.expectEqualSlices(u8, before_transcript, after_transcript);
     try testing.expectEqual(before_hs0, server.hs0);
     try testing.expectEqual(before_hs2, server.hs2);
-    try testing.expectEqual(@as(usize, 0), server.last_flight_len);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
 
     // First half second — completes the message. The PSK binder is computed
     // over the REASSEMBLED body, so this only verifies if the two halves
@@ -6416,7 +6575,7 @@ test "HRR server: the cookie exchange completes — and the connection that answ
     // RFC 9147 §5.1's FIRST attack (resource exhaustion), not just the
     // amplification one.
     try testing.expectEqual(State.start, server1.state);
-    try testing.expectEqual(@as(usize, 0), server1.last_flight_len);
+    try testing.expectEqual(@as(u8, 0), server1.flight_rns_len);
     var empty_th: Secret = undefined;
     var server1_th: Secret = undefined;
     try testing.expectEqualSlices(u8, (suitehash.Transcript{}).currentHash(.sha256, &empty_th), server1.transcript.currentHash(.sha256, &server1_th));
@@ -6795,9 +6954,13 @@ test "handshake: dropped ClientHello retransmits via poll (fake clock), then com
 
     // Before the initial 1000ms timeout: nothing to retransmit yet.
     try testing.expectEqual(@as(?[]const u8, null), try client.poll(500, &buf2));
-    // At/after the deadline: the SAME ClientHello bytes come back.
+    // At/after the deadline: the same ClientHello comes back in a NEW record
+    // (RFC 9147 §5.2): only the record sequence number (bytes 5..10) moved.
     const ch2 = (try client.poll(1000, &buf2)).?;
-    try testing.expectEqualSlices(u8, ch1_copy[0..ch1.len], ch2);
+    try testing.expectEqual(ch1.len, ch2.len);
+    try testing.expectEqualSlices(u8, ch1_copy[0..10], ch2[0..10]);
+    try testing.expectEqual(@as(u8, 1), ch2[10]);
+    try testing.expectEqualSlices(u8, ch1_copy[11..ch1.len], ch2[11..]);
 
     // Deliver the RETRANSMITTED copy — the handshake completes normally.
     const flight2 = try server.handleFlight(ch2, rnd, 1000, &buf1);
@@ -9284,9 +9447,9 @@ test "installApplicationSecrets: SHA-384 secrets install; the [32]u8 installAppl
 
 test "audit: AckCollector stops at its capacity" {
     var a: AckCollector = .{};
-    for (0..6) |i| a.add(i);
-    try testing.expectEqual(@as(usize, 4), a.items().len);
-    try testing.expectEqual(@as(u64, 3), a.items()[3].sequence_number);
+    for (0..max_ack_records + 2) |i| a.add(i);
+    try testing.expectEqual(@as(usize, max_ack_records), a.items().len);
+    try testing.expectEqual(@as(u64, max_ack_records - 1), a.items()[max_ack_records - 1].sequence_number);
 }
 
 test "audit: signatureAlgorithmsExtension takes eight schemes, not nine" {
@@ -9681,14 +9844,32 @@ test "audit: takeHandshakeMessage: non-handshake epoch-0 record, short fragment,
     try testing.expectError(error.BufferTooShort, c.takeHandshakeMessage(d[0..36], &pos, .epoch0_plaintext, &mb, &rb, null));
 }
 
-test "audit: cacheFlight takes a flight of exactly its capacity" {
+test "audit: the cached flight takes exactly its byte and record capacity" {
     var c = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "k" });
     defer c.deinit();
     const a = try testing.allocator.alloc(u8, max_flight_bytes + 1);
     defer testing.allocator.free(a);
     @memset(a, 3);
-    try c.cacheFlight(a[0..max_flight_bytes], 0);
-    try testing.expectError(error.BufferTooShort, c.cacheFlight(a, 0));
+    const rn: flight.RecordNumber = .{ .epoch = 0, .sequence_number = 0 };
+    c.beginFlight();
+    c.recordPiece(.epoch0_plaintext, a[0..max_flight_bytes], rn);
+    try c.cacheFlight(0);
+    try testing.expectEqual(@as(u8, 1), c.flight_rns_len);
+    c.beginFlight();
+    c.recordPiece(.epoch0_plaintext, a[0 .. max_flight_bytes - 1], rn);
+    c.recordPiece(.epoch0_plaintext, a[0..2], rn);
+    try testing.expectError(error.BufferTooShort, c.cacheFlight(0));
+    try testing.expectEqual(@as(u8, 0), c.flight_rns_len);
+    c.beginFlight();
+    for (0..max_flight_records) |_| c.recordPiece(.epoch0_plaintext, a[0..1], rn);
+    try c.cacheFlight(0);
+    try testing.expectEqual(@as(u8, max_flight_records), c.flight_rns_len);
+    c.beginFlight();
+    for (0..max_flight_records + 1) |_| c.recordPiece(.epoch0_plaintext, a[0..1], rn);
+    try testing.expectError(error.BufferTooShort, c.cacheFlight(0));
+    // Outside a recording nothing is remembered.
+    c.recordPiece(.epoch0_plaintext, a[0..1], rn);
+    try testing.expectEqual(@as(u8, 0), c.flight_rns_len);
 }
 
 fn auditConsume(s: *Connection, r: *Connection, msgs: []const struct { t: messages.HandshakeType, body: []const u8 }, allow_cr: bool) HandshakeError!Connection.PeerCertResult {
@@ -10099,50 +10280,12 @@ test "handshake: the cached flight's record numbers — ServerHello in epoch 0, 
     try testing.expectEqual(flight.RecordNumber{ .epoch = 0, .sequence_number = 0 }, server.flight_rns[0]);
     try testing.expectEqual(flight.RecordNumber{ .epoch = 2, .sequence_number = 7 }, server.flight_rns[1]);
     try testing.expectEqual(flight.RecordNumber{ .epoch = 2, .sequence_number = 8 }, server.flight_rns[2]);
-    try testing.expectEqual(@as(u8, 0), server.flight_rns_acked);
-    // A flight this cannot describe leaves the table empty.
-    var junk: [40]u8 = @splat(0x16);
-    try server.cacheFlight(&junk, 0);
-    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
-    junk = @splat(0);
-    try server.cacheFlight(&junk, 0);
-    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
-    // An epoch-0 header whose length runs past the flight.
-    var short: [record.plaintext_header_len + 8]u8 = @splat(0);
-    _ = try record.encodePlaintext(.{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 1, .length = 8 }, &short);
-    try server.cacheFlight(short[0 .. short.len - 1], 0);
-    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
-    try server.cacheFlight(&short, 0);
-    try testing.expectEqual(@as(u8, 1), server.flight_rns_len);
-    // An epoch-1 plaintext header is not one this engine sends.
-    _ = try record.encodePlaintext(.{ .content_type = content_type_handshake, .epoch = 1, .sequence_number = 1, .length = 0 }, &short);
-    try server.cacheFlight(short[0..record.plaintext_header_len], 0);
-    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
-    // More records than the table holds.
-    var many: [(max_flight_records + 1) * record.plaintext_header_len]u8 = undefined;
-    for (0..max_flight_records + 1) |k|
-        _ = try record.encodePlaintext(.{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = @intCast(k), .length = 0 }, many[k * record.plaintext_header_len ..]);
-    try server.cacheFlight(many[0 .. max_flight_records * record.plaintext_header_len], 0);
-    try testing.expectEqual(@as(u8, max_flight_records), server.flight_rns_len);
-    try server.cacheFlight(&many, 0);
-    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
-    // Unified-header records: epoch 2 only, and no more of them than
-    // `hs2.send_seq` has handed out.
-    var uni: [40]u8 = @splat(0);
-    for ([_]u2{ 2, 3 }) |el| {
-        const h = try record.encodeUnified(.{ .epoch_low = el, .seq_len = .short, .seq_wire = 0, .cid = null, .length = 16 }, &uni);
-        const one = uni[0 .. h.len + 16];
-        server.hs2.send_seq = 1;
-        try server.cacheFlight(one, 0);
-        try testing.expectEqual(@as(u8, if (el == 2) 1 else 0), server.flight_rns_len);
-        server.hs2.send_seq = 0;
-        try server.cacheFlight(one, 0);
-        try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
-    }
+    try testing.expectEqual(@as(u64, 0), server.flight_rns_acked);
     // A new flight starts with no record ACKed.
     server.flight_rns_acked = 0xff;
-    try server.cacheFlight(&short, 0);
-    try testing.expectEqual(@as(u8, 0), server.flight_rns_acked);
+    server.beginFlight();
+    try testing.expectEqual(@as(u64, 0), server.flight_rns_acked);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
 }
 
 /// The server's flight 2 sent and answered by nothing yet: `client` holds
@@ -10174,13 +10317,13 @@ test "handshake: RFC 9147 §7.2 — a flight whose every record is ACKed is no l
     // Part of the flight ACKed (in two ACKs, out of order): still resent.
     _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 50, rns[2..3], &ab), rnd, 0, &b2);
     _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 51, rns[0..1], &ab), rnd, 0, &b2);
-    try testing.expectEqual(@as(u8, 0b101), server.flight_rns_acked);
+    try testing.expectEqual(@as(u64, 0b101), server.flight_rns_acked);
     try testing.expect((try server.poll(5000, &pb)) != null);
     // The last record: the retransmission is cancelled, for good — even
     // though each ACK-only datagram rolled the parse back.
     const r = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 52, rns[1..2], &ab), rnd, 5000, &b2);
     try testing.expect(r.need_more_data);
-    try testing.expectEqual(@as(u8, 0b111), server.flight_rns_acked);
+    try testing.expectEqual(@as(u64, 0b111), server.flight_rns_acked);
     try testing.expect(!server.retransmit_timer.isArmed());
     try testing.expectEqual(@as(?[]const u8, null), try server.poll(1_000_000, &pb));
     // The client's Finished still completes the handshake behind the ACKs.
@@ -10213,7 +10356,7 @@ test "handshake: an ACK naming records we did not send, or arriving unauthentica
     _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 59, unknown[0..2], &ab), rnd, 0, &b2);
     _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 60, unknown[2..4], &ab), rnd, 0, &b2);
     _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 61, &.{}, &ab), rnd, 0, &b2);
-    try testing.expectEqual(@as(u8, 0), server.flight_rns_acked);
+    try testing.expectEqual(@as(u64, 0), server.flight_rns_acked);
     try testing.expectEqual(before, server.retransmit_timer);
     try testing.expect((try server.poll(5000, &pb)) != null);
     // A flight with no table is never "all ACKed".
@@ -10357,4 +10500,128 @@ test "handshake: an ACK record that is a replay, or a record of another content 
     @memcpy(dg[0..app.len], app);
     @memcpy(dg[app.len..][0..cf.out.len], cf.out);
     try testing.expectError(error.UnexpectedMessage, server.handleFlight(dg[0 .. app.len + cf.out.len], rnd, 0, &b2));
+}
+
+// ── send-side fragmentation (RFC 9147 §5.5) and partial retransmission (§7.2) ──
+
+/// Cuts `records` into datagrams of at most `limit` bytes (each checked) and
+/// feeds them to `to` in order. Returns the last result; `acks_out` counts
+/// the intermediate results that carried records (partial-flight ACKs).
+fn deliverSplit(to: *Connection, records: []const u8, limit: usize, rnd: Entropy, out: []u8, acks_out: *usize) !Connection.HandshakeResult {
+    var rest = records;
+    var n: usize = 0;
+    while (true) {
+        const sp = record.nextDatagram(rest, limit);
+        try testing.expect(sp.datagram.len <= limit);
+        rest = sp.rest;
+        n += 1;
+        const r = try to.handleFlight(sp.datagram, rnd, 0, out);
+        if (rest.len == 0) return r;
+        try testing.expect(r.need_more_data);
+        if (r.out.len != 0) acks_out.* += 1;
+    }
+}
+
+fn countRecords(bytes: []const u8) usize {
+    var rest = bytes;
+    var n: usize = 0;
+    while (rest.len != 0) : (n += 1) rest = record.nextDatagram(rest, 1).rest;
+    return n;
+}
+
+test "fragmentation: every flight of a mutual-auth hybrid cert-DHE handshake fits max_datagram_len 128" {
+    var cfg_c = certDheClientConfig();
+    cfg_c.cert = .{ .chain = &.{&cert_kat.client_cert_der}, .private_key = clientEcdsaKeyPair() };
+    cfg_c.key_share_group = .x25519_ml_kem768;
+    cfg_c.max_datagram_len = min_max_datagram_len;
+    var cfg_s = certDheServerConfig();
+    cfg_s.request_client_cert = true;
+    cfg_s.require_peer_cert = true;
+    cfg_s.peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der };
+    cfg_s.now_sec = cert_kat.valid_now_sec;
+    cfg_s.max_datagram_len = min_max_datagram_len;
+    var client = try Connection.clientInit(cfg_c);
+    defer client.deinit();
+    var server = try Connection.serverInit(cfg_s);
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7a)));
+    const rnd = seededForTest(&csprng);
+    var b1: [8192]u8 = undefined;
+    var b2: [8192]u8 = undefined;
+    var acks: usize = 0;
+
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    try testing.expect(countRecords(ch) > 10); // the 1216-byte hybrid share alone
+    const f2 = try deliverSplit(&server, ch, min_max_datagram_len, rnd, &b2, &acks);
+    try testing.expect(countRecords(f2.out) > 20);
+    try testing.expectEqual(@as(usize, countRecords(f2.out)), server.flight_rns_len);
+    const cf = try deliverSplit(&client, f2.out, min_max_datagram_len, rnd, &b1, &acks);
+    try testing.expect(cf.done);
+    try testing.expectEqual(@as(usize, 0), acks); // flight 2 is implicitly ACKed: no ACK from the client
+    const sf = try deliverSplit(&server, cf.out, min_max_datagram_len, rnd, &b2, &acks);
+    try testing.expect(sf.done);
+    // §7.1: the server ACKed the client's final flight as it arrived.
+    try testing.expect(acks > 0);
+    try expectSameKeys(&client, &server);
+    try expectRoundTrip(&client, &server, "fragmented both ways");
+}
+
+test "fragmentation: off (the default) keeps one record per message; a retransmission re-seals them in new records" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try ackPair(&client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7b)));
+    const rnd = seededForTest(&csprng);
+    var b1: [2048]u8 = undefined;
+    var b2: [2048]u8 = undefined;
+    var pb: [4096]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    try testing.expectEqual(@as(usize, 1), countRecords(ch));
+    const f2 = try server.handleFlight(ch, rnd, 0, &b2);
+    try testing.expectEqual(@as(usize, 3), countRecords(f2.out));
+    // The same server flight, re-sent: three NEW records (§5.2), the
+    // epoch-0 one with the next number, and the client accepts them.
+    const old = server.flight_rns;
+    const again = (try server.poll(5000, &pb)).?;
+    try testing.expectEqual(@as(usize, 3), countRecords(again));
+    try testing.expectEqual(f2.out.len, again.len);
+    for (0..3) |k| {
+        try testing.expectEqual(old[k].epoch, server.flight_rns[k].epoch);
+        try testing.expectEqual(old[k].sequence_number + if (k == 0) @as(u64, 1) else 2, server.flight_rns[k].sequence_number);
+    }
+    try testing.expect(!std.mem.eql(u8, f2.out, again));
+    const cf = try client.handleFlight(again, rnd, 5000, &b1);
+    try testing.expect(cf.done);
+}
+
+test "partial retransmission: an ACK naming part of the flight re-sends the rest at once, in new records" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    var ab: [200]u8 = undefined;
+    var pb: [3000]u8 = undefined;
+    const cf = try ackedFlightPair(0x7c, &client, &server, &b1, &b2);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x7c)));
+    const rnd = seededForTest(&csprng);
+    const ee_rn = server.flight_rns[1];
+    const fin_before = server.flight_rns[2];
+    const r = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 40, &.{ee_rn}, &ab), rnd, 10, &b2);
+    try testing.expect(r.need_more_data);
+    // ServerHello and Finished, not EncryptedExtensions.
+    try testing.expectEqual(@as(usize, 2), countRecords(r.out));
+    try testing.expectEqual(ee_rn, server.flight_rns[1]);
+    try testing.expect(server.flight_rns[2].sequence_number > fin_before.sequence_number);
+    // The timer still runs for them; its retransmission leaves EE out too.
+    try testing.expect(server.retransmit_timer.isArmed());
+    try testing.expectEqual(@as(usize, 2), countRecords((try server.poll(5000, &pb)).?));
+    // A duplicate of the same ACK changes nothing and sends nothing.
+    const dup = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 41, &.{ee_rn}, &ab), rnd, 5000, &b2);
+    try testing.expectEqual(@as(usize, 0), dup.out.len);
+    const sf = try server.handleFlight(cf, rnd, 5000, &b2);
+    try testing.expect(sf.done);
 }
