@@ -145,6 +145,15 @@ pub const Config = struct {
     /// a RequestVote or PreVote carrying a higher term, without adopting that
     /// term or replying. Off by default (etcd/raft's default).
     check_quorum: bool = false,
+    /// Lease-based linearizable reads (etcd/raft `ReadOnlyLeaseBased`):
+    /// `readIndex` is answered at once from the leader's lease instead of
+    /// after a round of probes. Safe only while clocks drift less than the
+    /// election timeout (the lease is `check_quorum`'s: followers ignore
+    /// higher-term votes for `election_ticks` after hearing the leader, and
+    /// the leader steps down after `election_ticks` without a quorum), so it
+    /// needs `check_quorum` (else `InvalidConfig`). Off: every read costs a
+    /// quorum round trip (`ReadOnlySafe`, the default there too).
+    read_lease: bool = false,
     /// Seeds the election-timeout jitter. Give every server a different one
     /// (two servers with the same seed time out in lockstep).
     seed: u64,
@@ -193,6 +202,20 @@ pub const Ready = struct {
     /// `init`). May include entries from `entries` above, which is why those
     /// must be persisted first.
     committed: []const Entry,
+    /// Reads `readIndex` has confirmed: the leader was still the leader
+    /// after the read was asked for. Serve `ctx` once `applied` has reached
+    /// `index` (the entries of this and earlier `committed` slices, applied):
+    /// the state machine then holds everything that was committed when the
+    /// read began.
+    read_states: []const ReadState,
+};
+
+/// A confirmed read (`Node.readIndex`, `Ready.read_states`).
+pub const ReadState = struct {
+    /// The caller's token, as passed to `readIndex`.
+    ctx: u64,
+    /// Serve the read once this index has been applied.
+    index: LogIndex,
 };
 
 /// A deliberately wrong rule, for the positive-control tests only: the
@@ -205,6 +228,12 @@ pub const InjectedBug = enum {
     /// §5.4.1 with the term-first clause dropped: "up to date" iff at least
     /// as long.
     index_only_up_to_date,
+    /// An election timeout never starts a campaign: the cluster cannot elect
+    /// a leader. A liveness defect, for the bounded-liveness analysis.
+    never_campaign,
+    /// `readIndex` is answered from the leader's commit index with no quorum
+    /// round and no lease: a stale leader serves stale reads.
+    unconfirmed_reads,
 };
 
 pub const InitError = error{ InvalidConfig, InvalidRestore } || Allocator.Error;
@@ -213,6 +242,8 @@ pub const InitError = error{ InvalidConfig, InvalidRestore } || Allocator.Error;
 pub const ProposeError = error{ NotLeader, EntryTooLarge, ProposalDropped } || Allocator.Error;
 /// `InvalidTarget`: the target is not a server of this cluster.
 pub const TransferError = error{ NotLeader, InvalidTarget } || Allocator.Error;
+/// `NotLeader`: ask the leader (`Node.leader`), as with `propose`.
+pub const ReadError = error{NotLeader} || Allocator.Error;
 
 /// Upper bound on any `propose` payload: the wire carries an entry's length
 /// as a `u32`. The effective bound is lower — `Config.max_append_bytes` minus
@@ -234,6 +265,8 @@ pub fn fingerprint(e: Entry) u64 {
     h.update(e.data);
     return h.final();
 }
+
+const PendingRead = struct { ctx: u64, index: LogIndex, seq: u64 };
 
 pub const Node = struct {
     gpa: Allocator,
@@ -276,6 +309,20 @@ pub const Node = struct {
     /// CheckQuorum: which followers sent an AppendEntries response since the
     /// leader's last quorum check (etcd/raft `Progress.RecentActive`).
     recent_active: []bool,
+    /// ReadIndex (leader only): reads asked for and not yet confirmed, oldest
+    /// first. `index == 0`: waiting for this term's no-op to commit (§8), so
+    /// no commit index can be promised yet; `seq == 0`: no probe round has
+    /// been numbered for it yet.
+    reads: std.ArrayList(PendingRead) = .empty,
+    /// Confirmed reads for the next `ready`; cleared by `advance`.
+    read_out: std.ArrayList(ReadState) = .empty,
+    /// The last probe number handed out (probes carry 1 and up).
+    read_seq: u64 = 0,
+    /// Per peer: the highest probe number it echoed in this leadership.
+    read_ack: []u64,
+    /// The index of the no-op this leader appended on election: the first
+    /// entry of its term. Its commit makes `commit` a valid read index.
+    term_start: LogIndex = 0,
     /// The server a leadership transfer is handing over to, or `no_vote`
     /// (etcd/raft's `leadTransferee`). While set, `propose` refuses.
     transferee: NodeId = no_vote,
@@ -322,6 +369,7 @@ pub const Node = struct {
         // A no-op (an empty entry) must fit in one AppendEntries.
         if (cfg.max_append_bytes < message.Message.entry_header_len) return error.InvalidConfig;
         if (cfg.max_inflight_msgs == 0) return error.InvalidConfig;
+        if (cfg.read_lease and !cfg.check_quorum) return error.InvalidConfig;
         if (cfg.max_inflight_bytes != 0 and cfg.max_inflight_bytes < cfg.max_append_bytes) return error.InvalidConfig;
         try validateRestore(cfg, restore);
 
@@ -343,6 +391,7 @@ pub const Node = struct {
             .infl_count = &.{},
             .infl_bytes = &.{},
             .recent_active = &.{},
+            .read_ack = &.{},
             .prng = .init(cfg.seed),
             .out_arena = .init(gpa),
             .decode_buf = &.{},
@@ -360,6 +409,8 @@ pub const Node = struct {
         self.infl_bytes = try gpa.alloc(u64, n);
         self.recent_active = try gpa.alloc(bool, n);
         @memset(self.recent_active, false);
+        self.read_ack = try gpa.alloc(u64, n);
+        @memset(self.read_ack, 0);
         @memset(self.infl_head, 0);
         @memset(self.infl_count, 0);
         @memset(self.infl_bytes, 0);
@@ -408,6 +459,9 @@ pub const Node = struct {
         gpa.free(self.infl_count);
         gpa.free(self.infl_bytes);
         gpa.free(self.recent_active);
+        gpa.free(self.read_ack);
+        self.reads.deinit(gpa);
+        self.read_out.deinit(gpa);
         self.* = undefined;
     }
 
@@ -469,6 +523,7 @@ pub const Node = struct {
         }
         self.election_elapsed += 1;
         if (self.election_elapsed >= self.election_timeout) {
+            if (self.injected_bug == .never_campaign) return;
             if (self.cfg.pre_vote) try self.preCampaign() else try self.campaign(false);
         }
     }
@@ -515,6 +570,24 @@ pub const Node = struct {
         if (self.match[target] == self.lastIndex()) try self.sendTimeoutNow(target) else try self.sendAppend(target);
     }
 
+    /// Ask for a linearizable read (Raft thesis §6.4; etcd/raft `ReadIndex`):
+    /// when the leader has confirmed it is still the leader, `Ready.read_states`
+    /// carries `ctx` with the index to wait for, and a read served after
+    /// `applied` reaches it sees every write committed before this call.
+    /// Nothing is written to the log. The confirmation is a round of probes
+    /// to a quorum (`Config.read_lease`: the lease instead), resent with every
+    /// heartbeat until it comes; before this term's first entry has committed
+    /// (§8) the read waits for that. A read never confirmed because
+    /// leadership was lost (or the probes never got through) simply produces
+    /// no `ReadState`: the caller times out and asks again, on the new leader.
+    /// Followers do not forward (as `propose`): `error.NotLeader`.
+    pub fn readIndex(self: *Node, ctx: u64) ReadError!void {
+        std.debug.assert(!self.in_ready);
+        if (self.role != .leader) return error.NotLeader;
+        try self.reads.append(self.gpa, .{ .ctx = ctx, .index = 0, .seq = 0 });
+        try self.startReads();
+    }
+
     /// Decode a frame from peer `from` and step it. A frame that does not
     /// decode is dropped and counted (`malformed_dropped`).
     pub fn stepBytes(self: *Node, from: NodeId, bytes: []const u8) Allocator.Error!void {
@@ -546,6 +619,8 @@ pub const Node = struct {
             .pre_vote_req => |v| try self.onPreVoteReq(m.from, v),
             .pre_vote_resp => |v| try self.onPreVoteResp(m.from, v),
             .timeout_now => |t| try self.onTimeoutNow(t),
+            .read_req => |r| try self.onReadReq(m.from, r),
+            .read_resp => |r| try self.onReadResp(m.from, r),
         }
     }
 
@@ -553,7 +628,7 @@ pub const Node = struct {
 
     pub fn hasReady(self: *const Node) bool {
         return self.hs_dirty or self.truncated != null or self.bcast_pending or
-            self.msgs.items.len > 0 or self.lastIndex() > self.stable or self.commit > self.applied;
+            self.read_out.items.len > 0 or self.msgs.items.len > 0 or self.lastIndex() > self.stable or self.commit > self.applied;
     }
 
     pub fn ready(self: *Node) Allocator.Error!Ready {
@@ -585,6 +660,7 @@ pub const Node = struct {
             .entries = entries,
             .messages = self.msgs.items,
             .committed = committed,
+            .read_states = self.read_out.items,
         };
     }
 
@@ -598,12 +674,14 @@ pub const Node = struct {
         self.stable = self.ready_last;
         self.applied = self.ready_commit;
         self.msgs.clearRetainingCapacity();
+        self.read_out.clearRetainingCapacity();
         _ = self.out_arena.reset(.retain_capacity);
         if (self.role == .leader) {
             // Only now is the leader's own log durable up to `stable`, so only
             // now may it count toward a majority.
             self.match[self.cfg.id] = self.stable;
             self.maybeCommit();
+            try self.startReads();
         }
     }
 
@@ -746,7 +824,10 @@ pub const Node = struct {
         self.transferee = no_vote;
         // §8: a fresh leader commits a no-op of its own term, which is what
         // lets the Figure-8 rule pull earlier-term entries in behind it.
-        _ = try self.appendLocal(.noop, "");
+        self.reads.clearRetainingCapacity();
+        @memset(self.read_ack, 0);
+        self.read_seq = 0;
+        self.term_start = try self.appendLocal(.noop, "");
         try self.bcastAppend();
     }
 
@@ -766,6 +847,8 @@ pub const Node = struct {
         // down: `ready` would send the stale tail under the NEW term, as a
         // leader of a term this node never won (review, H1).
         self.bcast_pending = false;
+        // Reads asked of a leader that no longer is one are never confirmed.
+        self.reads.clearRetainingCapacity();
         self.resetElectionTimer();
     }
 
@@ -846,6 +929,98 @@ pub const Node = struct {
             if (p == self.cfg.id) continue;
             try self.sendAppend(@intCast(p));
         }
+        // A read still waiting for its quorum asks again (a lost probe or
+        // reply must not strand it until the next election).
+        try self.probeReads();
+    }
+
+    // ── ReadIndex ───────────────────────────────────────────────────────────
+
+    /// Has an entry of this leader's term committed? Only then is `commit`
+    /// known to cover everything every earlier leader committed (§8).
+    fn committedInTerm(self: *const Node) bool {
+        return self.commit >= self.term_start;
+    }
+
+    /// Give the reads that can have one their index, number a probe round for
+    /// them and send it; confirm at once what needs no round.
+    fn startReads(self: *Node) Allocator.Error!void {
+        if (self.role != .leader or !self.committedInTerm()) return;
+        var probe = false;
+        for (self.reads.items) |*r| {
+            if (r.index != 0) continue;
+            r.index = self.commit;
+            if (!self.leaseReads()) {
+                self.read_seq += 1;
+                r.seq = self.read_seq;
+                probe = true;
+            }
+        }
+        // A broadcast already scheduled (`ready` sends it) carries the probes.
+        if (probe and !self.bcast_pending) try self.probeReads();
+        try self.settleReads();
+    }
+
+    /// Reads answered without a probe round (the lease, or the positive control).
+    fn leaseReads(self: *const Node) bool {
+        return self.cfg.read_lease or self.injected_bug == .unconfirmed_reads;
+    }
+
+    /// Send the newest probe number to every peer, if a read is waiting for one.
+    fn probeReads(self: *Node) Allocator.Error!void {
+        if (self.read_seq == 0 or self.reads.items.len == 0) return;
+        if (self.reads.items[self.reads.items.len - 1].seq == 0) return; // nothing numbered yet
+        for (0..self.cfg.cluster_size) |p| {
+            if (p == self.cfg.id) continue;
+            try self.send(@intCast(p), .{ .read_req = .{ .term = self.term, .seq = self.read_seq } });
+        }
+    }
+
+    /// Move to `read_out` every read, oldest first, whose probe a quorum
+    /// (this node included) echoed. A quorum for a later probe covers the
+    /// earlier ones: it was sent after them.
+    fn settleReads(self: *Node) Allocator.Error!void {
+        var done: usize = 0;
+        for (self.reads.items) |r| {
+            if (r.index == 0) break;
+            if (!self.leaseReads()) {
+                var n: usize = 1;
+                for (self.read_ack, 0..) |a, p| {
+                    if (p != self.cfg.id and a >= r.seq) n += 1;
+                }
+                if (n < self.majority()) break;
+            }
+            try self.read_out.append(self.gpa, .{ .ctx = r.ctx, .index = r.index });
+            done += 1;
+        }
+        if (done > 0) std.mem.copyForwards(PendingRead, self.reads.items, self.reads.items[done..]);
+        self.reads.items.len -= done;
+    }
+
+    /// A peer's leader asks whether this server still follows it. Answered the
+    /// way an AppendEntries heartbeat is: a current-or-newer term makes the
+    /// sender this server's leader (election timer reset); an older one is told
+    /// the term, so a deposed leader finds out.
+    fn onReadReq(self: *Node, from: NodeId, r: message.ReadProbe) Allocator.Error!void {
+        if (r.term >= self.term) {
+            self.becomeFollower(r.term);
+            self.leader = from;
+        }
+        try self.send(from, .{ .read_resp = .{ .term = self.term, .seq = r.seq } });
+    }
+
+    fn onReadResp(self: *Node, from: NodeId, r: message.ReadProbe) Allocator.Error!void {
+        const obs = safety.observeTerm(self.term, r.term);
+        if (obs.term_advanced) return self.becomeFollower(obs.new_term);
+        if (self.role != .leader or r.term != self.term) return;
+        // A probe number never handed out: forged or from an earlier leadership.
+        if (r.seq > self.read_seq) {
+            self.malformed_dropped += 1;
+            return;
+        }
+        self.recent_active[from] = true;
+        if (r.seq > self.read_ack[from]) self.read_ack[from] = r.seq;
+        try self.settleReads();
     }
 
     fn sendAppend(self: *Node, to: NodeId) Allocator.Error!void {
@@ -984,6 +1159,7 @@ pub const Node = struct {
             if (!progressed and self.inflFull(from)) self.inflFreeFirst(from);
             self.next[from] = @max(self.next[from], self.match[from] + 1);
             self.maybeCommit();
+            try self.startReads(); // a commit may have made `commit` a valid read index
             // A transfer waits for the target to hold the whole log (etcd:
             // on the ack that brings `Match` to `lastIndex`).
             if (progressed and from == self.transferee and self.match[from] == self.lastIndex()) try self.sendTimeoutNow(from);
@@ -1118,6 +1294,8 @@ fn Cluster(comptime n: u32) type {
         /// What each node's state machine applied, in order.
         applied: [n]std.ArrayList([]u8) = @splat(.empty),
         cut: [n]bool = @splat(false),
+        /// The `ReadState`s each node handed out.
+        reads: [n]std.ArrayList(ReadState) = @splat(.empty),
 
         fn init(gpa: Allocator) !Self {
             var c: Self = .{ .gpa = gpa };
@@ -1150,6 +1328,7 @@ fn Cluster(comptime n: u32) type {
                 for (a.items) |b| c.gpa.free(b);
                 a.deinit(c.gpa);
             }
+            for (&c.reads) |*r| r.deinit(c.gpa);
         }
 
         fn drain(c: *Self, i: NodeId) !void {
@@ -1163,6 +1342,7 @@ fn Cluster(comptime n: u32) type {
                 for (rd.committed) |e| {
                     if (e.kind == .command) try c.applied[i].append(c.gpa, try c.gpa.dupe(u8, e.data));
                 }
+                try c.reads[i].appendSlice(c.gpa, rd.read_states);
                 try node.advance();
             }
         }
@@ -2523,4 +2703,178 @@ test "transfer, end to end: a three-node cluster hands leadership to node 2 in t
         try testing.expectEqual(@as(usize, 2), a.items.len);
         try testing.expectEqualStrings("after", a.items[1]);
     }
+}
+
+// ── ReadIndex ───────────────────────────────────────────────────────────────
+
+fn countRead(rd: Ready, tag: message.Tag) usize {
+    var n: usize = 0;
+    for (rd.messages) |m| n += @intFromBool(std.meta.activeTag(m.body) == tag);
+    return n;
+}
+
+test "readIndex: a single-node leader answers once its no-op has committed, with the commit index" {
+    const gpa = testing.allocator;
+    var node = try Node.init(gpa, .{ .id = 0, .cluster_size = 1, .election_ticks = 3, .election_jitter_ticks = 0, .seed = 1 }, .{});
+    defer node.deinit();
+    try testing.expectError(error.NotLeader, node.readIndex(1));
+    for (0..3) |_| try node.tick();
+    try node.readIndex(7); // before the no-op is durable: no commit index to promise yet
+    var rd = try node.ready();
+    try testing.expectEqual(@as(usize, 0), rd.read_states.len);
+    try node.advance(); // the no-op commits, the read gets its index
+    rd = try node.ready();
+    try testing.expectEqual(@as(usize, 1), rd.read_states.len);
+    try testing.expectEqual(ReadState{ .ctx = 7, .index = 1 }, rd.read_states[0]);
+    try node.advance();
+    try testing.expect(!node.hasReady());
+    // Later reads are answered at once, at the then current commit index.
+    _ = try node.propose("w");
+    rd = try node.ready();
+    try node.advance();
+    rd = try node.ready();
+    try node.advance();
+    try node.readIndex(8);
+    try testing.expect(node.hasReady());
+    rd = try node.ready();
+    try testing.expectEqual(ReadState{ .ctx = 8, .index = 2 }, rd.read_states[0]);
+    try node.advance();
+}
+
+test "readIndex: a three-node leader confirms with a quorum round, and sends no log entry" {
+    var c = try Cluster(3).init(testing.allocator);
+    defer c.deinit();
+    try c.tickAll(12);
+    const l = c.leaderId().?;
+    const leader = &c.nodes[l].?;
+    const last = leader.lastIndex();
+    try leader.readIndex(41);
+    // Asked, not confirmed: the probes are still on the wire.
+    try c.drain(l);
+    try testing.expectEqual(@as(usize, 0), c.reads[l].items.len);
+    try testing.expectEqual(@as(usize, 2), c.net.items.len);
+    try c.deliver();
+    try testing.expectEqual(@as(usize, 1), c.reads[l].items.len);
+    try testing.expectEqual(@as(u64, 41), c.reads[l].items[0].ctx);
+    try testing.expectEqual(leader.commit, c.reads[l].items[0].index);
+    try testing.expectEqual(last, leader.lastIndex()); // nothing appended
+    try testing.expectEqual(@as(usize, 0), c.reads[1].items.len);
+}
+
+test "readIndex: a cut-off leader cannot confirm; the probe is resent and the read completes when the link heals" {
+    var c = try Cluster(3).init(testing.allocator);
+    defer c.deinit();
+    try c.tickAll(12);
+    const l = c.leaderId().?;
+    c.cut[l] = true;
+    try c.nodes[l].?.readIndex(5);
+    try c.drain(l);
+    try c.deliver();
+    try c.tickAll(2); // heartbeats go out and are lost; nobody else has timed out yet
+    try testing.expectEqual(@as(usize, 0), c.reads[l].items.len);
+    c.cut[l] = false;
+    try c.tickAll(2);
+    try testing.expectEqual(@as(usize, 1), c.reads[l].items.len);
+    try testing.expectEqual(@as(u64, 5), c.reads[l].items[0].ctx);
+}
+
+test "readIndex: a leader deposed meanwhile never confirms its read (no stale answer)" {
+    var c = try Cluster(3).init(testing.allocator);
+    defer c.deinit();
+    try c.tickAll(12);
+    try testing.expectEqual(@as(?NodeId, 0), c.leaderId());
+    c.cut[0] = true;
+    try c.nodes[0].?.readIndex(9);
+    try c.drain(0);
+    try c.tickAll(30); // the others elect a new leader
+    try testing.expect(c.leaderId().? != 0);
+    c.cut[0] = false;
+    try c.tickAll(10);
+    try testing.expectEqual(Role.follower, c.nodes[0].?.role);
+    try testing.expectEqual(@as(usize, 0), c.reads[0].items.len);
+    try testing.expectEqual(@as(usize, 0), c.nodes[0].?.reads.items.len);
+}
+
+test "readIndex: waits for this term's no-op to commit (section 8), then probes; echoes are matched by probe number" {
+    const gpa = testing.allocator;
+    var node = try testLeader(gpa, 0);
+    defer node.deinit();
+    try node.readIndex(1);
+    var rd = try node.ready();
+    try testing.expectEqual(@as(usize, 0), countRead(rd, .read_req)); // nothing committed yet: no probe
+    try node.advance();
+    // A follower holds the no-op: it commits, the read is numbered and probed (probe 1).
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 1 } } });
+    rd = try node.ready();
+    try testing.expectEqual(@as(usize, 2), countRead(rd, .read_req));
+    for (rd.messages) |m| if (m.body == .read_req) try testing.expectEqual(message.ReadProbe{ .term = 1, .seq = 1 }, m.body.read_req);
+    try node.advance();
+    // A second read is probe 2. An echo of probe 1 from peer 2 settles the first only.
+    try node.readIndex(2);
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .read_resp = .{ .term = 1, .seq = 1 } } });
+    rd = try node.ready();
+    try testing.expectEqual(@as(usize, 1), rd.read_states.len);
+    try testing.expectEqual(ReadState{ .ctx = 1, .index = 1 }, rd.read_states[0]);
+    try node.advance();
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .read_resp = .{ .term = 1, .seq = 1 } } }); // stale for read 2
+    try testing.expect(!node.hasReady() or (try node.ready()).read_states.len == 0);
+    if (node.in_ready) try node.advance();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .read_resp = .{ .term = 1, .seq = 2 } } });
+    rd = try node.ready();
+    try testing.expectEqual(@as(usize, 1), rd.read_states.len);
+    try testing.expectEqual(@as(u64, 2), rd.read_states[0].ctx);
+    try node.advance();
+    // A probe number never handed out is dropped and counted.
+    const before = node.malformed_dropped;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .read_resp = .{ .term = 1, .seq = 99 } } });
+    try testing.expectEqual(before + 1, node.malformed_dropped);
+}
+
+test "readIndex: a follower answers a probe like a heartbeat, and a stale leader is told the newer term" {
+    const gpa = testing.allocator;
+    var f = try Node.init(gpa, .{ .id = 1, .cluster_size = 3, .election_ticks = 5, .election_jitter_ticks = 0, .seed = 1 }, .{ .hard_state = .{ .term = 4 } });
+    defer f.deinit();
+    for (0..3) |_| try f.tick();
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .read_req = .{ .term = 4, .seq = 3 } } });
+    try testing.expectEqual(@as(NodeId, 0), f.leader);
+    try testing.expectEqual(@as(u32, 0), f.election_elapsed); // the timer was re-armed
+    var rd = try f.ready();
+    try testing.expectEqual(message.ReadProbe{ .term = 4, .seq = 3 }, rd.messages[0].body.read_resp);
+    try f.advance();
+    try f.step(.{ .from = 2, .to = 1, .body = .{ .read_req = .{ .term = 2, .seq = 1 } } });
+    rd = try f.ready();
+    try testing.expectEqual(message.ReadProbe{ .term = 4, .seq = 1 }, rd.messages[0].body.read_resp);
+    try testing.expectEqual(@as(NodeId, 0), f.leader); // the stale probe did not change who leads
+    try f.advance();
+}
+
+test "readIndex: a leader that sees a higher term drops its waiting reads" {
+    const gpa = testing.allocator;
+    var node = try testLeader(gpa, 0);
+    defer node.deinit();
+    try node.readIndex(1);
+    try testing.expectEqual(@as(usize, 1), node.reads.items.len);
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .read_resp = .{ .term = 5, .seq = 1 } } });
+    try testing.expectEqual(Role.follower, node.role);
+    try testing.expectEqual(@as(usize, 0), node.reads.items.len);
+    try testing.expectError(error.NotLeader, node.readIndex(2));
+}
+
+test "readIndex: read_lease needs check_quorum, and then answers without a probe round" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidConfig, Node.init(gpa, .{ .id = 0, .cluster_size = 3, .read_lease = true, .seed = 0 }, .{}));
+    var node = try Node.init(gpa, .{ .id = 0, .cluster_size = 3, .election_ticks = 2, .election_jitter_ticks = 0, .check_quorum = true, .read_lease = true, .seed = 0 }, .{});
+    defer node.deinit();
+    for (0..2) |_| try node.tick();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .vote_resp = .{ .term = 1, .granted = true } } });
+    _ = try node.ready();
+    try node.advance();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 1 } } });
+    var rd = try node.ready();
+    try node.advance();
+    try node.readIndex(3);
+    rd = try node.ready();
+    try testing.expectEqual(@as(usize, 0), countRead(rd, .read_req));
+    try testing.expectEqual(ReadState{ .ctx = 3, .index = 1 }, rd.read_states[0]);
+    try node.advance();
 }

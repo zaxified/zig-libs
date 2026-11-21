@@ -124,6 +124,19 @@ pub const Tag = enum(u8) {
     /// caveat as PreVote: an older decoder drops it, so a transfer to a
     /// server that predates it is abandoned after one election timeout.
     timeout_now = 0x16,
+    /// ReadIndex (Raft thesis §6.4; etcd/raft `MsgHeartbeat` with a context,
+    /// `ReadOnlySafe`): the leader asks a peer to confirm it still follows it.
+    /// New tags, same caveat as PreVote: an older decoder drops them, so a
+    /// read against such a peer never reaches a quorum.
+    read_req = 0x17,
+    read_resp = 0x18,
+};
+
+/// ReadIndex probe and its echo (same layout). `term` is the sender's term;
+/// `seq` is the leader's probe number (1 and up), echoed unchanged.
+pub const ReadProbe = struct {
+    term: Term,
+    seq: u64,
 };
 
 /// The leader tells a caught-up follower to start an election now.
@@ -144,6 +157,8 @@ pub const Body = union(Tag) {
     /// refusal the responder's own (etcd/raft does the same).
     pre_vote_resp: VoteResp,
     timeout_now: TimeoutNow,
+    read_req: ReadProbe,
+    read_resp: ReadProbe,
 };
 
 pub const Message = struct {
@@ -155,6 +170,7 @@ pub const Message = struct {
     /// `vote_req_len` plus the transfer flag byte.
     pub const vote_req_transfer_len = vote_req_len + 1;
     pub const timeout_now_len = 1 + 8;
+    pub const read_probe_len = 1 + 8 + 8;
     pub const vote_resp_len = 1 + 8 + 1;
     pub const append_resp_len = 1 + 8 + 1 + 8;
     /// `append_resp_len` plus `conflict_term` and `conflict_index`.
@@ -170,6 +186,7 @@ pub const Message = struct {
             .pre_vote_req => vote_req_len,
             .vote_resp, .pre_vote_resp => vote_resp_len,
             .timeout_now => timeout_now_len,
+            .read_req, .read_resp => read_probe_len,
             .append_resp => |a| if (a.conflict_index != 0) append_resp_hint_len else append_resp_len,
             .append_req => |a| blk: {
                 var n: usize = append_header_len;
@@ -197,6 +214,11 @@ pub const Message = struct {
             .timeout_now => |t| {
                 std.mem.writeInt(u64, buf[1..9], t.term, .little);
                 return timeout_now_len;
+            },
+            .read_req, .read_resp => |r| {
+                std.mem.writeInt(u64, buf[1..9], r.term, .little);
+                std.mem.writeInt(u64, buf[9..17], r.seq, .little);
+                return read_probe_len;
             },
             .vote_resp, .pre_vote_resp => |v| {
                 std.mem.writeInt(u64, buf[1..9], v.term, .little);
@@ -294,6 +316,17 @@ pub const Message = struct {
                 try exactLen(bytes, timeout_now_len);
                 break :blk .{ .timeout_now = .{ .term = try requestTermAt(bytes, 1) } };
             },
+            .read_req, .read_resp => blk: {
+                try exactLen(bytes, read_probe_len);
+                // Probes are numbered from 1; the leader's term is >= 1, and a
+                // reply may carry a lower one (a stale leader is told its own is old).
+                const r: ReadProbe = .{
+                    .term = if (tag == .read_req) try requestTermAt(bytes, 1) else try termAt(bytes, 1),
+                    .seq = std.mem.readInt(u64, bytes[9..17], .little),
+                };
+                if (r.seq == 0) return error.InvalidEncoding;
+                break :blk if (tag == .read_req) .{ .read_req = r } else .{ .read_resp = r };
+            },
         };
         return .{ .from = from, .to = to, .body = body };
     }
@@ -386,6 +419,8 @@ fn roundTrip(m: Message) !void {
         .pre_vote_req => |v| try testing.expectEqual(v, d.body.pre_vote_req),
         .pre_vote_resp => |v| try testing.expectEqual(v, d.body.pre_vote_resp),
         .timeout_now => |v| try testing.expectEqual(v, d.body.timeout_now),
+        .read_req => |v| try testing.expectEqual(v, d.body.read_req),
+        .read_resp => |v| try testing.expectEqual(v, d.body.read_resp),
         .append_resp => |v| try testing.expectEqual(v, d.body.append_resp),
         .append_req => |a| {
             const b = d.body.append_req;
@@ -411,6 +446,8 @@ test "every message kind round-trips, entries with their bytes" {
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .pre_vote_resp = .{ .term = 5, .granted = false } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .vote_req = .{ .term = 4, .last_log_index = 9, .last_log_term = 3, .transfer = true } } });
     try roundTrip(.{ .from = 0, .to = 2, .body = .{ .timeout_now = .{ .term = 7 } } });
+    try roundTrip(.{ .from = 0, .to = 2, .body = .{ .read_req = .{ .term = 7, .seq = 12 } } });
+    try roundTrip(.{ .from = 2, .to = 0, .body = .{ .read_resp = .{ .term = 7, .seq = 12 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17, .conflict_term = 3, .conflict_index = 9 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17, .conflict_term = 0, .conflict_index = 18 } } });
@@ -499,7 +536,7 @@ test "decode refuses lying lengths, trailing bytes, bad tags, bools and terms" {
     // One byte left over.
     try testing.expectError(error.InvalidEncoding, Message.decode(buf[0 .. ok.len + 1], 0, 1, &scratch));
     // Undefined tag; the old format's tags; an empty frame.
-    try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x17}, 0, 1, &scratch));
+    try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x19}, 0, 1, &scratch));
     try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x02}, 0, 1, &scratch));
     try testing.expectError(error.Truncated, Message.decode(&.{}, 0, 1, &scratch));
 
@@ -531,6 +568,8 @@ const message_seeds = [_][]const u8{
     seed("15" ++ "0500000000000000" ++ "00"), // pre_vote_resp
     seed("10" ++ "0500000000000000" ++ "0900000000000000" ++ "0300000000000000" ++ "01"), // vote_req, transfer
     seed("16" ++ "0700000000000000"), // timeout_now
+    seed("17" ++ "0700000000000000" ++ "0c00000000000000"), // read_req
+    seed("18" ++ "0700000000000000" ++ "0c00000000000000"), // read_resp
     seed("13" ++ "0400000000000000" ++ "00" ++ "1100000000000000"), // append_resp (reject + hint)
     seed("12" ++ "0300000000000000" ++ "0500000000000000" ++ "0200000000000000" ++ "0500000000000000" ++ "00000000"), // heartbeat
     seed("12" ++ "0300000000000000" ++ "0500000000000000" ++ "0200000000000000" ++ "0500000000000000" ++ "02000000" ++
@@ -547,7 +586,7 @@ const message_seeds = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
-const MessageMark = fz.Marker(enum { vote_req, vote_resp, append_resp, append_req, pre_vote_req, pre_vote_resp, timeout_now, refused });
+const MessageMark = fz.Marker(enum { vote_req, vote_resp, append_resp, append_req, pre_vote_req, pre_vote_resp, timeout_now, read_req, read_resp, refused });
 
 test "fuzz: Message.decode never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &message_seeds });
@@ -583,6 +622,8 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         .pre_vote_req => MessageMark.mark(.pre_vote_req),
         .pre_vote_resp => MessageMark.mark(.pre_vote_resp),
         .timeout_now => MessageMark.mark(.timeout_now),
+        .read_req => MessageMark.mark(.read_req),
+        .read_resp => MessageMark.mark(.read_resp),
     }
     // Accepted ⇒ re-encodes to the same bytes (the codec has one encoding).
     var out: [160]u8 = undefined;
@@ -606,7 +647,7 @@ test "corpus: every message seed reaches the decoder, and what it accepted is pi
         if (m.body == .append_req) entries += m.body.append_req.entries.len;
     }
     try testing.expectEqual(message_seeds.len - 1, nonempty);
-    try testing.expectEqual(@as(usize, 9), accepted);
+    try testing.expectEqual(@as(usize, 11), accepted);
     // The number a heartbeat-only corpus cannot produce.
     try testing.expectEqual(@as(usize, 2), entries);
 }
@@ -634,6 +675,28 @@ test "append_resp conflict hint: optional on the wire, legacy frames still decod
     bad = buf;
     std.mem.writeInt(u64, bad[18..26], types.max_term + 1, .little);
     try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..34], 1, 2, &scratch));
+}
+
+test "ReadIndex probes on the wire: new tags, 17 bytes, numbered from 1, fail closed" {
+    var scratch: [1]Entry = undefined;
+    var buf: [24]u8 = undefined;
+    const req: Message = .{ .from = 0, .to = 1, .body = .{ .read_req = .{ .term = 3, .seq = 9 } } };
+    try testing.expectEqual(Message.read_probe_len, req.encode(&buf));
+    try testing.expectEqual(@as(u8, 0x17), buf[0]);
+    const d = try Message.decode(buf[0..Message.read_probe_len], 0, 1, &scratch);
+    try testing.expectEqual(@as(u64, 9), d.body.read_req.seq);
+    try testing.expectError(error.Truncated, Message.decode(buf[0 .. Message.read_probe_len - 1], 0, 1, &scratch));
+    try testing.expectError(error.InvalidEncoding, Message.decode(buf[0 .. Message.read_probe_len + 1], 0, 1, &scratch));
+    var bad = buf;
+    @memset(bad[9..17], 0); // seq 0
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.read_probe_len], 0, 1, &scratch));
+    bad = buf;
+    @memset(bad[1..9], 0); // a request's term is never 0 ...
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.read_probe_len], 0, 1, &scratch));
+    bad[0] = 0x18; // ... a reply's may be (it echoes a stale leader's own term back)
+    try testing.expectEqual(@as(Term, 0), (try Message.decode(bad[0..Message.read_probe_len], 1, 0, &scratch)).body.read_resp.term);
+    std.mem.writeInt(u64, bad[1..9], types.max_term + 1, .little);
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.read_probe_len], 1, 0, &scratch));
 }
 
 test "leadership transfer on the wire: the vote flag is an optional byte, timeout_now a new tag, both fail closed" {

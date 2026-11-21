@@ -99,6 +99,26 @@ pub const RaftConfig = struct {
     /// as in `node.Config`).
     pre_vote: bool = false,
     check_quorum: bool = false,
+    /// Per 1000 `Ready`s, the chance that the server crashes in the MIDDLE of
+    /// one: after any prefix of the deployment's steps (hard state, truncation,
+    /// each entry, each message, apply) and before `advance`, and restarts at
+    /// once from what its disk then holds. Torn writes of this shape are what
+    /// a real crash does, and they are the sweep's only check of the
+    /// persist-before-send order: a `Ready` whose messages promise something
+    /// only a LATER `Ready` makes durable shows up as a safety violation
+    /// after the crash. 0 (the default) keeps every `Ready` atomic.
+    torn_ready_permille: u16 = 0,
+    /// POSITIVE CONTROL, never set outside the tests: send a `Ready`'s
+    /// messages BEFORE persisting it, against the contract. With torn
+    /// `Ready`s the sweep must then find a safety violation (a vote granted
+    /// or an entry acknowledged, then lost in the crash).
+    unsafe_send_before_persist: bool = false,
+    /// Every this many ticks, a leader asks for a linearizable read
+    /// (`Node.readIndex`); 0 = never. Every confirmed read must carry an index
+    /// at least as high as the highest commit index any server held when it
+    /// was asked (`error.StaleRead`): a read that returned less could miss a
+    /// write that had already been acknowledged.
+    read_period_ticks: u32 = 0,
 };
 
 /// The command a leader proposes when its next entry will be `index` while
@@ -165,6 +185,12 @@ const Slot = struct {
     }
 };
 
+const torn_seed: u64 = 0x7011_0c4a_5eed_0001;
+
+/// `RaftServer.commit_marks`: at `time`, `commit` became the highest commit
+/// index any node held.
+pub const CommitMark = struct { time: Time, commit: LogIndex };
+
 pub const RaftServer = struct {
     gpa: Allocator,
     node_count: usize,
@@ -187,6 +213,19 @@ pub const RaftServer = struct {
     /// Client commands a leader refused because a leadership transfer was
     /// under way (`error.ProposalDropped`), in this run.
     proposals_dropped: u64 = 0,
+    /// `Ready`s cut short by `RaftConfig.torn_ready_permille`, in this run.
+    torn_readys: u64 = 0,
+    /// Deterministic draws for the torn-`Ready` fault (reseeded by `reset`).
+    prng: std.Random.DefaultPrng = .init(torn_seed),
+    /// The highest commit index any node had reached, and when it rose: the
+    /// record `checkLiveness` measures progress by.
+    max_commit: LogIndex = 0,
+    commit_marks: std.ArrayList(CommitMark) = .empty,
+    /// `RaftConfig.read_period_ticks`: the next read token, the highest commit
+    /// index when each was asked, and how many came back confirmed.
+    next_read: u64 = 1,
+    read_floor: std.AutoHashMapUnmanaged(u64, LogIndex) = .empty,
+    reads_served: u64 = 0,
 
     /// Deliberate defect to run instead of the real rule, installed into every
     /// node. `.none` in every production path; the positive-control tests set
@@ -206,6 +245,8 @@ pub const RaftServer = struct {
         self.commit_terms.deinit(gpa);
         self.applied_commands.deinit(gpa);
         self.wire.deinit(gpa);
+        self.commit_marks.deinit(gpa);
+        self.read_floor.deinit(gpa);
         self.* = undefined;
     }
 
@@ -249,6 +290,13 @@ pub const RaftServer = struct {
         self.commit_terms.clearRetainingCapacity();
         self.applied_commands.clearRetainingCapacity();
         self.proposals_dropped = 0;
+        self.torn_readys = 0;
+        self.prng = .init(torn_seed);
+        self.max_commit = 0;
+        self.commit_marks.clearRetainingCapacity();
+        self.next_read = 1;
+        self.read_floor.clearRetainingCapacity();
+        self.reads_served = 0;
     }
 
     fn ticksOf(self: *const RaftServer, t: Time) u32 {
@@ -310,6 +358,12 @@ pub const RaftServer = struct {
                 else => |e| return e,
             };
         }
+        if (self.cfg.read_period_ticks != 0 and n.role == .leader and s.ticks % self.cfg.read_period_ticks == 0) {
+            const token = self.next_read;
+            self.next_read += 1;
+            try self.read_floor.put(self.gpa, token, self.max_commit);
+            try n.readIndex(token);
+        }
         try n.tick();
         try self.drain(sim, i);
         try sim.setTimer(i, self.cfg.tick, s.epoch);
@@ -322,7 +376,8 @@ pub const RaftServer = struct {
     }
 
     /// The deployment's half of the contract, in its order: persist, send,
-    /// apply, advance.
+    /// apply, advance. With `RaftConfig.torn_ready_permille` a `Ready` may be
+    /// cut short by a crash after any prefix of those steps.
     fn drain(self: *RaftServer, sim: *Sim, i: NodeId) anyerror!void {
         const gpa = self.gpa;
         const s = &self.slots[i];
@@ -330,11 +385,29 @@ pub const RaftServer = struct {
         while (n.hasReady()) {
             const rd = try n.ready();
 
-            if (rd.hard_state) |hs| s.disk_hs = hs;
+            // Steps before the crash, when this Ready is torn: hard state,
+            // truncation, each entry, each message, then the apply loop (one
+            // step: the checker's records are the state machine).
+            const steps = @as(usize, @intFromBool(rd.hard_state != null)) + @intFromBool(rd.truncate_after != null) +
+                rd.entries.len + rd.messages.len + 1;
+            var left: usize = std.math.maxInt(usize);
+            if (self.cfg.torn_ready_permille != 0 and self.prng.random().uintLessThan(u32, 1000) < self.cfg.torn_ready_permille)
+                left = self.prng.random().uintLessThan(usize, steps + 1);
+
+            if (self.cfg.unsafe_send_before_persist and try self.sendReady(sim, rd, &left)) return self.tear(sim, i);
+            if (rd.hard_state) |hs| {
+                if (left == 0) return self.tear(sim, i);
+                left -= 1;
+                s.disk_hs = hs;
+            }
             if (rd.truncate_after) |t| {
+                if (left == 0) return self.tear(sim, i);
+                left -= 1;
                 while (s.disk.items.len > t) gpa.free(s.disk.pop().?.data);
             }
             for (rd.entries) |e| {
+                if (left == 0) return self.tear(sim, i);
+                left -= 1;
                 if (e.index != s.disk.items.len + 1) return error.ReadyEntriesNotContiguous;
                 var owned = e;
                 owned.data = try gpa.dupe(u8, e.data);
@@ -342,12 +415,9 @@ pub const RaftServer = struct {
                 try s.disk.append(gpa, owned);
             }
 
-            for (rd.messages) |m| {
-                try self.wire.resize(gpa, m.encodedLen());
-                _ = m.encode(self.wire.items);
-                try sim.send(m.from, m.to, self.wire.items);
-            }
+            if (!self.cfg.unsafe_send_before_persist and try self.sendReady(sim, rd, &left)) return self.tear(sim, i);
 
+            if (left == 0) return self.tear(sim, i);
             for (rd.committed) |e| {
                 const fp = node_mod.fingerprint(e);
                 try self.checker.recordApply(gpa, e.index, fp);
@@ -357,7 +427,19 @@ pub const RaftServer = struct {
                 if (e.kind == .command and e.data.len == 8)
                     try self.applied_commands.put(gpa, e.index, std.mem.readInt(Command, e.data[0..8], .little));
             }
+            for (rd.read_states) |rs| {
+                const floor = self.read_floor.get(rs.ctx) orelse return error.UnknownRead;
+                if (rs.index < floor) return error.StaleRead;
+                self.reads_served += 1;
+            }
+            if (n.commit > self.max_commit) {
+                self.max_commit = n.commit;
+                try self.commit_marks.append(gpa, .{ .time = sim.now, .commit = n.commit });
+            }
 
+            // A crash after the last step and before `advance` loses nothing
+            // the caller had not already done: the whole Ready is replayed.
+            if (left == 0) return self.tear(sim, i);
             try n.advance();
         }
         // The disk now holds exactly the node's log — a Ready that missed an
@@ -371,6 +453,79 @@ pub const RaftServer = struct {
             try self.checker.recordLeader(gpa, n.term, i);
             s.leader_recorded = n.term;
         }
+    }
+
+    /// Send the `Ready`'s messages, one step each; true when the torn-`Ready`
+    /// crash falls inside them.
+    fn sendReady(self: *RaftServer, sim: *Sim, rd: node_mod.Ready, left: *usize) anyerror!bool {
+        for (rd.messages) |m| {
+            if (left.* == 0) return true;
+            left.* -= 1;
+            try self.wire.resize(self.gpa, m.encodedLen());
+            _ = m.encode(self.wire.items);
+            try sim.send(m.from, m.to, self.wire.items);
+        }
+        return false;
+    }
+
+    /// The server crashes in the middle of a `Ready` and restarts at once from
+    /// its disk (what `onStart` does after a `restart_node`).
+    fn tear(self: *RaftServer, sim: *Sim, i: NodeId) anyerror!void {
+        self.torn_readys += 1;
+        try onStart(self, sim, i);
+    }
+
+    // ── bounded liveness ─────────────────────────────────────────────────────
+
+    pub const Liveness = enum {
+        /// Exactly one leader, in the highest term any node has, and the commit
+        /// index kept rising in the last part of the run.
+        ok,
+        /// No server is a leader.
+        no_leader,
+        /// More than one server believes it leads, or the leader's term is not
+        /// the highest.
+        split_or_stale_leader,
+        /// A leader exists but the commit index did not rise after `settle`.
+        no_progress,
+    };
+
+    /// The bounded-liveness property, a post-run analysis (a `checkFn` sees
+    /// states, and "no leader is ever elected" is not a bad state, it is a
+    /// good event that never happens): the run's schedule was quiet from
+    /// `quiet_at` (every partition healed, every link up, every server
+    /// running), and `settle` after that, until the end of the run, a leader
+    /// must exist (alone, in the newest term) and the highest commit index must
+    /// have risen since `quiet_at + settle`. Needs `propose_client_commands` so
+    /// the leader has something to commit.
+    pub fn checkLiveness(self: *const RaftServer, quiet_at: Time, settle: Time) Liveness {
+        var leaders: usize = 0;
+        var max_term: Term = 0;
+        var leader_term: Term = 0;
+        for (self.slots) |s| {
+            const n = s.node orelse continue;
+            max_term = @max(max_term, n.term);
+            if (n.role == .leader) {
+                leaders += 1;
+                leader_term = n.term;
+            }
+        }
+        if (leaders == 0) return .no_leader;
+        if (leaders != 1 or leader_term != max_term) return .split_or_stale_leader;
+        return self.checkProgress(quiet_at, settle);
+    }
+
+    /// Only the progress half of `checkLiveness`: the highest commit index rose
+    /// after `quiet_at + settle`. For a run that keeps crashing servers (torn
+    /// `Ready`s), where "a leader exists at this very instant" is not a
+    /// property: a leader that has just been restarted is a follower until the
+    /// next election.
+    pub fn checkProgress(self: *const RaftServer, quiet_at: Time, settle: Time) Liveness {
+        var at_settle: LogIndex = 0;
+        for (self.commit_marks.items) |m| {
+            if (m.time <= quiet_at + settle) at_settle = m.commit;
+        }
+        return if (self.max_commit > at_settle) .ok else .no_progress;
     }
 
     // ── the live safety check (all five properties over global state) ─────────
@@ -1545,4 +1700,206 @@ test "real: transfers every 300 time units under a 100-seed fuzzed fault sweep (
     }
     // Precondition: the sweep did transfer, at volume.
     try testing.expect(probe.total_transfers >= 200);
+}
+
+// ── a crash in the middle of a Ready ─────────────────────────────────────────
+
+test "real: a 200-seed sweep with Readys torn by crashes (any prefix of persist, send, apply, then restart from disk)" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_]bool{ true, false }) |atomic_events| {
+        var cfg = DEFAULT_CFG;
+        cfg.torn_ready_permille = 60;
+        cfg.drain_every_event = atomic_events;
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+        const failing = try netsim.findFailing(gpa, template, .{}, 1, 200);
+        if (failing) |*f| {
+            var mf = f.*;
+            defer mf.deinit();
+            std.debug.print("raft: torn-Ready cluster tripped {} at seed {}\n", .{ mf.err, mf.case.seed });
+            return error.HardInvariantViolated;
+        }
+        // The fault actually fires, and the cluster still commits.
+        const r = try netsim.replay(gpa, .{ .seed = 7, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL }, &.{}, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+        try testing.expect(srv.torn_readys >= 10);
+        try testing.expect(srv.applied_commands.count() >= 10);
+    }
+}
+
+test "teeth: with messages sent BEFORE the Ready is persisted, torn Readys make the sweep find a violation" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var cfg = DEFAULT_CFG;
+    cfg.torn_ready_permille = 250;
+    cfg.unsafe_send_before_persist = true;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+    defer srv.deinit(gpa);
+    const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+    var failing = (try netsim.findFailing(gpa, template, .{}, 1, 400)) orelse return error.TornReadyUndetected;
+    defer failing.deinit();
+}
+
+// ── bounded liveness ─────────────────────────────────────────────────────────
+
+const LIVE_QUIET: Time = 1500;
+const LIVE_SETTLE: Time = 700;
+const LIVE_UNTIL: Time = LIVE_QUIET + LIVE_SETTLE + 600;
+
+/// Run `seed`'s fuzzed fault schedule up to `LIVE_QUIET`, repair everything
+/// then (heal every partition, restore every link, restart every server) and
+/// run on, quiet, to `LIVE_UNTIL`. Returns the analysis of the end state.
+fn liveAfterChurn(gpa: Allocator, srv: *RaftServer, seed: u64) !RaftServer.Liveness {
+    const template = netsim.Case{ .seed = seed, .scenario = scenario, .protocol = srv.protocol(), .until = LIVE_UNTIL };
+    const topo = try netsim.snapshotTopo(gpa, template);
+    defer gpa.free(topo.links);
+    var gen = try netsim.generateFaultTrace(gpa, seed, .{ .node_count = topo.node_count, .links = topo.links }, .{ .enable_clock_jump = false });
+    defer gen.deinit();
+    var events: std.ArrayList(netsim.FaultEvent) = .empty;
+    defer events.deinit(gpa);
+    for (gen.events) |e| if (e.time <= LIVE_QUIET) try events.append(gpa, e);
+    for (gen.events) |e| switch (e.kind) {
+        .partition => |p| try events.append(gpa, .{ .time = LIVE_QUIET, .kind = .{ .heal = .{ .id = p.id } } }),
+        .link_down => |l| try events.append(gpa, .{ .time = LIVE_QUIET, .kind = .{ .link_up = l } }),
+        .crash_node => |c| try events.append(gpa, .{ .time = LIVE_QUIET, .kind = .{ .restart_node = .{ .node = c.node } } }),
+        else => {},
+    };
+    const r = try netsim.replay(gpa, template, events.items, null);
+    if (r.outcome != .ok) return error.SafetyViolated;
+    return srv.checkLiveness(LIVE_QUIET, LIVE_SETTLE);
+}
+
+test "real: with PreVote, after any fuzzed churn, once the network is quiet a leader is elected and the commit index rises (bounded liveness)" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Variant = struct { check_quorum: bool, torn: u16 };
+    for ([_]Variant{ .{ .check_quorum = false, .torn = 0 }, .{ .check_quorum = true, .torn = 0 }, .{ .check_quorum = false, .torn = 40 } }) |v| {
+        var cfg = DEFAULT_CFG;
+        cfg.pre_vote = true;
+        cfg.check_quorum = v.check_quorum;
+        cfg.torn_ready_permille = v.torn;
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        var seed: u64 = 1;
+        while (seed <= 60) : (seed += 1) {
+            var verdict = try liveAfterChurn(gpa, &srv, seed);
+            // Torn Readys keep killing leaders: only progress is a property there.
+            if (v.torn != 0 and verdict == .no_leader) verdict = srv.checkProgress(LIVE_QUIET, LIVE_SETTLE);
+            if (verdict != .ok) {
+                std.debug.print("raft: liveness {t} at seed {} (check_quorum={}, torn={})\n", .{ verdict, seed, v.check_quorum, v.torn });
+                for (0..CLUSTER_N) |i| {
+                    const n = srv.node(@intCast(i));
+                    std.debug.print("  node {}: {t} term {} voted_for {} commit {} last {} elapsed {}/{}\n", .{ i, n.role, n.term, n.voted_for, n.commit, n.lastIndex(), n.election_elapsed, n.election_timeout });
+                }
+                return error.LivenessViolated;
+            }
+        }
+    }
+}
+
+// What the analysis found on its first run, kept as the reason PreVote exists
+// (Raft thesis §9.6). In this harness election timeouts are deterministic
+// (`election_jitter_ticks = 0`, a fixed spread per server). Seed 6's churn
+// leaves server 0, the one with the SHORTEST timeout, a candidate with a log
+// six entries behind the others: every RequestVote it sends is refused, yet
+// each one makes the up-to-date servers adopt its term and re-arm their timers
+// BEFORE their own (longer) timeouts fire, so none of them ever campaigns —
+// term after term, for the whole quiet window. Plain Raft recovers from this
+// only by randomized timeouts; with PreVote the stale server never gets a
+// pre-vote, so nobody's term or timer moves and an up-to-date one wins.
+test "liveness: seed 6's churn livelocks plain Raft under deterministic timeouts and PreVote ends it" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    {
+        var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+        defer srv.deinit(gpa);
+        try testing.expectEqual(RaftServer.Liveness.no_leader, try liveAfterChurn(gpa, &srv, 6));
+        const n0 = srv.node(0);
+        try testing.expectEqual(Role.candidate, n0.role);
+        // The newest term everywhere, and nobody ahead of a candidate that cannot win.
+        for (0..CLUSTER_N) |i| try testing.expectEqual(n0.term, srv.node(@intCast(i)).term);
+    }
+    {
+        var cfg = DEFAULT_CFG;
+        cfg.pre_vote = true;
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        try testing.expectEqual(RaftServer.Liveness.ok, try liveAfterChurn(gpa, &srv, 6));
+    }
+}
+
+test "teeth: a cluster whose election timeout never starts a campaign fails the liveness analysis" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+    defer srv.deinit(gpa);
+    srv.bug = .never_campaign;
+    try testing.expectEqual(RaftServer.Liveness.no_leader, try liveAfterChurn(gpa, &srv, 3));
+}
+
+test "teeth: the analysis tells a leaderless run from a stalled one and from a healthy one" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+    defer srv.deinit(gpa);
+    // A healthy quiet run.
+    _ = try netsim.replay(gpa, .{ .seed = 7, .scenario = scenario, .protocol = srv.protocol(), .until = LIVE_UNTIL }, &.{}, null);
+    try testing.expectEqual(RaftServer.Liveness.ok, srv.checkLiveness(0, LIVE_SETTLE));
+    // The same run judged as if it had gone quiet at its very end: nothing rose since.
+    try testing.expectEqual(RaftServer.Liveness.no_progress, srv.checkLiveness(LIVE_UNTIL, LIVE_SETTLE));
+    // A second leader at the highest term is not liveness.
+    var other: usize = 0;
+    for (0..CLUSTER_N) |i| {
+        if (srv.node(@intCast(i)).role != .leader) {
+            srv.node(@intCast(i)).role = .leader;
+            other = i;
+            break;
+        }
+    }
+    try testing.expectEqual(RaftServer.Liveness.split_or_stale_leader, srv.checkLiveness(0, LIVE_SETTLE));
+    srv.node(@intCast(other)).role = .follower;
+    for (0..CLUSTER_N) |i| srv.node(@intCast(i)).role = .follower;
+    try testing.expectEqual(RaftServer.Liveness.no_leader, srv.checkLiveness(0, LIVE_SETTLE));
+}
+
+// ── linearizable reads ───────────────────────────────────────────────────────
+
+test "real: ReadIndex reads, asked by every leader through fuzzed faults, never return less than what was already committed" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |pre_vote| {
+        var cfg = DEFAULT_CFG;
+        cfg.read_period_ticks = 3;
+        cfg.pre_vote = pre_vote;
+        cfg.check_quorum = pre_vote;
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+        const failing = try netsim.findFailing(gpa, template, .{}, 1, 200);
+        if (failing) |*f| {
+            var mf = f.*;
+            defer mf.deinit();
+            std.debug.print("raft: reads tripped {} at seed {}\n", .{ mf.err, mf.case.seed });
+            return error.HardInvariantViolated;
+        }
+        const r = try netsim.replay(gpa, .{ .seed = 7, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL }, &.{}, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+        try testing.expect(srv.reads_served >= 20); // on a quiet network most reads come back
+    }
+}
+
+test "teeth: a leader that answers reads without a quorum round serves a stale read, and the sweep sees it" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var cfg = DEFAULT_CFG;
+    cfg.read_period_ticks = 1;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+    defer srv.deinit(gpa);
+    srv.bug = .unconfirmed_reads;
+    const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+    var failing = (try netsim.findFailing(gpa, template, .{}, 1, 300)) orelse return error.StaleReadUndetected;
+    defer failing.deinit();
+    try testing.expectEqual(error.StaleRead, failing.err);
 }

@@ -117,6 +117,8 @@ pub const InjectedBug = node_mod.InjectedBug;
 pub const InitError = node_mod.InitError;
 pub const ProposeError = node_mod.ProposeError;
 pub const TransferError = node_mod.TransferError;
+pub const ReadError = node_mod.ReadError;
+pub const ReadState = node_mod.ReadState;
 pub const fingerprint = node_mod.fingerprint;
 
 /// What `Node`s exchange: entries carrying the caller's bytes, and the codec.
@@ -128,6 +130,7 @@ pub const MessageTag = message.Tag;
 pub const VoteReq = message.VoteReq;
 pub const VoteResp = message.VoteResp;
 pub const TimeoutNow = message.TimeoutNow;
+pub const ReadProbe = message.ReadProbe;
 pub const AppendReq = message.AppendReq;
 pub const AppendResp = message.AppendResp;
 

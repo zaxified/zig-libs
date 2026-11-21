@@ -19,13 +19,14 @@ Two ways in:
 
 > **Status — mvp.** Election, replication, the Figure-8 commit rule, restart
 > from persisted state, PreVote and CheckQuorum (off by default, as in
-> etcd/raft), leadership transfer (`node.transferLeadership(target)`) and flow
-> control. Depends on `netsim`. See [`SPEC.md`](SPEC.md).
+> etcd/raft), leadership transfer (`node.transferLeadership(target)`), linearizable
+> reads (`node.readIndex(ctx)`, quorum-confirmed; `read_lease` for lease reads) and
+> flow control. Depends on `netsim`. See [`SPEC.md`](SPEC.md).
 
 ## Not provided
 
-Snapshots / log compaction (the whole log is in memory), membership changes
-(`safety.jointMajority` exists, not wired) and linearizable reads. They are open
+Snapshots / log compaction (the whole log is in memory) and membership changes
+(`safety.jointMajority` exists, not wired). They are open
 items: SPEC.md *Backlog / deferred*; what is refused on purpose is in *What is
 deliberately not done*.
 
@@ -55,6 +56,9 @@ defer node.deinit();
 // (error.ProposalDropped while node.transferLeadership(target) hands
 // leadership over — done when the target wins, abandoned after one election
 // timeout; upgrade every server first, see SPEC § Leadership transfer).
+// A linearizable read on the leader: node.readIndex(token) writes nothing; the
+// token comes back in rd.read_states with an index, and the read may be served
+// once everything up to that index has been applied (SPEC § Linearizable reads).
 // After any of them:
 while (node.hasReady()) {
     const rd = try node.ready();
