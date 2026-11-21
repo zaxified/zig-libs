@@ -405,6 +405,12 @@ hold them. A consumer builds one instance per width and holds it.
 
 ## Backlog / deferred
 
-- **Poseidon2.** The newer ZK stacks (Plonky3, gnark-crypto, HorizenLabs, and the Zig `blockblaz/zig-poseidon`) ship Poseidon2, not the original permutation, and a user coming from them finds no digest here. It is a different permutation with its own linear layer, parameter set and vectors, a scoping note and not a refusal, so it stays a backlog candidate. Sizeable (new linear layer, `generate_matrix_full/partial` from the same sage script, vectors per field); published vectors exist for it. Fits CONVENTIONS section 2 (pure Zig; the fields are the sibling `bn254`/`bls12_381` and, for Goldilocks, `rescue`'s in-module field).
 - **Filecoin/neptune-compatible BLS12-381 Poseidon.** Filecoin and Lurk users need neptune's domain tags and arities; this module's BLS12-381 `hash`/`compress` framing is its own and only `t = 3, 5` exist (see *Limits*). The details of neptune's tags and arities are inferred, not read. Moderate; anchorable against neptune's own vectors (MIT licence file present) once the parameters are confirmed. Pure Zig.
 - **Performance is not measured.** There is no benchmark of `permute`/`hash`/`init()` against a reference (circomlibjs, light-poseidon, neptune), so the card's Performance line is *not measured* and the grade is limited by it.
+
+## Roadmap
+
+- **Poseidon2.** The newer ZK stacks (Plonky3, gnark-crypto, HorizenLabs, and the Zig `blockblaz/zig-poseidon`) ship Poseidon2, not the original permutation, and a user coming from them finds no digest here. It is a different permutation with its own linear layer, parameter set and vectors, a scoping note and not a refusal, so it stays a backlog candidate. Sizeable (new linear layer, `generate_matrix_full/partial` from the same sage script, vectors per field); published vectors exist for it. Fits CONVENTIONS section 2 (pure Zig; the fields are the sibling `bn254`/`bls12_381` and, for Goldilocks, `rescue`'s in-module field).
+  Project-size: a second permutation family (linear layers, round constants per field from the sage script, vectors
+  for BN254, BLS12-381 and Goldilocks), weeks.
+
