@@ -12,7 +12,7 @@
 //!   L2–L4 keys).
 //! * **actions** — the `TCA_*_ACT` list a filter runs on a match (`gact`,
 //!   `mirred`, `police`, `skbedit`, `vlan`, `connmark`, `csum`, `sample`,
-//!   `tunnel_key`, `mpls`, `nat`, `pedit`, `ct`, `raw`), chained by `TC_ACT_PIPE`,
+//!   `tunnel_key`, `mpls`, `nat`, `pedit`, `ct`, `simple`, `ctinfo`, `gate`, `bpf`, `ife`, `raw`), chained by `TC_ACT_PIPE`,
 //!   plus the standalone shared table (`RTM_NEWACTION`/`DELACTION`/
 //!   `GETACTION`).
 //!
@@ -269,6 +269,26 @@ pub const TCA_PEDIT = action.TCA_PEDIT;
 pub const TCA_PEDIT_KEY_EX = action.TCA_PEDIT_KEY_EX;
 pub const TCA_CT = action.TCA_CT;
 pub const peditMunge = action.peditMunge;
+pub const Simple = action.Simple;
+pub const SimpleWire = action.SimpleWire;
+pub const Ctinfo = action.Ctinfo;
+pub const CtinfoWire = action.CtinfoWire;
+pub const Gate = action.Gate;
+pub const GateEntry = action.GateEntry;
+pub const GateWire = action.GateWire;
+pub const BpfAct = action.BpfAct;
+pub const BpfActWire = action.BpfActWire;
+pub const Ife = action.Ife;
+pub const IfeMeta = action.IfeMeta;
+pub const IfeWire = action.IfeWire;
+pub const IFE_META = action.IFE_META;
+pub const TCA_DEF = action.TCA_DEF;
+pub const TCA_CTINFO = action.TCA_CTINFO;
+pub const TCA_GATE = action.TCA_GATE;
+pub const TCA_GATE_ENTRY = action.TCA_GATE_ENTRY;
+pub const TCA_ACT_BPF = action.TCA_ACT_BPF;
+pub const TCA_IFE = action.TCA_IFE;
+pub const CLOCK_TAI = action.CLOCK_TAI;
 pub const TCA_ACT = action.TCA_ACT;
 pub const TCA_ACT_TAB = action.TCA_ACT_TAB;
 pub const TCA_ROOT = action.TCA_ROOT;

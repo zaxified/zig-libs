@@ -192,6 +192,11 @@ pub const kind_mpls = "mpls";
 pub const kind_nat = "nat";
 pub const kind_pedit = "pedit";
 pub const kind_ct = "ct";
+pub const kind_simple = "simple";
+pub const kind_ctinfo = "ctinfo";
+pub const kind_gate = "gate";
+pub const kind_bpf = "bpf";
+pub const kind_ife = "ife";
 
 /// `TCA_ACT_MAX_PRIO` — the kernel's cap on actions in one list.
 pub const max_actions = 32;
@@ -1210,6 +1215,277 @@ pub const ExtWire = union(enum) {
     nat: NatWire,
     pedit: PeditWire,
     ct: CtWire,
+    simple: SimpleWire,
+    ctinfo: CtinfoWire,
+    gate: GateWire,
+    bpf: BpfActWire,
+    ife: IfeWire,
+};
+
+// ── simple ──────────────────────────────────────────────────────────────────
+
+/// `TCA_DEF_*`.
+pub const TCA_DEF = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const TM: u16 = 1;
+    pub const PARMS: u16 = 2;
+    pub const DATA: u16 = 3;
+    pub const PAD: u16 = 4;
+};
+
+/// The longest `simple` string kept on readback (`SIMP_MAX_DATA`).
+pub const simple_max_data = 32;
+
+/// **simple** — print a fixed string to the kernel log on every packet (a
+/// debugging action: `tc … action simple sdata "hello"`). `tc` 6.19 sends a
+/// buffer with uninitialised bytes after the string, so there is no golden;
+/// this encoder sends the string and its NUL only.
+pub const Simple = struct {
+    data: []const u8,
+    index: u32 = 0,
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const SimpleWire = struct {
+    data_buf: [simple_max_data]u8 = @splat(0),
+    data_len: u8 = 0,
+
+    pub fn data(w: *const SimpleWire) []const u8 {
+        return w.data_buf[0..w.data_len];
+    }
+};
+
+// ── ctinfo ──────────────────────────────────────────────────────────────────
+
+/// `TCA_CTINFO_*`.
+pub const TCA_CTINFO = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const PAD: u16 = 1;
+    pub const TM: u16 = 2;
+    pub const ACT: u16 = 3;
+    pub const ZONE: u16 = 4;
+    pub const PARMS_DSCP_MASK: u16 = 5;
+    pub const PARMS_DSCP_STATEMASK: u16 = 6;
+    pub const PARMS_CPMARK_MASK: u16 = 7;
+    pub const STATS_DSCP_SET: u16 = 8;
+    pub const STATS_DSCP_ERROR: u16 = 9;
+    pub const STATS_CPMARK_SET: u16 = 10;
+};
+
+/// **ctinfo** — copy conntrack's DSCP and/or mark into the packet (`tc …
+/// action ctinfo dscp MASK STATEMASK cpmark MASK zone N`).
+pub const Ctinfo = struct {
+    zone: u16 = 0,
+    dscp_mask: ?u32 = null,
+    dscp_statemask: ?u32 = null,
+    cpmark_mask: ?u32 = null,
+    index: u32 = 0,
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const CtinfoWire = struct {
+    zone: ?u16 = null,
+    dscp_mask: ?u32 = null,
+    dscp_statemask: ?u32 = null,
+    cpmark_mask: ?u32 = null,
+    stats_dscp_set: ?u64 = null,
+    stats_dscp_error: ?u64 = null,
+    stats_cpmark_set: ?u64 = null,
+};
+
+// ── gate ────────────────────────────────────────────────────────────────────
+
+/// `TCA_GATE_*`.
+pub const TCA_GATE = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const TM: u16 = 1;
+    pub const PARMS: u16 = 2;
+    pub const PAD: u16 = 3;
+    pub const PRIORITY: u16 = 4;
+    pub const ENTRY_LIST: u16 = 5;
+    pub const BASE_TIME: u16 = 6;
+    pub const CYCLE_TIME: u16 = 7;
+    pub const CYCLE_TIME_EXT: u16 = 8;
+    pub const FLAGS: u16 = 9;
+    pub const CLOCKID: u16 = 10;
+};
+
+/// `TCA_GATE_ENTRY_*`.
+pub const TCA_GATE_ENTRY = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const INDEX: u16 = 1;
+    pub const GATE: u16 = 2;
+    pub const INTERVAL: u16 = 3;
+    pub const IPV: u16 = 4;
+    pub const MAX_OCTETS: u16 = 5;
+};
+
+/// `CLOCK_TAI`, the clock `tc … gate clockid CLOCK_TAI` names.
+pub const CLOCK_TAI: i32 = 11;
+
+/// The most schedule entries a decoded gate keeps.
+pub const gate_max_entries_decoded = 8;
+
+/// One entry of a gate's schedule (`sched-entry open|close INTERVAL IPV
+/// MAXOCTETS`).
+pub const GateEntry = struct {
+    /// `open` (the gate passes traffic) or `close`.
+    open: bool,
+    /// How long the entry lasts, nanoseconds.
+    interval_ns: u32,
+    /// Internal priority value to set; -1 keeps the packet's.
+    ipv: i32 = -1,
+    /// Octets the entry may pass; -1 is unlimited.
+    max_octets: i32 = -1,
+};
+
+/// **gate** — an IEEE 802.1Qci time-gated pass/drop schedule (`tc … action
+/// gate base-time T sched-entry open 100000000 -1 -1 clockid CLOCK_TAI`).
+pub const Gate = struct {
+    /// `priority N`.
+    priority: ?i32 = null,
+    /// `base-time`, nanoseconds on `clockid`.
+    base_time_ns: ?u64 = null,
+    cycle_time_ns: ?u64 = null,
+    cycle_time_ext_ns: ?u64 = null,
+    /// `clockid` as a `CLOCK_*` number (`CLOCK_TAI`).
+    clockid: ?i32 = null,
+    entries: []const GateEntry = &.{},
+    index: u32 = 0,
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const GateWire = struct {
+    priority: ?i32 = null,
+    base_time_ns: ?u64 = null,
+    cycle_time_ns: ?u64 = null,
+    cycle_time_ext_ns: ?u64 = null,
+    clockid: ?i32 = null,
+    flags: ?u32 = null,
+    /// The first `gate_max_entries_decoded` schedule entries.
+    entries: [gate_max_entries_decoded]GateEntry = @splat(.{ .open = false, .interval_ns = 0 }),
+    entries_len: u8 = 0,
+    /// How many entries the kernel sent.
+    entries_total: u16 = 0,
+};
+
+// ── bpf (the action) ────────────────────────────────────────────────────────
+
+/// `TCA_ACT_BPF_*`.
+pub const TCA_ACT_BPF = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const TM: u16 = 1;
+    pub const PARMS: u16 = 2;
+    pub const OPS_LEN: u16 = 3;
+    pub const OPS: u16 = 4;
+    pub const FD: u16 = 5;
+    pub const NAME: u16 = 6;
+    pub const PAD: u16 = 7;
+    pub const TAG: u16 = 8;
+    pub const ID: u16 = 9;
+};
+
+/// One classic-BPF instruction (`struct sock_filter`); the same shape the
+/// `bpf` classifier takes.
+pub const BpfInsn = struct {
+    code: u16,
+    jt: u8 = 0,
+    jf: u8 = 0,
+    k: u32 = 0,
+};
+
+/// **bpf** — run a BPF program on the packet and take its return value as the
+/// verdict. Either inline classic bytecode (`ops`) or an already-loaded eBPF
+/// program by file descriptor (`fd`, with an optional `name`); exactly one.
+pub const BpfAct = struct {
+    ops: []const BpfInsn = &.{},
+    fd: ?u32 = null,
+    name: ?[]const u8 = null,
+    index: u32 = 0,
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const BpfActWire = struct {
+    ops_len: ?u16 = null,
+    id: ?u32 = null,
+    tag: ?[8]u8 = null,
+    name_buf: [32]u8 = @splat(0),
+    name_len: u8 = 0,
+
+    pub fn name(w: *const BpfActWire) []const u8 {
+        return w.name_buf[0..w.name_len];
+    }
+};
+
+// ── ife ─────────────────────────────────────────────────────────────────────
+
+/// `TCA_IFE_*`.
+pub const TCA_IFE = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const PARMS: u16 = 1;
+    pub const TM: u16 = 2;
+    pub const DMAC: u16 = 3;
+    pub const SMAC: u16 = 4;
+    pub const TYPE: u16 = 5;
+    pub const METALST: u16 = 6;
+    pub const PAD: u16 = 7;
+};
+
+/// `IFE_META_*` — the metadata an ife action carries.
+pub const IFE_META = struct {
+    pub const SKBMARK: u16 = 1;
+    pub const HASHID: u16 = 2;
+    pub const PRIO: u16 = 3;
+    pub const QMAP: u16 = 4;
+    pub const TCINDEX: u16 = 5;
+};
+
+/// `IFE_ENCODE` in `tc_ife.flags`.
+pub const IFE_ENCODE: u16 = 1;
+/// `sizeof(struct tc_ife)` — the prologue, `flags` and two bytes of padding.
+pub const tc_ife_len = tc_gen_len + 4;
+/// How many metadata entries a decoded ife keeps.
+pub const ife_max_meta_decoded = 8;
+
+/// One metadata entry: `allow mark` (no value) or `use mark 5`.
+pub const IfeMeta = struct {
+    /// `IFE_META.*`.
+    kind: u16,
+    /// The value `use` sets; null for `allow` (`tcindex` is 16 bits wide, the
+    /// others 32).
+    value: ?u32 = null,
+};
+
+/// **ife** — inter-FE (ForCES) encapsulation: wrap a packet with metadata
+/// (`encode`) or unwrap it (`decode`).
+pub const Ife = struct {
+    encode: bool = false,
+    dmac: ?[6]u8 = null,
+    smac: ?[6]u8 = null,
+    /// The ethertype of the encapsulation, host order (`type 0xed3e`).
+    ether_type: ?u16 = null,
+    meta: []const IfeMeta = &.{},
+    index: u32 = 0,
+    action: Verdict = .pipe,
+    cookie: []const u8 = &.{},
+    extra: Extra = .{},
+};
+
+pub const IfeWire = struct {
+    encode: bool = false,
+    dmac: ?[6]u8 = null,
+    smac: ?[6]u8 = null,
+    ether_type: ?u16 = null,
+    meta: [ife_max_meta_decoded]IfeMeta = @splat(.{ .kind = 0 }),
+    meta_len: u8 = 0,
 };
 
 // ── raw escape hatch ────────────────────────────────────────────────────────
@@ -1245,6 +1521,11 @@ pub const ActionSpec = union(enum) {
     nat: Nat,
     pedit: Pedit,
     ct: Ct,
+    simple: Simple,
+    ctinfo: Ctinfo,
+    gate: Gate,
+    bpf: BpfAct,
+    ife: Ife,
     raw: Raw,
 
     pub fn kind(self: ActionSpec) []const u8 {
@@ -1262,6 +1543,11 @@ pub const ActionSpec = union(enum) {
             .nat => kind_nat,
             .pedit => kind_pedit,
             .ct => kind_ct,
+            .simple => kind_simple,
+            .ctinfo => kind_ctinfo,
+            .gate => kind_gate,
+            .bpf => kind_bpf,
+            .ife => kind_ife,
             .raw => |r| r.kind,
         };
     }
@@ -1309,6 +1595,11 @@ pub const ActionSpec = union(enum) {
             .nat => |n| try appendNatOptions(n, gpa, list),
             .pedit => |x| try appendPeditOptions(x, gpa, list),
             .ct => |c| try appendCtOptions(c, gpa, list),
+            .simple => |x| try appendSimpleOptions(x, gpa, list),
+            .ctinfo => |x| try appendCtinfoOptions(x, gpa, list),
+            .gate => |x| try appendGateOptions(x, gpa, list),
+            .bpf => |x| try appendBpfActOptions(x, gpa, list),
+            .ife => |x| try appendIfeOptions(x, gpa, list),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
                 try list.appendSlice(gpa, r.options);
@@ -1645,6 +1936,93 @@ fn appendCtOptions(c: Ct, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) Enco
     // `tc` always sends the action word, 0 for a plain `ct zone N`.
     try codec.appendAttrU16(gpa, list, TCA_CT.ACTION, c.ct_action);
     try appendGenParms(gpa, list, TCA_CT.PARMS, c.index, c.action, &.{});
+}
+
+fn appendSimpleOptions(x: Simple, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    if (x.data.len + 1 > simple_max_data) return error.OptionsTooLong;
+    try appendGenParms(gpa, list, TCA_DEF.PARMS, x.index, x.action, &.{});
+    var raw: [simple_max_data]u8 = @splat(0);
+    @memcpy(raw[0..x.data.len], x.data);
+    try appendAttr(gpa, list, TCA_DEF.DATA, raw[0 .. x.data.len + 1]);
+}
+
+fn appendCtinfoOptions(c: Ctinfo, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    try appendGenParms(gpa, list, TCA_CTINFO.ACT, c.index, c.action, &.{});
+    try codec.appendAttrU16(gpa, list, TCA_CTINFO.ZONE, c.zone);
+    if (c.dscp_mask) |v| try codec.appendAttrU32(gpa, list, TCA_CTINFO.PARMS_DSCP_MASK, v);
+    if (c.dscp_statemask) |v| try codec.appendAttrU32(gpa, list, TCA_CTINFO.PARMS_DSCP_STATEMASK, v);
+    if (c.cpmark_mask) |v| try codec.appendAttrU32(gpa, list, TCA_CTINFO.PARMS_CPMARK_MASK, v);
+}
+
+fn appendGateOptions(g: Gate, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    try appendGenParms(gpa, list, TCA_GATE.PARMS, g.index, g.action, &.{});
+    if (g.priority) |v| try codec.appendAttrU32(gpa, list, TCA_GATE.PRIORITY, @bitCast(v));
+    if (g.base_time_ns) |v| try appendAttrU64(gpa, list, TCA_GATE.BASE_TIME, v);
+    if (g.cycle_time_ns) |v| try appendAttrU64(gpa, list, TCA_GATE.CYCLE_TIME, v);
+    if (g.cycle_time_ext_ns) |v| try appendAttrU64(gpa, list, TCA_GATE.CYCLE_TIME_EXT, v);
+    if (g.clockid) |v| try codec.appendAttrU32(gpa, list, TCA_GATE.CLOCKID, @bitCast(v));
+    if (g.entries.len != 0) {
+        const outer = try codec.nestBegin(gpa, list, TCA_GATE.ENTRY_LIST | codec.NLA_F_NESTED);
+        for (g.entries) |e| {
+            const ent = try codec.nestBegin(gpa, list, 1 | codec.NLA_F_NESTED); // TCA_GATE_ONE_ENTRY
+            if (e.open) try appendAttr(gpa, list, TCA_GATE_ENTRY.GATE, &.{});
+            try codec.appendAttrU32(gpa, list, TCA_GATE_ENTRY.INTERVAL, e.interval_ns);
+            try codec.appendAttrU32(gpa, list, TCA_GATE_ENTRY.IPV, @bitCast(e.ipv));
+            try codec.appendAttrU32(gpa, list, TCA_GATE_ENTRY.MAX_OCTETS, @bitCast(e.max_octets));
+            codec.nestEnd(list, ent) catch return error.OptionsTooLong;
+        }
+        codec.nestEnd(list, outer) catch return error.OptionsTooLong;
+    }
+}
+
+fn appendBpfActOptions(b: BpfAct, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    if ((b.ops.len == 0) == (b.fd == null) or b.ops.len > 4096) return error.OptionsTooLong;
+    if (b.ops.len != 0) {
+        var len_raw: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_raw, @intCast(b.ops.len), native_endian);
+        try appendAttr(gpa, list, TCA_ACT_BPF.OPS_LEN, &len_raw);
+        const raw = try gpa.alloc(u8, b.ops.len * 8);
+        defer gpa.free(raw);
+        for (b.ops, 0..) |i, n| {
+            std.mem.writeInt(u16, raw[n * 8 ..][0..2], i.code, native_endian);
+            raw[n * 8 + 2] = i.jt;
+            raw[n * 8 + 3] = i.jf;
+            std.mem.writeInt(u32, raw[n * 8 + 4 ..][0..4], i.k, native_endian);
+        }
+        try appendAttr(gpa, list, TCA_ACT_BPF.OPS, raw);
+    }
+    if (b.fd) |fd| try codec.appendAttrU32(gpa, list, TCA_ACT_BPF.FD, fd);
+    if (b.name) |name| {
+        codec.appendAttrString(gpa, list, TCA_ACT_BPF.NAME, name) catch |err| switch (err) {
+            error.AttrTooLong => return error.OptionsTooLong,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+    try appendGenParms(gpa, list, TCA_ACT_BPF.PARMS, b.index, b.action, &.{});
+}
+
+fn appendIfeOptions(x: Ife, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) EncodeError!void {
+    var tail: [4]u8 = @splat(0);
+    std.mem.writeInt(u16, tail[0..2], if (x.encode) IFE_ENCODE else 0, native_endian);
+    try appendGenParms(gpa, list, TCA_IFE.PARMS, x.index, x.action, &tail);
+    if (x.dmac) |m| try appendAttr(gpa, list, TCA_IFE.DMAC, &m);
+    if (x.smac) |m| try appendAttr(gpa, list, TCA_IFE.SMAC, &m);
+    if (x.ether_type) |t| try codec.appendAttrU16(gpa, list, TCA_IFE.TYPE, t);
+    if (x.meta.len != 0) {
+        const nest = try codec.nestBegin(gpa, list, TCA_IFE.METALST);
+        for (x.meta) |m| {
+            if (m.value) |v| {
+                if (m.kind == IFE_META.TCINDEX) {
+                    try codec.appendAttrU16(gpa, list, m.kind, @intCast(@min(v, std.math.maxInt(u16))));
+                } else {
+                    try codec.appendAttrU32(gpa, list, m.kind, v);
+                }
+            } else {
+                try appendAttr(gpa, list, m.kind, &.{});
+            }
+        }
+        codec.nestEnd(list, nest) catch return error.OptionsTooLong;
+    }
 }
 
 /// Append a complete action list as one nested attribute — `TCA_U32_ACT`,
@@ -2228,6 +2606,165 @@ fn parseCtOptions(a: *Action, data: []const u8) codec.Error!void {
     a.ext = .{ .ct = w };
 }
 
+fn parseSimpleOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: SimpleWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_DEF.PARMS => try readGen(a, attr.data, tc_gen_len),
+        TCA_DEF.DATA => {
+            const s = attr.asString();
+            const n = @min(s.len, simple_max_data);
+            @memcpy(w.data_buf[0..n], s[0..n]);
+            w.data_len = @intCast(n);
+        },
+        TCA_DEF.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .simple = w };
+}
+
+fn parseCtinfoOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: CtinfoWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_CTINFO.ACT => try readGen(a, attr.data, tc_gen_len),
+        TCA_CTINFO.ZONE => if (attr.data.len >= 2) {
+            w.zone = std.mem.readInt(u16, attr.data[0..2], native_endian);
+        },
+        TCA_CTINFO.PARMS_DSCP_MASK => if (attr.data.len >= 4) {
+            w.dscp_mask = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_CTINFO.PARMS_DSCP_STATEMASK => if (attr.data.len >= 4) {
+            w.dscp_statemask = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_CTINFO.PARMS_CPMARK_MASK => if (attr.data.len >= 4) {
+            w.cpmark_mask = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_CTINFO.STATS_DSCP_SET => if (attr.data.len >= 8) {
+            w.stats_dscp_set = std.mem.readInt(u64, attr.data[0..8], native_endian);
+        },
+        TCA_CTINFO.STATS_DSCP_ERROR => if (attr.data.len >= 8) {
+            w.stats_dscp_error = std.mem.readInt(u64, attr.data[0..8], native_endian);
+        },
+        TCA_CTINFO.STATS_CPMARK_SET => if (attr.data.len >= 8) {
+            w.stats_cpmark_set = std.mem.readInt(u64, attr.data[0..8], native_endian);
+        },
+        TCA_CTINFO.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .ctinfo = w };
+}
+
+fn parseGateOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: GateWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_GATE.PARMS => try readGen(a, attr.data, tc_gen_len),
+        TCA_GATE.PRIORITY => if (attr.data.len >= 4) {
+            w.priority = std.mem.readInt(i32, attr.data[0..4], native_endian);
+        },
+        TCA_GATE.BASE_TIME => if (attr.data.len >= 8) {
+            w.base_time_ns = std.mem.readInt(u64, attr.data[0..8], native_endian);
+        },
+        TCA_GATE.CYCLE_TIME => if (attr.data.len >= 8) {
+            w.cycle_time_ns = std.mem.readInt(u64, attr.data[0..8], native_endian);
+        },
+        TCA_GATE.CYCLE_TIME_EXT => if (attr.data.len >= 8) {
+            w.cycle_time_ext_ns = std.mem.readInt(u64, attr.data[0..8], native_endian);
+        },
+        TCA_GATE.CLOCKID => if (attr.data.len >= 4) {
+            w.clockid = std.mem.readInt(i32, attr.data[0..4], native_endian);
+        },
+        TCA_GATE.FLAGS => if (attr.data.len >= 4) {
+            w.flags = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_GATE.ENTRY_LIST => {
+            var eit: codec.AttrIterator = .{ .buf = attr.data };
+            while (try eit.next()) |ent| {
+                w.entries_total +|= 1;
+                if (w.entries_len >= gate_max_entries_decoded) continue;
+                var e: GateEntry = .{ .open = false, .interval_ns = 0 };
+                var fit: codec.AttrIterator = .{ .buf = ent.data };
+                while (try fit.next()) |f| switch (f.type) {
+                    TCA_GATE_ENTRY.GATE => e.open = true,
+                    TCA_GATE_ENTRY.INTERVAL => if (f.data.len >= 4) {
+                        e.interval_ns = std.mem.readInt(u32, f.data[0..4], native_endian);
+                    },
+                    TCA_GATE_ENTRY.IPV => if (f.data.len >= 4) {
+                        e.ipv = std.mem.readInt(i32, f.data[0..4], native_endian);
+                    },
+                    TCA_GATE_ENTRY.MAX_OCTETS => if (f.data.len >= 4) {
+                        e.max_octets = std.mem.readInt(i32, f.data[0..4], native_endian);
+                    },
+                    else => {},
+                };
+                w.entries[w.entries_len] = e;
+                w.entries_len += 1;
+            }
+        },
+        TCA_GATE.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .gate = w };
+}
+
+fn parseBpfActOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: BpfActWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_ACT_BPF.PARMS => try readGen(a, attr.data, tc_gen_len),
+        TCA_ACT_BPF.OPS_LEN => if (attr.data.len >= 2) {
+            w.ops_len = std.mem.readInt(u16, attr.data[0..2], native_endian);
+        },
+        TCA_ACT_BPF.ID => if (attr.data.len >= 4) {
+            w.id = std.mem.readInt(u32, attr.data[0..4], native_endian);
+        },
+        TCA_ACT_BPF.TAG => w.tag = copyArray(8, attr.data),
+        TCA_ACT_BPF.NAME => {
+            const s = attr.asString();
+            const n = @min(s.len, w.name_buf.len);
+            @memcpy(w.name_buf[0..n], s[0..n]);
+            w.name_len = @intCast(n);
+        },
+        TCA_ACT_BPF.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .bpf = w };
+}
+
+fn parseIfeOptions(a: *Action, data: []const u8) codec.Error!void {
+    var w: IfeWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |attr| switch (attr.type) {
+        TCA_IFE.PARMS => {
+            try readGen(a, attr.data, tc_ife_len);
+            w.encode = std.mem.readInt(u16, attr.data[20..22], native_endian) & IFE_ENCODE != 0;
+        },
+        TCA_IFE.DMAC => w.dmac = copyArray(6, attr.data),
+        TCA_IFE.SMAC => w.smac = copyArray(6, attr.data),
+        TCA_IFE.TYPE => if (attr.data.len >= 2) {
+            w.ether_type = std.mem.readInt(u16, attr.data[0..2], native_endian);
+        },
+        TCA_IFE.METALST => {
+            var mit: codec.AttrIterator = .{ .buf = attr.data };
+            while (try mit.next()) |m| {
+                if (w.meta_len >= ife_max_meta_decoded) break;
+                var e: IfeMeta = .{ .kind = m.type };
+                if (m.data.len >= 4) {
+                    e.value = std.mem.readInt(u32, m.data[0..4], native_endian);
+                } else if (m.data.len >= 2) {
+                    e.value = std.mem.readInt(u16, m.data[0..2], native_endian);
+                }
+                w.meta[w.meta_len] = e;
+                w.meta_len += 1;
+            }
+        },
+        TCA_IFE.TM => a.tm = parseTm(attr.data),
+        else => {},
+    };
+    a.ext = .{ .ife = w };
+}
+
 /// Parse one ordinal entry of an action list (the payload of the nest whose
 /// attribute type is the 1-based ordinal).
 pub fn parseAction(order: u16, data: []const u8) codec.Error!Action {
@@ -2282,6 +2819,16 @@ pub fn parseAction(order: u16, data: []const u8) codec.Error!Action {
             try parsePeditOptions(&a, opt);
         } else if (std.mem.eql(u8, k, kind_ct)) {
             try parseCtOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_simple)) {
+            try parseSimpleOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_ctinfo)) {
+            try parseCtinfoOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_gate)) {
+            try parseGateOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_bpf)) {
+            try parseBpfActOptions(&a, opt);
+        } else if (std.mem.eql(u8, k, kind_ife)) {
+            try parseIfeOptions(&a, opt);
         }
     }
     return a;

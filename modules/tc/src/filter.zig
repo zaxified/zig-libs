@@ -1113,13 +1113,9 @@ pub const TCA_BPF = struct {
 /// `TCA_BPF_FLAG_ACT_DIRECT` (`da` / `direct-action` on the command line).
 pub const TCA_BPF_FLAG_ACT_DIRECT: u32 = 1;
 
-/// One classic-BPF instruction (`struct sock_filter`), host byte order.
-pub const BpfInsn = struct {
-    code: u16,
-    jt: u8 = 0,
-    jf: u8 = 0,
-    k: u32 = 0,
-};
+/// One classic-BPF instruction (`struct sock_filter`), host byte order;
+/// shared with the `bpf` action.
+pub const BpfInsn = action.BpfInsn;
 
 /// `BPF_MAXINSNS`: the longest classic program the kernel accepts.
 pub const bpf_max_insns = 4096;

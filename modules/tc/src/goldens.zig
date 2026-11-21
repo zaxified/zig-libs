@@ -6077,3 +6077,218 @@ const g_hc_sc_rt =
     "540000002800050611e0006b00000000000000000100000010000100000001000000000009000100686673630000000024" ++
     "000200100001000000000000000000d8b8050010000200d43000008813000048e80100";
 const seq_hc_sc_rt: u32 = 1795219473;
+
+// ── ctinfo, gate, ife, bpf, simple ──────────────────────────────────────────
+
+test "golden: u32 + ctinfo" {
+    // tc filter add dev lo parent 1: protocol ip prio 160 u32 match ip src 10.0.2.60/32 flowid 1:10 action ctinfo dscp 0xfc000000 0x01000000 cpmark 0xff
+    var a = try actionGolden(g_u32_ctinfo_dscp, seq_u32_ctinfo_dscp, 60, .{ .ctinfo = .{
+        .dscp_mask = 0xfc000000,
+        .dscp_statemask = 0x01000000,
+        .cpmark_mask = 0xff,
+    } });
+    const w = a.ext.?.ctinfo;
+    try testing.expectEqual(@as(?u32, 0xfc000000), w.dscp_mask);
+    try testing.expectEqual(@as(?u32, 0x01000000), w.dscp_statemask);
+    try testing.expectEqual(@as(?u32, 0xff), w.cpmark_mask);
+    try testing.expectEqual(@as(?u16, 0), w.zone);
+    // tc filter add dev lo parent 1: protocol ip prio 161 u32 match ip src 10.0.2.61/32 flowid 1:10 action ctinfo zone 3
+    a = try actionGolden(g_u32_ctinfo_zone, seq_u32_ctinfo_zone, 61, .{ .ctinfo = .{ .zone = 3 } });
+    try testing.expectEqual(@as(?u16, 3), a.ext.?.ctinfo.zone);
+    try testing.expectEqual(@as(?u32, null), a.ext.?.ctinfo.dscp_mask);
+}
+
+test "golden: u32 + gate (schedule entries, clock, cycle times)" {
+    // tc filter add dev lo parent 1: protocol ip prio 162 u32 match ip src 10.0.2.62/32 flowid 1:10 action gate base-time 1000 sched-entry open 100000000 -1 -1 sched-entry close 200000000 -1 -1 clockid CLOCK_TAI
+    var a = try actionGolden(g_u32_gate_two, seq_u32_gate_two, 62, .{ .gate = .{
+        .base_time_ns = 1000,
+        .clockid = action.CLOCK_TAI,
+        .entries = &.{
+            .{ .open = true, .interval_ns = 100_000_000 },
+            .{ .open = false, .interval_ns = 200_000_000 },
+        },
+    } });
+    var w = a.ext.?.gate;
+    try testing.expectEqual(@as(?u64, 1000), w.base_time_ns);
+    try testing.expectEqual(@as(?i32, 11), w.clockid);
+    try testing.expectEqual(@as(u8, 2), w.entries_len);
+    try testing.expect(w.entries[0].open);
+    try testing.expect(!w.entries[1].open);
+    try testing.expectEqual(@as(u32, 200_000_000), w.entries[1].interval_ns);
+    try testing.expectEqual(@as(i32, -1), w.entries[0].ipv);
+    // tc filter add dev lo parent 1: protocol ip prio 163 u32 match ip src 10.0.2.63/32 flowid 1:10 action gate priority 3 base-time 500 cycle-time 5000000 cycle-time-ext 1000 sched-entry open 1000000 2 100 sched-entry close 2000000 -1 -1 clockid CLOCK_TAI
+    a = try actionGolden(g_u32_gate_full, seq_u32_gate_full, 63, .{ .gate = .{
+        .priority = 3,
+        .base_time_ns = 500,
+        .cycle_time_ns = 5_000_000,
+        .cycle_time_ext_ns = 1000,
+        .clockid = action.CLOCK_TAI,
+        .entries = &.{
+            .{ .open = true, .interval_ns = 1_000_000, .ipv = 2, .max_octets = 100 },
+            .{ .open = false, .interval_ns = 2_000_000 },
+        },
+    } });
+    w = a.ext.?.gate;
+    try testing.expectEqual(@as(?i32, 3), w.priority);
+    try testing.expectEqual(@as(?u64, 5_000_000), w.cycle_time_ns);
+    try testing.expectEqual(@as(?u64, 1000), w.cycle_time_ext_ns);
+    try testing.expectEqual(@as(i32, 2), w.entries[0].ipv);
+    try testing.expectEqual(@as(i32, 100), w.entries[0].max_octets);
+}
+
+test "golden: u32 + ife (decode, encode with values, encode with allowed metadata)" {
+    // tc filter add dev lo parent 1: protocol ip prio 164 u32 match ip src 10.0.2.64/32 flowid 1:10 action ife decode
+    var a = try actionGolden(g_u32_ife_decode, seq_u32_ife_decode, 64, .{ .ife = .{} });
+    try testing.expect(!a.ext.?.ife.encode);
+    // tc filter add dev lo parent 1: protocol ip prio 165 u32 match ip src 10.0.2.65/32 flowid 1:10 action ife encode use mark 5 use prio 6 use tcindex 7 src 66:77:88:99:aa:bb
+    a = try actionGolden(g_u32_ife_encode_use, seq_u32_ife_encode_use, 65, .{ .ife = .{
+        .encode = true,
+        .smac = .{ 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb },
+        .meta = &.{
+            .{ .kind = action.IFE_META.SKBMARK, .value = 5 },
+            .{ .kind = action.IFE_META.PRIO, .value = 6 },
+            .{ .kind = action.IFE_META.TCINDEX, .value = 7 },
+        },
+    } });
+    var w = a.ext.?.ife;
+    try testing.expect(w.encode);
+    try testing.expectEqual(@as(u8, 3), w.meta_len);
+    try testing.expectEqual(@as(?u32, 6), w.meta[1].value);
+    try testing.expectEqual(@as(?u32, 7), w.meta[2].value);
+    // tc filter add dev lo parent 1: protocol ip prio 166 u32 match ip src 10.0.2.66/32 flowid 1:10 action ife encode allow mark dst 00:11:22:33:44:55 type 0xed3e
+    a = try actionGolden(g_u32_ife_encode_allow, seq_u32_ife_encode_allow, 66, .{ .ife = .{
+        .encode = true,
+        .dmac = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 },
+        .ether_type = 0xed3e,
+        .meta = &.{.{ .kind = action.IFE_META.SKBMARK }},
+    } });
+    w = a.ext.?.ife;
+    try testing.expectEqual(@as(?u16, 0xed3e), w.ether_type);
+    try testing.expectEqual(@as(?u32, null), w.meta[0].value);
+    try testing.expectEqual(action.IFE_META.SKBMARK, w.meta[0].kind);
+}
+
+test "golden: u32 + bpf action (classic bytecode)" {
+    // tc filter add dev lo parent 1: protocol ip prio 167 u32 match ip src 10.0.2.67/32 flowid 1:10 action bpf bytecode "1,6 0 0 4294967295"
+    var a = try actionGolden(g_u32_bpf_bytecode, seq_u32_bpf_bytecode, 67, .{ .bpf = .{
+        .ops = &.{.{ .code = 6, .k = 0xffffffff }},
+    } });
+    try testing.expectEqual(@as(?u16, 1), a.ext.?.bpf.ops_len);
+    // tc filter add dev lo parent 1: protocol ip prio 168 u32 match ip src 10.0.2.68/32 flowid 1:10 action bpf bytecode "1,6 0 0 4294967295" index 3
+    a = try actionGolden(g_u32_bpf_bytecode_idx, seq_u32_bpf_bytecode_idx, 68, .{ .bpf = .{
+        .ops = &.{.{ .code = 6, .k = 0xffffffff }},
+        .index = 3,
+    } });
+    try testing.expectEqual(@as(u32, 3), a.gen.index);
+}
+
+test "bpf action by fd, and simple, round-trip; both-or-neither bpf programs are refused" {
+    const codec = @import("netlink").codec;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try action.appendActionList(gpa, &list, 7, &.{
+        .{ .bpf = .{ .fd = 9, .name = "prog" } },
+        .{ .simple = .{ .data = "hello" } },
+    }, ps);
+    var outer: codec.AttrIterator = .{ .buf = list.items };
+    const nest = (try outer.next()).?;
+    var it: action.ActionIterator = .init(nest.data);
+    const b = (try it.next()).?;
+    try testing.expectEqualStrings("prog", b.ext.?.bpf.name());
+    try testing.expectEqual(@as(?u16, null), b.ext.?.bpf.ops_len);
+    const s = (try it.next()).?;
+    try testing.expectEqualStrings("hello", s.ext.?.simple.data());
+    list.clearRetainingCapacity();
+    try testing.expectError(error.OptionsTooLong, action.appendActionList(gpa, &list, 7, &.{
+        .{ .bpf = .{ .fd = 9, .ops = &.{.{ .code = 6 }} } },
+    }, ps));
+    try testing.expectError(error.OptionsTooLong, action.appendActionList(gpa, &list, 7, &.{.{ .bpf = .{} }}, ps));
+    try testing.expectError(error.OptionsTooLong, action.appendActionList(gpa, &list, 7, &.{
+        .{ .simple = .{ .data = "0123456789012345678901234567890123" } },
+    }, ps));
+}
+
+// ── captured request bytes: ctinfo, gate, ife, bpf ──────────────────────────
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795220724 len=172
+// tc filter add dev lo parent 1: protocol ip prio 160 u32 match ip src 10.0.2.60/32 flowid 1:10 action ctinfo dscp 0xfc000000 0x01000000 cpmark 0xff
+const g_u32_ctinfo_dscp =
+    "ac0000002c000506f4e4006b00000000000000000100000000000000000001000800a00008000100753332008000020008" ++
+    "00010010000100500007004c0001000b0001006374696e666f00003c000280180003000000000000000000030000000000" ++
+    "000000000000060004000000000008000500000000fc080006000000000108000700ff0000002400050001000100000000" ++
+    "000000000000000000ffffffff0a00023c0c00000000000000";
+const seq_u32_ctinfo_dscp: u32 = 1795220724;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795220724 len=148
+// tc filter add dev lo parent 1: protocol ip prio 161 u32 match ip src 10.0.2.61/32 flowid 1:10 action ctinfo zone 3
+const g_u32_ctinfo_zone =
+    "940000002c000506f4e4006b00000000000000000100000000000000000001000800a10008000100753332006800020008" ++
+    "0001001000010038000700340001000b0001006374696e666f000024000280180003000000000000000000030000000000" ++
+    "00000000000006000400030000002400050001000100000000000000000000000000ffffffff0a00023d0c000000000000" ++
+    "00";
+const seq_u32_ctinfo_zone: u32 = 1795220724;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795220724 len=224
+// tc filter add dev lo parent 1: protocol ip prio 162 u32 match ip src 10.0.2.62/32 flowid 1:10 action gate base-time 1000 sched-entry open 100000000 -1 -1 sched-entry close 200000000 -1 -1 clockid CLOCK_TAI
+const g_u32_gate_two =
+    "e00000002c000506f4e4006b00000000000000000100000000000000000001000800a2000800010075333200b400020008" ++
+    "00010010000100840007008000010009000100676174650000000070000280180002000000000000000000030000000000" ++
+    "0000000000000c000600e80300000000000008000a000b0000004000058020000180040002000800030000e1f505080004" ++
+    "00ffffffff08000500ffffffff1c0001800800030000c2eb0b08000400ffffffff08000500ffffffff2400050001000100" ++
+    "000000000000000000000000ffffffff0a00023e0c00000000000000";
+const seq_u32_gate_two: u32 = 1795220724;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795220725 len=256
+// tc filter add dev lo parent 1: protocol ip prio 163 u32 match ip src 10.0.2.63/32 flowid 1:10 action gate priority 3 base-time 500 cycle-time 5000000 cycle-time-ext 1000 sched-entry open 1000000 2 100 sched-entry close 2000000 -1 -1 clockid CLOCK_TAI
+const g_u32_gate_full =
+    "000100002c000506f5e4006b00000000000000000100000000000000000001000800a3000800010075333200d400020008" ++
+    "00010010000100a4000700a000010009000100676174650000000090000280180002000000000000000000030000000000" ++
+    "00000000000008000400030000000c000600f4010000000000000c000700404b4c00000000000c000800e8030000000000" ++
+    "0008000a000b0000004000058020000180040002000800030040420f00080004000200000008000500640000001c000180" ++
+    "0800030080841e0008000400ffffffff08000500ffffffff2400050001000100000000000000000000000000ffffffff0a" ++
+    "00023f0c00000000000000";
+const seq_u32_gate_full: u32 = 1795220725;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795220725 len=140
+// tc filter add dev lo parent 1: protocol ip prio 164 u32 match ip src 10.0.2.64/32 flowid 1:10 action ife decode
+const g_u32_ife_decode =
+    "8c0000002c000506f5e4006b00000000000000000100000000000000000001000800a40008000100753332006000020008" ++
+    "00010010000100300007002c0001000800010069666500200002801c000100000000000000000003000000000000000000" ++
+    "0000000000002400050001000100000000000000000000000000ffffffff0a0002400c00000000000000";
+const seq_u32_ife_decode: u32 = 1795220725;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795220725 len=180
+// tc filter add dev lo parent 1: protocol ip prio 165 u32 match ip src 10.0.2.65/32 flowid 1:10 action ife encode use mark 5 use prio 6 use tcindex 7 src 66:77:88:99:aa:bb
+const g_u32_ife_encode_use =
+    "b40000002c000506f5e4006b00000000000000000100000000000000000001000800a50008000100753332008800020008" ++
+    "0001001000010058000700540001000800010069666500480002801c000100000000000000000003000000000000000000" ++
+    "0000010000000a00040066778899aabb00001c000600080001000500000008000300060000000600050007000000240005" ++
+    "0001000100000000000000000000000000ffffffff0a0002410c00000000000000";
+const seq_u32_ife_encode_use: u32 = 1795220725;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795220725 len=168
+// tc filter add dev lo parent 1: protocol ip prio 166 u32 match ip src 10.0.2.66/32 flowid 1:10 action ife encode allow mark dst 00:11:22:33:44:55 type 0xed3e
+const g_u32_ife_encode_allow =
+    "a80000002c000506f5e4006b00000000000000000100000000000000000001000800a60008000100753332007c00020008" ++
+    "000100100001004c0007004800010008000100696665003c0002801c000100000000000000000003000000000000000000" ++
+    "0000010000000a0003000011223344550000060005003eed00000800060004000100240005000100010000000000000000" ++
+    "0000000000ffffffff0a0002420c00000000000000";
+const seq_u32_ife_encode_allow: u32 = 1795220725;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795220725 len=156
+// tc filter add dev lo parent 1: protocol ip prio 167 u32 match ip src 10.0.2.67/32 flowid 1:10 action bpf bytecode "1,6 0 0 4294967295"
+const g_u32_bpf_bytecode =
+    "9c0000002c000506f5e4006b00000000000000000100000000000000000001000800a70008000100753332007000020008" ++
+    "00010010000100400007003c00010008000100627066003000028006000300010000000c00040006000000ffffffff1800" ++
+    "020000000000000000000300000000000000000000002400050001000100000000000000000000000000ffffffff0a0002" ++
+    "430c00000000000000";
+const seq_u32_bpf_bytecode: u32 = 1795220725;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795220810 len=156
+// tc filter add dev lo parent 1: protocol ip prio 168 u32 match ip src 10.0.2.68/32 flowid 1:10 action bpf bytecode "1,6 0 0 4294967295" index 3
+const g_u32_bpf_bytecode_idx =
+    "9c0000002c0005064ae5006b00000000000000000100000000000000000001000800a80008000100753332007000020008" ++
+    "00010010000100400007003c00010008000100627066003000028006000300010000000c00040006000000ffffffff1800" ++
+    "020003000000000000000300000000000000000000002400050001000100000000000000000000000000ffffffff0a0002" ++
+    "440c00000000000000";
+const seq_u32_bpf_bytecode_idx: u32 = 1795220810;
