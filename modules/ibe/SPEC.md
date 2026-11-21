@@ -301,10 +301,16 @@ Run: `scripts/modtest ibe` (the whole module is `heavy`); `IBE_FUZZ=<runs>` for 
 
 ## Backlog / deferred
 
+None open.
+
+## Roadmap
+
 - **Additional IBE / IBKEM schemes** (Kiltz-Vahlis IBE1 CCA KEM, Waters, Boyen-Waters): the reference offers five, all
   on BLS12-381; a user who wants a KEM rather than 32-byte blocks, or anonymous IBE, needs one. Medium each (an IBKEM
   API around the existing pairing); fits §2. HIBE and other Boneh-Franklin variants stay refused (*What is
   deliberately not done*).
+  Project-size: a new scheme each (its own key extraction, encapsulation and security proof to follow, plus vectors
+  from the reference), weeks for the set.
 
 ## Open
 
