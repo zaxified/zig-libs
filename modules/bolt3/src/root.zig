@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! bolt3 — Lightning BOLT#3 key derivation (the "Appendix E: Key Derivation"
-//! crypto pocket). This pass covers ONLY the secp256k1 public/secret-key and
-//! revocation-key derivations that BOLT#3 defines; the surrounding commitment-
-//! transaction / HTLC-output construction (non-crypto serialization) is left
-//! for a later, non-Fable pass — mirroring how `ssh` shipped its transport
-//! crypto first.
+//! crypto pocket): the secp256k1 public/secret-key and revocation-key
+//! derivations that BOLT#3 defines, plus the Appendix D shachain. The
+//! commitment- and HTLC-transaction construction built on them is the sibling
+//! file `commitment.zig` (re-exported as `commitment`).
 //!
 //! Two constructions, both over `std.crypto.ecc.Secp256k1`:
 //!
@@ -29,6 +28,9 @@
 
 const std = @import("std");
 const Secp256k1 = @import("k256").Secp256k1;
+
+/// Commitment and HTLC transaction construction (BOLT#3 §Transactions, Appendix C/F/H).
+pub const commitment = @import("commitment.zig");
 const scalar = Secp256k1.scalar;
 const Scalar = scalar.Scalar;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -51,7 +53,7 @@ pub const meta = .{
     .summary = "Lightning BOLT#3 key derivation (Appendix E): per-commitment + revocation public/secret keys over secp256k1",
     .status = "build",
     .model_after = "Lightning BOLT#3 (lightning/bolts) — Bitcoin Transaction and Script Formats §Key Derivation; the k256 module supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1)",
-    .deps = .{"k256"}, // k256 supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1); std.crypto.hash.sha2.Sha256
+    .deps = .{ "k256", "bitcointx", "ripemd160" }, // k256 supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1); std.crypto.hash.sha2.Sha256
 };
 
 pub const Error = error{
@@ -391,6 +393,9 @@ const hex33 = testkit.hex.literal;
 
 test {
     _ = @import("stackprobe_test.zig");
+    _ = @import("commitment.zig");
+    _ = @import("commitment_vectors.zig");
+    _ = @import("commitment_test.zig");
 }
 
 test "derivePrivateKey / deriveRevocationPrivateKey: out is zeroed on error, whatever it held" {

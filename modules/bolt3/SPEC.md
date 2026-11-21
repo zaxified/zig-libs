@@ -22,19 +22,20 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [lightningdevkit/rust-lightning](https://github.com/lightningdevkit/rust-lightning) (LDK) — **reference** | Rust | MIT OR Apache-2.0 | 1.4k | tag v0.3.0-beta1 (push 2026-09-29) | `chan_utils` holds the same key derivations *and* commitment/HTLC transaction construction, scripts and the shachain store (README describes `chan_utils` as reusable outside Lightning); this module has the derivations and the shachain generation and store *(rest inferred from the README)*. |
+| [lightningdevkit/rust-lightning](https://github.com/lightningdevkit/rust-lightning) (LDK) — **reference** | Rust | MIT OR Apache-2.0 | 1.4k | tag v0.3.0-beta1 (push 2026-09-29) | `chan_utils` holds the same key derivations *and* commitment/HTLC transaction construction, scripts and the shachain store (README describes `chan_utils` as reusable outside Lightning); this module has the derivations, the shachain generation and store, and the same transaction construction (`commitment`), byte-exact against the BOLT#3 appendices *(LDK's side inferred from the README)*. |
 | [lightningnetwork/lnd](https://github.com/lightningnetwork/lnd) | Go | MIT | 8.2k | v0.21.3-beta (2026-09-02) | BOLT#3 key derivation, `shachain`, commitment-tx and HTLC-script building live in lnd's packages *(inferred, not opened)*; this module covers the crypto pocket only. |
 | [ElementsProject/lightning](https://github.com/ElementsProject/lightning) (Core Lightning) | C | BSD-MIT (`LICENSE`; `ccan/` has its own) | 3.1k | v26.06.8 (2026-09-22) | Derivations and shachain in C (`common/`, `ccan/`) *(inferred)*. |
 | [ACINQ/eclair](https://github.com/ACINQ/eclair) | Scala | Apache-2.0 | 1.3k | v0.14.3 (2026-09-14) | Scala; transactions package builds commitment/HTLC transactions *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | GitHub search for Lightning/BOLT Zig repositories (2026-09-30) found none besides this collection. |
 
-**Where we are ahead:** a stand-alone, dependency-light (std + `k256`) Zig implementation, byte-exact against BOLT#3 Appendix D/E, which no other Zig library offers. **Where we are behind:** everything around the keys: commitment/HTLC transaction and script construction, feerate/dust math.
+**Where we are ahead:** a stand-alone, dependency-light (std + `k256`) Zig implementation, byte-exact against BOLT#3 Appendix D/E, which no other Zig library offers. **Where we are behind:** the funding and closing transactions, signing and HTLC claim/penalty transaction building (BOLT#5, a layer above).
 
 ## Scope
 
 BOLT#3 key derivation, the secp256k1 crypto pocket of the Lightning commitment
-scheme. Two constructions from the "Key Derivation" section plus the Appendix D
-per-commitment secret generation that sources them.
+scheme — two constructions from the "Key Derivation" section plus the Appendix D
+per-commitment secret generation that sources them — and the commitment and HTLC
+transaction construction (`commitment.zig`).
 
 ## Design & framing
 
@@ -59,6 +60,40 @@ per-commitment secret generation that sources them.
 - Hash-to-scalar reduction reuses the repo's `bip340` idiom (widen to 48 bytes,
   wide-reduce mod n) so a hash value ≥ n is never rejected.
 
+## Commitment and HTLC transactions
+
+`commitment.zig` (re-exported as `bolt3.commitment`) builds BOLT#3's transactions from public data; the caller
+derives the keys, signs the digests and passes the signatures back. **Channel types:** `Format{ anchors,
+zero_fee_commitments }`. They are independent switches because the standard keeps them so: the HTLC scripts and
+the `to_remote` output follow `anchors` only (the zero-fee vectors use the plain scripts and a P2WPKH
+`to_remote`), HTLC transactions are fee-free under either, their remote signature is SIGHASH_SINGLE|ANYONECANPAY
+under either, the input sequence is 1 under `anchors` and 0 otherwise, and the version is 3 under
+`zero_fee_commitments` only.
+
+- **Scripts:** `fundingScript`, `toLocalScript` (also the HTLC transaction output), `toRemoteAnchorScript`,
+  `anchorScript`, `offeredHtlcScript`, `receivedHtlcScript` (`anchors` adds `1 OP_CSV OP_DROP`), the P2A
+  `shared_anchor_script`, `p2wsh`, `p2wpkh`. Numbers (`to_self_delay`, `cltv_expiry`) are pushed minimally: `OP_0`,
+  `OP_1`..`OP_16`, otherwise the little-endian bytes with a sign byte (what LDK and lnd push).
+- **Fees and trimming:** `commitmentFee` is `feerate * (724 | 1124 + 172 * untrimmed) / 1000` (0 under zero-fee),
+  `htlcTxFee` 663 / 703 weight (0 under either), `htlcUntrimmed` the owner's dust test on whole satoshis minus the HTLC
+  transaction's fee. `buildCommitment` rounds every balance and HTLC amount down to satoshis, subtracts the base fee
+  and (anchors) both 330 sat anchors from the funder's side before the dust check, drops a side that ends below the
+  dust limit or negative, adds the anchors only while their owner has an output or HTLCs exist, adds the zero-fee
+  shared anchor with `min(240, input - other outputs)`, and sorts by value, scriptPubKey, then `cltv_expiry`
+  (stable, so equal HTLCs keep input order).
+- **Commitment number:** `obscuringFactor` (lower 48 bits of `SHA256(opener basepoint || accepter basepoint)`) and
+  `obscuredLocktimeSequence`.
+- **HTLC transactions:** `buildHtlcTx(p, commitment, output_index)`: locktime `cltv_expiry` (timeout) or 0 (success),
+  one output of the amount less the fee into the `to_local`-style script. `HtlcTx.remote_hash_type` is the type of
+  the remote's signature; the local node's is its choice, SIGHASH_ALL in every published vector.
+- **Digests and witnesses:** `Commitment.sighash`, `HtlcTx.sighash(hash_type)` (BIP143); `derSignature` makes the
+  DER-plus-type form a witness carries from the compact signature BOLT#2 messages carry; `finalize` places
+  `0 <sig1> <sig2> <script>` (ordered by funding key) and `0 <remote> <local> <preimage | empty> <script>`.
+- **Ownership:** each result owns one arena; `deinit` it, never `Transaction.deinit` on its `tx`.
+
+Not here: HTLC claim and penalty transactions (BOLT#5, built on these outputs), the funding transaction, and the
+closing transactions.
+
 ## Threat model
 
 Not a parser of untrusted wire data — inputs are keys/secrets a channel peer
@@ -70,7 +105,15 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
 
 ## Verification
 
-- Run: `scripts/modtest bolt3`. The tests live in `src/root.zig`; the stack-residue probe in `src/stackprobe_test.zig`.
+- Run: `scripts/modtest bolt3`. The key-derivation tests live in `src/root.zig`; the stack-residue probe in `src/stackprobe_test.zig`; the transaction tests in `src/commitment_test.zig` with the vectors in `src/commitment_vectors.zig`.
+- BOLT#3 **Appendix C, F and H** (`commitment_test.zig`): all 16 legacy cases, all 9 option_anchors cases and all 11
+  zero_fee_commitments cases, with every HTLC-timeout and HTLC-success transaction they publish. For each, the
+  published signed transaction is parsed, our unsigned one is built from the case's parameters, every signature in
+  the published witness must verify over our BIP143 digest (so scripts, amounts, sequence, locktime and sighash type
+  agree, not only the bytes), the HTLC transactions found are exactly the published ones, and our transaction with
+  those signatures placed is the published transaction byte for byte. Unit tests: the Appendix C obscuring factor, the
+  fee example of §Fee Calculation, the funding script (either key order), minimal script numbers, DER round trips,
+  the HTLC-output and amount refusals.
 - BOLT#3 **Appendix E**: all four vectors (key and revocation, public and secret) byte-exact.
 - BOLT#3 **Appendix D**: all five `generate_from_seed` generation vectors byte-exact, and all nine `insert_secret`
   storage sequences (accepted steps and the refused last step, which leaves the store unchanged); `get` returns every
@@ -90,13 +133,6 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
 ## Backlog / deferred
 
 None open.
-
-## Roadmap
-
-- **Commitment / HTLC transaction construction**: the non-crypto serialization (to_local/to_remote/HTLC outputs,
-  scripts, feerate math). Not a Fable pocket. Missing and it matters (most of what LDK `chan_utils` offers); effort
-  large; fits CONVENTIONS §2, builds on `bitcointx`/`bitcoinscript`.
-  Size: weeks: a transaction-construction layer (to_local/to_remote/HTLC scripts, feerate math) on top of bitcointx/bitcoinscript, with BOLT#3 vectors.
 
 ## Anchoring
 

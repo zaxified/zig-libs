@@ -1,10 +1,11 @@
 # bolt3
 
-BOLT#3 Schnorr-free **key derivation** — the secp256k1 crypto pocket of the
-Lightning commitment scheme. This module covers exactly two constructions from
-the BOLT#3 spec plus the per-commitment secret source that feeds them; the
-surrounding commitment-transaction / HTLC-output serialization (non-crypto) is
-deliberately out of scope for this pass.
+BOLT#3 **key derivation** — the secp256k1 crypto pocket of the Lightning commitment scheme
+(two constructions plus the per-commitment secret source that feeds them) — and the
+**commitment and HTLC transaction construction** built on it (`commitment`): the scripts, the
+fee and trimming arithmetic, the commitment transaction in BIP69+CLTV order, the HTLC-timeout and
+HTLC-success transactions, the BIP143 digests and the witness layouts, for legacy, option_anchors
+and zero_fee_commitments channels.
 
 Provenance: clean-room from BOLT#3 (`lightning/bolts`), a public specification;
 the secp256k1 group comes from the sibling [`k256`](../k256) module. Full
@@ -19,6 +20,7 @@ zig-libs' MIT license.
 | `derivePublicKey` / `derivePrivateKey` | Per-commitment blinding: `basepoint + SHA256(per_commitment_point ‖ basepoint)·G` (and the secret mod n) |
 | `deriveRevocationPublicKey` / `deriveRevocationPrivateKey` | Revocation split-secret: `rb·SHA256(rb‖pcp) + pcp·SHA256(pcp‖rb)` — the justice-transaction primitive that neither party alone can complete |
 | `perCommitmentSecret(out, seed, index)` | Appendix D shachain generation: the O(48) hash tree the secrets are drawn from |
+| `commitment.buildCommitment` / `buildHtlcTx` | BOLT#3 §Commitment Transaction Construction and §HTLC-Timeout and HTLC-Success Transactions; scripts (`fundingScript`, `toLocalScript`, `offeredHtlcScript`, ...), `commitmentFee`, `htlcTxFee`, `obscuringFactor`, the digests (`Commitment.sighash`, `HtlcTx.sighash`) and `finalize` witness placement, `derSignature` |
 | `RevocationStore` (`insert`, `get`) | Appendix D compact storage of the counterparty's revealed secrets (49 entries), refusing a secret its predecessors do not derive from |
 
 Points are 33-byte SEC1-compressed; secrets are 32-byte big-endian scalars. Secret inputs
@@ -27,11 +29,11 @@ entry point runs under a dead-stack burn (`src/burn.zig`).
 
 ## Scope
 
-In: the four Appendix E key derivations and the Appendix D per-commitment secret generation and storage.
+In: the four Appendix E key derivations, the Appendix D per-commitment secret generation and storage, and the commitment / HTLC transaction construction with its scripts, fees and digests.
 
 ## Not provided
 
-Commitment/HTLC transaction and script construction is not built; see SPEC *Backlog / deferred*.
+Signing (the caller signs the digests with its own keys), the funding transaction (Appendix B; interactive construction is `lnwire`'s) and the closing transactions.
 
 ## Verification
 
@@ -39,10 +41,10 @@ Byte-exact against the official BOLT#3 test vectors: **Appendix E** (all four
 base/revocation × public/secret derivations) and **Appendix D** (all five
 `generate_from_seed` generation vectors and all nine `insert_secret` storage sequences), plus cross-checks that each derived
 secret's public point equals the independently derived public key, and that a
-real shachain secret feeds the revocation derivation end-to-end. Green in
+real shachain secret feeds the revocation derivation end-to-end; and the signed commitment and HTLC transactions of **Appendix C** (16 legacy cases), **F** (9 option_anchors) and **H** (11 zero_fee_commitments): every published signature verifies over our digest and our transaction with those signatures is the published one, byte for byte. Green in
 Debug + ReleaseFast.
 
 ## Dependencies
 
-sibling [`k256`](../k256) (the `Secp256k1` curve group) and
+siblings [`k256`](../k256) (the `Secp256k1` curve group), [`bitcointx`](../bitcointx) (transactions, BIP143) and [`ripemd160`](../ripemd160), and
 `std.crypto.hash.sha2.Sha256`. No third-party crypto.
