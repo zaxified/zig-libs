@@ -38,6 +38,12 @@ test "7-Zip Deflate64 archive: far distances, long matches, fixed and dynamic bl
     defer archive.deinit();
     try testing.expectEqual(@as(usize, 5), archive.entries.items.len);
 
+    if (!zs.builtin_decoders_enabled) {
+        // `-Dzipstream-builtin-decoders=false` (profile small): Store and Deflate only, method 9 is refused.
+        try testing.expectError(error.UnsupportedCompressionMethod, readAll(a, &archive, archive.find("far.bin").?));
+        return;
+    }
+
     // far.bin: a 40000-byte block twice (distance 40000), 70000 zeros (one match of 65538 at most), the block's head, a tail.
     const far = archive.find("far.bin").?;
     try testing.expectEqual(@as(u16, 9), far.method());
