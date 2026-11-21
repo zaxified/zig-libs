@@ -98,7 +98,7 @@ pub const meta = .{
     // `bip340`/`adaptor`'s keys.
     .concurrency = .single_owner,
     .model_after = "RFC 8613 (OSCORE) \u{2014} AES-CCM-16-64-128 (COSE algorithm 10, RFC 8152 \u{a7}10.2) mandatory-to-implement AEAD + HKDF-SHA-256 (RFC 5869) context derivation; std.crypto.aead.aes_ccm.Aes128Ccm8 supplies the exact AEAD, std.crypto.kdf.hkdf.HkdfSha256 the KDF",
-    .deps = .{}, // std only — deliberately NOT depending on the sibling `coap` module, see the module doc comment's "Scope / non-goals"
+    .deps = .{"aesccm"}, // aesccm: the AES-CCM-16-64-128 AEAD; deliberately NOT depending on the sibling `coap` module, see the module doc comment's "Scope / non-goals"
 };
 
 // ── algorithm constants (AES-CCM-16-64-128 only — RFC 8613 §3.2's default) ──

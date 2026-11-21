@@ -145,7 +145,7 @@ pub const meta = .{
     .role = .codec, // consumes an untrusted wire document into a trusted result
     .concurrency = .reentrant,
     .model_after = "OASIS SAML 2.0 (SAMLCore / SAMLProf) Web Browser SSO, SP side; XSW-hardened per 'On Breaking SAML'",
-    .deps = .{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, // x509: the panic-safe SubjectPublicKeyInfo extractor behind HoK cross-form matching; datefmt: shared xsd:dateTime parsing
+    .deps = .{ "xmldsig", "xml", "xmlenc", "rsa", "p256", "x509", "datefmt" }, // p256: ECDSA P-256 for the SP's own signatures; x509: the panic-safe SubjectPublicKeyInfo extractor behind HoK cross-form matching; datefmt: shared xsd:dateTime parsing
 };
 
 // ── namespaces ───────────────────────────────────────────────────────────────

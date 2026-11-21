@@ -103,7 +103,7 @@ pub const meta = .{
     .role = .codec, // pure wire codec + crypto dispatch, no I/O of its own
     .concurrency = .reentrant, // no shared/global state; every call is self-contained
     .model_after = "RFC 7516 (JWE) + RFC 7518 (JWA encryption algs) + RFC 3394 (AES Key Wrap); sibling of this repo's `jwt` (RFC 7515 JWS)",
-    .deps = .{ "rsa", "p256", "aescbc", "aeskw", "aes192", "aesgcm" }, // p256 supplies the ECDH-ES P-256 curve (byte-exact to std.crypto.ecc.P256); X25519 stays on std; aescbc/aeskw supply the shared CBC + RFC 3394 key-wrap cores; aes192 the AES-192 block cipher; aesgcm all A128/A192/A256GCM (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+    .deps = .{ "rsa", "p256", "p384", "p521", "aescbc", "aeskw", "aes192", "aesgcm" }, // p256 / p384 / p521 supply the ECDH-ES NIST curves (p256 byte-exact to std.crypto.ecc.P256); X25519 stays on std; aescbc/aeskw supply the shared CBC + RFC 3394 key-wrap cores; aes192 the AES-192 block cipher; aesgcm all A128/A192/A256GCM (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 /// Key management algorithm (`alg` header parameter, RFC 7518 §4 names).
