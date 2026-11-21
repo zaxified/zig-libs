@@ -8,7 +8,11 @@
 //!     octets damaged and maybe cut short, through `AcmeDns.parseRegistration`;
 //!   - `txt`: an authoritative server's TXT reply (two records, one carrying
 //!     the value in two strings), damaged the same way, decoded by `dns` and
-//!     matched by `zone.txtPresent` — the verdict the propagation check acts on.
+//!     matched by `zone.txtPresent` — the verdict the propagation check acts on;
+//!   - `zone`: the zone walks (`followCname`, `findZone`, `nameservers`,
+//!     `nameserverIps`) against a hostile scripted DNS server on loopback: random
+//!     rules answering with CNAME loops and chains, SOA/NS/A records of the wrong
+//!     owner, class or type, junk rdata and error codes.
 //!
 //! Driver: `ACMEDNS_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there).
@@ -20,8 +24,11 @@ const fuzz_driver = testkit.fuzz.driver;
 const dns = @import("dns");
 const publishers = @import("publishers.zig");
 const zone = @import("zone.zig");
+const net = std.Io.net;
+const zt = @import("zone_test.zig");
+const netaddr = @import("netaddr");
 
-pub const Label = enum { json_rejected, json_parsed, txt_rejected, txt_absent, txt_found };
+pub const Label = enum { json_rejected, json_parsed, txt_rejected, txt_absent, txt_found, walk_followed, walk_loop, walk_failed, zone_found, zone_missing, ns_listed, ip_listed };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -78,6 +85,98 @@ fn txtHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if (zone.txtPresent(&msg, "_acme-challenge.example.org", value)) mark(.txt_found) else mark(.txt_absent);
 }
 
+const pool = [_][]const u8{ "_acme-challenge.a.test", "a.test", "x.dele.test", "test", "A.TEST", "loop1.test", "loop2.test", "b.a.test" };
+const pool_wire = [_][]const u8{ zt.wire("_acme-challenge.a.test"), zt.wire("a.test"), zt.wire("x.dele.test"), zt.wire("test"), zt.wire("A.TEST"), zt.wire("loop1.test"), zt.wire("loop2.test"), zt.wire("b.a.test") };
+const junk_rdata = [_][]const u8{ "\xff\x01", "\x3f", "\xc0\x00", "\x05ab", "", "\x00" };
+
+fn zoneHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var rules: [6]zt.Rule = undefined;
+    // One script in four holds a two-name CNAME loop, which the walk starts from.
+    const looped = src.valueRangeAtMost(u8, 0, 3) == 0;
+    const n = if (looped) src.valueRangeAtMost(u8, 2, 6) else src.valueRangeAtMost(u8, 1, 6);
+    const qtypes = [_]u16{ zt.t_cname, zt.t_cname, zt.t_soa, zt.t_soa, zt.t_ns, zt.t_a, zt.t_aaaa };
+    const rcodes = [_]u4{ 0, 0, 0, 2, 3, 5 };
+    const rtypes = [_]u16{ zt.t_cname, zt.t_soa, zt.t_ns, zt.t_a, zt.t_txt };
+    if (looped) {
+        rules[0] = .{ .name = "loop1.test", .qtype = zt.t_cname, .rdata = comptime zt.wire("loop2.test") };
+        rules[1] = .{ .name = "loop2.test", .qtype = zt.t_cname, .rdata = comptime zt.wire("loop1.test") };
+    }
+    for (rules[0..n], 0..) |*r, ri| {
+        if (looped and ri < 2) continue;
+        // Half of the scripts start with a sound zone apex, so the walks get past the first hop.
+        if (ri == 0 and src.valueRangeAtMost(u8, 0, 1) == 0) {
+            r.* = .{ .name = "a.test", .qtype = zt.t_soa, .rdata = zt.soa_rdata };
+            continue;
+        }
+        const name_i = src.index(pool.len);
+        const qtype = qtypes[src.index(qtypes.len)];
+        const rdata: ?[]const u8 = switch (src.valueRangeAtMost(u8, 0, 4)) {
+            0 => null,
+            1, 2 => if (qtype == zt.t_soa) zt.soa_rdata else pool_wire[src.index(pool_wire.len)],
+            3 => junk_rdata[src.index(junk_rdata.len)],
+            else => if (qtype == zt.t_a) "\x7f\x00\x00\x01" else pool_wire[src.index(pool_wire.len)],
+        };
+        r.* = .{
+            .name = pool[name_i],
+            .qtype = qtype,
+            .rcode = rcodes[src.index(rcodes.len)],
+            .rdata = rdata,
+            .class = if (src.valueRangeAtMost(u8, 0, 5) == 0) 3 else 1,
+            .owner = if (src.valueRangeAtMost(u8, 0, 4) == 0) pool_wire[src.index(pool_wire.len)] else null,
+            .rtype = if (src.valueRangeAtMost(u8, 0, 5) == 0) rtypes[src.index(rtypes.len)] else null,
+        };
+    }
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var stub = zt.Stub.bind(io, rules[0..n]) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const port = stub.port();
+    const th = try std.Thread.spawn(.{}, zt.Stub.run, .{&stub});
+    defer {
+        stub.stop.store(true, .release);
+        // wake the server out of its receive so the join does not wait for its poll interval
+        const any: net.IpAddress = .{ .ip4 = .loopback(0) };
+        if (any.bind(io, .{ .mode = .dgram })) |wake| {
+            const dest: net.IpAddress = .{ .ip4 = .loopback(port) };
+            wake.send(io, &dest, "x") catch {};
+            wake.close(io);
+        } else |_| {}
+        th.join();
+        stub.sock.close(io);
+    }
+    var r = dns.Resolver.init(io, gpa, .{ .servers = &zt.loopback, .port = port, .timeout_ms = 300, .attempts = 1, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+
+    var out: [zone.max_name_len]u8 = undefined;
+    const start = if (looped) "loop1.test" else pool[src.index(pool.len)];
+    if (zone.followCname(&r, start, &out)) |end| {
+        if (end.len == 0 or end.len > zone.max_name_len) {
+            std.debug.print("followCname {s} -> '{s}'\n", .{ start, end });
+            for (rules[0..n]) |ru| std.debug.print("  rule {s} qtype {d} rcode {d} rdata {?any} class {d} owner {?any} rtype {?d}\n", .{ ru.name, ru.qtype, ru.rcode, ru.rdata, ru.class, ru.owner, ru.rtype });
+            return error.TestUnexpectedResult;
+        }
+        mark(.walk_followed);
+    } else |err| switch (err) {
+        error.CnameLoop => mark(.walk_loop),
+        else => mark(.walk_failed),
+    }
+    if (zone.findZone(&r, pool[src.index(pool.len)], &out)) |z| {
+        if (z.len == 0 or z.len > zone.max_name_len) {
+            std.debug.print("findZone -> '{s}'\n", .{z});
+            return error.TestUnexpectedResult;
+        }
+        mark(.zone_found);
+    } else |_| mark(.zone_missing);
+    if (zone.nameservers(&r, gpa, pool[src.index(pool.len)])) |names| {
+        defer zone.freeNames(gpa, names);
+        mark(.ns_listed);
+    } else |_| {}
+    if (zone.nameserverIps(&r, gpa, pool[src.index(pool.len)])) |maybe| {
+        if (maybe) |ips| gpa.free(ips);
+        mark(.ip_listed);
+    } else |_| {}
+}
+
 /// `testing.fuzz`'s source: every choice read by a cursor from one `slice`.
 const ScriptSource = struct {
     cur: testkit.fuzz.Cursor,
@@ -115,20 +214,26 @@ test "fuzz: txtPresent never crashes on a damaged TXT reply" {
     try testing.fuzz({}, fuzzScript(txtHarness), .{});
 }
 
+test "fuzz: the zone walks never crash or leak against a hostile server" {
+    try testing.fuzz({}, fuzzScript(zoneHarness), .{});
+}
+
 test "fuzz driver: ACMEDNS_FUZZ" {
     try fuzz_driver.runAll(.{
         .{ registrationHarness, .{ .prefix = "ACMEDNS_FUZZ", .name = "acmedns-registration" } },
         .{ txtHarness, .{ .prefix = "ACMEDNS_FUZZ", .name = "acmedns-txt" } },
+        .{ zoneHarness, .{ .prefix = "ACMEDNS_FUZZ", .name = "acmedns-zone" } },
     });
 }
 
-test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
+test "fuzz harness: 500 seeds (60 for the zone walks) in every test run, and they get everywhere" {
     reach = @splat(0);
     for (0..500) |seed| {
         var prng = std.Random.DefaultPrng.init(seed);
         var rng: fuzz_driver.Rng = .{ .r = prng.random() };
         try registrationHarness(fuzz_driver.Rng, &rng, testing.allocator);
         try txtHarness(fuzz_driver.Rng, &rng, testing.allocator);
+        if (seed < 60) try zoneHarness(fuzz_driver.Rng, &rng, testing.allocator);
     }
     for (reach, 0..) |n, i| if (n == 0) {
         std.debug.print("reach: label {t} never hit in 500 seeds\n", .{@as(Label, @fromBackingInt(@intCast(i)))});

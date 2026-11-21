@@ -46,7 +46,8 @@ fn answered(msg: *const dns.Message) bool {
 /// or the end of its CNAME chain — the delegation lego follows by default
 /// (`_acme-challenge.example.org CNAME _acme-challenge.dns-provider.net`, or
 /// acme-dns's `<uuid>.auth.example.net`). Asked of `r` (recursive), one hop
-/// per query, so a resolver that flattens the chain is followed too.
+/// per query, so a resolver that flattens the chain is followed too. A CNAME whose target is the root
+/// is `error.ResolverFailed` (an answer that cannot be used), never an empty name.
 pub fn followCname(r: *dns.Resolver, name: []const u8, out: *[max_name_len]u8) Error![]const u8 {
     var cur = try copyName(out, name);
     var seen: [max_cname_hops + 1][max_name_len]u8 = undefined;
@@ -64,6 +65,8 @@ pub fn followCname(r: *dns.Resolver, name: []const u8, out: *[max_name_len]u8) E
             }
         }
         const t = target orelse return cur;
+        // A CNAME to the root is no place to publish a record (it would end the walk at an empty name).
+        if (trimDot(t).len == 0) return error.ResolverFailed;
         @memcpy(seen[hops][0..cur.len], cur);
         seen_len[hops] = cur.len;
         hops += 1;

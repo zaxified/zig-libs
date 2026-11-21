@@ -17,17 +17,17 @@ const Dns01Solver = root.Dns01Solver;
 const testing = std.testing;
 const net = std.Io.net;
 
-const t_a: u16 = 1;
-const t_ns: u16 = 2;
-const t_cname: u16 = 5;
-const t_soa: u16 = 6;
-const t_txt: u16 = 16;
-const t_aaaa: u16 = 28;
+pub const t_a: u16 = 1;
+pub const t_ns: u16 = 2;
+pub const t_cname: u16 = 5;
+pub const t_soa: u16 = 6;
+pub const t_txt: u16 = 16;
+pub const t_aaaa: u16 = 28;
 
 const servfail: u4 = 2;
 const nxdomain: u4 = 3;
 
-const Rule = struct {
+pub const Rule = struct {
     name: []const u8,
     qtype: u16,
     rcode: u4 = 0,
@@ -43,7 +43,7 @@ const Rule = struct {
 };
 
 /// `example.org` → `\x07example\x03org\x00`.
-fn wire(comptime name: []const u8) []const u8 {
+pub fn wire(comptime name: []const u8) []const u8 {
     comptime {
         var out: []const u8 = "";
         var it = std.mem.splitScalar(u8, name, '.');
@@ -52,11 +52,11 @@ fn wire(comptime name: []const u8) []const u8 {
     }
 }
 
-const soa_rdata = wire("ns1.a.test") ++ wire("hostmaster.a.test") ++ ("\x00\x00\x00\x01" ++ strRepeat("\x00\x00\x0e\x10", 4));
+pub const soa_rdata = wire("ns1.a.test") ++ wire("hostmaster.a.test") ++ ("\x00\x00\x00\x01" ++ strRepeat("\x00\x00\x0e\x10", 4));
 
 /// Answers every datagram by the first matching rules (all rules for the
 /// same name and type contribute one record each), else `fallback`.
-const Stub = struct {
+pub const Stub = struct {
     io: std.Io,
     sock: net.Socket,
     rules: []const Rule,
@@ -67,16 +67,16 @@ const Stub = struct {
     last_rd: std.atomic.Value(u8) = .init(2),
     stop: std.atomic.Value(bool) = .init(false),
 
-    fn bind(io: std.Io, rules: []const Rule) !Stub {
+    pub fn bind(io: std.Io, rules: []const Rule) !Stub {
         const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
         return .{ .io = io, .sock = try addr.bind(io, .{ .mode = .dgram }), .rules = rules };
     }
 
-    fn port(st: *const Stub) u16 {
+    pub fn port(st: *const Stub) u16 {
         return st.sock.address.getPort();
     }
 
-    fn run(st: *Stub) void {
+    pub fn run(st: *Stub) void {
         while (!st.stop.load(.acquire)) st.serveOne() catch {};
     }
 
@@ -140,7 +140,7 @@ const Stub = struct {
     }
 };
 
-const loopback = [_]netaddr.Ip{.{ .v4 = .{ 127, 0, 0, 1 } }};
+pub const loopback = [_]netaddr.Ip{.{ .v4 = .{ 127, 0, 0, 1 } }};
 
 const Lab = struct {
     threaded: std.Io.Threaded,
@@ -188,6 +188,18 @@ test "followCname: a chain is followed; a SERVFAIL is an error, not \"no CNAME\"
     // NXDOMAIN (the fallback) ends the walk at the name itself.
     try testing.expectEqualStrings("_acme-challenge.c.test", try zone.followCname(&r, "_acme-challenge.c.test", &out));
     try testing.expectError(error.ResolverFailed, zone.followCname(&r, "_acme-challenge.b.test", &out));
+}
+
+test "followCname: a CNAME to the root is a failed walk, not an empty name (found by the zone fuzz harness)" {
+    var lab: Lab = undefined;
+    try lab.start(&.{
+        .{ .name = "_acme-challenge.a.test", .qtype = t_cname, .rdata = "\x00" },
+    });
+    defer lab.stop();
+    var r = lab.resolver();
+    defer r.deinit();
+    var out: [zone.max_name_len]u8 = undefined;
+    try testing.expectError(error.ResolverFailed, zone.followCname(&r, "_acme-challenge.a.test", &out));
 }
 
 test "findZone: the SOA owner wins; a SERVFAIL on the way is an error, never the parent zone (review M2)" {
