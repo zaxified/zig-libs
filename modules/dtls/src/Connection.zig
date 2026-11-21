@@ -223,6 +223,8 @@ pub const ConfigError = error{
     /// `Config.srtp_profiles` holds more than `max_srtp_profiles` entries or
     /// the reserved value 0x0000.
     InvalidSrtpProfiles,
+    /// `Config.connection_id` is longer than `max_cid_len`.
+    InvalidConnectionId,
     /// `key_exchange = .psk` and no suite in `Config.cipher_suites` has the
     /// hash `Config.psk_hash` names. RFC 8446 §4.2.11: an external PSK is
     /// bound to one hash and is usable only with suites of that hash, so
@@ -559,6 +561,17 @@ pub const Config = struct {
     /// `negotiatedSrtpProfile`; the keying material is
     /// `exportKeyingMaterial("EXTRACTOR-dtls_srtp", "", out)` (§4.2).
     srtp_profiles: []const u16 = &.{},
+    /// RFC 9146 / RFC 9147 §9 connection ID: the CID this side wants the
+    /// peer to put on the records it sends here (at most `max_cid_len`
+    /// bytes; empty = "I will send a CID, but do not send me one"). Null
+    /// (the default) = not offered / not answered. A client offers it in the
+    /// ClientHello; a server answers in the ServerHello when it set one
+    /// too. Once both sent the extension, every protected record (epoch 2
+    /// on) carries the PEER's CID in the unified header (C bit), and a
+    /// received record must carry this side's own one (`error.Malformed`
+    /// otherwise, or for a CID on a connection that negotiated none). DTLS
+    /// 1.3 engine only.
+    connection_id: ?[]const u8 = null,
 
     // ── DTLS 1.2 (RFC 6347), all ADDITIVE: the defaults keep a 1.3-only
     // connection byte-identical to what it was before 1.2 existed.
@@ -647,6 +660,7 @@ pub const Config = struct {
             if (alpn_len > max_alpn_list_len) return error.InvalidAlpnProtocols;
         }
         if (self.srtp_profiles.len > max_srtp_profiles) return error.InvalidSrtpProfiles;
+        if (self.connection_id) |c| if (c.len > max_cid_len) return error.InvalidConnectionId;
         for (self.srtp_profiles) |p| if (p == 0) return error.InvalidSrtpProfiles;
         switch (self.key_exchange) {
             .psk => {
@@ -1054,6 +1068,11 @@ const max_alpn_list_len = 256;
 /// `Config.srtp_profiles` cap: RFC 5764 §4.1.2 and RFC 7714 define six
 /// profiles; sixteen leaves room for later ones.
 pub const max_srtp_profiles = 16;
+/// The longest connection ID this module sends or accepts (RFC 9146 allows
+/// 255; mbedTLS's `MBEDTLS_SSL_CID_IN_LEN_MAX` default is 32, pion uses 8).
+pub const max_cid_len = 32;
+/// RFC 9146 §3 `connection_id` extension type.
+pub const ext_connection_id: u16 = 54;
 
 /// The EncryptedExtensions this server sends: list length + one ALPN
 /// extension (4-byte header + 2-byte list length + 1 + 255-byte name).
@@ -1735,6 +1754,14 @@ pub const Connection = struct {
     alpn_len: u8 = 0,
     /// RFC 5764: the negotiated SRTP protection profile, 0 = none.
     srtp_profile: u16 = 0,
+    /// RFC 9146/9147 connection IDs: `cid_own` is `Config.connection_id`
+    /// (what received records must carry), `cid_peer` what the peer asked
+    /// for (what sent records carry); both meaningful once `cid_negotiated`.
+    cid_negotiated: bool = false,
+    cid_own: [max_cid_len]u8 = undefined,
+    cid_own_len: u8 = 0,
+    cid_peer: [max_cid_len]u8 = undefined,
+    cid_peer_len: u8 = 0,
 
     // ── handshake-in-progress state (RFC 9147 §5 flight engine) ─────────
     /// Running transcript hash (RFC 8446 §4.4.1, TLS-style 4-byte-header
@@ -2483,7 +2510,7 @@ pub const Connection = struct {
             .epoch_low = @truncate(self.write_epoch),
             .seq_len = seq_len,
             .seq_wire = @truncate(self.send_seq),
-            .cid = null,
+            .cid = self.peerConnectionId(),
             .length = @intCast(ct_len),
         };
         const hdr_slice = record.encodeUnified(hdr, out) catch return error.BufferTooShort;
@@ -2496,8 +2523,8 @@ pub const Connection = struct {
 
         // RFC 9147 §4.2.3: encrypt the on-wire sequence number using a
         // 16-byte sample of the record ciphertext. The seq bytes follow the
-        // 1-byte flags (and CID, if any) — here no CID, so offset 1.
-        const seq_off: usize = 1;
+        // 1-byte flags and the CID, if any.
+        const seq_off: usize = 1 + if (self.peerConnectionId()) |c| c.len else 0;
         try snMaskDispatch(self.suite, &self.write_keys, out[hdr_len..][0..16], out[seq_off..][0..seq_bytes_n]);
 
         self.send_seq +%= 1;
@@ -2517,7 +2544,8 @@ pub const Connection = struct {
     fn recvBody(self: *Connection, datagram: []const u8, out: []u8) SendError![]const u8 {
         if (self.state != .connected) return error.NotConnected;
 
-        const dec = record.decodeUnified(datagram, 0) catch return error.Malformed;
+        const dec = record.decodeUnified(datagram, self.rxCidLen()) catch return error.Malformed;
+        try self.checkRxCid(dec.hdr.cid);
         const seq_len = dec.hdr.seq_len;
         const seq_bytes_n: usize = if (seq_len == .short) 1 else 2;
         const hdr_len = dec.consumed;
@@ -2534,7 +2562,7 @@ pub const Connection = struct {
         // Copy the header into a working buffer so we can un-mask the seq
         // number in place: the AEAD additional_data is the header with the
         // PLAINTEXT sequence number (RFC 9147 §4.2.1).
-        var hdr_buf: [16]u8 = undefined;
+        var hdr_buf: [5 + max_cid_len]u8 = undefined;
         if (hdr_len > hdr_buf.len) return error.Malformed;
         @memcpy(hdr_buf[0..hdr_len], datagram[0..hdr_len]);
 
@@ -2690,6 +2718,49 @@ pub const Connection = struct {
     /// (not offered, not configured on the server, or no common profile).
     pub fn negotiatedSrtpProfile(self: *const Connection) ?u16 {
         return if (self.srtp_profile == 0) null else self.srtp_profile;
+    }
+
+    /// RFC 9146: the CID the peer asked this side to send (null when none
+    /// was negotiated, or it asked for an empty one).
+    pub fn peerConnectionId(self: *const Connection) ?[]const u8 {
+        return if (self.cid_negotiated and self.cid_peer_len != 0) self.cid_peer[0..self.cid_peer_len] else null;
+    }
+
+    /// The CID length a received protected record carries (0 = none).
+    fn rxCidLen(self: *const Connection) usize {
+        return if (self.cid_negotiated) self.cid_own_len else 0;
+    }
+
+    /// A received unified header's CID must be this side's own; with a
+    /// non-empty own CID negotiated, a record without one is invalid too
+    /// (RFC 9146 §3: "If a non-zero-length CID is expected ... the datagram
+    /// MUST be treated as invalid").
+    fn checkRxCid(self: *const Connection, cid: ?[]const u8) error{Malformed}!void {
+        if (cid) |c| {
+            if (!std.mem.eql(u8, c, self.cid_own[0..self.cid_own_len])) return error.Malformed;
+        } else if (self.rxCidLen() != 0) return error.Malformed;
+    }
+
+    /// Client: the ClientHello's `connection_id`, or null.
+    fn cidOffer(self: *const Connection, buf: *[1 + max_cid_len]u8) ?messages.Extension {
+        const c = self.config.connection_id orelse return null;
+        buf[0] = @intCast(c.len);
+        @memcpy(buf[1..][0..c.len], c);
+        return .{ .ext_type = ext_connection_id, .data = buf[0 .. 1 + c.len] };
+    }
+
+    /// `opaque cid<0..2^8-1>` into `cid_peer`, and the negotiation is on.
+    /// A CID longer than `max_cid_len` is `error.Malformed` (for a server,
+    /// the caller then declines to negotiate instead).
+    fn takePeerCid(self: *Connection, data: []const u8) error{Malformed}!void {
+        if (data.len < 1 or data.len != 1 + @as(usize, data[0])) return error.Malformed;
+        if (data[0] > max_cid_len) return error.Malformed;
+        @memcpy(self.cid_peer[0..data[0]], data[1..]);
+        self.cid_peer_len = data[0];
+        const own = self.config.connection_id.?;
+        @memcpy(self.cid_own[0..own.len], own);
+        self.cid_own_len = @intCast(own.len);
+        self.cid_negotiated = true;
     }
 
     /// Client: the ClientHello's `use_srtp`, or null with no
@@ -2906,7 +2977,8 @@ pub const Connection = struct {
         var srtp_buf: [2 + 2 * max_srtp_profiles + 1]u8 = undefined;
         const srtp_ext = try self.srtpOffer(&srtp_buf);
 
-        var exts_buf: [9 + dual12_extensions.len]messages.Extension = undefined;
+        var cid_buf: [1 + max_cid_len]u8 = undefined;
+        var exts_buf: [10 + dual12_extensions.len]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -2927,6 +2999,10 @@ pub const Connection = struct {
             n_exts += 1;
         }
         if (srtp_ext) |e| {
+            exts_buf[n_exts] = e;
+            n_exts += 1;
+        }
+        if (self.cidOffer(&cid_buf)) |e| {
             exts_buf[n_exts] = e;
             n_exts += 1;
         }
@@ -3066,7 +3142,8 @@ pub const Connection = struct {
         var srtp_buf: [2 + 2 * max_srtp_profiles + 1]u8 = undefined;
         const srtp_ext = try self.srtpOffer(&srtp_buf);
 
-        var exts_buf: [7 + dual12_extensions.len]messages.Extension = undefined;
+        var cid_buf: [1 + max_cid_len]u8 = undefined;
+        var exts_buf: [8 + dual12_extensions.len]messages.Extension = undefined;
         var n_exts: usize = 0;
         exts_buf[n_exts] = .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = versions_ext };
         n_exts += 1;
@@ -3085,6 +3162,10 @@ pub const Connection = struct {
             n_exts += 1;
         }
         if (srtp_ext) |e| {
+            exts_buf[n_exts] = e;
+            n_exts += 1;
+        }
+        if (self.cidOffer(&cid_buf)) |e| {
             exts_buf[n_exts] = e;
             n_exts += 1;
         }
@@ -3211,8 +3292,9 @@ pub const Connection = struct {
     /// RFC 9147 §5.5 fragments, one record each (`writeFragmented`).
     fn protectHandshakeMessage(self: *Connection, fragment_bytes: []const u8, out: []u8) HandshakeError![]const u8 {
         const limit: usize = self.config.max_datagram_len;
-        if (limit != 0 and max_epoch2_record_overhead + fragment_bytes.len > limit)
-            return self.writeFragmented(fragment_bytes, limit - max_epoch2_record_overhead - handshake.header_len, .epoch2_protected, out);
+        const overhead = max_epoch2_record_overhead + if (self.peerConnectionId()) |c| c.len else 0;
+        if (limit != 0 and overhead + fragment_bytes.len > limit)
+            return self.writeFragmented(fragment_bytes, limit - overhead - handshake.header_len, .epoch2_protected, out);
         if (fragment_bytes.len + 1 > max_send_fragment_inner)
             return self.writeFragmented(fragment_bytes, max_send_fragment_inner - 1 - handshake.header_len, .epoch2_protected, out);
         return self.protectHandshakeOne(fragment_bytes, out);
@@ -3250,7 +3332,7 @@ pub const Connection = struct {
             .epoch_low = 2,
             .seq_len = seq_len,
             .seq_wire = @truncate(self.hs2.send_seq),
-            .cid = null,
+            .cid = self.peerConnectionId(),
             .length = @intCast(ct_len),
         };
         const hdr_slice = record.encodeUnified(hdr, out) catch return error.BufferTooShort;
@@ -3261,7 +3343,7 @@ pub const Connection = struct {
             return error.BufferTooShort;
         std.debug.assert(n == ct_len);
 
-        const seq_off: usize = 1;
+        const seq_off: usize = 1 + if (self.peerConnectionId()) |c| c.len else 0;
         try snMaskDispatch(self.suite, &self.hs_write_keys, out[hdr_len..][0..16], out[seq_off..][0..seq_bytes_n]);
 
         if (inner_type == content_type_handshake)
@@ -3292,11 +3374,12 @@ pub const Connection = struct {
     /// The replay window is updated for either (an ACK is a record like any
     /// other, see `recv`).
     fn unprotectHandshakeRecord(self: *Connection, record_bytes: []const u8, out: []u8, seq_out: ?*u64, ctype_out: *u8) HandshakeError![]const u8 {
-        const dec = record.decodeUnified(record_bytes, 0) catch return error.Malformed;
+        const dec = record.decodeUnified(record_bytes, self.rxCidLen()) catch return error.Malformed;
+        try self.checkRxCid(dec.hdr.cid);
         const seq_len = dec.hdr.seq_len;
         const seq_bytes_n: usize = if (seq_len == .short) 1 else 2;
         const hdr_len = dec.consumed;
-        const seq_off: usize = 1;
+        const seq_off: usize = if (dec.hdr.cid) |c| 1 + c.len else 1;
 
         const ct = if (dec.hdr.length) |l| blk: {
             if (record_bytes.len < hdr_len + l) return error.Malformed;
@@ -3304,7 +3387,7 @@ pub const Connection = struct {
         } else record_bytes[hdr_len..];
         if (ct.len < 16) return error.RecordTooShort;
 
-        var hdr_buf: [16]u8 = undefined;
+        var hdr_buf: [5 + max_cid_len]u8 = undefined;
         if (hdr_len > hdr_buf.len) return error.Malformed;
         @memcpy(hdr_buf[0..hdr_len], record_bytes[0..hdr_len]);
         try snMaskDispatch(self.suite, &self.hs_read_keys, ct[0..16], hdr_buf[seq_off..][0..seq_bytes_n]);
@@ -3408,7 +3491,7 @@ pub const Connection = struct {
                     var record_seq: u64 = 0;
                     var ctype: u8 = 0;
                     const f = try self.unprotectHandshakeRecord(datagram[pos.*..], &plain_buf, &record_seq, &ctype);
-                    pos.* += try recordWireLen(datagram[pos.*..]);
+                    pos.* += try recordWireLenCid(datagram[pos.*..], self.rxCidLen());
                     if (ctype == content_type_ack) {
                         try checkAckBody(f);
                         self.noteFlightAck(f);
@@ -4251,6 +4334,14 @@ pub const Connection = struct {
         }
         try self.serverSelectAlpn(dec.extensions);
         try self.serverSelectSrtp(dec.extensions);
+        if (self.config.connection_id != null) {
+            for (dec.extensions) |e| {
+                if (e.ext_type != ext_connection_id) continue;
+                if (e.data.len < 1 or e.data.len != 1 + @as(usize, e.data[0])) return error.Malformed;
+                // A CID longer than this side can send: do not negotiate.
+                self.takePeerCid(e.data) catch {};
+            }
+        }
 
         // ClientHello accepted (PSK binder verified, or cert-DHE key_share
         // extracted): commit it to the transcript, which from here on runs
@@ -4286,10 +4377,16 @@ pub const Connection = struct {
         // conforming client it just did a DTLS 1.2 handshake.
         var sh_versions_buf: [2]u8 = undefined;
         const sh_versions = try messages.encodeSupportedVersionsServerHello(messages.version_dtls13, &sh_versions_buf);
-        const sh_exts = [_]messages.Extension{
+        var sh_cid_buf: [1 + max_cid_len]u8 = undefined;
+        sh_cid_buf[0] = self.cid_own_len;
+        @memcpy(sh_cid_buf[1..][0..self.cid_own_len], self.cid_own[0..self.cid_own_len]);
+        const sh_exts_all = [_]messages.Extension{
             .{ .ext_type = @backingInt(messages.ExtensionType.supported_versions), .data = sh_versions },
             sh_ext,
+            // RFC 9146 §3: the server's CID, in the ServerHello.
+            .{ .ext_type = ext_connection_id, .data = sh_cid_buf[0 .. 1 + @as(usize, self.cid_own_len)] },
         };
+        const sh_exts = sh_exts_all[0..if (self.cid_negotiated) @as(usize, 3) else 2];
         var sh_body_buf: [max_server_hello_body]u8 = undefined;
         // RFC 9147 §5: "DTLS implementations do not use the TLS 1.3
         // 'compatibility mode' ... DTLS servers MUST NOT echo the
@@ -4306,7 +4403,7 @@ pub const Connection = struct {
             .random = random_bytes,
             .legacy_session_id_echo = &.{},
             .cipher_suite = @backingInt(suite),
-            .extensions = &sh_exts,
+            .extensions = sh_exts,
         }, &sh_body_buf) catch return error.BufferTooShort;
         self.transcript.append(@backingInt(messages.HandshakeType.server_hello), sh_body);
 
@@ -4660,6 +4757,11 @@ pub const Connection = struct {
         }
         const version = negotiated_version orelse return error.VersionNotNegotiated;
         if (!std.mem.eql(u8, &version, &messages.version_dtls13)) return error.UnsupportedVersion;
+        for (sh_dec.extensions) |e| {
+            if (e.ext_type != ext_connection_id) continue;
+            if (self.config.connection_id == null) return error.Malformed; // not offered
+            try self.takePeerCid(e.data);
+        }
 
         // RFC 8446 §4.1.4: after a HelloRetryRequest the ServerHello MUST
         // select the suite the retry named. Checked BEFORE the suite is
@@ -5104,7 +5206,11 @@ fn checkWholeClientHello(datagram: []const u8) HandshakeError!void {
 }
 
 fn recordWireLen(buf: []const u8) HandshakeError!usize {
-    const dec = record.decodeUnified(buf, 0) catch return error.Malformed;
+    return recordWireLenCid(buf, 0);
+}
+
+fn recordWireLenCid(buf: []const u8, cid_len: usize) HandshakeError!usize {
+    const dec = record.decodeUnified(buf, cid_len) catch return error.Malformed;
     const len = dec.hdr.length orelse return error.Malformed;
     if (buf.len < dec.consumed + len) return error.Malformed;
     return dec.consumed + len;
@@ -11046,4 +11152,98 @@ test "server: a client share in every accepted group (secp384r1/521r1, pure and 
         try testing.expectEqual(g, server.ecdhe_group);
         try expectSameKeys(&client, &server);
     }
+}
+
+// ── connection ID (RFC 9146 / RFC 9147 §9) ───────────────────────────────
+
+fn cidPair(c_cid: ?[]const u8, s_cid: ?[]const u8, limit: u16, client: *Connection, server: *Connection) !void {
+    var cc = Config{ .role = .client, .psk_identity = "device-042", .psk = "a-shared-pre-shared-key", .connection_id = c_cid, .max_datagram_len = limit };
+    var sc = cc;
+    sc.role = .server;
+    sc.connection_id = s_cid;
+    cc.max_datagram_len = limit;
+    client.* = try Connection.clientInit(cc);
+    server.* = try Connection.serverInit(sc);
+}
+
+test "connection ID: negotiated both ways, every protected record carries the peer's CID, fragmented flights included" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try cidPair("cli-7", "server-cid-0099", min_max_datagram_len, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x86)));
+    const rnd = seededForTest(&csprng);
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    var r = try server.handleFlight(ch, rnd, 0, &b2);
+    try testing.expectEqualStrings("cli-7", server.peerConnectionId().?);
+    // Server flight: ServerHello (epoch 0, no CID), then sealed records with C=1 and the client's CID.
+    var rest = r.out;
+    var sealed: usize = 0;
+    while (rest.len != 0) {
+        const sp = record.nextDatagramCid(rest, min_max_datagram_len, 5);
+        try testing.expect(sp.datagram.len <= min_max_datagram_len);
+        rest = sp.rest;
+        const cr = try client.handleFlight(sp.datagram, rnd, 0, &b1);
+        if (sp.datagram[0] & 0xe0 == 0x20) {
+            try testing.expect(sp.datagram[0] & 0x10 != 0);
+            try testing.expectEqualStrings("cli-7", sp.datagram[1..6]);
+            sealed += 1;
+        }
+        if (rest.len == 0) r = cr;
+    }
+    try testing.expect(sealed > 0);
+    try testing.expect(r.done);
+    try testing.expectEqualStrings("server-cid-0099", client.peerConnectionId().?);
+    const sf = try server.handleFlight(r.out, rnd, 0, &b2);
+    try testing.expect(sf.done);
+    var wire: [128]u8 = undefined;
+    var plain: [128]u8 = undefined;
+    const rec = try client.send("over a CID", &wire);
+    try testing.expect(rec[0] & 0x10 != 0);
+    try testing.expectEqualStrings("server-cid-0099", rec[1..16]);
+    try testing.expectEqualStrings("over a CID", try server.recv(rec, &plain));
+    // Another CID, or none, on a record to the server is refused.
+    var bad = wire;
+    bad[3] ^= 1;
+    try testing.expectError(error.Malformed, server.recv(bad[0..rec.len], &plain));
+}
+
+test "connection ID: not negotiated unless both offer; an empty own CID means the peer sends none" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x87)));
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    var wire: [128]u8 = undefined;
+    var plain: [128]u8 = undefined;
+    for ([_][2]?[]const u8{ .{ "abc", null }, .{ null, "abc" } }) |pair| {
+        var client: Connection = undefined;
+        var server: Connection = undefined;
+        try cidPair(pair[0], pair[1], 0, &client, &server);
+        defer client.deinit();
+        defer server.deinit();
+        try driveHandshake(&client, &server, seededForTest(&csprng), &b1, &b2);
+        try testing.expect(!client.cid_negotiated and !server.cid_negotiated);
+        const rec = try client.send("plain header", &wire);
+        try testing.expect(rec[0] & 0x10 == 0);
+        try testing.expectEqualStrings("plain header", try server.recv(rec, &plain));
+    }
+    // Client asks for no CID ("" ): the server sends none, the client sends the server's.
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try cidPair("", "srv", 0, &client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    try driveHandshake(&client, &server, seededForTest(&csprng), &b1, &b2);
+    try testing.expect(client.cid_negotiated and server.cid_negotiated);
+    try testing.expectEqual(@as(?[]const u8, null), server.peerConnectionId());
+    const to_c = try server.send("no cid", &wire);
+    try testing.expect(to_c[0] & 0x10 == 0);
+    try testing.expectEqualStrings("no cid", try client.recv(to_c, &plain));
+    const to_s = try client.send("with cid", &wire);
+    try testing.expectEqualStrings("srv", to_s[1..4]);
+    try testing.expectEqualStrings("with cid", try server.recv(to_s, &plain));
+    const long: [max_cid_len + 1]u8 = @splat(1);
+    try testing.expectError(error.InvalidConnectionId, (Config{ .role = .client, .psk_identity = "id", .psk = "k", .connection_id = &long }).validate());
 }

@@ -218,10 +218,10 @@ pub fn decodePlaintext(buf: []const u8) RecordError!PlaintextHeader {
 /// a DTLS 1.3 unified-header record carrying a length. Null when the header
 /// is not readable, declares more bytes than `buf` holds, or is a unified
 /// header without a length (such a record runs to the end of its datagram).
-fn recordWireLen(buf: []const u8) ?usize {
+fn recordWireLen(buf: []const u8, cid_len: usize) ?usize {
     if (buf.len == 0) return null;
     if (buf[0] & fixed_mask == fixed_value) {
-        const dec = decodeUnified(buf, 0) catch return null;
+        const dec = decodeUnified(buf, cid_len) catch return null;
         const len = dec.hdr.length orelse return null;
         if (buf.len - dec.consumed < len) return null;
         return dec.consumed + len;
@@ -248,10 +248,17 @@ pub const DatagramSplit = struct {
 /// cannot be read (the rest is returned whole rather than guessed at).
 /// Pure: call it in a loop until `rest` is empty.
 pub fn nextDatagram(records: []const u8, max_len: usize) DatagramSplit {
+    return nextDatagramCid(records, max_len, 0);
+}
+
+/// `nextDatagram` for records that carry a connection ID of `cid_len` bytes
+/// (RFC 9147 §9: what `Connection.peerConnectionId` returns on the sending
+/// side).
+pub fn nextDatagramCid(records: []const u8, max_len: usize, cid_len: usize) DatagramSplit {
     if (max_len == 0) return .{ .datagram = records, .rest = records[records.len..] };
     var end: usize = 0;
     while (end < records.len) {
-        const n = recordWireLen(records[end..]) orelse
+        const n = recordWireLen(records[end..], cid_len) orelse
             return .{ .datagram = records, .rest = records[records.len..] };
         if (end > 0 and end + n > max_len) break;
         end += n;
