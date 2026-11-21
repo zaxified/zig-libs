@@ -25,6 +25,9 @@ const format = @import("format.zig");
 /// good bbox/kNN trade-off. Kept internal — the frozen decoder does not depend
 /// on it (each node stores its own `child_count`).
 pub const default_fanout: u16 = 16;
+/// The fan-out range `Builder.fanout` is clamped to (Flatbush: `nodeSize` 2..65535).
+pub const fanout_min: u16 = 2;
+pub const fanout_max: u16 = 65535;
 
 pub const BuildError = error{
     OutOfMemory,
@@ -32,6 +35,9 @@ pub const BuildError = error{
     NotFinite,
     /// A latitude outside [-90, 90] or longitude outside [-180, 180].
     OutOfRange,
+    /// `addBox`: a minimum above its maximum (a rectangle that wraps the antimeridian is
+    /// two items, one on each side).
+    InvertedBox,
 };
 
 pub const FreezeError = error{
@@ -43,11 +49,13 @@ pub const FreezeError = error{
 
 pub const Point = struct { lat: f64, lon: f64, value: u32 };
 
-/// One indexed point plus its Hilbert sort key. Stored in a single growable
-/// pool; sorting reorders this array in place.
+/// One indexed item (a point, or a rectangle: `lat`/`lon` its minimum corner, `max_lat`/`max_lon` its maximum, equal
+/// for a point) plus its Hilbert sort key. Stored in a single growable pool; sorting reorders this array in place.
 const Item = struct {
     lat: f64,
     lon: f64,
+    max_lat: f64,
+    max_lon: f64,
     value: u32,
     hilbert: u32,
 };
@@ -70,7 +78,11 @@ const BuildNode = struct {
 pub const Builder = struct {
     gpa: Allocator,
     items: std.ArrayListUnmanaged(Item),
+    /// Children per internal node, `fanout_min`..`fanout_max` (clamped at `freeze`, as Flatbush clamps its
+    /// `nodeSize`); default `default_fanout`. Recorded in the header, not needed to read the file.
     fanout: u16,
+    /// An item added by `addBox` is a rectangle (sets the header's `flag_extents`).
+    has_extents: bool = false,
 
     pub fn init(gpa: Allocator) Builder {
         return .{ .gpa = gpa, .items = .empty, .fanout = default_fanout };
@@ -87,7 +99,20 @@ pub const Builder = struct {
     pub fn add(self: *Builder, lat: f64, lon: f64, value: u32) BuildError!void {
         if (!std.math.isFinite(lat) or !std.math.isFinite(lon)) return error.NotFinite;
         if (lat < -90.0 or lat > 90.0 or lon < -180.0 or lon > 180.0) return error.OutOfRange;
-        try self.items.append(self.gpa, .{ .lat = lat, .lon = lon, .value = value, .hilbert = 0 });
+        try self.items.append(self.gpa, .{ .lat = lat, .lon = lon, .max_lat = lat, .max_lon = lon, .value = value, .hilbert = 0 });
+    }
+
+    /// Add one RECTANGLE (Flatbush's main case: footprints, tiles, extents): WGS84 degrees,
+    /// `min_lat <= max_lat` and `min_lon <= max_lon` (a box across the antimeridian is two
+    /// items), edges inclusive. `bbox` finds it when the query rectangle meets it, `knn` and
+    /// `within` rank it by its distance to the query point (0 inside). Same range and
+    /// finiteness checks as `add`; `error.InvertedBox` for a minimum above its maximum.
+    pub fn addBox(self: *Builder, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64, value: u32) BuildError!void {
+        for ([_]f64{ min_lat, min_lon, max_lat, max_lon }) |c| if (!std.math.isFinite(c)) return error.NotFinite;
+        if (min_lat < -90.0 or max_lat > 90.0 or min_lon < -180.0 or max_lon > 180.0) return error.OutOfRange;
+        if (min_lat > max_lat or min_lon > max_lon) return error.InvertedBox;
+        try self.items.append(self.gpa, .{ .lat = min_lat, .lon = min_lon, .max_lat = max_lat, .max_lon = max_lon, .value = value, .hilbert = 0 });
+        if (min_lat != max_lat or min_lon != max_lon) self.has_extents = true;
     }
 
     pub fn count(self: *const Builder) usize {
@@ -99,26 +124,27 @@ pub const Builder = struct {
     pub fn freeze(self: *Builder, out_gpa: Allocator) FreezeError![]u8 {
         const n = self.items.items.len;
         if (n == 0) return freezeEmpty(out_gpa);
+        const fanout = std.math.clamp(self.fanout, fanout_min, fanout_max);
 
-        // 1. Overall bbox of all points → the Hilbert grid frame.
-        var min_lat: f64 = self.items.items[0].lat;
-        var min_lon: f64 = self.items.items[0].lon;
+        // 1. Overall bbox of all item centres (a point's centre is the point) → the Hilbert grid frame.
+        var min_lat: f64 = center(self.items.items[0].lat, self.items.items[0].max_lat);
+        var min_lon: f64 = center(self.items.items[0].lon, self.items.items[0].max_lon);
         var max_lat: f64 = min_lat;
         var max_lon: f64 = min_lon;
         for (self.items.items) |it| {
-            min_lat = @min(min_lat, it.lat);
-            min_lon = @min(min_lon, it.lon);
-            max_lat = @max(max_lat, it.lat);
-            max_lon = @max(max_lon, it.lon);
+            min_lat = @min(min_lat, center(it.lat, it.max_lat));
+            min_lon = @min(min_lon, center(it.lon, it.max_lon));
+            max_lat = @max(max_lat, center(it.lat, it.max_lat));
+            max_lon = @max(max_lon, center(it.lon, it.max_lon));
         }
 
-        // 2. Hilbert key per point, then sort. Sorting mutates `self.items`, but
+        // 2. Hilbert key per item (its centre), then sort. Sorting mutates `self.items`, but
         //    the result is a permutation of the same set, so the builder stays
         //    valid and reusable. A total-order comparator keeps freeze
-        //    deterministic even when two points share a Hilbert cell.
+        //    deterministic even when two items share a Hilbert cell.
         for (self.items.items) |*it| {
-            const hx = gridCoord(it.lon, min_lon, max_lon);
-            const hy = gridCoord(it.lat, min_lat, max_lat);
+            const hx = gridCoord(center(it.lon, it.max_lon), min_lon, max_lon);
+            const hy = gridCoord(center(it.lat, it.max_lat), min_lat, max_lat);
             it.hilbert = hilbertXYToIndex(hx, hy);
         }
         std.mem.sort(Item, self.items.items, {}, itemLess);
@@ -127,15 +153,15 @@ pub const Builder = struct {
         //    Hilbert order), then internal levels, root last.
         var nodes: std.ArrayListUnmanaged(BuildNode) = .empty;
         defer nodes.deinit(out_gpa);
-        nodes.ensureTotalCapacity(out_gpa, n + n / (self.fanout - 1) + 1) catch return error.OutOfMemory;
+        nodes.ensureTotalCapacity(out_gpa, n + n / (fanout - 1) + 1) catch return error.OutOfMemory;
 
         for (self.items.items) |it| {
             nodes.append(out_gpa, .{
                 .leaf = true,
                 .min_lat = it.lat,
                 .min_lon = it.lon,
-                .max_lat = it.lat,
-                .max_lon = it.lon,
+                .max_lat = it.max_lat,
+                .max_lon = it.max_lon,
                 .data = it.value,
                 .child_count = 0,
             }) catch return error.OutOfMemory;
@@ -149,7 +175,7 @@ pub const Builder = struct {
             const parent_start = nodes.items.len;
             var i: usize = 0;
             while (i < level_len) {
-                const chunk = @min(@as(usize, self.fanout), level_len - i);
+                const chunk = @min(@as(usize, fanout), level_len - i);
                 const first_child = level_start + i;
                 var bb_min_lat: f64 = nodes.items[first_child].min_lat;
                 var bb_min_lon: f64 = nodes.items[first_child].min_lon;
@@ -201,9 +227,9 @@ pub const Builder = struct {
         std.debug.assert(p == total);
 
         const header = format.Header{
-            .flags = 0,
+            .flags = if (self.has_extents) format.flag_extents else 0,
             .node_count = @intCast(node_count),
-            .fanout = self.fanout,
+            .fanout = fanout,
             .item_count = n,
             .root_index = @intCast(root_index),
         };
@@ -224,7 +250,14 @@ fn itemLess(_: void, a: Item, b: Item) bool {
     if (a.hilbert != b.hilbert) return a.hilbert < b.hilbert;
     if (a.value != b.value) return a.value < b.value;
     if (a.lat != b.lat) return a.lat < b.lat;
-    return a.lon < b.lon;
+    if (a.lon != b.lon) return a.lon < b.lon;
+    if (a.max_lat != b.max_lat) return a.max_lat < b.max_lat;
+    return a.max_lon < b.max_lon;
+}
+
+/// The middle of `[lo, hi]`; exactly `lo` when `lo == hi` (a point).
+fn center(lo: f64, hi: f64) f64 {
+    return lo + (hi - lo) / 2;
 }
 
 /// Convenience: build + freeze from a slice of points in one call.

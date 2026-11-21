@@ -27,15 +27,40 @@ pub const QueryError = format.DecodeError || error{ StackOverflow, ScratchTooSma
 
 // ── result types ─────────────────────────────────────────────────────────────
 
-/// A point returned by `bbox`. `lat`/`lon` are the exact stored coordinates
-/// (f64, byte-identical to what was indexed — no quantization).
-pub const Match = struct { value: u32, lat: f64, lon: f64 };
+/// An item returned by `bbox`: `lat`/`lon` are the exact stored coordinates (f64, byte-identical
+/// to what was indexed — no quantization) of a point, or the minimum corner of a rectangle added
+/// by `Builder.addBox`; `max_lat`/`max_lon` the maximum corner (equal to `lat`/`lon` for a point).
+pub const Match = struct {
+    value: u32,
+    lat: f64,
+    lon: f64,
+    max_lat: f64,
+    max_lon: f64,
 
-/// A point returned by `knn`, plus its ranking distance. `dist2` is the SQUARED
-/// distance in the equirectangular ranking metric (see the ranking contract
-/// below), NOT a physical distance in metres — it is a monotone proxy for the
-/// great-circle distance suitable for ordering nearest neighbours locally.
-pub const Neighbor = struct { value: u32, lat: f64, lon: f64, dist2: f64 };
+    /// A point (not a rectangle with extent).
+    pub fn isPoint(m: Match) bool {
+        return m.lat == m.max_lat and m.lon == m.max_lon;
+    }
+};
+
+/// An item returned by `knn` or `within`, plus its ranking distance. `dist2` is the SQUARED
+/// distance in the metric of `QueryOptions.metric`: for `.planar` the equirectangular ranking
+/// metric (degrees squared; NOT a physical distance, a monotone proxy for ordering nearest
+/// neighbours locally), for `.great_circle` metres squared (`dist()` is the metres). For a
+/// rectangle the distance is that to its nearest point, 0 when the query is inside it.
+pub const Neighbor = struct {
+    value: u32,
+    lat: f64,
+    lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    dist2: f64,
+
+    /// The distance itself (`sqrt(dist2)`): metres under `.great_circle`, ranking degrees under `.planar`.
+    pub fn dist(n: Neighbor) f64 {
+        return @sqrt(n.dist2);
+    }
+};
 
 pub const BboxStatus = enum {
     /// Every point under the query rectangle was reported; `items` is complete.
@@ -72,6 +97,21 @@ pub const QueryOptions = struct {
     /// against the result capacity / `k`, so `knn` still returns the k nearest
     /// points that pass. Rejecting points does not widen the visit budget.
     filter: ?Filter = null,
+    /// How `knn` ranks and `within` measures (`dist2`, `radius`): see `Metric`.
+    metric: Metric = .planar,
+};
+
+/// The distance `knn` and `within` use.
+pub const Metric = enum {
+    /// The equirectangular ranking metric: degrees of latitude, with the longitude difference
+    /// (taken the short way round the antimeridian) scaled by cos(query latitude). Cheap and
+    /// exact enough for ordering locally; it degrades away from the query latitude and near the
+    /// poles, and `radius` is in degrees.
+    planar,
+    /// Great-circle (haversine) distance on a sphere of radius 6371 km (geoflatbush's), in
+    /// METRES: `radius` is metres, `dist2` metres squared. Correct near the poles and across
+    /// the antimeridian; costs a few trigonometric calls per node.
+    great_circle,
 };
 
 /// A point predicate with a context pointer (no closures in Zig). `func` is
@@ -197,9 +237,9 @@ pub const Frozen = struct {
                 continue;
 
             if (node.leaf) {
-                // A leaf's bbox is its point; intersection above already proved
-                // the point is inside the closed rectangle.
-                const m = Match{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon };
+                // A leaf's bbox is its point (or rectangle); intersection above already proved
+                // it meets the closed query rectangle.
+                const m = Match{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon, .max_lat = node.max_lat, .max_lon = node.max_lon };
                 if (opts.filter) |flt| if (!flt.keep(m)) continue;
                 if (n_out >= out.len)
                     return .{ .items = out[0..n_out], .status = .truncated_capacity };
@@ -223,16 +263,15 @@ pub const Frozen = struct {
 
     // ── within (radius) ──────────────────────────────────────────────────────
     //
-    // Every point whose RANKING-METRIC distance to (lat, lon) is <= `radius`.
-    // This module has no great-circle distance (see SPEC: haversine is deferred),
-    // so the radius is in the same equirectangular metric as `knn`: DEGREES of
-    // latitude, with the longitude difference scaled by cos(query latitude). It is
-    // the planar kdbush `within` in that metric, not a metre radius. Each result
-    // carries `dist2` (= squared metric distance, <= radius^2). Order is
-    // unspecified (depth-first); sort by `dist2` if needed. A negative or NaN
-    // radius, or NaN query coordinates, match nothing; radius 0 matches the points
-    // exactly at the query. Subtrees whose bbox lower bound exceeds the radius
-    // (padded by 1e-9 deg against rounding) are pruned.
+    // Every item whose distance (`QueryOptions.metric`) to (lat, lon) is <= `radius`: for the default
+    // `.planar` metric the equirectangular ranking metric of `knn` (DEGREES of latitude, the
+    // longitude difference taken the short way round the antimeridian and scaled by cos(query
+    // latitude)), the planar kdbush `within`; for `.great_circle` METRES on a sphere of 6371 km.
+    // Each result carries `dist2` (= squared distance, <= radius^2; for a rectangle item that to
+    // its nearest point). Order is unspecified (depth-first); sort by `dist2` if needed. A
+    // negative or NaN radius, or NaN query coordinates, match nothing; radius 0 matches the
+    // items exactly at the query. Subtrees whose bbox lower bound exceeds the radius (padded
+    // against rounding) are pruned.
 
     /// All indexed points within `radius` of `(lat, lon)` (see above), into
     /// `out`. No allocation. Status as for `bbox`.
@@ -248,9 +287,9 @@ pub const Frozen = struct {
             return .{ .items = out[0..0], .status = .complete };
         if (out.len == 0) return .{ .items = out[0..0], .status = .truncated_capacity };
 
-        const qk = std.math.cos(lat * std.math.pi / 180.0);
+        const rk = Ranker.init(opts.metric, lat, lon);
         const r2 = radius * radius;
-        const r_pad = radius + 1e-9;
+        const r_pad = radius + rk.pad();
         const prune2 = r_pad * r_pad;
 
         var stack: [max_stack]u32 = undefined;
@@ -268,24 +307,21 @@ pub const Frozen = struct {
             visited += 1;
 
             if (node.leaf) {
-                const d2 = pointDist2(lat, lon, node.min_lat, node.min_lon, qk);
+                const d2 = rk.leaf(node);
                 if (!(d2 <= r2)) continue;
                 if (opts.filter) |flt| {
-                    if (!flt.keep(.{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon })) continue;
+                    if (!flt.keep(.{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon, .max_lat = node.max_lat, .max_lon = node.max_lon })) continue;
                 }
                 if (n_out >= out.len)
                     return .{ .items = out[0..n_out], .status = .truncated_capacity };
-                out[n_out] = .{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon, .dist2 = d2 };
+                out[n_out] = .{ .value = node.data, .lat = node.min_lat, .lon = node.min_lon, .max_lat = node.max_lat, .max_lon = node.max_lon, .dist2 = d2 };
                 n_out += 1;
             } else {
                 var c: u32 = 0;
                 while (c < node.child_count) : (c += 1) {
                     const child_index = std.math.add(u32, node.data, c) catch return error.Corrupt;
                     const ch = try self.nodes.child(node, child_index);
-                    const bd2 = if (ch.leaf)
-                        pointDist2(lat, lon, ch.min_lat, ch.min_lon, qk)
-                    else
-                        boxDist2(lat, lon, ch.min_lat, ch.max_lat, ch.min_lon, ch.max_lon, qk);
+                    const bd2 = if (ch.leaf) rk.leaf(ch) else rk.box(ch.min_lat, ch.max_lat, ch.min_lon, ch.max_lon);
                     // A leaf child is tested exactly when popped; here only prune
                     // internal subtrees (and leaves clearly out of range).
                     if (bd2 <= prune2 or bd2 != bd2) {
@@ -310,16 +346,18 @@ pub const Frozen = struct {
     // whose bbox is farther away. So results come out in exact ascending order;
     // a budget cut therefore returns a correct, merely shorter, prefix.
     //
-    // Ranking metric (documented in README/SPEC): an equirectangular
+    // Ranking metric (documented in README/SPEC): by default an equirectangular
     // approximation scaled by cos(query latitude). With qk = cos(qlat):
-    //   dx = (lon - qlon) * qk ;  dy = lat - qlat ;  dist2 = dx*dx + dy*dy
-    // The node bbox lower bound is the squared distance from the (scaled) query
-    // point to the (scaled) axis-aligned node rectangle — a true lower bound in
-    // that metric, so pruning never drops a real neighbour. Total order used for
-    // ties: (dist2 asc, value asc, lat asc, lon asc); equal keys are identical
-    // points. See SPEC.md for why great-circle is deferred.
+    //   dx = wrap(lon - qlon) * qk ;  dy = lat - qlat ;  dist2 = dx*dx + dy*dy
+    // (`wrap`: the longitude difference the short way round, into [-180, 180]). The node bbox
+    // lower bound is the squared distance from the (scaled) query point to the (scaled)
+    // axis-aligned node rectangle, over the three copies of the box a turn of longitude apart — a
+    // true lower bound in that metric, so pruning never drops a real neighbour. With
+    // `QueryOptions.metric = .great_circle` the distance is haversine in metres and the bound
+    // the great-circle distance to the rectangle. Total order used for ties: (dist2 asc, value
+    // asc, lat asc, lon asc); equal keys are identical items. See SPEC.md.
 
-    /// The `k` nearest indexed points to `(lat, lon)`, ascending by distance,
+    /// The `k` nearest indexed items to `(lat, lon)`, ascending by distance,
     /// into `out` (need `k` slots). `scratch` is the heap workspace; size it via
     /// `knnScratchLen` — too small yields `error.ScratchTooSmall`. No allocation.
     pub fn knn(
@@ -335,12 +373,12 @@ pub const Frozen = struct {
         if (want == 0 or self.header.item_count == 0)
             return .{ .items = out[0..0], .status = .complete };
 
-        const qk = std.math.cos(lat * std.math.pi / 180.0);
+        const rk = Ranker.init(opts.metric, lat, lon);
         var heap = Heap{ .buf = scratch };
 
         // Seed with the root — as a point if it is itself a leaf, else as a node.
         const root = try self.nodes.at(self.header.root_index);
-        try heap.push(seedEntry(root, lat, lon, qk));
+        try heap.push(seedEntry(root, rk));
 
         var n_out: usize = 0;
         var visited: usize = 0;
@@ -353,9 +391,9 @@ pub const Frozen = struct {
             const e = heap.pop();
             if (e.is_point) {
                 if (opts.filter) |flt| {
-                    if (!flt.keep(.{ .value = e.value, .lat = e.lat, .lon = e.lon })) continue;
+                    if (!flt.keep(.{ .value = e.value, .lat = e.lat, .lon = e.lon, .max_lat = e.max_lat, .max_lon = e.max_lon })) continue;
                 }
-                out[n_out] = .{ .value = e.value, .lat = e.lat, .lon = e.lon, .dist2 = e.dist2 };
+                out[n_out] = .{ .value = e.value, .lat = e.lat, .lon = e.lon, .max_lat = e.max_lat, .max_lon = e.max_lon, .dist2 = e.dist2 };
                 n_out += 1;
             } else {
                 const node = try self.nodes.at(e.node_index);
@@ -363,7 +401,7 @@ pub const Frozen = struct {
                 while (c < node.child_count) : (c += 1) {
                     const child_index = std.math.add(u32, node.data, c) catch return error.Corrupt;
                     const ch = try self.nodes.child(node, child_index);
-                    try heap.push(seedEntry(ch, lat, lon, qk));
+                    try heap.push(seedEntry(ch, rk));
                 }
             }
         }
@@ -381,26 +419,30 @@ pub fn knnScratchLen(k: usize, fanout: u16, item_count: u64) usize {
     return @intCast(@min(cap, item_count + fanout + 8));
 }
 
-/// Build the heap entry for a node view: a point entry for a leaf (exact point
-/// distance), a node entry for an internal node (bbox lower-bound distance).
-fn seedEntry(node: format.NodeView, qlat: f64, qlon: f64, qk: f64) HeapEntry {
+/// Build the heap entry for a node view: a point entry for a leaf (exact distance to the
+/// point or rectangle), a node entry for an internal node (bbox lower-bound distance).
+fn seedEntry(node: format.NodeView, rk: Ranker) HeapEntry {
     if (node.leaf) {
         return .{
-            .dist2 = pointDist2(qlat, qlon, node.min_lat, node.min_lon, qk),
+            .dist2 = rk.leaf(node),
             .is_point = true,
             .node_index = 0,
             .value = node.data,
             .lat = node.min_lat,
             .lon = node.min_lon,
+            .max_lat = node.max_lat,
+            .max_lon = node.max_lon,
         };
     }
     return .{
-        .dist2 = boxDist2(qlat, qlon, node.min_lat, node.max_lat, node.min_lon, node.max_lon, qk),
+        .dist2 = rk.box(node.min_lat, node.max_lat, node.min_lon, node.max_lon),
         .is_point = false,
         .node_index = node.index,
         .value = 0,
         .lat = 0,
         .lon = 0,
+        .max_lat = 0,
+        .max_lon = 0,
     };
 }
 
@@ -423,19 +465,113 @@ fn boxesIntersect(
         a_max_lon >= b_min_lon and a_min_lon <= b_max_lon;
 }
 
-fn pointDist2(qlat: f64, qlon: f64, lat: f64, lon: f64, qk: f64) f64 {
-    const dy = lat - qlat;
-    const dx = (lon - qlon) * qk;
-    return dx * dx + dy * dy;
+/// Mean Earth radius of geoflatbush (6371 km), in metres.
+const earth_radius_m: f64 = 6_371_000.0;
+const rad: f64 = std.math.pi / 180.0;
+
+/// A longitude difference taken the short way round: into [-180, 180].
+fn wrapLon(d: f64) f64 {
+    return d - 360.0 * @round(d / 360.0);
 }
 
-/// Squared distance from the (scaled) query point to a (scaled) axis-aligned
-/// node rectangle — a lower bound on the distance to any point it contains.
-fn boxDist2(qlat: f64, qlon: f64, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64, qk: f64) f64 {
-    const dy = axisGap(qlat, min_lat, max_lat);
-    const dx = axisGap(qlon * qk, min_lon * qk, max_lon * qk);
-    return dx * dx + dy * dy;
-}
+/// One query point and the metric it is measured in: every distance `within` and `knn` compare
+/// comes from here, so the ranking, the pruning lower bounds and the final distances agree.
+const Ranker = struct {
+    metric: Metric,
+    qlat: f64,
+    qlon: f64,
+    /// `.planar`: cos(query latitude). `.great_circle`: cos of it too (a haversine term).
+    qk: f64,
+
+    fn init(metric: Metric, lat: f64, lon: f64) Ranker {
+        return .{ .metric = metric, .qlat = lat, .qlon = lon, .qk = std.math.cos(lat * std.math.pi / 180.0) };
+    }
+
+    /// Slack added to a radius before pruning against a lower bound, against rounding.
+    fn pad(r: Ranker) f64 {
+        return switch (r.metric) {
+            .planar => 1e-9,
+            .great_circle => 1e-3,
+        };
+    }
+
+    /// Squared distance to a leaf: its point, or the nearest point of its rectangle.
+    fn leaf(r: Ranker, n: format.NodeView) f64 {
+        if (n.min_lat == n.max_lat and n.min_lon == n.max_lon) return r.point(n.min_lat, n.min_lon);
+        return r.box(n.min_lat, n.max_lat, n.min_lon, n.max_lon);
+    }
+
+    /// Squared distance to a point.
+    fn point(r: Ranker, lat: f64, lon: f64) f64 {
+        switch (r.metric) {
+            .planar => {
+                const dy = lat - r.qlat;
+                const dx = wrapLon(lon - r.qlon) * r.qk;
+                return dx * dx + dy * dy;
+            },
+            .great_circle => {
+                const d = r.sphere(lat, lon);
+                return d * d;
+            },
+        }
+    }
+
+    /// Haversine distance in metres to a point.
+    fn sphere(r: Ranker, lat: f64, lon: f64) f64 {
+        const sdl = @sin(wrapLon(lon - r.qlon) * rad / 2);
+        const sdp = @sin((lat - r.qlat) * rad / 2);
+        const h = sdp * sdp + r.qk * std.math.cos(lat * rad) * sdl * sdl;
+        return 2 * earth_radius_m * std.math.asin(@sqrt(@min(h, 1.0)));
+    }
+
+    /// Squared distance from the query point to a rectangle: a lower bound on the distance to
+    /// anything inside it, and the exact distance to a rectangle item.
+    fn box(r: Ranker, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) f64 {
+        switch (r.metric) {
+            .planar => {
+                const dy = axisGap(r.qlat, min_lat, max_lat);
+                // Across the antimeridian a box may be nearer by a whole turn of longitude.
+                var dx = axisGap(r.qlon * r.qk, min_lon * r.qk, max_lon * r.qk);
+                dx = @min(dx, axisGap(r.qlon * r.qk, (min_lon - 360.0) * r.qk, (max_lon - 360.0) * r.qk));
+                dx = @min(dx, axisGap(r.qlon * r.qk, (min_lon + 360.0) * r.qk, (max_lon + 360.0) * r.qk));
+                return dx * dx + dy * dy;
+            },
+            .great_circle => {
+                const d = r.sphereBox(min_lat, max_lat, min_lon, max_lon);
+                return d * d;
+            },
+        }
+    }
+
+    /// Great-circle distance in metres to a lat/lon rectangle. Inside its longitudes the nearest
+    /// point is on the query's meridian (the latitude gap, or 0); outside them it is on one of
+    /// the two edge meridians: the foot of the perpendicular when it falls within the edge, else
+    /// an end of it.
+    fn sphereBox(r: Ranker, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) f64 {
+        const t = @mod(r.qlon - min_lon, 360.0);
+        if (max_lon - min_lon >= 360.0 or t <= max_lon - min_lon) {
+            const gap = axisGap(r.qlat, min_lat, max_lat);
+            return earth_radius_m * gap * rad;
+        }
+        return @min(r.meridianDist(min_lon, min_lat, max_lat), r.meridianDist(max_lon, min_lat, max_lat));
+    }
+
+    /// Distance in metres to the meridian arc at `lon` between two latitudes.
+    fn meridianDist(r: Ranker, lon: f64, lo: f64, hi: f64) f64 {
+        var best = @min(r.sphere(lo, lon), r.sphere(hi, lon));
+        const dl = wrapLon(lon - r.qlon) * rad;
+        const c = @cos(dl);
+        if (c > 0) {
+            // The foot of the perpendicular from the query to the meridian's great circle.
+            const foot = std.math.atan(@tan(r.qlat * rad) / c) / rad;
+            if (foot >= lo and foot <= hi) {
+                const s = std.math.asin(@min(r.qk * @abs(@sin(dl)), 1.0));
+                best = @min(best, earth_radius_m * s);
+            }
+        }
+        return best;
+    }
+};
 
 fn axisGap(v: f64, lo: f64, hi: f64) f64 {
     if (v < lo) return lo - v;
@@ -454,6 +590,8 @@ pub const HeapEntry = struct {
     value: u32,
     lat: f64,
     lon: f64,
+    max_lat: f64,
+    max_lon: f64,
 };
 
 /// Total order for the heap. Primary key: distance ascending. At an equal
@@ -512,6 +650,12 @@ const Heap = struct {
 
 const builder = @import("builder.zig");
 const testing = std.testing;
+
+/// The planar ranking distance, as the tests below state it (`qk` is cos of the query latitude).
+fn pointDist2(qlat: f64, qlon: f64, lat: f64, lon: f64, qk: f64) f64 {
+    _ = qk;
+    return Ranker.init(.planar, qlat, qlon).point(lat, lon);
+}
 
 fn build(points: []const builder.Point) ![]u8 {
     return builder.freezeFromPoints(testing.allocator, testing.allocator, points);
@@ -995,4 +1139,40 @@ test "filter: rejecting everything yields empty results with complete status" {
     const kr = try f.knn(0, 0, 10, &n_out, &scratch, .{ .filter = flt });
     try testing.expectEqual(@as(usize, 0), kr.items.len);
     try testing.expectEqual(KnnStatus.complete, kr.status);
+}
+
+test "Ranker.box is a lower bound on the distance to every point inside the box, in both metrics" {
+    var prng = std.Random.DefaultPrng.init(99);
+    const rnd = prng.random();
+    for ([_]Metric{ .planar, .great_circle }) |metric| {
+        for (0..400) |_| {
+            const lat0 = rnd.float(f64) * 180 - 90;
+            const lon0 = rnd.float(f64) * 360 - 180;
+            const min_lat = lat0;
+            const max_lat = @min(90, lat0 + rnd.float(f64) * 60);
+            const min_lon = lon0;
+            const max_lon = @min(180, lon0 + rnd.float(f64) * 200);
+            const qlat = rnd.float(f64) * 180 - 90;
+            const qlon = rnd.float(f64) * 360 - 180;
+            const rk = Ranker.init(metric, qlat, qlon);
+            const bound = rk.box(min_lat, max_lat, min_lon, max_lon);
+            var best: f64 = std.math.inf(f64);
+            const steps = 16;
+            for (0..steps + 1) |i| {
+                for (0..steps + 1) |j| {
+                    const lat = min_lat + (max_lat - min_lat) * @as(f64, @floatFromInt(i)) / steps;
+                    const lon = min_lon + (max_lon - min_lon) * @as(f64, @floatFromInt(j)) / steps;
+                    best = @min(best, rk.point(lat, lon));
+                }
+            }
+            // Never above the nearest sampled point (up to rounding) ...
+            try testing.expect(bound <= best * (1 + 1e-9) + 1e-6);
+            // ... and the nearest sampled point is not far above it (the bound is the exact distance, not merely valid).
+            const tol: f64 = switch (metric) {
+                .planar => 4 * 4 * 2, // degrees squared: a sampling cell is at most (200/16)° wide
+                .great_circle => 1.2e13, // metres squared: 3.5e6 m
+            };
+            if (bound == 0) try testing.expect(best <= tol) else try testing.expect(@sqrt(best) - @sqrt(bound) <= @sqrt(tol));
+        }
+    }
 }

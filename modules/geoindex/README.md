@@ -44,14 +44,18 @@ packed-Hilbert-R-tree bulk-load idea. No source consulted or copied.
   zero-area rectangle (`min == max` on both axes) is a valid point query. Pass
   `min_lat <= max_lat` (an inverted latitude range matches nothing). **`min_lon > max_lon`
   is an antimeridian-wrapping rectangle** (`[min_lon, 180] ∪ [-180, max_lon]`, no
-  duplicates, shared buffer/budget/filter); `within`/kNN are not wrap-aware (see `SPEC.md`).
-- **kNN distance is an equirectangular approximation** scaled by
-  `cos(query latitude)`: `dx = (lon − qlon)·cos(qlat)`, `dy = lat − qlat`,
-  `dist2 = dx² + dy²`. This is a monotone proxy for great-circle distance,
-  accurate for local/regional queries (the RÚIAN consumer) and degrading at
-  continental scale / near the poles. `Neighbor.dist2` is that **squared metric**
-  value, **not metres**. **Tie-break** (total order): `dist2` ascending, then
+  duplicates, shared buffer/budget/filter); `within`/kNN measure longitude the short way round the antimeridian.
+- **kNN and `within` distance.** By default (`QueryOptions.metric = .planar`) an equirectangular
+  approximation scaled by `cos(query latitude)`: `dx = wrap(lon − qlon)·cos(qlat)` (the short way round the
+  antimeridian), `dy = lat − qlat`, `dist2 = dx² + dy²`: a monotone proxy for great-circle distance, accurate
+  for local/regional queries (the RÚIAN consumer) and degrading at continental scale / near the poles;
+  `Neighbor.dist2` is that **squared metric** value, **not metres**. `.metric = .great_circle` ranks by
+  haversine on a 6371 km sphere and reports **metres** (`radius` in metres, `Neighbor.dist()` the distance),
+  correct near the poles and across the dateline. **Tie-break** (total order): `dist2` ascending, then
   `value`, then `lat`, then `lon` — so equal-distance results are deterministic.
+- **Rectangles.** `Builder.addBox(min_lat, min_lon, max_lat, max_lon, value)` indexes a rectangle (footprint,
+  tile); `bbox` finds it when the query rectangle meets it, `knn`/`within` rank it by its distance to the
+  query point (0 inside); `Match`/`Neighbor` carry `max_lat`/`max_lon` (`isPoint()`).
 - **Bounded work / DoS guard:** both queries take `QueryOptions.max_visited` (a
   node-decode budget, default 100 000). `bbox` reports `.truncated_budget` (or
   `.truncated_capacity` if the result buffer fills first) instead of walking the
@@ -90,7 +94,7 @@ const kr = try f.knn(49.2, 16.6, 10, &near, &scratch, .{});
 
 // within — everything within `radius` of (lat, lon), unordered, with dist2.
 // The radius is in the kNN ranking metric (degrees of latitude, longitude scaled
-// by cos(query lat)), NOT metres: the module has no great-circle distance.
+// by cos(query lat)); pass `.{ .metric = .great_circle }` for a radius in metres.
 var around: [256]geoindex.Neighbor = undefined;
 const wr = try f.within(49.2, 16.6, 0.05, &around, .{}); // wr.status as for bbox
 
@@ -125,8 +129,7 @@ model.
 
 ## Not provided
 
-Points only (no rectangle items), no great-circle metric or results in metres (kNN and `within` use the
-equirectangular ranking metric; only `bbox` wraps the antimeridian), `u32` payloads only. Each is listed, with its reason, under `SPEC.md` § Backlog / deferred.
+`u32` payloads only; STR packing, fixed-point storage and an out-of-core build (the reference has none of them). Each is named, with its reason, in `SPEC.md` § What is deliberately not done.
 
 ## Verify
 

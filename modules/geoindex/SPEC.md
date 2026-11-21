@@ -38,7 +38,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [uber/h3](https://github.com/uber/h3) / [google/s2geometry](https://github.com/google/s2geometry) | C / C++ | Apache-2.0 | 6.6k / 2.7k | v4.5.0 (2026-05-21) / v0.14.0 (2026-04-23) | Spherical cell indexes (hex / quad cells) rather than trees; cover-and-radius queries, exact spherical geometry *(inferred)*. |
 | Zig ecosystem | Zig | MIT | 0-6 | 2024-2025 | `nDimensional/zig-rtree` (MIT, 0 stars, "Generic RTree for Zig vectors") and `archaistvolts/kd-tree` (MIT, 6 stars): in-memory, no frozen format. No Zig geo index with a file format found (`gh search repos`: rtree / kd-tree / spatial index). |
 
-**Where we are ahead:** the only Zig frozen, zero-copy (mmap-able), versioned and checksummed spatial index found; bounded work (`max_visited`) with truncated-prefix semantics so an attacker query cannot walk the set; no query-side allocation; exact f64 round trip; tested against a linear-scan oracle including pole/antimeridian extremes and against a corrupt-buffer fuzz harness. **Where we are behind:** no rectangle/extent items, no max-distance cap on `knn` itself (`within` is the radius query), the kNN and `within` metric is an equirectangular approximation (not haversine, results not in metres) and only `bbox` wraps the antimeridian, payload `u32` only.
+**Where we are ahead:** the only Zig frozen, zero-copy (mmap-able), versioned and checksummed spatial index found; bounded work (`max_visited`) with truncated-prefix semantics so an attacker query cannot walk the set; no query-side allocation; exact f64 round trip; tested against a linear-scan oracle including pole/antimeridian extremes and against a corrupt-buffer fuzz harness. **Where we are behind:** no max-distance cap on `knn` itself (`within` is the radius query), payload `u32` only. Built since the survey: rectangle items (`Builder.addBox`), great-circle (haversine, metres) `knn` and `within`, the antimeridian-aware planar metric, a clamped build-time fan-out.
 
 ## Design decision — packed Hilbert R-tree vs Z-order array vs grid
 
@@ -74,13 +74,12 @@ the same robustness lever the sibling `trie` module leans on. A Z-order array
 would lean on `binary-search + range` bounds instead; workable, but the R-tree's
 monotone-index proof is simpler to audit.
 
-Deferred refinements (STR bulk-load bbox tightening, wider fan-out tuning,
-great-circle metric) are listed under *Backlog / deferred*; none change the query API or callers.
+Refinements the reference does not have (STR bulk-load, fixed-point coordinates, an out-of-core build) are named in *What is deliberately not done*.
 
 ### Cost model
 
 - **Memory (frozen):** header 40 B + `node_count` × 39 B. `node_count ≈
-  item_count × fanout/(fanout−1) ≈ 1.07 × item_count` at `fanout = 16` → ~42 B
+  item_count × fanout/(fanout−1) ≈ 1.07 × item_count` at the default `fanout = 16` (`Builder.fanout`, clamped to 2..65535 as Flatbush clamps its `nodeSize`; a wider fan-out is fewer, bigger nodes) → ~42 B
   per point.
 - **Build:** O(N log N) — dominated by the Hilbert sort; the pack is O(N). Held in
   a few growable arrays (point pool + node pool), a handful of allocations total.
@@ -101,11 +100,11 @@ pattern, also little-endian. The buffer is `header ++ node_region`.
 | 0  | 4 | `magic`         | ASCII `"ZGI1"` |
 | 4  | 2 | `version`       | format version = 1 |
 | 6  | 2 | `endian_marker` | `0x0102` — detects a wrong-endian / garbage load |
-| 8  | 4 | `flags`         | reserved, currently 0 |
+| 8  | 4 | `flags`         | bit 0 = at least one leaf is a rectangle (`Builder.addBox`; informational, a leaf record carries its own box); the rest reserved, 0 |
 | 12 | 4 | `node_count`    | number of node records |
 | 16 | 2 | `node_bytes`    | record stride = 39 (validated on load) |
-| 18 | 2 | `fanout`        | build-time R-tree fan-out (informational) |
-| 20 | 8 | `item_count`    | number of indexed points |
+| 18 | 2 | `fanout`        | build-time R-tree fan-out, 2..65535 (informational) |
+| 20 | 8 | `item_count`    | number of indexed items (points and rectangles) |
 | 28 | 4 | `root_index`    | index of the root node record |
 | 32 | 4 | `body_crc`      | CRC-32 of the node region (checked by `loadVerified`) |
 | 36 | 4 | `header_crc`    | CRC-32 of bytes `[0..36)` |
@@ -129,8 +128,8 @@ Each 39-byte record:
 
 | off | size | field | meaning |
 |----:|-----:|-------|---------|
-| 0  | 1 | `flags`       | bit0 = leaf (record is a single indexed point) |
-| 1  | 8 | `min_lat`     | bounding box; for a leaf `min == max == the point` |
+| 0  | 1 | `flags`       | bit0 = leaf (record is a single indexed item: a point, or a rectangle) |
+| 1  | 8 | `min_lat`     | bounding box; for a leaf the item's own: `min == max == the point`, or a rectangle's corners |
 | 9  | 8 | `min_lon`     | |
 | 17 | 8 | `max_lat`     | |
 | 25 | 8 | `max_lon`     | |
@@ -151,10 +150,20 @@ Each 39-byte record:
 - **Antimeridian.** `bbox` with `min_lon > max_lon` is a rectangle wrapping across
   ±180° and is answered as `[min_lon, 180] ∪ [-180, max_lon]` (two disjoint
   passes: no duplicates; shared output buffer, visit budget and filter; status of
-  the first truncating pass). `within` and the kNN metric take no rectangle and still measure raw
-  longitude difference, so a query point and a candidate on opposite sides of the
-  antimeridian are treated as far apart even if geographically near — a documented
-  limitation, not a silent wrong answer (wrap-aware distance is under *Backlog / deferred*).
+  the first truncating pass). `within` and `knn` measure the longitude difference the
+  short way round, in both metrics (geoflatbush does; a query at -179.95° finds a point at 179.9°
+  0.15° away, not 359.85°), and the pruning bound looks at the box and the copies of it a turn of
+  longitude away. A rectangle ITEM does not wrap (`addBox` refuses `min_lon > max_lon`): a footprint
+  across the antimeridian is two items.
+- **Rectangles (Flatbush's main case).** `Builder.addBox(min_lat, min_lon, max_lat, max_lon, value)` adds a
+  rectangle (edges inclusive; `error.InvertedBox` for a minimum above its maximum); the leaf record is the
+  same 39 bytes with its own box, so the format has no new field (header `flags` bit 0 says a rectangle is
+  present, for tools; a reader from before rectangles reads such a leaf as a point at its minimum corner).
+  Items are Hilbert-sorted by their box centre. `bbox` returns every item whose box meets the query rectangle
+  (`Match.max_lat`/`max_lon` carry the extent, `isPoint()` tells the two apart); `knn` and `within` rank an
+  item by the distance to the nearest point of its box, 0 inside it; a point is a degenerate box and its
+  distance is computed as before (bit-identical). Spec reference: Flatbush `add(minX, minY, maxX, maxY)`,
+  `search`, `neighbors`.
 - **Hilbert grid.** Points are mapped into a 65536×65536 grid spanning the data's
   overall bounding box for the Hilbert sort. A zero-width axis (all points share
   a latitude/longitude) collapses to grid column/row 0 — no divide-by-zero. The
@@ -172,37 +181,42 @@ always yields either the next-nearest point (emit) or the nearest unexplored nod
 results come out in exact ascending order and a budget cut returns a correct
 prefix.
 
-The metric is an **equirectangular approximation** scaled by the cosine of the
-query latitude. With `qk = cos(qlat)`:
+By default (`QueryOptions.metric = .planar`) the metric is an **equirectangular approximation** scaled by the
+cosine of the query latitude. With `qk = cos(qlat)` and `wrap` the longitude difference taken the short way
+round (into [-180, 180]):
 
 ```
-dx = (lon − qlon) · qk ;  dy = lat − qlat ;  dist2 = dx·dx + dy·dy
+dx = wrap(lon − qlon) · qk ;  dy = lat − qlat ;  dist2 = dx·dx + dy·dy
 ```
 
-Because `qk` is a single constant per query, this is an anisotropic linear
-scaling of the (lon, lat) plane, so the squared distance from the scaled query
-point to a scaled axis-aligned node rectangle is a **true lower bound** on the
-distance to any point in that box → pruning never drops a real neighbour, and the
-oracle can reproduce the identical f64 arithmetic bit-for-bit. `dist2` is a
-ranking key in this metric (degrees²), **not metres**. Ties break by
-`(dist2, value, lat, lon)` ascending — a total order (any remaining equal keys
-are identical points, so the output is deterministic).
+Because `qk` is a single constant per query, this is an anisotropic linear scaling of the (lon, lat) plane, so
+the squared distance from the scaled query point to a scaled axis-aligned node rectangle is a **true lower
+bound** on the distance to any point in that box (taken over the box and its copies a turn of longitude away,
+so the bound holds across the antimeridian) → pruning never drops a real neighbour, and the oracle can
+reproduce the identical f64 arithmetic bit-for-bit. `dist2` is a ranking key in this metric (degrees²), **not
+metres**. Ties break by `(dist2, value, lat, lon)` ascending — a total order (any remaining equal keys are
+identical items, so the output is deterministic).
 
-**Great-circle / haversine is deferred.** It would need a haversine box
-lower-bound (distance from a point to a lat/lon rectangle on the sphere), which
-is more involved and, more importantly, would make oracle/index bit-exact
-agreement harder to guarantee. The equirectangular metric matches great-circle
-ordering closely for the regional queries this index targets.
+**Great circle** (`QueryOptions.metric = .great_circle`; geoflatbush's `around`): haversine distance on a
+sphere of radius 6371 km, in **metres** (`radius` in metres, `Neighbor.dist2` metres squared,
+`Neighbor.dist()` the metres). Correct at any latitude, over the poles and across the antimeridian. The node
+bound is the great-circle distance from the query to the rectangle: inside the rectangle's longitudes the latitude gap on
+the query's meridian, else, for each of the two edge meridians, the foot of the perpendicular from the query when
+it falls within the edge and the distance to its two ends otherwise (the exact distance to the box; the same
+function ranks a rectangle item). Tested against a textbook haversine scan over the whole map, the poles and the
+dateline, and `Ranker.box` against dense samples of the box in both metrics. The index is
+bit-compared to its oracle in the planar metric; in this one results agree to rounding (a haversine
+scan and the index may order two items within a millimetre either way).
 
 ## Radius and filter queries
 
-- **`within(lat, lon, radius, out, opts)`** (kdbush `within`, geoflatbush `maxDistance`): every point whose
-  distance in the kNN ranking metric is `<= radius`. The radius is therefore in **degrees of latitude**
-  (longitude difference scaled by `cos(query latitude)`), not metres: the module has no great-circle
-  distance. Each result is a `Neighbor` carrying `dist2` (squared metric distance, `<= radius^2`); the
+- **`within(lat, lon, radius, out, opts)`** (kdbush `within`, geoflatbush `maxDistance`): every item whose
+  distance in `opts.metric` is `<= radius`. In the default `.planar` metric the radius is in **degrees of
+  latitude** (longitude difference scaled by `cos(query latitude)`), not metres; with `.great_circle` it is
+  **metres**. Each result is a `Neighbor` carrying `dist2` (squared distance, `<= radius^2`); the
   order is unspecified (depth-first), sort by `dist2` if it matters. A negative or NaN radius, or NaN
-  query coordinates, match nothing; radius 0 matches the points exactly at the query. Subtrees whose
-  box lower bound exceeds the radius (padded by 1e-9 degrees against rounding) are pruned. Status,
+  query coordinates, match nothing; radius 0 matches the items exactly at the query. Subtrees whose
+  box lower bound exceeds the radius (padded by 1e-9 degrees, or 1 mm, against rounding) are pruned. Status,
   capacity and the `max_visited` budget behave as for `bbox` (`WithinStatus` is `BboxStatus`); an empty
   `out` over a non-empty index is `.truncated_capacity`. No allocation.
 - **`QueryOptions.filter`** (geoflatbush `filterFn`): a `Filter{ ctx, func }` predicate over a candidate
@@ -256,6 +270,7 @@ authenticity matters.
 Run: `scripts/modtest geoindex`. Tests live in `src/root.zig` (oracle and controls), `src/query.zig`,
 `src/format.zig`, `src/builder.zig` and `src/fuzz_test.zig`.
 
+- **Rectangles, great circle, antimeridian, fan-out** (`src/extent_test.zig`, `Ranker` test in `query.zig`): `bbox` over mixed points and rectangles equal to a scan with the extents returned; `knn` and `within` over rectangles equal to a clamped-distance scan; the great-circle `knn` and `within` against a textbook haversine scan (and a sampled-boundary distance for rectangles) over the whole map with queries at the poles and on the dateline; a planar `knn` across ±180°; eight fan-out values (0, 1, 2, 3, 7, 16, 100, 65535) giving one answer; `Ranker.box` never above the nearest of 289 samples in the box, in both metrics, and within a stated gap of it; `addBox` refusals.
 - **Differential oracle** (`Oracle` in `src/root.zig`, the card's `**Model:**` line): a naive linear-scan
   reference computes the true bbox-membership multiset and the true kNN (exact distances, identical
   metric and tie-break) and must agree exactly with the index over randomized point sets and queries:
@@ -293,23 +308,22 @@ Run: `scripts/modtest geoindex`. Tests live in `src/root.zig` (oracle and contro
 
 **What the tests actually contain.** in-process Hilbert R-tree; naive linear-scan self oracle only (SPEC.md)
 
+## What is deliberately not done
+
+- **STR (Sort-Tile-Recursive) bulk-load:** the reference (Flatbush) packs by Hilbert order too; STR would tile the plane
+  first for slightly tighter leaf boxes. Not something a user of the reference expects, and the single-axis
+  Hilbert order already gives good locality.
+- **Fixed-point coordinate storage:** halves box bytes at the cost of a lossy round trip; the reference
+  stores floats, and the exact f64 round trip is a feature here (unnecessary at RÚIAN scale).
+- **A dense root fan-out table, SIMD node scans:** the fan-out is a build-time choice (`Builder.fanout`, 2..65535,
+  recorded in the header); the decoder reads `child_count` per node. A faster scan is a measurement-led change with no
+  consumer asking, and Flatbush has none.
+- **An on-disk / larger-than-RAM build:** the reference builds in memory; the pack holds the node pool in memory
+  before freezing. A frozen buffer is mmap-able for queries, which is where the scale is.
+- **Payloads wider than `u32`:** Flatbush's payload is the item's position; callers store a `u32` record id and
+  indirect through their own table (as the sibling `trie` does).
+
 ## Backlog / deferred
 
-- **Great-circle (haversine) kNN and `within`, results in metres** — `Neighbor.dist2` is an unscaled
-  proxy that degrades away from the query latitude and near the poles; geoflatbush returns km. Needs a
-  spherical box lower bound (distance from a point to a lat/lon rectangle on the sphere), and would make
-  bit-exact oracle agreement harder to guarantee. Effort: medium.
-- **Rectangle items (extents)** — Flatbush indexes boxes as its main case (footprints, tiles); this
-  index holds points. Effort: medium-large (format change: leaf boxes).
-- **Wrap-aware kNN/`within` metric** — only `bbox` wraps the antimeridian; distance queries still use
-  the raw longitude difference.
-- **STR (Sort-Tile-Recursive) bulk-load** — tiles the plane before the Hilbert pass for slightly tighter
-  leaf boxes; the current single-axis Hilbert order is simpler and already gives good locality.
-- **Fixed-point coordinate storage** — halves box bytes at the cost of a lossy round trip; unnecessary
-  at RÚIAN scale.
-- **Configurable / SIMD node fan-out and a dense root fan-out table** — the fan-out is fixed at 16; the
-  decoder already reads `child_count` per node, so a build-time change needs no format change.
-- **On-disk / larger-than-RAM build** — the pack currently holds the node pool in memory before
-  freezing.
-- **Payloads wider than `u32`** — callers store a `u32` record id and indirect through their own table
-  (same as the sibling `trie`).
+None open.
+

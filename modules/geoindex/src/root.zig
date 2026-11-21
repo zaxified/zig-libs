@@ -54,6 +54,8 @@ pub const freezeFromPoints = builder.freezeFromPoints;
 pub const BuildError = builder.BuildError;
 pub const FreezeError = builder.FreezeError;
 pub const default_fanout = builder.default_fanout;
+pub const fanout_min = builder.fanout_min;
+pub const fanout_max = builder.fanout_max;
 
 pub const Frozen = query.Frozen;
 pub const Match = query.Match;
@@ -64,6 +66,7 @@ pub const BboxStatus = query.BboxStatus;
 pub const KnnStatus = query.KnnStatus;
 pub const QueryOptions = query.QueryOptions;
 pub const Filter = query.Filter;
+pub const Metric = query.Metric;
 pub const WithinResult = query.WithinResult;
 pub const WithinStatus = query.WithinStatus;
 pub const HeapEntry = query.HeapEntry;
@@ -78,6 +81,7 @@ test {
     _ = @import("format.zig");
     _ = @import("builder.zig");
     _ = @import("query.zig");
+    _ = @import("extent_test.zig");
 }
 
 const testing = std.testing;
@@ -106,8 +110,9 @@ const Oracle = struct {
         const all = try arena.alloc(Neighbor, self.points.len);
         for (self.points, 0..) |p, i| {
             const dy = p.lat - qlat;
-            const dx = (p.lon - qlon) * qk; // identical expression to query.pointDist2
-            all[i] = .{ .value = p.value, .lat = p.lat, .lon = p.lon, .dist2 = dx * dx + dy * dy };
+            const dl = p.lon - qlon;
+            const dx = (dl - 360.0 * @round(dl / 360.0)) * qk; // the same expression as `query.Ranker.point`: the longitude difference the short way round
+            all[i] = .{ .value = p.value, .lat = p.lat, .lon = p.lon, .max_lat = p.lat, .max_lon = p.lon, .dist2 = dx * dx + dy * dy };
         }
         std.mem.sort(Neighbor, all, {}, neighborLess);
         return all[0..@min(k, all.len)];

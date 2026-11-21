@@ -66,6 +66,11 @@ pub const node_size_bytes: usize = 39;
 
 pub const leaf_bit: u8 = 0x01;
 
+/// Header `flags` bit 0: at least one leaf is a rectangle (min != max), added by `Builder.addBox`. Informational: a leaf
+/// record carries its own box, so a reader needs no flag to decode it; a reader from before rectangles reads such a
+/// leaf as a point at its minimum corner.
+pub const flag_extents: u32 = 0x01;
+
 /// Errors returned while decoding a node OR walking the buffer during a query.
 /// `Corrupt` means the frozen buffer is structurally invalid at some index we
 /// tried to follow — the caller loaded a truncated / bit-flipped / hand-crafted
