@@ -557,6 +557,27 @@ pub const SigningKey = struct {
         std.crypto.secureZero(u8, std.mem.asBytes(sk));
     }
 
+    /// `SecretKey.init` straight into the handle: the key is generated (or
+    /// restored) in `dst.sk`, so no other copy of it ever exists and there is
+    /// no wiped source left over. `dst` must already be at its final address.
+    /// On error `dst.sk` holds no secret and nothing is allocated.
+    // secret-api-ok: the seed arrives by pointer and goes only into `dst.sk` through `SecretKey.init` (whose tree build is burned)
+    pub fn initInPlace(
+        dst: *SigningKey,
+        gpa: Allocator,
+        levels: []const Level,
+        seed: *const [n]u8,
+        id: [id_len]u8,
+        restore_at: ?Position,
+        persist: ?Persist,
+    ) InitError!void {
+        try SecretKey.init(&dst.sk, gpa, levels, seed, id, restore_at);
+        dst.home = dst;
+        dst.busy = .init(false);
+        dst.io_mu = .init;
+        dst.persist = persist;
+    }
+
     pub fn deinit(self: *SigningKey) void {
         self.sk.deinit();
     }

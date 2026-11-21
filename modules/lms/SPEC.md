@@ -188,7 +188,9 @@ and every cached node against §5.3's recursive definition.
   returns through an out-param too. `Tree.deinit` and `SecretKey.deinit` wipe the seeds;
   the node cache and the certificates are public hashes and are freed without wiping
   (the probe scans the freed heap to confirm). `SigningKey.init` moves the key from
-  `*SecretKey` and wipes the source. `stackprobe_test.zig` (ReleaseFast only) needles the
+  `*SecretKey` and wipes the source; `SigningKey.initInPlace(dst, gpa, levels, seed,
+  id, restore_at, persist)` generates (or restores) the key directly in the handle, so
+  no source copy exists at all (an error leaves `dst.sk` without a secret). `stackprobe_test.zig` (ReleaseFast only) needles the
   SEED, the HSS child SEED, `x_q[i]` and the OTS chain values for key generation (every
   leaf) and signing (LMS and 2-level HSS), with a negative and a positive control; it is
   0 residue with the burns and finds `x_q` / chain values 240..1503 B deep without them.
@@ -227,6 +229,11 @@ and every cached node against §5.3's recursive definition.
   message digest over the published randomizer `C`, an artefact (the card's Hardening line has the counts).
 - **Dead stack:** `src/stackprobe_test.zig` and `src/stackprobe2_test.zig` (ReleaseFast only), described under
   *Threat notes*.
+- **Verification-only use:** `lmsVerify`/`hssVerify` (`core.zig`) need no allocator and hold no `p * n` array (the
+  chain state is one `n`-byte value). Zig analyses lazily, so a program that calls only them never compiles
+  `sign.zig`: a ReleaseSmall verify-only executable (2026-11-21) carried `core.*` symbols and none from `sign.*`.
+  Stack bound: `hssVerify` stays under 4 KiB on both RFC 8554 Appendix F test cases (`stackprobe2_test.zig`
+  measures how deep it reaches, ReleaseFast).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it. The whole-module run (221 mutants over `core.zig`,
   `sign.zig` and `params.zig`) covered the hash layouts and the four domain separators, `coef` and the checksum, chain
@@ -245,6 +252,14 @@ and every cached node against §5.3's recursive definition.
   `SecretKey.init` failing its allocation, the source of `SigningKey.init` and `deinit` leaving nothing built, and
   a failed rebuild after the path left a parent.
 
+## What is deliberately not done
+
+- **Fast HSS restart (serialised node caches or traversal state).** Every restart rebuilds the top tree and, on the
+  first signature, the current lower trees. Making it cheap needs a documented encoding of the signing state, which is
+  the secret-key serialisation this module declines (a stale cache is not a secret, but a stale *position* is the
+  hazard); `xmss` makes the same call. Pre-generating the next lower tree in a second thread (so the boundary
+  signature is not `O(2^h)`) is a speed item and sits with the parallel key generation in *Backlog*.
+
 ## Backlog / deferred
 
 - **SHA-256/192 and SHAKE256 parameter sets (NIST SP 800-208; the later additional-sets RFC
@@ -253,27 +268,12 @@ and every cached node against §5.3's recursive definition.
   that mandates 192-bit or SHAKE cannot use this module. Moderate: `n`, `m` and the hash
   are module constants (`params.zig`, `core.zig`) and would become parameters; needs the
   new sets' KATs from the standard, not from an implementation. Pure Zig.
-- **Faster HSS restart and signing state** *(survey 2026-09-30)*. Every restart rebuilds
-  the top tree (`2^h0` leaves) and, on the first signature, the current lower trees. A
-  documented serialisation of the node caches, or of the BDS-style traversal state
-  `xmss` keeps, would make a restart cheap; it conflicts with the no-serialisation choice
-  (a stale cache is not a secret, but a stale *position* is the hazard), so it is a decision
-  for the maintainer. Also lower-tree pre-generation in a second thread so the boundary
-  signature is not `O(2^h)`. Pure Zig.
 - **Parallel and hardware-hash key generation** *(survey 2026-09-30)*. cisco/hash-sigs
   threads key generation *(inferred)*; here H20 takes hours. Splitting `subtreeRoot` per
   worker is straightforward (each height-`c` subtree is independent) and `std.Io` group
   primitives fit; SHA-NI use is already up to `std.crypto`. Moderate.
-- **Verification-only build / `no_std` footprint** *(survey 2026-09-30)*. A device that only
-  verifies still links the signing code unless the linker drops it; a `verify`-only entry
-  point with a documented stack bound (`p * 32` is never held: the chain state is one
-  `n`-byte value) is a small follow-up.
 - **A foreign black-box oracle** (a differential run against cisco/hash-sigs's built binary
   through the wire format, not its source), not done for this first version.
-- **`SigningKey.init` takes the `SecretKey` by pointer and wipes it**: the source is zeroed after the move, so
-  its seeds and stale position do not linger, but `deinit` on the zeroed source is still not a no-op the type
-  system prevents. A stricter shape would build the `SecretKey` in place inside the handle
-  (`SigningKey.initInPlace(dst, gpa, levels, seed, id, restore_at, persist)`).
 - **W1/W2 external vectors:** the RFC has none; a foreign implementation's output (as
   oracle) would give them.
 

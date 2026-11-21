@@ -1925,8 +1925,8 @@ xmss	ReleaseFast	sign	1	2	889173339a34ea5d	eb0cb3d6777ae4c6
 # + 2 signs; seed tainted. lms 4 / hss 6 = the LM-OTS chain loop (core.zig `otsSign`)
 # whose count is a digit of Q = H(I||q||D_MESG||C||msg); C is derived from
 # the seed but published in the signature. Same artefact as xmss.
-lms	ReleaseFast	lms	1	4	0aeb1c9960ff528e	570900fe0d49b5a9
-lms	ReleaseFast	hss	1	6	0aeb1c9960ff528e	43dd64bf2e77e52a
+lms	ReleaseFast	lms	1	4	ec1420f9605cb8fe	570900fe0d49b5a9
+lms	ReleaseFast	hss	1	6	ec1420f9605cb8fe	43dd64bf2e77e52a
 # timelock_envelope (2026-10-10) — kdf: s_time + s_pq through deriveKeys and
 # deriveStreamKey: 0. env: Envelope128 seal (randomness + plaintext tainted)
 # and open (HQC dk tainted). 8, none in this module's own code: the AEAD

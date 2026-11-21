@@ -26,3 +26,29 @@ test "STACKPROBE: deriveX and deriveRandomizer leave no secret on the dead stack
     const c = try P.run("core.deriveRandomizer", core.deriveRandomizer, .{ &id, @as(u32, 3), &seed }, &.{&seed}, .{});
     _ = c;
 }
+
+/// The verify-only stack bound SPEC § Verification-only use documents.
+const verify_stack_bound = 4 * 1024;
+
+test "STACKPROBE: hssVerify's stack use stays under the documented bound (verify-only footprint)" {
+    try sp.skipUnlessOptimized();
+    const kat = @import("kat_vectors.zig");
+    const Vec = struct {
+        const tc1_pub = kat.bytes(kat.tc1_pub);
+        const tc1_msg = kat.bytes(kat.tc1_msg);
+        const tc1_sig = kat.bytes(kat.tc1_sig);
+        const tc2_pub = kat.bytes(kat.tc2_pub);
+        const tc2_msg = kat.bytes(kat.tc2_msg);
+        const tc2_sig = kat.bytes(kat.tc2_sig);
+    };
+    const VP = sp.Probe(.{ .window = 32 * 1024 });
+    // Public inputs only: no needles, no burn expected; what is measured is
+    // how deep the call reaches.
+    const r1 = try VP.run("core.hssVerify (RFC 8554 F.1)", core.hssVerify, .{ &Vec.tc1_pub, &Vec.tc1_msg, &Vec.tc1_sig }, &.{}, .{ .burn = false, .residue = false });
+    const r2 = try VP.run("core.hssVerify (RFC 8554 F.2)", core.hssVerify, .{ &Vec.tc2_pub, &Vec.tc2_msg, &Vec.tc2_sig }, &.{}, .{ .burn = false, .residue = false });
+    const depth = @max(r1.dirty_depth, r2.dirty_depth);
+    if (depth == 0 or depth > verify_stack_bound) {
+        std.debug.print("hssVerify reached {d} B of stack (bound {d} B)\n", .{ depth, verify_stack_bound });
+        return error.VerifyStackBound;
+    }
+}

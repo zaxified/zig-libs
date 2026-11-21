@@ -417,6 +417,38 @@ test "SigningKey: a copied handle refuses to sign" {
     _ = try handle.sign("x", buf);
 }
 
+test "SigningKey.initInPlace: the same key as SecretKey.init + SigningKey.init, no source copy; errors hold no secret" {
+    const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
+    var sk: lms.SecretKey = undefined;
+    try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(7), idOf(7), null);
+    var a: lms.SigningKey = undefined;
+    lms.SigningKey.init(&a, &sk, null);
+    defer a.deinit();
+    var b: lms.SigningKey = undefined;
+    try lms.SigningKey.initInPlace(&b, gpa, &levels, &seedOf(7), idOf(7), null, null);
+    defer b.deinit();
+    try std.testing.expectEqualSlices(u8, &a.sk.publicKey().toBytes(), &b.sk.publicKey().toBytes());
+    const buf_a = try gpa.alloc(u8, a.sk.signatureLength());
+    defer gpa.free(buf_a);
+    const buf_b = try gpa.alloc(u8, b.sk.signatureLength());
+    defer gpa.free(buf_b);
+    for (0..3) |_| {
+        const sa = try a.sign("in place", buf_a);
+        const sb = try b.sign("in place", buf_b);
+        try std.testing.expectEqualSlices(u8, sa, sb);
+        try std.testing.expect(b.sk.publicKey().verify("in place", sb));
+    }
+    // Restored at a position, as SecretKey.init is.
+    var c: lms.SigningKey = undefined;
+    try lms.SigningKey.initInPlace(&c, gpa, &levels, &seedOf(7), idOf(7), b.position(), null);
+    defer c.deinit();
+    try std.testing.expectEqual(b.position().q, c.position().q);
+    // An error leaves no secret in the handle.
+    var d: lms.SigningKey = undefined;
+    try std.testing.expectError(error.InvalidLevels, lms.SigningKey.initInPlace(&d, gpa, &.{}, &seedOf(7), idOf(7), null, null));
+    try std.testing.expect(std.mem.allEqual(u8, &d.sk.seed, 0));
+}
+
 test "deinit wipes the seeds" {
     const levels = @as([2]Level, @splat(.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 }));
     var sk: lms.SecretKey = undefined;
