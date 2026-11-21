@@ -66,6 +66,12 @@ defer px.deinit(gpa);
 // From a reader, in constant memory (Go's MatchReader / FindReaderIndex).
 const hit = try re.isMatchReader(&file_reader.interface);
 
+// As a byte-stepping automaton over whole keys (the shape `trie.search` takes).
+const au = try regex.ByteAutomaton.init(&re);
+var st = au.start();
+for (key) |b| st = au.accept(st, b);
+const whole = au.isMatch(st);
+
 // Rust's grammar; its bytes mode (`regex::bytes`); many patterns in one pass.
 var ru = try regex.Regex.compileOptions(gpa, "(?x) \\b{start} \\w+ (?<n>\\d+)", .{ .syntax = .rust });
 var raw = try regex.Regex.compileOptions(gpa, "(?-u:\\xff)[a-z]+", .{ .syntax = .rust, .utf8 = false });

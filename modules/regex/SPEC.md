@@ -222,6 +222,18 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   sequence left unread), so the reader is never read more than three code points past a match.
   No prefilter skipping (the bytes would have to be read anyway). A reader error before the
   answer is settled is `error.ReadFailed`; after it, the answer stands.
+  A bytes-mode `Regex` reads byte by byte through a window of the last and next four bytes
+  (`BytesReader`: what `bytesBefore` and the sequence decoder look at), so the same engines
+  serve a slice and a reader.
+- **`ByteAutomaton`** (`Regex` as a byte-stepping automaton over whole keys): the shape `trie.search`
+  takes (`State`, `start`, `accept`, `isMatch`, `canMatch`, `willAlwaysMatch`), after `regex-automata`
+  in `fst`. The state is a bit set of live instructions (≤ 128) plus up to three bytes of a code
+  point under way; UTF-8 is decoded across `accept` calls and an invalid byte reads as U+FFFD one
+  byte wide, so a key is accepted exactly when `fullMatch` accepts it (a test compares 24 patterns
+  with 40 keys). Only `^` / `$` without `(?m)` are supported: the other assertions look at the next
+  code point, which a byte stepper has not read (`error.UnsupportedAssertion`); a bytes-mode
+  `Regex` is refused (`error.BytesMode`), as is a program past 128 instructions. `willAlwaysMatch`
+  is always false.
 - **On top of a search** (`replace.zig`): `expand` reads Go's template grammar (names of Unicode
   letters, digits and `_`, greedy; a group number is ASCII digits without a leading zero; a
   repeated name means the first such group that took part); `SplitIterator` keeps Go's edges (an
@@ -347,11 +359,6 @@ All open.
 - **The next Unicode version** — `tools/ucd_unicode/fetch.sh <v>` and `gen.py --ucd data/<v> -out src`; re-run the Go replay
   (its UNICODE_VERSION count moves) and check new binary properties or property values against regex-syntax once it carries
   that version.
-- **A byte-stepping DFA state for `trie.search`** — fst searches its index with a `regex-automata` DFA
-  (`start`/`accept(state, byte)`/`isMatch`/`canMatch`); `trie.search` takes the same shape (`trie.automaton`), but this
-  module exposes no per-byte state, so in-index regex search is the one fst feature trie routes nowhere. The `isMatch` DFA's
-  states would serve if they were public and anchored; `canMatch` = "a match state is still reachable" needs a dead-state flag.
-  Effort small-medium once the DFA cache can live in a caller-owned value.
 - **Sibling modules that can now adopt it** — `validate` (`Pattern.matcher` takes a caller-supplied matcher today; a `regex`
   default), `jsonshape` (RFC 9535 `match()`/`search()` need I-Regexp, an RE2 subset), `tsdb` (regex label matchers), `probe`
   (`expect` regex). Each is that module's own backlog item; listed here so the dependency is visible.

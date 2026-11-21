@@ -849,13 +849,223 @@ pub const Regex = struct {
     }
 };
 
+/// A `Regex` as a **byte-stepping automaton** over whole keys — the shape
+/// `trie.search` takes (`State`, `start`, `accept(state, byte)`, `isMatch`,
+/// `canMatch`, `willAlwaysMatch`), as Rust's `regex-automata` DFA plugs into
+/// `fst`. A key is accepted when the pattern matches **all of it** (as
+/// `Regex.fullMatch`); UTF-8 is decoded across `accept` calls, and an
+/// invalid byte reads as U+FFFD, one byte wide, as everywhere else here.
+///
+/// The state is a value: the set of program counters still alive (a program
+/// of at most `max_insts` instructions) and up to three bytes of a code
+/// point under way. Only `^` and `$` without `(?m)` (`\A`, `\z`) are
+/// supported as assertions: the others look at the next code point, which a
+/// byte stepper has not read (`init` returns `error.UnsupportedAssertion`).
+pub const ByteAutomaton = struct {
+    re: *const Regex,
+
+    /// The longest program the state's bit set holds.
+    pub const max_program = 128;
+
+    pub const InitError = error{
+        /// A bytes-mode `Regex` (`Options.utf8 = false`): matches bytes, not code points.
+        BytesMode,
+        /// More than `max_program` instructions.
+        TooManyInstructions,
+        /// An assertion other than `^` / `$` without `(?m)`.
+        UnsupportedAssertion,
+    };
+
+    pub const State = struct {
+        /// One bit per instruction: the consuming instructions, `match` and
+        /// `$` assertions the stepper is waiting at.
+        set: [2]u64 = .{ 0, 0 },
+        /// The bytes of a code point read so far.
+        pend: [3]u8 = .{ 0, 0, 0 },
+        pend_n: u8 = 0,
+        /// This is the state before any byte (where `^` holds).
+        first: bool = false,
+    };
+
+    pub fn init(re: *const Regex) InitError!ByteAutomaton {
+        if (re.bytes) return error.BytesMode;
+        if (re.insts.len > max_program) return error.TooManyInstructions;
+        for (re.insts) |inst| switch (inst) {
+            .assert => |a| if (a != .begin_text and a != .end_text) return error.UnsupportedAssertion,
+            else => {},
+        };
+        return .{ .re = re };
+    }
+
+    pub fn start(a: *const ByteAutomaton) State {
+        var st: State = .{ .first = true };
+        a.closure(&st.set, 0, true, false, null);
+        return st;
+    }
+
+    /// Whether the bytes fed so far are a whole match.
+    pub fn isMatch(a: *const ByteAutomaton, s: State) bool {
+        var set = s.set;
+        // A code point cut short at the end reads as one U+FFFD per byte.
+        for (s.pend[0..s.pend_n]) |_| set = a.step(set, 0xfffd);
+        var found = false;
+        a.closure(&set, 0, s.first, true, &found);
+        return found;
+    }
+
+    /// False when no continuation of `s` can match: the search prunes there.
+    pub fn canMatch(a: *const ByteAutomaton, s: State) bool {
+        _ = a;
+        return s.set[0] != 0 or s.set[1] != 0;
+    }
+
+    /// Always false (never claims more than it knows): a search just keeps
+    /// feeding bytes.
+    pub fn willAlwaysMatch(a: *const ByteAutomaton, s: State) bool {
+        _ = a;
+        _ = s;
+        return false;
+    }
+
+    pub fn accept(a: *const ByteAutomaton, s: State, byte: u8) State {
+        var buf: [4]u8 = undefined;
+        var n: usize = 0;
+        for (s.pend[0..s.pend_n]) |c| {
+            buf[n] = c;
+            n += 1;
+        }
+        buf[n] = byte;
+        n += 1;
+        var set = s.set;
+        var i: usize = 0;
+        scan: while (i < n) {
+            const c = buf[i];
+            if (c < 0x80) {
+                set = a.step(set, c);
+                i += 1;
+                continue;
+            }
+            const len = std.unicode.utf8ByteSequenceLength(c) catch {
+                set = a.step(set, 0xfffd);
+                i += 1;
+                continue;
+            };
+            const have = @min(n - i, len);
+            var k: usize = 1;
+            while (k < have) : (k += 1) {
+                if (buf[i + k] & 0xc0 != 0x80) {
+                    set = a.step(set, 0xfffd);
+                    i += 1;
+                    continue :scan;
+                }
+            }
+            if (n - i < len) break; // the rest of the sequence is still to come
+            const cp = std.unicode.utf8Decode(buf[i..][0..len]) catch {
+                set = a.step(set, 0xfffd);
+                i += 1;
+                continue;
+            };
+            set = a.step(set, @intCast(cp));
+            i += len;
+        }
+        var out: State = .{ .set = set };
+        for (buf[i..n]) |c| {
+            out.pend[out.pend_n] = c;
+            out.pend_n += 1;
+        }
+        return out;
+    }
+
+    /// Every thread of `set` that consumes `cp`, one step on.
+    fn step(a: *const ByteAutomaton, set: [2]u64, cp: u21) [2]u64 {
+        var next: [2]u64 = .{ 0, 0 };
+        for (0..2) |w| {
+            var bits = set[w];
+            while (bits != 0) {
+                const pc: u16 = @intCast(w * 64 + @ctz(bits));
+                bits &= bits - 1;
+                switch (a.re.insts[pc]) {
+                    .rune, .any, .any_not_nl => if (a.re.consumes(pc, cp)) a.closure(&next, pc + 1, false, false, null),
+                    else => {},
+                }
+            }
+        }
+        return next;
+    }
+
+    /// Add what is reachable from `pc0` to `set`: the consuming instructions,
+    /// `match` and — unless `at_end` — the `$` assertions waiting for the
+    /// end. With `at_end`, `$` holds and `found` says whether a `match` was
+    /// reached. `at_start` is whether `^` holds.
+    fn closure(a: *const ByteAutomaton, set: *[2]u64, pc0: u16, at_start: bool, at_end: bool, found: ?*bool) void {
+        var stack: [max_program]u16 = undefined;
+        var seen: [2]u64 = .{ 0, 0 };
+        var sp: usize = 0;
+        if (at_end) {
+            // Start from every thread already in `set` too.
+            for (0..2) |w| {
+                var bits = set[w];
+                while (bits != 0) {
+                    const pc: u16 = @intCast(w * 64 + @ctz(bits));
+                    bits &= bits - 1;
+                    stack[sp] = pc;
+                    sp += 1;
+                }
+            }
+        } else {
+            stack[sp] = pc0;
+            sp += 1;
+        }
+        while (sp != 0) {
+            sp -= 1;
+            const pc = stack[sp];
+            const bit = @as(u64, 1) << @truncate(pc);
+            if (seen[pc >> 6] & bit != 0) continue;
+            seen[pc >> 6] |= bit;
+            switch (a.re.insts[pc]) {
+                .jmp => |t| {
+                    stack[sp] = t;
+                    sp += 1;
+                },
+                .split => |sp_| {
+                    stack[sp] = sp_.y;
+                    stack[sp + 1] = sp_.x;
+                    sp += 2;
+                },
+                .save => {
+                    stack[sp] = pc + 1;
+                    sp += 1;
+                },
+                .assert => |as| switch (as) {
+                    .begin_text => if (at_start) {
+                        stack[sp] = pc + 1;
+                        sp += 1;
+                    },
+                    .end_text => if (at_end) {
+                        stack[sp] = pc + 1;
+                        sp += 1;
+                    } else {
+                        set[pc >> 6] |= bit;
+                    },
+                    else => unreachable, // `init` refused them
+                },
+                .match => {
+                    if (found) |f| f.* = true;
+                    set[pc >> 6] |= bit;
+                },
+                .rune, .any, .any_not_nl => set[pc >> 6] |= bit,
+            }
+        }
+    }
+};
+
 /// Many patterns, one pass over the text: which of them match, each on its
 /// own and anywhere (Rust's `RegexSet`, RE2's `RE2::Set`). The patterns are
 /// compiled one by one and joined into one program — a chain of splits, one
 /// branch per pattern, each keeping its own `match` — which a set of threads
 /// runs once over the text, unanchored. No positions: ask a `Regex` for
-/// those. The joined program is bounded by `4 * max_insts` (bytes mode:
-/// `max_insts`): its scratch is on the stack.
+/// those. The joined program is bounded by `4 * max_program` (bytes mode:
+/// `max_program`): its scratch is on the stack.
 pub const RegexSet = struct {
     insts: []const Inst,
     ranges: []const Range,
@@ -5336,6 +5546,79 @@ test "bytes mode through a reader: same spans and groups as the slice, for every
             }
         }
     }
+}
+
+test "ByteAutomaton accepts exactly the keys fullMatch does, byte by byte" {
+    const gpa = testing.allocator;
+    const patterns = [_][]const u8{
+        "abc",         "a+b",    "(a|ab)(c|bcd)", "[a-c]*x",  "\\d+",   "^a.c$",
+        "(?i)straße",
+        "\\x{e9}+",    ".",
+        "é+",
+        "a{2,3}",      "(?s).",  "\\pL+\\d?",     "",         "^$",     "(ab)*c?",
+        "[^a]b",       "\\z",    "\\A\\w+\\z",    "x(?:y|)z", "(?i)k+",
+        "日本語",
+        "\\p{Greek}+", "a|b|cd",
+    };
+    const keys = [_][]const u8{
+        "",         "a",                "abc",        "abbcd", "abcd", "aabx", "x",       "12",
+        "5a",       "a\nc",
+        "é",
+        "éé",
+        "\xffa",    "\xe9",             "e\xcc\x81",
+        "日本語",
+        "日本",
+        "日",
+        "aaa",      "aa",               "ababc",      "ab",    "bb",   "KKk",  "STRASSE",
+        "straße",
+        "Straße",
+        "αβγ",
+        "Σ9",
+        "\xe6\x97", "\xf0\x9f\x98\x80", "xz",         "xyz",   "c",    "cd",   "b",       "\xc3",
+        "\xc3\xa9", "\xc3\xa9\xc3",     "a\xc3\xa9c",
+    };
+    for (patterns) |pat| {
+        var re = Regex.compile(gpa, pat) catch continue;
+        defer re.deinit(gpa);
+        const au = ByteAutomaton.init(&re) catch continue;
+        for (keys) |key| {
+            var s = au.start();
+            var alive = true;
+            for (key) |b| {
+                s = au.accept(s, b);
+                if (!au.canMatch(s)) alive = false;
+                // canMatch false means no continuation can match: so the key cannot.
+                if (!alive) try testing.expect(!re.fullMatch(key));
+            }
+            try testing.expectEqual(re.fullMatch(key), au.isMatch(s));
+        }
+    }
+}
+
+test "ByteAutomaton refuses what a byte stepper cannot decide" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "\\bfoo");
+    defer re.deinit(gpa);
+    try testing.expectError(error.UnsupportedAssertion, ByteAutomaton.init(&re));
+    var rm = try Regex.compile(gpa, "(?m)^a$");
+    defer rm.deinit(gpa);
+    try testing.expectError(error.UnsupportedAssertion, ByteAutomaton.init(&rm));
+    var rb = try Regex.compileOptions(gpa, "a", .{ .syntax = .rust, .utf8 = false });
+    defer rb.deinit(gpa);
+    try testing.expectError(error.BytesMode, ByteAutomaton.init(&rb));
+    var big = try Regex.compile(gpa, "a{70}b{70}");
+    defer big.deinit(gpa);
+    try testing.expectError(error.TooManyInstructions, ByteAutomaton.init(&big));
+    // A dead state stays dead, and the start is always the same value.
+    var ok = try Regex.compile(gpa, "ab");
+    defer ok.deinit(gpa);
+    const au = try ByteAutomaton.init(&ok);
+    var d = au.accept(au.accept(au.start(), 'x'), 'a');
+    try testing.expect(!au.canMatch(d));
+    d = au.accept(d, 'b');
+    try testing.expect(!au.isMatch(d));
+    try testing.expectEqual(au.start(), au.start());
+    try testing.expect(!au.willAlwaysMatch(au.start()));
 }
 
 test "bytes mode through a reader: a failing reader after the answer is settled does not matter" {
