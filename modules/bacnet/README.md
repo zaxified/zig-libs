@@ -129,7 +129,7 @@ doubles as a fleet-simulation target, and a BACnet/SC **node and hub**.
 ## Not provided
 
 No TLS (a seam, never verified), no
-MS/TP or IPv6, no alarms/events, backup/restore, file services, no
+MS/TP or IPv6, alarms and events only as OUT_OF_RANGE intrinsic reporting (no Event Enrollment object), backup/restore, file services, no
 a priority array only on properties the caller marks commandable; see `SPEC.md` (*What is deliberately not done*, *Backlog / deferred*).
 
 ## Use

@@ -32,6 +32,7 @@ const bvll = @import("bvll.zig");
 const npdu = @import("npdu.zig");
 const apdu = @import("apdu.zig");
 const service = @import("service.zig");
+const events = @import("events.zig");
 const transport = @import("transport.zig");
 
 const ObjectId = tag.ObjectId;
@@ -144,6 +145,59 @@ pub const Property = struct {
     /// The last value a COV notification was sent for, which
     /// `COV_Increment` is measured against (set by the device).
     cov_last: ?f32 = null,
+    /// Turns an object's `event_state` property into **intrinsic reporting**
+    /// for an analog object (clause 13.3.2, OUT_OF_RANGE): the caller's
+    /// `EventData` holds the state machine, and the device keeps the
+    /// object's `event_state`, `acked_transitions` and `event_time_stamps`
+    /// properties in step with it (see `EventData`).
+    event: ?*EventData = null,
+};
+
+/// The state of one object's intrinsic reporting, in the caller's storage
+/// (attach it with `Property.event` on the object's `event_state` property).
+///
+/// The algorithm is OUT_OF_RANGE (clause 13.3.2) over the object's own
+/// properties: Real `present_value`, `high_limit`, `low_limit`, `deadband`,
+/// BitString `limit_enable` (low, high) and `event_enable` (to-offnormal,
+/// to-fault, to-normal), Unsigned `notification_class`, `time_delay` and
+/// optional `time_delay_normal` (seconds), Enumerated `notify_type`, and
+/// optional `status_flags`. A transition happens once the condition has held
+/// for the delay; it is stamped with a **sequence number** (the device has no
+/// wall clock), and is announced to the recipients of the object's
+/// Notification Class object when `event_enable` allows it.
+pub const EventData = struct {
+    state: types.EventState = .normal,
+    /// `Acked_Transitions`: a transition that needs no acknowledgement (or is
+    /// not enabled) is acknowledged from the start.
+    acked: events.TransitionBits = .all,
+    /// The time stamp of the last transition of each kind.
+    stamps: [3]events.TimeStamp = @splat(events.TimeStamp.unspecified),
+    /// The state each of those transitions went to.
+    stamp_states: [3]types.EventState = .{ .offnormal, .fault, .normal },
+    /// A transition the condition currently asks for, and since when.
+    pending: ?types.EventState = null,
+    pending_since_ms: u64 = 0,
+    acked_octet: [1]u8 = .{0xE0},
+    stamps_wire: [24]u8 = undefined,
+    stamps_wire_len: usize = 0,
+
+    /// Writes the state into the object's `event_state`,
+    /// `acked_transitions` and `event_time_stamps` properties (those that
+    /// exist). The device does it after every change; call it once after
+    /// wiring so that a read before the first transition is served from
+    /// here. The properties then point into this struct, so it must stay put.
+    pub fn sync(self: *EventData, props: []Property) void {
+        var w = tag.Writer.init(&self.stamps_wire);
+        for (self.stamps) |ts| ts.encode(&w) catch {};
+        self.stamps_wire_len = w.written().len;
+        self.acked_octet[0] = self.acked.toOctet();
+        for (props) |*p| switch (p.id) {
+            .event_state => p.value = .{ .enumerated = @backingInt(self.state) },
+            .acked_transitions => p.value = .{ .bit_string = .{ .unused_bits = 5, .bytes = &self.acked_octet } },
+            .event_time_stamps => p.value = .{ .raw = self.stamps_wire[0..self.stamps_wire_len] },
+            else => {},
+        };
+    }
 };
 
 /// One object in the device's database.
@@ -248,6 +302,11 @@ pub const Event = union(enum) {
     /// `UTCTimeSynchronization`. The device has no clock of its own to set:
     /// the application applies `time`.
     time_synchronized: struct { time: service.DateTime, utc: bool },
+    /// Intrinsic reporting moved an object to a new event state (and sent
+    /// the notifications its Notification Class asks for).
+    event_transition: struct { object: ObjectId, from: types.EventState, to: types.EventState },
+    /// Accepted an `AcknowledgeAlarm`.
+    alarm_acknowledged: struct { object: ObjectId, state: types.EventState },
     /// Refused a request.
     refused: struct { class: types.ErrorClass, code: types.ErrorCode },
     /// Something arrived that this device does not serve.
@@ -288,6 +347,76 @@ const SegRx = struct {
     last_ms: u64 = 0,
 };
 
+fn realOf(p: ?*Property) ?f32 {
+    const q = p orelse return null;
+    return if (q.value == .real) q.value.real else null;
+}
+
+fn unsignedOf(p: ?*Property) ?u32 {
+    const q = p orelse return null;
+    return if (q.value == .unsigned) q.value.unsigned else null;
+}
+
+fn enumOf(p: ?*Property) ?u32 {
+    const q = p orelse return null;
+    return if (q.value == .enumerated) q.value.enumerated else null;
+}
+
+fn bitsOf(p: ?*Property) ?events.TransitionBits {
+    const q = p orelse return null;
+    if (q.value != .bit_string) return null;
+    return events.TransitionBits.fromBitString(.{ .unused_bits = q.value.bit_string.unused_bits, .bytes = q.value.bit_string.bytes });
+}
+
+/// The notification priority of a transition from the class's `priority`
+/// array (three Unsigned), 255 (the lowest) when there is none.
+fn classPriority(cls: ?*Object, tr: events.Transition) u8 {
+    const c = cls orelse return 255;
+    const p = c.find(.priority) orelse return 255;
+    if (p.value != .raw) return 255;
+    var r = tag.Reader.init(p.value.raw);
+    var i: usize = 0;
+    while (i <= @backingInt(tr)) : (i += 1) {
+        const v = r.expectApp(.unsigned) catch return 255;
+        if (i == @backingInt(tr)) return if (v.unsigned > 255) 255 else @intCast(v.unsigned);
+    }
+    return 255;
+}
+
+/// One `BACnetDestination` of a Notification Class's `recipient_list`.
+const Destination = struct {
+    address: ?BipAddress,
+    process_id: u32,
+    confirmed: bool,
+    transitions: events.TransitionBits,
+};
+
+fn parseDestination(r: *tag.Reader) events.Error!Destination {
+    _ = try r.expectApp(.bit_string); // valid days
+    _ = try r.expectApp(.time); // from
+    _ = try r.expectApp(.time); // to
+    var addr: ?BipAddress = null;
+    const t = try r.peek();
+    if (t.isContext(0)) {
+        _ = try r.ctxObjectId(0); // a device identifier: no address binding here
+    } else {
+        try r.expectOpen(1);
+        const net = (try r.expectApp(.unsigned)).unsigned;
+        const mac = (try r.expectApp(.octet_string)).octet_string;
+        try r.expectClose(1);
+        if (net == 0 and mac.len == BipAddress.wire_len) addr = BipAddress.decode(mac[0..6]);
+    }
+    const pid = (try r.expectApp(.unsigned)).unsigned;
+    const conf = (try r.expectApp(.boolean)).boolean;
+    const tr = try events.TransitionBits.decodeApp(r);
+    return .{
+        .address = addr,
+        .process_id = if (pid > std.math.maxInt(u32)) return error.InvalidValue else @intCast(pid),
+        .confirmed = conf,
+        .transitions = tr,
+    };
+}
+
 pub fn Device(comptime max_subscriptions: usize) type {
     return struct {
         const Self = @This();
@@ -309,6 +438,8 @@ pub fn Device(comptime max_subscriptions: usize) type {
         seg: SegTx = .{},
         /// The segmented request being received (clause 5.4.5), if any.
         rx_seg: SegRx = .{},
+        /// The last sequence number handed out as an event time stamp.
+        event_seq: u32 = 0,
 
         pub fn init(tp: Transport, config: Config, objects: []Object) Self {
             return .{ .tp = tp, .config = config, .objects = objects };
@@ -391,6 +522,7 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 self.comm = .enable;
                 self.comm_until_ms = null;
             };
+            if (try self.evaluateEvents(now_ms)) |ev| return ev;
             const got = (try self.tp.recv(&self.rx)) orelse return .none;
             return self.handle(got.from, got.bytes, now_ms) catch |e| switch (e) {
                 error.NotBvlc,
@@ -523,6 +655,9 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 .device_communication_control => self.handleDcc(origin, r, now_ms),
                 .reinitialize_device => self.handleReinitialize(origin, r),
                 .subscribe_cov => self.handleSubscribeCov(origin, r, now_ms),
+                .acknowledge_alarm => self.handleAcknowledgeAlarm(origin, r),
+                .get_event_information => self.handleGetEventInformation(origin, r),
+                .get_alarm_summary => self.handleGetAlarmSummary(origin, r),
                 else => blk: {
                     try self.sendApdu(origin, .{ .reject = .{
                         .invoke_id = r.invoke_id,
@@ -600,6 +735,253 @@ pub fn Device(comptime max_subscriptions: usize) type {
                 .sequence_number = seq,
                 .actual_window_size = window,
             } });
+        }
+
+        // ── alarms and events (clause 13) ──────────────────────────────────
+
+        /// One round of intrinsic reporting: every object with
+        /// `Property.event` is tested against its limits; the first one whose
+        /// condition has held for its delay makes the transition.
+        fn evaluateEvents(self: *Self, now_ms: u64) Error!?Event {
+            for (self.objects) |*obj| {
+                const esp = obj.find(.event_state) orelse continue;
+                const ed = esp.event orelse continue;
+                const pv = realOf(obj.find(.present_value)) orelse continue;
+                const hi = realOf(obj.find(.high_limit)) orelse continue;
+                const lo = realOf(obj.find(.low_limit)) orelse continue;
+                const db = realOf(obj.find(.deadband)) orelse 0;
+                const lim = bitsOf(obj.find(.limit_enable)) orelse continue;
+                const lo_en = lim.get(.to_offnormal); // bit 0: low limit enable
+                const hi_en = lim.get(.to_fault); // bit 1: high limit enable
+                const want: ?types.EventState = switch (ed.state) {
+                    .normal => if (hi_en and pv > hi) .high_limit else if (lo_en and pv < lo) .low_limit else null,
+                    .high_limit => if (lo_en and pv < lo) .low_limit else if (!hi_en or pv < hi - db) .normal else null,
+                    .low_limit => if (hi_en and pv > hi) .high_limit else if (!lo_en or pv > lo + db) .normal else null,
+                    else => null,
+                };
+                const to = want orelse {
+                    ed.pending = null;
+                    continue;
+                };
+                if (ed.pending != to) {
+                    ed.pending = to;
+                    ed.pending_since_ms = now_ms;
+                }
+                const delay_s: u32 = if (to == .normal)
+                    unsignedOf(obj.find(.time_delay_normal)) orelse unsignedOf(obj.find(.time_delay)) orelse 0
+                else
+                    unsignedOf(obj.find(.time_delay)) orelse 0;
+                if (now_ms -| ed.pending_since_ms < @as(u64, delay_s) * 1000) continue;
+
+                const from = ed.state;
+                ed.state = to;
+                ed.pending = null;
+                self.event_seq +%= 1;
+                const tr = events.Transition.into(to);
+                const stamp: events.TimeStamp = .{ .sequence_number = self.event_seq };
+                ed.stamps[@backingInt(tr)] = stamp;
+                ed.stamp_states[@backingInt(tr)] = to;
+                const enabled = (bitsOf(obj.find(.event_enable)) orelse events.TransitionBits.all).get(tr);
+                const cls = self.classOf(obj);
+                const needs_ack = if (cls) |c| (bitsOf(c.find(.ack_required)) orelse events.TransitionBits{}).get(tr) else false;
+                ed.acked.set(tr, !(enabled and needs_ack));
+                ed.sync(obj.properties);
+                if (enabled and self.comm == .enable) {
+                    const exceeded: f32 = if (to == .high_limit or (to == .normal and from == .high_limit)) hi else lo;
+                    var sf: types.StatusFlags = .{};
+                    if (obj.find(.status_flags)) |p| {
+                        if (p.value == .bit_string and p.value.bit_string.bytes.len > 0)
+                            sf = types.StatusFlags.fromOctet(p.value.bit_string.bytes[0]);
+                    }
+                    sf.in_alarm = to != .normal;
+                    var vbuf: [48]u8 = undefined;
+                    var vw = tag.Writer.init(&vbuf);
+                    try (events.OutOfRange{ .exceeding_value = pv, .status_flags = sf, .deadband = db, .exceeded_limit = exceeded }).encodeValues(&vw);
+                    try self.distribute(obj, cls, tr, .{
+                        .process_id = 0,
+                        .initiating_device = self.deviceId(),
+                        .event_object = obj.id,
+                        .time_stamp = stamp,
+                        .notification_class = unsignedOf(obj.find(.notification_class)) orelse 0,
+                        .priority = classPriority(cls, tr),
+                        .event_type = .out_of_range,
+                        .notify_type = @fromBackingInt(enumOf(obj.find(.notify_type)) orelse 0),
+                        .ack_required = needs_ack,
+                        .from_state = from,
+                        .to_state = to,
+                        .values = vw.written()[1 .. vw.written().len - 1],
+                    });
+                }
+                return .{ .event_transition = .{ .object = obj.id, .from = from, .to = to } };
+            }
+            return null;
+        }
+
+        /// The Notification Class object an event-initiating object names.
+        fn classOf(self: *Self, obj: *Object) ?*Object {
+            const n = unsignedOf(obj.find(.notification_class)) orelse return null;
+            for (self.objects) |*o| {
+                if (o.id.type == .notification_class and o.id.instance == n) return o;
+            }
+            return null;
+        }
+
+        /// Sends `base` to every recipient of the class whose `transitions`
+        /// include `tr`. Only recipients given by **address** (network 0, a
+        /// six-octet BACnet/IP address) are served: this device has no
+        /// address binding to turn a device identifier into one. Valid days
+        /// and times are not evaluated (no wall clock). A confirmed
+        /// notification is sent once, not retried.
+        fn distribute(self: *Self, obj: *Object, cls: ?*Object, tr: events.Transition, base: events.EventNotification) Error!void {
+            _ = obj;
+            const c = cls orelse return;
+            const rl = c.find(.recipient_list) orelse return;
+            if (rl.value != .raw) return;
+            var r = tag.Reader.init(rl.value.raw);
+            while (!r.atEnd()) {
+                const d = parseDestination(&r) catch return;
+                if (!d.transitions.get(tr)) continue;
+                const to = d.address orelse continue;
+                var n = base;
+                n.process_id = d.process_id;
+                var body: [192]u8 = undefined;
+                var w = tag.Writer.init(&body);
+                try n.encode(&w);
+                if (d.confirmed) {
+                    const id = self.next_invoke;
+                    self.next_invoke +%= 1;
+                    try self.sendApdu(to, .{ .confirmed_request = .{
+                        .invoke_id = id,
+                        .service = .confirmed_event_notification,
+                        .max_apdu = self.config.max_apdu,
+                        .data = w.written(),
+                    } });
+                } else {
+                    try self.sendApdu(to, .{ .unconfirmed_request = .{
+                        .service = .unconfirmed_event_notification,
+                        .data = w.written(),
+                    } });
+                }
+            }
+        }
+
+        fn handleAcknowledgeAlarm(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest) Error!Event {
+            const ak = events.AcknowledgeAlarm.decode(r.data) catch {
+                try self.sendApdu(to, .{ .reject = .{ .invoke_id = r.invoke_id, .reason = .invalid_tag } });
+                return .{ .refused = .{ .class = .services, .code = .reject_invalid_tag } };
+            };
+            const obj = self.find(ak.event_object) orelse
+                return self.refuse(to, r.invoke_id, .acknowledge_alarm, .object, .unknown_object);
+            const ed = (obj.find(.event_state) orelse
+                return self.refuse(to, r.invoke_id, .acknowledge_alarm, .object, .unknown_object)).event orelse
+                return self.refuse(to, r.invoke_id, .acknowledge_alarm, .object, .unknown_object);
+            const tr = events.Transition.into(ak.state);
+            const ti = @backingInt(tr);
+            if (ed.stamp_states[ti] != ak.state)
+                return self.refuse(to, r.invoke_id, .acknowledge_alarm, .services, .invalid_event_state);
+            if (!ak.time_stamp.eql(ed.stamps[ti]))
+                return self.refuse(to, r.invoke_id, .acknowledge_alarm, .services, .invalid_time_stamp);
+            try self.sendApdu(to, .{ .simple_ack = .{ .invoke_id = r.invoke_id, .service = .acknowledge_alarm } });
+            // Acknowledging what is already acknowledged succeeds and says
+            // nothing more.
+            if (ed.acked.get(tr)) return .{ .alarm_acknowledged = .{ .object = obj.id, .state = ak.state } };
+            ed.acked.set(tr, true);
+            ed.sync(obj.properties);
+            if (self.comm == .enable) {
+                const cls = self.classOf(obj);
+                try self.distribute(obj, cls, tr, .{
+                    .process_id = 0,
+                    .initiating_device = self.deviceId(),
+                    .event_object = obj.id,
+                    .time_stamp = ak.time_of_ack,
+                    .notification_class = unsignedOf(obj.find(.notification_class)) orelse 0,
+                    .priority = classPriority(cls, tr),
+                    .event_type = .out_of_range,
+                    .notify_type = .ack_notification,
+                    .to_state = ak.state,
+                });
+            }
+            return .{ .alarm_acknowledged = .{ .object = obj.id, .state = ak.state } };
+        }
+
+        /// The room a GetEventInformation / GetAlarmSummary answer may use.
+        fn answerRoom(self: *Self, r: apdu.ConfirmedRequest) usize {
+            const mine = self.config.max_apdu.octets() catch 1476;
+            const theirs = r.max_apdu.octets() catch 50;
+            // 3 octets of ComplexACK header, 3 of trailer (`moreEvents`).
+            return @min(mine, theirs) - 6;
+        }
+
+        fn handleGetEventInformation(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest) Error!Event {
+            const req = events.GetEventInformation.decode(r.data) catch {
+                try self.sendApdu(to, .{ .reject = .{ .invoke_id = r.invoke_id, .reason = .invalid_tag } });
+                return .{ .refused = .{ .class = .services, .code = .reject_invalid_tag } };
+            };
+            var skipping = req.last_received != null;
+            if (req.last_received) |last| {
+                if (self.find(last) == null)
+                    return self.refuse(to, r.invoke_id, .get_event_information, .object, .unknown_object);
+            }
+            const room = self.answerRoom(r);
+            var list: [transport.max_datagram]u8 = undefined;
+            var lw = tag.Writer.init(list[0..@min(room, list.len)]);
+            var more = false;
+            for (self.objects) |*obj| {
+                if (skipping) {
+                    if (obj.id.eql(req.last_received.?)) skipping = false;
+                    continue;
+                }
+                const ed = (obj.find(.event_state) orelse continue).event orelse continue;
+                if (ed.state == .normal and ed.acked.bits == 0b111) continue;
+                const cls = self.classOf(obj);
+                var one: [96]u8 = undefined;
+                var ow = tag.Writer.init(&one);
+                try (events.EventSummary{
+                    .object = obj.id,
+                    .state = ed.state,
+                    .acked_transitions = ed.acked,
+                    .time_stamps = ed.stamps,
+                    .notify_type = @fromBackingInt(enumOf(obj.find(.notify_type)) orelse 0),
+                    .event_enable = bitsOf(obj.find(.event_enable)) orelse events.TransitionBits.all,
+                    .priorities = .{ classPriority(cls, .to_offnormal), classPriority(cls, .to_fault), classPriority(cls, .to_normal) },
+                }).encode(&ow);
+                lw.raw(ow.written()) catch {
+                    more = true;
+                    break;
+                };
+            }
+            var body: [transport.max_datagram]u8 = undefined;
+            var w = tag.Writer.init(&body);
+            try events.GetEventInformationAck.encode(lw.written(), more, &w);
+            try self.sendApdu(to, .{ .complex_ack = .{
+                .invoke_id = r.invoke_id,
+                .service = .get_event_information,
+                .data = w.written(),
+            } });
+            return .{ .read = .{ .object = self.deviceId(), .property = .event_state } };
+        }
+
+        fn handleGetAlarmSummary(self: *Self, to: BipAddress, r: apdu.ConfirmedRequest) Error!Event {
+            if (r.data.len != 0) {
+                try self.sendApdu(to, .{ .reject = .{ .invoke_id = r.invoke_id, .reason = .too_many_arguments } });
+                return .{ .refused = .{ .class = .services, .code = .reject_too_many_arguments } };
+            }
+            var body: [transport.max_datagram]u8 = undefined;
+            const room = @min(self.answerRoom(r), body.len);
+            var w = tag.Writer.init(body[0..room]);
+            for (self.objects) |*obj| {
+                const ed = (obj.find(.event_state) orelse continue).event orelse continue;
+                if (ed.state == .normal) continue;
+                if (enumOf(obj.find(.notify_type)) orelse 0 != @backingInt(events.NotifyType.alarm)) continue;
+                (events.AlarmSummary{ .object = obj.id, .state = ed.state, .acked_transitions = ed.acked }).encode(&w) catch
+                    return self.abortOverflow(to, r.invoke_id);
+            }
+            try self.sendApdu(to, .{ .complex_ack = .{
+                .invoke_id = r.invoke_id,
+                .service = .get_alarm_summary,
+                .data = w.written(),
+            } });
+            return .{ .read = .{ .object = self.deviceId(), .property = .event_state } };
         }
 
         fn handleWhoHas(
@@ -1322,6 +1704,8 @@ pub const DefaultDevice = Device(16);
 
 const testing = std.testing;
 const client = @import("client.zig");
+const testkit = @import("testkit");
+const hex = testkit.hex.literal;
 
 const Rig = struct {
     net: transport.LoopNetwork = .{},
@@ -2460,6 +2844,248 @@ test "segmented request: a silent sender's transfer is dropped, a stray middle s
     const got = (try rig.client_ep.transport().recv(&drain)).?;
     const back = try apdu.decode((try npdu.decode((try bvll.decode(got.bytes)).npdu().?)).payload.apdu);
     try testing.expectEqual(types.AbortReason.invalid_apdu_in_this_state, back.abort.reason);
+}
+
+// Two destinations, both addressed to 192.0.2.1:47808 (the rig's client): process 7,
+// unconfirmed, to-offnormal and to-normal; process 8, confirmed, to-offnormal only.
+// The bytes of the first were emitted by bacpypes3 (`tools/event_goldens.py` recipe).
+const alarm_recipients = hex("8201feb400000000b4173b3b631e21006506c0000201bac01f21071082" ++ "05a0") ++
+    hex("8201feb400000000b4173b3b631e21006506c0000201bac01f21081182" ++ "0580");
+const alarm_priorities = hex("21642196" ++ "21c8");
+
+const AlarmDb = struct {
+    ai: [14]Property = undefined,
+    cls: [6]Property = undefined,
+    objects: [2]Object = undefined,
+    ed: EventData = .{},
+
+    fn wire(self: *AlarmDb) []Object {
+        self.ai = .{
+            .{ .id = .object_identifier, .value = .{ .object_id = .{ .type = .analog_input, .instance = 1 } } },
+            .{ .id = .object_name, .value = .{ .string = "TEMP" } },
+            .{ .id = .present_value, .value = .{ .real = 50 }, .writable = true },
+            .{ .id = .high_limit, .value = .{ .real = 80 } },
+            .{ .id = .low_limit, .value = .{ .real = 10 } },
+            .{ .id = .deadband, .value = .{ .real = 5 } },
+            .{ .id = .limit_enable, .value = .{ .bit_string = .{ .unused_bits = 6, .bytes = &.{0xC0} } } },
+            .{ .id = .event_enable, .value = .{ .bit_string = .{ .unused_bits = 5, .bytes = &.{0xE0} } } },
+            .{ .id = .notification_class, .value = .{ .unsigned = 3 } },
+            .{ .id = .time_delay, .value = .{ .unsigned = 2 } },
+            .{ .id = .notify_type, .value = .{ .enumerated = 0 } },
+            .{ .id = .event_state, .value = .{ .enumerated = 0 }, .event = &self.ed },
+            .{ .id = .acked_transitions, .value = .null },
+            .{ .id = .event_time_stamps, .value = .null },
+        };
+        self.cls = .{
+            .{ .id = .object_identifier, .value = .{ .object_id = .{ .type = .notification_class, .instance = 3 } } },
+            .{ .id = .object_name, .value = .{ .string = "NC" } },
+            .{ .id = .notification_class, .value = .{ .unsigned = 3 } },
+            .{ .id = .priority, .value = .{ .raw = &alarm_priorities } },
+            .{ .id = .ack_required, .value = .{ .bit_string = .{ .unused_bits = 5, .bytes = &.{0xA0} } } },
+            .{ .id = .recipient_list, .value = .{ .raw = &alarm_recipients } },
+        };
+        self.objects = .{
+            .{ .id = .{ .type = .analog_input, .instance = 1 }, .properties = &self.ai },
+            .{ .id = .{ .type = .notification_class, .instance = 3 }, .properties = &self.cls },
+        };
+        self.ed.sync(&self.ai);
+        return &self.objects;
+    }
+};
+
+/// What the client heard of one event notification.
+const Heard = struct { confirmed: bool, process: u32, to: types.EventState, notify: events.NotifyType, ack_required: ?bool, priority: u8, seq: u32 };
+
+/// Polls the client until quiet, collecting event notifications.
+fn hearEvents(c: anytype, now: u64, out: []Heard) !usize {
+    var n: usize = 0;
+    while (true) {
+        const ev = try c.poll(now);
+        switch (ev) {
+            .none => return n,
+            .event_notification => |e| {
+                out[n] = .{
+                    .confirmed = e.confirmed,
+                    .process = e.notification.process_id,
+                    .to = e.notification.to_state,
+                    .notify = e.notification.notify_type,
+                    .ack_required = e.notification.ack_required,
+                    .priority = e.notification.priority,
+                    .seq = e.notification.time_stamp.sequence_number,
+                };
+                n += 1;
+            },
+            else => {},
+        }
+    }
+}
+
+fn pumpUntil(dev: anytype, c: anytype, now: u64, comptime tagname: []const u8) !client.Event {
+    for (0..10) |_| {
+        _ = try dev.poll(now);
+        const ev = try c.poll(now);
+        if (ev != .none and std.mem.eql(u8, @tagName(ev), tagname)) return ev;
+    }
+    return error.NoAnswer;
+}
+
+test "intrinsic reporting: limit crossed for the delay, notified, listed, acknowledged, back to normal" {
+    var rig: Rig = .{};
+    rig.wire();
+    var adb: AlarmDb = .{};
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, adb.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const dev_addr = rig.device_ep.address;
+    const ai1: ObjectId = .{ .type = .analog_input, .instance = 1 };
+    var heard: [8]Heard = undefined;
+
+    // Quiet while the value is inside the limits.
+    try testing.expectEqual(Event.none, try dev.poll(0));
+    try dev.update(ai1, .present_value, .{ .real = 90 }, 0);
+    // Above the high limit, but only for 1 s of the 2 s delay.
+    try testing.expectEqual(Event.none, try dev.poll(0));
+    try testing.expectEqual(Event.none, try dev.poll(1_000));
+    // A dip back inside restarts the delay.
+    try dev.update(ai1, .present_value, .{ .real = 70 }, 1_500);
+    try testing.expectEqual(Event.none, try dev.poll(1_500));
+    try dev.update(ai1, .present_value, .{ .real = 90 }, 2_000);
+    try testing.expectEqual(Event.none, try dev.poll(2_000));
+    try testing.expectEqual(Event.none, try dev.poll(3_999));
+    const tr = (try dev.poll(4_000)).event_transition;
+    try testing.expectEqual(types.EventState.normal, tr.from);
+    try testing.expectEqual(types.EventState.high_limit, tr.to);
+    try testing.expectEqual(@as(u32, 3), adb.ai[11].value.enumerated);
+
+    // Both destinations got one: the unconfirmed one to-offnormal (process 7) and the confirmed one (8).
+    try testing.expectEqual(@as(usize, 2), try hearEvents(&c, 4_000, &heard));
+    try testing.expect(!heard[0].confirmed and heard[0].process == 7);
+    try testing.expect(heard[1].confirmed and heard[1].process == 8);
+    try testing.expectEqual(types.EventState.high_limit, heard[0].to);
+    try testing.expectEqual(events.NotifyType.alarm, heard[0].notify);
+    try testing.expectEqual(@as(?bool, true), heard[0].ack_required);
+    try testing.expectEqual(@as(u8, 100), heard[0].priority);
+    try testing.expectEqual(@as(u32, 1), heard[0].seq);
+    // The confirmed one was acknowledged by the client; the device takes it.
+    _ = try dev.poll(4_000);
+
+    // The properties follow the state machine: to-offnormal is waiting for an acknowledgement.
+    try testing.expectEqual(@as(u8, 0x60), adb.ai[12].value.bit_string.bytes[0]);
+
+    // GetEventInformation lists it with the time stamp, enable bits and priorities.
+    _ = try c.getEventInformation(dev_addr, null, 4_001);
+    var ev = try pumpUntil(&dev, &c, 4_001, "complex_ack");
+    const gi = try events.GetEventInformationAck.decode(ev.complex_ack.data);
+    try testing.expect(!gi.more_events);
+    var it = gi.summaries();
+    const sum = (try it.next()).?;
+    try testing.expectEqual(types.EventState.high_limit, sum.state);
+    try testing.expectEqual(@as(u3, 0b110), sum.acked_transitions.bits);
+    try testing.expect(sum.time_stamps[0].eql(.{ .sequence_number = 1 }));
+    try testing.expectEqual([3]u8{ 100, 150, 200 }, sum.priorities);
+    try testing.expectEqual(@as(?events.EventSummary, null), try it.next());
+    // Asking for the page after that object: nothing more.
+    _ = try c.getEventInformation(dev_addr, ai1, 4_002);
+    ev = try pumpUntil(&dev, &c, 4_002, "complex_ack");
+    const none_after = try events.GetEventInformationAck.decode(ev.complex_ack.data);
+    var none_it = none_after.summaries();
+    try testing.expectEqual(@as(?events.EventSummary, null), try none_it.next());
+    // After an unknown object: refused.
+    _ = try c.getEventInformation(dev_addr, .{ .type = .analog_input, .instance = 77 }, 4_003);
+    ev = try pumpUntil(&dev, &c, 4_003, "err");
+    try testing.expectEqual(types.ErrorCode.unknown_object, ev.err.code);
+
+    // GetAlarmSummary lists the same object.
+    _ = try c.getAlarmSummary(dev_addr, 4_004);
+    ev = try pumpUntil(&dev, &c, 4_004, "complex_ack");
+    var sit = events.AlarmSummaryIterator.init(ev.complex_ack.data);
+    const al = (try sit.next()).?;
+    try testing.expectEqual(ai1, al.object);
+    try testing.expectEqual(types.EventState.high_limit, al.state);
+    try testing.expectEqual(@as(?events.AlarmSummary, null), try sit.next());
+
+    // Acknowledging with the wrong state or the wrong time stamp is refused ...
+    var ack: events.AcknowledgeAlarm = .{
+        .process_id = 7,
+        .event_object = ai1,
+        .state = .low_limit,
+        .time_stamp = .{ .sequence_number = 1 },
+        .source = "op",
+        .time_of_ack = .{ .sequence_number = 500 },
+    };
+    _ = try c.acknowledgeAlarm(dev_addr, ack, 4_005);
+    ev = try pumpUntil(&dev, &c, 4_005, "err");
+    try testing.expectEqual(types.ErrorCode.invalid_event_state, ev.err.code);
+    ack.state = .high_limit;
+    ack.time_stamp = .{ .sequence_number = 9 };
+    _ = try c.acknowledgeAlarm(dev_addr, ack, 4_006);
+    ev = try pumpUntil(&dev, &c, 4_006, "err");
+    try testing.expectEqual(types.ErrorCode.invalid_time_stamp, ev.err.code);
+    try testing.expectEqual(@as(u8, 0x60), adb.ai[12].value.bit_string.bytes[0]);
+    // ... the right one succeeds and is itself announced (to both destinations).
+    ack.time_stamp = .{ .sequence_number = 1 };
+    _ = try c.acknowledgeAlarm(dev_addr, ack, 4_007);
+    try testing.expectEqual(types.EventState.high_limit, (try dev.poll(4_007)).alarm_acknowledged.state);
+    try testing.expectEqual(@as(u8, 0xE0), adb.ai[12].value.bit_string.bytes[0]);
+    const simple = try c.poll(4_007);
+    try testing.expectEqual(types.ConfirmedService.acknowledge_alarm, simple.simple_ack.svc);
+    try testing.expectEqual(@as(usize, 2), try hearEvents(&c, 4_007, &heard));
+    try testing.expectEqual(events.NotifyType.ack_notification, heard[0].notify);
+    try testing.expectEqual(@as(?bool, null), heard[0].ack_required);
+    try testing.expectEqual(@as(u32, 500), heard[0].seq);
+    _ = try dev.poll(4_007);
+    // Acknowledging again is a success that announces nothing.
+    _ = try c.acknowledgeAlarm(dev_addr, ack, 4_008);
+    _ = try pumpUntil(&dev, &c, 4_008, "simple_ack");
+    try testing.expectEqual(@as(usize, 0), try hearEvents(&c, 4_008, &heard));
+
+    // Inside the deadband (75..80) nothing happens; below it, after the delay, back to normal.
+    try dev.update(ai1, .present_value, .{ .real = 78 }, 5_000);
+    try testing.expectEqual(Event.none, try dev.poll(9_000));
+    try dev.update(ai1, .present_value, .{ .real = 70 }, 9_000);
+    try testing.expectEqual(Event.none, try dev.poll(9_000));
+    const back = (try dev.poll(11_000)).event_transition;
+    try testing.expectEqual(types.EventState.normal, back.to);
+    // Only the first destination wants to-normal, and it asks for an acknowledgement.
+    try testing.expectEqual(@as(usize, 1), try hearEvents(&c, 11_000, &heard));
+    try testing.expectEqual(types.EventState.normal, heard[0].to);
+    try testing.expectEqual(@as(u8, 200), heard[0].priority);
+    try testing.expectEqual(@as(?bool, true), heard[0].ack_required);
+    // No alarm is active any more, but the unacknowledged to-normal keeps it in the event list.
+    _ = try c.getAlarmSummary(dev_addr, 11_001);
+    ev = try pumpUntil(&dev, &c, 11_001, "complex_ack");
+    try testing.expectEqual(@as(usize, 0), ev.complex_ack.data.len);
+    _ = try c.getEventInformation(dev_addr, null, 11_002);
+    ev = try pumpUntil(&dev, &c, 11_002, "complex_ack");
+    const lastg = try events.GetEventInformationAck.decode(ev.complex_ack.data);
+    var lit = lastg.summaries();
+    const last = (try lit.next()).?;
+    try testing.expectEqual(types.EventState.normal, last.state);
+    try testing.expectEqual(@as(u3, 0b011), last.acked_transitions.bits);
+}
+
+test "intrinsic reporting: a disabled transition is not announced and needs no acknowledgement; no class, no notification" {
+    var rig: Rig = .{};
+    rig.wire();
+    var adb: AlarmDb = .{};
+    var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, adb.wire());
+    var c = client.DefaultClient.init(rig.client_ep.transport(), .{});
+    const ai1: ObjectId = .{ .type = .analog_input, .instance = 1 };
+    var heard: [4]Heard = undefined;
+    // to-offnormal disabled: Event_Enable = to-fault, to-normal only.
+    adb.ai[7].value = .{ .bit_string = .{ .unused_bits = 5, .bytes = &.{0x60} } };
+    try dev.update(ai1, .present_value, .{ .real = 5 }, 0); // below the low limit (10)
+    _ = try dev.poll(0);
+    try testing.expectEqual(types.EventState.low_limit, (try dev.poll(2_000)).event_transition.to);
+    try testing.expectEqual(@as(usize, 0), try hearEvents(&c, 2_000, &heard));
+    try testing.expectEqual(@as(u8, 0xE0), adb.ai[12].value.bit_string.bytes[0]);
+
+    // An object that names a class that does not exist transitions silently.
+    adb.ai[8].value = .{ .unsigned = 99 };
+    adb.ai[7].value = .{ .bit_string = .{ .unused_bits = 5, .bytes = &.{0xE0} } };
+    try dev.update(ai1, .present_value, .{ .real = 90 }, 3_000);
+    _ = try dev.poll(3_000);
+    try testing.expectEqual(types.EventState.high_limit, (try dev.poll(5_000)).event_transition.to);
+    try testing.expectEqual(@as(usize, 0), try hearEvents(&c, 5_000, &heard));
 }
 
 test "an unsupported confirmed service is Rejected" {

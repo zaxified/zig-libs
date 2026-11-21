@@ -43,6 +43,7 @@ const bvll = @import("bvll.zig");
 const npdu = @import("npdu.zig");
 const apdu = @import("apdu.zig");
 const service = @import("service.zig");
+const events = @import("events.zig");
 const transport = @import("transport.zig");
 
 const ObjectId = tag.ObjectId;
@@ -178,6 +179,13 @@ pub const Event = union(enum) {
         from: BipAddress,
         confirmed: bool,
         notification: service.CovNotification,
+    },
+    /// An event notification (clause 13.8, 13.9). A confirmed one has been
+    /// acknowledged automatically before this is reported.
+    event_notification: struct {
+        from: BipAddress,
+        confirmed: bool,
+        notification: events.EventNotification,
     },
     /// A confirmed request completed with no result data.
     simple_ack: struct { from: BipAddress, invoke_id: u8, svc: types.ConfirmedService },
@@ -587,6 +595,32 @@ pub fn Client(comptime max_pending: usize) type {
             return self.sendConfirmed(to, .read_range, w.written(), now_ms);
         }
 
+        /// Acknowledges an alarm (clause 13.5): `ack` must carry the event
+        /// state and time stamp of the transition as its notification did.
+        pub fn acknowledgeAlarm(self: *Self, to: BipAddress, ack: events.AcknowledgeAlarm, now_ms: u64) Error!u8 {
+            var body: [128]u8 = undefined;
+            var w = tag.Writer.init(&body);
+            try ack.encode(&w);
+            return self.sendConfirmed(to, .acknowledge_alarm, w.written(), now_ms);
+        }
+
+        /// Asks for the objects in alarm or with an unacknowledged transition
+        /// (clause 13.12); `last_received` continues a list the device cut
+        /// short (`events.GetEventInformationAck.more_events`). The answer is
+        /// a `.complex_ack` for `.get_event_information`.
+        pub fn getEventInformation(self: *Self, to: BipAddress, last_received: ?ObjectId, now_ms: u64) Error!u8 {
+            var body: [16]u8 = undefined;
+            var w = tag.Writer.init(&body);
+            try (events.GetEventInformation{ .last_received = last_received }).encode(&w);
+            return self.sendConfirmed(to, .get_event_information, w.written(), now_ms);
+        }
+
+        /// Asks for the active alarms (clause 13.7); the answer is a
+        /// `.complex_ack` for `.get_alarm_summary` (`events.AlarmSummaryIterator`).
+        pub fn getAlarmSummary(self: *Self, to: BipAddress, now_ms: u64) Error!u8 {
+            return self.sendConfirmed(to, .get_alarm_summary, &.{}, now_ms);
+        }
+
         // ── the poll loop ──────────────────────────────────────────────────
 
         /// Receives at most one datagram, expires at most one transaction, and
@@ -906,6 +940,14 @@ pub fn Client(comptime max_pending: usize) type {
                             .invoke_id = r.invoke_id,
                         } };
                     }
+                    if (r.service == .confirmed_event_notification) {
+                        const note = try events.EventNotification.decode(r.data);
+                        try self.sendApdu(origin, .{ .simple_ack = .{
+                            .invoke_id = r.invoke_id,
+                            .service = .confirmed_event_notification,
+                        } });
+                        return .{ .event_notification = .{ .from = origin, .confirmed = true, .notification = note } };
+                    }
                     if (r.service == .confirmed_cov_notification) {
                         const note = try service.CovNotification.decode(r.data);
                         try self.sendApdu(origin, .{ .simple_ack = .{
@@ -947,6 +989,11 @@ pub fn Client(comptime max_pending: usize) type {
                 .i_have => return .{ .i_have = .{
                     .from = origin,
                     .info = try service.IHave.decode(u.data),
+                } },
+                .unconfirmed_event_notification => return .{ .event_notification = .{
+                    .from = origin,
+                    .confirmed = false,
+                    .notification = try events.EventNotification.decode(u.data),
                 } },
                 .unconfirmed_cov_notification => return .{ .cov = .{
                     .from = origin,
