@@ -7,7 +7,8 @@
 //! them (testkit's fuzz driver; `_ONLY`, `_MS`, `_SEEDFILE`, `_INPUT` as
 //! documented there):
 //! - `dtls-handshake`: a whole handshake (PSK AES-GCM, PSK ChaCha20, PSK with
-//!   the HelloRetryRequest cookie exchange, certificate-less (EC)DHE) where ONE
+//!   the HelloRetryRequest cookie exchange, certificate-less (EC)DHE, a certificate handshake with an OCSP staple and
+//!   SCTs, a ticket resumption with 0-RTT early data) where ONE
 //!   flight on the way is damaged (0-3 octets / truncation), replaced by
 //!   random bytes, dropped or duplicated. Undamaged: both sides connect and
 //!   an application record crosses both ways. Whatever happens: if both
@@ -32,6 +33,10 @@ const record = @import("record.zig");
 const handshake = @import("handshake.zig");
 const messages = @import("messages.zig");
 const flight = @import("flight.zig");
+const dtls = @import("root.zig");
+const tlsresume = @import("tlsresume");
+const cert_kat = @import("certauth_kat_vectors.zig");
+const Ecdsa = std.crypto.sign.ecdsa;
 const Connection = conn_mod.Connection;
 const Config = conn_mod.Config;
 pub const fuzz_driver = testkit.fuzz.driver;
@@ -84,9 +89,90 @@ const psk_identity = "device-042";
 const psk = "a-shared-pre-shared-key";
 const cookie_secret = "server-side cookie MAC key, never on the wire";
 
-const Mode = enum { psk_gcm, psk_chacha, psk_hrr, dhe };
+const Mode = enum { psk_gcm, psk_chacha, psk_hrr, dhe, cert_staple, cert_resume };
 
-fn configs(mode: Mode) [2]Config {
+// Certificate modes: a P-256 server leaf under a trust anchor, with an OCSP staple and an SCT list on the leaf's
+// CertificateEntry, session tickets sealed by a STEK ring, and a ticket from one full handshake for `cert_resume`.
+const staple = "\x30\x03\x0a\x01\x00"; // OCSPResponse { successful }
+const sct_list = "\x00\x06\x00\x04\x05\x06\x07\x08";
+const early = "fuzz 0-RTT early data";
+var cert_ready = false;
+var sk_server: Ecdsa.EcdsaP256Sha256.SecretKey = undefined;
+var stek_ring: tlsresume.stek.DefaultRing = undefined;
+var stek_tkr: dtls.StekTicketer(tlsresume.stek.DefaultRing) = undefined;
+var resume_ticket: dtls.SessionTicket = undefined;
+
+fn admitAll(_: ?*anyopaque, _: []const u8, _: i64) bool {
+    return true;
+}
+
+fn certConfigs(with_ticket: bool) [2]Config {
+    var c: Config = .{
+        .role = .client,
+        .key_exchange = .cert_dhe,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+        .require_peer_cert = true,
+        .request_ocsp = true,
+        .request_scts = true,
+        .alpn_protocols = &.{"coap"},
+    };
+    const s: Config = .{
+        .role = .server,
+        .key_exchange = .cert_dhe,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{ .chain = &.{&cert_kat.server_cert_der}, .private_key = .{ .ecdsa_p256 = &sk_server }, .ocsp_response = staple, .sct_list = sct_list },
+        .now_sec = cert_kat.valid_now_sec,
+        .tickets = .{ .ticketer = stek_tkr.ticketer(), .max_early_data = 1024, .replay = .{ .ctx = null, .admit = admitAll } },
+        .alpn_protocols = &.{"coap"},
+    };
+    if (with_ticket) {
+        c.resumption = &resume_ticket;
+        c.early_data = early;
+    }
+    return .{ c, s };
+}
+
+/// One full handshake (undamaged) that leaves `resume_ticket`; once per process.
+fn ensureCert() !void {
+    if (cert_ready) return;
+    sk_server = try Ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(cert_kat.server_secret_key_bytes);
+    stek_ring = .init();
+    stek_ring.rotate(1, &@as([32]u8, @splat(0x5e)), cert_kat.valid_now_sec);
+    stek_tkr = .{ .ring = &stek_ring };
+    const cfg = certConfigs(false);
+    var client = try Connection.clientInit(cfg[0]);
+    var server = try Connection.serverInit(cfg[1]);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x61)));
+    const rnd: conn_mod.Entropy = .{ .seeded_for_test = csprng.random() };
+    var b1: [6144]u8 = undefined;
+    var b2: [6144]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    const f2 = try server.handleFlight(ch, rnd, 0, &b2);
+    const cf = try client.handleFlight(f2.out, rnd, 0, &b1);
+    const sr = try server.handleFlight(cf.out, rnd, 0, &b2);
+    if (!sr.done) return error.TestHandshakeFailed;
+    // The NewSessionTicket record(s) of the server's last flight.
+    var rest: []const u8 = sr.out;
+    var plain: [256]u8 = undefined;
+    while (rest.len != 0) {
+        const sp = record.nextDatagram(rest, 1);
+        rest = sp.rest;
+        _ = client.recv(sp.datagram, &plain) catch {};
+    }
+    resume_ticket = (client.sessionTicket() orelse return error.TestNoTicket).*;
+    cert_ready = true;
+}
+
+fn configs(mode: Mode) ![2]Config {
+    switch (mode) {
+        .cert_staple, .cert_resume => {
+            try ensureCert();
+            return certConfigs(mode == .cert_resume);
+        },
+        else => {},
+    }
     return switch (mode) {
         .psk_gcm, .psk_hrr => .{
             .{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} },
@@ -106,6 +192,7 @@ fn configs(mode: Mode) [2]Config {
             .{ .role = .client, .key_exchange = .cert_dhe_insecure_unauthenticated, .cipher_suites = &.{.aes_128_gcm_sha256} },
             .{ .role = .server, .key_exchange = .cert_dhe_insecure_unauthenticated, .cipher_suites = &.{.aes_128_gcm_sha256} },
         },
+        .cert_staple, .cert_resume => unreachable,
     };
 }
 
@@ -143,12 +230,15 @@ const HsMark = Marker(enum {
     after_damage_connected,
     hrr,
     dhe,
+    stapled,
+    resumed,
+    early_data,
 });
 
 pub fn fuzzHandshake(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
-    const mode: Mode = if (S == fuzz_driver.Rng) @fromBackingInt(@intCast(src.valueRangeAtMost(u8, 0, 3))) else .psk_gcm;
-    const cfg = configs(mode);
+    const mode: Mode = if (S == fuzz_driver.Rng) @fromBackingInt(@intCast(src.valueRangeAtMost(u8, 0, 5))) else .psk_gcm;
+    const cfg = try configs(mode);
     var client = try Connection.clientInit(cfg[0]);
     var server = try Connection.serverInit(cfg[1]);
     var csprng: std.Random.DefaultCsprng = undefined;
@@ -191,9 +281,15 @@ pub fn fuzzHandshake(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
                 msg = scratch[0..n];
                 if (n != cur.len or !std.mem.eql(u8, msg, cur)) {
                     changed = true;
-                    if (n != cur.len or cur[0] != 22) only_plain_header = false;
+                    // 0-RTT records after the ClientHello's record are not covered by the handshake's
+                    // transcript: damage there loses early data (the client resends it), nothing more.
+                    const hello_end: usize = if (mode == .cert_resume and step == 0 and cur.len >= 13 and cur[0] == 22)
+                        @min(cur.len, 13 + @as(usize, std.mem.readInt(u16, cur[11..13], .big)))
+                    else
+                        cur.len;
+                    if ((n != cur.len and n < hello_end) or cur[0] != 22) only_plain_header = false;
                     for (msg[0..@min(n, cur.len)], cur[0..@min(n, cur.len)], 0..) |a, b, i| {
-                        if (a != b and (i < 1 or i > 10)) only_plain_header = false;
+                        if (a != b and (i < 1 or i > 10) and i < hello_end) only_plain_header = false;
                     }
                 }
             },
@@ -233,6 +329,16 @@ pub fn fuzzHandshake(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
         if (kind == .damage or kind == .random) HsMark.mark(.after_damage_connected) else HsMark.mark(.connected);
         if (mode == .psk_hrr and kind == .none) HsMark.mark(.hrr);
         if (mode == .dhe) HsMark.mark(.dhe);
+        if (kind == .none) {
+            if (mode == .cert_staple and client.peerOcspResponse() != null and client.peerSctList() != null) HsMark.mark(.stapled);
+            if (mode == .cert_resume and server.resumed() and client.resumed()) HsMark.mark(.resumed);
+            if (mode == .cert_resume and server.earlyDataAccepted() and std.mem.eql(u8, early, server.earlyData())) HsMark.mark(.early_data);
+        }
+        // Early data that arrives is the client's, whatever was done to the flight.
+        if (mode == .cert_resume and server.earlyDataAccepted() and !std.mem.startsWith(u8, early, server.earlyData())) {
+            std.debug.print("dtls-handshake: the server took 0-RTT data the client never sent\n", .{});
+            return error.WrongEarlyData;
+        }
     } else {
         if ((kind == .none or kind == .duplicate) and S == fuzz_driver.Rng) {
             std.debug.print("dtls-handshake: an undamaged handshake did not connect (mode {t}, kind {t}, client {t}, server {t})\n", .{ mode, kind, client.state, server.state });
@@ -266,7 +372,7 @@ var pair: [2]Connection = undefined;
 fn ensurePair(mode: Mode) !void {
     _ = mode;
     if (pair_ready) return;
-    const cfg = configs(.psk_gcm);
+    const cfg = try configs(.psk_gcm);
     pair[0] = try Connection.clientInit(cfg[0]);
     pair[1] = try Connection.serverInit(cfg[1]);
     var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x31)));
@@ -520,7 +626,7 @@ fn ensureSeeds() !void {
     var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x44)));
     const rnd: conn_mod.Entropy = .{ .seeded_for_test = csprng.random() };
     for ([_]Mode{ .psk_gcm, .dhe }, 0..) |mode, i| {
-        const cfg = configs(mode);
+        const cfg = try configs(mode);
         var client = try Connection.clientInit(cfg[0]);
         var server = try Connection.serverInit(cfg[1]);
         var b1: [4096]u8 = undefined;
