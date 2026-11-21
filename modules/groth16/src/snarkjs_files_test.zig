@@ -272,6 +272,32 @@ test "phase2.newZkey reproduces snarkjs groth16 setup, all but the circuit hash"
     try testing.expectEqualSlices(u8, t0_zkey[t0_hash_off + 64 ..], out[t0_hash_off + 64 ..]);
 }
 
+test "phase2.newZkey: the domain-size boundary matches snarkjs (8 rows -> 8, 9 rows -> 16), byte for byte outside the circuit hash" {
+    // b8/b9 (`tools/snarkjs/gen.sh boundary`): a chain of 6 or 7 products
+    // with one public input, so constraints + public + 1 = 8 or 9 rows;
+    // snarkjs's `groth16 setup` over the same pot.ptau made the zkeys.
+    const p = try ptau_mod.Ptau.parse(pot_ptau);
+    const cases = [_]struct { r1cs: []const u8, zkey: []const u8, rows: u64, domain: u32 }{
+        .{ .r1cs = @embedFile("testdata/snarkjs/b8.r1cs"), .zkey = @embedFile("testdata/snarkjs/b8.zkey"), .rows = 8, .domain = 8 },
+        .{ .r1cs = @embedFile("testdata/snarkjs/b9.r1cs"), .zkey = @embedFile("testdata/snarkjs/b9.zkey"), .rows = 9, .domain = 16 },
+    };
+    for (cases) |c| {
+        var r = try circom.parseR1cs(testing.allocator, c.r1cs);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqual(c.rows, @as(u64, r.constraints.len) + r.nPublic() + 1);
+        var theirs = try zkey.parse(testing.allocator, c.zkey);
+        defer theirs.deinit(testing.allocator);
+        try testing.expectEqual(c.domain, theirs.domain_size);
+        var z = try phase2.newZkey(testing.allocator, r, p);
+        defer z.deinit(testing.allocator);
+        try testing.expectEqual(c.domain, z.domain_size);
+        z.circuit_hash = theirs.circuit_hash;
+        const out = try zkey.toBytes(testing.allocator, z);
+        defer testing.allocator.free(out);
+        try testing.expectEqualSlices(u8, c.zkey, out);
+    }
+}
+
 fn loadAll() !struct { r: circom.R1cs, p: ptau_mod.Ptau } {
     return .{ .r = try circom.parseR1cs(testing.allocator, t_r1cs), .p = try ptau_mod.Ptau.parse(pot_ptau) };
 }

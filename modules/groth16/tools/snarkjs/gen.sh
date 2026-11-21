@@ -12,6 +12,7 @@
 #     tools/snarkjs/gen.sh fixtures   # regenerate src/testdata/snarkjs (small circuit)
 #     tools/snarkjs/gen.sh ours       # snarkjs judges OUR proof (ours_proof.json)
 #     tools/snarkjs/gen.sh big        # 10 000-constraint circuit, both directions
+#     tools/snarkjs/gen.sh boundary   # 8-row and 9-row circuits (domain-size rule)
 #     tools/snarkjs/gen.sh json       # how ffjavascript itself writes/reads JSON points
 #
 # Work happens in <repo>/.zig-cache/g16 (droppable). Node is fetched there
@@ -115,6 +116,20 @@ json)
         c.G2.isZero(c.G2.fromObject([["0", "0"], ["1", "0"], ["0", "0"]])));
       await c.terminate();
     });'
+  ;;
+boundary)
+  # Two circuits around a power of two of rows (constraints + public + 1):
+  # b8 has exactly 8, b9 one more. snarkjs's `groth16 setup` over the
+  # committed pot.ptau fixes the domain size each gets; the zkeys are
+  # committed and src/audit_test.zig compares newZkey against them.
+  td=$mod/src/testdata/snarkjs
+  for n in 8 9; do
+    { cat "$here/boundary.circom"; echo "component main {public [x]} = Chain($((n - 2)));"; } > b$n.circom
+    $CIRCOM b$n.circom --r1cs -o . >/dev/null
+    $S groth16 setup b$n.r1cs "$td/pot.ptau" b$n.zkey >/dev/null
+    $S zkey verify b$n.r1cs "$td/pot.ptau" b$n.zkey 2>&1 | last
+    cp b$n.r1cs b$n.zkey "$td/"
+  done
   ;;
 big)
   build_g16

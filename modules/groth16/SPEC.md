@@ -341,7 +341,8 @@ stderr). Test classes:
   (4 constraints, 3 public inputs: `out1=x²`, `out2=y²`, `out3=(x+y)²`); tampered proof (negated `πA`/`πC`), wrong
   public input and non-satisfying witness → `false`.
 - **snarkjs/circom fixtures** (`snarkjs_files_test.zig`, `snarkjs_kat_test.zig`; see § Anchoring): the foreign
-  files read and round-tripped byte for byte, both proving directions, `newZkey`, `phase2.verify` verdicts per
+  files read and round-tripped byte for byte, both proving directions, `newZkey` (including the domain-size boundary:
+  `b8`/`b9`, 8 and 9 rows, get snarkjs's domains 8 and 16 and its bytes outside the circuit hash), `phase2.verify` verdicts per
   tampering, the JSON exporter (`snarkjs_export.zig`) and importer (`snarkjs_import.zig`, round trip, snarkjs's own files, refusals).
 - **Audit tests** (`audit_test.zig`, and in `phase2.zig`, `qap.zig`, `msm.zig`): the `2^28`-th root of unity pinned to
   the ark-bn254 / snarkjs constant (generators 5 and 7 give the same root for every domain up to `2^5`, so small
@@ -363,7 +364,7 @@ stderr). Test classes:
   control, at least 10). The wipes of the six `secureZero` defers of `prover.prove` and of `x_inv` in `contribute` are
   shadowed by the entry point's burn, so no test can see them (belt and braces).
 - **Interop oracle** (manual, needs node and a circom build: `tools/snarkjs/gen.sh fixtures|ours|big|json`;
-  `tools/snarkjs/g16.zig` is the command line). The 10 000-constraint `big` run is not committed.
+  `tools/snarkjs/g16.zig` is the command line). The 10 000-constraint `big` run is not committed (its keys are 5 MB; `gen.sh big` reruns it).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
 
@@ -380,9 +381,10 @@ accounted for by the `bn254` module, not restated here.
 
 **Data.** `src/testdata/snarkjs/` is OUTPUT of third-party binaries run as
 black-box oracles — circom 2.2.3 (`t.r1cs`, `t.wtns`) and snarkjs@0.7.6
-(`pot.ptau`, `t0.zkey`, `t1.zkey`, `vk.json`, `proof.json`, `public.json`),
+(`pot.ptau`, `t0.zkey`, `t1.zkey`, `vk.json`, `proof.json`, `public.json`; `b8.r1cs`/`b8.zkey`, `b9.r1cs`/`b9.zkey`
+from `gen.sh boundary` over that `pot.ptau`),
 both GPL-3.0, run by `tools/snarkjs/gen.sh`, their source not read. The
-circuit `t.circom` and `input.json` are this module's own; `ours_proof.json`
+circuits `t.circom`, `tools/snarkjs/boundary.circom` and `input.json` are this module's own; `ours_proof.json`
 is this module's own output. The files hold field elements and curve points
 computed from those inputs, not code or text of either project.
 
@@ -418,6 +420,5 @@ Missing and it matters, most-hit first:
 2. **Solidity verifier and calldata export**: snarkjs, gnark and ark-circom write a verifier contract for a key, and snarkjs the `verifyProof(...)` calldata for a proof. Today a user deploying on-chain runs snarkjs on the same `.zkey`/`proof.json`, which works *(inferred: same key, same equation; not run here)*. Effort: small-medium (a template over `VerifyingKey` plus the EVM's G2 coordinate order); needs a black-box oracle run (solc / an EVM) to anchor. Fits §2.
 3. **snarkjs's circuit hash and contribution proof:** needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b) — hit by a ceremony that mixes snarkjs and this module, not by proving. Black-box only; 29 340 hash constructions tried, so possibly infeasible without reading GPL source. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks.
 5. **Positional file source:** readers take bytes in memory. Proving needs only the `.zkey` (hundreds of MB at 10⁶ constraints *(inferred)*), and phase 2 needs a `.ptau` cut to the circuit's power; the full 2²⁸ ceremony file (~150 GB) does not fit. A `readAt` source over `std.Io.File` reading only the levels a circuit needs. Effort: medium.
-7. **Domain-size boundary fixture:** `phase2.newZkey`'s rule for a circuit whose row count is exactly a power of two (the `log_n` loop at the top of `newZkey`) is learnable black-box but no committed fixture pins it against snarkjs; a circom circuit landing on the boundary, run through `gen.sh`, would. The 10 000-constraint run is also manual (`gen.sh big`), not committed. `src/audit_test.zig` pins this module's own rule, but against itself.
 8. **Phase-1 (`.ptau`) contribution and verification**: reading only; users take a published ceremony (§ 5b item 5).
 9. **Circuit-building API (constraint-synthesis trait or gadget helpers):** arkworks (`ark-relations`), bellman and gnark all let users write circuits; here R1CS is assembled by hand or comes from circom. Effort: medium-large. Fits §2.
