@@ -1568,11 +1568,4 @@ Gaps that are unverified rather than unbuilt:
 - **`Group`'s retained state grows with session length** (Threat model). The fix
   is owning leaf bytes rather than aliasing them, which would let an epoch's
   arena go once nothing in the tree points into it.
-- **`hpke` does not export the HPKE `suite_id`.** `Context.exportSecret` takes one
-  as a parameter, but `schedule.suiteIdOf` (`hpke/src/schedule.zig`) is
-  private, so `keyschedule.hpkeSuiteId` (`keyschedule.zig`) restates the
-  `Aead` to `aead_id` mapping (`@compileError` for an unregistered AEAD).
-  `hpke.suite.suiteId` and `Kem.kem_id` ARE public, so only that one mapping is
-  duplicated. The clean fix is upstream in `hpke`: export `suiteIdOf`, or have
-  `Context` carry its own suite id.
 - **Measure the bulk `PrivateMessage` path** (AEAD from the sibling `aesgcm`; Zig 0.17, #36256); the card says `Performance: not measured`.

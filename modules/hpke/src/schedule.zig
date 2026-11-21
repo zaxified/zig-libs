@@ -510,7 +510,7 @@ fn oneStageSchedule(
 /// single-shot wrappers below to assemble the outer `suite_id` (§7.2.1)
 /// from their comptime type parameters alone. A compile error (not a
 /// runtime fallback) for an AEAD RFC 9180 doesn't register.
-fn aeadIdOf(comptime Aead: type) u16 {
+pub fn aeadIdOf(comptime Aead: type) u16 {
     if (Aead == ExportOnly) return @backingInt(suite.AeadId.export_only);
     if (Aead == aesgcm.Aes128Gcm or Aead == std.crypto.aead.aes_gcm.Aes128Gcm) return @backingInt(suite.AeadId.aes128gcm);
     if (Aead == aesgcm.Aes256Gcm or Aead == std.crypto.aead.aes_gcm.Aes256Gcm) return @backingInt(suite.AeadId.aes256gcm);
@@ -531,7 +531,11 @@ fn aeadIdOf(comptime Aead: type) u16 {
 /// uses to pick the actual `Hkdf` type, so a caller cannot pick a `Nh` that
 /// runs one KDF but names another in `suite_id` (RFC 9180 §7.2.1's
 /// domain-separation byte would then lie about which KDF was used).
-fn suiteIdOf(comptime Kem: type, comptime Aead: type, comptime Nh: anytype) [10]u8 {
+///
+/// Public because `Context.exportSecret` takes the `suite_id` as a
+/// parameter: a protocol holding a `Context` (MLS §8.3's external init) names
+/// the suite it was built for with this, instead of restating the registry.
+pub fn suiteIdOf(comptime Kem: type, comptime Aead: type, comptime Nh: anytype) [10]u8 {
     return suite.suiteId(Kem.kem_id, kdf.Of(Nh).kdf_id, aeadIdOf(Aead));
 }
 

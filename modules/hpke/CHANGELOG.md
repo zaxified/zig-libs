@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — `schedule.suiteIdOf(Kem, Aead, Nh)` and `schedule.aeadIdOf(Aead)` are now `pub`: the RFC 9180 §7.2.1 `suite_id` a `Context.exportSecret` caller must pass, from the same types the context was built with. Additive.
+
 - **2026-11-17** — New: `P256Kem`/`P384Kem`/`P521Kem.validatePublicKey(&pk)`, an admission check that refuses (`error.DeserializeError`) exactly the public keys `encap` would refuse (SEC1 uncompressed, canonical, on the curve), so a protocol (MLS KeyPackage `init_key` / leaf `encryption_key`) can refuse an invalid point when it receives it. Same accept set as Go `crypto/ecdh` `NewPublicKey`.
 
 - **2026-11-17** — New `keyPairFromSecret(out: *KeyPair, sk: *const [Nsk]u8) KeyPairFromSecretError!void` on all four DHKEMs (X25519, P-256, P-384, P-521): RFC 9180 §7.1.2 `DeserializePrivateKey` plus the public key, under `kem_burn`. The NIST curves refuse `sk` outside `[1, n-1]` with `error.DeserializeError`; X25519 accepts any 32 bytes (RFC 7748 clamping). Anchored on every RFC 9180 Appendix A private key, the Go vectors' `skRm` (including P-384) and `deriveKeyPair`'s own output (`src/keypair_from_secret_test.zig`). Additive; nothing else changes.

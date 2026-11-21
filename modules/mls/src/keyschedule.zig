@@ -82,7 +82,6 @@
 
 const std = @import("std");
 const hpke = @import("hpke");
-const aesgcm = @import("aesgcm");
 const codec = @import("codec.zig");
 const suite = @import("suite.zig");
 const crypto = @import("crypto.zig");
@@ -463,36 +462,12 @@ pub const label_external_init = "MLS 1.0 external init secret";
 
 /// The outer HPKE `suite_id` (RFC 9180 §5.1/§7.2.1, `"HPKE" ||
 /// I2OSP(kem_id, 2) || I2OSP(kdf_id, 2) || I2OSP(aead_id, 2)`) that
-/// `hpke.Context.exportSecret` needs as its first argument.
-///
-/// **Why this is computed here rather than asked of `hpke`.** `hpke`
-/// derives the identical value internally (`schedule.zig`'s `suiteIdOf`)
-/// but does not export it, and `Context.exportSecret` takes it as a
-/// parameter — so an MLS caller holding a `Context` has no supported way to
-/// name the suite that `Context` was built for. `hpke.suite.suiteId` and
-/// `Kem.kem_id` ARE public, so only the `Aead` → `aead_id` mapping has to
-/// be restated, and it is restated for exactly the suites `suite.zig`
-/// wires. Anything else is a `@compileError` rather than a wrong id
-/// silently derived. See `SPEC.md`'s Backlog: the clean fix is upstream in
-/// `hpke`, which this batch was scoped out of.
+/// `hpke.Context.exportSecret` needs as its first argument — `hpke`'s own
+/// derivation from the suite's KEM, AEAD and `Nh` (the same `Nh` dispatch
+/// `setupBaseS` uses to pick the KDF it runs), so the id cannot name a KDF
+/// or AEAD the context was not built with.
 fn hpkeSuiteId(comptime S: type) [10]u8 {
-    const aead_id: u16 = if (S.Aead == aesgcm.Aes128Gcm or S.Aead == std.crypto.aead.aes_gcm.Aes128Gcm)
-        @backingInt(hpke.AeadId.aes128gcm)
-    else if (S.Aead == aesgcm.Aes256Gcm or S.Aead == std.crypto.aead.aes_gcm.Aes256Gcm)
-        @backingInt(hpke.AeadId.aes256gcm)
-    else if (S.Aead == hpke.ChaCha20Poly1305 or S.Aead == std.crypto.aead.chacha_poly.ChaCha20Poly1305)
-        @backingInt(hpke.AeadId.chacha20poly1305)
-    else
-        @compileError("mls: no RFC 9180 aead_id registered for " ++ @typeName(S.Aead));
-    // The KDF half comes from `hpke.kdf.Of(S.Nh)` — the SAME `Nh` dispatch
-    // `hpke.sealBase`/`setupBaseS` use to pick the HKDF they actually run
-    // (32 -> HKDF-SHA256, 48 -> HKDF-SHA384, 64 -> HKDF-SHA512), so the
-    // exported suite_id cannot name a KDF the context was not built with.
-    return hpke.suite.suiteId(
-        S.Kem.kem_id,
-        hpke.kdf.Of(S.Nh).kdf_id,
-        aead_id,
-    );
+    return hpke.schedule.suiteIdOf(S.Kem, S.Aead, S.Nh);
 }
 
 /// What `externalInitSender` produces: the `kem_output` that goes into the
