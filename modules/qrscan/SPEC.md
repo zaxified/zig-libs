@@ -361,21 +361,23 @@ tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
 - **A minimum timing score for the dimension referee** — the score chooses between candidate versions and does not get a
   veto, because a real symbol with a damaged timing pattern still decodes (the data is protected, the timing is not).
 
+- **A mesh instead of one global map** (interpolating between the alignment patterns so that each cell carries its own local
+  map, for curvature and a higher tilt limit). ZXing, the reference, fits one perspective transform to the finders and the
+  alignment pattern (ZXing-class readers read to 40° that way), and no other surveyed reader builds a mesh; a curved
+  surface is not a scan a QR reader is expected to handle. The lattice and its extrapolation past the outer patterns would
+  be a new sampler to keep equal to the global one on flat symbols.
+
 ## Backlog / deferred
 
-- **A mesh instead of one global map.** The grid is a single projective map, so it models a flat plane at an angle and
-  nothing else. Interpolating between the alignment patterns instead — each cell of the lattice carrying its own local
-  map — would handle curvature as well, and would raise the tilt limit too (ZXing-class readers read to 40°; here 25–30°
-  about the vertical axis in the differential, 10–25° in the in-repo sweep), since it stops assuming the whole symbol is
-  one plane. The landmarks are already collected; what is missing is the lattice and the extrapolation for the margins
-  outside it. Effort: large.
 - **Tilt about the horizontal axis lags the vertical one** — 15° against 25° at version 6. Partly explained
   (2026-11-21, a version 6 text at 6 px per module, finders found on both axes up to 34°): the size estimate
   snapped *down* to a symbol size, so a 40.2-module span read as 37 where 41 is nearer (fixed: nearest size);
   the remaining gap is the grid fit, not the finders or the size: at the right size and from 19° the timing
   score of the best sampled grid is 0.55–0.57 about the horizontal axis, where about the vertical axis it is 1.0
   to 25°. The refinement (alignment patterns, `refine`) is the suspect: it takes one module size for both
-  directions, and a tilt about the horizontal axis changes the vertical one.
+  directions (`findAlignment` and `dropOutliers` are handed `c.module`), and a tilt about the horizontal axis changes the vertical one.
+  *BOUNCED: needs an experiment loop (render a tilted symbol, read it, change the vertical run's module size, repeat over the
+  sweep) that was not run; the first thing to try is a separate vertical module size from the finder runs.*
 - **Small symbols at three pixels per module.** A version 1 reads at about 79 % of angles there, against 100 % at four
   pixels. The fix has to happen in binarisation (see *What is deliberately not done* for the sampling idea that failed).
   Diagnosed 2026-11-21 (version 1, "HELLO", 3 px per module, every 3° of rotation): 27 of 30 angles read; at the
@@ -383,4 +385,5 @@ tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
   come out wrong, scattered over finder edges and data alike. With no alignment pattern the grid is three finder
   centres and nothing refines it, so a sub-pixel error in them moves every sample by a third of a module. It is
   the grid, not the binarisation: the cure would be a sub-pixel finder centre (edge fit rather than the run
-  midpoint), not tried.
+  midpoint), not tried. *BOUNCED: the same experiment loop (a binarisation or centre-fit change judged against the 3-pixel
+  version 1 sweep and the whole differential), not run in this wave.*
