@@ -143,7 +143,7 @@ prints, or from testing a hypothesis against the files. The non-obvious ones:
   here. `groth16 prove`, `zkey export verificationkey` and the verifier do not
   care.
 - **Contribution proof.** snarkjs's proof of knowledge uses a hash-to-G2 point
-  this module does not reproduce, so `verifyContribution` cannot check a
+  this module does not reproduce (ours: `phase2.hashToG2`, § 5b item 6), so `verifyContribution` cannot check a
   snarkjs record and snarkjs's `zkey verify` cannot check one of ours
   ("Inconsistent transcript"). `phase2.verify` does not depend on either: it
   checks the key itself.
@@ -288,13 +288,16 @@ That in turn trusts the `.ptau` — verifying a phase-1 ceremony is out of
 scope; use a published one (e.g. the Hermez/Polygon files) whose transcript
 others have checked.
 
-**6. A contribution record is a consistency proof, not a proof of knowledge.**
-`g2_sp` is `[h]₂` for a public hash `h`, so `[x]₂` can be read off any record
-and a valid record for `x' = k·x_prev` written without knowing `x'` (found by review). The ceremony still ends at an unknown δ if one contributor was
-honest — fixing δ to a known value needs `[1/δ_before]₂`, which nothing
-reveals — but `verifyContribution` does not prove who knew what. Hash-to-G2
-is the fix (backlog). `verify` checks neither the circuit hash nor the
-records before the last; it checks the key.
+**6. A contribution record is a proof of knowledge of the contributor's `x`.**
+`g2_sp = phase2.hashToG2(transcript)`: try-and-increment over Fp2 (blake2b-512 under a module tag, `y` from
+`Fp2.sqrt`, sign from a hash bit), then the cofactor `h₂ = 2p − r` multiplied out, so the point is in the order-r
+subgroup and its discrete log is unknown. `g2_spx = [x]·g2_sp` can then only be written by someone who knows `x` (the
+knowledge-of-exponent argument of the Bowe–Gabizon–Miers MPC, IACR ePrint 2017/1050, which snarkjs and Zcash's
+Sapling ceremony follow). Majority practice for the map itself is RFC 9380's SVDW (gnark's `HashToG2`); try-and-
+increment is chosen because the input is public (its variable attempt count leaks nothing), it needs only `Fp2.sqrt`,
+and no foreign party has to reproduce the point — snarkjs derives its own, so records stay unverifiable across the two
+either way (§ 4b). A record written with the earlier `g2_sp = [h]₂` construction fails `verifyContribution`.
+`verify` checks neither the circuit hash nor the records before the last; it checks the key.
 
 **7. Readers refuse before they allocate.** `.r1cs` requires section 3, which pays 8 bytes per wire and so bounds
 `n_wires` by the file's size (`circom.zig`); `zkey` checks every section size against the header counts before
@@ -408,7 +411,6 @@ Missing and it matters, most-hit first:
 1. **Multi-threaded prover and setup**: snarkjs, rapidsnark, arkworks, bellman and gnark all use every core; ours is one. Even at 10 000 constraints, but a user with a 10⁶-constraint circuit waits minutes where rapidsnark takes seconds *(inferred)*. MSM windows and the three coset FFTs split cleanly; an `std.Io`-group variant of `zkprove.prove`. Effort: medium. Fits §2.
 2. **Solidity verifier and calldata export**: snarkjs, gnark and ark-circom write a verifier contract for a key, and snarkjs the `verifyProof(...)` calldata for a proof. Today a user deploying on-chain runs snarkjs on the same `.zkey`/`proof.json`, which works *(inferred: same key, same equation; not run here)*. Effort: small-medium (a template over `VerifyingKey` plus the EVM's G2 coordinate order); needs a black-box oracle run (solc / an EVM) to anchor. Fits §2.
 3. **snarkjs's circuit hash and contribution proof:** needed for snarkjs's `zkey verify` to accept keys made or contributed here (§ 4b) — hit by a ceremony that mixes snarkjs and this module, not by proving. Black-box only; 29 340 hash constructions tried, so possibly infeasible without reading GPL source. Ideal: byte-identical `newZkey` and a `contribute` whose record snarkjs checks.
-4. **Hash-to-G2 for the contribution proof** (§ 5b item 6): replaces `[h]₂` with a point of unknown discrete log, so a record proves knowledge.
 5. **Positional file source:** readers take bytes in memory. Proving needs only the `.zkey` (hundreds of MB at 10⁶ constraints *(inferred)*), and phase 2 needs a `.ptau` cut to the circuit's power; the full 2²⁸ ceremony file (~150 GB) does not fit. A `readAt` source over `std.Io.File` reading only the levels a circuit needs. Effort: medium.
 6. **Faster `contribute`:** 12 s at 10 000 constraints, one constant-time `scalarMul` + inversion per C/H point; a fixed-window constant-time multiply and batch normalisation should take most of it.
 7. **Domain-size boundary fixture:** `phase2.newZkey`'s rule for a circuit whose row count is exactly a power of two (the `log_n` loop at the top of `newZkey`) is learnable black-box but no committed fixture pins it against snarkjs; a circom circuit landing on the boundary, run through `gen.sh`, would. The 10 000-constraint run is also manual (`gen.sh big`), not committed. `src/audit_test.zig` pins this module's own rule, but against itself.
