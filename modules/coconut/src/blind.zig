@@ -104,6 +104,78 @@ pub const BlindSignRequest = struct {
         self.* = undefined;
     }
 
+    /// Encoded length for `p` private of `q` attributes:
+    /// `p (u64 BE) ‖ cm ‖ p·(a ‖ b) ‖ challenge ‖ rr ‖ p·rk ‖ q·rm`
+    /// (compressed G1 points, 32-byte big-endian scalars).
+    pub fn encodedLen(p: usize, q: usize) usize {
+        return 8 + g1.compressed_bytes * (1 + 2 * p) + Fr.encoded_bytes * (2 + p + q);
+    }
+
+    /// Encode into a fresh allocation (`encodedLen(ciphertexts.len, rm.len)`).
+    pub fn toBytes(self: *const BlindSignRequest, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        const p = self.ciphertexts.len;
+        const out = try allocator.alloc(u8, encodedLen(p, self.proof.rm.len));
+        std.mem.writeInt(u64, out[0..8], @intCast(p), .big);
+        var off: usize = 8;
+        const put = struct {
+            fn pt(buf: []u8, o: *usize, x: g1.Affine) void {
+                buf[o.*..][0..g1.compressed_bytes].* = g1.toBytesCompressed(x);
+                o.* += g1.compressed_bytes;
+            }
+            fn fr(buf: []u8, o: *usize, x: Fr) void {
+                buf[o.*..][0..Fr.encoded_bytes].* = x.toBytes();
+                o.* += Fr.encoded_bytes;
+            }
+        };
+        put.pt(out, &off, self.cm);
+        for (self.ciphertexts) |c| {
+            put.pt(out, &off, c.a);
+            put.pt(out, &off, c.b);
+        }
+        put.fr(out, &off, self.proof.challenge);
+        put.fr(out, &off, self.proof.rr);
+        for (self.proof.rk) |x| put.fr(out, &off, x);
+        for (self.proof.rm) |x| put.fr(out, &off, x);
+        return out;
+    }
+
+    /// Decode a request for `q` attributes; every point must be in G1 and
+    /// every scalar canonical (`error.InvalidEncoding`), the length exact.
+    /// Caller `deinit`s.
+    pub fn fromBytes(allocator: std.mem.Allocator, bytes: []const u8, q: usize) BlindError!BlindSignRequest {
+        if (bytes.len < 8) return error.InvalidEncoding;
+        const p64 = std.mem.readInt(u64, bytes[0..8], .big);
+        if (p64 > q) return error.InvalidEncoding;
+        const p: usize = @intCast(p64);
+        if (bytes.len != encodedLen(p, q)) return error.InvalidEncoding;
+        var off: usize = 8;
+        const get = struct {
+            fn pt(buf: []const u8, o: *usize) BlindError!g1.Affine {
+                const x = g1.fromBytesCompressed(buf[o.*..][0..g1.compressed_bytes].*) catch return error.InvalidEncoding;
+                o.* += g1.compressed_bytes;
+                return x;
+            }
+            fn fr(buf: []const u8, o: *usize) BlindError!Fr {
+                const x = Fr.fromBytes(buf[o.*..][0..Fr.encoded_bytes].*) catch return error.InvalidEncoding;
+                o.* += Fr.encoded_bytes;
+                return x;
+            }
+        };
+        const cm = try get.pt(bytes, &off);
+        const cts = try allocator.alloc(ElGamalCiphertext, p);
+        errdefer allocator.free(cts);
+        for (cts) |*c| c.* = .{ .a = try get.pt(bytes, &off), .b = try get.pt(bytes, &off) };
+        const challenge = try get.fr(bytes, &off);
+        const rr = try get.fr(bytes, &off);
+        const rk = try allocator.alloc(Fr, p);
+        errdefer allocator.free(rk);
+        for (rk) |*x| x.* = try get.fr(bytes, &off);
+        const rm = try allocator.alloc(Fr, q);
+        errdefer allocator.free(rm);
+        for (rm) |*x| x.* = try get.fr(bytes, &off);
+        return .{ .cm = cm, .ciphertexts = cts, .proof = .{ .challenge = challenge, .rr = rr, .rk = rk, .rm = rm } };
+    }
+
     /// The common base every authority signs under: `H(cm)`.
     pub fn base(self: *const BlindSignRequest) g1.Affine {
         return bls.hash_to_curve.hashToCurveG1(&g1.toBytesCompressed(self.cm), params_mod.base_dst);
@@ -117,6 +189,25 @@ pub const BlindSignature = struct {
     h: g1.Affine,
     a: g1.Affine,
     b: g1.Affine,
+
+    pub const encoded_bytes = 8 + 3 * g1.compressed_bytes; // 152
+
+    pub fn toBytes(self: BlindSignature) [encoded_bytes]u8 {
+        var out: [encoded_bytes]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], self.index, .big);
+        out[8..][0..g1.compressed_bytes].* = g1.toBytesCompressed(self.h);
+        out[8 + g1.compressed_bytes ..][0..g1.compressed_bytes].* = g1.toBytesCompressed(self.a);
+        out[8 + 2 * g1.compressed_bytes ..][0..g1.compressed_bytes].* = g1.toBytesCompressed(self.b);
+        return out;
+    }
+
+    /// Every point must be in G1 (`error.InvalidEncoding`): `unblind`
+    /// multiplies `a` by the user's secret `d`.
+    pub fn fromBytes(bytes: [encoded_bytes]u8) BlindError!BlindSignature {
+        var pts: [3]g1.Affine = undefined;
+        for (&pts, 0..) |*x, i| x.* = g1.fromBytesCompressed(bytes[8 + i * g1.compressed_bytes ..][0..g1.compressed_bytes].*) catch return error.InvalidEncoding;
+        return .{ .index = std.mem.readInt(u64, bytes[0..8], .big), .h = pts[0], .a = pts[1], .b = pts[2] };
+    }
 };
 
 fn blindChallenge(
@@ -493,4 +584,39 @@ test "blind issuance with no private attribute reduces to public issuance" {
     }
     const cred = try credential.aggregateCredential(allocator, &partials, 2);
     try testing.expect(credential.psVerifyPlain(s.kk.master_vk, cred, &public));
+}
+
+test "blind issuance codecs: request and blind signature round-trip; bad bytes refused" {
+    const allocator = testing.allocator;
+    var s = try Setup.init(allocator, 0xB14D);
+    defer s.deinit(allocator);
+    var prng = std.Random.DefaultPrng.init(13);
+    const private = [_]Fr{ frOf(8), frOf(9), frOf(10) };
+    const public = [_]Fr{frOf(11)};
+    var req = try prepareBlindSignSeededForTest(allocator, prng.random(), s.p, s.eg.gamma, &private, &public);
+    defer req.deinit(allocator);
+    const bytes = try req.toBytes(allocator);
+    defer allocator.free(bytes);
+    try testing.expectEqual(BlindSignRequest.encodedLen(3, 4), bytes.len);
+    var back = try BlindSignRequest.fromBytes(allocator, bytes, 4);
+    defer back.deinit(allocator);
+    // The decoded request is signed like the original.
+    const bs = try blindSign(allocator, &s.kk.sk_shares[0], s.p, s.eg.gamma, &back, &public);
+    const bs2 = try BlindSignature.fromBytes(bs.toBytes());
+    const pc = unblind(&s.eg, &bs2);
+    const pc_direct = unblind(&s.eg, &bs);
+    try testing.expect(pc.s.x.eql(pc_direct.s.x) and pc.index == bs.index);
+    // Refusals: wrong length, p > q, a non-canonical scalar, a bad point.
+    try testing.expectError(error.InvalidEncoding, BlindSignRequest.fromBytes(allocator, bytes[0 .. bytes.len - 1], 4));
+    try testing.expectError(error.InvalidEncoding, BlindSignRequest.fromBytes(allocator, bytes, 2));
+    const bad = try allocator.dupe(u8, bytes);
+    defer allocator.free(bad);
+    @memset(bad[bad.len - 32 ..], 0xff);
+    try testing.expectError(error.InvalidEncoding, BlindSignRequest.fromBytes(allocator, bad, 4));
+    @memcpy(bad, bytes);
+    bad[8] ^= 0x01; // cm's x coordinate
+    try testing.expectError(error.InvalidEncoding, BlindSignRequest.fromBytes(allocator, bad, 4));
+    var sb = bs.toBytes();
+    sb[8 + 48 + 5] ^= 0x40;
+    try testing.expectError(error.InvalidEncoding, BlindSignature.fromBytes(sb));
 }

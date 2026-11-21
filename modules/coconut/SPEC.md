@@ -126,6 +126,10 @@ The reference's `prepare_blind_sign` / `blind_sign` / `unblind`, attribute order
   authority multiplies them by its key share, and `[y] T` for a small-order `T` leaks `y` modulo that order) or
   (`γ` the identity), recomputes `A`, `B`, `C` from the responses and the challenge, and returns
   `c̃ = (Σ [yᵢ] aᵢ, [x + Σ_{i>p} yᵢ mᵢ] h + Σ_{i≤p} [yᵢ] bᵢ)` only if the challenge matches (`error.InvalidProof`).
+- **Wire forms**: `BlindSignRequest.toBytes`/`fromBytes(allocator, bytes, q)` — `p (u64 BE) ‖ cm ‖ p·(a ‖ b) ‖
+  challenge ‖ rr ‖ p·rk ‖ q·rm`, compressed G1 points and 32-byte big-endian scalars, exact length, every point
+  subgroup-checked and every scalar canonical on decode; `BlindSignature` is `index ‖ h ‖ a ‖ b` (152 bytes), its
+  points checked too (`unblind` multiplies `a` by `d`). The ElGamal public key is one compressed G1 point.
 - **Unblind**: `s = b − [d] a`, a `PartialCredential` on `h`; partials from `t` authorities aggregate with
   `aggregateCredential` and show with `proveCredential` exactly like publicly issued ones (the base `h` is any
   hash-to-curve point; PS verification does not care which).
@@ -287,10 +291,8 @@ them. Do not use either outside a test.
 
 ## Backlog / deferred
 
-- **Wire codecs for the blind-issuance messages** (`BlindSignRequest`, `BlindSignature`, the ElGamal public key):
-  the user→authority and authority→user messages exist only in memory; `Credential`/`PartialCredential`/`ShowProof`
-  have codecs. Small (fixed-width given `q`, `p`; decode must run the G1 subgroup check). No ctgrind row covers
-  `prepareBlindSign`/`blindSign`/`unblind` yet.
+- **ctgrind rows for blind issuance:** `prepareBlindSign`, `blindSign` and `unblind` are stack-probed but have no
+  ctgrind target yet (the existing rows cover `signPartial`, the local commitment and `proveCredential`). Small.
 - **Dealer-free key generation for BLS12-381** (survey 2026-09-30): `keygen` is a trusted dealer; `dkg` targets
   secp256k1 only. A Pedersen/Feldman DKG over `Fr` of `bls12_381` (the shape `dkg` already has) would remove the
   dealer. Effort: medium; fits §2.

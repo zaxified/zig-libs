@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — Added: wire forms for blind issuance, `BlindSignRequest.toBytes`/`fromBytes` and `BlindSignature.toBytes`/`fromBytes` (exact length, G1 subgroup checks and canonical scalars on decode).
 - **2026-11-21** — Added: blind issuance (paper §4.3, `blind.zig`): `ElGamalKeyPair`/`elgamalKeyGen`, `prepareBlindSign` (commitment, ElGamal ciphertexts of the private attributes, formation proof `π_s`), `verifyBlindSignRequest`, `blindSign` (refuses a failed proof with `error.InvalidProof` and any point outside G1), `unblind`; `BlindError`. Secret-touching bodies are burned and stack-probed.
 - **2026-11-20** — **NO CONSUMER-VISIBLE CHANGE:** tests and test fixtures only (pinned show-challenge transcript, generator and common-base bytes, argument-error, torsion and aggregation-base cases), from the whole-module mutation run (143/145 killed, 2 equivalent); no production code moved.
 - **2026-10-18** — Ported to Zig 0.17.0. Tests: `@typeInfo(fn)` uses `param_types` (`?type` elements).
