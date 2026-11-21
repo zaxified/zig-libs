@@ -10,9 +10,11 @@ const std = @import("std");
 const netaddr = @import("netaddr");
 const procnet = @import("root.zig");
 
-/// One tracked flow, decoded from the *original*-direction tuple (the first
-/// `src=`/`dst=`/`sport=`/`dport=` on the line — conntrack prints the
-/// original tuple then the reply tuple).
+/// One tracked flow. `src`/`dst`/`sport`/`dport` are the *original*-direction
+/// tuple (the first `src=`/`dst=`/`sport=`/`dport=` on the line — conntrack
+/// prints the original tuple then the reply tuple); `reply_*` is the second
+/// one, where NAT translation is visible (a DNAT'd flow has `reply_src` ≠
+/// `dst`).
 pub const ConntrackFlow = struct {
     src: netaddr.Ip,
     dst: netaddr.Ip,
@@ -24,6 +26,23 @@ pub const ConntrackFlow = struct {
     /// non-TCP protocols, which the table doesn't track a state machine for.
     state_buf: [16]u8 = @splat(0),
     state_len: u8 = 0,
+    /// The reply-direction tuple; null when the line carries no second
+    /// `src=`/`dst=` (a malformed or truncated line) and 0 for a missing port
+    /// (icmp).
+    reply_src: ?netaddr.Ip = null,
+    reply_dst: ?netaddr.Ip = null,
+    reply_sport: u16 = 0,
+    reply_dport: u16 = 0,
+    /// `mark=` (0 when absent) and `use=` (the entry's reference count, 0
+    /// when absent).
+    mark: u32 = 0,
+    use: u32 = 0,
+    /// `packets=`/`bytes=` per direction — present only when the kernel
+    /// counts them (`net.netfilter.nf_conntrack_acct=1`); 0 otherwise.
+    orig_packets: u64 = 0,
+    orig_bytes: u64 = 0,
+    reply_packets: u64 = 0,
+    reply_bytes: u64 = 0,
 
     /// The layer-4 protocol name.
     pub fn proto(f: *const ConntrackFlow) []const u8 {
@@ -66,6 +85,23 @@ fn kvField(line: []const u8, key: []const u8) ?[]const u8 {
     const rest = line[i + key.len ..];
     const end = std.mem.findAny(u8, rest, " \t") orelse rest.len;
     return rest[0..end];
+}
+
+/// Value of the `n`-th (0-based) `key=` token that starts a word on `line`.
+fn kvNth(line: []const u8, key: []const u8, n: usize) ?[]const u8 {
+    var seen: usize = 0;
+    var it = std.mem.tokenizeAny(u8, line, " \t");
+    while (it.next()) |tok| {
+        if (!std.mem.startsWith(u8, tok, key)) continue;
+        if (seen == n) return tok[key.len..];
+        seen += 1;
+    }
+    return null;
+}
+
+fn kvInt(comptime T: type, line: []const u8, key: []const u8, n: usize) T {
+    const v = kvNth(line, key, n) orelse return 0;
+    return std.fmt.parseInt(T, v, 10) catch 0;
 }
 
 /// True if `s` is a non-empty run of `[A-Z_]` (a conntrack state word like
@@ -117,6 +153,16 @@ pub fn parseConntrack(gpa: std.mem.Allocator, text: []const u8, max: usize) std.
             .sport = std.fmt.parseInt(u16, sport_s, 10) catch 0,
             .dport = std.fmt.parseInt(u16, dport_s, 10) catch 0,
         };
+        flow.reply_src = if (kvNth(line, "src=", 1)) |v| netaddr.parseIp(v) else null;
+        flow.reply_dst = if (kvNth(line, "dst=", 1)) |v| netaddr.parseIp(v) else null;
+        flow.reply_sport = kvInt(u16, line, "sport=", 1);
+        flow.reply_dport = kvInt(u16, line, "dport=", 1);
+        flow.mark = kvInt(u32, line, "mark=", 0);
+        flow.use = kvInt(u32, line, "use=", 0);
+        flow.orig_packets = kvInt(u64, line, "packets=", 0);
+        flow.orig_bytes = kvInt(u64, line, "bytes=", 0);
+        flow.reply_packets = kvInt(u64, line, "packets=", 1);
+        flow.reply_bytes = kvInt(u64, line, "bytes=", 1);
         flow.proto_len = @intCast(procnet.copyClamped(&flow.proto_buf, proto_name));
         flow.state_len = @intCast(procnet.copyClamped(&flow.state_buf, state));
         try out.append(gpa, flow);
@@ -165,6 +211,37 @@ test "parseConntrack: real /proc/net/nf_conntrack fixture" {
     const f3 = result.flows[3]; // ipv6 flow
     try testing.expectEqual(netaddr.Ip{ .v6 = (netaddr.parseIp("fe80::1").?).v6 }, f3.src);
     try testing.expectEqual(@as(u16, 22), f3.sport);
+}
+
+test "parseConntrack: reply tuple, mark, use and per-direction counters" {
+    const text =
+        \\ipv4 2 tcp 6 431999 ESTABLISHED src=10.0.1.50 dst=203.0.113.9 sport=54210 dport=443 packets=5 bytes=300 src=10.9.9.9 dst=10.0.1.50 sport=8443 dport=54210 packets=4 bytes=2000 [ASSURED] mark=7 secctx=null use=2
+        \\ipv4 2 udp 17 30 src=10.0.0.5 dst=10.0.0.6 sport=5 dport=6 src=10.0.0.6 dst=10.0.0.5 sport=6 dport=5 mark=0 use=1
+        \\ipv4 2 icmp 1 29 src=10.0.0.5 dst=10.0.0.6 type=8 code=0 id=1 src=10.0.0.6 dst=10.0.0.5 type=0 code=0 id=1 mark=0 use=1
+        \\ipv4 2 tcp 6 100 ESTABLISHED src=10.0.0.5 dst=10.0.0.6 sport=1 dport=2
+        \\
+    ;
+    var result = try parseConntrack(testing.allocator, text, 50);
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), result.flows.len);
+    const nat = result.flows[0]; // DNAT: the reply comes from another address and port than dst
+    try testing.expectEqual(netaddr.Ip{ .v4 = .{ 203, 0, 113, 9 } }, nat.dst);
+    try testing.expectEqual(netaddr.Ip{ .v4 = .{ 10, 9, 9, 9 } }, nat.reply_src.?);
+    try testing.expectEqual(netaddr.Ip{ .v4 = .{ 10, 0, 1, 50 } }, nat.reply_dst.?);
+    try testing.expectEqual(@as(u16, 8443), nat.reply_sport);
+    try testing.expectEqual(@as(u16, 54210), nat.reply_dport);
+    try testing.expectEqual(@as(u32, 7), nat.mark);
+    try testing.expectEqual(@as(u32, 2), nat.use);
+    try testing.expectEqual(@as(u64, 5), nat.orig_packets);
+    try testing.expectEqual(@as(u64, 300), nat.orig_bytes);
+    try testing.expectEqual(@as(u64, 4), nat.reply_packets);
+    try testing.expectEqual(@as(u64, 2000), nat.reply_bytes);
+    try testing.expectEqual(@as(u16, 6), result.flows[1].reply_sport); // plain flow: reply is the mirror
+    try testing.expectEqual(@as(u64, 0), result.flows[1].orig_bytes); // no accounting
+    try testing.expectEqual(@as(u16, 0), result.flows[2].reply_sport); // icmp has no ports
+    try testing.expect(result.flows[2].reply_src != null);
+    try testing.expect(result.flows[3].reply_src == null); // a line with only one tuple
+    try testing.expectEqual(@as(u32, 0), result.flows[3].mark);
 }
 
 test "parseConntrack: max caps the sample but total counts every line" {

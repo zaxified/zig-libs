@@ -204,6 +204,5 @@ routes, `-N` neighbours and `-s` snapshot.
 
 Per-socket timer and congestion columns (`ss -o`/`ss -i`, better answered over `sock_diag`),
 `statvfs`/`/proc/mounts` disk usage, and the `/sys` and other `/proc` areas outside the
-prometheus/procfs parity scope are not covered; the conntrack reply tuple and
-`mark`/`use`/`packets`/`bytes` are not decoded yet. Reasons and open items are in `SPEC.md`
-(*What is deliberately not done*, *Backlog / deferred*).
+prometheus/procfs parity scope are not covered. Reasons are in `SPEC.md`
+(*What is deliberately not done*).

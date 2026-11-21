@@ -272,9 +272,7 @@ authoritative figure.
 
 ## Backlog / deferred
 
-- **Conntrack reply tuple and `mark`/`use`/`packets`/`bytes`.** `ConntrackFlow` decodes the
-  original-direction tuple only, which the type says; the reply tuple is where NAT translation is
-  visible and deserves explicit modelling rather than four more fields.
+None open.
 
 ## Anchoring
 
