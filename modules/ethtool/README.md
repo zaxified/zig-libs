@@ -35,9 +35,9 @@ against this module's — no `ethtool` source consulted, studied or ported. DATA
 
 | | |
 |---|---|
-| **Implemented** | `LINKINFO_GET`/`SET`, `LINKMODES_GET`/`SET`, `LINKSTATE_GET`, `RINGS_GET`/`SET`, `COALESCE_GET`/`SET`, `PAUSE_GET`/`SET`, `CHANNELS_GET`/`SET`, `FEATURES_GET`/`SET`, `STATS_GET`, `STRSET_GET`, `MODULE_GET`/`SET`, `MODULE_EEPROM_GET`, `EEE_GET`/`SET`, `FEC_GET`/`SET`, `WOL_GET`/`SET` (SOPASS wiped), `PRIVFLAGS_GET`/`SET`, `TSINFO_GET`, `RSS_GET`, the `monitor` multicast group |
+| **Implemented** | `LINKINFO_GET`/`SET`, `LINKMODES_GET`/`SET`, `LINKSTATE_GET`, `RINGS_GET`/`SET`, `COALESCE_GET`/`SET`, `PAUSE_GET`/`SET`, `CHANNELS_GET`/`SET`, `FEATURES_GET`/`SET`, `STATS_GET`, `STRSET_GET`, `MODULE_GET`/`SET`, `MODULE_EEPROM_GET`, `EEE_GET`/`SET`, `FEC_GET`/`SET`, `WOL_GET`/`SET` (SOPASS wiped), `PRIVFLAGS_GET`/`SET`, `DEBUG_GET`/`SET`, `PHC_VCLOCKS_GET`, `FEC` statistics (`fecStats`), `TSINFO_GET`, `RSS_GET`, the all-devices dump of link info/state, rings and channels, the `monitor` multicast group |
 | **Escape hatch** | `Ethtool.raw` — any command, caller-encoded attributes, replies handed back as attribute bytes |
-| **Not typed** | DEBUG, TSCONFIG, cable test, `RSS_SET`, PLCA, MM, PSE, PHY, tunnel info, module firmware flash, and the all-devices dump form — all reachable through `raw`; see *Not provided* |
+| **Not typed** | TSCONFIG, cable test, `RSS_SET`, PLCA, MM, PSE, PHY, tunnel info, module firmware flash, and the other getters' dump form — all reachable through `raw`; see *Not provided* |
 | **Two ioctls, nothing more** | `ioctl.drvinfo()` (`ethtool -i`: driver/version/firmware/bus info) and `ioctl.driverStats()` (plain `ethtool -S`: the driver's private counter array) over `SIOCETHTOOL` — there is no netlink message for either. No other legacy ioctl command is or will be here. See "The two ioctl calls" below. |
 
 ## API

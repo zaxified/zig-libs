@@ -206,6 +206,17 @@ through to the kernel, which is the correct place to resolve it.
 Likewise the caller's own copies of a WOL SOPASS (`WolSet.sopass`, a `Wol.sopass` kept past `deinit`, the
 datagram of `buildSetWol`) are the caller's to wipe.
 
+**Message level, PHC virtual clocks, FEC statistics, all-devices dumps.** `DEBUG_GET`/`SET` (`Ethtool.debug`,
+`setDebug`) are `PRIVFLAGS`-shaped: the `NETIF_MSG_*` classes as a bitset, named in a verbose reply, set by name or
+index. `PHC_VCLOCKS_GET` (`phcVclocks`) returns the count and the `s32` PHC indexes (at most 1024). `fecStats` sends
+`FEC_GET` with `ETHTOOL_FLAG_STATS` and decodes the `FEC_STATS` nest into `Fec.stats`: corrected blocks,
+uncorrectable blocks and corrected bits, each a total (null when the kernel's all-ones "not set" value stands there)
+plus up to eight per-lane values; the error-per-block histogram nest is reported only as present. The all-devices
+form is an `NLM_F_DUMP` request with an empty header nest, typed for `linkInfoAll`, `linkStateAll`, `ringsAll` and
+`channelsAll` (a reply that does not decode is `MalformedReply`, never skipped); the other getters stay on
+`raw(.{ .dump = true })`. A live test dumps on the build host and compares the first answer with the per-device
+getter.
+
 ## What is deliberately not done
 
 - **A second transport beyond the two ioctl calls.** `SIOCETHTOOL` is used only for `drvinfo()` and
@@ -441,12 +452,9 @@ Reachable through `Ethtool.raw`, not modelled; all fit CONVENTIONS §2 (netlink 
 
 | command family | why deferred |
 |---|---|
-| `DEBUG` | driver-private message-level flag set; the `PRIVFLAGS` shape would fit, add on demand |
-| `TSCONFIG`, `PHC_VCLOCKS`, the `TSINFO` stats/provider nests | newer PTP surface; `TSINFO_GET` itself is typed |
+| `TSCONFIG`, the `TSINFO` stats/provider nests | newer PTP surface; `TSINFO_GET` itself is typed |
 | `CABLE_TEST_ACT` / `_TDR_ACT` | asynchronous: the result arrives as a notification, so it needs a request/notification correlation design this v1 does not have (effort: medium) |
 | `RSS_SET` (and the `RSS_GET` per-flow `FLOW_HASH` nest / dump form), `PLCA`, `MM`, `PSE`, `PHY`, `TUNNEL_INFO`, `MODULE_FW_FLASH` | newer and narrower; several are still churning |
-| FEC per-lane statistics (`FEC_STATS`) | stays on `raw`; `FEC_GET`/`SET` are typed |
-| the all-devices **dump** form (`NLM_F_DUMP` with an empty header nest) | the typed API is per-device; `raw(.{ .dump = true })` reaches it |
 
 ## Provenance
 

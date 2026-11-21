@@ -127,6 +127,7 @@ pub const eee_fec = @import("eee_fec.zig");
 pub const wol = @import("wol.zig");
 /// `PRIVFLAGS_GET`/`SET`.
 pub const privflags = @import("privflags.zig");
+pub const debug = @import("debug.zig");
 /// `RSS_GET` (hash function, key, indirection table).
 pub const rss = @import("rss.zig");
 /// `TSINFO_GET`.
@@ -181,6 +182,11 @@ pub const FecSet = eee_fec.FecSet;
 pub const Wol = wol.Wol;
 pub const WolSet = wol.WolSet;
 pub const Privflags = privflags.Privflags;
+pub const Debug = debug.Debug;
+pub const DebugSet = debug.DebugSet;
+pub const PhcVclocks = debug.PhcVclocks;
+pub const FecStats = eee_fec.FecStats;
+pub const FecCounter = eee_fec.FecCounter;
 pub const PrivflagsSet = privflags.PrivflagsSet;
 pub const TsInfo = tsinfo.TsInfo;
 pub const Rss = rss.Rss;
@@ -224,6 +230,10 @@ pub const buildWol = wol.buildWol;
 /// The datagram may contain the SOPASS: zero it with `wol.wipe` before freeing.
 pub const buildSetWol = wol.buildSetWol;
 pub const buildPrivflags = privflags.buildPrivflags;
+pub const buildDebug = debug.buildDebug;
+pub const buildSetDebug = debug.buildSetDebug;
+pub const buildPhcVclocks = debug.buildPhcVclocks;
+pub const buildFecWith = eee_fec.buildFecWith;
 pub const buildSetPrivflags = privflags.buildSetPrivflags;
 pub const buildTsInfo = tsinfo.buildTsInfo;
 pub const buildRss = rss.buildRss;
@@ -261,6 +271,28 @@ fn openOrSkip() !Ethtool {
         error.FamilyNotFound => skip("the ethtool netlink family is not registered in this kernel"),
         else => skip("opening a NETLINK_GENERIC socket"),
     };
+}
+
+test "integration: the all-devices dump forms answer, and agree with the per-device getters" {
+    var et = try openOrSkip();
+    defer et.close();
+    const infos = et.linkInfoAll() catch |e| switch (e) {
+        error.NotSupported, error.AccessDenied => return skip("the kernel refuses an ethtool dump here"),
+        else => return e,
+    };
+    defer testing.allocator.free(infos);
+    const states = try et.linkStateAll();
+    defer testing.allocator.free(states);
+    // Every state in the dump names a device, and a per-device read of the first agrees with it.
+    for (states) |st| try testing.expect(st.device.index != null or st.device.name().len != 0);
+    if (states.len != 0) {
+        const one = try et.linkState(if (states[0].device.index) |i| .byIndex(i) else .byName(states[0].device.name()));
+        try testing.expectEqual(states[0].link, one.link);
+    }
+    const rings = try et.ringsAll();
+    defer testing.allocator.free(rings);
+    const channels = try et.channelsAll();
+    defer testing.allocator.free(channels);
 }
 
 /// `ARPHRD_ETHER` — the link type an ethtool-capable NIC has.
@@ -864,6 +896,7 @@ test {
     _ = eee_fec;
     _ = wol;
     _ = privflags;
+    _ = debug;
     _ = tsinfo;
     _ = rss;
     _ = client;

@@ -141,6 +141,8 @@ pub const Fec = struct {
     auto: ?bool = null,
     /// **Bit index** of the active mode in `modes`' universe.
     active: ?u32 = null,
+    /// The error counters, when the request asked for statistics and the driver has them (`fecStats`).
+    stats: ?FecStats = null,
 
     pub fn deinit(f: *Fec, gpa: std.mem.Allocator) void {
         if (f.modes) |*b| b.deinit(gpa);
@@ -156,6 +158,60 @@ pub const Fec = struct {
     }
 };
 
+/// Most lanes a FEC counter reports separately (`ETHTOOL_MAX_LANES`).
+pub const max_fec_lanes = 8;
+
+/// One FEC counter: the total over the port and, when the driver reports them, one value per lane.
+pub const FecCounter = struct {
+    /// Null when the driver does not report a total (the kernel's "not set" all-ones value).
+    total: ?u64 = null,
+    lane_values: [max_fec_lanes]u64 = @splat(0),
+    lane_count: u8 = 0,
+
+    pub fn lanes(c: *const FecCounter) []const u64 {
+        return c.lane_values[0..c.lane_count];
+    }
+};
+
+/// The `ETHTOOL_A_FEC_STATS` nest. A counter the driver does not keep is null.
+pub const FecStats = struct {
+    corrected_blocks: ?FecCounter = null,
+    uncorrectable_blocks: ?FecCounter = null,
+    corrected_bits: ?FecCounter = null,
+    /// The nest has a histogram of errors per block (not decoded).
+    has_histogram: bool = false,
+};
+
+const stat_not_set: u64 = std.math.maxInt(u64);
+
+/// `u64 total` followed by up to `max_fec_lanes` `u64` per-lane values, host order.
+fn parseFecCounter(data: []const u8) codec.Error!FecCounter {
+    if (data.len < 8 or data.len % 8 != 0 or data.len / 8 - 1 > max_fec_lanes) return error.BadLength;
+    const endian = @import("builtin").cpu.arch.endian();
+    var c: FecCounter = .{};
+    const total = std.mem.readInt(u64, data[0..8], endian);
+    if (total != stat_not_set) c.total = total;
+    var i: usize = 8;
+    while (i < data.len) : (i += 8) {
+        c.lane_values[c.lane_count] = std.mem.readInt(u64, data[i..][0..8], endian);
+        c.lane_count += 1;
+    }
+    return c;
+}
+
+pub fn parseFecStats(nest_bytes: []const u8) codec.Error!FecStats {
+    var out: FecStats = .{};
+    var it: codec.AttrIterator = .{ .buf = nest_bytes };
+    while (try it.next()) |a| switch (a.type) {
+        uapi.FEC_STAT.CORRECTED => out.corrected_blocks = try parseFecCounter(a.data),
+        uapi.FEC_STAT.UNCORR => out.uncorrectable_blocks = try parseFecCounter(a.data),
+        uapi.FEC_STAT.CORR_BITS => out.corrected_bits = try parseFecCounter(a.data),
+        uapi.FEC_STAT.HIST => out.has_histogram = true,
+        else => {},
+    };
+    return out;
+}
+
 pub fn parseFec(gpa: std.mem.Allocator, attr_bytes: []const u8) Error!Fec {
     var out: Fec = .{};
     errdefer out.deinit(gpa);
@@ -168,6 +224,7 @@ pub fn parseFec(gpa: std.mem.Allocator, attr_bytes: []const u8) Error!Fec {
         },
         uapi.FEC.AUTO => out.auto = (try a.asU8()) != 0,
         uapi.FEC.ACTIVE => out.active = try a.asU32(),
+        uapi.FEC.STATS => out.stats = try parseFecStats(a.data),
         else => {},
     };
     return out;
@@ -200,10 +257,22 @@ pub fn buildFec(
     target: header.Target,
     form: header.BitsetForm,
 ) header.Error![]u8 {
+    return buildFecWith(gpa, family_id, seq, target, form, false);
+}
+
+/// `buildFec`, asking for the statistics nest too (`ETHTOOL_FLAG_STATS`) — what `Ethtool.fecStats` sends.
+pub fn buildFecWith(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    form: header.BitsetForm,
+    stats: bool,
+) header.Error![]u8 {
     var msg: std.ArrayList(u8) = .empty;
     errdefer msg.deinit(gpa);
     const h = try header.beginRequest(gpa, &msg, .{ .family_id = family_id, .cmd = uapi.MSG.FEC_GET, .seq = seq });
-    try header.append(gpa, &msg, uapi.FEC.HEADER, .{ .target = target, .compact_bitsets = form.compactFlag() });
+    try header.append(gpa, &msg, uapi.FEC.HEADER, .{ .target = target, .compact_bitsets = form.compactFlag(), .stats = stats });
     return header.finishRequest(gpa, &msg, h);
 }
 
@@ -432,4 +501,60 @@ test "FEC_GET request carries the compact flag only when asked" {
     defer gpa.free(c);
     try testing.expectEqual(uapi.MSG.FEC_GET, v[16]);
     try testing.expect(c.len > v.len); // the FLAGS attribute is the difference
+}
+
+test "parseFec decodes the statistics nest: totals, per-lane values, 'not set' and a ragged counter" {
+    const gpa = testing.allocator;
+    const endian = @import("builtin").cpu.arch.endian();
+    var nest: std.ArrayList(u8) = .empty;
+    defer nest.deinit(gpa);
+    var corr: [24]u8 = undefined; // total + 2 lanes
+    std.mem.writeInt(u64, corr[0..8], 100, endian);
+    std.mem.writeInt(u64, corr[8..16], 60, endian);
+    std.mem.writeInt(u64, corr[16..24], 40, endian);
+    try codec.appendAttr(gpa, &nest, uapi.FEC_STAT.CORRECTED, &corr);
+    var unset: [8]u8 = undefined;
+    std.mem.writeInt(u64, &unset, std.math.maxInt(u64), endian);
+    try codec.appendAttr(gpa, &nest, uapi.FEC_STAT.UNCORR, &unset);
+    var bits: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bits, 7, endian);
+    try codec.appendAttr(gpa, &nest, uapi.FEC_STAT.CORR_BITS, &bits);
+    const hist = try codec.nestBegin(gpa, &nest, uapi.FEC_STAT.HIST);
+    try codec.nestEnd(&nest, hist);
+
+    var outer: std.ArrayList(u8) = .empty;
+    defer outer.deinit(gpa);
+    try codec.appendAttrU8(gpa, &outer, uapi.FEC.AUTO, 1);
+    try codec.appendAttr(gpa, &outer, uapi.FEC.STATS, nest.items);
+    var f = try parseFec(gpa, outer.items);
+    defer f.deinit(gpa);
+    const st = f.stats.?;
+    try testing.expectEqual(@as(?u64, 100), st.corrected_blocks.?.total);
+    try testing.expectEqualSlices(u64, &.{ 60, 40 }, st.corrected_blocks.?.lanes());
+    try testing.expectEqual(@as(?u64, null), st.uncorrectable_blocks.?.total);
+    try testing.expectEqual(@as(usize, 0), st.uncorrectable_blocks.?.lanes().len);
+    try testing.expectEqual(@as(?u64, 7), st.corrected_bits.?.total);
+    try testing.expect(st.has_histogram);
+
+    // No stats nest, no stats; a counter that is not whole u64s, or has too many lanes, is refused.
+    var plain = try parseFec(gpa, &.{});
+    defer plain.deinit(gpa);
+    try testing.expect(plain.stats == null);
+    try testing.expectError(error.BadLength, parseFecStats(&.{ 0x07, 0x00, 0x02, 0x00, 1, 2, 3, 0 }));
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(gpa);
+    try codec.appendAttr(gpa, &long, uapi.FEC_STAT.CORRECTED, &@as([8 * 10]u8, @splat(0)));
+    try testing.expectError(error.BadLength, parseFecStats(long.items));
+
+    // The request asks for statistics with the header flag.
+    const msg = try buildFecWith(gpa, 23, 1, .byIndex(2), .compact, true);
+    defer gpa.free(msg);
+    var it: codec.AttrIterator = .{ .buf = msg[20..] };
+    const hdr = (try it.next()).?;
+    var ht = hdr.nested();
+    var flags: u32 = 0;
+    while (try ht.next()) |a| if (a.type == uapi.HEADER.FLAGS) {
+        flags = try a.asU32();
+    };
+    try testing.expectEqual(uapi.FLAG.COMPACT_BITSETS | uapi.FLAG.STATS, flags);
 }

@@ -519,6 +519,33 @@ pub const EEE = struct {
     pub const TX_LPI_TIMER: u16 = 7;
 };
 
+pub const DEBUG = struct {
+    pub const HEADER: u16 = 1;
+    /// Bitset of `NETIF_MSG_*` classes.
+    pub const MSGMASK: u16 = 2;
+};
+
+pub const PHC_VCLOCKS = struct {
+    pub const HEADER: u16 = 1;
+    /// u32: how many virtual clocks.
+    pub const NUM: u16 = 2;
+    /// `s32 index[NUM]`: the PHC indexes, one binary attribute.
+    pub const INDEX: u16 = 3;
+};
+
+/// The attributes inside the `FEC.STATS` nest.
+pub const FEC_STAT = struct {
+    pub const PAD: u16 = 1;
+    /// `u64 total, u64 lane[]`: corrected blocks.
+    pub const CORRECTED: u16 = 2;
+    /// `u64 total, u64 lane[]`: uncorrectable blocks.
+    pub const UNCORR: u16 = 3;
+    /// `u64 total, u64 lane[]`: corrected bits.
+    pub const CORR_BITS: u16 = 4;
+    /// Nest of the histogram of errors per block. Not decoded by this module.
+    pub const HIST: u16 = 5;
+};
+
 pub const FEC = struct {
     pub const HEADER: u16 = 1;
     /// Bitset of FEC modes (named by the link-mode string set).
@@ -527,7 +554,7 @@ pub const FEC = struct {
     pub const AUTO: u16 = 3;
     /// u32: the *bit index* of the active FEC mode in the link-mode set.
     pub const ACTIVE: u16 = 4;
-    /// Nest of FEC statistics. Not decoded by this module.
+    /// Nest of FEC statistics (`FEC_STAT`); asked for with `ETHTOOL_FLAG_STATS`.
     pub const STATS: u16 = 5;
 };
 

@@ -58,6 +58,7 @@ const wol_mod = @import("wol.zig");
 const privflags_mod = @import("privflags.zig");
 const tsinfo_mod = @import("tsinfo.zig");
 const rss_mod = @import("rss.zig");
+const debug_mod = @import("debug.zig");
 
 /// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` (linux/netlink.h) —
 /// used by `EventSocket` below.
@@ -615,6 +616,94 @@ pub const Ethtool = struct {
         const seq = cl.sock.nextSeq();
         const msg = try privflags_mod.buildSetPrivflags(cl.allocator(), cl.family_id, seq, target, set);
         try cl.exchangeAck(msg, seq, uapi.PRIVFLAGS.HEADER, target);
+    }
+
+    /// `ETHTOOL_MSG_DEBUG_GET` — the driver's message level (`NETIF_MSG_*` classes). Unprivileged. Free with
+    /// `deinit`.
+    pub fn debug(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!debug_mod.Debug {
+        const seq = cl.sock.nextSeq();
+        const msg = try debug_mod.buildDebug(cl.allocator(), cl.family_id, seq, target, form);
+        var reply = try cl.exchangeGet(msg, seq, uapi.DEBUG.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return debug_mod.parseDebug(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
+    /// `ETHTOOL_MSG_DEBUG_SET`. Needs **CAP_NET_ADMIN**.
+    pub fn setDebug(cl: *Ethtool, target: header.Target, set: debug_mod.DebugSet) RequestError!void {
+        const seq = cl.sock.nextSeq();
+        const msg = try debug_mod.buildSetDebug(cl.allocator(), cl.family_id, seq, target, set);
+        try cl.exchangeAck(msg, seq, uapi.DEBUG.HEADER, target);
+    }
+
+    /// `ETHTOOL_MSG_PHC_VCLOCKS_GET` — the PTP virtual clocks on the device's hardware clock. Unprivileged. Free
+    /// with `deinit`.
+    pub fn phcVclocks(cl: *Ethtool, target: header.Target) RequestError!debug_mod.PhcVclocks {
+        const seq = cl.sock.nextSeq();
+        const msg = try debug_mod.buildPhcVclocks(cl.allocator(), cl.family_id, seq, target);
+        var reply = try cl.exchangeGet(msg, seq, uapi.PHC_VCLOCKS.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return debug_mod.parsePhcVclocks(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
+    /// `ETHTOOL_MSG_FEC_GET` with `ETHTOOL_FLAG_STATS`: the FEC settings and, when the driver keeps them, the
+    /// corrected / uncorrectable block and corrected bit counters per port and lane (`Fec.stats`). Unprivileged.
+    /// Free with `deinit`.
+    pub fn fecStats(cl: *Ethtool, target: header.Target, form: BitsetForm) RequestError!eee_fec.Fec {
+        const seq = cl.sock.nextSeq();
+        const msg = try eee_fec.buildFecWith(cl.allocator(), cl.family_id, seq, target, form, true);
+        var reply = try cl.exchangeGet(msg, seq, uapi.FEC.HEADER, target);
+        defer reply.deinit(cl.allocator());
+        return eee_fec.parseFec(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
+    }
+
+    // ── every device at once (NLM_F_DUMP) ──────────────────────────────────
+
+    /// `ETHTOOL_MSG_LINKINFO_GET` for every device that answers (a dump with an empty header). Free with
+    /// `gpa.free`.
+    pub fn linkInfoAll(cl: *Ethtool) RequestError![]link.LinkInfo {
+        return cl.dumpAll(link.LinkInfo, uapi.MSG.LINKINFO_GET, uapi.LINKINFO.HEADER, link.parseLinkInfo);
+    }
+
+    /// `ETHTOOL_MSG_LINKSTATE_GET` for every device that answers. Free with `gpa.free`.
+    pub fn linkStateAll(cl: *Ethtool) RequestError![]link.LinkState {
+        return cl.dumpAll(link.LinkState, uapi.MSG.LINKSTATE_GET, uapi.LINKSTATE.HEADER, link.parseLinkState);
+    }
+
+    /// `ETHTOOL_MSG_RINGS_GET` for every device that answers. Free with `gpa.free`.
+    pub fn ringsAll(cl: *Ethtool) RequestError![]params.Rings {
+        return cl.dumpAll(params.Rings, uapi.MSG.RINGS_GET, uapi.RINGS.HEADER, params.parseRings);
+    }
+
+    /// `ETHTOOL_MSG_CHANNELS_GET` for every device that answers. Free with `gpa.free`.
+    pub fn channelsAll(cl: *Ethtool) RequestError![]params.Channels {
+        return cl.dumpAll(params.Channels, uapi.MSG.CHANNELS_GET, uapi.CHANNELS.HEADER, params.parseChannels);
+    }
+
+    /// Send a dump of `cmd` (an empty header nest, no device) and decode every reply with `parse`; replies that
+    /// do not decode are an error, not skipped.
+    fn dumpAll(
+        cl: *Ethtool,
+        comptime T: type,
+        cmd: u8,
+        hdr_attr: u16,
+        comptime parse: fn ([]const u8) codec.Error!T,
+    ) RequestError![]T {
+        const gpa = cl.allocator();
+        var msg: std.ArrayList(u8) = .empty;
+        errdefer msg.deinit(gpa);
+        const seq = cl.sock.nextSeq();
+        const h = try header.beginRequest(gpa, &msg, .{ .family_id = cl.family_id, .cmd = cmd, .seq = seq, .extra_flags = codec.NLM_F_DUMP });
+        const nest = try codec.nestBegin(gpa, &msg, hdr_attr | codec.NLA_F_NESTED);
+        codec.nestEnd(&msg, nest) catch return error.InvalidRequest;
+        try cl.sendBuilt(try header.finishRequest(gpa, &msg, h));
+
+        var out: std.ArrayList(T) = .empty;
+        errdefer out.deinit(gpa);
+        var walk: Walk = .{ .cl = cl, .seq = seq };
+        while (try walk.next()) |m| {
+            try out.append(gpa, parse(m.attrs) catch return error.MalformedReply);
+        }
+        return out.toOwnedSlice(gpa);
     }
 
     /// `ETHTOOL_MSG_RSS_GET` — hash function, hash key and indirection table
