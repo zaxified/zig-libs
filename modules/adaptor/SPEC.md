@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [BlockstreamResearch/scriptless-scripts](https://github.com/BlockstreamResearch/scriptless-scripts) | TeX (docs) | not stated | 171 | push 2025-01-14 | Specification notes for the construction, not code. |
 | [Zig `std` and Zig ecosystem](https://ziglang.org/documentation/master/std/) | Zig | MIT | — | Zig 0.16.0 | No adaptor signatures in `std`; no Zig package found by GitHub search. |
 
-**Where we are ahead:** the only pure-Zig Schnorr adaptor; four operations plus a 65-byte pre-signature codec with the parity bit made explicit; output of `adapt` is a plain BIP340 signature checked by `bip340.verify`; interop with an independent implementation. **Where we are behind:** no MuSig2 adaptor combination, no ECDSA adaptor signatures (the DLC/Lightning variant), no standardized wire format to conform to (none exists; the 65-byte layout is this module's own).
+**Where we are ahead:** the only pure-Zig Schnorr adaptor; four operations plus a 65-byte pre-signature codec with the parity bit made explicit; output of `adapt` is a plain BIP340 signature checked by `bip340.verify`; interop with an independent implementation. **Where we are behind:** no ECDSA adaptor signatures (the DLC/Lightning variant), no standardized wire format to conform to (none exists; the 65-byte layout is this module's own).
 
 ## Design
 
@@ -303,5 +303,8 @@ this codebase did not generate.
 
 ## Backlog / deferred
 
-- **MuSig2 + adaptor (2-of-2 atomic swap flow)** (survey 2026-09-30) — the practical use of adaptors on Bitcoin; secp256k1-zkp has it. Effort M, shared with the `musig2` item. Fits §2.
-- **ECDSA adaptor signatures** (survey 2026-09-30) — needed by DLC and non-Taproot swaps; zkp has an experimental module. Effort L (different scheme, needs DLEQ proof). Fits §2; a separate module may be cleaner.
+None open.
+
+## Roadmap
+
+- **ECDSA adaptor signatures** (secp256k1-zkp's experimental module) — needed by DLC and non-Taproot swaps. Project size: a second scheme (ECDSA over secp256k1 with a DLEQ proof), best as a separate module; needs a decision on wire format (zkp's is experimental and not a standard).

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — Tests: the MuSig2 + adaptor two-signer flow (`musig2_flow_test.zig`; `musig2` is now a test-only dependency): the aggregate of the partial signatures of an adaptor session is a pre-signature `preVerify` accepts under the (tweaked) aggregate key, `adapt` gives a plain BIP340 signature, `extract` recovers `t`; both nonce parities. No source change.
 - **2026-10-10** — tests: deterministic fuzz driver `ADAPTOR_FUZZ` (testkit) over `preVerify` on damaged pre-signatures (only the pristine one verifies) and pre-sign/adapt/extract (adapted signature verifies, extract returns the secret; flipped pre-signature/signature and another adaptor point refused). No change to the library code.
 - **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `AdaptorPoint.fromSecret(adaptor_secret: *const [32]u8)` and `adapt(presig, adaptor_secret: *const [32]u8)` take the adaptor secret by pointer (were by value). Both now run under a stack burn (new `src/burn.zig`: 32 KiB / 4 KiB); `preSign` keeps its own. New `src/stackprobe2_test.zig` probes them. README snippet migrated.
 

@@ -33,15 +33,26 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [LLFourn/secp256kfun (`schnorr_fun::musig`)](https://github.com/LLFourn/secp256kfun) | Rust | 0BSD | 112 | push 2026-05-12 | Research-grade MuSig2, FROST, adaptor in one crate; its README says it is not for production. |
 | [Zig `std` and Zig ecosystem](https://ziglang.org/documentation/master/std/) | Zig | MIT | — | Zig 0.16.0 | No MuSig2 anywhere (`rg -il musig` over `lib/std`: no hits; GitHub search `zig musig2`: none). |
 
-**Where we are ahead:** the only MuSig2 in Zig; all seven non-deterministic BIP327 vector files byte-exact; constant-time masked parity selects in `sign`; tweak chain composed by the `gacc`/`tacc` accumulators. **Where we are behind:** no `DeterministicSign` (BIP327 optional; libsecp and btcd omit it *(inferred for btcd)*), no MuSig2-with-adaptor glue (zkp has it; see the `adaptor` module), no `nonce_gen_counter`, no session-object wrapper (caller passes `SessionContext` each call).
+**Where we are ahead:** the only MuSig2 in Zig; all eight BIP327 vector files byte-exact (`DeterministicSign` included); constant-time masked parity selects in `sign`; tweak chain composed by the `gacc`/`tacc` accumulators. **Where we are behind:** no `nonce_gen_counter`, no session-object wrapper (caller passes `SessionContext` each call).
 
 ## Design
 
 MuSig2 implements the full BIP327 core signing flow (`KeyAgg`, `NonceGen`, `NonceAgg`, `GetSessionValues`,
 `Sign`, `PartialSigVerify`, `PartialSigAgg`) and key tweaking (`ApplyTweak`: plain and x-only, composing through the
-`gacc`/`tacc` accumulators). Seven of the eight official BIP327 vector files are byte-exact; the final aggregate
-signature verifies under plain `bip340.verify` against the (possibly tweaked) aggregate key. `DeterministicSign` is
-not implemented (*Backlog / deferred*).
+`gacc`/`tacc` accumulators). All eight official BIP327 vector files are byte-exact; the final aggregate
+signature verifies under plain `bip340.verify` against the (possibly tweaked) aggregate key.
+
+`deterministicSign` is BIP327's optional single-signer wrapper (the last signer derives its nonces from `sk`, the
+aggregate of the others' nonces, the aggregate key and the message, then signs: no state to keep, as for a hardware
+wallet); `det_sign_vectors.json` is byte-exact. It is only safe for the last signer (the nonces depend on the others'),
+as BIP327 warns; libsecp256k1 does not have it.
+
+**Adaptor sessions.** `SessionContext.adaptor` (a 33-byte point `T`) makes the session's final nonce `R' + T` (as
+secp256k1-zkp's `musig_nonce_process`, adding `T` before the infinity-to-`G` substitution); signing, `partialSigVerifyAdaptor`
+and `partialSigAgg` then work unchanged and the aggregate is a pre-signature, which the sibling `adaptor` module takes as
+`PreSignature{ r, s', needs_negation = nonceNeedsNegation(ctx) }`: `preVerify` accepts it under the aggregate key
+(tweaked or not), `adapt` with `t` is a plain BIP340 signature under it and `extract` recovers `t` (the equivalents of
+zkp's `musig_nonce_parity`, `_adapt` and `_extract_adaptor`; tested end to end in `adaptor/src/musig2_flow_test.zig`).
 
 - **Source of truth**: BIP327 ("MuSig2 for BIP340-compatible
   Multi-Signatures", `bitcoin/bips`), consumed directly as
@@ -249,8 +260,8 @@ not implemented (*Backlog / deferred*).
 ## Verification
 
 - **Run**: `scripts/modtest musig2`; `zig build test-musig2 -Doptimize=ReleaseFast` runs the stack probes, which skip in Debug and ReleaseSafe.
-- **KAT oracles**: the official BIP327 vectors, seven of the eight published JSON files under `bip-0327/vectors/` in
-  `bitcoin/bips` (see `NOTICE`; only `det_sign_vectors.json` is not embedded), transcribed into
+- **KAT oracles**: the official BIP327 vectors, all eight published JSON files under `bip-0327/vectors/` in
+  `bitcoin/bips` (see `NOTICE`), transcribed into
   `src/kat_vectors.zig`. `src/kat_test.zig` asserts every embedded vector for real, valid and "invalid contribution"
   cases, untweaked and tweaked, at the leaf codec and through the composite function, plus two 3-signer end-to-end
   protocol tests (untweaked; a BIP341-shaped x-only tweak) ending in `bip340.verify` (and, tweaked, failing under the
@@ -277,12 +288,8 @@ not implemented (*Backlog / deferred*).
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** official BIP327 vectors (key_agg/nonce/sig_agg/tweak), NOTICE
+**What the tests actually contain.** official BIP327 vectors (key_agg/nonce/sig_agg/tweak/det_sign), NOTICE
 
 ## Backlog / deferred
 
-- **BIP327 `DeterministicSign`**: the optional single-signer wrapper around `NonceGen` + `Sign` for the last signer
-  (useful for hardware wallets); libsecp256k1 lacks it, so few users miss it. Needs `det_sign_vectors.json` embedded
-  in `src/kat_vectors.zig`. Effort S-M. Fits CONVENTIONS §2.
-- **Adaptor support: nonce parity + adapt/extract on partial-signature aggregation**: the combination used for atomic
-  swaps and PTLCs; secp256k1-zkp offers it. Effort M; cooperates with the `adaptor` module. Fits §2.
+None open.

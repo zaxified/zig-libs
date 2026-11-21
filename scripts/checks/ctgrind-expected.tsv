@@ -1025,7 +1025,7 @@ frost	ReleaseFast	sign	1	13	c58795725fdff352	1da8c496388f45b0
 # parse of the signer's own public key and public nonce -- values the signer publishes, tainted
 # because the harness derives them from the secrets. One group.add context in mulPublicGlv gone
 # (inlining). musig2 SPEC.md CT note.
-musig2	ReleaseFast	sign	1	<=103	a49b7d49c326af8c	2a2f275cd0c5c7c5
+musig2	ReleaseFast	sign	1	<=103	6ff8d1818a669821	2a2f275cd0c5c7c5
 # taproot secret 10 -> 9 (re-pin 2026-09-15). The row was already stale at
 # 0c0ef527: a --stacks run of that tree reads 9, with the SAME context set as
 # today. The source pin never moved, so the drop came from a dependency before

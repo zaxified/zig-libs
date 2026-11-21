@@ -49,8 +49,10 @@
 //!     5 official `tweak_vectors.json` valid cases, plus the tweak error
 //!     cases (`t >= n`, tweaked key at infinity).
 //!
-//! Still out of scope: `DeterministicSign` (the optional single-signer
-//! convenience wrapper) — see `SPEC.md`.
+//!   - `deterministicSign`: BIP327's optional single-signer wrapper (the last
+//!     signer derives its nonces from `sk`, the other signers' aggregate nonce,
+//!     the aggregate key and the message), byte-exact against all
+//!     `det_sign_vectors.json` cases.
 //!
 //! Zig std GAP: yes, same shape as `bip340` — `std.crypto.ecc.Secp256k1`
 //! supplies the curve group; this module (and `bip340` beneath it) supplies
@@ -90,6 +92,7 @@ pub const coefficient_tag = "KeyAgg coefficient";
 pub const noncecoef_tag = "MuSig/noncecoef";
 pub const aux_tag = "MuSig/aux";
 pub const nonce_tag = "MuSig/nonce";
+pub const det_nonce_tag = "MuSig/deterministic/nonce";
 
 /// `int(bytes32) mod n`: the same reducing conversion `bip340` uses
 /// internally for its challenge/nonce scalars (a 32-byte hash output can
@@ -691,6 +694,14 @@ pub const SessionContext = struct {
     pubkeys: []const PlainPublicKey,
     tweaks: []const Tweak = &.{},
     msg: []const u8,
+    /// Adaptor point `T` (secp256k1-zkp's `musig_nonce_process(.., adaptor)`):
+    /// when set, the session's final nonce is `R' + T` and every signer's
+    /// partial signature, the verification and `partialSigAgg` work against
+    /// it unchanged, so the aggregate is a PRE-signature (see
+    /// `nonceNeedsNegation` and the sibling `adaptor` module's `adapt` /
+    /// `extract`), not a valid BIP340 signature, until the adaptor secret
+    /// `t` is added.
+    adaptor: ?PlainPublicKey = null,
 };
 
 /// The six values `GetSessionValues` computes (BIP327 §"Session Context").
@@ -709,7 +720,10 @@ pub const SessionValues = struct {
 /// covers the tweak loop (an out-of-range tweak / a tweaked key at
 /// infinity is a session-level failure, per BIP327's `GetSessionValues`
 /// calling `ApplyTweak` itself).
-pub const SessionError = KeyAggError || AggNonceError || ApplyTweakError;
+pub const SessionError = KeyAggError || AggNonceError || ApplyTweakError || error{
+    /// `SessionContext.adaptor` is not a curve point.
+    InvalidAdaptorPoint,
+};
 
 /// Algorithm `GetSessionValues(session_ctx)` (BIP327 §"Session Context").
 ///
@@ -762,6 +776,8 @@ pub fn getSessionValues(ctx: SessionContext) SessionError!SessionValues {
             r_prime = r_prime.add(br2);
         } else |_| {}
     }
+    // secp256k1-zkp adds the adaptor BEFORE the infinity substitution.
+    if (ctx.adaptor) |t| r_prime = r_prime.add(t.point() catch return error.InvalidAdaptorPoint);
     const r: Secp256k1 = if (r_prime.rejectIdentity()) r_prime else |_| Secp256k1.basePoint;
 
     const rx = r.affineCoordinates().x.toBytes(.big);
@@ -779,6 +795,17 @@ pub fn getSessionValues(ctx: SessionContext) SessionError!SessionValues {
         .r = r,
         .e = e,
     };
+}
+
+/// Whether the session's final nonce `R` (adaptor included) has odd y, i.e.
+/// whether every signer negated its nonce: the `needs_negation` bit of the
+/// sibling `adaptor` module's `PreSignature` for a session with
+/// `ctx.adaptor` set (`adaptor.PreSignature{ .r = sig[0..32], .s_prime =
+/// sig[32..64], .needs_negation = nonceNeedsNegation(ctx) }`, with `sig` the
+/// `partialSigAgg` output).
+pub fn nonceNeedsNegation(ctx: SessionContext) SessionError!bool {
+    const sv = try getSessionValues(ctx);
+    return !hasEvenY(sv.r);
 }
 
 /// Returns the index of `pubkeys` whose bytes equal `target`, or `null`.
@@ -972,6 +999,105 @@ noinline fn burnSignStack() void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
+// ── DeterministicSign (BIP327 §"Deterministic and Stateless Signing for a Single Signer") ──
+
+pub const DeterministicSignError = SignError || NonceGenError || error{
+    /// `aggothernonce` is not the aggregate of valid public nonces (BIP327
+    /// "invalid contribution: aggothernonce"): a half that is not a point,
+    /// or that is the point at infinity.
+    InvalidAggOtherNonce,
+};
+
+pub const DeterministicSignResult = struct {
+    pubnonce: PubNonce,
+    psig: PartialSignature,
+};
+
+/// BIP327 `DeterministicSign(sk, aggothernonce, pk_1..u, tweak_1..v,
+/// is_xonly_t_1..v, m, rand)`: a signer who sees every other signer's public
+/// nonce first (the last signer; a hardware wallet) derives its own nonces
+/// from `sk`, `aggothernonce`, the (tweaked) aggregate key and the message
+/// instead of keeping state, and returns its public nonce and partial
+/// signature in one step. `aggothernonce` is the aggregate (`nonceAgg`) of the
+/// OTHER signers' public nonces; `rand` is optional auxiliary randomness
+/// mixed into `sk` before hashing (`sk xor taggedHash(MuSig/aux, rand)`).
+///
+/// Only for the last signer: the nonces are a function of the other signers'
+/// nonces, so a signer that signs first (or twice with different
+/// `aggothernonce`s over the same message) leaks its key, as BIP327 warns.
+/// libsecp256k1 does not offer this wrapper.
+pub fn deterministicSign(
+    out: *DeterministicSignResult,
+    sk: *const bip340.SecretKey,
+    aggothernonce: *const [66]u8,
+    pubkeys: []const PlainPublicKey,
+    tweaks: []const Tweak,
+    msg: []const u8,
+    rand: ?*const [32]u8,
+) DeterministicSignError!void {
+    return burn.run(burn.nonce_burn, DeterministicSignError!void, deterministicSignBody, .{ out, sk, aggothernonce, pubkeys, tweaks, msg, rand });
+}
+
+fn deterministicSignBody(
+    out: *DeterministicSignResult,
+    sk: *const bip340.SecretKey,
+    aggothernonce: *const [66]u8,
+    pubkeys: []const PlainPublicKey,
+    tweaks: []const Tweak,
+    msg: []const u8,
+    rand: ?*const [32]u8,
+) DeterministicSignError!void {
+    var sk_prime: [32]u8 = sk.bytes;
+    defer std.crypto.secureZero(u8, &sk_prime);
+    if (rand) |r| {
+        const aux = bip340.taggedHash(aux_tag, r);
+        for (&sk_prime, aux) |*b, a| b.* ^= a;
+    }
+
+    var keyagg_ctx = try keyAgg(pubkeys);
+    for (tweaks) |tw| keyagg_ctx = try keyagg_ctx.applyTweak(tw.tweak, tw.is_xonly);
+    const aggpk = keyagg_ctx.getXonlyPubkey();
+
+    var k: [2]Scalar = undefined;
+    defer for (&k) |*ki| std.crypto.secureZero(u8, std.mem.asBytes(ki));
+    inline for (0..2) |i| {
+        var hasher = bip340.hash.taggedHasher(det_nonce_tag);
+        hasher.update(&sk_prime);
+        hasher.update(aggothernonce);
+        hasher.update(&aggpk);
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, msg.len, .big);
+        hasher.update(&len_buf);
+        hasher.update(msg);
+        hasher.update(&[_]u8{@intCast(i)});
+        k[i] = reduceToScalar(hasher.finalResult());
+    }
+    if (k[0].isZero() or k[1].isZero()) return error.InvalidNonce;
+
+    const r1 = Secp256k1.combMulBase(k[0].toBytes(.big), .big) catch return error.InvalidNonce;
+    const r2 = Secp256k1.combMulBase(k[1].toBytes(.big), .big) catch return error.InvalidNonce;
+    var pubnonce_bytes: [66]u8 = undefined;
+    pubnonce_bytes[0..33].* = cbytes(r1);
+    pubnonce_bytes[33..66].* = cbytes(r2);
+
+    // The individual key comes from the ORIGINAL `sk`, not the masked one.
+    const p_point = Secp256k1.combMulBase(sk.bytes, .big) catch return error.SecretKeyMismatch;
+    var secnonce_bytes: [97]u8 = undefined;
+    secnonce_bytes[0..32].* = k[0].toBytes(.big);
+    secnonce_bytes[32..64].* = k[1].toBytes(.big);
+    secnonce_bytes[64..97].* = cbytes(p_point);
+    var secnonce = SecNonce.fromBytes(secnonce_bytes);
+    defer secnonce.deinit();
+    std.crypto.secureZero(u8, secnonce_bytes[0..64]);
+
+    const pubnonce = PubNonce.fromBytes(pubnonce_bytes) catch return error.InvalidNonce;
+    const others = PubNonce.fromBytes(aggothernonce.*) catch return error.InvalidAggOtherNonce;
+    const aggnonce = nonceAgg(&.{ pubnonce, others }) catch return error.InvalidAggOtherNonce;
+
+    const psig = try sign(&secnonce, sk, .{ .aggnonce = aggnonce, .pubkeys = pubkeys, .tweaks = tweaks, .msg = msg });
+    out.* = .{ .pubnonce = pubnonce, .psig = psig };
+}
+
 // ── PartialSigVerify (BIP327 §"Partial Signature Verification") ───────────
 
 pub const PartialSigVerifyError = SessionError || NonceAggError || PartialSignatureError;
@@ -997,13 +1123,27 @@ pub fn partialSigVerify(
     msg: []const u8,
     signer_index: usize,
 ) PartialSigVerifyError!void {
+    return partialSigVerifyAdaptor(psig, pubnonces, pubkeys, tweaks, msg, null, signer_index);
+}
+
+/// `partialSigVerify` for a session with an adaptor point (see
+/// `SessionContext.adaptor`; `null` is exactly `partialSigVerify`).
+pub fn partialSigVerifyAdaptor(
+    psig: PartialSignature,
+    pubnonces: []const PubNonce,
+    pubkeys: []const PlainPublicKey,
+    tweaks: []const Tweak,
+    msg: []const u8,
+    adaptor: ?PlainPublicKey,
+    signer_index: usize,
+) PartialSigVerifyError!void {
     // An index outside either list is the caller's input, not a reason to
     // panic (BIP327 requires the two lists to have the same length u).
     if (signer_index >= pubkeys.len) return error.InvalidPublicKey;
     if (signer_index >= pubnonces.len) return error.InvalidPubNonce;
     _ = pubkeys[signer_index].point() catch return error.InvalidPublicKey;
     const aggnonce = try nonceAgg(pubnonces);
-    const ctx = SessionContext{ .aggnonce = aggnonce, .pubkeys = pubkeys, .tweaks = tweaks, .msg = msg };
+    const ctx = SessionContext{ .aggnonce = aggnonce, .pubkeys = pubkeys, .tweaks = tweaks, .msg = msg, .adaptor = adaptor };
     return partialSigVerifyInternal(psig, pubnonces[signer_index], pubkeys[signer_index], ctx);
 }
 

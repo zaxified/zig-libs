@@ -6,12 +6,11 @@
 //! for this pass -- public BIP specification artifacts, not copied from any
 //! other implementation's test suite; see `../NOTICE`).
 //!
-//! Seven of the eight published vector files are embedded here: `key_agg`
+//! All eight published vector files are embedded here: `key_agg`
 //! (including its two tweak-related error cases), `key_sort`, `nonce_gen`,
 //! `nonce_agg`, `sign_verify`, `sig_agg`, and `tweak` (tweak_vectors.json,
-//! embedded in the tweaking pass). NOT embedded: `det_sign_vectors.json`
-//! (the optional single-signer `DeterministicSign` convenience wrapper,
-//! not part of the core signing flow this module implements).
+//! embedded in the tweaking pass) and `det_sign` (the optional
+//! single-signer `DeterministicSign` wrapper).
 
 // ---- key_agg_vectors.json --------------------------------------------------
 
@@ -607,6 +606,180 @@ pub const sig_agg = struct {
             .psig_indices = &.{ 7, 8 },
             .invalid_psig_signer = 1,
             .comment = "Partial signature is invalid because it exceeds group size",
+        },
+    };
+};
+
+// ---- det_sign_vectors.json -------------------------------------------------
+
+pub const det_sign = struct {
+    pub const sk = "7FB9E0E687ADA1EEBF7ECFE2F21E73EBDB51A7D450948DFE8D76D7F2D1007671";
+    pub const pubkeys: []const []const u8 = &.{
+        "03935F972DA013F80AE011890FA89B67A27B7BE6CCB24D3274D18B2D4067F261A9",
+        "02F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9",
+        "02DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659",
+        "020000000000000000000000000000000000000000000000000000000000000007",
+    };
+    pub const msgs: []const []const u8 = &.{
+        "F95466D086770E689964664219266FE5ED215C92AE20BAB5C9D79ADDDDF3C0CF",
+        "2626262626262626262626262626262626262626262626262626262626262626262626262626",
+        "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF",
+    };
+
+    pub const ValidCase = struct {
+        rand: ?[]const u8,
+        aggothernonce: []const u8,
+        key_indices: []const usize,
+        tweaks: []const []const u8,
+        is_xonly: []const bool,
+        msg_index: usize,
+        signer_index: usize,
+        expected_pubnonce: []const u8,
+        expected_psig: []const u8,
+        comment: []const u8,
+    };
+    pub const valid_test_cases = [_]ValidCase{
+        .{
+            .rand = "0000000000000000000000000000000000000000000000000000000000000000",
+            .aggothernonce = "0337C87821AFD50A8644D820A8F3E02E499C931865C2360FB43D0A0D20DAFE07EA0287BF891D2A6DEAEBADC909352AA9405D1428C15F4B75F04DAE642A95C2548480",
+            .key_indices = &.{ 0, 1, 2 },
+            .tweaks = &.{},
+            .is_xonly = &.{},
+            .msg_index = 0,
+            .signer_index = 0,
+            .expected_pubnonce = "03D96275257C2FCCBB6EEB77BDDF51D3C88C26EE1626C6CDA8999B9D34F4BA13A60309BE2BF883C6ABE907FA822D9CA166D51A3DCC28910C57528F6983FC378B7843",
+            .expected_psig = "41EA65093F71D084785B20DC26A887CD941C9597860A21660CBDB9CC2113CAD3",
+            .comment = "",
+        },
+        .{
+            .rand = null,
+            .aggothernonce = "0337C87821AFD50A8644D820A8F3E02E499C931865C2360FB43D0A0D20DAFE07EA0287BF891D2A6DEAEBADC909352AA9405D1428C15F4B75F04DAE642A95C2548480",
+            .key_indices = &.{ 1, 0, 2 },
+            .tweaks = &.{},
+            .is_xonly = &.{},
+            .msg_index = 0,
+            .signer_index = 1,
+            .expected_pubnonce = "028FBCCF5BB73A7B61B270BAD15C0F9475D577DD85C2157C9D38BEF1EC922B48770253BE3638C87369BC287E446B7F2C8CA5BEB9FFBD1EA082C62913982A65FC214D",
+            .expected_psig = "AEAA31262637BFA88D5606679018A0FEEEC341F3107D1199857F6C81DE61B8DD",
+            .comment = "",
+        },
+        .{
+            .rand = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            .aggothernonce = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F817980279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
+            .key_indices = &.{ 1, 2, 0 },
+            .tweaks = &.{},
+            .is_xonly = &.{},
+            .msg_index = 1,
+            .signer_index = 2,
+            .expected_pubnonce = "024FA8D774F0C8743FAA77AFB4D08EE5A013C2E8EEAD8A6F08A77DDD2D28266DB803050905E8C994477F3F2981861A2E3791EF558626E645FBF5AA131C5D6447C2C2",
+            .expected_psig = "FEE28A56B8556B7632E42A84122C51A4861B1F2DEC7E81B632195E56A52E3E13",
+            .comment = "Message longer than 32 bytes",
+        },
+        .{
+            .rand = "0000000000000000000000000000000000000000000000000000000000000000",
+            .aggothernonce = "032DE2662628C90B03F5E720284EB52FF7D71F4284F627B68A853D78C78E1FFE9303E4C5524E83FFE1493B9077CF1CA6BEB2090C93D930321071AD40B2F44E599046",
+            .key_indices = &.{ 0, 1, 2 },
+            .tweaks = &.{"E8F791FF9225A2AF0102AFFF4A9A723D9612A682A25EBE79802B263CDFCD83BB"},
+            .is_xonly = &.{true},
+            .msg_index = 0,
+            .signer_index = 0,
+            .expected_pubnonce = "031E07C0D11A0134E55DB1FC16095ADCBD564236194374AA882BFB3C78273BF673039D0336E8CA6288C00BFC1F8B594563529C98661172B9BC1BE85C23A4CE1F616B",
+            .expected_psig = "7B1246C5889E59CB0375FA395CC86AC42D5D7D59FD8EAB4FDF1DCAB2B2F006EA",
+            .comment = "Tweaked public key",
+        },
+        .{
+            .rand = "0000000000000000000000000000000000000000000000000000000000000000",
+            .aggothernonce = "032DE2662628C90B03F5E720284EB52FF7D71F4284F627B68A853D78C78E1FFE9303E4C5524E83FFE1493B9077CF1CA6BEB2090C93D930321071AD40B2F44E599046",
+            .key_indices = &.{ 0, 1, 2 },
+            .tweaks = &.{ "E8F791FF9225A2AF0102AFFF4A9A723D9612A682A25EBE79802B263CDFCD83BB", "AE2EA797CC0FE72AC5B97B97F3C6957D7E4199A167A58EB08BCAFFDA70AC0455" },
+            .is_xonly = &.{ false, true },
+            .msg_index = 0,
+            .signer_index = 0,
+            .expected_pubnonce = "0216794FAEAAED862634A73DBCE667395FE479CF0986B0111451F6C0EF8B82C04702BE7347E8CFF7540585ACC13D3B727372263E65A0E034D90CC3B2DF22603EF972",
+            .expected_psig = "324600EDB5B0321F47C27D7843EA38A4B61A80C276AB3EA5E9435B254D135B6B",
+            .comment = "Plain and x-only tweaks. Detects implementations that treat every tweak as x-only.",
+        },
+        .{
+            .rand = "0000000000000000000000000000000000000000000000000000000000000000",
+            .aggothernonce = "0337C87821AFD50A8644D820A8F3E02E499C931865C2360FB43D0A0D20DAFE07EA0287BF891D2A6DEAEBADC909352AA9405D1428C15F4B75F04DAE642A95C2548480",
+            .key_indices = &.{ 0, 1, 2 },
+            .tweaks = &.{},
+            .is_xonly = &.{},
+            .msg_index = 2,
+            .signer_index = 0,
+            .expected_pubnonce = "02CB9B7D4A7EC68635468B52755DD0314879F0E9EAE728817559B6DD213C4B4210024CDABB29C9BC46921F57FC622BA72A7E1AC431B4286DBB23927FFD2ECFF63A51",
+            .expected_psig = "D6CCC452B5C1277001A9178467AD697ECAB99E383B1C6F592A1C07F3723E541A",
+            .comment = "Message of 256 bytes. Detects implementations that encode only the low byte of the message length.",
+        },
+    };
+
+    pub const ErrorKind = enum { invalid_pubkey, signer_not_in_pubkeys, invalid_aggothernonce, tweak_out_of_range };
+    pub const ErrorCase = struct {
+        rand: ?[]const u8,
+        aggothernonce: []const u8,
+        key_indices: []const usize,
+        tweaks: []const []const u8,
+        is_xonly: []const bool,
+        msg_index: usize,
+        signer_index: usize,
+        kind: ErrorKind,
+        comment: []const u8,
+    };
+    pub const error_test_cases = [_]ErrorCase{
+        .{
+            .rand = "0000000000000000000000000000000000000000000000000000000000000000",
+            .aggothernonce = "0337C87821AFD50A8644D820A8F3E02E499C931865C2360FB43D0A0D20DAFE07EA0287BF891D2A6DEAEBADC909352AA9405D1428C15F4B75F04DAE642A95C2548480",
+            .key_indices = &.{ 1, 0, 3 },
+            .tweaks = &.{},
+            .is_xonly = &.{},
+            .msg_index = 0,
+            .signer_index = 1,
+            .kind = .invalid_pubkey,
+            .comment = "Signer 2 provided an invalid public key",
+        },
+        .{
+            .rand = "0000000000000000000000000000000000000000000000000000000000000000",
+            .aggothernonce = "0337C87821AFD50A8644D820A8F3E02E499C931865C2360FB43D0A0D20DAFE07EA0287BF891D2A6DEAEBADC909352AA9405D1428C15F4B75F04DAE642A95C2548480",
+            .key_indices = &.{ 1, 2 },
+            .tweaks = &.{},
+            .is_xonly = &.{},
+            .msg_index = 0,
+            .signer_index = 1,
+            .kind = .signer_not_in_pubkeys,
+            .comment = "The signers pubkey is not in the list of pubkeys",
+        },
+        .{
+            .rand = "0000000000000000000000000000000000000000000000000000000000000000",
+            .aggothernonce = "0437C87821AFD50A8644D820A8F3E02E499C931865C2360FB43D0A0D20DAFE07EA0287BF891D2A6DEAEBADC909352AA9405D1428C15F4B75F04DAE642A95C2548480",
+            .key_indices = &.{ 1, 2, 0 },
+            .tweaks = &.{},
+            .is_xonly = &.{},
+            .msg_index = 0,
+            .signer_index = 2,
+            .kind = .invalid_aggothernonce,
+            .comment = "aggothernonce is invalid due wrong tag, 0x04, in the first half",
+        },
+        .{
+            .rand = "0000000000000000000000000000000000000000000000000000000000000000",
+            .aggothernonce = "0000000000000000000000000000000000000000000000000000000000000000000287BF891D2A6DEAEBADC909352AA9405D1428C15F4B75F04DAE642A95C2548480",
+            .key_indices = &.{ 1, 2, 0 },
+            .tweaks = &.{},
+            .is_xonly = &.{},
+            .msg_index = 0,
+            .signer_index = 2,
+            .kind = .invalid_aggothernonce,
+            .comment = "aggothernonce is invalid because first half corresponds to point at infinity",
+        },
+        .{
+            .rand = "0000000000000000000000000000000000000000000000000000000000000000",
+            .aggothernonce = "0337C87821AFD50A8644D820A8F3E02E499C931865C2360FB43D0A0D20DAFE07EA0287BF891D2A6DEAEBADC909352AA9405D1428C15F4B75F04DAE642A95C2548480",
+            .key_indices = &.{ 1, 2, 0 },
+            .tweaks = &.{"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"},
+            .is_xonly = &.{false},
+            .msg_index = 0,
+            .signer_index = 2,
+            .kind = .tweak_out_of_range,
+            .comment = "Tweak is invalid because it exceeds group size",
         },
     };
 };

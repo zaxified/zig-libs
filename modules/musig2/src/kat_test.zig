@@ -923,3 +923,73 @@ test "corpus: the psig seeds actually corrupt the signature, and the counts are 
     try std.testing.expectEqual(@as(usize, 6), parsed); // the s >= n seed is the one refused
     try std.testing.expectEqual(@as(usize, 2), verified);
 }
+
+// ── det_sign_vectors.json (DeterministicSign) ───────────────────────────
+
+fn detSign(case_rand: ?[]const u8, aggother: []const u8, key_indices: []const usize, tweaks: []const []const u8, is_xonly: []const bool, msg_index: usize, out: *musig2.DeterministicSignResult) !void {
+    const sk = try bip340.SecretKey.fromBytes(hexN(32, v.det_sign.sk));
+    var pk_buf: [4]musig2.PlainPublicKey = undefined;
+    const pks = rawPubkeys(&pk_buf, v.det_sign.pubkeys, key_indices);
+    var tw_buf: [2]musig2.Tweak = undefined;
+    for (tweaks, is_xonly, 0..) |t, xo, i| tw_buf[i] = .{ .tweak = hexN(32, t), .is_xonly = xo };
+    const aggother_bytes = hexN(66, aggother);
+    const msg = try hexAlloc(std.testing.allocator, v.det_sign.msgs[msg_index]);
+    defer std.testing.allocator.free(msg);
+    var rand_buf: [32]u8 = undefined;
+    const rand: ?*const [32]u8 = if (case_rand) |r| blk: {
+        rand_buf = hexN(32, r);
+        break :blk &rand_buf;
+    } else null;
+    return musig2.deterministicSign(out, &sk, &aggother_bytes, pks, tw_buf[0..tweaks.len], msg, rand);
+}
+
+test "KAT det_sign: valid_test_cases — pubnonce and partial signature byte-exact" {
+    for (v.det_sign.valid_test_cases) |case| {
+        var out: musig2.DeterministicSignResult = undefined;
+        try detSign(case.rand, case.aggothernonce, case.key_indices, case.tweaks, case.is_xonly, case.msg_index, &out);
+        try std.testing.expectEqualSlices(u8, &hexN(66, case.expected_pubnonce), &out.pubnonce.bytes);
+        try std.testing.expectEqualSlices(u8, &hexN(32, case.expected_psig), &out.psig.bytes);
+    }
+}
+
+test "KAT det_sign: error_test_cases — each blamed failure is its own error" {
+    for (v.det_sign.error_test_cases) |case| {
+        var out: musig2.DeterministicSignResult = undefined;
+        const res = detSign(case.rand, case.aggothernonce, case.key_indices, case.tweaks, case.is_xonly, case.msg_index, &out);
+        switch (case.kind) {
+            .invalid_pubkey => try std.testing.expectError(error.InvalidPublicKey, res),
+            .signer_not_in_pubkeys => try std.testing.expectError(error.PubkeyNotInSession, res),
+            .invalid_aggothernonce => try std.testing.expectError(error.InvalidAggOtherNonce, res),
+            .tweak_out_of_range => try std.testing.expectError(error.TweakOutOfRange, res),
+        }
+    }
+}
+
+test "deterministicSign: the partial signature completes a session with the other signers' real nonces" {
+    // A 2-signer session where signer B is the deterministic (last) signer.
+    const sk_a = try bip340.SecretKey.fromBytes(@splat(0x11));
+    const sk_b = try bip340.SecretKey.fromBytes(@splat(0x22));
+    var pk_a: [33]u8 = undefined;
+    var pk_b: [33]u8 = undefined;
+    for ([_]struct { *const bip340.SecretKey, *[33]u8 }{ .{ &sk_a, &pk_a }, .{ &sk_b, &pk_b } }) |e| {
+        const p = try k256.Secp256k1.combMulBase(e[0].bytes, .big);
+        const aff = p.affineCoordinates();
+        e[1][0] = if (aff.y.isOdd()) 3 else 2;
+        e[1][1..33].* = aff.x.toBytes(.big);
+    }
+    const pks = [_]musig2.PlainPublicKey{ try musig2.PlainPublicKey.fromBytes(pk_a), try musig2.PlainPublicKey.fromBytes(pk_b) };
+    const msg = "deterministic signer goes last";
+    const agg = try musig2.keyAgg(&pks);
+    const aggpk = agg.getXonlyPubkey();
+
+    var na: musig2.NonceGenResult = undefined;
+    try musig2.nonceGen(&na, &sk_a.bytes, pk_a, aggpk, msg, null, &@as([32]u8, @splat(0x33)), std.testing.io);
+    var det: musig2.DeterministicSignResult = undefined;
+    try musig2.deterministicSign(&det, &sk_b, &na.pubnonce.bytes, &pks, &.{}, msg, null);
+    const aggnonce = try musig2.nonceAgg(&.{ na.pubnonce, det.pubnonce });
+    const ctx: musig2.SessionContext = .{ .aggnonce = aggnonce, .pubkeys = &pks, .msg = msg };
+    const psig_a = try musig2.sign(&na.secnonce, &sk_a, ctx);
+    try musig2.partialSigVerify(det.psig, &.{ na.pubnonce, det.pubnonce }, &pks, &.{}, msg, 1);
+    const sig = try musig2.partialSigAgg(&.{ psig_a, det.psig }, ctx);
+    try std.testing.expect(bip340.verify(try bip340.XOnlyPublicKey.fromBytes(aggpk), msg, try bip340.Signature.fromBytes(sig)));
+}

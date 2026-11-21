@@ -18,14 +18,14 @@ verification, and final aggregation — whose 64-byte result verifies under
 plain `bip340.verify`. Key tweaking (`ApplyTweak`) is implemented too:
 plain (BIP32-style) and x-only (Taproot-style) tweaks compose on a
 `KeyAggContext` via the `gacc`/`tacc` accumulators, byte-exact against
-the official `tweak_vectors.json`. `DeterministicSign` remains out of
-scope. See `SPEC.md` for the design and the threat model (the parity/`g`/`gacc`
+the official `tweak_vectors.json`. `deterministicSign` (the optional single-signer wrapper) and adaptor sessions
+(`SessionContext.adaptor`, for the sibling `adaptor` module) are provided. See `SPEC.md` for the design and the threat model (the parity/`g`/`gacc`
 sign-flip chain).
 
 | File | Contents |
 |---|---|
 | `root.zig` | Every public type (`PlainPublicKey`, `PubNonce`, `AggNonce`, `SecNonce`, `PartialSignature`, `KeyAggContext`, `Tweak`, `SessionContext`/`SessionValues`) + the full API surface (`keySort`, `nonceGen`, `keyAgg`, `nonceAgg`, `KeyAggContext.applyTweak`, `getSessionValues`, `sign`, `partialSigVerify`, `partialSigAgg`) |
-| `kat_vectors.zig` | Seven of the eight official BIP327 vector files, embedded (only `det_sign` is not) |
+| `kat_vectors.zig` | All eight official BIP327 vector files, embedded |
 | `burn.zig` | The dead-stack burn `nonceGen` runs under (`sign` has its own in `root.zig`) |
 | `fuzz_test.zig` | Deterministic fuzz harnesses (`MUSIG2_FUZZ`): partial-signature verification, whole sessions |
 | `stackprobe_test.zig`, `stackprobe2_test.zig` | Dead-stack scans after `sign` and `nonceGen` (ReleaseFast/ReleaseSmall only) |
@@ -142,8 +142,7 @@ Debug and ReleaseSafe and run in the ReleaseFast pass.
 
 ## Not provided
 
-`DeterministicSign` (BIP327's optional single-signer wrapper) and the MuSig2-with-adaptor
-glue are not implemented; see `SPEC.md` *Backlog / deferred*. Zeroizing a `bip340.SecretKey`
+`nonce_gen_counter` and a session-object wrapper are not provided. Zeroizing a `bip340.SecretKey`
 or a copy of a `SecNonce` the caller made is the caller's, see *What is deliberately not
 done*.
 

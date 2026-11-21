@@ -69,8 +69,7 @@ adaptor → k256   (point arithmetic and scalar field)
 
 ## Not provided
 
-MuSig2 adaptor combination and ECDSA adaptor signatures (the DLC/Lightning variant) are not provided; see
-[SPEC.md](SPEC.md) *Backlog / deferred*. A pre-signature is bound to `±T`, and `adapt` does not check its own
+ECDSA adaptor signatures (the DLC/Lightning variant) are not provided (SPEC *Roadmap*); the MuSig2 combination lives in `musig2` (`SessionContext.adaptor`) and is tested here. A pre-signature is bound to `±T`, and `adapt` does not check its own
 output: verify it with `bip340.verify` (SPEC *Threat model / limits*).
 
 ## Verify
