@@ -249,6 +249,7 @@ Run `scripts/modtest simio` (loopback-dependent tests skip where binding is unav
   beyond stderr**, **preemptive threads** and **the CPU memory model** — an operation simio does not
   simulate behaves as in `std.Io.failing`; reasons under *Scope*.
 - **Sweeping the raw clock reads of about 60 other modules.** A module's clock moves behind its `Io` when its own pilot is written (`sntp`, `mqtt` and the `http` Server did); reads in tests and benchmarks are real time by design. Not a change to simio.
+- **Reach of the industrial-protocol live transports and `probe`.** The `s7comm`, `iec61850` and `iec104` TCP transports already bound their reads with `io.operateTimeout` (a simulated `Io` sees the wait). What is still raw is test and tool code (the `iec61850` regression helpers, the `opcua` `server_interop` tool) and `probe`'s connect race, which stays on non-blocking sockets and `poll(2)` because `std.Io.Threaded` cannot abort a connect (measured in the `probe` SPEC: 134 s on a 200 ms budget) and the race binds a source address or device; `probe` is tested offline through its own `Sys` seam instead.
 - **Simulated `io_uring`** (turmoil has one) — in Zig `io_uring` is an `std.Io` implementation, not an API
   the code under test calls.
 
