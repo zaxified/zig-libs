@@ -36,6 +36,13 @@ const decoded = try bech32.decode(encoded.slice());
 `InvalidDataChar`, `InvalidChecksum`, `TooLong` (>90 chars total). No allocation: `Decoded` and
 `Bech32String` are fixed-size value types sized to BIP173's own 90-character ceiling.
 
+`bech32.locateErrors(s, expected)` says where a mistyped string went wrong, as Bitcoin Core's `LocateErrors`
+does: the first structural fault with its positions (mixed case, a bad HRP byte, a bad data character, a
+bad separator), or, when only the checksum fails, the one or two substituted data-part characters that explain
+it, with the character that belongs there (`Located.positions()`, `Located.fixes()`). It never allocates and
+never fails; a result of three or more wrong characters can be a miscorrection, so show it as a hint.
+Errors in the HRP are not located (`bad_checksum_unlocated`).
+
 ## Segwit addresses (BIP141/BIP173/BIP350)
 
 ```zig

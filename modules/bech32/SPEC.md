@@ -25,7 +25,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** | C++ | MIT | 90.3k | v31.1 (2026-07-08) | `bech32.cpp`/`base58.cpp` plus `DecodeDestination`/`GetScriptForDestination`: address string <-> scriptPubKey for every output type, network from the HRP/version byte; bech32 error *location* (inferred). This module has the codecs and the segwit rules, not the destination layer. |
+| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** | C++ | MIT | 90.3k | v31.1 (2026-07-08) | `bech32.cpp`/`base58.cpp` plus `DecodeDestination`/`GetScriptForDestination`: address string <-> scriptPubKey for every output type, network from the HRP/version byte; bech32 error *location* (`LocateErrors`; here `locateErrors`, data-part substitutions only). This module has the codecs and the segwit rules, not the destination layer. |
 | [rust-bitcoin/rust-bech32](https://github.com/rust-bitcoin/rust-bech32) | Rust | MIT | 102 | v0.11.0 (tag; push 2026-09-29) | Generic bech32/bech32m with a checked `Hrp` type and no 90-character cap for non-Bitcoin use, segwit rules in a `segwit` module *(inferred from memory of the crate; no release tag on GitHub besides v0.11.0)*. Comparable codec; this module's generic path is capped at 90 (`polymod` etc. are `pub` for longer strings). |
 | [rust-bitcoin/rust-bitcoin](https://github.com/rust-bitcoin/rust-bitcoin) | Rust | CC0-1.0 | 2.7k | units-0.2.0 (tag; push 2026-09-30) | `addresses` crate: typed `Address` with network check, script_pubkey conversion, P2SH/P2TR/WIF-adjacent helpers *(inferred from the repo layout: `addresses`, `base58` directories)*. This is what a Rust user compares against. |
 | [btcsuite/btcd (`btcutil/bech32`, `btcutil/base58`, `btcutil` address types)](https://github.com/btcsuite/btcd/tree/master/btcutil) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | Go equivalents plus `Address` types and `WIF`. Same split. |
@@ -42,6 +42,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   layered on top) `base58.zig` (the unrelated, older Base58Check encoding + P2PKH/P2WPKH
   convenience over `ripemd160.hash160`). `root.zig` re-exports the first two flat and namespaces
   the third as `base58` (its own `encode`/`decode` would otherwise collide with the bech32 pair).
+
+- **`locateErrors`:** the checksum is linear, so the residue of a string with up to two substituted data characters is the XOR of two table entries (one per position and 5-bit delta, from `step0^(distance)`); a sorted table and a binary search find the pair. The code detects four errors, so a one- or two-character explanation is unique. Errors in the HRP and the separator are not located (they change the HRP expansion, not one data symbol); insertions and deletions are not repaired.
 
 - **No allocation:** every function works through fixed-size stack buffers sized to the specs'
   own length ceilings — bech32/bech32m: BIP173's 90-character total-string ceiling (`max_len`);
@@ -172,6 +174,7 @@ property, not cryptographic unforgeability.
 ## Verification
 
 - **Run:** `scripts/modtest bech32` (Debug by default; `-Doptimize=ReleaseFast` runs the same suite optimised).
+- **Error location** (`src/bech32.zig`, `locateErrors`): every structural fault with its positions; 400 random strings with one or two substituted data characters (both constants) located exactly, repaired to the original, and, for the short ones, checked against a brute force over every one- and two-character repair through `decode` (exactly one exists); three errors, a bad HRP byte and a deleted character never crash and any repair offered is a genuine valid string.
 - **Anchors** (`src/kat_test.zig`, `src/kat_vectors.zig`): the complete BIP173 "Test vectors" appendix (valid and
   invalid generic bech32 strings) and BIP350's bech32m analogue, each invalid vector asserted against its specific
   documented typed error; BIP350's "Test vectors for v0-v16 native segregated witness addresses" (valid ones checked
@@ -206,8 +209,7 @@ property, not cryptographic unforgeability.
 
 ## Backlog / deferred
 
-- **bech32 error location** (Bitcoin Core's `bech32.cpp` reports where a mistyped character is; see *Compared
-  with*): not built; no consumer has asked.
+None open.
 
 ## Anchoring
 

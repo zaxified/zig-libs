@@ -235,6 +235,215 @@ pub fn decode(s: []const u8) DecodeError!Decoded {
     return result;
 }
 
+// ── error location (what Bitcoin Core's `LocateErrors` reports) ───────────
+
+/// Why `locateErrors` has something to say about a string.
+pub const Fault = enum {
+    /// The string is a valid bech32/bech32m string (`Located.encoding` says which).
+    none,
+    /// The checksum is valid, but for the other constant than `expected`
+    /// (`Located.encoding` is the one it carries); no positions.
+    wrong_variant,
+    /// Longer than `max_len`; no positions.
+    too_long,
+    /// Upper- and lowercase letters mixed; `positions` = the first letter whose
+    /// case differs from the case of the string's first letter.
+    mixed_case,
+    /// A byte of the human-readable part outside US-ASCII [33,126]; every such position.
+    invalid_character,
+    /// No `1` separator; no positions.
+    no_separator,
+    /// The separator is first (empty HRP), the HRP is longer than `max_hrp_len`, or
+    /// fewer than `checksum_len` characters follow it; `positions` = the separator.
+    bad_separator,
+    /// A data-part character not in `charset`; every such position.
+    invalid_data_character,
+    /// The checksum fails and one or two substituted data-part characters explain it:
+    /// `positions` (ascending, indexes into the input) and `fixes` (the character
+    /// that belongs there, lowercase). Errors in the HRP are not located.
+    bad_checksum,
+    /// The checksum fails and no one- or two-character substitution in the data part
+    /// repairs it (three or more errors, an error in the HRP or the separator, an
+    /// insertion or a deletion).
+    bad_checksum_unlocated,
+};
+
+/// The result of `locateErrors`. A decoder that finds errors is a guess beyond two
+/// substitutions: a string with three or more wrong characters can be "repaired"
+/// into a different valid string, so treat `bad_checksum` as a hint to show the
+/// user, never as a correction to apply silently.
+pub const Located = struct {
+    fault: Fault,
+    /// For `.none` the encoding the string checksums against; for `.bad_checksum` the
+    /// one the repair was computed for.
+    encoding: ?Encoding = null,
+    count: u8 = 0,
+    pos_buf: [max_len]u8 = undefined,
+    fix_buf: [2]u8 = undefined,
+
+    pub fn positions(self: *const Located) []const u8 {
+        return self.pos_buf[0..self.count];
+    }
+
+    /// For `.bad_checksum`: the character that belongs at `positions()[i]`.
+    pub fn fixes(self: *const Located) []const u8 {
+        return if (self.fault == .bad_checksum) self.fix_buf[0..self.count] else self.fix_buf[0..0];
+    }
+};
+
+/// The polymod step for a zero symbol (the linear part of `polymod`).
+fn stepZero(chk: u32) u32 {
+    const b: u32 = chk >> 25;
+    var c = (chk & 0x1ffffff) << 5;
+    if (b & 1 != 0) c ^= gen[0];
+    if (b & 2 != 0) c ^= gen[1];
+    if (b & 4 != 0) c ^= gen[2];
+    if (b & 8 != 0) c ^= gen[3];
+    if (b & 16 != 0) c ^= gen[4];
+    return c;
+}
+
+const Atom = struct { key: u32, pos: u8, val: u8 };
+
+fn atomLess(_: void, a: Atom, b: Atom) bool {
+    return a.key < b.key;
+}
+
+fn atomOrder(key: u32, a: Atom) std.math.Order {
+    return std.math.order(key, a.key);
+}
+
+const Repair = struct {
+    enc: Encoding,
+    a: Atom,
+    b: ?Atom,
+
+    fn size(r: Repair) u8 {
+        return if (r.b == null) 1 else 2;
+    }
+};
+
+/// The one or two table atoms whose residues XOR to `target`, if any.
+fn repair(table: []const Atom, target: u32, enc: Encoding) ?Repair {
+    if (std.sort.binarySearch(Atom, table, target, atomOrder)) |i| return .{ .enc = enc, .a = table[i], .b = null };
+    for (table) |a| {
+        const i = std.sort.binarySearch(Atom, table, target ^ a.key, atomOrder) orelse continue;
+        if (table[i].pos > a.pos) return .{ .enc = enc, .a = a, .b = table[i] };
+    }
+    return null;
+}
+
+/// Where the mistyped characters of `s` are, as Bitcoin Core's `bech32.cpp` reports
+/// them: the first structural fault with its positions, or, when only the checksum
+/// fails, the one or two substituted data-part characters that explain it (the code
+/// detects four errors, so such an explanation is unique). `expected` names the
+/// checksum constant the string is meant to carry (segwit v0: `.bech32`, v1+:
+/// `.bech32m`); null tries both and takes the repair with fewer errors (bech32 on a
+/// tie). Never fails and never allocates; the work is one 31-entry table per data
+/// character and a binary search per candidate (well under a millisecond).
+pub fn locateErrors(s: []const u8, expected: ?Encoding) Located {
+    var r: Located = .{ .fault = .none };
+    if (s.len > max_len) {
+        r.fault = .too_long;
+        return r;
+    }
+    var first_letter: ?bool = null; // true = upper
+    for (s, 0..) |c, i| {
+        const up = c >= 'A' and c <= 'Z';
+        if (!up and !(c >= 'a' and c <= 'z')) continue;
+        if (first_letter == null) first_letter = up else if (first_letter.? != up) {
+            r.fault = .mixed_case;
+            r.pos_buf[0] = @intCast(i);
+            r.count = 1;
+            return r;
+        }
+    }
+    const sep = std.mem.findScalarLast(u8, s, '1') orelse {
+        r.fault = .no_separator;
+        return r;
+    };
+    for (s[0..sep], 0..) |c, i| if (c < 33 or c > 126) {
+        r.fault = .invalid_character;
+        r.pos_buf[r.count] = @intCast(i);
+        r.count += 1;
+    };
+    if (r.fault != .none) return r;
+    if (sep == 0 or sep > max_hrp_len or s.len - sep - 1 < checksum_len) {
+        r.fault = .bad_separator;
+        r.pos_buf[0] = @intCast(sep);
+        r.count = 1;
+        return r;
+    }
+    var hrp_buf: [max_hrp_len]u8 = undefined;
+    for (s[0..sep], 0..) |c, i| hrp_buf[i] = toLower(c);
+    const hrp = hrp_buf[0..sep];
+    const dlen = s.len - sep - 1;
+    var vals: [max_len]u5 = undefined;
+    for (s[sep + 1 ..], 0..) |c, i| {
+        if (charValue(toLower(c))) |v| {
+            vals[i] = v;
+        } else {
+            r.fault = .invalid_data_character;
+            r.pos_buf[r.count] = @intCast(sep + 1 + i);
+            r.count += 1;
+        }
+    }
+    if (r.fault != .none) return r;
+
+    var buf: [max_combined]u5 = undefined;
+    var n = hrpExpandInto(hrp, buf[0..]);
+    @memcpy(buf[n..][0..dlen], vals[0..dlen]);
+    n += dlen;
+    const residue = polymod(buf[0..n]);
+    if (residue == 1 or residue == encodingConst(.bech32m)) {
+        const enc: Encoding = if (residue == 1) .bech32 else .bech32m;
+        r.encoding = enc;
+        if (expected != null and expected.? != enc) r.fault = .wrong_variant;
+        return r;
+    }
+
+    // A substitution of value `v`-delta at data index k changes the residue by
+    // step0^(dlen-1-k)(delta): linear, so the residue of a string with two
+    // substitutions is the XOR of two table entries.
+    var atoms: [max_data_len + checksum_len][31]u32 = undefined; // [k][delta - 1]
+    var cur: [31]u32 = undefined;
+    for (&cur, 0..) |*c, d| c.* = @intCast(d + 1);
+    var k = dlen;
+    while (k > 0) {
+        k -= 1;
+        atoms[k] = cur;
+        for (&cur) |*c| c.* = stepZero(c.*);
+    }
+    var table: [(max_data_len + checksum_len) * 31]Atom = undefined;
+    var tn: usize = 0;
+    for (0..dlen) |kk| for (0..31) |d| {
+        table[tn] = .{ .key = atoms[kk][d], .pos = @intCast(kk), .val = @intCast(d + 1) };
+        tn += 1;
+    };
+    std.mem.sort(Atom, table[0..tn], {}, atomLess);
+
+    var best: ?Repair = null;
+    for ([_]Encoding{ .bech32, .bech32m }) |enc| {
+        if (expected != null and expected.? != enc) continue;
+        const rep = repair(table[0..tn], residue ^ encodingConst(enc), enc) orelse continue;
+        if (best == null or rep.size() < best.?.size()) best = rep;
+    }
+    const found = best orelse {
+        r.fault = .bad_checksum_unlocated;
+        return r;
+    };
+    r.fault = .bad_checksum;
+    r.encoding = found.enc;
+    const items = [2]?Atom{ found.a, found.b };
+    for (items) |maybe| {
+        const a = maybe orelse continue;
+        r.pos_buf[r.count] = @intCast(sep + 1 + a.pos);
+        r.fix_buf[r.count] = charset[@as(u5, @intCast(vals[a.pos] ^ a.val))];
+        r.count += 1;
+    }
+    return r;
+}
+
 // ── encode ───────────────────────────────────────────────────────────────
 
 pub const EncodeError = error{
@@ -529,4 +738,139 @@ test "corpus: every bech32 seed reaches decode, and the counts are pinned" {
     try testing.expectEqual(@as(usize, 3), accepted);
     try testing.expectEqual(@as(usize, 48), data_symbols);
     try testing.expectEqual(@as(usize, 89), hrp_octets);
+}
+
+// ── locateErrors ─────────────────────────────────────────────────────────
+
+fn randomValid(r: std.Random, buf: *[max_len]u8, enc: Encoding) []const u8 {
+    const hrps = [_][]const u8{ "bc", "tb", "a", "bcrt", "lnbc", "split" };
+    const hrp = hrps[r.uintLessThan(usize, hrps.len)];
+    var data: [max_data_len]u5 = undefined;
+    const room = max_len - hrp.len - 1 - checksum_len;
+    const n = r.uintLessThan(usize, @min(room, max_data_len) + 1);
+    for (data[0..n]) |*d| d.* = r.int(u5);
+    const e = encode(hrp, data[0..n], enc) catch unreachable;
+    @memcpy(buf[0..e.len], e.slice());
+    return buf[0..e.len];
+}
+
+test "locateErrors: valid strings are none, and name their encoding" {
+    const l = locateErrors("A12UEL5L", null);
+    try testing.expectEqual(Fault.none, l.fault);
+    try testing.expectEqual(@as(?Encoding, .bech32), l.encoding);
+    const m = locateErrors("a1lqfn3a", null);
+    try testing.expectEqual(Fault.none, m.fault);
+    try testing.expectEqual(@as(?Encoding, .bech32m), m.encoding);
+    // valid, but for the other constant than the caller expects
+    const w = locateErrors("a1lqfn3a", .bech32);
+    try testing.expectEqual(Fault.wrong_variant, w.fault);
+    try testing.expectEqual(@as(?Encoding, .bech32m), w.encoding);
+    try testing.expectEqual(Fault.none, locateErrors("a1lqfn3a", .bech32m).fault);
+}
+
+test "locateErrors: structural faults carry their positions" {
+    try testing.expectEqual(Fault.too_long, locateErrors("bc1" ++ @as([90]u8, @splat('q')), null).fault);
+    const mixed = locateErrors("bc1qpzRy9x8gf2tvdw0s3jn54khce6mua7lmqqqxw", null);
+    try testing.expectEqual(Fault.mixed_case, mixed.fault);
+    try testing.expectEqualSlices(u8, &.{6}, mixed.positions());
+    try testing.expectEqual(Fault.no_separator, locateErrors("pzry9x0s0muk", null).fault);
+    const empty_hrp = locateErrors("1pzry9x0s0muk", null);
+    try testing.expectEqual(Fault.bad_separator, empty_hrp.fault);
+    try testing.expectEqualSlices(u8, &.{0}, empty_hrp.positions());
+    try testing.expectEqual(Fault.bad_separator, locateErrors("li1dgmt3", null).fault); // 5 data characters
+    const hrp_bad = locateErrors("x\x7fy1pzry9x0s0muk", null);
+    try testing.expectEqual(Fault.invalid_character, hrp_bad.fault);
+    try testing.expectEqualSlices(u8, &.{1}, hrp_bad.positions());
+    const data_bad = locateErrors("de1lg7wt\xff", null);
+    try testing.expectEqual(Fault.invalid_data_character, data_bad.fault);
+    try testing.expectEqualSlices(u8, &.{8}, data_bad.positions());
+    const two_bad = locateErrors("bc1qbpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw", null);
+    try testing.expectEqual(Fault.invalid_data_character, two_bad.fault);
+    try testing.expectEqualSlices(u8, &.{4}, two_bad.positions());
+}
+
+test "locateErrors: one or two substituted characters are found, with their fixes, against a brute force" {
+    var prng = std.Random.DefaultPrng.init(0x6c6f6361);
+    const r = prng.random();
+    var buf: [max_len]u8 = undefined;
+    var located: usize = 0;
+    for (0..400) |_| {
+        const enc: Encoding = if (r.boolean()) .bech32 else .bech32m;
+        const good = randomValid(r, &buf, enc);
+        const sep = std.mem.findScalarLast(u8, good, '1').?;
+        var bad: [max_len]u8 = undefined;
+        @memcpy(bad[0..good.len], good);
+        const want_n = 1 + r.uintLessThan(usize, 2);
+        var at: [2]usize = undefined;
+        for (0..want_n) |i| {
+            while (true) {
+                const p = sep + 1 + r.uintLessThan(usize, good.len - sep - 1);
+                if (i == 1 and p == at[0]) continue;
+                at[i] = p;
+                break;
+            }
+            const orig = bad[at[i]];
+            while (bad[at[i]] == orig) bad[at[i]] = charset[r.uintLessThan(usize, 32)];
+        }
+        const l = locateErrors(bad[0..good.len], enc);
+        try testing.expectEqual(Fault.bad_checksum, l.fault);
+        try testing.expectEqual(want_n, l.count);
+        // the repaired string is the original, at the located positions
+        var fixed: [max_len]u8 = bad;
+        for (l.positions(), l.fixes()) |p, f| fixed[p] = f;
+        try testing.expectEqualStrings(good, fixed[0..good.len]);
+        _ = try decode(fixed[0..good.len]);
+        located += 1;
+        if (good.len - sep > 14 or located > 40) continue; // the brute force is quadratic in the data length
+        // brute force: no other one- or two-character repair exists
+        var found: usize = 0;
+        for (sep + 1..good.len) |p| for (charset) |c1| {
+            var t = bad;
+            if (c1 == t[p]) continue;
+            t[p] = c1;
+            if (decode(t[0..good.len])) |d| {
+                if (d.encoding == enc) found += 1;
+            } else |_| {}
+            for (p + 1..good.len) |q| for (charset) |c2| {
+                if (c2 == t[q]) continue;
+                var u = t;
+                u[q] = c2;
+                if (decode(u[0..good.len])) |d| {
+                    if (d.encoding == enc) found += 1;
+                } else |_| {}
+            };
+        };
+        try testing.expectEqual(@as(usize, 1), found);
+    }
+}
+
+test "locateErrors: three errors, a bad HRP and a missing character never crash and are not a repair of the original" {
+    var prng = std.Random.DefaultPrng.init(0x7468726565);
+    const r = prng.random();
+    var buf: [max_len]u8 = undefined;
+    for (0..300) |_| {
+        const good = randomValid(r, &buf, .bech32);
+        var bad: [max_len]u8 = undefined;
+        @memcpy(bad[0..good.len], good);
+        const sep = std.mem.findScalarLast(u8, good, '1').?;
+        var len = good.len;
+        switch (r.uintLessThan(usize, 3)) {
+            0 => for (0..3) |_| {
+                const p = sep + 1 + r.uintLessThan(usize, good.len - sep - 1);
+                bad[p] = if (bad[p] == 'q') 'p' else 'q';
+            },
+            1 => bad[0] = if (bad[0] == 'z') 'y' else 'z',
+            else => {
+                std.mem.copyForwards(u8, bad[sep + 1 ..], bad[sep + 2 .. len]);
+                len -= 1;
+            },
+        }
+        const l = locateErrors(bad[0..len], .bech32);
+        try testing.expect(l.fault != .none);
+        if (l.fault == .bad_checksum) { // a miscorrection is allowed, but it must be a genuine repair
+            var fixed: [max_len]u8 = bad;
+            for (l.positions(), l.fixes()) |p, f| fixed[p] = f;
+            _ = try decode(fixed[0..len]);
+        }
+    }
 }

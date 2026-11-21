@@ -68,6 +68,11 @@ pub const Decoded = bech32_impl.Decoded;
 /// Decodes and checksum-verifies a bech32/bech32m string.
 pub const decode = bech32_impl.decode;
 
+pub const Fault = bech32_impl.Fault;
+pub const Located = bech32_impl.Located;
+/// Where the mistyped characters of a bech32/bech32m string are (Bitcoin Core's `LocateErrors`).
+pub const locateErrors = bech32_impl.locateErrors;
+
 pub const EncodeError = bech32_impl.EncodeError;
 pub const Bech32String = bech32_impl.Bech32String;
 /// Encodes `hrp` + 5-bit `data` with a fresh checksum for `encoding`.
