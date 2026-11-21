@@ -173,12 +173,134 @@ test "verifyAttestation: the W3C §16.14 android-key certificate passes x509.saf
     } else |e| try testing.expect(e != error.InvalidCertificate);
 }
 
-test "verifyAttestation: fmt=tpm -> error.UnsupportedFormat (not yet implemented)" {
+const tpm_fixtures = @import("tpm_fixtures.zig");
+
+/// Rebuild `attestation_object` with `attStmt[key]` replaced by `value` (or removed when `value` is null).
+fn withStmt(a: std.mem.Allocator, attestation_object: []const u8, key: []const u8, value: ?cbor.Value) ![]u8 {
+    const decoded = try cbor.decode(a, attestation_object, .{});
+    var out: std.ArrayList(cbor.MapEntry) = .empty;
+    for (decoded.map) |e| {
+        if (e.key == .text and std.mem.eql(u8, e.key.text, "attStmt")) {
+            var stmt: std.ArrayList(cbor.MapEntry) = .empty;
+            for (e.value.map) |se| {
+                if (se.key == .text and std.mem.eql(u8, se.key.text, key)) {
+                    if (value) |v| try stmt.append(a, .{ .key = se.key, .value = v });
+                } else try stmt.append(a, se);
+            }
+            try out.append(a, .{ .key = e.key, .value = .{ .map = stmt.items } });
+        } else try out.append(a, e);
+    }
+    return cbor.encode(a, .{ .map = out.items }, .{});
+}
+
+fn stmtBytes(a: std.mem.Allocator, attestation_object: []const u8, key: []const u8) ![]const u8 {
+    const decoded = try cbor.decode(a, attestation_object, .{});
+    for (decoded.map) |e| {
+        if (e.key == .text and std.mem.eql(u8, e.key.text, "attStmt")) {
+            for (e.value.map) |se| if (se.key == .text and std.mem.eql(u8, se.key.text, key)) return se.value.bytes;
+        }
+    }
+    return error.MissingField;
+}
+
+test "verifyAttestation: fmt=tpm, the W3C §16.13 vector (ES256 credential, ECC pubArea, ES256 AIK signature)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const hash: [32]u8 = @splat(0);
-    try testing.expectError(error.UnsupportedFormat, webauthn.verifyAttestation(a, &vectors.tpm_es256_attestation_object, hash));
+    const hash = clientDataHash(&vectors.tpm_es256_client_data_json);
+    const r = try webauthn.verifyAttestation(a, &vectors.tpm_es256_attestation_object, hash);
+    try testing.expectEqual(webauthn.AttestationType.attestation_ca, r.attestation_type);
+    try testing.expectEqualStrings("tpm", r.format);
+    try testing.expect(r.leaf_cert_der != null);
+    // A different client data hash is not what the TPM certified.
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, &vectors.tpm_es256_attestation_object, @splat(0)));
+}
+
+test "verifyAttestation: fmt=tpm, real TPM attestations (RS1 / RSASSA-SHA-1 AIK signatures, RSA and ECC public areas)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (tpm_fixtures.fixtures) |f| {
+        const r = webauthn.verifyAttestation(a, f.attestation_object, clientDataHash(f.client_data_json)) catch |e| {
+            std.debug.print("tpm fixture {s}: {s}\n", .{ f.name, @errorName(e) });
+            return e;
+        };
+        try testing.expectEqual(webauthn.AttestationType.attestation_ca, r.attestation_type);
+        try testing.expectEqualStrings("tpm", r.format);
+        try testing.expect(r.leaf_cert_der != null);
+    }
+}
+
+test "verifyAttestation: fmt=tpm, the AIK certificate requirements of §8.3.1 (SAN attributes, EKU)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = &vectors.tpm_es256_attestation_object;
+    const hash = clientDataHash(&vectors.tpm_es256_client_data_json);
+    const decoded = try cbor.decode(a, base, .{});
+    var cert: []const u8 = &.{};
+    for (decoded.map) |e| {
+        if (e.key != .text or !std.mem.eql(u8, e.key.text, "attStmt")) continue;
+        for (e.value.map) |se| {
+            if (se.key == .text and std.mem.eql(u8, se.key.text, "x5c")) cert = se.value.array[0].bytes;
+        }
+    }
+    // Same-length edits of the certificate; the statement signature is over certInfo, so only §8.3.1 can object.
+    const edits = [_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = &.{ 0x67, 0x81, 0x05, 0x08, 0x03 }, .to = &.{ 0x67, 0x81, 0x05, 0x08, 0x04 } }, // EKU: tcg-kp-AIKCertificate -> another
+        .{ .from = &.{ 0x67, 0x81, 0x05, 0x02, 0x01 }, .to = &.{ 0x67, 0x81, 0x05, 0x02, 0x09 } }, // SAN: tpmManufacturer missing
+        .{ .from = &.{ 0x67, 0x81, 0x05, 0x02, 0x02 }, .to = &.{ 0x67, 0x81, 0x05, 0x02, 0x09 } }, // SAN: tpmModel missing
+        .{ .from = &.{ 0x67, 0x81, 0x05, 0x02, 0x03 }, .to = &.{ 0x67, 0x81, 0x05, 0x02, 0x09 } }, // SAN: tpmVersion missing
+    };
+    for (edits) |e| {
+        const m = try a.dupe(u8, cert);
+        const at = std.mem.indexOf(u8, m, e.from) orelse return error.EditNotFound;
+        @memcpy(m[at..][0..e.to.len], e.to);
+        const arr = try a.alloc(cbor.Value, 1);
+        arr[0] = .{ .bytes = m };
+        try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try withStmt(a, base, "x5c", .{ .array = arr }), hash));
+    }
+}
+
+test "verifyAttestation: fmt=tpm, each rule of §8.3 has a variant that breaks only it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = &vectors.tpm_es256_attestation_object;
+    const hash = clientDataHash(&vectors.tpm_es256_client_data_json);
+    const cert_info = try stmtBytes(a, base, "certInfo");
+    const pub_area = try stmtBytes(a, base, "pubArea");
+
+    // ver must be "2.0".
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try withStmt(a, base, "ver", .{ .text = "1.0" }), hash));
+    // Missing members.
+    for ([_][]const u8{ "ver", "alg", "sig", "x5c", "certInfo", "pubArea" }) |k| {
+        try testing.expectError(error.MissingField, webauthn.verifyAttestation(a, try withStmt(a, base, k, null), hash));
+    }
+    // certInfo: magic, type, extraData, attested name, trailing bytes.
+    inline for (.{ 0, 4, 12, cert_info.len - 1 }) |at| {
+        const m = try a.dupe(u8, cert_info);
+        m[at] ^= 1;
+        const got = webauthn.verifyAttestation(a, try withStmt(a, base, "certInfo", .{ .bytes = m }), hash);
+        try testing.expectError(error.InvalidAttestationStatement, got);
+    }
+    const trailing = try std.mem.concat(a, u8, &.{ cert_info, &[_]u8{0} });
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try withStmt(a, base, "certInfo", .{ .bytes = trailing }), hash));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try withStmt(a, base, "certInfo", .{ .bytes = cert_info[0 .. cert_info.len - 1] }), hash));
+    // pubArea: the unique key differs from the credential key (flip the last y byte), truncated, trailing.
+    const pm = try a.dupe(u8, pub_area);
+    pm[pm.len - 1] ^= 1;
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try withStmt(a, base, "pubArea", .{ .bytes = pm }), hash));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try withStmt(a, base, "pubArea", .{ .bytes = pub_area[0 .. pub_area.len - 1] }), hash));
+    const pt = try std.mem.concat(a, u8, &.{ pub_area, &[_]u8{0} });
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try withStmt(a, base, "pubArea", .{ .bytes = pt }), hash));
+    // The AIK signature: a flipped byte, an algorithm that is not the key's.
+    const sig = try stmtBytes(a, base, "sig");
+    const sm = try a.dupe(u8, sig);
+    sm[sm.len - 1] ^= 1;
+    try testing.expectError(error.BadSignature, webauthn.verifyAttestation(a, try withStmt(a, base, "sig", .{ .bytes = sm }), hash));
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifyAttestation(a, try withStmt(a, base, "alg", cbor.Value.fromI64(-257)), hash));
+    try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifyAttestation(a, try withStmt(a, base, "alg", cbor.Value.fromI64(-8)), hash));
 }
 
 test "verifyAttestation: fmt=apple verifies the nonce extension and the credential key; AnonCA type" {

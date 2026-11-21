@@ -41,15 +41,11 @@
 //! **Attestation-statement verify — `verifyAttestation`**: parses the
 //! CBOR `attestationObject` (`{fmt, attStmt, authData}`), extracts the
 //! attested credential's COSE public key from `authData`, and verifies the
-//! attestation statement for `fmt` in {`none`, `packed`, `fido-u2f`}
-//! (WebAuthn §8.2/§8.3/§8.6) — the statement half only, for a caller that
-//! does the ceremony binding itself. `tpm` and `android-key` are DEFERRED —
-//! structurally recognized and rejected with `error.UnsupportedFormat`
-//! rather than half-implemented (see SPEC.md "Deferred" for the rationale:
-//! both require parsing/validating a manufacturer certificate-chain format
-//! — TPM's `TPMS_ATTEST`/`TPMT_SIGNATURE` wire structs, Android's key
-//! attestation X.509 extension — that is a project of its own, orthogonal
-//! to the WebAuthn verification procedure itself).
+//! attestation statement for `fmt` in {`none`, `packed`, `fido-u2f`, `apple`, `android-key`, `tpm`}
+//! (WebAuthn §8.2-§8.8) — the statement half only, for a caller that
+//! does the ceremony binding itself. Any other `fmt` is `error.UnsupportedFormat`.
+//! (`android-key` is implemented but cannot run until `x509.safe` accepts the high-tag-number
+//! tags of an Android KeyDescription, see SPEC.md.)
 //!
 //! **Out of scope, by design (not silently skipped):** account-recovery /
 //! backup codes are a product concern layered *above* WebAuthn, not part of
@@ -564,6 +560,9 @@ pub const AttestationType = enum {
     self_attestation,
     /// WebAuthn "AnonCA" (`apple`, §8.8): a certificate issued per credential by the vendor's anonymization CA.
     anonymization_ca,
+    /// WebAuthn "AttCA" (`tpm`, §8.3): an AIK certificate issued by an attestation CA for this TPM key; the caller
+    /// checks the chain (`AttestationResult.leaf_cert_der`, `verifyAttestationChain`).
+    attestation_ca,
 };
 
 /// The outcome of a registration ceremony.
@@ -1013,6 +1012,289 @@ fn verifyAndroidKey(
     return .{ .attestation_type = .basic, .leaf_cert_der = leaf_der };
 }
 
+// ── tpm attestation (WebAuthn §8.3) ─────────────────────────────────────────
+
+/// RS1 (RSASSA-PKCS1-v1_5 with SHA-1, COSE -65535): the algorithm TPM 1.2-era and many TPM 2.0 attestation statements
+/// carry. Accepted for the `tpm` format only, where §8.3 names it; no credential key may use it.
+const alg_rs1: i64 = -65535;
+
+/// A big-endian TPM structure reader (TPM 2.0 Part 2 marshalling).
+const TpmReader = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn bytes(self: *TpmReader, n: usize) error{InvalidAttestationStatement}![]const u8 {
+        if (n > self.buf.len - self.pos) return error.InvalidAttestationStatement;
+        const out = self.buf[self.pos..][0..n];
+        self.pos += n;
+        return out;
+    }
+
+    fn int(self: *TpmReader, comptime T: type) error{InvalidAttestationStatement}!T {
+        const b = try self.bytes(@sizeOf(T));
+        return std.mem.readInt(T, b[0..@sizeOf(T)], .big);
+    }
+
+    /// TPM2B_*: a 16-bit size and that many bytes.
+    fn tpm2b(self: *TpmReader) error{InvalidAttestationStatement}![]const u8 {
+        return self.bytes(try self.int(u16));
+    }
+
+    fn done(self: *const TpmReader) bool {
+        return self.pos == self.buf.len;
+    }
+};
+
+const tpm_alg_null: u16 = 0x0010;
+const tpm_alg_rsa: u16 = 0x0001;
+const tpm_alg_ecc: u16 = 0x0023;
+const tpm_generated_value: u32 = 0xff544347;
+const tpm_st_attest_certify: u16 = 0x8017;
+
+/// The hash of a TPM_ALG_ID (`nameAlg`), or null for one this module does not compute.
+fn tpmNameHash(alg: u16, data: []const u8, out: *[64]u8) ?[]const u8 {
+    switch (alg) {
+        0x0004 => {
+            std.crypto.hash.Sha1.hash(data, out[0..20], .{});
+            return out[0..20];
+        },
+        0x000B => {
+            std.crypto.hash.sha2.Sha256.hash(data, out[0..32], .{});
+            return out[0..32];
+        },
+        0x000C => {
+            std.crypto.hash.sha2.Sha384.hash(data, out[0..48], .{});
+            return out[0..48];
+        },
+        0x000D => {
+            std.crypto.hash.sha2.Sha512.hash(data, out[0..64], .{});
+            return out[0..64];
+        },
+        else => return null,
+    }
+}
+
+/// Skip a TPMT_*_SCHEME or TPMT_KDF_SCHEME: the scheme id, and its hash algorithm unless the scheme is NULL.
+fn tpmSkipScheme(r: *TpmReader) error{InvalidAttestationStatement}!void {
+    const scheme = try r.int(u16);
+    if (scheme != tpm_alg_null) _ = try r.int(u16);
+}
+
+/// Parse a TPMT_PUBLIC (`pubArea`) and check that its `unique` is the credential public key (§8.3: "the credential
+/// public key ... MUST match the unique field of pubArea"). Returns `nameAlg`.
+fn checkTpmPubArea(pub_area: []const u8, key: CoseKey) AttestationError!u16 {
+    var r: TpmReader = .{ .buf = pub_area };
+    const ty = try r.int(u16);
+    const name_alg = try r.int(u16);
+    _ = try r.int(u32); // objectAttributes
+    _ = try r.tpm2b(); // authPolicy
+    switch (ty) {
+        tpm_alg_rsa => {
+            // TPMS_RSA_PARMS: symmetric (a signing key has none), scheme, keyBits, exponent.
+            const sym = try r.int(u16);
+            if (sym != tpm_alg_null) return error.InvalidAttestationStatement;
+            try tpmSkipScheme(&r);
+            _ = try r.int(u16); // keyBits
+            const exp = try r.int(u32);
+            const modulus = try r.tpm2b();
+            if (!r.done()) return error.InvalidAttestationStatement;
+            const rk = switch (key) {
+                .rsa => |k| k,
+                else => return error.InvalidAttestationStatement,
+            };
+            const want_e: u32 = if (exp == 0) 65537 else exp; // TPM2: 0 stands for 2^16 + 1
+            var e: u64 = 0;
+            for (std.mem.trimStart(u8, rk.e, "\x00")) |b| e = (e << 8) | b;
+            if (std.mem.trimStart(u8, rk.e, "\x00").len > 4 or e != want_e) return error.InvalidAttestationStatement;
+            if (!std.mem.eql(u8, std.mem.trimStart(u8, modulus, "\x00"), std.mem.trimStart(u8, rk.n, "\x00"))) return error.InvalidAttestationStatement;
+        },
+        tpm_alg_ecc => {
+            // TPMS_ECC_PARMS: symmetric, scheme, curveID, kdf.
+            const sym = try r.int(u16);
+            if (sym != tpm_alg_null) return error.InvalidAttestationStatement;
+            try tpmSkipScheme(&r);
+            const curve = try r.int(u16);
+            try tpmSkipScheme(&r); // kdf
+            const x = try r.tpm2b();
+            const y = try r.tpm2b();
+            if (!r.done()) return error.InvalidAttestationStatement;
+            const ec = switch (key) {
+                .ec2 => |k| k,
+                else => return error.InvalidAttestationStatement,
+            };
+            const want_curve: u16 = switch (ec.crv) {
+                cbor.cose.crv_p256 => 0x0003,
+                cbor.cose.crv_p384 => 0x0004,
+                cbor.cose.crv_p521 => 0x0005,
+                else => return error.InvalidAttestationStatement,
+            };
+            if (curve != want_curve) return error.InvalidAttestationStatement;
+            if (!std.mem.eql(u8, x, ec.x) or !std.mem.eql(u8, y, ec.y)) return error.InvalidAttestationStatement;
+        },
+        else => return error.UnsupportedAlgorithm,
+    }
+    return name_alg;
+}
+
+/// Parse a TPMS_ATTEST (`certInfo`) and check §8.3's bindings: magic and type, `extraData` equal to the hash of
+/// `attToBeSigned` (the hash of the statement's `alg`), and `attested.name` the `nameAlg` id followed by that hash of `pubArea`.
+fn checkTpmCertInfo(cert_info: []const u8, pub_area: []const u8, name_alg: u16, extra_data_expected: []const u8) AttestationError!void {
+    var r: TpmReader = .{ .buf = cert_info };
+    if ((try r.int(u32)) != tpm_generated_value) return error.InvalidAttestationStatement;
+    if ((try r.int(u16)) != tpm_st_attest_certify) return error.InvalidAttestationStatement;
+    _ = try r.tpm2b(); // qualifiedSigner
+    const extra = try r.tpm2b();
+    if (!std.mem.eql(u8, extra, extra_data_expected)) return error.InvalidAttestationStatement;
+    _ = try r.bytes(8 + 4 + 4 + 1); // clockInfo
+    _ = try r.bytes(8); // firmwareVersion
+    const name = try r.tpm2b(); // attested.name
+    _ = try r.tpm2b(); // attested.qualifiedName
+    if (!r.done()) return error.InvalidAttestationStatement;
+    var digest: [64]u8 = undefined;
+    const h = tpmNameHash(name_alg, pub_area, &digest) orelse return error.UnsupportedAlgorithm;
+    if (name.len != 2 + h.len) return error.InvalidAttestationStatement;
+    if (std.mem.readInt(u16, name[0..2], .big) != name_alg or !std.mem.eql(u8, name[2..], h)) return error.InvalidAttestationStatement;
+}
+
+/// 2.5.29.17 subjectAltName, 2.5.29.37 extKeyUsage, 2.5.29.19 basicConstraints.
+const oid_san = [_]u8{ 0x55, 0x1D, 0x11 };
+const oid_eku = [_]u8{ 0x55, 0x1D, 0x25 };
+const oid_basic_constraints = [_]u8{ 0x55, 0x1D, 0x13 };
+/// 2.23.133.8.3 tcg-kp-AIKCertificate; 2.23.133.2.1 / .2 / .3 tcg-at-tpmManufacturer / -tpmModel / -tpmVersion.
+const oid_tcg_kp_aik = [_]u8{ 0x67, 0x81, 0x05, 0x08, 0x03 };
+const oid_tpm_manufacturer = [_]u8{ 0x67, 0x81, 0x05, 0x02, 0x01 };
+const oid_tpm_model = [_]u8{ 0x67, 0x81, 0x05, 0x02, 0x02 };
+const oid_tpm_version = [_]u8{ 0x67, 0x81, 0x05, 0x02, 0x03 };
+
+/// §8.3 step "Verify that aikCert meets the requirements in §8.3.1": version 3, empty subject, a subjectAltName
+/// carrying the TPM manufacturer, model and firmware version in a directoryName, extKeyUsage with
+/// tcg-kp-AIKCertificate, and CA false; the id-fido-gen-ce-aaguid extension, if present, equals the AAGUID.
+fn checkAikCertificate(cert: std.crypto.Certificate, parsed: std.crypto.Certificate.Parsed, aaguid: [16]u8) AttestationError!void {
+    if (parsed.version != .v3) return error.InvalidAttestationStatement;
+    if (parsed.subject().len != 0) return error.InvalidAttestationStatement;
+
+    const san = (try certExtension(cert, &oid_san)) orelse return error.InvalidAttestationStatement;
+    // GeneralNames ::= SEQUENCE OF GeneralName; the TPM attributes sit in a [4] directoryName.
+    var seen_man = false;
+    var seen_model = false;
+    var seen_version = false;
+    const names = Tlv.universal(san, 0x10) catch return error.InvalidCertificate;
+    var rest = names.content;
+    while (rest.len != 0) {
+        const gn = Tlv.read(rest) catch return error.InvalidCertificate;
+        rest = gn.rest;
+        if (gn.class != 2 or gn.tag != 4 or !gn.constructed) continue;
+        const name = Tlv.universal(gn.content, 0x10) catch return error.InvalidCertificate; // Name = SEQUENCE OF RDN
+        var rdns = name.content;
+        while (rdns.len != 0) {
+            const rdn = Tlv.universal(rdns, 0x11) catch return error.InvalidCertificate;
+            rdns = rdn.rest;
+            var atvs = rdn.content;
+            while (atvs.len != 0) {
+                const atv = Tlv.universal(atvs, 0x10) catch return error.InvalidCertificate;
+                atvs = atv.rest;
+                const oid = Tlv.universal(atv.content, 0x06) catch return error.InvalidCertificate;
+                if (std.mem.eql(u8, oid.content, &oid_tpm_manufacturer)) seen_man = true;
+                if (std.mem.eql(u8, oid.content, &oid_tpm_model)) seen_model = true;
+                if (std.mem.eql(u8, oid.content, &oid_tpm_version)) seen_version = true;
+            }
+        }
+    }
+    if (!(seen_man and seen_model and seen_version)) return error.InvalidAttestationStatement;
+
+    const eku = (try certExtension(cert, &oid_eku)) orelse return error.InvalidAttestationStatement;
+    const purposes = Tlv.universal(eku, 0x10) catch return error.InvalidCertificate;
+    var aik = false;
+    var p = purposes.content;
+    while (p.len != 0) {
+        const o = Tlv.universal(p, 0x06) catch return error.InvalidCertificate;
+        p = o.rest;
+        if (std.mem.eql(u8, o.content, &oid_tcg_kp_aik)) aik = true;
+    }
+    if (!aik) return error.InvalidAttestationStatement;
+
+    if (try certExtension(cert, &oid_basic_constraints)) |bc| {
+        const seq = Tlv.universal(bc, 0x10) catch return error.InvalidCertificate;
+        if (seq.content.len != 0) {
+            const first = Tlv.read(seq.content) catch return error.InvalidCertificate;
+            if (first.class == 0 and first.tag == 0x01 and first.content.len == 1 and first.content[0] != 0) return error.InvalidAttestationStatement;
+        }
+    }
+    try checkAaguidExtension(cert, aaguid);
+}
+
+/// `tpm` attestation (WebAuthn §8.3): `attStmt = {ver: "2.0", alg, x5c, sig, certInfo, pubArea}`. `pubArea`'s `unique`
+/// is the credential public key; `certInfo` is a TPMS_ATTEST of type CERTIFY whose `extraData` is the hash of
+/// `authData || clientDataHash` (the hash of `alg`: SHA-1 for RS1, SHA-256 for RS256 / ES256) and whose attested
+/// `name` is `nameAlg || H(pubArea)`; `sig` is the AIK certificate key's signature over `certInfo` (RS1, RS256 or ES256);
+/// and the AIK certificate meets §8.3.1. Trust is the chain to the attestation CA: `AttestationResult.leaf_cert_der`
+/// (`verifyAttestationChain`). ECDAA (removed from the specification) is not supported.
+fn verifyTpm(
+    allocator: Allocator,
+    att_stmt: []const cbor.MapEntry,
+    obj: AttestationObject,
+    att: AttestedCredentialData,
+    client_data_hash: [32]u8,
+) AttestationError!StatementResult {
+    const ver = cborMapGetStr(att_stmt, "ver") orelse return error.MissingField;
+    switch (ver) {
+        .text => |t| if (!std.mem.eql(u8, t, "2.0")) return error.InvalidAttestationStatement,
+        else => return error.WrongType,
+    }
+    const alg = (cborMapGetStr(att_stmt, "alg") orelse return error.MissingField).toI64() orelse return error.WrongType;
+    const sig = switch (cborMapGetStr(att_stmt, "sig") orelse return error.MissingField) {
+        .bytes => |b| b,
+        else => return error.WrongType,
+    };
+    const cert_info = switch (cborMapGetStr(att_stmt, "certInfo") orelse return error.MissingField) {
+        .bytes => |b| b,
+        else => return error.WrongType,
+    };
+    const pub_area = switch (cborMapGetStr(att_stmt, "pubArea") orelse return error.MissingField) {
+        .bytes => |b| b,
+        else => return error.WrongType,
+    };
+    const leaf_der = (try firstX5cDer(att_stmt, false)) orelse return error.MissingField;
+
+    const name_alg = try checkTpmPubArea(pub_area, att.credential_public_key);
+    const to_be_signed = try std.mem.concat(allocator, u8, &.{ obj.auth_data_raw, &client_data_hash });
+    var extra: [32]u8 = undefined;
+    var extra_len: usize = 32;
+    switch (alg) {
+        alg_rs1 => {
+            std.crypto.hash.Sha1.hash(to_be_signed, extra[0..20], .{});
+            extra_len = 20;
+        },
+        alg_rs256, cbor.cose.alg_es256 => std.crypto.hash.sha2.Sha256.hash(to_be_signed, &extra, .{}),
+        else => return error.UnsupportedAlgorithm,
+    }
+    try checkTpmCertInfo(cert_info, pub_area, name_alg, extra[0..extra_len]);
+
+    var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+    const cert = x509.safe.safeCertificate(leaf_der, &scratch) catch return error.InvalidCertificate;
+    const parsed = cert.parse() catch return error.InvalidCertificate;
+    switch (parsed.pub_key_algo) {
+        .rsaEncryption => {
+            const components = std.crypto.Certificate.rsa.PublicKey.parseDer(parsed.pubKey()) catch return error.InvalidCertificate;
+            const pk = rsa.PublicKey.fromBytes(components.modulus, components.exponent) catch return error.InvalidKey;
+            if (pk.n.bits() < rs256_min_modulus_bits) return error.InvalidKey;
+            switch (alg) {
+                alg_rs1 => rsa.verifyPkcs1v15(pk, std.crypto.hash.Sha1, cert_info, sig) catch return error.BadSignature,
+                alg_rs256 => rsa.verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, cert_info, sig) catch return error.BadSignature,
+                else => return error.UnsupportedAlgorithm,
+            }
+        },
+        .X9_62_id_ecPublicKey => |named_curve| {
+            if (named_curve != .X9_62_prime256v1 or alg != cbor.cose.alg_es256) return error.UnsupportedAlgorithm;
+            const parsed_sig = p256.EcdsaP256Sha256.Signature.fromDer(sig) catch return error.InvalidSignature;
+            if (!p256.sign.ecdsaVerify(parsed.pubKey(), cert_info, parsed_sig.toBytes())) return error.BadSignature;
+        },
+        else => return error.UnsupportedAlgorithm,
+    }
+    try checkAikCertificate(cert, parsed, att.aaguid);
+    return .{ .attestation_type = .attestation_ca, .leaf_cert_der = leaf_der };
+}
+
 /// The attestation-statement dispatch result: the type, plus the leaf
 /// certificate DER when one was verified (`.basic` only — see
 /// `AttestationResult.leaf_cert_der`).
@@ -1108,8 +1390,10 @@ fn verifyStatement(
         return verifyApple(allocator, obj.att_stmt, obj, att, client_data_hash);
     } else if (std.mem.eql(u8, obj.fmt, "android-key")) {
         return verifyAndroidKey(allocator, obj.att_stmt, obj, att, client_data_hash);
+    } else if (std.mem.eql(u8, obj.fmt, "tpm")) {
+        return verifyTpm(allocator, obj.att_stmt, obj, att, client_data_hash);
     }
-    return error.UnsupportedFormat; // covers "tpm" and anything unrecognized
+    return error.UnsupportedFormat; // anything unrecognized
 }
 
 fn attestationResult(
