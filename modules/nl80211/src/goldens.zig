@@ -2328,3 +2328,69 @@ test "golden: LEAVE_MESH" {
     defer testing.allocator.free(req);
     try expectSameRequest(&captured, req);
 }
+
+test "golden: SET_WIPHY antenna masks" {
+    // strace … iw phy#99 set antenna 3 7   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2c000000290005009d78fe9411e1a50c" ++
+            "02000000080001006300000008006900" ++
+            "0300000008006a0007000000",
+    );
+    const req = try config.buildSetWiphyParams(testing.allocator, fam, 0x94fe789d, .{ .wiphy = 99 }, .{ .antenna_tx = 3, .antenna_rx = 7 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY antenna all, and one mask for both directions" {
+    // strace … iw phy#99 set antenna all   /   iw phy#99 set antenna 2
+    try skipUnlessLittleEndian();
+    const all = hex(
+        "2c000000290005009d78fe9416e1a50c" ++
+            "02000000080001006300000008006900" ++
+            "ffffffff08006a00ffffffff",
+    );
+    const req = try config.buildSetWiphyParams(testing.allocator, fam, 0x94fe789d, .{ .wiphy = 99 }, .{ .antenna_tx = config.antenna_all, .antenna_rx = config.antenna_all });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&all, req);
+    const two = hex(
+        "2c000000290005009d78fe941be1a50c" ++
+            "02000000080001006300000008006900" ++
+            "0200000008006a0002000000",
+    );
+    const req2 = try config.buildSetWiphyParams(testing.allocator, fam, 0x94fe789d, .{ .wiphy = 99 }, .{ .antenna_tx = 2, .antenna_rx = 2 });
+    defer testing.allocator.free(req2);
+    try expectSameRequest(&two, req2);
+}
+
+test "SET_WIPHY antenna masks: both or neither, never empty" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidRequest, config.buildSetWiphyParams(gpa, fam, 1, .{ .wiphy = 0 }, .{ .antenna_tx = 3 }));
+    try testing.expectError(error.InvalidRequest, config.buildSetWiphyParams(gpa, fam, 1, .{ .wiphy = 0 }, .{ .antenna_rx = 3 }));
+    try testing.expectError(error.InvalidRequest, config.buildSetWiphyParams(gpa, fam, 1, .{ .wiphy = 0 }, .{ .antenna_tx = 0, .antenna_rx = 1 }));
+    try testing.expectError(error.InvalidRequest, config.buildSetWiphyParams(gpa, fam, 1, .{ .wiphy = 0 }, .{ .antenna_tx = 1, .antenna_rx = 0 }));
+    // Alongside another limit they ride in the same message.
+    const req = try config.buildSetWiphyParams(gpa, fam, 1, .{ .wiphy = 0 }, .{ .rts_threshold = 500, .antenna_tx = 1, .antenna_rx = 1 });
+    defer gpa.free(req);
+    try testing.expectEqual(@as(usize, 16 + 4 + 8 + 8 + 8 + 8), req.len);
+}
+
+test "golden reply: GET_WIPHY — the antenna masks of a real radio" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var parser: wiphy.Parser = .init(gpa);
+    defer parser.deinit();
+    var it: codec.MessageIterator = .{ .buf = &get_wiphy_split_dump };
+    while (try it.next()) |m| {
+        if (m.type != fam) continue;
+        const p = try genl.splitPayload(m.payload);
+        try parser.feed(p.attrs);
+    }
+    const list = try parser.finish();
+    defer wiphy.freeAll(gpa, list);
+    const w = &list[0];
+    try testing.expectEqual(@as(?u32, 3), w.antenna_avail_tx);
+    try testing.expectEqual(@as(?u32, 3), w.antenna_avail_rx);
+    try testing.expectEqual(@as(?u32, 3), w.antenna_tx);
+    try testing.expectEqual(@as(?u32, 3), w.antenna_rx);
+}

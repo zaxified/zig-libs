@@ -324,7 +324,15 @@ pub const WiphyParams = struct {
     /// Coverage class: slot, ACK and CTS timeouts scale with it (3 us per step).
     /// 802.11 tables it to 31; `iw` and the kernel take any u8, and so does this.
     coverage_class: ?u8 = null,
+    /// Antenna bitmasks (`iw phy … set antenna <tx> [<rx>]`): bit `n` is antenna
+    /// `n`, `antenna_all` is every one. The kernel takes both or neither, so
+    /// they are set together (`iw` with a single mask sends it as both).
+    antenna_tx: ?u32 = null,
+    antenna_rx: ?u32 = null,
 };
+
+/// Every antenna (`iw phy … set antenna all`).
+pub const antenna_all: u32 = 0xffff_ffff;
 
 /// `NL80211_CMD_SET_WIPHY` with radio limits. Each attribute is pinned against
 /// `iw` 6.17 alone; combinations are sent in the order retry-short,
@@ -332,7 +340,12 @@ pub const WiphyParams = struct {
 /// unordered attribute set).
 pub fn buildSetWiphyParams(gpa: std.mem.Allocator, family_id: u16, seq: u32, target: Target, p: WiphyParams) BuildError![]u8 {
     if (p.rts_threshold == null and p.frag_threshold == null and p.retry_short == null and
-        p.retry_long == null and p.coverage_class == null) return error.InvalidRequest;
+        p.retry_long == null and p.coverage_class == null and p.antenna_tx == null and
+        p.antenna_rx == null) return error.InvalidRequest;
+    // The kernel refuses one without the other, and an empty mask.
+    if ((p.antenna_tx == null) != (p.antenna_rx == null)) return error.InvalidRequest;
+    if (p.antenna_tx) |m| if (m == 0) return error.InvalidRequest;
+    if (p.antenna_rx) |m| if (m == 0) return error.InvalidRequest;
     if (p.retry_short) |r| if (r == 0) return error.InvalidRequest;
     if (p.retry_long) |r| if (r == 0) return error.InvalidRequest;
     var list: std.ArrayList(u8) = .empty;
@@ -344,6 +357,8 @@ pub fn buildSetWiphyParams(gpa: std.mem.Allocator, family_id: u16, seq: u32, tar
     if (p.frag_threshold) |f| try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_FRAG_THRESHOLD, f);
     if (p.rts_threshold) |r| try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_RTS_THRESHOLD, r);
     if (p.coverage_class) |c| try codec.appendAttrU8(gpa, &list, uapi.ATTR.WIPHY_COVERAGE_CLASS, c);
+    if (p.antenna_tx) |m| try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_ANTENNA_TX, m);
+    if (p.antenna_rx) |m| try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_ANTENNA_RX, m);
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }

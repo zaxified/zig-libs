@@ -125,6 +125,11 @@ pub fn freeAll(gpa: std.mem.Allocator, list: []RegDomain) void {
 
 /// Decode one `NL80211_CMD_GET_REG` reply message's attribute bytes.
 pub fn parse(gpa: std.mem.Allocator, attr_bytes: []const u8) ParseError!RegDomain {
+    return parseLimited(gpa, attr_bytes, max_rules);
+}
+
+/// `parse` with another ceiling on the rules of one domain.
+pub fn parseLimited(gpa: std.mem.Allocator, attr_bytes: []const u8, rule_limit: usize) ParseError!RegDomain {
     var d: RegDomain = .{};
     errdefer d.deinit(gpa);
     var it: codec.AttrIterator = .{ .buf = attr_bytes };
@@ -141,14 +146,14 @@ pub fn parse(gpa: std.mem.Allocator, attr_bytes: []const u8) ParseError!RegDomai
         uapi.ATTR.REG_INITIATOR => d.initiator = try a.asU8(),
         uapi.ATTR.REG_RULES => {
             if (d.rules.len != 0) return error.BadLength; // repeated attribute
-            d.rules = try parseRules(gpa, a.data);
+            d.rules = try parseRules(gpa, a.data, rule_limit);
         },
         else => {},
     };
     return d;
 }
 
-fn parseRules(gpa: std.mem.Allocator, nest: []const u8) ParseError![]RegRule {
+fn parseRules(gpa: std.mem.Allocator, nest: []const u8, rule_limit: usize) ParseError![]RegRule {
     var out: std.ArrayList(RegRule) = .empty;
     errdefer out.deinit(gpa);
     var it: codec.AttrIterator = .{ .buf = nest };
@@ -166,7 +171,7 @@ fn parseRules(gpa: std.mem.Allocator, nest: []const u8) ParseError![]RegRule {
             uapi.REG_RULE_ATTR.POWER_RULE_PSD => r.psd_mbm = try a.asU32(),
             else => {},
         };
-        if (out.items.len >= max_rules) return error.TooManyEntries;
+        if (out.items.len >= rule_limit) return error.TooManyEntries;
         try out.append(gpa, r);
     }
     return out.toOwnedSlice(gpa);

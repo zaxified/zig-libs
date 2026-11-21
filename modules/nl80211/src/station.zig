@@ -140,6 +140,19 @@ pub fn parseRateInfo(nest: []const u8) Error!RateInfo {
     return r;
 }
 
+/// Radio chains the per-chain signal arrays keep (the kernel's
+/// `IEEE80211_MAX_CHAINS` is 4).
+pub const max_chains = 8;
+
+/// `STA_INFO.BSS_PARAM`: the flags and timing of the BSS a station is part of.
+pub const BssParam = struct {
+    cts_protection: bool = false,
+    short_preamble: bool = false,
+    short_slot_time: bool = false,
+    dtim_period: u8 = 0,
+    beacon_interval_tu: u16 = 0,
+};
+
 /// One peer's link statistics.
 pub const Station = struct {
     ifindex: ?u32 = null,
@@ -174,6 +187,29 @@ pub const Station = struct {
     rx_duration_us: ?u64 = null,
     tx_duration_us: ?u64 = null,
 
+    /// Per-chain signal, dBm, in chain order (`STA_INFO.CHAIN_SIGNAL`); read
+    /// through `chainSignals`. Chains past `max_chains` are dropped.
+    chain_signal_buf: [max_chains]i8 = @splat(0),
+    n_chain_signal: u8 = 0,
+    chain_signal_avg_buf: [max_chains]i8 = @splat(0),
+    n_chain_signal_avg: u8 = 0,
+    /// The AP's basic parameters as the station sees them (`STA_INFO.BSS_PARAM`).
+    bss_param: ?BssParam = null,
+    /// Multi-link operation: the link this entry describes and the peer MLD's
+    /// address (top-level attributes of the station message).
+    mlo_link_id: ?u8 = null,
+    mld_addr: ?uapi.Mac = null,
+
+    /// Per-chain signal, dBm.
+    pub fn chainSignals(s: *const Station) []const i8 {
+        return s.chain_signal_buf[0..s.n_chain_signal];
+    }
+
+    /// Per-chain running average, dBm.
+    pub fn chainSignalsAvg(s: *const Station) []const i8 {
+        return s.chain_signal_avg_buf[0..s.n_chain_signal_avg];
+    }
+
     /// Signal in dBm, preferring the average when a spot value is missing.
     pub fn bestSignalDbm(s: Station) ?i8 {
         return s.signal_dbm orelse s.signal_avg_dbm;
@@ -192,9 +228,132 @@ pub fn parse(attr_bytes: []const u8) Error!Station {
             out.mac = a.data[0..6].*;
         },
         uapi.ATTR.STA_INFO => try parseStaInfo(a.data, &out),
+        uapi.ATTR.MLO_LINK_ID => out.mlo_link_id = try a.asU8(),
+        uapi.ATTR.MLD_ADDR => {
+            if (a.data.len != 6) return error.BadLength;
+            out.mld_addr = a.data[0..6].*;
+        },
         else => {},
     };
     return out;
+}
+
+/// Per-TID counters of one peer (`STA_INFO.TID_STATS`), including the
+/// driver's per-TID transmit queue (`txq`). Every field is null when the
+/// driver does not report it.
+pub const TidStats = struct {
+    /// The traffic identifier, 0..16 (16 is the non-QoS / management slot).
+    tid: u8 = 0,
+    rx_msdu: ?u64 = null,
+    tx_msdu: ?u64 = null,
+    tx_msdu_retries: ?u64 = null,
+    tx_msdu_failed: ?u64 = null,
+    txq: ?TxqStats = null,
+};
+
+/// `TID_STATS.TXQ_STATS`: the intermediate transmit queue of one TID.
+pub const TxqStats = struct {
+    backlog_bytes: ?u32 = null,
+    backlog_packets: ?u32 = null,
+    flows: ?u32 = null,
+    drops: ?u32 = null,
+    ecn_marks: ?u32 = null,
+    overlimit: ?u32 = null,
+    overmemory: ?u32 = null,
+    collisions: ?u32 = null,
+    tx_bytes: ?u32 = null,
+    tx_packets: ?u32 = null,
+    max_flows: ?u32 = null,
+};
+
+/// Most TIDs one peer reports: 0..15 plus the management slot.
+pub const max_tids = 17;
+
+/// Decode `STA_INFO.TID_STATS` of one station message into `out`, in the order
+/// the kernel sent them, and return how many entries it holds. Kept apart from
+/// `parse` because a full table is ~3 KiB a peer and most callers never ask for
+/// it; more entries than `out` holds are dropped. Entries whose TID is out of
+/// range are skipped.
+pub fn parseTidStats(attr_bytes: []const u8, out: []TidStats) Error!usize {
+    var n: usize = 0;
+    var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    while (try it.next()) |a| {
+        if (a.type != uapi.ATTR.STA_INFO) continue;
+        var inner: codec.AttrIterator = .{ .buf = a.data };
+        while (try inner.next()) |s| {
+            if (s.type != uapi.STA_INFO.TID_STATS) continue;
+            var tids: codec.AttrIterator = .{ .buf = s.data };
+            while (try tids.next()) |t| {
+                // The nest's type is the TID plus one.
+                if (t.type == 0 or t.type > max_tids) continue;
+                if (n >= out.len) return n;
+                out[n] = try parseOneTid(@intCast(t.type - 1), t.data);
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
+fn parseOneTid(tid: u8, nest: []const u8) Error!TidStats {
+    var r: TidStats = .{ .tid = tid };
+    var it: codec.AttrIterator = .{ .buf = nest };
+    while (try it.next()) |a| switch (a.type) {
+        uapi.TID_STATS.RX_MSDU => r.rx_msdu = try asU64(a),
+        uapi.TID_STATS.TX_MSDU => r.tx_msdu = try asU64(a),
+        uapi.TID_STATS.TX_MSDU_RETRIES => r.tx_msdu_retries = try asU64(a),
+        uapi.TID_STATS.TX_MSDU_FAILED => r.tx_msdu_failed = try asU64(a),
+        uapi.TID_STATS.TXQ_STATS => r.txq = try parseTxq(a.data),
+        else => {},
+    };
+    return r;
+}
+
+fn parseTxq(nest: []const u8) Error!TxqStats {
+    var q: TxqStats = .{};
+    var it: codec.AttrIterator = .{ .buf = nest };
+    while (try it.next()) |a| switch (a.type) {
+        uapi.TXQ_STATS.BACKLOG_BYTES => q.backlog_bytes = try a.asU32(),
+        uapi.TXQ_STATS.BACKLOG_PACKETS => q.backlog_packets = try a.asU32(),
+        uapi.TXQ_STATS.FLOWS => q.flows = try a.asU32(),
+        uapi.TXQ_STATS.DROPS => q.drops = try a.asU32(),
+        uapi.TXQ_STATS.ECN_MARKS => q.ecn_marks = try a.asU32(),
+        uapi.TXQ_STATS.OVERLIMIT => q.overlimit = try a.asU32(),
+        uapi.TXQ_STATS.OVERMEMORY => q.overmemory = try a.asU32(),
+        uapi.TXQ_STATS.COLLISIONS => q.collisions = try a.asU32(),
+        uapi.TXQ_STATS.TX_BYTES => q.tx_bytes = try a.asU32(),
+        uapi.TXQ_STATS.TX_PACKETS => q.tx_packets = try a.asU32(),
+        uapi.TXQ_STATS.MAX_FLOWS => q.max_flows = try a.asU32(),
+        else => {},
+    };
+    return q;
+}
+
+fn parseChains(nest: []const u8, buf: *[max_chains]i8, n: *u8) Error!void {
+    var it: codec.AttrIterator = .{ .buf = nest };
+    var count: u8 = 0;
+    while (try it.next()) |a| {
+        const v = try asI8(a);
+        if (count < max_chains) {
+            buf[count] = v;
+            count += 1;
+        }
+    }
+    n.* = count;
+}
+
+fn parseBssParam(nest: []const u8) Error!BssParam {
+    var p: BssParam = .{};
+    var it: codec.AttrIterator = .{ .buf = nest };
+    while (try it.next()) |a| switch (a.type) {
+        uapi.STA_BSS_PARAM.CTS_PROT => p.cts_protection = true,
+        uapi.STA_BSS_PARAM.SHORT_PREAMBLE => p.short_preamble = true,
+        uapi.STA_BSS_PARAM.SHORT_SLOT_TIME => p.short_slot_time = true,
+        uapi.STA_BSS_PARAM.DTIM_PERIOD => p.dtim_period = try a.asU8(),
+        uapi.STA_BSS_PARAM.BEACON_INTERVAL => p.beacon_interval_tu = try a.asU16(),
+        else => {},
+    };
+    return p;
 }
 
 fn parseStaInfo(nest: []const u8, out: *Station) Error!void {
@@ -227,6 +386,9 @@ fn parseStaInfo(nest: []const u8, out: *Station) Error!void {
         uapi.STA_INFO.EXPECTED_THROUGHPUT => out.expected_throughput_kbps = try a.asU32(),
         uapi.STA_INFO.RX_DURATION => out.rx_duration_us = try asU64(a),
         uapi.STA_INFO.TX_DURATION => out.tx_duration_us = try asU64(a),
+        uapi.STA_INFO.CHAIN_SIGNAL => try parseChains(a.data, &out.chain_signal_buf, &out.n_chain_signal),
+        uapi.STA_INFO.CHAIN_SIGNAL_AVG => try parseChains(a.data, &out.chain_signal_avg_buf, &out.n_chain_signal_avg),
+        uapi.STA_INFO.BSS_PARAM => out.bss_param = try parseBssParam(a.data),
         else => {},
     };
 }
@@ -556,4 +718,113 @@ test "kilobitsPerSecond saturates instead of overflowing on a hostile BITRATE32"
     // (`maxInt(u32) == 4_294_967_295`) — the true boundary.
     const r2: RateInfo = .{ .bitrate32_100kbps = 42_949_672 };
     try testing.expectEqual(@as(?u32, 4_294_967_200), r2.kilobitsPerSecond());
+}
+
+// ── chain signal, BSS parameters, TID statistics, multi-link ────────────────
+
+fn nestOf(gpa: std.mem.Allocator, list: *std.ArrayList(u8), t: u16) !usize {
+    return codec.nestBegin(gpa, list, t);
+}
+
+test "parse: per-chain signal and its average keep the chain order and drop past max_chains" {
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    const sta = try nestOf(gpa, &msg, uapi.ATTR.STA_INFO);
+    const chains = try nestOf(gpa, &msg, uapi.STA_INFO.CHAIN_SIGNAL);
+    for ([_]i8{ -50, -61, -72 }, 1..) |v, i| try codec.appendAttrU8(gpa, &msg, @intCast(i), @bitCast(v));
+    try codec.nestEnd(&msg, chains);
+    const avg = try nestOf(gpa, &msg, uapi.STA_INFO.CHAIN_SIGNAL_AVG);
+    for (0..max_chains + 3) |i| try codec.appendAttrU8(gpa, &msg, @intCast(i + 1), @bitCast(@as(i8, -40)));
+    try codec.nestEnd(&msg, avg);
+    try codec.nestEnd(&msg, sta);
+
+    const s = try parse(msg.items);
+    try testing.expectEqualSlices(i8, &.{ -50, -61, -72 }, s.chainSignals());
+    try testing.expectEqual(@as(usize, max_chains), s.chainSignalsAvg().len);
+    // A chain value that is not one octet is a malformed message.
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    const sta2 = try nestOf(gpa, &bad, uapi.ATTR.STA_INFO);
+    const c2 = try nestOf(gpa, &bad, uapi.STA_INFO.CHAIN_SIGNAL);
+    try codec.appendAttrU32(gpa, &bad, 1, 7);
+    try codec.nestEnd(&bad, c2);
+    try codec.nestEnd(&bad, sta2);
+    try testing.expectError(error.BadLength, parse(bad.items));
+}
+
+test "parse: BSS_PARAM flags, DTIM period and beacon interval" {
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    const sta = try nestOf(gpa, &msg, uapi.ATTR.STA_INFO);
+    const p = try nestOf(gpa, &msg, uapi.STA_INFO.BSS_PARAM);
+    try codec.appendAttr(gpa, &msg, uapi.STA_BSS_PARAM.SHORT_PREAMBLE, &.{});
+    try codec.appendAttr(gpa, &msg, uapi.STA_BSS_PARAM.SHORT_SLOT_TIME, &.{});
+    try codec.appendAttrU8(gpa, &msg, uapi.STA_BSS_PARAM.DTIM_PERIOD, 3);
+    try codec.appendAttrU16(gpa, &msg, uapi.STA_BSS_PARAM.BEACON_INTERVAL, 100);
+    try codec.nestEnd(&msg, p);
+    try codec.nestEnd(&msg, sta);
+    const s = try parse(msg.items);
+    const b = s.bss_param.?;
+    try testing.expect(!b.cts_protection and b.short_preamble and b.short_slot_time);
+    try testing.expectEqual(@as(u8, 3), b.dtim_period);
+    try testing.expectEqual(@as(u16, 100), b.beacon_interval_tu);
+    try testing.expect((try parse(&.{})).bss_param == null);
+}
+
+test "parseTidStats: TID = nest type - 1, counters and the transmit queue" {
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    const sta = try nestOf(gpa, &msg, uapi.ATTR.STA_INFO);
+    const tids = try nestOf(gpa, &msg, uapi.STA_INFO.TID_STATS);
+    // TID 0 and TID 5, and a type that is not a TID (0) and one past the table.
+    for ([_]u16{ 1, 6, 0, max_tids + 1 }) |t| {
+        const one = try nestOf(gpa, &msg, t);
+        try codec.appendAttrU64(gpa, &msg, uapi.TID_STATS.RX_MSDU, 1000 + t);
+        try codec.appendAttrU64(gpa, &msg, uapi.TID_STATS.TX_MSDU_FAILED, 3);
+        const q = try nestOf(gpa, &msg, uapi.TID_STATS.TXQ_STATS);
+        try codec.appendAttrU32(gpa, &msg, uapi.TXQ_STATS.BACKLOG_BYTES, 1500);
+        try codec.appendAttrU32(gpa, &msg, uapi.TXQ_STATS.DROPS, 2);
+        try codec.appendAttrU32(gpa, &msg, uapi.TXQ_STATS.MAX_FLOWS, 4096);
+        try codec.nestEnd(&msg, q);
+        try codec.nestEnd(&msg, one);
+    }
+    try codec.nestEnd(&msg, tids);
+    try codec.nestEnd(&msg, sta);
+
+    var out: [max_tids]TidStats = undefined;
+    const n = try parseTidStats(msg.items, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u8, 0), out[0].tid);
+    try testing.expectEqual(@as(?u64, 1001), out[0].rx_msdu);
+    try testing.expectEqual(@as(u8, 5), out[1].tid);
+    try testing.expectEqual(@as(?u64, 1006), out[1].rx_msdu);
+    try testing.expectEqual(@as(?u64, 3), out[1].tx_msdu_failed);
+    try testing.expectEqual(@as(?u64, null), out[1].tx_msdu);
+    try testing.expectEqual(@as(?u32, 1500), out[1].txq.?.backlog_bytes);
+    try testing.expectEqual(@as(?u32, 2), out[1].txq.?.drops);
+    try testing.expectEqual(@as(?u32, 4096), out[1].txq.?.max_flows);
+    try testing.expectEqual(@as(?u32, null), out[1].txq.?.flows);
+    // A short output keeps what fits.
+    var one: [1]TidStats = undefined;
+    try testing.expectEqual(@as(usize, 1), try parseTidStats(msg.items, &one));
+    // None reported: zero entries, no error.
+    try testing.expectEqual(@as(usize, 0), try parseTidStats(&.{}, &out));
+}
+
+test "parse: multi-link attributes of a station message" {
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    try codec.appendAttrU8(gpa, &msg, uapi.ATTR.MLO_LINK_ID, 2);
+    try codec.appendAttr(gpa, &msg, uapi.ATTR.MLD_ADDR, &.{ 2, 0, 0, 1, 2, 3 });
+    const s = try parse(msg.items);
+    try testing.expectEqual(@as(?u8, 2), s.mlo_link_id);
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 1, 2, 3 }, &s.mld_addr.?);
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    try codec.appendAttr(gpa, &bad, uapi.ATTR.MLD_ADDR, &.{ 1, 2, 3 });
+    try testing.expectError(error.BadLength, parse(bad.items));
 }

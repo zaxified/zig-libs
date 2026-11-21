@@ -175,6 +175,31 @@ fn mapResolve(e: genl.McastGroupError) SubscribeError {
     };
 }
 
+/// The ceilings a client puts on what a reply may grow to. A reply that exceeds
+/// one is `error.TooManyMessages` (close the client then: the kernel's dump is
+/// still running). The defaults are the former constants; raise one only when
+/// real hardware meets it (a radio with an unusual number of channels, a host
+/// with very many regulatory self-managed radios).
+pub const Limits = struct {
+    /// Radio, band and channel ceilings of `wiphys` (`wiphy.Limits`).
+    wiphy: wiphy_mod.Limits = .{},
+    /// Rules in one regulatory domain, and domains in one `regDomains`.
+    reg_rules: u32 = reg_mod.max_rules,
+    reg_domains: u32 = reg_mod.max_domains,
+    /// Datagrams, bytes and family messages one dump may consume.
+    dump_messages: u32 = max_dump_messages,
+    dump_bytes: usize = max_dump_bytes,
+    dump_items: u32 = max_dump_items,
+};
+
+/// The limits of a transport: its own when it has them, the defaults otherwise
+/// (the scripted sockets of the tests do not).
+fn limitsOf(cl: anytype) Limits {
+    const T = @typeInfo(@TypeOf(cl)).pointer.child;
+    if (@hasField(T, "limits")) return cl.limits;
+    return .{};
+}
+
 // ── the command socket ─────────────────────────────────────────────────────
 
 /// Wi-Fi control client. One instance per thread/loop; no shared state.
@@ -189,6 +214,9 @@ pub const Nl80211 = struct {
     sock: genl.Socket,
     /// The dynamically resolved `nl80211` message-type id.
     family_id: u16,
+    /// The ceilings on what one call accepts; the defaults are the constants
+    /// every earlier version had. Change before the first call.
+    limits: Limits = .{},
 
     /// Open a `NETLINK_GENERIC` socket and resolve the nl80211 family.
     /// `error.FamilyNotFound` means no cfg80211 in this kernel (or none
@@ -609,12 +637,13 @@ const max_dump_bytes: usize = 64 << 20;
 fn awaitAckStep(cl: anytype, seq: u32) RequestError!void {
     var msgs: u32 = 0;
     var bytes: usize = 0;
+    const lim = limitsOf(cl);
     while (true) {
-        if (msgs >= max_dump_messages) return error.TooManyMessages;
+        if (msgs >= lim.dump_messages) return error.TooManyMessages;
         const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
         msgs += 1;
         bytes +|= dgram.len;
-        if (bytes > max_dump_bytes) return error.TooManyMessages;
+        if (bytes > lim.dump_bytes) return error.TooManyMessages;
         var it: codec.MessageIterator = .{ .buf = dgram };
         while (it.next() catch return error.MalformedReply) |m| {
             if (m.pid != cl.sock.portid or m.seq != seq) continue;
@@ -645,8 +674,8 @@ fn regErr(e: reg_mod.ParseError) RequestError {
 }
 
 /// Collect one regulatory domain, refusing the `max_domains + 1`-th.
-fn appendDomain(gpa: std.mem.Allocator, out: *std.ArrayList(reg_mod.RegDomain), d: reg_mod.RegDomain) RequestError!void {
-    if (out.items.len >= reg_mod.max_domains) return error.TooManyMessages;
+fn appendDomain(gpa: std.mem.Allocator, out: *std.ArrayList(reg_mod.RegDomain), d: reg_mod.RegDomain, limit: usize) RequestError!void {
+    if (out.items.len >= limit) return error.TooManyMessages;
     try out.append(gpa, d);
 }
 
@@ -685,6 +714,8 @@ const DumpState = struct {
     bytes: usize = 0,
     /// Family messages handed to the collector (`max_dump_items`).
     items: u32 = 0,
+    /// The budgets this walk runs under.
+    limits: Limits = .{},
     /// `NLM_F_DUMP_INTR` was seen: the rest of this dump is read and thrown
     /// away, and the walk ends in `error.DumpInterrupted` at its terminator.
     interrupted: bool = false,
@@ -716,7 +747,7 @@ fn DumpOver(comptime Cl: type) type {
 }
 
 fn walkOf(cl: anytype, seq: u32) DumpOver(@typeInfo(@TypeOf(cl)).pointer.child) {
-    return .{ .cl = cl, .seq = seq };
+    return .{ .cl = cl, .seq = seq, .st = .{ .limits = limitsOf(cl) } };
 }
 
 // ── the collectors ─────────────────────────────────────────────────────────
@@ -725,7 +756,7 @@ fn walkOf(cl: anytype, seq: u32) DumpOver(@typeInfo(@TypeOf(cl)).pointer.child) 
 // `dumpStep`/`awaitAckStep` are. The request has been sent already.
 
 fn collectWiphys(gpa: std.mem.Allocator, cl: anytype, seq: u32) RequestError![]wiphy_mod.Wiphy {
-    var parser: wiphy_mod.Parser = .init(gpa);
+    var parser: wiphy_mod.Parser = .initWithLimits(gpa, limitsOf(cl).wiphy);
     defer parser.deinit();
     var walk = walkOf(cl, seq);
     while (try walk.next()) |m| {
@@ -803,13 +834,13 @@ fn collectRegDomains(gpa: std.mem.Allocator, cl: anytype, seq: u32) RequestError
     var walk = walkOf(cl, seq);
     while (try walk.next()) |m| {
         if (m.cmd != uapi.CMD.GET_REG) continue;
-        const d = reg_mod.parse(gpa, m.attrs) catch |e| return walk.fail(regErr(e));
+        const d = reg_mod.parseLimited(gpa, m.attrs, limitsOf(cl).reg_rules) catch |e| return walk.fail(regErr(e));
         {
             errdefer {
                 var tmp = d;
                 tmp.deinit(gpa);
             }
-            try appendDomain(gpa, &out, d);
+            try appendDomain(gpa, &out, d, limitsOf(cl).reg_domains);
         }
     }
     return out.toOwnedSlice(gpa);
@@ -860,12 +891,12 @@ fn dumpStep(cl: anytype, seq: u32, st: *DumpState) RequestError!?DumpMessage {
         if (st.finished) return null;
         const maybe = st.it.next() catch return error.MalformedReply;
         const m = maybe orelse {
-            if (st.msgs >= max_dump_messages) return error.TooManyMessages;
+            if (st.msgs >= st.limits.dump_messages) return error.TooManyMessages;
             const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
             st.msgs += 1;
             st.bytes +|= dgram.len;
             // The bound on the quantity that grows — see `max_dump_bytes`.
-            if (st.bytes > max_dump_bytes) return error.TooManyMessages;
+            if (st.bytes > st.limits.dump_bytes) return error.TooManyMessages;
             st.it = .{ .buf = dgram };
             continue;
         };
@@ -908,7 +939,7 @@ fn dumpStep(cl: anytype, seq: u32, st: *DumpState) RequestError!?DumpMessage {
                 if (m.type != cl.family_id) continue;
                 if (st.interrupted) continue; // discarded: the caller must retry
                 st.items += 1;
-                if (st.items > max_dump_items) return error.TooManyMessages;
+                if (st.items > st.limits.dump_items) return error.TooManyMessages;
                 const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
                 return .{ .cmd = p.cmd, .attrs = p.attrs };
             },
@@ -917,6 +948,29 @@ fn dumpStep(cl: anytype, seq: u32, st: *DumpState) RequestError!?DumpMessage {
 }
 
 // ── the event socket ───────────────────────────────────────────────────────
+
+/// Most octets of one information-element blob an `Event` keeps. The (Re)Association
+/// frames of a modern AP carry 300 to 700 octets of elements (HE and EHT capabilities
+/// are the bulk); a longer blob is cut and `truncated` says so.
+pub const max_event_ie = 1024;
+
+/// A copy of one information-element attribute of an event.
+pub const EventIes = struct {
+    buf: [max_event_ie]u8 = undefined,
+    len: u16 = 0,
+    truncated: bool = false,
+
+    pub fn bytes(i: *const EventIes) []const u8 {
+        return i.buf[0..i.len];
+    }
+
+    fn set(i: *EventIes, data: []const u8) void {
+        const n = @min(data.len, max_event_ie);
+        @memcpy(i.buf[0..n], data[0..n]);
+        i.len = @intCast(n);
+        i.truncated = data.len > max_event_ie;
+    }
+};
 
 /// A decoded nl80211 multicast event. Everything it carries is copied, so an
 /// `Event` outlives the datagram it came from.
@@ -931,7 +985,59 @@ pub const Event = struct {
     status_code: ?u16 = null,
     /// `NL80211_ATTR_REASON_CODE` of a DISCONNECT/DEAUTH.
     reason_code: ?u16 = null,
+    /// The BSSID of a CONNECT or ROAM, the peer of a NEW_/DEL_STATION.
     mac: ?uapi.Mac = null,
+    /// `NL80211_ATTR_TIMED_OUT`: a CONNECT that ended because the AP did not answer.
+    timed_out: bool = false,
+    /// `NL80211_ATTR_DISCONNECTED_BY_AP`: a DISCONNECT the AP started (otherwise
+    /// the local side did).
+    disconnected_by_ap: bool = false,
+    /// The (Re)Association Request and Response elements of a CONNECT or ROAM
+    /// (`REQ_IE`, `RESP_IE`), and the elements of a DISCONNECT (`IE`).
+    req_ie: EventIes = .{},
+    resp_ie: EventIes = .{},
+    ie: EventIes = .{},
+    /// Multi-link operation: the link a CONNECT/ROAM/station event concerns.
+    mlo_link_id: ?u8 = null,
+    mld_addr: ?uapi.Mac = null,
+    /// The peer's statistics carried by a NEW_STATION event.
+    station: ?station_mod.Station = null,
+
+    /// What happened, for the commands this module models.
+    pub const Kind = enum {
+        scan_complete,
+        scan_aborted,
+        sched_scan_results,
+        sched_scan_stopped,
+        connect,
+        roam,
+        disconnect,
+        new_station,
+        del_station,
+        /// Any other command; `cmd` has the number.
+        other,
+    };
+
+    pub fn kind(e: Event) Kind {
+        return switch (e.cmd) {
+            uapi.CMD.NEW_SCAN_RESULTS => .scan_complete,
+            uapi.CMD.SCAN_ABORTED => .scan_aborted,
+            uapi.CMD.SCHED_SCAN_RESULTS => .sched_scan_results,
+            uapi.CMD.SCHED_SCAN_STOPPED => .sched_scan_stopped,
+            uapi.CMD.CONNECT => .connect,
+            uapi.CMD.ROAM => .roam,
+            uapi.CMD.DISCONNECT => .disconnect,
+            uapi.CMD.NEW_STATION => .new_station,
+            uapi.CMD.DEL_STATION => .del_station,
+            else => .other,
+        };
+    }
+
+    /// A CONNECT that succeeded: status 0 and no timeout (`iw event`'s
+    /// "connected to"; anything else is "failed to connect").
+    pub fn connectSucceeded(e: Event) bool {
+        return e.cmd == uapi.CMD.CONNECT and !e.timed_out and (e.status_code orelse 0xffff) == 0;
+    }
 
     /// A scan finished and its results are in the kernel's BSS table.
     pub fn isScanComplete(e: Event) bool {
@@ -1084,6 +1190,16 @@ pub fn parseEvent(cmd: u8, attr_bytes: []const u8) codec.Error!Event {
         uapi.ATTR.IFINDEX => e.ifindex = try a.asU32(),
         uapi.ATTR.STATUS_CODE => e.status_code = try a.asU16(),
         uapi.ATTR.REASON_CODE => e.reason_code = try a.asU16(),
+        uapi.ATTR.TIMED_OUT => e.timed_out = true,
+        uapi.ATTR.DISCONNECTED_BY_AP => e.disconnected_by_ap = true,
+        uapi.ATTR.REQ_IE => e.req_ie.set(a.data),
+        uapi.ATTR.RESP_IE => e.resp_ie.set(a.data),
+        uapi.ATTR.IE => e.ie.set(a.data),
+        uapi.ATTR.MLO_LINK_ID => e.mlo_link_id = try a.asU8(),
+        uapi.ATTR.MLD_ADDR => {
+            if (a.data.len != 6) return error.BadLength;
+            e.mld_addr = a.data[0..6].*;
+        },
         uapi.ATTR.WDEV => {
             if (a.data.len != 8) return error.BadLength;
             e.wdev = std.mem.readInt(u64, a.data[0..8], .little);
@@ -1094,6 +1210,10 @@ pub fn parseEvent(cmd: u8, attr_bytes: []const u8) codec.Error!Event {
         },
         else => {},
     };
+    // A new station carries its statistics: decode them with the same decoder
+    // the station dump uses. A malformed nest is not an event error (the peer
+    // and the fact it appeared are still true).
+    if (cmd == uapi.CMD.NEW_STATION) e.station = station_mod.parse(attr_bytes) catch null;
     return e;
 }
 
@@ -1406,9 +1526,9 @@ test "regDomains collects at most reg.max_domains domains (sweep NL-2)" {
     const gpa = testing.allocator;
     var out: std.ArrayList(reg_mod.RegDomain) = .empty;
     defer out.deinit(gpa);
-    for (0..reg_mod.max_domains) |_| try appendDomain(gpa, &out, .{});
+    for (0..reg_mod.max_domains) |_| try appendDomain(gpa, &out, .{}, reg_mod.max_domains);
     try testing.expectEqual(@as(usize, 256), out.items.len);
-    try testing.expectError(error.TooManyMessages, appendDomain(gpa, &out, .{}));
+    try testing.expectError(error.TooManyMessages, appendDomain(gpa, &out, .{}, reg_mod.max_domains));
     try testing.expectEqual(@as(usize, 256), out.items.len);
 }
 
@@ -2357,4 +2477,219 @@ test "waitForEventStep: one recv per drained datagram, events in order, a stale 
     try testing.expectEqual(@as(usize, 2), ev.sock.next);
     // Script exhausted: the receive error surfaces.
     try testing.expectError(error.RecvFailed, waitForEventStep(&ev));
+}
+
+// ── typed events and limits ─────────────────────────────────────────────────
+
+fn eventAttrs(gpa: std.mem.Allocator, list: *std.ArrayList(u8), ifindex: u32, mac: ?[6]u8) !void {
+    try codec.appendAttrU32(gpa, list, uapi.ATTR.WIPHY, 0);
+    try codec.appendAttrU32(gpa, list, uapi.ATTR.IFINDEX, ifindex);
+    if (mac) |m| try codec.appendAttr(gpa, list, uapi.ATTR.MAC, &m);
+}
+
+test "parseEvent: CONNECT carries the BSSID, status and both association element blobs" {
+    const gpa = testing.allocator;
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    try eventAttrs(gpa, &a, 3, .{ 2, 0, 0, 1, 2, 3 });
+    try codec.appendAttrU16(gpa, &a, uapi.ATTR.STATUS_CODE, 0);
+    try codec.appendAttr(gpa, &a, uapi.ATTR.REQ_IE, &.{ 0, 4, 't', 'e', 's', 't' });
+    try codec.appendAttr(gpa, &a, uapi.ATTR.RESP_IE, &.{ 1, 2, 0x82, 0x84 });
+    const e = try parseEvent(uapi.CMD.CONNECT, a.items);
+    try testing.expectEqual(Event.Kind.connect, e.kind());
+    try testing.expect(e.connectSucceeded());
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 1, 2, 3 }, &e.mac.?);
+    try testing.expectEqualSlices(u8, &.{ 0, 4, 't', 'e', 's', 't' }, e.req_ie.bytes());
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 0x82, 0x84 }, e.resp_ie.bytes());
+    try testing.expectEqual(@as(usize, 0), e.ie.bytes().len);
+    try testing.expect(!e.req_ie.truncated);
+    try testing.expect(!e.endsScan());
+
+    // A refusal, and a timeout, are not successes; a missing status is not one either.
+    var f: std.ArrayList(u8) = .empty;
+    defer f.deinit(gpa);
+    try eventAttrs(gpa, &f, 3, null);
+    try codec.appendAttrU16(gpa, &f, uapi.ATTR.STATUS_CODE, 17);
+    try testing.expect(!(try parseEvent(uapi.CMD.CONNECT, f.items)).connectSucceeded());
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    try eventAttrs(gpa, &t, 3, null);
+    try codec.appendAttrU16(gpa, &t, uapi.ATTR.STATUS_CODE, 0);
+    try codec.appendAttr(gpa, &t, uapi.ATTR.TIMED_OUT, &.{});
+    const timed = try parseEvent(uapi.CMD.CONNECT, t.items);
+    try testing.expect(timed.timed_out and !timed.connectSucceeded());
+    try testing.expect(!(try parseEvent(uapi.CMD.CONNECT, a.items[0..0])).connectSucceeded());
+    try testing.expect(!(try parseEvent(uapi.CMD.ROAM, t.items)).connectSucceeded());
+}
+
+test "parseEvent: ROAM, DISCONNECT (who started it), stations and scheduled scans" {
+    const gpa = testing.allocator;
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    try eventAttrs(gpa, &a, 3, .{ 2, 0, 0, 9, 9, 9 });
+    try codec.appendAttr(gpa, &a, uapi.ATTR.REQ_IE, &.{ 0, 0 });
+    try codec.appendAttr(gpa, &a, uapi.ATTR.RESP_IE, &.{ 1, 0 });
+    try codec.appendAttrU8(gpa, &a, uapi.ATTR.MLO_LINK_ID, 1);
+    try codec.appendAttr(gpa, &a, uapi.ATTR.MLD_ADDR, &.{ 2, 0, 0, 7, 7, 7 });
+    const roam = try parseEvent(uapi.CMD.ROAM, a.items);
+    try testing.expectEqual(Event.Kind.roam, roam.kind());
+    try testing.expectEqual(@as(?u8, 1), roam.mlo_link_id);
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 7, 7, 7 }, &roam.mld_addr.?);
+    try testing.expectEqualSlices(u8, &.{ 1, 0 }, roam.resp_ie.bytes());
+
+    var d: std.ArrayList(u8) = .empty;
+    defer d.deinit(gpa);
+    try eventAttrs(gpa, &d, 3, null);
+    try codec.appendAttrU16(gpa, &d, uapi.ATTR.REASON_CODE, 3);
+    try codec.appendAttr(gpa, &d, uapi.ATTR.IE, &.{ 0xdd, 0 });
+    const local = try parseEvent(uapi.CMD.DISCONNECT, d.items);
+    try testing.expectEqual(Event.Kind.disconnect, local.kind());
+    try testing.expectEqual(@as(?u16, 3), local.reason_code);
+    try testing.expect(!local.disconnected_by_ap);
+    try testing.expectEqualSlices(u8, &.{ 0xdd, 0 }, local.ie.bytes());
+    try codec.appendAttr(gpa, &d, uapi.ATTR.DISCONNECTED_BY_AP, &.{});
+    try testing.expect((try parseEvent(uapi.CMD.DISCONNECT, d.items)).disconnected_by_ap);
+
+    // A new station carries its statistics; a deleted one only its address.
+    var s: std.ArrayList(u8) = .empty;
+    defer s.deinit(gpa);
+    try eventAttrs(gpa, &s, 3, .{ 2, 0, 0, 5, 5, 5 });
+    const sta = try codec.nestBegin(gpa, &s, uapi.ATTR.STA_INFO);
+    try codec.appendAttrU8(gpa, &s, uapi.STA_INFO.SIGNAL, @bitCast(@as(i8, -55)));
+    try codec.nestEnd(&s, sta);
+    const ns = try parseEvent(uapi.CMD.NEW_STATION, s.items);
+    try testing.expectEqual(Event.Kind.new_station, ns.kind());
+    try testing.expectEqual(@as(?i8, -55), ns.station.?.signal_dbm);
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 5, 5, 5 }, &ns.mac.?);
+    const ds = try parseEvent(uapi.CMD.DEL_STATION, s.items);
+    try testing.expectEqual(Event.Kind.del_station, ds.kind());
+    try testing.expect(ds.station == null);
+    // A malformed STA_INFO does not lose the event.
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    try eventAttrs(gpa, &bad, 3, .{ 2, 0, 0, 5, 5, 5 });
+    const b = try codec.nestBegin(gpa, &bad, uapi.ATTR.STA_INFO);
+    try codec.appendAttrU32(gpa, &bad, uapi.STA_INFO.SIGNAL, 7);
+    try codec.nestEnd(&bad, b);
+    const nb = try parseEvent(uapi.CMD.NEW_STATION, bad.items);
+    try testing.expect(nb.station == null and nb.mac != null);
+
+    try testing.expectEqual(Event.Kind.sched_scan_results, (try parseEvent(uapi.CMD.SCHED_SCAN_RESULTS, &.{})).kind());
+    try testing.expectEqual(Event.Kind.sched_scan_stopped, (try parseEvent(uapi.CMD.SCHED_SCAN_STOPPED, &.{})).kind());
+    try testing.expectEqual(Event.Kind.scan_complete, (try parseEvent(uapi.CMD.NEW_SCAN_RESULTS, &.{})).kind());
+    try testing.expectEqual(Event.Kind.scan_aborted, (try parseEvent(uapi.CMD.SCAN_ABORTED, &.{})).kind());
+    try testing.expectEqual(Event.Kind.other, (try parseEvent(uapi.CMD.GET_WIPHY, &.{})).kind());
+}
+
+test "parseEvent: an over-long element blob is cut and says so" {
+    const gpa = testing.allocator;
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    const big = try gpa.alloc(u8, max_event_ie + 50);
+    defer gpa.free(big);
+    @memset(big, 0xab);
+    try codec.appendAttr(gpa, &a, uapi.ATTR.RESP_IE, big);
+    const e = try parseEvent(uapi.CMD.CONNECT, a.items);
+    try testing.expectEqual(@as(usize, max_event_ie), e.resp_ie.bytes().len);
+    try testing.expect(e.resp_ie.truncated);
+    try testing.expectEqual(@as(u8, 0xab), e.resp_ie.bytes()[max_event_ie - 1]);
+    try testing.expect(!e.req_ie.truncated);
+}
+
+test "Limits: a client's dump budgets are the ones it was given" {
+    const gpa = testing.allocator;
+    // The defaults are the former constants.
+    const d: Limits = .{};
+    try testing.expectEqual(max_dump_messages, d.dump_messages);
+    try testing.expectEqual(max_dump_bytes, d.dump_bytes);
+    try testing.expectEqual(max_dump_items, d.dump_items);
+    try testing.expectEqual(@as(u32, wiphy_mod.max_bands), d.wiphy.max_bands);
+    try testing.expectEqual(@as(u32, reg_mod.max_rules), d.reg_rules);
+
+    // A transport that carries its own limits is walked under them.
+    const family_id: u16 = 41;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    for (0..10) |_| {
+        const hdr = try codec.appendHeader(gpa, &list, family_id, codec.NLM_F_MULTI, seq, pid);
+        try list.appendSlice(gpa, &.{ 34, 1, 0, 0 });
+        codec.finishHeader(&list, hdr);
+    }
+    const Tight = struct { sock: MockSock, family_id: u16, limits: Limits };
+    var cl: Tight = .{
+        .sock = .{ .portid = pid, .datagram = list.items },
+        .family_id = family_id,
+        .limits = .{ .dump_items = 3 },
+    };
+    var walk = walkOf(&cl, seq);
+    var got: u32 = 0;
+    while (true) {
+        const r = walk.next() catch |e| {
+            try testing.expectEqual(error.TooManyMessages, e);
+            break;
+        };
+        try testing.expect(r != null);
+        got += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), got);
+    // The same walk on a transport without limits is under the defaults.
+    var plain: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = list.items }, .family_id = family_id };
+    const w2 = walkOf(&plain, seq);
+    try testing.expectEqual(max_dump_items, w2.st.limits.dump_items);
+    // A byte budget below one datagram refuses the first.
+    var tiny: Tight = .{ .sock = .{ .portid = pid, .datagram = list.items }, .family_id = family_id, .limits = .{ .dump_bytes = 8 } };
+    var w3 = walkOf(&tiny, seq);
+    try testing.expectError(error.TooManyMessages, w3.next());
+    // Message budget: awaitAck gives up after the datagrams it was allowed.
+    var ack: Tight = .{ .sock = .{ .portid = pid + 1, .datagram = list.items }, .family_id = family_id, .limits = .{ .dump_messages = 5 } };
+    try testing.expectError(error.TooManyMessages, awaitAckStep(&ack, seq));
+}
+
+test "Limits: the wiphy and regulatory ceilings can be raised or lowered" {
+    const gpa = testing.allocator;
+    var p = wiphy_mod.Parser.initWithLimits(gpa, .{ .max_wiphys = 1 });
+    defer p.deinit();
+    var m0: std.ArrayList(u8) = .empty;
+    defer m0.deinit(gpa);
+    try codec.appendAttrU32(gpa, &m0, uapi.ATTR.WIPHY, 0);
+    try p.feed(m0.items);
+    var m1: std.ArrayList(u8) = .empty;
+    defer m1.deinit(gpa);
+    try codec.appendAttrU32(gpa, &m1, uapi.ATTR.WIPHY, 1);
+    try testing.expectError(error.TooManyEntries, p.feed(m1.items));
+
+    // Bands and channels.
+    var q = wiphy_mod.Parser.initWithLimits(gpa, .{ .max_bands = 1, .max_channels_per_band = 2, .max_total_channels = 3 });
+    defer q.deinit();
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    try codec.appendAttrU32(gpa, &msg, uapi.ATTR.WIPHY, 0);
+    const bands = try codec.nestBegin(gpa, &msg, uapi.ATTR.WIPHY_BANDS);
+    const band = try codec.nestBegin(gpa, &msg, 0);
+    const freqs = try codec.nestBegin(gpa, &msg, uapi.BAND_ATTR.FREQS);
+    for (0..3) |i| {
+        const f = try codec.nestBegin(gpa, &msg, @intCast(i));
+        try codec.appendAttrU32(gpa, &msg, uapi.FREQUENCY_ATTR.FREQ, @intCast(2412 + 5 * i));
+        try codec.nestEnd(&msg, f);
+    }
+    try codec.nestEnd(&msg, freqs);
+    try codec.nestEnd(&msg, band);
+    try codec.nestEnd(&msg, bands);
+    try testing.expectError(error.TooManyEntries, q.feed(msg.items));
+
+    // A rule limit on one regulatory domain.
+    var rules: std.ArrayList(u8) = .empty;
+    defer rules.deinit(gpa);
+    try codec.appendAttr(gpa, &rules, uapi.ATTR.REG_ALPHA2, "CZ\x00");
+    const r = try codec.nestBegin(gpa, &rules, uapi.ATTR.REG_RULES);
+    for (1..4) |i| {
+        const one = try codec.nestBegin(gpa, &rules, @intCast(i));
+        try codec.nestEnd(&rules, one);
+    }
+    try codec.nestEnd(&rules, r);
+    var ok = try reg_mod.parseLimited(gpa, rules.items, 3);
+    ok.deinit(gpa);
+    try testing.expectError(error.TooManyEntries, reg_mod.parseLimited(gpa, rules.items, 2));
 }

@@ -38,6 +38,7 @@ pub const CMD = struct {
     pub const DEL_INTERFACE: u8 = 8;
     pub const GET_STATION: u8 = 17;
     pub const NEW_STATION: u8 = 19;
+    pub const DEL_STATION: u8 = 20;
     pub const REQ_SET_REG: u8 = 27;
     pub const GET_REG: u8 = 31;
     pub const GET_SCAN: u8 = 32;
@@ -99,6 +100,17 @@ pub const ATTR = struct {
     pub const SCHED_SCAN_MATCH: u16 = 132;
     pub const EXT_FEATURES: u16 = 217;
     pub const IE: u16 = 42;
+    pub const TIMED_OUT: u16 = 65;
+    pub const DISCONNECTED_BY_AP: u16 = 71;
+    pub const REQ_IE: u16 = 77;
+    pub const RESP_IE: u16 = 78;
+    pub const WIPHY_ANTENNA_TX: u16 = 105;
+    pub const WIPHY_ANTENNA_RX: u16 = 106;
+    pub const WIPHY_ANTENNA_AVAIL_TX: u16 = 113;
+    pub const WIPHY_ANTENNA_AVAIL_RX: u16 = 114;
+    pub const MLO_LINKS: u16 = 312;
+    pub const MLO_LINK_ID: u16 = 313;
+    pub const MLD_ADDR: u16 = 314;
     pub const MAX_NUM_SCAN_SSIDS: u16 = 43;
     pub const SCAN_FREQUENCIES: u16 = 44;
     pub const SCAN_SSIDS: u16 = 45;
@@ -252,6 +264,41 @@ pub const STA_INFO = struct {
     pub const FCS_ERROR_COUNT: u16 = 37;
     pub const TX_DURATION: u16 = 39;
     pub const ASSOC_AT_BOOTTIME: u16 = 42;
+};
+
+/// enum nl80211_sta_bss_param — inside `STA_INFO.BSS_PARAM`.
+pub const STA_BSS_PARAM = struct {
+    pub const CTS_PROT: u16 = 1;
+    pub const SHORT_PREAMBLE: u16 = 2;
+    pub const SHORT_SLOT_TIME: u16 = 3;
+    pub const DTIM_PERIOD: u16 = 4;
+    pub const BEACON_INTERVAL: u16 = 5;
+};
+
+/// enum nl80211_tid_stats — one entry of `STA_INFO.TID_STATS` (the nest's
+/// attribute type is the TID plus one).
+pub const TID_STATS = struct {
+    pub const RX_MSDU: u16 = 1;
+    pub const TX_MSDU: u16 = 2;
+    pub const TX_MSDU_RETRIES: u16 = 3;
+    pub const TX_MSDU_FAILED: u16 = 4;
+    pub const PAD: u16 = 5;
+    pub const TXQ_STATS: u16 = 6;
+};
+
+/// enum nl80211_txq_stats — inside `TID_STATS.TXQ_STATS`.
+pub const TXQ_STATS = struct {
+    pub const BACKLOG_BYTES: u16 = 1;
+    pub const BACKLOG_PACKETS: u16 = 2;
+    pub const FLOWS: u16 = 3;
+    pub const DROPS: u16 = 4;
+    pub const ECN_MARKS: u16 = 5;
+    pub const OVERLIMIT: u16 = 6;
+    pub const OVERMEMORY: u16 = 7;
+    pub const COLLISIONS: u16 = 8;
+    pub const TX_BYTES: u16 = 9;
+    pub const TX_PACKETS: u16 = 10;
+    pub const MAX_FLOWS: u16 = 11;
 };
 
 /// enum nl80211_rate_info — inside `STA_INFO.TX_BITRATE` / `RX_BITRATE`.

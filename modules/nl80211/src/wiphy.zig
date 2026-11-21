@@ -57,6 +57,15 @@ pub const max_channels_per_band = 1024;
 /// multiply (256 x 16 x 1024 = 4 M entries, ~190 MiB), this one does not.
 /// Real hardware: ~300 channels per radio, at most 8 radios.
 pub const max_total_channels = 16384;
+/// The parser ceilings as values, for a caller whose hardware or test needs other
+/// ones (`Parser.limits`, `client.Limits.wiphy`). The defaults are the constants above.
+pub const Limits = struct {
+    max_wiphys: u32 = max_wiphys,
+    max_bands: u32 = max_bands,
+    max_channels_per_band: u32 = max_channels_per_band,
+    max_total_channels: u32 = max_total_channels,
+};
+
 /// Bytes of the extended-feature bitmap kept (the kernel defines ~80 bits
 /// today; this holds 256). A longer bitmap keeps its first 32 bytes and sets
 /// `Wiphy.capabilities_truncated`.
@@ -167,6 +176,12 @@ pub const Wiphy = struct {
     /// Bytes of extra IEs a scan request may carry.
     max_scan_ie_len: ?u16 = null,
     feature_flags: ?u32 = null,
+    /// Antenna bitmasks: the ones in use (`iw phy … set antenna`) and the ones
+    /// the radio has. Bit `n` is antenna `n`.
+    antenna_tx: ?u32 = null,
+    antenna_rx: ?u32 = null,
+    antenna_avail_tx: ?u32 = null,
+    antenna_avail_rx: ?u32 = null,
     /// The radio's permanent MAC address.
     mac: ?uapi.Mac = null,
     generation: ?u32 = null,
@@ -293,9 +308,15 @@ pub const Parser = struct {
     builders: std.ArrayList(WiphyBuilder) = .empty,
     /// Channels held across all radios and bands (`max_total_channels`).
     n_channels: u32 = 0,
+    limits: Limits = .{},
 
     pub fn init(gpa: std.mem.Allocator) Parser {
         return .{ .gpa = gpa };
+    }
+
+    /// A parser with other ceilings than the defaults.
+    pub fn initWithLimits(gpa: std.mem.Allocator, limits: Limits) Parser {
+        return .{ .gpa = gpa, .limits = limits };
     }
 
     pub fn deinit(p: *Parser) void {
@@ -331,6 +352,10 @@ pub const Parser = struct {
                 b.w.name_len = @intCast(s.len);
             },
             uapi.ATTR.GENERATION => b.w.generation = try a.asU32(),
+            uapi.ATTR.WIPHY_ANTENNA_TX => b.w.antenna_tx = try a.asU32(),
+            uapi.ATTR.WIPHY_ANTENNA_RX => b.w.antenna_rx = try a.asU32(),
+            uapi.ATTR.WIPHY_ANTENNA_AVAIL_TX => b.w.antenna_avail_tx = try a.asU32(),
+            uapi.ATTR.WIPHY_ANTENNA_AVAIL_RX => b.w.antenna_avail_rx = try a.asU32(),
             uapi.ATTR.MAX_NUM_SCAN_SSIDS => b.w.max_num_scan_ssids = try a.asU8(),
             uapi.ATTR.MAX_NUM_SCHED_SCAN_SSIDS => b.w.max_num_sched_scan_ssids = try a.asU8(),
             uapi.ATTR.MAX_SCAN_IE_LEN => b.w.max_scan_ie_len = try a.asU16(),
@@ -434,7 +459,7 @@ pub const Parser = struct {
 
     fn builderFor(p: *Parser, idx: u32) Error!*WiphyBuilder {
         for (p.builders.items) |*b| if (b.w.index == idx) return b;
-        if (p.builders.items.len >= max_wiphys) return error.TooManyEntries;
+        if (p.builders.items.len >= p.limits.max_wiphys) return error.TooManyEntries;
         try p.builders.append(p.gpa, .{ .w = .{ .index = idx } });
         return &p.builders.items[p.builders.items.len - 1];
     }
@@ -442,10 +467,10 @@ pub const Parser = struct {
     fn feedBands(p: *Parser, b: *WiphyBuilder, nest: []const u8) Error!void {
         var it: codec.AttrIterator = .{ .buf = nest };
         while (try it.next()) |band_attr| {
-            const bb = try bandBuilderFor(p.gpa, b, band_attr.type);
+            const bb = try bandBuilderFor(p.gpa, b, band_attr.type, p.limits);
             var inner: codec.AttrIterator = .{ .buf = band_attr.data };
             while (try inner.next()) |a| switch (a.type) {
-                uapi.BAND_ATTR.FREQS => try feedFreqs(p.gpa, bb, a.data, &p.n_channels),
+                uapi.BAND_ATTR.FREQS => try feedFreqs(p.gpa, bb, a.data, &p.n_channels, p.limits),
                 uapi.BAND_ATTR.RATES => {
                     bb.rates.clearRetainingCapacity();
                     var rit: codec.AttrIterator = .{ .buf = a.data };
@@ -577,17 +602,17 @@ fn feedCombinations(w: *Wiphy, nest: []const u8) Error!void {
     }
 }
 
-fn bandBuilderFor(gpa: std.mem.Allocator, b: *WiphyBuilder, index: u32) Error!*BandBuilder {
+fn bandBuilderFor(gpa: std.mem.Allocator, b: *WiphyBuilder, index: u32, limits: Limits) Error!*BandBuilder {
     for (b.bands.items) |*bb| if (bb.index == index) return bb;
-    if (b.bands.items.len >= max_bands) return error.TooManyEntries;
+    if (b.bands.items.len >= limits.max_bands) return error.TooManyEntries;
     try b.bands.append(gpa, .{ .index = index });
     return &b.bands.items[b.bands.items.len - 1];
 }
 
-fn feedFreqs(gpa: std.mem.Allocator, bb: *BandBuilder, nest: []const u8, total: *u32) Error!void {
+fn feedFreqs(gpa: std.mem.Allocator, bb: *BandBuilder, nest: []const u8, total: *u32, limits: Limits) Error!void {
     var it: codec.AttrIterator = .{ .buf = nest };
     while (try it.next()) |entry| {
-        const f = try freqFor(gpa, bb, entry.type, total);
+        const f = try freqFor(gpa, bb, entry.type, total, limits);
         var inner: codec.AttrIterator = .{ .buf = entry.data };
         while (try inner.next()) |a| switch (a.type) {
             uapi.FREQUENCY_ATTR.FREQ => f.freq_mhz = try a.asU32(),
@@ -608,10 +633,10 @@ fn feedFreqs(gpa: std.mem.Allocator, bb: *BandBuilder, nest: []const u8, total: 
     }
 }
 
-fn freqFor(gpa: std.mem.Allocator, bb: *BandBuilder, index: u32, total: *u32) Error!*Frequency {
+fn freqFor(gpa: std.mem.Allocator, bb: *BandBuilder, index: u32, total: *u32, limits: Limits) Error!*Frequency {
     if (bb.freq_pos.get(index)) |pos| return &bb.freqs.items[pos];
-    if (bb.freqs.items.len >= max_channels_per_band) return error.TooManyEntries;
-    if (total.* >= max_total_channels) return error.TooManyEntries;
+    if (bb.freqs.items.len >= limits.max_channels_per_band) return error.TooManyEntries;
+    if (total.* >= limits.max_total_channels) return error.TooManyEntries;
     const pos: u32 = @intCast(bb.freqs.items.len); // < max_channels_per_band
     try bb.freq_pos.put(gpa, index, pos);
     errdefer _ = bb.freq_pos.remove(index);

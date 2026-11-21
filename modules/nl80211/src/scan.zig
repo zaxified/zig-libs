@@ -279,6 +279,10 @@ pub const Bss = struct {
     chan_width: ?uapi.ChanWidth = null,
     /// True when `ies` came from a probe response rather than a beacon.
     presp_data: bool = false,
+    /// Multi-link operation (802.11be): which link of the AP MLD this BSS is,
+    /// and the MLD's own address, when the kernel reported them.
+    mlo_link_id: ?u8 = null,
+    mld_addr: ?uapi.Mac = null,
 
     /// Information elements as received (probe response when `presp_data`,
     /// otherwise beacon). Owned.
@@ -348,6 +352,11 @@ pub fn parseBssNest(gpa: std.mem.Allocator, nest: []const u8) ParseError!Bss {
         uapi.BSS.BEACON_INTERVAL => b.beacon_interval_tu = try a.asU16(),
         uapi.BSS.CHAN_WIDTH => b.chan_width = @fromBackingInt(@intCast(try a.asU32())),
         uapi.BSS.PRESP_DATA => b.presp_data = true,
+        uapi.BSS.MLO_LINK_ID => b.mlo_link_id = try a.asU8(),
+        uapi.BSS.MLD_ADDR => {
+            if (a.data.len != 6) return error.BadLength;
+            b.mld_addr = a.data[0..6].*;
+        },
         uapi.BSS.TSF => b.tsf = try asU64(a),
         uapi.BSS.BEACON_TSF => b.beacon_tsf = try asU64(a),
         uapi.BSS.LAST_SEEN_BOOTTIME => b.last_seen_boottime_ns = try asU64(a),
@@ -673,4 +682,20 @@ test "corpus: every scan seed reaches both parsers, and the counts are pinned" {
     try testing.expectEqual(entries.len, nonempty);
     try testing.expectEqual(@as(usize, 3), nests);
     try testing.expectEqual(@as(usize, 1), found);
+}
+
+test "parseBssNest: multi-link attributes" {
+    const gpa = std.testing.allocator;
+    var nest: std.ArrayList(u8) = .empty;
+    defer nest.deinit(gpa);
+    try codec.appendAttrU8(gpa, &nest, uapi.BSS.MLO_LINK_ID, 1);
+    try codec.appendAttr(gpa, &nest, uapi.BSS.MLD_ADDR, &.{ 2, 0, 0, 4, 5, 6 });
+    var b = try parseBssNest(gpa, nest.items);
+    defer b.deinit(gpa);
+    try std.testing.expectEqual(@as(?u8, 1), b.mlo_link_id);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0, 4, 5, 6 }, &b.mld_addr.?);
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    try codec.appendAttr(gpa, &bad, uapi.BSS.MLD_ADDR, &.{ 1, 2 });
+    try std.testing.expectError(error.BadLength, parseBssNest(gpa, bad.items));
 }

@@ -33,9 +33,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; S2 re-survey 2026-11-07. Licences 
 | [MarekMracna/zig-netlink-wifi](https://github.com/MarekMracna/zig-netlink-wifi) | Zig | AGPL-3.0 | 0 | push 2025-11-09 | Its description: "Experiments with netlink and IEEE 802.11 in Zig". AGPL: source not read. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No nl80211. *(inferred)* |
 
-**Verdict per survey gap** (survey date 2026-11-07). *Built from the survey:* PMK from a passphrase (`connect.pmkFromPassphrase`, IEEE 802.11i Annex H.4 vectors); HT and VHT capability words with named accessors plus A-MPDU parameters and MCS sets, HE MAC/PHY/MCS bytes per interface-type group (`caps`, `Band.ht_caps`/`vht_caps`/`heSets`); interface combinations (`Wiphy.ifaceCombinations`); the extended-feature bitmap (`Wiphy.hasExtFeature`); the BSS Load element (`ie.BssLoad`, standard and Cisco forms); `RELOAD_REGDB`; radio RTS/fragmentation threshold, retry limits and coverage class; monitor flags, 4addr and MAC on interface add/set; scheduled scan start/stop (SSIDs, channels, match SSIDs); IBSS and mesh join/leave. *Already built before:* interfaces, stations with HT/VHT/HE/EHT rate decoding, scan, connect/disconnect (open, WEP, WPA with a PMK), survey, regulatory get/set, channel and tx power, interface add/del/type, power save, event socket. *Rejected, with the reasons in *What is deliberately not done*:* key management, raw MLME and the PMKSA cache; AP mode; P2P, TDLS, WoWLAN, coalesce, CQM, offchannel and management-frame TX/RX, vendor commands; mesh configuration (`MESHCONF_*`) and IBSS/mesh security; `iw event` pretty-printing. *Deferred, open in *Backlog / deferred*:* HE/EHT capability *bit* decoding (needs a capture from an HE radio), typed CONNECT/ROAM/DISCONNECT events.
+**Verdict per survey gap** (survey date 2026-11-07). *Built from the survey:* PMK from a passphrase (`connect.pmkFromPassphrase`, IEEE 802.11i Annex H.4 vectors); HT and VHT capability words with named accessors plus A-MPDU parameters and MCS sets, HE MAC/PHY/MCS bytes per interface-type group (`caps`, `Band.ht_caps`/`vht_caps`/`heSets`); interface combinations (`Wiphy.ifaceCombinations`); the extended-feature bitmap (`Wiphy.hasExtFeature`); the BSS Load element (`ie.BssLoad`, standard and Cisco forms); `RELOAD_REGDB`; radio RTS/fragmentation threshold, retry limits and coverage class; monitor flags, 4addr and MAC on interface add/set; scheduled scan start/stop (SSIDs, channels, match SSIDs); IBSS and mesh join/leave. *Already built before:* interfaces, stations with HT/VHT/HE/EHT rate decoding, scan, connect/disconnect (open, WEP, WPA with a PMK), survey, regulatory get/set, channel and tx power, interface add/del/type, power save, event socket. *Rejected, with the reasons in *What is deliberately not done*:* key management, raw MLME and the PMKSA cache; AP mode; P2P, TDLS, WoWLAN, coalesce, CQM, offchannel and management-frame TX/RX, vendor commands; mesh configuration (`MESHCONF_*`) and IBSS/mesh security; `iw event` pretty-printing. *Deferred, open in *Backlog / deferred*:* HE/EHT capability *bit* decoding (needs a capture from an HE radio).
 
-**Where we are ahead:** the only typed pure-Zig nl80211 client we found, request bytes pinned to a real `iw` 6.17 on Linux 7.0 (36 goldens); a decode about 10–14× faster than mdlayher/wifi on the bench corpus (no allocation per message); hostile-IE hardening (a malformed element cannot downgrade a BSS to `.open`); dumps that never return an interrupted or capped table as complete; scan trigger/results, connect/disconnect, regulatory, survey, sched scan, IBSS/mesh and a multicast `EventSocket` in one API; the capability decoders checked against a real radio's capture. **Where we are behind:** the rejected families above (AP, P2P, TDLS, WoWLAN, CQM, keys, raw MLME, HE bit decoding), typed mlme/regulatory event decoding.
+**Where we are ahead:** the only typed pure-Zig nl80211 client we found, request bytes pinned to a real `iw` 6.17 on Linux 7.0 (36 goldens); a decode about 10–14× faster than mdlayher/wifi on the bench corpus (no allocation per message); hostile-IE hardening (a malformed element cannot downgrade a BSS to `.open`); dumps that never return an interrupted or capped table as complete; scan trigger/results, connect/disconnect, regulatory, survey, sched scan, IBSS/mesh and a multicast `EventSocket` in one API; the capability decoders checked against a real radio's capture. **Where we are behind:** the rejected families above (AP, P2P, TDLS, WoWLAN, CQM, keys, raw MLME, HE bit decoding), regulatory event decoding.
 
 ## Verification
 
@@ -312,6 +312,16 @@ unsolicited events out of its own replies.
 Ordering hazard, documented at both ends: **subscribe before triggering**, or
 the completion event can fire in the gap and be lost.
 
+**Events are typed** (`Event.kind()`): scan complete/aborted, scheduled-scan results/stopped, `CONNECT`, `ROAM`,
+`DISCONNECT`, `NEW_STATION`, `DEL_STATION`; any other command is `.other` with its number. A CONNECT/ROAM carries the BSSID
+(`mac`), `status_code`, `timed_out` and the association request/response elements (`req_ie`, `resp_ie`), a DISCONNECT the
+`reason_code`, `disconnected_by_ap` (who started it, the way `iw event` prints "(by AP)" / "(local choice)") and its elements
+(`ie`), a NEW_STATION its statistics (`station`, the dump's decoder; a malformed nest costs the statistics, not the event).
+`Event.connectSucceeded` is `iw`'s "connected to": status 0 and no timeout. Element blobs are **copied** into the event
+(`EventIes`, at most `max_event_ie` = 1024 octets, a longer one is cut and `truncated` says so), so an `Event` outlives its
+datagram as before. Layouts are the kernel's `nl80211.h` (checked by compiling the header here); the kernel-side payload of
+these events was not captured from a live association, so the decoder is tested on bytes built from that header only.
+
 ### 2.4 Lifetimes
 
 `Dump.next` hands back attribute bytes that borrow the socket's receive buffer
@@ -391,9 +401,12 @@ constraints, so it cannot be used to escape a regulatory limit.
   item budget (`max_dump_items`, 65536, `src/client.zig`) bound a talkative peer (`error.TooManyMessages`; close the client
   after it, `src/client.zig`), a silent one is bounded only by `setRecvTimeout` or the caller polling `fd()`.
   `EventSocket.waitForEvent` blocks by design (§ 2.3).
-- **Parser ceilings are fixed constants:** `wiphy.max_wiphys` / `max_bands` / `max_channels_per_band` / `max_total_channels`
-  (256 / 16 / 1024 / 16384, `src/wiphy.zig`) and `reg.max_rules` / `max_domains` (1024 / 256, `src/reg.zig`); a well-formed
-  reply that outgrows one is `TooManyMessages` (`src/client.zig`).
+- **Parser ceilings default to constants and are options:** `wiphy.max_wiphys` / `max_bands` / `max_channels_per_band` /
+  `max_total_channels` (256 / 16 / 1024 / 16384, `src/wiphy.zig`), `reg.max_rules` / `max_domains` (1024 / 256,
+  `src/reg.zig`) and the dump budgets above; a well-formed reply that outgrows one is `TooManyMessages` (`src/client.zig`).
+  `Nl80211.limits` (`client.Limits`, set before the first call) replaces any of them, `wiphy.Parser.initWithLimits` and
+  `reg.parseLimited` do the same for the pure decoders. Raising one is the caller's decision about its own memory: the
+  defaults were measured (the dump comment in `src/client.zig`), no real radio met one.
 - **Secrets on the stack:** PBKDF2 frames inside `pmkFromPassphrase` are not scrubbed (§ 2.5).
 
 ## What is deliberately not done
@@ -435,13 +448,10 @@ attribution.
 
 ## Backlog / deferred
 
-- **Typed events:** CONNECT / ROAM / DISCONNECT / NEW_STATION and `SCHED_SCAN_RESULTS` on the event socket. `Event` carries the
-  command number with `status_code`, `reason_code` and `mac`, but only the scan-terminal predicates are modelled
-  (`src/client.zig`); every `iw event` user sees these. Decode only.
-- **Capability decoding beyond HT/VHT/HE bytes:** HE/EHT per-bit accessors (needs a capture from an HE radio; this host's iwlwifi
-  is 802.11ac), `TID_STATS`, `BSS_PARAM`, `CHAIN_SIGNAL`, and multi-link (`BSS_MLD_ADDR` / `MLO_LINK_ID`) handling beyond decoding the attributes.
-- **`SET_WIPHY` antenna masks** (channel, tx power, RTS/fragmentation, retry limits and coverage class are built).
-- **Parser ceilings as options:** make the fixed ceilings (see § 3, Limits) options only if real hardware ever meets one.
+- **HE/EHT capability per-bit accessors** (wait: hardware and reference). The HE MAC/PHY/MCS bytes and the EHT rate fields are decoded
+  and carried unchanged; named bit accessors need either a capture from an HE/EHT radio (this host's iwlwifi is 802.11ac, so a
+  table built from memory could not be checked against anything) or a permissive source for the bit layout (IEEE 802.11ax/be is
+  paywalled; the kernel's `ieee80211.h` is GPL-2.0 and was not read).
 
 ## Anchoring
 
