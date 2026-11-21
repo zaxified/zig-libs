@@ -60,14 +60,7 @@ const Disagreement = struct {
 /// Real disagreements between this module and the suite, found by running it
 /// and NOT fixed. The old in-tree list (vendored slice) was empty; this one is
 /// from the first run against the full suite on 2026-10-24 (2164 manifest entries).
-const known_disagreements = [_]Disagreement{
-    .{
-        .id = "x-rmt-008b",
-        .parses_but_not_wf = false,
-        .why = "XML 1.0 5th ed. allows any 1.x VersionNum (here 1.7); this module " ++
-            "refuses every version but 1.0 (UnsupportedVersion) -- the strict direction",
-    },
-};
+const known_disagreements = [_]Disagreement{};
 
 fn isKnown(id: []const u8, parses_but_not_wf: bool) ?Disagreement {
     for (known_disagreements) |k| {

@@ -87,20 +87,8 @@ def oracle(data, entities):
 
 
 # Deliberate deviations from libxml2, id -> "accept" | ErrorName. Filled by hand
-# after reading the cause (see the comment on each).
-OURS = {
-    # Measured 2026-10-24 with tools/probe.zig. Each is a place where this module is MORE
-    # LENIENT than libxml2 (the direction that matters for a signature verifier); they are
-    # recorded, not fixed, by the commit that introduced this file -- see CHANGELOG.
-    # NSC "Reserved Prefixes and Namespace Names": the XML namespace as the DEFAULT namespace.
-    "r-ns-xml-uri-default": "accept",
-    # Under doctype=.ignore the DOCTYPE is skipped without checking its position or shape.
-    "r-dt-two": "accept",            # second DOCTYPE
-    "r-dt-after-root": "accept",     # DOCTYPE after the root element
-    "r-dt-in-content": "accept",     # DOCTYPE inside the root element
-    "r-dt-no-name": "accept",        # <!DOCTYPE> with no name
-    "r-dt-bad-subset-open": "accept",  # <!DOCTYPE a ]> (] without [)
-}
+# after reading the cause (see the comment on each). None at present.
+OURS = {}
 
 cases = []  # (id, sections, desc, bytes, mode)
 
@@ -124,6 +112,7 @@ add("r-decl-version-unquoted", "2.8 [24]", "version value without quotes", '<?xm
 add("r-decl-version-mixed-quotes", "2.8 [24]", "version quoted with ' and \"", "<?xml version='1.0\"?><a/>")
 add("r-decl-version-empty", "2.8 [26]", "empty VersionNum", '<?xml version=""?><a/>')
 add("r-decl-version-letters", "2.8 [26]", "VersionNum with letters", '<?xml version="1.x"?><a/>')
+add("a-decl-version-1x", "2.8 [26]", "5th-edition VersionNum 1.7 (read as 1.0)", '<?xml version="1.7"?><a/>')
 add("r-decl-version-3", "2.8 [26]", "unsupported major version", '<?xml version="3.0"?><a/>')
 add("r-decl-order", "2.8 [23]", "standalone before encoding", '<?xml version="1.0" standalone="yes" encoding="UTF-8"?><a/>')
 add("r-decl-standalone-value", "2.9 [32]", "standalone other than yes/no", '<?xml version="1.0" standalone="maybe"?><a/>')

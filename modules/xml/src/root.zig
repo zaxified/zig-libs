@@ -751,6 +751,8 @@ const Parser = struct {
     ids: std.StringHashMapUnmanaged(*Element),
     stack: std.ArrayList(Open) = .empty,
     stats: ?*Stats = null,
+    /// A DOCTYPE declaration has been read (a document has at most one).
+    doctype_seen: bool = false,
     /// Elements seen so far — the breadth counterpart to `stack.items.len`.
     n_elements: usize = 0,
     source_encoding: SourceEncoding = .utf8,
@@ -839,7 +841,7 @@ const Parser = struct {
         // version (required, must be 1.0)
         if (!self.starts("version")) return error.UnsupportedVersion;
         const ver = try self.parsePseudoAttr("version");
-        if (!std.mem.eql(u8, ver, "1.0")) return error.UnsupportedVersion;
+        if (!isVersionNum(ver) or std.mem.eql(u8, ver, "1.1")) return error.UnsupportedVersion;
         version.* = ver;
 
         // Grammar: XMLDecl ::= '<?xml' VersionInfo (S EncodingDecl)?
@@ -875,6 +877,14 @@ const Parser = struct {
         }
         if (!self.starts("?>")) return error.MalformedPI;
         self.i += 2;
+    }
+
+    /// XML 1.0 5th ed. [26] VersionNum ::= '1.' [0-9]+ (every `1.x` is read as
+    /// 1.0, as libxml2 does; `1.1` itself is refused, see Backlog).
+    fn isVersionNum(v: []const u8) bool {
+        if (v.len < 3 or v[0] != '1' or v[1] != '.') return false;
+        for (v[2..]) |c| if (c < '0' or c > '9') return false;
+        return true;
     }
 
     /// Does the declared `encoding` name the encoding the bytes were
@@ -952,6 +962,8 @@ const Parser = struct {
                     if (self.stack.items.len == 0) return error.TrailingContent;
                     try self.parseCData();
                 } else if (self.starts("<!DOCTYPE")) {
+                    // XML 1.0 [22]: one doctypedecl, in the prolog, before the root.
+                    if (self.stack.items.len != 0 or root.* != null or self.doctype_seen) return error.UnexpectedChar;
                     try self.parseDoctype();
                 } else return error.UnexpectedChar;
             },
@@ -974,9 +986,13 @@ const Parser = struct {
     // ── DOCTYPE ─────────────────────────────────────────────────────────────
     fn parseDoctype(self: *Parser) ParseError!void {
         if (self.opts.doctype == .reject) return error.DoctypeForbidden;
+        self.doctype_seen = true;
         // .ignore: skip the whole declaration without ever parsing entity decls
         // or touching an external subset. Balances a `[ internal subset ]`.
         self.i += "<!DOCTYPE".len;
+        // [28] 'DOCTYPE' S Name: the root's name is required.
+        try self.requireWs();
+        _ = try self.parseNameRaw();
         // Quote state is tracked for the ENTIRE declaration, not just inside
         // `[ ... ]` -- a `>` inside a quoted SYSTEM/PUBLIC literal in the
         // EXTERNAL part (e.g. `SYSTEM "a>b"`) used to end the skip early,
@@ -1037,6 +1053,9 @@ const Parser = struct {
             } else if (c == '>') {
                 self.i += 1;
                 return;
+            } else if (c == ']') {
+                // A `]` with no open `[` (the subset's own `]` is consumed above).
+                return error.UnexpectedChar;
             } else {
                 self.i += 1;
             }
@@ -1447,6 +1466,9 @@ const Parser = struct {
                 // xmlns="..." — value may be "" (undeclare). May not be the
                 // reserved xmlns URI.
                 if (std.mem.eql(u8, ra.value, xmlns_ns)) return error.NamespaceError;
+                // NSC "Reserved Prefixes and Namespace Names": the XML namespace is
+                // bound to `xml` only, never as the default.
+                if (std.mem.eql(u8, ra.value, xml_ns)) return error.NamespaceError;
                 try ns_decls.append(self.a, .{ .prefix = "", .uri = ra.value });
             } else if (std.mem.eql(u8, ra.name.prefix, "xmlns")) {
                 // prefixed namespace declaration
@@ -2380,6 +2402,28 @@ test "not-wf: literal noncharacter U+FFFE/U+FFFF rejected in text, attr value, c
     // The adjoining valid boundary must still be accepted.
     var ok = try parse(testing.allocator, "<a>\u{FFFD}</a>", .{});
     defer ok.deinit();
+}
+
+test "DOCTYPE: one, named, in the prolog, under both accepting policies" {
+    const bad = [_][]const u8{
+        "<!DOCTYPE a><!DOCTYPE a><a/>",
+        "<a/><!DOCTYPE a>",
+        "<!DOCTYPE a><a><!DOCTYPE a></a>",
+        "<!DOCTYPE><a/>",
+        "<!DOCTYPEa><a/>",
+        "<!DOCTYPE a ]><a/>",
+    };
+    for (bad) |src| {
+        try testing.expectError(error.UnexpectedChar, parse(testing.allocator, src, .{ .doctype = .ignore }));
+        const r = parse(testing.allocator, src, .{ .doctype = .internal_entities });
+        try testing.expect(std.meta.isError(r));
+    }
+    var ok = try parse(testing.allocator, "<!-- c --><!DOCTYPE a [<!ENTITY e \"x\">]><a>&e;</a>", .{ .doctype = .internal_entities });
+    ok.deinit();
+}
+
+test "xmlns bound to the XML namespace URI as the default is refused" {
+    try testing.expectError(error.NamespaceError, parse(testing.allocator, "<a xmlns=\"" ++ xml_ns ++ "\"/>", .{}));
 }
 
 test "doctype=.ignore: internal subset skip is quote- and comment-aware" {

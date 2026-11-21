@@ -184,7 +184,7 @@ outside the root.
 - **Not a validating parser** — no DTD content-model validation; no
   attribute-default or ID/IDREF typing from a DTD (the ID heuristic above stands
   in for the SAML/dsig use case).
-- **No XML 1.1** yet (`version` must be `1.0`, else `UnsupportedVersion`; deferred, see Backlog).
+- **No XML 1.1** yet (`version` must be `1.` and digits, `1.1` itself and anything else is `UnsupportedVersion`; every other `1.x` is read as 1.0, like libxml2; deferred, see Backlog).
 - **No XPath** — the `xmldsig`/`saml` layers navigate the tree directly.
 - **Encodings beyond UTF-8/UTF-16/ISO-8859-1/US-ASCII** are rejected
   (`UnsupportedEncoding`); those four are transcoded to UTF-8.
@@ -295,17 +295,10 @@ Run with `scripts/modtest xml` (`zig build test-xml`).
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** `src/wf_test.zig` runs 491 OWN inputs (`src/wf_vectors.zig`, 245 not-well-formed + 246 well-formed, written for the XML 1.0 productions and the Namespaces 1.0 constraints; recipe `tools/gen_wf_vectors.py`) through `parse`; the verdict for each, and the infoset of each accepted one, is libxml2's (through lxml, as a black box). Six deliberate deviations are recorded in the recipe (`ours`): five places where `doctype = .ignore` skips a misplaced or malformed DOCTYPE that libxml2 refuses, and `xmlns="<XML namespace>"` accepted (CR inside CDATA sections, the third finding, was fixed 2026-10-24). `core_test.zig` replays the accepted ones through `.internal_entities` and the writer. The W3C suite is not in the repository (its files grant no right to redistribute): `tools/xmlconf_fetch.sh` downloads it, sha256-pinned, into a gitignored directory and `tools/xmlconf_run.zig` runs it by hand (2026-10-24: 883 pass, 1 known disagreement, 0 unexpected; see `tools/README.md`).
+**What the tests actually contain.** `src/wf_test.zig` runs 492 OWN inputs (`src/wf_vectors.zig`, 245 not-well-formed + 247 well-formed, written for the XML 1.0 productions and the Namespaces 1.0 constraints; recipe `tools/gen_wf_vectors.py`) through `parse`; the verdict for each, and the infoset of each accepted one, is libxml2's (through lxml, as a black box). No deliberate deviation from libxml2 is recorded (the recipe's `ours` table is empty). `core_test.zig` replays the accepted ones through `.internal_entities` and the writer. The W3C suite is not in the repository (its files grant no right to redistribute): `tools/xmlconf_fetch.sh` downloads it, sha256-pinned, into a gitignored directory and `tools/xmlconf_run.zig` runs it by hand (883 pass, 0 known disagreements, 0 unexpected, as last run; see `tools/README.md`).
 
 ## Backlog / deferred
 
-- **Leniencies against libxml2** (recorded as `OURS` in `tools/gen_wf_vectors.py`,
-  pinned by `wf_test.zig`, not yet fixed; fixing each flips its `OURS` entry):
-  (1) under `doctype = .ignore` a second, misplaced, nameless or
-  `]`-without-`[` DOCTYPE is accepted; (2) `xmlns` bound to the XML namespace URI
-  as the default namespace is accepted. Also open: XML 1.0 5th-edition version
-  numbers (`1.7`, `x-rmt-008b`) are refused (`UnsupportedVersion`), the W3C
-  runner's one known disagreement.
 - **Streaming (pull/SAX) reader** — expat, quick-xml and zig-xml are
   stream-first; a user with a large document, or one arriving in chunks, cannot
   use a whole-document tree. A resumable tokenizer is a second parser with its

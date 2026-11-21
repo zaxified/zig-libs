@@ -91,7 +91,7 @@ zig build-exe -O ReleaseSafe --dep xml -Mmain=modules/xml/tools/xmlconf_run.zig 
 <scratch>/xmlconf_run            # from the repo root; exit 1 on an unexpected verdict
 ```
 
-Measured 2026-10-24: `tests=2164 pass=883 known=1 FAIL=0`; out of scope 67 valid
+`tests=2164 pass=884 known=0 FAIL=0` expected (measured 2026-10-24 as 883 pass + 1 known: `x-rmt-008b`, version `1.7`, now accepted; not re-run); out of scope 67 valid
 cases that declare entities under `.ignore`; skipped 126 by TYPE (invalid/error),
 309 for earlier editions, 770 not-wf cases that carry a DOCTYPE, 7 namespace-
-ignorant, 1 for XML 1.1. The one known disagreement is `x-rmt-008b` (version `1.7`).
+ignorant, 1 for XML 1.1.

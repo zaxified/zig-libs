@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Behaviour change (stricter):** `parse` now refuses what libxml2 refuses and it accepted: under `doctype = .ignore` / `.internal_entities` a second DOCTYPE, one after the root or inside content, one with no name (`<!DOCTYPE>`) or a `]` without `[` is `UnexpectedChar`; `xmlns="http://www.w3.org/XML/1998/namespace"` is `NamespaceError`. Also: any XML 1.0 5th-edition `version="1.N"` other than `1.1` is accepted (read as 1.0), as libxml2 does; before, only `1.0` was.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `asciiEqualIgnoreCase` is now an alias of `std.ascii.eqlIgnoreCase` (identical semantics: equal length, per-byte ASCII lower-casing). (duplicate-code pass)
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-10-24** — **Behaviour change (fix):** a CR (CR LF or lone CR) inside a CDATA section is now

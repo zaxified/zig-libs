@@ -43,9 +43,9 @@ test "wf corpus: canary (counts)" {
         if (c.ours != null) deviations += 1;
         if (c.lxml == null) rejected += 1 else accepted += 1;
     }
-    try testing.expectEqual(@as(usize, 6), deviations); // 8 until the CDATA CR fix (2026-10-24)
+    try testing.expectEqual(@as(usize, 0), deviations);
     try testing.expectEqual(@as(usize, 245), rejected);
-    try testing.expectEqual(@as(usize, 246), accepted);
+    try testing.expectEqual(@as(usize, 247), accepted);
     try testing.expectEqual(wf.cases.len, rejected + accepted);
 }
 
