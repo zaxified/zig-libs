@@ -44,14 +44,15 @@ pub const Time = u64;
 /// An 8-octet LSP-ID: system-id (6) + pseudonode-id (1) + LSP-number (1).
 pub const LspId = [8]u8;
 
-/// The comptime ceiling on the number of circuits (interfaces) a store tracks
-/// SRM/SSN flags for. The per-LSP flag sets are fixed-size bitsets of this
-/// width, so there is no per-interface allocation. An interface index is a
-/// `u8 < interface_count <= max_interfaces`.
-pub const max_interfaces: u8 = 32;
+/// The ceiling on the number of circuits (interfaces) a store tracks SRM/SSN
+/// flags for: 255, the most a one-octet circuit index can name (ISO/IEC 10589
+/// §7.2.8.1 Local Circuit ID is one octet, 0 reserved). An interface index is
+/// a `u8 < interface_count <= max_interfaces`. The per-circuit flag queues are
+/// allocated on first use, so a store with 4 circuits pays for 4.
+pub const max_interfaces: u8 = 255;
 
 /// The per-interface flag bitset (SRM or SSN), one bit per circuit index.
-pub const InterfaceSet = std.bit_set.IntegerBitSet(max_interfaces);
+pub const InterfaceSet = std.bit_set.IntegerBitSet(256);
 
 /// ISO 10589 default `ZeroAgeLifetime` (60 s in the reference unit): how long a
 /// purged (zero-lifetime) header is retained so the purge floods before removal.
@@ -143,6 +144,37 @@ pub const Config = struct {
     /// this level must leave out the #10. LSPs are unaffected. Ignored
     /// without `auth_keys`.
     auth_snp: bool = true,
+    /// RFC 7987 minimum remaining lifetime: when non-zero, a received LSP
+    /// of another system that is stored (newer, or new) with a Remaining
+    /// Lifetime below this value is stored with this value instead (RFC 7987
+    /// §2 action vi: "If the Remaining Lifetime of the new LSP is less than
+    /// MaxAge, it is set to MaxAge"), so a lifetime corrupted in flight can
+    /// not age the LSP out before its originator's refresh. RFC 7987 §3.1:
+    /// the value must be at least the locally configured MaxAge (1200 in
+    /// ISO/IEC 10589). `0` (the default) switches the rule off. Purges and
+    /// the system's own LSPs are never raised. The PDU copy the store keeps
+    /// gets the raised lifetime too (it is outside the checksum and the
+    /// authentication digest).
+    lifetime_floor: u16 = 0,
+    /// RFC 6232 Purge Originator Identification: add a #13 TLV carrying this
+    /// system's id to a purge this store makes by aging an LSP out
+    /// (RFC 6232 §3: a system that generates a purge SHOULD include it).
+    /// Off by default, as in holo-isis, where it is an option. A purge
+    /// received from a neighbour is stored as it came and is not given a #13
+    /// naming the neighbour: the store does not know the neighbour's system
+    /// id, and the flooding layer re-sends the stored bytes unchanged.
+    purge_originator: bool = false,
+    /// ISO/IEC 10589 §7.3.19 LSPDBOverload: `insert` of a new LSP-ID that
+    /// does not fit (`error.DatabaseFull`) puts the store in the overloaded
+    /// state, readable with `Lsdb.isOverloaded`, which the LSP generator
+    /// turns into the overload bit of its LSP 0. `false` keeps the state
+    /// permanently clear (the error is still returned).
+    lspdb_overload: bool = true,
+    /// How long, in `Time` units, the store must have stayed below `capacity`
+    /// before `tick` clears the overloaded state again. Any `DatabaseFull`
+    /// during the wait restarts it. ISO/IEC 10589 §7.3.19 leaves the wait to
+    /// the implementation; a minute covers several CSNP rounds.
+    overload_recovery: u16 = 60,
 };
 
 /// TLV codes a purge may carry when authentication is in use: Authentication
@@ -151,7 +183,10 @@ pub const Config = struct {
 /// TLVs other than the authentication TLV"; RFC 6233 §3 replaces that with
 /// the IANA registry's "Purge" column, which marks exactly these three
 /// (holo-isis `valid_purge_tlvs` accepts the same set).
-pub const purge_allowed_tlvs = [_]u8{ isis.auth.tlv_code, 13, isis.tlvs.code.dynamic_hostname };
+pub const purge_allowed_tlvs = [_]u8{ isis.auth.tlv_code, purge_originator_tlv, isis.tlvs.code.dynamic_hostname };
+
+/// TLV 13, Purge Originator Identification (RFC 6232).
+const purge_originator_tlv: u8 = 13;
 
 pub const InsertError = error{
     /// The store is at `capacity` and this is a new distinct LSP-ID.
@@ -222,6 +257,9 @@ pub const AgeReport = struct {
     /// Request placeholders whose `Config.request_timeout` elapsed without the
     /// requested LSP ever arriving, and which were dropped this tick.
     requests_expired: usize = 0,
+    /// The LSPDBOverload state ended this tick (`Lsdb.isOverloaded` is now
+    /// false): the LSP generator clears the overload bit it set.
+    overload_cleared: bool = false,
 };
 
 /// A read-only view of a stored entry, aged to the `now` passed to the query.
@@ -320,6 +358,40 @@ const EntryMap = std.AutoHashMapUnmanaged(LspId, Entry);
 /// instead of a full-database scan. See `Lsdb.srm_queue`/`ssn_queue`.
 const FlagQueue = std.AutoArrayHashMapUnmanaged(LspId, void);
 
+/// The per-circuit queues of one flag kind (SRM or SSN), indexed by circuit.
+/// The list grows on the first `put` for a circuit, so a store pays only for
+/// the circuits that were ever flagged; an index past the end reads as empty.
+const FlagQueues = struct {
+    list: std.ArrayList(FlagQueue) = .empty,
+
+    fn deinit(self: *FlagQueues, alloc: std.mem.Allocator) void {
+        for (self.list.items) |*q| q.deinit(alloc);
+        self.list.deinit(alloc);
+    }
+
+    /// Best-effort under allocator failure, as `Lsdb.queueSrm` documents.
+    fn put(self: *FlagQueues, alloc: std.mem.Allocator, iface: u8, id: LspId) void {
+        while (self.list.items.len <= iface) self.list.append(alloc, .empty) catch return;
+        self.list.items[iface].put(alloc, id, {}) catch {};
+    }
+
+    fn remove(self: *FlagQueues, iface: u8, id: LspId) void {
+        if (iface < self.list.items.len) _ = self.list.items[iface].swapRemove(id);
+    }
+
+    fn contains(self: *const FlagQueues, iface: u8, id: LspId) bool {
+        return iface < self.list.items.len and self.list.items[iface].contains(id);
+    }
+
+    fn len(self: *const FlagQueues, iface: u8) usize {
+        return if (iface < self.list.items.len) self.list.items[iface].count() else 0;
+    }
+
+    fn keys(self: *const FlagQueues, iface: u8) []const LspId {
+        return if (iface < self.list.items.len) self.list.items[iface].keys() else &.{};
+    }
+};
+
 /// The link-state database. Single-owner: one caller/loop drives it; it holds no
 /// shared state and takes a lock nowhere.
 pub const Lsdb = struct {
@@ -334,6 +406,10 @@ pub const Lsdb = struct {
     /// steady-state tick allocates nothing once it has warmed up to the
     /// high-water mark of entries removed in one tick.
     tick_victims: std.ArrayList(LspId) = .empty,
+    /// ISO/IEC 10589 §7.3.19 LSPDBOverload state, see `isOverloaded`.
+    overloaded: bool = false,
+    /// While overloaded and below capacity: when `tick` may clear the state.
+    overload_clear_at: ?Time = null,
     /// The SRM/SSN flooding-flag queues, one per circuit — the **sole**
     /// record of which LSP-IDs are flagged on which interface (audit F7). The
     /// previous shape stored an `InterfaceSet` bitset *per Entry* and
@@ -359,9 +435,9 @@ pub const Lsdb = struct {
     /// forever (the entry itself was never observable this way, since
     /// `FlagIterator` cross-checks against `map` — but the *union* query
     /// was not, before that test).
-    srm_queue: [max_interfaces]FlagQueue = @as([max_interfaces]FlagQueue, @splat(.empty)),
+    srm_queue: FlagQueues = .{},
     /// SSN counterpart of `srm_queue`. See there.
-    ssn_queue: [max_interfaces]FlagQueue = @as([max_interfaces]FlagQueue, @splat(.empty)),
+    ssn_queue: FlagQueues = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: Config) Lsdb {
         std.debug.assert(cfg.interface_count <= max_interfaces);
@@ -375,8 +451,8 @@ pub const Lsdb = struct {
         }
         self.map.deinit(self.alloc);
         self.tick_victims.deinit(self.alloc);
-        for (&self.srm_queue) |*q| q.deinit(self.alloc);
-        for (&self.ssn_queue) |*q| q.deinit(self.alloc);
+        self.srm_queue.deinit(self.alloc);
+        self.ssn_queue.deinit(self.alloc);
     }
 
     /// Number of stored LSP-IDs (includes request placeholders).
@@ -524,7 +600,7 @@ pub const Lsdb = struct {
                 if (!e.is_request) {
                     self.setSrmAll(id);
                     var i: u8 = 0;
-                    while (i < self.cfg.interface_count) : (i += 1) _ = self.ssn_queue[i].swapRemove(id);
+                    while (i < self.cfg.interface_count) : (i += 1) self.ssn_queue.remove(i, id);
                 }
                 return .{ .ordering = ord, .stored = false, .lsp_id = id, .self_challenge = lsp.sequence_number };
             }
@@ -538,7 +614,7 @@ pub const Lsdb = struct {
             const ord = if (e.is_request) Ordering.newer else compare(incoming, e.versionAt(now));
             switch (ord) {
                 .newer => {
-                    try self.fillEntry(e, lsp, bytes, now);
+                    try self.fillEntry(e, lsp, bytes, now, from_peer);
                     self.applyNewer(id, arrival_iface);
                 },
                 .same => self.applySame(id, arrival_iface),
@@ -552,9 +628,15 @@ pub const Lsdb = struct {
             // Purge for an unknown LSP → ignore (nothing to purge; not stored).
             return .{ .ordering = .same, .stored = false, .lsp_id = id };
         }
-        if (self.map.count() >= self.cfg.capacity) return error.DatabaseFull;
+        if (self.map.count() >= self.cfg.capacity) {
+            if (self.cfg.lspdb_overload) {
+                self.overloaded = true;
+                self.overload_clear_at = null;
+            }
+            return error.DatabaseFull;
+        }
         const gop = try self.map.getOrPut(self.alloc, id);
-        gop.value_ptr.* = try self.newEntry(lsp, bytes, now);
+        gop.value_ptr.* = try self.newEntry(lsp, bytes, now, from_peer);
         self.applyNewer(id, arrival_iface);
         return .{ .ordering = .newer, .stored = true, .lsp_id = id };
     }
@@ -603,11 +685,11 @@ pub const Lsdb = struct {
     }
 
     /// Build a fresh owned entry from a decoded LSP (dupes the PDU bytes).
-    fn newEntry(self: *Lsdb, lsp: isis.Lsp, bytes: []const u8, now: Time) !Entry {
+    fn newEntry(self: *Lsdb, lsp: isis.Lsp, bytes: []const u8, now: Time, from_peer: bool) !Entry {
         const owned = try self.dupeRetainedBytes(lsp, bytes);
         return .{
             .sequence_number = lsp.sequence_number,
-            .initial_lifetime = lsp.remaining_lifetime,
+            .initial_lifetime = self.floored(lsp, owned, from_peer),
             .checksum = lsp.checksum,
             .flags = lsp.flags,
             .set_now = now,
@@ -621,17 +703,29 @@ pub const Lsdb = struct {
         };
     }
 
+    /// The Remaining Lifetime a stored copy of `lsp` starts aging from:
+    /// `lsp.remaining_lifetime`, raised to `Config.lifetime_floor` for a live
+    /// LSP of another system received from a circuit (RFC 7987 §2 action vi).
+    /// The raised value is written into `owned` (the stored PDU copy) too.
+    fn floored(self: *const Lsdb, lsp: isis.Lsp, owned: []u8, from_peer: bool) u16 {
+        const floor = self.cfg.lifetime_floor;
+        if (floor == 0 or !from_peer or lsp.remaining_lifetime == 0 or lsp.remaining_lifetime >= floor) return lsp.remaining_lifetime;
+        if (std.mem.eql(u8, lsp.lsp_id[0..6], &self.cfg.local_system_id)) return lsp.remaining_lifetime;
+        std.mem.writeInt(u16, owned[10..12], floor, .big);
+        return floor;
+    }
+
     /// Replace an existing entry's contents with a newer decoded LSP (frees the
     /// old bytes, dupes the new). Resets purge/refresh/request state; the caller
     /// then re-applies the flooding flags.
-    fn fillEntry(self: *Lsdb, e: *Entry, lsp: isis.Lsp, bytes: []const u8, now: Time) !void {
+    fn fillEntry(self: *Lsdb, e: *Entry, lsp: isis.Lsp, bytes: []const u8, now: Time, from_peer: bool) !void {
         const owned = try self.dupeRetainedBytes(lsp, bytes);
         if (e.bytes.len > 0) self.alloc.free(e.bytes);
         // The placeholder is being satisfied — give its slot back to the budget.
         if (e.is_request) self.request_count -= 1;
         e.bytes = owned;
         e.sequence_number = lsp.sequence_number;
-        e.initial_lifetime = lsp.remaining_lifetime;
+        e.initial_lifetime = self.floored(lsp, owned, from_peer);
         e.checksum = lsp.checksum;
         e.flags = lsp.flags;
         e.set_now = now;
@@ -649,12 +743,12 @@ pub const Lsdb = struct {
     /// comparison event re-attempts it, so nothing is silently lost forever,
     /// only deferred.
     fn queueSrm(self: *Lsdb, id: LspId, iface: u8) void {
-        self.srm_queue[iface].put(self.alloc, id, {}) catch {};
+        self.srm_queue.put(self.alloc, iface, id);
     }
 
     /// Add `id` to interface `iface`'s SSN queue. See `queueSrm`.
     fn queueSsn(self: *Lsdb, id: LspId, iface: u8) void {
-        self.ssn_queue[iface].put(self.alloc, id, {}) catch {};
+        self.ssn_queue.put(self.alloc, iface, id);
     }
 
     fn setSsnIfP2p(self: *Lsdb, id: LspId, iface: u8) void {
@@ -663,12 +757,12 @@ pub const Lsdb = struct {
 
     /// Remove `id` from every interface's SRM and SSN queue — the queue
     /// counterpart of resetting an `InterfaceSet` bitset to empty. Bounded by
-    /// `interface_count` (<= `max_interfaces` = 32), not by database size.
+    /// `interface_count` (<= `max_interfaces` = 255), not by database size.
     fn dequeueAll(self: *Lsdb, id: LspId) void {
         var i: u8 = 0;
         while (i < self.cfg.interface_count) : (i += 1) {
-            _ = self.srm_queue[i].swapRemove(id);
-            _ = self.ssn_queue[i].swapRemove(id);
+            self.srm_queue.remove(i, id);
+            self.ssn_queue.remove(i, id);
         }
     }
 
@@ -684,7 +778,7 @@ pub const Lsdb = struct {
 
     fn applySame(self: *Lsdb, id: LspId, arrival_iface: ?u8) void {
         if (arrival_iface) |a| {
-            _ = self.srm_queue[a].swapRemove(id);
+            self.srm_queue.remove(a, id);
             self.setSsnIfP2p(id, a);
         }
     }
@@ -692,8 +786,19 @@ pub const Lsdb = struct {
     fn applyOlder(self: *Lsdb, id: LspId, arrival_iface: ?u8) void {
         if (arrival_iface) |a| {
             self.queueSrm(id, a);
-            _ = self.ssn_queue[a].swapRemove(id);
+            self.ssn_queue.remove(a, id);
         }
+    }
+
+    /// ISO/IEC 10589 §7.3.19 LSPDBOverload: `true` from the moment an
+    /// `insert` of a new LSP-ID fails with `error.DatabaseFull` (the LSP is
+    /// shed: discarded, store unchanged) until `tick` has seen the store
+    /// below `capacity` for `Config.overload_recovery`. While it is `true`
+    /// the LSP generator advertises the overload bit in its LSP 0 so other
+    /// systems stop routing transit traffic through this one. Always `false`
+    /// with `Config.lspdb_overload = false`.
+    pub fn isOverloaded(self: *const Lsdb) bool {
+        return self.overloaded;
     }
 
     // ── aging + purge (ISO 10589 §7.3.16.4) ─────────────────────────────────
@@ -784,6 +889,22 @@ pub const Lsdb = struct {
             }
         }
 
+        // LSPDBOverload recovery (§7.3.19): clear once the store has stayed
+        // below capacity for `overload_recovery`.
+        if (self.overloaded) {
+            if (self.map.count() >= self.cfg.capacity) {
+                self.overload_clear_at = null;
+            } else if (self.overload_clear_at) |at| {
+                if (now >= at) {
+                    self.overloaded = false;
+                    self.overload_clear_at = null;
+                    rep.overload_cleared = true;
+                }
+            } else {
+                self.overload_clear_at = now + self.cfg.overload_recovery;
+            }
+        }
+
         return rep;
     }
 
@@ -817,7 +938,7 @@ pub const Lsdb = struct {
     /// their own aging instead of by this purge.
     fn retainHeaderOnly(self: *Lsdb, e: *Entry) void {
         if (e.bytes.len < isis.pdu.lsp_fixed_len) return; // request placeholder
-        if (self.cfg.auth_keys.len != 0 and self.retainSignedPurge(e)) return;
+        if ((self.cfg.auth_keys.len != 0 or self.cfg.purge_originator) and self.retainSignedPurge(e)) return;
         if (e.bytes.len > isis.pdu.lsp_fixed_len) {
             if (self.alloc.realloc(e.bytes, isis.pdu.lsp_fixed_len)) |shrunk| {
                 e.bytes = shrunk;
@@ -835,17 +956,24 @@ pub const Lsdb = struct {
     /// digest does not cover it (RFC 5304 §2). Returns false, leaving `e`
     /// untouched, when the TLV does not fit or the allocation fails.
     fn retainSignedPurge(self: *Lsdb, e: *Entry) bool {
-        const key = self.cfg.auth_keys[0];
         const hl = isis.pdu.lsp_fixed_len;
-        var tmp: [hl + 2 + isis.tlv.max_value_len]u8 = undefined;
+        var tmp: [hl + 2 + isis.tlv.max_value_len + 2 + 7]u8 = undefined;
         @memcpy(tmp[0..hl], e.bytes[0..hl]);
         const carried = tmp[isis.pdu.lsp_checksum_off..][0..2].*;
         stampPurgeHeader(tmp[0..hl]);
         var tb = isis.tlv.Builder.init(tmp[hl..]);
-        isis.auth.addPlaceholder(&tb, key) catch return false;
+        const keyed = self.cfg.auth_keys.len != 0;
+        if (keyed) isis.auth.addPlaceholder(&tb, self.cfg.auth_keys[0]) catch return false;
+        if (self.cfg.purge_originator) {
+            // RFC 6232 §3: one system id, our own.
+            var poi: [7]u8 = undefined;
+            poi[0] = 1;
+            @memcpy(poi[1..], &self.cfg.local_system_id);
+            tb.addTlv(purge_originator_tlv, &poi) catch return false;
+        }
         const n = hl + tb.pos;
         std.mem.writeInt(u16, tmp[8..10], @intCast(n), .big);
-        isis.auth.sign(tmp[0..n], key) catch return false;
+        if (keyed) isis.auth.sign(tmp[0..n], self.cfg.auth_keys[0]) catch return false;
         tmp[isis.pdu.lsp_checksum_off..][0..2].* = carried;
         const resized = self.alloc.realloc(e.bytes, n) catch return false;
         @memcpy(resized, tmp[0..n]);
@@ -880,7 +1008,7 @@ pub const Lsdb = struct {
         var acc = InterfaceSet.empty;
         var i: u8 = 0;
         while (i < self.cfg.interface_count) : (i += 1) {
-            if (self.srm_queue[i].count() != 0) acc.set(i);
+            if (self.srm_queue.len(i) != 0) acc.set(i);
         }
         return acc;
     }
@@ -891,7 +1019,7 @@ pub const Lsdb = struct {
         var acc = InterfaceSet.empty;
         var i: u8 = 0;
         while (i < self.cfg.interface_count) : (i += 1) {
-            if (self.srm_queue[i].contains(id)) acc.set(i);
+            if (self.srm_queue.contains(i, id)) acc.set(i);
         }
         return acc;
     }
@@ -909,7 +1037,7 @@ pub const Lsdb = struct {
     pub fn srmIsSet(self: *const Lsdb, id: LspId, iface: u8) bool {
         if (iface >= self.cfg.interface_count) return false;
         if (!self.map.contains(id)) return false;
-        return self.srm_queue[iface].contains(id);
+        return self.srm_queue.contains(iface, id);
     }
 
     /// The SSN flag set for one LSP, or `null` if it is not stored.
@@ -918,7 +1046,7 @@ pub const Lsdb = struct {
         var acc = InterfaceSet.empty;
         var i: u8 = 0;
         while (i < self.cfg.interface_count) : (i += 1) {
-            if (self.ssn_queue[i].contains(id)) acc.set(i);
+            if (self.ssn_queue.contains(i, id)) acc.set(i);
         }
         return acc;
     }
@@ -926,39 +1054,39 @@ pub const Lsdb = struct {
     /// Clear the SRM flag for `id` on `iface` — the flooding layer calls this
     /// after transmitting the LSP out that circuit.
     pub fn clearSrm(self: *Lsdb, id: LspId, iface: u8) void {
-        _ = self.srm_queue[iface].swapRemove(id);
+        self.srm_queue.remove(iface, id);
     }
 
     /// Clear the SSN flag for `id` on `iface` — called after the PSNP ack for it
     /// has been sent out that circuit.
     pub fn clearSsn(self: *Lsdb, id: LspId, iface: u8) void {
-        _ = self.ssn_queue[iface].swapRemove(id);
+        self.ssn_queue.remove(iface, id);
     }
 
     /// Iterate the LSPs with SRM set on `iface` — the flooding loop for one
     /// circuit. Read `bytes` to transmit, then `clearSrm`. Do not mutate the
     /// store (in particular, do not `clearSrm`/`clearSsn` on this same
     /// interface) while iterating — same contract as before, now because it
-    /// walks `srm_queue[iface]`'s dense array directly rather than the whole
+    /// walks `srm_queue`'s queue for `iface`'s dense array directly rather than the whole
     /// map.
     ///
     /// **Iteration order changed by this fix.** It used to be
     /// `self.map.iterator()`'s bucket order (a function of the whole
     /// database's insertion/rehash history) filtered down to the flagged
-    /// subset; it is now `srm_queue[iface]`'s own insertion order — the order
+    /// subset; it is now `srm_queue`'s queue for `iface`'s own insertion order — the order
     /// in which SRM was most recently *set* on this circuit for each id
     /// (FIFO, matching the reference per-circuit send queue). Both are
     /// deterministic for a given operation sequence (which is what
     /// `isis-flood`'s determinism test actually pins), but the specific
     /// sequence differs from before this commit.
     pub fn srmIterator(self: *const Lsdb, iface: u8) FlagIterator {
-        return .{ .ids = self.srm_queue[iface].keys(), .idx = 0, .map = &self.map };
+        return .{ .ids = self.srm_queue.keys(iface), .idx = 0, .map = &self.map };
     }
 
     /// Iterate the LSPs with SSN set on `iface` — to build a PSNP for one
     /// circuit. Same order note as `srmIterator`.
     pub fn ssnIterator(self: *const Lsdb, iface: u8) FlagIterator {
-        return .{ .ids = self.ssn_queue[iface].keys(), .idx = 0, .map = &self.map };
+        return .{ .ids = self.ssn_queue.keys(iface), .idx = 0, .map = &self.map };
     }
 
     pub const FlagIterator = struct {
@@ -1190,7 +1318,7 @@ pub const Lsdb = struct {
                 // Ours is newer → flood it to them.
                 .older => self.queueSrm(entry.lsp_id, iface),
                 // In sync → stop flooding it to them.
-                .same => _ = self.srm_queue[iface].swapRemove(entry.lsp_id),
+                .same => self.srm_queue.remove(iface, entry.lsp_id),
             }
             return;
         }
@@ -1207,7 +1335,7 @@ pub const Lsdb = struct {
                 // Ours is newer → flood ours to them (SRM).
                 .older => self.queueSrm(entry.lsp_id, iface),
                 // In sync → stop flooding it to them (implicit ack).
-                .same => _ = self.srm_queue[iface].swapRemove(entry.lsp_id),
+                .same => self.srm_queue.remove(iface, entry.lsp_id),
             }
         } else {
             // We lack it. A summary entry that is itself an all-zero purge for an
@@ -2536,4 +2664,137 @@ test "srmIterator walks the LSPs queued for one circuit" {
         n += 1;
     }
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "a store with more than 32 circuits floods on every one and reads past the last flagged circuit as empty" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = max_interfaces, .capacity = 8 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000), 200, 0);
+    const id = idOf(sys_other, 0);
+    // Newer from circuit 200: SRM on every circuit but 200, SSN on 200.
+    const srm = db.srmSet(id).?;
+    try testing.expectEqual(@as(usize, max_interfaces - 1), srm.count());
+    try testing.expect(!srm.isSet(200) and srm.isSet(0) and srm.isSet(254));
+    try testing.expect(db.ssnSet(id).?.isSet(200));
+    try testing.expect(db.srmIsSet(id, 254));
+    db.clearSrm(id, 254);
+    try testing.expect(!db.srmIsSet(id, 254));
+    var it = db.srmIterator(100);
+    try testing.expect(it.next() != null);
+    // A circuit nothing was ever flagged on (queue never allocated) is empty.
+    var small = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer small.deinit();
+    var it2 = small.srmIterator(40);
+    try testing.expect(it2.next() == null);
+    small.clearSrm(id, 40);
+    small.clearSsn(id, 40);
+}
+
+test "LSPDBOverload: DatabaseFull sets the state; tick clears it after the recovery wait below capacity" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 2, .overload_recovery = 30, .zero_age_lifetime = 10 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    try testing.expect(!db.isOverloaded());
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 20), 0, 0);
+    _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 1000), 0, 0);
+    try testing.expect(!db.isOverloaded()); // exactly full is not overload
+    // An update of a stored LSP-ID at capacity is not a shed.
+    _ = try db.insert(buildLsp(&buf, sys_other, 1, 2, 1000), 0, 0);
+    try testing.expect(!db.isOverloaded());
+    try testing.expectError(error.DatabaseFull, db.insert(buildLsp(&buf, sys_other, 2, 1, 1000), 0, 1));
+    try testing.expect(db.isOverloaded());
+    try testing.expectEqual(@as(usize, 2), db.count()); // shed: store unchanged
+    // Still full: no recovery timer.
+    try testing.expect(!db.tick(5).overload_cleared);
+    try testing.expect(db.isOverloaded());
+    // LSP 0 ages out (t=20), purge hold 10 -> removed at t=30: room again.
+    _ = db.tick(20);
+    const r = db.tick(30);
+    try testing.expectEqual(@as(usize, 1), r.removed);
+    try testing.expect(db.isOverloaded()); // the wait starts now
+    try testing.expect(!db.tick(59).overload_cleared);
+    try testing.expect(db.isOverloaded());
+    // A DatabaseFull during the wait restarts it.
+    _ = try db.insert(buildLsp(&buf, sys_other, 3, 1, 1000), 0, 60);
+    try testing.expectError(error.DatabaseFull, db.insert(buildLsp(&buf, sys_other, 4, 1, 1000), 0, 60));
+    try testing.expect(!db.tick(61).overload_cleared);
+}
+
+test "LSPDBOverload: recovery clears exactly at the end of the wait; the switch keeps the state clear" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 1, .overload_recovery = 30, .zero_age_lifetime = 10 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 5), 0, 0);
+    try testing.expectError(error.DatabaseFull, db.insert(buildLsp(&buf, sys_other, 1, 1, 1000), 0, 0));
+    try testing.expect(db.isOverloaded());
+    _ = db.tick(5); // purge hold until 15
+    _ = db.tick(15); // removed; recovery wait starts: clears at 45
+    try testing.expect(db.isOverloaded());
+    try testing.expect(!db.tick(44).overload_cleared);
+    const r = db.tick(45);
+    try testing.expect(r.overload_cleared);
+    try testing.expect(!db.isOverloaded());
+    try testing.expect(!db.tick(46).overload_cleared);
+
+    var off = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 1, .lspdb_overload = false });
+    defer off.deinit();
+    _ = try off.insert(buildLsp(&buf, sys_other, 0, 1, 1000), 0, 0);
+    try testing.expectError(error.DatabaseFull, off.insert(buildLsp(&buf, sys_other, 1, 1, 1000), 0, 0));
+    try testing.expect(!off.isOverloaded());
+}
+
+test "RFC 7987 lifetime floor: a received live LSP below the floor is stored and aged from the floor" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .lifetime_floor = 1200 });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 5), 0, 0);
+    const id = idOf(sys_other, 0);
+    try testing.expectEqual(@as(?u16, 1195), db.remainingLifetime(id, 5));
+    // The stored PDU carries the raised lifetime.
+    const l = try isis.Lsp.decode(db.get(id, 0).?.bytes);
+    try testing.expectEqual(@as(u16, 1200), l.remaining_lifetime);
+    // Not purged at its received lifetime.
+    try testing.expectEqual(@as(usize, 0), db.tick(6).entered_purge);
+    // A value at or above the floor is kept; a newer LSP is floored again.
+    _ = try db.insert(buildLsp(&buf, sys_other, 1, 1, 1300), 0, 0);
+    try testing.expectEqual(@as(?u16, 1300), db.remainingLifetime(idOf(sys_other, 1), 0));
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 2, 100), 0, 10);
+    try testing.expectEqual(@as(?u16, 1200), db.remainingLifetime(id, 10));
+    // A purge is not raised; a locally originated LSP is not raised.
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 3, 0), 0, 11);
+    try testing.expect(db.get(id, 11).?.is_purge);
+    _ = try db.insert(buildLsp(&buf, sys_local, 0, 1, 50), null, 0);
+    try testing.expectEqual(@as(?u16, 50), db.remainingLifetime(idOf(sys_local, 0), 0));
+    // Off (the default): the received lifetime is kept.
+    var plain = Lsdb.init(testing.allocator, testCfg());
+    defer plain.deinit();
+    _ = try plain.insert(buildLsp(&buf, sys_other, 0, 1, 5), 0, 0);
+    try testing.expectEqual(@as(?u16, 5), plain.remainingLifetime(id, 0));
+}
+
+test "RFC 6232: an aged-out purge carries our system id in a #13 TLV when purge_originator is set" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8, .purge_originator = true });
+    defer db.deinit();
+    var buf: [128]u8 = undefined;
+    const orig = buildLsp(&buf, sys_other, 0, 7, 10);
+    const orig_csum = (try isis.Lsp.decode(orig)).checksum;
+    _ = try db.insert(orig, 0, 0);
+    try testing.expectEqual(@as(usize, 1), db.tick(10).entered_purge);
+    const bytes = db.get(idOf(sys_other, 0), 10).?.bytes;
+    const p = try isis.Lsp.decode(bytes);
+    try testing.expectEqual(@as(u16, 0), p.remaining_lifetime);
+    try testing.expectEqual(orig_csum, p.checksum);
+    try testing.expectEqual(isis.pdu.lsp_fixed_len + 2 + 7, bytes.len);
+    var it = p.tlvIterator();
+    const t = (try it.next()).?;
+    try testing.expectEqual(@as(u8, 13), t.code);
+    try testing.expectEqualSlices(u8, &([_]u8{1} ++ sys_local), t.value);
+    try testing.expect((try it.next()) == null);
+    // Default off: the header alone, as before.
+    var plain = Lsdb.init(testing.allocator, testCfg());
+    defer plain.deinit();
+    _ = try plain.insert(orig, 0, 0);
+    _ = plain.tick(10);
+    try testing.expectEqual(isis.pdu.lsp_fixed_len, plain.get(idOf(sys_other, 0), 10).?.bytes.len);
 }
