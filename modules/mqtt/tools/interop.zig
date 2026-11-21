@@ -21,6 +21,7 @@
 //!     zig build interop-mqtt                 # run both directions, check them
 //!     zig build interop-mqtt -- --capture    # ...and rewrite the transcript
 //!     zig build interop-mqtt -- --tls        # the MQTT-over-TLS recipe only
+//!     zig build interop-mqtt -- --mqttz      # the mqttz client against our broker only
 //!
 //! `--tls` is the tested recipe for TLS on the client side (the module is
 //! transport-agnostic and ships no TLS of its own): our `Client` over this
@@ -42,6 +43,21 @@
 //! are black-box peers — EPL-2.0 OR EDL-1.0, neither source read nor copied
 //! (root NOTICE §0).
 //!
+//! A third client, **karlseguin/mqttz** (MIT, a Zig client, 5.0 and 3.1.1), is
+//! driven against `TcpServer` by `tools/mqttz_driver/main.zig` (QoS 0/1/2 both
+//! ways, retained, unsubscribe, PINGREQ, a Will on a dropped connection). It
+//! decodes and encodes with a codec we did not write, so it is a differential
+//! oracle for the broker; nothing is recorded from it. It builds with Zig
+//! 0.16 (its own toolchain) into the droppable cache:
+//!
+//!     git clone --depth 1 https://github.com/karlseguin/mqttz .zig-cache/mqtt-interop/mqttz
+//!     # two defects of its codec.zig (cf8acd2): `unsubscribe` does not compile
+//!     # (`var pos` is a comptime_int) and `PublishFlags` has DUP and RETAIN
+//!     # swapped, so it sends RETAIN as DUP and reads our retain flag as dup;
+//!     # modules/mqtt/tools/mqttz_driver/mqttz.patch fixes both:
+//!     git -C .zig-cache/mqtt-interop/mqttz apply ../../../modules/mqtt/tools/mqttz_driver/mqttz.patch
+//!     (cd modules/mqtt/tools/mqttz_driver && <zig 0.16> build --prefix ../../../../.zig-cache/mqtt-interop/driver)
+//!
 //! ## What is recorded
 //!
 //! - `case client`: every byte our `Client` wrote to mosquitto and read back,
@@ -62,6 +78,7 @@ const net = std.Io.net;
 const transcript_path = "modules/mqtt/src/testdata/v5_transcript.txt";
 const python = ".zig-cache/mqtt-interop/venv/bin/python";
 const paho_script = "modules/mqtt/tools/paho_v5.py";
+const mqttz_driver = ".zig-cache/mqtt-interop/driver/bin/mqttz-driver";
 const image = "docker.io/library/eclipse-mosquitto:2";
 
 var t0_ns: i96 = 0;
@@ -115,7 +132,7 @@ fn watchdog(io: std.Io) void {
 
 const budget_s = 180;
 var step_name: std.atomic.Value(*const []const u8) = .init(&step_names[0]);
-const step_names = [_][]const u8{ "start", "preflight", "image pull", "podman run", "mosquitto ready", "client vs mosquitto", "paho vs broker", "tls certificates", "tls vs mosquitto" };
+const step_names = [_][]const u8{ "start", "preflight", "image pull", "podman run", "mosquitto ready", "client vs mosquitto", "paho vs broker", "tls certificates", "tls vs mosquitto", "mqttz vs broker" };
 
 /// Names the step the watchdog reports, and prints it: a CI log that ends
 /// mid-run must say where.
@@ -137,11 +154,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var capture = false;
     var tls_only = false;
+    var mqttz_only = false;
     var args = init.args.iterate();
     _ = args.skip();
     while (args.next()) |a| {
-        if (std.mem.eql(u8, a, "--capture")) capture = true else if (std.mem.eql(u8, a, "--tls")) tls_only = true else {
-            std.debug.print("usage: interop-mqtt [--capture | --tls]\n", .{});
+        if (std.mem.eql(u8, a, "--capture")) capture = true else if (std.mem.eql(u8, a, "--tls")) tls_only = true else if (std.mem.eql(u8, a, "--mqttz")) mqttz_only = true else {
+            std.debug.print("usage: interop-mqtt [--capture | --tls | --mqttz]\n", .{});
             return 2;
         }
     }
@@ -153,6 +171,18 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             return 1;
         };
         std.debug.print("interop-mqtt: MQTT over TLS to mosquitto works, and a wrong host name is refused\n", .{});
+        return 0;
+    }
+    if (mqttz_only) {
+        std.Io.Dir.cwd().access(io, mqttz_driver, .{}) catch {
+            std.debug.print("interop-mqtt: no mqttz driver at {s} — see the header of tools/interop.zig\n", .{mqttz_driver});
+            return 1;
+        };
+        mqttzVsBroker(gpa, io) catch |e| {
+            std.debug.print("mqttz vs broker: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        std.debug.print("interop-mqtt: the mqttz client and our broker agree\n", .{});
         return 0;
     }
     step(1);
@@ -171,6 +201,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         std.debug.print("paho vs broker: {s}\n", .{@errorName(e)});
         return 1;
     };
+    mqttzVsBroker(gpa, io) catch |e| {
+        std.debug.print("mqttz vs broker: {s}\n", .{@errorName(e)});
+        return 1;
+    };
     if (capture) {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = transcript_path, .data = out.items });
         std.debug.print("interop-mqtt: transcript written to {s}\n", .{transcript_path});
@@ -187,6 +221,10 @@ fn preflight(io: std.Io) !void {
     std.Io.Dir.cwd().access(io, python, .{}) catch {
         std.debug.print("interop-mqtt: no paho venv at {s} — python3 -m venv .zig-cache/mqtt-interop/venv && .zig-cache/mqtt-interop/venv/bin/pip install paho-mqtt==2.1.0\n", .{python});
         return error.PahoVenvMissing;
+    };
+    std.Io.Dir.cwd().access(io, mqttz_driver, .{}) catch {
+        std.debug.print("interop-mqtt: no mqttz driver at {s} — see the header of tools/interop.zig (git clone karlseguin/mqttz, apply the patch, zig 0.16 build)\n", .{mqttz_driver});
+        return error.MqttzDriverMissing;
     };
 }
 
@@ -667,6 +705,43 @@ fn pahoVsBroker(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) !vo
         try appendHex(gpa, out, o.items);
         try out.append(gpa, '\n');
     }
+}
+
+/// karlseguin/mqttz (a client we did not write) against `TcpServer`.
+fn mqttzVsBroker(gpa: std.mem.Allocator, io: std.Io) !void {
+    var broker = mqtt.Broker.init(gpa, .{});
+    defer broker.deinit();
+    var srv = mqtt.TcpServer.init(io, &broker);
+    try srv.bind("127.0.0.1", 0);
+    defer srv.deinit();
+    var serving = try io.concurrent(serveTcp, .{&srv});
+    var port_buf: [8]u8 = undefined;
+    const port_str = try std.mem.print(&port_buf, "{d}", .{srv.boundAddress().getPort()});
+    std.debug.print("interop-mqtt: mqttz vs our TcpServer on port {s}\n", .{port_str});
+    step(9);
+    const r = std.process.run(gpa, io, .{ .argv = &.{ mqttz_driver, port_str }, .timeout = peer_timeout }) catch |e| {
+        srv.shutdown();
+        serving.await(io);
+        return e;
+    };
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    // The driver's connections are closed by its exit; stop the server after.
+    srv.shutdown();
+    serving.await(io);
+    const good = switch (r.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!good or std.mem.indexOf(u8, r.stderr, "done\n") == null) {
+        std.debug.print("mqttz driver failed:\n{s}\n{s}\n", .{ r.stdout, r.stderr });
+        return error.MqttzFailed;
+    }
+    std.debug.print("{s}", .{r.stderr});
+}
+
+fn serveTcp(srv: *mqtt.TcpServer) void {
+    srv.serve() catch {};
 }
 
 /// What paho observed, step by step (`tools/paho_v5.py`).

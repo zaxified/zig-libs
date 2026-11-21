@@ -1,0 +1,13 @@
+.{
+    .name = .mqttz_driver,
+    .version = "0.0.0",
+    // Any value: this package is never fetched or published.
+    .fingerprint = 0xe8c058fdb57c40b1,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // karlseguin/mqttz (MIT), cloned by interop.zig's preflight message
+        // into the droppable cache; see tools/interop.zig.
+        .mqttz = .{ .path = "../../../../.zig-cache/mqtt-interop/mqttz" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

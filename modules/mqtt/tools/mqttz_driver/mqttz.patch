@@ -1,0 +1,25 @@
+diff --git a/src/codec.zig b/src/codec.zig
+index 41a4ccc..ad2aa0d 100644
+--- a/src/codec.zig
++++ b/src/codec.zig
+@@ -322,7 +322,7 @@ pub fn encodeUnsubscribe(buf: []u8, comptime protocol_version: mqttz.ProtocolVer
+     else
+         0; // MQTT 3.1.1 has no properties
+ 
+-    var pos = PROPERTIES_OFFSET + properties_len;
++    var pos: usize = PROPERTIES_OFFSET + properties_len;
+     for (opts.topics) |topic| {
+         pos += try writeString(buf[pos..], topic);
+     }
+@@ -520,9 +520,9 @@ pub fn encodePacketHeader(buf: []u8, packet_type: u8, packet_flags: u8) []u8 {
+ }
+ 
+ pub const PublishFlags = packed struct(u4) {
+-    dup: bool,
+-    qos: mqttz.QoS,
+     retain: bool,
++    qos: mqttz.QoS,
++    dup: bool,
+ };
+ 
+ const t = @import("std").testing;
