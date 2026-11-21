@@ -29,7 +29,7 @@ anchored by the `bn254` verifier and by real `snarkjs`/`circom` files (see [SPEC
 | `snarkjs_bin.zig` | the iden3 binary container and the field/point encodings inside it |
 | `zkey.zig` | snarkjs `.zkey` (Groth16 proving key) reader and writer — round-trips snarkjs's files byte for byte |
 | `circom.zig` | circom `.r1cs` reader, `.wtns` reader and writer |
-| `ptau.zig` | snarkjs powers-of-tau (`.ptau`) reader, points decoded on demand |
+| `ptau.zig` | snarkjs powers-of-tau (`.ptau`) reader, points decoded on demand; `readCut(gpa, io, file, power)` reads by position only what a smaller power needs (a ceremony file too large for memory) |
 | `zkprove.zig` | **the real prover**: `.zkey` + witness → proof, quotient on a coset; Pippenger MSM (variable-time in the witness, the default) or `proveWith(…, .{ .msm = .constant_time })` (~21× slower) |
 | `phase2.zig` | phase-2 ceremony: `newZkey(r1cs, ptau)`, `contribute`, `verifyContribution`, `verify` |
 | `solidity.zig` | `verifier(vk, name)`: a Solidity verifier contract for a key (snarkjs's `verifyProof` signature, EVM precompiles 0x06–0x08); the matching calldata is `snarkjs_export.solidityCalldata(proof, public)` |
