@@ -46,6 +46,11 @@ const burn = @import("burn.zig");
 pub const protocol_name = "MQTT";
 /// Protocol level for MQTT 3.1.1 (spec 3.1.2.2).
 pub const protocol_level: u8 = 4;
+/// MQTT 3.1's protocol name (`MQIsdp`) and level 3. A 3.1 CONNECT decodes as
+/// `.v3_1_1` with `Connect.legacy_3_1` set; everything after the CONNECT is
+/// the 3.1.1 wire, so the connection runs as 3.1.1 (Mosquitto does the same).
+pub const protocol_name_3_1 = "MQIsdp";
+pub const protocol_level_3_1: u8 = 3;
 
 /// The protocol version a connection speaks — the CONNECT's protocol level.
 pub const Version = enum(u8) {
@@ -818,6 +823,12 @@ pub const Connect = struct {
     password: ?[]const u8 = null,
     /// The protocol level to send; on decode, the level the client sent.
     version: Version = .v3_1_1,
+    /// MQTT 3.1 (`MQIsdp`, level 3) instead of 3.1.1: on decode, the client
+    /// spoke 3.1; on encode (with `version == .v3_1_1`), write a 3.1 CONNECT.
+    /// The rest of the connection is the 3.1.1 wire. 3.1 differs in the
+    /// client identifier (1 to 23 characters, never empty) and has no Session
+    /// Present flag.
+    legacy_3_1: bool = false,
     /// CONNECT Properties (5.0 only).
     properties: Properties = .{},
 };
@@ -1290,8 +1301,9 @@ fn writeConnect(cur: *Cursor, c: Connect) EncodeError!void {
         if (!c.properties.isEmpty()) return error.UnsupportedInVersion;
         if (c.will) |w| if (!w.properties.isEmpty()) return error.UnsupportedInVersion;
     }
-    try cur.lenPrefixed(protocol_name);
-    try cur.byte(@backingInt(c.version));
+    const legacy = c.legacy_3_1 and !v5;
+    try cur.lenPrefixed(if (legacy) protocol_name_3_1 else protocol_name);
+    try cur.byte(if (legacy) protocol_level_3_1 else @backingInt(c.version));
 
     var flags: u8 = 0;
     if (c.clean_session) flags |= 0x02;
@@ -1696,10 +1708,13 @@ fn decodeReasonOnly(r: *BodyReader, comptime ctx: PropertyContext) DecodeError!s
 
 fn decodeConnect(r: *BodyReader, version: Version) DecodeError!Connect {
     const name = try r.lenPrefixed();
-    if (!std.mem.eql(u8, name, protocol_name)) return error.UnsupportedProtocol;
+    const is_3_1 = std.mem.eql(u8, name, protocol_name_3_1);
+    if (!is_3_1 and !std.mem.eql(u8, name, protocol_name)) return error.UnsupportedProtocol;
     const level = try r.byte();
+    // `MQIsdp` goes with level 3 and only that; `MQTT` with 4 and 5.
+    if (is_3_1 != (level == protocol_level_3_1)) return error.UnsupportedProtocol;
     const sent: Version = switch (level) {
-        4 => .v3_1_1,
+        3, 4 => .v3_1_1,
         5 => if (version == .v5) .v5 else return error.UnsupportedProtocol,
         else => return error.UnsupportedProtocol,
     };
@@ -1751,6 +1766,7 @@ fn decodeConnect(r: *BodyReader, version: Version) DecodeError!Connect {
         .username = username,
         .password = password,
         .version = sent,
+        .legacy_3_1 = is_3_1,
         .properties = props,
     };
 }
@@ -3140,4 +3156,30 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "MQTT 3.1 CONNECT (MQIsdp, level 3) decodes as the 3.1.1 wire and round-trips" {
+    const wire = "\x10\x0f\x00\x06MQIsdp\x03\x02\x00\x00\x00\x01x";
+    const d = (try decode(wire)).?;
+    try testing.expectEqual(Version.v3_1_1, d.packet.connect.version);
+    try testing.expect(d.packet.connect.legacy_3_1);
+    try testing.expectEqualStrings("x", d.packet.connect.client_id);
+    // Under a 5.0 decoder (a server that does not know the version yet) too.
+    try testing.expect((try decodePacket(wire, .v5)).?.packet.connect.legacy_3_1);
+    // The encoder writes the same bytes; a plain 3.1.1 CONNECT is unchanged.
+    var buf: [64]u8 = undefined;
+    const enc = try encodeConnect(&buf, .{ .client_id = "x", .clean_session = true, .legacy_3_1 = true });
+    try testing.expectEqualSlices(u8, wire, enc);
+    const plain = try encodeConnect(&buf, .{ .client_id = "x", .clean_session = true });
+    try testing.expect(!(try decode(plain)).?.packet.connect.legacy_3_1);
+    try testing.expectEqualSlices(u8, "\x00\x04MQTT\x04", plain[2..9]);
+    // The flag is ignored for a 5.0 CONNECT.
+    const v5 = try encodePacket(&buf, .v5, .{ .connect = .{ .version = .v5, .client_id = "x", .legacy_3_1 = true } });
+    try testing.expectEqualSlices(u8, "\x00\x04MQTT\x05", v5[2..9]);
+    // The name and the level go together: MQIsdp with level 4, MQTT with level 3.
+    try testing.expectError(error.UnsupportedProtocol, decode("\x10\x0f\x00\x06MQIsdp\x04\x02\x00\x00\x00\x01x"));
+    try testing.expectError(error.UnsupportedProtocol, decode("\x10\x0d\x00\x04MQTT\x03\x02\x00\x00\x00\x01x"));
+    try testing.expectError(error.UnsupportedProtocol, decode("\x10\x0f\x00\x06MQIsdp\x05\x02\x00\x00\x00\x01x"));
+    // Password without user name is as malformed in 3.1 as in 3.1.1.
+    try testing.expectError(error.MalformedPacket, decode("\x10\x12\x00\x06MQIsdp\x03\x42\x00\x00\x00\x01x\x00\x01p"));
 }

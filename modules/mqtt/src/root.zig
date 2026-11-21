@@ -110,6 +110,8 @@ pub const Broker = broker.Broker;
 pub const Connection = broker.Connection;
 pub const BrokerConfig = broker.Config;
 pub const BrokerTransport = broker.Transport;
+/// A subscriber inside the process: a callback instead of a socket.
+pub const InlineSubscriber = broker.InlineSubscriber;
 pub const BrokerTransportError = broker.TransportError;
 pub const TcpServer = broker.TcpServer;
 

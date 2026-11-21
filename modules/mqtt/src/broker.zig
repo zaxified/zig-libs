@@ -96,6 +96,8 @@ pub const max_in_flight = 64;
 /// Largest client id the broker stores inline (spec permits 65 535; a longer
 /// one is refused with CONNACK `identifier_rejected`).
 pub const max_client_id = 256;
+/// The longest client identifier of an MQTT 3.1 (`MQIsdp`) client.
+pub const max_client_id_3_1 = 23;
 /// The longest `Config.response_information` the CONNACK buffer takes.
 pub const max_response_information = 256;
 
@@ -158,6 +160,93 @@ pub const Transport = struct {
 
     pub fn close(t: Transport) void {
         if (t.closeFn) |f| f(t.ctx);
+    }
+};
+
+/// A subscriber inside the process: matching messages are handed to a callback
+/// instead of being written to a socket (what `mosquitto_callback_register` is
+/// to a Mosquitto plugin, or a broker's in-process client in other servers).
+/// It is an ordinary client of the broker (a Connection with a Transport
+/// that decodes what the broker writes), so retained messages, `$SYS`, shared
+/// subscriptions, ACLs and the session rules behave exactly as for a socket
+/// client; deliveries are QoS 0 (nothing to acknowledge).
+///
+/// `callback` runs on the publisher's thread, inside the delivery: it must be
+/// short and must not call into the broker (the registry lock is held in places).
+/// The value must stay at its address from `attach` to `detach`.
+pub const InlineSubscriber = struct {
+    pub const Callback = *const fn (ctx: ?*anyopaque, topic: []const u8, payload: []const u8, retain: bool) void;
+
+    broker: *Broker,
+    conn: *Connection,
+    callback: Callback,
+    ctx: ?*anyopaque,
+    /// The last CONNACK / SUBACK / UNSUBACK the broker wrote to this subscriber.
+    connected: bool = false,
+    suback: ?u8 = null,
+    next_packet_id: u16 = 1,
+
+    pub const AttachError = Error || error{Refused};
+
+    /// Connects `client_id` as a clean-session MQTT 3.1.1 client. `error.Refused`
+    /// when the broker answered the CONNECT with anything but "accepted"
+    /// (identifier in use is not refused: the older connection is taken over,
+    /// as for any client).
+    pub fn attach(self: *InlineSubscriber, b: *Broker, client_id: []const u8, callback: Callback, ctx: ?*anyopaque, now: i64) AttachError!void {
+        self.* = .{ .broker = b, .conn = undefined, .callback = callback, .ctx = ctx };
+        self.conn = try b.accept(.{ .ctx = self, .writeFn = writeFn });
+        errdefer b.remove(self.conn);
+        var buf: [max_client_id + 64]u8 = undefined;
+        const connect = packet.encodeConnect(&buf, .{ .client_id = client_id, .clean_session = true }) catch return error.Refused;
+        try b.feed(self.conn, connect);
+        _ = try b.process(self.conn, now);
+        if (!self.connected) return error.Refused;
+    }
+
+    /// Subscribes to `filter` at QoS 0; retained messages are delivered at once.
+    /// `error.Refused` when the broker's SUBACK says no (an ACL, a bad filter).
+    pub fn subscribe(self: *InlineSubscriber, filter: []const u8, now: i64) AttachError!void {
+        var buf: [max_client_id + 512]u8 = undefined;
+        const id = self.takeId();
+        const bytes = packet.encodeSubscribe(&buf, id, &.{.{ .filter = filter }}) catch return error.Refused;
+        self.suback = null;
+        try self.broker.feed(self.conn, bytes);
+        _ = try self.broker.process(self.conn, now);
+        const code = self.suback orelse return error.Refused;
+        if (code == 0x80) return error.Refused;
+    }
+
+    pub fn unsubscribe(self: *InlineSubscriber, filter: []const u8, now: i64) AttachError!void {
+        var buf: [max_client_id + 512]u8 = undefined;
+        const bytes = packet.encodeUnsubscribe(&buf, self.takeId(), &.{filter}) catch return error.Refused;
+        try self.broker.feed(self.conn, bytes);
+        _ = try self.broker.process(self.conn, now);
+    }
+
+    /// Disconnects. The subscriber must not be used afterwards.
+    pub fn detach(self: *InlineSubscriber) void {
+        self.broker.remove(self.conn);
+    }
+
+    fn takeId(self: *InlineSubscriber) u16 {
+        const id = self.next_packet_id;
+        self.next_packet_id = if (id == std.math.maxInt(u16)) 1 else id + 1;
+        return id;
+    }
+
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
+        const self: *InlineSubscriber = @ptrCast(@alignCast(ctx));
+        var rest = bytes;
+        while (rest.len != 0) {
+            const dec = (packet.decode(rest) catch return error.TransportFailed) orelse return error.TransportFailed;
+            switch (dec.packet) {
+                .connack => |c| self.connected = c.return_code == .accepted,
+                .suback => |a| self.suback = if (a.codes.len != 0) a.codes[0] else 0x80,
+                .publish => |p| self.callback(self.ctx, p.topic, p.payload, p.retain),
+                else => {},
+            }
+            rest = rest[dec.consumed..];
+        }
     }
 };
 
@@ -515,6 +604,20 @@ const Stats = struct {
     /// PUBLISHes dropped for a subscriber for want of room — the same count as
     /// `Broker.queueDrops` (every drop goes through `countQueueDrop`).
     publish_dropped: std.atomic.Value(usize) = .init(0),
+    /// Transports `accept`ed (`$SYS/broker/load/sockets/...`).
+    sockets_opened: std.atomic.Value(usize) = .init(0),
+    /// CONNECT packets received (`$SYS/broker/load/connections/...`).
+    connects_received: std.atomic.Value(usize) = .init(0),
+};
+
+/// The `$SYS/broker/load/...` moving averages (mosquitto(8)): per metric, the
+/// count at the previous `publishSys` and the exponentially weighted rate per
+/// minute over 1, 5 and 15 minutes.
+const SysLoad = struct {
+    pub const metrics = 9;
+    prev: [metrics]u64 = @splat(0),
+    avg: [metrics][3]f64 = @splat(.{ 0, 0, 0 }),
+    prev_ms: ?i64 = null,
 };
 
 /// One outbound QoS 1/2 delivery waiting for the client.
@@ -750,9 +853,9 @@ const SubRef = struct {
 
 /// One Shared Subscription (5.0 spec 4.8.2), `$share/{ShareName}/{filter}`:
 /// each matching message goes to ONE member, round-robin, a member that can
-/// take it now first. Kept beside the trie, not in it, matched with
-/// `topic.matches` per publish — shared groups are few, and their member
-/// lists are what the trie would otherwise have to duplicate per level.
+/// take it now first. Kept beside the subscription trie: the groups sit in a
+/// trie of their own (`GroupIndex`, by their `{filter}`), found by the topic
+/// walk of a PUBLISH, and by name in a hash map for SUBSCRIBE/UNSUBSCRIBE.
 const Shared = struct {
     /// The filter as subscribed, `$share/...` (owned) — what an owner's filter
     /// list holds and what UNSUBSCRIBE names.
@@ -762,6 +865,8 @@ const Shared = struct {
     members: std.ArrayListUnmanaged(SubRef) = .empty,
     /// Where the round-robin looks first next time.
     next: usize = 0,
+    /// Its slot in `Broker.shared` (kept up to date by `dropShared`).
+    pos: usize = 0,
 };
 
 /// The `{filter}` of a Shared Subscription filter, or null when `f` is an
@@ -1033,6 +1138,155 @@ const Index = struct {
                 return;
             }
             try out.append(alloc, r);
+        }
+    }
+};
+
+/// The Shared Subscription groups of a broker in a trie over their `{filter}`,
+/// so a PUBLISH walks the levels of its topic instead of testing every group
+/// (65536 distinct groups made each PUBLISH and SUBSCRIBE a linear scan under
+/// the registry lock, review R-MQ-7). Same matching as `Index`: `+` and `#`,
+/// and no leading wildcard against a `$` topic. Caller holds `mutex`.
+const GroupIndex = struct {
+    const GNode = struct {
+        children: std.StringHashMapUnmanaged(*GNode) = .empty,
+        plus: ?*GNode = null,
+        groups: std.ArrayListUnmanaged(*Shared) = .empty,
+        hash_groups: std.ArrayListUnmanaged(*Shared) = .empty,
+
+        fn isEmpty(n: *const GNode) bool {
+            return n.children.count() == 0 and n.plus == null and n.groups.items.len == 0 and n.hash_groups.items.len == 0;
+        }
+    };
+
+    root: GNode = .{},
+
+    fn deinit(idx: *GroupIndex, alloc: std.mem.Allocator) void {
+        freeNode(alloc, &idx.root, true);
+    }
+
+    fn freeNode(alloc: std.mem.Allocator, node: *GNode, is_root: bool) void {
+        var it = node.children.iterator();
+        while (it.next()) |e| {
+            freeNode(alloc, e.value_ptr.*, false);
+            alloc.free(e.key_ptr.*);
+        }
+        node.children.deinit(alloc);
+        if (node.plus) |p| freeNode(alloc, p, false);
+        node.groups.deinit(alloc);
+        node.hash_groups.deinit(alloc);
+        if (!is_root) alloc.destroy(node);
+    }
+
+    fn add(idx: *GroupIndex, alloc: std.mem.Allocator, filter: []const u8, g: *Shared) Error!void {
+        var node = &idx.root;
+        var it = std.mem.splitScalar(u8, filter, '/');
+        while (it.next()) |level| {
+            if (std.mem.eql(u8, level, "#")) return node.hash_groups.append(alloc, g);
+            if (std.mem.eql(u8, level, "+")) {
+                if (node.plus == null) {
+                    const child = try alloc.create(GNode);
+                    child.* = .{};
+                    node.plus = child;
+                }
+                node = node.plus.?;
+            } else if (node.children.get(level)) |child| {
+                node = child;
+            } else {
+                const key = try alloc.dupe(u8, level);
+                errdefer alloc.free(key);
+                const child = try alloc.create(GNode);
+                errdefer alloc.destroy(child);
+                child.* = .{};
+                try node.children.put(alloc, key, child);
+                node = child;
+            }
+        }
+        try node.groups.append(alloc, g);
+    }
+
+    fn remove(idx: *GroupIndex, alloc: std.mem.Allocator, filter: []const u8, g: *Shared) void {
+        var levels: [max_filter_levels][]const u8 = undefined;
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, filter, '/');
+        while (it.next()) |level| {
+            if (n >= max_filter_levels) return;
+            levels[n] = level;
+            n += 1;
+        }
+        _ = removeRec(alloc, &idx.root, levels[0..n], g);
+    }
+
+    fn removeFrom(list: *std.ArrayListUnmanaged(*Shared), g: *Shared) void {
+        if (std.mem.findScalar(*Shared, list.items, g)) |i| _ = list.swapRemove(i);
+    }
+
+    /// Whether `node` became empty (the caller prunes it).
+    fn removeRec(alloc: std.mem.Allocator, node: *GNode, levels: [][]const u8, g: *Shared) bool {
+        if (levels.len == 0) {
+            removeFrom(&node.groups, g);
+            return node.isEmpty();
+        }
+        const head = levels[0];
+        if (std.mem.eql(u8, head, "#")) {
+            removeFrom(&node.hash_groups, g);
+            return node.isEmpty();
+        }
+        if (std.mem.eql(u8, head, "+")) {
+            if (node.plus) |p| {
+                if (removeRec(alloc, p, levels[1..], g)) {
+                    freeNode(alloc, p, false);
+                    node.plus = null;
+                }
+            }
+            return node.isEmpty();
+        }
+        if (node.children.getEntry(head)) |e| {
+            const child = e.value_ptr.*;
+            const key = e.key_ptr.*;
+            if (removeRec(alloc, child, levels[1..], g)) {
+                _ = node.children.remove(head);
+                alloc.free(key);
+                freeNode(alloc, child, false);
+            }
+        }
+        return node.isEmpty();
+    }
+
+    /// Every group whose filter matches `topic_name`, up to `max`; true when cut short.
+    fn collect(idx: *GroupIndex, alloc: std.mem.Allocator, topic_name: []const u8, out: *std.ArrayListUnmanaged(*Shared), max: usize) Error!bool {
+        const dollar = topic_name.len > 0 and topic_name[0] == '$';
+        var capped = false;
+        try collectRec(alloc, &idx.root, topic_name, true, dollar, out, max, &capped);
+        return capped;
+    }
+
+    fn appendAll(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(*Shared), list: *std.ArrayListUnmanaged(*Shared), max: usize, capped: *bool) Error!void {
+        for (list.items) |g| {
+            if (out.items.len >= max) {
+                capped.* = true;
+                return;
+            }
+            try out.append(alloc, g);
+        }
+    }
+
+    fn collectRec(alloc: std.mem.Allocator, node: *GNode, rest: ?[]const u8, is_root: bool, dollar: bool, out: *std.ArrayListUnmanaged(*Shared), max: usize, capped: *bool) Error!void {
+        if (out.items.len >= max) {
+            capped.* = true;
+            return;
+        }
+        if (!(is_root and dollar)) try appendAll(alloc, out, &node.hash_groups, max, capped);
+        const cur = rest orelse {
+            try appendAll(alloc, out, &node.groups, max, capped);
+            return;
+        };
+        const slash = std.mem.findScalar(u8, cur, '/');
+        const head = cur[0 .. slash orelse cur.len];
+        const tail: ?[]const u8 = if (slash) |sl| cur[sl + 1 ..] else null;
+        if (node.children.get(head)) |child| try collectRec(alloc, child, tail, false, dollar, out, max, capped);
+        if (!(is_root and dollar)) {
+            if (node.plus) |p| try collectRec(alloc, p, tail, false, dollar, out, max, capped);
         }
     }
 };
@@ -1608,6 +1862,9 @@ pub const Broker = struct {
     /// Shared Subscriptions (`$share/{group}/{filter}`, 5.0 4.8.2, honoured
     /// for 3.1.1 clients too). Guarded by `mutex`.
     shared: std.ArrayList(*Shared) = .empty,
+    /// The groups by `Shared.full`, and by `{filter}` in a trie (R-MQ-7).
+    shared_by_full: std.StringHashMapUnmanaged(*Shared) = .empty,
+    shared_index: GroupIndex = .{},
     /// 5.0 Wills waiting out their Will Delay Interval. Guarded by `mutex`.
     delayed_wills: std.ArrayList(DelayedWill) = .empty,
     /// The latest caller time (ms) the broker has been given, for paths that
@@ -1635,6 +1892,8 @@ pub const Broker = struct {
     /// Guarded by `mutex`.
     sys_first_ms: ?i64 = null,
     sys_last_ms: ?i64 = null,
+    sys_load: SysLoad = .{},
+    heap_peak: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Broker {
         return .{ .allocator = allocator, .config = config };
@@ -1663,6 +1922,8 @@ pub const Broker = struct {
             b.allocator.destroy(g);
         }
         b.shared.deinit(b.allocator);
+        b.shared_by_full.deinit(b.allocator);
+        b.shared_index.deinit(b.allocator);
         for (b.delayed_wills.items) |w| b.freeDelayedWill(w);
         b.delayed_wills.deinit(b.allocator);
         for (b.retained.items) |r| {
@@ -2239,8 +2500,8 @@ pub const Broker = struct {
     // Caller holds `mutex`.
 
     fn findShared(b: *Broker, full: []const u8) ?usize {
-        for (b.shared.items, 0..) |g, i| if (std.mem.eql(u8, g.full, full)) return i;
-        return null;
+        const g = b.shared_by_full.get(full) orelse return null;
+        return g.pos;
     }
 
     fn indexAdd(b: *Broker, filter: []const u8, ref: SubRef) Error!void {
@@ -2250,8 +2511,12 @@ pub const Broker = struct {
             errdefer b.allocator.destroy(g);
             const full = try b.allocator.dupe(u8, filter);
             errdefer b.allocator.free(full);
-            g.* = .{ .full = full, .filter = full[full.len - inner.len ..] };
+            g.* = .{ .full = full, .filter = full[full.len - inner.len ..], .pos = b.shared.items.len };
             try b.shared.append(b.allocator, g);
+            errdefer _ = b.shared.pop();
+            try b.shared_by_full.put(b.allocator, g.full, g);
+            errdefer _ = b.shared_by_full.remove(g.full);
+            try b.shared_index.add(b.allocator, g.filter, g);
             break :blk g;
         };
         g.members.append(b.allocator, ref) catch |e| {
@@ -2286,7 +2551,10 @@ pub const Broker = struct {
     }
 
     fn dropShared(b: *Broker, g: *Shared) void {
-        if (std.mem.findScalar(*Shared, b.shared.items, g)) |i| _ = b.shared.swapRemove(i);
+        b.shared_index.remove(b.allocator, g.filter, g);
+        _ = b.shared_by_full.remove(g.full);
+        _ = b.shared.swapRemove(g.pos);
+        if (g.pos < b.shared.items.len) b.shared.items[g.pos].pos = g.pos;
         g.members.deinit(b.allocator);
         b.allocator.free(g.full);
         b.allocator.destroy(g);
@@ -2351,6 +2619,7 @@ pub const Broker = struct {
         errdefer b.allocator.free(tx);
         conn.* = .{ .transport = transport, .rx_buf = rx, .tx_buf = tx, .tx_lock = .{ .io = transport.io }, .stats = &b.stats };
         try b.connections.append(b.allocator, conn);
+        _ = b.stats.sockets_opened.fetchAdd(1, .monotonic);
         return conn;
     }
 
@@ -2653,7 +2922,26 @@ pub const Broker = struct {
         "$SYS/broker/subscriptions/count",
         "$SYS/broker/retained messages/count",
         "$SYS/broker/store/messages/count",
+        "$SYS/broker/heap/current",
+        "$SYS/broker/heap/maximum",
     };
+    /// The `$SYS/broker/load/<metric>/<window>` topics, metric-major, windows
+    /// 1min, 5min, 15min; the metric order is `SysLoad`'s.
+    const sys_load_names = blk: {
+        const metric = [SysLoad.metrics][]const u8{
+            "messages/received", "messages/sent", "publish/dropped",
+            "publish/received",  "publish/sent",  "bytes/received",
+            "bytes/sent",        "sockets",       "connections",
+        };
+        const window = [3][]const u8{ "1min", "5min", "15min" };
+        var out: [SysLoad.metrics * 3][]const u8 = undefined;
+        for (metric, 0..) |m, i| for (window, 0..) |w, j| {
+            out[i * 3 + j] = "$SYS/broker/load/" ++ m ++ "/" ++ w;
+        };
+        break :blk out;
+    };
+    /// Minutes of the three windows.
+    const sys_load_minutes = [3]f64{ 1, 5, 15 };
     const sys_version_topic = "$SYS/broker/version";
     const sys_version = "zig-libs mqtt 1.0.0 (MQTT 3.1.1, 5.0)";
 
@@ -2691,6 +2979,7 @@ pub const Broker = struct {
     // secret-api-ok: touches counters and $SYS topics only; no credential or key reaches this frame
     pub fn publishSys(b: *Broker, now: i64) usize {
         var values: [sys_topics.len]u64 = undefined;
+        var load: [SysLoad.metrics][3]f64 = undefined;
         {
             b.mutex.lock();
             defer b.mutex.unlock();
@@ -2723,6 +3012,47 @@ pub const Broker = struct {
                 if (!std.mem.startsWith(u8, r.topic, "$SYS/")) user_retained += 1;
             }
             const st = &b.stats;
+            // Held by the broker for its clients: the topics and payloads of
+            // the retained messages plus the bytes queued for sessions. Not
+            // the process heap (the broker's allocator is the caller's and
+            // keeps no counter); what this broker's state costs in message
+            // data.
+            var held_bytes: u64 = 0;
+            for (b.retained.items) |r| {
+                if (!std.mem.startsWith(u8, r.topic, "$SYS/")) held_bytes += r.topic.len + r.payload.len;
+            }
+            for (b.sessions.items) |x| held_bytes += x.queued_bytes;
+            b.heap_peak = @max(b.heap_peak, held_bytes);
+            // Moving averages of the per-minute rates, as mosquitto: the rate
+            // since the previous publication, folded in with weight
+            // `1 - e^(-dt / window)`.
+            const counts = [SysLoad.metrics]u64{
+                st.messages_received.load(.monotonic),
+                st.messages_sent.load(.monotonic),
+                st.publish_dropped.load(.monotonic),
+                st.publish_received.load(.monotonic),
+                st.publish_sent.load(.monotonic),
+                st.bytes_received.load(.monotonic),
+                st.bytes_sent.load(.monotonic),
+                st.sockets_opened.load(.monotonic),
+                st.connects_received.load(.monotonic),
+            };
+            if (b.sys_load.prev_ms) |prev_ms| {
+                const dt_ms = now -| prev_ms;
+                if (dt_ms > 0) {
+                    const dt_min = @as(f64, @floatFromInt(dt_ms)) / 60_000.0;
+                    for (counts, 0..) |c, i| {
+                        const rate = @as(f64, @floatFromInt(c -| b.sys_load.prev[i])) / dt_min;
+                        for (sys_load_minutes, 0..) |w, k| {
+                            const e = @exp(-dt_min / w);
+                            b.sys_load.avg[i][k] = rate * (1 - e) + b.sys_load.avg[i][k] * e;
+                        }
+                    }
+                }
+            }
+            b.sys_load.prev = counts;
+            b.sys_load.prev_ms = now;
+            load = b.sys_load.avg;
             values = .{
                 @as(u64, @intCast(@divTrunc(@max(now -| first, 0), 1000))),
                 connected,
@@ -2739,6 +3069,8 @@ pub const Broker = struct {
                 b.subscriptions_total,
                 user_retained,
                 user_retained + held,
+                held_bytes,
+                b.heap_peak,
             };
         }
         var n: usize = 0;
@@ -2746,6 +3078,11 @@ pub const Broker = struct {
         for (sys_topics, values) |name, v| {
             var buf: [24]u8 = undefined;
             const text = std.mem.print(&buf, "{d}", .{v}) catch continue;
+            if (b.fanout(.{ .topic = name, .payload = text, .retain = true }, .at_most_once, now)) |_| n += 1 else |_| {}
+        }
+        for (sys_load_names, 0..) |name, i| {
+            var buf: [32]u8 = undefined;
+            const text = std.mem.print(&buf, "{d:.2}", .{load[i / 3][i % 3]}) catch continue;
             if (b.fanout(.{ .topic = name, .payload = text, .retain = true }, .at_most_once, now)) |_| n += 1 else |_| {}
         }
         return n;
@@ -2948,7 +3285,7 @@ pub const Broker = struct {
     /// 5.0 permits 0x84 (3.1.2-2 there). The level picks the dialect the
     /// client most likely reads: above 5, a 5.0-format 0x84 -- Mosquitto's
     /// answer, pinned by `session_replay.zig` connect_refusals; below 4, and
-    /// for an MQTT 3.1 client (`MQIsdp`), a 3.1.1-format 0x01, which 3.1
+    /// for `MQIsdp` at a level other than 3, a 3.1.1-format 0x01, which 3.1
     /// reads the same way. Any other protocol name may simply be
     /// disconnected (3.1.2-1), and is.
     fn refuseProtocolLevel(conn: *Connection) void {
@@ -3080,6 +3417,7 @@ pub const Broker = struct {
     }
 
     fn handleConnect(b: *Broker, conn: *Connection, c: packet.Connect, now: i64) Error!Disposition {
+        _ = b.stats.connects_received.fetchAdd(1, .monotonic);
         conn.version = c.version;
         const v5 = c.version == .v5;
         // Known before the first refusal, so even that CONNACK is held to the
@@ -3095,6 +3433,12 @@ pub const Broker = struct {
         // `session_replay.zig` connect_refusals). Otherwise assign or
         // generate the id — 5.0 says which in CONNACK (3.1.3-7).
         if (!v5 and c.client_id.len == 0 and !c.clean_session) {
+            return b.refuseConnect(conn, .identifier_rejected, .client_identifier_not_valid);
+        }
+        // MQTT 3.1 (`MQIsdp`): the identifier is 1 to 23 characters, never
+        // empty and never generated (3.1 spec 3.1.3.1; Mosquitto refuses it
+        // the same way, CONNACK 0x02).
+        if (c.legacy_3_1 and (c.client_id.len == 0 or c.client_id.len > max_client_id_3_1)) {
             return b.refuseConnect(conn, .identifier_rejected, .client_identifier_not_valid);
         }
         var assigned = false;
@@ -3270,7 +3614,12 @@ pub const Broker = struct {
         // acknowledged — or starts one when one is to be kept.
         var resumed: ?*Session = null;
         var owed: Superseded = .{};
-        {
+        // A refusal found under the registry lock is encoded there and written
+        // after it is released, so a Transport that blocks cannot stall every
+        // other client behind the lock.
+        var refusal_buf: [128]u8 = undefined;
+        var refusal: ?[]const u8 = null;
+        locked: {
             b.mutex.lock();
             defer b.mutex.unlock();
             b.now_hint = @max(b.now_hint, now);
@@ -3288,9 +3637,8 @@ pub const Broker = struct {
             // with clean session 1. Refused before anything changes hands.
             if (b.claimedByAnother(conn, existing)) {
                 b.dropWill(conn);
-                var cbuf: [128]u8 = undefined;
-                try conn.write(try connackRefusalFor(&cbuf, conn, .not_authorized, .not_authorized));
-                return .close;
+                refusal = try connackRefusalFor(&refusal_buf, conn, .not_authorized, .not_authorized);
+                break :locked;
             }
             const resuming = !c.clean_session and existing != null;
             const create = !resuming and keep;
@@ -3298,9 +3646,8 @@ pub const Broker = struct {
                 // Refused before anything changed hands, so a live session
                 // under this id — there is none — is not disturbed either.
                 b.dropWill(conn);
-                var cbuf: [128]u8 = undefined;
-                try conn.write(try connackRefusalFor(&cbuf, conn, .server_unavailable, .quota_exceeded));
-                return .close;
+                refusal = try connackRefusalFor(&refusal_buf, conn, .server_unavailable, .quota_exceeded);
+                break :locked;
             }
             // Allocated before the take-over, so running out of memory here
             // leaves the earlier connection alone.
@@ -3330,11 +3677,15 @@ pub const Broker = struct {
             // counted only when the list could beat it.
             if (b.connections.items.len > b.clients_peak) b.clients_peak = @max(b.clients_peak, b.connectedLocked());
         }
+        if (refusal) |bytes| {
+            try conn.write(bytes);
+            return .close;
+        }
         b.tellSuperseded(&owed);
 
         var cbuf: [64 + max_client_id + max_response_information]u8 = undefined;
         var connack: packet.Packet = .{ .connack = .{
-            .session_present = resumed != null,
+            .session_present = resumed != null and !c.legacy_3_1,
             .properties = if (v5) b.connackProperties(conn, assigned, if (sei != requested_sei) sei else null, server_keep_alive) else .{},
         } };
         if (want_response_info) {
@@ -4466,8 +4817,10 @@ pub const Broker = struct {
             // unbounded work. A truncated walk is surfaced via the counter.
             var capped = try b.index.collect(b.allocator, msg.topic, &matches, b.config.max_fanout_matches);
             // One member of each matching Shared Subscription (4.8.2).
-            for (b.shared.items) |g| {
-                if (!topic.matches(g.filter, msg.topic)) continue;
+            var groups: std.ArrayListUnmanaged(*Shared) = .empty;
+            defer groups.deinit(b.allocator);
+            if (try b.shared_index.collect(b.allocator, msg.topic, &groups, b.config.max_fanout_matches)) capped = true;
+            for (groups.items) |g| {
                 if (matches.items.len >= b.config.max_fanout_matches) {
                     capped = true;
                     break;
@@ -5431,7 +5784,7 @@ test "the watchdog's deadlines: CONNECT timeout up to maxInt(u32) ms, then 1.5 x
 /// delivery-failure containment (FIX B). `closed` records a take-over / reap
 /// shutdown (FIX C).
 const TestTransport = struct {
-    written: [4096]u8 = undefined,
+    written: [16384]u8 = undefined,
     len: usize = 0,
     read_off: usize = 0,
     fail: bool = false,
@@ -5874,14 +6227,14 @@ test "empty client-id is accepted and assigned a generated id" {
 
 test "CONNECT refusals are answered before the close (3.1.2-2, 3.1.3-8)" {
     // The byte-level anchor is Mosquitto (`session_replay.zig`
-    // connect_refusals); these pin the cases it does not cover: an MQTT 3.1
-    // client, which Mosquitto accepts and this broker does not, and a foreign
-    // protocol name, which may be dropped silently (3.1.2-1).
+    // connect_refusals); these pin the cases it does not cover: `MQIsdp` at
+    // the wrong level, and a foreign protocol name, which may be dropped
+    // silently (3.1.2-1).
     const cases = [_]struct { connect: []const u8, answer: []const u8 }{
         // 3.1.1, empty id without clean session: 0x02.
         .{ .connect = "\x10\x0c\x00\x04MQTT\x04\x00\x00\x00\x00\x00", .answer = "\x20\x02\x00\x02" },
-        // MQTT 3.1 ("MQIsdp", level 3): 0x01 in the format 3.1 reads too.
-        .{ .connect = "\x10\x0f\x00\x06MQIsdp\x03\x02\x00\x00\x00\x01x", .answer = "\x20\x02\x00\x01" },
+        // MQTT 3.1 ("MQIsdp") at a level other than 3: 0x01 in the format 3.1 reads too.
+        .{ .connect = "\x10\x0f\x00\x06MQIsdp\x04\x02\x00\x00\x00\x01x", .answer = "\x20\x02\x00\x01" },
         // "MQTT" below 4: 0x01; above 5: 5.0's 0x84.
         .{ .connect = "\x10\x0d\x00\x04MQTT\x02\x02\x00\x00\x00\x01x", .answer = "\x20\x02\x00\x01" },
         .{ .connect = "\x10\x0d\x00\x04MQTT\x07\x02\x00\x00\x00\x01x", .answer = "\x20\x03\x00\x84\x00" },
@@ -9816,8 +10169,8 @@ test "Reason Strings: on CONNACK refusals, DISCONNECTs and failure acks; Request
 }
 
 const SysSeen = struct {
-    topics: [40][]const u8 = undefined,
-    payloads: [40][]const u8 = undefined,
+    topics: [64][]const u8 = undefined,
+    payloads: [64][]const u8 = undefined,
     n: usize = 0,
 
     fn drain(t: *TestTransport) !SysSeen {
@@ -9872,9 +10225,9 @@ test "$SYS: publishSys publishes the broker's counts as retained topics; a plain
     try b.publish("d", "m", .at_least_once, false);
     try testing.expectEqual(@as(?usize, 1), b.sessionQueued("D"));
 
-    try testing.expectEqual(@as(usize, 16), b.publishSys(2000));
+    try testing.expectEqual(@as(usize, 45), b.publishSys(2000));
     const r1 = try SysSeen.drain(&to);
-    try testing.expectEqual(@as(usize, 16), r1.n);
+    try testing.expectEqual(@as(usize, 45), r1.n);
     try testing.expect(std.mem.startsWith(u8, r1.get("$SYS/broker/version").?, "zig-libs mqtt"));
     try testing.expectEqual(@as(u64, 0), try r1.num("$SYS/broker/uptime"));
     try testing.expectEqual(@as(u64, 4), try r1.num("$SYS/broker/clients/connected")); // A B C O
@@ -9891,6 +10244,11 @@ test "$SYS: publishSys publishes the broker's counts as retained topics; a plain
     try testing.expect((try r1.num("$SYS/broker/messages/sent")) >= 9);
     try testing.expect((try r1.num("$SYS/broker/bytes/received")) > 50);
     try testing.expect((try r1.num("$SYS/broker/bytes/sent")) > 50);
+    // The retained "t" (1 + 1 octets) and D's queued message are held; $SYS itself is not counted.
+    try testing.expect((try r1.num("$SYS/broker/heap/current")) >= 2);
+    try testing.expect((try r1.num("$SYS/broker/heap/maximum")) >= try r1.num("$SYS/broker/heap/current"));
+    // The first publication has no earlier one to take a rate against.
+    try testing.expectEqualStrings("0.00", r1.get("$SYS/broker/load/messages/received/1min").?);
 
     // A's '#' got "t" and "d" and nothing from $SYS (4.7.2).
     const seen_a = try SysSeen.drain(&ta);
@@ -9900,10 +10258,10 @@ test "$SYS: publishSys publishes the broker's counts as retained topics; a plain
 
     // The interval is the caller's to keep; the method keeps it too.
     try testing.expectEqual(@as(usize, 0), b.publishSys(2500));
-    try testing.expectEqual(@as(usize, 16), b.publishSys(5000));
+    try testing.expectEqual(@as(usize, 45), b.publishSys(5000));
     const r2 = try SysSeen.drain(&to);
     try testing.expectEqual(@as(u64, 3), try r2.num("$SYS/broker/uptime"));
-    try testing.expect((try r2.num("$SYS/broker/publish/messages/sent")) >= 3 + 16);
+    try testing.expect((try r2.num("$SYS/broker/publish/messages/sent")) >= 3 + 45);
     try testing.expectEqual(@as(u64, 1), try r2.num("$SYS/broker/retained messages/count")); // not counting itself
 
     // Retained: a later subscriber to one topic gets the value at once.
@@ -9935,7 +10293,7 @@ test "$SYS: dropped counts a persistent session's queue overflow; publishSys ign
     b.remove(s.conn);
     try b.publish("q", "1", .at_least_once, false);
     try b.publish("q", "2", .at_least_once, false); // over the cap
-    try testing.expectEqual(@as(usize, 16), b.publishSys(10));
+    try testing.expectEqual(@as(usize, 45), b.publishSys(10));
     var tw = TestTransport{};
     const w = try connectClient(&b, &tw, "W", 60, 11);
     try feedSubscribe(&b, w, 1, &.{.{ .filter = "$SYS/broker/publish/messages/dropped" }});
@@ -10690,10 +11048,10 @@ test "review L9: the delivery ACL is checked again when a persistent session's q
 test "review L6: publishSys survives a clock step back, and its retained topics do not age out" {
     var b = Broker.init(testing.allocator, .{ .sys_interval_ms = 1000, .retain_expiry_interval_ms = 100 });
     defer b.deinit();
-    try testing.expectEqual(@as(usize, 16), b.publishSys(10_000));
-    try testing.expectEqual(@as(usize, 16), b.publishSys(5_000)); // the clock went back
+    try testing.expectEqual(@as(usize, 45), b.publishSys(10_000));
+    try testing.expectEqual(@as(usize, 45), b.publishSys(5_000)); // the clock went back
     _ = b.expireSessions(50_000);
-    try testing.expectEqual(@as(usize, 16), b.retained.items.len);
+    try testing.expectEqual(@as(usize, 45), b.retained.items.len);
     try testing.expectEqual(@as(u64, 0), b.messagesExpired());
 }
 
@@ -10709,4 +11067,289 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "MQTT 3.1 (MQIsdp) client: accepted as 3.1.1 wire, identifier 1..23, no Session Present" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var buf: [128]u8 = undefined;
+    const Probe = struct {
+        fn connect(br: *Broker, tt: *TestTransport, bb: []u8, c: packet.Connect) !packet.Connack {
+            const conn = try br.accept(tt.transport());
+            try br.feed(conn, try packet.encodeConnect(bb, c));
+            _ = br.process(conn, 0) catch {};
+            const p = (try tt.next()).?;
+            return p.connack;
+        }
+    };
+    // A plain 3.1 CONNECT, the bytes of an old client.
+    var t1 = TestTransport{};
+    const ok = try Probe.connect(&b, &t1, &buf, .{ .client_id = "old-client", .legacy_3_1 = true });
+    try testing.expectEqual(packet.ConnectReturnCode.accepted, ok.return_code);
+    // 23 characters: accepted; 24, or none: identifier rejected (also with clean session).
+    var t2 = TestTransport{};
+    const id23 = strRepeat("a", max_client_id_3_1);
+    try testing.expectEqual(packet.ConnectReturnCode.accepted, (try Probe.connect(&b, &t2, &buf, .{ .client_id = id23, .legacy_3_1 = true })).return_code);
+    var t3 = TestTransport{};
+    const id24 = strRepeat("b", max_client_id_3_1 + 1);
+    try testing.expectEqual(packet.ConnectReturnCode.identifier_rejected, (try Probe.connect(&b, &t3, &buf, .{ .client_id = id24, .legacy_3_1 = true })).return_code);
+    var t4 = TestTransport{};
+    try testing.expectEqual(packet.ConnectReturnCode.identifier_rejected, (try Probe.connect(&b, &t4, &buf, .{ .client_id = "", .clean_session = true, .legacy_3_1 = true })).return_code);
+    // A 3.1.1 client may use 24 characters and an empty id, as before.
+    var t5 = TestTransport{};
+    try testing.expectEqual(packet.ConnectReturnCode.accepted, (try Probe.connect(&b, &t5, &buf, .{ .client_id = id24 })).return_code);
+    var t6 = TestTransport{};
+    try testing.expectEqual(packet.ConnectReturnCode.accepted, (try Probe.connect(&b, &t6, &buf, .{ .client_id = "", .clean_session = true })).return_code);
+
+    // A resumed persistent session: 3.1.1 says Session Present, 3.1 (no such flag) says 0.
+    var b2 = Broker.init(testing.allocator, .{});
+    defer b2.deinit();
+    var a1 = TestTransport{};
+    const c1 = try b2.accept(a1.transport());
+    try b2.feed(c1, try packet.encodeConnect(&buf, .{ .client_id = "persist", .clean_session = false, .legacy_3_1 = true }));
+    _ = try b2.process(c1, 0);
+    try testing.expect(!(try a1.next()).?.connack.session_present);
+    b2.remove(c1);
+    var a2 = TestTransport{};
+    const c2 = try b2.accept(a2.transport());
+    try b2.feed(c2, try packet.encodeConnect(&buf, .{ .client_id = "persist", .clean_session = false, .legacy_3_1 = true }));
+    _ = try b2.process(c2, 0);
+    try testing.expect(!(try a2.next()).?.connack.session_present);
+    b2.remove(c2);
+    var a3 = TestTransport{};
+    const c3 = try b2.accept(a3.transport());
+    try b2.feed(c3, try packet.encodeConnect(&buf, .{ .client_id = "persist", .clean_session = false }));
+    _ = try b2.process(c3, 0);
+    try testing.expect((try a3.next()).?.connack.session_present);
+}
+
+test "$SYS: load/<metric>/<window> are exponentially weighted per-minute rates, heap/* the held message data" {
+    var b = Broker.init(testing.allocator, .{ .sys_interval_ms = 1000 });
+    defer b.deinit();
+    var to = TestTransport{};
+    const o = try connectClient(&b, &to, "O", 60, 0);
+    try feedSubscribe(&b, o, 1, &.{.{ .filter = "$SYS/broker/#" }});
+    _ = (try to.next()).?;
+    try testing.expectEqual(@as(usize, 45), b.publishSys(0));
+    _ = try SysSeen.drain(&to);
+
+    // One more socket and CONNECT in the first minute; a retained message of
+    // 1 + 4 octets (topic + payload).
+    var tx = TestTransport{};
+    const x = try connectClient(&b, &tx, "X", 60, 100);
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, x, .{ .topic = "k", .payload = "data", .retain = true }));
+    try testing.expectEqual(@as(usize, 45), b.publishSys(60_000));
+    const r = try SysSeen.drain(&to);
+    // Exactly one minute: rate 1/min, weights 1-e^-1, 1-e^-0.2, 1-e^-(1/15).
+    try testing.expectEqualStrings("0.63", r.get("$SYS/broker/load/sockets/1min").?);
+    try testing.expectEqualStrings("0.18", r.get("$SYS/broker/load/sockets/5min").?);
+    try testing.expectEqualStrings("0.06", r.get("$SYS/broker/load/sockets/15min").?);
+    try testing.expectEqualStrings("0.63", r.get("$SYS/broker/load/connections/1min").?);
+    // PUBLISH received: one in the minute.
+    try testing.expectEqualStrings("0.63", r.get("$SYS/broker/load/publish/received/1min").?);
+    try testing.expectEqual(@as(u64, 5), try r.num("$SYS/broker/heap/current"));
+    try testing.expectEqual(@as(u64, 5), try r.num("$SYS/broker/heap/maximum"));
+    // No traffic in the next minute: the averages decay by e^-1, e^-0.2, e^-(1/15).
+    try testing.expectEqual(@as(usize, 45), b.publishSys(120_000));
+    const r2 = try SysSeen.drain(&to);
+    try testing.expectEqualStrings("0.23", r2.get("$SYS/broker/load/sockets/1min").?); // 0.632 * 0.368
+    try testing.expectEqualStrings("0.15", r2.get("$SYS/broker/load/sockets/5min").?); // 0.181 * 0.819
+    try testing.expectEqualStrings("0.06", r2.get("$SYS/broker/load/sockets/15min").?);
+    // A clock that stepped back does not divide by zero or go negative.
+    try testing.expectEqual(@as(usize, 45), b.publishSys(100_000));
+    const r3 = try SysSeen.drain(&to);
+    try testing.expectEqualStrings("0.23", r3.get("$SYS/broker/load/sockets/1min").?);
+    // The peak stays after the retained message is cleared.
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, x, .{ .topic = "k", .payload = "", .retain = true }));
+    try testing.expectEqual(@as(usize, 45), b.publishSys(200_000));
+    const r4 = try SysSeen.drain(&to);
+    try testing.expectEqual(@as(u64, 0), try r4.num("$SYS/broker/heap/current"));
+    try testing.expectEqual(@as(u64, 5), try r4.num("$SYS/broker/heap/maximum"));
+}
+
+const InlineLog = struct {
+    topics: [16][32]u8 = undefined,
+    topic_len: [16]usize = undefined,
+    payload_first: [16]u8 = undefined,
+    retained: [16]bool = undefined,
+    n: usize = 0,
+
+    fn record(ctx: ?*anyopaque, t: []const u8, payload: []const u8, retain: bool) void {
+        const l: *InlineLog = @ptrCast(@alignCast(ctx.?));
+        if (l.n == l.topics.len) return;
+        @memcpy(l.topics[l.n][0..t.len], t);
+        l.topic_len[l.n] = t.len;
+        l.payload_first[l.n] = if (payload.len != 0) payload[0] else 0;
+        l.retained[l.n] = retain;
+        l.n += 1;
+    }
+
+    fn name(l: *const InlineLog, i: usize) []const u8 {
+        return l.topics[i][0..l.topic_len[i]];
+    }
+};
+
+test "InlineSubscriber: filters, retained, server publishes, $SYS, unsubscribe, refusals" {
+    var b = Broker.init(testing.allocator, .{ .sys_interval_ms = 1000 });
+    defer b.deinit();
+    var tc = TestTransport{};
+    const c = try connectClient(&b, &tc, "C", 60, 0);
+    // A retained message before the subscriber exists.
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, c, .{ .topic = "a/old", .payload = "R", .retain = true }));
+
+    var log: InlineLog = .{};
+    var sub: InlineSubscriber = undefined;
+    try sub.attach(&b, "inline-1", InlineLog.record, &log, 0);
+    try sub.subscribe("a/#", 0);
+    // The retained message arrives at subscription time, flagged retained.
+    try testing.expectEqual(@as(usize, 1), log.n);
+    try testing.expectEqualStrings("a/old", log.name(0));
+    try testing.expect(log.retained[0]);
+    try testing.expectEqual(@as(u8, 'R'), log.payload_first[0]);
+
+    // A client's PUBLISH, one outside the filter, and the broker's own publish.
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, c, .{ .topic = "a/b", .payload = "1" }));
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, c, .{ .topic = "z", .payload = "2" }));
+    try b.publish("a/c/d", "3", .at_most_once, false);
+    try testing.expectEqual(@as(usize, 3), log.n);
+    try testing.expectEqualStrings("a/b", log.name(1));
+    try testing.expectEqualStrings("a/c/d", log.name(2));
+    try testing.expect(!log.retained[1]);
+    // A QoS 1 publish is delivered at the subscription's QoS 0.
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, c, .{ .topic = "a/q", .payload = "4", .qos = .at_least_once, .packet_id = 9 }));
+    try testing.expectEqual(@as(usize, 4), log.n);
+
+    // `$SYS` through the same path.
+    try sub.subscribe("$SYS/broker/uptime", 0);
+    try testing.expectEqual(@as(usize, 45), b.publishSys(5000));
+    try testing.expectEqual(@as(usize, 5), log.n);
+    try testing.expectEqualStrings("$SYS/broker/uptime", log.name(4));
+
+    // Unsubscribe stops the deliveries; the filter that remains still works.
+    try sub.unsubscribe("a/#", 0);
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, c, .{ .topic = "a/b", .payload = "5" }));
+    try testing.expectEqual(@as(usize, 5), log.n);
+
+    // A bad filter is refused by the SUBACK; the subscriber stays usable.
+    try testing.expectError(error.Refused, sub.subscribe("a/#/b", 0));
+    try sub.subscribe("w/+", 0);
+    try b.publish("w/x", "6", .at_most_once, false);
+    try testing.expectEqual(@as(usize, 6), log.n);
+
+    // Detached: no more callbacks, and the broker holds no connection of it.
+    const before = b.connections.items.len;
+    sub.detach();
+    try testing.expectEqual(before - 1, b.connections.items.len);
+    try b.publish("w/y", "7", .at_most_once, false);
+    try testing.expectEqual(@as(usize, 6), log.n);
+
+    // The connection limit is the broker's: a full broker refuses the attach.
+    var b2 = Broker.init(testing.allocator, .{ .max_connections = 0 });
+    defer b2.deinit();
+    var s2: InlineSubscriber = undefined;
+    try testing.expectError(error.ConnectionLimitReached, s2.attach(&b2, "x", InlineLog.record, &log, 0));
+}
+
+/// A transport that notes whether the broker's registry lock was free while it
+/// was being written to (R-MQ-9: a refusal used to be written under it).
+const LockProbeTransport = struct {
+    broker: *Broker,
+    writes: usize = 0,
+    lock_was_free: bool = true,
+
+    fn transport(m: *LockProbeTransport) Transport {
+        return .{ .ctx = m, .writeFn = writeFn };
+    }
+
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
+        _ = bytes;
+        const m: *LockProbeTransport = @ptrCast(@alignCast(ctx));
+        m.writes += 1;
+        // A spinlock: held means `locked` is set; never touch it.
+        if (m.broker.mutex.locked.load(.acquire)) m.lock_was_free = false;
+    }
+};
+
+test "a CONNECT refused for the session limit is written outside the registry lock (R-MQ-9)" {
+    var b = Broker.init(testing.allocator, .{ .max_sessions = 1 });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const first = try b.accept(t1.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(first, try packet.encodeConnect(&buf, .{ .client_id = "one", .clean_session = false }));
+    _ = try b.process(first, 0);
+    try testing.expectEqual(@as(usize, 1), b.sessionCount());
+
+    var probe = LockProbeTransport{ .broker = &b };
+    const second = try b.accept(probe.transport());
+    try b.feed(second, try packet.encodeConnect(&buf, .{ .client_id = "two", .clean_session = false }));
+    try testing.expectEqual(Disposition.close, try b.process(second, 0));
+    try testing.expectEqual(@as(usize, 1), probe.writes); // the CONNACK refusal
+    try testing.expect(probe.lock_was_free);
+    try testing.expectEqual(@as(usize, 1), b.sessionCount());
+}
+
+test "Shared Subscription groups live in a trie: wildcard shapes, $-topics, many groups, pruning (R-MQ-7)" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tp = TestTransport{};
+    const pubc = try connectClient(&b, &tp, "P", 60, 0);
+
+    // Many distinct groups on distinct topics, plus the wildcard shapes.
+    var ts: [40]TestTransport = undefined;
+    var conns: [40]*Connection = undefined;
+    for (0..40) |i| {
+        ts[i] = .{};
+        var idb: [8]u8 = undefined;
+        const id = try std.fmt.bufPrint(&idb, "m{d}", .{i});
+        conns[i] = try connectClient(&b, &ts[i], id, 60, 0);
+        var fb: [32]u8 = undefined;
+        const f = try std.fmt.bufPrint(&fb, "$share/g{d}/room/{d}", .{ i, i });
+        try feedSubscribe(&b, conns[i], 1, &.{.{ .filter = f }});
+        _ = (try ts[i].next()).?;
+    }
+    // One subscriber per wildcard group (a subscriber in several matching groups
+    // gets one copy).
+    const wild_filters = [4][]const u8{ "$share/plus/room/+", "$share/hash/room/#", "$share/all/#", "$share/all2/+/#" };
+    var tw: [4]TestTransport = undefined;
+    for (0..4) |i| {
+        tw[i] = .{};
+        var idb: [8]u8 = undefined;
+        const c = try connectClient(&b, &tw[i], try std.fmt.bufPrint(&idb, "w{d}", .{i}), 60, 0);
+        try feedSubscribe(&b, c, 1, &.{.{ .filter = wild_filters[i] }});
+        _ = (try tw[i].next()).?;
+    }
+    try testing.expectEqual(@as(usize, 44), b.shared.items.len);
+    for (b.shared.items, 0..) |g, i| try testing.expectEqual(i, g.pos);
+
+    // room/7: its own group, plus, hash, all and all2: one delivery each.
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, pubc, .{ .topic = "room/7", .payload = "x" }));
+    try testing.expect((try ts[7].next()) != null);
+    for (0..40) |i| if (i != 7) try testing.expect((try ts[i].next()) == null);
+    for (0..4) |i| try testing.expect((try tw[i].next()) != null);
+    // room/7/deeper: hash, all and all2 match; `+` is one level.
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, pubc, .{ .topic = "room/7/deeper", .payload = "y" }));
+    try testing.expect((try tw[0].next()) == null);
+    for (1..4) |i| try testing.expect((try tw[i].next()) != null);
+    // A $-topic matches no wildcard-first group.
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, pubc, .{ .topic = "$private/x", .payload = "z" }));
+    for (0..4) |i| try testing.expect((try tw[i].next()) == null);
+
+    // Unsubscribing prunes: the swap-removed groups keep their slots right.
+    const f0 = "$share/g0/room/0";
+    var ub: [64]u8 = undefined;
+    try b.feed(conns[0], try packet.encodeUnsubscribe(&ub, 2, &.{f0}));
+    try testing.expectEqual(Disposition.keep, try b.process(conns[0], 1));
+    _ = (try ts[0].next()).?;
+    try testing.expectEqual(@as(usize, 43), b.shared.items.len);
+    for (b.shared.items, 0..) |g, i| try testing.expectEqual(i, g.pos);
+    try testing.expect(b.findShared(f0) == null);
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, pubc, .{ .topic = "room/0", .payload = "w" }));
+    try testing.expect((try ts[0].next()) == null);
+    // The same group name can be created again.
+    try feedSubscribe(&b, conns[0], 3, &.{.{ .filter = f0 }});
+    _ = (try ts[0].next()).?;
+    try testing.expectEqual(@as(usize, 44), b.shared.items.len);
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, pubc, .{ .topic = "room/0", .payload = "v" }));
+    try testing.expect((try ts[0].next()) != null);
 }

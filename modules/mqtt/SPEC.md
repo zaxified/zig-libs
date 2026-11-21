@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [eclipse-mosquitto/mosquitto](https://github.com/eclipse-mosquitto/mosquitto) — **reference** | C | EPL-2.0 OR EDL-1.0 (`epl-v20` + `edl-v10` files present; API says NOASSERTION) | 11.2k | push 2026-09-03 (no GitHub releases) | Its README: broker for MQTT 5.0, 3.1.1 and 3.1, plus C/C++ client library and CLI tools; TLS via build option. Here: 5.0 and 3.1.1 (not 3.1), QoS 2 both ways, extended auth, `$SYS`, bridges (`bridge`) and a persistence seam (the broker writes no store itself). Interop measured against 2.1.2 (`tools/interop.zig`). |
+| [eclipse-mosquitto/mosquitto](https://github.com/eclipse-mosquitto/mosquitto) — **reference** | C | EPL-2.0 OR EDL-1.0 (`epl-v20` + `edl-v10` files present; API says NOASSERTION) | 11.2k | push 2026-09-03 (no GitHub releases) | Its README: broker for MQTT 5.0, 3.1.1 and 3.1, plus C/C++ client library and CLI tools; TLS via build option. Here: 5.0, 3.1.1 and 3.1 (`MQIsdp`, as the 3.1.1 wire with the 3.1 identifier rules), QoS 2 both ways, extended auth, `$SYS`, bridges (`bridge`) and a persistence seam (the broker writes no store itself). Interop measured against 2.1.2 (`tools/interop.zig`). |
 | [eclipse-paho/paho.mqtt.c](https://github.com/eclipse-paho/paho.mqtt.c) | C | EPL-2.0 OR EDL-1.0 (files present) | 2.4k | v1.3.16 (2026-02-20) | Client library: MQTT 3.1/3.1.1/5.0, TLS, websockets, auto-reconnect *(inferred from its documentation; README not read)*. Here the client is transport-agnostic; reconnect is a sans-I/O backoff schedule (`reconnect`) plus an opt-in outbox that resumes in-flight QoS 1/2 publishes. |
 | [eclipse-paho/paho.mqtt.golang](https://github.com/eclipse-paho/paho.mqtt.golang) | Go | EPL-2.0 OR EDL-1.0 (files present) | 3.1k | v1.5.1 (2025-09-16) | The de-facto Go client, 3.1.1, with TLS/websocket and reconnect built in *(inferred)*. Feature-equal on protocol level; ours is sans-I/O and offline-testable. |
 | [bytebeamio/rumqtt](https://github.com/bytebeamio/rumqtt) | Rust | Apache-2.0 | 2.2k | rumqttc-0.25.1 (2025-11-21) | Rust client (`rumqttc`) and a broker (`rumqttd`), MQTT 3.1.1 and 5 *(inferred)*. |
 | [karlseguin/mqttz](https://github.com/karlseguin/mqttz) | Zig | MIT | 59 | push 2026-06-01 | Zig client only, low-level and a POSIX client; its README describes an MQTT 5 client (`Client5`), no timeouts in the low-level one. No broker. |
 | [ikskuh/zig-mqtt](https://github.com/ikskuh/zig-mqtt) | Zig | MIT | 24 | push 2022-12-28 | Unmaintained since 2022 (push date); client only *(README not read)*. |
 
-**Where we are ahead** (2026-10-17): a broker with depth no Zig alternative shows; the message-path rows of `zig build bench-mqtt` against Mosquitto 2.1.2 with the same driver (the card's Performance line carries the range); session, topic and wire behaviour replayed byte for byte against Mosquitto and paho (`v5_replay`, `session_replay`, `topic_oracle_test`); fuzzing (six harnesses incl. random 5.0 packet streams through the extended-auth state machine), ctgrind on credentials, mutation-tested core. **Where we are behind:** nothing a Mosquitto user would notice in a library (2026-10-17: extended AUTH, `$SYS`, bridging, a persistence seam for retained messages and session bodies, ACL / password files with `%u`/`%c` and `$7$` hashes, `max_keepalive`, `retain_available`, `retain_expiry`, `queue_qos0_messages`, Payload Format validation, Reason Strings, reconnect + in-flight resume in the client, MQTT over WebSocket and TLS as tested recipes). Not built (see *Backlog / deferred*): a TLS *listener* in `TcpServer`, the remaining `$SYS` load/heap topics, an inline in-process subscribe, MQTT 3.1 (`MQIsdp`; a 3.1 CONNECT is refused with CONNACK 0x01). Outbound Topic Aliases, broker and client, are built. A configuration-file daemon, a dynamic-security plugin, clustering and rule engines are product features on top of the hooks, not library scope.
+**Where we are ahead** (2026-10-17): a broker with depth no Zig alternative shows; the message-path rows of `zig build bench-mqtt` against Mosquitto 2.1.2 with the same driver (the card's Performance line carries the range); session, topic and wire behaviour replayed byte for byte against Mosquitto and paho (`v5_replay`, `session_replay`, `topic_oracle_test`); fuzzing (six harnesses incl. random 5.0 packet streams through the extended-auth state machine), ctgrind on credentials, mutation-tested core. **Where we are behind:** nothing a Mosquitto user would notice in a library (2026-10-17: extended AUTH, `$SYS`, bridging, a persistence seam for retained messages and session bodies, ACL / password files with `%u`/`%c` and `$7$` hashes, `max_keepalive`, `retain_available`, `retain_expiry`, `queue_qos0_messages`, Payload Format validation, Reason Strings, reconnect + in-flight resume in the client, MQTT over WebSocket and TLS as tested recipes). Not built (see *Backlog / deferred*): a TLS *listener* in `TcpServer`, a bounded per-connection outbox. Built since: `$SYS` load and heap topics, an inline in-process subscribe (`InlineSubscriber`), MQTT 3.1 (`MQIsdp`). Outbound Topic Aliases, broker and client, are built. A configuration-file daemon, a dynamic-security plugin, clustering and rule engines are product features on top of the hooks, not library scope.
 
 ## Design & invariants
 Three allocation-free codec/client layers plus a broker, all offline-testable; MQTT 3.1.1 and 5.0
@@ -415,6 +415,36 @@ anything changes hands. `sessionStates` reports the owner (`SessionState.usernam
 `restoreSession(client_id, username, subs, offline_since_ms)` takes it back. The binding holds
 with or without an `authenticateFn`; without one, the username is only what clients claim.
 
+## MQTT 3.1, `$SYS` load/heap, inline subscriber, Shared Subscription index
+
+- **MQTT 3.1 (`MQIsdp`, level 3).** A 3.1 CONNECT decodes as `.v3_1_1` with `Connect.legacy_3_1` set, and the connection runs
+  the 3.1.1 wire from then on (what Mosquitto does; the 3.1 packets differ from 3.1.1's in the CONNECT only). The broker
+  applies 3.1's identifier rule, as Mosquitto does: 1 to 23 characters, never empty (an empty one is not replaced by a
+  generated id), otherwise CONNACK 0x02; and the CONNACK has no Session Present flag (3.1 has none; it is sent 0).
+  `MQIsdp` with another level, or `MQTT` with level 3, is still refused (CONNACK 0x01). The encoder writes a 3.1 CONNECT
+  for `legacy_3_1` with a 3.1.1 version, so a client can talk to an old broker.
+- **`$SYS/broker/load/...` and `heap/...`** (mosquitto(8)). `publishSys` also publishes `load/<metric>/<1min|5min|15min>` for
+  messages received/sent, publish dropped/received/sent, bytes received/sent, sockets and connections: the per-minute rate since
+  the previous publication, folded into an exponentially weighted average with weight `1 - e^(-dt/window)`, as two decimals
+  (the first publication has no earlier one and reports 0.00; a clock that steps back changes nothing). `sockets` counts
+  `accept`ed transports, `connections` CONNECT packets. `heap/current` and `heap/maximum` are the bytes of retained
+  (non-`$SYS`) topics and payloads plus the bytes queued for sessions, and the highest such value seen: what the broker's state costs
+  in message data, **not** the process heap (the allocator is the caller's and `Broker` is moved by value, so it cannot
+  wrap it in a counter). `publishSys` now returns 45 topics.
+- **`InlineSubscriber`.** A subscriber with no socket: a clean-session client whose Transport decodes what the broker writes and hands
+  PUBLISHes to a callback (`attach`, `subscribe`, `unsubscribe`, `detach`). Everything that applies to a client applies to it (ACL,
+  retained messages at subscription, `$SYS`, shared subscriptions, the connection limit); deliveries are QoS 0. The callback runs on the
+  publisher's thread inside the delivery and must not call into the broker.
+- **Shared Subscription groups in a trie (`GroupIndex`).** The groups are matched by walking the topic through a trie of their
+  `{filter}` (the same rules as the subscription trie: `+`, `#`, no leading wildcard against a `$` topic) and found by name in a
+  hash map; they used to be a flat list scanned on every PUBLISH and SUBSCRIBE (R-MQ-7). Each group keeps its slot in `Broker.shared`.
+  Their trie nodes are not counted against `max_subscription_nodes`; `max_subscriptions_total` bounds the groups.
+- **A refused CONNECT is written outside the registry lock.** The two refusals found under it (a client id owned by another account,
+  the session limit) are encoded there and written after it is released (R-MQ-9).
+- **Sessions that never expire (R-MQ-6).** `Config.session_expiry_ms = 0` keeps persistent sessions until restart, as Mosquitto's
+  default does; with it, anonymous `clean_session=0` CONNECTs under unique ids fill `max_sessions` (1024). A deployment that accepts
+  anonymous clients sets `session_expiry_ms` and calls `expireSessions(now)`, or `max_sessions` to what it can hold.
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -446,6 +476,8 @@ The bench is `zig build bench-mqtt` (`BENCH_ROUNDS=5`, ReleaseFast): one raw dri
 - **A configuration-file daemon, a dynamic-security plugin, clustering and rule engines.** Product features on top of the hooks, not library scope.
 - **A store written by the broker.** The broker keeps sessions and retained messages in memory; a server persists them through the seam (`sessionStatesWith`, `retainedMessages`, `restoreSession`, `restoreRetained`).
 - **Transport security in the codec, client or broker core.** The caller supplies the transport (TLS, WebSocket as tested recipes); see *Threat model / out of scope*.
+- **A hop or loop bound on bridges (R-MQ-11).** Two bridges between one pair of brokers, a ring, or a 3.1.1 remote that reorders more than the 32 remembered messages can make messages circulate at link speed. Mosquitto has no bound either and treats it as an operator error (its answer is topic prefixes and `try_private`); the bridge rules already refuse the obviously loop-prone `both` rule with equal prefixes (`LoopProneRule`).
+- **An unauthenticated rate limit on password-file PBKDF2 cost (R-MQ-12).** A hostile password file with `max_iterations` 1e7 makes each CONNECT cost seconds. The password file is operator-supplied configuration, not a network input, and Mosquitto has no such limit; `Passwords.max_iterations` is the opt-in bound.
 - **Response Information by default.** It is a MAY; `Config.response_information` is null, as in Mosquitto.
 
 ## Open
@@ -455,15 +487,7 @@ The bench is `zig build bench-mqtt` (`BENCH_ROUNDS=5`, ReleaseFast): one raw dri
 ## Backlog / deferred
 
 - **A TLS listener in `TcpServer`.** The accept loop takes plaintext; terminate TLS in front. The collection has a `tlsserver` module; `TcpServer` does not use it.
-- **The remaining `$SYS` load and heap topics** (`publishSys` publishes 16 Mosquitto-named `$SYS/broker/...` topics).
-- **An inline in-process subscribe** (a subscriber with no transport).
-- **MQTT 3.1 (`MQIsdp`).** A 3.1 CONNECT is refused with CONNACK 0x01 (the 3.1.1 format).
 - **Differential oracle against karlseguin's library (idea, not scheduled).** `karlseguin/mqttz` is a client only (MIT, Zig 0.16): drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so the broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9).
 - **Global byte caps, if a consumer needs them:** queued bytes across all sessions and connections (`(max_sessions + max_connections) * max_queued_bytes`), subscription filter bytes (`max_subscriptions_total * max_packet_size`), and an examined-entries envelope for the retained walk at SUBSCRIBE (documented in `Config`; Mosquitto has no such caps either).
 - **Sweep-review items, each with the review's trigger:**
   - R-MQ-1 follow-up: a bounded per-connection outbox (a slow subscriber is cut off by `TcpServer.write_timeout_ms`, but a publisher still waits up to that long inside the write).
-  - R-MQ-6: persistent sessions never expire by default (`session_expiry_ms = 0`); 1024 anonymous `clean_session=0` CONNECTs with unique ids fill `max_sessions` until restart (Mosquitto's default too). A safe default or docs.
-  - R-MQ-7: Shared Subscriptions are a flat list (`fanout`, `findShared`, `pickShared`): 65536 distinct `$share/g<i>/...` groups make every PUBLISH and SUBSCRIBE scan them all under the lock. Put groups into the trie.
-  - R-MQ-9: a CONNACK refusal (`claimedByAnother`, session limit) is written while holding `b.mutex`; only a consumer `Transport` that blocks could stall the broker (the stock socket cannot block on a fresh connection).
-  - R-MQ-11: bridges have no hop or loop bound (two bridges between one pair of brokers, a ring, a 3.1.1 remote reordering more than the 32 remembered messages): messages can circulate at link speed. Operator error, as in Mosquitto.
-  - R-MQ-12: PBKDF2 login cost: a hostile password file with `max_iterations` 1e7 makes each CONNECT cost seconds; no unauthenticated rate limit (config-time concern).
