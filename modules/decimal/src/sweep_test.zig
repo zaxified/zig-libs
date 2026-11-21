@@ -531,3 +531,66 @@ test "a coefficient of exactly max_coeff_digits digits is accepted by the exact-
     var r2 = try BigDecimal.rescale(a, y2, 0, .down);
     r2.deinit();
 }
+
+/// `digits` zeros-padded text to a coefficient with `exponent`.
+fn wideDecimal(a: std.mem.Allocator, text: []const u8, exponent: i32) !BigDecimal {
+    var c = try Managed.init(a);
+    errdefer c.deinit();
+    try c.setString(10, text);
+    return .{ .coeff = c, .exponent = exponent };
+}
+
+test "toFloat of a wide coefficient reads only the leading digits: ties, ties broken by a far digit, random (wave 15)" {
+    const a = testing.allocator;
+    // 2^53 + 1 is exactly halfway between two doubles: 900 zeros after it keep it a tie (to even,
+    // 2^53), a 1 after the zeros breaks it upward.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    try text.appendSlice(a, "9007199254740993");
+    try text.appendNTimes(a, '0', 900);
+    var tie = try wideDecimal(a, text.items, -900);
+    defer tie.deinit();
+    try testing.expectEqual(@as(f64, 9007199254740992.0), try tie.toFloat(a));
+    try text.append(a, '1');
+    var above = try wideDecimal(a, text.items, -901);
+    defer above.deinit();
+    try testing.expectEqual(@as(f64, 9007199254740994.0), try above.toFloat(a));
+    var below = try wideDecimal(a, text.items, -901);
+    defer below.deinit();
+    below.coeff.negate();
+    try testing.expectEqual(@as(f64, -9007199254740994.0), try below.toFloat(a));
+
+    // Random wide values against the standard library's parser over the whole text.
+    var prng = std.Random.DefaultPrng.init(0x7f10a7);
+    const rnd = prng.random();
+    for (0..40) |_| {
+        const len = 801 + rnd.uintLessThan(usize, 600);
+        var t: std.ArrayList(u8) = .empty;
+        defer t.deinit(a);
+        try t.append(a, '1' + rnd.uintLessThan(u8, 9));
+        for (1..len) |_| try t.append(a, if (rnd.uintLessThan(u8, 4) == 0) '0' else '0' + rnd.uintLessThan(u8, 10));
+        const exp: i32 = -@as(i32, @intCast(len)) + rnd.intRangeAtMost(i32, -300, 300);
+        var d = try wideDecimal(a, t.items, exp);
+        defer d.deinit();
+        const full = try std.fmt.allocPrint(a, "{s}e{d}", .{ t.items, exp });
+        defer a.free(full);
+        const want = try std.fmt.parseFloat(f64, full);
+        try testing.expectEqual(@as(u64, @bitCast(want)), @as(u64, @bitCast(try d.toFloat(a))));
+    }
+}
+
+test "toFloat of a 190000-digit in-range value is fast and right (wave 15)" {
+    const a = testing.allocator;
+    // 3.141592653589793... x 10^k + 7: the 7 is a nonzero tail 189000 digits below the leading one.
+    var d = try tenPow(a, 3141592653589793238, 189_982, -190_000);
+    defer d.deinit();
+    try d.coeff.addScalar(&d.coeff, 7);
+    const started = monoNs();
+    const got = try d.toFloat(a);
+    const took = monoNs() - started;
+    try testing.expectEqual(@as(f64, 3.141592653589793), got);
+    if (took > 2 * std.time.ns_per_s) {
+        std.debug.print("toFloat took {d} ms\n", .{took / std.time.ns_per_ms});
+        return error.TooSlow;
+    }
+}

@@ -715,6 +715,11 @@ pub const BigDecimal = struct {
     /// `BigDecimal` is `+0.0`). Consequence: the conversion is not
     /// invertible at the edges — `fromFloat` refuses the `inf` it produces.
     /// Only allocation can fail.
+    /// Significant digits `toFloat` reads exactly; the rest only matter as "nonzero". A decimal
+    /// of more than 767 significant digits is never exactly halfway between two f64 (the widest
+    /// halfway point has 767), so 800 digits and a sticky one decide every rounding.
+    const float_sig_digits: u32 = 800;
+
     pub fn toFloat(self: BigDecimal, allocator: Allocator) Allocator.Error!f64 {
         if (self.isZero()) return 0.0;
         {
@@ -725,16 +730,58 @@ pub const BigDecimal = struct {
             if (bounds.lo > 310) return if (neg0) -std.math.inf(f64) else std.math.inf(f64);
             if (bounds.hi < -326) return std.math.copysign(@as(f64, 0.0), if (neg0) -1.0 else 1.0);
         }
-        const digits = try self.coeff.toConst().toStringAlloc(allocator, 10, .lower);
+        var exp10: i64 = self.exponent;
+        var ndigits: u64 = 0; // digits of the coefficient
+        var digits: []u8 = undefined;
+        const bits = self.coeff.toConst().bitCountAbs();
+        if (digitsAtLeast(bits) > float_sig_digits) {
+            // A wide coefficient: the first `float_sig_digits` or a few more digits decide the
+            // rounding, and everything below them only whether the value is exactly those digits.
+            // `drop` comes from the bit length (no exact digit count: that is a quadratic
+            // conversion itself); the quotient then has `digits - drop` digits, a handful over.
+            // (the range check above bounds `digits + exponent`, so the digit count fits u32)
+            const drop: u32 = @intCast(digitsAtLeast(bits) - float_sig_digits);
+            var mag = try self.coeff.clone();
+            defer mag.deinit();
+            mag.setSign(true);
+            var p10 = try pow10(allocator, drop);
+            defer p10.deinit();
+            var q = try Managed.init(allocator);
+            defer q.deinit();
+            var r = try Managed.init(allocator);
+            defer r.deinit();
+            try q.divTrunc(&r, &mag, &p10);
+            const head = try q.toConst().toStringAlloc(allocator, 10, .lower);
+            defer allocator.free(head);
+            ndigits = head.len + drop;
+            const neg = !self.coeff.isPositive();
+            // A nonzero remainder is the digit `1` one place below the kept ones: it only
+            // has to break a tie the right way (a decimal of more than 767 significant
+            // digits never sits exactly on one).
+            const sticky = !r.eqlZero();
+            digits = try allocator.alloc(u8, head.len + @intFromBool(neg) + @intFromBool(sticky));
+            var w: usize = 0;
+            if (neg) {
+                digits[0] = '-';
+                w = 1;
+            }
+            @memcpy(digits[w..][0..head.len], head);
+            w += head.len;
+            if (sticky) digits[w] = '1';
+            exp10 += @as(i64, drop) - @intFromBool(sticky);
+        } else {
+            digits = try self.coeff.toConst().toStringAlloc(allocator, 10, .lower);
+            ndigits = digits.len - @as(usize, @intFromBool(digits[0] == '-'));
+        }
         defer allocator.free(digits);
         const neg = digits[0] == '-';
         // Decimal exponent of the leading digit: value ∈ [10^adj, 10^(adj+1)).
-        const adj: i64 = @as(i64, @intCast(digits.len - @as(usize, @intFromBool(neg)))) - 1 + self.exponent;
+        const adj: i64 = @as(i64, @intCast(ndigits)) - 1 + self.exponent;
         // f64 max ≈ 1.8e308 and half the smallest subnormal ≈ 2.5e-324, so
         // these cut-offs are safely outside the rounding window.
         if (adj > 310) return if (neg) -std.math.inf(f64) else std.math.inf(f64);
         if (adj < -326) return std.math.copysign(@as(f64, 0.0), if (neg) -1.0 else 1.0);
-        const text = try allocator.print("{s}e{d}", .{ digits, self.exponent });
+        const text = try allocator.print("{s}e{d}", .{ digits, exp10 });
         defer allocator.free(text);
         // Well-formed by construction: optional '-', decimal digits, 'e', integer.
         return std.fmt.parseFloat(f64, text) catch unreachable;
