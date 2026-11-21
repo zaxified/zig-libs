@@ -5,7 +5,7 @@ end-to-end application-layer security for CoAP, built on a COSE_Encrypt0
 wrapper around an AEAD. This module targets the MANDATORY-to-implement
 ciphersuite only — **AES-CCM-16-64-128** (COSE algorithm 10: 128-bit key,
 13-byte nonce, 64-bit/8-byte tag) for the AEAD, and **HKDF-SHA-256** for
-§3.2.1 context derivation. The sibling `aesccm` module's `Aes128Ccm8Nonce13` is exactly
+§3.2.1 context derivation. `std.crypto.aead.aes_ccm.Aes128Ccm8` is exactly
 this AEAD; `std.crypto.kdf.hkdf.HkdfSha256` is exactly this KDF — neither
 is a gap. The OSCORE-specific construction around them (security context,
 nonce, AAD, compressed wire option, replay protection) is this module.
@@ -140,7 +140,7 @@ simply be stored and reloaded.
 ## Import graph
 
 ```
-oscore → aesccm.Aes128Ccm8Nonce13 / std.crypto.kdf.hkdf.HkdfSha256 / std.crypto.hash.sha2.Sha256
+oscore → std.crypto.aead.aes_ccm.Aes128Ccm8 / std.crypto.kdf.hkdf.HkdfSha256 / std.crypto.hash.sha2.Sha256
 ```
 
 No sibling-module dependency (`meta.deps = .{}`) — deliberately not

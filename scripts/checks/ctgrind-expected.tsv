@@ -254,9 +254,9 @@ chachapoly	ReleaseSafe	xaead	1	>=1	b94ef506c3742448	b8e31007e13e23b8
 # `crypto.timing_safe.eql` two lines above it. Branching on the answer is the
 # API; the comparison that produced it is the constant-time one. It is here and
 # not in the other two because only `unprotect` verifies a tag.
-oscore	ReleaseFast	derive	1	0	b6e4bbe38605c5e1	2f7c17dad79da56d
-oscore	ReleaseFast	protect	1	0	b6e4bbe38605c5e1	6eac6a90e3479ab8
-oscore	ReleaseFast	unprotect	1	1	b6e4bbe38605c5e1	ed85db89e3d7e9fd
+oscore	ReleaseFast	derive	1	0	5348e0af1901ba83	2f7c17dad79da56d
+oscore	ReleaseFast	protect	1	0	5348e0af1901ba83	6eac6a90e3479ab8
+oscore	ReleaseFast	unprotect	1	1	5348e0af1901ba83	ed85db89e3d7e9fd
 # ssh dh / ffpow (2026-10-02). `dh`: the MODP DH secret x through
 # dhPowModPrime (montint powMont) in group14 and group16 — 0 contexts in
 # montint; the 4 in-file are stripLeadingZeros on e (public) and on K, twice:
@@ -2388,11 +2388,8 @@ saml	ReleaseFast	sign	1	45	6c9ac2d2df017817	88075a41bcf0b2bb
 # A1/A2 -- std soft AES: secret-indexed masked S-box loads in the key expansion (A1); where
 # control/trap are pinned, std's undefined bitsliced padding (A2, untainted). Measured 2026-11-18,
 # -mcpu=x86_64.
-# oscore (2026-11-21): AEAD moved from std's Aes128Ccm8 to the aesccm module; the in-file count halved (80/81 -> 40/41;
-# the cause was not broken down per site) and the untainted control / no-fvalgrind
-# trap rows went to 0 (std's undefined-padding sites are no longer on the path).
-oscore	ReleaseFast	protect	1	40	b6e4bbe38605c5e1	6eac6a90e3479ab8	cpu=x86_64
-oscore	ReleaseFast	unprotect	1	41	b6e4bbe38605c5e1	ed85db89e3d7e9fd	cpu=x86_64
+oscore	ReleaseFast	protect	1	80	5348e0af1901ba83	6eac6a90e3479ab8	cpu=x86_64 control=2 trap=2
+oscore	ReleaseFast	unprotect	1	81	5348e0af1901ba83	ed85db89e3d7e9fd	cpu=x86_64 control=1 trap=1
 fss	ReleaseFast	gen	1	0	04a4f7caf30f2695	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
 fss	ReleaseFast	eval	1	0	04a4f7caf30f2695	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
 aesgcm	ReleaseFast	generic	1	226	96d433b8d464dac1	b60805fea700d105	cpu=x86_64 control=8 trap=8
