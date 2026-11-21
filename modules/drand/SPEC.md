@@ -287,8 +287,9 @@ Run with `scripts/modtest drand` (`zig build test-drand`).
   0.0.19's fixtures (MIT; recorded there from `drand.cloudflare.com`), round
   2634945 and the key from drand/drand v2.1.7 `crypto/schemes_test.go`
   `TestVerifyBeacon`, which verifies them with drand's own scheme.
-  `tools/fetch_chained.py` re-finds every value in both packages; a re-check
-  against the live API is open (Backlog). Refusals pinned on these beacons:
+  `tools/fetch_chained.py` re-finds every value in both packages, and its `live`
+  mode (2026-11-21, `api.drand.sh`) matched the chain info and every pinned
+  signature, `previous_signature` and `randomness` of all three rounds. Refusals pinned on these beacons:
   tampered signature, three wrong rounds (incl. `+2^32`), `previous_signature`
   flipped at three positions / swapped / dropped / genesis seed altered,
   tampered randomness, cross-chain, cross-scheme; positive controls show the
@@ -347,10 +348,6 @@ Go source) and reused here.
 
 ## Backlog / deferred
 
-- **Live re-check of the chained fixtures** — `tools/fetch_chained.py live`
-  has not been run against the live API; the fixtures come from two published
-  packages (`packages` mode re-finds them there). A live re-fetch of the
-  beacons would close it.
 - **A genuine `bls-unchained-on-g1` beacon** — none is in the repository, so
   that scheme's tests are self-consistency only; add a real vector when one is
   available.
