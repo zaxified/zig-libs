@@ -680,6 +680,36 @@ test "revert: a symlink or a FIFO at the delta name is refused, nothing is creat
     try t.expectError(error.FileNotFound, fx.save.statFile(t.io, "absent", .{}));
 }
 
+test "Session.commit(null): also commits the packages with a staged delta that the session never opened" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "net", base_conf);
+    try fx.put(fx.conf, "other", base_conf);
+    try fx.put(fx.conf, "quiet", base_conf);
+    try fx.put(fx.save, "other", "other.lan.proto='dhcp'\n");
+    try fx.put(fx.save, "quiet", ""); // an empty delta: nothing to commit
+    const st = fx.store();
+    const listed = try st.stagedPackages(t.allocator);
+    defer {
+        for (listed) |n| t.allocator.free(n);
+        t.allocator.free(listed);
+    }
+    try t.expectEqual(@as(usize, 1), listed.len);
+    try t.expectEqualStrings("other", listed[0]);
+    var s = uci.Session.init(t.allocator, st);
+    defer s.deinit();
+    try s.run("set net.lan.proto=none\n", .{}, null, null);
+    const quiet_before = (try fx.conf.statFile(t.io, "quiet", .{})).inode;
+    try s.commit(null);
+    for ([_][]const u8{ "net", "other" }) |nm| {
+        var p = try st.load(t.allocator, nm, null);
+        defer p.deinit(t.allocator);
+        try t.expectEqualStrings(if (std.mem.eql(u8, nm, "net")) "none" else "dhcp", p.section("iface", "lan").?.get("proto").?);
+    }
+    try t.expect(!try st.hasStaged(t.allocator, "other"));
+    try t.expectEqual(quiet_before, (try fx.conf.statFile(t.io, "quiet", .{})).inode);
+}
+
 test "save and partial revert: the delta replays to the editor's state; a section or option goes back to the committed one" {
     var fx = try Fixture.init();
     defer fx.deinit();

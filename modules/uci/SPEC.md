@@ -31,7 +31,7 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 (grade-2 pass) per `SURVEY-PLAYBOOK.
 | `set` `add` `add_list` `del_list` `delete` `rename` `reorder` [V] | done (`Editor`, `Session.run`); a rename onto a name in use is **NOT BUILT (budget)**: the binary performs it and holds two sections of one name (a committed file then merges them on reload); we refuse with `DuplicateSection`/`DuplicateOption` because the model cannot hold two. Making it parity needs duplicate ids in `Editor` and a merge in `toPackage`. This is the one place the Scope line's "parity" is short |
 | `show` incl. `-X`, `-d <str>` [V] | done (`ShowOptions.extended`, `.delimiter`) |
 | `export` [V] | done (`serialize`; two style differences stay: quoting segments, one trailing blank line) |
-| `commit` [V] | **done** (`Store.commit`/`commitEditor`/`commitStaged`: temp file, fsync, rename, directory fsync, mode kept, delta emptied; the binary also replaces the file with a new inode and leaves no lock file). Hooks and `reload_config` are the system's, not libuci's: rejected, the caller runs them |
+| `commit` [V] | **done** (`Store.commit`/`commitEditor`/`commitStaged`; `Session.commit(null)` also commits every package with a non-empty delta in the save directory, listed by `Store.stagedPackages`, as the binary does: temp file, fsync, rename, directory fsync, mode kept, delta emptied; the binary also replaces the file with a new inode and leaves no lock file). Hooks and `reload_config` are the system's, not libuci's: rejected, the caller runs them |
 | `import`, `import -m` [V] | **done** (`Store.importText` writes at once and leaves the delta, as measured; `merge` for `-m`: named section same type, anonymous always added, `list` appends, `option` sets) |
 | `batch` [V] | **done** (`Session.run`, `parseScript`; the binary goes on after a failing line and exits 0, `RunOptions.keep_going` reproduces that, the default stops: deliberate) |
 | `revert <pkg>` [V] | **done** (`Store.revert`, `Session` `revert`; the delta file stays, empty, as in the binary) |
@@ -301,22 +301,15 @@ Performance line has the figures.
 - **Mixed `option`/`list` under one key** is rejected as `MixedOptionList`, where the binary merges (the last kind
   wins): this module's own strictness, kept on purpose.
 
+- **Delete-heavy deltas on very large sections, and `@type[N]` lookup in `Editor`.** A record that removes an option or list entry shifts the rest of its section (O(options)), and `@type[N]` scans the sections (O(sections)); `applyDelta` charges both to `max_delta_work`, so a delta of many such records on a section with ~100k options (about 650 deletes) stops with `WorkLimitExceeded`. libuci keeps its sections and options in linked lists and walks them for every lookup too, and real packages hold tens of sections and options, so an index here would be an optimisation no user of the binary's model needs; the cap is the answer to a hostile delta. `Editor.applyDelta` is not atomic: earlier records stay applied after an error (documented; the free `applyDelta` works on a copy).
+
 ## Backlog / deferred
 
 - **Duplicate-name renames** as `uci` performs them (a rename onto a name already in use; the binary holds two sections of
-  one name and a committed file merges them on reload). Not built for budget: needs duplicate ids in `Editor` and a
+  one name and a committed file merges them on reload). Not built: needs duplicate ids in `Editor` and a
   merge in `toPackage`; today `DuplicateSection`/`DuplicateOption`. The one place the Scope line's "parity" is short.
-- **`Session.commit(null)` over packages the session never opened**: it writes only the packages the session changed;
-  the binary commits every package with a delta in the save directory, which needs a directory listing of it.
 - **Several `-p` orders beyond the one measured** (one extra directory observed: its delta first, then the save
-  directory's).
-- **Delete-heavy deltas on very large sections can hit `max_delta_work`**: a record that removes an option or list entry
-  shifts the rest of that section (O(options)), so a delta of many such records on a section with ~100k+ options stops
-  with `WorkLimitExceeded` (about 650 deletes at 100k options). Real sections hold tens of options.
-  `Editor.applyDelta` is not atomic: earlier records stay applied after an error (documented; the free `applyDelta`
-  works on a copy).
-- **`Editor` section/option lookup by `@type[N]`** is O(sections) per call (id and key lookups are hashed);
-  `applyDelta` bounds the total with `max_delta_work`.
+  directory's). Needs the real binary run with two or more `-p` directories (`tools/build-oracle.sh` builds it from a source copy).
 
 ## Anchoring
 

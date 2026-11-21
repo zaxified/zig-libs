@@ -164,8 +164,9 @@ pub const Session = struct {
     /// but the editor is left as it was: stale, still dirty, its stamp old, so a
     /// retry gives `ChangedOnDisk`. The next step is `discard` (the next
     /// `editor` call reloads from disk). Writes `name` (or, with null, every package this
-    /// session changed) and empty the deltas. A package the session never
-    /// opened is committed from its staged delta. Packages are written one
+    /// session changed, then every other package with a staged delta in the
+    /// save directory, as the binary does) and empty the deltas. A package the
+    /// session never opened is committed from its staged delta. Packages are written one
     /// after the other: a failure in the middle leaves the earlier ones
     /// committed (each of them atomically).
     pub fn commit(self: *Session, name: ?[]const u8) SessionError!void {
@@ -180,6 +181,16 @@ pub const Session = struct {
             if (!e.dirty) continue;
             try self.store.commitEditor(self.gpa, e.name, &e.ed, e.stamp);
             try self.reload(i);
+        }
+        // Like the binary, also every other package with a delta in the save directory.
+        const staged = try self.store.stagedPackages(self.gpa);
+        defer {
+            for (staged) |n| self.gpa.free(n);
+            self.gpa.free(staged);
+        }
+        for (staged) |n| {
+            try self.store.commitStaged(self.gpa, n, null);
+            if (self.indexOf(n)) |i| try self.reload(i);
         }
     }
 

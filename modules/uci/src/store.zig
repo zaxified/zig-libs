@@ -329,6 +329,31 @@ pub const Store = struct {
 
     /// True when `name` has staged changes: the delta's CONTENT, not the
     /// file's existence (an emptied delta stays on disk).
+    /// The packages with a non-empty delta in the save directory, sorted by name: what `uci commit`
+    /// without an argument commits. Only regular files whose name is a valid package name are
+    /// listed (`allow_paths` names cannot appear in a directory listing). No save directory: none.
+    /// The caller frees each name and the slice.
+    pub fn stagedPackages(self: Store, gpa: Allocator) (StoreError || Allocator.Error)![][]u8 {
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |n| gpa.free(n);
+            out.deinit(gpa);
+        }
+        const dir = self.save orelse return out.toOwnedSlice(gpa);
+        var it = dir.iterate();
+        while (it.next(self.io) catch return error.ReadFailed) |e| {
+            if (e.kind != .file or !validPackageName(e.name)) continue;
+            if (!try self.hasStaged(gpa, e.name)) continue;
+            try out.append(gpa, try gpa.dupe(u8, e.name));
+        }
+        std.mem.sort([]u8, out.items, {}, struct {
+            fn lt(_: void, a: []u8, b: []u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        return out.toOwnedSlice(gpa);
+    }
+
     pub fn hasStaged(self: Store, gpa: Allocator, name: []const u8) StoreError!bool {
         const d = (try self.staged(gpa, name)) orelse return false;
         defer gpa.free(d);
