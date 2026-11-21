@@ -38,9 +38,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 attached program (CO-RE field relocations, BTF, links, XDP over netlink, uprobe offset resolution)
 and to consume ring/perf buffers with documented barrier discipline; hand-built verifier-passing
 programs need no clang at all; every malformed-object path is a typed error. **Where we are
-behind:** sub-program calls, kfuncs/externs, map-in-map, pinning, skeleton/mmap'd data, non-field
-CO-RE kinds, `tcx`/`netkit`, `kprobe_multi`, USDT discovery, `BPF_PROG_QUERY` and typed map wrappers
-(→ Backlog; each is a typed error today, never a mis-load).
+behind:** everything libbpf's loader does is implemented, but little of the privileged half (creating maps and
+loading programs with sub-programs, externs, map-in-map, struct_ops, a downgraded BTF) has run against a live kernel in
+this repository's own tests (no `CAP_BPF` on the development machine): the structural checks (attrs, instruction streams,
+value layouts, BTF rewrites) are golden-tested, the syscalls are not. iterators and the libbpf-only convenience API
+(`bpf_object__*` accessors, `bpf_program__attach` by section) are not provided.
 
 ## Threat model / what can go wrong
 
@@ -1109,33 +1111,24 @@ guards, and bitfield-of-array members clang never emits. The privileged lane (th
   "file:line" or a C++ source name needs debug info this module does not read.
 - **AUX/ITRACE perf areas**: the perf-buffer consumer reads the data area only; `aux_head`/`aux_tail` (Intel PT and
   friends) are a different consumer entirely.
+- **Kernel-module `struct_ops`, libbpf's probed virtual externs and map `map_extra`.** `struct_ops` is planned against
+  vmlinux BTF only (`error.StructOpsTypeNotFound` otherwise); `LINUX_HAS_BPF_COOKIE` / `LINUX_HAS_SYSCALL_WRAPPER` need a
+  feature probe per kernel and are strong-`ExternNotFound`; a non-zero BTF `map_extra` is `UnknownMapMember` (the `__ulong`
+  encoding is a 64-bit element count that this parser does not read).
+- **Iterators and a `bpf_object__*`-style convenience API.** `bpf_iter` programs have no consumer; libbpf's
+  `bpf_program__attach(section)` auto-attach is not offered because attaching is explicit in this module (`attach.zig`,
+  `bpflink.zig`).
 - **A fourth *program* builder**: the builder surface is exactly `kprobe-counter` / `xdp-filter` / `ringbuf-emit`;
   tc/classifier programs remain additive rather than a redesign. The live perf-buffer test's `bpf_perf_event_output`
   producer is test-local for the same reason: a public builder would need its own clang-derived golden vector.
 
 ## Backlog / deferred
 
-The object loader's gaps (CO-RE kinds, sub-program calls, externs, map-in-map, pinning) are typed errors naming the
-symbol, never a mis-load; the attach and API gaps are simply absent.
-
-
-### Priority order
-
-Ranked by how soon a libbpf/cilium-ebpf user meets the gap. The detailed bullets above stay authoritative for effort. All
-fit CONVENTIONS §2 (pure Zig, no libc).
-
-1. **Sub-program (`.text`) call linking**: any C program with a non-inlined helper or a `__noinline` global function (very
-   common in real programs) is refused with `SubprogramCallsUnsupported`. Effort: medium.
-2. **bpffs pinning**: pinned maps/programs/links are how a loader hands state to another process; cilium/ebpf and aya both
-   do it. Effort: small-medium (`BPF_OBJ_PIN`/`_GET` plus path policy).
-3. **kfuncs / externs / ksyms / `.kconfig`**: modern tracing and networking programs use kfuncs. Effort: large.
-4. **Map-in-map and `prog_array` population**: tail calls and per-CPU-config maps. Effort: medium.
-5. **Typed map wrapper**: see the bullet above. Effort: small-medium.
-6. **`tcx`/`netkit` attach and `BPF_PROG_QUERY`**: the tc/classifier program type is not driveable from an object. Effort:
-   medium.
-7. **Non-field CO-RE relocation kinds and multi-candidate matching**: the rest of libbpf's CO-RE. Effort: medium.
-8. **`kprobe_multi`/`uprobe_multi`, USDT discovery, struct_ops, mmap'd global data**: see the bullets above. Effort: medium
-   each.
+Nothing is deferred: every item the module's backlog held (the rest of CO-RE, sub-program linking, externs, map-in-map,
+pinning, mmap'd global data and the skeleton, `struct_ops`, BTF sanitization, BTF by id, `kprobe_multi`/`uprobe_multi`,
+`tcx`/`netkit`, USDT discovery, `BPF_PROG_QUERY`, cpumap/devmap attach, the typed map wrapper) is implemented and described
+above. What is left out on purpose is under "What is deliberately not done"; what has no live-kernel verification is
+listed per feature in the sections above.
 
 ## Anchoring
 

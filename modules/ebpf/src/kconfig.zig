@@ -219,30 +219,6 @@ fn writeNumber(dst: []u8, negative: bool, magnitude: u64, signed: bool, end: std
 
 // ── reading the running kernel's configuration ──────────────────────────────
 
-/// Read a whole file that does not report its size (`/proc` files).
-pub fn readStreaming(gpa: std.mem.Allocator, path: [:0]const u8, max: usize) error{ OpenFailed, ReadFailed, TooLarge, OutOfMemory }![]u8 {
-    if (comptime builtin.os.tag != .linux) @compileError("ebpf.kconfig is Linux-only");
-    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
-    const fd: linux.fd_t = @intCast(rc);
-    defer _ = linux.close(fd);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var chunk: [16 * 1024]u8 = undefined;
-    while (true) {
-        const r = linux.read(fd, &chunk, chunk.len);
-        switch (linux.errno(r)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return error.ReadFailed,
-        }
-        if (r == 0) break;
-        if (out.items.len + r > max) return error.TooLarge;
-        out.appendSlice(gpa, chunk[0..r]) catch return error.OutOfMemory;
-    }
-    return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
-}
-
 /// The address of kernel symbol `name` in `/proc/kallsyms`-formatted `text`
 /// (`addr type name [module]`), or `null` — also when the address reads 0,
 /// which is what an unprivileged reader (`kptr_restrict`) is shown.
@@ -267,7 +243,7 @@ pub const ReadError = error{ NoKernelConfig, BadConfig } || ParseError;
 /// `/boot/config-<release>` (`release` as `uname -r` says).
 pub fn readKernelConfig(gpa: std.mem.Allocator) ReadError!Config {
     if (comptime builtin.os.tag != .linux) @compileError("ebpf.kconfig is Linux-only");
-    if (readStreaming(gpa, "/proc/config.gz", 8 << 20)) |gz| {
+    if (elfsym.readFileStreaming(gpa, "/proc/config.gz", 8 << 20)) |gz| {
         defer gpa.free(gz);
         var in: std.Io.Reader = .fixed(gz);
         var window: [std.compress.flate.max_window_len]u8 = undefined;

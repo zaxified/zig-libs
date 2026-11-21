@@ -72,13 +72,13 @@
 //! Every one of these is a *typed error naming the symbol or section*, never
 //! a silently broken program:
 //!
-//! - `error.SubprogramCallsUnsupported` — a `R_BPF_64_32` call relocation into
-//!   `.text`. Static linking of sub-programs needs instruction-stream
-//!   concatenation and `func_info` merging.
-//! - `error.ExternSymbolUnsupported` — an `SHN_UNDEF` symbol: a kfunc
-//!   (`BPF_PSEUDO_KFUNC_CALL`), an extern kconfig variable, or a weak extern.
+//! - `error.ExternSymbolUnsupported` — an `SHN_UNDEF` symbol the object's BTF
+//!   does not describe as a `.kconfig` / `.ksyms` extern.
 //! - `error.PinningUnsupported` — a `pinning` member that is neither none nor
 //!   by-name.
+//! - `error.MalformedMapDefinition`, `error.UnknownMapMember`,
+//!   `error.UnknownProgramSection` — a map or section the loader cannot
+//!   describe exactly.
 //!
 //! Provenance: the wire formats are the kernel UAPI (`linux/bpf.h`'s
 //! `BPF_PSEUDO_*`, `bpf_map_def`, the `bpf_attr` arms) and the System V gABI
@@ -2843,7 +2843,7 @@ pub fn resolveKernelExterns(obj: *Object, kernel: *const Btf, opts: LoadOptions)
         switch (e.kind) {
             .kconfig => continue,
             .ksym_var => if (e.typeless) {
-                if (kallsyms == null) kallsyms = kconfig_mod.readStreaming(obj.gpa, "/proc/kallsyms", 64 << 20) catch null;
+                if (kallsyms == null) kallsyms = elfsym.readFileStreaming(obj.gpa, "/proc/kallsyms", 64 << 20) catch null;
                 const addr = if (kallsyms) |k| kconfig_mod.kallsymsAddress(k, e.name) else null;
                 if (addr) |ad| {
                     e.addr = ad;

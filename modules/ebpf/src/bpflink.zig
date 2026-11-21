@@ -62,6 +62,8 @@ const verboseSkip = testkit.verboseSkip;
 const linux = std.os.linux;
 const BPF = linux.BPF;
 
+const elfsym = @import("elfsym.zig");
+
 const native_endian = builtin.cpu.arch.endian();
 
 // ── errors ──────────────────────────────────────────────────────────────────
@@ -783,6 +785,43 @@ pub fn selectSymbols(gpa: std.mem.Allocator, listing: []const u8, pattern: []con
     const ptrs = try gpa.alloc([*:0]const u8, offs.items.len);
     for (offs.items, 0..) |o, i| ptrs[i] = @ptrCast(bytes[o..].ptr);
     return .{ .gpa = gpa, .storage = bytes, .ptrs = ptrs };
+}
+
+/// The tracefs file listing the functions a kprobe-multi may attach to, in
+/// either of its two mount points.
+pub const filter_functions_paths = [_][:0]const u8{
+    "/sys/kernel/tracing/available_filter_functions",
+    "/sys/kernel/debug/tracing/available_filter_functions",
+};
+
+/// Read the tracefs `available_filter_functions` listing (needs `CAP_SYS_ADMIN`
+/// or a readable tracefs), for `selectSymbols`. The caller frees it.
+pub fn readFilterFunctions(gpa: std.mem.Allocator) error{ NotFound, OutOfMemory }![]u8 {
+    for (filter_functions_paths) |path| {
+        return elfsym.readFileStreaming(gpa, path, 256 << 20) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+    }
+    return error.NotFound;
+}
+
+/// Attach one program to every kernel function whose name matches the glob
+/// `pattern` (`*`, `?`), as libbpf's `attach_kprobe_multi_opts(pattern)` does:
+/// the listing is read from tracefs, filtered with `selectSymbols`, and one
+/// link is created over the result. A pattern that matches nothing is
+/// `error.InvalidOptions`.
+pub fn linkCreateKprobeMultiGlob(
+    gpa: std.mem.Allocator,
+    prog_fd: linux.fd_t,
+    pattern: []const u8,
+    return_probe: bool,
+) (MultiLinkError || error{ NotFound, OutOfMemory })!LinkHandle {
+    const listing = try readFilterFunctions(gpa);
+    defer gpa.free(listing);
+    var syms = try selectSymbols(gpa, listing, pattern);
+    defer syms.deinit();
+    return linkCreateKprobeMulti(prog_fd, .{ .symbols = syms.ptrs, .return_probe = return_probe });
 }
 
 /// Map a `bpf()` errno onto `LinkError`. `EINVAL`/`EOPNOTSUPP` deliberately

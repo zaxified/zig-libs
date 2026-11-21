@@ -80,8 +80,7 @@ set it deliberately.
 
 See `modules/ebpf/src/*.zig` doc comments for the authoritative, per-function
 constraint lists and `SPEC.md` for the attach lifetime rules, the uprobe offset
-trap, and both consumers' barrier discipline. What the module does not do yet
-(the rest of CO-RE, sub-program calls, kfuncs/externs, map-in-map, pinning, ...)
+trap, and both consumers' barrier discipline. What the module leaves out
 is under *Not provided* below.
 
 | File | Tier | Status |
@@ -414,8 +413,10 @@ global-data relocations, per-program `func_info`/`line_info` slicing with
 grown from `log_true_size` so it is never truncated.
 
 What it refuses with a typed error naming the symbol, rather than emitting a
-silently broken program: `error.ExternSymbolUnsupported` (kfuncs,
-extern symbols the BTF does not describe).
+silently broken program: `error.ExternSymbolUnsupported` (an undefined symbol
+the BTF does not describe as an extern), `error.UnknownMapMember`,
+`error.UnknownProgramSection`, `error.PinningUnsupported` (a mode other than
+none / by-name).
 
 Map-in-map (`ARRAY_OF_MAPS`/`HASH_OF_MAPS` with an inner definition) and
 `PROG_ARRAY` initializers (`.values = { &inner, [1] = &prog }`) are created and
@@ -624,12 +625,11 @@ generate large or many programs.
 
 ## Not provided
 
-The rest of CO-RE (multi-candidate matching, the non-field relocation kinds), and in
-the object loader sub-program (`.text`) call linking, kfunc/extern/ksym resolution,
-`struct_ops` values, map-in-map initialization, bpffs pinning and mmap-able
-global-data maps with a skeleton; `kprobe_multi`/`uprobe_multi`, USDT discovery,
-`tcx`/`netkit` entry points, `BPF_PROG_QUERY`, cpumap/devmap attach; perf AUX/ITRACE
-areas, DWARF/line lookup and symbol demangling, and tc/classifier program builders.
-Every one of the loader's gaps is a typed error naming the symbol, not a silent
-mis-load. `SPEC.md` *Backlog / deferred* says what each item would take and *What is
-deliberately not done* why the rest is left out.
+Kernel-module `struct_ops`, libbpf's probed virtual externs (`LINUX_HAS_*`),
+BTF `map_extra`, `bpf_iter` consumers and a `bpf_object__*`-style convenience
+API; perf AUX/ITRACE areas, DWARF/line lookup and symbol demangling, and
+tc/classifier program builders. Every malformed-object path is a typed error.
+`SPEC.md` *What is deliberately not done* says why the rest is left out; the
+privileged half of the loader (map creation, program load, attach) is
+structurally tested but has not run against a live kernel here.
+

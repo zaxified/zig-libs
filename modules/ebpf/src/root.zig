@@ -208,6 +208,8 @@ pub const MprogPlacement = bpflink.Placement;
 pub const MprogRelative = bpflink.Relative;
 /// Pick the symbols of a tracefs `available_filter_functions` listing by glob.
 pub const selectKprobeSymbols = bpflink.selectSymbols;
+/// kprobe-multi over every function matching a glob (reads tracefs).
+pub const linkCreateKprobeMultiGlob = bpflink.linkCreateKprobeMultiGlob;
 pub const globMatch = bpflink.globMatch;
 pub const linkUpdate = bpflink.linkUpdate;
 pub const linkDetach = bpflink.linkDetach;

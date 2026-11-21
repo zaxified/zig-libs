@@ -801,6 +801,30 @@ pub fn readFileAlloc(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize)
     return buf;
 }
 
+/// Read a whole file that does not report its size (`/proc` files).
+pub fn readFileStreaming(gpa: std.mem.Allocator, path: [:0]const u8, max: usize) error{ OpenFailed, ReadFailed, TooLarge, OutOfMemory }![]u8 {
+    if (comptime builtin.os.tag != .linux) @compileError("ebpf.kconfig is Linux-only");
+    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var chunk: [16 * 1024]u8 = undefined;
+    while (true) {
+        const r = linux.read(fd, &chunk, chunk.len);
+        switch (linux.errno(r)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+        if (r == 0) break;
+        if (out.items.len + r > max) return error.TooLarge;
+        out.appendSlice(gpa, chunk[0..r]) catch return error.OutOfMemory;
+    }
+    return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
+}
+
 /// Default ceiling for `openImageFile` — a relocatable BPF object is tens of
 /// kilobytes; 256 MB is "something is wrong", not a real object.
 pub const max_image_bytes: usize = 256 << 20;
