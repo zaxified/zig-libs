@@ -375,6 +375,7 @@ against a model of one.
 
 ## What is deliberately not done
 
+- **A smarter backoff for rate-limited routers than the single re-probe** (see the per-hop walk design note). The reference `tracepath` (run as a black box) reports a silent hop as `no reply`, and no surveyed tool offers more; a silent hop is already surfaced as `silence_narrowed` / `uncertain`, which is the honest answer, and `retries` is the caller's knob.
 - **Packetization-layer PMTUD (RFC 4821 / RFC 8899).** It needs a cooperating transport (a peer that
   acknowledges UDP/QUIC/DTLS probes); `probe` is ICMP/DF-bit only and no sibling module offers such a
   transport. `probe` detects the black hole (`blackhole = true`) and still finds a number. Revisit if a
@@ -463,7 +464,7 @@ the host changes).
 
 ## Backlog / deferred
 
-- **Backoff for rate-limited routers:** a smarter backoff than the single re-probe is not built (see the per-hop walk design note).
+None open.
 
 ## Open
 
