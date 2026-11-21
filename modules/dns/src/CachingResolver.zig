@@ -312,6 +312,11 @@ const Entry = struct {
     /// Marked by a hit late in the TTL (`Options.prefetch_pct`); cleared by
     /// `refreshDue` taking it and by a new answer being stored.
     prefetch_due: bool = false,
+    /// `lookupIp` entries whose answer carried both families' replies
+    /// (`Lookup.detail`): the absolute second each family expires. `expires_s`
+    /// is the earlier of the two.
+    fam_exp: [2]u64 = .{ 0, 0 },
+    fam_have: bool = false,
 };
 
 /// `error.InvalidOptions`: `max_entries` 0, `min_ttl_s` > `max_ttl_s`,
@@ -453,7 +458,9 @@ pub fn stats(c: *CachingResolver) Stats {
 
 pub fn lookupIp(c: *CachingResolver, name: []const u8) Error!Answer(netaddr.Ip) {
     var buf: [key_buf_len]u8 = undefined;
-    return c.run(netaddr.Ip, nameKey(&buf, .ip, name), netaddr.parseIp(name) != null or config.isDnsAvoided(name), name, callIp);
+    var ctx: IpCtx = .{ .name = name };
+    defer ctx.deinit();
+    return c.run(netaddr.Ip, nameKey(&buf, .ip, name), netaddr.parseIp(name) != null or config.isDnsAvoided(name), &ctx, callIp);
 }
 
 pub fn reverse(c: *CachingResolver, ip: netaddr.Ip) Error!Answer([]const u8) {
@@ -548,7 +555,11 @@ fn refreshKey(c: *CachingResolver, k: []const u8) Error!void {
     const kind: Kind = std.enums.fromInt(Kind, k[0]) orelse return;
     const body = k[1..];
     switch (kind) {
-        .ip => try settle(c.runLocked(netaddr.Ip, k, false, true, body, callIp)),
+        .ip => {
+            var ctx: IpCtx = .{ .name = body };
+            defer ctx.deinit();
+            try settle(c.runLocked(netaddr.Ip, k, false, true, &ctx, callIp));
+        },
         .mx => try settle(c.runLocked(Resolver.Mx, k, false, true, body, callMx)),
         .ns => try settle(c.runLocked([]const u8, k, false, true, body, callNs)),
         .txt => try settle(c.runLocked([]const u8, k, false, true, body, callTxt)),
@@ -611,8 +622,25 @@ fn dropAnswer(r: anytype) void {
     } else |_| {}
 }
 
-fn callIp(r: *Resolver, name: []const u8) Resolver.Error!Resolver.Lookup(netaddr.Ip) {
-    return r.lookupIp(name);
+/// `lookupIp`'s call context. `runLocked` fills `old` and `refresh_v6` when the
+/// entry's two families expire apart and only one is due: the call then asks
+/// that family alone (`Resolver.lookupIpRefresh`) and keeps the other's addresses.
+const IpCtx = struct {
+    name: []const u8,
+    old: ?Resolver.Lookup(netaddr.Ip) = null,
+    refresh_v6: bool = false,
+    /// The entry's per-family expiries when `old` is set.
+    kept_exp: [2]u64 = .{ 0, 0 },
+
+    fn deinit(x: *IpCtx) void {
+        if (x.old) |*o| o.deinit();
+        x.old = null;
+    }
+};
+
+fn callIp(r: *Resolver, x: *IpCtx) Resolver.Error!Resolver.Lookup(netaddr.Ip) {
+    if (x.old) |*o| return r.lookupIpRefresh(o, if (x.refresh_v6) .v6 else .v4);
+    return r.lookupIp(x.name);
 }
 fn callReverse(r: *Resolver, ip: netaddr.Ip) Resolver.Error!Resolver.Lookup([]const u8) {
     return r.reverse(ip);
@@ -715,6 +743,7 @@ fn runLocked(
                 if (pct != 0 and !e.prefetch_due and @as(u64, left) * 100 < @as(u64, pct) * e.stored_ttl) e.prefetch_due = true;
                 return ans;
             }
+            if (comptime @TypeOf(ctx) == *IpCtx) if (e.payload != null and t0 >= e.expires_s) c.ipHint(ctx, e, t0);
             if (e.payload != null and !c.staleUsable(e, t0)) {
                 dropPayload(e);
                 if (e.fail_count == 0) {
@@ -785,7 +814,34 @@ fn runLocked(
     held = true;
     const t1 = c.now();
     var lk = res catch |err| return c.failed(T, k, err, t1, refresh);
-    return c.succeeded(T, k, &lk, t_call);
+    const kept_exp: [2]u64 = if (comptime @TypeOf(ctx) == *IpCtx) ctx.kept_exp else .{ 0, 0 };
+    return c.succeeded(T, k, &lk, t_call, kept_exp);
+}
+
+/// Per-RRset expiry: an `lookupIp` entry whose two families expire apart and
+/// where only one is due gets a copy of its answer in `x`, so the lookup asks
+/// that family alone. Called with `mutex` held.
+fn ipHint(c: *CachingResolver, x: *IpCtx, e: *const Entry, t: u64) void {
+    x.deinit();
+    if (!e.fam_have) return;
+    const p = if (e.payload) |*pl| &pl.ip else return;
+    const due0 = t >= e.fam_exp[0];
+    const due1 = t >= e.fam_exp[1];
+    if (due0 == due1) return;
+    x.old = p.clone(c.gpa) catch return;
+    x.refresh_v6 = due1;
+    x.kept_exp = e.fam_exp;
+}
+
+/// The absolute second each family of a `lookupIp` result expires (the clamps
+/// per family: positive for an address, negative for NODATA), null without a
+/// full `detail`. A family `lookupIpRefresh` kept keeps its expiry `kept_exp`.
+fn famExpiry(c: *const CachingResolver, lk: *const Resolver.Lookup(netaddr.Ip), t: u64, kept_exp: [2]u64) ?[2]u64 {
+    if (lk.partial or lk.status != .found or lk.detail.candidate == null) return null;
+    const fams = [2]Resolver.FamilyTtl{ lk.detail.v4 orelse return null, lk.detail.v6 orelse return null };
+    var out: [2]u64 = undefined;
+    for (fams, 0..) |f, i| out[i] = if (f.kept) kept_exp[i] else t +| c.effectiveTtl(f.status, f.ttl_s, false);
+    return out;
 }
 
 /// Registers this miss as the key's network lookup. Called with `mutex` held.
@@ -949,24 +1005,26 @@ fn failed(c: *CachingResolver, comptime T: type, k: []const u8, err: Resolver.Er
 }
 
 /// Called with `mutex` held. Applies the TTL policy and keeps a clone.
-fn succeeded(c: *CachingResolver, comptime T: type, k: []const u8, lk: *Resolver.Lookup(T), t: u64) Answer(T) {
+fn succeeded(c: *CachingResolver, comptime T: type, k: []const u8, lk: *Resolver.Lookup(T), t: u64, kept_exp: [2]u64) Answer(T) {
     if (lk.canonical == null) {
         // /etc/hosts (literals never get here): never cached, and it did not
         // use the network.
         c.refundLocked();
         return .{ .lookup = lk.*, .source = .network };
     }
-    const ttl = c.effectiveTtl(lk.status, lk.ttl_s, lk.partial);
+    var ttl = c.effectiveTtl(lk.status, lk.ttl_s, lk.partial);
+    const fx: ?[2]u64 = if (comptime T == netaddr.Ip) c.famExpiry(lk, t, kept_exp) else null;
+    if (fx) |ex| ttl = std.math.lossyCast(u32, @min(ex[0], ex[1]) -| t);
     lk.ttl_s = ttl;
     if (ttl == 0) {
         if (c.map.get(k)) |e| c.removeEntry(e); // supersedes whatever was there
     } else {
-        c.store(T, k, lk, t, ttl);
+        c.store(T, k, lk, t, ttl, fx);
     }
     return .{ .lookup = lk.*, .source = .network };
 }
 
-fn store(c: *CachingResolver, comptime T: type, k: []const u8, lk: *const Resolver.Lookup(T), t: u64, ttl: u32) void {
+fn store(c: *CachingResolver, comptime T: type, k: []const u8, lk: *const Resolver.Lookup(T), t: u64, ttl: u32, fx: ?[2]u64) void {
     var copy = lk.clone(c.gpa) catch return; // OOM: the answer is still returned, just not cached
     const e = c.map.get(k) orelse c.insertEntry(k) catch {
         copy.deinit();
@@ -977,6 +1035,10 @@ fn store(c: *CachingResolver, comptime T: type, k: []const u8, lk: *const Resolv
     e.payload = Payload.from(T, copy);
     e.stored_ttl = ttl;
     e.expires_s = t +| ttl;
+    if (comptime T == netaddr.Ip) {
+        e.fam_have = fx != null;
+        if (fx) |ex| e.fam_exp = ex;
+    }
     e.fail_count = 0;
     e.retry_at_s = 0;
     e.prefetch_due = false;
@@ -985,6 +1047,18 @@ fn store(c: *CachingResolver, comptime T: type, k: []const u8, lk: *const Resolv
 fn answerFrom(c: *CachingResolver, comptime T: type, e: *Entry, source: Source, ttl: u32) error{OutOfMemory}!Answer(T) {
     var lk = try Payload.of(T, &e.payload.?).clone(c.gpa);
     lk.ttl_s = ttl;
+    if (comptime T == netaddr.Ip) if (e.fam_have) {
+        // The per-family TTLs age with the answer.
+        const now_s = c.now();
+        if (lk.detail.v4) |*f| {
+            f.ttl_s = std.math.lossyCast(u32, e.fam_exp[0] -| now_s);
+            f.kept = false;
+        }
+        if (lk.detail.v6) |*f| {
+            f.ttl_s = std.math.lossyCast(u32, e.fam_exp[1] -| now_s);
+            f.kept = false;
+        }
+    };
     return .{ .lookup = lk, .source = source };
 }
 
@@ -1101,6 +1175,7 @@ fn dropPayload(e: *Entry) void {
     if (e.payload) |*p| p.deinit();
     e.payload = null;
     e.stored_ttl = 0;
+    e.fam_have = false;
 }
 
 fn removeEntry(c: *CachingResolver, e: *Entry) void {
@@ -1171,6 +1246,10 @@ const Stub = struct {
     mode: std.atomic.Value(Mode) = .init(.answer),
     ttl: std.atomic.Value(u32) = .init(60),
     drop_aaaa: std.atomic.Value(bool) = .init(false),
+    /// AAAA queries counted apart, a TTL of its own for them (0 = `ttl`), and AAAA answered NODATA (with SOA).
+    queries_aaaa: std.atomic.Value(u32) = .init(0),
+    ttl6: std.atomic.Value(u32) = .init(0),
+    aaaa_empty: std.atomic.Value(bool) = .init(false),
     /// The answer to a name starting with "slow" is held back until
     /// `release_slow` is set: `stashed` says it is being held.
     stashed: std.atomic.Value(bool) = .init(false),
@@ -1203,7 +1282,7 @@ const Stub = struct {
     fn serve(st: *Stub, in: net.IncomingMessage) !void {
         const q = in.data;
         _ = st.queries.fetchAdd(1, .acq_rel);
-        const mode = st.mode.load(.acquire);
+        var mode = st.mode.load(.acquire);
         if (mode == .silent or q.len < 17) return;
         var i: usize = 12;
         while (i < q.len and q[i] != 0) i += @as(usize, q[i]) + 1;
@@ -1211,7 +1290,12 @@ const Stub = struct {
         const qtype = std.mem.readInt(u16, q[i + 1 ..][0..2], .big);
         if (qtype == 28 and st.drop_aaaa.load(.acquire)) return;
         if (std.ascii.eqlIgnoreCase(q[12 .. i + 1], "\x04_sip\x04_tcp\x07example\x03com\x00")) _ = st.sip_queries.fetchAdd(1, .acq_rel);
-        const ttl = st.ttl.load(.acquire);
+        var ttl = st.ttl.load(.acquire);
+        if (qtype == 28) {
+            _ = st.queries_aaaa.fetchAdd(1, .acq_rel);
+            if (st.ttl6.load(.acquire) != 0) ttl = st.ttl6.load(.acquire);
+            if (mode == .answer and st.aaaa_empty.load(.acquire)) mode = .nodata_soa;
+        }
         const alias = q.len > 18 and std.ascii.eqlIgnoreCase(q[13..][0..@min(@as(usize, q[12]), 5)], "alias");
 
         var rd: [300]u8 = undefined;
@@ -1540,6 +1624,92 @@ test "a partial lookupIp answer is kept at most partial_ttl_s" {
     defer a3.deinit();
     try expectIp(&a3, .network, 30);
     try testing.expectEqual(@as(u32, 4), h.queries());
+}
+
+test "per-RRset expiry: a family that is due is asked alone, the other keeps its own TTL" {
+    var h: Harness = .{};
+    try h.start(.any);
+    defer h.stop();
+    h.stub.ttl.store(600, .release);
+    h.stub.ttl6.store(100, .release);
+    var c = try h.cache(.{});
+    defer c.deinit();
+
+    var a1 = try c.lookupIp("dual.example.com");
+    defer a1.deinit();
+    try expectIp(&a1, .network, 100);
+    try testing.expectEqual(@as(usize, 2), a1.lookup.items.len);
+    try testing.expectEqual(@as(?u32, 600), a1.lookup.detail.v4.?.ttl_s);
+    try testing.expectEqual(@as(?u32, 100), a1.lookup.detail.v6.?.ttl_s);
+    try testing.expectEqual(@as(u32, 2), h.queries());
+    h.clock.now += 50;
+    var a2 = try c.lookupIp("dual.example.com");
+    defer a2.deinit();
+    try expectIp(&a2, .cache, 50);
+    try testing.expectEqual(@as(?u32, 550), a2.lookup.detail.v4.?.ttl_s);
+    try testing.expectEqual(@as(?u32, 50), a2.lookup.detail.v6.?.ttl_s);
+    try testing.expectEqual(@as(u32, 2), h.queries());
+    // The AAAA record is due, the A record is not: one query, both families answered.
+    h.clock.now += 51;
+    var a3 = try c.lookupIp("dual.example.com");
+    defer a3.deinit();
+    try expectIp(&a3, .network, 100);
+    try testing.expectEqual(@as(usize, 2), a3.lookup.items.len);
+    try testing.expectEqual(@as(u32, 3), h.queries());
+    try testing.expectEqual(@as(u32, 2), h.stub.queries_aaaa.load(.acquire));
+    try testing.expect(a3.lookup.detail.v4.?.kept);
+    try testing.expect(!a3.lookup.detail.v6.?.kept);
+    // The kept A record keeps its ORIGINAL expiry (600), not one restarted by the refresh.
+    h.clock.now += 99;
+    var a4 = try c.lookupIp("dual.example.com");
+    defer a4.deinit();
+    try expectIp(&a4, .cache, 1);
+    try testing.expectEqual(@as(?u32, 600 - 200), a4.lookup.detail.v4.?.ttl_s);
+    h.clock.now += 1;
+    var a5 = try c.lookupIp("dual.example.com"); // AAAA due again, A due in 399
+    defer a5.deinit();
+    try expectIp(&a5, .network, 100);
+    try testing.expectEqual(@as(u32, 4), h.queries());
+    // Both due: a full lookup.
+    h.clock.now += 400;
+    var a6 = try c.lookupIp("dual.example.com");
+    defer a6.deinit();
+    try expectIp(&a6, .network, 100);
+    try testing.expectEqual(@as(u32, 6), h.queries());
+    try testing.expect(!a6.lookup.detail.v4.?.kept);
+}
+
+test "per-RRset expiry: an empty AAAA answer expires on its negative TTL while the A record stays" {
+    var h: Harness = .{};
+    try h.start(.any);
+    defer h.stop();
+    h.stub.ttl.store(600, .release);
+    h.stub.ttl6.store(30, .release);
+    h.stub.aaaa_empty.store(true, .release);
+    var c = try h.cache(.{});
+    defer c.deinit();
+
+    var a1 = try c.lookupIp("dual.example.com");
+    defer a1.deinit();
+    try expectIp(&a1, .network, 30);
+    try testing.expectEqual(@as(usize, 1), a1.lookup.items.len);
+    try testing.expectEqual(Resolver.Status.nodata, a1.lookup.detail.v6.?.status);
+    h.clock.now += 31;
+    var a2 = try c.lookupIp("dual.example.com");
+    defer a2.deinit();
+    try expectIp(&a2, .network, 30);
+    try testing.expectEqual(@as(usize, 1), a2.lookup.items.len);
+    try testing.expectEqual(@as(u32, 3), h.queries()); // A once, AAAA twice
+    // The AAAA record appears: the refresh merges it in.
+    h.stub.aaaa_empty.store(false, .release);
+    h.stub.ttl6.store(60, .release);
+    h.clock.now += 31;
+    var a3 = try c.lookupIp("dual.example.com");
+    defer a3.deinit();
+    try testing.expectEqual(@as(usize, 2), a3.lookup.items.len);
+    try testing.expectEqual(Resolver.Status.found, a3.lookup.status);
+    try testing.expectEqual(@as(u32, 4), h.queries());
+    try testing.expect(a3.lookup.detail.v4.?.kept);
 }
 
 test "literals and DNS-free names pass through uncached" {
@@ -3268,10 +3438,12 @@ test "the direct bypass counts a lookup that reached DNS and not one that did no
     defer h.stop();
     var c = try h.cache(.{});
     defer c.deinit();
-    var a = try c.bypass(netaddr.Ip, @as([]const u8, "host.example.com"), callIp);
+    var ctx_host: IpCtx = .{ .name = "host.example.com" };
+    var a = try c.bypass(netaddr.Ip, &ctx_host, callIp);
     a.deinit();
     try testing.expectEqual(@as(u64, 1), c.stats().network_lookups);
-    var lit = try c.bypass(netaddr.Ip, @as([]const u8, "192.0.2.9"), callIp); // canonical == null: nothing was asked
+    var ctx_lit: IpCtx = .{ .name = "192.0.2.9" };
+    var lit = try c.bypass(netaddr.Ip, &ctx_lit, callIp); // canonical == null: nothing was asked
     lit.deinit();
     try testing.expectEqual(@as(u64, 1), c.stats().network_lookups);
     try testing.expectEqual(@as(u32, 1), h.queries());
@@ -3587,7 +3759,7 @@ test "a hit of more than max_sort_candidates addresses keeps its order, and the 
     for (&many, 0..) |*ip, i| ip.* = .{ .v4 = .{ 198, 51, 100, @intCast(200 - i) } };
     const src: Resolver.Lookup(netaddr.Ip) = .{ .arena = undefined, .items = &many, .status = .found, .ttl_s = 60, .canonical = null, .authenticated = false, .partial = false };
     var buf: [key_buf_len]u8 = undefined;
-    c.store(netaddr.Ip, nameKey(&buf, .ip, "many.example.com").?, &src, c.now(), 60);
+    c.store(netaddr.Ip, nameKey(&buf, .ip, "many.example.com").?, &src, c.now(), 60, null);
 
     probe_calls = 0;
     var hit = try c.lookupIp("many.example.com");

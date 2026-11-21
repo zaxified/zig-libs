@@ -247,6 +247,6 @@ network) and `zig build live-dns` (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of
 ## Not provided
 
 DNSSEC validation (the sibling `dnssec` module; `authenticated` is a trusted
-upstream's AD bit), IDNA, per-address TTLs, server failover memory, DNS cookie
+upstream's AD bit), IDNA, per-record TTLs on each address (`Lookup.detail` has the two families'), server failover memory, DNS cookie
 state, DoT connection reuse and RFC 8467 padding, DoQ / DoH3. See
 `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.

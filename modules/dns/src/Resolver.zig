@@ -643,6 +643,9 @@ pub fn Lookup(comptime T: type) type {
         /// family only. A caller keeping an address of the missing family
         /// should not take this as its replacement. Always false elsewhere.
         partial: bool,
+        /// `lookupIp` only (void elsewhere): what each address family's reply
+        /// said, for a cache that keeps A and AAAA apart.
+        detail: if (T == netaddr.Ip) IpDetail else void = if (T == netaddr.Ip) .{} else {},
 
         /// A deep copy in its own arena over `gpa` -- what a cache keeps after
         /// the original is freed. Owns nothing of the Resolver's.
@@ -658,6 +661,10 @@ pub fn Lookup(comptime T: type) type {
             out.canonical = if (l.canonical) |c| try a.dupe(u8, c) else null;
             out.authenticated = l.authenticated;
             out.partial = l.partial;
+            if (T == netaddr.Ip) {
+                out.detail = l.detail;
+                if (l.detail.candidate) |c| out.detail.candidate = try a.dupe(u8, c);
+            }
             return out;
         }
 
@@ -669,6 +676,27 @@ pub fn Lookup(comptime T: type) type {
         }
     };
 }
+
+/// What one address family's reply said about the name (`Lookup.detail`).
+pub const FamilyTtl = struct {
+    /// `.found` when the reply held an address, else the negative status.
+    status: Status,
+    /// As `Lookup.ttl_s`, for this family alone: the smallest TTL of its records
+    /// and the CNAME chain, or the SOA's negative TTL; null without any.
+    ttl_s: ?u32,
+    /// Set by `lookupIpRefresh` on the family it did not ask again.
+    kept: bool = false,
+};
+
+/// `Lookup(netaddr.Ip).detail` (`lookupIp`, both families asked): the search-list
+/// candidate that produced the addresses and one `FamilyTtl` per family. The
+/// members are null for a result that is empty, partial or from a literal or
+/// /etc/hosts, and for a family that was not asked.
+pub const IpDetail = struct {
+    candidate: ?[]const u8 = null,
+    v4: ?FamilyTtl = null,
+    v6: ?FamilyTtl = null,
+};
 
 /// One item of a `Lookup`, its strings duplicated into `a`.
 fn cloneItem(comptime T: type, a: std.mem.Allocator, v: T) error{OutOfMemory}!T {
@@ -773,8 +801,11 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
     var won: Tally = .{};
     var neg: Tally = .{};
     var partial = false;
+    var won_candidate: ?[]const u8 = null;
+    var won_fam: [2]?FamilyTtl = .{ null, null };
     while (it.next(&candidate_buf)) |candidate| {
         var cand: Tally = .{};
+        var fams: [2]?FamilyTtl = .{ null, null };
         partial = false;
         families: {
             const fam = r.effectiveFamily();
@@ -802,8 +833,8 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
                 r.rotate_next = r6.rotate_next;
                 defer if (res4) |*m| m.deinit() else |_| {};
                 defer if (res6) |*m| m.deinit() else |_| {};
-                try takeFamily(arena, &list, candidate, .a, &res4, &cand, &last_err, &partial, r.options.filter_addresses);
-                try takeFamily(arena, &list, candidate, .aaaa, &res6, &cand, &last_err, &partial, r.options.filter_addresses);
+                try takeFamily(arena, &list, candidate, .a, &res4, &cand, &last_err, &partial, r.options.filter_addresses, &fams[0]);
+                try takeFamily(arena, &list, candidate, .aaaa, &res6, &cand, &last_err, &partial, r.options.filter_addresses, &fams[1]);
                 break :families;
             }
             const types: []const message.Type = switch (fam) {
@@ -814,12 +845,14 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
             for (types) |ty| {
                 var res = r.query(candidate, ty);
                 defer if (res) |*m| m.deinit() else |_| {};
-                try takeFamily(arena, &list, candidate, ty, &res, &cand, &last_err, &partial, r.options.filter_addresses);
+                try takeFamily(arena, &list, candidate, ty, &res, &cand, &last_err, &partial, r.options.filter_addresses, &fams[@intFromBool(ty == .aaaa)]);
             }
             break :families;
         }
         if (list.items.len > 0) { // first useful candidate wins
             won = cand;
+            won_candidate = try arena.dupe(u8, candidate);
+            won_fam = fams;
             break;
         }
         neg.merge(&cand);
@@ -833,6 +866,53 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
     lk.items = list.items;
     lk.partial = partial and list.items.len > 0;
     try (if (list.items.len > 0) &won else &neg).fill(arena, &lk.status, &lk.ttl_s, &lk.canonical, &lk.authenticated);
+    if (list.items.len > 0 and !lk.partial and won_fam[0] != null and won_fam[1] != null)
+        lk.detail = .{ .candidate = won_candidate, .v4 = won_fam[0], .v6 = won_fam[1] };
+    return lk;
+}
+
+/// `lookupIp`'s answer `old` with one family asked again: the search-list
+/// candidate that won (`old.detail.candidate`) is queried for `fam` only, no
+/// search, no /etc/hosts, and the result replaces that family's addresses; the
+/// other family's are kept (marked `kept` in the detail) with their old TTL. For a
+/// cache whose A and AAAA expire apart. `old` must carry a full `detail`
+/// (`InvalidOptions` otherwise). Errors as `lookupIp`, an outage included.
+pub fn lookupIpRefresh(r: *Resolver, old: *const Lookup(netaddr.Ip), fam: enum { v4, v6 }) Error!Lookup(netaddr.Ip) {
+    const d = old.detail;
+    const candidate = d.candidate orelse return error.InvalidOptions;
+    if (d.v4 == null or d.v6 == null) return error.InvalidOptions;
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
+    try r.ensureState();
+    var lk = try newLookup(netaddr.Ip, r.gpa);
+    errdefer lk.deinit();
+    const arena = lk.arena.allocator();
+    const ty: message.Type = if (fam == .v4) .a else .aaaa;
+    var res = r.query(candidate, ty);
+    defer if (res) |*m| m.deinit() else |_| {};
+    var list: std.ArrayList(netaddr.Ip) = .empty;
+    var tally: Tally = .{};
+    var last_err: ?Error = null;
+    var partial = false;
+    var got: ?FamilyTtl = null;
+    try takeFamily(arena, &list, candidate, ty, &res, &tally, &last_err, &partial, r.options.filter_addresses, &got);
+    if (got == null) return last_err orelse error.ServerFailed;
+    // The family that was not asked again keeps its addresses.
+    for (old.items) |ip| if ((ip == .v4) != (fam == .v4)) try list.append(arena, ip);
+    sortIps(list.items);
+    lk.items = list.items;
+    lk.status = if (list.items.len > 0) .found else got.?.status;
+    var kept = if (fam == .v4) d.v6.? else d.v4.?;
+    kept.kept = true;
+    lk.ttl_s = minTtl(got.?.ttl_s, kept.ttl_s);
+    lk.canonical = if (old.canonical) |c| try arena.dupe(u8, c) else null;
+    lk.authenticated = old.authenticated and tally.authenticated;
+    lk.detail = .{
+        .candidate = try arena.dupe(u8, candidate),
+        .v4 = if (fam == .v4) got else kept,
+        .v6 = if (fam == .v6) got else kept,
+    };
+    if (list.items.len == 0) lk.detail = .{};
     return lk;
 }
 
@@ -2065,7 +2145,7 @@ const default_servers = [_]netaddr.Ip{
 /// collected (owner-chain checked, into the result's arena `a`), the reply's
 /// verdict tallied, and failures remembered — a failed family is tolerated
 /// (Go aggregates too) but marks the result `partial`.
-fn takeFamily(a: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), candidate: []const u8, ty: message.Type, res: *Error!message.Message, cand: *Tally, last_err: *?Error, partial: *bool, filter: []const netaddr.Prefix) Error!void {
+fn takeFamily(a: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), candidate: []const u8, ty: message.Type, res: *Error!message.Message, cand: *Tally, last_err: *?Error, partial: *bool, filter: []const netaddr.Prefix, fam: *?FamilyTtl) Error!void {
     const msg = res.* catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => |e| return e,
         else => {
@@ -2096,6 +2176,7 @@ fn takeFamily(a: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), candidate:
         list.shrinkRetainingCapacity(kept);
     }
     cand.add(verdict);
+    fam.* = .{ .status = verdict.status, .ttl_s = verdict.ttl_s };
 }
 
 fn filtered(filter: []const netaddr.Prefix, ip: netaddr.Ip) bool {
