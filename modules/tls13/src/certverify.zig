@@ -392,6 +392,42 @@ comptime {
     for (std.enums.values(SignatureScheme)) |s| std.debug.assert(maxSignatureLen(s) <= max_signature_len);
 }
 
+/// The stack `sign` (and `signContent`, `signWith`) needs below the caller
+/// for `scheme`, in bytes, burns included; 0 for a scheme it does not make.
+/// A worker or fiber whose stack has less overflows on a peer that asks for
+/// the scheme. Measured (`stackprobe_test.zig`, ReleaseFast, 2026-11-21):
+/// RSA-PSS 161.5 (`rsa`'s private-op burn), ECDSA P-256 / P-384 / P-521
+/// 19.2 / 26.0 / 26.2, Ed25519 9.4, ML-DSA-44 / 65 / 87 129.4 / 225.4 /
+/// 353.4 KiB; ~1.15x, rounded up. Debug frames are larger.
+pub fn signStackRequirement(scheme: SignatureScheme) usize {
+    return switch (scheme) {
+        .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => 192 * 1024,
+        .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384, .ecdsa_secp521r1_sha512 => 40 * 1024,
+        .ed25519 => 16 * 1024,
+        .mldsa44 => 160 * 1024,
+        .mldsa65 => 272 * 1024,
+        .mldsa87 => 416 * 1024,
+        _ => 0,
+    };
+}
+
+/// The stack `verify` (and `verifyContent`) needs below the caller for
+/// `scheme`, in bytes, burns included; 0 for a scheme it does not check.
+/// Measured as `signStackRequirement`: RSA-PSS 64.1, ECDSA P-256 / P-384 /
+/// P-521 26.3 / 23.5 / 34.4, Ed25519 23.3, ML-DSA-44 / 65 / 87 229.9 /
+/// 309.9 / 469.9 KiB.
+pub fn verifyStackRequirement(scheme: SignatureScheme) usize {
+    return switch (scheme) {
+        .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => 80 * 1024,
+        .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384, .ecdsa_secp521r1_sha512 => 48 * 1024,
+        .ed25519 => 32 * 1024,
+        .mldsa44 => 272 * 1024,
+        .mldsa65 => 368 * 1024,
+        .mldsa87 => 560 * 1024,
+        _ => 0,
+    };
+}
+
 // ── verify ────────────────────────────────────────────────────────────────
 
 pub const VerifyError = BuildContentError || error{

@@ -223,3 +223,82 @@ test "STACKPROBE: no secret residue after the keyschedule steps of a handshake" 
     _ = try PKs.run("deriveMasterSecret", ksMaster, .{}, &outs, .{});
     _ = try PKs.run("computeFinishedVerifyData", ksFinished, .{}, &outs, .{});
 }
+
+// ── stack requirement per entry point (`kex.stackRequirement`,
+// `certverify.signStackRequirement` / `verifyStackRequirement`) ──────────
+
+/// The deepest any entry point here reaches (ML-DSA-87 verify, under its
+/// 448 KiB burn) with room above.
+const PReq = sp.Probe(.{ .window = 768 * 1024 });
+const measure_only: sp.Expect = .{ .burn = false, .residue = false };
+
+fn probeFail(what: []const u8, e: anyerror) anyerror {
+    std.debug.print("stack requirement probe: {s}: {t}\n", .{ what, e });
+    return e;
+}
+
+fn requireUnder(label: []const u8, r: sp.Report, need: usize) !void {
+    if (r.dirty_depth > need) {
+        std.debug.print("{s}: {d} B deep, stated requirement {d} B\n", .{ label, r.dirty_depth, need });
+        return error.StackRequirementExceeded;
+    }
+}
+
+test "STACKPROBE: every entry point stays within its stated stack requirement" {
+    try sp.skipUnlessOptimized();
+    inline for (.{
+        .{ "x25519", kex.x25519_group },                        .{ "secp256r1", kex.secp256r1_group },
+        .{ "secp384r1", kex.secp384r1_group },                  .{ "secp521r1", kex.secp521r1_group },
+        .{ "mlkem512", kex.mlkem512_group },                    .{ "mlkem768", kex.mlkem768_group },
+        .{ "x25519mlkem768", kex.x25519_mlkem768_group },       .{ "mlkem1024", kex.mlkem1024_group },
+        .{ "secp256r1mlkem768", kex.secp256r1_mlkem768_group }, .{ "secp384r1mlkem1024", kex.secp384r1_mlkem1024_group },
+        .{ "ffdhe2048", kex.ffdhe2048_group },                  .{ "ffdhe8192", kex.ffdhe8192_group },
+    }) |g| {
+        csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5c)));
+        const rnd = csprng.random();
+        const need = kex.stackRequirement(g[1]);
+        try requireUnder(g[0] ++ " generate", try PReq.run(g[0] ++ " generate", kex.generate, .{ g[1], rnd, &client }, &.{}, measure_only), need);
+        try requireUnder(g[0] ++ " serverExchange", try PReq.run(g[0] ++ " serverExchange", kex.serverExchange, .{ g[1], client.public[0..client.public_len], rnd, &ex }, &.{}, measure_only), need);
+        const n = kex.scalarLen(g[1]);
+        try requireUnder(g[0] ++ " sharedSecret", try PReq.run(g[0] ++ " sharedSecret", kex.sharedSecret, .{ g[1], client.secret[0..n], ex.public[0..ex.public_len], &shared }, &.{}, measure_only), need);
+    }
+    // Signing and verifying, every scheme.
+    var rsa_sk: @import("rsa").SecretKey = undefined;
+    @import("certverify_kat_vectors.zig").rsa_pss_sha256_server.secretKey(&rsa_sk) catch |e| return probeFail("rsa key", e);
+    const sk256 = Ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(pattern(32, 0x21)) catch |e| return probeFail("p256 key", e);
+    const pk256 = (Ecdsa.EcdsaP256Sha256.KeyPair.fromSecretKey(sk256) catch |e| return probeFail("p256 public", e)).public_key;
+    const sk384 = Ecdsa.EcdsaP384Sha384.SecretKey.fromBytes(pattern(48, 0x23)) catch |e| return probeFail("p384 key", e);
+    const pk384 = (Ecdsa.EcdsaP384Sha384.KeyPair.fromSecretKey(sk384) catch |e| return probeFail("p384 public", e)).public_key;
+    var b521 = pattern(66, 0x11);
+    b521[0] = 0; // below the order (2^521)
+    const sk521 = EcdsaP521.SecretKey.fromBytes(b521) catch |e| return probeFail("p521 key", e);
+    var kp521: EcdsaP521.KeyPair = undefined;
+    EcdsaP521.KeyPair.fromSecretKeyInto(&kp521, &sk521) catch |e| return probeFail("p521 public", e);
+    const ed = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(pattern(32, 0x31)) catch |e| return probeFail("ed25519 key", e);
+    const Case = struct { []const u8, certverify.SignatureScheme, certverify.SecretKey, certverify.PublicKey };
+    const cases = [_]Case{
+        .{ "rsa_pss_rsae_sha256", .rsa_pss_rsae_sha256, .{ .rsa = &rsa_sk }, .{ .rsa = rsa_sk.publicKey() } },
+        .{ "ecdsa_secp256r1_sha256", .ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = &sk256 }, .{ .ecdsa_p256 = pk256 } },
+        .{ "ecdsa_secp384r1_sha384", .ecdsa_secp384r1_sha384, .{ .ecdsa_p384 = &sk384 }, .{ .ecdsa_p384 = pk384 } },
+        .{ "ecdsa_secp521r1_sha512", .ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = &sk521 }, .{ .ecdsa_p521 = kp521.public_key } },
+        .{ "ed25519", .ed25519, .{ .ed25519 = &ed.secret_key }, .{ .ed25519 = ed.public_key } },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("case {s}\n", .{c[0]});
+        const rs = try PReq.run("sign", signInto, .{ c[1], c[2] }, &.{}, measure_only);
+        try requireUnder(c[0], rs, certverify.signStackRequirement(c[1]));
+        const rv = try PReq.run("verify", verifyIt, .{ c[1], c[3] }, &.{}, measure_only);
+        try requireUnder(c[0], rv, certverify.verifyStackRequirement(c[1]));
+    }
+    inline for (.{ .{ mldsa.MLDSA44, .mldsa44 }, .{ mldsa.MLDSA65, .mldsa65 }, .{ mldsa.MLDSA87, .mldsa87 } }) |m| {
+        const kp = try std.heap.page_allocator.create(m[0].KeyPair); // global-alloc-ok: probe fixture, freed below
+        defer std.heap.page_allocator.destroy(kp); // global-alloc-ok: the fixture above
+        kp.* = try m[0].KeyPair.generateDeterministic(@splat(0x3d));
+        const scheme: certverify.SignatureScheme = m[1];
+        const rs = try PReq.run("sign", signInto, .{ scheme, @unionInit(certverify.SecretKey, @tagName(m[1]), &kp.secret_key) }, &.{}, measure_only);
+        try requireUnder(@tagName(m[1]), rs, certverify.signStackRequirement(scheme));
+        const pk_bytes = kp.public_key.toBytes();
+        const rv = try PReq.run("verify", verifyIt, .{ scheme, @unionInit(certverify.PublicKey, @tagName(m[1]), &pk_bytes) }, &.{}, measure_only);
+        try requireUnder(@tagName(m[1]), rv, certverify.verifyStackRequirement(scheme));
+    }
+}

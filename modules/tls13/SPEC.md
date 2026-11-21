@@ -251,6 +251,12 @@ The only contexts in this module's own code are the sampler verdict above and th
 `certverify.zig`; neither depends on a secret beyond a verdict. `dtls hs` additionally covers the schedule
 inside a handshake.
 
+**Stack requirement.** `kex.stackRequirement(group)`, `certverify.signStackRequirement(scheme)` and
+`certverify.verifyStackRequirement(scheme)` state the stack each entry point needs below its caller,
+burns included (ReleaseFast depths, ~1.15x): from 16 KiB (an Ed25519 signature) to 304 KiB (ML-KEM-1024)
+and 560 KiB (an ML-DSA-87 verification); a worker or fiber stack must be sized for the groups and
+schemes it enables. `stackprobe_test.zig` fails when an entry point outgrows its figure.
+
 Dead stack (`CONVENTIONS.md` §2.1.1): secrets in by `*const`, out through out-pointers;
 `expandLabel`, `earlySecret`, `pskBinder`, `verifyPskBinder`, `deriveHandshakeSecret`,
 `deriveMasterSecret`, `computeFinishedVerifyData` and `verifyFinished` run their body under a burn (`burn.ks_burn`), the chaining
@@ -390,17 +396,8 @@ benchmark `zig build bench-tls13` (see *Performance*), the example `zig build ru
 
 - **Performance: `cli_x25519`.** `cli_x25519` (`ct25519`'s ladder against s2n-bignum) is the row over the 1.25×
   fastest-candidate bound; re-measure on a quiet host before the card says P1.
-- **Engine support for secp521r1 / MLKEM512 / MLKEM768:** `kex` computes them (OpenSSL oracle both ways);
-  `tlsserver` and `dtls` keep their offered/accepted group lists, so no engine offers them yet.
-- **End-to-end interop for SecP256r1MLKEM768 / SecP384r1MLKEM1024:** `tlsserver` (and
-  `tlsclient`/`dtls`) must offer and accept the groups; only then does a real Go 1.26 / rustls
-  handshake anchor them beyond the composition oracle. `tlsserver` sizes buffers from
-  `kex.max_*_share_len` (1665); the engines' group policy is theirs.
-- **SHA-384 HMAC state caching in the key schedule:** 18 % of a `tlsserver`
-  TLS_AES_256_GCM_SHA384 handshake is SHA-384 (profile), mostly lone-block HMACs
-  that recompute the ipad/opad blocks of the same secret; `sha2` does not help lone blocks.
+- **`dtls` engine groups:** `tlsserver` serves secp521r1, MLKEM512/768/1024 and the NIST hybrids
+  (`extra_groups`, live against OpenSSL 3.5 and Go 1.26); `dtls` keeps its own accepted group list
+  without them.
 - **Certificate-authentication helpers** (`dtls/certauth.zig`): deferred to `tlsserver` M2
   (client auth), where the one-hop `verifyLeafAgainstAnchor` gives way to `x509.verifyChain`.
-- **Stack requirement per entry point:** ML-DSA-87 verify/sign need
-  ~340/260 KiB and the ML-KEM arms 160–256 KiB of burn (`burn.zig`), so a small-stack worker
-  thread overflows on a peer that picks them. State a `stack_requirement` per entry point.

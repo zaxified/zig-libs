@@ -193,6 +193,26 @@ pub const Error = error{
 /// function returns — it sizes what a server accepts and what `generate`
 /// produces), while a hybrid SERVER answers with the 1120-byte ciphertext
 /// form (checked where the client consumes it, `sharedSecret`).
+/// The stack `generate`, `serverExchange` and `sharedSecret` (and their
+/// `…Expanded` forms) need below the caller for `group`, in bytes, burns
+/// included; 0 for a group this file does not compute. A worker or fiber
+/// whose stack has less overflows on a peer that picks the group. Measured
+/// (`stackprobe_test.zig`, ReleaseFast, the deepest of the three, 2026-11-21):
+/// x25519 18.2, secp256r1 19.1, secp384r1 27.0, secp521r1 27.2, MLKEM512
+/// 128.3, MLKEM768 / X25519MLKEM768 / SecP384r1MLKEM1024 160.3, MLKEM1024
+/// 256.3, SecP256r1MLKEM768 112.3, ffdhe2048..8192 160.3 KiB; ~1.15x,
+/// rounded up. Debug frames are larger.
+pub fn stackRequirement(group: u16) usize {
+    return switch (group) {
+        x25519_group, secp256r1_group, secp384r1_group, secp521r1_group => 40 * 1024,
+        mlkem512_group => 160 * 1024,
+        mlkem768_group, x25519_mlkem768_group, secp384r1_mlkem1024_group => 192 * 1024,
+        mlkem1024_group => 304 * 1024,
+        secp256r1_mlkem768_group => 144 * 1024,
+        else => if (ffdhe.find(group) != null) 192 * 1024 else 0,
+    };
+}
+
 pub fn expectedShareLen(group: u16) usize {
     return switch (group) {
         x25519_group => 32,

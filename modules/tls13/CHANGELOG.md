@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — **Added:** `kex.stackRequirement(group)`, `certverify.signStackRequirement(scheme)`, `certverify.verifyStackRequirement(scheme)`: the stack each entry point needs below its caller, burns included (measured in ReleaseFast, ~1.15x; 16 KiB for an Ed25519 signature up to 560 KiB for an ML-DSA-87 verification); a stack probe fails when an entry point outgrows its figure.
 - **2026-11-21** — **Performance:** an `ecdsa_secp521r1_sha512` CertificateVerify is signed from the secret scalar through `p521`'s `Signer`, without the `d·G` its `KeyPair` computed per signature: 32 % faster (paired ratio 0.681, ReleaseFast); byte-identical signatures (the OpenSSL RFC 6979 KAT). P-256 and P-384 already signed from the scalar alone.
 - **2026-11-21** — **Added:** `certverify.SignOptions`, `certverify.signWith` and `certverify.signContentWith`: `sign` / `signContent` with an optional per-key `rsa.BlindingCache` (`rsa_blinding`) for RSA-PSS, ~5 % of an RSA-2048 signature (OpenSSL keeps a blinding pair per key). `sign` / `signContent` are unchanged.
 - **2026-11-20** — New `keyschedule.verifyFinished` (also on `tls13`/`dtls13`) and `Schedule.verifyPskBinder`: recompute the Finished `verify_data` / PSK binder under the burn, compare with `std.crypto.timing_safe.eql` (a wrong-length input is false) and wipe the expected MAC, so a consumer cannot reach for `std.mem.eql`. Additive. Tests: RFC 8448 §4 binder, every flipped octet, short / long / empty inputs, SHA-384.
