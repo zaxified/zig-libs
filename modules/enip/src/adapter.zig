@@ -77,6 +77,7 @@ const connmgr = @import("connmgr.zig");
 const types = @import("types.zig");
 const stdobj = @import("stdobj.zig");
 const implicit = @import("implicit.zig");
+const pccc = @import("pccc.zig");
 
 pub const Error = error{
     /// The request could not be parsed far enough to answer it at all.
@@ -237,6 +238,15 @@ pub const Config = struct {
     /// connection is **multicast** (the TCP/IP Interface object's
     /// `Num_Mcast` / `Mcast_Start_Addr`), handed out round-robin.
     io_multicast: implicit.MulticastPool = .{},
+    /// The data files the **PCCC object** (class 0x67) serves to `Execute
+    /// PCCC` (`pccc.zig`): typed logical reads and masked writes, so an
+    /// SLC / MicroLogix / PLC-5 driver can read and write them (`N7:0`).
+    /// Empty withholds the object (`path_destination_unknown`). The buffers
+    /// are the caller's.
+    pccc_files: []const pccc.File = &.{},
+    /// What the diagnostic status reply says the processor is (at most 11
+    /// characters), which an SLC driver reports as the processor type.
+    pccc_processor: []const u8 = pccc.default_processor,
 };
 
 /// One datagram `ioPoll` has for the network.
@@ -511,6 +521,7 @@ pub const Adapter = struct {
         if (class != null and class.? == connmgr.class_code) {
             return self.connectionManager(req, out, depth);
         }
+        if (class != null and class.? == pccc.class_code) return self.executePccc(req, out);
         switch (req.service) {
             @backingInt(cip.Service.multiple_service_packet) => return self.multipleService(req, out, depth),
             @backingInt(cip.Service.get_attributes_all) => return self.getAttributesAll(req, class, out),
@@ -565,6 +576,30 @@ pub const Adapter = struct {
             cip.LogixService.write_tag_fragmented => return self.writeTag(req, true, out),
             else => return errorReply(req.service, .service_not_supported, out),
         }
+    }
+
+    /// The PCCC object (class 0x67, instance 1): `Execute PCCC` only.
+    fn executePccc(self: *Adapter, req: cip.Request, out: []u8) Error![]const u8 {
+        if (self.cfg.pccc_files.len == 0) return errorReply(req.service, .path_destination_unknown, out);
+        const inst = epath.findLogical(req.path, .instance) catch null;
+        if (inst == null or inst.? != pccc.instance) return errorReply(req.service, .path_destination_unknown, out);
+        if (req.service != pccc.service_execute) return errorReply(req.service, .service_not_supported, out);
+        const parsed = pccc.decodeData(req.data) catch return errorReply(req.service, .not_enough_data, out);
+        var data: [512]u8 = undefined;
+        const r = pccc.serve(self.cfg.pccc_files, self.cfg.pccc_processor, parsed.msg, data[11..]);
+        // Requester id echoed, then CMD with the reply bit, STS, TNS, data.
+        data[0] = 7;
+        std.mem.writeInt(u16, data[1..3], parsed.who.vendor_id, .little);
+        std.mem.writeInt(u32, data[3..7], parsed.who.serial, .little);
+        data[7] = parsed.msg.cmd | pccc.Cmd.reply_bit;
+        data[8] = r.sts;
+        std.mem.writeInt(u16, data[9..11], parsed.msg.tns, .little);
+        return (cip.Reply{
+            .service = req.service,
+            .general_status = .success,
+            .additional_status = &.{},
+            .data = data[0 .. 11 + r.data.len],
+        }).encode(out) catch error.BufferTooSmall;
     }
 
     fn connectionManager(self: *Adapter, req: cip.Request, out: []u8, depth: usize) Error![]const u8 {

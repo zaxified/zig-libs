@@ -30,6 +30,7 @@ const connmgr = @import("connmgr.zig");
 const types = @import("types.zig");
 const tagpath = @import("tagpath.zig");
 const transport = @import("transport.zig");
+const pccc = @import("pccc.zig");
 
 pub const Transport = transport.Transport;
 
@@ -371,6 +372,24 @@ pub const Client = struct {
         const reply = try self.sendCip(wire);
         if (!reply.general_status.isSuccess()) return error.CipError;
         return reply.data;
+    }
+
+    /// Sends one PCCC message (`Execute PCCC`, see `pccc.zig`) and returns the
+    /// reply's message; its `body` points into the receive buffer. It goes
+    /// over the open Class 3 connection when there is one, else unconnected.
+    /// `scratch` holds the encoded request. `error.MalformedReply` when the
+    /// reply is not an `Execute PCCC` reply; the DF1 status is `reply.sts`
+    /// (a non-zero one is the peer refusing the command, not a CIP error).
+    pub fn executePccc(self: *Client, who: pccc.Requester, msg: pccc.Message, scratch: []u8) Error!pccc.Message {
+        var data_buf: [300]u8 = undefined;
+        const data = pccc.encodeRequestData(who, msg, &data_buf) catch return error.BufferTooSmall;
+        const wire = (cip.Request{ .service = pccc.service_execute, .path = &pccc.path, .data = data }).encode(scratch) catch
+            return error.BufferTooSmall;
+        const reply = if (self.connection != null) try self.sendConnectedCip(wire) else try self.sendCip(wire);
+        if (!reply.general_status.isSuccess()) return error.CipError;
+        const back = pccc.decodeData(reply.data) catch return error.MalformedReply;
+        if (back.msg.cmd != (msg.cmd | pccc.Cmd.reply_bit) or back.msg.tns != msg.tns) return error.MalformedReply;
+        return back.msg;
     }
 
     /// `Get_Attributes_All`. The value points into the receive buffer.

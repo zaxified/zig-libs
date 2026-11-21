@@ -119,8 +119,8 @@ fleet-simulation target.
 
 ## Not provided
 
-No scanner-side (originator) implicit I/O (the target-side engine and the adapter's I/O connections exist), no UDT member decoding on the client side, no CIP Safety, Sync or Security, no
-PCCC. See SPEC.md, *What is deliberately not done* and *Backlog / deferred*.
+No scanner-side (originator) implicit I/O (the target-side engine and the adapter's I/O connections exist), no UDT member decoding on the client side, no CIP Safety, Sync or Security, no PLC-5 word-range PCCC
+commands. See SPEC.md, *What is deliberately not done*.
 
 ## Use
 

@@ -103,6 +103,9 @@ pub const stdobj = @import("stdobj.zig");
 /// Implicit (Class 0/1) I/O messaging: the cyclic UDP datagram, its timers
 /// and its watchdog, over an injected clock.
 pub const implicit = @import("implicit.zig");
+/// PCCC over CIP (`Execute PCCC`): the SLC / MicroLogix / PLC-5 data-table
+/// commands, their file types and a data-table model.
+pub const pccc = @import("pccc.zig");
 pub const transport = @import("transport.zig");
 /// An EtherNet/IP client.
 pub const client = @import("client.zig");
@@ -170,6 +173,7 @@ test {
     _ = tagpath;
     _ = stdobj;
     _ = implicit;
+    _ = pccc;
     _ = transport;
     _ = client;
     _ = adapter;
@@ -3761,4 +3765,69 @@ test "implicit I/O: change of state sends on change and heartbeats; multicast ge
     rig.in_data[5] = 0xEE;
     const changed = target.ioPoll(1_000 + 1, &dg);
     try testing.expect(changed != null);
+}
+
+// ── PCCC over CIP ──────────────────────────────────────────────────────────
+
+test "PCCC: a client reads and writes data files through Execute PCCC, connected and unconnected; the object can be withheld" {
+    var n7: [20]u8 = @splat(0);
+    std.mem.writeInt(i16, n7[4..6], -123, .little);
+    var f8: [8]u8 = undefined;
+    std.mem.writeInt(u32, f8[0..4], @bitCast(@as(f32, 1.5)), .little);
+    std.mem.writeInt(u32, f8[4..8], @bitCast(@as(f32, -2.0)), .little);
+    const files = [_]pccc.File{
+        .{ .number = 7, .file_type = .integer, .data = &n7 },
+        .{ .number = 8, .file_type = .float, .data = &f8, .writable = false },
+    };
+    var target = Adapter.init(.{ .pccc_files = &files, .pccc_processor = "SLC 5/05" }, &.{});
+    var paired = PairedTransport{ .target = &target };
+    var buf: [4096]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    const who: pccc.Requester = .{ .vendor_id = 0x1009, .serial = 0x71191009 };
+    var scratch: [128]u8 = undefined;
+    var body: [32]u8 = undefined;
+
+    // Unconnected: N7:2 is -123.
+    const rb = try pccc.typedReadBody(.{ .byte_size = 2, .file_number = 7, .file_type = .integer, .element = 2, .sub_element = 0 }, &body);
+    var r = try c.executePccc(who, .{ .cmd = pccc.Cmd.typed, .sts = 0, .tns = 0x31, .body = rb }, &scratch);
+    try testing.expectEqual(pccc.Sts.success, r.sts);
+    try testing.expectEqual(@as(i16, -123), std.mem.readInt(i16, r.body[0..2], .little));
+    try testing.expectEqual(@as(u16, 0x31), r.tns);
+
+    // Connected, as an SLC driver does: a masked write, then the read back.
+    _ = try c.forwardOpen(.{ .size = 500 });
+    var wb: [32]u8 = undefined;
+    const w = try pccc.typedMaskedWriteBody(.{ .byte_size = 4, .file_number = 7, .file_type = .integer, .element = 0, .sub_element = 0 }, 0xFFFF, &.{ 1, 0, 2, 0 }, &wb);
+    r = try c.executePccc(who, .{ .cmd = pccc.Cmd.typed, .sts = 0, .tns = 0x32, .body = w }, &scratch);
+    try testing.expectEqual(pccc.Sts.success, r.sts);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 2, 0 }, n7[0..4]);
+    // A float file, read-only: the write is refused with the DF1 protection status, the read works.
+    const fw = try pccc.typedMaskedWriteBody(.{ .byte_size = 4, .file_number = 8, .file_type = .float, .element = 0, .sub_element = 0 }, 0xFFFF, &.{ 0, 0, 0, 0 }, &wb);
+    r = try c.executePccc(who, .{ .cmd = pccc.Cmd.typed, .sts = 0, .tns = 0x33, .body = fw }, &scratch);
+    try testing.expectEqual(pccc.Sts.protected, r.sts);
+    const fr = try pccc.typedReadBody(.{ .byte_size = 8, .file_number = 8, .file_type = .float, .element = 0, .sub_element = 0 }, &body);
+    r = try c.executePccc(who, .{ .cmd = pccc.Cmd.typed, .sts = 0, .tns = 0x34, .body = fr }, &scratch);
+    try testing.expectEqual(@as(f32, -2.0), @as(f32, @bitCast(std.mem.readInt(u32, r.body[4..8], .little))));
+    // The processor type, as a driver asks it.
+    r = try c.executePccc(who, .{ .cmd = pccc.Cmd.status, .sts = 0, .tns = 0x35, .body = &.{pccc.Fnc.diagnostic_status} }, &scratch);
+    try testing.expectEqualStrings("SLC 5/05   ", r.body[5..16]);
+    // An address that does not exist is a DF1 status, not a CIP error.
+    const bad = try pccc.typedReadBody(.{ .byte_size = 2, .file_number = 99, .file_type = .integer, .element = 0, .sub_element = 0 }, &body);
+    r = try c.executePccc(who, .{ .cmd = pccc.Cmd.typed, .sts = 0, .tns = 0x36, .body = bad }, &scratch);
+    try testing.expectEqual(pccc.Sts.illegal, r.sts);
+
+    // Withheld: no files, no object.
+    var bare = Adapter.init(.{}, &.{});
+    var out: [64]u8 = undefined;
+    var req: [64]u8 = undefined;
+    var data: [64]u8 = undefined;
+    const d = try pccc.encodeRequestData(who, .{ .cmd = pccc.Cmd.typed, .sts = 0, .tns = 1, .body = rb }, &data);
+    const wire = try (cip.Request{ .service = pccc.service_execute, .path = &pccc.path, .data = d }).encode(&req);
+    try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, (try cip.Reply.decode(try bare.messageRouter(wire, &out))).general_status);
+    // Another service on the object, and a short request.
+    const other = try (cip.Request{ .service = 0x0E, .path = &pccc.path, .data = &.{} }).encode(&req);
+    try testing.expectEqual(cip.GeneralStatus.service_not_supported, (try cip.Reply.decode(try target.messageRouter(other, &out))).general_status);
+    const short = try (cip.Request{ .service = pccc.service_execute, .path = &pccc.path, .data = &.{ 7, 1, 2 } }).encode(&req);
+    try testing.expectEqual(cip.GeneralStatus.not_enough_data, (try cip.Reply.decode(try target.messageRouter(short, &out))).general_status);
 }
