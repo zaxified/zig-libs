@@ -39,7 +39,7 @@ const burn = @import("burn.zig");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Lightning BOLT#3 key derivation — per-commitment blinded keys, split-secret revocation keys, shachain secret generation.",
+    .doc = "Lightning BOLT#3 — per-commitment and revocation key derivation, shachain secrets, and commitment / HTLC transaction construction (option_anchors and zero_fee_commitments included).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.

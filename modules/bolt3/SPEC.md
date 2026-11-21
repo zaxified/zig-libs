@@ -126,7 +126,12 @@ beyond `std.crypto.ecc`'s constant-time scalar ladder.
   2^-128), so no test can tell them apart; the mutation run counts that mutant as equivalent.
 - Constant time: `src/ctgrind_harness.zig` drives the secret-input entry points (`derive`, `revocation`, `shachain`,
   `shachain_index` targets) under valgrind; the pinned rows are in the ctgrind table of the repository checks.
-- No fuzz harness (no fuzz obligation).
+- No fuzz harness: the module does not parse wire data.
+
+**Fuzz exemption:** EMIT-ONLY
+
+`commitment.zig` takes bytes only as already-validated inputs it copies or hashes: witness scripts into `p2wsh`, the caller's own
+signatures into `finalize` and public keys as fixed-size arrays; it builds transactions and never decodes any. Nothing in the module reads bytes that came from a peer.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 - **Mutation run:** Whole-module mutation run (mutant schemata, ReleaseSafe; 32 mutants over `root.zig`: hash-to-scalar, the four derivations with their argument order and validation, the shachain loop): 30 killed, 2 equivalent, 0 open. Equivalent (unobservable): the `IdentityElement` error mapping of `derivePublicKey` and `deriveRevocationPublicKey` is reachable only if a SHA-256-derived scalar is zero (about 2^-256 per call), so no test input can reach it.
 

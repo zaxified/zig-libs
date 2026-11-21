@@ -1168,10 +1168,10 @@ sphinx	ReleaseFast	process	1	<=47	5c64cfeb17913fb1	e7c50d755f64b027
 # derivePrivateKey now refuses a per_commitment_secret >= n, so the std scalar
 # canonicality verdict (common.zig `fromBytes` via scalar.zig `fromBytes`, root.zig `derivePrivateKey`) appears
 # for the second secret too — the class already counted for basepoint_secret.
-bolt3	ReleaseFast	derive	1	6	2274bb5605fa1e3f	c0fc92c5fbd8fb55
-bolt3	ReleaseFast	revocation	1	8	2274bb5605fa1e3f	bc9bf12a55a312c4
-bolt3	ReleaseFast	shachain	1	0	2274bb5605fa1e3f	0516122e43713a52
-bolt3	ReleaseFast	shachain_index	1	1	2274bb5605fa1e3f	21055013990ce08a
+bolt3	ReleaseFast	derive	1	6	2f6ffa22d0fe28bf	c0fc92c5fbd8fb55
+bolt3	ReleaseFast	revocation	1	8	2f6ffa22d0fe28bf	bc9bf12a55a312c4
+bolt3	ReleaseFast	shachain	1	0	2f6ffa22d0fe28bf	0516122e43713a52
+bolt3	ReleaseFast	shachain_index	1	1	2f6ffa22d0fe28bf	21055013990ce08a
 ctap2pin	ReleaseFast	ecdh	1	3	1b2ea97a80cc47e9	4596df5a3f29ae3b
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 ctap2pin	ReleaseFast	one	1	5	1b2ea97a80cc47e9	12de2588e792c80e
