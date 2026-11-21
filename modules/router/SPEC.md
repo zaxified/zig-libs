@@ -180,10 +180,12 @@ The bench is `zig build bench-router` (`tools/bench.zig` against go-chi/chi in `
 - **Percent-decoding and case folding in the matcher:** never, whatever `normalize_path` says (*Threat model*).
 - **A `middleware` package:** chi's pieces live in sibling modules (`ratelimit`, `throttle`, `cors`, `requestid`, `accesslog`, `security-headers`, `metrics`).
 - **Authentication or error classification:** the router attaches no identity and does not catch handler errors (`http.Server` answers a plain 500).
+- **Runtime `Router` static children as a faster structure:** they stay a hash-map `get` per level; `Static` already walks comptime node functions. Not tried and not wanted until the runtime router's speed is measured to matter.
 
 ## Backlog / deferred
 
-- **Runtime `Router` static children.** They are still a hash-map `get` per level; not tried, an idea if the runtime router's speed is ever needed (`Static` already walks comptime node functions).
+None open.
+
 
 ## Anchoring
 

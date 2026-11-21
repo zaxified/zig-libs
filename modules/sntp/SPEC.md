@@ -178,7 +178,7 @@ scripted loopback "server" tests skip themselves when the sandbox refuses a loop
 ## Backlog / deferred
 
 - *BOUNCED (waits-external):* **TTL/DSCP option:** `std.Io.net.BindOptions` offers no socket option (checked in Zig 0.17.0 `std/Io/net.zig`; not a zig-libs module gap); revisit when std grows one.
-- **Not measured for the "fastest" mark:** Rust sntpc and ntpd-rs (crates.io is reachable now: sntpc 0.11.0 is MIT OR Apache-2.0; needs an in-memory `NtpUdpSocket` harness like `go_bench`), chrony (GPL, black box only, a daemon rather than a library). Until one of them is built and timed, the card says `fastest ?`.
+- *BOUNCED (quiet-host):* **Not measured for the "fastest" mark:** Rust sntpc and ntpd-rs (crates.io is reachable now: sntpc 0.11.0 is MIT OR Apache-2.0; needs an in-memory `NtpUdpSocket` harness like `go_bench`), chrony (GPL, black box only, a daemon rather than a library). Until one of them is built and timed, the card says `fastest ?`. *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*
 
 
 ## Anchoring

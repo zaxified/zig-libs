@@ -446,12 +446,12 @@ after a pop is decoded again from its offset.
   automaton is built in).
 - **A built-in regex automaton.** `regex.ByteAutomaton` already has the shape `Frozen.search`
   takes; a built-in one would make `trie` depend on `regex` for no gain.
+- **A dense jump table for the first levels of a lookup:** it would cut the share of a miss lookup the first levels cost (measured on the version-3 layout) but only matters if lookup speed against darts-clone matters again; not built.
 
 ## Backlog / deferred
 
-- **Dense table for the first levels** of a lookup (idea): the first levels cost a large
-  share of a miss lookup's time (measured on the version-3 layout); a 256-entry jump table at the root and the next level
-  would cut it. Only if lookup speed against darts-clone ever matters again.
+None open.
+
 
 ## Anchoring
 

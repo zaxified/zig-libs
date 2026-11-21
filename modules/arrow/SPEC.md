@@ -430,5 +430,5 @@ reads one batch on its own.
   front and a rule for a frame whose dictionary differs (a replacement batch, legal in a stream); the reader decodes
   dictionaries after the last batch (`RDict.gens`), so a batch-at-a-time reader needs per-batch dictionary state and
   must stop borrowing `bytes` for dictionaries and footers. Needs a decision on the declared-type API first.
-- **Performance.** The bench (`tools/bench.zig`) shows this module 9-13x behind pyarrow on write and on a materialising
-  read of a 1 M-row Int64/Float64/Utf8 table; a profile of `write` and `read` comes before any rewrite.
+- *BOUNCED (quiet-host):* **Performance.** The bench (`tools/bench.zig`) shows this module 9-13x behind pyarrow on write and on a materialising
+  read of a 1 M-row Int64/Float64/Utf8 table; a profile of `write` and `read` comes before any rewrite. *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*

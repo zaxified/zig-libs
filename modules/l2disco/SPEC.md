@@ -176,10 +176,10 @@ Run: `scripts/modtest l2disco` (the module's tests; the Go benchmark is `zig bui
 
 ## Backlog / deferred
 
-- **Two benchmark rows** (`tools/bench.zig` + `tools/go_bench`): an encode row (our builders against gopacket's
+- *BOUNCED (quiet-host):* **Two benchmark rows** (`tools/bench.zig` + `tools/go_bench`): an encode row (our builders against gopacket's
   `SerializeTo`), and a paired decode row for DHCPv4/v6 in which ours also decodes the IAs and DUIDs, so that
   insomniacslk/dhcp can be compared like for like. Measured runs on a shared host, no claim on the card until
-  the spread is below the effect.
+  the spread is below the effect. *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*
 
 ## Anchoring
 

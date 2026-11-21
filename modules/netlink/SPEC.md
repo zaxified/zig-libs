@@ -535,7 +535,7 @@ rule's `rule_del`. Plus: a monitor socket opens unprivileged on the host.
 
 ## Backlog / deferred
 
-- **P "fastest" row** — rust netlink-packet-route (MIT) is the candidate for the fastest decoder; not benchmarked (the reference, Go, was). A cargo bench under `tools/` would settle it.
+- *BOUNCED (quiet-host):* **P "fastest" row** — rust netlink-packet-route (MIT) is the candidate for the fastest decoder; not benchmarked (the reference, Go, was). A cargo bench under `tools/` would settle it. *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*
 
 ## Anchoring
 

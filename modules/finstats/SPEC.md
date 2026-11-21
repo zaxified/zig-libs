@@ -269,9 +269,9 @@ authoritative). The newer functions have no bench row; see *Backlog / deferred*.
 
 ## Backlog / deferred
 
-- **Speed of the newer functions:** `tools/bench.zig` measures the period functions and `riskMetrics`; the newer
+- *BOUNCED (quiet-host):* **Speed of the newer functions:** `tools/bench.zig` measures the period functions and `riskMetrics`; the newer
   functions have no row, and the card's `fastest ?` stands. Rust `quantstats` and `quant-metrics` are the candidates to
-  measure.
+  measure. *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*
 - **No mutants yet:** the `xirrPrecise` 1e-14 derivative guard and bracket exits, `gpdFit`'s grid bounds and
   golden-section constants, `distOf`'s percentile positions, the `tradeStats` and `periodStats` wrappers.
 

@@ -155,4 +155,4 @@ The CPython comparison covers the tables where 16.0.0, 17.0.0 and 18.0.0 all agr
 
 ## Backlog / deferred
 
-- A bench against Rust `str::to_lowercase` and `unicode-normalization` (not written: the card's Performance line stays `not measured`); `tools/rust_case.rs` already drives Rust over the same inputs.
+- *BOUNCED (quiet-host):* A bench against Rust `str::to_lowercase` and `unicode-normalization` (not written: the card's Performance line stays `not measured`); `tools/rust_case.rs` already drives Rust over the same inputs. *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*

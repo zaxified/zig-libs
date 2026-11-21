@@ -196,12 +196,12 @@ sequence with the clock injected on every side. The card's Performance line carr
   cancel is a no-op.
 - **Concurrency capping** — `ConnectionLimiter` limits the establishment rate only; the sibling
   `abuseguard` covers connection-level abuse.
+- **Sliding-window counter mode:** the reference (`golang.org/x/time/rate`) has none; httprate/ulule offer it. A token bucket allows a `burst`-sized spike at any time, which is the documented behaviour of the reference. Not built (owner policy: what the reference does not have is not added).
 
 ## Backlog / deferred
 
-- **Sliding-window counter mode** — not a parity gap (the reference, x/time/rate, has none);
-  httprate/ulule offer it, and a token bucket allows a `burst`-sized spike at any time. Effort:
-  medium; unsure a typical user needs it.
+None open.
+
 
 ## Anchoring
 

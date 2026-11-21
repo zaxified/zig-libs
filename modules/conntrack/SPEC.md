@@ -322,7 +322,7 @@ conntrack-tools adds. The delete path is additionally proven end-to-end by the l
 
 ## Backlog / deferred
 
-- **A live-dump comparison row** against ti-mo and florianl in a netns — a kernel tie; needs thousands of inserted flows; not measured.
+- *BOUNCED (quiet-host):* **A live-dump comparison row** against ti-mo and florianl in a netns — a kernel tie; needs thousands of inserted flows; not measured. *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*
 
 ## Roadmap
 

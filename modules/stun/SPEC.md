@@ -180,8 +180,8 @@ building is built and described above.
 
 ## Backlog / deferred
 
-- **Speed rows outside the bench** — `longTermKey*`, URI parsing and `bindingResponse` are
-  unmeasured. Effort: small.
+- *BOUNCED (quiet-host):* **Speed rows outside the bench** — `longTermKey*`, URI parsing and `bindingResponse` are
+  unmeasured. Effort: small. *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*
 
 ## Anchoring
 

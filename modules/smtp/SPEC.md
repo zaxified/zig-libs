@@ -443,7 +443,7 @@ CONVENTIONS.md §5 also puts outside NOTICE's scope.
 
 ## Backlog / deferred
 
-- **Differential oracle against karlseguin's library** — IDEA (not scheduled). `karlseguin/smtp_client.zig`. Point both clients at one recording SMTP server with the same message and compare the command/DATA transcripts: dot-stuffing, line endings, EHLO parameters and AUTH. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT, but its last commit predates Zig 0.16, so it needs a port or a 0.15 toolchain first.
+- *BOUNCED (tool):* **Differential oracle against karlseguin's library** — IDEA (not scheduled). `karlseguin/smtp_client.zig`. Point both clients at one recording SMTP server with the same message and compare the command/DATA transcripts: dot-stuffing, line endings, EHLO parameters and AUTH. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT, but its last commit predates Zig 0.16, so it needs a port or a 0.15 toolchain first. *The library's last commit predates Zig 0.16: it needs a port or an old toolchain first, and the oracle is only worth the port if a second client's transcript is wanted.*
 
 ## Roadmap
 

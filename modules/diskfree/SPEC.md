@@ -398,5 +398,5 @@ reads of the host; GNU `df`, namespaces and Go are needed only by the by-hand in
 
 ## Backlog / deferred
 
-- **Speed rows outside the bench**: the bench pairs the mountinfo parse, the live read and `statfs("/")`; `table.readTable` (one `statfs` per mount) has no like-for-like reference (gopsutil/sysinfo were not built). A faster reader in another language than Go (Rust `procfs`, C libmount) was not measured, hence the card's "fastest ?".
-- **Mounts-file parse with a reference**: `mounts.parseMounts` has no Go/Rust counterpart in the bench (moby reads only mountinfo).
+- *BOUNCED (quiet-host):* **Speed rows outside the bench**: the bench pairs the mountinfo parse, the live read and `statfs("/")`; `table.readTable` (one `statfs` per mount) has no like-for-like reference (gopsutil/sysinfo were not built). A faster reader in another language than Go (Rust `procfs`, C libmount) was not measured, hence the card's "fastest ?". *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*
+- *BOUNCED (quiet-host):* **Mounts-file parse with a reference**: `mounts.parseMounts` has no Go/Rust counterpart in the bench (moby reads only mountinfo). *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*

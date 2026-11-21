@@ -399,6 +399,7 @@ Consumer build options (CONVENTIONS §4.2), after Rust `regex-syntax`'s `unicode
 - **`RegexBuilder` knobs** beyond `Options` (Rust) — one option struct is the whole configuration.
 - **`MarshalText`/`UnmarshalText`** — Go's encoding interfaces; `source` and `compile` are the same pair.
 - **Hand-written `Regex` values** — a `Regex` built by writing its fields is outside the guarantee.
+- **Sibling modules adopting `regex`:** `validate` (`Pattern.matcher` takes a caller-supplied matcher today), `jsonshape` (RFC 9535 `match()`/`search()` need I-Regexp), `tsdb` (regex label matchers) and `probe` (`expect` regex) each carry that as their own backlog item; they are not this module's work.
 
 ## Backlog / deferred
 
@@ -431,9 +432,6 @@ Open items.
 - *BOUNCED (waits-external):* **The next Unicode version** — `tools/ucd_unicode/fetch.sh <v>` and `gen.py --ucd data/<v> -out src`; re-run the Go replay
   (its UNICODE_VERSION count moves) and check new binary properties or property values against regex-syntax once it carries
   that version.
-- **Sibling modules that can now adopt it** — `validate` (`Pattern.matcher` takes a caller-supplied matcher today; a `regex`
-  default), `jsonshape` (RFC 9535 `match()`/`search()` need I-Regexp, an RE2 subset), `tsdb` (regex label matchers), `probe`
-  (`expect` regex). Each is that module's own backlog item; listed here so the dependency is visible.
 
 ## Anchoring
 

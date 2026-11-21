@@ -93,7 +93,7 @@ Limits a consumer relies on: decode output is at most 3 bytes per input byte (pl
 
 ## Backlog / deferred
 
-- **Latin-1 fast converters** (encoding_rs `mem` `convert_latin1_to_utf8` …) are speed rows, not features: `latin1ToUtf8` / `utf8ToLatin1Lossy` are thin wrappers over the identity page.
+- *BOUNCED (quiet-host):* **Latin-1 fast converters** (encoding_rs `mem` `convert_latin1_to_utf8` …) are speed rows, not features: `latin1ToUtf8` / `utf8ToLatin1Lossy` are thin wrappers over the identity page. *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*
 
 ## Anchoring
 

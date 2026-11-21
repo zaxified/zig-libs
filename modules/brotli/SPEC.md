@@ -685,10 +685,10 @@ from source on the same payloads; the reference decode is the preallocated-buffe
 - *BOUNCED (quiet-host):* **R18 Parallel compression on a quiet host:** `parallel.compress`'s wall time with 1–8 workers on 5–8 MB
   inputs, measured only under load (1.3–2.4× one pass with 8 workers). Expected near the job count, less
   the cuts' 0–9 % CPU. Needs an idle machine; the host is shared.
-- **R19 Speed rows outside the bench** (owner: S2 = feature parity + the bench within 1.1×; these rows are
+- *BOUNCED (quiet-host):* **R19 Speed rows outside the bench** (owner: S2 = feature parity + the bench within 1.1×; these rows are
   Backlog, not a condition): `.q0`/`.q1` on 4 KiB inputs 1.08–1.62× (a fixed cost per call; 0.44–0.89× from
   16 KiB up); one-shot `compressWith` `.q6` on 4–64 KiB under `smp_allocator` 1.10–1.83× (the allocator maps
   the 256 KiB table afresh per call; `Compressor` 0.89–1.11×, glibc 0.87–1.10×); `Compressor` `.q4` up to
   1.23×; a raw dictionary prepared per call up to 1.22× (prepared once: in the band); `.q6`/`.q9` on inputs
   of 1 MiB and more up to 1.11×/1.12× (`langtag`); `.q1` with a dictionary 1.17–1.44× (exempt: google's q1
-  ignores the dictionary, ours is 14–21 % smaller).
+  ignores the dictionary, ours is 14–21 % smaller). *Needs a quiet host: a measured claim needs a spread below the effect, and this host is shared.*
