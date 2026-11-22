@@ -1075,6 +1075,28 @@ pub fn build(b: *std.Build) void {
         });
         if (in_group) check_pubfn_reach.dependOn(&force_tests.step);
 
+        // `check-<name>`: semantic analysis of one module with NO binary, for
+        // the edit loop (an agent's post-edit hook, ZLS build-on-save, a
+        // `--watch -fincremental` session). Two compiles that nothing asks a
+        // binary from, so both run as `-fno-emit-bin` and code generation
+        // never starts:
+        //   * the module's tests over the same root `test-<name>` builds --
+        //     every test body and everything they reach;
+        //   * `force_tests` above -- every non-generic public declaration,
+        //     including the ones no test reaches.
+        // What it cannot see is what only a run sees (safety panics, leaks,
+        // wrong results) and generic bodies no test instantiates; closing work
+        // on a module is still `scripts/modtest <name>`.
+        const unit_check = b.addTest(.{
+            .name = b.fmt("check-{s}", .{m.name}),
+            .root_module = test_root,
+            .use_llvm = use_llvm,
+            .filters = test_filters,
+        });
+        const check_one = b.step(b.fmt("check-{s}", .{m.name}), b.fmt("Analyse the {s} module and its tests without building a binary", .{m.name}));
+        check_one.dependOn(&unit_check.step);
+        check_one.dependOn(&force_tests.step);
+
         // ⭐ The one class nothing else here can cover: **is the published API
         // sufficient to do the job?**
         //
@@ -1178,6 +1200,17 @@ pub fn build(b: *std.Build) void {
             run_example.has_side_effects = fresh_run;
             b.step(b.fmt("run-example-{s}", .{m.name}), b.fmt("Build AND run the {s} example", .{m.name})).dependOn(&run_example.step);
             if (in_group) run_examples.dependOn(&run_example.step);
+            // `check-<name>` analyses the example too, as a second Compile
+            // over the same root that nothing asks a binary from: an example
+            // left behind by a public type or error-set change is the most
+            // frequent "green locally, red in CI" class (four full-CI rounds
+            // in 2026-11-08..22), and the check sees it in the edit loop.
+            const example_check = b.addExecutable(.{
+                .name = b.fmt("check-example-{s}", .{m.name}),
+                .root_module = example_mod,
+                .use_llvm = use_llvm,
+            });
+            check_one.dependOn(&example_check.step);
         }
     }
 

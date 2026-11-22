@@ -13,7 +13,7 @@ same mode:
 
 | when | what to run |
 |---|---|
-| editing | whatever is fastest; `-Dselfhosted` is fine here |
+| editing | `zig build check-<m>`: analysis of the module's tests, every non-generic public declaration and its example, no binary (1–2 s for a small module, up to ~80 s for `http`/`dns`; 1.5–8× faster than `test-<m>`). It catches what `test-<m>` cannot: an untested `pub fn` that does not compile, an example broken by a public type or error-set change. An agent's post-edit hook may run it in the background. `-Dselfhosted` is fine here |
 | before ending work on a module | `scripts/modtest <m>` for **each module you touched** — Debug with LLVM; `heavy` modules build at ReleaseSafe on their own. Nothing else locally. |
 | the dependency closure | CI's push lane (`changed modules`), on the push |
 | optimized modes, the shipped mode | CI's `ReleaseSafe` and `ReleaseFast` full lanes on a tag or `workflow_dispatch` — "full gate green" is claimed only from CI |
