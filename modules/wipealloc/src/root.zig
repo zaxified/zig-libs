@@ -361,7 +361,9 @@ test "SecureAllocator: alignment is honoured up to the page size, larger is refu
         try testing.expectEqual(@as(usize, 0), @intFromPtr(buf.ptr) % al);
         try testing.expect(sa.canaryIntact(buf));
     }
-    try testing.expectError(error.OutOfMemory, a.alignedAlloc(u8, .fromByteUnits(2 * std.heap.pageSize()), 8));
+    // Comptime alignment: `pageSize()` is a run-time query where the page
+    // size varies (aarch64: 4K..64K), so take the comptime upper bound.
+    try testing.expectError(error.OutOfMemory, a.alignedAlloc(u8, .fromByteUnits(2 * std.heap.page_size_max), 8));
     try testing.expectError(error.OutOfMemory, a.alloc(u8, std.math.maxInt(usize)));
     try testing.expectError(error.OutOfMemory, a.alloc(u8, 1 << 41));
 }
