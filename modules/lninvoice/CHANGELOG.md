@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots. Clean. Test only.
 - **2026-11-21** — **New public API: typed BOLT#12 blinded paths, offer rules, offer builder.** `blinded` (`PathIterator`, `Path`, `Hop`, `FirstNode`, `PayInfo`, `PayInfoIterator`, `appendPath`, `appendPayInfo`) with `Offer.blindedPaths`, `InvoiceRequest.blindedPaths` / `record`, `Invoice.blindedPaths` / `blindedPayInfo` / `record`; `offer.readOffer` / `checkOffer` (the reader rules; all 53 `offers-test.json` rows are now asserted as valid or rejected), `offer.encodeOffer` (unsigned offers under the writer rules, byte-exact against the valid vector rows) and `offer.checkInvoiceRequest`.
 - **2026-11-17** — **Behaviour change:** a leading zero in the HRP amount is now accepted (`lnbc01u` = `lnbc1u`, `lnbc0001u` likewise, also very many zeros); **API: `AmountLeadingZero` is removed from `AmountError`/`DecodeError` — code that names `error.AmountLeadingZero` (an explicit switch arm or comparison) no longer compiles; drop that arm.** BOLT#11 forbids leading zeros for writers only, and lnd (`zpay32`) and LDK (`lightning-invoice`) both read the digits as an integer. The writer is unchanged (a new test pins that `formatAmount` never emits a leading zero). Delta mutation: 5 mutants, 4 killed, 1 equivalent; card counts cumulative (336/352, 16 eq).
 
