@@ -94,7 +94,19 @@ pub const Party = struct {
     r1: [][32]u8,
 
     /// Round 1 for value `v` with blinding `gamma` at position `j`.
-    pub fn init(out: *Party, allocator: std.mem.Allocator, io: std.Io, gens: Generators, j: usize, v: u64, gamma: [32]u8) MpcError!BitCommitment {
+    ///
+    /// Every round runs its body one frame down and then zeroes the stack
+    /// that body used (`rangeproof.burnStack`, as `prove`): without it the
+    /// dead stack kept `gamma` and the blinding scalars after each round
+    /// (`stackprobe2_test.zig`, 2026-11-23). `gamma` by pointer for the same
+    /// reason (no by-value copy in this frame).
+    pub fn init(out: *Party, allocator: std.mem.Allocator, io: std.Io, gens: Generators, j: usize, v: u64, gamma: *const [32]u8) MpcError!BitCommitment {
+        const r = initBody(out, allocator, io, gens, j, v, gamma);
+        rp.burnStack();
+        return r;
+    }
+
+    noinline fn initBody(out: *Party, allocator: std.mem.Allocator, io: std.Io, gens: Generators, j: usize, v: u64, gamma: *const [32]u8) MpcError!BitCommitment {
         const n = gens.n;
         if (j >= gens.parties) return error.InvalidPosition;
         if (n < 64 and v >= (@as(u64, 1) << @intCast(n))) return error.ValueOutOfRange;
@@ -112,7 +124,7 @@ pub const Party = struct {
             .allocator = allocator,
             .gens = gens,
             .j = j,
-            .gamma = gamma,
+            .gamma = gamma.*,
             .alpha = undefined,
             .rho = undefined,
             .a_l = bufs[0],
@@ -143,7 +155,7 @@ pub const Party = struct {
         defer std.crypto.secureZero(u8, &v_bytes);
         std.mem.writeInt(u64, v_bytes[0..8], v, .little);
         return .{
-            .v = rp.commit(gens, v_bytes, gamma),
+            .v = rp.commit(gens, v_bytes, gamma.*),
             .a = scalarvec.mulCt(gens.h, out.alpha)
                 .add(scalarvec.multiScalarMul(out.a_l, g_j) catch unreachable)
                 .add(scalarvec.multiScalarMul(out.a_r, h_j) catch unreachable),
@@ -156,6 +168,12 @@ pub const Party = struct {
     /// Round 2: the party's slice of `l(X)`, `r(X)` (offset `y^{jn}`,
     /// weight `z^{2+j}`), `T1_j = t1_j G + tau1_j H`, `T2_j` likewise.
     pub fn applyBitChallenge(self: *Party, c: BitChallenge) PolyCommitment {
+        const r = applyBitChallengeBody(self, c);
+        rp.burnStack();
+        return r;
+    }
+
+    noinline fn applyBitChallengeBody(self: *Party, c: BitChallenge) PolyCommitment {
         const n = self.gens.n;
         self.z = c.z;
         const zz = zPow(c.z, 2 + self.j);
@@ -184,6 +202,12 @@ pub const Party = struct {
     /// Round 3: the share. The party's secrets are no longer needed after
     /// it; `deinit` wipes them.
     pub fn applyPolyChallenge(self: *Party, c: PolyChallenge, out: *ProofShare) error{OutOfMemory}!void {
+        const r = applyPolyChallengeBody(self, c, out);
+        rp.burnStack();
+        return r;
+    }
+
+    noinline fn applyPolyChallengeBody(self: *Party, c: PolyChallenge, out: *ProofShare) error{OutOfMemory}!void {
         const n = self.gens.n;
         const l = try self.allocator.alloc([32]u8, n);
         errdefer self.allocator.free(l);
@@ -441,7 +465,7 @@ fn runMpc(gens: Generators, values: []const u64, corrupt: ?usize, bad: []bool) M
     var made: usize = 0;
     defer for (parties[0..made]) |*p| p.deinit();
     for (values, 0..) |v, j| {
-        bcs[j] = try Party.init(&parties[j], talloc, testing.io, gens, j, v, gammaFor(j));
+        bcs[j] = try Party.init(&parties[j], talloc, testing.io, gens, j, v, &gammaFor(j));
         made += 1;
     }
     const bit_c = try dealer.receiveBitCommitments(bcs[0..m]);
@@ -500,7 +524,7 @@ test "mpc: honest shares pass the audit" {
     var dealer = try Dealer.init(gens, &t, 2);
     var parties: [2]Party = undefined;
     var bcs: [2]BitCommitment = undefined;
-    for (&parties, 0..) |*p, j| bcs[j] = try Party.init(p, talloc, testing.io, gens, j, 100 + j, gammaFor(j));
+    for (&parties, 0..) |*p, j| bcs[j] = try Party.init(p, talloc, testing.io, gens, j, 100 + j, &gammaFor(j));
     defer for (&parties) |*p| p.deinit();
     const bit_c = try dealer.receiveBitCommitments(&bcs);
     var pcs: [2]PolyCommitment = undefined;
@@ -522,8 +546,8 @@ test "mpc: malformed setups are refused" {
     try testing.expectError(error.InvalidAggregation, Dealer.init(gens, &t, 3));
     try testing.expectError(error.InvalidAggregation, Dealer.init(gens, &t, 4));
     var p: Party = undefined;
-    try testing.expectError(error.InvalidPosition, Party.init(&p, talloc, testing.io, gens, 2, 1, gammaFor(0)));
-    try testing.expectError(error.ValueOutOfRange, Party.init(&p, talloc, testing.io, gens, 0, 256, gammaFor(0)));
+    try testing.expectError(error.InvalidPosition, Party.init(&p, talloc, testing.io, gens, 2, 1, &gammaFor(0)));
+    try testing.expectError(error.ValueOutOfRange, Party.init(&p, talloc, testing.io, gens, 0, 256, &gammaFor(0)));
     var dealer = try Dealer.init(gens, &t, 2);
     const one: [1]BitCommitment = undefined;
     try testing.expectError(error.InvalidAggregation, dealer.receiveBitCommitments(&one));

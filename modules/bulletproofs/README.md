@@ -29,7 +29,7 @@ methodology.
 | `aggregate_test.zig`, `batch_test.zig` | Aggregated proofs (m = 1..8, malformed batches, reordered/swapped/dropped commitments); batch verification |
 | `verify_b8_diff_test.zig` | The verifier held byte-exact to the plain one (SPEC § B8) |
 | `interop_test.zig` | The external anchor: merlin transcripts and dalek range proofs, single and aggregated, in both directions (`interop_vectors.zig`, from `tools/dalek/`) |
-| `fuzz_test.zig`, `stackprobe_test.zig`, `ctgrind_harness.zig` | Decoder/prove-verify fuzz, dead-stack probe, constant-time harness |
+| `fuzz_test.zig`, `stackprobe_test.zig`, `stackprobe2_test.zig`, `ctgrind_harness.zig` | Decoder/prove-verify fuzz, dead-stack probe, constant-time harness |
 
 ## Import
 

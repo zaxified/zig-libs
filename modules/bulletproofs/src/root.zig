@@ -185,6 +185,7 @@ test {
     _ = batch_test;
     _ = interop_test;
     _ = stackprobe_test;
+    _ = @import("stackprobe2_test.zig");
     _ = verify_b8_diff_test;
     _ = @import("fuzz_test.zig");
 }

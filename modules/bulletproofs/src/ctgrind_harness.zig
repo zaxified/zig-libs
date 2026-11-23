@@ -191,12 +191,13 @@ fn reloadVolatile(comptime len: usize, s: *const [len]u8) [len]u8 {
     return out;
 }
 
-const Target = enum { rangeproof, ipa };
+const Target = enum { rangeproof, ipa, party };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "rangeproof")) return .rangeproof;
     if (std.mem.eql(u8, s, "ipa")) return .ipa;
+    if (std.mem.eql(u8, s, "party")) return .party;
     return error.UnknownTarget;
 }
 
@@ -272,6 +273,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             std.debug.print("ipa_a={x}\n", .{proof.a});
             std.debug.print("ipa_b={x}\n", .{proof.b});
+        },
+        .party => {
+            // `mpc.Party`'s three rounds (2026-11-23) with `v` and `gamma`
+            // tainted, as `rangeproof`. The dealer's challenges are public
+            // (a function of the public commitments); fixed bytes here, so
+            // the row measures the party alone. The blinding scalars are
+            // drawn inside `init`, from the `Io`, like `prove`'s.
+            var v_raw = secretValueBytes();
+            var gamma_raw = secretScalarBytes("ctgrind-bulletproofs-harness-party-gamma-v1");
+            if (tainted) {
+                std.valgrind.memcheck.makeMemUndefined(&v_raw);
+                std.valgrind.memcheck.makeMemUndefined(&gamma_raw);
+            }
+            const v_bytes = reloadVolatile(8, &v_raw);
+            const gamma = reloadVolatile(32, &gamma_raw);
+            const v = std.mem.readInt(u64, &v_bytes, .little);
+
+            var party: bulletproofs.mpc.Party = undefined;
+            _ = try bulletproofs.mpc.Party.init(&party, allocator, threaded.io(), gens, 0, v, &gamma);
+            defer party.deinit();
+            _ = party.applyBitChallenge(.{
+                .y = secretScalarBytes("ctgrind-bulletproofs-harness-party-y-v1"),
+                .z = secretScalarBytes("ctgrind-bulletproofs-harness-party-z-v1"),
+            });
+            var share: bulletproofs.mpc.ProofShare = undefined;
+            try party.applyPolyChallenge(.{ .x = secretScalarBytes("ctgrind-bulletproofs-harness-party-x-v1") }, &share);
+            defer share.deinit(allocator);
+
+            // Propagation witness: downstream of v and gamma.
+            std.debug.print("t_x={x}\n", .{share.t_x});
+            std.debug.print("t_x_blinding={x}\n", .{share.t_x_blinding});
         },
     }
 }

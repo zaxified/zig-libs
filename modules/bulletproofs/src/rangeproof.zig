@@ -512,7 +512,7 @@ const prove_stack_burn = 128 * 1024;
 /// occupied. `noinline` here is load-bearing, measured: made `inline`, this
 /// buffer lands in the caller's frame, above the region the proof used, and
 /// the probe finds blinding scalars again. Volatile stores keep the dead store.
-noinline fn burnStack() void {
+pub noinline fn burnStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
     // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns

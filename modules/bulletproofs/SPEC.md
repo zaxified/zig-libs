@@ -94,8 +94,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   corrupted share at each position is blamed on that party only; honest shares
   audit, a share at the wrong position does not; malformed setups refused. The
   party's secrets (`a_L`, `a_R`, `s_L`, `s_R`, `alpha`, `rho`, `tau1`, `tau2`,
-  `gamma`) are wiped by `Party.deinit`; the multi-party paths have no ctgrind row
-  or dead-stack probe yet (*Backlog / deferred*).
+  `gamma`) are wiped by `Party.deinit`. `Party.init` takes `gamma` by pointer,
+  and each of the three rounds runs its body one frame down under `prove`'s
+  128 KiB stack burn (before 2026-11-23 the dead stack kept `gamma` and the
+  blinding scalars after `init`: `stackprobe2_test.zig`). ctgrind row `party`.
 - **`v` is a plain `u64`**, not a bignum. Every realistic Bulletproofs
   range width (8/16/32/64 bits — the paper's own running example is `n =
   64`, "prove a value fits in a `uint64`") fits in a `u64` witness. A
@@ -198,7 +200,7 @@ Constant time forbids a digit-dependent schedule, not shared doublings. The leng
   vector; 25 random vectors per size in optimized builds, 1 in Debug. End to end, the `ipa` ctgrind row's
   pinned output digest — which depends on every `L`/`R` through the transcript — is the same as before the
   change.
-- ctgrind: the `rangeproof` and `ipa` rows are 0 in-file; `ct25519`'s `msm` target measures the primitive
+- ctgrind: the `rangeproof`, `ipa` and `party` (`mpc.Party`'s three rounds) rows are 0 in-file; `ct25519`'s `msm` target measures the primitive
   itself, with a positive control.
 
 ## Batch verification (`rangeproof.verifyBatch`)
@@ -363,10 +365,12 @@ cannot see an error both sides share.
   harnesses: `RangeProof` decoder (canonical re-encode; a decodable damaged proof does not verify),
   `InnerProductProof` decoder (never panics, accepts only canonical encodings), and prove/verify (wrong
   commitment, wrong domain, flipped bit and out-of-range value refused); each has a reach test.
-- **Constant time:** ctgrind rows `rangeproof` and `ipa` (`scripts/checks/ctgrind.sh bulletproofs`), 0
-  in-file; see *Caveats*.
+- **Constant time:** ctgrind rows `rangeproof`, `ipa` and `party` (`scripts/checks/ctgrind.sh bulletproofs`),
+  0 in-file; see *Caveats*.
 - **Dead stack:** `stackprobe_test.zig` asserts zero residue for `v`, `v_bytes`, `gamma`, `z^2*gamma` and every
-  random scalar `prove` drew, beside a negative and a positive control.
+  random scalar `prove` drew, beside a negative and a positive control; `stackprobe2_test.zig`
+  (`testkit.stackprobe`) does the same for `mpc.Party`'s three rounds (`gamma`, `alpha`, `rho`, `tau1`,
+  `tau2`, `s_L`/`s_R`, `t1`, `t2`, `z^(2+j)*gamma`, plus the engine's residue rule).
 - **Mutation:** whole module, 337 mutants over `rangeproof.zig`, `ipa.zig`, `transcript.zig`, `scalarvec.zig` and
   `generators.zig` (every transcript absorption in the prover, the verifier and the batch replay, the range-proof
   relation terms, the `P` reconstruction, the batch coefficients and weights, the IPA fold, the codecs and every
@@ -387,5 +391,4 @@ cannot see an error both sides share.
 
 ## Backlog / deferred
 
-- **ctgrind rows and a dead-stack probe for the multi-party party side** (`mpc.Party`): the
-  single-prover rows do not cover its round functions.
+None open.

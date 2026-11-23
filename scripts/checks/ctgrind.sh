@@ -212,7 +212,7 @@ declare -A TARGETS=(
     # Paillier factors p, q -- one proof, no protocol run, seconds.
     [threshold_ecdsa]="share nonce betaprime fac pimod piprm prime auxgen open7"
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────
-    [bulletproofs]="rangeproof ipa"
+    [bulletproofs]="rangeproof ipa party"
     [paillier]="crt noncrt mul addm keygen"
     [aescbc]="pkcs7 xmlenc x923 iso7816 zero"
     [tlock]="fp12pow decrypt"
@@ -616,6 +616,7 @@ declare -A PATTERN=(
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────
     [bulletproofs/rangeproof]='rangeproof[.]zig|ipa[.]zig|scalarvec[.]zig|generators[.]zig|transcript[.]zig|root[.]zig'
     [bulletproofs/ipa]='ipa[.]zig|scalarvec[.]zig|transcript[.]zig|root[.]zig'
+    [bulletproofs/party]='mpc[.]zig|rangeproof[.]zig|scalarvec[.]zig|generators[.]zig|root[.]zig'
     # ⚠ `root[.]zig` alone would have MISSED over half of paillier's crt total:
     # std's schoolbook big-int division under `divFloor` lives in int.zig, and
     # the Montgomery machinery in ff.zig. Naming only the module's own file is
@@ -1007,6 +1008,7 @@ declare -A LABEL=(
     [adaptor/extract]='adaptor extract (t out)+k256'
     [bulletproofs/rangeproof]='bulletproofs prove (v,gamma)+ct25519'
     [bulletproofs/ipa]='bulletproofs ipa witness+ct25519'
+    [bulletproofs/party]='bulletproofs mpc.Party (v,gamma)+ct25519'
     [paillier/crt]='paillier decrypt CRT+std bigint'
     [paillier/noncrt]='paillier decrypt non-CRT+std bigint'
     [paillier/mul]='paillier mulPlaintext (k)'

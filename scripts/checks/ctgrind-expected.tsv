@@ -939,8 +939,12 @@ threshold_ecdsa	ReleaseFast	open7	1	2	9f8a8e4656c01dfb	e040997143d67ecf
 # rangeproof.zig, the IPA transcript replay and challenge products moved into
 # `ipa.replayChallenges`/`challengeProducts`, verifier side only). Both rows
 # re-measured unchanged.
-bulletproofs	ReleaseFast	rangeproof	1	0	71c7b9473eba0e5c	RANDOMIZED
-bulletproofs	ReleaseFast	ipa	1	0	3f64cdea60e24639	2ade41bb2f418497
+bulletproofs	ReleaseFast	rangeproof	1	0	097b3fd438fd2580	RANDOMIZED
+bulletproofs	ReleaseFast	ipa	1	0	76bda7175c68bf00	2ade41bb2f418497
+# bulletproofs party (2026-11-23): mpc.Party init + applyBitChallenge + applyPolyChallenge with v and
+# gamma tainted, fixed public challenges. 0 in-file, 4 witness (the printed share). RANDOMIZED for the
+# same reason as rangeproof: init draws alpha/rho/s_L/s_R/tau1/tau2 from the Io.
+bulletproofs	ReleaseFast	party	1	0	67d5be25ce6ef528	RANDOMIZED
 # paillier 2026-10-02 — decrypt, gPow and the homomorphic products moved onto
 # montint.DynModint; the L-function is DynModint.divExact (Hensel) instead of
 # std.math.big.int divFloor. crt 325 -> 2, noncrt 133 -> 3, mul 9 -> 0,
