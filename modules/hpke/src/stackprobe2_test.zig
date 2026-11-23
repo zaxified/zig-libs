@@ -31,3 +31,26 @@ test "STACKPROBE: labeledExtract and labeledExpand leave no secret on the dead s
     _ = try P.run("labeledExtract", extract, .{ &prk, &ikm }, &.{ &ikm, &prk }, .{});
     _ = try P.run("labeledExpand", expand, .{ &okm, &prk }, &.{ &prk, &okm }, .{});
 }
+
+const root = @import("root.zig");
+var pq_ikm: [32]u8 = undefined;
+var mk_ref: root.MlKem768Kem.KeyPair = undefined;
+var mk_out: root.MlKem768Kem.KeyPair = undefined;
+var hy_ref: root.MlKem768X25519Kem.KeyPair = undefined;
+var hy_out: root.MlKem768X25519Kem.KeyPair = undefined;
+
+fn mkDerive(out: *root.MlKem768Kem.KeyPair, i: *const [32]u8) void {
+    root.MlKem768Kem.deriveKeyPair(out, i);
+}
+fn hyDerive(out: *root.MlKem768X25519Kem.KeyPair, i: *const [32]u8) void {
+    root.MlKem768X25519Kem.deriveKeyPair(out, i);
+}
+
+test "STACKPROBE: the PQ and hybrid KEMs' deriveKeyPair leave no ikm or seed on the dead stack" {
+    try sp.skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha256.hash("hpke probe2 pq ikm", &pq_ikm, .{});
+    root.MlKem768Kem.deriveKeyPair(&mk_ref, &pq_ikm);
+    _ = try P.run("MlKem768Kem.deriveKeyPair", mkDerive, .{ &mk_out, &pq_ikm }, &.{ &pq_ikm, &mk_ref.seed }, .{});
+    root.MlKem768X25519Kem.deriveKeyPair(&hy_ref, &pq_ikm);
+    _ = try P.run("MlKem768X25519Kem.deriveKeyPair", hyDerive, .{ &hy_out, &pq_ikm }, &.{ &pq_ikm, &hy_ref.seed, &hy_ref.t_secret }, .{});
+}

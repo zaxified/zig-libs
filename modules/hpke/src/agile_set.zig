@@ -76,6 +76,7 @@ pub fn Agile(comptime opts: Options) type {
         }
 
         /// `DeriveKeyPair(ikm)` (Go `KEM.DeriveKeyPair`).
+        // secret-api-ok: a dispatch to the static KEM's deriveKeyPair, which burns (DHKEM: kem_burn; ML-KEM/hybrid: fromSeed's burn covers deriveSeed's sibling frames, needle probe in stackprobe2_test.zig).
         pub fn deriveKeyPair(out: *KeyPair, kem: KemId, ikm: []const u8) SuiteError!void {
             inline for (opts.kems) |k| if (kem == k) {
                 out.* = @unionInit(KeyPair, @tagName(k), undefined);
@@ -118,6 +119,7 @@ pub fn Agile(comptime opts: Options) type {
 
             /// RFC 9180 §5.2 `Context.Seal`: `out.len == pt.len +
             /// suite.tagLength()`.
+            // secret-api-ok: a dispatch to the static Context.seal, which runs under msg_burn.
             pub fn seal(self: *Context, aad: []const u8, pt: []const u8, out: []u8) SealError!void {
                 inline for (opts.aeads) |a| if (a != .export_only and std.meta.activeTag(self.msg) == @field(MsgTag, @tagName(a)))
                     return @field(self.msg, @tagName(a)).seal(aad, pt, out);
@@ -126,6 +128,7 @@ pub fn Agile(comptime opts: Options) type {
 
             /// RFC 9180 §5.2 `Context.Open`: `out.len == ct.len -
             /// suite.tagLength()`.
+            // secret-api-ok: a dispatch to the static Context.open, which runs under msg_burn.
             pub fn open(self: *Context, aad: []const u8, ct: []const u8, out: []u8) OpenError!void {
                 inline for (opts.aeads) |a| if (a != .export_only and std.meta.activeTag(self.msg) == @field(MsgTag, @tagName(a)))
                     return @field(self.msg, @tagName(a)).open(aad, ct, out);
