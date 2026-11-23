@@ -534,7 +534,21 @@ pub fn rawToDer(sig_rs: [64]u8, buf: *[der_max_len]u8) []const u8 {
 /// with different sizes would need the bit-shifting the RFC describes; this is
 /// deliberately not written generically for a case the module cannot reach.
 /// Mirrors `k256.ecdsa_recover`'s DRBG, which the same reasoning covers.
-pub fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
+///
+/// The nonce is as secret as the key (it reveals the key with one signature),
+/// so the key comes in by pointer, the nonce goes out through `out`, and the
+/// DRBG runs one frame down under a dead-stack burn (`burn.zig`).
+pub fn rfc6979NonceInto(out: *Scalar, privkey: *const [32]u8, hash32: *const [32]u8) void {
+    rfc6979NonceIntoUnburned(out, privkey, hash32);
+    burn.stack(burn.nonce_burn);
+}
+
+noinline fn rfc6979NonceIntoUnburned(out: *Scalar, privkey: *const [32]u8, hash32: *const [32]u8) void {
+    out.* = rfc6979Nonce(privkey.*, hash32.*);
+}
+
+/// The DRBG itself, for callers already inside a burned body.
+fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
     const h1 = reduceToScalar(hash32).toBytes(.big);
 
     var v: [32]u8 = @as([32]u8, @splat(0x01));

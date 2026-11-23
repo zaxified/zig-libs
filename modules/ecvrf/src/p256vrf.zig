@@ -158,7 +158,8 @@ pub fn Suite(comptime kind: Kind) type {
             // §5.4.2.1: RFC 6979 §3.2 with m = h_string, H = SHA-256.
             var hm: [32]u8 = undefined;
             Sha256.hash(&h_string, &hm, .{});
-            var k = p256.sign.rfc6979Nonce(kp.sk, hm);
+            var k: Scalar = undefined;
+            p256.sign.rfc6979NonceInto(&k, &kp.sk, &hm);
             defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
             var k_bytes = k.toBytes(.big);
             defer std.crypto.secureZero(u8, &k_bytes);

@@ -37,3 +37,8 @@ pub const affine_burn = 4 * 1024;
 /// An ECDSA signature (the std scaffold or `ecdsaSign`, `k·G` included)
 /// dirtied 5.9 KiB in ReleaseFast (2026-10-08).
 pub const sign_burn = 8 * 1024;
+
+/// `sign.rfc6979NonceInto`: the HMAC-SHA-256 DRBG alone (a few SHA-256 states
+/// and the 97-byte message buffer): needles reached 1 535 B deep in ReleaseFast
+/// (`stackprobe2_test.zig`, 2026-11-23); 4 KiB leaves room for other targets.
+pub const nonce_burn = 4 * 1024;

@@ -218,7 +218,7 @@ RFC 9381 §5.5 over NIST P-256 and SHA-256. `x = SK` (a big-endian integer in `[
 `KeyPair.init(out, &sk)` refuses anything else with `error.InvalidSecretKey` and leaves `out`
 untouched, so `prove` cannot fail),
 `point_to_string` = SEC1 compressed (33 bytes), `int_to_string` = I2OSP (big-endian), the nonce is
-RFC 6979 §3.2 over `h_string` (§5.4.2.1, the sibling `p256`'s `sign.rfc6979Nonce`),
+RFC 6979 §3.2 over `h_string` (§5.4.2.1, the sibling `p256`'s `sign.rfc6979NonceInto`),
 `encode_to_curve` is try-and-increment with `string_to_point(0x02 || hash)` (TAI, a loop over
 `alpha`) or RFC 9380 `P256_XMD:SHA-256_SSWU_NU_` with `DST = "ECVRF_" || suite || 0x02` (SSWU,
 `voprf`'s `hash_to_field` and SSWU map: one field element, no loop). Proof 81 bytes, output 32.

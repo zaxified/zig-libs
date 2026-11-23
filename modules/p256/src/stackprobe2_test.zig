@@ -25,7 +25,20 @@ test "STACKPROBE: P-256 key generation and signer construction leave no secret o
     // `signer` returns the Signer — secret key inside — by value, so its own
     // result slot holds the key (18 windows, 2026-10-09); `signerInto` does not.
     _ = try P.run("KeyPair.signerInto", Ecdsa.KeyPair.signerInto, .{ &signer_out, &kp, null }, &.{std.mem.asBytes(&kp.secret_key)}, .{});
+    // RFC 6979 nonce on its own (public for ecvrf): the key and the nonce it
+    // derives (big- and little-endian) must not survive below the call.
+    nonce_sk = kp.secret_key.toBytes();
+    std.crypto.hash.sha2.Sha256.hash("p256 probe2 msg", &nonce_h, .{});
+    p256.sign.rfc6979NonceInto(&nonce_ref, &nonce_sk, &nonce_h);
+    const k_be = nonce_ref.toBytes(.big);
+    const k_le = nonce_ref.toBytes(.little);
+    _ = try P.run("sign.rfc6979NonceInto", p256.sign.rfc6979NonceInto, .{ &nonce_out, &nonce_sk, &nonce_h }, &.{ &nonce_sk, &k_be, &k_le }, .{});
 }
+
+var nonce_sk: [32]u8 = undefined;
+var nonce_h: [32]u8 = undefined;
+var nonce_ref: p256.Scalar = undefined;
+var nonce_out: p256.Scalar = undefined;
 
 // Stack budget (README "Stack use"): the figures the README quotes are pinned here so the
 // document cannot drift from the code. Runs in any build mode (it paints a stack window and
@@ -110,6 +123,7 @@ test "stack use: burn sizes, and every entry point runs in a 64 KiB stack within
     try std.testing.expectEqual(@as(usize, 16 * 1024), burn.mul_burn);
     try std.testing.expectEqual(@as(usize, 4 * 1024), burn.affine_burn);
     try std.testing.expectEqual(@as(usize, 8 * 1024), burn.sign_burn);
+    try std.testing.expectEqual(@as(usize, 4 * 1024), burn.nonce_burn);
     s_ok = true;
     var job: StackJob = .{};
     const th = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, StackJob.run, .{&job});

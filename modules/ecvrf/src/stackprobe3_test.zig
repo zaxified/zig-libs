@@ -57,7 +57,8 @@ fn probeSuite(comptime S: type, comptime name: []const u8) !void {
         const h = try p256.P256.fromSec1(&h_string);
         var hm: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&h_string, &hm, .{});
-        const k = p256.sign.rfc6979Nonce(sk, hm);
+        var k: p256.Scalar = undefined;
+        p256.sign.rfc6979NonceInto(&k, &sk, &hm);
         const k_be = k.toBytes(.big);
         const k_le = k.toBytes(.little);
         var kb: p256.P256 = undefined;

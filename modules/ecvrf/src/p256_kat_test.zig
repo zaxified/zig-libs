@@ -58,7 +58,9 @@ fn check(comptime S: type, v: V) !void {
     // k (RFC 6979 over h_string) and U = k*B, V = k*H.
     var hm: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&h, &hm, .{});
-    const k = p256.sign.rfc6979Nonce(sk, hm).toBytes(.big);
+    var k_s: p256.Scalar = undefined;
+    p256.sign.rfc6979NonceInto(&k_s, &sk, &hm);
+    const k = k_s.toBytes(.big);
     try testing.expectEqualSlices(u8, &try hex(32, v.k), &k);
     const u = try p256.P256.basePoint.mul(k, .big);
     try testing.expectEqualSlices(u8, &try hex(33, v.u), &u.toCompressedSec1());
