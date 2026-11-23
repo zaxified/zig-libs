@@ -7,7 +7,9 @@
 //! something a Zig test can assert on.
 //!
 //! Run through `../../../scripts/checks/ctgrind.sh sphinx` (targets
-//! `construct` and `process`, ReleaseFast); the pinned counts are in
+//! `construct`, `process`, and the route-blinding pair `blind_create`
+//! (taints `createPath`'s session key) and `unblind` (taints the node's
+//! private key), ReleaseFast); the pinned counts are in
 //! `scripts/checks/ctgrind-expected.tsv`.
 //!
 //! ## The two targets, and which claim each pins
@@ -113,12 +115,14 @@ fn reloadVolatile(comptime n: usize, s: *const [n]u8) [n]u8 {
     return out;
 }
 
-const Target = enum { construct, process };
+const Target = enum { construct, process, blind_create, unblind };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "construct")) return .construct;
     if (std.mem.eql(u8, s, "process")) return .process;
+    if (std.mem.eql(u8, s, "blind_create")) return .blind_create;
+    if (std.mem.eql(u8, s, "unblind")) return .unblind;
     return error.UnknownTarget;
 }
 
@@ -222,5 +226,55 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 result.payload_buf,
             });
         },
+        // Own `noinline` functions: inlined into `main`, the two extra arms
+        // changed how `construct` was inlined and its row read 5 in-file
+        // contexts instead of 7 (measured 2026-11-23).
+        .blind_create => try blindCreate(tainted),
+        .unblind => try unblindTarget(tainted),
     }
+}
+
+noinline fn blindCreate(tainted: bool) !void {
+    // Route blinding, path creator: the session key `e_0` is the
+    // secret (every `e_i`, `ss_i`, `rho_i` and factor derives from
+    // it). Node ids and payloads: BOLT#4 `route-blinding-test.json`,
+    // first segment (Bob -> Carol), public route data.
+    var sk: [32]u8 = @splat(0x02);
+    taintIf(tainted, &sk);
+    const session_key = reloadVolatile(32, &sk);
+    const ids = [2][sphinx.pubkey_len]u8{
+        hexN(sphinx.pubkey_len, "0324653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c"),
+        hexN(sphinx.pubkey_len, "027f31ebc5462c1fdce1b737ecff52d37d75dea43ce11c74d25aa297165faa2007"),
+    };
+    var pl_storage: [2][100]u8 = undefined;
+    const payloads = [2][]const u8{
+        hexInto(&pl_storage[0], "011a0000000000000000000000000000000000000000000000000000020800000000000006c10a0800240000009627100c06000b69e505dc0e00fd023103123456"),
+        hexInto(&pl_storage[1], "020800000000000004510821031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f0a0800300000006401f40c06000b69c105dc0e00"),
+    };
+    var enc: [2][116]u8 = undefined;
+    var out: [2]sphinx.blinded.BlindedHop = undefined;
+    for (&out, payloads, &enc) |*o, p, *e| o.* = .{ .blinded_node_id = undefined, .encrypted_data = e[0 .. p.len + sphinx.blinded.tag_len] };
+    const first = try sphinx.blinded.createPath(&session_key, &ids, &payloads, &out);
+    // Propagation witness: the first path key and the ciphertexts
+    // are downstream of `e_0`.
+    std.debug.print("first={x}\nenc0={x}\nenc1={x}\n", .{ first, out[0].encrypted_data, out[1].encrypted_data });
+}
+
+noinline fn unblindTarget(tainted: bool) !void {
+    // Route blinding, a node of the path: its private key `k_i` is
+    // the secret. Path key and `encrypted_recipient_data`: the same
+    // BOLT#4 file, Bob's hop (public, seen on the wire).
+    var pv: [32]u8 = @splat(0x42);
+    taintIf(tainted, &pv);
+    const node_privkey = reloadVolatile(32, &pv);
+    const path_key = hexN(sphinx.pubkey_len, "024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766");
+    var enc_storage: [100]u8 = undefined;
+    const enc = hexInto(&enc_storage, "cd4100ff9c09ed28102b210ac73aa12d63e90852cebc496c49f57c49982088b49f2e70b99287fdee0aa58aa39913ab405813b999f66783aa2fe637b3cda91ffc0913c30324e2c6ce327e045183e4bffecb");
+    var plain: [100]u8 = undefined;
+    var u: sphinx.blinded.Unblinded = undefined;
+    // ⚠ The tag check's verdict (DecryptionFailed or not) depends on
+    // the secret by design (a wrong key fails): `try` branches on it
+    // here, in the harness, not in the module.
+    try sphinx.blinded.unblind(&node_privkey, &path_key, enc, plain[0 .. enc.len - sphinx.blinded.tag_len], &u);
+    std.debug.print("b={x}\nnext={x}\n", .{ u.blinded_privkey, u.next_path_key });
 }

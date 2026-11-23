@@ -135,7 +135,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   session key, the node keys, the blinded ephemeral scalars (both byte orders), the blinding factors, every hop's
   shared secret and `rho`/`mu` keys and the padding key, next to a negative and a positive control
   (`stackprobe_test.zig`: `deriveHopSecrets`, `construct`, `process`; `stackprobe2_test.zig`: key derivation and
-  the failure functions).
+  the failure functions; `stackprobe3_test.zig`: route blinding, `blinded.createPath` with every `e_i`, `ss_i`,
+  `rho_i` and both factors as needles, `blinded.unblind` with `k_i`, `ss_i`, `rho_i`, the factors and `b_i`).
+  Route blinding's two entry points burn 40 KiB, as `core`.
 - **Per-hop unlinkability is the module's entire reason to exist.** Two
   distinct properties, both required, neither sufficient alone:
   - **Ephemeral-key blinding** (`deriveHopSecrets`'s blinding-factor chain,
@@ -194,12 +196,16 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `process` operates on values that are either fully public (the packet
   bytes) or, once past the HMAC gate, this node's own already-established
   secrets.
-  - **What ctgrind measures** (`scripts/checks/ctgrind.sh sphinx`, ReleaseFast, rows `construct` and `process`;
-    the expected counts and source digests are pinned in `scripts/checks/ctgrind-expected.tsv`: `construct` 7
-    in-file contexts, `process` at most 47, controls 0) — the paragraph above is the intent, not what the
-    binary does. (1) std's secp256k1 scalar code is NOT branch-free here: `cmovznzU64`
-    (`secp256k1_scalar_64.zig`), a branchless bitmask select in source, compiles to `test $0x1,%al; jne` at
-    ReleaseFast — std's code, under every secp256k1 consumer, not something this module adds or can fix. (2)
+  - **What ctgrind measures** (`scripts/checks/ctgrind.sh sphinx`, ReleaseFast, rows `construct`, `process`,
+    `blind_create` and `unblind`; the expected counts and source digests are pinned in
+    `scripts/checks/ctgrind-expected.tsv`: `construct` 5 in-file contexts, `process` at most 47, `blind_create` 6,
+    `unblind` 5, controls 0; every route-blinding context is a verdict, listed in the tsv) — the paragraph above
+    is the intent, not what the binary does. (1) std's secp256k1 scalar code is NOT reliably branch-free:
+    `cmovznzU64` (`secp256k1_scalar_64.zig`), a branchless bitmask select in source, compiled to
+    `test $0x1,%al; jne` at ReleaseFast while `construct` was its only caller (2 of the 7 contexts it read until
+    2026-11-23); with the route-blinding targets in the same harness binary std's `scalar.mul` is a shared
+    out-of-line function and compiles without the branch, so the row reads 5. std's code, under every secp256k1
+    consumer, codegen-dependent, not something this module adds or can fix. (2)
     `process`'s final-hop test is a secret-derived comparison (`frame.hmac` is deobfuscated with the shared
     secret); it is `timing_safe.eql` against an all-zero HMAC (pinned by `check-ct-compare`), constant-time by
     construction like the HMAC gate, and the one in-file context at that line is the branch on the verdict (the
@@ -230,7 +236,8 @@ every other payload here; two paths concatenate through the first one's
 burn. Anchor: BOLT#4 `route-blinding-test.json`, the generate section (both
 concatenated segments: path keys, blinded node ids, encrypted data) and the
 unblind section (every hop's blinded private key, plaintext, next path key),
-byte-exact. No ctgrind row or stack-probe needle set for it yet (Backlog).
+byte-exact. Hardening: `stackprobe3_test.zig` (dead stack) and the ctgrind rows `blind_create` / `unblind`
+(*Threat model / limits*).
 
 ## Returning Errors (`failure.zig`)
 
@@ -327,8 +334,8 @@ are plain classic packets). Failure messages with `path_key` (blinded paths turn
   (a whole route built by `construct`, peeled hop by hop; a flipped bit, other associated data or a damaged packet
   is refused) and `sphinx-forged` (a packet whose HMAC is valid because the sender chose the ephemeral key, with an
   arbitrary deobfuscated hop frame: `process` returns a result or a typed error, never a panic).
-- **Dead stack:** `src/stackprobe_test.zig` and `src/stackprobe2_test.zig`, ReleaseFast only (see *Threat model /
-  limits*).
+- **Dead stack:** `src/stackprobe_test.zig`, `src/stackprobe2_test.zig` and `src/stackprobe3_test.zig` (route
+  blinding), ReleaseFast only (see *Threat model / limits*).
 - **Constant time:** `scripts/checks/ctgrind.sh sphinx`, the rows described under *Threat model / limits*.
 - **Mutation:** whole-module over `construct`'s route checks and filler, `process`'s HMAC gate, frame-error mapping
   and `consumed` bound, the blinding chain, `hopframe`, `bigsize`, `packet`, `keyderive` and `failure.zig`. The
@@ -346,8 +353,6 @@ are plain classic packets). Failure messages with `path_key` (blinded paths turn
 ## Backlog / deferred
 
 - **`attribution_data` and the success-path `fulfillment_payload`** (BOLT#4 `option_attribution_data`: per-hop hold times and truncated HMACs) — the attributable-failure revision of "Returning Errors"; the classic failure packets are implemented. Effort: medium; fits §2.
-- **Route blinding hardening rows:** `blinded.createPath`/`unblind` have no ctgrind row and no stack-probe needles
-  (`e_i`, `ss_i`, `rho_i`, `b_i`) yet; they use the same secp256k1 and burn shapes as `core`.
 
 ## Anchoring
 

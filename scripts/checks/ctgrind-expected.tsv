@@ -1180,8 +1180,21 @@ signal	ReleaseFast	ratchet	1	2	2b3a57cfc5374b2a	92ab00fad0ce5c41
 # gives), chunked differently now that the result is built in processBody.
 # Zig 0.17.0 (2026-10-18): construct 11/7, process 50/45, as on 0.16; the only shape change is
 # compiler_rt's memset frame (`memsetSmallPowerOf2 <- memset`, was `memset`). Digest re-pinned.
-sphinx	ReleaseFast	construct	1	7	5c64cfeb17913fb1	cb364f94f78ea089
+sphinx	ReleaseFast	construct	1	5	5c64cfeb17913fb1	cb364f94f78ea089
 sphinx	ReleaseFast	process	1	<=47	5c64cfeb17913fb1	e7c50d755f64b027
+# sphinx construct 7 -> 5 (2026-11-23): the two std `cmovznzU64` contexts (scalar.mul and toBytes, a
+# branch LLVM emitted for a bitmask select) are gone once the route-blinding targets share the
+# binary: std's scalar.mul is then out of line and compiles branch-free. Same 5 other contexts,
+# line for line (--stacks diff against the HEAD harness). Codegen, not a module change.
+# sphinx route blinding (2026-11-23): blind_create taints createPath's session key e_0, unblind a
+# node's private key k_i (BOLT#4 route-blinding-test.json, Bob's hop). All in-file contexts are
+# verdicts, none a branch on a digit of a secret (--stacks): blind_create 6 = comb rejectIdentity
+# of E_0 (blinded.zig:95), mul rejectIdentity of e_i*N_i (:101), f*N_i (:106) and f*E_i (:115),
+# std scalar canonicality x2 in Secp256k1.scalar.mul (:116). unblind 5 = mul rejectIdentity of
+# k_i*E_i (:156) and f*E_i (:172), the ChaCha20-Poly1305 tag verdict (:163; a wrong key fails by
+# design), std scalar canonicality x2 (:170).
+sphinx	ReleaseFast	blind_create	1	6	e64552b6a2bfbb28	b93ef113e0ecb54b
+sphinx	ReleaseFast	unblind	1	5	e64552b6a2bfbb28	94a6c204558dab30
 # bolt3 derive 7 -> 8 (re-pin 2026-10-06; the fix landed 2026-10-05):
 # derivePrivateKey now refuses a per_commitment_secret >= n, so the std scalar
 # canonicality verdict (common.zig `fromBytes` via scalar.zig `fromBytes`, root.zig `derivePrivateKey`) appears
