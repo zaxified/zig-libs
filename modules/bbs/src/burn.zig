@@ -42,23 +42,30 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 
 // Sizes: the real depth of each body was measured with every burn at 1 KiB,
 // `verbose` on, in the probe (deepest residue hit, ReleaseFast);
-// each constant keeps about 2x that.
+// each constant keeps about 2x that. ⚠ "Residue" there meant a NEEDLE hit;
+// since 2026-11-23 the probe also applies the residue rule (any non-zero,
+// non-paint byte below the burn), which sizes a burn by the body's DIRTY
+// depth: the intermediates of a multiply by a secret scalar are secret-
+// dependent even when no needle names them.
 
 /// `keyGen`: the 4 KiB derive buffer (a copy of the key material) plus
 /// `hash_to_scalar` under it; residue reached 4.4 KiB below the entry.
 pub const keygen_burn = 12 * 1024;
 
-/// `skToPk` (a G2 multiply by SK) and `SecretKey.fromBytes`/`toBytes`: no
-/// residue below 1 KiB (the whole call dirties 11 KiB, none of it SK).
-pub const key_burn = 4 * 1024;
+/// `skToPk` (a G2 multiply by SK) and `SecretKey.fromBytes`/`toBytes`:
+/// `skToPk` dirties 11.7 KiB, and its frames hold the G2 multiply's
+/// SK-dependent intermediates. At 4 KiB (until 2026-11-23) about 6.8 KiB of
+/// them stayed below the burn (residue rule).
+pub const key_burn = 24 * 1024;
 
 /// `sign`: message scalars, `SK || msgs`, `1/(SK+e)` and a G1 multiply;
 /// residue reached 1.3 KiB below the entry.
 pub const sign_burn = 8 * 1024;
 
 /// `proofGen`: the blinding scalars, `r3`, `r1*r2` and the G1 multiplies by
-/// them; residue reached 4.4 KiB below the entry.
-pub const proof_burn = 8 * 1024;
+/// them; needle residue reached 4.4 KiB below the entry, the body dirties
+/// 12.3 KiB (at 8 KiB, until 2026-11-23, 3.9 KiB stayed below the burn).
+pub const proof_burn = 24 * 1024;
 
 /// `calculateRandomScalars`: the raw entropy and the reduction; residue
 /// reached 0.9 KiB below the entry.
