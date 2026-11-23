@@ -324,7 +324,7 @@ ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # "one witness context, zero in-file", never as "one expected context in
 # ct25519's own code" — that reading would describe the fragile
 # single-context pin this module deliberately does not have.
-ct25519	ReleaseFast	ct25519	1	0	9a52995b15c26959	4e5e08fafcda58f8
+ct25519	ReleaseFast	ct25519	1	0	aaa45198aa7c91a1	4e5e08fafcda58f8
 ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 # ct25519 targets added 2026-09-16, first pinned 2026-09-15 (A1 ct25519 C3/C4,
 # bulletproofs B9). All four claim zero in-file contexts, 2 witness each
@@ -336,10 +336,10 @@ ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 #               the same point as the `ct25519` row, so its output pin equals
 #               that row's.
 #   msm         `mulMultiRistretto` over 9 terms (B9).
-ct25519	ReleaseFast	comb	1	0	9a52995b15c26959	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladderbase	1	0	9a52995b15c26959	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladder	1	0	9a52995b15c26959	4e5e08fafcda58f8
-ct25519	ReleaseFast	msm	1	0	9a52995b15c26959	09aa32de83cec03a
+ct25519	ReleaseFast	comb	1	0	aaa45198aa7c91a1	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladderbase	1	0	aaa45198aa7c91a1	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladder	1	0	aaa45198aa7c91a1	4e5e08fafcda58f8
+ct25519	ReleaseFast	msm	1	0	aaa45198aa7c91a1	09aa32de83cec03a
 # x25519 (added 2026-09-28, pinned 2026-09-29 with P6): `X25519.recoverPublicKey`
 # (comb + Edwards->Montgomery map) and then `X25519.scalarmult` of the same
 # tainted key against RFC 7748 §6.1 Bob's public key -- the shared-secret
@@ -349,7 +349,7 @@ ct25519	ReleaseFast	msm	1	0	9a52995b15c26959	09aa32de83cec03a
 # shape is declassified (a function of the public point only, SPEC.md § P6);
 # positive controls in SPEC.md § P6: without the declassify 1 in-file at that
 # line, a branching cswap 1 in-file at the swap (native and -mcpu=x86_64_v3).
-ct25519	ReleaseFast	x25519	1	0	9a52995b15c26959	8af2fe8213b778aa
+ct25519	ReleaseFast	x25519	1	0	aaa45198aa7c91a1	8af2fe8213b778aa
 decaf448	ReleaseFast	scalarmul	1	0	43963c0c719ebae4	77a1bd1038ca1053
 # ecvrf prove 3 -> 0 (4db1e627): the three contexts were try-and-increment
 # branches on H, which is derived from the PUBLIC key. The harness now
@@ -2548,7 +2548,7 @@ xmlenc	ReleaseFast	kw	1	182	d6941608df256e41	65e898b409f3bf26	cpu=x86_64 control
 # ssh ecdh: no variant since 2026-11-18 -- the fromScalar zero verdict is declassified (ssh audit c1),
 # and portable now reads 20, equal to the plain row.
 ssh	ReleaseFast	pem	1	4	44bc21276091fd81	2ba7559fa99a2188	cpu=x86_64
-ct25519	ReleaseFast	x25519	1	1	9a52995b15c26959	8af2fe8213b778aa	cpu=x86_64
+ct25519	ReleaseFast	x25519	1	1	aaa45198aa7c91a1	8af2fe8213b778aa	cpu=x86_64
 hpke	ReleaseFast	x25519_decap	1	1	988bf797e9128852	c0cee0a8c6bf72c3	cpu=x86_64
 hpke	ReleaseFast	x25519_authdecap	1	2	988bf797e9128852	05af25d1d0e3943d	cpu=x86_64
 hpke	ReleaseFast	xwing_decap	1	1	9792528fc668b453	a1bdb379c24261c4	cpu=x86_64

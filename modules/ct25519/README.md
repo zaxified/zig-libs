@@ -42,8 +42,9 @@ torsion components included — std's `Edwards25519.mulMulti` is variable-time.
 `Edwards25519` tables = 21504 B (21 KiB) in `strausChunk`, however many points
 you pass (more terms run in further passes); afterwards they burn 32 KiB of dead
 stack (`msm_burn`; the body dirtied 28.5 KiB in ReleaseFast). `X25519.recoverPublicKey`
-/`recoverPublicKeyInto` burn 16 KiB, `X25519.scalarmult` 4 KiB; `mul`/`mulBase` need
-only a few KiB. **Give a thread that calls them at least 64 KiB of free stack**, which
+/`recoverPublicKeyInto` burn 16 KiB, `X25519.scalarmult` 4 KiB, `mul`/`mulRistretto`
+16 KiB (`mul_burn`; the body dirtied 8.2 KiB), `mulBase`/`mulRistrettoBase`/`mulBaseEncode`/
+`mulBaseEncode2` 4 KiB (`base_burn`; 2.4 KiB). **Give a thread that calls them at least 64 KiB of free stack**, which
 covers the 32 KiB burn plus the body's frames in the build `scripts/modtest` runs; a test
 (`stack use: ...` in `src/stackprobe2_test.zig`) pins every figure above and runs the four
 entry points in a 64 KiB thread. Embedded or coroutine stacks smaller than that need a

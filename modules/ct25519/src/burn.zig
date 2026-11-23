@@ -35,3 +35,15 @@ pub const x25519_burn = 4 * 1024;
 /// not yet measured; the coordinator adjusts after the ReleaseFast probe
 /// (`stackprobe2_test.zig`, 2026-10-09).
 pub const x25519_base_burn = 16 * 1024;
+
+/// `mul` / `mulRistretto`: the body (the point's 16-entry window table and
+/// the ladder) dirtied 8.2 KiB in ReleaseFast (2026-11-23, the probe's
+/// residue rule with the burns cut to 512 B). Until then the secret-scalar
+/// primitives burned nothing: the needle probe found no scalar image, but the
+/// residue rule found ~200 B of comb frames (intermediates of the secret
+/// digits) below `fastBaseMul`'s state wipe.
+pub const mul_burn = 16 * 1024;
+
+/// `mulBase` / `mulRistrettoBase` / `mulBaseEncode` / `mulBaseEncode2` (the
+/// comb): the body dirtied 2.4 KiB in ReleaseFast (2026-11-23).
+pub const base_burn = 4 * 1024;

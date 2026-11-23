@@ -181,6 +181,14 @@ fn pcSelect(pc: *const [16]Edwards25519, slot: u4) Edwards25519 {
 pub fn mul(p: Edwards25519, s: [32]u8) Edwards25519 {
     var sc = s;
     defer std.crypto.secureZero(u8, &sc);
+    const r = mulBody(p, &sc);
+    burn.stack(burn.mul_burn);
+    return r;
+}
+
+/// `mul` without the burn, one frame down (the callers burn).
+noinline fn mulBody(p: Edwards25519, s: *const [32]u8) Edwards25519 {
+    const sc = s;
     const pc = if (p.is_base) base_pc else precompute(p);
     var q = Edwards25519.identityElement;
     var pos: usize = 252;
@@ -326,7 +334,9 @@ fn combMulBase(s: *const [32]u8) Edwards25519 {
 pub fn mulBase(s: [32]u8) Edwards25519 {
     var sc = s;
     defer std.crypto.secureZero(u8, &sc);
-    return baseMul(&sc);
+    const r = baseMul(&sc);
+    burn.stack(burn.base_burn);
+    return r;
 }
 
 /// Whether the fixed-base scalar multiplications (`mulBase`,
@@ -348,9 +358,10 @@ pub const base_comb: bool = zl_options.ct25519_base_comb orelse switch (zl_optio
 const zl_options = @import("zl_options");
 
 /// `s·B` through the comb or the ladder, per `base_comb`.
-fn baseMul(s: *const [32]u8) Edwards25519 {
+/// `noinline`: its frames lie below the public callers', which burn them.
+noinline fn baseMul(s: *const [32]u8) Edwards25519 {
     if (comptime base_comb and fast_ed) return fastBaseMul(s);
-    return if (comptime base_comb) combMulBase(s) else mul(Edwards25519.basePoint, s.*);
+    return if (comptime base_comb) combMulBase(s) else mulBody(Edwards25519.basePoint, s);
 }
 
 /// The 4×64 comb in a frame of its own (`noinline`: keeps the callers'
@@ -378,7 +389,9 @@ noinline fn fastBaseMul(s: *const [32]u8) Edwards25519 {
 pub fn mulRistretto(p: Ristretto255, s: [32]u8) Ristretto255 {
     var sc = s;
     defer std.crypto.secureZero(u8, &sc);
-    return .{ .p = mul(p.p, sc) };
+    const r: Ristretto255 = .{ .p = mulBody(p.p, &sc) };
+    burn.stack(burn.mul_burn);
+    return r;
 }
 
 // ── X25519 key generation on the comb ────────────────────────────────────
@@ -1839,26 +1852,36 @@ fn verifyTailFast(comptime adx: bool, a: Edwards25519, r: [32]u8, s: [32]u8, hra
 pub fn mulBaseEncode(s: [32]u8) [32]u8 {
     var sc = s;
     defer std.crypto.secureZero(u8, &sc);
+    const r = mulBaseEncodeBody(&sc);
+    burn.stack(burn.base_burn);
+    return r;
+}
+
+noinline fn mulBaseEncodeBody(sc: *const [32]u8) [32]u8 {
     if (comptime base_comb and fast_ed) {
         var st: fe64.State = undefined;
         defer wipeState(&st);
         if (comptime fe64.adx) {
             const E = EdOps(true);
-            E.combMulBase(&st, &sc);
+            E.combMulBase(&st, sc);
             return E.encode(&st);
         } else {
             const E = EdOps(false);
-            E.combMulBase(&st, &sc);
+            E.combMulBase(&st, sc);
             return E.encode(&st);
         }
     }
-    return baseMul(&sc).toBytes();
+    return baseMul(sc).toBytes();
 }
 
 /// `mulBaseEncode(s1)` and `mulBaseEncode(s2)` with one shared field
 /// inversion (Ed25519 signing encodes two points).
 pub fn mulBaseEncode2(s1: [32]u8, s2: [32]u8) [2][32]u8 {
-    if (comptime base_comb and fast_ed) return fastBaseEncode2(s1, s2);
+    if (comptime base_comb and fast_ed) {
+        const r = fastBaseEncode2(s1, s2);
+        burn.stack(burn.base_burn);
+        return r;
+    }
     return .{ mulBaseEncode(s1), mulBaseEncode(s2) };
 }
 
@@ -1882,7 +1905,9 @@ noinline fn fastBaseEncode2(s1: [32]u8, s2: [32]u8) [2][32]u8 {
 pub fn mulRistrettoBase(s: [32]u8) Ristretto255 {
     var sc = s;
     defer std.crypto.secureZero(u8, &sc);
-    return .{ .p = baseMul(&sc) };
+    const r: Ristretto255 = .{ .p = baseMul(&sc) };
+    burn.stack(burn.base_burn);
+    return r;
 }
 
 // ── constant-time multi-scalar multiplication (audit `bulletproofs` B9) ───

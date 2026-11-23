@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **BEHAVIOURAL, not breaking:** `mul` / `mulRistretto` now zero 16 KiB of stack after their body, `mulBase` / `mulRistrettoBase` / `mulBaseEncode` / `mulBaseEncode2` 4 KiB (they burned nothing before): the dead-stack probe's new residue rule found ~200 B of the comb's frames (intermediates of the secret digits) left below `fastBaseMul`'s state wipe, and `mul`'s 8.2 KiB body unburned. ~80 ns on a ~12 µs `mulBase` (bench: `ed_base` 0.61× libsodium). Give a calling thread the 64 KiB README *Stack use* asks for. ctgrind counts unchanged, digests re-taken.
 - **2026-11-20** — **NO CONSUMER-VISIBLE CHANGE:** `meta.doc` (the catalog line) now names what the module provides (ladder, comb, Straus multi-scalar, `X25519`, `verifyEd25519Strict`, the `mulBaseEncode` encoders), not only the comb. Text only; no code token moved.
 - **2026-11-13** — **PERFORMANCE:** the X25519 shared secret is about 5 % faster on x86-64 with MULX/ADX: the ladder's conditional swap is asm with 64-bit loads (LLVM's vectorised swap could not be store-forwarded from the field blocks' 64-bit stores) and the three sum/difference pairs of a ladder step are one asm block each. Same results, same constant-time shape (ctgrind counts unchanged).
 - **2026-11-01** — **Performance:** the 4×64 comb uses signed radix-32 digits (52 additions instead of 65, 40 KiB table instead of 24.5) and a vector-blend select; Ed25519 signing with one comb 13.7 → 12.5 µs. Same bytes; no API change.
