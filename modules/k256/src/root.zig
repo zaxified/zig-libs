@@ -90,6 +90,7 @@ test {
     _ = @import("wycheproof_bitcoin_vectors.zig");
     _ = @import("wycheproof_kat_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
     _ = @import("fuzz_test.zig");
 }
 

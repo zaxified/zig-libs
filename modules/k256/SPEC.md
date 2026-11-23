@@ -251,9 +251,10 @@ GLV to the double-base `s·G − e·P` path.
   the end — the same point for every `s`, but the table digits and the intermediate coordinates are no longer
   functions of `s` alone, against power/EM probing a timing argument does not cover. `d` is formed by masked integer
   arithmetic (two `blackBox`-masked subtractions of `n`): std's `Scalar.fromBytes64` would branch on the secret
-  (its `Field.fromBytes` canonicity check; ctgrind read 2 extra contexts with it). `fromSeed` derives `b` from 255 bits
-  of SHA-512 under a module tag (no reduction needed, `b = 0` becomes 1) and `f` from SHA-256 with the top bit cleared;
-  `fromSeed(null)` is the fixed state `b = 1, f = 1`, as libsecp256k1 resets on a NULL seed; `random(io)` draws a seed.
+  (its `Field.fromBytes` canonicity check; ctgrind read 2 extra contexts with it). `fromSeedInto(out, seed)` derives `b` from 255
+  bits of SHA-512 under a module tag (no reduction needed, `b = 0` becomes 1) and `f` from SHA-256 with the top bit
+  cleared, under a dead-stack burn, the state out through `out` only; `fromSeedInto(out, null)` is the fixed state
+  `b = 1, f = 1`, as libsecp256k1 resets on a NULL seed; `random(out, io)` draws a seed.
   The blinded rows `combblind`/`signblind`/`ecdsablind` (scalar or key AND the whole state tainted) read the same
   counts as their unblinded rows (1 / 11 / 10). There is no separate blinded key generation: a public key is
   `combMulBaseBlinded(d)`.

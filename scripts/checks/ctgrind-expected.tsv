@@ -485,19 +485,19 @@ k256	ReleaseFast	field	1	0	1798731813210e82	4f13cccddea81376
 #                base point, which let LLVM fold `mul`'s per-call table (not
 #                the ECDH binary).
 #   ecdsa 10 -> 11   16/11/5/0 (G7 19a05328, `sign` handles R.x >= n).
-k256	ReleaseFast	mul	1	1	27438f199f7cea16	2e85d4bddb851304
-k256	ReleaseFast	comb	1	1	27438f199f7cea16	cdfc5773d52775d3
-k256	ReleaseFast	sign	1	11	3a85546baa2f4dfa	bb06c2ed85209b8d
+k256	ReleaseFast	mul	1	1	e0969c588c9c93b2	2e85d4bddb851304
+k256	ReleaseFast	comb	1	1	e0969c588c9c93b2	cdfc5773d52775d3
+k256	ReleaseFast	sign	1	11	9324a216ab78d520	bb06c2ed85209b8d
 # Zig 0.17.0 (2026-10-18): ecdsa 11 -> 10 (decrease). One of signInner's five own contexts
 # (ecdsa_recover.zig) is gone in the LLVM 22 build; every other context has the same shape (the
 # harness frame now prints as `ctgrind_harness.main`). Normalised --stacks diff vs B0.
-k256	ReleaseFast	ecdsa	1	10	d60698c0789b29fb	8ff4812d21149442
+k256	ReleaseFast	ecdsa	1	10	d521718b0df64e7d	8ff4812d21149442
 # k256 2026-11-21 — the blinded fixed-base paths (`Blinding`, libsecp256k1's context randomisation): scalar/key AND
 # the whole blinding state tainted. combblind = comb's one `rejectIdentityOneBranch` (on the final s·G); the
 # reduction of s + (n − b) is masked integer arithmetic (std's `Scalar.fromBytes64` read 2 more, removed).
-k256	ReleaseFast	combblind	1	1	27438f199f7cea16	31b63b5e1ab5d793
-k256	ReleaseFast	signblind	1	11	3a85546baa2f4dfa	9bb769bcd1b73254
-k256	ReleaseFast	ecdsablind	1	10	d60698c0789b29fb	cdc0d7699f169fcf
+k256	ReleaseFast	combblind	1	1	e0969c588c9c93b2	31b63b5e1ab5d793
+k256	ReleaseFast	signblind	1	11	9324a216ab78d520	9bb769bcd1b73254
+k256	ReleaseFast	ecdsablind	1	10	d521718b0df64e7d	cdc0d7699f169fcf
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
@@ -1213,7 +1213,7 @@ ctap2pin	ReleaseFast	one	1	5	1b2ea97a80cc47e9	12de2588e792c80e
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 ctap2pin	ReleaseFast	two	1	5	1b2ea97a80cc47e9	4f76909ff534c3cc
 ctap2pin	ReleaseFast	token	1	0	1b2ea97a80cc47e9	076a3a6729a924b0
-fss	ReleaseFast	gen	1	0	f45d5a97e463db3d	b40b02f9cf423f05
+fss	ReleaseFast	gen	1	0	128aeb9126f237e0	b40b02f9cf423f05
 # Was `>=1` and a confirmed defect: `dpf.zig`'s xorMasked compiled to
 # `test $0x1,%r9b` / `je` on the secret control bit at THIS call site while
 # staying branch-free at genWithSeeds'. Fixed by laundering the mask through
@@ -1223,7 +1223,7 @@ fss	ReleaseFast	gen	1	0	f45d5a97e463db3d	b40b02f9cf423f05
 # `key.cw_final & (0 -% @as(Elem, t))` (dpf.zig) compiled to `test $0x1,%r13b` / `je` over the
 # load of cw_final -- a jump on the secret final control bit. Every secret-bit mask over an `Elem`
 # now goes through `secretMask` (asm-laundered word, dpf.zig); back to 0.
-fss	ReleaseFast	eval	1	0	f45d5a97e463db3d	da79011b1ab46d96
+fss	ReleaseFast	eval	1	0	128aeb9126f237e0	da79011b1ab46d96
 bfv	ReleaseFast	keygen	1	<=29	b5e0aaa8f81c3991	85d334608120f4fc
 bfv	ReleaseFast	encrypt	1	<=17	b5e0aaa8f81c3991	e4cdbb1aa2e9c9dc
 bfv	ReleaseFast	decrypt	1	<=6	b5e0aaa8f81c3991	51de1d1011ed3c4c
@@ -2452,8 +2452,8 @@ saml	ReleaseFast	sign	1	45	6c9ac2d2df017817	88075a41bcf0b2bb
 # -mcpu=x86_64.
 oscore	ReleaseFast	protect	1	80	5348e0af1901ba83	6eac6a90e3479ab8	cpu=x86_64 control=2 trap=2
 oscore	ReleaseFast	unprotect	1	81	5348e0af1901ba83	ed85db89e3d7e9fd	cpu=x86_64 control=1 trap=1
-fss	ReleaseFast	gen	1	0	f45d5a97e463db3d	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
-fss	ReleaseFast	eval	1	0	f45d5a97e463db3d	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
+fss	ReleaseFast	gen	1	0	128aeb9126f237e0	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
+fss	ReleaseFast	eval	1	0	128aeb9126f237e0	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
 aesgcm	ReleaseFast	generic	1	226	96d433b8d464dac1	b60805fea700d105	cpu=x86_64 control=8 trap=8
 # aesccm on x86_64 (2026-11-21, full CI 44922862032 ctgrind-portable; read with --stacks and
 # valgrind --track-origins): claim 192 in-file = 184 A1 (std soft.zig `expandKey` masked S-box loads

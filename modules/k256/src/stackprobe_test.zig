@@ -267,7 +267,7 @@ test "STACKPROBE (A1 G2): no RFC 6979 nonce or key residue on the dead stack aft
     var sum: usize = 0;
     resetDepths();
     const seed: [32]u8 = @splat(0x77);
-    cur_bl = group.Blinding.fromSeed(&seed);
+    group.Blinding.fromSeedInto(&cur_bl, &seed);
     for (0..5) |_| {
         measure(callSign);
         sum += countAll(&needles, &total);
@@ -416,7 +416,7 @@ test "STACKPROBE (review 2026-10-08): no key or nonce residue on the dead stack 
         var hits = @as([needles.len]usize, @splat(0));
         resetDepths();
         const seed: [32]u8 = @splat(0x78);
-        cur_bl = group.Blinding.fromSeed(&seed);
+        group.Blinding.fromSeedInto(&cur_bl, &seed);
         for (0..5) |_| {
             measure(callBip340Sign);
             _ = countAll(&needles, &hits);
@@ -498,7 +498,7 @@ test "STACKPROBE: no scalar, comb-input or blinding residue on the dead stack af
     std.crypto.hash.sha2.Sha256.hash("k256 stackprobe combMulBaseBlinded secret scalar", &cur_scalar, .{});
     cur_scalar[0] &= 0x7f;
     const seed: [32]u8 = @splat(0x79);
-    cur_bl = group.Blinding.fromSeed(&seed);
+    group.Blinding.fromSeedInto(&cur_bl, &seed);
     const n = @import("scalar.zig").field_order;
     const s_int = std.mem.readInt(u256, &cur_scalar, .big);
     var b_be: [32]u8 = undefined;

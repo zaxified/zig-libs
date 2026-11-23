@@ -951,7 +951,7 @@ pub const CombTable = [fb_t][fb_teeth]AffineCoordinates;
 /// (kept as `−b mod n`), the point `b·G`, and a nonzero field element `f`
 /// that rescales the comb's first entry. Derive a fresh one per process (or
 /// per signing session) with `random`, or from a 32-byte secret seed with
-/// `fromSeed`; `fromSeed(null)` is the fixed, non-random state (`b = 1`,
+/// `fromSeedInto`; `fromSeedInto(out, null)` is the fixed, non-random state (`b = 1`,
 /// `f = 1`), as libsecp256k1 resets on a NULL seed. Wipe with `wipe`.
 pub const Blinding = struct {
     /// `n − b`, canonical (`0 < b < n`).
@@ -963,18 +963,26 @@ pub const Blinding = struct {
 
     const tag = "zig-libs k256 blinding v1";
 
-    /// The state derived from `seed` (under a module tag: `b` from 255 bits
-    /// of SHA-512, `f` from SHA-256 with the top bit cleared), or the fixed
-    /// state for `null`.
-    pub fn fromSeed(seed: ?*const [32]u8) Blinding {
-        var out: Blinding = undefined;
-        fromSeedInto(&out, seed);
-        return out;
+    /// The state derived from `seed` into `out` (under a module tag: `b` from
+    /// 255 bits of SHA-512, `f` from SHA-256 with the top bit cleared), or the
+    /// fixed state for `null`. The state goes out through `out` only, and the
+    /// derivation (the hash states over the seed, `b`, `f`, `f²`) runs one
+    /// frame down under a dead-stack burn (`blinding_stack_burn`).
+    pub fn fromSeedInto(out: *Blinding, seed_opt: ?*const [32]u8) void {
+        fromSeedIntoUnburned(out, seed_opt);
+        burnBlindingStack();
     }
 
-    /// `fromSeed` into `out`, leaving no copy of the state in this frame's
-    /// caller (the form `random` uses).
-    pub fn fromSeedInto(out: *Blinding, seed_opt: ?*const [32]u8) void {
+    noinline fn burnBlindingStack() void {
+        // Same store pattern as `Secp256k1.burnCombStack` (16-byte volatile
+        // vectors, no frame realignment).
+        const V = @Vector(2, u64);
+        var buf: [blinding_stack_burn / @sizeOf(V)]V align(16) = undefined;
+        const p: [*]align(16) volatile V = &buf;
+        for (0..buf.len) |i| p[i] = @splat(0);
+    }
+
+    noinline fn fromSeedIntoUnburned(out: *Blinding, seed_opt: ?*const [32]u8) void {
         const seed = seed_opt orelse {
             out.* = .{ .neg_b = scalarmod.field_order - 1, .b_g = Secp256k1.basePoint.affineCoordinates(), .f = field.Fe.one, .f2 = field.Fe.one, .f3 = field.Fe.one };
             return;
@@ -1009,11 +1017,11 @@ pub const Blinding = struct {
     }
 
     /// A fresh state from 32 bytes of `io`'s randomness.
-    pub fn random(io: std.Io) Blinding {
+    pub fn random(out: *Blinding, io: std.Io) void {
         var seed: [32]u8 = undefined;
         defer std.crypto.secureZero(u8, &seed);
         io.random(&seed);
-        return fromSeed(&seed);
+        fromSeedInto(out, &seed);
     }
 
     /// Zero the state.
@@ -1075,6 +1083,12 @@ const mul_stack_burn = 16 * 1024;
 /// every call. Its call tree reached 1.3 KiB in ReleaseFast;
 /// `stackprobe_test.zig` goes red when it outgrows this.
 const comb_stack_burn = 8 * 1024;
+
+/// Bytes `Blinding.fromSeedInto` zeroes below its frame: the SHA-512 and
+/// SHA-256 states over the seed, `b`, `f`, `f²`, and `combMulBase` (which
+/// burns its own `comb_stack_burn` under that). `stackprobe2_test.zig` goes red
+/// when the derivation outgrows it.
+const blinding_stack_burn = 8 * 1024;
 
 const SignedDigit = struct { mag: u64, is_neg: u64 };
 
@@ -1675,9 +1689,11 @@ test "mul zeroes its copy of the scalar, on success and on the identity error" {
 test "combMulBaseBlinded == combMulBase on 0, 1, n − 1, n, a wrapping s + (−b), 2^256 − 1 and random scalars" {
     const n = scalarmod.field_order;
     var seed: [32]u8 = @splat(0x42);
-    var bl = Blinding.fromSeed(&seed);
+    var bl: Blinding = undefined;
+    Blinding.fromSeedInto(&bl, &seed);
     defer bl.wipe();
-    const fixed = Blinding.fromSeed(null);
+    var fixed: Blinding = undefined;
+    Blinding.fromSeedInto(&fixed, null);
     // b itself: s − b ≡ 0, the comb's accumulator ends at O and b·G is all.
     var b_be: [32]u8 = undefined;
     std.mem.writeInt(u256, &b_be, n - bl.neg_b, .big);
@@ -1709,17 +1725,21 @@ test "combMulBaseBlinded == combMulBase on 0, 1, n − 1, n, a wrapping s + (−
 }
 
 test "Blinding: the fixed state is b = 1, f = 1; seeds give different states; wipe zeroes" {
-    const fixed = Blinding.fromSeed(null);
+    var fixed: Blinding = undefined;
+    Blinding.fromSeedInto(&fixed, null);
     try std.testing.expect(fixed.b_g.x.equivalent(Secp256k1.basePoint.affineCoordinates().x));
     try std.testing.expect(fixed.f.equivalent(field.Fe.one));
     const s1: [32]u8 = @splat(1);
     const s2: [32]u8 = @splat(2);
-    var a = Blinding.fromSeed(&s1);
-    const b = Blinding.fromSeed(&s2);
+    var a: Blinding = undefined;
+    Blinding.fromSeedInto(&a, &s1);
+    var b: Blinding = undefined;
+    Blinding.fromSeedInto(&b, &s2);
     try std.testing.expect(!a.b_g.x.equivalent(b.b_g.x));
     try std.testing.expect(!a.f.equivalent(b.f));
     try std.testing.expect(a.f2.equivalent(a.f.sq()) and a.f3.equivalent(a.f2.mul(a.f)));
-    const again = Blinding.fromSeed(&s1);
+    var again: Blinding = undefined;
+    Blinding.fromSeedInto(&again, &s1);
     try std.testing.expect(again.b_g.x.equivalent(a.b_g.x));
     a.wipe();
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&a), 0));

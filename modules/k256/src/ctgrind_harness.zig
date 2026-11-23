@@ -337,7 +337,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // per process from a seed; what runs per signature is its use.
         .combblind, .signblind, .ecdsablind => {
             const seed = secretBytes(32, "ctgrind-k256-harness-blinding-seed-v1");
-            var bl = root.Blinding.fromSeed(&seed);
+            var bl: root.Blinding = undefined;
+            root.Blinding.fromSeedInto(&bl, &seed);
             taintIf(tainted, std.mem.asBytes(&bl));
             var k = secretScalar("ctgrind-k256-harness-blinded-secret-v1");
             taintIf(tainted, &k);

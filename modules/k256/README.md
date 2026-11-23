@@ -74,7 +74,8 @@ const q = try k256.ecdsa_recover.recoverPubkey(hash32, rsig.r, rsig.s, rsig.reci
 // Blinding (libsecp256k1's context randomisation): the same results, with the
 // fixed-base multiply's inputs and coordinates randomised. One per process or
 // session; wipe it when done.
-var bl = k256.Blinding.random(io);
+var bl: k256.Blinding = undefined;
+k256.Blinding.random(&bl, io);
 defer bl.wipe();
 const pk = try k256.Secp256k1.combMulBaseBlinded(&bl, secret_key, .big);
 const bsig = try k256.sign.bip340SignBlinded(&bl, &secret_key, msg, aux_rand);

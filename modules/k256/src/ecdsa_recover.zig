@@ -675,7 +675,8 @@ test "sK: sign refuses r = 0 (R.x = n) and s = 0 (e = −r·d) through the signi
 test "signBlinded == sign (RFC 6979: deterministic), and the key recovers" {
     const privkey: [32]u8 = @splat(0x21);
     const seed: [32]u8 = @splat(0x5e);
-    const bl = Blinding.fromSeed(&seed);
+    var bl: Blinding = undefined;
+    Blinding.fromSeedInto(&bl, &seed);
     for (0..4) |i| {
         var h: [32]u8 = @splat(@intCast(i));
         h[0] = 0xa5;

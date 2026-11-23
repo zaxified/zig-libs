@@ -421,8 +421,10 @@ test "bip340SignBlinded == bip340Sign, and it verifies" {
     const sk: [32]u8 = @splat(0x3c);
     const aux: [32]u8 = @splat(0x07);
     const seed: [32]u8 = @splat(0x99);
-    const bl = Blinding.fromSeed(&seed);
-    const fixed = Blinding.fromSeed(null);
+    var bl: Blinding = undefined;
+    Blinding.fromSeedInto(&bl, &seed);
+    var fixed: Blinding = undefined;
+    Blinding.fromSeedInto(&fixed, null);
     const msg = "blinded";
     const want = try bip340Sign(&sk, msg, aux);
     try std.testing.expectEqualSlices(u8, &want, &(try bip340SignBlinded(&bl, &sk, msg, aux)));
