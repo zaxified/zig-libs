@@ -320,6 +320,36 @@ podman pull -q docker.io/library/eclipse-mosquitto:2 >/dev/null 2>&1 \
 python3 -m venv .zig-cache/mqtt-interop/venv >/dev/null 2>&1 || true
 .zig-cache/mqtt-interop/venv/bin/pip -q install "paho-mqtt==2.1.0" >/dev/null 2>&1 \
     && echo "paho venv: OK" || echo "paho venv: install failed"
+# The third peer, karlseguin/mqttz driven by tools/mqttz_driver (the default
+# run needs it; full CI 45100771036 had none: MqttzDriverMissing). Its own
+# toolchain is Zig 0.16.0 (pinned by the index.json shasum), the clone is
+# pinned to the commit mqttz.patch was written against.
+Z16="$HOME/.local/share/zig-libs/oracle-bin/zig-x86_64-linux-0.16.0"
+if [[ ! -x "$Z16/zig" ]]; then
+    mkdir -p "$(dirname "$Z16")" \
+        && curl -fsSL -o "$Z16.tar.xz" https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+        && echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $Z16.tar.xz" | sha256sum -c --quiet \
+        && tar -xJf "$Z16.tar.xz" -C "$(dirname "$Z16")" && rm -f "$Z16.tar.xz" || true
+fi
+MQTTZ=.zig-cache/mqtt-interop/mqttz
+if [[ "$(git -C "$MQTTZ" rev-parse HEAD 2>/dev/null)" != cf8acd2c1acae7f5c1c67b7df53228e7dd8c8c74 ]]; then
+    git clone -q https://github.com/karlseguin/mqttz "$MQTTZ" >/dev/null 2>&1 \
+        && git -C "$MQTTZ" checkout -q cf8acd2c1acae7f5c1c67b7df53228e7dd8c8c74 \
+        && git -C "$MQTTZ" apply ../../../modules/mqtt/tools/mqttz_driver/mqttz.patch || true
+fi
+(cd modules/mqtt/tools/mqttz_driver && "$Z16/zig" build --prefix ../../../../.zig-cache/mqtt-interop/driver >/dev/null 2>&1) \
+    && echo "mqttz driver: cf8acd2 + mqttz.patch, zig 0.16.0" || echo "mqttz driver: fetch or build failed"
+echo "::endgroup::"
+
+echo "::group::interop: dnssec (ldns-verify-zone, unbound-host), xmlenc (xmlsec1)"
+# Peers of two programs added in waves 14-15 that no runner had (full CI
+# 45100771036: "ldns-verify-zone not found", "xmlsec1 not found"). dnssec's
+# unbound.zig half needs unbound-host; xmlenc needs xmlsec1 >= 1.3 with the
+# OpenSSL backend (Ubuntu's xmlsec1 package) and openssl.
+sudo apt-get install "${APT_QUIET[@]}" ldnsutils unbound-host xmlsec1 openssl >/dev/null 2>&1 \
+    && echo "ldnsutils, unbound-host, xmlsec1: OK" || echo "ldnsutils/unbound-host/xmlsec1: install failed"
+command -v xmlsec1 >/dev/null 2>&1 && echo "xmlsec1: $(xmlsec1 --version 2>&1 | head -1)" || echo "xmlsec1: MISSING"
+command -v ldns-verify-zone >/dev/null 2>&1 && echo "ldns-verify-zone: OK" || echo "ldns-verify-zone: MISSING"
 echo "::endgroup::"
 
 ORACLE_VENVS="$HOME/.local/share/zig-libs/oracle-venvs"
