@@ -498,5 +498,6 @@ test {
     _ = @import("keygen_sign_test.zig");
     _ = @import("kat_sign_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
     _ = @import("boundary_test.zig");
 }

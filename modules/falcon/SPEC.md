@@ -141,10 +141,14 @@ status).
   (`src/burn.zig`); `src/stackprobe_test.zig` (ReleaseFast) guards it for both
   degrees. The keygen probe also looks for the residues of f and g modulo the
   first four small primes, plain and forward-NTT (`ntru.probe.rnsImage`, a
-  helper compiled in test builds only). Not covered: the intermediate
-  big-integer limbs of the NTRUSolve recursion levels below the top (no
-  independent model short of re-running the descent; see *Backlog*), the
-  caller's own `rng`/CSPRNG state, and hardware-register or swap-level residue.
+  helper compiled in test builds only). The intermediate big-integer limbs of
+  the NTRUSolve recursion levels below the top have no needle model; they are
+  covered by `src/stackprobe2_test.zig` (`testkit.stackprobe`, keygen and
+  signing, both degrees), whose residue rule flags any non-zero byte deeper
+  than the burn's top whatever it held: with keygen's burn cut to 4 KiB it
+  reports 3 KiB of residue down to 55 KB, where the needle probe stays green.
+  Not covered: the caller's own `rng`/CSPRNG state, and hardware-register or
+  swap-level residue.
 - Verification and public-key handling touch public data only, so no
   constant-time claims are made or needed for that surface. Secret-key
   *decode* is not constant-time; treat `SecretKey.fromBytes` as a
@@ -190,7 +194,7 @@ is executed).
   public-key decode and secret-key decode, both degrees; a Smith replay test
   and a reach test (every outcome is reached) accompany it.
 - Constant-time and dead-stack: `check-fp-freedom.sh` and the ctgrind row (see
-  *Threat model / limits*), `src/stackprobe_test.zig`.
+  *Threat model / limits*), `src/stackprobe_test.zig`, `src/stackprobe2_test.zig`.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
   the last whole-module mutation run and the delta runs after it.
 
@@ -298,10 +302,6 @@ publishes only hashes of its padded KAT responses.
   and LDL tree, and the integer-emulated FP is already about 5x slower than
   native. Moderate, pure Zig; worth it only for a signing-heavy consumer.
   A performance item, to be measured A/B on a quiet host.
-- **Dead-stack probe below the top NTRUSolve level.** The probe sees the entry
-  points and the top-level RNS limbs of f and g; the intermediate big-integer
-  limbs of the F/G recursion levels (depth > 0) have no independent model short
-  of re-running the descent.
 
 ## Anchoring
 
