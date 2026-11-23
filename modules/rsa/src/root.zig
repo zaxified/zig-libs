@@ -275,7 +275,12 @@ fn ffModulusSecret(v: *const MontElem, mp: *const MontParams, nbits: usize) Modu
     }
     m.m0inv = (@as(Limb, 1) << t_bits) - @as(TLimb, @truncate(y));
 
-    var r = MontParams.zero;
+    // `R = 2^(63·limbs)` can sit past the last montint limb: a prime of
+    // nearly `max_modulus_bits` bits (an unbalanced `fromPrimes` pair, or a
+    // 4096-bit prime under the small profile's 4096-bit cap) rounds up to a
+    // 63-bit limb count whose top bit is ≥ 64·max_limbs. `reduceLimbs` takes
+    // any length, so two spare limbs hold it (63·⌈b/63⌉ < b + 63).
+    var r: [MontParams.max_limbs + 2]u64 = @splat(0);
     defer std.crypto.secureZero(u64, &r);
     r[(t_bits * limbs) / 64] = @as(u64, 1) << @intCast((t_bits * limbs) % 64);
     var r_mod = mp.reduceLimbs(&r);
@@ -8688,7 +8693,10 @@ test "ffModulusSecret equals Modulus.fromBytes field for field" {
     var prng = std.Random.DefaultPrng.init(0x5eC2e7);
     // 63·k + 1 (top limb holding one bit), the 512- and 1024-bit primes of
     // 1024- and 2048-bit keys, and the 4096-bit prime of the 8192-bit cap.
-    const sizes = [_]usize{ 61, 62, 63, 64, 65, 125, 126, 127, 189, 190, 512, 1009, 1024, 1025, 2017, 2047, 2048, 4096 };
+    // The last three sit just under the configured cap: their 63-bit limb
+    // count puts `R` past the last montint limb (an unbalanced `fromPrimes`
+    // pair reaches them; small profile, cap 4096, crashed here before).
+    const sizes = [_]usize{ 61, 62, 63, 64, 65, 125, 126, 127, 189, 190, 512, 1009, 1024, 1025, 2017, 2047, 2048, 4096, max_modulus_bits - 63, max_modulus_bits - 2, max_modulus_bits - 1 };
     for (sizes) |bits| {
         var buf: [max_modulus_len]u8 = undefined;
         const len = (bits + 7) / 8;
