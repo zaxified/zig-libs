@@ -343,6 +343,7 @@ pub const PrivateKey = struct {
     /// The EC scalar left-padded into `out`, which must be exactly
     /// `secretLen` long. Writes nothing and returns `MalformedKey` for a
     /// non-EC key or a wrong `out` length. `out` then holds the secret.
+    // secret-api-ok: PrivateKey is a view into the caller's buffer; the DER walk compares/copies the secret in place, no stack buffer (needle probe in stackprobe_test.zig)
     pub fn scalarInto(k: *const PrivateKey, out: []u8) error{MalformedKey}!void {
         if (!k.algorithm.isEc()) return error.MalformedKey;
         const n = k.algorithm.secretLen().?;
@@ -354,6 +355,7 @@ pub const PrivateKey = struct {
 
 /// A PKCS#8 PrivateKeyInfo (v1) or OneAsymmetricKey (v2): `attributes [0]`
 /// are skipped, `publicKey [1]` (v2 only) goes to `public`.
+// secret-api-ok: PrivateKey is a view into the caller's buffer; the DER walk compares/copies the secret in place, no stack buffer (needle probe in stackprobe_test.zig)
 pub fn parsePkcs8(bytes: []const u8) ParseError!PrivateKey {
     var top = der.Reader.init(bytes);
     var info = try top.sub(0x30);
@@ -428,6 +430,7 @@ pub fn parsePkcs8(bytes: []const u8) ParseError!PrivateKey {
 /// A SEC1 / RFC 5915 ECPrivateKey (`openssl ec` output). `curve` is the curve
 /// the context already names (null for a bare key, which then needs its
 /// `[0] parameters`); a `[0]` naming another curve is `MalformedKey`.
+// secret-api-ok: PrivateKey is a view into the caller's buffer; the DER walk compares/copies the secret in place, no stack buffer (needle probe in stackprobe_test.zig)
 pub fn parseSec1(bytes: []const u8, curve: ?Algorithm) ParseError!PrivateKey {
     if (curve) |c| if (!c.isEc()) return error.MalformedKey;
     var k = try parseEcInner(bytes, curve);
@@ -467,6 +470,7 @@ fn parseEcInner(bytes: []const u8, known: ?Algorithm) ParseError!PrivateKey {
 
 /// An RSAPrivateKey (PKCS#1) DER: its outer shape only (SEQUENCE of a
 /// version 0 or 1 and INTEGERs); the `rsa` module reads the numbers.
+// secret-api-ok: PrivateKey is a view into the caller's buffer; the DER walk compares/copies the secret in place, no stack buffer (needle probe in stackprobe_test.zig)
 pub fn parsePkcs1(bytes: []const u8) ParseError!PrivateKey {
     try checkPkcs1Private(bytes);
     return .{ .algorithm = .rsa, .encoding = .pkcs1, .secret = bytes };
@@ -477,6 +481,7 @@ pub fn parsePkcs1(bytes: []const u8) ParseError!PrivateKey {
 /// PKCS#1 (`0`/`1`, then an INTEGER) -- what Go's
 /// `ParsePKCS8PrivateKey`/`ParseECPrivateKey`/`ParsePKCS1PrivateKey` trio
 /// leaves to the caller.
+// secret-api-ok: PrivateKey is a view into the caller's buffer; the DER walk compares/copies the secret in place, no stack buffer (needle probe in stackprobe_test.zig)
 pub fn parsePrivateKeyDer(bytes: []const u8) ParseError!PrivateKey {
     var top = der.Reader.init(bytes);
     var s = try top.sub(0x30);
@@ -499,6 +504,7 @@ pub fn parsePrivateKeyDer(bytes: []const u8) ParseError!PrivateKey {
 /// first is the caller's to see, not something to paper over. The result points into `der_buf`: the caller wipes it
 /// (`std.crypto.secureZero`) when done, also after an error (the decoded
 /// part is wiped here on a parse error, but not past the decoded length).
+// secret-api-ok: PrivateKey is a view (slices into the caller's buffer, no secret byte of its own); the secret work runs burned, here or in the burned call it delegates to
 pub fn parsePrivateKeyPem(text: []const u8, der_buf: []u8) PemError!PrivateKey {
     return burn.run(burn.pem_burn, PemError!PrivateKey, parsePrivateKeyPemBody, .{ text, der_buf });
 }
@@ -569,6 +575,7 @@ fn decryptPkcs8Body(bytes: []const u8, password: []const u8, out: []u8, opts: De
 /// password, a damaged ciphertext and a plaintext that is not a PKCS#8
 /// structure are all `IncorrectPasswordOrCorrupt`; a well-formed plaintext
 /// with an algorithm outside `Algorithm` is `UnsupportedAlgorithm`.
+// secret-api-ok: PrivateKey is a view (slices into the caller's buffer, no secret byte of its own); the secret work runs burned, here or in the burned call it delegates to
 pub fn parseEncryptedPkcs8(bytes: []const u8, password: []const u8, out: []u8, opts: DecryptOptions) EncryptedKeyError!PrivateKey {
     return burn.run(burn.pbes2_burn, EncryptedKeyError!PrivateKey, parseEncryptedPkcs8Body, .{ bytes, password, out, opts });
 }
@@ -598,6 +605,7 @@ fn parseDecrypted(info: pbes2.Info, password: []const u8, out: []u8, opts: Decry
 /// legacy `Proc-Type: 4,ENCRYPTED` block `UnsupportedEncryption` (SPEC §
 /// Encrypted keys: not read), an `OPENSSH PRIVATE KEY` block
 /// `UnsupportedFormat`.
+// secret-api-ok: PrivateKey is a view (slices into the caller's buffer, no secret byte of its own); the secret work runs burned, here or in the burned call it delegates to
 pub fn parseEncryptedPrivateKeyPem(text: []const u8, password: []const u8, der_buf: []u8, opts: DecryptOptions) EncryptedPemError!PrivateKey {
     return burn.run(burn.pbes2_burn + burn.pem_burn, EncryptedPemError!PrivateKey, parseEncryptedPrivateKeyPemBody, .{ text, password, der_buf, opts });
 }
@@ -633,6 +641,7 @@ fn parseEncryptedPrivateKeyPemBody(text: []const u8, password: []const u8, der_b
 /// `EncryptOptions{}` is `openssl pkcs8 -topk8`'s default output shape.
 /// The plaintext exists only in a wiped stack buffer; `out` is wiped on
 /// every error.
+// secret-api-ok: PrivateKey is a view (slices into the caller's buffer, no secret byte of its own); the secret work runs burned, here or in the burned call it delegates to
 pub fn encryptPkcs8(out: []u8, k: PrivateKey, password: []const u8, random: std.Random, opts: EncryptOptions) EncryptWriteError![]u8 {
     return burn.run(burn.pbes2_write_burn, EncryptWriteError![]u8, encryptPkcs8Body, .{ out, k, password, random, opts });
 }
@@ -649,6 +658,7 @@ fn encryptPkcs8Body(out: []u8, k: PrivateKey, password: []const u8, random: std.
 
 /// `encryptPkcs8` armoured as PEM `ENCRYPTED PRIVATE KEY` (64-column lines,
 /// LF: `openssl pkcs8 -topk8`'s text).
+// secret-api-ok: PrivateKey is a view (slices into the caller's buffer, no secret byte of its own); the secret work runs burned, here or in the burned call it delegates to
 pub fn writeEncryptedPrivateKeyPem(out: []u8, k: PrivateKey, password: []const u8, random: std.Random, opts: EncryptOptions) EncryptWriteError![]u8 {
     var buf: [max_encrypted_der_len]u8 = undefined; // ciphertext: public
     const bytes = encryptPkcs8(&buf, k, password, random, opts) catch |err| return switch (err) {
@@ -735,6 +745,7 @@ pub fn parsePublicKeyPem(text: []const u8, der_buf: []u8) PemError!PublicKey {
 /// for a non-EC key, then v2 with `[1] publicKey` (an EC public key rides in
 /// the inner ECPrivateKey, as OpenSSL writes it). Byte-identical to
 /// `openssl pkey`'s output for every form in `src/vectors.zig`.
+// secret-api-ok: PrivateKey is a view into the caller's buffer; the DER walk compares/copies the secret in place, no stack buffer (needle probe in stackprobe_test.zig)
 pub fn writePkcs8(out: []u8, k: PrivateKey) WriteError![]u8 {
     try checkWritable(k);
     var w = der.Writer.init(out);
@@ -772,6 +783,7 @@ pub fn writePkcs8(out: []u8, k: PrivateKey) WriteError![]u8 {
 
 /// An EC `k` as SEC1 ECPrivateKey with `[0]` curve and, when `k.public` is
 /// set, `[1]` public key (`openssl ec`'s shape).
+// secret-api-ok: PrivateKey is a view into the caller's buffer; the DER walk compares/copies the secret in place, no stack buffer (needle probe in stackprobe_test.zig)
 pub fn writeSec1(out: []u8, k: PrivateKey) WriteError![]u8 {
     if (!k.algorithm.isEc()) return error.MalformedKey;
     try checkWritable(k);
@@ -781,6 +793,7 @@ pub fn writeSec1(out: []u8, k: PrivateKey) WriteError![]u8 {
 }
 
 /// `k` in its own `encoding`: PKCS#8, SEC1, or (RSA) the PKCS#1 DER itself.
+// secret-api-ok: PrivateKey is a view into the caller's buffer; the DER walk compares/copies the secret in place, no stack buffer (needle probe in stackprobe_test.zig)
 pub fn writePrivateKeyDer(out: []u8, k: PrivateKey) WriteError![]u8 {
     return switch (k.encoding) {
         .pkcs8 => writePkcs8(out, k),
@@ -797,6 +810,7 @@ pub fn writePrivateKeyDer(out: []u8, k: PrivateKey) WriteError![]u8 {
 
 /// `writePrivateKeyDer` armoured as PEM under `k.encoding`'s label. The DER
 /// exists only in a wiped stack buffer; the base64 is constant time.
+// secret-api-ok: PrivateKey is a view (slices into the caller's buffer, no secret byte of its own); the secret work runs burned, here or in the burned call it delegates to
 pub fn writePrivateKeyPem(out: []u8, k: PrivateKey) WriteError![]u8 {
     return writePrivateKeyPemWithHeaders(out, k, &.{});
 }
@@ -806,6 +820,7 @@ pub fn writePrivateKeyPem(out: []u8, k: PrivateKey) WriteError![]u8 {
 /// order and the checks). The headers are public text: this does not encrypt
 /// anything, and writing `Proc-Type: 4,ENCRYPTED` over a plain key makes a
 /// file no reader accepts.
+// secret-api-ok: PrivateKey is a view (slices into the caller's buffer, no secret byte of its own); the secret work runs burned, here or in the burned call it delegates to
 pub fn writePrivateKeyPemWithHeaders(out: []u8, k: PrivateKey, headers: []const pem.Header) WriteError![]u8 {
     return burn.run(burn.pem_write_burn, WriteError![]u8, writePrivateKeyPemBody, .{ out, k, headers });
 }

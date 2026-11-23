@@ -122,3 +122,41 @@ test "STACKPROBE: no key residue after the encrypted-key entry points" {
 }
 
 var stage_buf: [kc.max_encrypted_der_len]u8 = undefined;
+
+var plain_out: [kc.max_private_der_len]u8 = undefined;
+var scalar_out: [66]u8 = undefined;
+
+// The plain DER entry points run with no burn: `PrivateKey` is a view (slices
+// into the caller's buffer, no secret byte of its own), and parsing and writing
+// compare or copy the secret in place, through no stack buffer. This holds
+// that claim: the key's DER and its raw secret must not show up below them.
+test "STACKPROBE: the plain DER parse/write entry points leave no key on the dead stack" {
+    try sp.skipUnlessOptimized();
+    var seen: usize = 0;
+    for (probed) |name| {
+        const c = caseNamed(name) orelse continue;
+        seen += 1;
+        const enc = std.meta.stringToEnum(kc.Encoding, c.encoding).?;
+        const block = (try kc.pem.find(c.pem, enc.pemLabel())).?;
+        const der = try block.decode(&der_copy);
+        const k = try kc.parsePrivateKeyDer(der);
+        const secrets = &[_][]const u8{ der, k.secret };
+        const nb: sp.Expect = .{ .burn = false };
+
+        _ = try P.run("parsePrivateKeyDer", kc.parsePrivateKeyDer, .{der}, secrets, nb);
+        switch (enc) {
+            .pkcs8 => _ = try P.run("parsePkcs8", kc.parsePkcs8, .{der}, secrets, nb),
+            .sec1 => _ = try P.run("parseSec1", kc.parseSec1, .{ der, null }, secrets, nb),
+            .pkcs1 => _ = try P.run("parsePkcs1", kc.parsePkcs1, .{der}, secrets, nb),
+        }
+        _ = try P.run("writePrivateKeyDer", kc.writePrivateKeyDer, .{ &plain_out, k }, secrets, nb);
+        if (k.algorithm != .rsa or k.encoding == .pkcs8)
+            _ = try P.run("writePkcs8", kc.writePkcs8, .{ &plain_out, k }, secrets, nb);
+        if (k.algorithm.isEc()) {
+            _ = try P.run("writeSec1", kc.writeSec1, .{ &plain_out, k }, secrets, nb);
+            const n = k.algorithm.secretLen().?;
+            _ = try P.run("PrivateKey.scalarInto", kc.PrivateKey.scalarInto, .{ &k, scalar_out[0..n] }, secrets, nb);
+        }
+    }
+    try std.testing.expectEqual(probed.len, seen);
+}

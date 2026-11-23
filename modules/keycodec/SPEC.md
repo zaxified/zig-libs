@@ -295,6 +295,10 @@ dead-stack probe, which skips in unoptimised builds. The vectors' recipe is `too
   `parseEncryptedPrivateKeyPem`, `parseEncryptedPkcs8`, `decryptPkcs8`, `encryptPkcs8` and the public
   `pbes2.decrypt`/`encrypt`, the key's DER and, for the encrypted layer, the derived cipher key are not found on
   the dead stack; each non-equivalent burn mutant planted in a plain ReleaseFast build fails it.
+  The plain DER entry points (`parsePrivateKeyDer`, `parsePkcs8`, `parseSec1`, `parsePkcs1`, `writePrivateKeyDer`,
+  `writePkcs8`, `writeSec1`, `PrivateKey.scalarInto`) run unburned by design (`PrivateKey` is a view into the
+  caller's buffer; they compare or copy the secret in place) and are probed for needles only (the DER, the raw
+  secret): a stack copy of the secret planted in `writeSec1` fails it.
 - **Consumers:** `src/mlkem_test.zig` loads every OpenSSL ML-KEM key into `mlkem` and writes one back to OpenSSL's
   bytes.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
