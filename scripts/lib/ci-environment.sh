@@ -80,8 +80,13 @@ echo "ci-environment: role=$ROLE"
 # Quiet, but not silent: `apt-get -qq` still lets dpkg print a twenty-four line
 # "(Reading database ... 5% ... 100%)" progress bar into a log that gets read by
 # hand. The pty is what produces it.
+#
+# Acquire::Retries=3: apt retries a failed fetch itself (resolver hiccups such as
+# "Temporary failure resolving security.ubuntu.com", tag CI 43040077339). Package
+# NAMES stay unpinned on purpose: the Ubuntu archive rotates versions, and a pinned
+# apt version breaks the install the day the archive drops it.
 export DEBIAN_FRONTEND=noninteractive
-APT_QUIET=(-y -qq -o Dpkg::Use-Pty=0)
+APT_QUIET=(-y -qq -o Dpkg::Use-Pty=0 -o Acquire::Retries=3)
 
 # ⚠ BOTH ROLES, not only `tests` (2026-10-07). The netns-backed interop
 # programs (nftables, rawsock, wireguard, pathmtu, traceroute, sntp, syslog)
@@ -528,7 +533,7 @@ echo "::group::valgrind"
 # lost both the ctgrind and the count lane to a single failed fetch, and a full
 # re-run of the tag matrix costs ~1.5 h. Still red if all three fail.
 for attempt in 1 2 3; do
-    sudo apt-get update -qq || true
+    sudo apt-get update "${APT_QUIET[@]}" || true
     if sudo apt-get install "${APT_QUIET[@]}" valgrind && command -v valgrind >/dev/null; then
         break
     fi
