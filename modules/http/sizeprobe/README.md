@@ -2,8 +2,10 @@
 
 Verification tool for the plaintext-only `http.Client` split
 (`Client.requestPlain` / `requestStreamingPlain` / `putFilePlain`, alongside
-`dialPlain`/`dialTls` — see their doc comments in `../src/Client.zig`). Not
-wired into the repo's `zig build`: this is a one-off, documented probe, not a
+`dialPlain`/`dialTls` — see their doc comments in `../src/Client.zig`). The
+probes are the root build step `zig build http-sizeprobe` (over the published
+`http` module, so its real dependency closure and build options); the gate is
+`scripts/checks/check-http-sizeprobe.sh`. It is a documented probe, not a
 unit test — see "Why not a Zig test" below for why the actual property it
 proves cannot be a `zig build test-http` assertion.
 
@@ -30,7 +32,7 @@ what they always cost — TLS included.
 
 `run.sh` builds, for two targets (x86_64-linux-musl and mips-linux-musleabi
 — big-endian MIPS32, the second target that consumer measured), two pairs of static
-`ReleaseSmall` executables via `build.zig`:
+`ReleaseSmall` executables via the root step `http-sizeprobe`:
 
 - `probe_before.zig` — the consumer's two call sites through `request`/`putFile`
   (the original, TLS-capable entry points every existing caller still uses).
@@ -57,7 +59,7 @@ delta is larger in this isolated two-call-site probe than in the real
 agent, because that agent carries substantial non-HTTP code that dilutes the
 same absolute TLS cost into a smaller percentage; the mechanism is identical.
 
-`nm -C zig-out/<target>/bin/probe_after_syms` reports **zero** matches for
+`nm -C zig-out/<target>/http-sizeprobe/probe_after_syms` reports **zero** matches for
 `tls\.Client|Certificate|X25519|P256|P384|Sha1|Sha256|Sha3|Sha512|Rsa|MlKem|
 Aegis|Aes(128|256)?Gcm|ChaCha20Poly1305` on both targets. The same grep
 against `probe_before_syms` matches 196 times on both — proof the grep
@@ -70,8 +72,8 @@ there).
 modules/http/sizeprobe/run.sh
 ```
 
-Run from anywhere; it `cd`s to its own directory. Builds and cleans up its
-own `zig-out/`/`.zig-cache/` subdirectories (both already covered by the
+Run from anywhere; it `cd`s to the repo root and installs into
+`modules/http/sizeprobe/zig-out/<target>/` (both already covered by the
 repo's top-level `.gitignore` patterns). Exits non-zero if either target's
 `probe_after_syms` references a TLS/crypto symbol.
 

@@ -1791,8 +1791,9 @@ cmd_changed() {
 
     # `modules/http/sizeprobe/` proves requestPlain/requestStreamingPlain/
     # putFilePlain never pull in TLS (CONVENTIONS.md-adjacent doc on
-    # `Client.zig`'s `dialPlain`), and it has its OWN standalone build.zig
-    # that nothing else in the repo referenced -- an artefact whose check
+    # `Client.zig`'s `dialPlain`); its probes are the root step
+    # `http-sizeprobe` (until 2026-11-23 a standalone build.zig nothing else
+    # referenced, then mirrored by hand) -- an artefact whose check
     # never runs is worse than none (same lesson as the portability table
     # above). Builds both probes for x86_64-linux-musl only and asserts
     # zero TLS/certificate/curve/hash symbols in the plaintext one; see the
@@ -2853,8 +2854,8 @@ Usage: scripts/test.sh [subcommand] [args]
                         siblings reaching outside a caller-supplied allocator
                         (CONVENTIONS.md §1.2), sub-second warm.
                         `scripts/checks/check-http-sizeprobe.sh` likewise: rebuilds
-                        modules/http/sizeprobe/ (its own standalone build.zig,
-                        x86_64-linux-musl only) and asserts the plaintext
+                        the root step `http-sizeprobe` (probes in
+                        modules/http/sizeprobe/, x86_64-linux-musl only) and asserts the plaintext
                         http.Client entry points link zero TLS/certificate/
                         curve/hash symbols. ~30s when Client.zig's content
                         changed, near-instant otherwise (Zig's own cache).

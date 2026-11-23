@@ -4,8 +4,9 @@
 # `requestPlain`/`requestStreamingPlain`/`putFilePlain` -- see
 # modules/http/sizeprobe/README.md). That directory is the ONLY proof of the
 # split's whole claim -- that the plaintext entry points never pull the TLS
-# stack in -- and it has its own standalone build.zig that nothing in the
-# repo referenced: not the root build.zig, not scripts/test.sh, not CI. An
+# stack in. It once had a standalone build.zig that nothing in the repo
+# referenced (and later one that mirrored http's deps by hand); it is now the
+# root step `http-sizeprobe`. An
 # artefact whose check never runs is worse than none, because it still looks
 # authoritative (the lesson this repo paid for the same day on the
 # generated Portability table -- see check-portable-table).
@@ -34,18 +35,21 @@
 # even when the exit code is 0.
 set -uo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../modules/http/sizeprobe" && pwd)"
-cd "$HERE"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
 
 CRYPTO_GREP='tls\.Client|Certificate|X25519|P256|P384|Sha1|Sha256|Sha3|Sha512|\bRsa\b|MlKem|ml_kem|Aegis|Aes(128|256)?Gcm|ChaCha20Poly1305'
-OUT="zig-out/gate"
-CACHE=".zig-cache/gate"
+# The probes are a root build step (`http-sizeprobe`) over the published
+# `http` module since 2026-11-23, so they follow http's real dependency
+# closure; the repo's own cache is reused.
+PREFIX=".zig-cache/http-sizeprobe-gate"
+OUT="$PREFIX/http-sizeprobe"
 
-build_err=$(zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall \
-    --prefix "$OUT" --cache-dir "$CACHE" --summary none 2>&1)
+build_err=$(zig build http-sizeprobe -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall \
+    --prefix "$PREFIX" --summary none 2>&1)
 rc=$?
 if [[ $rc -ne 0 ]]; then
-    echo "check-http-sizeprobe: modules/http/sizeprobe failed to build for x86_64-linux-musl" >&2
+    echo "check-http-sizeprobe: the http-sizeprobe step failed to build for x86_64-linux-musl" >&2
     echo "$build_err" >&2
     exit 1
 fi
@@ -56,13 +60,13 @@ if [[ -n "$build_err" ]]; then
 fi
 
 for bin in probe_before probe_after probe_before_syms probe_after_syms; do
-    if [[ ! -x "$OUT/bin/$bin" ]]; then
-        echo "check-http-sizeprobe: $OUT/bin/$bin was not produced" >&2
+    if [[ ! -x "$OUT/$bin" ]]; then
+        echo "check-http-sizeprobe: $OUT/$bin was not produced" >&2
         exit 1
     fi
 done
 
-after_hits=$(nm -C "$OUT/bin/probe_after_syms" 2>/dev/null | grep -iE "$CRYPTO_GREP" || true)
+after_hits=$(nm -C "$OUT/probe_after_syms" 2>/dev/null | grep -iE "$CRYPTO_GREP" || true)
 if [[ -n "$after_hits" ]]; then
     echo "check-http-sizeprobe: probe_after_syms references TLS/crypto symbols:" >&2
     echo "$after_hits" >&2
@@ -73,7 +77,7 @@ if [[ -n "$after_hits" ]]; then
     exit 1
 fi
 
-before_hits=$(nm -C "$OUT/bin/probe_before_syms" 2>/dev/null | grep -icE "$CRYPTO_GREP" || true)
+before_hits=$(nm -C "$OUT/probe_before_syms" 2>/dev/null | grep -icE "$CRYPTO_GREP" || true)
 if [[ "$before_hits" -eq 0 ]]; then
     echo "check-http-sizeprobe: probe_before_syms has ZERO TLS/crypto symbol matches" >&2
     echo "  probe_before goes through request()/putFile(), which DO use TLS -- so a" >&2

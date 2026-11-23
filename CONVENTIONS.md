@@ -380,8 +380,9 @@ Rules:
 - `build.zig`: one `zl_options.addOption(?T, "<module>_<knob>", b.option(T, "<module>-<knob>", "…"))`
   next to the existing ones. `zl_options` is already imported by every compilation of a
   module's own sources (published module, test root, cross-compiles, bench graph, ctgrind
-  harnesses); a standalone build that compiles module sources by path
-  (`modules/http/sizeprobe/build.zig`) mirrors it by hand.
+  harnesses). Do not compile module sources by path from a standalone build: it
+  has to mirror the deps and `zl_options` by hand and breaks on every new one (the http
+  size probe did, 2026-11-23; it is now the root step `http-sizeprobe`).
 - The module: `const zl_options = @import("zl_options");` and ONE `pub const` resolving
   `zl_options.<module>_<knob> orelse switch (zl_options.profile) { … }`, with a
   `@compileError` for values outside the supported range (see `rsa.max_modulus_bits`).

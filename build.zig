@@ -1039,6 +1039,39 @@ pub fn build(b: *std.Build) void {
             if (in_group) check_interop.dependOn(&sp_exe.step);
         }
 
+        // `http-sizeprobe`: the plaintext http.Client reachability probe
+        // (modules/http/sizeprobe/README.md), over the PUBLISHED `http` module
+        // and therefore its real dependency closure and `zl_options`. Until
+        // 2026-11-23 it had a standalone build.zig that mirrored http's deps
+        // by hand and broke on every new dep (hpke via tlsclient's ECH). Four
+        // executables into zig-out/http-sizeprobe/: probe_{before,after}
+        // (stripped at ReleaseSmall, for the size delta) and `_syms`
+        // variants with the symbol table kept, for the `nm` check
+        // (scripts/checks/check-http-sizeprobe.sh).
+        if (std.mem.eql(u8, m.name, "http")) {
+            const hsp = b.step("http-sizeprobe", "Build the plaintext http.Client size/reachability probes (zig-out/http-sizeprobe/)");
+            for ([_][]const u8{ "before", "after" }) |which| {
+                for ([_]bool{ false, true }) |syms| {
+                    const root_mod = b.createModule(.{
+                        .root_source_file = b.path(b.fmt("modules/http/sizeprobe/probe_{s}.zig", .{which})),
+                        .target = target,
+                        .optimize = optimize,
+                    });
+                    root_mod.addImport("http", mod);
+                    if (syms) root_mod.strip = false;
+                    const exe = b.addExecutable(.{
+                        .name = b.fmt("probe_{s}{s}", .{ which, if (syms) "_syms" else "" }),
+                        .root_module = root_mod,
+                        .linkage = .static,
+                        .use_llvm = true,
+                    });
+                    hsp.dependOn(&b.addInstallArtifact(exe, .{
+                        .dest_dir = .{ .override = .{ .custom = "http-sizeprobe" } },
+                    }).step);
+                }
+            }
+        }
+
         // fingerprint-exempt: end
 
         // `check-pubfn-reach`: compile a second root over the SAME module graph
