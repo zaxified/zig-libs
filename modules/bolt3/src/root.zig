@@ -217,31 +217,41 @@ pub const RevocationStore = struct {
     }
 
     /// Store the secret for `index`, after checking every entry it must
-    /// derive. On `InconsistentSecret` the store is unchanged.
+    /// derive. On `InconsistentSecret` the store is unchanged. The check's
+    /// hash walks run under a dead-stack burn (`shachain_burn`).
     pub fn insert(self: *RevocationStore, secret: *const [32]u8, index: u48) InsertError!void {
+        return burn.run(burn.shachain_burn, InsertError!void, insertBody, .{ self, secret, index });
+    }
+
+    fn insertBody(self: *RevocationStore, secret: *const [32]u8, index: u48) InsertError!void {
         const b = bucket(index);
         for (self.known[0..b]) |*e| {
             const old_index = e.index orelse return error.InconsistentSecret;
             var derived: [32]u8 = undefined;
+            defer std.crypto.secureZero(u8, &derived);
             deriveBits(&derived, secret, b, old_index);
             if (!std.mem.eql(u8, &derived, &e.secret)) return error.InconsistentSecret;
         }
         self.known[b] = .{ .secret = secret.*, .index = index };
     }
 
-    /// BOLT#3 `derive_old_secret`: the secret for `index`, or null when no
-    /// stored entry covers it (not received yet).
-    pub fn get(self: *const RevocationStore, index: u48) ?[32]u8 {
+    /// BOLT#3 `derive_old_secret`: the secret for `index` into `out` and
+    /// true, or false (and `out` untouched) when no stored entry covers it
+    /// (not received yet). Under a dead-stack burn (`shachain_burn`).
+    pub fn get(self: *const RevocationStore, out: *[32]u8, index: u48) bool {
+        return burn.run(burn.shachain_burn, bool, getBody, .{ self, out, index });
+    }
+
+    fn getBody(self: *const RevocationStore, out: *[32]u8, index: u48) bool {
         for (&self.known, 0..) |*e, b| {
             const known_index = e.index orelse continue;
             const mask: u48 = if (b == 48) 0 else ~((@as(u48, 1) << @intCast(b)) - 1);
             if (index & mask == known_index & mask) {
-                var out: [32]u8 = undefined;
-                deriveBits(&out, &e.secret, @intCast(b), index);
-                return out;
+                deriveBits(out, &e.secret, @intCast(b), index);
+                return true;
             }
         }
-        return null;
+        return false;
     }
 };
 
@@ -524,10 +534,14 @@ test "RevocationStore.get derives every received secret and nothing newer" {
     }
     for (0..n) |k| {
         const index = max_index - @as(u48, @intCast(k));
-        try std.testing.expectEqualSlices(u8, &tShachain(seed, index), &(st.get(index) orelse return error.TestUnexpectedResult));
+        var got: [32]u8 = undefined;
+        try std.testing.expect(st.get(&got, index));
+        try std.testing.expectEqualSlices(u8, &tShachain(seed, index), &got);
     }
-    // Not received yet: the next one down.
-    try std.testing.expect(st.get(max_index - n) == null);
+    // Not received yet: the next one down; `out` untouched.
+    var untouched: [32]u8 = @splat(0xa5);
+    try std.testing.expect(!st.get(&untouched, max_index - n));
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0xa5)), &untouched);
     // Out of order: skipping an index leaves a lower bucket empty or wrong.
     var gap: RevocationStore = .{};
     try gap.insert(&tShachain(seed, max_index), max_index);

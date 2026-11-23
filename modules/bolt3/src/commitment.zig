@@ -188,6 +188,7 @@ fn hash160(data: []const u8) [20]u8 {
 
 /// The funding output's witness script: `2 <pubkey1> <pubkey2> 2 OP_CHECKMULTISIG`, the
 /// lexicographically lesser key first.
+// secret-api-ok: key_a/key_b are the two funding PUBLIC keys (33-byte compressed points), not secrets
 pub fn fundingScript(allocator: Allocator, key_a: [33]u8, key_b: [33]u8) Allocator.Error![]u8 {
     const swap = std.mem.lessThan(u8, &key_b, &key_a);
     var w: ScriptWriter = .{ .allocator = allocator };

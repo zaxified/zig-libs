@@ -537,6 +537,7 @@ pub const DeviceCommunicationControl = struct {
     state: CommunicationState,
     password: ?[]const u8 = null,
 
+    // secret-api-ok: self holds the password as a borrowed slice; ctxString copies it straight into the caller's writer (BACnet carries it in clear on the wire)
     pub fn encode(self: DeviceCommunicationControl, w: *tag.Writer) Error!void {
         if (self.duration_minutes) |d| try w.ctxUnsigned(0, d);
         try w.ctxEnumerated(1, @backingInt(self.state));
@@ -574,6 +575,7 @@ pub const ReinitializeDevice = struct {
     state: ReinitializedState,
     password: ?[]const u8 = null,
 
+    // secret-api-ok: self holds the password as a borrowed slice; ctxString copies it straight into the caller's writer (BACnet carries it in clear on the wire)
     pub fn encode(self: ReinitializeDevice, w: *tag.Writer) Error!void {
         try w.ctxEnumerated(0, @backingInt(self.state));
         try encodePassword(w, 1, self.password);

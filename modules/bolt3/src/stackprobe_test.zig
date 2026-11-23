@@ -16,6 +16,7 @@ var base_secret: [32]u8 = undefined;
 var pcs: [32]u8 = undefined;
 var seed: [32]u8 = undefined;
 var out: [32]u8 = undefined;
+var store: root.RevocationStore = .{};
 
 test "STACKPROBE: bolt3 key derivations leave no secret in any frame" {
     try sp.skipUnlessOptimized();
@@ -30,4 +31,14 @@ test "STACKPROBE: bolt3 key derivations leave no secret in any frame" {
     _ = try P.run("deriveRevocationPrivateKey", root.deriveRevocationPrivateKey, .{ &out, &base_secret, &pcs }, &[_][]const u8{ &base_secret, &pcs, &out }, .{});
     // Per-commitment shachain: 48 hash steps, per channel update.
     _ = try P.run("perCommitmentSecret", root.perCommitmentSecret, .{ &out, &seed, root.max_index }, &[_][]const u8{ &seed, &out }, .{});
+    // RevocationStore: received secrets (the shachain of `seed`), checked on
+    // insert and derived on get by the same hash walk.
+    var s0: [32]u8 = undefined;
+    var s1: [32]u8 = undefined;
+    root.perCommitmentSecret(&s0, &seed, root.max_index);
+    root.perCommitmentSecret(&s1, &seed, root.max_index - 1);
+    store = .{};
+    try store.insert(&s0, root.max_index);
+    _ = try P.run("RevocationStore.insert", root.RevocationStore.insert, .{ &store, &s1, root.max_index - 1 }, &[_][]const u8{ &s0, &s1 }, .{});
+    _ = try P.run("RevocationStore.get", root.RevocationStore.get, .{ &store, &out, root.max_index }, &[_][]const u8{ &s0, &s1 }, .{});
 }

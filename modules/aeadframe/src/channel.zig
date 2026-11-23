@@ -398,7 +398,14 @@ pub fn Channel(comptime Aead: type) type {
             /// until `dropPrevious` or the next rekey/bump of any kind. Whatever
             /// was retained before is dropped. The sealer side needs nothing: it
             /// only ever seals under its newest epoch.
+            ///
+            /// Under the same burn as `rekeyOverlap`: the retained-epoch literal
+            /// carries the key and may be built on the stack first.
             pub fn bumpEpochOverlap(self: *Opener) EpochError!void {
+                return burn.run(burn.frame_burn, EpochError!void, bumpEpochOverlapBody, .{self});
+            }
+
+            fn bumpEpochOverlapBody(self: *Opener) EpochError!void {
                 if (self.epoch == std.math.maxInt(u32)) return error.EpochExhausted;
                 self.dropPrevious();
                 self.prev = .{ .key = self.key, .epoch = self.epoch, .window = self.window };
