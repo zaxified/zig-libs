@@ -831,3 +831,22 @@ test "AcmeDns.Store.register: the account of a domain, kept and ready for Option
     try testing.expectEqual(@as(usize, 1), st.accounts().len);
     peer.finish();
 }
+
+test "AcmeDns.Store.toJson: one exact allocation for the bytes (no outgrown buffer holding a password is freed)" {
+    const Store = publishers.AcmeDns.Store;
+    var st = Store.init(testing.allocator);
+    defer st.deinit();
+    // Enough accounts that a growing writer would have reallocated several times.
+    var name_buf: [32]u8 = undefined;
+    for (0..40) |i| {
+        const d = try std.fmt.bufPrint(&name_buf, "host{d}.example", .{i});
+        try st.put(d, .{ .username = "user", .password = "a password with \"quotes\" and \\ backslash", .fulldomain = "f.auth.test", .subdomain = "s" });
+    }
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const json = try st.toJson(fa.allocator());
+    defer testing.allocator.free(json);
+    // `order`, then the bytes: two allocations, no resize, one free (`order`).
+    try testing.expectEqual(@as(usize, 2), fa.allocations);
+    try testing.expectEqual(@as(usize, 1), fa.deallocations);
+    try testing.expect(std.mem.endsWith(u8, json, "\n}\n"));
+}

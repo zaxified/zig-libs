@@ -305,12 +305,14 @@ pub const AcmeDns = struct {
         }
 
         /// The account of `domain` (compared as DNS names are), or null.
+        // secret-api-ok: Account holds heap slices (a by-value copy copies pointers); a name comparison, no secret read
         pub fn find(st: *const Store, domain: []const u8) ?Account {
             for (st.list.items) |a| if (zone.eqlName(a.domain, domain)) return a;
             return null;
         }
 
         /// Keep `reg` as the account of `domain`, replacing the one it had. The strings are copied.
+        // secret-api-ok: the strings are copied heap to heap (gpa.dupe), no stack buffer; Registration holds slices
         pub fn put(st: *Store, domain: []const u8, reg: Registration) !void {
             if (domain.len == 0) return error.InvalidDomain;
             const idx: ?usize = for (st.list.items, 0..) |a, i| {
@@ -379,6 +381,7 @@ pub const AcmeDns = struct {
 
         /// The file's bytes, the domains in name order. The buffer holds the passwords: wipe it before
         /// freeing (`save` does).
+        // secret-api-ok: the passwords go from heap slices straight into one exact heap buffer (no growth, no stack buffer)
         pub fn toJson(st: *const Store, gpa: std.mem.Allocator) ![]u8 {
             const order = try gpa.alloc(usize, st.list.items.len);
             defer gpa.free(order);
@@ -389,12 +392,25 @@ pub const AcmeDns = struct {
                     return std.mem.lessThan(u8, it[x].domain, it[y].domain);
                 }
             }.less);
-            var out: std.Io.Writer.Allocating = .init(gpa);
+            // Two passes: count, then write into one exact allocation. A growing
+            // `Writer.Allocating` frees each outgrown buffer unwiped, leaving
+            // copies of the passwords in freed heap memory.
+            // No buffer: the counting pass keeps no copy of a password.
+            var counter: std.Io.Writer.Discarding = .init(&.{});
+            writeJson(&counter.writer, items, order) catch unreachable; // Discarding never fails
+            const len: usize = @intCast(counter.fullCount());
+            const buf = try gpa.alloc(u8, len);
             errdefer {
-                std.crypto.secureZero(u8, out.written());
-                out.deinit();
+                std.crypto.secureZero(u8, buf);
+                gpa.free(buf);
             }
-            const w = &out.writer;
+            var w: std.Io.Writer = .fixed(buf);
+            writeJson(&w, items, order) catch unreachable; // sized by the first pass
+            std.debug.assert(w.end == len);
+            return buf;
+        }
+
+        fn writeJson(w: *std.Io.Writer, items: []const Account, order: []const usize) std.Io.Writer.Error!void {
             try w.writeAll("{");
             for (order, 0..) |oi, n| {
                 const a = items[oi];
@@ -405,7 +421,6 @@ pub const AcmeDns = struct {
                 try std.json.Stringify.value(.{ .username = a.username, .password = a.password, .fulldomain = a.fulldomain, .subdomain = a.subdomain }, .{}, w);
             }
             try w.writeAll(if (order.len == 0) "}\n" else "\n}\n");
-            return out.toOwnedSlice();
         }
 
         /// Write the file: a temporary next to it (mode 0600), renamed over `sub_path`, so a crash leaves
