@@ -92,6 +92,8 @@ inline fn measure(call: *const fn () void) void {
     paint();
     shim(call);
     snapshot();
+    // The controls (`callInnocent`, the hold/park positives) are not judged.
+    if (call != &callInnocent and call != &holdNoWipe and call != &holdThenWipe and call != &parkKey) residueCheck("a call `measure` ran");
 }
 
 /// Count `needle` in the last snapshot.
@@ -253,4 +255,28 @@ test "STACKPROBE (A1 L4): the secret-key codecs leave neither the text nor the k
         }
     }
     try std.testing.expectEqual(@as(usize, 0), total);
+}
+
+// ── residue rule (`testkit.stackprobe.residueOf`, 2026-11-23) ───────────────
+//
+// The needles above are a model of the secrets. The shared engine's residue
+// rule needs none: in a snapshot with a burn (the longest zero run, at least
+// 512 B), a byte deeper than the burn's top that is neither zero nor paint is
+// a frame the burn did not reach, whatever it held. It runs over this probe's
+// own snapshot after every measured call (`measure`, the two controls excepted), so no call is re-run
+// (protocol rounds cannot be). Origin: falcon, 2026-11-23 — a keygen burn cut
+// to 4 KiB passed the needle probe and failed this rule. A snapshot without
+// such a run (a call that does not burn) is not judged. Failures print here
+// and are asserted by the last test in this file.
+var residue_failures: usize = 0;
+fn residueCheck(label: []const u8) void {
+    const r = @import("testkit").stackprobe.residueOf(&snap, 0xC7, 512);
+    if (r.residue_bytes == 0) return;
+    residue_failures += 1;
+    std.debug.print("\n=== STACKPROBE residue rule ({t}): {s}: {d} B below the burn (burn {d} B from {d} B, deepest {d} B) ===\n", .{ builtin.mode, label, r.residue_bytes, r.burn_len, r.burn_top, r.residue_deepest });
+}
+
+test "STACKPROBE residue rule: no measured call left a frame below its burn" {
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, 0), residue_failures);
 }

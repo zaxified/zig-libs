@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-23** — **BREAKING (`mpc` only, unreleased since 2026-11-21):** `mpc.Party.init` takes `gamma: *const [32]u8` (was by value), and `init`, `applyBitChallenge` and `applyPolyChallenge` now zero the stack their body used (`prove`'s 128 KiB burn): the new dead-stack probe `src/stackprobe2_test.zig` found `gamma` and the blinding scalars on the dead stack after `init`. New ctgrind row `party` (0 in-file).
 - **2026-11-21** — New `bulletproofs.mpc`: dalek's dealer/party multi-party aggregation (`Party`, `Dealer`, `BitCommitment`, `BitChallenge`, `PolyCommitment`, `PolyChallenge`, `ProofShare`, `MpcError`): `m` parties build one aggregated `RangeProof` (verified by `verifyMultiple` before the dealer returns it); a failing proof audits every share and reports the culprits (`error.MalformedProofShares`). `rangeproof.randomScalar` is now `pub` (the parties draw their blinding with it). Additive.
 

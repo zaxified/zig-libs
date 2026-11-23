@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-17** — **NO API CHANGE** — Hardening: `pickle.decodeInbound`, `sealOutbound`, `sealInbound` and `openInbound` (public) now run a `noinline` body under their own stack burn; a direct `decodeInbound` call used to leave ratchet copies 111..1519 B deep on the dead stack. Stack-probe rows for the four (ReleaseFast); delta mutation of the burns (8 mutants, 4 killed, 4 equivalent); the card is cumulative: `mutation 2026-11-17 (324/364, 40 eq)`.
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** `OutboundSession.pickleSealed` and `InboundGroupSession.pickleSealed` run under `decrypt_burn`, like `fromSealedPickle` (the stack probe found pickle-key residue).
 
