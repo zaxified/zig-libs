@@ -277,6 +277,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
     _ = @import("kat_p256_test.zig");
     _ = @import("kat_x25519_test.zig");
     _ = @import("kat_vectors_x25519.zig");

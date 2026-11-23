@@ -267,7 +267,13 @@ masking / auth / export keys, the client's long-term and ephemeral keys and
 seeds, the server key, the per-client OPRF key, the three DH outputs, `ikm`,
 the key schedule's `prk` / handshake secret / `Km2` / `Km3` and the session key;
 each set carries a control needle that must be found. ReleaseFast/ReleaseSmall
-only (Debug fills `undefined` with `0xaa`).
+only (Debug fills `undefined` with `0xaa`). That probe drives the ristretto255
+configuration; `src/stackprobe2_test.zig` runs the same entry points for
+`P256Sha256` and `Ristretto255Sha512X25519` on the RFC 9807 C.1.5 / C.1.3
+vectors through `testkit.stackprobe` (needles: the secret inputs and the secret
+fields of every `out`; the engine's residue rule covers the intermediates below
+each burn). `serverFinish`'s needles omit `expected_client_mac`: on success it
+equals the public `ke3.client_mac` the call takes by value.
 
 Not covered: a `Ksf` callback that dirties more than the entry point's burn
 (Argon2 and friends manage their own memory; the callback receives the OPRF
@@ -352,7 +358,8 @@ Offline. Run `scripts/modtest opaque`.
   configurations), `I2OSP(len, 2)` with the high byte, `checkIdentities` at its edge for client, server and context,
   oversized identities refused by `generateKE2`/`generateKE3`, a malformed evaluated element `InvalidMessage` on both
   client paths.
-- **Dead stack:** `src/stackprobe_test.zig` (ReleaseFast/ReleaseSmall), see *Secret residue on the dead stack*.
+- **Dead stack:** `src/stackprobe_test.zig` (ristretto255) and `src/stackprobe2_test.zig` (P256-SHA256,
+  curve25519 3DH), ReleaseFast/ReleaseSmall, see *Secret residue on the dead stack*.
 - **Constant time:** the ctgrind harness above.
 - **Fuzz:** `OPAQUE_FUZZ=<runs>[,<first seed>]` runs the deterministic driver (testkit) over `opaque-login` (a run is a
   registration plus a login; genuine accepted, flipped refused) and `opaque-hostile` (hostile wire messages); each
@@ -361,8 +368,9 @@ Offline. Run `scripts/modtest opaque`.
 
 ## Backlog / deferred
 
-- **P256-SHA256 and curve25519-3DH hardening rows:** the ctgrind harness, the dead-stack probe and the fuzz harnesses
-  drive the ristretto255 configuration only; the P-256 one runs
+- **P256-SHA256 and curve25519-3DH ctgrind and fuzz rows:** the ctgrind harness and the fuzz harnesses
+  drive the ristretto255 configuration only (the dead-stack probe covers all three since 2026-11-23,
+  `stackprobe2_test.zig`); the P-256 one runs
   through the same code with `voprf`'s P-256 suite (whose own ctgrind rows are
   pinned), the curve25519 one with `ct25519`'s X25519 (pinned there), but neither has an opaque-level row yet.
 
