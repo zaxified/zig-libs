@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-21** — Added: several recipients (wire version 3), `Envelope(Kem).sealMulti` / `sealMultiWithRandomness` / `openMulti` / `multiSealedLen` / `MultiRandomness`, `multi.zig`, `MultiLimits` (default 64 recipients), `MultiSealError` / `MultiOpenError`: one time lock, one HQC slot per recipient; any one recipient's secret key AND the round's signature open it. `peekHeader` now also reports version 3 (it returned `UnsupportedVersion` for it before).
 - **2026-11-16** — `Envelope.peekHeader(prefix)` → `Header{version, round}`: the framing and round of a version-1
   envelope or a version-2 stream from their shared 15-byte prefix, before anything is opened (nothing authenticated).

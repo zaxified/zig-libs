@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-21** — Constant time: new ctgrind target `group` in `src/ctgrind_harness.zig` — `Group.protectApplication` twice after a real create + Add + Welcome, the sender's `EpochSecrets` and Ed25519 key tainted (secret tree built and ratchet advanced under taint), opened by an untainted second member. 2 in-file contexts (std Ed25519 signing), 3 on the portable `cpu=x86_64` build. No code change.
 
 - **2026-11-21** — ReInit and subgroup branching (RFC 9420 §11.2/§11.3): new `Group.reinit` (set when an adopted Commit carried a ReInit; the group then refuses to send, new `error.GroupReinitialized`), `createSuccessor`/`SuccessorParams`, `reinitialize(S2, …)` (suite may change; new `error.NotReinitialized`), `branch`, `successorPsk`, `joinSuccessor(S2, usage, …)` with §11.2/§11.3's receiver checks (new `error.InvalidSuccessor`; `WelcomeParams.successor`/`Successor`). A resumption PSK with usage `reinit`/`branch` is admitted in exactly a successor's first Commit. **Source-breaking:** three new `group.Error` values.

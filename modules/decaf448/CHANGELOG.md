@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-16** — **BEHAVIOUR CHANGE:** a DST over 255 bytes is no longer refused with `DstTooLong`; `expandMessageXof`
   (and so `hashToElement` / `hashToScalar`) reduces it as RFC 9380 §5.3.3 requires, `SHAKE256("H2C-OVERSIZE-DST-" || DST, 56)`
   (k = 224). New `hash.reduceOversizeDst`. `DstTooLong` stays in `HashError` but is no longer returned.

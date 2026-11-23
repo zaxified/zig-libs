@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-21** — Added: dealer-free key generation, `coconut.dkg` (`part1`/`part2`/`part3`, frost-core's two-round Pedersen DKG per key component, Feldman commitments in G2): the output `SecretKeyShare` and `PublicKeyPackage` (group `VerificationKey`, every `VerificationKeyShare`) feed `signPartial`, `blindSign` and the aggregations unchanged; a bad proof of knowledge or share names the sender in `culprit`. Bodies burned and stack-probed.
 - **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind harness targets for blind issuance (`blind_prepare`, `blind_sign`, `unblind`) in `src/ctgrind_harness.zig`; no library code moved.
 - **2026-11-21** — Added: wire forms for blind issuance, `BlindSignRequest.toBytes`/`fromBytes` and `BlindSignature.toBytes`/`fromBytes` (exact length, G1 subgroup checks and canonical scalars on decode).

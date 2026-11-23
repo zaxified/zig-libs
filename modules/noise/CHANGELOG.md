@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 
 - **2026-10-19** — AES-GCM (`AESGCM` cipher, spec §4.2) now comes from the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (new dep; Zig 0.17 #36256). `Suite` still accepts std's `Aes256Gcm` identically; vectors and the stack probe run on `aesgcm`. Same bytes on the wire.
 

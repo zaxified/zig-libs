@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-20** — `encrypt`'s `Gid^r` is `bls12_381`'s new `Fp12.pow` (the same construction, moved upstream); the private `fp12Pow`/`fp12CtSelect` copy, its tests and the test hook `testing_fp12Pow` are gone (callers of the hook use `gid.pow(&r)`). Same ciphertexts.
 
 - **2026-10-10** — tests: deterministic fuzz driver `IBE_FUZZ` (`ibe-ciphertext`) with oracles: the pristine ciphertext decrypts to its message and is refused under another identity's key; any damaged one (0-3 octets of the real ciphertext, or wild bytes) is refused at the decoder or the FO check. No change in `src/` outside tests.

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 
 - **2026-10-10** — tests: deterministic fuzz driver `SPAKE2PLUS_FUZZ` (testkit) over the share-decode boundary and a full SPAKE2+ exchange (both sides finish with equal K_shared; tampered confirmations, shares, context or password refused). No change to the library code.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** every secret path left

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-17** — Double Ratchet session persistence: `ratchet.State.toBytes(out)` / `State.fromBytes(allocator, bytes, &out)` (`encodedLength`, `format_version` = 1, `max_encoded_length`), a versioned layout of this module, not libsignal's protobuf. The decoder is fail-closed (`error.InvalidState`: wrong version, reserved flags, any truncation, trailing byte, skipped count above `max_skip_store` or not matching the length, duplicate skipped key, chain key without a remote ratchet key) and zeroes its partial table on every error path; both calls burn their stack. Tests: mid-conversation round trip of both sides with skipped keys, byte-identical continuation, every truncation, full-store size, allocation failures; `signal-state` fuzz harness; delta mutation of the new code 52 killed + 4 equivalent of 56. No change to any existing API.
 - **2026-11-16** — PQXDH wire codecs: `PreKeyBundle.toBytes`/`fromBytes` (1805 bytes) and `InitialMessage.toBytes`/
   `fromBytes` — the X3DH layouts extended by the KEM prekey, its id and signature / the KEM ciphertext and id, with the same

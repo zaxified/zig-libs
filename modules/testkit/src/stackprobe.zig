@@ -124,6 +124,69 @@ pub const Expect = struct {
     quiet: bool = false,
 };
 
+/// The residue rule alone, over a snapshot another probe took: `snapshot[0]`
+/// is the DEEPEST byte of the measured region and the last byte its top, the
+/// region was painted with `paint` before the call. Finds the longest zero
+/// run of at least `min_burn` bytes (the burn) and counts the bytes deeper
+/// than its top that are neither zero nor paint — frames the burn did not
+/// reach. No run that long: no burn, nothing judged (`burn_len == 0`).
+/// Depths are bytes below the region top. For the hand-written probes that
+/// keep their own region and needle model (2026-11-23): they hand their
+/// snapshot here instead of re-running a call, so stateful calls (a
+/// protocol round that cannot run twice) are covered too.
+pub fn residueOf(snapshot: []const u8, paint: u8, min_burn: usize) Report {
+    var r: Report = .{};
+    const len = snapshot.len;
+    var lo: usize = 0;
+    while (lo < len and snapshot[lo] == paint) : (lo += 1) {}
+    r.dirty_depth = len - lo;
+    var best_start: usize = len;
+    var best_len: usize = 0;
+    var i: usize = lo;
+    while (i < len) {
+        if (snapshot[i] != 0) {
+            i += 1;
+            continue;
+        }
+        const s = i;
+        while (i < len and snapshot[i] == 0) : (i += 1) {}
+        if (i - s > best_len) {
+            best_len = i - s;
+            best_start = s;
+        }
+    }
+    if (best_len >= min_burn) {
+        r.burn_len = best_len;
+        r.burn_top = len - (best_start + best_len);
+        const top = best_start + best_len;
+        for (snapshot[lo..top], lo..) |b, j| {
+            if (b != 0 and b != paint) {
+                r.residue_bytes += 1;
+                r.residue_deepest = @max(r.residue_deepest, len - j);
+            }
+        }
+    }
+    return r;
+}
+
+test "residueOf: residue below the burn counts, above it does not, no burn judges nothing" {
+    // index 0 = deepest. paint 0xC7.
+    var snap: [64]u8 = @splat(0xC7);
+    // a frame deep below the burn, the burn, a frame above it
+    snap[8] = 0x11;
+    @memset(snap[16..40], 0);
+    snap[50] = 0x22;
+    const r = residueOf(&snap, 0xC7, 16);
+    try std.testing.expectEqual(@as(usize, 24), r.burn_len);
+    try std.testing.expectEqual(@as(usize, 24), r.burn_top);
+    try std.testing.expectEqual(@as(usize, 1), r.residue_bytes);
+    try std.testing.expectEqual(@as(usize, 56), r.residue_deepest);
+    try std.testing.expectEqual(@as(usize, 56), r.dirty_depth);
+    const none = residueOf(&snap, 0xC7, 32);
+    try std.testing.expectEqual(@as(usize, 0), none.burn_len);
+    try std.testing.expectEqual(@as(usize, 0), none.residue_bytes);
+}
+
 pub fn Probe(comptime cfg: Config) type {
     return struct {
         const Self = @This();
@@ -242,34 +305,11 @@ pub fn Probe(comptime cfg: Config) type {
             while (lo < WINDOW and snap[lo] == PAINT) : (lo += 1) {}
             r.dirty_depth = WINDOW - lo;
 
-            // longest zero run in the dirtied part
-            var best_start: usize = WINDOW;
-            var best_len: usize = 0;
-            var i: usize = lo;
-            while (i < WINDOW) {
-                if (snap[i] != 0) {
-                    i += 1;
-                    continue;
-                }
-                const s = i;
-                while (i < WINDOW and snap[i] == 0) : (i += 1) {}
-                if (i - s > best_len) {
-                    best_len = i - s;
-                    best_start = s;
-                }
-            }
-            if (best_len >= cfg.min_burn) {
-                r.burn_len = best_len;
-                r.burn_top = depthOf(best_start + best_len);
-                // residue: deeper (lower index) than the run's top
-                const top = best_start + best_len;
-                for (snap[lo..top], lo..) |b, j| {
-                    if (b != 0 and b != PAINT) {
-                        r.residue_bytes += 1;
-                        r.residue_deepest = @max(r.residue_deepest, depthOf(j));
-                    }
-                }
-            }
+            const res = residueOf(&snap, PAINT, cfg.min_burn);
+            r.burn_len = res.burn_len;
+            r.burn_top = res.burn_top;
+            r.residue_bytes = res.residue_bytes;
+            r.residue_deepest = res.residue_deepest;
 
             // needles
             var skip_until: usize = 0;

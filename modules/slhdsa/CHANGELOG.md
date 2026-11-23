@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 
 - **2026-10-18** — Ported to Zig 0.17.0: tests: `EnumSet.empty`, enum iteration via `field_values`.
 - **2026-10-11** — **HashSLH-DSA pre-hash (FIPS 205 §10.2.2, Algorithms 23/25):** `signPrehash`, `signPrehashDigest`, `verifyPrehash`, `verifyPrehashDigest` and the `PreHash` enum (`src/prehash.zig`, re-exported as `slhdsa.prehash`; SHA-2 ×6, SHA3 ×4, SHAKE128/256 with their DER OIDs). Additive, no change to existing entry points. Tests: NIST ACVP pre-hash sigGen (all twelve PH functions, deterministic + hedged, SHA2-128f and SHAKE-128f) and sigVer (valid, modified message/R/SIGFORS) vectors, digest-length and context-bound checks; the verify fuzz harnesses also feed the pure-signature fixture to the pre-hash verifiers. Scope core → parity.

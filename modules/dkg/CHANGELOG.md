@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-17** — audit: whole-module mutation (715 mutants incl. the snapshot delta; 605 killed, 110 equivalent / unobservable, 0 open; one kill by construction of a late test), card line updated; ctgrind source digests re-pinned (counts unchanged). tests: a missing confirmation names the silent party. No source change.
 - **2026-11-17** — tests: ECDSA keygen / refresh killing tests from the whole-module mutation audit (start twice, frames before or outside their round, an empty frame, sender ids 0 / n+1 / ourselves, duplicate announcement and Πfac, the confirmation round's refusals, a second `takeKeyShare`, the abort phase, named culprits, no frame addressed to oneself, `untag` and `keygenContext` edges). No source change.
 - **2026-11-17** — Hardening: `EcdsaKeygen.takeKeyShare` and `EcdsaRefresh.takeKeyShare` run their body one frame down and burn 2 KiB of stack afterwards, like every other secret entry point. The whole-module mutation build's ReleaseFast stack probe found `x_i` and the message seed of the moved `KeyShare` on the dead stack (the plain build was clean: codegen-fragile). No API or result change.
