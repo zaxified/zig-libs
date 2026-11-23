@@ -2072,14 +2072,17 @@ fn shiftElement(e: Element, tweak_point: Secp256k1) DeriveChildError!Element {
 /// same `tweak` (from `childTweak` on the group public key). Allocates the
 /// child's own `public_keys.entries` (free it with `allocator`, once per
 /// derived share). The parent share is not modified; wipe it when retiring
-/// it. Constant time in the secret share.
-pub fn deriveChild(share: *const KeyShare, allocator: std.mem.Allocator, tweak: Scalar) DeriveChildError!KeyShare {
-    const result = deriveChildUnburned(share, allocator, tweak);
+/// it. Constant time in the secret share. The child goes out through `out`
+/// only (a by-value `KeyShare` result would leave its secret share, Paillier
+/// key and message seed in the caller's result slot, above the burn); `out` is
+/// untouched on error.
+pub fn deriveChild(out: *KeyShare, share: *const KeyShare, allocator: std.mem.Allocator, tweak: Scalar) DeriveChildError!void {
+    const result = deriveChildUnburned(out, share, allocator, tweak);
     burn.stack(key_share_to_bytes_stack_burn);
     return result;
 }
 
-noinline fn deriveChildUnburned(share: *const KeyShare, allocator: std.mem.Allocator, tweak: Scalar) DeriveChildError!KeyShare {
+noinline fn deriveChildUnburned(out: *KeyShare, share: *const KeyShare, allocator: std.mem.Allocator, tweak: Scalar) DeriveChildError!void {
     const tg = Secp256k1.basePoint.mul(tweak.toBytes(.big), .big) catch return error.InvalidChildKey;
     const entries = try allocator.alloc(PartyPublicKeys, share.public_keys.entries.len);
     errdefer allocator.free(entries);
@@ -2092,7 +2095,7 @@ noinline fn deriveChildUnburned(share: *const KeyShare, allocator: std.mem.Alloc
     child.group_public_key = try shiftElement(share.group_public_key, tg);
     child.verifying_share = try shiftElement(share.verifying_share, tg);
     child.public_keys = .{ .entries = entries };
-    return child;
+    out.* = child;
 }
 
 // BIP-32 test vectors 1 and 2 (the public keys and chain codes are the ones

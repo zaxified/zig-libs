@@ -160,7 +160,8 @@ public tweak from the group key and a chain code, then shifts its own share:
 
 ```zig
 const ct = try tecdsa.childTweak(key_share.group_public_key, chain_code, 7); // index < 2^31
-const child = try tecdsa.deriveChild(&key_share, allocator, ct.tweak); // free child.public_keys.entries
+var child: tecdsa.KeyShare = undefined;
+try tecdsa.deriveChild(&child, &key_share, allocator, ct.tweak); // free child.public_keys.entries
 // the child group key is what a plain BIP-32 wallet derives (CKDpub); ct.chain_code is its chain code
 ```
 

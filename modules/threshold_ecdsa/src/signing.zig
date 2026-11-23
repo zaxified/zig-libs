@@ -505,7 +505,7 @@ fn deriveAll(allocator: std.mem.Allocator, parents: []const root.KeyShare, chain
     var made: usize = 0;
     errdefer freeChildren(allocator, out[0..made]);
     for (parents, out) |p, *o| {
-        o.* = try root.deriveChild(&p, allocator, ct.tweak);
+        try root.deriveChild(o, &p, allocator, ct.tweak);
         made += 1;
     }
     return ct;
@@ -567,10 +567,14 @@ test "BIP-32 child shares: signatures verify under the child key; Σ λ·x' = x 
 
     // a zero tweak is refused, and so is one that makes this party's own
     // share zero (its public share would be the identity); nothing leaks
-    try testing.expectError(error.InvalidChildKey, root.deriveChild(&kg.key_shares[0], allocator, Scalar.zero));
-    try testing.expectError(error.InvalidChildKey, root.deriveChild(&kg.key_shares[0], allocator, kg.key_shares[0].secret_share.neg()));
+    // and `out` stays untouched
+    var scratch_child: root.KeyShare = undefined;
+    @memset(std.mem.asBytes(&scratch_child), 0xa5);
+    try testing.expectError(error.InvalidChildKey, root.deriveChild(&scratch_child, &kg.key_shares[0], allocator, Scalar.zero));
+    try testing.expectError(error.InvalidChildKey, root.deriveChild(&scratch_child, &kg.key_shares[0], allocator, kg.key_shares[0].secret_share.neg()));
     // another party's entry hitting the identity is refused too (after the loop's first entries)
-    try testing.expectError(error.InvalidChildKey, root.deriveChild(&kg.key_shares[0], allocator, kg.key_shares[2].secret_share.neg()));
+    try testing.expectError(error.InvalidChildKey, root.deriveChild(&scratch_child, &kg.key_shares[0], allocator, kg.key_shares[2].secret_share.neg()));
+    for (std.mem.asBytes(&scratch_child)) |b| try testing.expectEqual(@as(u8, 0xa5), b);
 
     // a party still on the parent share is refused (different group key)
     const mixed = [_]root.KeyShare{ kids[0], kg.key_shares[1] };
