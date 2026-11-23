@@ -1574,7 +1574,7 @@ pub const cases = [_]Case{
     .{ .format = "http_url", .s = "http//a:99999/", .go = false, .want = false, .class = "" },
     .{ .format = "http_url", .s = "http://a:t/", .go = false, .want = false, .class = "" },
     .{ .format = "http_url", .s = "htt//", .go = false, .want = false, .class = "" },
-    .{ .format = "http_url", .s = "http://-[::1]/", .go = false, .want = false, .class = "" },
+    .{ .format = "http_url", .s = "http://-[::1]/", .go = true, .want = false, .class = "URL_RFC3986_CHARS" },
     .{ .format = "http_url", .s = "h\xa4//a#f", .go = false, .want = false, .class = "" },
     .{ .format = "http_url", .s = "ha/", .go = false, .want = false, .class = "" },
     .{ .format = "http_url", .s = "http://a:", .go = true, .want = true, .class = "" },

@@ -353,6 +353,11 @@ def go_verdicts(cases):
     env = dict(os.environ)
     env.setdefault("GOPROXY", "off")
     env.setdefault("GOFLAGS", "-mod=readonly")
+    # Pinned like gen_format_tables.py: the verdicts depend on the Go patch
+    # release (net/url: go1.26.0 accepts "http://-[::1]/", later 1.26.x
+    # refuse it), and an unpinned `go` took them with whatever was installed
+    # (full CI 45100771036 differed from a go1.26.8 take).
+    env["GOTOOLCHAIN"] = "go1.26.0"
     r = subprocess.run(["go", "run", "."], cwd=os.path.join(HERE, "go_formats"), input=payload.encode(),
                        capture_output=True, env=env, check=True)
     return json.loads(r.stdout)
@@ -787,6 +792,9 @@ def main():
         with open(OUT) as f:
             old = f.read()
         if old != text:
+            import difflib
+            diff = difflib.unified_diff(old.splitlines(), text.splitlines(), "committed", "fresh", lineterm="", n=0)
+            sys.stderr.write("\n".join(list(diff)[:40]) + "\n")
             sys.exit("go_format_vectors.zig differs from a fresh take")
         print("go_format_vectors.zig: %d cases, identical" % len(cases))
     else:
