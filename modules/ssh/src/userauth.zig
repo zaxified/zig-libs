@@ -301,6 +301,7 @@ pub fn authenticatePublickey(
 /// reject it). Production callers want `authenticatePublickey`, which always
 /// passes the transport's own `session_id`; passing anything else here
 /// produces a signature that is not bound to this connection.
+// secret-api-ok: the publickey step itself (authenticatePublickey wraps it); the signature is made by AuthKey.sign (sign_burn), packets leave through sendPacket (record_burn), nothing here holds key material.
 pub fn authenticatePublickeyBoundTo(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
@@ -450,6 +451,7 @@ fn rsaHashFor(key: *const AuthKey, server_sig_algs: ?transport.ServerSigAlgs) ?A
 /// SSH_MSG_USERAUTH_BANNER too — the §5.4 banner is not tied to a method, and
 /// "log in with a password" is precisely the case where a server has
 /// something to say first.
+// secret-api-ok: the password goes into a heap request buffer scrubbed on exit and out through sendPacket (record_burn); the same passwordStep is needle-probed ("authenticateWith password_prompt").
 pub fn authenticatePassword(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
@@ -548,6 +550,7 @@ pub const max_kbd_rounds = 32;
 /// answers each SSH_MSG_USERAUTH_INFO_REQUEST through `responder` until the
 /// server decides. `ssh-userauth` must already be requested
 /// (`Transport.requestService`).
+// secret-api-ok: answers are copied into a heap buffer scrubbed at once and sent through sendPacket (record_burn); the stack holds only slices.
 pub fn authenticateKeyboardInteractive(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
@@ -676,6 +679,7 @@ pub const ClientMethod = union(enum) {
     };
 
     /// The RFC 4252 method this tries.
+    // secret-api-ok: a switch over the method tag, no secret is read.
     pub fn method(self: ClientMethod) AuthMethod {
         return switch (self) {
             .publickey => .publickey,
