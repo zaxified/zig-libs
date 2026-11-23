@@ -713,6 +713,15 @@ def scan_module(module, want_burned=False):
             continue
         if not (set(CALL.findall(body)) - {name}).isdisjoint(burned):
             continue
+        # A QUALIFIED call to the same name on another container is not
+        # recursion: voprf's `OprfServer.blindEvaluate` calls
+        # `Self.blindEvaluate`, the burned protocol function (2026-11-23:
+        # 5 false findings). The name is burned through that other body.
+        if name in burned and any(
+            q not in enc and q not in ("self", "s")
+            for q in re.findall(r"\b([A-Za-z_]\w*)\." + re.escape(name) + r"\s*\(", body)
+        ):
+            continue
         if dep_call and dep_call.search(body):
             continue
         findings.append((module, rel, line, qual, "noburn", ",".join(touches) or rs))

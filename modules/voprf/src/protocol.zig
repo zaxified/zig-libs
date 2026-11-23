@@ -833,10 +833,17 @@ pub fn Protocol(comptime G: type) type {
 
             /// §3.2.1 `DeriveKeyPair` in OPRF mode.
             pub fn derive(seed: *const [32]u8, info: []const u8) DeriveKeyPairError!OprfServer {
+                var s: OprfServer = undefined;
+                try deriveInto(&s, seed, info);
+                return s;
+            }
+            /// `derive` into the caller's `out` (no copy of `skS` left in a
+            /// returning frame).
+            pub fn deriveInto(out: *OprfServer, seed: *const [32]u8, info: []const u8) DeriveKeyPairError!void {
                 var kp: KeyPair = undefined;
                 defer std.crypto.secureZero(u8, &kp.sk);
                 try deriveKeyPair(.oprf, seed, info, &kp);
-                return .{ .sk = kp.sk };
+                out.sk = kp.sk;
             }
             pub fn blindEvaluate(s: *const OprfServer, blinded_element: Element) Element {
                 return Self.blindEvaluate(&s.sk, blinded_element);
@@ -859,8 +866,13 @@ pub fn Protocol(comptime G: type) type {
 
             pub fn derive(seed: *const [32]u8, info: []const u8) DeriveKeyPairError!VoprfServer {
                 var s: VoprfServer = undefined;
-                try deriveKeyPair(.voprf, seed, info, &s.key_pair);
+                try deriveInto(&s, seed, info);
                 return s;
+            }
+            /// `derive` into the caller's `out` (no copy of `skS` left in a
+            /// returning frame).
+            pub fn deriveInto(out: *VoprfServer, seed: *const [32]u8, info: []const u8) DeriveKeyPairError!void {
+                try deriveKeyPair(.voprf, seed, info, &out.key_pair);
             }
             pub fn publicKey(s: *const VoprfServer) Element {
                 return s.key_pair.pk;
@@ -885,8 +897,13 @@ pub fn Protocol(comptime G: type) type {
 
             pub fn derive(seed: *const [32]u8, info: []const u8) DeriveKeyPairError!PoprfServer {
                 var s: PoprfServer = undefined;
-                try deriveKeyPair(.poprf, seed, info, &s.key_pair);
+                try deriveInto(&s, seed, info);
                 return s;
+            }
+            /// `derive` into the caller's `out` (no copy of `skS` left in a
+            /// returning frame).
+            pub fn deriveInto(out: *PoprfServer, seed: *const [32]u8, info: []const u8) DeriveKeyPairError!void {
+                try deriveKeyPair(.poprf, seed, info, &out.key_pair);
             }
             pub fn publicKey(s: *const PoprfServer) Element {
                 return s.key_pair.pk;

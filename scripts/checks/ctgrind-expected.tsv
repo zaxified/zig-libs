@@ -1879,9 +1879,9 @@ base32	ReleaseFast	decode	1	8	8f9de776f14328be	4b6a48f852c57125
 # the t == 0 verdict 2; client 8 = hashToGroup rejectIdentity 2 + the blind
 # canonical-scalar verdict 3 + the blind == 0 verdict 3; keygen 3 = the
 # constant-time skS == 0 verdict per mode.
-voprf	ReleaseFast	server	1	5	387de363d19b6e97	985a5bcd0456a35f
-voprf	ReleaseFast	client	1	8	387de363d19b6e97	82e99d9133134c5f
-voprf	ReleaseFast	keygen	1	3	387de363d19b6e97	f2504d3c494735f2
+voprf	ReleaseFast	server	1	5	a448ff40ae25f5e0	985a5bcd0456a35f
+voprf	ReleaseFast	client	1	8	a448ff40ae25f5e0	82e99d9133134c5f
+voprf	ReleaseFast	keygen	1	3	a448ff40ae25f5e0	f2504d3c494735f2
 # voprf (2026-11-13): the protocol code moved from root.zig into protocol.zig/groups.zig/h2c.zig
 # (every RFC 9497 suite through one generic layer); PATTERN widened to those files. The three
 # ristretto255 rows above kept their counts (5/8/3, same contexts, same out digests).
@@ -1920,18 +1920,18 @@ voprf	ReleaseFast	keygen	1	3	387de363d19b6e97	f2504d3c494735f2
 #                 it (main 2026-11-13); h2c now uses the sibling's `Fe.cMov` for p256 and p521
 #                 (re-measured: every count unchanged) and keeps its own laundered byte select
 #                 for p384, whose `Fe.cMov` still builds its mask from the bare bit.
-voprf	ReleaseFast	decaf448-server	1	21	387de363d19b6e97	9543f02b1201b9cb
-voprf	ReleaseFast	decaf448-client	1	19	387de363d19b6e97	969cd54fa62ca9e8
-voprf	ReleaseFast	decaf448-keygen	1	6	387de363d19b6e97	d3f8144ee6d4be08
-voprf	ReleaseFast	p256-server	1	59	387de363d19b6e97	6afdfb7a486b2a85
-voprf	ReleaseFast	p256-client	1	27	387de363d19b6e97	5d8dfb2d4afe8974
-voprf	ReleaseFast	p256-keygen	1	12	387de363d19b6e97	d26dc23c71b4c631
-voprf	ReleaseFast	p384-server	1	30	387de363d19b6e97	5ed6c2e0c382fda2
-voprf	ReleaseFast	p384-client	1	15	387de363d19b6e97	ff25c1410ee44fb9
-voprf	ReleaseFast	p384-keygen	1	3	387de363d19b6e97	c65d6fb0102b9c90
-voprf	ReleaseFast	p521-server	1	26	387de363d19b6e97	5a0178ab968c5fe9
-voprf	ReleaseFast	p521-client	1	7	387de363d19b6e97	c519de5273b05353
-voprf	ReleaseFast	p521-keygen	1	3	387de363d19b6e97	517083316574f2e7
+voprf	ReleaseFast	decaf448-server	1	21	a448ff40ae25f5e0	9543f02b1201b9cb
+voprf	ReleaseFast	decaf448-client	1	19	a448ff40ae25f5e0	969cd54fa62ca9e8
+voprf	ReleaseFast	decaf448-keygen	1	6	a448ff40ae25f5e0	d3f8144ee6d4be08
+voprf	ReleaseFast	p256-server	1	59	a448ff40ae25f5e0	6afdfb7a486b2a85
+voprf	ReleaseFast	p256-client	1	27	a448ff40ae25f5e0	5d8dfb2d4afe8974
+voprf	ReleaseFast	p256-keygen	1	12	a448ff40ae25f5e0	d26dc23c71b4c631
+voprf	ReleaseFast	p384-server	1	30	a448ff40ae25f5e0	5ed6c2e0c382fda2
+voprf	ReleaseFast	p384-client	1	15	a448ff40ae25f5e0	ff25c1410ee44fb9
+voprf	ReleaseFast	p384-keygen	1	3	a448ff40ae25f5e0	c65d6fb0102b9c90
+voprf	ReleaseFast	p521-server	1	26	a448ff40ae25f5e0	5a0178ab968c5fe9
+voprf	ReleaseFast	p521-client	1	7	a448ff40ae25f5e0	c519de5273b05353
+voprf	ReleaseFast	p521-keygen	1	3	a448ff40ae25f5e0	517083316574f2e7
 # smtp (2026-10-10) — auth: the password through plainResponse/loginResponse
 # at three tail lengths. FIX: std.base64 indexed its alphabet by the secret
 # and checkCredential branched per byte: 312 -> 6. The 6 = the one
@@ -2586,7 +2586,7 @@ paillier	ReleaseFast	keygen	1	<=270	14b7f5ff2a91b536	61a35e2d95a376cf	cpu=x86_64
 # only as consequences of k. The secret `k` goes through `mulSecret` (protocol.zig `computeCompositesFast`), which is not
 # involved. On native the same table load is attributed to addAffineVt (-2), because the asm field
 # mul is inlined there.
-voprf	ReleaseFast	p384-server	1	32	387de363d19b6e97	5ed6c2e0c382fda2	cpu=x86_64
+voprf	ReleaseFast	p384-server	1	32	a448ff40ae25f5e0	5ed6c2e0c382fda2	cpu=x86_64
 acme	ReleaseFast	pem	1	43	5338dfdbd665eb9f	e3f3e71bec825dd7	cpu=x86_64
 acme	ReleaseFast	pem384	1	44	5338dfdbd665eb9f	5eb84a3bc4959381	cpu=x86_64
 acme	ReleaseFast	pkcs8	1	46	5338dfdbd665eb9f	b26448f1c577ca4e	cpu=x86_64
