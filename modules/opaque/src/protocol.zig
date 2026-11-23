@@ -39,6 +39,7 @@ pub fn OprfAke(comptime Oprf: type) type {
             _ = Oprf.Element.fromBytes(pk) catch return error.InvalidPublicKey;
         }
 
+        // secret-api-ok: an RFC 9807 step (the AKE group's DH), public for the module's KATs; the entry points that use it (generateKE2/KE3) run it under their burn
         pub fn dh(sk: [Nsk]u8, pk: [Npk]u8) error{InvalidPublicKey}![Npk]u8 {
             const point = Oprf.Element.fromBytes(pk) catch return error.InvalidPublicKey;
             return Oprf.Group.encode(Oprf.Group.mulSecret(point.p, &sk));
@@ -65,6 +66,7 @@ pub const X25519Ake = struct {
         _ = pk;
     }
 
+    // secret-api-ok: an RFC 9807 step (the AKE group's DH), public for the module's KATs; the entry points that use it (generateKE2/KE3) run it under their burn
     pub fn dh(sk: [Nsk]u8, pk: [Npk]u8) error{InvalidPublicKey}![Npk]u8 {
         var out: [Npk]u8 = undefined;
         ct25519.X25519.scalarmultInto(&out, &sk, pk) catch return error.InvalidPublicKey;
@@ -358,6 +360,7 @@ pub fn Opaque(comptime C: type) type {
         /// 0x02)`. Pinned against `std.crypto.kdf.hkdf.C.Hkdf.expand` by
         /// the `"expandMulti agrees with std"` test below (and transitively by
         /// every KAT).
+        // secret-api-ok: an RFC 9807 KDF step, public for the module's KATs (`expandMulti agrees with std`); every entry point runs it under its burn
         pub fn expandMulti(out: []u8, prk: *const [Nx]u8, info_parts: []const []const u8) void {
             std.debug.assert(out.len >= 1 and out.len <= 255 * Nx);
             var t: [Nx]u8 = undefined;
@@ -420,12 +423,12 @@ pub fn Opaque(comptime C: type) type {
             return burn.run(burn.small_burn, error{DeriveKeyPairFailed}!void, deriveAkeKeyPairBody, .{ seed, out });
         }
 
-        pub fn deriveAkeKeyPairBody(seed: *const [Nseed]u8, out: *AkeKeyPair) error{DeriveKeyPairFailed}!void {
+        fn deriveAkeKeyPairBody(seed: *const [Nseed]u8, out: *AkeKeyPair) error{DeriveKeyPairFailed}!void {
             out.* = try akeKeyPair(seed);
         }
 
         /// The by-value form for callers that already run inside a burned frame.
-        pub fn akeKeyPair(seed: *const [Nseed]u8) error{DeriveKeyPairFailed}!AkeKeyPair {
+        fn akeKeyPair(seed: *const [Nseed]u8) error{DeriveKeyPairFailed}!AkeKeyPair {
             var kp: AkeKeyPair = undefined;
             try Ake.deriveKeyPair(seed, &kp.private_key, &kp.public_key);
             return kp;
@@ -460,7 +463,7 @@ pub fn Opaque(comptime C: type) type {
         /// §5.2.2/§6.3.2.2's per-client OPRF key: `seed = Expand(oprf_seed,
         /// credential_identifier || "OprfKey", Nok)`, then RFC 9497
         /// `DeriveKeyPair(seed, "OPAQUE-DeriveKeyPair")` via `voprf`.
-        pub fn deriveOprfKey(oprf_seed: [Nh]u8, credential_identifier: []const u8) error{DeriveKeyPairFailed}![Nok]u8 {
+        fn deriveOprfKey(oprf_seed: [Nh]u8, credential_identifier: []const u8) error{DeriveKeyPairFailed}![Nok]u8 {
             var seed: [Nok]u8 = undefined;
             defer std.crypto.secureZero(u8, &seed);
             expandMulti(&seed, &oprf_seed, &.{ credential_identifier, "OprfKey" });
@@ -489,6 +492,7 @@ pub fn Opaque(comptime C: type) type {
         /// output (the RFC 9497 §3.2.1 loop rejects zero) or a caller-supplied
         /// long-term server key held to the same rule. There is nothing left for
         /// a runtime check to catch that a branch on `k` would not simply leak.
+        // secret-api-ok: an RFC 9807 §6.4.2 step, public for the module's KATs; generateKE2/KE3 run it under their burn
         pub fn diffieHellman(private_key: [Nsk]u8, public_key: [Npk]u8) error{InvalidPublicKey}![Npk]u8 {
             return Ake.dh(private_key, public_key);
         }
@@ -595,7 +599,7 @@ pub fn Opaque(comptime C: type) type {
         /// serialization is `server_public_key || I2OSP(len(server_identity),
         /// 2) || server_identity || I2OSP(len(client_identity), 2) ||
         /// client_identity` (identities already defaulted by the caller).
-        pub fn envelopeAuthTag(
+        fn envelopeAuthTag(
             auth_key: *const [Nh]u8,
             envelope_nonce: [Nn]u8,
             server_public_key: [Npk]u8,
@@ -674,6 +678,7 @@ pub fn Opaque(comptime C: type) type {
         /// auth_tag over the cleartext credentials, and compare timing-safe.
         /// Fails CLOSED (`error.EnvelopeRecovery`) on any mismatch — including
         /// the negligible key-derivation failure — releasing nothing.
+        // secret-api-ok: RFC 9807 §4.1.3 `Recover`, public for the module's KATs; generateKE3 runs it under its burn
         pub fn recover(
             randomized_password: *const [Nx]u8,
             server_public_key: [Npk]u8,
@@ -717,7 +722,7 @@ pub fn Opaque(comptime C: type) type {
             return burn.run(burn.mul_burn, voprf.BlindError!RegistrationRequest, createRegistrationRequestBody, .{ password, blind });
         }
 
-        pub fn createRegistrationRequestBody(password: []const u8, blind: *const [Ns]u8) voprf.BlindError!RegistrationRequest {
+        fn createRegistrationRequestBody(password: []const u8, blind: *const [Ns]u8) voprf.BlindError!RegistrationRequest {
             const blinded = try C.Oprf.blind(.oprf, password, blind);
             return .{ .blinded_message = blinded.toBytes() };
         }
@@ -738,7 +743,7 @@ pub fn Opaque(comptime C: type) type {
             return burn.run(burn.mul_burn, CreateRegistrationResponseError!RegistrationResponse, createRegistrationResponseBody, .{ request, server_public_key, credential_identifier, oprf_seed });
         }
 
-        pub fn createRegistrationResponseBody(
+        fn createRegistrationResponseBody(
             request: RegistrationRequest,
             server_public_key: [Npk]u8,
             credential_identifier: []const u8,
@@ -789,7 +794,7 @@ pub fn Opaque(comptime C: type) type {
             return burn.run(burn.reg_burn, FinalizeRegistrationError!void, finalizeRegistrationRequestBody, .{ password, blind, response, identities, envelope_nonce, ksf, out });
         }
 
-        pub fn finalizeRegistrationRequestBody(
+        fn finalizeRegistrationRequestBody(
             password: []const u8,
             blind: *const [Ns]u8,
             response: RegistrationResponse,
@@ -862,7 +867,7 @@ pub fn Opaque(comptime C: type) type {
             return burn.run(burn.mul_burn, GenerateKE1Error!void, generateKE1Body, .{ password, blind, client_nonce, client_keyshare_seed, out });
         }
 
-        pub fn generateKE1Body(
+        fn generateKE1Body(
             password: []const u8,
             blind: *const [Ns]u8,
             client_nonce: [Nn]u8,
@@ -923,7 +928,7 @@ pub fn Opaque(comptime C: type) type {
             return burn.run(burn.reg_burn, GenerateKE2Error!void, generateKE2Body, .{ server_private_key, server_public_key, record, credential_identifier, oprf_seed, ke1, identities, context, masking_nonce, server_nonce, server_keyshare_seed, out });
         }
 
-        pub fn generateKE2Body(
+        fn generateKE2Body(
             server_private_key: *const [Nsk]u8,
             server_public_key: [Npk]u8,
             record: RegistrationRecord,
@@ -1045,7 +1050,7 @@ pub fn Opaque(comptime C: type) type {
             return burn.run(burn.ke3_burn, GenerateKE3Error!void, generateKE3Body, .{ state, identities, context, ke2, ksf, out });
         }
 
-        pub fn generateKE3Body(
+        fn generateKE3Body(
             state: *const ClientLoginState,
             identities: Identities,
             context: []const u8,
@@ -1118,7 +1123,7 @@ pub fn Opaque(comptime C: type) type {
             return burn.run(burn.small_burn, ClientAuthenticationError!void, serverFinishBody, .{ state, ke3, out });
         }
 
-        pub fn serverFinishBody(state: *const ServerLoginState, ke3: KE3, out: *[Nx]u8) ClientAuthenticationError!void {
+        fn serverFinishBody(state: *const ServerLoginState, ke3: KE3, out: *[Nx]u8) ClientAuthenticationError!void {
             if (!timing_safe.eql([Nm]u8, ke3.client_mac, state.expected_client_mac))
                 return error.ClientAuthentication;
             out.* = state.session_key;
@@ -1129,6 +1134,7 @@ pub fn Opaque(comptime C: type) type {
         /// `credential_response_pad = Expand(masking_key, masking_nonce ||
         /// "CredentialResponsePad", Npk + Nn + Nm)` — the XOR pad over
         /// `server_public_key || Envelope` in both directions.
+        // secret-api-ok: an RFC 9807 §6.3.2 step, public for the module's KATs; generateKE2/KE3 run it under their burn
         pub fn credentialResponsePad(masking_key: *const [Nh]u8, masking_nonce: [Nn]u8) [masked_response_length]u8 {
             var pad: [masked_response_length]u8 = undefined;
             expandMulti(&pad, masking_key, &.{ &masking_nonce, "CredentialResponsePad" });
@@ -1141,6 +1147,7 @@ pub fn Opaque(comptime C: type) type {
         /// `Expand(Secret, CustomLabel, Nx)` with the TLS 1.3-style
         /// `CustomLabel = I2OSP(Nx, 2) || I2OSP(len("OPAQUE-" || Label), 1) ||
         /// "OPAQUE-" || Label || I2OSP(len(Context), 1) || Context`.
+        // secret-api-ok: the RFC 9807 §6.4.1 `Derive-Secret`, public for the key-schedule KATs and probes; every entry point runs it under its burn
         pub fn deriveSecret(secret: *const [Nx]u8, comptime label: []const u8, transcript: []const u8) [Nx]u8 {
             const full_label = "OPAQUE-" ++ label;
             comptime std.debug.assert(full_label.len >= 8 and full_label.len <= 255);
@@ -1172,7 +1179,7 @@ pub fn Opaque(comptime C: type) type {
         /// `session_key` via `Derive-Secret(..., Hash(preamble))`, `Km2`/`Km3`
         /// from `handshake_secret`, `server_mac = MAC(Km2, Hash(preamble))`,
         /// and `client_mac = MAC(Km3, Hash(preamble || server_mac))`.
-        pub fn runKeySchedule(
+        fn runKeySchedule(
             ikm: *const [3 * Npk]u8,
             context: []const u8,
             client_identity: []const u8,

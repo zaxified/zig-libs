@@ -1396,9 +1396,9 @@ pir	ReleaseFast	reconstruct	1	1	77d6f22bed08bd99	b6ecd96f96e9b339
 # Then the same day: opaque's protocol code moved from root.zig into opaque/src/protocol.zig
 # (generic over the configuration, P256-SHA256 added); --check opaque again 4 / 11 / 2, outputs
 # unchanged; source pin re-pinned (root.zig + protocol.zig).
-opaque	ReleaseFast	register	1	4	e625d09e9a2cc409	843c12b053124a78
-opaque	ReleaseFast	login	1	11	e625d09e9a2cc409	f8be3480eb708638
-opaque	ReleaseFast	serverke2	1	2	e625d09e9a2cc409	4ef279b842b3cb55
+opaque	ReleaseFast	register	1	4	3630bba764a15423	843c12b053124a78
+opaque	ReleaseFast	login	1	11	3630bba764a15423	f8be3480eb708638
+opaque	ReleaseFast	serverke2	1	2	3630bba764a15423	4ef279b842b3cb55
 # bip32 mnemonic 3 is the M6-CT tree (8c2f1aa4, constant-time `wordIndex`).
 # The three are the mnemonic split plus two accept/reject verdicts, not the
 # word search.
