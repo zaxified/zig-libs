@@ -9,7 +9,7 @@ Writes `src/testdata/session_transcript.txt`, replayed by
     python3 modules/mqtt/tools/session_oracle.py > modules/mqtt/src/testdata/session_transcript.txt
 
 Needs podman and the image `tools/interop.zig` uses (`podman pull
-docker.io/library/eclipse-mosquitto:2`). Raw packets, not a client library: the
+docker.io/library/eclipse-mosquitto@sha256:38c0da4f2ef84284d47b3b3eeea1cb3bdeabe81ee10caf0cd5c5ff61ee3ea408`). Raw packets, not a client library: the
 scenarios ack late, drop sockets mid-flow and send what a library would refuse.
 
 What it pins is the part of the broker the other anchors leave to self-tests:
@@ -34,7 +34,7 @@ import subprocess
 import sys
 import time
 
-IMAGE = "docker.io/library/eclipse-mosquitto:2"
+IMAGE = "docker.io/library/eclipse-mosquitto@sha256:38c0da4f2ef84284d47b3b3eeea1cb3bdeabe81ee10caf0cd5c5ff61ee3ea408"
 SETTLE = 0.15
 
 

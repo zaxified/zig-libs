@@ -156,7 +156,7 @@ echo "::group::open62541 container"
 # but it is no longer invisible: test.sh compares the image architecture with
 # the host's and reports the emulation, its cost, and that no native image
 # exists. Whether the minutes are worth the coverage is the owner's call.
-podman pull -q docker.io/open62541/open62541:latest >/dev/null 2>&1 \
+podman pull -q docker.io/open62541/open62541@sha256:c8eab97289fd58791824aa1a5a902ccb5548ef0ccb09653f743b1ed3b4eb42a3 >/dev/null 2>&1 \
     && echo "open62541: OK" || echo "open62541: pull failed"
 echo "::endgroup::"
 
@@ -315,7 +315,7 @@ echo "::group::interop: mqtt (mosquitto container + paho)"
 # Pulled here, not by `podman run`: tools/interop.zig bounds every podman call,
 # and a first pull from docker.io is the slow one. The venv path is the fixed,
 # repo-relative one the program uses (this script runs from the checkout).
-podman pull -q docker.io/library/eclipse-mosquitto:2 >/dev/null 2>&1 \
+podman pull -q docker.io/library/eclipse-mosquitto@sha256:38c0da4f2ef84284d47b3b3eeea1cb3bdeabe81ee10caf0cd5c5ff61ee3ea408 >/dev/null 2>&1 \
     && echo "mosquitto image: OK" || echo "mosquitto image: pull failed"
 python3 -m venv .zig-cache/mqtt-interop/venv >/dev/null 2>&1 || true
 .zig-cache/mqtt-interop/venv/bin/pip -q install "paho-mqtt==2.1.0" >/dev/null 2>&1 \

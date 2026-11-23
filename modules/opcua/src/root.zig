@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const burn = @import("burn.zig");
+const server_interop = @import("server_interop.zig");
 
 // Skip diagnostics are opt-in: `zig build test` must be silent on
 // success (any stderr triggers the build runner's `failed command:`
@@ -2438,7 +2439,7 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
         "run",    "--rm",     "-d", "-p", run.publish(),
         "--name", run.name(),
         "--pull=never", // fail fast (not "hang pulling") if the image is missing
-        "docker.io/open62541/open62541:latest",
+        server_interop.image,
     }) catch |err| switch (err) {
         error.SkipZigTest => {
             if (verboseSkip()) std.debug.print("\nLIVE opcua interop test SKIPPED: `podman` is not available in this environment.\n", .{});
@@ -2751,8 +2752,8 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
     stopContainer(gpa, io, run.name()); // leftover cleanup, best-effort
 
     var run_result = runPodman(gpa, io, &.{
-        "run",    "--rm",     "-d",           "-p",                                   run.publish(),
-        "--name", run.name(), "--pull=never", "docker.io/open62541/open62541:latest",
+        "run",    "--rm",     "-d",           "-p",                 run.publish(),
+        "--name", run.name(), "--pull=never", server_interop.image,
     }) catch |err| switch (err) {
         error.SkipZigTest => {
             if (verboseSkip()) std.debug.print("\nLIVE opcua subscriptions test SKIPPED: `podman` is not available in this environment.\n", .{});
@@ -3112,12 +3113,12 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
     stopContainer(gpa, io, run.name()); // leftover cleanup, best-effort
 
     var run_result = runPodman(gpa, io, &.{
-        "run",                                  "--rm",                                         "-d",                                         "-p",
-        run.publish(),                          "--name",                                       run.name(),                                   "--pull=never",
-        "docker.io/open62541/open62541:latest",
-        // The image's CMD, minus its implicit empty trust list:
+        "run",                "--rm",                                         "-d",                                         "-p",
+        run.publish(),        "--name",                                       run.name(),                                   "--pull=never",
+        server_interop.image,
+            // The image's CMD, minus its implicit empty trust list:
         "/opt/open62541/build/bin/examples/server_ctt", "/opt/open62541/pki/created/server_cert.der", "/opt/open62541/pki/created/server_key.der",
-        "--trustlistFolder",                    "/trust",                                       "--enableUnencrypted",                        "--enableAnonymous",
+        "--trustlistFolder",  "/trust",                                       "--enableUnencrypted",                        "--enableAnonymous",
     }) catch |err| switch (err) {
         error.SkipZigTest => {
             if (verboseSkip()) std.debug.print("\nLIVE opcua secure interop test SKIPPED: `podman` is not available in this environment.\n", .{});

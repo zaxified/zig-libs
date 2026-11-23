@@ -1175,8 +1175,8 @@ capability_check() {
     elif ! command -v podman >/dev/null 2>&1; then
         _CAP_GAP_MODS="$_CAP_GAP_MODS opcua"; gaps+=("podman missing|opcua live server-interop tests skip|sudo apt install podman")
     else
-        if ! podman image exists docker.io/open62541/open62541:latest 2>/dev/null; then
-            _CAP_GAP_MODS="$_CAP_GAP_MODS opcua"; gaps+=("open62541 image not pulled|opcua live server-interop tests skip|podman pull docker.io/open62541/open62541:latest")
+        if ! podman image exists docker.io/open62541/open62541@sha256:c8eab97289fd58791824aa1a5a902ccb5548ef0ccb09653f743b1ed3b4eb42a3 2>/dev/null; then
+            _CAP_GAP_MODS="$_CAP_GAP_MODS opcua"; gaps+=("open62541 image not pulled|opcua live server-interop tests skip|podman pull docker.io/open62541/open62541@sha256:c8eab97289fd58791824aa1a5a902ccb5548ef0ccb09653f743b1ed3b4eb42a3")
         else
             # ⚠ THE PEER'S ARCHITECTURE IS PART OF WHAT THIS COSTS, and nothing
             # said so until the arm64 lane of tag 2026-08-15. open62541 publishes
@@ -1191,7 +1191,7 @@ capability_check() {
             # call, so this states the fact and the price instead of deciding.
             local img_arch host_arch
             img_arch="$(podman image inspect --format '{{.Architecture}}' \
-                docker.io/open62541/open62541:latest 2>/dev/null)"
+                docker.io/open62541/open62541@sha256:c8eab97289fd58791824aa1a5a902ccb5548ef0ccb09653f743b1ed3b4eb42a3 2>/dev/null)"
             host_arch="$(uname -m)"
             case "$host_arch" in x86_64) host_arch=amd64 ;; aarch64) host_arch=arm64 ;; esac
             if [[ -n "$img_arch" && "$img_arch" != "$host_arch" ]]; then

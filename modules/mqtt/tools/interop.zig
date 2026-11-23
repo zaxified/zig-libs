@@ -34,7 +34,7 @@
 //!
 //! The peers (installed once, into the droppable `.zig-cache/mqtt-interop/`):
 //!
-//!     podman pull docker.io/library/eclipse-mosquitto:2
+//!     podman pull docker.io/library/eclipse-mosquitto@sha256:38c0da4f2ef84284d47b3b3eeea1cb3bdeabe81ee10caf0cd5c5ff61ee3ea408
 //!     python3 -m venv .zig-cache/mqtt-interop/venv
 //!     .zig-cache/mqtt-interop/venv/bin/pip install paho-mqtt==2.1.0
 //!
@@ -79,7 +79,9 @@ const transcript_path = "modules/mqtt/src/testdata/v5_transcript.txt";
 const python = ".zig-cache/mqtt-interop/venv/bin/python";
 const paho_script = "modules/mqtt/tools/paho_v5.py";
 const mqttz_driver = ".zig-cache/mqtt-interop/driver/bin/mqttz-driver";
-const image = "docker.io/library/eclipse-mosquitto:2";
+// Pinned by digest (multi-arch index of the tag `2`, which floats); re-pin
+// with `podman image inspect --format '{{.RepoDigests}}'` after a pull.
+const image = "docker.io/library/eclipse-mosquitto@sha256:38c0da4f2ef84284d47b3b3eeea1cb3bdeabe81ee10caf0cd5c5ff61ee3ea408";
 
 var t0_ns: i96 = 0;
 

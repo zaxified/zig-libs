@@ -9,7 +9,7 @@ broker, no Python and no socket:
     python3 modules/mqtt/tools/topic_oracle.py > modules/mqtt/src/topic_vectors.zig
 
 Needs podman and the image `tools/interop.zig` uses (`podman pull
-docker.io/library/eclipse-mosquitto:2`). Raw packets, not a client library:
+docker.io/library/eclipse-mosquitto@sha256:38c0da4f2ef84284d47b3b3eeea1cb3bdeabe81ee10caf0cd5c5ff61ee3ea408`). Raw packets, not a client library:
 paho refuses some filters and names itself, and the point is the broker's
 answer to every one.
 
@@ -29,7 +29,7 @@ import struct
 import subprocess
 import time
 
-IMAGE = "docker.io/library/eclipse-mosquitto:2"
+IMAGE = "docker.io/library/eclipse-mosquitto@sha256:38c0da4f2ef84284d47b3b3eeea1cb3bdeabe81ee10caf0cd5c5ff61ee3ea408"
 
 FILTERS = [
     "#", "+", "+/+", "+/#", "/#", "/+", "a", "a/b", "a/b/c", "a/#", "a/+", "a/+/c", "a/+/#", "+/b", "+/b/#",

@@ -5,7 +5,7 @@
 //! the maturity card (CONVENTIONS.md §9, kept instrument kind 3).
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-mqtt` runs it (always
-//! ReleaseFast). Needs podman and the image `docker.io/library/eclipse-mosquitto:2`
+//! ReleaseFast). Needs podman and the image `docker.io/library/eclipse-mosquitto@sha256:38c0da4f2ef84284d47b3b3eeea1cb3bdeabe81ee10caf0cd5c5ff61ee3ea408`
 //! (2.1.2 when measured; `podman pull` it first — this program never pulls).
 //! Run from the repository root.
 //!
@@ -44,7 +44,9 @@ const mqtt = @import("mqtt");
 const packet = mqtt.packet;
 const net = std.Io.net;
 
-const image = "docker.io/library/eclipse-mosquitto:2";
+// Pinned by digest (multi-arch index of the tag `2`, which floats); re-pin
+// with `podman image inspect --format '{{.RepoDigests}}'` after a pull.
+const image = "docker.io/library/eclipse-mosquitto@sha256:38c0da4f2ef84284d47b3b3eeea1cb3bdeabe81ee10caf0cd5c5ff61ee3ea408";
 const payload_len = 64;
 
 const Row = enum { qos0_1to1, qos1_1to1, qos2_1to1, qos0_fanout100, qos0_fanin32, rtt_1k, connect };

@@ -579,7 +579,11 @@ const Driver = struct {
 
 // ── podman helpers (the open62541 image is the only external dependency) ────
 
-const image = "docker.io/open62541/open62541:latest";
+/// Pinned by digest (the tag `latest` floats; the image is a single amd64
+/// manifest, open62541 publishes no other architecture). `root.zig`'s live
+/// interop tests run the same image. Re-pin: `podman pull` the tag, then
+/// `podman image inspect --format '{{.RepoDigests}}'`.
+pub const image = "docker.io/open62541/open62541@sha256:c8eab97289fd58791824aa1a5a902ccb5548ef0ccb09653f743b1ed3b4eb42a3";
 
 const PodmanResult = struct {
     exit_code: ?u8,
