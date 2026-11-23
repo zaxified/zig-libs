@@ -1833,12 +1833,14 @@ pub fn Bfv(comptime P: params.Params) type {
             return bytes[poly_bytes..];
         }
 
+        // secret-api-ok: a limb-by-limb copy between the caller's key and byte buffers (no stack buffer, no transform); the key goes in and out by pointer
         pub fn encodeSecretKey(sk: *const SecretKey, out: *[secret_key_bytes]u8) void {
             _ = writePoly(&sk.s, writeHeader(.secret_key, out));
         }
 
         /// Decode a secret key into `out` (key material goes through an
         /// out-param, never a return slot).
+        // secret-api-ok: a limb-by-limb copy between the caller's key and byte buffers (no stack buffer, no transform); the key goes in and out by pointer
         pub fn decodeSecretKey(bytes: []const u8, out: *SecretKey) DecodeError!void {
             if (bytes.len != secret_key_bytes) return error.WrongLength;
             _ = try readPoly(try readHeader(.secret_key, bytes), &out.s);

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-23** — **Added:** `suite.Ed448.KeyPair.generateDeterministicInto(out, &seed)`, the seed by pointer and the key pair through `out` (the std-shaped `generateDeterministic(seed)` stays, now a wrapper of it). `secrettree.EpochTree.init` copies the epoch's encryption secret straight into its heap node instead of through an optional temporary on the stack. ctgrind counts unchanged, digests re-pinned.
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-21** — Constant time: new ctgrind target `group` in `src/ctgrind_harness.zig` — `Group.protectApplication` twice after a real create + Add + Welcome, the sender's `EpochSecrets` and Ed25519 key tainted (secret tree built and ratchet advanced under taint), opened by an untainted second member. 2 in-file contexts (std Ed25519 signing), 3 on the portable `cpu=x86_64` build. No code change.
 

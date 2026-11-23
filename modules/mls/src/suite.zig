@@ -328,9 +328,16 @@ pub const Ed448 = struct {
         /// `std.crypto.sign` shape; it never fails.
         pub fn generateDeterministic(seed: [seed_length]u8) error{}!KeyPair {
             var kp: KeyPair = undefined;
-            ed448.KeyPair.createInto(&kp.inner, &seed);
-            kp.public_key = .{ .bytes = kp.inner.public_key.toBytes() };
+            generateDeterministicInto(&kp, &seed);
             return kp;
+        }
+
+        /// `generateDeterministic` with the seed by pointer and the key pair
+        /// through `out` only (no copy in a caller's frame or result slot);
+        /// `ed448.KeyPair.createInto` burns its own stack.
+        pub fn generateDeterministicInto(out: *KeyPair, seed: *const [seed_length]u8) void {
+            ed448.KeyPair.createInto(&out.inner, seed);
+            out.public_key = .{ .bytes = out.inner.public_key.toBytes() };
         }
 
         /// Ed448 is deterministic; `noise` exists for the shape and is

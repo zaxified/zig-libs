@@ -1664,6 +1664,7 @@ pub fn Group(comptime S: type) type {
         /// §11.3: branch a subgroup off this group's current epoch: a new
         /// group (same suite) adding `params.members`, linked by a
         /// resumption PSK with usage `branch`.
+        // secret-api-ok: params holds borrowed pointers (the resumption PSK by reference); the secret work runs in createSuccessor's burned callees (create, commit)
         pub fn branch(self: *const Self, gpa: std.mem.Allocator, allocator: std.mem.Allocator, params: SuccessorParams, out: *Self) !Created {
             var p = params;
             p.predecessor = self.successorPsk(.branch);

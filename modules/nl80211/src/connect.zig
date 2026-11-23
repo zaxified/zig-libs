@@ -51,6 +51,7 @@
 //! of them. That remaining gap is stated again in SPEC.md.
 
 const std = @import("std");
+const burn = @import("burn.zig");
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const genl = @import("genetlink");
@@ -146,9 +147,17 @@ pub const ConnectOptions = struct {
 ///
 /// The key is written to `out` (no copy is returned by value). Secrets are the
 /// caller's to wipe: `std.crypto.secureZero` the passphrase and `out` once the
-/// connect is sent. std's PBKDF2 and HMAC frames are not scrubbed by this
-/// function (the module has no stack burn).
+/// connect is sent. std's PBKDF2 and HMAC frames run one frame down and are
+/// zeroed after it (`pbkdf2_burn`).
 pub fn pmkFromPassphrase(out: *[uapi.pmk_len]u8, passphrase: []const u8, ssid: []const u8) error{ InvalidPassphrase, InvalidRequest }!void {
+    return burn.run(pbkdf2_burn, error{ InvalidPassphrase, InvalidRequest }!void, pmkFromPassphraseBody, .{ out, passphrase, ssid });
+}
+
+/// Bytes zeroed below `pmkFromPassphrase`: PBKDF2-HMAC-SHA1's frames. Sized
+/// from `stackprobe_test.zig`.
+const pbkdf2_burn = 4 * 1024;
+
+fn pmkFromPassphraseBody(out: *[uapi.pmk_len]u8, passphrase: []const u8, ssid: []const u8) error{ InvalidPassphrase, InvalidRequest }!void {
     if (passphrase.len < 8 or passphrase.len > 63) return error.InvalidPassphrase;
     for (passphrase) |c| if (c < 0x20 or c > 0x7e) return error.InvalidPassphrase;
     if (ssid.len > uapi.max_ssid_len) return error.InvalidRequest;

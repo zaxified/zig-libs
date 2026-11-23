@@ -508,4 +508,5 @@ test {
     _ = @import("goldens.zig");
     _ = @import("sweep_test.zig");
     _ = @import("strict_test.zig");
+    _ = @import("stackprobe_test.zig");
 }

@@ -348,8 +348,8 @@ the datagram it arrived in.
   also set, as IEEE 802.11-2020 9.4.2.55.4 defines it; otherwise it returns 0 (`src/caps.zig`).
 - **Key material.** `buildConnect` reserves its capacity once, returns an exact copy and wipes its working buffer on every
   path (`src/connect.zig`); `Nl80211.connect` wipes the request (`src/client.zig`); `pmkFromPassphrase` writes the
-  key through an out pointer. std's PBKDF2 and HMAC frames are not scrubbed: the module has no stack burn
-  (`src/connect.zig`).
+  key through an out pointer and runs PBKDF2 one frame down under a 4 KiB dead-stack burn (`src/connect.zig`,
+  `src/burn.zig`); `src/stackprobe_test.zig` holds it (passphrase and PMK as needles, ReleaseFast).
 - **The radio-limits builder's coverage class** (`config.buildSetWiphyParams`) takes any `u8`, as `iw` and the kernel do (`src/config.zig`).
 - **A scan on an interface that is administratively down** answers `ENETDOWN`; `errnoToError` maps it to `error.NetworkDown`
   (`src/client.zig`), not `Unexpected`.

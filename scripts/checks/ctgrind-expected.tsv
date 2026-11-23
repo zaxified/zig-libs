@@ -1224,9 +1224,9 @@ fss	ReleaseFast	gen	1	0	128aeb9126f237e0	b40b02f9cf423f05
 # load of cw_final -- a jump on the secret final control bit. Every secret-bit mask over an `Elem`
 # now goes through `secretMask` (asm-laundered word, dpf.zig); back to 0.
 fss	ReleaseFast	eval	1	0	128aeb9126f237e0	da79011b1ab46d96
-bfv	ReleaseFast	keygen	1	<=29	b5e0aaa8f81c3991	85d334608120f4fc
-bfv	ReleaseFast	encrypt	1	<=17	b5e0aaa8f81c3991	e4cdbb1aa2e9c9dc
-bfv	ReleaseFast	decrypt	1	<=6	b5e0aaa8f81c3991	51de1d1011ed3c4c
+bfv	ReleaseFast	keygen	1	<=29	2fdbc34c4be7aa47	85d334608120f4fc
+bfv	ReleaseFast	encrypt	1	<=17	2fdbc34c4be7aa47	e4cdbb1aa2e9c9dc
+bfv	ReleaseFast	decrypt	1	<=6	2fdbc34c4be7aa47	51de1d1011ed3c4c
 tfhe	ReleaseFast	keygen	1	0	8c530e4dfed31d2e	69d480284dbfd7e8
 tfhe	ReleaseFast	encrypt	1	0	8c530e4dfed31d2e	01f895b45b944863
 tfhe	ReleaseFast	decrypt	1	0	8606c3d979962240	3d8c08984d3541f6
@@ -1784,10 +1784,10 @@ megolm	ReleaseFast	pickle	1	26	4bcd2cc0b8d7321d	f06f4b1b938d2036
 # bob untainted, then her EpochSecrets and Ed25519 key tainted; secret tree
 # built under taint, ratchet advanced); bob opens both untainted. 2 = std
 # Ed25519 signing internals (sign, pcMul16 rejectIdentity), as in priv.
-mls	ReleaseFast	ks	1	0	3eb090c51a286cc7	cbdae823f31fa99e
-mls	ReleaseFast	tree	1	0	3eb090c51a286cc7	22ea84b82599122e
-mls	ReleaseFast	priv	1	4	3eb090c51a286cc7	616cb338b933af50
-mls	ReleaseFast	group	1	2	93f740bb89511bda	f4c3dc710c6be88a
+mls	ReleaseFast	ks	1	0	1f288358fcdb0505	cbdae823f31fa99e
+mls	ReleaseFast	tree	1	0	1f288358fcdb0505	22ea84b82599122e
+mls	ReleaseFast	priv	1	4	1f288358fcdb0505	616cb338b933af50
+mls	ReleaseFast	group	1	2	6885b2e94cda915c	f4c3dc710c6be88a
 # otp (2026-10-10) — code: the shared secret through hotp/totp/hotpFmt/
 # totpVerify for SHA-1/256/512. FIX: the RFC 4226 dynamic truncation read
 # mac[offset..][0..4] with offset = the MAC's low nibble, a load address
@@ -1936,7 +1936,7 @@ voprf	ReleaseFast	p521-keygen	1	3	a448ff40ae25f5e0	517083316574f2e7
 # at three tail lengths. FIX: std.base64 indexed its alphabet by the secret
 # and checkCredential branched per byte: 312 -> 6. The 6 = the one
 # NUL/CR/LF verdict per call (auth.zig).
-smtp	ReleaseFast	auth	1	6	bd71be4c815e04bd	58737f369d111669
+smtp	ReleaseFast	auth	1	6	ab732595c5522595	58737f369d111669
 # mcp-http (2026-10-10) — sid: the 16 CSPRNG bytes of an Mcp-Session-Id
 # through sidhex.encode (what Sessions.create runs). FIX: it used std.fmt
 # "{x}", a digit table indexed by the secret nibble. 0.
@@ -2556,8 +2556,8 @@ tlsclient	ReleaseFast	kex	1	5	e09520cb0a81b4fa	dcbfcf24be022c59	cpu=x86_64 contr
 tlsclient	ReleaseFast	cv	1	33	aeb841d005c8d4a6	a92e71f50313cf2b	cpu=x86_64
 tlsserver	ReleaseFast	hs	1	24	82a28eda0eb571f6	18b712e147be54c3	cpu=x86_64
 tlsserver	ReleaseFast	ech	1	442	82a28eda0eb571f6	c257fcbb1b68d8df	cpu=x86_64
-mls	ReleaseFast	priv	1	5	3eb090c51a286cc7	616cb338b933af50	cpu=x86_64
-mls	ReleaseFast	group	1	3	93f740bb89511bda	f4c3dc710c6be88a	cpu=x86_64
+mls	ReleaseFast	priv	1	5	1f288358fcdb0505	616cb338b933af50	cpu=x86_64
+mls	ReleaseFast	group	1	3	6885b2e94cda915c	f4c3dc710c6be88a	cpu=x86_64
 wireguard	ReleaseFast	handshake	1	13	e3bba5e674102f92	40f18e84501394fa	cpu=x86_64
 wireguard	ReleaseFast	tunnel	1	14	e3bba5e674102f92	8f458611fc103bea	cpu=x86_64
 tls13	ReleaseFast	x25519_shared	1	1	4115b347f0c1b95d	d94c3e5680258153	cpu=x86_64

@@ -34,6 +34,11 @@
 //! LF anywhere would forge a whole SMTP command line.
 
 const std = @import("std");
+const burn = @import("burn.zig");
+
+/// Bytes zeroed below `ScramClient.clientFinal`: PBKDF2-HMAC-SHA-256 and the
+/// key derivation. Sized from `stackprobe_test.zig`.
+const scram_burn = 8 * 1024;
 const testing = std.testing;
 
 pub const AuthError = error{
@@ -377,7 +382,14 @@ pub const ScramClient = struct {
     /// not base64 or longer than `scram_max_salt_len`, and an iteration count
     /// outside `scram_min_iterations..scram_max_iterations` — all before any
     /// key derivation.
+    ///
+    /// The derivation (PBKDF2 over the password, the client/server keys, std's
+    /// HMAC frames) runs one frame down and is zeroed after it (`scram_burn`).
     pub fn clientFinal(self: *ScramClient, out: []u8, server_first: []const u8, password: []const u8) AuthError![]const u8 {
+        return burn.run(scram_burn, AuthError![]const u8, clientFinalBody, .{ self, out, server_first, password });
+    }
+
+    fn clientFinalBody(self: *ScramClient, out: []u8, server_first: []const u8, password: []const u8) AuthError![]const u8 {
         try checkScramCredential(password);
         var it = std.mem.splitScalar(u8, server_first, ',');
         const r_attr = it.next() orelse return error.UnexpectedChallenge;

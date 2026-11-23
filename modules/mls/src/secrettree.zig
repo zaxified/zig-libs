@@ -421,6 +421,7 @@ pub fn EpochTree(comptime S: type, comptime window_capacity: usize) type {
         /// `encryption_secret` (the root's secret, §9). The caller may wipe
         /// its own copy of `encryption_secret` afterwards — this tree holds
         /// the only one it needs.
+        // secret-api-ok: the secret is copied by pointer straight into a heap node; Self holds only heap pointers and public counts
         pub fn init(
             allocator: std.mem.Allocator,
             encryption_secret: *const [S.Nh]u8,
@@ -438,7 +439,11 @@ pub fn EpochTree(comptime S: type, comptime window_capacity: usize) type {
             @memset(nodes, null);
             const leaves = try allocator.alloc(?*LeafRatchets, n_leaves);
             @memset(leaves, null);
-            nodes[treemath.root(n_leaves)] = encryption_secret.*;
+            // Straight into the heap node: assigning `encryption_secret.*` to the
+            // optional would build the `?[Nh]u8` in a stack temporary first.
+            const r = treemath.root(n_leaves);
+            nodes[r] = @as([S.Nh]u8, @splat(0));
+            @memcpy(&nodes[r].?, encryption_secret);
             return .{
                 .allocator = allocator,
                 .n_leaves = n_leaves,
