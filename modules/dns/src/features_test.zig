@@ -12,6 +12,14 @@ const net = std.Io.net;
 const question_end_fixed = 4;
 const server_cookie = "SERVERCK";
 
+/// The parallel-servers tests: the default `async_limit` is the CPU count - 1,
+/// and the stub threads count against it, so on a 4-vCPU runner a group's
+/// second `async` already ran inline on the caller: the winner answered
+/// before the first task's thread had sent anything, and that task was
+/// canceled unsent (schedule CI 45174288171: `seen` 0). On 1-2 CPUs the
+/// whole group ran serially. Unlimited: every task gets a thread.
+const parallel_io: std.Io.Threaded.InitOptions = .{ .async_limit = .unlimited };
+
 const Stub = struct {
     io: std.Io,
     sock: net.Socket,
@@ -29,6 +37,12 @@ const Stub = struct {
     cookie_len: [4]usize = @splat(0),
     client: [4][8]u8 = @splat(@splat(0)),
     server_part: [4][8]u8 = @splat(@splat(0)),
+    /// Answer only once each of these stubs has seen its query (bounded at
+    /// 2 s): the parallel-servers tests need every query of a group to have
+    /// left before the winner replies. Otherwise, on a loaded runner, a
+    /// loser's task may not have started yet and is canceled unsent (full CI
+    /// 45114863972, schedule 45174288171: `seen` 0).
+    wait_seen: []const *const Stub = &.{},
 
     const Mode = enum { answer, servfail, silent, cookie_good, cookie_bad_client, badcookie };
 
@@ -52,6 +66,11 @@ const Stub = struct {
             return;
         }
         if (st.delay_ms > 0) try st.io.sleep(.fromMilliseconds(st.delay_ms), .awake);
+        for (st.wait_seen) |other| {
+            var waited: usize = 0;
+            while (@atomicLoad(usize, &other.seen, .acquire) == 0 and waited < 2000) : (waited += 1)
+                try st.io.sleep(.fromMilliseconds(1), .awake);
+        }
         var qend: usize = message.header_len;
         while (q[qend] != 0) qend += @as(usize, q[qend]) + 1;
         qend += 1 + question_end_fixed;
@@ -318,7 +337,7 @@ test "routes: split DNS sends each name to its own servers; a route without serv
 }
 
 test "parallel servers: the first usable reply wins, a slow server does not hold the query" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    var threaded = std.Io.Threaded.init(testing.allocator, parallel_io);
     defer threaded.deinit();
     const io = threaded.io();
     var a = try bindStub(io, .{ 127, 0, 0, 1 }, 0, .answer, 1);
@@ -328,6 +347,8 @@ test "parallel servers: the first usable reply wins, a slow server does not hold
     var b = try bindStub(io, .{ 127, 0, 0, 2 }, a.sock.address.getPort(), .answer, 1);
     defer b.sock.close(io);
     b.ip = .{ 192, 0, 2, 20 };
+    const before_b = [_]*const Stub{&a};
+    b.wait_seen = &before_b;
     var fa = try io.concurrent(Stub.run, .{&a});
     var fb = try io.concurrent(Stub.run, .{&b});
     var r = resolver(io, &two_servers, a.sock.address.getPort());
@@ -337,19 +358,15 @@ test "parallel servers: the first usable reply wins, a slow server does not hold
     var m = try r.query("example.com", .a);
     defer m.deinit();
     try testing.expectEqualSlices(u8, &b.ip, &firstA(&m)); // serial would have waited for A
-    // And A was asked too. Both queries left together, but A's stub thread
-    // may read its datagram only after B's reply already won (a loaded
-    // runner: full CI 45114863972 saw 0), so wait for it, bounded.
-    var waited: usize = 0;
-    while (@atomicLoad(usize, &a.seen, .acquire) == 0 and waited < 2000) : (waited += 1)
-        try io.sleep(.fromMilliseconds(1), .awake);
+    // And A was asked too: B answered only after A had seen its query, and
+    // serial would have waited 700 ms for A before asking B at all.
     try testing.expectEqual(@as(usize, 1), @atomicLoad(usize, &a.seen, .acquire));
     fa.cancel(io);
     fb.await(io);
 }
 
 test "parallel servers: failure replies do not win, groups follow one another, serial stays serial" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    var threaded = std.Io.Threaded.init(testing.allocator, parallel_io);
     defer threaded.deinit();
     const io = threaded.io();
     for ([_]u8{ 2, 3, 1 }, [_]usize{ 1, 1, 1 }) |par, want_third| {
@@ -360,6 +377,8 @@ test "parallel servers: failure replies do not win, groups follow one another, s
         var c = try bindStub(io, .{ 127, 0, 0, 3 }, a.sock.address.getPort(), .answer, 1);
         defer c.sock.close(io);
         c.ip = .{ 192, 0, 2, 30 };
+        const before_c = [_]*const Stub{ &a, &b };
+        c.wait_seen = &before_c;
         var fa = try io.concurrent(Stub.run, .{&a});
         var fb = try io.concurrent(Stub.run, .{&b});
         var fc = try io.concurrent(Stub.run, .{&c});
@@ -379,7 +398,7 @@ test "parallel servers: failure replies do not win, groups follow one another, s
 }
 
 test "parallel servers: every server failing still returns the failure; zero is refused" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    var threaded = std.Io.Threaded.init(testing.allocator, parallel_io);
     defer threaded.deinit();
     const io = threaded.io();
     var a = try bindStub(io, .{ 127, 0, 0, 1 }, 0, .servfail, 1);
