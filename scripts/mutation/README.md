@@ -123,6 +123,36 @@ A card entry whose previous mutation run recorded no counts (`mutation <date> ·
 src ?`) does not take a delta run's counts: those would read as a whole-module
 score. Put the delta in a SPEC paragraph and run the whole module.
 
+## 4a. `score.py`: the card line from the tables
+
+Nobody sums counts by hand (six card errors, 2026-11-08..22). `score.py` turns
+the verdict tables into the card's mutation entry, in the exact grammar the
+grade gate parses (`mutation <date> (<killed>/<total>[, <n> eq])`):
+
+```sh
+python3 scripts/mutation/score.py whole --table m.tsv [--table m2.tsv] --date YYYY-MM-DD \
+    --src <16 hex> [--total N] [--card modules/<m>/SPEC.md --write]
+python3 scripts/mutation/score.py delta --card modules/<m>/SPEC.md --table d.tsv --date ... \
+    --src-from-report maturity.tsv [--write]
+python3 -I scripts/mutation/score.py --self-test        # in the checks-fast phase
+```
+
+- A table has a header with a `verdict` column (and `id`), or is `run.sh`'s
+  headerless output. A later table / row overrides an earlier one per id, so
+  `run.sh` output followed by the analysed table works. EQUIVALENT, EQ and
+  UNOBSERVABLE count as `eq`; KILLED and HANG as killed (the first word of the
+  cell decides: `KILLED-DEBUG` is killed, with a warning); SURVIVED, UNCLEAR
+  and anything else is OPEN. The baseline row 0 is ignored.
+- `whole`: total counts every mutant (`--total N` when ids were never run, so
+  a cut-short run still gets a score; OPEN = total - killed - eq).
+- `delta` is cumulative: old + delta (783/824, 41 eq + 13/14, 1 eq = 796/838,
+  42 eq). It prints the delta's own numbers for the dated SPEC paragraph, and
+  REFUSES (exit 1, card untouched) when the card's mutation entry has no counts
+  (`src ?`, `none`): whole-module run needed.
+- `--write` rewrites the mutation and `src` parts of the card's `**Audit:**`
+  line; the review part is untouched. `--src-from-report` reads the `src now`
+  column of `zig build maturity-report` (the hash is never computed here).
+
 ## 5. Stack-burn and wipe sites
 
 A wipe (`secureZero`) or a stack burn is observable only to the module's

@@ -1929,6 +1929,7 @@ phase_checks_fast_tail() {
     step "auto-release self-test" ./scripts/lib/with-decoy-gitdir.sh ./scripts/lib/test-tag.sh
     step "release-notes self-test" ./scripts/lib/with-decoy-gitdir.sh python3 -I scripts/lib/release-notes.py --self-test
     step "ci-red-issue self-test" python3 -I scripts/lib/ci-red-issue.py --self-test
+    step "mutation score self-test" python3 -I scripts/mutation/score.py --self-test
     step "check-ci-cache-keys" ./scripts/checks/check-ci-cache-keys.sh
     step "check-fingerprint-exempt" ./scripts/checks/fingerprint-exempt.py
     step "check-scripts-doc" zig build check-scripts-doc
