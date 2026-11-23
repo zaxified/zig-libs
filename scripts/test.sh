@@ -1982,6 +1982,11 @@ phase_checks_fast_tail() {
     step "check-fuzz" zig build check-fuzz
     step "check-global-alloc" zig build check-global-alloc
     step "check-skip-as-pass" ./scripts/checks/check-skip-as-pass.py
+    # CONVENTIONS 7.2 (a module over the trigger has an example). It ran only
+    # in the push lane's check-examples, so a new module without its example
+    # reached main red four times in 2026-11-08..15 (clock, indicators x2,
+    # stopsignal). Same zl-gates tool as the two steps above, so ~0.1 s here.
+    step "check-example-rule" zig build check-example-rule
 
     # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
     # input. A `Smith` ranged draw returns the range MINIMUM unless the eight

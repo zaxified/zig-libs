@@ -349,7 +349,11 @@ jobs:
     # measured causes of the 37-105-minute runs before: every module re-keyed
     # by any build.zig edit, every repo check over the whole tree in each
     # shard, a second ReleaseFast build of the closure, dkg/threshold_ecdsa.
-    timeout-minutes: 15
+    # 27 since 2026-11-23 (owner OK): the 12-minute compile step below now gets
+    # ONE resume attempt in the same job. An ordinary push still ends in
+    # minutes; only a cold shard spends the extra time, and it used to spend it
+    # anyway as a red run plus a manual re-run (12 runs in 2026-11-08..22).
+    timeout-minutes: 27
     # ⭐ THREE SHARDS, like the full lanes (2026-09-18). On an ordinary push each
     # shard finds most of its modules stamped and is minutes, so the split
     # costs two runner start-ups. It is there for the push that re-keys
@@ -550,7 +554,10 @@ jobs:
       # 604 s of `zig build`, then check-examples cut off at 15 min. A step
       # timeout is a failure, the save still runs, and the next push resumes.
       - name: Check consistency and compile
+        id: compile1
         timeout-minutes: 12
+        # A failure here is decided by the resume step below, not by this one.
+        continue-on-error: true
         env:
           ZIGLIBS_LANE: changed modules [${{ matrix.shard }}]
           ZIGLIBS_SPLIT: ${{ matrix.split }}
@@ -560,6 +567,23 @@ jobs:
           # A pinned CPU level: GitHub's amd64 pool mixes CPU models, and with
           # `native` every change would have to go green once per model before
           # its stamp holds. +aes+pclmul because no psABI level carries them.
+          bash scripts/test.sh build -Dcpu=x86_64_v3+aes+pclmul ${{ matrix.groups }}
+      # ⭐ ONE RESUME IN THE SAME JOB (2026-11-23). In 2026-11-08..22 the step
+      # above timed out 12 times on a cold shard and every time a manual re-run
+      # went green in 3-14 minutes, because the re-run restored what the red
+      # attempt had saved. Here the job's own .zig-cache and stamps file are
+      # still on disk, so this attempt resumes exactly where the first stopped
+      # -- no human, no cache round trip. A real error fails it again in
+      # seconds (everything before it is cached), so the job is still red.
+      - name: Check consistency and compile (resume)
+        if: ${{ steps.compile1.outcome == 'failure' }}
+        timeout-minutes: 12
+        env:
+          ZIGLIBS_LANE: changed modules [${{ matrix.shard }}]
+          ZIGLIBS_SPLIT: ${{ matrix.split }}
+          ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
+        run: |
+          bash scripts/test.sh checks-fast
           bash scripts/test.sh build -Dcpu=x86_64_v3+aes+pclmul ${{ matrix.groups }}
       - name: Decide whether the build tree grew
         id: zsave
