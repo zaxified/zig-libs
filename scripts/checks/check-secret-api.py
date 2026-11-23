@@ -98,7 +98,8 @@ NOT_SECRET_NAME = re.compile(r"(?i)(public|pub_|_pub|pk$|^pk_|peer|remote|their|
 SECRET_RET_FN = re.compile(r"(?i)(secret|seed|private|priv[A-Z_]|sharedkey|sessionkey|traffickey|derive\w*key)")
 PUBLIC_FN = re.compile(r"(?i)public")
 # Type names the SECRET_TYPE pattern catches but that hold no secret.
-NOT_SECRET_TYPE = re.compile(r"^(Encrypted\w*|Public\w*|\w*Public\w*|\w*(Len|Length|Size|Error|Tag|Kind|Id|Label|Options)|SecretSharing)$")
+NOT_SECRET_TYPE_SRC = (r"^(Encrypted\w*|Public\w*|\w*Public\w*|\w*(Len|Length|Size|Error|Tag|Kind|Id|Label|Options)|SecretSharing)$")
+NOT_SECRET_TYPE = re.compile(NOT_SECRET_TYPE_SRC)
 # Read-only accessors of a secret-holding object: they return public facts
 # (its public key, a length, a counter) and touch no secret.
 ACCESSOR = re.compile(r"^(public\w*|\w*[Ll]en|\w*[Ll]ength|position|remaining|levelList|count|size|id|keyId|algorithm\w*)$")
@@ -565,6 +566,25 @@ def scan_module(module, want_burned=False):
     # own code keys a std MAC/AEAD/KDF/signature/DH with it (stun's
     # MESSAGE-INTEGRITY HMAC key is a `net` module's `key: []const u8`).
     crypto = module in CRYPTO or any(STD_KEYED.search(fi.src) for fi in files.values())
+    # A type the module defines as an `enum` holds no secret, whatever its
+    # name: indicators' `Seed` is the seeding strategy of a moving average
+    # (2026-11-23: 60 false findings). A name is excluded only when every
+    # definition of it in the module is an enum or an alias of one.
+    global NOT_SECRET_TYPE
+    enums = set()
+    for fi in files.values():
+        enums.update(re.findall(r"\bconst\s+([A-Z]\w*)\s*=\s*enum\b", fi.src))
+    for fi in files.values():
+        for a, t in re.findall(r"\bconst\s+([A-Z]\w*)\s*=\s*(?:[\w]+\.)+([A-Z]\w*)\s*;", fi.src):
+            if t in enums:
+                enums.add(a)
+    others = set()
+    for fi in files.values():
+        for name, rhs in re.findall(r"\bconst\s+([A-Z]\w*)\s*=\s*([^;\n]*)", fi.src):
+            if name in enums and not re.match(r"enum\b|(?:[\w]+\.)+[A-Z]\w*\s*$", rhs.strip()):
+                others.add(name)
+    enums -= others
+    NOT_SECRET_TYPE = re.compile(NOT_SECRET_TYPE_SRC + (r"|^(" + "|".join(sorted(enums)) + r")$" if enums else ""))
     DERIVED.clear()
     DERIVED_REF.clear()
     inl, ref = derive_secret_types(files, crypto)
