@@ -578,11 +578,18 @@ jobs:
       - name: Check consistency and compile (resume)
         if: ${{ steps.compile1.outcome == 'failure' }}
         timeout-minutes: 12
+        # ⚠ The timed-out step's `zig` children outlive it and still hold
+        # test.sh's flock (fd 9 is inherited): run 45094825598 refused the
+        # resume with "another run holds this checkout" 1 s after the timeout.
+        # Nothing else runs `zig` on this runner, so stop the orphans, then
+        # queue on the lock instead of refusing.
         env:
           ZIGLIBS_LANE: changed modules [${{ matrix.shard }}]
           ZIGLIBS_SPLIT: ${{ matrix.split }}
           ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
+          ZIGLIBS_WAIT_LOCK: 1
         run: |
+          pkill -x zig || true
           bash scripts/test.sh checks-fast
           bash scripts/test.sh build -Dcpu=x86_64_v3+aes+pclmul ${{ matrix.groups }}
       - name: Decide whether the build tree grew
