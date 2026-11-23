@@ -29,6 +29,7 @@ pub fn Z2k(comptime L: usize) type {
         pub const Elem = Int;
 
         /// A PRG seed's element: `convert`'s `8L` uniform bits.
+        // secret-api-ok: a group primitive like add/sub; dpf/dcf/idpf/mpf call it only inside their burned bodies (burn.run)
         pub fn fromPrg(p: anytype, seed: [16]u8) Int {
             return p.convert(L, seed);
         }
@@ -72,6 +73,7 @@ pub fn Xor(comptime L: usize) type {
         pub const Int = @Int(.unsigned, 8 * L);
         pub const Elem = Int;
 
+        // secret-api-ok: a group primitive like add/sub; dpf/dcf/idpf/mpf call it only inside their burned bodies (burn.run)
         pub fn fromPrg(p: anytype, seed: [16]u8) Int {
             return p.convert(L, seed);
         }
@@ -99,6 +101,7 @@ pub fn ZMod(comptime N: u65) type {
         pub const modulus = N;
         pub const Elem = u64;
 
+        // secret-api-ok: a group primitive like add/sub; dpf/dcf/idpf/mpf call it only inside their burned bodies (burn.run)
         pub fn fromPrg(p: anytype, seed: [16]u8) u64 {
             const wide: u192 = p.convert(24, seed);
             // Bit-serial reduction with a masked subtract: a `%` on a 192-bit
@@ -146,6 +149,7 @@ pub fn Vector(comptime L: usize, comptime k: usize) type {
         pub const Comp = @Int(.unsigned, 8 * L);
         pub const Elem = @Int(.unsigned, 8 * L * k);
 
+        // secret-api-ok: a group primitive like add/sub; dpf/dcf/idpf/mpf call it only inside their burned bodies (burn.run)
         pub fn fromPrg(p: anytype, seed: [16]u8) Elem {
             return p.convert(L * k, seed);
         }
