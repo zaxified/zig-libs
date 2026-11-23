@@ -41,7 +41,8 @@ const Stub = struct {
         const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(3000), .clock = .awake } };
         const incoming = try st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io));
         const q = incoming.data;
-        st.seen += 1;
+        // Atomic: one test reads it while the stub still runs.
+        _ = @atomicRmw(usize, &st.seen, .Add, 1, .release);
         var name_end: usize = message.header_len;
         while (name_end < q.len and q[name_end] != 0) name_end += @as(usize, q[name_end]) + 1;
         st.last_q_len = @min(st.last_q.len, name_end + 1 - message.header_len);
@@ -336,7 +337,13 @@ test "parallel servers: the first usable reply wins, a slow server does not hold
     var m = try r.query("example.com", .a);
     defer m.deinit();
     try testing.expectEqualSlices(u8, &b.ip, &firstA(&m)); // serial would have waited for A
-    try testing.expectEqual(@as(usize, 1), a.seen); // and A was asked too
+    // And A was asked too. Both queries left together, but A's stub thread
+    // may read its datagram only after B's reply already won (a loaded
+    // runner: full CI 45114863972 saw 0), so wait for it, bounded.
+    var waited: usize = 0;
+    while (@atomicLoad(usize, &a.seen, .acquire) == 0 and waited < 2000) : (waited += 1)
+        try io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expectEqual(@as(usize, 1), @atomicLoad(usize, &a.seen, .acquire));
     fa.cancel(io);
     fb.await(io);
 }
