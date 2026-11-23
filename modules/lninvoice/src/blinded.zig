@@ -136,6 +136,7 @@ pub const PathIterator = struct {
 
 /// Appends one `blinded_path` to `out`. Refuses what BOLT#12 refuses on reading: no hops, more than 255
 /// hops, a hop's data over 65535 bytes, a point that is not a valid compressed point.
+// secret-api-ok: first_path_key is the path's first PUBLIC blinding point (33-byte compressed, checked by validPoint), not a secret
 pub fn appendPath(allocator: Allocator, out: *std.ArrayList(u8), first_node: FirstNode, first_path_key: [33]u8, hops: []const Hop) (Allocator.Error || PathError || error{FieldTooLong})!void {
     if (hops.len == 0) return error.ZeroHops;
     if (hops.len > 255) return error.FieldTooLong;

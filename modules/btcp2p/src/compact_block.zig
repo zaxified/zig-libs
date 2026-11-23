@@ -74,6 +74,7 @@ pub fn shortIdKey(header: BlockHeader, nonce: u64) [16]u8 {
 }
 
 /// The short id of a transaction hash (its txid, or its wtxid for version 2).
+// secret-api-ok: the BIP152 SipHash key is derived from the public block header and nonce (shortIdKey), not a secret
 pub fn shortId(key: *const [16]u8, tx_hash: [32]u8) ShortId {
     var out: [8]u8 = undefined;
     std.crypto.auth.siphash.SipHash64(2, 4).create(&out, &tx_hash, key);

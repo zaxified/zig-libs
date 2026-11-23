@@ -264,8 +264,8 @@ oscore	ReleaseFast	unprotect	1	1	5348e0af1901ba83	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-isis	ReleaseFast	md5	1	0	0373b1aa690293c1	348beddaddc06aa1
-isis	ReleaseFast	sha256	1	0	0373b1aa690293c1	a8ea418331958712
+isis	ReleaseFast	md5	1	0	c2d6c36db32da8b6	348beddaddc06aa1
+isis	ReleaseFast	sha256	1	0	c2d6c36db32da8b6	a8ea418331958712
 ssh	ReleaseFast	dh	1	4	4955fcb9a013ec1a	95639ff37028e502
 # Zig 0.17.0 (2026-10-18): ffpow 3 -> 17, still the positive control (>=1). 0.17 std ff pow's
 # table select is now `cmov(ct.eql(k, i+1))` (ff.zig `powWithEncodedExponentInternal` -> `cmov`) and compiles to a jump per

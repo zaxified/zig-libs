@@ -60,6 +60,12 @@
 //! (MIT) and FRR documentation and pull-request text (no FRR source read).
 
 const std = @import("std");
+const burn = @import("burn.zig");
+
+/// Bytes zeroed below `sign`, `verify` and `addPlaceholder`: the HMAC frames
+/// (SHA-512 the deepest) and the 255-byte TLV value buffer. Sized from
+/// `stackprobe_test.zig`.
+const auth_burn = 4 * 1024;
 const header = @import("header.zig");
 const tlv = @import("tlv.zig");
 const pdu = @import("pdu.zig");
@@ -183,7 +189,13 @@ pub fn parse(value: []const u8) ParseError!Tlv {
 /// holo-isis initialise it). For cleartext this is the final TLV. Add it
 /// before any other TLV — holo-isis and FRR put it first, and a receiver that
 /// stops walking at a malformed later TLV still finds it.
+///
+/// Runs one frame down under a dead-stack burn (`auth_burn`).
 pub fn addPlaceholder(b: *tlv.Builder, key: Key) tlv.BuildError!void {
+    return burn.run(auth_burn, tlv.BuildError!void, addPlaceholderBody, .{ b, key });
+}
+
+fn addPlaceholderBody(b: *tlv.Builder, key: Key) tlv.BuildError!void {
     var value: [tlv.max_value_len]u8 = undefined;
     value[0] = key.algorithm.authType();
     const len: usize = switch (key.algorithm) {
@@ -334,7 +346,13 @@ pub const SignError = FindError || error{
 /// Checksum is then re-stamped (ISO 10589 §7.3.11), because it covers the
 /// digest; Remaining Lifetime is left as it is. Cleartext needs no digest:
 /// the TLV is only checked against `key`.
+///
+/// Runs one frame down under a dead-stack burn (`auth_burn`).
 pub fn sign(bytes: []u8, key: Key) SignError!void {
+    return burn.run(auth_burn, SignError!void, signBody, .{ bytes, key });
+}
+
+fn signBody(bytes: []u8, key: Key) SignError!void {
     const loc = (try find(bytes)) orelse return error.AuthMissing;
     const pdu_bytes = bytes[0..loc.pdu_len];
     const l = key.algorithm.digestLen();
@@ -372,7 +390,13 @@ pub const VerifyError = FindError || error{
 /// Verify the PDU's authentication against `keys`; returns the index of the
 /// key that matched. Comparison is constant-time in the received value and
 /// the computed one (the lengths and which key is tried are public).
+///
+/// Runs one frame down under a dead-stack burn (`auth_burn`).
 pub fn verify(bytes: []const u8, keys: []const Key) VerifyError!usize {
+    return burn.run(auth_burn, VerifyError!usize, verifyBody, .{ bytes, keys });
+}
+
+fn verifyBody(bytes: []const u8, keys: []const Key) VerifyError!usize {
     const loc = (try find(bytes)) orelse return error.AuthMissing;
     const pdu_bytes = bytes[0..loc.pdu_len];
     var any_key = false;

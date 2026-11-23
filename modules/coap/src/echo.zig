@@ -58,8 +58,11 @@ pub const EchoVerifier = struct {
         invalid,
     };
 
-    pub fn init(key: [32]u8, lifetime_ms: u64) EchoVerifier {
-        return .{ .key = key, .lifetime_ms = lifetime_ms };
+    /// The key by pointer and the verifier (which holds it) through `out`:
+    /// no copy of the key in a caller's frame or result slot.
+    pub fn init(out: *EchoVerifier, key: *const [32]u8, lifetime_ms: u64) void {
+        out.key = key.*;
+        out.lifetime_ms = lifetime_ms;
     }
 
     fn mac(self: *const EchoVerifier, now_ms: u64, peer: u64) [mac_len]u8 {
@@ -104,6 +107,7 @@ pub const ChallengeBuf = struct {
 /// Echo challenge (RFC 9175 §2.3), to send in place of the real answer; the
 /// client repeats the request with the value. A request whose Echo option is
 /// malformed (empty or over 40 octets) is challenged as well.
+// secret-api-ok: buf receives the public challenge; the MAC key is read through `verifier` (by pointer) by HMAC-SHA-256, unburned on this per-request path by design: the key only authenticates Echo freshness values (RFC 9175)
 pub fn challenge(
     verifier: *const EchoVerifier,
     req: coap.Message,
@@ -275,7 +279,8 @@ fn echoReq(value: ?[]const u8, store: *[2]coap.Option) coap.Message {
 }
 
 test "Echo: issue and check, bound to time and peer" {
-    const v = EchoVerifier.init(@splat(0x42), 1000);
+    var v: EchoVerifier = undefined;
+    EchoVerifier.init(&v, &@as([32]u8, @splat(0x42)), 1000);
     const val = v.issue(5000, 77);
     try testing.expectEqual(EchoVerifier.value_len, val.len);
     try testing.expect(val.len >= 1 and val.len <= options.echo_max_len);
@@ -286,7 +291,8 @@ test "Echo: issue and check, bound to time and peer" {
     // Another peer cannot use it.
     try testing.expectEqual(EchoVerifier.Check.invalid, v.check(&val, 5000, 78));
     // Another key neither.
-    const other = EchoVerifier.init(@splat(0x43), 1000);
+    var other: EchoVerifier = undefined;
+    EchoVerifier.init(&other, &@as([32]u8, @splat(0x43)), 1000);
     try testing.expectEqual(EchoVerifier.Check.invalid, other.check(&val, 5000, 77));
     // Every octet matters: flip each one.
     for (0..val.len) |i| {
@@ -308,7 +314,8 @@ test "Echo: issue and check, bound to time and peer" {
 }
 
 test "Echo: the challenge answers 4.01 with an Echo value and lets a fresh repeat through" {
-    const v = EchoVerifier.init(@splat(7), 2000);
+    var v: EchoVerifier = undefined;
+    EchoVerifier.init(&v, &@as([32]u8, @splat(7)), 2000);
     var st: [2]coap.Option = undefined;
     var cb: ChallengeBuf = .{};
     // No Echo: challenged.

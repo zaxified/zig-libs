@@ -116,6 +116,7 @@ test {
     _ = @import("mutation_test.zig");
     _ = @import("auth.zig");
     _ = @import("auth_kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta is well-formed" {
