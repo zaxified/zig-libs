@@ -49,7 +49,8 @@ fn hex(comptime n: usize, h: []const u8) ![n]u8 {
 
 fn check(comptime S: type, v: V) !void {
     const sk = try hex(32, v.sk);
-    const kp = try S.KeyPair.init(&sk);
+    var kp: S.KeyPair = undefined;
+    try S.KeyPair.init(&kp, &sk);
     try testing.expectEqualSlices(u8, &try hex(33, v.pk), &kp.pk);
     const h = S.encodeToCurve(&kp.pk, v.alpha);
     try testing.expectEqualSlices(u8, &try hex(33, v.h), &h);
@@ -87,12 +88,14 @@ test "ECVRF-P256-SHA256-SSWU: RFC 9381 B.2 Examples 13-15, every published value
 test "P-256 suites: tamper, wrong key, wrong alpha and cross-suite proofs are refused" {
     const sk = try hex(32, sk_a);
     inline for (.{ vrf.tai, vrf.sswu }, .{ vrf.sswu, vrf.tai }) |S, Other| {
-        const kp = try S.KeyPair.init(&sk);
+        var kp: S.KeyPair = undefined;
+        try S.KeyPair.init(&kp, &sk);
         const pi = kp.prove("alpha");
         _ = try S.verify(&kp.pk, "alpha", &pi);
         try testing.expectError(error.InvalidProof, S.verify(&kp.pk, "alphb", &pi));
         try testing.expectError(error.InvalidProof, Other.verify(&kp.pk, "alpha", &pi));
-        const other = try S.KeyPair.init(&try hex(32, sk_b));
+        var other: S.KeyPair = undefined;
+        try S.KeyPair.init(&other, &try hex(32, sk_b));
         try testing.expectError(error.InvalidProof, S.verify(&other.pk, "alpha", &pi));
         for (0..vrf.proof_len) |i| {
             var bad = pi;
@@ -111,12 +114,16 @@ test "P-256 suites: tamper, wrong key, wrong alpha and cross-suite proofs are re
 }
 
 test "P-256 suites: SK outside [1, q-1] is InvalidSecretKey" {
+    var kp: vrf.tai.KeyPair = .{ .sk = @splat(0x5a), .pk = @splat(0xa5) };
     const zero: [32]u8 = @splat(0);
-    try testing.expectError(error.InvalidSecretKey, vrf.tai.KeyPair.init(&zero));
+    try testing.expectError(error.InvalidSecretKey, vrf.tai.KeyPair.init(&kp, &zero));
+    try testing.expectEqual(@as(u8, 0x5a), kp.sk[0]); // a refused key leaves `out` untouched
+    try testing.expectEqual(@as(u8, 0xa5), kp.pk[0]);
     const big: [32]u8 = @splat(0xff);
-    try testing.expectError(error.InvalidSecretKey, vrf.sswu.KeyPair.init(&big));
+    var kp2: vrf.sswu.KeyPair = undefined;
+    try testing.expectError(error.InvalidSecretKey, vrf.sswu.KeyPair.init(&kp2, &big));
     var one: [32]u8 = @splat(0);
     one[31] = 1;
-    const kp = try vrf.tai.KeyPair.init(&one);
+    try vrf.tai.KeyPair.init(&kp, &one);
     try testing.expectEqualSlices(u8, &p256.P256.basePoint.toCompressedSec1(), &kp.pk);
 }

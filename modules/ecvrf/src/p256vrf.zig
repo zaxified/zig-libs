@@ -70,19 +70,25 @@ pub fn Suite(comptime kind: Kind) type {
             pk: PublicKey,
 
             /// `SK` as a big-endian integer in `[1, q-1]` (SEC1 §3.2.1),
-            /// `Y = x*B`. `error.InvalidSecretKey` otherwise.
-            pub fn init(sk: *const SecretKey) KeyError!KeyPair {
-                const r = initUnburned(sk);
+            /// `Y = x*B`, written to `out`. `error.InvalidSecretKey`
+            /// otherwise (`out` untouched). The key pair goes out through a
+            /// pointer, not by value: a returned `KeyError!KeyPair` left a
+            /// copy of `SK` in this frame, above the burn
+            /// (`stackprobe3_test.zig`).
+            pub fn init(out: *KeyPair, sk: *const SecretKey) KeyError!void {
+                const r = initUnburned(out, sk);
                 burn.stack(burn.key_burn);
                 return r;
             }
 
-            noinline fn initUnburned(sk: *const SecretKey) KeyError!KeyPair {
-                const x = Scalar.fromBytes(sk.*, .big) catch return error.InvalidSecretKey;
+            noinline fn initUnburned(out: *KeyPair, sk: *const SecretKey) KeyError!void {
+                var x = Scalar.fromBytes(sk.*, .big) catch return error.InvalidSecretKey;
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&x));
                 if (x.isZero()) return error.InvalidSecretKey;
                 var y: P256 = undefined;
                 P256.basePoint.mulInto(&y, sk, .big) catch unreachable; // x in [1, q-1]
-                return .{ .sk = sk.*, .pk = y.toCompressedSec1() };
+                out.pk = y.toCompressedSec1();
+                out.sk = sk.*;
             }
 
             /// `ECVRF_prove(SK, alpha_string)` (§5.1). The key pair holds

@@ -179,7 +179,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.crypto.hash.sha2.Sha256.hash("ctgrind-ecvrf-harness-p256-key-v1", &sk, .{});
             if (taint == .yes) memcheck.makeMemUndefined(&sk);
             const secret = reloadVolatile([32]u8, &sk);
-            var kp = S.KeyPair.init(&secret) catch unreachable; // a hash is in range
+            var kp: S.KeyPair = undefined;
+            S.KeyPair.init(&kp, &secret) catch unreachable; // a hash is in range
             if (taint == .yes) memcheck.makeMemDefined(&kp.pk);
             kp.pk = reloadVolatile([33]u8, &kp.pk);
             const pi = kp.prove(alpha_text);

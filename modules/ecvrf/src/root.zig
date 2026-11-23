@@ -121,6 +121,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("stackprobe3_test.zig");
     _ = p256vrf;
     _ = @import("p256_kat_test.zig");
 }

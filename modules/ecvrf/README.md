@@ -101,7 +101,8 @@ compressed 33-byte keys, 81-byte proofs, 32-byte outputs):
 
 ```zig
 const S = ecvrf.p256_sha256_sswu; // or p256_sha256_tai
-const kp = try S.KeyPair.init(&sk); // sk: [32]u8 big-endian in [1, q-1]
+var kp: S.KeyPair = undefined;
+try S.KeyPair.init(&kp, &sk); // sk: [32]u8 big-endian in [1, q-1]; wipe kp when done
 const pi = kp.prove(alpha);
 const beta = try S.verify(&kp.pk, alpha, &pi);
 ```

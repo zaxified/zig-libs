@@ -215,7 +215,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 `p256_sha256_tai` (`suite_string = 0x01`) and `p256_sha256_sswu` (`0x02`), `src/p256vrf.zig`:
 RFC 9381 §5.5 over NIST P-256 and SHA-256. `x = SK` (a big-endian integer in `[1, q-1]`,
-`KeyPair.init` refuses anything else with `error.InvalidSecretKey`, so `prove` cannot fail),
+`KeyPair.init(out, &sk)` refuses anything else with `error.InvalidSecretKey` and leaves `out`
+untouched, so `prove` cannot fail),
 `point_to_string` = SEC1 compressed (33 bytes), `int_to_string` = I2OSP (big-endian), the nonce is
 RFC 6979 §3.2 over `h_string` (§5.4.2.1, the sibling `p256`'s `sign.rfc6979Nonce`),
 `encode_to_curve` is try-and-increment with `string_to_point(0x02 || hash)` (TAI, a loop over
@@ -228,8 +229,12 @@ cofactor 1, so `validate_key` refuses only the identity, which has no 33-byte fo
 `mulInto`; `prove` burns `prove_burn`, `KeyPair.init` `key_burn`. ctgrind rows `p256_tai` and
 `p256_sswu`: 10 in-file contexts each, all verdicts (range and zero checks of `SK`, the RFC 6979
 candidate loop, the `rejectIdentity` of each product, the range check of the published `c`), none
-on a digit of `x` or `k`; the list is in `ctgrind-expected.tsv`. No dead-stack probe for these
-suites yet (*Backlog / deferred*).
+on a digit of `x` or `k`; the list is in `ctgrind-expected.tsv`. Dead stack:
+`src/stackprobe3_test.zig` (`testkit.stackprobe`) runs `KeyPair.init` and `KeyPair.prove` of both
+suites with needles `SK`, `k` (both byte orders), `k*B`, `k*H` and `c*x`, plus the engine's
+needle-free residue rule below the burn. Its first run found `SK` above the burn: `init` then
+returned `KeyError!KeyPair` by value and the result temporary stayed in its frame, so `init` now
+writes the key pair through `out` (the edwards25519 `KeyPair.fromSecretKey` shape).
 
 ## What is deliberately not done
 
@@ -278,8 +283,8 @@ suites yet (*Backlog / deferred*).
   (damaged key/proof pairs) and `ecvrf-prove-verify` (a genuine proof is accepted and the hashes
   agree; a flipped bit, another `alpha` or another key is refused). Each harness has an in-suite
   seeded check that it reaches every outcome.
-- **Dead stack:** `src/stackprobe_test.zig` and `src/stackprobe2_test.zig`, optimized builds only
-  (see *Threat model*).
+- **Dead stack:** `src/stackprobe_test.zig`, `src/stackprobe2_test.zig` and (P-256 suites)
+  `src/stackprobe3_test.zig`, optimized builds only (see *Threat model*).
 - **ctgrind:** rows `prove` and `verify` in `scripts/checks/ctgrind-expected.tsv`, harness
   `src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh ecvrf`; `check-ct-compare.py`
   pins the one `timing_safe` comparison. The rows measure the TAI suite; ELL2 shares every step
@@ -289,9 +294,7 @@ suites yet (*Backlog / deferred*).
 
 ## Backlog / deferred
 
-- **Dead-stack probe for the P-256 suites:** `stackprobe_test.zig` covers the edwards25519 suites;
-  `p256_sha256_tai`/`_sswu` `KeyPair.init`/`prove` run under the same burns but have no needle
-  set (`SK`, `k`, `k*B`/`k*H`, `s` before encoding) yet.
+None open.
 
 
 ## Anchoring
