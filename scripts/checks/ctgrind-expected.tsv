@@ -2285,18 +2285,18 @@ tls13	ReleaseFast	sign_rsa	1	2	3dc6deccafaf286b	15b034e3d63aca72
 # KeyGen (kem.zig: it is published in ek), so SampleNTT's rejection loop
 # over it is not counted. fromBytesN (2026-11-12): SecretKey.fromBytes with the s vector and z
 # tainted (ek and H(ek) are public); in-file 0 pins fromNttBytes' range check as branch-free.
-mlkem	ReleaseFast	keygen512	1	0	2d4eb0fb5cafaef2	c8287b52d3e5f778
-mlkem	ReleaseFast	keygen768	1	0	2d4eb0fb5cafaef2	eb016d7e8c3cc899
-mlkem	ReleaseFast	keygen1024	1	0	2d4eb0fb5cafaef2	7aff6ff648180dbf
-mlkem	ReleaseFast	encaps512	1	0	2d4eb0fb5cafaef2	aaf60090db82bd9b
-mlkem	ReleaseFast	encaps768	1	0	2d4eb0fb5cafaef2	da25956af0f64e4b
-mlkem	ReleaseFast	encaps1024	1	0	2d4eb0fb5cafaef2	4f3a04ae41de05ac
-mlkem	ReleaseFast	decaps512	1	0	2d4eb0fb5cafaef2	1cc002f740d266a9
-mlkem	ReleaseFast	decaps768	1	0	2d4eb0fb5cafaef2	69dbd1230a031721
-mlkem	ReleaseFast	decaps1024	1	0	2d4eb0fb5cafaef2	38f8642262218d87
-mlkem	ReleaseFast	fromBytes512	1	0	2d4eb0fb5cafaef2	a8d5466e804a363d
-mlkem	ReleaseFast	fromBytes768	1	0	2d4eb0fb5cafaef2	8cbe1dfd1b2d618c
-mlkem	ReleaseFast	fromBytes1024	1	0	2d4eb0fb5cafaef2	856d03c6374f92c1
+mlkem	ReleaseFast	keygen512	1	0	ba16ddb4621238dc	c8287b52d3e5f778
+mlkem	ReleaseFast	keygen768	1	0	ba16ddb4621238dc	eb016d7e8c3cc899
+mlkem	ReleaseFast	keygen1024	1	0	ba16ddb4621238dc	7aff6ff648180dbf
+mlkem	ReleaseFast	encaps512	1	0	ba16ddb4621238dc	aaf60090db82bd9b
+mlkem	ReleaseFast	encaps768	1	0	ba16ddb4621238dc	da25956af0f64e4b
+mlkem	ReleaseFast	encaps1024	1	0	ba16ddb4621238dc	4f3a04ae41de05ac
+mlkem	ReleaseFast	decaps512	1	0	ba16ddb4621238dc	1cc002f740d266a9
+mlkem	ReleaseFast	decaps768	1	0	ba16ddb4621238dc	69dbd1230a031721
+mlkem	ReleaseFast	decaps1024	1	0	ba16ddb4621238dc	38f8642262218d87
+mlkem	ReleaseFast	fromBytes512	1	0	ba16ddb4621238dc	a8d5466e804a363d
+mlkem	ReleaseFast	fromBytes768	1	0	ba16ddb4621238dc	8cbe1dfd1b2d618c
+mlkem	ReleaseFast	fromBytes1024	1	0	ba16ddb4621238dc	856d03c6374f92c1
 # keycodec (2026-11-06) — the key codec under every PEM/PKCS#8/SEC1 reader of jwt, tlsserver,
 # acme, rsa and ssh. Seven OpenSSL keys (EC P-256 SEC1, P-384 PKCS#8, P-521 SEC1, Ed25519,
 # X25519, ML-DSA-44 both, ML-KEM-512 seed); RSA left to `rsa` (its secret is the whole PKCS#1).

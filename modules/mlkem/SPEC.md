@@ -152,7 +152,15 @@ input. `decaps` cannot fail (implicit rejection).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
   the last whole-module mutation run and the delta runs after it. Not mutated:
   comptime tables and constants (checked against a Python model), and dead-stack
-  `secureZero` of locals (no probe).
+  `secureZero` of locals (the burn after each body makes each one redundant).
+- **Dead stack:** `src/stackprobe_test.zig` (`testkit.stackprobe`, ReleaseFast;
+  keygen, encaps, decaps and secret-key import, all three sets; needles d ‖ z, m,
+  the encoded NTT of s, K, plus the engine's residue rule). Every secret entry
+  point runs its body one frame down and zeroes what it dirtied (`src/burn.zig`,
+  sized per set from the probe: body 7.5–18.3 KiB, burns 12–28 KiB). Added
+  2026-11-23: the module had no burn; the probe's first run also found the shared
+  secret in `encapsDeterministic`'s own frame (a by-value result), hence the
+  `…Into` forms. The bench shows no change (noise level).
 
 ## What is deliberately not done
 

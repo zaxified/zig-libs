@@ -45,6 +45,11 @@ error union — implicit rejection cannot fail); `SecretKey.fromBytes` performs 
 hash check (`error.InconsistentKey`); a generated `SecretKey` keeps its seed; random draws are
 fail-closed. `encapsDeterministic` and `generateDeterministic` are FIPS 203's `_internal`
 functions: for known-answer tests, seed-form import, and protocols that derive their randomness.
+Every secret entry point zeroes the stack its body used before returning; the `…Into` forms
+(`encapsInto`, `encapsDeterministicInto`, `decapsInto`, `SecretKey.fromBytesInto`,
+`KeyPair.generateInto`) write the secret result into caller memory, so no copy stays in a
+returning frame — prefer them where that matters. A calling thread needs about 32 KiB of
+free stack beyond the body (the burns are 12–28 KiB, `src/burn.zig`).
 
 Size note: like std, a `PublicKey` caches the expanded matrix Âᵀ (k² · 512 bytes: 8 KiB for
 ML-KEM-1024) and a `SecretKey` embeds the public key, so these are large values — keep them by

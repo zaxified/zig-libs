@@ -163,18 +163,33 @@ pub fn Kem(comptime p: Params) type {
             /// (CONVENTIONS.md §2.2): without entropy the process aborts.
             /// `tryEncaps` returns the failure instead.
             pub fn encaps(pk: *const PublicKey, io: std.Io) EncapsulatedSecret {
+                var out: EncapsulatedSecret = undefined;
+                pk.encapsInto(io, &out);
+                return out;
+            }
+
+            /// `encaps` with the result written to `out` (no copy of the
+            /// shared secret left in a returning frame).
+            pub fn encapsInto(pk: *const PublicKey, io: std.Io, out: *EncapsulatedSecret) void {
                 var m: [32]u8 = undefined;
                 defer std.crypto.secureZero(u8, &m);
                 entropy.fill(io, &m);
-                return pk.encapsDeterministic(&m);
+                pk.encapsDeterministicInto(&m, out);
             }
 
             /// `encaps` with the entropy failure as an error.
             pub fn tryEncaps(pk: *const PublicKey, io: std.Io) error{EntropyUnavailable}!EncapsulatedSecret {
+                var out: EncapsulatedSecret = undefined;
+                try pk.tryEncapsInto(io, &out);
+                return out;
+            }
+
+            /// `tryEncaps` with the result written to `out`.
+            pub fn tryEncapsInto(pk: *const PublicKey, io: std.Io, out: *EncapsulatedSecret) error{EntropyUnavailable}!void {
                 var m: [32]u8 = undefined;
                 defer std.crypto.secureZero(u8, &m);
                 try entropy.tryFill(io, &m);
-                return pk.encapsDeterministic(&m);
+                pk.encapsDeterministicInto(&m, out);
             }
 
             /// ML-KEM.Encaps_internal (Algorithm 17) with m supplied. For
@@ -182,6 +197,20 @@ pub fn Kem(comptime p: Params) type {
             /// m must be uniformly random and secret, or the shared secret
             /// is not.
             pub fn encapsDeterministic(pk: *const PublicKey, m: *const [encaps_seed_length]u8) EncapsulatedSecret {
+                var out: EncapsulatedSecret = undefined;
+                pk.encapsDeterministicInto(m, &out);
+                return out;
+            }
+
+            /// `encapsDeterministic` with the result written to `out`: no
+            /// copy of the shared secret is left in a returning frame (the
+            /// by-value form keeps one in its own frame, as any by-value
+            /// result does).
+            pub fn encapsDeterministicInto(pk: *const PublicKey, m: *const [encaps_seed_length]u8, out: *EncapsulatedSecret) void {
+                burn.run(burn.by(p.k, burn.encaps_burn), void, encapsBody, .{ pk, m, out });
+            }
+
+            fn encapsBody(pk: *const PublicKey, m: *const [encaps_seed_length]u8, out: *EncapsulatedSecret) void {
                 var kr: [64]u8 = undefined;
                 defer std.crypto.secureZero(u8, &kr);
                 var g = sha3.Sha3_512.init(.{});
@@ -189,10 +218,8 @@ pub fn Kem(comptime p: Params) type {
                 g.update(m);
                 g.update(&pk.hpk);
                 g.final(&kr);
-                var out: EncapsulatedSecret = undefined;
                 pk.pk.encrypt(m, kr[32..64], &out.ciphertext);
                 out.shared_secret = kr[0..32].*;
-                return out;
             }
 
             pub fn toBytes(pk: *const PublicKey) [encoded_length]u8 {
@@ -227,6 +254,18 @@ pub fn Kem(comptime p: Params) type {
             /// ML-KEM.Decaps_internal (Algorithm 18). Never fails: an
             /// invalid ciphertext yields the implicit-rejection key J(z ‖ c).
             pub fn decaps(sk: *const SecretKey, c: *const [ciphertext_length]u8) [shared_length]u8 {
+                var out: [shared_length]u8 = undefined;
+                sk.decapsInto(c, &out);
+                return out;
+            }
+
+            /// `decaps` with the shared secret written to `out` (no copy
+            /// left in a returning frame).
+            pub fn decapsInto(sk: *const SecretKey, c: *const [ciphertext_length]u8, out: *[shared_length]u8) void {
+                burn.run(burn.by(p.k, burn.decaps_burn), void, decapsBody, .{ sk, c, out });
+            }
+
+            fn decapsBody(sk: *const SecretKey, c: *const [ciphertext_length]u8, out: *[shared_length]u8) void {
                 var m: [32]u8 = undefined;
                 var kr: [64]u8 = undefined;
                 var c2: [ciphertext_length]u8 = undefined;
@@ -258,9 +297,7 @@ pub fn Kem(comptime p: Params) type {
                 asm volatile (""
                     : [keep] "+r" (keep),
                 );
-                var out: [32]u8 = undefined;
-                for (&out, kr[0..32], &k_bar) |*o, a, b| o.* = (a & keep) | (b & ~keep);
-                return out;
+                for (out, kr[0..32], &k_bar) |*o, a, b| o.* = (a & keep) | (b & ~keep);
             }
 
             pub fn toBytes(sk: *const SecretKey) [encoded_length]u8 {
@@ -275,8 +312,19 @@ pub fn Kem(comptime p: Params) type {
             /// Import a decapsulation key with the FIPS 203 §7.3 checks: the
             /// embedded ek passes the modulus check and H(ek) matches.
             pub fn fromBytes(buf: *const [encoded_length]u8) KeyError!SecretKey {
-                var ret: SecretKey = undefined;
-                errdefer std.crypto.secureZero(u8, std.mem.asBytes(&ret));
+                var out: SecretKey = undefined;
+                try fromBytesInto(&out, buf);
+                return out;
+            }
+
+            /// `fromBytes` into the caller's `out` (no copy of the key left
+            /// in a returning frame); `out` is zeroed on error.
+            pub fn fromBytesInto(out: *SecretKey, buf: *const [encoded_length]u8) KeyError!void {
+                return burn.run(burn.by(p.k, burn.key_burn), KeyError!void, fromBytesBody, .{ out, buf });
+            }
+
+            fn fromBytesBody(ret: *SecretKey, buf: *const [encoded_length]u8) KeyError!void {
+                errdefer std.crypto.secureZero(u8, std.mem.asBytes(ret));
                 ret.has_seed = false;
                 ret.seed = @splat(0);
                 const s0 = InnerSk.encoded_length;
@@ -289,11 +337,11 @@ pub fn Kem(comptime p: Params) type {
                 ret.z = buf[s1 + 32 ..][0..32].*;
                 // The hash is over public data; a plain compare is fine.
                 if (!std.mem.eql(u8, &h, &ret.hpk)) return error.InconsistentKey;
-                return ret;
             }
 
             /// The 64-byte seed d ‖ z this key was generated from, or null
             /// for a key imported in expanded form (`fromBytes`).
+            // secret-api-ok: an accessor whose purpose is handing out the seed form of the key (Go's `Bytes()`); it copies a field and computes nothing
             pub fn seedBytes(sk: *const SecretKey) ?[seed_length]u8 {
                 return if (sk.has_seed) sk.seed else null;
             }
@@ -315,6 +363,10 @@ pub fn Kem(comptime p: Params) type {
             }
 
             pub fn generateDeterministicInto(kp: *KeyPair, seed: *const [seed_length]u8) void {
+                burn.run(burn.by(p.k, burn.keygen_burn), void, generateBody, .{ kp, seed });
+            }
+
+            fn generateBody(kp: *KeyPair, seed: *const [seed_length]u8) void {
                 // (ρ, σ) = G(d ‖ k)
                 var rs: [64]u8 = undefined;
                 defer std.crypto.secureZero(u8, &rs);
@@ -423,3 +475,4 @@ pub fn Kem(comptime p: Params) type {
 }
 
 const entropy = @import("entropy");
+const burn = @import("burn.zig");
