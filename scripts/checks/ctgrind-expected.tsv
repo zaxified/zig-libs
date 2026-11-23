@@ -2350,11 +2350,11 @@ keycodec	ReleaseFast	pem	1	3	e76b62f820116fb2	3727ff639b8dfcc7
 #   A valid-length message vs the decoy differ by a 32-byte copy vs one SHA-256, but
 #   a ciphertext that decodes validly is one the sender knew the CEK of (the public
 #   key makes any such ciphertext), so no oracle is opened.
-jwe	ReleaseFast	content	1	18	701fcc163081743b	5b95af95390d7044
-jwe	ReleaseFast	kw	1	5	0ae68032638f3463	29bdefbeeb697801
-jwe	ReleaseFast	ecdh	1	8	b1edda05a23a81fd	0e8a78e319485b8a
-jwe	ReleaseFast	pbes2	1	3	0ae68032638f3463	45882587fad30673
-jwe	ReleaseFast	rsa	1	20	0ae68032638f3463	043474d84426957a
+jwe	ReleaseFast	content	1	18	b7baff229681f34b	5b95af95390d7044
+jwe	ReleaseFast	kw	1	5	1fb2849f71d91fb0	29bdefbeeb697801
+jwe	ReleaseFast	ecdh	1	8	8f52c2e7c7b1a42d	0e8a78e319485b8a
+jwe	ReleaseFast	pbes2	1	3	1fb2849f71d91fb0	45882587fad30673
+jwe	ReleaseFast	rsa	1	20	1fb2849f71d91fb0	043474d84426957a
 # webhooksig (2026-11-13) — the HMAC secrets, the signature comparison, the
 # `whsec_` / `whsk_` key text. Four targets; the harness taints only the secret
 # (the key text's prefix stays public) and prints hex of every witness.
@@ -2442,7 +2442,7 @@ xmlenc	ReleaseFast	kw	1	4	d6941608df256e41	65e898b409f3bf26
 # The decryption path is deliberately not a row: see the harness header (the contexts there are
 # xml.parse on the recovered plaintext, which is the output, and the key-dependent work is
 # xmlenc's own rows).
-saml	ReleaseFast	sign	1	45	6c9ac2d2df017817	88075a41bcf0b2bb
+saml	ReleaseFast	sign	1	45	9a05391d73ffba44	88075a41bcf0b2bb
 
 # ── per-CPU variant rows: CTGRIND_CPU=x86_64 (scripts/test.sh ctgrind-portable), 2026-11-18 ──
 # Format and the cause tags: header above. Each group below names its cause.
@@ -2530,10 +2530,10 @@ aes192	ReleaseFast	bitsliced	1	128	ba4c8387c14267e7	5ea64f081b0ffcbb	cpu=x86_64
 #   (jwe content trap, megolm msg trap, xmlenc cbc claim+control+trap, compiler_rt memcpy symbolised
 #   at line 0). They now use the length of the plaintext they sent, checked against the returned one
 #   under -fvalgrind. jwe rsa, xmlenc oaep and xmlenc rsa15 match their plain rows (no variant).
-jwe	ReleaseFast	content	1	487	701fcc163081743b	5b95af95390d7044	cpu=x86_64 control=100 trap=100
-jwe	ReleaseFast	kw	1	332	0ae68032638f3463	29bdefbeeb697801	cpu=x86_64 control=55 trap=55
-jwe	ReleaseFast	ecdh	1	181	b1edda05a23a81fd	0e8a78e319485b8a	cpu=x86_64 control=51 trap=51
-jwe	ReleaseFast	pbes2	1	182	0ae68032638f3463	45882587fad30673	cpu=x86_64 control=29 trap=29
+jwe	ReleaseFast	content	1	487	b7baff229681f34b	5b95af95390d7044	cpu=x86_64 control=100 trap=100
+jwe	ReleaseFast	kw	1	332	1fb2849f71d91fb0	29bdefbeeb697801	cpu=x86_64 control=55 trap=55
+jwe	ReleaseFast	ecdh	1	181	8f52c2e7c7b1a42d	0e8a78e319485b8a	cpu=x86_64 control=51 trap=51
+jwe	ReleaseFast	pbes2	1	182	1fb2849f71d91fb0	45882587fad30673	cpu=x86_64 control=29 trap=29
 megolm	ReleaseFast	msg	1	138	4bcd2cc0b8d7321d	505eb3dc7b45f5cd	cpu=x86_64 control=1 trap=105
 megolm	ReleaseFast	skey	1	33	4bcd2cc0b8d7321d	a22db1b8b5220a74	cpu=x86_64
 megolm	ReleaseFast	pickle	1	28	4bcd2cc0b8d7321d	f06f4b1b938d2036	cpu=x86_64

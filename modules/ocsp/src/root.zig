@@ -805,6 +805,7 @@ pub fn errorResponse(status: ResponseStatus) error{NotAnError}![5]u8 {
 /// `OCSP_basic_sign`. `verify` accepts the result for an entry's certificate
 /// when the responder is the issuer or a delegate it signed. The bytes are
 /// owned by `gpa`.
+// secret-api-ok: SigningKey is a union of BORROWED pointers (a by-value copy copies a pointer, never key bytes)
 pub fn createResponse(
     gpa: std.mem.Allocator,
     entries: []const ResponseEntry,

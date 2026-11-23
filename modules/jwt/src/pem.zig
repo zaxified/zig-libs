@@ -101,6 +101,7 @@ pub const PrivateKey = union(enum) {
     /// The `SigningKey` for the key's own algorithm: ES256/ES384/ES512,
     /// EdDSA, ML-DSA-*, and RS256 for an RSA key (`rsaSigningKey` picks
     /// another RSA algorithm).
+    // secret-api-ok: SigningKey is a union of BORROWED pointers into this PrivateKey (a by-value copy copies a pointer, never key bytes); nothing is computed here
     pub fn signingKey(self: *const PrivateKey) SigningKey {
         return switch (self.*) {
             .ecdsa_p256 => |*kp| .{ .es256 = kp },
@@ -117,6 +118,7 @@ pub const PrivateKey = union(enum) {
     /// An RSA key's `SigningKey` for `alg`: RS256/384/512, or PS256/384/512
     /// with the CSPRNG `random` (required for PS*, ignored for RS*).
     /// `InvalidKey` for a non-RSA key, another `alg`, or PS* without `random`.
+    // secret-api-ok: SigningKey is a union of BORROWED pointers into this PrivateKey (a by-value copy copies a pointer, never key bytes); nothing is computed here
     pub fn rsaSigningKey(self: *const PrivateKey, alg: root.Alg, random: ?std.Random) KeyError!SigningKey {
         const kp = switch (self.*) {
             .rsa => |*kp| kp,

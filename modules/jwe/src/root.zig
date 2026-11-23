@@ -749,6 +749,7 @@ pub const JsonForm = enum { flattened, general };
 /// single-element `recipients` array). The protected header, encrypted key, IV, ciphertext and tag are the
 /// compact token's own segments, so the result decrypts with the same key through `decryptJson`.
 /// For several recipients and the JSON `aad` member see `encryptJsonRecipients`.
+// secret-api-ok: KeyMaterial holds only BORROWED slices / pointers; the key work runs in encryptCompact, the rest re-serializes its public output
 pub fn encryptJson(
     gpa: std.mem.Allocator,
     form: JsonForm,

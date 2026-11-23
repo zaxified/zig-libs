@@ -2048,6 +2048,7 @@ pub fn buildAuthnRequest(alloc: std.mem.Allocator, opts: AuthnRequestOptions) st
 /// the Redirect binding build the unsigned request and sign the query string
 /// with `buildSignedRedirectQuery` instead. `opts.id` must be an NCName (the
 /// signature's `URI="#id"`), as for the other signed messages.
+// secret-api-ok: SigningKey holds BORROWED pointers (plus the caller's public-grade signature noise); the private operation runs in rsa.signPkcs1v15 / p256 KeyPair.sign under their own burns, the rest is XML assembly
 pub fn buildSignedAuthnRequest(alloc: std.mem.Allocator, opts: AuthnRequestOptions, key: SigningKey) ProtocolMessageBuildError![]u8 {
     var open: std.ArrayList(u8) = .empty;
     errdefer open.deinit(alloc);
