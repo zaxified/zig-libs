@@ -1253,8 +1253,18 @@ tfhe	ReleaseFast	noise	1	0	bf2fd88be74b1e41	57f844d8aeb1660a
 # inlined into `Dkg.run` and merged into one call chain are now distinct call
 # chains (verifyFeldmanShare 3 -> 5, its SEC1 decoding 6 -> 11). Bound moved to
 # the measurement.
-dkg	ReleaseFast	coeffs	1	<=110	baa2cbf0a493fe51	ace23d0e40b2c8f5
-dkg	ReleaseFast	combine	1	0	2c7c5926b347c934	6407896882d3491c
+dkg	ReleaseFast	coeffs	1	<=110	748ff9c18730c700	ace23d0e40b2c8f5
+dkg	ReleaseFast	combine	1	0	4eb192bfd107b6c1	6407896882d3491c
+# dkg/reshare (2026-11-24) — `EcdsaReshare`: three old-only processes deal tainted old shares
+# with tainted randomness, three `ReshareReceiver`s combine. 103 in-file, 0 of them in
+# ecdsa_reshare.zig; by class (--stacks): std secp256k1 `rejectIdentity` at the end of the
+# secret-scalar `mul` (the dealer's `B_ik = g^{b_ik}` and `x_i·G`), the decoding
+# (`fromSec1`/`rejectNonCanonical`/`sqrt`) and `rejectIdentity` of public points the in-process
+# run derived from tainted values (commitments, `X_i`), and the reshare verdicts
+# (`x_i·G = X_i` reshare.zig:203, `B_0 = X_i` :553/556, a dealt share canonical :565, its
+# Feldman check :628, `F'_0 = Q` :693, `x'_j·G = X'_j` :698). No branch inside the arithmetic.
+# Bound as `coeffs` (same classes, std may move them).
+dkg	ReleaseFast	reshare	1	<=110	2ed9dd9a627070d3	4c309a20403322dc
 # aescbc — the two padding strippers, the only place this module does its own
 # arithmetic over a secret. ⭐ The claim these rows test is NOT "zero": both
 # functions END in `if (invalid != 0) return error.InvalidPadding` and return

@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ringtailsoftware/misshod](https://github.com/ringtailsoftware/misshod) | Zig | MIT | 32 | push 2025-01-06 | Its README: "not secure, should not be used in real world systems"; exactly one algorithm of each kind. Narrower than this module. |
 
 
-**Where we are ahead:** against the Zig implementations whose READMEs we read: the ML-KEM-768/X25519 hybrid KEX plus curve25519, NIST ECDH P-256/P-384/P-521, DH group-exchange and DH group14/16, rsa-sha2 and P-256/P-384/P-521 host keys, ChaCha20-Poly1305 and AES-GCM ciphers, RFC 8308 `server-sig-algs`, server role included (misshod: one algorithm of each kind; sshz README states no algorithm list, so its algorithm set is unchecked) · **Where we are behind:** no SFTP, no certificates or `ssh-agent`, no X11/agent forwarding, no server-side TCP/IP forwarding (the server owns no sockets by design), no `hostbased`, no legacy SHA-1/CBC opt-ins yet (the non-legacy algorithm menu matches Go's), and server handlers that are one-shot callbacks (a "shell" served here is batch, not a pty driving a process) (see *What is deliberately not done* and *Backlog / deferred*); sshz advertises agent forwarding and Dropbear/libssh interop besides.
+**Where we are ahead:** against the Zig implementations whose READMEs we read: the ML-KEM-768/X25519 hybrid KEX plus curve25519, NIST ECDH P-256/P-384/P-521, DH group-exchange and DH group14/16, rsa-sha2 and P-256/P-384/P-521 host keys, ChaCha20-Poly1305 and AES-GCM ciphers, RFC 8308 `server-sig-algs`, server role included (misshod: one algorithm of each kind; sshz README states no algorithm list, so its algorithm set is unchecked) · **Where we are behind:** no SFTP, no certificates or `ssh-agent`, no X11/agent forwarding, no server-side TCP/IP forwarding (the server owns no sockets by design), no legacy SHA-1/CBC opt-ins yet (the non-legacy algorithm menu matches Go's), and server handlers that are one-shot callbacks (a "shell" served here is batch, not a pty driving a process) (see *What is deliberately not done* and *Backlog / deferred*); sshz advertises agent forwarding and Dropbear/libssh interop besides.
 
 ## Design & invariants
 
@@ -191,9 +191,36 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   let a client skip a `callbacks` chain — or a `partial` whose `next` enables nothing) is
   `error.InvalidAuthConfig`. `ServeConfig.fromAuth` copies user and permissions together. `Permissions` (critical options, extensions, `extra`) are borrowed
   from the callback's `ctx` and travel `AuthResult.permissions` → `ServeConfig.permissions` →
-  `RequestInfo.permissions`; this module enforces none of them (Go acts only on
-  `source-address`, which needs the peer address this module never sees, and on
-  `no-touch-required` for security keys, which this module does not accept).
+  `RequestInfo.permissions`; the one this module enforces is `source-address` (as Go does; Go's
+  other one, `no-touch-required`, is for security keys, which this module does not accept).
+  **The peer address is handed in** (`AuthConfig.remote_address`/`local_address`, Go's
+  `ConnMetadata.RemoteAddr`/`LocalAddr`; the module never sees the socket) and reaches every callback in
+  `AuthRequest`. `source-address` is Go's `checkSourceAddressCriticalOption`: a comma list of
+  addresses and CIDR blocks (`netaddr`), checked on the grant that would log the user in, for every
+  method, and on a `publickey` callback's grant before PK_OK (a query fails too, before the client
+  signs); no address, an empty value or an entry that parses as neither refuses
+  (`AuthFailure.source_address_denied`); an IPv4-mapped peer matches as IPv4; host bits in a block are
+  ignored as Go's `ParseCIDR` does (OpenSSH refuses such an entry).
+  **Go's other server hooks:** `banner_callback` (Go `BannerCallback`: asked once, at the first request,
+  instead of the static `banner` — both set is `InvalidAuthConfig`), `pre_auth` (Go
+  `PreAuthConnCallback`: at entry, with `PreAuthConn.sendBanner`; valid for the call only, where Go's
+  value may be kept until authentication ends), `on_auth` (Go `AuthLogCallback`: every verdict —
+  accepted, partial, rejected with its reason — with the method name; not a successful §7 query, as
+  in Go) and `publickey_verified` (Go `VerifiedPublicKeyCallback`: after the signature verified, with
+  the grant that accepted the key; its `Decision` is the verdict; while it is set a `publickey`
+  callback answering `partial` is `InvalidAuthConfig`, Go's "invalid library usage").
+  **`hostbased` (RFC 4252 §9), both roles** (OpenSSH has both; Go neither): server
+  `AuthConfig.hostbased` (yes/no) or `AuthCallbacks.hostbased` over a `HostbasedRequest` (client host
+  with one trailing '.' stripped as `sshd` does, client user, algorithm, host key blob), then the host
+  key's signature over `signedBlobHostbased` with this transport's session id; a refusal is
+  `unauthorized_host`. Whether the name belongs to the peer address and the key to the host
+  (`sshd`'s reverse DNS and `ssh_known_hosts`) is the hook's. Client `ClientMethod.hostbased` (the host
+  key, host name sent as given, client user).
+  **§8 password change, client side** (OpenSSH `ssh` and libssh2 have it; Go does not):
+  `PasswordOptions`/`ClientAuthOptions.password_change` (`PasswordChanger`, libssh2's callback shape)
+  answers SSH_MSG_USERAUTH_PASSWD_CHANGEREQ with `TRUE, old, new`, asked again when the server
+  refuses the new one (at most `max_password_changes`); without it a change request stays
+  `error.UnsupportedAuthMethod`. The server refuses a change request (`wrong_password`).
   *Client* (`authenticateWith`, Go `clientAuthenticate`): `none` first; then the first of the
   caller's `ClientMethod`s that the server's latest FAILURE lists and that has not failed
   (caller's order, as Go `Auth` and OpenSSH `PreferredAuthentications`); a partial success does
@@ -371,10 +398,17 @@ proves interop). `zig build interop-ssh` drives the Go `x/crypto/ssh` oracle (`t
   see Known limits), and canned-stream units for both roles of the auth state machines (partial
   success, multi-round keyboard-interactive, abandoned dialogue, `none` under `no_client_auth`,
   `max_auth_requests`, `InvalidAuthConfig` cases, caller order, `retryable`, several keys with only the
-  PK_OK'd one signed).
+  PK_OK'd one signed); Go's hooks (`sourceAddressAllowed` over addresses, blocks, mapped IPv4 and each
+  refusal; a `source-address` grant refused for every method and at the `publickey` query;
+  `publickey_verified` keeping, replacing and refusing a grant and never seeing a query or a bad
+  signature; pre-auth and per-connection banners on the wire; the auth log of every verdict);
+  `hostbased` both roles (`signedBlobHostbased` field order, a signature from another session, an
+  unknown host, a mismatched or unsupported algorithm, the host-name bound); the client's password
+  change (a refused new password asked again, a changer that gives up, the `max_password_changes`
+  bound).
 - **Loopback self-interop (`connection.zig`, `interop_test.zig`):** our client <-> our server over a real
   loopback socket, full stack: KEX, `publickey` (two-phase and direct), `password`, keyboard-interactive,
-  partial-success chains, session channel, `exec`, stdout/stderr/`exit-status`, and bulk output squeezed
+  partial-success chains, `hostbased`, session channel, `exec`, stdout/stderr/`exit-status`, and bulk output squeezed
   through a small window so window-adjust blocking happens in both directions.
 - **Reject-teeth, each with a positive control through the same harness:** a signature bound to another
   session id, an unauthorized key, CHANNEL_OPEN before authentication (`ProtocolError` + DISCONNECT), a
@@ -391,7 +425,8 @@ proves interop). `zig build interop-ssh` drives the Go `x/crypto/ssh` oracle (`t
   `direct-tcpip`, `tcpip-forward` + `forwarded-tcpip`, a real `ssh` ControlMaster over one connection to
   `serveConnection`, `ssh -tt`, `SetEnv` filtered by `accept_env`; `AuthenticationMethods` chains
   (`publickey,publickey`, `publickey,password`); a real `ssh` answering our keyboard-interactive prompts
-  through `SSH_ASKPASS_REQUIRE=force`; the Go oracle for keyboard-interactive and for
+  through `SSH_ASKPASS_REQUIRE=force`; a real `ssh` shown our pre-auth and per-connection banners and
+  logging in under a `source-address` grant it meets, and refused by one it does not; the Go oracle for keyboard-interactive and for
   `PartialSuccessError`, with a wrong second answer refused.
 - **Fuzz** (`SSH_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver, ReleaseSafe; never
   `zig build --fuzz`): `ssh-readstring`, `ssh-readmpint`, `ssh-kexinit`, `ssh-readpacket`,
@@ -464,16 +499,21 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
   the client `Session` keeps data the server sends after its EOF (Go's `handleData` does not check EOF
   either; OpenSSH drops it); a CHANNEL_OPEN_CONFIRMATION with a zero maximum packet size is
   `error.ChannelOpenFailed` without a CLOSE to the server (Go returns its error the same way).
+- **The §8 password-change sub-protocol, server side.** `serveUserauth` never sends
+  SSH_MSG_USERAUTH_PASSWD_CHANGEREQ and refuses a change request as a wrong password: `sshd` does the
+  same (`auth2-passwd.c` logs "password change not supported" and fails the attempt) and Go's server
+  refuses one outright. The client half is implemented.
+- **`hostbased` against OpenSSH, live.** Not tested: a real `ssh` signs hostbased requests only
+  through the setuid `ssh-keysign` with `EnableSSHKeysign` in the system `ssh_config`, and `sshd`
+  reads `shosts.equiv`/`~/.shosts` and `ssh_known_hosts` from fixed paths; neither can be arranged
+  without root or the user's home. Our client and server are tested against each other and the
+  signed blob field by field.
 - **`@cert-authority` known_hosts lines as trust anchors** (they need certificates), Go's
   `KeyError.Want` host-key-algorithm preference and the `CheckHostIP` second lookup by address.
 
 ## Backlog / deferred
 
-- **Userauth methods and callbacks not provided:** `hostbased` (RFC 4252 §9), the §8 password-change
-  sub-protocol (SSH_MSG_USERAUTH_PASSWD_CHANGEREQ is rejected, not handled), and from Go's server a
-  per-connection `BannerCallback` (the banner is a static `AuthConfig.banner`), `AuthLogCallback` for
-  successes (`on_rejected` covers refusals), `VerifiedPublicKeyCallback`, `PreAuthConnCallback` and the
-  `source-address` check (the module never sees the peer address).
+None open.
 
 ## Roadmap
 

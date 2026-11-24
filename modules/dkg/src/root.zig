@@ -129,6 +129,13 @@ pub const ecdsa_refresh = @import("ecdsa_refresh.zig");
 pub const EcdsaRefresh = ecdsa_refresh.EcdsaRefresh;
 pub const EcdsaRefreshPhase = ecdsa_refresh.Phase;
 
+/// Redistribution of a `threshold_ecdsa` key to a new committee (`n'`, `t'`):
+/// the old committee deals its shares, the new one runs keygen's proven aux
+/// rounds and receives — parties with no `KeyShare` yet included.
+pub const ecdsa_reshare = @import("ecdsa_reshare.zig");
+pub const EcdsaReshare = ecdsa_reshare.EcdsaReshare;
+pub const EcdsaResharePhase = ecdsa_reshare.Phase;
+
 /// Echo-broadcast helper: hash-compare layer that lets a point-to-point
 /// transport carry the reliable broadcast the round APIs assume.
 pub const echo = @import("echo.zig");
@@ -371,6 +378,7 @@ test {
     _ = core;
     _ = ecdsa_keygen;
     _ = ecdsa_refresh;
+    _ = ecdsa_reshare;
     _ = checks;
     _ = protocol;
     _ = wire;

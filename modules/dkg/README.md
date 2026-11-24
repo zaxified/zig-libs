@@ -40,13 +40,15 @@ this party's Shamir share `x_j`, the group key `Q = x·G`, and its verifying sha
 (which attaches each party's independently-generated Paillier keypair + ring-Pedersen aux
 params). `EcdsaKeygen` / `EcdsaRefresh` wrap the same machine into a full dealer-free
 `threshold_ecdsa` keygen / refresh that first exchanges the aux material with its
-correctness proofs (see `SPEC.md`).
+correctness proofs, and `EcdsaReshare` hands a `threshold_ecdsa` key to a new committee
+`(t', n')` — newcomers with no `KeyShare` included — the old committee dealing, the new one
+running the same proven aux rounds and confirming before the old shares may be erased (see
+`SPEC.md`).
 
 ## Not provided
 
-CGGMP21 signing-phase identifiable abort, jointly generated aux parameters, resharing with
-aux refresh, a FROST-style DKG with a proof of knowledge, and any `n < 2t − 1` (refused). See
-`SPEC.md`: *What is deliberately not done* and *Backlog / deferred*.
+CGGMP21 signing-phase identifiable abort, jointly generated aux parameters, a FROST-style DKG with a proof of knowledge, and any `n < 2t − 1` (refused). See
+`SPEC.md`: *What is deliberately not done* and *Roadmap*.
 
 ## Echo broadcast over point-to-point
 

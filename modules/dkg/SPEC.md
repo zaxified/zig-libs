@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [coinbase/kryptology](https://github.com/coinbase/kryptology) | Go | Apache-2.0 | 869 | **archived**, pushed 2022-09 | Pedersen/Gennaro DKG among many primitives; no longer maintained. |
 | Zig ecosystem (GitHub search "distributed key generation", "threshold signatures", language Zig, 2026-09-30) | Zig | — | — | — | Nothing comparable found. |
 
-**Where we are ahead:** the only Zig DKG found; GJKR's Pedersen-then-Feldman ordering (bias resistance) is implemented and covered by Byzantine round-sim tests plus an end-to-end anchor (DKG shares -> `threshold_ecdsa.signWithShares` -> `std` ECDSA verify under `Q`); a per-participant sans-I/O state machine (`Participant`) whose frames are fully validated, and resharing / proactive refresh that keeps `Q` (`ReshareDealer`/`ReshareReceiver`), as tss-lib does, and for `threshold_ecdsa` a full refresh (`EcdsaRefresh`: new shares plus new proven Paillier, ring-Pedersen and message keys) — with a plain-integer Python recomputation of a recorded transcript (`tools/gjkr_oracle.py`). **Where we are behind:** no proof of knowledge of the constant term, and reliable broadcast is the caller's (as GJKR assumes; `EchoBroadcast` checks that every party saw the same bytes); like GJKR it needs an honest majority (`n ≥ 2t − 1`), so `n`-of-`n` is refused, where a FROST-style DKG with a proof of knowledge takes any `t ≤ n`; resharing dealers answer complaints by opening shares (no identifiable-abort proof beyond that); aux material (Paillier, ring-Pedersen) is generated per party, not jointly — but `EcdsaKeygen` exchanges it with its correctness proofs (Πmod, Πprm, Πfac) before the shares are dealt, as tss-lib v2+ and CGGMP21 do; the older `assembleKeyShares` path still attaches unproven material; an in-flight run snapshots to plain bytes whose protection at rest is the caller's (as in frost-core and tss-lib); output only fits `threshold_ecdsa`, whose own scope is a proof of concept, and the sibling `frost` has no DKG at all.
+**Where we are ahead:** the only Zig DKG found; GJKR's Pedersen-then-Feldman ordering (bias resistance) is implemented and covered by Byzantine round-sim tests plus an end-to-end anchor (DKG shares -> `threshold_ecdsa.signWithShares` -> `std` ECDSA verify under `Q`); a per-participant sans-I/O state machine (`Participant`) whose frames are fully validated, and resharing / proactive refresh that keeps `Q` (`ReshareDealer`/`ReshareReceiver`), as tss-lib does, and for `threshold_ecdsa` a full refresh (`EcdsaRefresh`: new shares plus new proven Paillier, ring-Pedersen and message keys) and a redistribution to a new committee with the same proven aux rounds (`EcdsaReshare`) — with a plain-integer Python recomputation of a recorded transcript (`tools/gjkr_oracle.py`). **Where we are behind:** no proof of knowledge of the constant term, and reliable broadcast is the caller's (as GJKR assumes; `EchoBroadcast` checks that every party saw the same bytes); like GJKR it needs an honest majority (`n ≥ 2t − 1`), so `n`-of-`n` is refused, where a FROST-style DKG with a proof of knowledge takes any `t ≤ n`; resharing dealers answer complaints by opening shares (no identifiable-abort proof beyond that); aux material (Paillier, ring-Pedersen) is generated per party, not jointly — but `EcdsaKeygen` exchanges it with its correctness proofs (Πmod, Πprm, Πfac) before the shares are dealt, as tss-lib v2+ and CGGMP21 do; the older `assembleKeyShares` path still attaches unproven material; an in-flight run snapshots to plain bytes whose protection at rest is the caller's (as in frost-core and tss-lib); output only fits `threshold_ecdsa`, whose own scope is a proof of concept, and the sibling `frost` has no DKG at all.
 
 ## Goal
 
@@ -220,7 +220,7 @@ parties: a missing or failing announcement or Πfac aborts with `culprit()`
 naming the party; a duplicate modulus aborts without one (who copied whom is
 not visible in the bytes). The GJKR rounds keep their own rules. Every
 frame, the inner GJKR ones included, starts with a 16-byte run tag
-(`runTag`: protocol keygen/refresh, session id, `t`, `n`), checked before anything else; a
+(`runTag`: protocol keygen/refresh/reshare, session id, `t`, `n`), checked before anything else; a
 frame with another tag is `WrongSession` (without the tag the Feldman, complaint and
 defense frames would be bound to a run by the transport alone, so an aborted run's frames
 could be replayed into the retry). The bare `Participant` and `Reshare*` machines leave run
@@ -250,6 +250,25 @@ repeats a modulus or the message key of the old table, and the announce round re
 peer's (`StaleAuxMaterial`, culprit named), via `threshold_ecdsa.aux_info.reusesMaterial`
 against every old entry. A party whose last confirmations are lost aborts while the others
 finish (it keeps the old share; rerun to bring it in) — inherent to any final round.
+
+**Redistribution to a new committee (`ecdsa_reshare.zig`, `EcdsaReshare`).** `EcdsaRefresh`
+with the committees apart, as tss-lib's resharing splits them: the old committee `(t, n)`
+deals its shares (`ReshareDealer`, every dealer in `Params.dealers`, at least `t`), the new
+committee `(t', n')` runs keygen's aux rounds among itself (announcements with Πprm/Πmod, Πfac
+pairwise, the stale-material refusal against the OLD table) and receives (`ReshareReceiver`),
+then confirms as in refresh. A process is old, new or both (`init` takes an optional
+`KeyShare` and an optional `NewSeat` — a new party needs no `KeyShare`, only `Params`, which
+carries the old public-key table and `Q`). Senders are `Member{ old, new }`: dealing and
+defenses must come from an old id, announcements, Πfac, complaints and confirmations from a
+new id (`UnknownSender` otherwise); `.party = j` frames address NEW ids; a broadcast a role
+does not use is dropped. Old-only processes go through the same phases and reach `.done`
+when all `n'` new parties sent the same confirmation (tss-lib's old committee waits for the
+new committee's acknowledgement the same way) — the point after which the old share may be
+erased. The run tag is protocol `.reshare` over the session id and both configurations, and
+the new committee's proofs are bound to that tag (not the bare session id), `t'`, `n'` and
+the prover's new id. A bad dealer is excluded as in `ReshareReceiver` (the run continues
+while `t` dealers remain); an aux or confirmation fault aborts with `culprit()` naming the
+new id.
 
 ## Resharing (`reshare.zig`)
 
@@ -380,6 +399,17 @@ material uses Blum, not safe, primes for `Ñ`; the proofs and checks are the pro
 - **Per-participant equivalence.** `Participant`s driven over an in-memory router produce
   byte-identical `DkgShareOutput`s to `Dkg.run` for the same seed over a range of `(n, t)` with
   `n ≥ 2t − 1`; the joint Feldman commitments re-derive every `X_j`.
+- **ECDSA resharing** (`ecdsa_reshare.zig`). `(2,3) → (3,3)` with old party 3 leaving and a
+  newcomer with no `KeyShare` joining: every process finishes, the new committee signs under
+  `Q` (std ECDSA verifies), two new shares do not sign, an old share among new ones does not
+  sign, and the new shares interpolate to the old secret while an old share mixed in does not;
+  the new table reuses no old modulus or message key. A dealer whose share to one new party is
+  bad and who leaves the complaint undefended is excluded by every receiver, the two other
+  dealers carry the key and the result signs. A bent confirmation aborts every other process,
+  old-only included, naming the new id, and nobody hands out a share. Guards: no role, a
+  non-dealing old share, a share of another key or table, too few dealers, a bad new id, an
+  empty session id; senders of the wrong committee, own ids, frames to an old-only process
+  that must not reach it, out-of-round dealing, another protocol's run tag, duplicates.
 - **ECDSA keygen / refresh.** 2-of-3 over frames → `KeyShare`s → every signer pair signs → std
   ECDSA verifies under the joint key; a tampered Πfac aborts the receiver with the prover
   named; an announcement replayed under another party's id is refused with that id named; a
@@ -462,10 +492,6 @@ None open.
 
 ## Roadmap
 
-- **Resharing with aux refresh**: a membership change needs new parties' Paillier / ring-Pedersen
-  material; today it is attached by the caller.
-  Size: weeks — it is CGGMP21's auxiliary-info refresh protocol (with its Paillier-Blum and
-  ring-Pedersen proofs), the same sub-protocol as the next-but-one item; do the two together.
 - **CGGMP21 signing-phase identifiable abort** (naming a culprit during signing): a separate
   increment on top of `threshold_ecdsa` signing.
   Size: weeks — new proofs and a blame round in `threshold_ecdsa`'s signing, not in this module.

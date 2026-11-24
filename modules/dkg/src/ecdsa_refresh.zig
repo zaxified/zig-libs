@@ -608,34 +608,7 @@ pub const EcdsaRefresh = struct {
 
 const testing = std.testing;
 
-/// Test-only `LocalAux` from Blum primes (see `ecdsa_keygen.zig`'s twin).
-fn quickLocal(allocator: std.mem.Allocator, random: std.Random) !aux_info.LocalAux {
-    var key: tecdsa.PaillierBlumKey = undefined;
-    try tecdsa.generatePaillierBlum(random, 2048, &key);
-    errdefer key.wipe();
-    var ring: tecdsa.PaillierBlumKey = undefined;
-    try tecdsa.generatePaillierBlum(random, 2048, &ring);
-    defer ring.wipe();
-    const nt = ring.modulus();
-    var buf: [tecdsa.aux_modulus_bytes]u8 = undefined;
-    random.bytes(&buf);
-    buf[0] &= 0x3f;
-    const h2 = nt.sq(try tecdsa.AuxFe.fromBytes(nt, &buf, .big));
-    random.bytes(&buf);
-    buf[0] &= 0x3f;
-    const lambda = try tecdsa.AuxFe.fromBytes(nt, &buf, .big);
-    const h1 = try nt.pow(h2, lambda);
-    const p = try allocator.dupe(u8, ring.p());
-    errdefer allocator.free(p);
-    const q = try allocator.dupe(u8, ring.q());
-    var seed: [32]u8 = undefined;
-    random.bytes(&seed);
-    const aux: tecdsa.AuxParams = .{ .n_tilde = nt, .h1 = h1, .h2 = h2 };
-    var trapdoor: tecdsa.AuxTrapdoor = .{ .p = p, .q = q, .lambda = lambda };
-    var local: aux_info.LocalAux = undefined;
-    aux_info.LocalAux.fromParts(&key, aux, &trapdoor, &seed, &local);
-    return local;
-}
+const quickLocal = @import("testaux.zig").quickLocal;
 
 /// Lockstep driver over any party type with `start`/`advance`/`handle`/
 /// `takeOutgoing`/`phase`; `drop` filters frames (true = drop).

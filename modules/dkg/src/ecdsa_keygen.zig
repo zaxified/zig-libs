@@ -424,8 +424,8 @@ pub const run_tag_len = 16;
 pub const RunTag = [run_tag_len]u8;
 
 /// Which wrapper a run tag belongs to, so a keygen frame never passes as a
-/// refresh frame under the same session id.
-pub const Protocol = enum(u8) { keygen = 1, refresh = 2 };
+/// refresh or resharing frame under the same session id.
+pub const Protocol = enum(u8) { keygen = 1, refresh = 2, reshare = 3 };
 
 /// `SHA-256(domain || protocol || u32-BE len || session id || u32-BE t ||
 /// u32-BE n)[0..16]`: the prefix of every frame of one run.
@@ -477,37 +477,7 @@ pub fn appendTagged(list: *std.ArrayList(Outgoing), allocator: std.mem.Allocator
 
 const testing = std.testing;
 
-/// Test-only `LocalAux` from Blum primes: a second Paillier-Blum modulus
-/// stands in for `Ñ` (production uses safe primes — `LocalAux.generate` —
-/// which take minutes; Πprm/Πmod hold over any Blum modulus with a known
-/// `λ`, so the proofs and every check run for real).
-fn quickLocal(allocator: std.mem.Allocator, random: std.Random) !aux_info.LocalAux {
-    var key: tecdsa.PaillierBlumKey = undefined;
-    try tecdsa.generatePaillierBlum(random, 2048, &key);
-    errdefer key.wipe();
-    var ring: tecdsa.PaillierBlumKey = undefined;
-    try tecdsa.generatePaillierBlum(random, 2048, &ring);
-    defer ring.wipe();
-    const nt = ring.modulus();
-    var buf: [tecdsa.aux_modulus_bytes]u8 = undefined;
-    random.bytes(&buf);
-    buf[0] &= 0x3f;
-    const h2 = nt.sq(try tecdsa.AuxFe.fromBytes(nt, &buf, .big));
-    random.bytes(&buf);
-    buf[0] &= 0x3f;
-    const lambda = try tecdsa.AuxFe.fromBytes(nt, &buf, .big);
-    const h1 = try nt.pow(h2, lambda); // h1 ∈ ⟨h2⟩, the relation Πprm proves
-    const p = try allocator.dupe(u8, ring.p());
-    errdefer allocator.free(p);
-    const q = try allocator.dupe(u8, ring.q());
-    var seed: [32]u8 = undefined;
-    random.bytes(&seed);
-    const aux: tecdsa.AuxParams = .{ .n_tilde = nt, .h1 = h1, .h2 = h2 };
-    var trapdoor: tecdsa.AuxTrapdoor = .{ .p = p, .q = q, .lambda = lambda };
-    var local: aux_info.LocalAux = undefined;
-    aux_info.LocalAux.fromParts(&key, aux, &trapdoor, &seed, &local);
-    return local;
-}
+const quickLocal = @import("testaux.zig").quickLocal;
 
 const Rig = struct {
     parties: []EcdsaKeygen,

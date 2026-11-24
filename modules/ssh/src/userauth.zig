@@ -12,7 +12,10 @@
 //!     `server.serverHandshake`, the client half is `Transport.requestService`),
 //!   - the `publickey` method (§7) including the two-phase
 //!     query→SSH_MSG_USERAUTH_PK_OK→signed-request flow,
-//!   - the `password` method (§8), without the password-change sub-protocol,
+//!   - the `password` method (§8); the password-change sub-protocol on the
+//!     client side only (`PasswordChanger`, libssh2's shape — `sshd` and Go's
+//!     server refuse a change request, and so does `serveUserauth`),
+//!   - the `hostbased` method (§9), both roles,
 //!   - the `keyboard-interactive` method (RFC 4256): any number of
 //!     challenge rounds in both roles (server: `KbdCallback` +
 //!     `KbdPrompter`; the fixed one-round `KbdInteractiveCheck` stays),
@@ -59,8 +62,14 @@
 //! `rsa-sha2-512` (RFC 8332, key blob typed `ssh-rsa`) and
 //! `ecdsa-sha2-nistp256` (RFC 5656).
 //!
-//! Deferred (documented in SPEC.md, not stubbed): `hostbased` (§9), the §8
-//! password-change exchange, agent forwarding, and certificate
+//! Server hooks in Go's shape besides the deciding callbacks: a
+//! per-connection banner (`BannerCallback`), an authentication log of every
+//! verdict (`AuthLogHandler`), a second look at a verified key
+//! (`VerifiedPublickeyCallback`), a pre-authentication hook
+//! (`PreAuthHandler`), and the `source-address` critical option, checked
+//! against the peer address the caller hands in (`AuthConfig.remote_address`).
+//!
+//! Not here (SPEC.md): agent forwarding and certificate
 //! (`*-cert-v01@openssh.com`) key types.
 
 const std = @import("std");
@@ -68,6 +77,7 @@ const transport = @import("transport.zig");
 const messages = @import("messages.zig");
 const burn = @import("burn.zig");
 const server_mod = @import("server.zig");
+const netaddr = @import("netaddr");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 /// helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
@@ -92,6 +102,8 @@ pub const connection_service = "ssh-connection";
 pub const max_user_len = 255;
 pub const max_service_len = 64;
 pub const max_password_len = 1024;
+/// A `hostbased` client host name (§9: an FQDN; DNS caps one at 253).
+pub const max_host_len = 255;
 /// 4 KiB comfortably holds any key blob this module can verify (an rsa-4096
 /// blob is ~535 bytes) while keeping the SSH_MSG_USERAUTH_PK_OK echo of it
 /// inside one binary packet.
@@ -134,6 +146,8 @@ pub const AuthMethod = enum {
     password,
     keyboard_interactive,
     none,
+    /// RFC 4252 §9: the client HOST's key vouches for its user.
+    hostbased,
 
     pub fn wireName(m: AuthMethod) []const u8 {
         return switch (m) {
@@ -141,11 +155,12 @@ pub const AuthMethod = enum {
             .password => "password",
             .keyboard_interactive => "keyboard-interactive",
             .none => "none",
+            .hostbased => "hostbased",
         };
     }
 
-    /// `null` for a name this module does not implement (`hostbased`,
-    /// `gssapi-with-mic`, anything else).
+    /// `null` for a name this module does not implement (`gssapi-with-mic`,
+    /// anything else).
     pub fn fromWire(name: []const u8) ?AuthMethod {
         inline for (comptime std.enums.values(AuthMethod)) |m| {
             if (std.mem.eql(u8, name, comptime m.wireName())) return m;
@@ -217,6 +232,43 @@ pub fn signedBlob(
     try messages.writeString(w, key_blob);
 }
 
+/// The byte string an RFC 4252 §9 `hostbased` signature is made over — the
+/// request itself up to the signature, behind the session id:
+///
+///     string    session identifier
+///     byte      SSH_MSG_USERAUTH_REQUEST (50)
+///     string    user name
+///     string    service name
+///     string    "hostbased"
+///     string    public key algorithm for host key
+///     string    public host key (blob)
+///     string    client host name (as sent: OpenSSH's trailing '.' included)
+///     string    user name on the client host
+///
+/// One encoder for the signer (client) and the verifier (server), as
+/// `signedBlob` is for `publickey`.
+// secret-api-ok: encodes public protocol fields (session id, names, the host's PUBLIC key blob).
+pub fn signedBlobHostbased(
+    w: *std.Io.Writer,
+    session_id: []const u8,
+    user: []const u8,
+    service: []const u8,
+    algorithm: []const u8,
+    key_blob: []const u8,
+    client_host: []const u8,
+    client_user: []const u8,
+) std.Io.Writer.Error!void {
+    try messages.writeString(w, session_id);
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try messages.writeString(w, user);
+    try messages.writeString(w, service);
+    try messages.writeString(w, "hostbased");
+    try messages.writeString(w, algorithm);
+    try messages.writeString(w, key_blob);
+    try messages.writeString(w, client_host);
+    try messages.writeString(w, client_user);
+}
+
 // ── client side ────────────────────────────────────────────────────────────
 
 /// Caller seam for SSH_MSG_USERAUTH_BANNER (RFC 4252 §5.4): the server's
@@ -242,13 +294,39 @@ pub const BannerHandler = struct {
     }
 };
 
-/// Client-side `password` options. Only a banner seam for now — the §8
-/// method has no `probe_first` equivalent and authenticates for
-/// `ssh-connection` unconditionally.
+/// Client-side `password` options. The §8 method has no `probe_first`
+/// equivalent and authenticates for `ssh-connection` unconditionally.
 pub const PasswordOptions = struct {
     /// Where to deliver an SSH_MSG_USERAUTH_BANNER; `null` discards it.
     banner: ?BannerHandler = null,
+    /// Answers SSH_MSG_USERAUTH_PASSWD_CHANGEREQ (§8); `null` keeps the
+    /// method failing with `error.UnsupportedAuthMethod` on one.
+    password_change: ?PasswordChanger = null,
 };
+
+/// Asks the caller for a NEW password when the server answers a `password`
+/// request with SSH_MSG_USERAUTH_PASSWD_CHANGEREQ (RFC 4252 §8: the old one
+/// has expired) — the shape of libssh2's `passwd_change_cb`; OpenSSH's `ssh`
+/// prompts the user at the same point. `newFn` writes the new password into
+/// `buf` (`max_password_len` bytes, owned and scrubbed by this module) and
+/// returns its length, or `null` to give up (nothing is sent; the method
+/// counts as declined). `prompt` and `language` are the server's, borrowed
+/// for the call; `prompt` is attacker-controlled text like a banner.
+///
+/// The client then sends the change request (`boolean TRUE`, the old
+/// password, the new one). The server answers SUCCESS, FAILURE (with or
+/// without partial success: changed, more methods needed), or another
+/// CHANGEREQ when it does not accept the new password — `newFn` is asked
+/// again then, at most `max_password_changes` times.
+pub const PasswordChanger = struct {
+    ctx: *anyopaque = transport.no_context,
+    newFn: *const fn (ctx: *anyopaque, user: []const u8, prompt: []const u8, language: []const u8, buf: []u8) ?usize,
+};
+
+/// How many SSH_MSG_USERAUTH_PASSWD_CHANGEREQs one `password` request
+/// answers before the client gives up (`error.ProtocolError`): a server that
+/// keeps refusing every new password is not converging.
+pub const max_password_changes = 8;
 
 /// Client-side `publickey` options.
 pub const PublickeyOptions = struct {
@@ -465,7 +543,7 @@ pub fn authenticatePassword(
     const scratch = try gpa.alloc(u8, scratch_len);
     defer gpa.free(scratch);
 
-    const r = try passwordStep(t, gpa, scratch, user, password, opts.banner);
+    const r = try passwordStep(t, gpa, scratch, user, password, opts.banner, opts.password_change);
     if (r.outcome != .success) return error.AuthenticationFailed;
 }
 
@@ -476,9 +554,47 @@ fn passwordStep(
     user: []const u8,
     password: []const u8,
     banner: ?BannerHandler,
+    changer: ?PasswordChanger,
 ) UserauthError!StepResult {
     if (password.len > max_password_len) return error.NameTooLong;
-    const buf = try gpa.alloc(u8, 512 + user.len + password.len);
+    try sendPasswordRequest(t, gpa, user, password, null);
+
+    var new_buf: [max_password_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &new_buf);
+    var changes: usize = 0;
+    while (true) {
+        switch (try awaitAuthReply(t, scratch, banner)) {
+            .success => return .{ .outcome = .success },
+            .failure => |f| return .fromFailure(f),
+            // SSH_MSG_USERAUTH_PASSWD_CHANGEREQ shares message number 60
+            // with PK_OK: `string prompt || string language tag`.
+            .pk_ok => |body| {
+                const h = changer orelse return error.UnsupportedAuthMethod;
+                changes += 1;
+                if (changes > max_password_changes) return error.ProtocolError;
+                var c = Cursor{ .b = body };
+                const prompt = try c.string();
+                if (prompt.len > max_banner_len) return error.NameTooLong;
+                const language = try c.string();
+                const n = h.newFn(h.ctx, user, prompt, language, &new_buf) orelse return .{ .outcome = .declined };
+                if (n > new_buf.len) return error.NameTooLong;
+                try sendPasswordRequest(t, gpa, user, password, new_buf[0..n]);
+            },
+        }
+    }
+}
+
+/// §8: `boolean FALSE || string password`, or for a change `boolean TRUE ||
+/// string old || string new`, in a heap buffer scrubbed before it is freed.
+fn sendPasswordRequest(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    user: []const u8,
+    password: []const u8,
+    new_password: ?[]const u8,
+) UserauthError!void {
+    const new_len = if (new_password) |np| np.len else 0;
+    const buf = try gpa.alloc(u8, 512 + user.len + password.len + new_len);
     defer {
         std.crypto.secureZero(u8, buf);
         gpa.free(buf);
@@ -488,17 +604,10 @@ fn passwordStep(
     try messages.writeString(&w, user);
     try messages.writeString(&w, connection_service);
     try messages.writeString(&w, "password");
-    try w.writeByte(0); // FALSE: not a password *change* request
+    try w.writeByte(@intFromBool(new_password != null)); // TRUE: a change request
     try messages.writeString(&w, password);
+    if (new_password) |np| try messages.writeString(&w, np);
     try t.sendPacket(w.buffered());
-
-    switch (try awaitAuthReply(t, scratch, banner)) {
-        .success => return .{ .outcome = .success },
-        .failure => |f| return .fromFailure(f),
-        // SSH_MSG_USERAUTH_PASSWD_CHANGEREQ shares message number 60; the
-        // change sub-protocol is deliberately not implemented.
-        .pk_ok => return error.UnsupportedAuthMethod,
-    }
 }
 
 /// Client convenience: request the `ssh-userauth` service, then authenticate
@@ -666,6 +775,9 @@ pub const ClientMethod = union(enum) {
     password_prompt: PasswordPrompt,
     /// RFC 4256 (Go `KeyboardInteractive`).
     keyboard_interactive: KbdResponder,
+    /// RFC 4252 §9 (OpenSSH `HostbasedAuthentication`): `key` is the client
+    /// HOST's key, signing for `client_user` on `client_host`. Borrowed.
+    hostbased: Hostbased,
     /// Go `RetryableAuthMethod`: try `method` again after a plain failure,
     /// up to `max_tries` times in all (0: until `max_client_auth_steps`), as
     /// long as the server still lists it — a mistyped password or code
@@ -678,6 +790,17 @@ pub const ClientMethod = union(enum) {
         max_tries: u32 = 3,
     };
 
+    pub const Hostbased = struct {
+        /// The client host's private key (OpenSSH signs with
+        /// `/etc/ssh/ssh_host_*_key` through `ssh-keysign`).
+        key: *const AuthKey,
+        /// The client host's fully qualified name, sent as given (OpenSSH
+        /// appends a '.'; `sshd` and `serveUserauth` strip one).
+        client_host: []const u8,
+        /// The user's name on the client host.
+        client_user: []const u8,
+    };
+
     /// The RFC 4252 method this tries.
     // secret-api-ok: a switch over the method tag, no secret is read.
     pub fn method(self: ClientMethod) AuthMethod {
@@ -685,6 +808,7 @@ pub const ClientMethod = union(enum) {
             .publickey => .publickey,
             .password, .password_prompt => .password,
             .keyboard_interactive => .keyboard_interactive,
+            .hostbased => .hostbased,
             .retryable => |r| switch (r.method.*) {
                 .retryable => .none, // refused by `authenticateWith` before use
                 else => r.method.method(),
@@ -718,6 +842,9 @@ pub const ClientAuthOptions = struct {
     request_service: bool = true,
     /// Filled in on return, success or not.
     progress: ?*AuthProgress = null,
+    /// `password` and `password_prompt`: answers a password-change request
+    /// (see `PasswordChanger`).
+    password_change: ?PasswordChanger = null,
 };
 
 /// Bound on the steps of one `authenticateWith` (Go `maxAuthClientTried`).
@@ -836,15 +963,16 @@ fn runMethod(
             }
             return .{ .outcome = .failure, .allowed = allowed };
         },
-        .password => |pw| return passwordStep(t, gpa, scratch, user, pw, opts.banner),
+        .password => |pw| return passwordStep(t, gpa, scratch, user, pw, opts.banner, opts.password_change),
         .password_prompt => |p| {
             var buf: [max_password_len]u8 = undefined;
             defer std.crypto.secureZero(u8, &buf);
             const n = p.promptFn(p.ctx, user, &buf) orelse return .{ .outcome = .declined };
             if (n > buf.len) return error.NameTooLong;
-            return passwordStep(t, gpa, scratch, user, buf[0..n], opts.banner);
+            return passwordStep(t, gpa, scratch, user, buf[0..n], opts.banner, opts.password_change);
         },
         .keyboard_interactive => |resp| return kbdStep(t, gpa, scratch, user, resp, opts.banner),
+        .hostbased => |hb| return hostbasedStep(t, gpa, scratch, user, hb, opts.banner, session_id),
         .retryable => |rt| {
             const limit: u32 = if (rt.max_tries == 0) max_client_auth_steps else rt.max_tries;
             var r: StepResult = .{ .outcome = .failure };
@@ -859,6 +987,52 @@ fn runMethod(
             }
             return r;
         },
+    }
+}
+
+/// RFC 4252 §9 from the client's side: one signed request, no query phase
+/// (the method has none).
+fn hostbasedStep(
+    t: *transport.Transport,
+    gpa: std.mem.Allocator,
+    scratch: []u8,
+    user: []const u8,
+    hb: ClientMethod.Hostbased,
+    banner: ?BannerHandler,
+    session_id: []const u8,
+) UserauthError!StepResult {
+    if (hb.client_host.len > max_host_len or hb.client_user.len > max_user_len) return error.NameTooLong;
+    const rsa_hash = rsaHashFor(hb.key, t.server_sig_algs);
+    const algorithm = hb.key.algorithmNameFor(rsa_hash);
+    const blob = try hb.key.publicBlob(gpa);
+    defer gpa.free(blob);
+
+    const fixed_len = 1024 + blob.len + user.len + algorithm.len + hb.client_host.len + hb.client_user.len;
+    const to_sign = try gpa.alloc(u8, fixed_len + session_id.len);
+    defer gpa.free(to_sign);
+    var bw: std.Io.Writer = .fixed(to_sign);
+    try signedBlobHostbased(&bw, session_id, user, connection_service, algorithm, blob, hb.client_host, hb.client_user);
+    const signature = try hb.key.signWithHash(gpa, bw.buffered(), rsa_hash);
+    defer gpa.free(signature);
+
+    const buf = try gpa.alloc(u8, fixed_len + signature.len);
+    defer gpa.free(buf);
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try messages.writeString(&w, user);
+    try messages.writeString(&w, connection_service);
+    try messages.writeString(&w, "hostbased");
+    try messages.writeString(&w, algorithm);
+    try messages.writeString(&w, blob);
+    try messages.writeString(&w, hb.client_host);
+    try messages.writeString(&w, hb.client_user);
+    try messages.writeString(&w, signature);
+    try t.sendPacket(w.buffered());
+
+    switch (try awaitAuthReply(t, scratch, banner)) {
+        .success => return .{ .outcome = .success },
+        .failure => |f| return .fromFailure(f),
+        .pk_ok => return error.ProtocolError,
     }
 }
 
@@ -1067,6 +1241,14 @@ pub const AuthFailure = enum {
     wrong_answers,
     /// The peer sent SSH_MSG_DISCONNECT instead of another credential.
     peer_disconnected,
+    /// The deciding callback accepted, but the permissions it granted carry
+    /// a `source-address` critical option that `AuthConfig.remote_address`
+    /// does not match — or no address was handed in, or the list does not
+    /// parse (Go `checkSourceAddressCriticalOption`, OpenSSH alike).
+    source_address_denied,
+    /// `AuthConfig.hostbased` (or `callbacks.hostbased`) refused the client
+    /// host, its key or its user.
+    unauthorized_host,
 };
 
 /// Called synchronously, once, every time `serveUserauth` rejects a
@@ -1166,13 +1348,17 @@ pub const Decision = union(enum) {
     pub const accepted: Decision = .{ .accept = .{} };
 };
 
-/// What every deciding callback is told about the request (part of Go's
+/// What every deciding callback is told about the request (Go's
 /// `ConnMetadata`). Borrowed for the call.
 pub const AuthRequest = struct {
     user: []const u8,
     /// Methods that already partially succeeded on this connection.
     completed: MethodSet,
     session_id: []const u8,
+    /// `AuthConfig.remote_address` / `local_address`, as handed in (Go
+    /// `RemoteAddr`/`LocalAddr`; this module never sees the socket).
+    remote_address: ?std.Io.net.IpAddress = null,
+    local_address: ?std.Io.net.IpAddress = null,
 };
 
 /// Go `PublicKeyCallback`: decide on `key_blob` (the wire blob) offered with
@@ -1219,12 +1405,116 @@ pub const NoneCallback = struct {
     decideFn: *const fn (ctx: *anyopaque, req: *const AuthRequest) Decision,
 };
 
+/// The client's side of a `hostbased` request (RFC 4252 §9), borrowed for
+/// the call like every other peer string. `client_host` has one trailing
+/// '.' removed (OpenSSH's client sends `host.example.`, `sshd` strips it
+/// the same way). Whether that name belongs to the peer's address
+/// (`AuthRequest.remote_address`; `sshd` asks reverse DNS unless
+/// `HostbasedUsesNameFromPacketOnly`) and whether `key_blob` is that host's
+/// key (`ssh_known_hosts`) are the hook's decisions.
+pub const HostbasedRequest = struct {
+    client_host: []const u8,
+    client_user: []const u8,
+    /// The signature algorithm the request names (as `AuthorizedKeyCheck`).
+    algorithm: []const u8,
+    /// The host's public key blob, type prefix included.
+    key_blob: []const u8,
+};
+
+/// Server yes/no hook for `hostbased` (OpenSSH `HostbasedAuthentication`
+/// with `shosts.equiv` + `ssh_known_hosts`): may `hb.client_user` on
+/// `hb.client_host`, whose host key is `hb.key_blob`, log in as `user`? A
+/// true still needs the host key's signature over the session-id-bound
+/// request.
+pub const HostbasedCheck = struct {
+    ctx: *anyopaque = transport.no_context,
+    checkFn: *const fn (ctx: *anyopaque, user: []const u8, hb: *const HostbasedRequest) bool,
+};
+
+/// The deciding form of `HostbasedCheck` (for `AuthCallbacks`). Its verdict
+/// counts only once the signature verifies.
+pub const HostbasedCallback = struct {
+    ctx: *anyopaque = transport.no_context,
+    decideFn: *const fn (ctx: *anyopaque, req: *const AuthRequest, hb: *const HostbasedRequest) Decision,
+};
+
 /// The deciding callbacks for one step (Go `ServerAuthCallbacks`). A method
 /// is enabled when its field is set.
 pub const AuthCallbacks = struct {
     publickey: ?PublickeyCallback = null,
     password: ?PasswordCallback = null,
     keyboard_interactive: ?KbdCallback = null,
+    hostbased: ?HostbasedCallback = null,
+};
+
+/// Go `VerifiedPublicKeyCallback`: called once a client has PROVED it holds
+/// a key the `publickey` hook or callback accepted (the signature verified),
+/// with the permissions that accepted it (`granted`; empty for the yes/no
+/// hook). Its `Decision` is the step's verdict: `.accept` with these or other
+/// permissions, `.reject`, or `.partial`. While it is set, the publickey
+/// callback itself may not answer `.partial` (`error.InvalidAuthConfig`, Go:
+/// "invalid library usage"). It changes nothing about which methods are
+/// offered, and it is not called for the §7 query. Same borrowing as
+/// `PublickeyCallback`.
+pub const VerifiedPublickeyCallback = struct {
+    ctx: *anyopaque = transport.no_context,
+    decideFn: *const fn (ctx: *anyopaque, req: *const AuthRequest, algorithm: []const u8, key_blob: []const u8, granted: Permissions) Decision,
+};
+
+/// Go `BannerCallback`: the SSH_MSG_USERAUTH_BANNER for this connection,
+/// asked once, when the first USERAUTH_REQUEST arrives (the user name is
+/// known then). `null` or `""` sends none. The text must stay valid until
+/// the callback returns and fit `max_sent_banner_len`.
+pub const BannerCallback = struct {
+    ctx: *anyopaque = transport.no_context,
+    bannerFn: *const fn (ctx: *anyopaque, req: *const AuthRequest) ?[]const u8,
+};
+
+/// What one USERAUTH_REQUEST came to, for `AuthLogHandler`.
+pub const AuthOutcome = union(enum) {
+    /// SSH_MSG_USERAUTH_SUCCESS was sent.
+    accepted,
+    /// A partial success (`Decision.partial`).
+    partial,
+    /// Refused, with the reason `AuthConfig.failure` records.
+    rejected: AuthFailure,
+};
+
+/// Go `AuthLogCallback`: called after the verdict on every
+/// USERAUTH_REQUEST — successes and partial successes as well as refusals
+/// (`on_rejected` sees refusals only) — with the method name as the client
+/// sent it (an unknown one included). Not called for a §7 `publickey` query
+/// answered PK_OK, which is no verdict (Go skips it too). `req` and
+/// `method` are borrowed for the call.
+pub const AuthLogHandler = struct {
+    ctx: *anyopaque = transport.no_context,
+    onFn: *const fn (ctx: *anyopaque, req: *const AuthRequest, method: []const u8, outcome: AuthOutcome) void,
+};
+
+/// The connection before authentication, handed to `PreAuthHandler` (Go
+/// `ServerPreAuthConn`). Valid for the duration of the call only — Go lets
+/// an application keep it until authentication ends, which needs a handle
+/// this module does not have; a banner later in the dialogue is
+/// `BannerCallback`'s.
+pub const PreAuthConn = struct {
+    t: *transport.Transport,
+    session_id: []const u8,
+    remote_address: ?std.Io.net.IpAddress,
+    local_address: ?std.Io.net.IpAddress,
+
+    /// Send an SSH_MSG_USERAUTH_BANNER (§5.4) now, before any request is
+    /// read. At most `max_sent_banner_len` bytes (`error.NameTooLong`).
+    pub fn sendBanner(self: *const PreAuthConn, message: []const u8) UserauthError!void {
+        return sendBannerPacket(self.t, message);
+    }
+};
+
+/// Go `PreAuthConnCallback`: called once when `serveUserauth` starts, before
+/// the first request is read (rate limiting by address, a banner chosen by
+/// address, a log line).
+pub const PreAuthHandler = struct {
+    ctx: *anyopaque = transport.no_context,
+    onFn: *const fn (ctx: *anyopaque, conn: *const PreAuthConn) void,
 };
 
 /// The server's half of an RFC 4256 dialogue, handed to a `KbdCallback`
@@ -1386,6 +1676,29 @@ pub const AuthConfig = struct {
     /// behavior exactly: `failure` is still written on every rejection,
     /// this only adds an optional, unambiguous way to observe it.
     on_rejected: ?RejectionHandler = null,
+    /// Enables the RFC 4252 §9 `hostbased` method when set (a yes/no hook;
+    /// or `callbacks.hostbased`).
+    hostbased: ?HostbasedCheck = null,
+    /// A banner chosen per connection (Go `BannerCallback`), instead of the
+    /// static `banner` — both set is `error.InvalidAuthConfig`.
+    banner_callback: ?BannerCallback = null,
+    /// Every verdict, successes included (Go `AuthLogCallback`).
+    on_auth: ?AuthLogHandler = null,
+    /// A second decision once a `publickey` signature verified (Go
+    /// `VerifiedPublicKeyCallback`).
+    publickey_verified: ?VerifiedPublickeyCallback = null,
+    /// Called once before the first request is read (Go
+    /// `PreAuthConnCallback`).
+    pre_auth: ?PreAuthHandler = null,
+    /// The peer's address (Go `ConnMetadata.RemoteAddr`): this module never
+    /// sees the socket, so the caller that accepted it hands it in. Passed
+    /// to every callback in `AuthRequest`, and what the `source-address`
+    /// critical option is checked against — with `null`, a grant that
+    /// carries `source-address` is refused (as Go does without an address).
+    remote_address: ?std.Io.net.IpAddress = null,
+    /// The local address the peer connected to (Go `LocalAddr`); passed on
+    /// only.
+    local_address: ?std.Io.net.IpAddress = null,
 };
 
 /// Every SSH_MSG_USERAUTH_REQUEST counts against this, whatever its outcome
@@ -1438,6 +1751,14 @@ pub fn serveUserauth(
     const sid = try sessionId(t);
     var active = try Active.initial(config);
     if (active.methods().count() == 0 and !config.no_client_auth) return error.InvalidAuthConfig;
+    if (config.banner != null and config.banner_callback != null) return error.InvalidAuthConfig;
+
+    if (config.pre_auth) |h| h.onFn(h.ctx, &.{
+        .t = t,
+        .session_id = sid,
+        .remote_address = config.remote_address,
+        .local_address = config.local_address,
+    });
 
     const scratch = try gpa.alloc(u8, scratch_len);
     // The §8 `password` method delivers the peer's plaintext secret straight
@@ -1483,8 +1804,7 @@ pub fn serveUserauth(
         requests += 1;
 
         if (!banner_sent) {
-            if (config.banner) |b| try sendBanner(t, b);
-            banner_sent = true;
+            if (config.banner) |b| try sendBannerPacket(t, b);
         }
 
         var c = Cursor{ .b = pkt.payload[1..] };
@@ -1503,19 +1823,34 @@ pub fn serveUserauth(
         var res = AuthResult{ .completed = completed };
         @memcpy(res.user_buf[0..user.len], user);
         res.user_len = user.len;
-        const req: AuthRequest = .{ .user = res.user(), .completed = completed, .session_id = sid };
+        const req: AuthRequest = .{
+            .user = res.user(),
+            .completed = completed,
+            .session_id = sid,
+            .remote_address = config.remote_address,
+            .local_address = config.local_address,
+        };
+        if (!banner_sent) {
+            banner_sent = true;
+            // Go calls its BannerCallback here: once, the user name known.
+            if (config.banner_callback) |h| if (h.bannerFn(h.ctx, &req)) |b| if (b.len > 0) try sendBannerPacket(t, b);
+        }
         const method = AuthMethod.fromWire(method_name);
         const is_none = method != null and method.? == .none;
         if (is_none) none_requests += 1;
 
-        const step: Step = blk: {
+        var step: Step = blk: {
             // §5: authenticating for any service other than the connection
             // protocol is not something this module supports.
             if (!std.mem.eql(u8, service, connection_service)) break :blk .{ .rejected = .no_acceptable_method };
             const m = method orelse break :blk .{ .rejected = .no_acceptable_method };
             break :blk switch (m) {
                 .publickey => if (active.pk) |hook|
-                    try servePublickey(t, &c, &req, service, hook)
+                    try servePublickey(t, &c, &req, service, hook, config.publickey_verified)
+                else
+                    .{ .rejected = .no_acceptable_method },
+                .hostbased => if (active.hb) |hook|
+                    try serveHostbased(&c, &req, service, hook)
                 else
                     .{ .rejected = .no_acceptable_method },
                 .password => if (active.pw) |hook| pw: {
@@ -1542,6 +1877,22 @@ pub fn serveUserauth(
                     .{ .rejected = .no_acceptable_method },
             };
         };
+
+        // Go: `source-address` binds every grant, whichever method made it.
+        if (step == .accepted and !sourceAddressAllowed(step.accepted, config.remote_address))
+            step = .{ .rejected = .source_address_denied };
+        // A known method's name from the enum: keyboard-interactive has read
+        // its answers into the scratch `method_name` points into.
+        if (config.on_auth) |h| {
+            const name = if (method) |mm| mm.wireName() else method_name;
+            switch (step) {
+                .pk_ok_sent => {},
+                .accepted => h.onFn(h.ctx, &req, name, .accepted),
+                .partial => h.onFn(h.ctx, &req, name, .partial),
+                .rejected => |w| h.onFn(h.ctx, &req, name, .{ .rejected = w }),
+                .abandoned => h.onFn(h.ctx, &req, name, .{ .rejected = .wrong_answers }),
+            }
+        }
 
         switch (step) {
             .pk_ok_sent => continue,
@@ -1589,6 +1940,7 @@ const Active = struct {
     pk: ?PkHook = null,
     pw: ?PwHook = null,
     kbd: ?KbdHook = null,
+    hb: ?HbHook = null,
 
     fn initial(config: AuthConfig) UserauthError!Active {
         const cb = config.callbacks;
@@ -1596,13 +1948,16 @@ const Active = struct {
         // hook-enabled method is always active in the first step, so beside
         // a callback that starts a chain (`publickey` → partial → `password`)
         // a `password` hook would log in alone, skipping the chain.
-        const any_hook = config.authorized_key != null or config.password != null or config.keyboard_interactive != null;
-        const any_callback = cb.publickey != null or cb.password != null or cb.keyboard_interactive != null;
+        const any_hook = config.authorized_key != null or config.password != null or
+            config.keyboard_interactive != null or config.hostbased != null;
+        const any_callback = cb.publickey != null or cb.password != null or
+            cb.keyboard_interactive != null or cb.hostbased != null;
         if (any_hook and any_callback) return error.InvalidAuthConfig;
         var a: Active = .from(&cb);
         if (config.authorized_key) |h| a.pk = .{ .check = h };
         if (config.password) |h| a.pw = .{ .check = h };
         if (config.keyboard_interactive) |h| a.kbd = .{ .check = h };
+        if (config.hostbased) |h| a.hb = .{ .check = h };
         return a;
     }
 
@@ -1611,6 +1966,7 @@ const Active = struct {
             .pk = if (cb.publickey) |h| .{ .callback = h } else null,
             .pw = if (cb.password) |h| .{ .callback = h } else null,
             .kbd = if (cb.keyboard_interactive) |h| .{ .callback = h } else null,
+            .hb = if (cb.hostbased) |h| .{ .callback = h } else null,
         };
     }
 
@@ -1619,6 +1975,7 @@ const Active = struct {
         if (self.pk != null) s.insert(.publickey);
         if (self.pw != null) s.insert(.password);
         if (self.kbd != null) s.insert(.keyboard_interactive);
+        if (self.hb != null) s.insert(.hostbased);
         return s;
     }
 };
@@ -1626,6 +1983,7 @@ const Active = struct {
 const PkHook = union(enum) { check: AuthorizedKeyCheck, callback: PublickeyCallback };
 const PwHook = union(enum) { check: PasswordCheck, callback: PasswordCallback };
 const KbdHook = union(enum) { check: KbdInteractiveCheck, callback: KbdCallback };
+const HbHook = union(enum) { check: HostbasedCheck, callback: HostbasedCallback };
 
 /// How one request ended, server side.
 const Step = union(enum) {
@@ -1694,6 +2052,7 @@ fn servePublickey(
     req: *const AuthRequest,
     service: []const u8,
     hook: PkHook,
+    verified: ?VerifiedPublickeyCallback,
 ) UserauthError!Step {
     const has_signature = try c.boolean();
     const algorithm = try c.string();
@@ -1717,6 +2076,11 @@ fn servePublickey(
         .callback => |h| h.decideFn(h.ctx, req, algorithm, key_blob),
     };
     if (d == .reject) return .{ .rejected = .unauthorized_key };
+    if (d == .partial and verified != null) return error.InvalidAuthConfig;
+    // Go: a `source-address` the key's grant cannot meet fails the query
+    // too, before the client signs.
+    if (d == .accept and !sourceAddressAllowed(d.accept, req.remote_address))
+        return .{ .rejected = .source_address_denied };
 
     if (!has_signature) {
         // §7 query phase: SSH_MSG_USERAUTH_PK_OK || string alg || string blob.
@@ -1753,7 +2117,88 @@ fn servePublickey(
         error.UnsupportedAlgorithm => return .{ .rejected = .unsupported_algorithm },
         else => return e,
     };
+    if (verified) |h| if (d == .accept) return decided(h.decideFn(h.ctx, req, algorithm, key_blob, d.accept), .unauthorized_key);
     return decided(d, .unauthorized_key);
+}
+
+/// The `hostbased` half of `serveUserauth` (RFC 4252 §9). `c` is positioned
+/// just after the method name. No query phase: the request is signed.
+fn serveHostbased(
+    c: *Cursor,
+    req: *const AuthRequest,
+    service: []const u8,
+    hook: HbHook,
+) UserauthError!Step {
+    const algorithm = try c.string();
+    const key_blob = try c.string();
+    const client_host = try c.string();
+    const client_user = try c.string();
+    const signature = try c.string();
+    if (key_blob.len > max_key_blob_len or signature.len > max_signature_len or
+        client_host.len > max_host_len or client_user.len > max_user_len) return error.NameTooLong;
+
+    const want_blob_type = transport.keyBlobTypeFor(algorithm) orelse
+        return .{ .rejected = .unsupported_algorithm };
+    var kc = Cursor{ .b = key_blob };
+    const blob_type = kc.string() catch return .{ .rejected = .algorithm_mismatch };
+    if (!std.mem.eql(u8, blob_type, want_blob_type)) return .{ .rejected = .algorithm_mismatch };
+
+    // `sshd` (auth2-hostbased.c) drops one trailing '.' the OpenSSH client
+    // appends; the signature still covers the name as sent.
+    const host = if (std.mem.endsWith(u8, client_host, ".")) client_host[0 .. client_host.len - 1] else client_host;
+    const hb: HostbasedRequest = .{ .client_host = host, .client_user = client_user, .algorithm = algorithm, .key_blob = key_blob };
+    const d: Decision = switch (hook) {
+        .check => |h| if (h.checkFn(h.ctx, req.user, &hb)) Decision.accepted else .reject,
+        .callback => |h| h.decideFn(h.ctx, req, &hb),
+    };
+    if (d == .reject) return .{ .rejected = .unauthorized_host };
+
+    var to_sign: [max_key_blob_len + 2048]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&to_sign);
+    signedBlobHostbased(&bw, req.session_id, req.user, service, algorithm, key_blob, client_host, client_user) catch
+        return error.NameTooLong;
+    var sc = Cursor{ .b = signature };
+    const sig_algorithm = sc.string() catch return .{ .rejected = .bad_signature };
+    if (!std.mem.eql(u8, sig_algorithm, algorithm)) return .{ .rejected = .algorithm_mismatch };
+    transport.verifySignature(blob_type, key_blob, signature, bw.buffered()) catch |e| switch (e) {
+        error.HostKeyVerificationFailed, error.ProtocolError => return .{ .rejected = .bad_signature },
+        error.UnsupportedAlgorithm => return .{ .rejected = .unsupported_algorithm },
+        else => return e,
+    };
+    return decided(d, .unauthorized_host);
+}
+
+/// The critical option Go and OpenSSH enforce themselves.
+pub const source_address_option = "source-address";
+
+/// Go `checkSourceAddressCriticalOption`: true unless `perms` carries a
+/// `source-address` critical option — a comma-separated list of addresses
+/// and CIDR blocks — that `remote` does not match. Like Go: no address
+/// known, an empty value or an entry that parses as neither an address nor
+/// a prefix all refuse; an IPv4-mapped IPv6 peer is matched as IPv4; host
+/// bits in a prefix are ignored (`10.1.2.3/8` is `10.0.0.0/8`; OpenSSH
+/// refuses such an entry).
+pub fn sourceAddressAllowed(perms: Permissions, remote: ?std.Io.net.IpAddress) bool {
+    const list = perms.criticalOption(source_address_option) orelse return true;
+    const peer = (netaddr.Ip.fromStd(remote orelse return false)).unmap();
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |entry| {
+        if (netaddr.parseIp(entry)) |ip| {
+            if (ip.unmap().eql(peer)) return true;
+        } else if (netaddr.parsePrefix(entry)) |p| {
+            if (unmapPrefix(p).contains(peer)) return true;
+        } else return false;
+    }
+    return false;
+}
+
+/// `::ffff:a.b.c.d/n` with `n >= 96` as the IPv4 prefix it denotes (Go
+/// compares such a network with an IPv4 peer through `To4`).
+fn unmapPrefix(p: netaddr.Prefix) netaddr.Prefix {
+    return switch (p.addr) {
+        .v4 => p,
+        .v6 => if (p.bits >= 96 and p.addr.unmap() == .v4) .{ .addr = p.addr.unmap(), .bits = p.bits - 96 } else p,
+    };
 }
 
 fn sendSuccess(t: *transport.Transport) UserauthError!void {
@@ -1767,9 +2212,9 @@ fn sendFailure(t: *transport.Transport, set: MethodSet, partial: bool) UserauthE
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE));
-    var names: [3][]const u8 = undefined;
+    var names: [4][]const u8 = undefined;
     var n: usize = 0;
-    for ([_]AuthMethod{ .publickey, .password, .keyboard_interactive }) |m| {
+    for ([_]AuthMethod{ .publickey, .password, .keyboard_interactive, .hostbased }) |m| {
         if (!set.contains(m)) continue;
         names[n] = m.wireName();
         n += 1;
@@ -1779,7 +2224,7 @@ fn sendFailure(t: *transport.Transport, set: MethodSet, partial: bool) UserauthE
     return t.sendPacket(w.buffered());
 }
 
-fn sendBanner(t: *transport.Transport, banner: []const u8) UserauthError!void {
+fn sendBannerPacket(t: *transport.Transport, banner: []const u8) UserauthError!void {
     if (banner.len > max_sent_banner_len) return error.NameTooLong;
     var buf: [max_sent_banner_len + 64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -2370,7 +2815,7 @@ test "servePublickey: an ed25519 key blob, its OWN valid signature, wrapped in a
         fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
             return true;
         }
-    }.f } });
+    }.f } }, null);
     // Not merely "refused": refused for the RIGHT reason — the blob-type
     // cross-check, which is the one thing standing between this forged
     // request and a successful login.
@@ -2645,7 +3090,7 @@ test "AuthorizedKeyCheck: the caller's context decides, and its refusal is named
         var c = Cursor{ .b = rw.buffered() };
         const outcome = try servePublickey(&tr, &c, &.{ .user = "alice", .completed = .empty, .session_id = "session" }, connection_service, .{
             .check = .{ .ctx = &policy, .checkFn = KeyPolicy.f },
-        });
+        }, null);
         try t.expectEqual(Step.pk_ok_sent, outcome);
         try t.expectEqual(@as(usize, 1), policy.calls);
         // …and the hook was told who and with what, not just shown a blob.
@@ -2662,7 +3107,7 @@ test "AuthorizedKeyCheck: the caller's context decides, and its refusal is named
         var c = Cursor{ .b = rw.buffered() };
         const outcome = try servePublickey(&tr, &c, &.{ .user = "alice", .completed = .empty, .session_id = "session" }, connection_service, .{
             .check = .{ .ctx = &policy, .checkFn = KeyPolicy.f },
-        });
+        }, null);
         try t.expectEqual(AuthFailure.unauthorized_key, outcome.rejected);
     }
 }
@@ -3205,9 +3650,9 @@ test "authenticateWith: several keys in order — only one the server answers PK
 
 test "parseMethodList: known names only, unknown and empty ignored" {
     const t = std.testing;
-    const s = parseMethodList("gssapi-with-mic,publickey,,keyboard-interactive,hostbased");
-    try t.expectEqual(@as(usize, 2), s.count());
-    try t.expect(s.contains(.publickey) and s.contains(.keyboard_interactive));
+    const s = parseMethodList("gssapi-with-mic,publickey,,keyboard-interactive,hostbased,password-change");
+    try t.expectEqual(@as(usize, 3), s.count());
+    try t.expect(s.contains(.publickey) and s.contains(.keyboard_interactive) and s.contains(.hostbased));
     try t.expectEqual(@as(usize, 0), parseMethodList("").count());
     for (std.enums.values(AuthMethod)) |m| try t.expectEqual(@as(?AuthMethod, m), AuthMethod.fromWire(m.wireName()));
 }
@@ -4048,7 +4493,7 @@ test "userauth banner: the longest one a server sends is a banner its client acc
     var ww: std.Io.Writer = .fixed(&S.wire);
     var none: std.Io.Reader = .fixed("");
     var srv = transport.Transport.init(&none, &ww);
-    try sendBanner(&srv, &long);
+    try sendBannerPacket(&srv, &long);
     try frameRaw(&ww, &[_]u8{@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)});
     var r: std.Io.Reader = .fixed(ww.buffered());
     var sink: std.Io.Writer = .fixed(&S.out);
@@ -4201,4 +4646,687 @@ test "serveUserauth: a keyboard-interactive answer is scrubbed from the scratch 
     const res = try serveUserauth(&tr, fba.allocator(), .{ .callbacks = .{ .keyboard_interactive = .{ .decideFn = S.kbd } } });
     try t.expectEqual(AuthMethod.keyboard_interactive, res.method);
     try t.expect(!S.leaked);
+}
+
+// ── Go-shaped server hooks, hostbased, password change ─────────────────────
+
+fn testAddr(text: []const u8) std.Io.net.IpAddress {
+    return std.Io.net.IpAddress.parse(text, 22) catch unreachable;
+}
+
+fn sourceAddressPerms(list: []const u8, store: *[1]Permissions.Option) Permissions {
+    store.* = .{.{ .name = source_address_option, .value = list }};
+    return .{ .critical_options = store };
+}
+
+test "sourceAddressAllowed: Go's matching — addresses, CIDR blocks, mapped IPv4, and every refusal" {
+    const t = std.testing;
+    var o: [1]Permissions.Option = undefined;
+    // No option: nothing to check, with or without an address.
+    try t.expect(sourceAddressAllowed(.{}, null));
+    try t.expect(sourceAddressAllowed(.{}, testAddr("192.0.2.1")));
+    // An address, a block, a list.
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("192.0.2.1", &o), testAddr("192.0.2.1")));
+    try t.expect(!sourceAddressAllowed(sourceAddressPerms("192.0.2.1", &o), testAddr("192.0.2.2")));
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("10.0.0.0/8,192.0.2.0/24", &o), testAddr("192.0.2.77")));
+    try t.expect(!sourceAddressAllowed(sourceAddressPerms("10.0.0.0/8,192.0.2.0/24", &o), testAddr("198.51.100.1")));
+    // Host bits in a block are ignored, as Go's ParseCIDR does.
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("10.1.2.3/8", &o), testAddr("10.200.0.1")));
+    // IPv6, and an IPv4-mapped peer against an IPv4 entry (Go's To4).
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("2001:db8::/32", &o), testAddr("2001:db8::5")));
+    try t.expect(!sourceAddressAllowed(sourceAddressPerms("2001:db8::/32", &o), testAddr("2001:db9::5")));
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("192.0.2.1", &o), testAddr("::ffff:192.0.2.1")));
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("192.0.2.0/24", &o), testAddr("::ffff:192.0.2.9")));
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("::ffff:192.0.2.0/120", &o), testAddr("192.0.2.9")));
+    // Refusals: no address known, an empty value, an entry that is neither
+    // (even after one that would have matched nothing yet), a space.
+    try t.expect(!sourceAddressAllowed(sourceAddressPerms("192.0.2.1", &o), null));
+    try t.expect(!sourceAddressAllowed(sourceAddressPerms("", &o), testAddr("192.0.2.1")));
+    try t.expect(!sourceAddressAllowed(sourceAddressPerms("garbage,192.0.2.1", &o), testAddr("192.0.2.1")));
+    try t.expect(!sourceAddressAllowed(sourceAddressPerms("192.0.2.1, 192.0.2.2", &o), testAddr("192.0.2.2")));
+    // An earlier match wins before a later bad entry is read (Go returns
+    // at the first match).
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("192.0.2.1,garbage", &o), testAddr("192.0.2.1")));
+}
+
+/// A deciding password callback that grants `perms` for "hunter2".
+const GrantingPassword = struct {
+    perms: Permissions = .{},
+    fn decide(ctx: *anyopaque, _: *const AuthRequest, pw: []const u8) Decision {
+        const self: *GrantingPassword = @ptrCast(@alignCast(ctx));
+        return if (std.mem.eql(u8, pw, "hunter2")) .{ .accept = self.perms } else .reject;
+    }
+    fn config(self: *GrantingPassword) AuthConfig {
+        return .{ .callbacks = .{ .password = .{ .ctx = self, .decideFn = decide } } };
+    }
+};
+
+test "serveUserauth: a grant whose source-address the peer does not match is refused, whatever the method" {
+    const t = std.testing;
+    var o: [1]Permissions.Option = undefined;
+    var g: GrantingPassword = .{ .perms = sourceAddressPerms("192.0.2.0/24", &o) };
+    // Inside the block: accepted, and the option is handed on.
+    {
+        var cfg = g.config();
+        cfg.remote_address = testAddr("192.0.2.10");
+        var m: [1]Msg = undefined;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        const res = try serveCanned(&.{m[0].password("alice", "hunter2").bytes()}, &sink, cfg);
+        try t.expectEqualStrings("192.0.2.0/24", res.permissions.criticalOption("source-address").?);
+    }
+    // Outside it, and with no address at all: a refusal named for it, and a
+    // FAILURE on the wire (the right password notwithstanding).
+    for ([_]?std.Io.net.IpAddress{ testAddr("198.51.100.1"), null }) |addr| {
+        var why: AuthFailure = .peer_disconnected;
+        var rec: RejectionRecorder = .{};
+        var cfg = g.config();
+        cfg.remote_address = addr;
+        cfg.failure = &why;
+        cfg.on_rejected = rec.handler();
+        cfg.max_attempts = 1;
+        var m: [1]Msg = undefined;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.AuthenticationFailed, serveCanned(&.{m[0].password("alice", "hunter2").bytes()}, &sink, cfg));
+        try t.expectEqual(AuthFailure.source_address_denied, why);
+        try t.expectEqual(@as(usize, 1), rec.calls);
+        var store: [4][512]u8 = undefined;
+        const replies = try replyPayloads(sink.buffered(), &store);
+        try t.expectEqual(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE), replies[0][0]);
+    }
+}
+
+/// A publickey callback granting `perms` to the ed25519 key of seed 9.
+const PkGrant = struct {
+    blob: []const u8,
+    perms: Permissions = .{},
+    partial_next: ?*const AuthCallbacks = null,
+    fn decide(ctx: *anyopaque, _: *const AuthRequest, _: []const u8, key_blob: []const u8) Decision {
+        const self: *PkGrant = @ptrCast(@alignCast(ctx));
+        if (!std.mem.eql(u8, key_blob, self.blob)) return .reject;
+        if (self.partial_next) |n| return .{ .partial = n };
+        return .{ .accept = self.perms };
+    }
+};
+
+fn pkKey() AuthKey {
+    return .{ .ed25519 = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(9))) catch unreachable };
+}
+
+/// A signed `publickey` request for `key` over the canned session id
+/// "session"; `sig_store` holds the signature.
+fn signedPkRequest(m: *Msg, key: *const AuthKey, blob: []const u8, sig_store: []u8) ![]const u8 {
+    var to_sign: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&to_sign);
+    try signedBlob(&w, "session", "alice", connection_service, "ssh-ed25519", blob);
+    const sig = try key.sign(std.testing.allocator, w.buffered());
+    defer std.testing.allocator.free(sig);
+    @memcpy(sig_store[0..sig.len], sig);
+    return m.request("alice", "publickey").byte(1).str("ssh-ed25519").str(blob).str(sig_store[0..sig.len]).bytes();
+}
+
+test "serveUserauth publickey: a grant the peer address cannot meet fails the query too, before the client signs" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const key = pkKey();
+    const blob = try key.publicBlob(gpa);
+    defer gpa.free(blob);
+    var o: [1]Permissions.Option = undefined;
+    var grant: PkGrant = .{ .blob = blob, .perms = sourceAddressPerms("10.0.0.1", &o) };
+    var why: AuthFailure = .peer_disconnected;
+    var m: [1]Msg = undefined;
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try t.expectError(error.AuthenticationFailed, serveCanned(&.{
+        m[0].request("alice", "publickey").byte(0).str("ssh-ed25519").str(blob).bytes(),
+    }, &sink, .{
+        .callbacks = .{ .publickey = .{ .ctx = &grant, .decideFn = PkGrant.decide } },
+        .remote_address = testAddr("10.0.0.2"),
+        .failure = &why,
+        .max_attempts = 1,
+    }));
+    try t.expectEqual(AuthFailure.source_address_denied, why);
+    var store: [4][512]u8 = undefined;
+    const replies = try replyPayloads(sink.buffered(), &store);
+    // FAILURE, not PK_OK.
+    try t.expectEqual(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE), replies[0][0]);
+}
+
+const Verified = struct {
+    calls: usize = 0,
+    saw_granted: ?[]const u8 = null,
+    verdict: enum { keep, replace, reject } = .keep,
+    replacement: [1]Permissions.Option = .{.{ .name = "force-command", .value = "/bin/verified" }},
+
+    fn decide(ctx: *anyopaque, req: *const AuthRequest, algorithm: []const u8, _: []const u8, granted: Permissions) Decision {
+        const self: *Verified = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        std.debug.assert(std.mem.eql(u8, req.user, "alice") and std.mem.eql(u8, algorithm, "ssh-ed25519"));
+        self.saw_granted = granted.criticalOption("force-command");
+        return switch (self.verdict) {
+            .keep => .{ .accept = granted },
+            .replace => .{ .accept = .{ .critical_options = &self.replacement } },
+            .reject => .reject,
+        };
+    }
+};
+
+test "serveUserauth: publickey_verified decides after the signature verified, never for the query" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const key = pkKey();
+    const blob = try key.publicBlob(gpa);
+    defer gpa.free(blob);
+    var granted: [1]Permissions.Option = .{.{ .name = "force-command", .value = "/bin/first" }};
+    var grant: PkGrant = .{ .blob = blob, .perms = .{ .critical_options = &granted } };
+    var sig_store: [128]u8 = undefined;
+
+    for ([_]@FieldType(Verified, "verdict"){ .keep, .replace, .reject }) |verdict| {
+        var v: Verified = .{ .verdict = verdict };
+        var why: AuthFailure = .peer_disconnected;
+        var m: [2]Msg = undefined;
+        const payloads = [_][]const u8{
+            m[0].request("alice", "publickey").byte(0).str("ssh-ed25519").str(blob).bytes(),
+            try signedPkRequest(&m[1], &key, blob, &sig_store),
+        };
+        var sink_buf: [2048]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        const cfg: AuthConfig = .{
+            .callbacks = .{ .publickey = .{ .ctx = &grant, .decideFn = PkGrant.decide } },
+            .publickey_verified = .{ .ctx = &v, .decideFn = Verified.decide },
+            .failure = &why,
+            .max_attempts = 1,
+        };
+        const r = serveCanned(&payloads, &sink, cfg);
+        // Called once: for the signed request, not for the query.
+        try t.expectEqual(@as(usize, 1), v.calls);
+        try t.expectEqualStrings("/bin/first", v.saw_granted.?);
+        switch (verdict) {
+            .keep => try t.expectEqualStrings("/bin/first", (try r).permissions.criticalOption("force-command").?),
+            .replace => try t.expectEqualStrings("/bin/verified", (try r).permissions.criticalOption("force-command").?),
+            .reject => {
+                try t.expectError(error.AuthenticationFailed, r);
+                try t.expectEqual(AuthFailure.unauthorized_key, why);
+            },
+        }
+    }
+
+    // A signature that does not verify never reaches it.
+    {
+        var v: Verified = .{};
+        var m: [1]Msg = undefined;
+        var bad_sig = sig_store;
+        const req = try signedPkRequest(&m[0], &key, blob, &bad_sig);
+        var tampered: [1024]u8 = undefined;
+        @memcpy(tampered[0..req.len], req);
+        tampered[req.len - 1] ^= 1;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.AuthenticationFailed, serveCanned(&.{tampered[0..req.len]}, &sink, .{
+            .callbacks = .{ .publickey = .{ .ctx = &grant, .decideFn = PkGrant.decide } },
+            .publickey_verified = .{ .ctx = &v, .decideFn = Verified.decide },
+            .max_attempts = 1,
+        }));
+        try t.expectEqual(@as(usize, 0), v.calls);
+    }
+
+    // With it set, the publickey callback may not answer partial (Go).
+    {
+        var v: Verified = .{};
+        const next: AuthCallbacks = .{ .password = .{ .decideFn = struct {
+            fn f(_: *anyopaque, _: *const AuthRequest, _: []const u8) Decision {
+                return .reject;
+            }
+        }.f } };
+        var partial: PkGrant = .{ .blob = blob, .partial_next = &next };
+        var m: [1]Msg = undefined;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.InvalidAuthConfig, serveCanned(&.{
+            m[0].request("alice", "publickey").byte(0).str("ssh-ed25519").str(blob).bytes(),
+        }, &sink, .{
+            .callbacks = .{ .publickey = .{ .ctx = &partial, .decideFn = PkGrant.decide } },
+            .publickey_verified = .{ .ctx = &v, .decideFn = Verified.decide },
+        }));
+    }
+}
+
+const BannerAndLog = struct {
+    banner_calls: usize = 0,
+    banner_user: [16]u8 = undefined,
+    banner_user_len: usize = 0,
+    pre_calls: usize = 0,
+    pre_saw_port: u16 = 0,
+    log: [8]struct { method: [24]u8, method_len: usize, outcome: AuthOutcome } = undefined,
+    logged: usize = 0,
+
+    fn banner(ctx: *anyopaque, req: *const AuthRequest) ?[]const u8 {
+        const self: *BannerAndLog = @ptrCast(@alignCast(ctx));
+        self.banner_calls += 1;
+        @memcpy(self.banner_user[0..req.user.len], req.user);
+        self.banner_user_len = req.user.len;
+        return "per-connection banner";
+    }
+    fn onAuth(ctx: *anyopaque, _: *const AuthRequest, method: []const u8, outcome: AuthOutcome) void {
+        const self: *BannerAndLog = @ptrCast(@alignCast(ctx));
+        const e = &self.log[self.logged];
+        @memcpy(e.method[0..method.len], method);
+        e.method_len = method.len;
+        e.outcome = outcome;
+        self.logged += 1;
+    }
+    fn preAuth(ctx: *anyopaque, conn: *const PreAuthConn) void {
+        const self: *BannerAndLog = @ptrCast(@alignCast(ctx));
+        self.pre_calls += 1;
+        self.pre_saw_port = conn.remote_address.?.getPort();
+        conn.sendBanner("pre-auth banner") catch unreachable;
+    }
+    fn methodAt(self: *const BannerAndLog, i: usize) []const u8 {
+        return self.log[i].method[0..self.log[i].method_len];
+    }
+};
+
+test "serveUserauth: pre_auth, banner_callback and on_auth — Go's PreAuthConn, BannerCallback and AuthLogCallback" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var hooks: BannerAndLog = .{};
+    var two: TwoStep = .{};
+    two.init();
+    var cfg = two.config();
+    cfg.pre_auth = .{ .ctx = &hooks, .onFn = BannerAndLog.preAuth };
+    cfg.banner_callback = .{ .ctx = &hooks, .bannerFn = BannerAndLog.banner };
+    cfg.on_auth = .{ .ctx = &hooks, .onFn = BannerAndLog.onAuth };
+    cfg.remote_address = std.Io.net.IpAddress.parse("192.0.2.1", 40022) catch unreachable;
+    // `none` (refused), an unknown method (refused), the password (partial),
+    // a publickey query (no verdict: not logged), then two kbd rounds.
+    const key = pkKey();
+    const blob = try key.publicBlob(gpa);
+    defer gpa.free(blob);
+    var m: [7]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    // The publickey query is refused after the partial (the next step has
+    // keyboard-interactive only), so it is a verdict and is logged.
+    const res = try serveCanned(&.{
+        m[0].request("alice", "none").bytes(),
+        m[1].request("alice", "gssapi-with-mic").bytes(),
+        m[2].password("alice", "hunter2").bytes(),
+        m[3].request("alice", "publickey").byte(0).str("ssh-ed25519").str(blob).bytes(),
+        m[4].kbd("alice").bytes(),
+        m[5].infoResponse("111").bytes(),
+        m[6].infoResponse("222").bytes(),
+    }, &sink, cfg);
+    try t.expectEqual(AuthMethod.keyboard_interactive, res.method);
+
+    try t.expectEqual(@as(usize, 1), hooks.pre_calls);
+    try t.expectEqual(@as(u16, 40022), hooks.pre_saw_port);
+    try t.expectEqual(@as(usize, 1), hooks.banner_calls);
+    try t.expectEqualStrings("alice", hooks.banner_user[0..hooks.banner_user_len]);
+    try t.expectEqual(@as(usize, 5), hooks.logged);
+    try t.expectEqualStrings("none", hooks.methodAt(0));
+    try t.expectEqual(AuthOutcome{ .rejected = .no_acceptable_method }, hooks.log[0].outcome);
+    try t.expectEqualStrings("gssapi-with-mic", hooks.methodAt(1));
+    try t.expectEqualStrings("password", hooks.methodAt(2));
+    try t.expectEqual(AuthOutcome.partial, hooks.log[2].outcome);
+    try t.expectEqualStrings("publickey", hooks.methodAt(3));
+    try t.expectEqual(AuthOutcome{ .rejected = .no_acceptable_method }, hooks.log[3].outcome);
+    try t.expectEqualStrings("keyboard-interactive", hooks.methodAt(4));
+    try t.expectEqual(AuthOutcome.accepted, hooks.log[4].outcome);
+
+    // The wire: the pre-auth banner first, the callback's banner before the
+    // first verdict.
+    var store: [12][512]u8 = undefined;
+    const replies = try replyPayloads(sink.buffered(), &store);
+    try t.expectEqual(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER), replies[0][0]);
+    try t.expect(std.mem.indexOf(u8, replies[0], "pre-auth banner") != null);
+    try t.expectEqual(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER), replies[1][0]);
+    try t.expect(std.mem.indexOf(u8, replies[1], "per-connection banner") != null);
+    try t.expectEqual(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE), replies[2][0]);
+}
+
+test "serveUserauth: a successful publickey query is not logged; a static banner and a banner callback together are refused" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const key = pkKey();
+    const blob = try key.publicBlob(gpa);
+    defer gpa.free(blob);
+    var grant: PkGrant = .{ .blob = blob };
+    var hooks: BannerAndLog = .{};
+    var sig_store: [128]u8 = undefined;
+    var m: [2]Msg = undefined;
+    const payloads = [_][]const u8{
+        m[0].request("alice", "publickey").byte(0).str("ssh-ed25519").str(blob).bytes(),
+        try signedPkRequest(&m[1], &key, blob, &sig_store),
+    };
+    var sink_buf: [2048]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    _ = try serveCanned(&payloads, &sink, .{
+        .callbacks = .{ .publickey = .{ .ctx = &grant, .decideFn = PkGrant.decide } },
+        .on_auth = .{ .ctx = &hooks, .onFn = BannerAndLog.onAuth },
+    });
+    try t.expectEqual(@as(usize, 1), hooks.logged);
+    try t.expectEqual(AuthOutcome.accepted, hooks.log[0].outcome);
+
+    try t.expectError(error.InvalidAuthConfig, serveCanned(&.{}, &sink, .{
+        .callbacks = .{ .publickey = .{ .ctx = &grant, .decideFn = PkGrant.decide } },
+        .banner = "static",
+        .banner_callback = .{ .ctx = &hooks, .bannerFn = BannerAndLog.banner },
+    }));
+}
+
+// ── hostbased (RFC 4252 §9) ────────────────────────────────────────────────
+
+const HostPolicy = struct {
+    host_blob: []const u8,
+    calls: usize = 0,
+    saw_host: [64]u8 = undefined,
+    saw_host_len: usize = 0,
+
+    fn check(ctx: *anyopaque, user: []const u8, hb: *const HostbasedRequest) bool {
+        const self: *HostPolicy = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        @memcpy(self.saw_host[0..hb.client_host.len], hb.client_host);
+        self.saw_host_len = hb.client_host.len;
+        return std.mem.eql(u8, user, "alice") and std.mem.eql(u8, hb.client_user, "alice") and
+            std.mem.eql(u8, hb.client_host, "client.example") and std.mem.eql(u8, hb.key_blob, self.host_blob);
+    }
+};
+
+/// A hostbased request from `client.example.` signed by `key` over
+/// `session`; `store` holds the signature.
+fn hostbasedRequest(m: *Msg, key: *const AuthKey, blob: []const u8, session: []const u8, store: []u8) ![]const u8 {
+    var to_sign: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&to_sign);
+    try signedBlobHostbased(&w, session, "alice", connection_service, "ssh-ed25519", blob, "client.example.", "alice");
+    const sig = try key.sign(std.testing.allocator, w.buffered());
+    defer std.testing.allocator.free(sig);
+    @memcpy(store[0..sig.len], sig);
+    return m.request("alice", "hostbased").str("ssh-ed25519").str(blob).str("client.example.").str("alice").str(store[0..sig.len]).bytes();
+}
+
+test "serveUserauth hostbased: a host key's signature over the session logs the user in; the trailing dot is stripped for the hook" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const host_key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x48))) };
+    const blob = try host_key.publicBlob(gpa);
+    defer gpa.free(blob);
+    var policy: HostPolicy = .{ .host_blob = blob };
+    var sig_store: [128]u8 = undefined;
+    var m: [2]Msg = undefined;
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    const res = try serveCanned(&.{
+        m[0].request("alice", "none").bytes(),
+        try hostbasedRequest(&m[1], &host_key, blob, "session", &sig_store),
+    }, &sink, .{ .hostbased = .{ .ctx = &policy, .checkFn = HostPolicy.check } });
+    try t.expectEqual(AuthMethod.hostbased, res.method);
+    try t.expectEqualStrings("client.example", policy.saw_host[0..policy.saw_host_len]);
+    // The none probe's FAILURE lists hostbased.
+    var store: [4][512]u8 = undefined;
+    const replies = try replyPayloads(sink.buffered(), &store);
+    const f = try parseFailure(replies[0]);
+    try t.expect(f.allowed.contains(.hostbased) and f.allowed.count() == 1);
+}
+
+test "serveUserauth hostbased: another session's signature, an unknown host key, a mismatched algorithm are refused and named" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const host_key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x48))) };
+    const blob = try host_key.publicBlob(gpa);
+    defer gpa.free(blob);
+    const Case = struct { session: []const u8, authorized: bool, algorithm: []const u8, want: AuthFailure };
+    for ([_]Case{
+        .{ .session = "other-session", .authorized = true, .algorithm = "ssh-ed25519", .want = .bad_signature },
+        .{ .session = "session", .authorized = false, .algorithm = "ssh-ed25519", .want = .unauthorized_host },
+        .{ .session = "session", .authorized = true, .algorithm = "rsa-sha2-256", .want = .algorithm_mismatch },
+        .{ .session = "session", .authorized = true, .algorithm = "ssh-dss", .want = .unsupported_algorithm },
+    }) |case| {
+        var policy: HostPolicy = .{ .host_blob = if (case.authorized) blob else "another host's key" };
+        var sig_store: [128]u8 = undefined;
+        var m: [1]Msg = undefined;
+        var req = try hostbasedRequest(&m[0], &host_key, blob, case.session, &sig_store);
+        var alt: Msg = undefined;
+        if (!std.mem.eql(u8, case.algorithm, "ssh-ed25519")) {
+            var to_sign: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&to_sign);
+            try signedBlobHostbased(&w, "session", "alice", connection_service, "ssh-ed25519", blob, "client.example.", "alice");
+            const sig = try host_key.sign(gpa, w.buffered());
+            defer gpa.free(sig);
+            @memcpy(sig_store[0..sig.len], sig);
+            req = alt.request("alice", "hostbased").str(case.algorithm).str(blob).str("client.example.").str("alice").str(sig_store[0..sig.len]).bytes();
+        }
+        var why: AuthFailure = .peer_disconnected;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.AuthenticationFailed, serveCanned(&.{req}, &sink, .{
+            .hostbased = .{ .ctx = &policy, .checkFn = HostPolicy.check },
+            .failure = &why,
+            .max_attempts = 1,
+        }));
+        try t.expectEqual(case.want, why);
+    }
+    // Bounds: a client host name of max_host_len + 1 is NameTooLong.
+    {
+        var policy: HostPolicy = .{ .host_blob = blob };
+        const long: [max_host_len + 1]u8 = @splat('h');
+        var m: [1]Msg = undefined;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.NameTooLong, serveCanned(&.{
+            m[0].request("alice", "hostbased").str("ssh-ed25519").str(blob).str(&long).str("alice").str("sig").bytes(),
+        }, &sink, .{ .hostbased = .{ .ctx = &policy, .checkFn = HostPolicy.check } }));
+    }
+    // A hostbased hook beside a callback is a configuration that cannot work.
+    {
+        var policy: HostPolicy = .{ .host_blob = blob };
+        var sink_buf: [64]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.InvalidAuthConfig, serveCanned(&.{}, &sink, .{
+            .hostbased = .{ .ctx = &policy, .checkFn = HostPolicy.check },
+            .callbacks = .{ .password = .{ .decideFn = struct {
+                fn f(_: *anyopaque, _: *const AuthRequest, _: []const u8) Decision {
+                    return .reject;
+                }
+            }.f } },
+        }));
+    }
+}
+
+test "authenticateWith hostbased: the request carries the host key, names and a signature the server's encoder verifies" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const host_key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x48))) };
+    const blob = try host_key.publicBlob(gpa);
+    defer gpa.free(blob);
+    var m: [2]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var progress: AuthProgress = .{};
+    try clientCanned(&.{
+        m[0].failure("hostbased", false).bytes(),
+        m[1].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+    }, &sink, &.{.{ .hostbased = .{ .key = &host_key, .client_host = "client.example.", .client_user = "bob" } }}, &progress);
+    try t.expectEqual(@as(?AuthMethod, .hostbased), progress.succeeded);
+
+    var store: [4][512]u8 = undefined;
+    const reqs = try replyPayloads(sink.buffered(), &store);
+    try t.expectEqual(@as(usize, 2), reqs.len);
+    var c = Cursor{ .b = reqs[1][1..] };
+    try t.expectEqualStrings("alice", try c.string());
+    try t.expectEqualStrings(connection_service, try c.string());
+    try t.expectEqualStrings("hostbased", try c.string());
+    try t.expectEqualStrings("ssh-ed25519", try c.string());
+    try t.expectEqualSlices(u8, blob, try c.string());
+    try t.expectEqualStrings("client.example.", try c.string());
+    try t.expectEqualStrings("bob", try c.string());
+    const sig = try c.string();
+    try t.expect(c.atEnd());
+    var w_buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&w_buf);
+    try signedBlobHostbased(&w, "session", "alice", connection_service, "ssh-ed25519", blob, "client.example.", "bob");
+    try transport.verifySignature("ssh-ed25519", blob, sig, w.buffered());
+    // A server answering PK_OK to a hostbased request is a protocol error.
+    var m2: [2]Msg = undefined;
+    var sink2_buf: [4096]u8 = undefined;
+    var sink2: std.Io.Writer = .fixed(&sink2_buf);
+    try t.expectError(error.ProtocolError, clientCanned(&.{
+        m2[0].failure("hostbased", false).bytes(),
+        m2[1].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_PK_OK)).str("").str("").bytes(),
+    }, &sink2, &.{.{ .hostbased = .{ .key = &host_key, .client_host = "h", .client_user = "bob" } }}, &progress));
+}
+
+test "signedBlobHostbased: exact RFC 4252 §9 field order" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try signedBlobHostbased(&w, "SID", "alice", connection_service, "ssh-ed25519", "KEY", "host.", "bob");
+    var c = Cursor{ .b = w.buffered() };
+    try t.expectEqualStrings("SID", try c.string());
+    try t.expectEqual(@as(u8, 50), try c.byte());
+    try t.expectEqualStrings("alice", try c.string());
+    try t.expectEqualStrings("ssh-connection", try c.string());
+    try t.expectEqualStrings("hostbased", try c.string());
+    try t.expectEqualStrings("ssh-ed25519", try c.string());
+    try t.expectEqualStrings("KEY", try c.string());
+    try t.expectEqualStrings("host.", try c.string());
+    try t.expectEqualStrings("bob", try c.string());
+    try t.expect(c.atEnd());
+}
+
+// ── the §8 password change, client side ─────────────────────────────────────
+
+const NewPassword = struct {
+    answers: []const []const u8,
+    calls: usize = 0,
+    prompt: [64]u8 = undefined,
+    prompt_len: usize = 0,
+
+    fn new(ctx: *anyopaque, user: []const u8, prompt: []const u8, _: []const u8, buf: []u8) ?usize {
+        const self: *NewPassword = @ptrCast(@alignCast(ctx));
+        std.debug.assert(std.mem.eql(u8, user, "alice"));
+        @memcpy(self.prompt[0..prompt.len], prompt);
+        self.prompt_len = prompt.len;
+        if (self.calls == self.answers.len) return null;
+        const a = self.answers[self.calls];
+        self.calls += 1;
+        @memcpy(buf[0..a.len], a);
+        return a.len;
+    }
+};
+
+fn changeReq(m: *Msg, prompt: []const u8) []const u8 {
+    return m.begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_PK_OK)).str(prompt).str("").bytes();
+}
+
+const PwReq = struct { change: bool, old: []const u8, new: []const u8 };
+
+/// The `password` requests in `wire`: (change flag, old, new).
+fn passwordRequests(wire: []const u8, store: [][512]u8, out: []PwReq) !usize {
+    const payloads = try replyPayloads(wire, store);
+    var n: usize = 0;
+    for (payloads) |p| {
+        var c = Cursor{ .b = p[1..] };
+        _ = try c.string();
+        _ = try c.string();
+        if (!std.mem.eql(u8, try c.string(), "password")) continue;
+        const change = try c.boolean();
+        const old = try c.string();
+        out[n] = .{ .change = change, .old = old, .new = if (change) try c.string() else "" };
+        try std.testing.expect(c.atEnd());
+        n += 1;
+    }
+    return n;
+}
+
+test "authenticateWith password: a change request is answered with the old and the new password; a refused new one is asked again" {
+    const t = std.testing;
+    var np: NewPassword = .{ .answers = &.{ "weak", "Str0ng-enough" } };
+    var m: [4]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var progress: AuthProgress = .{};
+    var wire: [16 * 1024]u8 = undefined;
+    const framed = try framePackets(&wire, &.{
+        m[0].failure("password", false).bytes(),
+        changeReq(&m[1], "Password expired, choose a new one"),
+        changeReq(&m[2], "Too weak"),
+        m[3].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+    });
+    var r: std.Io.Reader = .fixed(framed);
+    var tr = transport.Transport.init(&r, &sink);
+    tr.session_id = transport.SessionId.from("session");
+    try authenticateWith(&tr, t.allocator, "alice", &.{.{ .password = "old-pw" }}, .{
+        .request_service = false,
+        .progress = &progress,
+        .password_change = .{ .ctx = &np, .newFn = NewPassword.new },
+    });
+    try t.expectEqual(@as(?AuthMethod, .password), progress.succeeded);
+    try t.expectEqual(@as(usize, 2), np.calls);
+    try t.expectEqualStrings("Too weak", np.prompt[0..np.prompt_len]);
+
+    var store: [8][512]u8 = undefined;
+    var reqs: [4]PwReq = undefined;
+    const n = try passwordRequests(sink.buffered(), &store, &reqs);
+    try t.expectEqual(@as(usize, 3), n);
+    try t.expect(!reqs[0].change);
+    try t.expectEqualStrings("old-pw", reqs[0].old);
+    try t.expect(reqs[1].change);
+    try t.expectEqualStrings("old-pw", reqs[1].old);
+    try t.expectEqualStrings("weak", reqs[1].new);
+    try t.expect(reqs[2].change);
+    try t.expectEqualStrings("Str0ng-enough", reqs[2].new);
+}
+
+test "authenticatePassword: without a changer a change request stays UnsupportedAuthMethod; a changer that gives up sends nothing; the change loop is bounded" {
+    const t = std.testing;
+    // No changer: today's behaviour.
+    {
+        var m: [1]Msg = undefined;
+        var wire: [4096]u8 = undefined;
+        const framed = try framePackets(&wire, &.{changeReq(&m[0], "expired")});
+        var r: std.Io.Reader = .fixed(framed);
+        var sink_buf: [2048]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        try t.expectError(error.UnsupportedAuthMethod, authenticatePassword(&tr, t.allocator, "alice", "pw", .{}));
+    }
+    // A changer that gives up: declined, so AuthenticationFailed, and only
+    // the first request on the wire.
+    {
+        var np: NewPassword = .{ .answers = &.{} };
+        var m: [1]Msg = undefined;
+        var wire: [4096]u8 = undefined;
+        const framed = try framePackets(&wire, &.{changeReq(&m[0], "expired")});
+        var r: std.Io.Reader = .fixed(framed);
+        var sink_buf: [2048]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        try t.expectError(error.AuthenticationFailed, authenticatePassword(&tr, t.allocator, "alice", "pw", .{
+            .password_change = .{ .ctx = &np, .newFn = NewPassword.new },
+        }));
+        var store: [4][512]u8 = undefined;
+        try t.expectEqual(@as(usize, 1), (try replyPayloads(sink.buffered(), &store)).len);
+    }
+    // max_password_changes CHANGEREQs are answered, the next one ends it.
+    {
+        const many: [max_password_changes + 1][]const u8 = @splat("again");
+        var np: NewPassword = .{ .answers = &many };
+        var m: [max_password_changes + 1]Msg = undefined;
+        var payloads: [max_password_changes + 1][]const u8 = undefined;
+        for (&payloads, &m) |*p, *mm| p.* = changeReq(mm, "no");
+        var wire: [16 * 1024]u8 = undefined;
+        const framed = try framePackets(&wire, &payloads);
+        var r: std.Io.Reader = .fixed(framed);
+        var sink_buf: [8192]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        try t.expectError(error.ProtocolError, authenticatePassword(&tr, t.allocator, "alice", "pw", .{
+            .password_change = .{ .ctx = &np, .newFn = NewPassword.new },
+        }));
+        try t.expectEqual(@as(usize, max_password_changes), np.calls);
+    }
 }

@@ -282,14 +282,113 @@ fn runCombine(tainted: bool) !void {
     std.debug.print("ctgrind_result={x}\n", .{x_j.toBytes(.big)});
 }
 
+// ── target "reshare": old shares and dealer randomness through EcdsaReshare ──
+
+/// `EcdsaReshare`'s composition on secrets: three OLD-only processes (each
+/// built from a `KeyShare` whose secret share is tainted, drawing its
+/// dealing polynomial from tainted randomness) deal to the new committee,
+/// whose three receivers (`ReshareReceiver`, what a new party runs inside
+/// `EcdsaReshare`) combine the dealt shares. The new committee's aux rounds
+/// (2048-bit Paillier proofs) are left out: they handle no share, and they
+/// have their own rows in `threshold_ecdsa` (`fac`, `pimod`, `piprm`).
+/// Measures `EcdsaReshare.init` (the copy of the old share into the dealer),
+/// the dealing, the frame routing and the receivers' Lagrange combination.
+/// Witness: the new shares, printed.
+fn runReshare(allocator: std.mem.Allocator, tainted: bool) !void {
+    const tecdsa = @import("threshold_ecdsa");
+    const ecdsa_reshare = root.ecdsa_reshare;
+    var old_prng = std.Random.DefaultPrng.init(0x646b675f727368); // "dkg_rsh"
+    const old_cfg: Config = .{ .t = 2, .n = 3 };
+    const outs = try Dkg.run(allocator, old_cfg, .{}, old_prng.random());
+    defer {
+        for (outs) |*o| o.deinit();
+        allocator.free(outs);
+    }
+
+    // The old committee's `KeyShare`s: only the fields a dealer reads are
+    // set (the Paillier and aux material belong to the new committee's
+    // rounds, which this target does not run); the rest is zero bytes.
+    var entries: [3]tecdsa.PartyPublicKeys = undefined;
+    @memset(std.mem.sliceAsBytes(&entries), 0);
+    for (&entries, outs) |*e, o| {
+        e.index = o.index;
+        e.verifying_share = o.verifying_share;
+    }
+    var shares: [3]tecdsa.KeyShare = undefined;
+    @memset(std.mem.sliceAsBytes(&shares), 0);
+    for (&shares, outs) |*ks, o| {
+        ks.index = o.index;
+        ks.t = old_cfg.t;
+        ks.n = old_cfg.n;
+        ks.secret_share = o.secret_share;
+        ks.group_public_key = o.group_public_key;
+        ks.verifying_share = o.verifying_share;
+        ks.public_keys = .{ .entries = &entries };
+        if (tainted) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&ks.secret_share));
+    }
+    defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(&shares));
+
+    const dealers = [_]u32{ 1, 2, 3 };
+    const new_cfg: Config = .{ .t = 2, .n = 3 };
+    const params: ecdsa_reshare.Params = .{
+        .old = old_cfg,
+        .new = new_cfg,
+        .dealers = &dealers,
+        .group_public_key = outs[0].group_public_key,
+        .old_public_keys = .{ .entries = &entries },
+    };
+    var inner_prng = std.Random.DefaultPrng.init(0x646b675f726e64); // "dkg_rnd"
+    var wrapper: TaintAll = .{ .inner = inner_prng.random(), .tainted = tainted };
+
+    var procs: [3]ecdsa_reshare.EcdsaReshare = undefined;
+    var made: usize = 0;
+    defer for (procs[0..made]) |*p| p.deinit();
+    while (made < 3) : (made += 1) procs[made] = try ecdsa_reshare.EcdsaReshare.init(allocator, params, "ctgrind", &shares[made], null, wrapper.random());
+
+    var xs: [3]root.Element = undefined;
+    for (&xs, outs) |*x, o| x.* = o.verifying_share;
+    const rc: root.ReshareConfig = .{ .old = old_cfg, .new = new_cfg, .dealers = &dealers, .group_public_key = outs[0].group_public_key, .old_verifying_shares = &xs };
+    var receivers: [3]root.ReshareReceiver = undefined;
+    var rmade: usize = 0;
+    defer for (receivers[0..rmade]) |*r| r.deinit();
+    while (rmade < 3) : (rmade += 1) receivers[rmade] = try root.ReshareReceiver.init(allocator, rc, @intCast(rmade + 1));
+
+    // new -> announce -> factors -> shares: the old-only processes deal.
+    for (&procs) |*p| try p.start();
+    for (&procs) |*p| try p.advance();
+    for (&procs) |*p| try p.advance();
+    const tag_len = root.ecdsa_keygen.run_tag_len;
+    for (&procs, 1..) |*p, i| {
+        const msgs = try p.takeOutgoing();
+        defer root.freeOutgoing(allocator, msgs);
+        for (msgs) |m| for (&receivers, 1..) |*r, j| {
+            switch (m.to) {
+                .broadcast => {},
+                .party => |to| if (to != j) continue,
+            }
+            try r.handle(.{ .dealer = @intCast(i) }, m.bytes[tag_len..]);
+        };
+    }
+    for (&receivers) |*r| try r.advance(); // shares -> complaints (none)
+    for (&procs) |*p| try p.advance(); // shares -> complaints
+    for (&procs) |*p| try p.advance(); // complaints -> defenses (nothing to open)
+    for (&receivers) |*r| try r.advance(); // complaints -> defenses
+    for (&receivers) |*r| try r.advance(); // defenses -> done
+    for (&receivers) |*r| {
+        const o = r.output().?;
+        std.debug.print("ctgrind_result={x}\n", .{o.secret_share.toBytes(.big)});
+    }
+}
+
 // ── the harness proper ────────────────────────────────────────────────────
 
-const Target = enum { coeffs, combine };
+const Target = enum { coeffs, combine, reshare };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "coeffs")) return .coeffs;
     if (std.mem.eql(u8, s, "combine")) return .combine;
+    if (std.mem.eql(u8, s, "reshare")) return .reshare;
     return error.UnknownTarget;
 }
 
@@ -314,6 +413,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             try runCoeffs(da.allocator(), tainted);
         },
         .combine => try runCombine(tainted),
+        .reshare => {
+            var da: std.heap.DebugAllocator(.{}) = .init; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
+            defer _ = da.deinit();
+            try runReshare(da.allocator(), tainted);
+        },
     }
 }
 

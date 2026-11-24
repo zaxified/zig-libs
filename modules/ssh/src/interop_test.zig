@@ -1576,3 +1576,133 @@ test "live: a real ssh client through our two-step server — publickey (partial
     try std.testing.expect(std.mem.startsWith(u8, out, "kind=exec cmd=uname -a"));
     try std.testing.expect(std.mem.find(u8, out, " force=uptime") != null);
 }
+
+// ── hostbased, and Go's server hooks against a real ssh ────────────────────
+
+test "loopback: hostbased — our client signs with the host key, our server checks host, user and signature" {
+    const gpa = std.testing.allocator;
+    const host_key = testHostKey(0x81);
+    const blob = try host_key.publicBlob(gpa);
+    defer gpa.free(blob);
+    const Policy = struct {
+        blob: []const u8,
+        fn check(ctx: *anyopaque, user: []const u8, hb: *const userauth.HostbasedRequest) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return std.mem.eql(u8, user, "alice") and std.mem.eql(u8, hb.client_user, "alice") and
+                std.mem.eql(u8, hb.client_host, "client.example") and std.mem.eql(u8, hb.key_blob, self.blob);
+        }
+    };
+    var policy: Policy = .{ .blob = blob };
+    const r = try loopbackAuth(&.{.{ .hostbased = .{ .key = &host_key, .client_host = "client.example.", .client_user = "alice" } }}, .{
+        .hostbased = .{ .ctx = &policy, .checkFn = Policy.check },
+    });
+    if (r.client_err) |e| return e;
+    const res = try r.server;
+    try std.testing.expectEqual(userauth.AuthMethod.hostbased, res.method);
+    try std.testing.expectEqual(@as(?userauth.AuthMethod, .hostbased), r.progress.succeeded);
+
+    // Another host's key: refused, and the client has nothing left.
+    const other = testHostKey(0x82);
+    var why: userauth.AuthFailure = .peer_disconnected;
+    const r2 = try loopbackAuth(&.{.{ .hostbased = .{ .key = &other, .client_host = "client.example.", .client_user = "alice" } }}, .{
+        .hostbased = .{ .ctx = &policy, .checkFn = Policy.check },
+        .failure = &why,
+    });
+    try std.testing.expectEqual(@as(?anyerror, error.AuthenticationFailed), r2.client_err);
+    try std.testing.expect(std.meta.isError(r2.server));
+    try std.testing.expectEqual(userauth.AuthFailure.unauthorized_host, why);
+}
+
+/// The Go-shaped hooks of `serveUserauth` around a real ssh's publickey
+/// login: a pre-auth banner, a per-connection banner, the auth log, and a
+/// `source-address` grant checked against the address we hand in.
+const GoHooks = struct {
+    blob: []const u8,
+    perms: [1]userauth.Permissions.Option = undefined,
+    logged_accept: usize = 0,
+    logged_reject: usize = 0,
+    last_reject: ?userauth.AuthFailure = null,
+
+    fn pk(ctx: *anyopaque, _: *const userauth.AuthRequest, _: []const u8, key_blob: []const u8) userauth.Decision {
+        const self: *GoHooks = @ptrCast(@alignCast(ctx));
+        if (!std.mem.eql(u8, key_blob, self.blob)) return .reject;
+        return .{ .accept = .{ .critical_options = &self.perms } };
+    }
+    fn preAuth(_: *anyopaque, conn: *const userauth.PreAuthConn) void {
+        conn.sendBanner("pre-auth banner from the hook\n") catch {};
+    }
+    fn banner(_: *anyopaque, req: *const userauth.AuthRequest) ?[]const u8 {
+        return if (std.mem.eql(u8, req.user, "alice")) "hello alice, per-connection banner\n" else null;
+    }
+    fn onAuth(ctx: *anyopaque, _: *const userauth.AuthRequest, _: []const u8, outcome: userauth.AuthOutcome) void {
+        const self: *GoHooks = @ptrCast(@alignCast(ctx));
+        switch (outcome) {
+            .accepted => self.logged_accept += 1,
+            .partial => {},
+            .rejected => |w| {
+                self.logged_reject += 1;
+                self.last_reject = w;
+            },
+        }
+    }
+    fn config(self: *GoHooks, source_address: []const u8) userauth.AuthConfig {
+        self.perms = .{.{ .name = "source-address", .value = source_address }};
+        return .{
+            .callbacks = .{ .publickey = .{ .ctx = self, .decideFn = pk } },
+            .pre_auth = .{ .ctx = self, .onFn = preAuth },
+            .banner_callback = .{ .ctx = self, .bannerFn = banner },
+            .on_auth = .{ .ctx = self, .onFn = onAuth },
+            .remote_address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+        };
+    }
+};
+
+fn clientStderr(fx: *SshClient) ![]u8 {
+    const p = try fx.gpa.print("{s}.err", .{fx.out_path});
+    defer fx.gpa.free(p);
+    return std.Io.Dir.cwd().readFileAlloc(fx.io, p, fx.gpa, .limited(1 << 20));
+}
+
+test "live: a real ssh client sees our pre-auth and per-connection banners and logs in under a source-address it meets" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try SshClient.start(gpa, threaded.io(), .{});
+    defer fx.deinit();
+    var hooks: GoHooks = .{ .blob = fx.authorized_blob[0..fx.authorized_len] };
+    const auth = userauth.serveUserauth(&fx.t, gpa, hooks.config("10.0.0.0/8,127.0.0.0/8")) catch |e| {
+        _ = fx.finish() catch null;
+        fx.dumpErr();
+        return e;
+    };
+    try std.testing.expectEqual(userauth.AuthMethod.publickey, auth.method);
+    try std.testing.expectEqual(@as(usize, 1), hooks.logged_accept);
+    try connection.serveSession(&fx.t, gpa, .fromAuth(&auth, .{ .exec = info_handler, .stdin_mode = .ignore }));
+    const out = try fx.finish();
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "kind=exec cmd=uname -a"));
+    const err_text = try clientStderr(fx);
+    defer gpa.free(err_text);
+    try std.testing.expect(std.mem.find(u8, err_text, "pre-auth banner from the hook") != null);
+    try std.testing.expect(std.mem.find(u8, err_text, "hello alice, per-connection banner") != null);
+}
+
+test "live: a real ssh client is refused by a source-address its address does not meet, with the right key" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var fx = try SshClient.start(gpa, threaded.io(), .{});
+    defer fx.deinit();
+    var hooks: GoHooks = .{ .blob = fx.authorized_blob[0..fx.authorized_len] };
+    var why: userauth.AuthFailure = .peer_disconnected;
+    var cfg = hooks.config("192.0.2.0/24");
+    cfg.failure = &why;
+    try std.testing.expect(std.meta.isError(userauth.serveUserauth(&fx.t, gpa, cfg)));
+    const out = try fx.finish();
+    defer gpa.free(out);
+    // ssh gave up: no command output, a non-zero status.
+    try std.testing.expect(std.mem.startsWith(u8, out, "255"));
+    try std.testing.expectEqual(userauth.AuthFailure.source_address_denied, why);
+    try std.testing.expectEqual(@as(usize, 0), hooks.logged_accept);
+    try std.testing.expectEqual(@as(?userauth.AuthFailure, .source_address_denied), hooks.last_reject);
+}

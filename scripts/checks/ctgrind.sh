@@ -242,7 +242,7 @@ declare -A TARGETS=(
     [fss]="gen eval"
     [bfv]="keygen encrypt decrypt"
     [tfhe]="keygen encrypt decrypt bootstrap noise"
-    [dkg]="coeffs combine"
+    [dkg]="coeffs combine reshare"
     # ── writeback round, 2026-09-09: the sealedbox contradiction ───────────
     # An early audit said the secret-key codecs light up; the coverage
     # pass filed the module as a thin std wrapper with nothing to measure. Both
@@ -712,6 +712,7 @@ declare -A PATTERN=(
     [tfhe/noise]='noise[.]zig|tfhe[.]zig'
     [dkg/coeffs]='protocol[.]zig|commit[.]zig|core[.]zig|root[.]zig|secp256k1[.]zig|common[.]zig|scalar[.]zig'
     [dkg/combine]='core[.]zig|root[.]zig|secp256k1[.]zig'
+    [dkg/reshare]='reshare[.]zig|commit[.]zig|core[.]zig|root[.]zig|secp256k1[.]zig|common[.]zig|scalar[.]zig'
     # ⛔ `fmt[.]zig` is DELIBERATELY ABSENT even though `bytesToHex`/`hexToBytes`
     # live there and ARE the subject of the hex rows. It is also in WITNESS, and
     # PATTERN is tested first against the WHOLE paragraph, so listing it would
@@ -1186,6 +1187,7 @@ declare -A LABEL=(
     [tfhe/noise]='tfhe Gaussian sampler (encryption entropy)'
     [dkg/coeffs]='dkg round-1 secret coefficients'
     [dkg/combine]='dkg final combined share'
+    [dkg/reshare]='dkg EcdsaReshare: old shares + dealer randomness -> new shares'
     # ⭐ Were 8/7/43/47 with std's tables; now table-free. The parsers keep ONE
     # context each and a pin of 0 would be WRONG there -- see the .tsv rows.
     [pir/query]='pir Pir.query (SECRET index) + fss DPF Gen'
