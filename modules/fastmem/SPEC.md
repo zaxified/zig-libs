@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — memcpy/memset (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: exported memcpy/memset trap on a null pointer with a non-zero length instead of `.?` UB, frameless kept (objdump); delta: both forms die by signal, argued eq)
 
-**Performance:** ref 0.10–1.01× musl 1.2.5 memset/memcpy · fastest 0.57–1.08× glibc 2.43 memset/memcpy (measured 2026-10-26)
+**Performance:** ref 0.07–1.05× musl 1.2.5 memset/memcpy · fastest 0.56–1.30× glibc 2.43 memset/memcpy (measured 2026-11-24)
 
 **Evidence:** model-fuzz — 3000 seeded cases each for `set` and `copy` (length drawn per arm: small, overlap k = 1/2/4, vector loop, `rep movsb`, `rep stosq`; destination and source offsets 0..127; random fill byte and contents) compared byte by byte with the C11 definition, 128-byte guards checked untouched, every arm reached; plus exhaustive length 0..300 x offset 0..63 and PROT_NONE guard pages on both sides of source and destination
 **Model:** src/root.zig:modelFuzz
@@ -201,8 +201,15 @@ Why P2 and not P1: the 64 KiB aligned rows sit at 1.00–1.01× musl. At 64 KiB 
 - `rep movsq` for `copy`: 3–8 % faster at 1 MiB but 5–10 % slower at 64 KiB
   unaligned (probe).
 - `memmove`, `bcmp`: see *What this module is, and what it is not*.
+- P1 (every row at or below musl): not claimed. Measured in a cpuset shield
+  (bench alone on one physical core, desktop and builds fenced off it), the
+  64 KiB and 1 MiB rows land at 0.97–1.05× musl with a 5–49 % spread between
+  rounds: those rows are bound by the shared L3 and memory bandwidth, which no
+  CPU fence isolates, so 1.00× and 0.99× cannot be told apart on this machine.
+  Both sides run the same string store there (hardware parity, § Performance).
+  The glibc column's worst row is `set_256_a` (1.30×, 3.29 against 2.54 ns,
+  spread ≤ 5 %): not chased, the fastest-candidate bound only matters for P1.
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **Performance P2 → P1** — to be measured in the quiet-host phase (the rows are at hardware parity; only a quiet machine can tell 1.00× from 0.99×): the 64 KiB aligned rows are at 1.00–1.01× musl, which is hardware parity (§ Performance); P1 needs the reference at or below 1.0 on every row.
 - *BOUNCED (waits-external):* **Re-check against compiler_rt on each Zig upgrade** — recurring, until the next Zig release: (`lib/compiler_rt.zig`, `memset` and `memcpy`), and decide delete or keep. The original trigger (compiler_rt's `memset` vectorised) fired on Zig 0.17.0, but this module is still ahead (Zig 0.17.1, `bench-fastmem` 2026-11-20 on a loaded machine: compiler_rt 1.0–2.3× slower on `memset`, 1.0–2.6× on `memcpy`, the gap largest at 16–256 B, smallest at 4–64 KiB), so it stays.
