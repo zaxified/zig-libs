@@ -69,7 +69,7 @@ defer alloc.free(q);
   (one `$err_N` entry per malformed member); limit the input length when it is untrusted.
 - **Role:** codec. **Platform:** any.
   **Concurrency:** reentrant (no shared state; both functions take an
-  allocator and a borrowed input slice). **Deps:** std-only.
+  allocator and a borrowed input slice). **Deps:** `jsontext` (the JSON string writer of the recovery messages) + std only.
 - **Model after:** the JSON5 spec (json5.org) preprocessor-to-JSON
   approach — this module rewrites every JSON5 numeric, string-continuation,
   whitespace and string-escape form (`\v`, `\0`, `\xHH`, escaped non-escape characters);
