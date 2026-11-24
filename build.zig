@@ -339,7 +339,7 @@ pub const module_list = [_]Module{
     .{ .name = "ini", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "yaml", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "jinja", .libs = &.{"format"}, .deps = &.{"unitext"}, .test_deps = &.{"testkit"} },
-    .{ .name = "cbor", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
+    .{ .name = "cbor", .libs = &.{"format"}, .deps = &.{"jsontext"}, .test_deps = &.{"testkit"} },
     .{ .name = "protobuf", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf", "b64ct", "clock", "workerpool" }, .test_deps = &.{"testkit"} },
     .{ .name = "webauthn", .libs = &.{"crypto"}, .deps = &.{ "cbor", "rsa", "p256", "p384", "p521", "x509" }, .test_deps = &.{"testkit"} },

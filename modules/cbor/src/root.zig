@@ -73,7 +73,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "RFC 8949 (CBOR) + RFC 9052 (COSE) — clean-room from the specs",
-    .deps = .{},
+    .deps = .{"jsontext"},
 };
 
 // ── errors ──────────────────────────────────────────────────────────────────
