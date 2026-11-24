@@ -6,14 +6,14 @@
 //! n has no special form, so this is a plain Montgomery field: nine saturated
 //! 64-bit limbs, R = 2^576, word-by-word (CIOS) reduction, one masked final
 //! subtraction. Every operation is branch-free in its inputs; `invert` is
-//! Fermat (x^(n−2)) with a 4-bit window over the PUBLIC exponent, so the
-//! table index is a constant, not a secret.
+//! the constant-time safegcd inverse of `modinv.zig`.
 //!
 //! The std-shaped surface mirrors `std.crypto.ecc.P384.scalar`: a `Scalar`
 //! type plus `CompressedScalar` helpers, `encoded_length` = 66.
 
 const std = @import("std");
 const ct = @import("ct.zig");
+const modinv = @import("modinv.zig");
 const NonCanonicalError = std.crypto.errors.NonCanonicalError;
 
 /// Length of a serialized scalar (bytes).
@@ -37,6 +37,9 @@ fn limbsOf(comptime x: anytype) Limbs {
 }
 
 const N: Limbs = limbsOf(field_order);
+
+/// The safegcd inverse mod n (see `modinv.zig`).
+const Safegcd = modinv.Safegcd(field_order);
 
 /// −n⁻¹ mod 2^64 (Newton iteration on the low limb).
 const N0INV: u64 = blk: {
@@ -236,8 +239,16 @@ pub const Scalar = struct {
         return a.mul(a);
     }
 
-    /// a⁻¹ (0 for 0): a^(n−2), constant time in `a`.
+    /// a⁻¹ (0 for 0), constant time in `a`: the safegcd inverse
+    /// (`modinv.zig`) of the plain value, taken back into Montgomery form.
     pub fn invert(a: Scalar) Scalar {
+        const plain = montMul(a.m, .{ 1, 0, 0, 0, 0, 0, 0, 0, 0 });
+        return .{ .m = montMul(Safegcd.invert(plain), R2) };
+    }
+
+    /// The Fermat inverse a^(n−2) with a 4-bit window over the PUBLIC
+    /// exponent: the differential oracle for `invert`.
+    fn invertFermat(a: Scalar) Scalar {
         const e: u528 = field_order - 2;
         var tbl: [16]Scalar = undefined;
         tbl[0] = one;
@@ -361,6 +372,45 @@ test "scalar: differential against wide integer arithmetic" {
         std.mem.writeInt(u528, &wl, w, .little);
         try testing.expectEqual(@as(u1200, w) % NN, valueOf(Scalar.fromBytesReduce(wl, .little)));
     }
+}
+
+test "scalar: safegcd invert == Fermat on edges and random values" {
+    var prng = std.Random.DefaultPrng.init(0x5215);
+    const r = prng.random();
+    const n521: u521 = field_order;
+    const edges = [_]u521{ 0, 1, 2, n521 - 1, n521 - 2, n521 >> 1, (n521 >> 1) + 1, 1 << 64, 1 << 128, 1 << 255, 1 << 519, (1 << 519) - 1, (1 << 192) - 1 };
+    for (edges) |x| {
+        const a = scalarOf(x);
+        try testing.expect(a.invert().equivalent(a.invertFermat()));
+    }
+    for (0..300) |_| {
+        const a = scalarOf(r.int(u521));
+        try testing.expect(a.invert().equivalent(a.invertFermat()));
+    }
+}
+
+test "bench scalar invert: safegcd vs Fermat, interleaved (opt-in via P521_BENCH)" {
+    if (@import("builtin").target.os.tag != .linux or std.testing.environ.getPosix("P521_BENCH") == null) return error.SkipZigTest;
+    const n = 2000;
+    var a = scalarOf(0x1234567890abcdef1234567890abcdef1234567890abcdef);
+    var best_g: u64 = std.math.maxInt(u64);
+    var best_f: u64 = std.math.maxInt(u64);
+    for (0..7) |_| {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t0 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        for (0..n) |_| a = a.invert();
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_g = @min(best_g, t1 - t0);
+        t0 = t1;
+        for (0..n) |_| a = a.invertFermat();
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_f = @min(best_f, t1 - t0);
+    }
+    std.mem.doNotOptimizeAway(&a);
+    std.debug.print("\nscalar invert: safegcd {d:.2} us, Fermat {d:.2} us (best of 7 x {d})\n", .{ @as(f64, @floatFromInt(best_g)) / n / 1000.0, @as(f64, @floatFromInt(best_f)) / n / 1000.0, n });
 }
 
 test "scalar: invert" {

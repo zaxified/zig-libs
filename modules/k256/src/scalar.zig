@@ -19,7 +19,8 @@
 //! What IS k256's own here: the GLV decomposition `splitScalar` (the endomorphism
 //! `λ`, `β`, and the decomposition lattice basis), tested byte-exact against
 //! std's `Endormorphism.splitScalar`. The gated GLV scalarmul (`group.mulPublicGlv`)
-//! consumes it.
+//! consumes it, and `invert`, the constant-time safegcd inverse (`modinv.zig`)
+//! that replaces std's slower `Scalar.invert` on this module's own paths.
 
 const std = @import("std");
 const math = std.math;
@@ -31,6 +32,24 @@ pub const CompressedScalar = scalar.CompressedScalar;
 
 /// The scalar field (group) order `n`.
 pub const field_order: u256 = scalar.field_order;
+
+const Safegcd = @import("modinv.zig").Safegcd(field_order);
+
+/// `s⁻¹ mod n` (`0` for `0`), constant time in `s`: the safegcd inverse of
+/// `modinv.zig`, ≈ 3 µs against ≈ 40 µs for std's `Scalar.invert`. The
+/// scalar type stays std's, so this is a free function, not a method.
+pub fn invert(s: Scalar) Scalar {
+    // std's field elements are Montgomery limbs (value·R, R = 2^256). One
+    // Montgomery product by {1,0,0,0} (the value 1/R) yields the plain limbs;
+    // one by R mod n takes the plain inverse back. No byte round trip: std's
+    // `fromBytes` branches on its canonical verdict, which ctgrind would
+    // count against the secret input.
+    const Fe = @TypeOf(s.fe);
+    const to_plain = Fe{ .limbs = .{ 1, 0, 0, 0 } };
+    const r_mod_n = comptime Fe.fromInt(0 -% field_order) catch unreachable;
+    const plain: [4]u64 = s.fe.mul(to_plain).limbs;
+    return .{ .fe = (Fe{ .limbs = Safegcd.invert(plain) }).mul(r_mod_n) };
+}
 
 // ── GLV endomorphism constants ──────────────────────────────────────────────
 //
@@ -148,4 +167,47 @@ test "splitScalar byte-exact vs std + reconstructs k = r1 + r2·λ (mod n)" {
         const recon = r1.add(r2.mul(Scalar.fromBytes(lambda_s, .little) catch unreachable));
         try std.testing.expect(recon.equivalent(k));
     }
+}
+
+test "invert: safegcd == std's Scalar.invert on edges and random values" {
+    var prng = std.Random.DefaultPrng.init(0x256_1);
+    const r = prng.random();
+    const n = field_order;
+    const edges = [_]u256{ 0, 1, 2, n - 1, n - 2, n >> 1, (n >> 1) + 1, 1 << 64, 1 << 128, 1 << 192, 1 << 255, (1 << 255) - 1, (1 << 128) - 1, n - (1 << 128) };
+    for (edges) |x| {
+        var b: CompressedScalar = undefined;
+        std.mem.writeInt(u256, &b, x, .big);
+        const s = try Scalar.fromBytes(b, .big);
+        try std.testing.expectEqualSlices(u8, &s.invert().toBytes(.big), &invert(s).toBytes(.big));
+    }
+    for (0..300) |_| {
+        var b: [64]u8 = undefined;
+        r.bytes(&b);
+        const s = Scalar.fromBytes64(b, .little);
+        try std.testing.expectEqualSlices(u8, &s.invert().toBytes(.big), &invert(s).toBytes(.big));
+    }
+}
+
+test "bench scalar invert: safegcd vs std, interleaved (opt-in via K256_BENCH)" {
+    if (@import("builtin").target.os.tag != .linux or std.testing.environ.getPosix("K256_BENCH") == null) return error.SkipZigTest;
+    const n = 2000;
+    var a = Scalar.fromBytes64(@as([64]u8, @splat(0x5a)), .little);
+    var best_g: u64 = std.math.maxInt(u64);
+    var best_f: u64 = std.math.maxInt(u64);
+    for (0..7) |_| {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t0 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        for (0..n) |_| a = invert(a);
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_g = @min(best_g, t1 - t0);
+        t0 = t1;
+        for (0..n) |_| a = a.invert();
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_f = @min(best_f, t1 - t0);
+    }
+    std.mem.doNotOptimizeAway(&a);
+    std.debug.print("\nscalar invert: safegcd {d:.2} us, std {d:.2} us (best of 7 x {d})\n", .{ @as(f64, @floatFromInt(best_g)) / n / 1000.0, @as(f64, @floatFromInt(best_f)) / n / 1000.0, n });
 }

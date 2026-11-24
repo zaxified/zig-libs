@@ -71,14 +71,17 @@ the end) and a final subtraction of K selected by six `cmov` (in Intel's data-in
 same generator serves the scalar field (`Kind.n`: n = 2^384 − c, c < 2^190, three `mulx` and an `imul`).
 The round structure follows s2n-bignum's `bignum_montmul_p384` (Apache-2.0 OR ISC OR MIT-0), read for it; the code is ours. The asm text is
 generated at comptime from that description. Pinned to the portable product on edge values and
-200,000 random pairs (ReleaseFast; 20,000 in Debug). Inversion: a^(p−2) by a fixed chain (runs
-x2, x3, x6, x12, x15, x30, x32, x60, x120, x240, x255; then p − 2's tail 0, 32 ones, 64 zeros,
-30 ones, 0, 1). Square root: a^((p+1)/4) by the same runs, checked by squaring. Both chains are
+200,000 random pairs (ReleaseFast; 20,000 in Debug). Inversion: constant-time safegcd (`modinv.zig`: Bernstein–Yang divsteps in
+batches of 59, 885 steps for 384 bits, ≈ 3.6 µs; the plain value goes in, the Montgomery form comes
+back with one multiply by R²), tested against a^(p−2) by a fixed chain (runs x2, x3, x6, x12, x15,
+x30, x32, x60, x120, x240, x255; then p − 2's tail 0, 32 ones, 64 zeros, 30 ones, 0, 1; ≈ 13 µs).
+Square root: a^((p+1)/4) by the same runs, checked by squaring. Both chains are
 tested against square-and-multiply on wide integers.
 
 **Scalars** (`scalar.zig`) — `mont.zig` with n as the modulus. `fromBytesReduce` takes any
 48-byte string (< R = 2^384, one multiply by R² mod n); `fromBytes64` adds the high 16 bytes
-times 2^384 for 64-byte inputs. Inversion: Fermat with a 4-bit window over the public exponent.
+times 2^384 for 64-byte inputs. Inversion: the same safegcd routine over n (≈ 3.5 µs), tested against Fermat with a 4-bit window over the
+public exponent (≈ 17 µs).
 
 **Group** (`group.zig`) — `p521`'s, with 48-byte scalars. The public type is projective with the
 Renes–Costello–Batina complete formulas (a = −3); the scalar loops run in Jacobian coordinates
@@ -213,8 +216,8 @@ independent products written next to each other in the Jacobian formulas (the co
 tail with the next block's head only when the next does not wait for it), and the ECDSA x-check without
 an affine conversion (`xEqualsDoubleBasePublic`). Dropped: `*m` operands instead of pointer registers
 plus a `memory` clobber (Zig 0.17 passes the address of a slot holding the pointer; the products came out
-wrong). What remains against aws-lc is the per-product cost of the asm blocks and the two Fermat inversions of an
-ECDH (about 11 %; safegcd would halve it).
+wrong). What remains against aws-lc is the per-product cost of the asm blocks and the rest of ECDH (its two field
+inversions now run as safegcd).
 
 ## What is deliberately not done
 
@@ -240,7 +243,4 @@ ECDH (about 11 %; safegcd would halve it).
 
 ## Backlog / deferred
 
-- **Faster scalar inversion** — Fermat costs ~480 Montgomery products per signature; safegcd or
-  blinding.
-- **ECDH's two field inversions** (table batch + affine output) — ~10 % of an ECDH.
 - **Measure the fastest in the field** (aws-lc) — until then `fastest ?`.

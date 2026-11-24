@@ -69,7 +69,7 @@ canonical `< l`). Every operation is constant-time in its secret inputs.
 const sc = decaf448.scalar;
 var k: sc.CompressedScalar = undefined;
 try sc.random(&k, io);                   // 114 bytes of io.randomSecure, wide-reduced, into `k`
-const k_inv = sc.invert(k);              // Fermat a^(l-2); invert(0) == 0
+const k_inv = sc.invert(k);              // constant-time safegcd; invert(0) == 0
 std.debug.assert(std.mem.eql(u8, &sc.mul(k, k_inv), &sc.one));
 const d = sc.sub(sc.add(k, sc.one), k);  // == one
 const n = sc.negate(k);                  // add(k, n) == zero

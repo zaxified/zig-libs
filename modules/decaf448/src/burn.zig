@@ -23,5 +23,6 @@ pub noinline fn stack(comptime n: usize) void {
     for (0..buf.len) |i| p[i] = @splat(0);
 }
 
-/// `scalar.invert` dirtied 2.1 KiB in ReleaseFast, `scalar.random` less.
-pub const scalar_burn = 4 * 1024;
+/// `scalar.invert` dirtied 4.3 KiB in ReleaseFast with the first safegcd version
+/// (`scalar.random` less); 6 KiB leaves headroom.
+pub const scalar_burn = 6 * 1024;

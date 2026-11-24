@@ -16,8 +16,11 @@
 //!
 //! ## What this measures
 //!
-//! `Element.scalarMul` with the scalar marked `MAKE_MEM_UNDEFINED`. That
-//! function is a pure delegation to `ed448.ed448.Point.mul`'s constant-time
+//! Target `invert`: `scalar.invert` (the safegcd inverse of `modinv.zig`) of a
+//! tainted scalar, its result printed as the propagation witness.
+//!
+//! Target `scalarmul`: `Element.scalarMul` with the scalar marked
+//! `MAKE_MEM_UNDEFINED`. That function is a pure delegation to `ed448.ed448.Point.mul`'s constant-time
 //! 4-bit fixed window, so the property is really ed448's; measuring it HERE is
 //! what shows the delegation (the 56 -> 57 byte `scalar.toEd448` widening
 //! included) adds no branch of its own.
@@ -90,7 +93,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = it.next(); // argv[0]
     const target_arg = it.next() orelse return error.MissingTarget;
     const taint_arg = it.next() orelse return error.MissingTaint;
-    if (!std.mem.eql(u8, target_arg, "scalarmul")) return error.UnknownTarget;
+    const is_invert = std.mem.eql(u8, target_arg, "invert");
+    if (!is_invert and !std.mem.eql(u8, target_arg, "scalarmul")) return error.UnknownTarget;
     const taint = try parseTaint(taint_arg);
 
     std.debug.print("valgrind_support={}\n", .{builtin.valgrind_support});
@@ -98,6 +102,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var s = secretScalarBytes();
     if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&s);
     const secret = reloadVolatile(&s);
+
+    if (is_invert) {
+        // `scalar.invert`: the safegcd inverse (`modinv.zig`), burned after.
+        const inv = scalar.invert(secret);
+        std.debug.print("inv={x}\n", .{inv});
+        return;
+    }
 
     const q = Element.generator.scalarMul(&secret);
 

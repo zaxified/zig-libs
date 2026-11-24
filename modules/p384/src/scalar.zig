@@ -5,8 +5,7 @@
 //!
 //! n has no special form: `mont.zig`'s Montgomery arithmetic (six 64-bit
 //! limbs, R = 2^384) with n as the modulus. Every operation is branch-free in
-//! its inputs; `invert` is Fermat (x^(n−2)) with a 4-bit window over the
-//! PUBLIC exponent, so the table index is a constant, not a secret.
+//! its inputs; `invert` is the constant-time safegcd inverse of `modinv.zig`.
 //!
 //! The std-shaped surface mirrors `std.crypto.ecc.P384.scalar`: a `Scalar`
 //! type plus `CompressedScalar` helpers, `encoded_length` = 48.
@@ -15,6 +14,7 @@ const std = @import("std");
 const ct = @import("ct.zig");
 const mont = @import("mont.zig");
 const fast_core = @import("fast_core.zig");
+const modinv = @import("modinv.zig");
 const NonCanonicalError = std.crypto.errors.NonCanonicalError;
 
 /// Length of a serialized scalar (bytes).
@@ -28,6 +28,8 @@ pub const field_order: u384 = 0xffffffffffffffffffffffffffffffffffffffffffffffff
 const Limbs = mont.Limbs;
 const limbsOf = mont.limbsOf;
 const A = mont.Mont(field_order);
+/// The safegcd inverse mod n (see `modinv.zig`).
+const Safegcd = modinv.Safegcd(field_order);
 
 /// Load 48 bytes into limbs (little-endian limb order).
 fn load(s: *const CompressedScalar, endian: std.builtin.Endian) Limbs {
@@ -150,8 +152,16 @@ pub const Scalar = struct {
         return .{ .m = A.sq(a.m) };
     }
 
-    /// a⁻¹ (0 for 0): a^(n−2), constant time in `a`.
+    /// a⁻¹ (0 for 0), constant time in `a`: the safegcd inverse
+    /// (`modinv.zig`) of the plain value, taken back into Montgomery form.
     pub fn invert(a: Scalar) Scalar {
+        const inv = Safegcd.invert(A.fromMont(a.m));
+        return .{ .m = A.mul(inv, A.R2) };
+    }
+
+    /// The Fermat inverse a^(n−2) with a 4-bit window over the PUBLIC
+    /// exponent: the differential oracle for `invert`.
+    fn invertFermat(a: Scalar) Scalar {
         const e: u384 = field_order - 2;
         var tbl: [16]Scalar = undefined;
         tbl[0] = one;
@@ -162,8 +172,6 @@ pub const Scalar = struct {
         while (pos > 0) {
             pos -= 1;
             r = r.sq().sq().sq().sq();
-            // The exponent is a public constant: indexing by it is not a
-            // secret-dependent access.
             const nib: u4 = @truncate(e >> @intCast(4 * pos));
             if (nib != 0) r = r.mul(tbl[nib]);
         }
@@ -292,6 +300,45 @@ test "scalar: invert" {
         if (a.isZero()) continue;
         try testing.expect(a.mul(a.invert()).equivalent(Scalar.one));
     }
+}
+
+test "scalar: safegcd invert == Fermat on edges and random values" {
+    var prng = std.Random.DefaultPrng.init(0x3845);
+    const r = prng.random();
+    const n384: u384 = field_order;
+    const edges = [_]u384{ 0, 1, 2, n384 - 1, n384 - 2, n384 >> 1, (n384 >> 1) + 1, 1 << 64, 1 << 128, 1 << 255, 1 << 383, (1 << 383) - 1, (1 << 192) - 1 };
+    for (edges) |x| {
+        const a = scalarOf(x);
+        try testing.expect(a.invert().equivalent(a.invertFermat()));
+    }
+    for (0..300) |_| {
+        const a = scalarOf(r.int(u384));
+        try testing.expect(a.invert().equivalent(a.invertFermat()));
+    }
+}
+
+test "bench scalar invert: safegcd vs Fermat, interleaved (opt-in via P384_BENCH)" {
+    if (@import("builtin").target.os.tag != .linux or std.testing.environ.getPosix("P384_BENCH") == null) return error.SkipZigTest;
+    const n = 2000;
+    var a = scalarOf(0x1234567890abcdef1234567890abcdef1234567890abcdef);
+    var best_g: u64 = std.math.maxInt(u64);
+    var best_f: u64 = std.math.maxInt(u64);
+    for (0..7) |_| {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t0 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        for (0..n) |_| a = a.invert();
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_g = @min(best_g, t1 - t0);
+        t0 = t1;
+        for (0..n) |_| a = a.invertFermat();
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_f = @min(best_f, t1 - t0);
+    }
+    std.mem.doNotOptimizeAway(&a);
+    std.debug.print("\nscalar invert: safegcd {d:.2} us, Fermat {d:.2} us (best of 7 x {d})\n", .{ @as(f64, @floatFromInt(best_g)) / n / 1000.0, @as(f64, @floatFromInt(best_f)) / n / 1000.0, n });
 }
 
 test "scalar: fromBytes refuses n and above, accepts n − 1" {

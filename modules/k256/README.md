@@ -117,7 +117,7 @@ live on the card's Performance line (see `SPEC.md`'s Performance section).
 ## Not provided
 
 ElligatorSwift (BIP324), Silent Payments (BIP352) helpers, an aarch64 field asm
-and hybrid SEC1 tags (`06` / `07`) are not provided; the scalar field is std's. See `SPEC.md`:
+and hybrid SEC1 tags (`06` / `07`) are not provided; the scalar field is std's (only its inverse is k256's). See `SPEC.md`:
 *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from the secp256k1 domain parameters + the public
