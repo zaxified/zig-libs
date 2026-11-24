@@ -253,6 +253,43 @@ pub fn exp4(x_in: V) V {
     return out;
 }
 
+/// `@log10(x)` (compiler-rt's, fdlibm's `e_log10.c`) for the four lanes; the scalar function answers a lane
+/// that is not a positive normal number other than 1.
+pub fn log10_4(x_in: V) V {
+    const ix: VU = @bitCast(x_in);
+    const hx0: VU = ix >> @splat(32);
+    const special = (hx0 < @as(VU, @splat(0x00100000))) | (hx0 >= @as(VU, @splat(0x7FF00000))) | (ix == @as(VU, @bitCast(splat(1.0))));
+    var hx = hx0 +% @as(VU, @splat(0x3FF00000 - 0x3FE6A09E));
+    const k: VI = @bitCast((hx >> @splat(20)) -% @as(VU, @splat(0x3FF)));
+    hx = (hx & @as(VU, @splat(0x000FFFFF))) + @as(VU, @splat(0x3FE6A09E));
+    const x: V = @bitCast((hx << @splat(32)) | (ix & @as(VU, @splat(0xFFFFFFFF))));
+    const f = x - splat(1.0);
+    const hfsq = splat(0.5) * f * f;
+    const s = f / (splat(2.0) + f);
+    const z = s * s;
+    const w = z * z;
+    const t1 = w * (splat(3.999999999940941908e-01) + w * (splat(2.222219843214978396e-01) + w * splat(1.531383769920937332e-01)));
+    const t2 = z * (splat(6.666666666666735130e-01) + w * (splat(2.857142874366239149e-01) + w * (splat(1.818357216161805012e-01) + w * splat(1.479819860511658591e-01))));
+    const R = t2 + t1;
+    var hi = f - hfsq;
+    hi = @bitCast(@as(VU, @bitCast(hi)) & @as(VU, @splat(0xFFFFFFFF00000000)));
+    const lo = f - hi - hfsq + s * (hfsq + R);
+    var val_hi = hi * splat(4.34294481878168880939e-01);
+    const dk: V = @floatFromInt(k);
+    const y = dk * splat(3.01029995663611771306e-01);
+    var val_lo = dk * splat(3.69423907715893078616e-13) + (lo + hi) * splat(2.50829467116452752298e-11) + lo * splat(4.34294481878168880939e-01);
+    const ww = y + val_hi;
+    val_lo += (y - ww) + val_hi;
+    val_hi = ww;
+    var out = val_lo + val_hi;
+    if (@reduce(.Or, special)) {
+        inline for (0..4) |l| {
+            if (special[l]) out[l] = @log10(x_in[l]);
+        }
+    }
+    return out;
+}
+
 const expm1_q = [5]f64{
     -3.33333333333331316428e-02,
     1.58730158725481460165e-03,
@@ -422,4 +459,35 @@ test "tanh4 equals the scalar tanh bit for bit (PSO's range, the wide range, and
         }
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "log10_4 equals @log10 bit for bit (random positives over many binades, and the special lanes)" {
+    var prng = std.Random.DefaultPrng.init(0x10a10);
+    const r = prng.random();
+    var bad: usize = 0;
+    for (0..250_000) |_| {
+        var xa: [4]f64 = undefined;
+        for (0..4) |l| {
+            const mode = r.uintLessThan(u8, 7);
+            xa[l] = switch (mode) {
+                0 => r.float(f64) * 20.0,
+                1 => 1.0 + (r.float(f64) - 0.5) * 0.2,
+                2 => @exp((r.float(f64) - 0.5) * 1400.0),
+                3 => 1.0 + r.float(f64) * 49.0,
+                4 => 0.5 + r.float(f64),
+                5 => @as(f64, @bitCast(r.int(u64))),
+                else => 1.0,
+            };
+        }
+        const x: V = xa;
+        const ga: [4]f64 = log10_4(x);
+        for (0..4) |l| {
+            if (!sameBits(ga[l], @log10(xa[l]))) bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+    const sp: V = .{ 0.0, -1.0, std.math.inf(f64), 5e-324 };
+    const gs: [4]f64 = log10_4(sp);
+    const spa: [4]f64 = sp;
+    for (0..4) |l| try std.testing.expect(sameBits(gs[l], @log10(spa[l])));
 }

@@ -19,6 +19,7 @@ const smooth = @import("smooth.zig");
 const vs = @import("vs_kit.zig");
 const mu = @import("mom_util.zig");
 const window = @import("window.zig");
+const vmath = @import("vmath.zig");
 const Error = core.Error;
 const Unstable = core.Unstable;
 const pf = core.pf;
@@ -1360,6 +1361,7 @@ pub fn chopLookback(p: ChopParams) Error!usize {
     return CHOP.lookback(p);
 }
 pub fn chop(comptime T: type, high: []const T, low: []const T, close: []const T, out: []T, p: ChopParams) Error!usize {
+    if (T == f64) return chopBlocked(false, high, low, close, out, p);
     return vs.batch(T, CHOP, p, .{ .high = high, .low = low, .close = close }, .{out});
 }
 pub fn ChopStream(comptime T: type) type {
@@ -1370,7 +1372,77 @@ pub fn choptrLookback(p: ChopParams) Error!usize {
     return CHOPTR.lookback(p);
 }
 pub fn choptr(comptime T: type, high: []const T, low: []const T, close: []const T, out: []T, p: ChopParams) Error!usize {
+    if (T == f64) return chopBlocked(true, high, low, close, out, p);
     return vs.batch(T, CHOPTR, p, .{ .high = high, .low = low, .close = close }, .{out});
+}
+
+/// The f64 batch of `ChopCore.step`, bitwise: the sums and extremes of a block of bars first, then the block's
+/// `log10` four lanes at a time (`vmath.log10_4`, bit for bit `@log10`).
+fn chopBlocked(comptime true_range: bool, high: []const f64, low: []const f64, close: []const f64, out: []f64, p: ChopParams) Error!usize {
+    const C = ChopCore(true_range);
+    try C.validate(p);
+    const n = high.len;
+    if (low.len != n or close.len != n or out.len != n) return error.BadParam;
+    const per = p.period;
+    const log_p = std.math.log10(pf(per));
+    const nan = std.math.nan(f64);
+    const block = 64;
+    var arg: [block]f64 = undefined;
+    var flat: [block]bool = undefined;
+    var lg: [block]f64 = undefined;
+    var start: usize = 0;
+    while (start < n) : (start += block) {
+        const len = @min(block, n - start);
+        for (0..len) |j| {
+            const today = start + j;
+            flat[j] = false;
+            arg[j] = 2.0;
+            if (today < per) continue;
+            var highest = high[today];
+            var lowest = low[today];
+            var sum_tr: f64 = 0.0;
+            var prev_close = close[today - per];
+            var i = per;
+            while (i > 0) {
+                i -= 1;
+                const t = today - i;
+                var th = high[t];
+                if (prev_close > th) th = prev_close;
+                var tl = low[t];
+                if (prev_close < tl) tl = prev_close;
+                sum_tr += th - tl;
+                if (true_range) {
+                    if (th > highest) highest = th;
+                    if (tl < lowest) lowest = tl;
+                } else {
+                    if (high[t] > highest) highest = high[t];
+                    if (low[t] < lowest) lowest = low[t];
+                }
+                prev_close = close[t];
+            }
+            if (true_range) {
+                if (sum_tr <= 0.0) {
+                    flat[j] = true;
+                    continue;
+                }
+            } else if (highest - lowest <= 0.0 or sum_tr <= 0.0) {
+                flat[j] = true;
+                continue;
+            }
+            arg[j] = sum_tr / (highest - lowest);
+        }
+        @memset(arg[len..], 2.0);
+        var q: usize = 0;
+        while (q < block) : (q += 4) {
+            const v: vmath.V = arg[q..][0..4].*;
+            lg[q..][0..4].* = vmath.log10_4(v);
+        }
+        for (0..len) |j| {
+            const today = start + j;
+            out[today] = if (today < per) nan else if (flat[j]) 100.0 else 100.0 * (lg[j] / log_p);
+        }
+    }
+    return C.lookback(p);
 }
 pub fn ChoptrStream(comptime T: type) type {
     return vs.Stream(T, CHOPTR);
@@ -2087,5 +2159,41 @@ test "willr / cci batch equal the stepped core (cci bit for bit; willr where no 
             const want = s2.step(src, src.at(i));
             if (want) |w| try testing.expect(th_.sameBits(w, out2[i])) else try testing.expect(std.math.isNan(out2[i]));
         }
+    }
+}
+
+test "chop, choptr: the blocked f64 batch equals the core's steps bit for bit (flat stretches, periods)" {
+    const thp = @import("testhelp.zig");
+    var prng = std.Random.DefaultPrng.init(0xc409);
+    const r = prng.random();
+    const n = 700;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: [n]f64 = undefined;
+    var m: f64 = 100.0;
+    for (0..n) |i| {
+        if (i < 300 or i >= 380) m *= 1.0 + (r.float(f64) - 0.5) * 0.04;
+        h[i] = m * 1.001;
+        l[i] = m * 0.999;
+        c[i] = l[i] + (h[i] - l[i]) * r.float(f64);
+        if (i >= 300 and i < 380) {
+            h[i] = m;
+            l[i] = m;
+            c[i] = m;
+        }
+    }
+    const ins = .{ .high = @as([]const f64, &h), .low = @as([]const f64, &l), .close = @as([]const f64, &c) };
+    for ([_]usize{ 2, 14, 50 }) |per| {
+        const p: ChopParams = .{ .period = per };
+        var got: [n]f64 = undefined;
+        var want: [n]f64 = undefined;
+        const lb = try chop(f64, &h, &l, &c, &got, p);
+        const lb2 = try vs.batch(f64, CHOP, p, ins, .{@as([]f64, &want)});
+        try std.testing.expectEqual(lb2, lb);
+        for (0..n) |i| try std.testing.expect(thp.sameBits(got[i], want[i]));
+        const lt = try choptr(f64, &h, &l, &c, &got, p);
+        const lt2 = try vs.batch(f64, CHOPTR, p, ins, .{@as([]f64, &want)});
+        try std.testing.expectEqual(lt2, lt);
+        for (0..n) |i| try std.testing.expect(thp.sameBits(got[i], want[i]));
     }
 }
