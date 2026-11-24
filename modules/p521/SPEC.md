@@ -82,7 +82,7 @@ worst-case-limb test (*Anchoring*).
 limbs, R = 2^576, CIOS with one masked final subtraction (valid for a < R,
 b < n, so `fromBytesReduce` reduces any 528-bit string with one multiply by
 R² mod n). Constants (R mod n, R² mod n, −n⁻¹ mod 2^64) are computed at
-comptime. Inversion: Fermat with a 4-bit window over the public exponent.
+comptime. Inversion: constant-time safegcd (`modinv.zig`: Bernstein–Yang divsteps in batches of 59, 1239 steps for 521 bits, ≈ 5.5 µs; the plain value goes in, the Montgomery form comes back with one multiply by R²), tested against Fermat with a 4-bit window over the public exponent (≈ 86 µs).
 
 **Group** (`group.zig`) — the public type is projective (X:Y:Z) with the
 Renes–Costello–Batina 2016 complete formulas for a = −3 (eprint 2015/1060,
@@ -252,9 +252,6 @@ Performance line is measured on it.
 
 ## Backlog / deferred
 
-- **Faster scalar inversion** — Fermat costs ~650 Montgomery products per
-  signature; a constant-time safegcd (`p256/src/modinv.zig`'s shape) or
-  blinding would remove most of it.
 - **amd64 MULX/ADX field multiply** — the portable u128 schoolbook only
   (LLVM spills it: 543 instructions for 81 `mulx`). The lever for P1 (fastest
   ≤ 1.25×) once aws-lc is measured.
