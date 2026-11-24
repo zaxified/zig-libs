@@ -472,6 +472,19 @@ inline fn unitAt(src: []const u8, i: usize, comptime e: Endian) u16 {
     return if (e == .le) @as(u16, src[i]) | (@as(u16, src[i + 1]) << 8) else (@as(u16, src[i]) << 8) | src[i + 1];
 }
 
+/// A BMP scalar (not a surrogate) as UTF-8 at `dst[w..]`: up to 3 bytes written
+/// without branching on the length (three bytes of room are needed). Returns
+/// the length. Arithmetic, not selects: the compiler kept the ASCII/non-ASCII
+/// select as a branch, and mixed-script text mispredicts it.
+inline fn putBmp(dst: []u8, w: usize, u: u32) usize {
+    const extra: u5 = @as(u5, @intFromBool(u >= 0x80)) + @intFromBool(u >= 0x800); // 0, 1, 2
+    const lead: u32 = (@as(u32, 0xE0C000) >> (extra * 8)) & 0xFF; // 0x00, 0xC0, 0xE0
+    dst[w] = @truncate(lead | (u >> (extra * 6)));
+    dst[w + 1] = @truncate(0x80 | ((u >> ((extra >> 1) * 6)) & 0x3F));
+    dst[w + 2] = @truncate(0x80 | (u & 0x3F));
+    return 1 + @as(usize, extra);
+}
+
 /// UTF-16 to UTF-8, WHATWG rules: an unpaired surrogate is U+FFFD, a lead
 /// followed by a non-trail is U+FFFD and the unit read again, an odd final
 /// byte (at `last`) is U+FFFD. Needs room for 7 bytes per step.
@@ -499,6 +512,21 @@ pub fn decodeUtf16(comptime e: Endian, state: *Utf16State, src: []const u8, dst:
     }
     while (r + 1 < src.len) {
         if (dst.len - w < 7) return .{ .status = .output_full, .read = r, .written = w, .replaced = replaced };
+        if (r + 8 <= src.len and dst.len - w >= 16 and st.lead_surrogate == null) {
+            // Four units per step when none is a surrogate: one test, one
+            // headroom check and one loop branch for all four.
+            const x0 = std.mem.readInt(u64, src[r..][0..8], .little);
+            const x = if (e == .le) x0 else ((x0 & 0x00FF00FF00FF00FF) << 8) | ((x0 >> 8) & 0x00FF00FF00FF00FF);
+            const m = (x & 0xF800F800F800F800) ^ 0xD800D800D800D800; // a lane is 0 for a surrogate
+            if ((m -% 0x0001000100010001) & ~m & 0x8000800080008000 == 0) {
+                inline for (0..4) |k| {
+                    const unit: u32 = @as(u16, @truncate(x >> (16 * k)));
+                    w += putBmp(dst, w, unit);
+                }
+                r += 8;
+                continue;
+            }
+        }
         const u = unitAt(src, r, e);
         r += 2;
         if (st.lead_surrogate != null or u & 0xF800 == 0xD800) {
@@ -508,17 +536,7 @@ pub fn decodeUtf16(comptime e: Endian, state: *Utf16State, src: []const u8, dst:
             if (rep) replaced = true;
             continue;
         }
-        // A BMP scalar: up to 3 bytes written without branching on the
-        // length (the headroom check above covers all three).
-        // Arithmetic, not selects: the compiler kept the ASCII/non-ASCII
-        // select as a branch, and mixed-script text mispredicts it.
-        const extra: u5 = @as(u5, @intFromBool(u >= 0x80)) + @intFromBool(u >= 0x800); // 0, 1, 2
-        const lead: u32 = (@as(u32, 0xE0C000) >> (extra * 8)) & 0xFF; // 0x00, 0xC0, 0xE0
-        const wide: u32 = u;
-        dst[w] = @truncate(lead | (wide >> (extra * 6)));
-        dst[w + 1] = @truncate(0x80 | ((wide >> ((extra >> 1) * 6)) & 0x3F));
-        dst[w + 2] = @truncate(0x80 | (wide & 0x3F));
-        w += 1 + @as(usize, extra);
+        w += putBmp(dst, w, u);
     }
     if (r < src.len) {
         // One byte left: carried into the next call.

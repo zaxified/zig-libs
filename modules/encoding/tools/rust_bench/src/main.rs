@@ -23,6 +23,8 @@
 //              Unmappable(c) writes '?' (our replacement) and goes on. This is
 //              how the row is made comparable: the default `encode` would write
 //              `&#128512;` and the lengths would differ.
+//   lat1dec    mem::convert_latin1_to_utf8 / lat1enc mem::convert_utf8_to_latin1_lossy
+//              (into a zeroed Vec<u8>, the result an owned buffer)
 //   stream*    Decoder::decode_to_utf8 over 4 KiB chunks into one reused
 //              buffer (the stream is consumed per chunk, nothing accumulates)
 //   celldec    one decode_without_bom_handling per 20-byte cell, 1 000 000 cells
@@ -33,7 +35,7 @@ use std::time::Instant;
 const CHUNK: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Kind { Dec1250, DecUtf8, U16Dec, U16Enc, Enc1250, Enc1250U, Stream1250, StreamUtf8, CellDec, CellEnc, CjkDec, CjkEnc, StreamCjk }
+enum Kind { Dec1250, DecUtf8, U16Dec, U16Enc, Enc1250, Enc1250U, Stream1250, StreamUtf8, CellDec, CellEnc, CjkDec, CjkEnc, StreamCjk, Lat1Dec, Lat1Enc }
 
 const WORKS: &[(&str, Kind, &str)] = &[
     ("dec_1250_ascii", Kind::Dec1250, "ascii-v1.bin"),
@@ -61,6 +63,8 @@ const WORKS: &[(&str, Kind, &str)] = &[
     ("dec_iso2022jp", Kind::CjkDec, "cjk-iso2022jp-v1.bin"),
     ("enc_iso2022jp", Kind::CjkEnc, "cjk-iso2022jp-v1.txt"),
     ("stream_sjis", Kind::StreamCjk, "cjk-sjis-v1.bin"),
+    ("lat1_to_utf8", Kind::Lat1Dec, "lat1-v1.bin"),
+    ("utf8_to_lat1", Kind::Lat1Enc, "lat1u-v1.txt"),
 ];
 
 /// The CJK rows' encoding, by the workload name's suffix.
@@ -147,6 +151,18 @@ fn run(name: &str, kind: Kind, data: &[u8], cs: &[&[u8]], strs: &[&str], whole: 
             }
             out.take(&dst[..o]);
         }
+        Kind::Lat1Dec => {
+            let src = std::hint::black_box(data);
+            let mut v = vec![0u8; src.len() * 2];
+            let n = encoding_rs::mem::convert_latin1_to_utf8(src, &mut v);
+            out.take(&v[..n]);
+        }
+        Kind::Lat1Enc => {
+            let s = std::hint::black_box(whole.unwrap());
+            let mut v = vec![0u8; s.len()];
+            let n = encoding_rs::mem::convert_utf8_to_latin1_lossy(s.as_bytes(), &mut v);
+            out.take(&v[..n]);
+        }
         Kind::CjkDec => {
             let s = cjk_encoding(name).decode_without_bom_handling(std::hint::black_box(data)).0.into_owned();
             out.take(s.as_bytes());
@@ -211,7 +227,7 @@ fn main() {
         (vec![], vec![])
     };
     // &str input of the encoders: validated once, untimed.
-    let whole = if matches!(kind, Kind::Enc1250 | Kind::Enc1250U | Kind::U16Enc | Kind::CjkEnc) {
+    let whole = if matches!(kind, Kind::Enc1250 | Kind::Enc1250U | Kind::U16Enc | Kind::CjkEnc | Kind::Lat1Enc) {
         Some(std::str::from_utf8(&data).unwrap_or_else(|e| fail(&format!("{file}: {e}"))))
     } else {
         None
