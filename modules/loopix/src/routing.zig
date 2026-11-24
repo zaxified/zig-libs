@@ -46,20 +46,60 @@ pub fn mix64(x: u64) u64 {
     return z ^ (z >> 31);
 }
 
-/// Fill `out.route` with one mix per layer (chosen by hashing `key`) followed
-/// by `dest` — or, in the provider topology, by `dest`'s provider — and set
-/// `hop`/`n_hops`/`recipient`. `key` should be unique per message (e.g.
-/// `source*K + seq`) so different messages spread across the mixes.
+/// Fill `out.route` with `layers` mixes (chosen by hashing `key`, per
+/// `cfg.topology`) followed by `dest` — or, in the provider topology, by
+/// `dest`'s provider — and set `hop`/`n_hops`/`recipient`. `key` should be
+/// unique per message (e.g. `source*K + seq`) so different messages spread
+/// across the mixes.
+///
+///  - stratified: one mix per layer, each picked independently;
+///  - cascade / multi-cascade: one chain picked (always chain 0 for a
+///    cascade), then its mixes in order;
+///  - free route: `layers` DISTINCT mixes out of all of them, in random order
+///    (a partial Fisher-Yates over the hashed key).
 pub fn pickRoute(cfg: LoopixConfig, key: u64, dest: NodeId, out: *MixHeader) void {
-    var h = mix64(key);
-    var layer: u8 = 0;
-    while (layer < cfg.layers) : (layer += 1) {
-        h = mix64(h ^ (@as(u64, layer) +% 1));
-        const w: u8 = @intCast(h % cfg.width);
-        out.route[layer] = cfg.mixNode(layer, w);
-    }
+    pickMixes(cfg, key, out);
     out.route[cfg.layers] = if (cfg.providers > 0) cfg.providerOf(cfg.clientIndex(dest)) else dest;
     out.recipient = dest;
+}
+
+/// The route of a loop a MIX sends to itself: `layers` mixes picked as for a
+/// client's packet, then the sender `mix` as the destination.
+pub fn pickMixLoopRoute(cfg: LoopixConfig, key: u64, mix: NodeId, out: *MixHeader) void {
+    pickMixes(cfg, key, out);
+    out.route[cfg.layers] = mix;
+    out.recipient = mix;
+}
+
+fn pickMixes(cfg: LoopixConfig, key: u64, out: *MixHeader) void {
+    var h = mix64(key);
+    switch (cfg.topology) {
+        .stratified => {
+            var layer: u8 = 0;
+            while (layer < cfg.layers) : (layer += 1) {
+                h = mix64(h ^ (@as(u64, layer) +% 1));
+                const w: u8 = @intCast(h % cfg.width);
+                out.route[layer] = cfg.mixNode(layer, w);
+            }
+        },
+        .cascade, .multi_cascade => {
+            const w: u8 = @intCast(h % cfg.width); // width is 1 for a cascade
+            var layer: u8 = 0;
+            while (layer < cfg.layers) : (layer += 1) out.route[layer] = cfg.mixNode(layer, w);
+        },
+        .free_route => {
+            var pool: [256]u8 = undefined;
+            const m = cfg.mixCount();
+            for (pool[0..m], 0..) |*p, i| p.* = @intCast(i);
+            var i: usize = 0;
+            while (i < cfg.layers) : (i += 1) {
+                h = mix64(h ^ (@as(u64, @intCast(i)) +% 1));
+                const j = i + @as(usize, @intCast(h % (m - i)));
+                std.mem.swap(u8, &pool[i], &pool[j]);
+                out.route[i] = pool[i];
+            }
+        },
+    }
     out.n_hops = cfg.layers;
     out.hop = 0;
 }
@@ -198,4 +238,50 @@ test "pickDestClient: never returns self, always a valid client" {
         try testing.expect(d != cfg.clientNode(self)); // never self
         try testing.expect(cfg.isClient(d)); // a real client node
     }
+}
+
+test "pickRoute: cascade takes the one chain in order; multi-cascade stays inside one chain" {
+    const casc = LoopixConfig{ .topology = .cascade, .layers = 4, .width = 1 };
+    const multi = LoopixConfig{ .topology = .multi_cascade, .layers = 3, .width = 4, .clients = 3 };
+    var h = MixHeader{ .kind = .real, .id = 0, .hop = 0, .n_hops = 0, .route = @splat(0) };
+    pickRoute(casc, 7, casc.clientNode(0), &h);
+    try testing.expectEqualSlices(NodeId, &.{ 0, 1, 2, 3 }, h.route[0..4]);
+    var seen: [4]bool = @splat(false);
+    var key: u64 = 0;
+    while (key < 200) : (key += 1) {
+        pickRoute(multi, key, multi.clientNode(1), &h);
+        const w = h.route[0] % multi.width;
+        seen[w] = true;
+        for (h.route[0..3], 0..) |m, l| try testing.expectEqual(multi.mixNode(@intCast(l), @intCast(w)), m);
+    }
+    for (seen) |s| try testing.expect(s); // every chain is used
+}
+
+test "pickRoute: a free route is `layers` distinct mixes, any of them first or last" {
+    const cfg = LoopixConfig{ .topology = .free_route, .layers = 4, .width = 3, .clients = 3 }; // 12 mixes
+    var h = MixHeader{ .kind = .real, .id = 0, .hop = 0, .n_hops = 0, .route = @splat(0) };
+    var first: [12]bool = @splat(false);
+    var last: [12]bool = @splat(false);
+    var key: u64 = 0;
+    while (key < 2000) : (key += 1) {
+        pickRoute(cfg, key, cfg.clientNode(2), &h);
+        try testing.expectEqual(@as(u8, 4), h.n_hops);
+        for (h.route[0..4], 0..) |m, i| {
+            try testing.expect(cfg.isMix(m));
+            for (h.route[0..i]) |o| try testing.expect(o != m); // no mix twice
+        }
+        try testing.expectEqual(cfg.clientNode(2), h.route[4]);
+        first[h.route[0]] = true;
+        last[h.route[3]] = true;
+    }
+    for (first, last) |f, l| try testing.expect(f and l);
+}
+
+test "pickMixLoopRoute: ends at the sending mix" {
+    const cfg = LoopixConfig{ .providers = 2, .clients = 4 };
+    var h = MixHeader{ .kind = .loop_cover, .id = 0, .hop = 0, .n_hops = 0, .route = @splat(0) };
+    pickMixLoopRoute(cfg, 5, cfg.mixNode(1, 2), &h);
+    try testing.expectEqual(cfg.mixNode(1, 2), h.route[cfg.layers]);
+    try testing.expectEqual(cfg.mixNode(1, 2), h.recipient);
+    try testing.expectEqual(cfg.layers, h.n_hops);
 }
