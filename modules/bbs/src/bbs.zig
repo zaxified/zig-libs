@@ -274,8 +274,8 @@ fn msmLoop(points: []const G1.Affine, scalars: []const Fr) G1.Jacobian {
 }
 
 /// `Σ scalars[i] * points[i]` via `bls12_381.kzg.g1Msm` (Pippenger bucket
-/// MSM). `g1Msm`'s only fallible step is its two internal `allocator.alloc`
-/// calls (see `kzg.zig`'s `g1Msm` body) — no other error path exists for
+/// MSM). `g1Msm`'s only fallible steps are its internal `allocator.alloc`
+/// calls (see `kzg.zig`'s `g1Msm` and `msm.zig`) — no other error path exists for
 /// well-formed equal-length input, so every other `KzgError` variant is
 /// `unreachable` here.
 fn msmPippenger(allocator: std.mem.Allocator, points: []const G1.Affine, scalars: []const Fr) std.mem.Allocator.Error!G1.Jacobian {

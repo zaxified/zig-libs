@@ -1097,8 +1097,8 @@ spake2plus	ReleaseFast	verifierfinish	1	6	277c47794bc94e5e	dbdff43379a90cf5
 # now), made affine (toAffine) and encoded -- plus the
 # zero-check of the blinding scalar r1 (next to r2.inv). Every
 # context is on a value the proof publishes or on "is this random scalar 0".
-bbs	ReleaseFast	sign	1	3	cf145ca4a97fb51c	0929643a5972b8ba
-bbs	ReleaseFast	proofgen	1	15	cf145ca4a97fb51c	464ac571cf1943c2
+bbs	ReleaseFast	sign	1	3	b7635b16cd94775e	0929643a5972b8ba
+bbs	ReleaseFast	proofgen	1	15	b7635b16cd94775e	464ac571cf1943c2
 coconut	ReleaseFast	authority_sign	1	2	03ce935337b645ec	3492f1201b641f09
 coconut	ReleaseFast	user_issue	1	17	01094de468b4fd8b	af24664cb307a403
 # Count 27 -> 26 on 2026-10-09 (dead-stack sweep: proveCredential's body runs one
