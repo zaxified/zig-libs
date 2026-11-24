@@ -1100,7 +1100,7 @@ spake2plus	ReleaseFast	verifierfinish	1	6	277c47794bc94e5e	dbdff43379a90cf5
 bbs	ReleaseFast	sign	1	3	cf145ca4a97fb51c	0929643a5972b8ba
 bbs	ReleaseFast	proofgen	1	15	cf145ca4a97fb51c	464ac571cf1943c2
 coconut	ReleaseFast	authority_sign	1	2	03ce935337b645ec	3492f1201b641f09
-coconut	ReleaseFast	user_issue	1	21	01094de468b4fd8b	af24664cb307a403
+coconut	ReleaseFast	user_issue	1	17	01094de468b4fd8b	af24664cb307a403
 # Count 27 -> 26 on 2026-10-09 (dead-stack sweep: proveCredential's body runs one
 # frame down under `burn.run`, `Entropy.scalar` writes in place). --stacks diff vs
 # the base: every context is the same site renamed (proveCredentialFrom ->
@@ -1122,7 +1122,7 @@ coconut	ReleaseFast	user_show	1	26	03ce935337b645ec	286e5ea12d924b29
 #   points (blindSignBody's a, b) + the harness's encoding of them (2). The proof check runs
 #   before the share is read.
 # unblind 2 = ElGamal secret d tainted: `toAffine` identity verdict of s + the harness's encoding.
-coconut	ReleaseFast	blind_prepare	1	45	966e28a34bfb344b	053f2af7fbd7948d
+coconut	ReleaseFast	blind_prepare	1	41	966e28a34bfb344b	053f2af7fbd7948d
 coconut	ReleaseFast	blind_sign	1	4	966e28a34bfb344b	3bfff44503633af4
 coconut	ReleaseFast	unblind	1	2	966e28a34bfb344b	77d4ab19fd73fe6f
 # hpke x25519 (2026-11-01): X25519 moved from std to ct25519 -- std's curve25519.zig isZero context is gone (ct25519's identity check is constant time): x25519 1->0 / 2->0 in-file, xwing 2->1.
@@ -2600,10 +2600,10 @@ tls13	ReleaseFast	x25519mlkem768_server	1	1	4115b347f0c1b95d	3335c00d4dcdf9e5	cp
 # -16; tlsserver ech readInt/memcpy/mlkem decode shape -13; voprf p384-server +4 mulPortable inlined
 # into the vartime addAffineVt (-2); coconut user_issue +6 at bls12_381 fp.zig sqrt (a
 # site the native row already counts); tlsserver hs also has B.
-coconut	ReleaseFast	user_issue	1	27	01094de468b4fd8b	af24664cb307a403	cpu=x86_64
+coconut	ReleaseFast	user_issue	1	23	01094de468b4fd8b	af24664cb307a403	cpu=x86_64
 # coconut blind_prepare +6 on the portable lane (2026-11-21): the same bls12_381 fp.zig sqrt shape as
 # user_issue above, reached through hash-to-curve of the published cm.
-coconut	ReleaseFast	blind_prepare	1	51	966e28a34bfb344b	053f2af7fbd7948d	cpu=x86_64
+coconut	ReleaseFast	blind_prepare	1	47	966e28a34bfb344b	053f2af7fbd7948d	cpu=x86_64
 # paillier keygen on the portable lane (2026-11-21): 260 in-file in one CTGRIND_CPU=x86_64 run (the native
 # row is 270, deterministic over three runs). Measured once only, so this row keeps a bound;
 # its contexts were not re-read frame by frame (the bound is the native exact count).
