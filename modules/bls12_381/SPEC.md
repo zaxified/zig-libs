@@ -512,7 +512,26 @@ design" below.
     `O(n·256)` full add+double pairs. Zero digits skip bucket work, so
     zero scalars/identity points drop out naturally; `n == 0` returns
     the identity (spec's explicit case). It takes an allocator (scalar
-    bytes + bucket array) .
+    bytes + bucket array, and from 512 points on the affine scratch below).
+  - **Bucket accumulation is batch-affine from 512 points on** (`msm.zig`,
+    `AffineScratch`): each window's points are grouped by bucket
+    (counting sort) and summed in rounds of pairwise affine additions
+    whose denominators `x2 - x1` (`2y` for a doubling; `1` for the pairs that
+    need none — identity operand, `P == -Q`) share ONE inversion by
+    Montgomery's batch inversion (`3` multiplications per pair instead of
+    the `11M + 3S` of a Jacobian mixed addition). A round runs only while
+    it has at least 128 pairs (one Fermat `Fp.inv` is about 450
+    multiplications); what is left of each bucket is folded with Jacobian
+    mixed additions, so small windows, small `n` and the tails cost what
+    they did. The shape is gnark-crypto's and arkworks' "batch affine" MSM
+    (permissive; named, not read). The result is the same group element
+    as the Jacobian-only accumulation (differential test over
+    `n = 1..70` with every round forced, and up to 8192, with identity
+    points, edge scalars `0`, `1`, `r - 1`, repeated and negated points).
+    Measured in-process A/B (ReleaseFast): `n = 256` 1.01x/1.03x (G1/G2,
+    neutral, hence the 512 floor), `512` 0.88x/0.89x, `4096` (a blob's KZG
+    commitment) 0.74x/0.70x, `16384` 0.69x/0.66x, `65536` (G1) 0.67x; the
+    128-pair floor is flat within noise between 16 and 384.
   - **The primitive `2^32` root of unity is DERIVED, not embedded**
     (`primitiveRootOfUnity2Pow32`): `7^((r-1)/2^32) mod r` per the
     spec's own `compute_roots_of_unity` formula, with the exponent
@@ -874,6 +893,11 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
 
 ## What is deliberately not done
 
+- **Per-window parallel MSM.** `msm` takes only an allocator: the module has no `Io` / thread
+  knob for its computations (the one thread use is the KZG setup parse), and adding one would
+  put a concurrency parameter on `g1Msm`/`g2Msm`, `kzg` and every caller, for work consumers can
+  split themselves by partitioning the points and adding the partial sums.
+
 - **Distributed key generation (Pedersen/GJKR).** `threshold.zig` is trusted-dealer only. A DKG, where
   no single party learns `sk`, is a materially different, interactive protocol (every participant
   deals shares of its own polynomial plus a complaint/justification round), a separate module with
@@ -905,11 +929,7 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
 
 ## Backlog / deferred
 
-- **MSM beyond signed-digit Pippenger.** Affine batch-inverted bucket additions and per-window
-  parallelism (each bucket addition still pays a Jacobian mixed addition). The batch inversion
-  amortizes one `Fp.inv` — Fermat's `a^(p-2)`, about 450 multiplications here — over the batch, so
-  it pays only with batches of ~100+ distinct buckets; a fast variable-time inversion would lower
-  that bar.
+(none)
 
 ## Roadmap
 

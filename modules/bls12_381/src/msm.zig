@@ -148,7 +148,31 @@ fn signedDigits(bytes: *const [32]u8, c: usize, out: []i16) void {
 /// form this replaced stays as `msmUnsignedRef`, the bench baseline. An
 /// empty input is the identity; identity points and zero scalars drop
 /// out. Allocates the digits and the buckets. Public data only.
+///
+/// Bucket accumulation: from `affine_min_n` points on, each window's points
+/// are grouped by bucket and summed in rounds of pairwise AFFINE additions
+/// whose denominators share one inversion (Montgomery's batch inversion;
+/// the "batch affine" step of gnark-crypto's and arkworks' MSM), while a
+/// round has at least `affine_min_pairs` pairs to amortise it; what is left
+/// of each bucket is folded with Jacobian mixed additions. The result is the
+/// same group element either way.
 pub fn msm(comptime G: type, allocator: std.mem.Allocator, points: []const G.Affine, scalars: []const Fr) MsmError!G.Jacobian {
+    return msmWith(G, allocator, points, scalars, .{});
+}
+
+/// Tuning of `msm`'s bucket accumulation; the defaults are what `msm` uses,
+/// the fields exist so tests and the bench can force either path.
+const Tuning = struct {
+    /// Fewest points for which the affine batch-inverted accumulation is
+    /// used at all; below it every bucket addition is a Jacobian mixed one.
+    min_n: usize = affine_min_n,
+    /// A round of pairwise affine additions runs only while it has at least
+    /// this many pairs to share one inversion; the rest of each bucket is
+    /// folded with Jacobian mixed additions.
+    min_pairs: usize = affine_min_pairs,
+};
+
+fn msmWith(comptime G: type, allocator: std.mem.Allocator, points: []const G.Affine, scalars: []const Fr, tuning: Tuning) MsmError!G.Jacobian {
     if (points.len != scalars.len) return error.LengthMismatch;
     if (points.len == 0) return G.Jacobian.identity;
 
@@ -166,6 +190,11 @@ pub fn msm(comptime G: type, allocator: std.mem.Allocator, points: []const G.Aff
     const buckets = try allocator.alloc(G.Jacobian, n_buckets);
     defer allocator.free(buckets);
 
+    const use_affine = points.len >= tuning.min_n;
+    var aff: AffineScratch(G) = undefined;
+    if (use_affine) aff = try AffineScratch(G).init(allocator, points.len, n_buckets);
+    defer if (use_affine) aff.deinit(allocator);
+
     var acc = G.Jacobian.identity;
     var w = n_windows;
     while (w > 0) {
@@ -176,7 +205,9 @@ pub fn msm(comptime G: type, allocator: std.mem.Allocator, points: []const G.Aff
 
         @memset(buckets, G.Jacobian.identity);
         var any = false;
-        for (points, 0..) |point, i| {
+        if (use_affine) {
+            any = aff.fillBuckets(points, digits, n_windows, w, tuning.min_pairs, buckets);
+        } else for (points, 0..) |point, i| {
             const d = digits[i * n_windows + w];
             if (d == 0) continue;
             const b: usize = @abs(d) - 1;
@@ -198,6 +229,179 @@ pub fn msm(comptime G: type, allocator: std.mem.Allocator, points: []const G.Aff
         acc = addVartime(G.Jacobian, acc, window_sum);
     }
     return acc;
+}
+
+/// Fewest points for which `msm` uses the batch-inverted affine bucket
+/// accumulation (measured crossover: see SPEC "MSM").
+const affine_min_n: usize = 512;
+/// Fewest pairs in a round for its shared inversion to pay: one `Fp.inv`
+/// (Fermat, about 450 multiplications) against ~3 multiplications saved per
+/// pair, so a round needs on the order of 100 pairs.
+const affine_min_pairs: usize = 128;
+
+/// Montgomery's batch inversion: `vals[i] = 1/vals[i]` for all `i` with one
+/// field inversion and `3 (n - 1)` multiplications. Every element must be
+/// nonzero (the caller substitutes 1 for the slots it does not need).
+/// `prefix.len >= vals.len`.
+fn batchInvert(comptime F: type, vals: []F, prefix: []F) void {
+    if (vals.len == 0) return;
+    var run = F.one;
+    for (vals, 0..) |v, i| {
+        prefix[i] = run;
+        run = run.mul(v);
+    }
+    // A product of nonzero elements is nonzero.
+    var inv_run = run.inv() catch unreachable;
+    var i = vals.len;
+    while (i > 0) {
+        i -= 1;
+        const v = vals[i];
+        vals[i] = inv_run.mul(prefix[i]);
+        inv_run = inv_run.mul(v);
+    }
+}
+
+/// What adding two affine points `a + b` needs.
+const PairKind = enum { add, dbl, take_a, take_b, identity };
+
+fn classify(comptime G: type, a: G.Affine, b: G.Affine) PairKind {
+    if (a.infinity) return .take_b;
+    if (b.infinity) return .take_a;
+    if (a.x.eql(b.x)) {
+        if (a.y.eql(b.y) and !a.y.isZero()) return .dbl;
+        return .identity; // P == -Q (or a point of order 2: 2P = O)
+    }
+    return .add;
+}
+
+/// Scratch for the batch-affine bucket accumulation of one `msm` call:
+/// the window's points grouped by bucket plus the batch-inversion arrays.
+fn AffineScratch(comptime G: type) type {
+    const F = @TypeOf(G.Affine.generator.x);
+    return struct {
+        const Self = @This();
+        /// The window's non-zero-digit points (sign applied), bucket by bucket.
+        work: []G.Affine,
+        /// First slot of each bucket in `work`, and its current length.
+        starts: []usize,
+        lens: []usize,
+        /// Denominators (then their inverses) and the prefix products.
+        den: []F,
+        prefix: []F,
+
+        fn init(allocator: std.mem.Allocator, n: usize, n_buckets: usize) std.mem.Allocator.Error!Self {
+            const work = try allocator.alloc(G.Affine, n);
+            errdefer allocator.free(work);
+            const starts = try allocator.alloc(usize, n_buckets);
+            errdefer allocator.free(starts);
+            const lens = try allocator.alloc(usize, n_buckets);
+            errdefer allocator.free(lens);
+            const den = try allocator.alloc(F, n / 2 + 1);
+            errdefer allocator.free(den);
+            const prefix = try allocator.alloc(F, n / 2 + 1);
+            return .{ .work = work, .starts = starts, .lens = lens, .den = den, .prefix = prefix };
+        }
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.work);
+            allocator.free(self.starts);
+            allocator.free(self.lens);
+            allocator.free(self.den);
+            allocator.free(self.prefix);
+        }
+
+        /// Fill `buckets` (all identity on entry) with window `w`'s bucket
+        /// sums; false when no point has a non-zero digit in the window.
+        fn fillBuckets(self: *Self, points: []const G.Affine, digits: []const i16, n_windows: usize, w: usize, min_pairs: usize, buckets: []G.Jacobian) bool {
+            const lens = self.lens;
+            const starts = self.starts;
+            const work = self.work;
+            @memset(lens, 0);
+            var total: usize = 0;
+            for (points, 0..) |point, i| {
+                const d = digits[i * n_windows + w];
+                if (d == 0 or point.infinity) continue;
+                lens[@abs(d) - 1] += 1;
+                total += 1;
+            }
+            if (total == 0) return false;
+            var off: usize = 0;
+            for (lens, starts) |l, *st| {
+                st.* = off;
+                off += l;
+            }
+            // Counting-sort placement; `lens` doubles as the fill cursor.
+            @memset(lens, 0);
+            for (points, 0..) |point, i| {
+                const d = digits[i * n_windows + w];
+                if (d == 0 or point.infinity) continue;
+                const b: usize = @abs(d) - 1;
+                work[starts[b] + lens[b]] = if (d > 0) point else negAffine(G, point);
+                lens[b] += 1;
+            }
+
+            // Rounds of pairwise affine additions, one shared inversion each.
+            while (true) {
+                var n_pairs: usize = 0;
+                for (lens) |l| n_pairs += l / 2;
+                if (n_pairs < @max(min_pairs, 1)) break;
+
+                var k: usize = 0;
+                for (lens, starts) |l, s| {
+                    var j: usize = 0;
+                    while (j + 1 < l) : (j += 2) {
+                        const a = work[s + j];
+                        const b = work[s + j + 1];
+                        self.den[k] = switch (classify(G, a, b)) {
+                            .add => b.x.sub(a.x),
+                            .dbl => a.y.add(a.y),
+                            else => F.one,
+                        };
+                        k += 1;
+                    }
+                }
+                batchInvert(F, self.den[0..k], self.prefix[0..k]);
+
+                k = 0;
+                for (lens, starts) |*lp, s| {
+                    const l = lp.*;
+                    var j: usize = 0;
+                    while (j + 1 < l) : (j += 2) {
+                        const a = work[s + j];
+                        const b = work[s + j + 1];
+                        const inv_den = self.den[k];
+                        k += 1;
+                        work[s + j / 2] = switch (classify(G, a, b)) {
+                            .add => addAffine(G, a, b, b.y.sub(a.y).mul(inv_den)),
+                            .dbl => blk: {
+                                const xx = a.x.square();
+                                break :blk addAffine(G, a, a, xx.add(xx).add(xx).mul(inv_den));
+                            },
+                            .take_a => a,
+                            .take_b => b,
+                            .identity => G.Affine.identity,
+                        };
+                    }
+                    if (l & 1 == 1) work[s + l / 2] = work[s + l - 1];
+                    lp.* = (l + 1) / 2;
+                }
+            }
+
+            for (lens, starts, buckets) |l, s, *bucket| {
+                for (work[s..][0..l]) |p| bucket.* = mixedAddVartime(G, bucket.*, p);
+            }
+            return true;
+        }
+    };
+}
+
+/// The affine sum `a + b` given the slope `lambda` (`a != -b`; `b == a` for
+/// a doubling, where `lambda = 3 x^2 / 2 y`): `x3 = lambda^2 - x1 - x2`,
+/// `y3 = lambda (x1 - x3) - y1`.
+fn addAffine(comptime G: type, a: G.Affine, b: G.Affine, lambda: @TypeOf(a.x)) G.Affine {
+    const x3 = lambda.square().sub(a.x).sub(b.x);
+    const y3 = lambda.mul(a.x.sub(x3)).sub(a.y);
+    return .{ .x = x3, .y = y3, .infinity = false };
 }
 
 fn negAffine(comptime G: type, p: G.Affine) G.Affine {
@@ -390,6 +594,89 @@ test "signed-digit msm == the unsigned Pippenger it replaced (G1 n = 300, G2 n =
     }
 }
 
+/// Random points/scalars for `n`, with identity points, edge scalars
+/// (0, 1, r-1), repeated points (bucket P == Q) and negated points (P == -Q)
+/// mixed in.
+fn randomInputs(comptime G: type, rnd: std.Random, points: []G.Affine, scalars: []Fr) void {
+    var p = G.Jacobian.fromAffine(G.Affine.generator);
+    for (points, scalars, 0..) |*pt, *s, i| {
+        var wide: [64]u8 = undefined;
+        rnd.bytes(&wide);
+        s.* = Fr.reduceWide(&wide);
+        p = p.add(G.Jacobian.fromAffine(G.Affine.generator)).double();
+        pt.* = p.toAffine();
+        switch (i % 11) {
+            1 => pt.* = G.Affine.identity,
+            2 => s.* = Fr.zero,
+            3 => s.* = Fr.one,
+            4 => s.* = Fr.zero.sub(Fr.one),
+            5 => if (i > 0) {
+                pt.* = points[i - 1];
+                s.* = scalars[i - 1];
+            },
+            6 => if (i > 0) {
+                pt.* = G.Jacobian.fromAffine(points[i - 1]).negate().toAffine();
+                s.* = scalars[i - 1];
+            },
+            else => {},
+        }
+    }
+}
+
+fn smallScalar(v: u16) Fr {
+    var b: [32]u8 = @splat(0);
+    std.mem.writeInt(u16, b[30..32], v, .big);
+    return Fr.fromBytes(b) catch unreachable;
+}
+
+fn expectPathsAgree(comptime G: type, n: usize, seed: u64) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const points = try testing.allocator.alloc(G.Affine, n);
+    defer testing.allocator.free(points);
+    const scalars = try testing.allocator.alloc(Fr, n);
+    defer testing.allocator.free(scalars);
+    randomInputs(G, prng.random(), points, scalars);
+    const jac = (try msmWith(G, testing.allocator, points, scalars, .{ .min_n = std.math.maxInt(usize) })).toAffine();
+    const forced = (try msmWith(G, testing.allocator, points, scalars, .{ .min_n = 0, .min_pairs = 1 })).toAffine();
+    const dflt = (try msm(G, testing.allocator, points, scalars)).toAffine();
+    try testing.expectEqual(G.toBytesCompressed(jac), G.toBytesCompressed(forced));
+    try testing.expectEqual(G.toBytesCompressed(jac), G.toBytesCompressed(dflt));
+}
+
+test "batch-affine msm == Jacobian-bucket msm, n = 1..70 in G1 and G2 (every round forced)" {
+    for (1..71) |n| {
+        try expectPathsAgree(g1, n, 0xa5f1000 + n);
+        try expectPathsAgree(g2, n, 0xa5f2000 + n);
+    }
+}
+
+test "batch-affine msm == Jacobian-bucket msm at larger n (default thresholds engage)" {
+    for ([_]usize{ 511, 512, 1000, 2049, 8192 }, 0..) |n, k| try expectPathsAgree(g1, n, 0xa5f3000 + k);
+    for ([_]usize{ 600, 2100 }, 0..) |n, k| try expectPathsAgree(g2, n, 0xa5f4000 + k);
+}
+
+test "batch-affine msm: all points equal / all pairs cancel / all identity / all scalars equal" {
+    const n = 300;
+    var points: [n]g1.Affine = undefined;
+    var scalars: [n]Fr = undefined;
+    const forced: Tuning = .{ .min_n = 0, .min_pairs = 1 };
+    const gen = g1.Affine.generator;
+    const neg_gen = negAffine(g1, gen);
+    // Every point equal, one scalar: every bucket pair is a doubling.
+    @memset(&points, gen);
+    @memset(&scalars, smallScalar(5));
+    var got = (try msmWith(g1, testing.allocator, &points, &scalars, forced)).toAffine();
+    const want = g1.Jacobian.fromAffine(gen).scalarMul(smallScalar(5 * n)).toAffine();
+    try testing.expectEqual(g1.toBytesCompressed(want), g1.toBytesCompressed(got));
+    // Alternating P, -P under one scalar: everything cancels.
+    for (&points, 0..) |*pt, i| pt.* = if (i % 2 == 0) gen else neg_gen;
+    got = (try msmWith(g1, testing.allocator, &points, &scalars, forced)).toAffine();
+    try testing.expect(got.infinity);
+    // All identity points.
+    @memset(&points, g1.Affine.identity);
+    try testing.expect((try msmWith(g1, testing.allocator, &points, &scalars, forced)).isIdentity());
+}
+
 test "bench: msm, unsigned vs signed digits (opt-in BLS12_381_BENCH)" {
     const bench = @import("bench.zig");
     if (!bench.enabled()) return error.SkipZigTest;
@@ -422,4 +709,43 @@ test "bench: msm, unsigned vs signed digits (opt-in BLS12_381_BENCH)" {
     bench.ab("G1 msm n=4096 (A unsigned, B signed)", 4, &ctx, S.unsigned, S.signed);
     const small: Ctx = .{ .gpa = gpa, .points = points[0..64], .scalars = scalars[0..64] };
     bench.ab("G1 msm n=64 (A unsigned, B signed)", 20, &small, S.unsigned, S.signed);
+}
+
+test "bench: msm, Jacobian vs batch-affine bucket accumulation (opt-in BLS12_381_BENCH)" {
+    const bench = @import("bench.zig");
+    if (!bench.enabled()) return error.SkipZigTest;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: opt-in bench, buffers outside the leak checker
+    inline for (.{ g1, g2 }) |G| {
+        const max_n = if (G == g1) 65536 else 16384;
+        const points = try gpa.alloc(G.Affine, max_n);
+        defer gpa.free(points);
+        const scalars = try gpa.alloc(Fr, max_n);
+        defer gpa.free(scalars);
+        var prng = std.Random.DefaultPrng.init(0xbe7d);
+        const rnd = prng.random();
+        var p = G.Jacobian.fromAffine(G.Affine.generator);
+        for (points, scalars) |*pt, *s| {
+            pt.* = p.toAffine();
+            p = p.add(G.Jacobian.fromAffine(G.Affine.generator)).double();
+            var wide: [64]u8 = undefined;
+            rnd.bytes(&wide);
+            s.* = Fr.reduceWide(&wide);
+        }
+        const Ctx = struct { points: []const G.Affine, scalars: []const Fr };
+        const S = struct {
+            fn jac(c: *const Ctx) void {
+                std.mem.doNotOptimizeAway(msmWith(G, std.heap.page_allocator, c.points, c.scalars, .{ .min_n = std.math.maxInt(usize) }) catch unreachable);
+            }
+            fn affine(c: *const Ctx) void {
+                std.mem.doNotOptimizeAway(msmWith(G, std.heap.page_allocator, c.points, c.scalars, .{ .min_n = 0 }) catch unreachable);
+            }
+        };
+        inline for (.{ 256, 512, 1024, 4096, 16384, 65536 }) |n| {
+            if (n <= max_n) {
+                const ctx: Ctx = .{ .points = points[0..n], .scalars = scalars[0..n] };
+                const iters = if (n <= 1024) 8 else if (n <= 4096) 2 else 1;
+                bench.ab((if (G == g1) "G1" else "G2") ++ " msm n=" ++ std.fmt.comptimePrint("{d}", .{n}) ++ " (A jacobian buckets, B batch-affine)", iters, &ctx, S.jac, S.affine);
+            }
+        }
+    }
 }
