@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, ED448_FUZZ) · ct 2026-11-13 (ctgrind: full 3, ladder 0, decaf448 scalarmul 0 — unchanged; select masks laundered) · panic 2026-11-13 (sweep of every pub entry point of field/scalar/ed448/x448: `Point.toBytes` of a `z = 0` point is total instead of `unreachable`; `Fe.random` redraws at most 64 times, so a broken `io` no longer hangs it; a hand-built `Fe` with a limb over 2^57 is a documented contract violation)
 
-**Performance:** ref 0.47–1.07× OpenSSL 3.5.5 Ed448/X448 · fastest ? (measured 2026-11-13)
+**Performance:** ref 0.37–0.93× OpenSSL 3.5.5 Ed448/X448 · fastest ? (measured 2026-11-24)
 
 **Known defects:** none recorded
 

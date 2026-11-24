@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-11-01 (160,000 runs clean, CT25519_FUZZ, 8 jobs × 20,000, every reach label hit) · ct 2026-09-29 (ctgrind) · panic 2026-10-30 (sweep + blind review: nothing to fix (fixed-size inputs, mulMulti already a checked panic); stack minimum in Backlog)
 
-**Performance:** ref 0.56–1.04× libsodium 1.0.18 · fastest 0.92× OpenSSL 3.5.5 (measured 2026-10-31)
+**Performance:** ref 0.35–0.79× libsodium 1.0.18 · fastest 0.88× OpenSSL 3.5.5 (measured 2026-11-24)
 
 **Known defects:** none recorded
 
@@ -565,6 +565,30 @@ Constant time unchanged in kind: straight-line, a mask, no branch; ctgrind rows 
 ladderbase, ladder, msm, x25519) unchanged in count, digests re-pinned.
 
 Correctness: the field differential and RFC 7748 vectors over every backend (§ Verification).
+
+## P10 — X25519 ladder: what the profile says, and four changes measured and not kept
+
+`cli_x25519` against aws-lc-rs (s2n-bignum) stays at 1.26× in the `tls13` bench (P1 bound 1.25; ours 29.9 µs, aws-lc-rs
+23.8 µs, spread 1 %). `perf annotate` of `bench-ct25519 x25519`: 89 % of the cycles are the 255-step loop, 952
+instructions a step at IPC ≈ 2.7 (no single hot instruction; the profile is flat), 9.5 % the inversion chain
+(265 dependent squarings and multiplications, ≈ 36 cycles each). A step is bound by the carry-flag and
+multiply ports (≈ 160 `mulx`, several hundred `adc`/`sbb`/`adcx`/`adox`, which run on two ports), not by one
+instruction, and the asm blocks execute almost in program order (a block of ≈ 90 micro-ops fills the scheduler).
+Measured in the shield, ABAB, with the cycle ratio against libsodium as the metric (spread ≤ 0.3 %; the ns column
+moves ± 3 % between invocations, the ratio does not): baseline 0.785–0.789.
+
+| change | cycle ratio | kept |
+|---|---|---|
+| `E = AA − BB`, `a24·E` and `AA + a24·E` in one block (`E` stays in registers, the product is added as five words and folded once): 29 instructions a step fewer | 0.795, 0.798 | no (slower: the block is one long dependent chain) |
+| the state addressed through two base registers so that the 15 ladder slots all take an 8-bit displacement (code ≈ 20 % shorter) | 0.789, 0.788 | no (no gain) |
+| ladder order with the critical chain `DA, CB → DA±CB → (DA−CB)² → z3` first | 0.822, 0.826 | no (+4.5 %) |
+| the same, `(DA−CB)²` and `(DA+CB)²` right after `DA±CB`, `AA`/`BB` after them | 0.841, 0.849 | no (+8 %) |
+| squares first, then the products, `x2` and `E` before `DA±CB` | 0.795, 0.796 | no (equal) |
+
+The order of `P7` (OpenSSL's) is a local optimum: moving a consumer next to its producer costs 4–8 %. What would
+still pay is fusing the product blocks (interleaving two multiplications' `mulx` rows in one block, impossible in 15
+registers) or lazy five-word `mul_5`-style operands for `DA ± CB` (s2n-bignum's way, two folds a step), a new field
+core rather than a tuning pass.
 
 ## Performance — `bench-ct25519`
 
