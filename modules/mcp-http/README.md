@@ -26,10 +26,8 @@ the endpoint really does serve one client — see [Security](#security). Set a `
 server→client **`GET /mcp` stream**. That stream is **drain-and-close** (a
 long-poll over SSE): it replays every event queued since the request's
 `Last-Event-ID`, then closes; the client's `EventSource` auto-reconnects (with
-`Last-Event-ID`) for more. This fits the io-less handler model (a handler can't
-park a connection waiting for a future push) and MCP's low-frequency
-server→client traffic — nothing is lost within the bounded resumable replay
-buffer. Enqueue a message from any thread with `Sessions.push(id, data)`.
+`Last-Event-ID`) for more. Nothing is lost within the bounded resumable
+replay buffer. Enqueue a message from any thread with `Sessions.push(id, data)`.
 
 ```zig
 var server = mcp.Server.init(gpa, .{ .name = "netops", .version = "1.0" });
@@ -160,18 +158,28 @@ session-era clients on the same endpoint:
   (-32021) → 400, unknown method → 404, anything else 200.
 - **SSE** only when the server has something to stream before the answer
   (progress, the `subscriptions/listen` acknowledgment); a lone answer goes out
-  as `application/json`, so its status is visible. Closing the stream is the
-  client's cancellation.
+  as `application/json`, so its status is visible. Closing the stream (or the
+  connection of a JSON answer) is the client's cancellation: a running
+  `tools/call` sees `ToolCall.cancelled()` at once (over a socket).
 - **Sampling / elicitation** travel as multi round-trip requests
   (`InputRequiredResult`, then the client's retry) — nothing to correlate, no
   session, no `stateless_responses` question. See `mcp`'s README.
-- **`subscriptions/listen`** is acknowledged with an empty filter and closed at
-  once: `mcp` emits no change notifications yet.
+- **`subscriptions/listen`** is held open when `Transport.listens` is set and
+  `mcp.Server.push` is on: the acknowledgment, then every notification the
+  application pushes, until the client closes it or the server ends it with
+  the graceful-close result. Without a registry it is closed at once.
+
+  ```zig
+  var listens = mcphttp.Listens.init(gpa);
+  var transport = mcphttp.Transport{ .gpa = gpa, .server = &server, .listens = &listens, .lock = lock };
+  // later, on any thread, under the same lock as every mcp.Server call:
+  lock.acquire(); _ = server.notifyListChanged(transport.pushSink(), .tools); lock.release();
+  // shutting down: listens.finishAll() (http.Server.shutdownGraceful does it too)
+  ```
 
 ## Not provided
 
 TLS, rate limiting and authentication (compose `ratelimit`, `aaa-gate` /
 `jwt`; SPEC *What is deliberately not done*), the older HTTP+SSE dual-endpoint
-transport, and, open work (SPEC *Backlog / deferred*), a held-open
-`subscriptions/listen` stream and cancellation of a running handler when the
-client closes the stream.
+transport, and, open work (SPEC *Backlog / deferred*), a held-open session `GET`
+stream.

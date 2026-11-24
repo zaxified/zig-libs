@@ -378,6 +378,34 @@ pub const Sessions = struct {
         lockSpin(&self.lock);
         defer self.lock.unlock();
         const s = self.map.get(id) orelse return false;
+        try self.enqueue(s, data);
+        return true;
+    }
+
+    /// `push` by peer handle (`Session.tag`): how `Transport.pushSink` delivers
+    /// `mcp`'s change notifications to a session's `GET` stream.
+    pub fn pushTag(self: *Sessions, tag: u64, data: []const u8) error{OutOfMemory}!bool {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        var it = self.map.valueIterator();
+        while (it.next()) |sp| if (sp.*.tag == tag) {
+            try self.enqueue(sp.*, data);
+            return true;
+        };
+        return false;
+    }
+
+    /// Whether `tag` names a live session.
+    fn hasTag(self: *Sessions, tag: u64) bool {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        var it = self.map.valueIterator();
+        while (it.next()) |sp| if (sp.*.tag == tag) return true;
+        return false;
+    }
+
+    /// Caller holds the lock.
+    fn enqueue(self: *Sessions, s: *Session, data: []const u8) error{OutOfMemory}!void {
         const copy = try self.gpa.dupe(u8, data);
         errdefer self.gpa.free(copy);
         if (s.events.items.len >= self.replay_depth) {
@@ -386,7 +414,6 @@ pub const Sessions = struct {
         }
         try s.events.append(self.gpa, .{ .id = s.next_event_id, .data = copy });
         s.next_event_id += 1;
-        return true;
     }
 
     /// Mark a session closing — its next `GET` drains what is queued and ends.
@@ -414,6 +441,122 @@ pub const Sessions = struct {
                 try out.append(arena, .{ .id = e.id, .data = try arena.dupe(u8, e.data) });
         }
         return s.closing;
+    }
+};
+
+/// A peer handle no session and no other request uses: from 2^62 up (session
+/// tags count from 1). A 2026-07-28 request is otherwise served as peer 0, which
+/// every client shares; a held listen and a cancellable `tools/call` need one of
+/// their own, so that a notification or a cancellation reaches only them.
+var private_peer_seq: std.atomic.Value(u64) = .init(1 << 62);
+
+fn privatePeer() u64 {
+    return private_peer_seq.fetchAdd(1, .monotonic);
+}
+
+/// The open 2026-07-28 `subscriptions/listen` streams — the only push channel
+/// of that revision — held open on their POST (`http.Server.Hold`). Optional:
+/// set `Transport.listens` to hold them; without it a listen is acknowledged
+/// and closed at once (the graceful closure), as before. `mcp.Server.push`
+/// must be on too, or `mcp` itself closes every listen.
+///
+/// Each held listen gets a peer handle of its own (`privatePeer`, never a
+/// session tag), so `mcp` routes a listen's notifications to exactly that
+/// stream. `Transport.pushSink` maps a peer to its stream (or, for a session
+/// peer, to the session's `GET` queue). Thread-safe; must outlive the Router.
+pub const Listens = struct {
+    gpa: std.mem.Allocator,
+    lock: std.atomic.Mutex = .unlocked,
+    map: std.AutoHashMapUnmanaged(u64, *http.Server.Hold) = .empty,
+    /// The sink's writer and its routing state: used only inside
+    /// `mcp.Server.notify*`, which run under `Transport.lock`.
+    feed: std.Io.Writer = .{ .vtable = &.{ .drain = feedDrain }, .buffer = &.{} },
+    line: std.ArrayList(u8) = .empty,
+    cur_peer: u64 = 0,
+    cur_sessions: ?*Sessions = null,
+
+    pub fn init(gpa: std.mem.Allocator) Listens {
+        return .{ .gpa = gpa };
+    }
+
+    /// Call only once no listen is held any more (after the server stopped).
+    pub fn deinit(self: *Listens) void {
+        self.map.deinit(self.gpa);
+        self.line.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// Listen streams held open now.
+    pub fn count(self: *Listens) usize {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        return self.map.count();
+    }
+
+    /// End every held listen gracefully: each answers its request with the
+    /// subscription's graceful-close result (subscriptions.mdx "Graceful
+    /// Closure") and its response ends. `http.Server.shutdownGraceful` does
+    /// the same for the listens on that server.
+    pub fn finishAll(self: *Listens) void {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        var it = self.map.valueIterator();
+        while (it.next()) |h| h.*.finish();
+    }
+
+    fn add(self: *Listens, peer: u64, hold: *http.Server.Hold) error{OutOfMemory}!void {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        try self.map.put(self.gpa, peer, hold);
+    }
+
+    fn remove(self: *Listens, peer: u64) void {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        _ = self.map.remove(peer);
+    }
+
+    fn holdOf(self: *Listens, peer: u64) ?*http.Server.Hold {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        return self.map.get(peer);
+    }
+
+    /// `mcp` writes whole newline-terminated lines; each goes to `cur_peer`.
+    fn feedDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Listens = @alignCast(@fieldParentPtr("feed", w));
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            self.line.appendSlice(self.gpa, d) catch return error.WriteFailed;
+            consumed += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| self.line.appendSlice(self.gpa, last) catch return error.WriteFailed;
+        consumed += last.len * splat;
+        while (std.mem.findScalar(u8, self.line.items, '\n')) |nl| {
+            const ok = self.route(std.mem.trimEnd(u8, self.line.items[0..nl], "\r"));
+            const rest = self.line.items.len - (nl + 1);
+            std.mem.copyForwards(u8, self.line.items[0..rest], self.line.items[nl + 1 ..]);
+            self.line.shrinkRetainingCapacity(rest);
+            if (!ok) {
+                self.line.clearRetainingCapacity();
+                return error.WriteFailed;
+            }
+        }
+        return consumed;
+    }
+
+    fn route(self: *Listens, line: []const u8) bool {
+        if (line.len == 0) return true;
+        if (self.holdOf(self.cur_peer)) |h| {
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            defer aw.deinit();
+            http.sse.writeEvent(&aw.writer, .{ .data = line }) catch return false;
+            h.send(aw.written()) catch return false;
+            return true;
+        }
+        const sessions = self.cur_sessions orelse return false;
+        return sessions.pushTag(self.cur_peer, line) catch false;
     }
 };
 
@@ -459,8 +602,41 @@ pub const Transport = struct {
     /// with a registry every POST carries its session's peer handle and the
     /// question does not arise. See `StatelessResponses`.
     stateless_responses: StatelessResponses = .reject,
+    /// Held-open `subscriptions/listen` streams (see `Listens`). Null (the
+    /// default): a listen is acknowledged and closed at once.
+    listens: ?*Listens = null,
+    /// Bytes of notifications one held listen may have queued and not yet
+    /// written; a burst past it ends that stream with the graceful close
+    /// (the client re-subscribes) rather than dropping notifications unseen.
+    listen_queue_bytes: usize = 64 * 1024,
+    /// Idle timeout and heartbeat of a held listen (`http.Server.Hold.Options`;
+    /// `on_full` is always `.end_stream`). Default: neither, as the
+    /// reference SDKs.
+    listen_hold: http.Server.Hold.Options = .{},
 
     pub const StreamMode = enum { auto, off };
+
+    /// The `mcp.PushSink` for `mcp.Server.notifyListChanged` /
+    /// `notifyResourceUpdated`: a held listen's peer writes SSE events on its
+    /// stream, a session peer queues on the session's `GET` stream. Call the
+    /// `notify*` functions under `lock`, like every other `mcp.Server` call.
+    /// Needs `listens`; without it every peer is skipped.
+    pub fn pushSink(t: *const Transport) mcp.PushSink {
+        return .{ .ctx = @constCast(t), .writerFor = sinkWriterFor };
+    }
+
+    fn sinkWriterFor(ctx: ?*anyopaque, peer: u64) ?*std.Io.Writer {
+        const t: *const Transport = @ptrCast(@alignCast(ctx.?));
+        const l = t.listens orelse return null;
+        if (l.holdOf(peer) == null) {
+            const sessions = t.sessions orelse return null;
+            if (!sessions.hasTag(peer)) return null;
+        }
+        l.cur_peer = peer;
+        l.cur_sessions = t.sessions;
+        l.line.clearRetainingCapacity();
+        return &l.feed;
+    }
 
     /// Whether a stateless endpoint may correlate a client's response to a
     /// server→client request (`sampling/createMessage`, `elicitation/create`).
@@ -922,10 +1098,17 @@ const HeaderView = struct {
 /// to go — that revision has no `GET` stream — and is dropped, as it is on a
 /// stateless session-era endpoint. Nothing written: a notification, 202.
 fn modernJsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!void {
+    var id_arena: std.heap.ArenaAllocator = .init(t.gpa);
+    defer id_arena.deinit();
+    var cancel: CallCancel = undefined;
+    var watch: http.Server.PeerWatch = .{};
+    const peer = cancel.watch(t, ctx, body, id_arena.allocator(), &watch);
+    defer watch.stop();
+
     var out: std.Io.Writer.Allocating = .init(t.gpa);
     defer out.deinit();
     t.lock.acquire();
-    const rc = t.server.handleMessageFrom(body, &out.writer, 0);
+    const rc = t.server.handleMessageFrom(body, &out.writer, peer);
     t.lock.release();
     rc catch return error.OutOfMemory; // see `jsonResponse`
 
@@ -960,20 +1143,38 @@ fn lastLine(written: []const u8) []const u8 {
 /// client that decides its era fallback from the status.
 ///
 /// Closing the stream is the client's cancellation (streamable-http.mdx
-/// "Cancellation"): once a write fails nothing more is sent, the failure is
-/// not an error of this request, and the handler runs out its course (no
-/// cancellation seam reaches a running `mcp` handler yet).
+/// "Cancellation"): once a write fails nothing more is sent and the failure is
+/// not an error of this request; a `tools/call` is also watched
+/// (`CallCancel`), so the running tool sees `ToolCall.cancelled()` as soon as
+/// the connection goes, not only at its next write.
 fn modernStreamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!void {
+    if (t.listens != null and std.mem.eql(u8, ctx.req.header("mcp-method") orelse "", "subscriptions/listen"))
+        return heldListen(t, ctx, body);
+    var id_arena: std.heap.ArenaAllocator = .init(t.gpa);
+    defer id_arena.deinit();
+    var cancel: CallCancel = undefined;
+    var watch: http.Server.PeerWatch = .{};
+    const peer = cancel.watch(t, ctx, body, id_arena.allocator(), &watch);
+    defer watch.stop();
+
     var buf: [4096]u8 = undefined;
     var adapter = SseAdapter.init(t.gpa, ctx.res, &buf);
     adapter.hold_lone_response = true;
     defer adapter.deinit();
 
     t.lock.acquire();
-    const rc = t.server.handleMessageFrom(body, &adapter.writer, 0);
+    const rc = t.server.handleMessageFrom(body, &adapter.writer, peer);
     t.lock.release();
     adapter.writer.flush() catch {};
     adapter.finish();
+    return modernStreamTail(t, ctx, &adapter, rc);
+}
+
+/// What follows `handleMessageFrom` on a 2026-07-28 SSE request: a refused
+/// write after the stream started is the client's cancellation; a lone
+/// response goes out as `application/json` with its status; nothing at all
+/// is a 202.
+fn modernStreamTail(t: *const Transport, ctx: *router.Ctx, adapter: *SseAdapter, rc: mcp.Error!void) anyerror!void {
     rc catch |err| switch (err) {
         error.WriteFailed => if (!adapter.started) return err, // cancelled: see above
         else => return err,
@@ -988,6 +1189,119 @@ fn modernStreamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8)
         return;
     }
     if (!adapter.started) ctx.res.setStatus(202);
+}
+
+/// A 2026-07-28 `subscriptions/listen` held open (`Transport.listens`): the
+/// acknowledgment opens the SSE stream, then the POST stays open on an
+/// `http.Server.Hold` and carries every notification `mcp` pushes to the
+/// listen's private peer (`Transport.pushSink`), until the client closes it
+/// (its cancellation: nothing more is written), the server shuts down, the
+/// application calls `Listens.finishAll`, the queue overflows or the idle
+/// timeout passes — those four end it with the graceful-close result.
+/// A listen `mcp` answered at once (push off, a refusal) is not held.
+fn heldListen(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!void {
+    const l = t.listens.?;
+    const peer = privatePeer();
+    var buf: [4096]u8 = undefined;
+    var adapter = SseAdapter.init(t.gpa, ctx.res, &buf);
+    adapter.hold_lone_response = true;
+    adapter.track_response = true;
+    defer adapter.deinit();
+    const queue = try t.gpa.alloc(u8, @max(t.listen_queue_bytes, 1));
+    defer t.gpa.free(queue);
+    var hold: http.Server.Hold = .{};
+    var opts = t.listen_hold;
+    opts.on_full = .end_stream;
+
+    // Under one lock with the call: no notification can be written to this
+    // peer between the acknowledgment and the registration (`notify*` runs
+    // under `lock` too).
+    var holding = false;
+    t.lock.acquire();
+    const rc = t.server.handleMessageFrom(body, &adapter.writer, peer);
+    adapter.writer.flush() catch {};
+    adapter.finish();
+    if (rc) |_| {
+        if (adapter.started and !adapter.saw_response) {
+            if (hold.begin(ctx.req, ctx.res, queue, opts)) |_| {
+                if (l.add(peer, &hold)) |_| {
+                    holding = true;
+                } else |_| hold.end();
+            } else |_| {}
+            // Cannot be held (`max_held_responses`, memory): end it now, as
+            // the server ending it would.
+            if (!holding) closeListen(t, &adapter, peer);
+        }
+    } else |_| {}
+    if (!holding) t.server.forgetPeer(peer);
+    t.lock.release();
+    if (!holding) return modernStreamTail(t, ctx, &adapter, rc);
+
+    const why = hold.run();
+    t.lock.acquire();
+    l.remove(peer);
+    if (why != .peer_gone and why != .write_failed) closeListen(t, &adapter, peer);
+    t.server.forgetPeer(peer);
+    t.lock.release();
+    hold.end();
+}
+
+/// The graceful close of `peer`'s listen, as the stream's last event.
+/// Caller holds `lock`.
+fn closeListen(t: *const Transport, adapter: *SseAdapter, peer: u64) void {
+    _ = t.server.endSubscriptions(&adapter.writer, peer) catch {};
+    adapter.writer.flush() catch {};
+}
+
+/// 2026-07-28: the client closing a `tools/call`'s connection cancels the
+/// call (streamable-http.mdx "Cancellation"). A `PeerWatch` fires
+/// `mcp.Server.cancelInflight` for the request's id on the request's private
+/// peer, so only this call can be hit. The session era does not get it: its
+/// revision says a disconnect is not a cancellation (a client sends
+/// `notifications/cancelled`).
+const CallCancel = struct {
+    server: *mcp.Server,
+    peer: u64,
+    id: std.json.Value,
+
+    /// Start watching when the request is a `tools/call` with an id and the
+    /// connection can be watched; the peer to serve it as (0 otherwise).
+    fn watch(c: *CallCancel, t: *const Transport, ctx: *router.Ctx, body: []const u8, arena: std.mem.Allocator, pw: *http.Server.PeerWatch) u64 {
+        if (!std.mem.eql(u8, ctx.req.header("mcp-method") orelse "", "tools/call")) return 0;
+        const id = topLevelId(arena, body) orelse return 0;
+        c.* = .{ .server = t.server, .peer = privatePeer(), .id = id };
+        pw.start(ctx.req, .{ .ctx = c, .f = fire }) catch return 0;
+        return c.peer;
+    }
+
+    fn fire(ctx: ?*anyopaque) void {
+        const c: *CallCancel = @ptrCast(@alignCast(ctx.?));
+        _ = c.server.cancelInflight(c.peer, c.id);
+    }
+};
+
+/// The top-level `id` of a JSON-RPC request when it is a string or an integer
+/// (the only ids `mcp` registers for cancellation), else null. One scan, as
+/// `isInitialize`.
+fn topLevelId(arena: std.mem.Allocator, body: []const u8) ?std.json.Value {
+    var scanner: std.json.Scanner = .initCompleteInput(arena, body);
+    if ((scanner.next() catch return null) != .object_begin) return null;
+    while (true) {
+        const key_tok = scanner.nextAllocMax(arena, .alloc_if_needed, 64) catch return null;
+        const key: []const u8 = switch (key_tok) {
+            .string, .allocated_string => |k| k,
+            else => return null, // object end or malformed
+        };
+        if (std.mem.eql(u8, key, "id")) {
+            const v = scanner.nextAllocMax(arena, .alloc_always, 256) catch return null;
+            return switch (v) {
+                .allocated_string => |x| .{ .string = x },
+                .allocated_number => |n| .{ .integer = std.fmt.parseInt(i64, n, 10) catch return null },
+                else => null,
+            };
+        }
+        if (!skipOneValue(&scanner)) return null;
+    }
 }
 
 /// A `std.Io.Writer` that turns the server's newline-delimited JSON-RPC output
@@ -1008,6 +1322,10 @@ const SseAdapter = struct {
     /// stream as usual.
     hold_lone_response: bool = false,
     held: ?[]u8 = null,
+    /// Note whether a JSON-RPC response went out (`saw_response`): a
+    /// `subscriptions/listen` still open has written none.
+    track_response: bool = false,
+    saw_response: bool = false,
 
     fn init(gpa: std.mem.Allocator, rw: *http.Server.ResponseWriter, buffer: []u8) SseAdapter {
         return .{
@@ -1066,6 +1384,7 @@ const SseAdapter = struct {
             }
         }
         if (!self.started) try self.startStream();
+        if (self.track_response and isResponse(self.gpa, trimmed)) self.saw_response = true;
         self.es.send(.{ .data = trimmed }) catch return error.WriteFailed;
     }
 
@@ -3263,4 +3582,256 @@ test "a POST whose body ends before its Content-Length is a 400" {
     var buf: [2048]u8 = undefined;
     const got = runWire(&r, "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{\"a\"", &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
+}
+
+// ── held listens and cancellation over a real socket ───────────────────────
+
+const SpinLock = struct {
+    m: std.atomic.Mutex = .unlocked,
+    fn lock(ctx: ?*anyopaque) void {
+        const self: *SpinLock = @ptrCast(@alignCast(ctx.?));
+        lockSpin(&self.m);
+    }
+    fn unlock(ctx: ?*anyopaque) void {
+        const self: *SpinLock = @ptrCast(@alignCast(ctx.?));
+        self.m.unlock();
+    }
+    fn iface(self: *SpinLock) Lock {
+        return .{ .ctx = self, .lockFn = lock, .unlockFn = unlock };
+    }
+};
+
+fn sleepMs(io: std.Io, ms: u32) void {
+    const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake };
+    d.sleep(io) catch {};
+}
+
+fn serveWrap(s: *http.Server) void {
+    s.serve() catch {};
+}
+
+/// A real `http.Server` (threads) in front of a router with the transport.
+const Live = struct {
+    threaded: std.Io.Threaded,
+    server: http.Server,
+    thread: std.Thread,
+
+    fn start(self: *Live, r: *router.Router) !bool {
+        self.threaded = std.Io.Threaded.init(testing.allocator, .{});
+        self.server = http.Server.init(self.threaded.io(), testing.allocator, .{ .handler = r.handler(), .context = r });
+        self.server.bind() catch {
+            self.server.deinit();
+            self.threaded.deinit();
+            return false;
+        };
+        self.thread = try std.Thread.spawn(.{}, serveWrap, .{&self.server});
+        return true;
+    }
+
+    fn io(self: *Live) std.Io {
+        return self.threaded.io();
+    }
+
+    fn connect(self: *Live) !std.Io.net.Stream {
+        return self.server.boundAddress().connect(self.io(), .{ .mode = .stream });
+    }
+
+    fn stop(self: *Live) void {
+        self.server.close();
+        self.server.shutdown();
+        self.thread.join();
+        self.server.deinit();
+        self.threaded.deinit();
+    }
+};
+
+fn sendAll(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var wbuf: [256]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll(bytes);
+    try sw.interface.flush();
+}
+
+fn readToEnd(io: std.Io, stream: std.Io.net.Stream, buf: []u8) []const u8 {
+    var rbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var w: std.Io.Writer = .fixed(buf);
+    _ = sr.interface.streamRemaining(&w) catch {};
+    return w.buffered();
+}
+
+fn waitFor(io: std.Io, ctx: anytype, comptime ready: fn (@TypeOf(ctx)) bool) !void {
+    var waited: u32 = 0;
+    while (!ready(ctx)) : (waited += 2) {
+        if (waited > 5000) return error.ConditionNeverHeld;
+        sleepMs(io, 2);
+    }
+}
+
+fn oneListen(l: *Listens) bool {
+    return l.count() == 1;
+}
+
+fn noListen(l: *Listens) bool {
+    return l.count() == 0;
+}
+
+const listen_wire = postHeaders("Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\n", "{\"jsonrpc\":\"2.0\",\"id\":\"listen-1\",\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"toolsListChanged\":true,\"resourceSubscriptions\":[\"file:///a\"]}}}");
+
+test "held listen: notifications pushed from another thread stream live, finishAll ends with the graceful close" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    server.push = true;
+    var listens = Listens.init(gpa);
+    defer listens.deinit();
+    var spin: SpinLock = .{};
+    var transport = Transport{ .gpa = gpa, .server = &server, .listens = &listens, .lock = spin.iface() };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    const stream = try live.connect();
+    defer stream.close(io);
+    try sendAll(io, stream, listen_wire);
+    try waitFor(io, &listens, oneListen);
+
+    transport.lock.acquire();
+    const n1 = server.notifyListChanged(transport.pushSink(), .tools);
+    const n2 = server.notifyListChanged(transport.pushSink(), .prompts); // not asked for
+    const n3 = server.notifyResourceUpdated(transport.pushSink(), "file:///a");
+    transport.lock.release();
+    try testing.expectEqual(@as(usize, 1), n1);
+    try testing.expectEqual(@as(usize, 0), n2);
+    try testing.expectEqual(@as(usize, 1), n3);
+    listens.finishAll();
+
+    var buf: [8192]u8 = undefined;
+    const got = readToEnd(io, stream, &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    const ack = std.mem.find(u8, got, "notifications/subscriptions/acknowledged").?;
+    const tools = std.mem.find(u8, got, "notifications/tools/list_changed").?;
+    const res = std.mem.find(u8, got, "notifications/resources/updated").?;
+    const done = std.mem.find(u8, got, "\"id\":\"listen-1\",\"result\"").?;
+    try testing.expect(ack < tools and tools < res and res < done);
+    try testing.expect(std.mem.find(u8, got, "/subscriptionId\":\"listen-1\"") != null);
+    try testing.expect(std.mem.endsWith(u8, got, "0\r\n\r\n"));
+    try waitFor(io, &listens, noListen);
+    // The listen's peer is forgotten: nothing is left to notify.
+    transport.lock.acquire();
+    const after = server.notifyListChanged(transport.pushSink(), .tools);
+    transport.lock.release();
+    try testing.expectEqual(@as(usize, 0), after);
+}
+
+test "held listen: the client closing ends it and drops the subscription" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    server.push = true;
+    var listens = Listens.init(gpa);
+    defer listens.deinit();
+    var spin: SpinLock = .{};
+    var transport = Transport{ .gpa = gpa, .server = &server, .listens = &listens, .lock = spin.iface() };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    const stream = try live.connect();
+    try sendAll(io, stream, listen_wire);
+    try waitFor(io, &listens, oneListen);
+    stream.close(io);
+    try waitFor(io, &listens, noListen);
+    transport.lock.acquire();
+    const n = server.notifyListChanged(transport.pushSink(), .tools);
+    transport.lock.release();
+    try testing.expectEqual(@as(usize, 0), n);
+}
+
+test "held listen: without Transport.listens the listen is acknowledged and closed, as before" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    server.push = true;
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var buf: [8192]u8 = undefined;
+    const got = runWire(&r, listen_wire, &buf);
+    try testing.expect(std.mem.find(u8, got, "notifications/subscriptions/acknowledged") != null);
+    // `mcp` holds it open (push on) and nothing ends it here: no result.
+    try testing.expect(std.mem.find(u8, got, "\"result\"") == null);
+    try testing.expect(std.mem.endsWith(u8, got, "0\r\n\r\n"));
+    server.forgetPeer(0);
+}
+
+var slow_started: std.atomic.Value(bool) = .init(false);
+var slow_saw_cancel: std.atomic.Value(bool) = .init(false);
+
+fn slowTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
+    slow_started.store(true, .release);
+    var spins: u32 = 0;
+    while (!call.cancelled() and spins < 5000) : (spins += 1) {
+        // ~5 s at most; the cancellation ends it long before.
+        var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+    slow_saw_cancel.store(call.cancelled(), .release);
+    call.write("{\"ok\":true}");
+    return false;
+}
+
+fn slowStarted(_: void) bool {
+    return slow_started.load(.acquire);
+}
+
+test "2026-07-28: closing the connection of a running tools/call cancels it (ToolCall.cancelled)" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{ .name = "slow", .description = "waits for cancellation", .input_schema = "{\"type\":\"object\"}", .handler = slowTool });
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    for ([_][]const u8{ "", "Accept: application/json, text/event-stream\r\n" }) |accept| {
+        slow_started.store(false, .release);
+        slow_saw_cancel.store(false, .release);
+        var wire_buf: [1024]u8 = undefined;
+        const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}," ++ modern_meta ++ "}}";
+        const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\n{s}MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ accept, body.len, body });
+        const stream = try live.connect();
+        try sendAll(io, stream, wire);
+        try waitFor(io, {}, slowStarted);
+        stream.close(io);
+        var waited: u32 = 0;
+        while (!slow_saw_cancel.load(.acquire) and waited < 4000) : (waited += 2) sleepMs(io, 2);
+        try testing.expect(slow_saw_cancel.load(.acquire));
+    }
+}
+
+test "topLevelId: string and integer ids, nothing else" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqual(@as(i64, 7), topLevelId(a, "{\"params\":{\"id\":1},\"id\":7}").?.integer);
+    try testing.expectEqualStrings("x", topLevelId(a, "{\"id\":\"x\"}").?.string);
+    try testing.expect(topLevelId(a, "{\"id\":1.5}") == null);
+    try testing.expect(topLevelId(a, "{\"id\":null}") == null);
+    try testing.expect(topLevelId(a, "{\"a\":}") == null);
+    try testing.expect(topLevelId(a, "[1]") == null);
 }
