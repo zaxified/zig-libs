@@ -213,7 +213,10 @@ Run: `scripts/modtest mcp-http`; the example (`example/main.zig`) is built by
   the subscription is gone; the client closing it drops the subscription; without `listens` the old ack-and-close
   shape. A modern `tools/call` whose connection the client closes sees `ToolCall.cancelled()` (JSON and SSE), a chunked-body one too; a client that left while its call waited for the transport lock never runs it.
 - **Fuzz:** the deterministic driver `MCP_HTTP_FUZZ=<runs>[,<first seed>]` (testkit; `_ONLY` selects
-  a harness) over `mcp-http-pre-parse` (the two JSON scanners) and `mcp-http-wire` (whole raw HTTP
+  a harness) over `mcp-http-pre-parse` (the two JSON scanners), `mcp-http-top-level-id` (`topLevelId`, the
+  id a disconnect cancels, against a `std.json.Value` parse of the same bytes: same id on every body the
+  parse accepts, bar the scanner's own limits of a 64-byte top-level key and a 256-byte id; a duplicate
+  `id` key is a parse error in `mcp`, so never reaches a call; 600,000 runs clean) and `mcp-http-wire` (whole raw HTTP
   requests against a router with two live sessions: a forged session id is 404, a foreign Origin
   403, `DELETE` takes only its own session, damaged requests are answered or dropped); both also run
   with a fixed number of seeds in every test run and must reach every outcome.
