@@ -86,16 +86,28 @@ test "bench field (opt-in via P521_BENCH)" {
     var a = Fe.fromInt(0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12) catch unreachable;
     const b = Fe.fromInt(0x0fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba098765432) catch unreachable;
     const n = 1_000_000;
-    var best_m: u64 = std.math.maxInt(u64);
-    var best_s: u64 = std.math.maxInt(u64);
+    // `mul`/`sq` (the MULX core where `field.mulx_core`) and the portable
+    // forms, interleaved round by round: an A/B inside one run.
+    var best: [4]u64 = @splat(std.math.maxInt(u64));
     for (0..5) |_| {
         var t0 = nowNs();
         for (0..n) |_| a = a.mul(b);
-        best_m = @min(best_m, nowNs() - t0);
+        best[0] = @min(best[0], nowNs() - t0);
         t0 = nowNs();
         for (0..n) |_| a = a.sq();
-        best_s = @min(best_s, nowNs() - t0);
+        best[1] = @min(best[1], nowNs() - t0);
+        t0 = nowNs();
+        for (0..n) |_| a = a.mulPortable(b);
+        best[2] = @min(best[2], nowNs() - t0);
+        t0 = nowNs();
+        for (0..n) |_| a = a.sqPortable();
+        best[3] = @min(best[3], nowNs() - t0);
     }
     std.mem.doNotOptimizeAway(&a);
-    std.debug.print("fe.mul  {d:8.1} ns\nfe.sq   {d:8.1} ns\n", .{ @as(f64, @floatFromInt(best_m)) / n, @as(f64, @floatFromInt(best_s)) / n });
+    const ns = struct {
+        fn f(x: u64) f64 {
+            return @as(f64, @floatFromInt(x)) / n;
+        }
+    }.f;
+    std.debug.print("fe.mul  {d:8.1} ns (portable {d:8.1})\nfe.sq   {d:8.1} ns (portable {d:8.1})  mulx core: {}\n", .{ ns(best[0]), ns(best[2]), ns(best[1]), ns(best[3]), @import("field.zig").mulx_core });
 }

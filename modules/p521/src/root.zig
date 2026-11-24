@@ -54,7 +54,7 @@ pub const meta = .{
     // The module catalog's one-line entry. README.md's table is rendered
     // from it by `zig build gen-catalog`.
     .doc = "NIST P-521 (secp521r1): Mersenne field, constant-time ECDH and ECDSA-P521 (RFC 6979) with std `P384`/`Ecdsa`-shaped API; CAVP + Wycheproof + OpenSSL anchored.",
-    .platform_note = "any (portable, no asm)",
+    .platform_note = "amd64 asm + portable fallback",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation, no I/O
