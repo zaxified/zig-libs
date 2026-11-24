@@ -41,7 +41,12 @@ as the server. No `@panic` stubs remain in this module.
   `Decision` — accept with `Permissions`, reject, or partial success naming
   the next step — with multi-round keyboard-interactive, `no_client_auth` and
   `max_attempts` (6). Live-tested against OpenSSH 10.2 (`AuthenticationMethods`
-  both roles) and Go (`PartialSuccessError`).
+  both roles) and Go (`PartialSuccessError`). Go's other server hooks:
+  `banner_callback`, `pre_auth`, `on_auth` (every verdict), `publickey_verified`,
+  and the `source-address` critical option, checked against the peer address the
+  caller hands in (`AuthConfig.remote_address`). **`hostbased`** (RFC 4252 §9)
+  in both roles, and the client side of the §8 **password change**
+  (`password_change`, libssh2's callback shape).
 - **Part 3 — connection protocol** (`connection.zig`): channels with real
   RFC 4254 §5.2 window/flow control, `CHANNEL_DATA` / `_EXTENDED_DATA`
   (stderr) / `_EOF` / `_CLOSE`; `"exec"` / `"subsystem"` / `"shell"` /
@@ -288,6 +293,19 @@ try ssh.connection.serveConnection(&st, gpa, .fromAuth(&auth2, .{ .exec = handle
 // round before `.accept`/`.partial` counts.
 // `.no_client_auth = true` (+ optional `.no_client_auth_callback`) admits a
 // `none` request: Go's NoClientAuth.
+
+// ── server: Go's other hooks, and the peer address ─────────────────────────
+// const auth3 = try ssh.userauth.serveUserauth(&st, gpa, .{
+//     .callbacks = .{ .publickey = .{ .ctx = &policy, .decideFn = Policy.key } },
+//     .remote_address = peer_address, // what `accept` gave you; Go's RemoteAddr
+//     .banner_callback = .{ .ctx = &me, .bannerFn = bannerFor },  // once, user known
+//     .on_auth = .{ .ctx = &me, .onFn = logVerdict },  // successes too
+//     .publickey_verified = .{ .ctx = &me, .decideFn = afterSignature },
+// });
+// A grant with `.{ .name = "source-address", .value = "10.0.0.0/8,192.0.2.7" }`
+// among its critical options logs in only from those addresses (Go, OpenSSH).
+// Hostbased: `AuthConfig.hostbased` (server) and
+// `ClientMethod{ .hostbased = .{ .key = &host_key, .client_host = "me.example.", .client_user = "alice" } }`.
 ```
 
 Top-level shortcuts: `ssh.authenticate` (client publickey auth),
@@ -322,11 +340,11 @@ deferred.
 ## Not provided
 
 SFTP, compression, SSH certificates, `ssh-agent`, X11/agent forwarding, server-side TCP/IP forwarding
-(the server never opens or listens on sockets), `hostbased` and password-change authentication, legacy
+(the server never opens or listens on sockets), serving a password change (the client answers one), legacy
 algorithms (`ssh-rsa`/SHA-1, CBC, HMAC-SHA1), and a server that streams a handler's stdin/stdout (a served
 `"shell"` is batch input to output). Requests for them are answered `SSH_MSG_CHANNEL_FAILURE` /
 `SSH_MSG_CHANNEL_OPEN_FAILURE` / `SSH_MSG_REQUEST_FAILURE`, never mishandled. SPEC.md has the reasons
-(*What is deliberately not done*) and the planned items (*Backlog / deferred*).
+(*What is deliberately not done*) and the planned items (*Roadmap*).
 
 ## Tests
 
