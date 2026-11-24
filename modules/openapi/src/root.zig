@@ -71,6 +71,7 @@
 //!   (`error.UnresolvedPathParameter`).
 
 const std = @import("std");
+const jsontext = @import("jsontext");
 const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
@@ -92,7 +93,7 @@ pub const meta = .{
     // so the middleware as a whole is `.threadsafe`, not `.reentrant`.
     .concurrency = .threadsafe,
     .model_after = "FastAPI auto-docs (generated-spec shape) + utoipa (Rust) / OpenAPI 3.1 spec",
-    .deps = .{ "router", "http" },
+    .deps = .{ "router", "http", "jsontext" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -1710,7 +1711,7 @@ fn serveIntercepted(e: *Endpoint, ctx: *router.Ctx, what: enum { spec, docs }) a
                 ctx.res.setStatus(200);
                 try ctx.res.setHeader("Content-Type", "text/html; charset=utf-8");
                 try ctx.res.writeAll(docs_html_head);
-                try writeScriptString(ctx.res, e.path);
+                try writeScriptString(ctx.res.writer(), e.path);
                 try ctx.res.writeAll(docs_html_tail);
             },
         },
@@ -1772,22 +1773,15 @@ const docs_html_tail =
 /// `"`, `\\` and control bytes escaped, `<` as `\\u003c` so no `</script>`
 /// can close the element. The path is the developer's, but it went out raw
 /// before (review 2026-10-23): a `"` in it broke the page.
-fn writeScriptString(res: anytype, s: []const u8) !void {
-    try res.writeAll("\"");
-    var start: usize = 0;
-    for (s, 0..) |c, i| {
-        if (c >= 0x20 and c != '"' and c != '\\' and c != '<') continue;
-        try res.writeAll(s[start..i]);
-        var esc: [6]u8 = undefined;
-        try res.writeAll(switch (c) {
-            '"' => "\\\"",
-            '\\' => "\\\\",
-            else => std.mem.print(&esc, "\\u{x:0>4}", .{c}) catch unreachable,
-        });
-        start = i + 1;
-    }
-    try res.writeAll(s[start..]);
-    try res.writeAll("\"");
+fn writeScriptString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    jsontext.writeString(w, s, .{
+        .invalid_utf8 = .verbatim,
+        .short_escapes = .none,
+        .escape_chars = "<",
+    }) catch |e| switch (e) {
+        error.WriteFailed => return error.WriteFailed,
+        error.InvalidUtf8 => unreachable, // only `.reject` returns it
+    };
 }
 
 // ── conformance: a real OpenAPI 3.1 structural validator ────────────────────
@@ -4353,14 +4347,8 @@ test "endpoint: a 405 carries a plain-text body and Allow" {
 }
 
 test "docs page: the spec path is spliced as a JS string -- only quote, backslash, controls and < are escaped" {
-    const ListRes = struct {
-        list: *std.ArrayList(u8),
-        fn writeAll(self: @This(), b: []const u8) !void {
-            try self.list.appendSlice(testing.allocator, b);
-        }
-    };
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(testing.allocator);
-    try writeScriptString(ListRes{ .list = &list }, "a b\x1f\x01\"\\<c");
-    try testing.expectEqualStrings("\"a b\\u001f\\u0001\\\"\\\\\\u003cc\"", list.items);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeScriptString(&aw.writer, "a b\x1f\x01\"\\<c");
+    try testing.expectEqualStrings("\"a b\\u001f\\u0001\\\"\\\\\\u003cc\"", aw.written());
 }
