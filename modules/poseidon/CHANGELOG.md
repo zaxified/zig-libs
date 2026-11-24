@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-24** — **New:** `poseidon.neptune` — Filecoin's / Lurk's Poseidon over BLS12-381: `Hasher(arity, strength)` for arities 1..36 with neptune's round numbers (`roundNumbers`, `partialRounds`; standard and strengthened), Grain constants seeded with S-box tag 1, the Cauchy MDS `1/(i+t+j)`, `HashType` domain tags (Merkle tree, constant length, encryption, custom) and the digest at state element 1. Byte-exact against neptune's `hash_values` vectors and a 426-line transcript of neptune itself, `round_numbers.txt` for `t = 2..125` and the arity-8 constants. `grain.Config` gained `sbox_tag` (default 0) and `mds` (default `.grain`), `grain.Lfsr.initTagged`; defaults leave every existing table unchanged. `bench-poseidon` and `tools/oracle` (light-poseidon and neptune as foreign sides); the card's Performance line is measured (BN254 0.65–0.75× light-poseidon, BLS12-381 1.56–3.23× neptune).
+
 - **2026-11-14** — No-panic sweep: every `mds_security.Checks` entry point now rejects a state width outside `1..n_max` with a checked `@panic` (was out-of-bounds slice / UB in ReleaseFast, and `t - 1` underflow at `t = 0`); `grain.derive` turns a zero modulus or `n > 256` in a `Config` into a `@compileError` (was an endless rejection loop / silently truncated draws). No change for any valid input.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

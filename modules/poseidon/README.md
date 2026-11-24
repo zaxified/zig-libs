@@ -95,13 +95,25 @@ const s = q.permute(.{ x, y, z });             // externally anchored
 |---|---|---|---|
 | BN254 `Fr` (`bn254.Fr`) | `t = 2..17`, i.e. 1..16 inputs | 8 / `N_ROUNDS_P[t-2]` | circomlib — what deployed circuits use |
 | BLS12-381 `Fr` (`bls12_381.Fr`) | `t = 3`, `t = 5` | 8 / 57, 8 / 60 | the authors' `poseidonperm_x5_255_{3,5}` |
+| BLS12-381 `Fr`, Filecoin's `neptune` (`neptune`) | arity 1..36 (`t = 2..37`), standard or strengthened | 8 / 55..60 (x 1.25 strengthened) | neptune's own round numbers, constants (Grain seed tag 1), Cauchy MDS and domain tags |
 
 No new field arithmetic is defined anywhere in this module; both `Fr` types
 come from the sibling curve modules unchanged.
 
-⚠ On BLS12-381 only the **permutation** has an external anchor. The
-`hash`/`compress` framing on that field is this module's own and does not
-match Filecoin's `neptune` or dusk, which use domain tags. See `SPEC.md`.
+⚠ On `bls12_381.Perm` only the **permutation** has an external anchor. Its
+`hash`/`compress` framing is this module's own and does not match Filecoin's
+`neptune` or dusk, which use domain tags: for Filecoin / Lurk compatibility use
+`poseidon.neptune`:
+
+```zig
+const H = poseidon.neptune.Hasher(8, .standard);   // an 8-ary Merkle node
+const h = H.init();                                // once: runs the Grain generator
+const node = h.merkle(children);                   // [8]Fr -> Fr, neptune's HashType::MerkleTree
+const d = try h.hash(.{ .constant_length = 3 }, &three_elements); // also .encryption, .{ .custom = id }
+```
+
+Its digest is state element 1, `[domain tag] ++ preimage` is the state, and only
+one-permutation hashes exist (no sponge). See `SPEC.md`.
 
 ## Anchoring
 
@@ -158,8 +170,7 @@ The Debug lane is slow because `std.crypto.ff`'s constant-time multiply costs
 ## Not provided
 
 Variable-length (sponge) hashing and circuit / constraint-system integration are
-refused; Poseidon2 and a neptune-compatible BLS12-381 framing are not built (open
-items). Rescue-Prime is the sibling module [`rescue`](../rescue/README.md).
+refused; Poseidon2 is not built (roadmap) and neptune's sponge API is not here. Rescue-Prime is the sibling module [`rescue`](../rescue/README.md).
 `SPEC.md` gives the reasoning (*What is deliberately not done*, *Backlog /
 deferred*).
 

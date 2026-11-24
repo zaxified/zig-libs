@@ -44,7 +44,9 @@
 //!   - Two field instantiations:
 //!     - `bn254` — circomlib's parameter set, `t = 2..17` (1..16 inputs),
 //!       which is what deployed circom circuits use;
-//!     - `bls12_381` — the authors' `poseidonperm_x5_255_{3,5}`, `t = 3, 5`.
+//!     - `bls12_381` — the authors' `poseidonperm_x5_255_{3,5}`, `t = 3, 5`;
+//!     - `neptune` — Filecoin's Poseidon over BLS12-381 (arity 1..36, domain
+//!       tags, standard and strengthened), byte-exact against neptune.
 //!
 //! ## Anchoring
 //!
@@ -69,6 +71,7 @@
 //! ```
 //!
 //!   - `bn254.Perm(t)` — `t` in 2..17, i.e. `t - 1` inputs.
+//!   - `neptune.Hasher(arity, strength)` — Filecoin / Lurk framing and parameters;
 //!   - `bls12_381.Perm(t)` — `t` in {3, 5}, permutation externally anchored;
 //!     the hash framing on this field is not (see that file).
 //!
@@ -119,12 +122,18 @@ pub const bn254 = @import("bn254_poseidon.zig");
 /// Poseidon over the BLS12-381 scalar field — the authors' `x5_255_{3,5}`.
 pub const bls12_381 = @import("bls12_381_poseidon.zig");
 
+/// Poseidon over the BLS12-381 scalar field with Filecoin's `neptune`
+/// parameters, round numbers, domain tags and framing.
+pub const neptune = @import("neptune.zig");
+
 test {
     _ = grain;
     _ = mds_security;
     _ = @import("linalg.zig");
     _ = bn254;
     _ = bls12_381;
+    _ = neptune;
+    _ = @import("neptune_test.zig");
     _ = @import("vectors_test.zig");
     _ = @import("constants_test.zig");
     _ = @import("fuzz_test.zig");

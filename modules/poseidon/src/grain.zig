@@ -65,13 +65,21 @@ pub const Lfsr = struct {
     ///
     /// Field layout, MSB-first, 2+4+12+12+10+10+30 = 80 bits:
     /// `field(2) ‖ sbox(4) ‖ n(12) ‖ t(12) ‖ R_F(10) ‖ R_P(10) ‖ 1^30`.
-    /// `field = 1` is GF(p) and `sbox = 0` is `x^alpha`; the GF(2^n) and
-    /// `x^-1` paths of the reference script are out of scope (see `SPEC.md`),
-    /// so those two are fixed rather than parameters.
+    /// `field = 1` is GF(p) and `sbox = 0` is `x^alpha` (`init`; `initTagged`
+    /// takes the tag); the GF(2^n) and `x^-1` paths of the reference script are
+    /// out of scope (see `SPEC.md`).
     pub fn init(n: u12, t: u12, r_f: u10, r_p: u10) Lfsr {
+        return initTagged(0, n, t, r_f, r_p);
+    }
+
+    /// `init` with the S-box field of the seed spelled out. The reference script
+    /// writes its `s_box` argument there (0 = `x^alpha`, 1 = `x^-1`); neptune
+    /// (Filecoin) passes 1 while using `x^5` (`Config.sbox_tag`), so its constants
+    /// differ from the `0` ones for the same `(n, t, R_F, R_P)`.
+    pub fn initTagged(sbox_tag: u4, n: u12, t: u12, r_f: u10, r_p: u10) Lfsr {
         var s: u128 = 0;
         s = (s << 2) | 1; // field = 1 (GF(p))
-        s = (s << 4) | 0; // sbox  = 0 (x^alpha)
+        s = (s << 4) | sbox_tag; // sbox tag
         s = (s << 12) | n;
         s = (s << 12) | t;
         s = (s << 10) | r_f;
@@ -139,6 +147,22 @@ pub const Config = struct {
     r_f: u10,
     /// Number of partial rounds `R_P`.
     r_p: u10,
+    /// The 4-bit S-box field of the Grain seed. 0 for every set that follows the
+    /// reference script's `x^alpha` convention (circomlib, the authors' files);
+    /// neptune seeds 1 (see `Lfsr.initTagged`).
+    sbox_tag: u4 = 0,
+    /// How the MDS matrix is made.
+    mds: MdsRule = .grain,
+
+    pub const MdsRule = enum {
+        /// The reference script's: `2t` Grain draws, Cauchy matrix, subspace-trail
+        /// checks and the rejection loop.
+        grain,
+        /// neptune's `generate_mds`: `M[i][j] = (i + t + j)^-1` (Cauchy over the
+        /// consecutive integers `xs = 0..t`, `ys = t..2t`), no Grain draws, no
+        /// security checks (it is symmetric by construction).
+        cauchy_consecutive,
+    };
 
     pub fn numConstants(comptime cfg: Config) usize {
         return (@as(usize, cfg.r_f) + cfg.r_p) * cfg.t;
@@ -224,14 +248,13 @@ pub const Error = error{
 pub fn derive(comptime cfg: Config) Error!Tables(cfg) {
     const Fr = cfg.Fr;
     // One instantiation per field, not one per width — see `Checks`.
-    comptime std.debug.assert(cfg.t <= mds_security.max_state_width);
+    comptime std.debug.assert(cfg.mds == .cauchy_consecutive or cfg.t <= mds_security.max_state_width);
     // A zero modulus makes the rejection loop below spin forever; `n > 256`
     // silently drops draw bits in `nextNum`'s u256. Config is comptime, so
     // both are compile errors, not runtime hazards.
     comptime if (std.mem.readInt(u256, &cfg.modulus_be, .big) == 0 or cfg.n > 256)
         @compileError("poseidon: Config needs a non-zero modulus and n <= 256");
-    const checks = mds_security.Checks(Fr, &cfg.modulus_be, mds_security.max_state_width);
-    var lfsr: Lfsr = .init(cfg.n, cfg.t, cfg.r_f, cfg.r_p);
+    var lfsr: Lfsr = .initTagged(cfg.sbox_tag, cfg.n, cfg.t, cfg.r_f, cfg.r_p);
     const p = std.mem.readInt(u256, &cfg.modulus_be, .big);
 
     var out: Tables(cfg) = undefined;
@@ -244,6 +267,19 @@ pub fn derive(comptime cfg: Config) Error!Tables(cfg) {
         std.mem.writeInt(u256, &be, v, .big);
         c.* = Fr.fromBytes(be) catch unreachable; // v < p by construction
     }
+
+    if (cfg.mds == .cauchy_consecutive) {
+        var denom: [cfg.t * cfg.t]Fr = undefined;
+        for (0..cfg.t) |i| {
+            for (0..cfg.t) |j| denom[i * cfg.t + j] = smallFr(Fr, i + cfg.t + j);
+        }
+        for (0..cfg.t) |i| {
+            for (0..cfg.t) |j| out.mds[i][j] = denom[i * cfg.t + j].inv() catch return error.NotInvertible;
+        }
+        out.mds_candidates = 0;
+        return out;
+    }
+    const checks = mds_security.Checks(Fr, &cfg.modulus_be, mds_security.max_state_width);
 
     var attempts: usize = 0;
     while (true) {
@@ -318,6 +354,13 @@ pub fn derive(comptime cfg: Config) Error!Tables(cfg) {
         out.mds_candidates = attempts;
         return out;
     }
+}
+
+/// A small integer as a field element.
+fn smallFr(comptime Fr: type, v: usize) Fr {
+    var be: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, be[24..32], v, .big);
+    return Fr.fromBytes(be) catch unreachable;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

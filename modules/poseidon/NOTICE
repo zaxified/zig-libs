@@ -96,3 +96,46 @@ Nothing at all is taken from `iden3/circomlib`; it is a design reference,
 recorded as such in this module's `README.md` `Provenance:` statement and in
 `SPEC.md`. No circomlib or circomlibjs source and no circomlib or circomlibjs
 data is present in this repository, so their terms do not reach this module.
+
+## neptune (Filecoin / Lurk Poseidon)  (affects: src/neptune.zig, src/grain.zig
+## (`sbox_tag`, `cauchy_consecutive`), src/neptune_test.zig,
+## src/testdata/neptune_vectors.txt, tools/oracle)
+
+`src/neptune.zig` follows the parameters and framing of `neptune`
+(https://github.com/argumentcomputer/neptune, formerly filecoin-project/neptune
+and lurk-lab/neptune; commit b06f03c5abcb6ff72625349572b21241956d55df,
+2025-03-10), which is licensed `MIT OR Apache-2.0`; this module takes it under
+the MIT terms. What is taken, as facts and algorithms read from its source and
+re-expressed in Zig, not copied code: the round-number search of
+`round_numbers.rs` (itself a port of the Poseidon authors' `calc_round_numbers.py`),
+the domain tags of `hash_type.rs`, the Grain seed tag and the consecutive-integer
+Cauchy MDS of `round_constants.rs`/`mds.rs`, the digest position of
+`poseidon_alt.rs`. `src/neptune_test.zig` carries known answers and table values
+copied from neptune's test suite and `parameters/` directory (data), and
+`src/testdata/neptune_vectors.txt` is the output of RUNNING neptune
+(`tools/oracle`). Its copyright and permission notice (the `LICENSE-MIT` text,
+holder as named in `LICENSE-APACHE`):
+
+    Copyright (c) 2018 Filecoin Project
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+The bench programs (`tools/bench.zig`, `tools/oracle`) build and run neptune and
+light-poseidon (Apache-2.0) from source as black boxes; none of their code is in
+the published module.
