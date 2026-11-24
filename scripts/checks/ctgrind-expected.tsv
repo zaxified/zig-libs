@@ -2582,6 +2582,10 @@ ssh	ReleaseFast	pem	1	4	44bc21276091fd81	2ba7559fa99a2188	cpu=x86_64
 # the 3DH (ephemeral and static keys), +3 over the plain row; the voprf/recover/KE3 verdicts are unchanged.
 opaque	ReleaseFast	login_x25519	1	8	f5d9779d6e4f3a18	4dd6b390a25482a8	cpu=x86_64
 opaque	ReleaseFast	serverke2_x25519	1	4	f5d9779d6e4f3a18	28c4b4c908b2e302	cpu=x86_64
+# voprf p521-server (2026-11-24): portable 26 against native 24 -- the same classes, p521 group.zig's
+# variable-time addAffineVt (mulPublic on the PUBLIC composite scalars) reads 6 contexts without the
+# amd64 MULX field core (4 with it); nothing outside the documented classes.
+voprf	ReleaseFast	p521-server	1	26	a448ff40ae25f5e0	5a0178ab968c5fe9	cpu=x86_64
 ct25519	ReleaseFast	x25519	1	1	aaa45198aa7c91a1	8af2fe8213b778aa	cpu=x86_64
 hpke	ReleaseFast	x25519_decap	1	1	988bf797e9128852	c0cee0a8c6bf72c3	cpu=x86_64
 hpke	ReleaseFast	x25519_authdecap	1	2	988bf797e9128852	05af25d1d0e3943d	cpu=x86_64
