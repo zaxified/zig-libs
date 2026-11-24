@@ -221,6 +221,14 @@ test "crc64: the table path alone equals the kernel" {
     }
 }
 
+test "crc64: the run-time PCLMULQDQ detection agrees with CPUID" {
+    if (!pclmul_emittable) return error.SkipZigTest;
+    if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .pclmul)) return error.SkipZigTest;
+    // Twice: the first call fills the cache, the second reads it.
+    try std.testing.expectEqual(cpuidPclmul(), usePclmul());
+    try std.testing.expectEqual(cpuidPclmul(), usePclmul());
+}
+
 /// 100003 bytes of `kat_input`, the CRC-64 liblzma computed (`tools/gen_kat.py`).
 fn katInput(buf: []u8) void {
     var x: u32 = 12345;

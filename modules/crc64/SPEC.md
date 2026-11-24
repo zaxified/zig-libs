@@ -6,7 +6,7 @@
 
 **Scope:** parity — liblzma 5.8.1 `lzma_crc64` (surveyed 2026-11-21)
 
-**Audit:** review none · mutation none · src ?
+**Audit:** review 2026-11-24 · mutation 2026-11-24 (18/24, 6 eq) · src 76944a542effe233
 
 **Hardening:** fuzz none · ct n/a — checksum only, no secret · panic n/a — every length is a valid input; no cast, unwrap or assert on a data path
 
@@ -65,6 +65,16 @@ the table path alone against the kernel.
 
 Run: `scripts/modtest crc64`. A `std.testing.fuzz` harness compares any bytes at any split with `std` (no driver run recorded). The kernel test is skipped where the CPU or the backend has no PCLMULQDQ (the table
 path is then the only one). The card's `**Audit:**` line is the current score.
+
+- **Review:** the whole of `src/root.zig` read against liblzma's kernel shape: the dispatch takes the kernel only
+  for a multiple of 16 bytes and leaves the tail to the tables; the register is inverted once on entry and once on
+  exit; the detection cache is idempotent, so a race between two threads stores the same value. No finding.
+- **Mutation:** a whole-module schemata run, built for the baseline `x86_64` CPU so that the run-time detection
+  path executes (on a native build it is compiled out). The survivors: five are cost-only (the kernel bypassed or
+  the detection re-run, the 8-, 48- and 64-byte thresholds at `>`: the bytes left over take the next path, which
+  gives the same value) and one is unobservable here (CPUID bit 0 for bit 1: alive because the test CPU has both
+  SSE3 and PCLMULQDQ; it needs a pre-Westmere CPU). The detection test was added for this run: without it a
+  detection that always said "no" left every long input on the table path, five times slower, with no failure.
 
 ## What is deliberately not done
 
