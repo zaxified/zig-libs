@@ -17,6 +17,7 @@ const std = @import("std");
 const value = @import("value.zig");
 const frame_mod = @import("frame.zig");
 const textio = @import("textio.zig");
+const jsontext = @import("jsontext");
 
 const Frame = frame_mod.Frame;
 const Value = value.Value;
@@ -55,8 +56,8 @@ pub const JsonDateUnit = enum { s, ms, us, ns };
 pub const JsonWriteOptions = struct {
     /// Escape every non-ASCII character as `\uXXXX` (surrogate pairs past the BMP): pandas'
     /// `force_ascii`, which is *on* by default there; polars never does. Off here, the
-    /// existing form (valid UTF-8). Written in this file instead of through `jsontext`'s
-    /// `ascii_only`, which would add a module dependency for fifteen lines.
+    /// existing form (valid UTF-8). Written by `jsontext`'s
+    /// `ascii_only`.
     force_ascii: bool = false,
     /// Round floats to this many decimals and drop trailing zeros but one (pandas
     /// `double_precision`, default 10 there, at most 15, else `error.BadOptions` as pandas'
@@ -401,47 +402,12 @@ pub fn writeString(w: *std.Io.Writer, s: []const u8) JsonError!void {
 /// `writeString`; with `ascii`, every non-ASCII character is `\uXXXX` (a surrogate pair
 /// past the BMP), a byte that is not valid UTF-8 `\ufffd`.
 pub fn writeStringA(w: *std.Io.Writer, s: []const u8, ascii: bool) JsonError!void {
-    try w.writeByte('"');
-    var i: usize = 0;
-    var run: usize = 0; // start of the bytes not written yet
-    while (i < s.len) {
-        const ch = s[i];
-        if (ch < 0x80) {
-            const esc: ?[]const u8 = switch (ch) {
-                '"' => "\\\"",
-                '\\' => "\\\\",
-                '\n' => "\\n",
-                '\r' => "\\r",
-                '\t' => "\\t",
-                else => null,
-            };
-            if (esc != null or ch < 0x20) {
-                try w.writeAll(s[run..i]);
-                if (esc) |e| try w.writeAll(e) else try w.print("\\u{x:0>4}", .{ch});
-                run = i + 1;
-            }
-            i += 1;
-            continue;
-        }
-        const n = std.unicode.utf8ByteSequenceLength(ch) catch 0;
-        if (n != 0 and i + n <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + n])) {
-            if (ascii) {
-                try w.writeAll(s[run..i]);
-                const cp = std.unicode.utf8Decode(s[i .. i + n]) catch 0xFFFD;
-                if (cp >= 0x10000) {
-                    const x = cp - 0x10000;
-                    try w.print("\\u{x:0>4}\\u{x:0>4}", .{ 0xD800 + (x >> 10), 0xDC00 + (x & 0x3FF) });
-                } else try w.print("\\u{x:0>4}", .{cp});
-                run = i + n;
-            }
-            i += n;
-            continue;
-        }
-        try w.writeAll(s[run..i]);
-        if (ascii) try w.writeAll("\\ufffd") else try w.writeAll(&std.unicode.replacement_character_utf8);
-        i += 1;
-        run = i;
-    }
-    try w.writeAll(s[run..]);
-    try w.writeByte('"');
+    const r = if (ascii)
+        jsontext.writeString(w, s, .{ .invalid_utf8 = .replace_per_byte, .short_escapes = .tnr, .ascii_only = true })
+    else
+        jsontext.writeString(w, s, .{ .invalid_utf8 = .replace_per_byte, .short_escapes = .tnr });
+    r catch |e| switch (e) {
+        error.WriteFailed => return error.WriteFailed,
+        error.InvalidUtf8 => unreachable, // only `.reject` returns it
+    };
 }

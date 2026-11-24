@@ -29,7 +29,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "pandas 3.1 (reference) and polars 2.1 (fastest) eager DataFrame API",
-    .deps = .{ "datefmt", "csvstream", "regex", "tz", "unitext" },
+    .deps = .{ "datefmt", "csvstream", "regex", "tz", "unitext", "jsontext" },
 };
 
 // ── the cell model ──────────────────────────────────────────────────────────

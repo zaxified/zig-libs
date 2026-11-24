@@ -81,7 +81,7 @@ position.
   (`ColumnType`, `src/value.zig`; `SPEC.md` § Design notes by feature).
 - **Model after:** pandas 3.1 and polars 2.1, eager DataFrame API.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared state).
-  **Deps:** `datefmt` (the calendar of the `dt` functions), `csvstream` (records, fields and quoting of the CSV reader and writer), `regex` (the regular-expression `Expr` functions), `tz` (time zones), `unitext` (Unicode case mapping and character classes).
+  **Deps:** `datefmt` (the calendar of the `dt` functions), `csvstream` (records, fields and quoting of the CSV reader and writer), `regex` (the regular-expression `Expr` functions), `tz` (time zones), `unitext` (Unicode case mapping and character classes), `jsontext` (the JSON string writer).
 
 Provenance: original work of the zig-libs authors (MIT); the storage came from
 `dataset`'s `Frame` and the verbs from `tabular`, same authors (both modules are retired). Modeled after pandas

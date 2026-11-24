@@ -348,8 +348,7 @@ cases, 8 `to_html` and 3 `glimpse` cases).
 - **JSON write:** `writeJsonOpts(a, w, f, orient, JsonWriteOptions)`; `writeJson(w, f, orient)` is unchanged and compact.
   `JsonOrient` gained `split`, `index`, `values`, `table` (pandas shapes with the default `RangeIndex` 0..n-1; the
   Table Schema carries `pandas_version` `"1.4.0"`); `force_ascii` (pandas, default *on* there, off here: valid UTF-8 as
-  before; escaped in this file rather than through `jsontext`'s `ascii_only`, which would make `jsontext` a dependency for
-  fifteen lines), `double_precision` (pandas, at most 15), `indent` (pandas, ujson's layout: `"a":1` without a space; the
+  before; escaped by `jsontext`'s `ascii_only`), `double_precision` (pandas, at most 15), `indent` (pandas, ujson's layout: `"a":1` without a space; the
   document is built compact in memory first, capped by `max_indent_bytes` -> `OutputTooLarge`), `date_format = .epoch` with
   `date_unit` (pandas; a date is its midnight UTC, a duration a count of the unit).
 - **JSON read:** `JsonReadOrient` gained `split` (`columns` found by its own scan, so key order is free; a row longer than
