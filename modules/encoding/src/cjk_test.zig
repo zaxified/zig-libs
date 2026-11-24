@@ -859,6 +859,11 @@ fn encodeCorpus(a: std.mem.Allocator) !std.ArrayList([]const u8) {
         "x\xe3\x81", // cut sequence at the end
         "\xe3\x81\xe3\x81\x82\xff\xf0\x9f\x98\x80\xc0\x80",
         "한국어 中文 \u{10FFFF}",
+        // The encoders' inline run (two- and three-byte forms) meets every kind of
+        // sequence it must leave to the state machine, in the middle of text.
+        "日本\x1b語\x0e\x0f字 \xed\xa0\x80 \xe0\x80\x80 \xc1\xbf ア\u{A5}ア\u{203E}ア\u{2212}ア\u{FF61}\u{FF9F}ア",
+        "中\u{20AC}\u{E5E5}\u{E78D}\u{E864}\u{E865}文\u{80}\u{81}\u{FFFF}\u{10000}字",
+        "漢\xe6\xbc\xa2\xe6\xbc", // a whole character, then a cut one
     };
     for (text) |x| try list.append(a, x);
     return list;

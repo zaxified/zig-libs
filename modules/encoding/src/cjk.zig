@@ -902,6 +902,100 @@ fn putCp(dst: []u8, cp: u21) usize {
 /// `.output_full` without progress.
 pub const encoder_headroom = 16;
 
+/// The two output bytes (high byte first) of the common two-byte form of
+/// `cp` (>= 0x80, BMP) in `enc`, or null for everything else (special cases,
+/// four-byte gb18030, unmappable): the state machine in `Encoder.put` decides.
+inline fn pairBytes(comptime enc: Cjk, cp: u21) ?u16 {
+    switch (enc) {
+        .euc_kr => {
+            const ptr = EkRev.get(cp) orelse return null;
+            return (ptr / 190 + 0x81) << 8 | (ptr % 190 + 0x41);
+        },
+        .gb18030, .gbk => {
+            if (cp == 0xE5E5 or (cp >= 0xE78D and cp <= 0xE864)) return null;
+            if (enc == .gbk and cp == 0x20AC) return null;
+            const ptr = GbRev.get(cp) orelse return null;
+            const trailing = ptr % 190;
+            return (ptr / 190 + 0x81) << 8 | (trailing + @as(u16, if (trailing < 0x3F) 0x40 else 0x41));
+        },
+        .big5 => {
+            const ptr = B5Rev.get(cp) orelse return null;
+            const trailing = ptr % 157;
+            return (ptr / 157 + 0x81) << 8 | (trailing + @as(u16, if (trailing < 0x3F) 0x40 else 0x62));
+        },
+        .shift_jis => {
+            if (cp < 0x81 or cp == 0x00A5 or cp == 0x203E or cp == 0x2212 or (cp >= 0xFF61 and cp <= 0xFF9F)) return null;
+            const ptr = J8Rev.get(cp) orelse return null;
+            if (ptr >= 8272 and ptr <= 8835) return null; // the sjis index differs there
+            const leading = ptr / 188;
+            const trailing = ptr % 188;
+            return (leading + @as(u16, if (leading < 0x1F) 0x81 else 0xC1)) << 8 | (trailing + @as(u16, if (trailing < 0x3F) 0x40 else 0x41));
+        },
+        .euc_jp, .iso_2022_jp => {
+            if (cp < 0x80 or cp == 0x00A5 or cp == 0x203E or cp == 0x2212 or (cp >= 0xFF61 and cp <= 0xFF9F)) return null;
+            const ptr = J8Rev.get(cp) orelse return null;
+            const base: u16 = if (enc == .euc_jp) 0xA1 else 0x21;
+            return (ptr / 94 + base) << 8 | (ptr % 94 + base);
+        },
+    }
+}
+
+/// The inline fast path of the encoders, from a clean state (no carried
+/// bytes; ISO-2022-JP in its ASCII or jis0208 state): ASCII and
+/// well-formed two- and three-byte UTF-8 whose code point has the common
+/// two-byte form, until anything else (or the end of either buffer) stops
+/// it. Returns the new `{ r, w }`; the sequence at `r` is then for the state
+/// machine.
+inline fn fastEnc(comptime enc: Cjk, src: []const u8, dst: []u8, r0: usize, w0: usize, iso: *IsoEncState) [2]usize {
+    var r = r0;
+    var w = w0;
+    if (enc == .iso_2022_jp and iso.* == .roman) return .{ r, w };
+    while (r < src.len and dst.len - w >= 2 + 3 * @as(usize, @intFromBool(enc == .iso_2022_jp))) {
+        const b = src[r];
+        var cp: u21 = undefined;
+        var n: usize = undefined;
+        if (b < 0x80) {
+            if (enc == .iso_2022_jp) {
+                if (b == 0x0E or b == 0x0F or b == 0x1B) break;
+                if (iso.* == .jis0208) {
+                    @memcpy(dst[w..][0..3], "\x1b(B");
+                    w += 3;
+                    iso.* = .ascii;
+                }
+            }
+            dst[w] = b;
+            r += 1;
+            w += 1;
+            continue;
+        } else if (b >= 0xE0 and b <= 0xEF) {
+            if (r + 3 > src.len) break;
+            const b1 = src[r + 1];
+            const b2 = src[r + 2];
+            if ((b1 & 0xC0) != 0x80 or (b2 & 0xC0) != 0x80) break;
+            cp = (@as(u21, b & 0x0F) << 12) | (@as(u21, b1 & 0x3F) << 6) | (b2 & 0x3F);
+            if (cp < 0x800 or (cp & 0xF800) == 0xD800) break;
+            n = 3;
+        } else if (b >= 0xC2 and b <= 0xDF) {
+            if (r + 2 > src.len) break;
+            const b1 = src[r + 1];
+            if ((b1 & 0xC0) != 0x80) break;
+            cp = (@as(u21, b & 0x1F) << 6) | (b1 & 0x3F);
+            n = 2;
+        } else break;
+        const two = pairBytes(enc, cp) orelse break;
+        if (enc == .iso_2022_jp and iso.* != .jis0208) {
+            @memcpy(dst[w..][0..3], "\x1b$B");
+            w += 3;
+            iso.* = .jis0208;
+        }
+        dst[w] = @intCast(two >> 8);
+        dst[w + 1] = @truncate(two);
+        r += n;
+        w += 2;
+    }
+    return .{ r, w };
+}
+
 const IsoEncState = enum { ascii, roman, jis0208 };
 
 pub const Encoder = struct {
@@ -946,6 +1040,15 @@ pub const Encoder = struct {
         var w: usize = 0;
         var replaced = false;
         while (true) {
+            if (self.pending_len == 0) {
+                switch (self.enc) {
+                    inline else => |e| {
+                        const f = fastEnc(e, src, dst, r, w, &self.iso);
+                        r = f[0];
+                        w = f[1];
+                    },
+                }
+            }
             // ASCII that no state can change the meaning of.
             if (self.pending_len == 0) {
                 while (r < src.len and w < dst.len and src[r] < 0x80 and self.asciiDirect(src[r])) {

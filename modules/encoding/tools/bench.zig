@@ -48,6 +48,10 @@
 //!                   generator); enc_* the same text as UTF-8 -> legacy bytes
 //!   dec_iso2022jp / enc_iso2022jp  ASCII words + kanji + kana runs (escapes)
 //!   stream_sjis     the streaming `cjk.Decoder` over 4 KiB chunks (Shift_JIS)
+//!   lat1_to_utf8 / utf8_to_lat1  ISO-8859-1 <-> UTF-8, 10 % of the characters U+0080..U+00FF
+//!                   (`latin1ToUtf8` / `utf8ToLatin1Lossy` vs encoding_rs `mem::convert_latin1_to_utf8` /
+//!                   `convert_utf8_to_latin1_lossy`, x/text `charmap.ISO8859_1`); all representable, so the
+//!                   lossy converters agree
 //!
 //! Every op is the whole input through the whole-buffer API and leaves an OWNED
 //! output allocated for that op (ours `page_allocator` for the 32 MiB rows --
@@ -95,7 +99,7 @@ const fnv_off: u64 = 0xcbf29ce484222325;
 const fnv_prime: u64 = 0x100000001b3;
 
 const cjk = encoding.cjk;
-const Kind = enum { dec1250, decutf8, u16dec, u16enc, enc1250, stream1250, streamutf8, celldec, cellenc, cjkdec, cjkenc, streamcjk };
+const Kind = enum { dec1250, decutf8, u16dec, u16enc, enc1250, stream1250, streamutf8, celldec, cellenc, cjkdec, cjkenc, streamcjk, lat1dec, lat1enc };
 const Work = struct { name: []const u8, kind: Kind, file: []const u8, cjk: cjk.Cjk = .shift_jis };
 const works = [_]Work{
     .{ .name = "dec_1250_ascii", .kind = .dec1250, .file = "ascii-v1.bin" },
@@ -123,6 +127,8 @@ const works = [_]Work{
     .{ .name = "dec_iso2022jp", .kind = .cjkdec, .file = "cjk-iso2022jp-v1.bin", .cjk = .iso_2022_jp },
     .{ .name = "enc_iso2022jp", .kind = .cjkenc, .file = "cjk-iso2022jp-v1.txt", .cjk = .iso_2022_jp },
     .{ .name = "stream_sjis", .kind = .streamcjk, .file = "cjk-sjis-v1.bin", .cjk = .shift_jis },
+    .{ .name = "lat1_to_utf8", .kind = .lat1dec, .file = "lat1-v1.bin" },
+    .{ .name = "utf8_to_lat1", .kind = .lat1enc, .file = "lat1u-v1.txt" },
 };
 
 /// Output sink: the length always, FNV-1a-64 only in check mode.
@@ -172,6 +178,16 @@ fn run(c: *const Ctx, wk: Work, o: *Out) void {
         },
         .enc1250 => {
             const r = encoding.encodeFromUtf8(a, c.data, .windows_1250) catch @panic("oom");
+            o.take(r);
+            a.free(r);
+        },
+        .lat1dec => {
+            const r = encoding.latin1ToUtf8(a, c.data) catch @panic("oom");
+            o.take(r);
+            a.free(r);
+        },
+        .lat1enc => {
+            const r = encoding.utf8ToLatin1Lossy(a, c.data) catch @panic("oom");
             o.take(r);
             a.free(r);
         },
@@ -383,6 +399,31 @@ fn multiWord(r: std.Random, w8: *std.Io.Writer, w16: ?*std.Io.Writer, bad_pct: u
             written.* += 1;
         }
     }
+}
+
+/// Latin-1 text: 10 % of the characters are a random U+0080..U+00FF, the rest
+/// ASCII; `lat1-v1.bin` the Latin-1 bytes, `lat1u-v1.txt` the same as UTF-8
+/// (every character is representable, so the lossy converters agree).
+fn genLat1(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
+    if (exists(io, dir, &.{ "lat1-v1.bin", "lat1u-v1.txt" })) return;
+    std.debug.print("{s}: generating lat1-v1.bin, lat1u-v1.txt ...\n", .{bench_name});
+    var prng = std.Random.DefaultPrng.init(0x656e_6307);
+    const r = prng.random();
+    const a = try FileSink.open(arena, io, dir, "lat1-v1.bin");
+    const b = try FileSink.open(arena, io, dir, "lat1u-v1.txt");
+    for (0..big) |_| {
+        if (r.uintLessThan(u8, 10) == 0) {
+            const c = r.intRangeAtMost(u8, 0x80, 0xFF);
+            try a.w().writeByte(c);
+            try putUtf8(b.w(), c);
+        } else {
+            const c = asciiChar(r);
+            try a.w().writeByte(c);
+            try b.w().writeByte(c);
+        }
+    }
+    try a.close(io);
+    try b.close(io);
 }
 
 fn genMulti(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
@@ -644,6 +685,7 @@ pub fn main(init: std.process.Init) !u8 {
     try genAscii(arena, io, dir);
     try genCz(arena, io, dir);
     try genMulti(arena, io, dir);
+    try genLat1(arena, io, dir);
     try genCells(arena, io, dir);
     try genCjk(arena, io, dir);
 

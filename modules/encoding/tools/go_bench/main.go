@@ -21,6 +21,7 @@
 //	            (RepertoireError) writes '?' and the rune is skipped. Not
 //	            encoding.ReplaceUnsupported: that writes the charmap's own
 //	            replacement 0x1a, ours is '?'.
+//	lat1dec/enc charmap.ISO8859_1 NewDecoder / NewEncoder .Bytes
 //	stream*     Transform(dst, chunk, atEOF) over 4 KiB chunks into one reused
 //	            buffer; an incomplete trailing sequence is carried to the next chunk
 //	celldec     one Decoder.Bytes per 20-byte cell (one Decoder, reset by Bytes)
@@ -64,6 +65,8 @@ const (
 	cjkDec
 	cjkEnc
 	streamCJK
+	lat1Dec
+	lat1Enc
 )
 
 var works = []struct {
@@ -96,6 +99,8 @@ var works = []struct {
 	{"dec_iso2022jp", cjkDec, "cjk-iso2022jp-v1.bin"},
 	{"enc_iso2022jp", cjkEnc, "cjk-iso2022jp-v1.txt"},
 	{"stream_sjis", streamCJK, "cjk-sjis-v1.bin"},
+	{"lat1_to_utf8", lat1Dec, "lat1-v1.bin"},
+	{"utf8_to_lat1", lat1Enc, "lat1u-v1.txt"},
 }
 
 // cjkEncoding: the CJK rows' encoding, by the workload name's suffix.
@@ -221,6 +226,10 @@ func run(name string, k kind, data []byte, cs [][]byte, o *out) {
 		o.take(must(cjkEncoding(name).NewDecoder().Bytes(data)))
 	case cjkEnc:
 		o.take(must(cjkEncoding(name).NewEncoder().Bytes(data)))
+	case lat1Dec:
+		o.take(must(charmap.ISO8859_1.NewDecoder().Bytes(data)))
+	case lat1Enc:
+		o.take(must(charmap.ISO8859_1.NewEncoder().Bytes(data)))
 	case streamCJK:
 		stream(cjkEncoding(name).NewDecoder(), data, o)
 	case cellDec:
