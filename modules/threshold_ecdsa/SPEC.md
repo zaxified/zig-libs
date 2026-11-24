@@ -613,7 +613,7 @@ Behaviour of the pieces added on top of the GG18/GG20 core, grouped by area. Eac
 
 - **`aux_info.AnnouncementSet`** (`aux_info.zig`) records which checks have passed for every peer (`verifyAnnouncement`, the distinct-moduli check, each peer's Πfac made for this party); only its `verified()` produces the `Verified` that `assembleKeyShare` takes (`aux_info.zig`), so a key share cannot be assembled from announcements nobody checked. `Verified`'s seal is the address of a declaration private to `aux_info.zig`, so a hand-written `Verified` is refused (`InvalidParameters`). `assembleKeyShare` also refuses a DKG share that does not match its Feldman commitment (`ShareMismatch`) and checks `h1`/`h2` of its own slot and `t ≤ n`.
 - **Message keys.** Every participant has an Ed25519 message key (`message_key` in `PartyPublicKeys`, `message_seed` in `KeyShare`; `keygenTrustedDealer` takes one 32-byte seed per party, `aux_info.LocalAux` and the keygen announcement create them on the dealer-free path). `findDuplicate` refuses a key shared by two announcements; `aux_info.reusesMaterial` (`aux_info.zig`) lets a key refresh refuse a new announcement that reuses an old Paillier `N`, ring-Pedersen `Ñ` or message key.  The `KeyShare`, `PublicKeys` and `Announcement` codecs carry the keys.
-- **Dealer-free keygen** is `dkg.EcdsaKeygen` over `aux_info` + `fac_proof` + `Pimod.provePaillier`, and key refresh is `dkg.EcdsaRefresh`; this module supplies the aux half, the sibling the rounds. The protocol run (GJKR + these rounds, then sign, then `std` verify) is tested in `dkg`'s `ecdsa_keygen.zig`.
+- **Dealer-free keygen** is `dkg.EcdsaKeygen` over `aux_info` + `fac_proof` + `Pimod.provePaillier`, key refresh is `dkg.EcdsaRefresh`, and redistribution to a new committee `(t', n')` — newcomers with no `KeyShare` yet included — is `dkg.EcdsaReshare` (the old committee deals, the new one runs the same proven aux rounds); this module supplies the aux half, the sibling the rounds (the sibling depends on this module, so the wrappers live there). The protocol run (GJKR + these rounds, then sign, then `std` verify) is tested in `dkg`'s `ecdsa_keygen.zig`.
 - **Constant-time key setup.** Paillier-Blum key generation, Πmod, Πprm, Πfac and `generateAuxParams` handle the secret factors on `montint` (see "Πfac and the dealer-free aux half").
 
 **Identifiable abort for types 5 and 7 (GG20 §4.3)**
@@ -795,7 +795,6 @@ GG20's "one-round" online signing is one round of messages, not one unit of work
 ## Backlog / deferred
 
 - *BOUNCED (owner):* **Independent cryptographic review** of the implemented constructions (GG18 Appendix A proofs, the Fiat-Shamir instantiations, `PdlProof`, the presigning composition) before production use: the questions A1–A9 are itemized in "Auditor brief". Signing inherits it, being built on `zkproofs.zig`'s checked MtA/MtAwc. The tests show self-consistency and the reject contract, not soundness against an unbounded malicious prover.
-- **Redistribution to a new committee.** `dkg`'s reshare already takes `n'`, `t'`; a `threshold_ecdsa` wrapper needs the NEW committee's aux rounds (announcements, Πfac) alongside the old committee's dealing, and new parties that hold no `KeyShare` yet. Effort: medium.
 
 ## Verification
 
