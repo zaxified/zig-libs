@@ -24,7 +24,8 @@ if (!jsontext.depthWithin(body, 64)) return error.TooDeep;
 ```
 
 `StringOptions` are `comptime`: `.invalid_utf8` (`replace` | `escape_bytes` |
-`reject`), `.ascii_only`, `.html_safe`. `writeStringContents` is the same without
+`reject` | `replace_per_byte` | `escape_all_high_if_invalid` | `verbatim`), `.ascii_only`, `.html_safe`,
+`.escape_del`, `.short_escapes`, `.escape_chars`. `writeStringContents` is the same without
 the quotes. See `SPEC.md` for what is deliberately not done and how the values are
 anchored.
 

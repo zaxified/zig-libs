@@ -10,6 +10,7 @@
 const std = @import("std");
 const value = @import("value.zig");
 const ut = @import("unitext");
+const jsontext = @import("jsontext");
 const pytext = @import("pytext.zig");
 const urlize_mod = @import("urlize.zig");
 const pprint_mod = @import("pprint.zig");
@@ -1514,17 +1515,9 @@ fn fTojson(ctx: *Ctx, input: Value, args: Args) Error!Value {
     };
     var aw: std.Io.Writer.Allocating = .init(ctx.arena);
     try jsonWrite(ctx, &aw.writer, input, indent, 0);
-    // Jinja escapes the four characters that could break out of a <script> or
-    // an attribute, then marks the result safe.
-    var out: std.ArrayList(u8) = .empty;
-    for (aw.written()) |c| switch (c) {
-        '<' => try out.appendSlice(ctx.arena, "\\u003c"),
-        '>' => try out.appendSlice(ctx.arena, "\\u003e"),
-        '&' => try out.appendSlice(ctx.arena, "\\u0026"),
-        '\'' => try out.appendSlice(ctx.arena, "\\u0027"),
-        else => try out.append(ctx.arena, c),
-    };
-    return .{ .string = .{ .bytes = out.items, .safe = true } };
+    // `jsonString` already escaped the four characters that could break out of a <script>
+    // or an attribute (they occur nowhere but inside strings); mark the result safe.
+    return .{ .string = .{ .bytes = aw.written(), .safe = true } };
 }
 
 fn jsonWrite(ctx: *Ctx, w: *std.Io.Writer, v: Value, indent: ?usize, depth: usize) Error!void {
@@ -1591,48 +1584,20 @@ fn jsonSep(w: *std.Io.Writer, indent: ?usize, depth: usize, comma: bool) Error!v
     }
 }
 
+/// `ensure_ascii=True` is the reference's default (non-ASCII becomes `\uXXXX`, a surrogate pair
+/// above the BMP; DEL too), and `htmlsafe_json_dumps` then escapes `<`, `>`, `&` and `'`.
+/// Text that is not UTF-8 cannot come out of the reference (it only sees `str`): any ill-formed
+/// byte is `error.BadArgument`.
 fn jsonString(w: *std.Io.Writer, s: []const u8) Error!void {
-    w.writeAll("\"") catch return error.OutOfMemory;
-    var i: usize = 0;
-    while (i < s.len) {
-        const c = s[i];
-        if (c < 0x80) {
-            switch (c) {
-                '"' => w.writeAll("\\\"") catch return error.OutOfMemory,
-                '\\' => w.writeAll("\\\\") catch return error.OutOfMemory,
-                '\n' => w.writeAll("\\n") catch return error.OutOfMemory,
-                '\r' => w.writeAll("\\r") catch return error.OutOfMemory,
-                '\t' => w.writeAll("\\t") catch return error.OutOfMemory,
-                0x08 => w.writeAll("\\b") catch return error.OutOfMemory,
-                0x0c => w.writeAll("\\f") catch return error.OutOfMemory,
-                else => if (c < 0x20)
-                    w.print("\\u{x:0>4}", .{c}) catch return error.OutOfMemory
-                else
-                    w.writeByte(c) catch return error.OutOfMemory,
-            }
-            i += 1;
-            continue;
-        }
-        // `ensure_ascii=True` is the reference's default: non-ASCII becomes
-        // \uXXXX, with surrogate pairs above the BMP.
-        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch {
-            w.print("\\u{x:0>4}", .{s[i]}) catch return error.OutOfMemory;
-            i += 1;
-            continue;
-        };
-        if (i + n > s.len) return error.BadArgument;
-        const cp = std.unicode.utf8Decode(s[i .. i + n]) catch return error.BadArgument;
-        if (cp < 0x10000) {
-            w.print("\\u{x:0>4}", .{cp}) catch return error.OutOfMemory;
-        } else {
-            const v2 = cp - 0x10000;
-            const hi = 0xD800 + (v2 >> 10);
-            const lo = 0xDC00 + (v2 & 0x3FF);
-            w.print("\\u{x:0>4}\\u{x:0>4}", .{ hi, lo }) catch return error.OutOfMemory;
-        }
-        i += n;
-    }
-    w.writeAll("\"") catch return error.OutOfMemory;
+    jsontext.writeString(w, s, .{
+        .ascii_only = true,
+        .escape_del = true,
+        .invalid_utf8 = .reject,
+        .escape_chars = "<>&'",
+    }) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+        error.InvalidUtf8 => return error.BadArgument,
+    };
 }
 
 // ── format / wordwrap / filesizeformat / groupby ────────────────────────────

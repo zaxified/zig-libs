@@ -10,7 +10,7 @@ authenticator data, COSE public keys) and any other CBOR/COSE-based wire format 
   implementation ported or consulted.
 - **Platform:** any (pure logic, no I/O). **Role:** codec. **Concurrency:** reentrant (no shared
   state).
-- **Deps:** none (std only).
+- **Deps:** `jsontext` (the diagnostic notation's text escaper) + std only.
 
 Provenance: RFC 8949/9052 are public specifications (merger doctrine — CONVENTIONS.md §5), so the
 code needs no attribution; the RFC example vectors embedded in `src/` are covered by [NOTICE](NOTICE).

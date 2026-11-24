@@ -5,6 +5,7 @@
 //! + a source-location annotated variant.
 
 const std = @import("std");
+const jsontext = @import("jsontext");
 
 /// JSON5 writer (the other direction): `stringify.writeValue(w, value, opts)`
 /// for a `std.json.Value`, `stringify.write(w, anytype, opts)` for a Zig value.
@@ -23,7 +24,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "JSON5 spec (json5.org) preprocessor to std.json",
-    .deps = .{},
+    .deps = .{"jsontext"},
 };
 
 /// What to do with the JSON5 non-finite numbers `Infinity`, `-Infinity`,
@@ -1652,25 +1653,16 @@ test "skipValue never returns an index past the end of the input" {
     }
 }
 
-/// Append `s` as a JSON-escaped double-quoted string to `out`.
+/// Append `s` as a JSON-escaped double-quoted string to `out`. Every control byte is
+/// escaped (a raw one made the "recovered" document invalid JSON, review); bytes
+/// >= 0x80 are copied as they are (the message is built from the source text).
 fn appendJsonStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    try out.append(alloc, '"');
-    for (s) |ch| switch (ch) {
-        '"' => try out.appendSlice(alloc, "\\\""),
-        '\\' => try out.appendSlice(alloc, "\\\\"),
-        '\n' => try out.appendSlice(alloc, "\\n"),
-        '\r' => try out.appendSlice(alloc, "\\r"),
-        '\t' => try out.appendSlice(alloc, "\\t"),
-        // Every other control byte too: a raw one (a form feed or a U+0001
-        // copied out of the source into a recovery message) made the
-        // "recovered" document invalid JSON (review).
-        0...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-            var buf: [6]u8 = undefined;
-            try out.appendSlice(alloc, std.mem.print(&buf, "\\u{x:0>4}", .{ch}) catch unreachable);
-        },
-        else => try out.append(alloc, ch),
+    var aw: std.Io.Writer.Allocating = .fromArrayList(alloc, out);
+    defer out.* = aw.toArrayList();
+    jsontext.writeString(&aw.writer, s, .{ .invalid_utf8 = .verbatim, .short_escapes = .tnr }) catch |e| switch (e) {
+        error.WriteFailed => return error.OutOfMemory,
+        error.InvalidUtf8 => unreachable, // only `.reject` returns it
     };
-    try out.append(alloc, '"');
 }
 
 // ── annotated variant: silently strips comments, injects $err_<N> markers ─

@@ -18,7 +18,7 @@ code. Closes the Web service / API cluster.
   first request and publishes it once under a lock (concurrent first
   requests may each build it), so it is not reentrant: a route registered
   after that first request will not appear in the served document.
-- **Deps:** `router`, `http` (+ `std.json`).
+- **Deps:** `router`, `http`, `jsontext` (+ `std.json`).
 
 Provenance: clean-room. Design references: FastAPI (MIT; generated-spec
 shape + defaults), utoipa (MIT OR Apache-2.0), OpenAPI Specification 3.1.0

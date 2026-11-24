@@ -54,6 +54,7 @@
 const std = @import("std");
 const router = @import("router");
 const http = @import("http");
+const jsontext = @import("jsontext");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -70,7 +71,7 @@ pub const meta = .{
     // thread-safe as the caller's Check callbacks (documented).
     .concurrency = .threadsafe,
     .model_after = "Kubernetes liveness/readiness probes; the /healthz-/readyz convention",
-    .deps = .{ "router", "http" },
+    .deps = .{ "router", "http", "jsontext" },
 };
 
 /// A readiness predicate: returns true when this dependency is ready. `ctx` is
@@ -216,36 +217,21 @@ fn respondStartup(h: *const Health, res: *http.Server.ResponseWriter) anyerror!v
 /// previously they were left out, so a 503 could list only `up` checks.
 const json_max_checks = 256;
 
-/// Write `s` as a JSON string literal. Quote, backslash and control bytes are
-/// escaped; a name that is not valid UTF-8 has every byte >= 0x80 written as
-/// `\u00XX` so the document stays valid JSON.
+/// Write `s` as a JSON string literal. Quote, backslash, control bytes and DEL are
+/// escaped (`\n \r \t` short, the rest `\u00XX`); a name that is not valid UTF-8 has
+/// every byte >= 0x80 written as `\u00XX` so the document stays valid JSON.
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
-    // A plain ASCII name (the usual "database", "cache") needs no escape:
-    // one write instead of a call per byte (the per-byte path was
-    // most of a 3-check JSON readiness probe, 1.28x fiber's healthcheck).
-    for (s) |c| {
-        if (c < 0x20 or c >= 0x7f or c == '"' or c == '\\') break;
-    } else {
-        try w.writeByte('"');
-        try w.writeAll(s);
-        return w.writeByte('"');
-    }
-    const utf8 = std.unicode.utf8ValidateSlice(s);
-    try w.writeByte('"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            0...8, 11, 12, 14...31, 127 => try w.print("\\u{x:0>4}", .{c}),
-            128...255 => if (utf8) try w.writeByte(c) else try w.print("\\u{x:0>4}", .{c}),
-            else => try w.writeByte(c),
-        }
-    }
-    try w.writeByte('"');
+    jsontext.writeString(w, s, json_opts) catch |e| switch (e) {
+        error.WriteFailed => return error.WriteFailed,
+        error.InvalidUtf8 => unreachable, // only `.reject` returns it
+    };
 }
+
+const json_opts: jsontext.StringOptions = .{
+    .invalid_utf8 = .escape_all_high_if_invalid,
+    .escape_del = true,
+    .short_escapes = .tnr,
+};
 
 fn respondReadyJson(h: *const Health, res: *http.Server.ResponseWriter) anyerror!void {
     // Every check runs exactly once (see respondReady); the pass bits of the

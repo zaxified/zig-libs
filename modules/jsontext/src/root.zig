@@ -43,6 +43,32 @@ pub const InvalidUtf8 = enum {
     /// the writer: the opening quote and everything before the bad sequence
     /// (the partial literal is not valid JSON, do not use it).
     reject,
+    /// One U+FFFD per ill-formed BYTE (Go's `encoding/json`, Python's `errors='replace'` is
+    /// per maximal subpart and is `.replace`): a truncated valid prefix such as `E2 82`
+    /// is two replacements here, one under `.replace`. Every well-formed sequence is
+    /// untouched. The output is always a valid JSON string.
+    replace_per_byte,
+    /// When any byte of `s` is ill-formed, EVERY byte >= 0x80 (valid sequences too) is
+    /// written as `\u00XX`; a well-formed `s` is written as it is. A name that is not
+    /// text is then shown as bytes as a whole, never half as text. (`escape_bytes`
+    /// escapes only the ill-formed bytes.) Costs one validation pass over `s`.
+    escape_all_high_if_invalid,
+    /// Every byte >= 0x80 is passed through untouched, well-formed or not (the caller
+    /// does not care or has checked). The output is valid JSON only when `s` is valid
+    /// UTF-8. Cannot be combined with `ascii_only` or `html_safe` (both need to read
+    /// the sequences): that is a compile error.
+    verbatim,
+};
+
+/// Which of the control characters have a short form.
+pub const ShortEscapes = enum {
+    /// RFC 8259's five: `\b \t \n \f \r`.
+    all,
+    /// Only `\t \n \r`; `\b` and `\f` are `\u0008` and `\u000c` (what `std.json` and a
+    /// number of hand-written escapers do).
+    tnr,
+    /// None: every byte below 0x20 is `\u00XX`.
+    none,
 };
 
 /// Options of `writeString` / `writeStringContents`. They are `comptime`
@@ -59,6 +85,14 @@ pub const StringOptions = struct {
     /// so the text can sit inside an HTML `<script>` element or be `eval`ed by an
     /// older JavaScript engine.
     html_safe: bool = false,
+    /// Also write DEL (0x7F) as `\u007f` (CPython's `ensure_ascii` does; RFC 8259 does not
+    /// require it).
+    escape_del: bool = false,
+    short_escapes: ShortEscapes = .all,
+    /// Further ASCII bytes (each below 0x80, else a compile error) written as `\u00XX`,
+    /// on top of the always-escaped ones: `"<"` for a literal inside `<script>`,
+    /// `"<>&'"` for an attribute-safe one.
+    escape_chars: []const u8 = "",
 };
 
 /// `writeString` errors: the writer's, plus `InvalidUtf8` which only
@@ -85,6 +119,10 @@ pub fn writeString(w: *std.Io.Writer, s: []const u8, comptime opts: StringOption
 /// already well-formed UTF-8 the string it decodes to is exactly `s`.
 pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: StringOptions) WriteError!void {
     const verbatim = comptime verbatimTable(opts);
+    comptime if (opts.invalid_utf8 == .verbatim and (opts.ascii_only or opts.html_safe))
+        @compileError("jsontext: .verbatim cannot be combined with ascii_only or html_safe");
+    // `.escape_all_high_if_invalid`: decided once, for the whole string.
+    const all_high = opts.invalid_utf8 == .escape_all_high_if_invalid and !std.unicode.utf8ValidateSlice(s);
     // Nothing to escape (the common case): one `writeAll` of the caller's own
     // bytes, before any staging state exists.
     var i: usize = 0;
@@ -106,13 +144,20 @@ pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: Stri
             switch (c) {
                 '"' => try out.putLit("\\\""),
                 '\\' => try out.putLit("\\\\"),
-                0x08 => try out.putLit("\\b"),
-                0x09 => try out.putLit("\\t"),
-                0x0A => try out.putLit("\\n"),
-                0x0C => try out.putLit("\\f"),
-                0x0D => try out.putLit("\\r"),
+                0x08 => if (opts.short_escapes == .all) try out.putLit("\\b") else try out.putUnit(c),
+                0x09 => if (opts.short_escapes != .none) try out.putLit("\\t") else try out.putUnit(c),
+                0x0A => if (opts.short_escapes != .none) try out.putLit("\\n") else try out.putUnit(c),
+                0x0C => if (opts.short_escapes == .all) try out.putLit("\\f") else try out.putUnit(c),
+                0x0D => if (opts.short_escapes != .none) try out.putLit("\\r") else try out.putUnit(c),
                 else => try out.putUnit(c),
             }
+            i += 1;
+            run = i;
+            continue;
+        }
+        if (all_high) {
+            try out.put(s[run..i]);
+            try out.putUnit(c);
             i += 1;
             run = i;
             continue;
@@ -140,6 +185,7 @@ pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: Stri
             continue;
         }
         switch (opts.invalid_utf8) {
+            .verbatim => unreachable,
             .reject => {
                 // Everything before the bad sequence is written, then the error.
                 try out.put(s[run..i]);
@@ -150,7 +196,13 @@ pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: Stri
                 try out.put(s[run..i]);
                 try out.putLit(if (opts.ascii_only) "\\ufffd" else replacement);
             },
-            .escape_bytes => {
+            .replace_per_byte => {
+                try out.put(s[run..i]);
+                for (0..step.len) |_| try out.putLit(if (opts.ascii_only) "\\ufffd" else replacement);
+            },
+            // `.escape_all_high_if_invalid` with a well-formed `s` never gets here (`all_high`
+            // is off); `.verbatim` never leaves the table.
+            .escape_bytes, .escape_all_high_if_invalid => {
                 try out.put(s[run..i]);
                 for (s[i..][0..step.len]) |b| try out.putUnit(b);
             },
@@ -237,6 +289,14 @@ fn verbatimTable(comptime opts: StringOptions) [256]bool {
     for (0x20..0x80) |c| t[c] = true;
     t['"'] = false;
     t['\\'] = false;
+    if (opts.escape_del) t[0x7f] = false;
+    if (opts.invalid_utf8 == .verbatim) for (0x80..0x100) |c| {
+        t[c] = true;
+    };
+    for (opts.escape_chars) |c| {
+        if (c >= 0x80) @compileError("jsontext: escape_chars holds ASCII only");
+        t[c] = false;
+    }
     if (opts.html_safe) {
         t['<'] = false;
         t['>'] = false;
@@ -803,4 +863,40 @@ test "vectors: replay of the frozen CPython (d, a) / own (ah, e, ea, eh, eah) / 
     }
     try testing.expect(go_lines.next() == null);
     try testing.expect(rows >= 1000);
+}
+
+test "escape_del, short_escapes and escape_chars: exact bytes" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("a\\u007fb", try render(&buf, "a\x7fb", .{ .escape_del = true }));
+    try testing.expectEqualStrings("a\x7fb", try render(&buf, "a\x7fb", .{}));
+    const ctl = "\x08\t\n\x0c\r\x01";
+    try testing.expectEqualStrings("\\b\\t\\n\\f\\r\\u0001", try render(&buf, ctl, .{}));
+    try testing.expectEqualStrings("\\u0008\\t\\n\\u000c\\r\\u0001", try render(&buf, ctl, .{ .short_escapes = .tnr }));
+    try testing.expectEqualStrings("\\u0008\\u0009\\u000a\\u000c\\u000d\\u0001", try render(&buf, ctl, .{ .short_escapes = .none }));
+    try testing.expectEqualStrings("\\u003ca>&'", try render(&buf, "<a>&'", .{ .escape_chars = "<" }));
+    try testing.expectEqualStrings("\\u003ca\\u003e\\u0026\\u0027", try render(&buf, "<a>&'", .{ .escape_chars = "<>&'" }));
+    // Combines with html_safe without doubling anything.
+    try testing.expectEqualStrings("\\u003c\\u003e\\u0027", try render(&buf, "<>'", .{ .html_safe = true, .escape_chars = "<'" }));
+}
+
+test "replace_per_byte: one U+FFFD per ill-formed byte" {
+    const R = replacement;
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings(R ++ R, try render(&buf, "\xe2\x82", .{ .invalid_utf8 = .replace_per_byte }));
+    try testing.expectEqualStrings(R ++ R ++ R, try render(&buf, "\xf0\x9f\x98", .{ .invalid_utf8 = .replace_per_byte }));
+    try testing.expectEqualStrings("a" ++ R ++ R ++ "\u{20ac}b", try render(&buf, "a\xed\xa0\xe2\x82\xacb", .{ .invalid_utf8 = .replace_per_byte }));
+    try testing.expectEqualStrings("\\ufffd\\ufffd\\u20ac", try render(&buf, "\x80\xff\xe2\x82\xac", .{ .invalid_utf8 = .replace_per_byte, .ascii_only = true }));
+}
+
+test "escape_all_high_if_invalid: whole string as bytes once any byte is ill-formed" {
+    var buf: [64]u8 = undefined;
+    const o: StringOptions = .{ .invalid_utf8 = .escape_all_high_if_invalid };
+    try testing.expectEqualStrings("a\u{20ac}", try render(&buf, "a\xe2\x82\xac", o));
+    try testing.expectEqualStrings("a\\u00e2\\u0082\\u00ac\\u00ff", try render(&buf, "a\xe2\x82\xac\xff", o));
+}
+
+test "verbatim: non-ASCII bytes pass through, ill-formed ones too" {
+    var buf: [64]u8 = undefined;
+    const o: StringOptions = .{ .invalid_utf8 = .verbatim };
+    try testing.expectEqualStrings("\xff\xe2\x82\\\"x\\n\xc3\xa9", try render(&buf, "\xff\xe2\x82\"x\n\xc3\xa9", o));
 }

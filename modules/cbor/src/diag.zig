@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const jsontext = @import("jsontext");
 const Value = root.Value;
 const Writer = std.Io.Writer;
 
@@ -82,51 +83,16 @@ pub fn alloc(gpa: std.mem.Allocator, v: Value) std.mem.Allocator.Error![]u8 {
 }
 
 fn writeText(w: *Writer, t: []const u8) Writer.Error!void {
-    try w.writeByte('"');
-    var i: usize = 0;
-    while (i < t.len) {
-        const c = t[i];
-        if (c < 0x80) {
-            switch (c) {
-                '"' => try w.writeAll("\\\""),
-                '\\' => try w.writeAll("\\\\"),
-                '\n' => try w.writeAll("\\n"),
-                '\r' => try w.writeAll("\\r"),
-                '\t' => try w.writeAll("\\t"),
-                0x08 => try w.writeAll("\\b"),
-                0x0c => try w.writeAll("\\f"),
-                0x00...0x07, 0x0b, 0x0e...0x1f, 0x7f => try w.print("\\u{x:0>4}", .{c}),
-                else => try w.writeByte(c),
-            }
-            i += 1;
-            continue;
-        }
-        // Non-ASCII. A decoded text is valid UTF-8; a hand-built one may not
-        // be, and an invalid byte prints as U+FFFD rather than failing.
-        const len = std.unicode.utf8ByteSequenceLength(c) catch {
-            try w.writeAll("\\ufffd");
-            i += 1;
-            continue;
-        };
-        if (len > t.len - i) {
-            try w.writeAll("\\ufffd");
-            i += 1;
-            continue;
-        }
-        const cp = std.unicode.utf8Decode(t[i..][0..len]) catch {
-            try w.writeAll("\\ufffd");
-            i += 1;
-            continue;
-        };
-        if (cp > 0xffff) {
-            const u = cp - 0x10000;
-            try w.print("\\u{x:0>4}\\u{x:0>4}", .{ 0xd800 + (u >> 10), 0xdc00 + (u & 0x3ff) });
-        } else {
-            try w.print("\\u{x:0>4}", .{cp});
-        }
-        i += len;
-    }
-    try w.writeByte('"');
+    // A decoded text is valid UTF-8; a hand-built one may not be, and an ill-formed
+    // byte prints as U+FFFD rather than failing.
+    jsontext.writeString(w, t, .{
+        .ascii_only = true,
+        .invalid_utf8 = .replace_per_byte,
+        .escape_del = true,
+    }) catch |e| switch (e) {
+        error.WriteFailed => return error.WriteFailed,
+        error.InvalidUtf8 => unreachable, // only `.reject` returns it
+    };
 }
 
 fn writeFloat(w: *Writer, x: f64) Writer.Error!void {

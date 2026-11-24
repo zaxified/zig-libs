@@ -80,7 +80,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "Jinja2 3.1.x (pallets/jinja) — behaviour anchored byte-for-byte against it",
-    .deps = .{"unitext"},
+    .deps = .{ "unitext", "jsontext" },
 };
 
 const lexer = @import("lexer.zig");

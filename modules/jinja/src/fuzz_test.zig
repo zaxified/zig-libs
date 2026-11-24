@@ -969,8 +969,9 @@ test "corpus: every autoescape seed reaches every site, and the markup escaped i
     // collapsed draw produced — so the "before" input stays in the corpus.
     try std.testing.expectEqual(escape_seeds.len - 1, nonempty);
     // Measured: 1 site of 32 reached with an EMPTY `e`, 0 markup
-    // octets escaped. 20 non-empty data / 672 renders / 1978 escaped after.
-    try std.testing.expectEqual(@as(usize, 672), renders);
+    // octets escaped. 20 non-empty data / 672 renders / 1978 escaped after; 671 since
+    // `|tojson` refuses ill-formed UTF-8 (one seed carries a stray continuation byte).
+    try std.testing.expectEqual(@as(usize, 671), renders);
     try std.testing.expectEqual(@as(usize, 1978), escaped);
 }
 

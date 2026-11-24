@@ -1171,3 +1171,18 @@ test "splat: running out of memory while expanding stays OutOfMemory" {
     }
     try testing.expect(i < 200);
 }
+
+test "tojson: ill-formed UTF-8 is BadArgument (any byte, stray ones included); DEL and the html set are escaped" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const bad = [_][]const u8{ "\x80", "\xbf", "\xf8", "\xff", "a\xe2\x82", "\xc0\xaf", "\xed\xa0\x80", "ok\xff" };
+    for (bad) |b| {
+        const ctx = try jinja.valueFrom(arena.allocator(), .{ .s = b });
+        try testing.expectError(error.BadArgument, renderWith(gpa, .{}, "{{ s|tojson }}", ctx));
+    }
+    const ctx = try jinja.valueFrom(arena.allocator(), .{ .s = "a\x7f<>&'\"\x08\u{e9}\u{1f600}" });
+    const out = try renderWith(gpa, .{}, "{{ s|tojson }}", ctx);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("\"a\\u007f\\u003c\\u003e\\u0026\\u0027\\\"\\b\\u00e9\\ud83d\\ude00\"", out);
+}
