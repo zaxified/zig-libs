@@ -1020,3 +1020,110 @@ test "HSS: a failed rebuild after the path left a parent leaves nothing dangling
     for (sk.sigs) |s| try std.testing.expect(s == null);
     sk.deinit(); // a dangling tree or certificate would be freed a second time here
 }
+
+test "Parallel: Tree.initParallel builds the serial tree, byte for byte, at every task count and cache height" {
+    const io = std.testing.io;
+    const len = lms.lmsSignatureLength(.sha256_m32_h10, .sha256_n32_w2);
+    var a: [lms.max_lms_signature_length]u8 = undefined;
+    var b: [lms.max_lms_signature_length]u8 = undefined;
+    for ([_]u5{ 0, 3, 10 }) |c| {
+        var serial: lms.Tree = undefined;
+        try lms.Tree.initCached(&serial, gpa, .sha256_m32_h10, .sha256_n32_w2, idOf(7), &seedOf(8), c);
+        defer serial.deinit();
+        // 0 = the CPU count; 1 = the caller only; more tasks than subtrees (c = 10: one subtree).
+        for ([_]usize{ 0, 1, 2, 3, 16 }) |threads| {
+            var par: lms.Tree = undefined;
+            try lms.Tree.initCachedParallel(&par, gpa, .sha256_m32_h10, .sha256_n32_w2, idOf(7), &seedOf(8), c, .{ .io = io, .threads = threads });
+            defer par.deinit();
+            try std.testing.expectEqualSlices([32]u8, serial.nodes, par.nodes);
+            for ([_]u32{ 0, 1, 511, 1023 }) |q| {
+                _ = try serial.sign(q, "msg", a[0..len]);
+                _ = try par.sign(q, "msg", b[0..len]);
+                try std.testing.expectEqualSlices(u8, a[0..len], b[0..len]);
+            }
+        }
+    }
+}
+
+test "Parallel: Tree.initParallel with the default cache height, every hash family" {
+    const io = std.testing.io;
+    const sets = [_]struct { l: lms.ParamSet, o: lms.OtsParamSet }{
+        .{ .l = .sha256_m32_h5, .o = .sha256_n32_w4 },
+        .{ .l = .shake_m32_h5, .o = .shake_n32_w4 },
+        .{ .l = .sha256_m24_h5, .o = .sha256_n24_w4 },
+    };
+    for (sets) |s| {
+        var serial: lms.Tree = undefined;
+        try lms.Tree.init(&serial, gpa, s.l, s.o, idOf(1), &seedOf(2));
+        defer serial.deinit();
+        var par: lms.Tree = undefined;
+        try lms.Tree.initParallel(&par, gpa, s.l, s.o, idOf(1), &seedOf(2), .{ .io = io, .threads = 4 });
+        defer par.deinit();
+        try std.testing.expectEqualSlices([32]u8, serial.nodes, par.nodes);
+    }
+}
+
+test "Parallel: a single-threaded Io leaves the work to the caller and gives the same tree" {
+    var single: std.Io.Threaded = .init_single_threaded;
+    var serial: lms.Tree = undefined;
+    try lms.Tree.init(&serial, gpa, .sha256_m32_h5, .sha256_n32_w4, idOf(3), &seedOf(4));
+    defer serial.deinit();
+    var par: lms.Tree = undefined;
+    try lms.Tree.initParallel(&par, gpa, .sha256_m32_h5, .sha256_n32_w4, idOf(3), &seedOf(4), .{ .io = single.io(), .threads = 8 });
+    defer par.deinit();
+    try std.testing.expectEqualSlices([32]u8, serial.nodes, par.nodes);
+}
+
+test "Parallel: an allocation failure leaves no secret and no node cache" {
+    var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var t: lms.Tree = undefined;
+    try std.testing.expectError(error.OutOfMemory, lms.Tree.initParallel(&t, fa.allocator(), .sha256_m32_h5, .sha256_n32_w4, idOf(3), &seedOf(4), .{ .io = std.testing.io }));
+    try std.testing.expectEqual(@as(usize, 0), t.nodes.len);
+    try std.testing.expect(std.mem.allEqual(u8, &t.seed, 0));
+}
+
+test "Parallel: HSS SecretKey.initParallel signs the very bytes SecretKey.init does, across a lower-tree boundary and from a restored position" {
+    const io = std.testing.io;
+    const levels = [_]Level{
+        .{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w2 },
+        .{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w4 },
+    };
+    const start: lms.Position = .{ .q = .{ 1, 30, 0, 0, 0, 0, 0, 0 } };
+    for ([_]?lms.Position{ null, start }) |restore| {
+        var serial: lms.SecretKey = undefined;
+        try lms.SecretKey.init(&serial, gpa, &levels, &seedOf(5), idOf(6), restore);
+        defer serial.deinit();
+        var par: lms.SecretKey = undefined;
+        try lms.SecretKey.initParallel(&par, gpa, &levels, &seedOf(5), idOf(6), restore, .{ .io = io, .threads = 3 });
+        defer par.deinit();
+        const buf_a = try gpa.alloc(u8, serial.signatureLength());
+        defer gpa.free(buf_a);
+        const buf_b = try gpa.alloc(u8, par.signatureLength());
+        defer gpa.free(buf_b);
+        var pk_a: [@TypeOf(serial.publicKey()).max_encoded_len]u8 = undefined;
+        var pk_b: [@TypeOf(par.publicKey()).max_encoded_len]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, serial.publicKey().encode(&pk_a), par.publicKey().encode(&pk_b));
+        for (0..5) |_| { // positions 30, 31, then the next lower tree
+            const sa = try serial.sign("m", buf_a);
+            const sb = try par.sign("m", buf_b);
+            try std.testing.expectEqualSlices(u8, sa, sb);
+            try std.testing.expect(lms.hssVerify(serial.publicKey().encode(&pk_a), "m", sb));
+        }
+    }
+}
+
+test "Parallel: SigningKey.initInPlaceParallel is the same key as initInPlace" {
+    const io = std.testing.io;
+    const levels = [_]Level{.{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w4 }};
+    var a: lms.SigningKey = undefined;
+    try lms.SigningKey.initInPlace(&a, gpa, &levels, &seedOf(9), idOf(9), null, null);
+    defer a.deinit();
+    var b: lms.SigningKey = undefined;
+    try lms.SigningKey.initInPlaceParallel(&b, gpa, &levels, &seedOf(9), idOf(9), null, null, .{ .io = io, .threads = 2 });
+    defer b.deinit();
+    const buf_a = try gpa.alloc(u8, a.sk.signatureLength());
+    defer gpa.free(buf_a);
+    const buf_b = try gpa.alloc(u8, b.sk.signatureLength());
+    defer gpa.free(buf_b);
+    try std.testing.expectEqualSlices(u8, try a.sign("x", buf_a), try b.sign("x", buf_b));
+}

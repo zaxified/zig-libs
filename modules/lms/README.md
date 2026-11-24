@@ -57,8 +57,10 @@ SPEC.md for what a software library cannot supply.
 `p * (2^w - 1)` hashes each (W8: 8 704, W4: 1 072, W2: 532, W1: 530). That is the
 reason HSS exists: with a small top tree (`H5`/`H10`/`H15`) generation is quick and a
 lower tree is built only when the position first enters it (`O(2^h)` hashing for one
-signature in `2^h`). A single H20 or H25 tree takes hours or days here (single
-thread, no hardware SHA extensions); use HSS instead. Signing needs the public
+signature in `2^h`). A single H20 or H25 tree takes hours or days on one thread
+(`std.crypto`'s SHA-256 uses the CPU's SHA extensions where present); `SecretKey.initParallel`
+/ `Tree.initParallel` with a `Parallel{ .io = io, .threads = n }` spread the work over `n` tasks,
+byte-identical to the serial key (3.7x on 8 tasks for H15/W4); or use HSS instead. Signing needs the public
 node cache (at most 2 MiB per tree, `sign.zig`).
 
 Provenance: clean-room from RFC 8554, a public specification; no LMS/HSS source
