@@ -655,6 +655,8 @@ const ServerState = struct {
             .bad_signature => "the key was authorized, but the signature did not verify under it",
             .peer_disconnected => "the client sent SSH_MSG_DISCONNECT instead of another credential",
             .wrong_answers => "the keyboard-interactive answers were refused",
+            .source_address_denied => "the granted permissions carry a source-address option this peer's address does not match",
+            .unauthorized_host => "the hostbased check refused the client host, its key or its user",
         };
         std.debug.print("Failed authentication from {s}: {t} — {s}\n", .{ peer, why, detail });
     }
