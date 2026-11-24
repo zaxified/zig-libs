@@ -1108,6 +1108,12 @@ fn modernJsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) a
     var out: std.Io.Writer.Allocating = .init(t.gpa);
     defer out.deinit();
     t.lock.acquire();
+    // The client may have left while this call waited for the lock: the watch
+    // fired when no call was in flight to cancel yet, so it is not run at all.
+    if (watch.gone()) {
+        t.lock.release();
+        return;
+    }
     const rc = t.server.handleMessageFrom(body, &out.writer, peer);
     t.lock.release();
     rc catch return error.OutOfMemory; // see `jsonResponse`
@@ -1163,6 +1169,11 @@ fn modernStreamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8)
     defer adapter.deinit();
 
     t.lock.acquire();
+    // See `modernJsonResponse`: a client gone before the call started.
+    if (watch.gone()) {
+        t.lock.release();
+        return;
+    }
     const rc = t.server.handleMessageFrom(body, &adapter.writer, peer);
     t.lock.release();
     adapter.writer.flush() catch {};
@@ -3823,6 +3834,69 @@ test "2026-07-28: closing the connection of a running tools/call cancels it (Too
         while (!slow_saw_cancel.load(.acquire) and waited < 4000) : (waited += 2) sleepMs(io, 2);
         try testing.expect(slow_saw_cancel.load(.acquire));
     }
+}
+
+test "2026-07-28: a client that left while its tools/call waited for the transport lock never runs the call" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{ .name = "slow", .description = "waits for cancellation", .input_schema = "{\"type\":\"object\"}", .handler = slowTool });
+    var spin: SpinLock = .{};
+    var transport = Transport{ .gpa = gpa, .server = &server, .lock = spin.iface() };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    for ([_][]const u8{ "", "Accept: application/json, text/event-stream\r\n" }) |accept| {
+        slow_started.store(false, .release);
+        slow_saw_cancel.store(false, .release);
+        var wire_buf: [1024]u8 = undefined;
+        const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}," ++ modern_meta ++ "}}";
+        const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\n{s}MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ accept, body.len, body });
+        // Another call holds the transport: the request waits for the lock
+        // with its watch already running, and the client leaves meanwhile.
+        transport.lock.acquire();
+        const stream = try live.connect();
+        try sendAll(io, stream, wire);
+        sleepMs(io, 150);
+        stream.close(io);
+        sleepMs(io, 150); // the watch fires; no call is in flight to cancel yet
+        transport.lock.release();
+        sleepMs(io, 400);
+        try testing.expect(!slow_started.load(.acquire));
+    }
+}
+
+test "2026-07-28: a chunked tools/call body is still watched (cancellation reaches the running call)" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{ .name = "slow", .description = "waits for cancellation", .input_schema = "{\"type\":\"object\"}", .handler = slowTool });
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    slow_started.store(false, .release);
+    slow_saw_cancel.store(false, .release);
+    var wire_buf: [1024]u8 = undefined;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}," ++ modern_meta ++ "}}";
+    const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\n", .{ body.len, body });
+    const stream = try live.connect();
+    try sendAll(io, stream, wire);
+    try waitFor(io, {}, slowStarted);
+    stream.close(io);
+    var waited: u32 = 0;
+    while (!slow_saw_cancel.load(.acquire) and waited < 4000) : (waited += 2) sleepMs(io, 2);
+    try testing.expect(slow_saw_cancel.load(.acquire));
 }
 
 test "topLevelId: string and integer ids, nothing else" {
