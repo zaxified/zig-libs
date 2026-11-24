@@ -690,6 +690,29 @@ pub const STC = struct {
         }
         return if (n >= self.l_total) self.pff else null;
     }
+    /// True once every further `step` is `steadyStep`: past the first output, so both EMAs are bare recurrences
+    /// and both windows are past their first full block (`pw.count > cycle`).
+    pub fn steady(self: *const Self) bool {
+        return self.n > self.l_total;
+    }
+    /// `step` once `steady()`, without the warm-up branches; bitwise what `step` answers.
+    pub inline fn steadyStep(self: *Self, _: anytype, b: In) f64 {
+        self.n += 1;
+        const s = self.slow.stepSteady(b.x);
+        const f = self.fast.stepSteady(b.x);
+        const line = f - s;
+        const lx = self.lw.extremes(line);
+        self.lw.commit(line);
+        const r1 = lx[0] - lx[1];
+        if (r1 > 0.0) self.frac1 = (line - lx[1]) / r1 * 100.0;
+        self.pf_v = @mulAdd(f64, 0.5, self.frac1 - self.pf_v, self.pf_v);
+        const px = self.pw.extremes(self.pf_v);
+        self.pw.commit(self.pf_v);
+        const r2 = px[0] - px[1];
+        if (r2 > 0.0) self.frac2 = (self.pf_v - px[1]) / r2 * 100.0;
+        self.pff = @mulAdd(f64, 0.5, self.frac2 - self.pff, self.pff);
+        return self.pff;
+    }
     /// A step that writes nothing outside the copy: the extremes read the suffix arrays, only `commit` writes them.
     pub fn peekStep(self: *const Self, src: anytype, b: In) ?f64 {
         var c = self.*;

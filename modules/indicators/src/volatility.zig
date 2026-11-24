@@ -563,6 +563,43 @@ pub const RviCore = struct {
         const total = self.prev_up + self.prev_dn;
         return if (total == 0.0) 50.0 else 100.0 * (self.prev_up / total);
     }
+    /// True once every further `step` is the smoothing recurrence with an output.
+    pub fn steady(self: *const RviCore) bool {
+        return self.n >= self.sd - 1 + @max(self.p, self.p - 1 + self.u);
+    }
+    /// `step` over bars `i..` once `steady()` (`i >= 1`; bar `j` of the core is `in[j]`), bitwise
+    /// what `step` answers, with the state in locals and the side of the close change taken as
+    /// a vector select (a branch on its sign mispredicts about half the time).
+    pub fn steadyRun(self: *RviCore, comptime T: type, in: []const T, out: []T, start: usize) void {
+        var v = self.v;
+        var prev_up = self.prev_up;
+        var prev_dn = self.prev_dn;
+        var prev_x: f64 = self.prev_x;
+        const beta = self.w_beta;
+        const alpha = self.w_alpha;
+        const src = core.SliceSrc(T){ .xs = in };
+        const V = @Vector(2, f64);
+        const zero: V = @splat(0.0);
+        for (in[start..], out[start..]) |xt, *o| {
+            const x: f64 = xt;
+            const sigma = @sqrt(v.steadyStep(src, x));
+            const delta = x - prev_x;
+            prev_x = x;
+            const sv: V = @splat(sigma);
+            const dv: V = @splat(delta);
+            // lane 0: up (delta > 0), lane 1: down (delta < 0)
+            const sel = @select(f64, zero < dv * @as(V, .{ 1.0, -1.0 }), sv, zero);
+            prev_up = @mulAdd(f64, beta, prev_up, alpha * sel[0]);
+            prev_dn = @mulAdd(f64, beta, prev_dn, alpha * sel[1]);
+            const total = prev_up + prev_dn;
+            o.* = core.to(T, if (total == 0.0) 50.0 else 100.0 * (prev_up / total));
+        }
+        self.v = v;
+        self.prev_up = prev_up;
+        self.prev_dn = prev_dn;
+        self.prev_x = prev_x;
+        self.n = in.len;
+    }
 };
 pub fn rviLookback(p: RviParams) Error!usize {
     try RviCore.validate(p);

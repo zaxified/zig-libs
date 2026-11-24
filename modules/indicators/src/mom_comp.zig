@@ -795,6 +795,8 @@ pub const WAVETREND = struct {
         return struct { wt1: T, wt2: T };
     }
     ch: usize,
+    avg: usize,
+    un: Unstable,
     esa: EmaCore,
     d: EmaCore,
     wt1: EmaCore,
@@ -802,6 +804,7 @@ pub const WAVETREND = struct {
     ring: mu.Ring,
     prev_ap: f64 = 0.0,
     prev_esa: f64 = 0.0,
+    slot: usize = 0, // where the ring's next push lands (`ring.n % signal`, kept without the division)
     n: usize = 0,
     pub fn validate(p: Params) Error!void {
         try core.checkPeriod(p.channel, 2);
@@ -823,6 +826,8 @@ pub const WAVETREND = struct {
         if (scratch.len < p.signal) return error.BadParam;
         return .{
             .ch = p.channel,
+            .avg = p.average,
+            .un = p.unstable,
             .esa = try ema(p.channel, p.unstable),
             .d = try ema(p.channel, p.unstable),
             .wt1 = try ema(p.average, p.unstable),
@@ -839,8 +844,41 @@ pub const WAVETREND = struct {
         const ci = if (scaled > 0.0) num / scaled else 0.0;
         const w1 = self.wt1.step(NoSrc{}, ci) orelse return null;
         self.ring.push(w1);
+        self.slot = if (self.slot + 1 == self.ring.buf.len) 0 else self.slot + 1;
         const w2 = self.sig.step(self.ring.view(), w1) orelse return null;
         return .{ .wt1 = w1, .wt2 = w2 };
+    }
+    /// True once every further `step` is `steadyStep` (past the first output: the three averages are bare recurrences
+    /// and the signal window is full).
+    pub fn steady(self: *const Self) bool {
+        return self.n > lookback(.{ .channel = self.ch, .average = self.avg, .signal = self.ring.buf.len, .unstable = self.un });
+    }
+    /// `step` once `steady()`, bitwise: the same operations, the signal average's ring read at the slot after the one
+    /// just written (the bar that leaves the window) instead of through a modulo.
+    pub inline fn steadyStep(self: *Self, _: anytype, b: In) Out {
+        const n_ap = self.n;
+        self.n += 1;
+        const ap = (b.high + b.low + b.close) / 3.0;
+        const e = self.esa.stepSteady(ap);
+        var num = ap - e;
+        if (n_ap >= self.ch and ap == self.prev_ap and self.esa.prev == self.prev_esa) num = 0.0;
+        const dv = self.d.stepSteady(@abs(num));
+        const scaled = 0.015 * dv;
+        const ci = if (scaled > 0.0) num / scaled else 0.0;
+        const w1 = self.wt1.stepSteady(ci);
+        const buf = self.ring.buf;
+        const s = self.slot;
+        buf[s] = w1;
+        self.ring.n += 1;
+        const next = if (s + 1 == buf.len) 0 else s + 1;
+        self.slot = next;
+        self.sig.n += 1;
+        self.sig.sum += w1;
+        const t = self.sig.sum;
+        self.sig.sum -= buf[next];
+        self.prev_ap = ap;
+        self.prev_esa = self.esa.prev;
+        return .{ .wt1 = w1, .wt2 = t / pf(self.sig.p) };
     }
     pub fn step(self: *Self, _: anytype, b: In) ?Out {
         const n_ap = self.n;
