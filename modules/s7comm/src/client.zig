@@ -195,6 +195,7 @@ pub const Client = struct {
 
     /// Sends a COTP disconnect request. Best effort: most PLCs simply see the
     /// TCP close.
+    // secret-api-ok: sends a COTP disconnect (public reference numbers); no secret is read
     pub fn disconnect(self: *Client) void {
         defer self.connected = false;
         var body: [16]u8 = undefined;
@@ -741,6 +742,7 @@ pub const Client = struct {
     /// 1500 access protection runs over S7CommPlus and is not this call. The
     /// encoded copies on the stack are wiped; the transmit buffer keeps the
     /// frame until the next request overwrites it.
+    // secret-api-ok: the S7 password is only obfuscated, reversible by anyone on the wire (SPEC "Threat model"); the encoded copies on the stack are wiped
     pub fn setSessionPassword(self: *Client, password: []const u8) Error!void {
         if (!self.connected) return error.NotConnected;
         var enc = userdata.encodePassword(password);

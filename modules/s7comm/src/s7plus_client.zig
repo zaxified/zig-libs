@@ -89,6 +89,7 @@ pub const Client = struct {
 
     // ── connect ──────────────────────────────────────────────────────────────
 
+    // secret-api-ok: the S7CommPlus session setup carries no secret (no legitimation here); public handshake fields only
     pub fn connect(self: *Client) Error!void {
         try self.cotpConnect();
 
@@ -132,6 +133,7 @@ pub const Client = struct {
         }
     }
 
+    // secret-api-ok: sends the session teardown (public ids); no secret is read
     pub fn disconnect(self: *Client) void {
         defer self.connected = false;
         var body: [16]u8 = undefined;

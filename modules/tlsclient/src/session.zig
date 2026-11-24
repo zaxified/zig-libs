@@ -178,6 +178,7 @@ pub const SessionCache = struct {
 
     /// Free the entry for `k` (secrets zeroed); false when there was none
     /// (caller holds the lock). Go: `Put(key, nil)`.
+    // secret-api-ok: zeroes the entry for `k` (a wipe); `k` is the cache key (server name + port), public
     pub fn drop(c: *SessionCache, k: []const u8) bool {
         const e = c.find(k) orelse return false;
         std.crypto.secureZero(u8, mem.asBytes(e));

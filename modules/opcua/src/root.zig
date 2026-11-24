@@ -183,7 +183,7 @@ pub const SecureChannel = struct {
 
         // OPC 10000-7 key-length band of the policy, own key and server
         // certificate, before any nonce or RSA work.
-        if (options.security) |sec| try security.checkContextKeyLengths(sec);
+        if (options.security) |*sec| try security.checkContextKeyLengths(sec);
 
         try ch.exchange(.issue, options.requested_lifetime_ms, options.timeout_hint_ms, options.now_ms);
         out.* = ch;

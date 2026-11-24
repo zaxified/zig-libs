@@ -655,7 +655,7 @@ pub const SecurityContext = struct {
 /// must both fit `ctx.policy`'s band (open62541 checks the remote certificate
 /// in `rsaNewChannelContext`; own keys at policy creation). Skipped for
 /// `.none` and when `insecure_allow_key_length_outside_policy` is set.
-pub fn checkContextKeyLengths(ctx: SecurityContext) (CertificatePublicKeyError || KeyLengthError)!void {
+pub fn checkContextKeyLengths(ctx: *const SecurityContext) (CertificatePublicKeyError || KeyLengthError)!void {
     if (ctx.insecure_allow_key_length_outside_policy or ctx.mode == .none) return;
     if (ctx.credentials) |c| {
         if (!ctx.policy.allowsKeyBits(c.public_key.bits())) return error.KeyLengthOutOfPolicy;
@@ -1843,19 +1843,19 @@ test "checkContextKeyLengths: own key and server certificate, escape and .none s
     var buf3: [2048]u8 = undefined;
     const big = test_cert.withModulusBits(&buf3, 4097);
     var ctx: SecurityContext = .{ .policy = .basic256sha256, .mode = .sign, .server_certificate = good };
-    try checkContextKeyLengths(ctx);
+    try checkContextKeyLengths(&ctx);
     ctx.server_certificate = small;
-    try testing.expectError(error.KeyLengthOutOfPolicy, checkContextKeyLengths(ctx));
+    try testing.expectError(error.KeyLengthOutOfPolicy, checkContextKeyLengths(&ctx));
     ctx.server_certificate = big;
-    try testing.expectError(error.KeyLengthOutOfPolicy, checkContextKeyLengths(ctx));
+    try testing.expectError(error.KeyLengthOutOfPolicy, checkContextKeyLengths(&ctx));
     ctx.server_certificate = "junk";
-    try testing.expectError(error.InvalidCertificate, checkContextKeyLengths(ctx));
+    try testing.expectError(error.InvalidCertificate, checkContextKeyLengths(&ctx));
     ctx.insecure_allow_key_length_outside_policy = true;
     ctx.server_certificate = small;
-    try checkContextKeyLengths(ctx);
+    try checkContextKeyLengths(&ctx);
     ctx.insecure_allow_key_length_outside_policy = false;
     ctx.mode = .none;
-    try checkContextKeyLengths(ctx);
+    try checkContextKeyLengths(&ctx);
 }
 
 test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {

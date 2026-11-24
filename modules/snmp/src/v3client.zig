@@ -450,6 +450,7 @@ pub const V3Client = struct {
     /// `error.NotDiscovered`. The message carries `reportable = false`; `sysUpTime.0` and
     /// `snmpTrapOID.0` are inserted as the first two varbinds. At authPriv a `SaltSeed.csprng`
     /// is required as for any encrypted message.
+    // secret-api-ok: the keys are used only inside the burned usm/priv calls that buildRequest makes (as for every request)
     pub fn trap(c: *V3Client, n: message.Notification) (Error || error{SendNotSupported})!void {
         if (!c.engine.discovered) return error.NotDiscovered;
         const send = c.transport.sendFn orelse return error.SendNotSupported;

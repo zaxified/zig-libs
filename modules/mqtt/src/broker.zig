@@ -224,6 +224,7 @@ pub const InlineSubscriber = struct {
     }
 
     /// Disconnects. The subscriber must not be used afterwards.
+    // secret-api-ok: removes the connection from the broker; no secret is read
     pub fn detach(self: *InlineSubscriber) void {
         self.broker.remove(self.conn);
     }
