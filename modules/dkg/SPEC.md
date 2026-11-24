@@ -430,7 +430,9 @@ material uses Blum, not safe, primes for `Ñ`; the proofs and checks are the pro
   *Anchoring*.
 - **Dead-stack probe** (`src/stackprobe_test.zig`, ReleaseFast): paints a window of the dead
   stack, makes one call (every participant, reshare, ECDSA keygen and refresh call, the free
-  functions, `takeKeyShare`, and `toBytes` / `fromBytes` of mid-run machines), and looks for
+  functions, `takeKeyShare`, and `toBytes` / `fromBytes` of mid-run machines; `EcdsaReshare`'s init, start, every
+  handle and advance of a (2,3) -> (2,3) run with an old-and-new, an old-only and a new-only process, and
+  `takeKeyShare`), and looks for
   every 16-byte window of every secret's big-endian, little-endian and in-memory image and of
   every byte the call drew from its `std.Random` (published bytes excluded), with negative and
   positive controls in the same binary. `verbose = true` prints each call's depth, to resize a
@@ -441,6 +443,14 @@ material uses Blum, not safe, primes for `Ñ`; the proofs and checks are the pro
   Feldman-complaint and reveal rounds), and the snapshot decoders; run by the deterministic
   driver with the `DKG_FUZZ` prefix (`DKG_FUZZ=<seeds> scripts/modtest dkg`; check that the
   summary shows counts).
+  `EcdsaReshare.handle` (`dkg-ecdsa-reshare-handle`): one of the four processes of the tests' run,
+  replayed to the start of any round from the honest frames of a captured run (a PRNG per process),
+  then a frame from any `Member` (old, new, both, neither): a captured frame damaged or cut, or
+  drawn bytes behind the run tag with a real kind byte. Never a panic, and every refusal leaves
+  phase, culprit, outbox and collected-frame counts as they were. A world is built once per process
+  (2048-bit keys, one honest run: about 90 s), a replayed process costs seconds, so the driver's
+  watchdog is 60 s per input and a verdict run is minutes, not seconds (about 1 seed in 3 s per
+  core).
 - **ctgrind.** `src/ctgrind_harness.zig` records the module's constant-time posture (it makes no
   claim); rows in `scripts/checks/ctgrind-expected.tsv`.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
