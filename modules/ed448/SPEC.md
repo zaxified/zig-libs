@@ -149,10 +149,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   guard is this module's policy, RFC 8032 itself would accept a key holder's signature with `R = O`);
   then the cofactored equation `[4]([S]B + [k](-A')) = [4]R` with `k = SHAKE256(dom4 ‖ R ‖ A' ‖ M, 114)
   mod L`.
-- **Scalars** (`scalar.zig`): internal 56-bit `u64` limbs, 9 per scalar. `L` has no Solinas structure, so
-  reduction is a generic constant-time binary long division (`reduceLimbs`): one fixed iteration per input
-  bit, each `r = 2r + bit` then a branch-free conditional subtract of `L` (`condSubL`, the same
-  trial-subtract-and-select shape as the field's). `reduceWide` reduces the 114-byte digest (17 limbs);
+- **Scalars** (`scalar.zig`): internal 56-bit `u64` limbs, 9 per scalar. `L = 2^446 - δ` with `δ` a 224-bit
+  number, so the reduction folds the part above bit 448 by `2^448 ≡ 4δ (mod L)` (`reduceLimbs`: four fold
+  steps of at most 9×5 limb products each, then three branch-free conditional subtracts of `2L`, `L`, `L`
+  (`condSubBy`, the same trial-subtract-and-select shape as the field's)). `reduceWide` reduces the 114-byte digest (17 limbs);
   `mul` is a 9×9 schoolbook product (accepting un-reduced 456-bit inputs, the clamped scalar again)
   through the same reduction; `add` is one limb add and one conditional subtract; `mulAdd` is
   `add(mul(a, b), c)`.
@@ -181,8 +181,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `ed448.zig`'s `Point.mul` / `mulBasePoint` (fixed 112 nibble windows,
   each a masked 16-entry table scan plus an unconditional point-add) —
   used by keygen and signing, and by `decaf448`;
-  `scalar.zig`'s `reduceWide`/`add`/`mul`/`mulAdd` (fixed-iteration
-  binary reduction, branch-free conditional subtracts). Deliberately
+  `scalar.zig`'s `reduceWide`/`add`/`mul`/`mulAdd` (fixed-shape
+  folding reduction, branch-free conditional subtracts). Deliberately
   VARIABLE-time, public inputs only: `verify`/`verifyPh` (`Point.
   fromBytes`'s decode control flow, `equivalent`'s early-`and`, the
   final accept/reject branch) and the byte-codec range checks on
@@ -304,7 +304,7 @@ measured on it.
 
 - **A `blackBox` on `scalar.zig`'s `condSubL` mask.** `Fe`'s selects launder their mask; the scalar's
   conditional subtraction does not. Measured 2026-11-21 (`ctgrind.sh --stacks ed448`, ReleaseFast): target
-  `full` runs `sign`, whose `reduceWide` takes the secret nonce digest through `condSubL` 912 times, and
+  `full` runs `sign`, whose `reduceWide` takes the secret nonce digest through the folding reduction's conditional subtracts, and
   reports no context in `scalar.zig` (its 3 are `Fe.invert`'s public-length entry and the harness's prints), so
   the select is branch-free as compiled; a compiler that branched there would move the pinned count. Laundering
   it anyway moved `decaf448`'s `scalar.invert` dead-stack probe (the scalar found 167–199 B below the region top)

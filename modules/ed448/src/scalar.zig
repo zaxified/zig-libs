@@ -14,8 +14,8 @@
 //! `rejectNonCanonical`, and the full mod-`L` arithmetic
 //! (`reduceWide`/`add`/`mul`/`mulAdd`, all constant-time — fixed
 //! iteration counts, branch-free conditional subtracts) are real.
-//! Reduction is a generic constant-time binary long division (`L` has no
-//! Solinas structure to exploit, unlike `field.zig`'s `p`).
+//! Reduction folds the part above bit 448 by `2^448 == 4 * (2^446 - L)`
+//! (`L` is `2^446` minus a 224-bit number), then three conditional subtracts.
 //!
 //! Zig std GAP: yes — `std.crypto.ecc.Edwards25519.scalar` supplies the
 //! identical SHAPE of API (`reduce64`-style wide-hash reduction,
@@ -101,9 +101,8 @@ pub fn clamp(buf: *[encoded_bytes]u8) void {
 // ── internal limb machinery ─────────────────────────────────────────────
 //
 // Scalars are computed on as little-endian arrays of 56-bit `u64` limbs
-// (same digit size as `field.zig`, chosen for the same headroom reason,
-// though `L` has no Solinas structure to exploit — reduction here is a
-// generic constant-time binary long division instead). A canonical
+// (same digit size as `field.zig`, chosen for the same headroom reason;
+// reduction folds the high part by `2^448 mod L`, see `reduceLimbs`). A canonical
 // scalar needs ceil(456/56) = 9 limbs; wide intermediates (the 114-byte
 // digest, double-width products) use larger fixed limb counts.
 
@@ -136,47 +135,83 @@ fn limbsToBytes(limbs: [num_limbs]u64) CompressedScalar {
 /// `L` in 9×56-bit limb form.
 const l_limbs: [num_limbs]u64 = limbsFromBytes(num_limbs, &l_bytes);
 
-/// Branch-free `if (v >= L) v -= L` over 9 canonical-width limbs (each
-/// `< 2^56`; the value may be up to `2L - 1 < 2^447`). Same
+/// `c` (a canonical multiple of `L`, or `L` itself) in 9×56-bit limb form.
+fn constLimbs(comptime v: u512) [num_limbs]u64 {
+    var out: [num_limbs]u64 = undefined;
+    for (&out, 0..) |*limb, i| limb.* = @truncate((v >> (limb_bits * i)) & limb_mask);
+    return out;
+}
+
+const l_int: u512 = std.mem.readInt(u456, &l_bytes, .little);
+/// `2^448 mod L = 4 * (2^446 - L)`: `L = 2^446 - delta`, so `2^446 == delta`
+/// and `2^448 == 4 * delta` (226 bits, five limbs). The reduction folds by it.
+const fold_limbs: [5]u64 = blk: {
+    const full = constLimbs((1 << 448) - 4 * l_int);
+    std.debug.assert(full[5] == 0 and full[6] == 0 and full[7] == 0 and full[8] == 0);
+    break :blk full[0..5].*;
+};
+
+/// Branch-free `if (v >= c) v -= c` over 9 canonical-width limbs (each
+/// `< 2^56`), `c` a comptime constant below `2^448`. Same
 /// trial-subtract-then-mask-select shape as `field.zig`'s `condSubP`.
-fn condSubL(limbs: [num_limbs]u64) [num_limbs]u64 {
+fn condSubBy(comptime c: [num_limbs]u64, limbs: [num_limbs]u64) [num_limbs]u64 {
     var diff: [num_limbs]u64 = undefined;
     var borrow: u64 = 0;
     inline for (0..num_limbs) |i| {
-        const t = limbs[i] -% l_limbs[i] -% borrow;
+        const t = limbs[i] -% c[i] -% borrow;
         borrow = t >> 63; // limbs < 2^56: bit 63 set iff the true result went negative
         diff[i] = t & limb_mask;
     }
-    const keep: u64 = 0 -% borrow; // borrow == 1 -> v < L -> keep original
+    const keep: u64 = 0 -% borrow; // borrow == 1 -> v < c -> keep original
     var out: [num_limbs]u64 = undefined;
     inline for (0..num_limbs) |i| out[i] = (limbs[i] & keep) | (diff[i] & ~keep);
     return out;
 }
 
-/// Constant-time binary reduction of an arbitrary-width little-endian
-/// limb value mod `L`: classic shift-and-conditional-subtract long
-/// division, one fixed iteration per input bit (MSB first). The running
-/// remainder `r` satisfies `r < L` at every step, so `2r + bit < 2L`
-/// and a single `condSubL` per step restores the invariant. Every
-/// iteration executes identically regardless of data — no secret-
-/// dependent branch, no early exit.
-fn reduceLimbs(comptime n_limbs: usize, wide: [n_limbs]u64) [num_limbs]u64 {
-    var r = @as([num_limbs]u64, @splat(0));
-    var bit_index: usize = n_limbs * limb_bits;
-    while (bit_index > 0) {
-        bit_index -= 1;
-        const bit: u64 = (wide[bit_index / limb_bits] >> @intCast(bit_index % limb_bits)) & 1;
-        // r = 2r + bit (r < L < 2^446, so the shifted value < 2^447
-        // stays comfortably inside 9 limbs with no carry-out).
-        var carry: u64 = bit;
-        for (&r) |*limb| {
-            const cur = (limb.* << 1) | carry;
-            carry = cur >> limb_bits;
-            limb.* = cur & limb_mask;
-        }
-        r = condSubL(r);
+/// `if (v >= L) v -= L` (`v < 2L`), branch-free.
+fn condSubL(limbs: [num_limbs]u64) [num_limbs]u64 {
+    return condSubBy(l_limbs, limbs);
+}
+
+/// One fold step of the reduction: `lo + hi * 2^448` with `lo` the low eight
+/// limbs of `x` and `hi` the rest, replaced by the congruent `lo + hi * 4 *
+/// delta` (`2^448 == 4 * delta mod L`), into `n_out` clean limbs. The caller's
+/// bounds argument (see `reduceLimbs`) guarantees the result fits `n_out`
+/// limbs, so the final carry is dropped. Fixed shape, no data-dependent
+/// branch or index.
+fn foldStep(comptime n_in: usize, comptime n_out: usize, x: [n_in]u64) [n_out]u64 {
+    var cols = @as([n_out]u128, @splat(0));
+    inline for (0..8) |i| cols[i] = x[i];
+    inline for (8..n_in) |i| {
+        inline for (0..5) |j| cols[i - 8 + j] += @as(u128, x[i]) * fold_limbs[j];
     }
-    return r;
+    var out: [n_out]u64 = undefined;
+    var carry: u128 = 0;
+    inline for (0..n_out) |i| {
+        const cur = cols[i] + carry;
+        out[i] = @truncate(cur & limb_mask);
+        carry = cur >> limb_bits;
+    }
+    return out;
+}
+
+const two_l_limbs = constLimbs(2 * l_int);
+
+/// Constant-time reduction of a value `< 2^912` (17 limbs) mod `L`, by
+/// folding the part above bit 448 with `2^448 == delta4`, `delta4 < 2^226`.
+/// Bounds: the input's high part is `< 2^464`, so fold 1 gives `< 2^691`
+/// (13 limbs); its high part is `< 2^243`, so fold 2 gives `< 2^470`; the
+/// high part of that is `< 2^22`, so fold 3 gives `< 2^448 + 2^248`; fold 4
+/// (high part 0 or 1, and then the low part is `< 2^248`) leaves `v < 2^448`.
+/// As `2^448 = 4L + delta4`, three branch-free conditional subtractions (`2L`,
+/// `L`, `L`) bring `v` below `L`. Every step runs identically for any input.
+fn reduceLimbs(x: [17]u64) [num_limbs]u64 {
+    const f1 = foldStep(17, 13, x);
+    const f2 = foldStep(13, 9, f1);
+    const f3 = foldStep(9, 9, f2);
+    const f4 = foldStep(9, 9, f3);
+    // f4[8] is zero: v < 2^448 (see the bounds above).
+    return condSubL(condSubL(condSubBy(two_l_limbs, f4)));
 }
 
 /// Reduce a 114-byte (912-bit) `SHAKE256` digest modulo `L`, returning a
@@ -186,7 +221,7 @@ fn reduceLimbs(comptime n_limbs: usize, wide: [n_limbs]u64) [num_limbs]u64 {
 /// and challenge (`k`) derivation.
 pub fn reduceWide(digest: [114]u8) CompressedScalar {
     // ceil(114 / 7) = 17 limbs (952 bits >= 912).
-    return limbsToBytes(reduceLimbs(17, limbsFromBytes(17, &digest)));
+    return limbsToBytes(reduceLimbs(limbsFromBytes(17, &digest)));
 }
 
 /// `a + b (mod L)`, both inputs canonical (`< L`). Constant-time:
@@ -210,7 +245,7 @@ pub fn add(a: CompressedScalar, b: CompressedScalar) CompressedScalar {
 /// accepted and fully reduced (Ed448's clamped secret scalar is `2^447 +
 /// 4t`, deliberately NOT reduced mod `L` before use — RFC 8032 §5.2.5).
 /// Constant-time: fixed schoolbook multiply into u128 column
-/// accumulators, then the fixed-iteration binary reduction.
+/// accumulators, then the fixed-shape folding reduction.
 pub fn mul(a: CompressedScalar, b: CompressedScalar) CompressedScalar {
     const al = limbsFromBytes(num_limbs, &a);
     const bl = limbsFromBytes(num_limbs, &b);
@@ -232,7 +267,8 @@ pub fn mul(a: CompressedScalar, b: CompressedScalar) CompressedScalar {
         carry = cur >> limb_bits;
     }
     t[17] = @intCast(carry);
-    return limbsToBytes(reduceLimbs(18, t));
+    // t[17] is zero: the product is below 2^912 < 2^952.
+    return limbsToBytes(reduceLimbs(t[0..17].*));
 }
 
 /// `a * b + c (mod L)` — RFC 8032 §5.2.6 step 5's `S = (r + k*s) mod L`
@@ -341,4 +377,43 @@ test "mul accepts any 456-bit operand (bits 448..455 included) and reduces it mo
     var wb: [encoded_bytes]u8 = undefined;
     std.mem.writeInt(u456, &wb, @intCast(want), .little);
     try std.testing.expectEqualSlices(u8, &wb, &mul(a, b));
+}
+
+test "reduceWide matches u1024 remainder on structured and pseudo-random digests" {
+    const l: u1024 = l_int;
+    var prng = std.Random.DefaultPrng.init(0x448);
+    const rnd = prng.random();
+    var n: usize = 0;
+    while (n < 300) : (n += 1) {
+        var digest: [114]u8 = undefined;
+        rnd.bytes(&digest);
+        switch (n % 6) {
+            1 => @memset(digest[57..], 0xff),
+            2 => @memset(digest[0..57], 0xff),
+            3 => @memset(&digest, 0xff),
+            4 => @memset(digest[28..], 0),
+            5 => @memset(digest[8..], 0),
+            else => {},
+        }
+        const want: u1024 = std.mem.readInt(u912, &digest, .little) % l;
+        var wb: [encoded_bytes]u8 = @splat(0);
+        std.mem.writeInt(u456, &wb, @intCast(want), .little);
+        try std.testing.expectEqualSlices(u8, &wb, &reduceWide(digest));
+    }
+    // Multiples of L at the top of the range, with 0, 1 and L - 1 added.
+    const top: u1024 = (@as(u1024, 1) << 912) - 1;
+    var k: u1024 = top / l;
+    var steps: usize = 0;
+    while (steps < 4) : (steps += 1) {
+        for ([_]u1024{ 0, 1, l - 1 }) |off| {
+            const v = k * l + off;
+            if (v > top) continue;
+            var d: [114]u8 = undefined;
+            std.mem.writeInt(u912, &d, @intCast(v), .little);
+            var wb: [encoded_bytes]u8 = @splat(0);
+            std.mem.writeInt(u456, &wb, @intCast(v % l), .little);
+            try std.testing.expectEqualSlices(u8, &wb, &reduceWide(d));
+        }
+        k -= 1;
+    }
 }

@@ -26,7 +26,7 @@ validated byte-exact against the official RFC test vectors. See
 | `field.zig` | `Fp448` (`p = 2^448 - 2^224 - 1`), 8×56-bit-limb representation with the Goldilocks/Solinas reduction (`2^448 ≡ 2^224 + 1`) |
 | `x448.zig` | RFC 7748 X448: scalar clamping + the constant-time Montgomery ladder |
 | `ed448.zig` | RFC 8032 Ed448/Ed448ph: `dom4` framing, wire codecs, `Point` curve arithmetic (complete Edwards formulas), sign/verify |
-| `scalar.zig` | Arithmetic mod `L` (the edwards448 subgroup order) for Ed448 signing — constant-time binary reduction |
+| `scalar.zig` | Arithmetic mod `L` (the edwards448 subgroup order) for Ed448 signing — constant-time folding reduction |
 | `kat_vectors.zig` | Official RFC 7748 §5.2/§6.2 (X448) and RFC 8032 §7.4/§7.5 (Ed448/Ed448ph) test vectors |
 | `rfc8032_vectors.zig`, `wycheproof_vectors.zig` | Every RFC 8032 §7.4/§7.5 vector, and the Wycheproof `ed448_test.json` cases, as data |
 | `kat_test.zig` | Byte-exact KAT assertions against the vector files through the public API |
