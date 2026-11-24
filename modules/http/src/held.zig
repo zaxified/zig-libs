@@ -173,7 +173,9 @@ fn monoMs() u64 {
 /// ```
 ///
 /// `stop` must run before the handler returns. After it returns the hook
-/// does not fire any more (one already running has finished).
+/// does not fire any more (one already running has finished). A peer that is
+/// gone before `start` runs fires the hook from inside `start`, on the
+/// handler's own thread.
 pub const PeerWatch = struct {
     w: Watcher = .{},
     source: ?Source = null,
@@ -187,6 +189,15 @@ pub const PeerWatch = struct {
         switch (src) {
             .h2 => |l| if (!l.attachFn(l.ctx, l.id, &pw.w)) pw.w.fire(),
             .socket => |c| {
+                // A peer that left before the watch began is gone *now*: the
+                // task below would only learn it a moment later, and a caller
+                // that checks `gone()` right after `start` (or whose hook
+                // must find its work already running) would miss it.
+                var now = [1]linux.pollfd{.{ .fd = c.stream.socket.handle, .events = pollrdhup, .revents = 0 }};
+                if (linux.errno(linux.poll(&now, 1, 0)) == .SUCCESS and hungUp(now[0].revents)) {
+                    pw.w.fire();
+                    return; // nothing to stop: `source` stays null
+                }
                 pw.stop_fd = try newEventFd();
                 pw.task = c.server.io.concurrent(watchTask, .{ pw, c.stream.socket.handle }) catch {
                     closeFd(pw.stop_fd);
@@ -403,16 +414,19 @@ pub const Hold = struct {
     /// (see `Options.on_full`).
     pub fn send(h: *Hold, bytes: []const u8) error{ Closed, Full }!void {
         if (bytes.len == 0) return;
+        // Everything that touches `h` happens under the lock, the wake-up
+        // included: `end` takes the lock before it closes the eventfd, and the
+        // owner only sees the queue (or `finished`) under it, so once this
+        // returns nothing here reads the Hold, whose storage may go away with
+        // the owner's frame at any moment after `run` returned.
         lockSpin(&h.lock);
-        if (h.closed or h.finished or h.overflow) {
-            h.lock.unlock();
-            return error.Closed;
-        }
+        defer h.lock.unlock();
+        if (h.closed or h.finished or h.overflow) return error.Closed;
         if (bytes.len > h.buf.len - h.len) {
-            const end_it = h.opts.on_full == .end_stream;
-            if (end_it) h.overflow = true;
-            h.lock.unlock();
-            if (end_it) wake(h.efd);
+            if (h.opts.on_full == .end_stream) {
+                h.overflow = true;
+                wake(h.efd);
+            }
             return error.Full;
         }
         const cap = h.buf.len;
@@ -421,7 +435,6 @@ pub const Hold = struct {
         @memcpy(h.buf[tail..][0..first], bytes[0..first]);
         @memcpy(h.buf[0 .. bytes.len - first], bytes[first..]);
         h.len += bytes.len;
-        h.lock.unlock();
         h.last_send_ms.store(monoMs(), .monotonic);
         wake(h.efd);
     }
@@ -430,10 +443,10 @@ pub const Hold = struct {
     /// (`End.finished`). Thread-safe, idempotent.
     pub fn finish(h: *Hold) void {
         lockSpin(&h.lock);
+        defer h.lock.unlock();
         const was = h.finished or h.closed;
         h.finished = true;
-        h.lock.unlock();
-        if (!was) wake(h.efd);
+        if (!was) wake(h.efd); // under the lock, as in `send`
     }
 
     /// The peer is gone (see `PeerWatch.gone`). Thread-safe.
@@ -600,6 +613,24 @@ const Probe = struct {
             p.hold.store(null, .release);
             p.end.store(@backingInt(e), .release);
             if (e == .shutdown) es.data("bye") catch {};
+        } else if (std.mem.eql(u8, req.path, "/bighold")) {
+            var es = try sse.EventStream.start(rw);
+            _ = &es;
+            var q: [64 * 1024]u8 = undefined;
+            var h: Hold = .{};
+            try h.begin(req, rw, &q, p.opts);
+            defer h.end();
+            p.hold.store(&h, .release);
+            const e = h.run();
+            p.hold.store(null, .release);
+            p.end.store(@backingInt(e), .release);
+        } else if (std.mem.eql(u8, req.path, "/latewatch")) {
+            _ = try req.reader().discardRemaining();
+            sleepMs(p.io, 300); // the client leaves meanwhile
+            var pw: PeerWatch = .{};
+            try pw.start(req, .{ .ctx = p, .f = onGone });
+            defer pw.stop();
+            try rw.writeAll(if (pw.gone() and p.hook_ran.load(.acquire)) "gone" else "alive");
         } else if (std.mem.eql(u8, req.path, "/watch")) {
             _ = try req.reader().discardRemaining();
             var pw: PeerWatch = .{};
@@ -921,4 +952,131 @@ test "Hold socket-free: send/finish from a thread, on_full reject keeps the stre
         try testing.expectEqual(@backingInt(want), T.end.load(.acquire));
         if (reject) try testing.expect(std.mem.indexOf(u8, out.buffered(), "abcd") != null);
     }
+}
+
+test "Hold: the server's read, request and idle timeouts do not cut a held response" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var probe: Probe = .{ .io = threaded.io() };
+    var f: Fixture = undefined;
+    if (!try f.start(&probe, .{
+        .handler = Probe.handler,
+        .read_timeout_ms = 100,
+        .request_timeout_ms = 100,
+        .idle_timeout_ms = 100,
+        .read_header_timeout_ms = 100,
+    })) return;
+    defer f.stop();
+    const io = probe.io;
+
+    const stream = try f.server.boundAddress().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    try writeAll(io, stream, "GET /hold HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    const h = try probe.waitHold();
+    sleepMs(io, 500); // several multiples of every timeout
+    try testing.expect(!h.gone());
+    try h.send("data: late\n\n");
+    h.finish();
+    var buf: [2048]u8 = undefined;
+    const got = readAll(io, stream, &buf);
+    try testing.expectEqual(Hold.End.finished, try probe.waitEnd());
+    try testing.expect(std.mem.indexOf(u8, got, "data: late") != null);
+}
+
+test "Hold: a peer that stops reading ends run with write_failed (write stall), not a hang" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var probe: Probe = .{ .io = threaded.io(), .opts = .{ .on_full = .reject } };
+    var f: Fixture = undefined;
+    if (!try f.start(&probe, .{ .handler = Probe.handler, .write_timeout_ms = 300 })) return;
+    defer f.stop();
+    const io = probe.io;
+
+    const stream = try f.server.boundAddress().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    try writeAll(io, stream, "GET /bighold HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    const h = try probe.waitHold();
+    // The client never reads: fill the socket buffers until the server's write stalls.
+    var chunk: [8192]u8 = undefined;
+    @memset(&chunk, 'x');
+    var waited: u32 = 0;
+    while (probe.end.load(.acquire) == 0xff and waited < 8000) : (waited += 1) {
+        h.send(&chunk) catch sleepMs(io, 1);
+    }
+    try testing.expectEqual(Hold.End.write_failed, try probe.waitEnd());
+}
+
+test "PeerWatch: a peer that left before start is gone when start returns, hook already run" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var probe: Probe = .{ .io = threaded.io() };
+    var f: Fixture = undefined;
+    if (!try f.start(&probe, .{ .handler = Probe.handler })) return;
+    defer f.stop();
+    const io = probe.io;
+
+    const stream = try f.server.boundAddress().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    try writeAll(io, stream, "POST /latewatch HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc");
+    sleepMs(io, 50);
+    try stream.shutdown(io, .send);
+    var buf: [1024]u8 = undefined;
+    const got = readAll(io, stream, &buf);
+    try testing.expect(std.mem.endsWith(u8, got, "gone"));
+}
+
+test "Hold: feeders racing end never touch the owner's eventfd or storage after it was closed" {
+    // The owner's `run` returns `.finished` the moment a feeder's `finish`
+    // has set the flag; `end` then closes the eventfd and the handler's
+    // frame goes away. A feeder still inside `send`/`finish` (after its
+    // unlock) would write to the closed descriptor number, which the next
+    // `eventfd` in the process reuses at once: a stray write shows up as a
+    // count on the probe descriptor created right after the handler returned.
+    const T = struct {
+        var hold: std.atomic.Value(?*Hold) = .init(null);
+        var go: std.atomic.Value(bool) = .init(false);
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            var q: [64]u8 = undefined;
+            var h: Hold = .{};
+            try h.begin(req, rw, &q, .{ .on_full = .reject });
+            defer h.end();
+            hold.store(&h, .release);
+            _ = h.run();
+            hold.store(null, .release);
+        }
+        fn feed() void {
+            const h = while (true) {
+                if (hold.load(.acquire)) |p| break p;
+                std.atomic.spinLoopHint();
+            };
+            var n: u32 = 0;
+            while (n < 4) : (n += 1) h.send("x") catch break;
+            h.finish();
+            // Keep calling: after `end` these must fail `Closed` without any
+            // effect (the frame behind `h` is gone only in a misuse; the
+            // contract is that `send` after `finish` is `Closed`).
+        }
+    };
+    var stray: u32 = 0;
+    var iter: u32 = 0;
+    while (iter < 4000) : (iter += 1) {
+        T.hold.store(null, .release);
+        const th = try std.Thread.spawn(.{}, T.feed, .{});
+        var out_buf: [1024]u8 = undefined;
+        var in: std.Io.Reader = .fixed("GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var head: [1024]u8 = undefined;
+        var body: [256]u8 = undefined;
+        var req_body: [256]u8 = undefined;
+        var chunk: [64]u8 = undefined;
+        Server.serveStream(.{ .handler = T.handler }, &in, &out, .{ .head = &head, .response_body = &body, .request_body = &req_body, .chunk = &chunk });
+        const probe = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+        th.join();
+        if (linux.errno(probe) != .SUCCESS) return error.SkipZigTest;
+        const pfd: linux.fd_t = @intCast(probe);
+        var v: u64 = 0;
+        if (linux.errno(linux.read(pfd, std.mem.asBytes(&v), 8)) == .SUCCESS) stray += 1;
+        closeFd(pfd);
+    }
+    try testing.expectEqual(@as(u32, 0), stray);
 }

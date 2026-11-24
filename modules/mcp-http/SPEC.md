@@ -119,8 +119,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `ToolCall.cancelled()` at once, not at its next write. The call is served on a private peer handle
   (from 2^62 up; 2026-07-28 requests otherwise share peer 0), so one client's close cannot cancel
   another client's call with the same id. Not on the session path: 2025-06-18 says a disconnect is
-  not a cancellation (`notifications/cancelled` is). Over a socket only; socket-free there is no
-  peer to watch.
+  not a cancellation (`notifications/cancelled` is). A client already gone when the call gets the
+  transport lock (the watch fired before any call was in flight to cancel) never runs it. Over a
+  socket only; socket-free there is no peer to watch.
 - **`subscriptions/listen` held open (`Transport.listens`).** With `mcp.Server.push` on, `mcp`
   acknowledges a listen and keeps it open. With a `Listens` registry the POST then stays open on an
   `http.Server.Hold`: the listen gets a private peer handle, is registered under it in the same
@@ -210,9 +211,12 @@ Run: `scripts/modtest mcp-http`; the example (`example/main.zig`) is built by
   another thread (`notifyListChanged` / `notifyResourceUpdated` through `pushSink`) arrive after the
   acknowledgment, a kind it did not ask for does not, `Listens.finishAll` ends it with the graceful-close result and
   the subscription is gone; the client closing it drops the subscription; without `listens` the old ack-and-close
-  shape. A modern `tools/call` whose connection the client closes sees `ToolCall.cancelled()` (JSON and SSE).
+  shape. A modern `tools/call` whose connection the client closes sees `ToolCall.cancelled()` (JSON and SSE), a chunked-body one too; a client that left while its call waited for the transport lock never runs it.
 - **Fuzz:** the deterministic driver `MCP_HTTP_FUZZ=<runs>[,<first seed>]` (testkit; `_ONLY` selects
-  a harness) over `mcp-http-pre-parse` (the two JSON scanners) and `mcp-http-wire` (whole raw HTTP
+  a harness) over `mcp-http-pre-parse` (the two JSON scanners), `mcp-http-top-level-id` (`topLevelId`, the
+  id a disconnect cancels, against a `std.json.Value` parse of the same bytes: same id on every body the
+  parse accepts, bar the scanner's own limits of a 64-byte top-level key and a 256-byte id; a duplicate
+  `id` key is a parse error in `mcp`, so never reaches a call; 600,000 runs clean) and `mcp-http-wire` (whole raw HTTP
   requests against a router with two live sessions: a forged session id is 404, a foreign Origin
   403, `DELETE` takes only its own session, damaged requests are answered or dropped); both also run
   with a fixed number of seeds in every test run and must reach every outcome.

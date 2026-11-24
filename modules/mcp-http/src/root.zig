@@ -1108,6 +1108,12 @@ fn modernJsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) a
     var out: std.Io.Writer.Allocating = .init(t.gpa);
     defer out.deinit();
     t.lock.acquire();
+    // The client may have left while this call waited for the lock: the watch
+    // fired when no call was in flight to cancel yet, so it is not run at all.
+    if (watch.gone()) {
+        t.lock.release();
+        return;
+    }
     const rc = t.server.handleMessageFrom(body, &out.writer, peer);
     t.lock.release();
     rc catch return error.OutOfMemory; // see `jsonResponse`
@@ -1163,6 +1169,11 @@ fn modernStreamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8)
     defer adapter.deinit();
 
     t.lock.acquire();
+    // See `modernJsonResponse`: a client gone before the call started.
+    if (watch.gone()) {
+        t.lock.release();
+        return;
+    }
     const rc = t.server.handleMessageFrom(body, &adapter.writer, peer);
     t.lock.release();
     adapter.writer.flush() catch {};
@@ -3239,6 +3250,179 @@ test "fuzz harness: pre-parse, 500 seeds, reaches every outcome" {
     try PreMark.reach(fuzzPreParse, "mcp-http-pre-parse", 500);
 }
 
+// ── fuzz: topLevelId against std.json ───────────────────────────────────────
+//
+// `topLevelId` decides which request id a client's disconnect cancels. The
+// oracle is the authoritative parse (`std.json.Value`): on every body it
+// accepts, the scanner must find the same id (a string or an integer; anything
+// else is null) — the scanner's documented limits aside (a top-level key past
+// 64 bytes, an id past 256).
+
+const IdMark = fz.Marker(enum { int_id, string_id, no_id, duplicate_id, nested_decoy, escaped_key, limit, malformed, damaged });
+
+/// What the generator put in the body that the scanner is allowed to refuse.
+const IdGen = struct {
+    limit: bool = false,
+    ids: u32 = 0,
+    decoy: bool = false,
+    escaped: bool = false,
+};
+
+fn genIdBody(seed: []const u8, buf: []u8, info: *IdGen) []const u8 {
+    if (seed.len == 0) return buf[0..0];
+    if (seed[0] == 0) {
+        const n = @min(seed.len - 1, buf.len);
+        @memcpy(buf[0..n], seed[1..][0..n]);
+        info.limit = n > 256; // a verbatim body may hold a token past the limits
+        return buf[0..n];
+    }
+    var script: fuzzseed.Cursor = .{ .bytes = seed[1..] };
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeByte('{') catch return w.buffered();
+    const members = script.ranged(0, 5);
+    var k: u32 = 0;
+    while (k < members) : (k += 1) {
+        if (k != 0) w.writeByte(',') catch break;
+        const key_kind = script.ranged(0, 7);
+        var is_id = false;
+        switch (key_kind) {
+            0, 1, 2 => {
+                w.writeAll("\"id\":") catch break;
+                is_id = true;
+            },
+            3 => {
+                w.writeAll("\"\\u0069d\":") catch break;
+                is_id = true;
+                info.escaped = true;
+            },
+            4 => w.writeAll("\"params\":") catch break,
+            5 => w.writeAll("\"method\":") catch break,
+            6 => w.writeAll("\"i\":") catch break,
+            else => {
+                // A top-level key past the scanner's 64-byte limit.
+                w.writeByte('"') catch break;
+                for (0..70) |_| w.writeByte('k') catch break;
+                w.writeAll("\":") catch break;
+                info.limit = true;
+            },
+        }
+        if (is_id) info.ids += 1;
+        switch (script.ranged(0, 11)) {
+            0 => w.print("{d}", .{@as(i16, @bitCast(script.word()))}) catch break,
+            1 => w.print("{d}", .{@as(i64, @bitCast((@as(u64, script.word()) << 48) | (@as(u64, script.word()) << 32) | (@as(u64, script.word()) << 16) | script.word()))}) catch break,
+            2 => w.writeAll("123456789012345678901234567890") catch break, // past i64
+            3 => w.writeAll("1.5") catch break,
+            4 => w.writeAll("1e2") catch break,
+            5 => w.writeAll("\"abc\"") catch break,
+            6 => w.writeAll("\"a\\u0041\\n\\\"\\\\\"") catch break,
+            7 => {
+                w.writeByte('"') catch break;
+                for (0..300) |_| w.writeByte('z') catch break;
+                w.writeByte('"') catch break;
+                if (is_id) info.limit = true;
+            },
+            8 => w.writeAll(switch (script.ranged(0, 2)) {
+                0 => "null",
+                1 => "true",
+                else => "false",
+            }) catch break,
+            9 => {
+                w.writeAll("{\"id\":9,\"a\":[{\"id\":\"z\"},1],\"b\":{\"id\":null}}") catch break;
+                info.decoy = true;
+            },
+            10 => w.writeAll("[1,{\"id\":3},[]]") catch break,
+            else => w.writeAll("{}") catch break,
+        }
+    }
+    w.writeByte('}') catch {};
+    return w.buffered();
+}
+
+fn sameId(a: std.json.Value, b: std.json.Value) bool {
+    return switch (a) {
+        .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+        .integer => |x| b == .integer and x == b.integer,
+        else => false,
+    };
+}
+
+pub fn fuzzTopLevelId(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [1 + 1024]u8 = undefined;
+    var n: usize = 0;
+    var damaged = false;
+    if (S == fz.fuzz_driver.Rng and src.value(bool)) {
+        const entry = id_corpus[src.index(id_corpus.len)];
+        const flen = std.mem.readInt(u32, entry[0..4], .little);
+        n = fz.damage(src, &raw, entry[4..][0..@min(flen, entry.len - 4)]);
+        damaged = true;
+    } else n = src.slice(&raw);
+    var buf: [2048]u8 = undefined;
+    var info: IdGen = .{};
+    const body = genIdBody(raw[0..n], &buf, &info);
+    if (damaged) IdMark.mark(.damaged);
+    if (info.decoy) IdMark.mark(.nested_decoy);
+    if (info.escaped) IdMark.mark(.escaped_key);
+    if (info.limit) IdMark.mark(.limit);
+    if (info.ids > 1) IdMark.mark(.duplicate_id);
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const got = topLevelId(arena_state.allocator(), body);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch {
+        IdMark.mark(.malformed); // nothing is promised on a body the parse refuses
+        return;
+    };
+    defer parsed.deinit();
+    const want: ?std.json.Value = switch (parsed.value) {
+        .object => |o| if (o.get("id")) |v| switch (v) {
+            .string, .integer => v,
+            else => null,
+        } else null,
+        else => null,
+    };
+    if (want) |w| {
+        if (w == .string) IdMark.mark(.string_id) else IdMark.mark(.int_id);
+    } else IdMark.mark(.no_id);
+
+    if (got) |g| {
+        if (want == null or !sameId(g, want.?)) {
+            std.debug.print("topLevelId: got {any}, the parse says {any}, body {s}\n", .{ g, want, body });
+            return error.IdDisagrees;
+        }
+    } else if (want != null and !info.limit) {
+        std.debug.print("topLevelId: found nothing, the parse says {any}, body {s}\n", .{ want, body });
+        return error.IdMissed;
+    }
+}
+
+const id_corpus = [_][]const u8{
+    fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\"}"),
+    fuzzseed.seed("\x00" ++ "{\"id\":\"x\",\"params\":{\"id\":1}}"),
+    fuzzseed.seed("\x00" ++ "{\"id\":1,\"id\":2}"), // the key twice: the parse keeps the last
+    fuzzseed.seed("\x00" ++ "{\"i\\u0064\":5}"),
+    fuzzseed.seed("\x00" ++ "{\"id\":null,\"id\":3}"),
+    fuzzseed.seed("\x00" ++ "{\"id\":4,\"id\":null}"),
+    fuzzseed.seed("\x01" ++ "\x03\x00\x01\x00\x00\x02\x00"),
+    fuzzseed.seed("\x01" ++ "\x04\x00\x05\x00\x00\x00\x07\x09\x00\x01\x00"),
+};
+
+fn fuzzTopLevelIdSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzTopLevelId(std.testing.Smith, smith, std.testing.allocator);
+}
+
+test "fuzz: topLevelId against std.json, driver harness" {
+    try std.testing.fuzz({}, fuzzTopLevelIdSmith, .{ .corpus = &id_corpus });
+}
+
+test "fuzz driver: MCP_HTTP_FUZZ (top-level id)" {
+    try fz.fuzz_driver.run(fuzzTopLevelId, .{ .prefix = "MCP_HTTP_FUZZ", .name = "mcp-http-top-level-id" });
+}
+
+test "fuzz harness: top-level id, 500 seeds, reaches every outcome" {
+    try IdMark.reach(fuzzTopLevelId, "mcp-http-top-level-id", 500);
+}
+
 const WireMark = fz.Marker(enum {
     list_ok,
     call_ok,
@@ -3729,6 +3913,54 @@ test "held listen: notifications pushed from another thread stream live, finishA
     try testing.expectEqual(@as(usize, 0), after);
 }
 
+fn twoListens(l: *Listens) bool {
+    return l.count() == 2;
+}
+
+test "held listen: two listens on one server each get only what they asked for" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    server.push = true;
+    var listens = Listens.init(gpa);
+    defer listens.deinit();
+    var spin: SpinLock = .{};
+    var transport = Transport{ .gpa = gpa, .server = &server, .listens = &listens, .lock = spin.iface() };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    const wire_b = postHeaders("Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\n", "{\"jsonrpc\":\"2.0\",\"id\":\"listen-2\",\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"resourceSubscriptions\":[\"file:///b\"]}}}");
+    const a = try live.connect();
+    defer a.close(io);
+    try sendAll(io, a, listen_wire);
+    try waitFor(io, &listens, oneListen);
+    const b = try live.connect();
+    defer b.close(io);
+    try sendAll(io, b, wire_b);
+    try waitFor(io, &listens, twoListens);
+
+    transport.lock.acquire();
+    const n = server.notifyResourceUpdated(transport.pushSink(), "file:///b");
+    transport.lock.release();
+    try testing.expectEqual(@as(usize, 1), n);
+    listens.finishAll();
+
+    var abuf: [8192]u8 = undefined;
+    const got_a = readToEnd(io, a, &abuf);
+    var bbuf: [8192]u8 = undefined;
+    const got_b = readToEnd(io, b, &bbuf);
+    try testing.expect(std.mem.find(u8, got_a, "notifications/resources/updated") == null);
+    try testing.expect(std.mem.find(u8, got_b, "notifications/resources/updated") != null);
+    try testing.expect(std.mem.find(u8, got_b, "\"id\":\"listen-2\",\"result\"") != null);
+    try testing.expect(std.mem.find(u8, got_a, "\"id\":\"listen-1\",\"result\"") != null);
+    try waitFor(io, &listens, noListen);
+}
+
 test "held listen: the client closing ends it and drops the subscription" {
     const gpa = testing.allocator;
     var server = try buildServer(gpa);
@@ -3823,6 +4055,69 @@ test "2026-07-28: closing the connection of a running tools/call cancels it (Too
         while (!slow_saw_cancel.load(.acquire) and waited < 4000) : (waited += 2) sleepMs(io, 2);
         try testing.expect(slow_saw_cancel.load(.acquire));
     }
+}
+
+test "2026-07-28: a client that left while its tools/call waited for the transport lock never runs the call" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{ .name = "slow", .description = "waits for cancellation", .input_schema = "{\"type\":\"object\"}", .handler = slowTool });
+    var spin: SpinLock = .{};
+    var transport = Transport{ .gpa = gpa, .server = &server, .lock = spin.iface() };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    for ([_][]const u8{ "", "Accept: application/json, text/event-stream\r\n" }) |accept| {
+        slow_started.store(false, .release);
+        slow_saw_cancel.store(false, .release);
+        var wire_buf: [1024]u8 = undefined;
+        const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}," ++ modern_meta ++ "}}";
+        const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\n{s}MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ accept, body.len, body });
+        // Another call holds the transport: the request waits for the lock
+        // with its watch already running, and the client leaves meanwhile.
+        transport.lock.acquire();
+        const stream = try live.connect();
+        try sendAll(io, stream, wire);
+        sleepMs(io, 150);
+        stream.close(io);
+        sleepMs(io, 150); // the watch fires; no call is in flight to cancel yet
+        transport.lock.release();
+        sleepMs(io, 400);
+        try testing.expect(!slow_started.load(.acquire));
+    }
+}
+
+test "2026-07-28: a chunked tools/call body is still watched (cancellation reaches the running call)" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{ .name = "slow", .description = "waits for cancellation", .input_schema = "{\"type\":\"object\"}", .handler = slowTool });
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    slow_started.store(false, .release);
+    slow_saw_cancel.store(false, .release);
+    var wire_buf: [1024]u8 = undefined;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}," ++ modern_meta ++ "}}";
+    const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\n", .{ body.len, body });
+    const stream = try live.connect();
+    try sendAll(io, stream, wire);
+    try waitFor(io, {}, slowStarted);
+    stream.close(io);
+    var waited: u32 = 0;
+    while (!slow_saw_cancel.load(.acquire) and waited < 4000) : (waited += 2) sleepMs(io, 2);
+    try testing.expect(slow_saw_cancel.load(.acquire));
 }
 
 test "topLevelId: string and integer ids, nothing else" {
