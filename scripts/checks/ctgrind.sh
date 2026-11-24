@@ -262,7 +262,7 @@ declare -A TARGETS=(
     # Each target taints ONE party's secrets; the other party runs untainted
     # first, so nothing public on the wire is counted as secret
     # (see each harness's module doc comment).
-    [opaque]="register login serverke2"
+    [opaque]="register login serverke2 register_p256 login_p256 serverke2_p256 register_x25519 login_x25519 serverke2_x25519"
     [bip32]="master derive seed mnemonic xprv"
     [btcaddr]="wif"
     # ── 2026-09-28: aesgcm (stitched AES-NI kernel + std-primitive backend) ─
@@ -761,6 +761,12 @@ declare -A PATTERN=(
     [opaque/register]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
     [opaque/login]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
     [opaque/serverke2]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [opaque/register_p256]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [opaque/login_p256]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [opaque/serverke2_p256]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [opaque/register_x25519]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [opaque/login_x25519]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
+    [opaque/serverke2_x25519]='root[.]zig|protocol[.]zig|groups[.]zig|h2c[.]zig'
     # bip32's own files; k256/std frames count through their bip32.zig or
     # bip39.zig callers (the whole paragraph is matched).
     [bip32/master]='bip32[.]zig'
@@ -1200,6 +1206,12 @@ declare -A LABEL=(
     [opaque/register]='opaque client registration (password, blind)+voprf'
     [opaque/login]='opaque client KE1+KE3 (password, blind, keyshare)+voprf'
     [opaque/serverke2]='opaque server KE2 (sk, oprf_seed, keyshare, masking_key)'
+    [opaque/register_p256]='opaque P256-SHA256 client registration (password, blind)+voprf'
+    [opaque/login_p256]='opaque P256-SHA256 client KE1+KE3 (password, blind, keyshare)+voprf'
+    [opaque/serverke2_p256]='opaque P256-SHA256 server KE2 (sk, oprf_seed, keyshare, masking_key)'
+    [opaque/register_x25519]='opaque curve25519-3DH client registration (password, blind)+voprf'
+    [opaque/login_x25519]='opaque curve25519-3DH client KE1+KE3 (password, blind, keyshare)+voprf'
+    [opaque/serverke2_x25519]='opaque curve25519-3DH server KE2 (sk, oprf_seed, keyshare, masking_key)'
     [bip32/master]='bip32 masterFromSeed (seed)'
     [bip32/derive]='bip32 derivePath (master scalar)+k256'
     [bip32/seed]='bip39 mnemonicToSeed (PBKDF2)'

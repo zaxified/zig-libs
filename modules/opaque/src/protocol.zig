@@ -116,10 +116,14 @@ pub fn Opaque(comptime C: type) type {
         /// masking of `server_public_key || Envelope`.
         pub const masked_response_length: usize = Npk + Nn + Nm;
 
-        /// Re-exported from `voprf` (RFC 9497 §4.7.2): reduce 64 uniformly
-        /// random bytes to a canonical scalar — the intended way for callers
-        /// with their own CSPRNG to produce the `blind` inputs below.
+        /// Re-exported from `voprf` (RFC 9497 §4.7.2): reduce `wide_length`
+        /// uniformly random bytes to a canonical scalar — the intended way for
+        /// callers with their own CSPRNG to produce the `blind` inputs below.
         pub const scalarFromWideBytes = C.Oprf.scalarFromWideBytes;
+
+        /// The input length of `scalarFromWideBytes`: 64 for ristretto255, 48
+        /// for P-256 (the OPRF suite's `L`, RFC 9497 §4.7.2).
+        pub const wide_length: usize = C.Oprf.wide_length;
 
         // ── typed errors (RFC 9807 §9.3) ─────────────────────────────────────────
 

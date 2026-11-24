@@ -1396,9 +1396,21 @@ pir	ReleaseFast	reconstruct	1	1	77d6f22bed08bd99	b6ecd96f96e9b339
 # Then the same day: opaque's protocol code moved from root.zig into opaque/src/protocol.zig
 # (generic over the configuration, P256-SHA256 added); --check opaque again 4 / 11 / 2, outputs
 # unchanged; source pin re-pinned (root.zig + protocol.zig).
-opaque	ReleaseFast	register	1	4	3630bba764a15423	843c12b053124a78
-opaque	ReleaseFast	login	1	11	3630bba764a15423	f8be3480eb708638
-opaque	ReleaseFast	serverke2	1	2	3630bba764a15423	4ef279b842b3cb55
+opaque	ReleaseFast	register	1	4	f5d9779d6e4f3a18	843c12b053124a78
+opaque	ReleaseFast	login	1	11	f5d9779d6e4f3a18	f8be3480eb708638
+opaque	ReleaseFast	serverke2	1	2	f5d9779d6e4f3a18	4ef279b842b3cb55
+# 2026-11-23: the P256-SHA256 (C.1.5) and curve25519-3DH (C.1.3) configurations get rows; outputs are
+# the RFC 9807 vectors byte for byte. P-256's in-file contexts are the classes voprf's p256 rows and p256's SPEC
+# itemise (canonical-range decode verdicts in Fe.fromBytes / std pcurves fromBytes, std's cmovznz scalar
+# select, rejectIdentity verdicts in mulCtWindowed / combMulBaseFast, voprf's hashToGroup / deserializeScalar /
+# unblind / DeriveKeyPair verdicts, the unmasked server key's sqrt on decode, the envelope and server-MAC verdicts);
+# curve25519-3DH's are the ristretto rows' voprf verdicts plus recover / generateKE3's MAC verdicts.
+opaque	ReleaseFast	register_p256	1	17	f5d9779d6e4f3a18	408f64107760c8bb
+opaque	ReleaseFast	login_p256	1	31	f5d9779d6e4f3a18	bdc83a63198c7305
+opaque	ReleaseFast	serverke2_p256	1	15	f5d9779d6e4f3a18	33694b03ba8c679a
+opaque	ReleaseFast	register_x25519	1	3	f5d9779d6e4f3a18	c0178dae4b0f438a
+opaque	ReleaseFast	login_x25519	1	5	f5d9779d6e4f3a18	4dd6b390a25482a8
+opaque	ReleaseFast	serverke2_x25519	1	1	f5d9779d6e4f3a18	28c4b4c908b2e302
 # bip32 mnemonic 3 is the M6-CT tree (8c2f1aa4, constant-time `wordIndex`).
 # The three are the mnemonic split plus two accept/reject verdicts, not the
 # word search.

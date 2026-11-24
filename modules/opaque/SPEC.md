@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-15 · mutation 2026-11-17 (247/271, 24 eq) · src 700b4233440d07ac
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `opaque-login` at `.scale` 4 = 50,000 runs — a run is a registration plus a login — `opaque-hostile` 200,000, OPAQUE_FUZZ) · ct 2026-09-16 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `opaque-login` at `.scale` 4 = 50,000 runs — a run is a registration plus a login — `opaque-hostile` 200,000, OPAQUE_FUZZ; P256-SHA256 and curve25519-3DH harnesses 2026-11-23, 40,000-run budget, clean) · ct 2026-09-16 (ctgrind)
 
 **Performance:** not measured
 
@@ -210,14 +210,23 @@ Both MAC checks are `std.crypto.timing_safe.eql` and fail closed.
 `src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh opaque`; the pinned counts are the `opaque`
 rows of `scripts/checks/ctgrind-expected.tsv`. Each target taints ONE party's secrets and runs the other
 party untainted first, so a value that reached the measured party over the wire is never counted as its
-secret. Inputs are RFC 9807 C.1.1, so the printed outputs are the published vector. The harness drives the
-ristretto255 configuration only.
+secret. Inputs are RFC 9807 C.1.1 (ristretto255), C.1.5 (`_p256`, P256-SHA256) and C.1.3 (`_x25519`,
+curve25519-3DH), so the printed outputs are the published vectors.
 
 | target | tainted | in-file contexts |
 |---|---|---|
 | `register` | password, blind | 4 |
 | `login` | password, blind, client keyshare seed | 11 |
 | `serverke2` | server private key, `oprf_seed`, server keyshare seed, `masking_key` | 2 |
+| `register_p256` / `login_p256` / `serverke2_p256` | the same, P256-SHA256 | 17 / 31 / 15 |
+| `register_x25519` / `login_x25519` / `serverke2_x25519` | the same, curve25519-3DH | 3 / 5 / 1 |
+
+The P-256 rows' contexts are the classes `voprf`'s `p256-*` rows and `p256`'s SPEC itemise: the canonical-range
+decode verdicts (`Fe.fromBytes`, std's pcurves `fromBytes`) on values that always pass, std's `cmovznz` scalar
+select, the `rejectIdentity` verdicts of `mulCtWindowed` / `combMulBaseFast`, voprf's `hashToGroup` /
+`deserializeScalar` / `unblind` / `DeriveKeyPair` verdicts, the `sqrt` of decoding the unmasked server key, and the
+envelope / server-MAC verdicts below. The curve25519-3DH rows are the ristretto rows' voprf verdicts plus the
+`recover` and `generateKE3` MAC verdicts; X25519 itself adds none.
 
 The source pattern also matches the sibling `voprf` and `ct25519` sources, so their constant-time property is
 this module's for every byte that flows through them. Every in-file context, by the function that holds the
@@ -362,17 +371,15 @@ Offline. Run `scripts/modtest opaque`.
   curve25519 3DH), ReleaseFast/ReleaseSmall, see *Secret residue on the dead stack*.
 - **Constant time:** the ctgrind harness above.
 - **Fuzz:** `OPAQUE_FUZZ=<runs>[,<first seed>]` runs the deterministic driver (testkit) over `opaque-login` (a run is a
-  registration plus a login; genuine accepted, flipped refused) and `opaque-hostile` (hostile wire messages); each
-  harness has an in-suite reach check.
+  registration plus a login; genuine accepted, flipped refused) and `opaque-hostile` (hostile wire messages), and
+  the same two over P256-SHA256 (`opaque-login-p256`, `opaque-hostile-p256`) and curve25519-3DH
+  (`opaque-login-x25519`, `opaque-hostile-x25519`, where no record can fail `validate`: every 32-byte string is an
+  X25519 key); each harness has an in-suite reach check.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-- **P256-SHA256 and curve25519-3DH ctgrind and fuzz rows:** the ctgrind harness and the fuzz harnesses
-  drive the ristretto255 configuration only (the dead-stack probe covers all three since 2026-11-23,
-  `stackprobe2_test.zig`); the P-256 one runs
-  through the same code with `voprf`'s P-256 suite (whose own ctgrind rows are
-  pinned), the curve25519 one with `ct25519`'s X25519 (pinned there), but neither has an opaque-level row yet.
+- None open.
 
 
 ## Anchoring
