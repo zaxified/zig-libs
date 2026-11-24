@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [0xPolygonZero/plonky2](https://github.com/0xPolygonZero/plonky2) | Rust | Apache-2.0 | 858 | v1.1.0 (2025-05-12) | Uses Poseidon over Goldilocks, not Rescue *(inferred)* — listed because it is the Goldilocks hash a STARK user is likelier to meet. |
 | Go and Zig ecosystems | — | — | — | — | No Rescue-Prime implementation found: GitHub searches for "rescue prime" in Zig and Go returned nothing (2026-09-30); `std` has no algebraic hash. |
 
-**Where we are ahead:** the only Rescue-Prime outside Rust/Sage; both published sponge framings of RPO (the reference's and Miden's) instead of one, with a test asserting they never agree; a fixed-chain constant-time inverse S-box; constants derived from SHAKE256 and pinned against the deployed table rather than pasted. **Where we are behind:** no RPX; no Rp62_248; no packed/SIMD or arch-specific permutation (→ *Backlog / deferred*). The deployed reference itself has been archived and its neighbouring directory carries Poseidon2, so the deployed stack may be moving away from RPO *(inferred from a directory listing)*.
+**Where we are ahead:** the only Rescue-Prime outside Rust/Sage; both published sponge framings of RPO (the reference's and Miden's) instead of one, with a test asserting they never agree; a fixed-chain constant-time inverse S-box; constants derived from SHAKE256 and pinned against the deployed table rather than pasted. **Where we are behind:** no RPX; no Rp62_248; no packed/SIMD or arch-specific permutation (→ *What is deliberately not done*). The deployed reference itself has been archived and its neighbouring directory carries Poseidon2, so the deployed stack may be moving away from RPO *(inferred from a directory listing)*.
 
 ## What was actually decided
 
@@ -153,7 +153,15 @@ already implements. **They do not reproduce.** Tried and rejected: seed
 templates `Rescue-XLIX(p,m,c,s)`, `Rescue-Prime(p,m,c,s)` and `RPO(p,m,c,s)`;
 `capacity ∈ {4, 6, 8}`; `security_level ∈ {80, 128, 160}`; `bytes_per_int ∈
 {8, 9, 10}`; both byte orders; and a scan for `ARK1[0][0]` anywhere in the first
-576 constants of every resulting stream. No hit.
+576 constants of every resulting stream. No hit. A wider sweep also found nothing:
+the reference's own seed format (`Rescue-XLIX(%i,%i,%i,%i)` of the KU Leuven
+`rescue_prime.sage`, the "sage reference implementation" Winterfell's tests name) for every
+`m ≤ 32`, `capacity ≤ m`, `security_level ≤ 300`; and 146 880 further seed spellings (five
+renderings of `p`, twelve scheme names, three bracket styles, optional round count,
+SHAKE256 and SHAKE128), each stream searched at every byte offset of its first 300 bytes
+for any of Winterfell's 168 constants as an 8-, 9-, 10-, 12- or 16-byte integer of either
+byte order, reduced mod `p`. Winterfell's history (first Rp64_256 commit 2021-10-22,
+unchanged constants since) holds no generator script, only the comment quoted above.
 
 So `xlix_constants.zig` is **embedded, not derived** — the one table in this
 module that is a blob. It is pinned by the SHA-256 of the upstream file it came
@@ -181,8 +189,15 @@ which is what makes the RPO half of this module grade 1 at the constant level.)
 * **Non-canonical `[0, 2^64)` field representation** (plonky2, Winterfell): the
   canonical one buys trivial equality and serialisation (next section).
 
-RPX (`eprint 2023/1045`) and a SIMD permutation are not refused, only not built:
-see *Backlog / deferred*.
+* **RPX (Rescue-Prime eXtension) hasher.** Conditional on a consumer: miden-crypto ships `Rpx256`
+  next to `Rpo256`, but no user of this module reads RPX-hashed commitments. A second round function
+  over the same Goldilocks field with its own vectors; miden-crypto is Apache-2.0, so its tests are
+  not readable under the survey playbook's MIT rule and the specification would come from the
+  paper (`eprint 2023/1045`). Added when a consumer appears.
+* **SIMD S-box layers / packed or arch-specific permutation.** Conditional on Rescue being on a hot
+  path here; it is not (no in-repo consumer), so the scalar constant-time path stays.
+
+RPX and a SIMD permutation are not refused, only not built, for the reasons above.
 
 ## The Goldilocks field is in-module on purpose
 
@@ -343,14 +358,9 @@ Test classes:
 ## Backlog / deferred
 
 - **Recover Winterfell's constant-generation invocation** and turn
-  `xlix_constants.zig` into a derivation (divergence 4).
-- **RPX (Rescue-Prime eXtension) hasher**, if a consumer appears (survey
-  2026-09-30: miden-crypto ships `Rpx256` next to `Rpo256`; a Miden user who
-  reads RPX-hashed commitments cannot with this module). A second round function
-  over the same Goldilocks field plus its own vectors; miden-crypto is
-  Apache-2.0, so its tests are not readable under the survey playbook's MIT
-  rule and the RPX specification must come from its paper.
-- **SIMD S-box layers**, if Rescue ever lands on a hot path here.
+  `xlix_constants.zig` into a derivation (divergence 4). Blocked on something outside this
+  repository: the argument tuple (or script) the Winterfell authors ran; every combination the
+  reference's seed format allows has been tried.
 
 ## Anchoring
 
