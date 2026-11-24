@@ -90,6 +90,7 @@
 
 const std = @import("std");
 const keycodec = @import("keycodec");
+const aes192 = @import("aes192");
 
 /// Fast constant-time Montgomery modexp backend for the RSA hot path
 /// (private CRT op, non-CRT private op, public op). See `montint`'s SPEC.md.
@@ -3224,14 +3225,10 @@ pub fn opensshDecryptSection(
         .none => unreachable,
         .aes256_ctr => {
             const ctx = aes.Aes256.initEnc(aes_key.*);
-            std.crypto.core.modes.ctr(
-                aes.AesEncryptCtx(aes.Aes256),
-                ctx,
-                dec,
-                section,
-                iv.*,
-                .big,
-            );
+            // `aes192.ctrXor`, not `modes.ctr`: std's per-block counter store is
+            // lowered byte by byte on Zig 0.17 (#36256).
+            var counter = iv.*;
+            aes192.ctrXor(aes.AesEncryptCtx(aes.Aes256), ctx, dec, section, &counter);
         },
         .aes256_cbc => {
             const ctx = aes.Aes256.initDec(aes_key.*);

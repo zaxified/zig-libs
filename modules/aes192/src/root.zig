@@ -302,37 +302,8 @@ pub const Aes192EncryptCtx = struct {
     /// (it would be an out-of-bounds write in ReleaseFast otherwise; sweep A9-1).
     pub fn ctr(ctx: Self, dst: []u8, src: []const u8, iv: [16]u8) void {
         if (dst.len < src.len) @panic("aes192: ctr dst shorter than src");
-        const n = Block.parallel.optimal_parallel_blocks;
-        var hi = std.mem.readInt(u64, iv[0..8], .big);
-        var lo = std.mem.readInt(u64, iv[8..16], .big);
-        var counters: [16 * n]u8 = undefined;
-        var i: usize = 0;
-        while (i < src.len) : (i += 16 * n) {
-            if (lo <= std.math.maxInt(u64) - n) {
-                // No carry into `hi` within this batch (the counter is
-                // public): each block is one vector byte swap. Vector to
-                // vector `@bitCast` -- `@Vector(2, u64)` straight to `[16]u8`
-                // is lowered byte by byte on 0.17 (#36256).
-                const V2 = @Vector(2, u64);
-                inline for (0..n) |j| {
-                    const be: @Vector(16, u8) = @bitCast(@byteSwap(V2{ hi, lo + j }));
-                    counters[j * 16 ..][0..16].* = be;
-                }
-                lo += n;
-            } else inline for (0..n) |j| {
-                counters[j * 16 ..][0..8].* = @bitCast(std.mem.nativeToBig(u64, hi));
-                counters[j * 16 + 8 ..][0..8].* = @bitCast(std.mem.nativeToBig(u64, lo));
-                lo +%= 1;
-                hi +%= @intFromBool(lo == 0);
-            }
-            if (i + 16 * n <= src.len) {
-                ctx.xorWide(n, dst[i..][0 .. 16 * n], src[i..][0 .. 16 * n], counters);
-            } else {
-                var ks: [16 * n]u8 = undefined;
-                ctx.encryptWide(n, &ks, &counters);
-                for (dst[i..src.len], src[i..], ks[0 .. src.len - i]) |*d, s, k| d.* = s ^ k;
-            }
-        }
+        var counter = iv;
+        ctrXor(Self, ctx, dst, src, &counter);
     }
 
     /// Zero the round keys (and their packed form).
@@ -340,6 +311,68 @@ pub const Aes192EncryptCtx = struct {
         std.crypto.secureZero(u8, std.mem.asBytes(ctx));
     }
 };
+
+/// CTR mode over ANY AES encryption context of std's shape (`block.parallel`,
+/// `encryptWide`, `xorWide`: `Aes192EncryptCtx`, `std.crypto.core.aes.AesEncryptCtx(Aes128)`
+/// or `(Aes256)`), the whole block a 128-bit big-endian counter that wraps:
+/// `dst[0..src.len]` ← `src` XOR E(`counter`), E(`counter` + 1), … — byte for
+/// byte `std.crypto.core.modes.ctr(Ctx, ctx, dst, src, counter.*, .big)`, and
+/// `dst` may be `src` itself. `counter` is advanced by one per 16-byte block
+/// consumed (a final partial block counts), so the next call continues the
+/// stream — what a protocol that keeps ONE counter across messages needs
+/// (a message that is not a whole number of blocks discards the rest of that
+/// block's keystream, as `std` does).
+///
+/// Why not `std`'s: its per-block `mem.writeInt(u128, …, .big)` is lowered byte
+/// by byte on Zig 0.17 (#36256) — 2.3× OpenSSL's EVP AES-192-CTR at 16 KiB.
+/// Here the counter is two `u64` halves, each byte-swapped whole.
+///
+/// Dead stack: as `Aes192EncryptCtx.xorWide` — the keystream is working state
+/// (`CONVENTIONS.md` §2.1 Z3); the caller that owns key and message burns.
+/// The counter and its values are public (no secret-dependent branch).
+///
+/// `dst.len >= src.len` is the caller's contract; a shorter `dst` is a checked
+/// `@panic("aes192: ctrXor dst shorter than src")` in every build mode.
+pub fn ctrXor(comptime Ctx: type, ctx: Ctx, dst: []u8, src: []const u8, counter: *[16]u8) void {
+    if (dst.len < src.len) @panic("aes192: ctrXor dst shorter than src");
+    const n = Ctx.block.parallel.optimal_parallel_blocks;
+    const hi0 = std.mem.readInt(u64, counter[0..8], .big);
+    const lo0 = std.mem.readInt(u64, counter[8..16], .big);
+    var hi = hi0;
+    var lo = lo0;
+    var counters: [16 * n]u8 = undefined;
+    var i: usize = 0;
+    while (i < src.len) : (i += 16 * n) {
+        if (lo <= std.math.maxInt(u64) - n) {
+            // No carry into `hi` within this batch: each block is one vector
+            // byte swap. Vector to vector `@bitCast` -- `@Vector(2, u64)`
+            // straight to `[16]u8` is lowered byte by byte on 0.17 (#36256).
+            const V2 = @Vector(2, u64);
+            inline for (0..n) |j| {
+                const be: @Vector(16, u8) = @bitCast(@byteSwap(V2{ hi, lo + j }));
+                counters[j * 16 ..][0..16].* = be;
+            }
+            lo += n;
+        } else inline for (0..n) |j| {
+            counters[j * 16 ..][0..8].* = @bitCast(std.mem.nativeToBig(u64, hi));
+            counters[j * 16 + 8 ..][0..8].* = @bitCast(std.mem.nativeToBig(u64, lo));
+            lo +%= 1;
+            hi +%= @intFromBool(lo == 0);
+        }
+        if (i + 16 * n <= src.len) {
+            ctx.xorWide(n, dst[i..][0 .. 16 * n], src[i..][0 .. 16 * n], counters);
+        } else {
+            var ks: [16 * n]u8 = undefined;
+            ctx.encryptWide(n, &ks, &counters);
+            for (dst[i..src.len], src[i..], ks[0 .. src.len - i]) |*d, s, k| d.* = s ^ k;
+        }
+    }
+    // Advance by the blocks actually consumed (the loop above ran on in
+    // whole batches).
+    const next = ((@as(u128, hi0) << 64) | lo0) +% ((src.len + 15) / 16);
+    std.mem.writeInt(u64, counter[0..8], @truncate(next >> 64), .big);
+    std.mem.writeInt(u64, counter[8..16], @truncate(next), .big);
+}
 
 /// A context to decrypt with one AES-192 key (the equivalent inverse cipher,
 /// FIPS-197 §5.3.5, as std's `AesDecryptCtx`). Same lifetime and dead-stack
@@ -616,6 +649,65 @@ test "ctr equals std modes.ctr: every length through two wide batches, counters 
             std.crypto.core.modes.ctr(Aes192EncryptCtx, enc, want[0..len], src[0..len], iv, .big);
             enc.ctr(got[0..len], src[0..len], iv);
             try testing.expectEqualSlices(u8, &want, &got);
+        }
+    }
+}
+
+test "ctrXor over std's Aes128 and Aes256 contexts: SP 800-38A F.5.1 and F.5.5 vectors, in place, and the counter advance" {
+    const pt = fromHex(64, "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51" ++
+        "30c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710");
+    const iv = fromHex(16, "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+    const want128 = fromHex(64, "874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff" ++
+        "5ae4df3edbd5d35e5b4f09020db03eab1e031dda2fbe03d1792170a0f3009cee");
+    const want256 = fromHex(64, "601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c5" ++
+        "2b0930daa23de94ce87017ba2d84988ddfc9c58db67aada613c2dd08457941a6");
+    const k128 = fromHex(16, "2b7e151628aed2a6abf7158809cf4f3c");
+    const k256 = fromHex(32, "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+    var buf: [64]u8 = undefined;
+    var counter = iv;
+    ctrXor(aes.AesEncryptCtx(aes.Aes128), aes.Aes128.initEnc(k128), &buf, &pt, &counter);
+    try testing.expectEqualSlices(u8, &want128, &buf);
+    // Four blocks consumed: f0..ff + 4 carries into the second-to-last byte.
+    try testing.expectEqualSlices(u8, &fromHex(16, "f0f1f2f3f4f5f6f7f8f9fafbfcfdff03"), &counter);
+    buf = pt;
+    counter = iv;
+    ctrXor(aes.AesEncryptCtx(aes.Aes256), aes.Aes256.initEnc(k256), &buf, &buf, &counter);
+    try testing.expectEqualSlices(u8, &want256, &buf);
+    // The same stream again undoes it (a partial last block counts as one).
+    var counter2 = iv;
+    ctrXor(aes.AesEncryptCtx(aes.Aes256), aes.Aes256.initEnc(k256), buf[0..23], buf[0..23], &counter2);
+    try testing.expectEqualSlices(u8, &fromHex(16, "f0f1f2f3f4f5f6f7f8f9fafbfcfdff01"), &counter2); // 23 bytes = 2 blocks
+    try testing.expectEqualSlices(u8, pt[0..23], buf[0..23]);
+}
+
+test "ctrXor equals std modes.ctr at every width and counter: random lengths, across the half carry and the full wrap, counter advance exact" {
+    var prng = std.Random.DefaultPrng.init(0x36256);
+    const rnd = prng.random();
+    inline for (.{ aes.Aes128, aes.Aes256, Aes192 }) |A| {
+        var key: [A.key_bits / 8]u8 = undefined;
+        rnd.bytes(&key);
+        const ctx = A.initEnc(key);
+        const C = @TypeOf(ctx);
+        const ivs = [_][16]u8{
+            fromHex(16, "0011223344556677fffffffffffffffd"),
+            fromHex(16, "fffffffffffffffffffffffffffffffe"),
+            fromHex(16, "ffffffffffffffffffffffffffffffff"),
+            @splat(0),
+        };
+        var src: [16 * 40 + 16]u8 = undefined;
+        for (0..60) |round| {
+            rnd.bytes(&src);
+            var iv: [16]u8 = ivs[round % ivs.len];
+            if (round >= ivs.len) rnd.bytes(iv[0..4]); // random high bytes, adversarial low half
+            const len = rnd.uintAtMost(usize, src.len);
+            var want: [src.len]u8 = @splat(0xaa);
+            var got: [src.len]u8 = @splat(0xaa);
+            std.crypto.core.modes.ctr(C, ctx, want[0..len], src[0..len], iv, .big);
+            var counter = iv;
+            ctrXor(C, ctx, got[0..len], src[0..len], &counter);
+            try testing.expectEqualSlices(u8, &want, &got);
+            const blocks: u128 = (len + 15) / 16;
+            try testing.expectEqual(std.mem.readInt(u128, &iv, .big) +% blocks, std.mem.readInt(u128, &counter, .big));
         }
     }
 }
