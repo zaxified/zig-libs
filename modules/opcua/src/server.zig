@@ -1604,13 +1604,14 @@ pub const Connection = struct {
             return .failed;
         }
         const token_id = std.mem.readInt(u32, wire_body[4..8], .little);
-        const keys: security.ChannelKeys = blk: {
+        // By pointer: a by-value copy would put the channel keys in this frame.
+        const keys: *const security.ChannelKeys = blk: {
             if (token_id == c.token_id) {
                 if (c.tokenExpired(now_ms)) {
                     try c.fail(out, status.bad_secure_channel_token_unknown, "SecurityToken lifetime elapsed without a renewal");
                     return .failed;
                 }
-                break :blk c.keys orelse {
+                break :blk if (c.keys) |*k| k else {
                     try c.fail(out, status.bad_secure_channel_token_unknown, "no keys for this SecurityToken");
                     return .failed;
                 };
@@ -1618,7 +1619,7 @@ pub const Connection = struct {
             if (token_id != 0 and token_id == c.prev_token_id and now_ms <= c.prev_token_valid_until_ms) {
                 // Never `.?`: a previous token without keys must be a refusal,
                 // not a panic reachable from the wire (review 2026-10-06, H1).
-                break :blk c.prev_keys orelse {
+                break :blk if (c.prev_keys) |*k| k else {
                     try c.fail(out, status.bad_secure_channel_token_unknown, "no keys for the previous SecurityToken");
                     return .failed;
                 };
@@ -1632,7 +1633,7 @@ pub const Connection = struct {
             header,
             wire_body,
             c.sec_mode,
-            &keys,
+            keys,
             .client_to_server,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1785,7 +1786,7 @@ pub const Connection = struct {
         request_id: u32,
         payload: []const u8,
     ) ServerError!void {
-        const keys = c.keys orelse return error.ResponseTooLarge; // unreachable in practice: sec_mode != none implies keys
+        const keys: *const security.ChannelKeys = if (c.keys) |*k| k else return error.ResponseTooLarge; // unreachable in practice: sec_mode != none implies keys
         var body = std.Io.Writer.Allocating.init(c.server.allocator);
         defer body.deinit();
         try body.writer.writeInt(u32, c.channel_id, .little);
@@ -1800,7 +1801,7 @@ pub const Connection = struct {
             @backingInt(chunk_type),
             body.writer.buffered(),
             c.sec_mode,
-            &keys,
+            keys,
             .server_to_client,
         );
         defer c.server.allocator.free(sealed);
@@ -2179,7 +2180,8 @@ pub const Connection = struct {
             // P-SHA256 over the nonce pair — both directions' signing keys,
             // encrypting keys and IVs (§6.7.5).
             if (c.keys) |*k| k.wipe();
-            c.keys = security.deriveKeys(request.client_nonce.?, &server_nonce, policy);
+            c.keys = @as(security.ChannelKeys, undefined);
+            security.deriveKeysInto(&c.keys.?, request.client_nonce.?, &server_nonce, policy);
             c.sec_policy = policy;
             c.sec_mode = request.security_mode;
         }

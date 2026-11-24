@@ -314,7 +314,8 @@ pub const SecureChannel = struct {
             // bytes for Basic256Sha256), both ways; a shorter one would key the
             // client-to-server direction from a few bytes of secret.
             if (server_nonce.len != client_nonce.len) return error.InvalidSecureMessage;
-            derived = security.deriveKeys(&client_nonce, server_nonce, ch.io.security.?.policy);
+            derived = @as(security.ChannelKeys, undefined);
+            security.deriveKeysInto(&derived.?, &client_nonce, server_nonce, ch.io.security.?.policy);
         }
 
         ch.io.channel_id = response.security_token.channel_id;

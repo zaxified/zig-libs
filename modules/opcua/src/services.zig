@@ -3355,7 +3355,7 @@ pub const Channel = struct {
                     // AsymmetricAlgorithmSecurityHeader, carrying this
                     // client's certificate + the pinned server certificate's
                     // SHA-1 thumbprint.
-                    const sec = ch.security.?;
+                    const sec = &ch.security.?;
                     const creds = sec.credentials orelse @panic("opcua security: SecurityMode != none requires ClientCredentials");
                     const server_cert = sec.server_certificate orelse @panic("opcua security: SecurityMode != none requires a pinned server certificate");
                     const thumbprint = security.certificateThumbprint(server_cert);

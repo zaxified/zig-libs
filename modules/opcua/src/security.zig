@@ -807,10 +807,19 @@ fn pSha256Body(secret: []const u8, seed: []const u8, out: []u8) void {
 /// bytes-in-bytes-out — no allocation, no error. The caller should `wipe`
 /// the returned keys when the channel dies.
 pub fn deriveKeys(client_nonce: []const u8, server_nonce: []const u8, policy: SecurityPolicy) ChannelKeys {
+    var keys: ChannelKeys = undefined;
+    deriveKeysInto(&keys, client_nonce, server_nonce, policy);
+    return keys;
+}
+
+/// `deriveKeys` with the keys written through `out` only: no copy in a
+/// returned-by-value temporary or a caller's result slot.
+pub fn deriveKeysInto(out: *ChannelKeys, client_nonce: []const u8, server_nonce: []const u8, policy: SecurityPolicy) void {
     std.debug.assert(policy != .none); // no keys without a policy
     // signingKey(32) ‖ encryptingKey(ek) ‖ IV(16), ek = 32 or 16 (AES-128).
     const ek = policy.encryptingKeyLen();
-    var keys: ChannelKeys = std.mem.zeroes(ChannelKeys);
+    const keys = out;
+    keys.* = std.mem.zeroes(ChannelKeys);
     keys.encrypting_key_len = @intCast(ek);
     var buf: [32 + 32 + 16]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
@@ -825,8 +834,6 @@ pub fn deriveKeys(client_nonce: []const u8, server_nonce: []const u8, policy: Se
     keys.server_signing_key = block[0..32].*;
     @memcpy(keys.server_encrypting_key[0..ek], block[32..][0..ek]);
     keys.server_iv = block[32 + ek ..][0..16].*;
-
-    return keys;
 }
 
 // ── AES-256-CBC (hand-built over std's raw block cipher) ─────────────────

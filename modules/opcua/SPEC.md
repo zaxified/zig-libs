@@ -515,7 +515,7 @@ Server side, deliberately out of scope for this part — each is a Bad status, n
 
 ## Backlog / deferred
 
-- **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. Also `deriveKeys` still returns `ChannelKeys` by value and `services.zig`/`server.zig` copy `SecurityContext`/`ChannelKeys` by value (`ch.security.?`, `c.keys orelse`) inside those burned frames. Next: drive one Basic256Sha256 session over the loopback fixture under the probe, then move the copies to pointers.
+- **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. The by-value key copies inside those frames are gone (2026-11-23: `deriveKeysInto`, the server's chunk keys and the client's security header by pointer). Next: drive one Basic256Sha256 session over the loopback fixture under the probe.
 
 ## Roadmap
 
