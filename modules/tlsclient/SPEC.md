@@ -475,6 +475,11 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
   in Zig 0.17.1 (checked in its `lib/std/crypto/tls/Client.zig`); a `*const Client` would break
   `Client.eof(c)` callers of the drop-in. The by-value copy may put the traffic keys in the
   caller's frame for the call (std behaves the same); a caller that burns its stack covers it.
+- **One record-protection layer shared with `tlsserver`:** both seal AES-GCM with `aesgcm`, through `tlsserver`'s
+  `record.Protection` and this module's std-shaped cipher unions (`src/cipher.zig`), which the std-copied handshake
+  reads field by field. Merging them means moving this record layer off the std shape (every `P.AEAD` use in the
+  handshake) for no measured gain — the bulk work is the same `aesgcm` call on both sides — and it would make
+  "Updating the copy" from a newer std harder. Revisit only if a cipher has to be added to both.
 
 ## Anchoring
 
@@ -493,8 +498,3 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
 - *BOUNCED (waits-external):* **Stack requirement checked at run time**: `init` documents about 400 KiB; a caller on a small fibre stack
   overflows. A check needs the thread's stack bounds (no std API); revisit if a consumer runs clients on
   small stacks.
-- **One record-protection layer with `tlsserver`**: both now seal AES-GCM with `aesgcm`, but through two
-  layers — `tlsserver`'s `record.Protection` and this module's std-shaped cipher unions (`src/cipher.zig`),
-  which the std-copied handshake reads field by field. Sharing one means moving this record layer off the
-  std shape (the handshake's every `P.AEAD` use), a refactor with no measured gain left once both are on
-  `aesgcm`.
