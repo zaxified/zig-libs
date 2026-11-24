@@ -108,13 +108,15 @@ period 30 s, genesis 1595431050).
 - `verifyRound` dispatches to `verifyDeprecatedUnchainedPoints`:
   `QuicknetSuite.coreAggregateVerify` (explicit DST, so `KeyValidate` of
   both operands still runs) over that DST. Same errors as quicknet.
-- **No external anchor.** The repository holds no genuine beacon of such a
-  network; the tests are self-consistency (a known secret signs through
-  `bls12_381.hash_to_curve` and a scalar multiply, `verifyRound` checks),
-  plus the cross-checks that a signature under either DST is refused under
-  the other scheme and that quicknet's genuine round 1000 is refused here.
-  A misreading of drand shared by code and tests would not be caught;
-  a genuine beacon of an old network would close this (see backlog).
+- **External anchor: one genuine beacon.** fastnet (chain `dbd506d6…c493`, retired: the relays stopped serving
+  it on 2024-10-07) round 2, with the chain's `/info`, as pinned in `drand/tlock-js` (MIT OR Apache-2.0,
+  `src/drand/defaults.ts` and `test/age/compatibility.test.ts`; the same round opens a Go-`tle`-produced
+  file there): `parseInfo` re-derives the chain hash, `verifyRound` accepts the beacon under the
+  deprecated DST, and refuses it under another round number or the RFC 9380 tag. Beside it, self-consistency
+  tests (a known secret signs through `bls12_381.hash_to_curve` and a scalar multiply, `verifyRound` checks),
+  and the cross-checks that a signature under either DST is refused under the other scheme and that
+  quicknet's genuine round 1000 is refused here.
+  A misreading of drand shared by code and tests is caught by that one genuine beacon.
 
 ## The verification algorithm
 
@@ -294,8 +296,7 @@ Run with `scripts/modtest drand` (`zig build test-drand`).
   flipped at three positions / swapped / dropped / genesis seed altered,
   tampered randomness, cross-chain, cross-scheme; positive controls show the
   `_POP_` DST, the G1 DST and swapped digest order all fail.
-- **Deprecated scheme.** `bls-unchained-on-g1` has self-consistency tests only
-  (see its section); no external anchor.
+- **Deprecated scheme.** `bls-unchained-on-g1`: one genuine fastnet beacon plus self-consistency tests (see its section).
 - **Parsers and codecs.** Round trips and every malformed variant of both
   documents (see *Malformed-input handling*), with the document-size limits and
   the Go-reader integer rules pinned; `computeChainHash` against three live
@@ -348,9 +349,7 @@ Go source) and reused here.
 
 ## Backlog / deferred
 
-- *BOUNCED (waits-external):* **A genuine `bls-unchained-on-g1` beacon** — none is in the repository, so
-  that scheme's tests are self-consistency only; add a real vector when one is
-  available.
+None open.
 
 ## Anchoring
 
@@ -359,7 +358,7 @@ Go source) and reused here.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** quicknet KAT is live-fetched public drand network data, same pins tlock uses; the chained default-network beacons are genuine network output taken from drand's own Go test suite and `drand_core`'s fixtures (recipe `tools/fetch_chained.py`)
+**What the tests actually contain.** quicknet KAT is live-fetched public drand network data, same pins tlock uses; the chained default-network beacons are genuine network output taken from drand's own Go test suite and `drand_core`'s fixtures (recipe `tools/fetch_chained.py`); the deprecated `bls-unchained-on-g1` has one genuine fastnet beacon, from `drand/tlock-js`'s tests
 
 **Independent differential (`tools/`):** `go/main.go` (drand's own Go `crypto`/`kyber`
 client, fetched not vendored) and this module's own `parseInfo`/`parseRound`/`verifyRound`

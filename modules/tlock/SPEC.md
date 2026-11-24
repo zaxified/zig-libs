@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [drand/kyber](https://github.com/drand/kyber) `encrypt/ibe` | Go | MPL-2.0 (`LICENSE` header; source NOT read) | 12 | v1.3.2 (2025-12-15) | The BF-IBE library `drand/tlock` uses. Its `LICENSE` file is the MPL-2.0 text (the module NOTICE calls it Apache-2.0/MIT dual: see the survey report); this module is validated byte-exact against a genuine `tle` ciphertext. |
 | Zig ecosystem | Zig | — | — | — | No Zig timelock/drand-encryption repository found by GitHub search (2026-09-30). |
 
-**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `Fp12.pow` measured with ctgrind. **Where we are behind:** only the G1-signature (quicknet) scheme, not the G2-signature testnet variant or BN254; (the age layer, arbitrary-length payloads, streaming encrypt/decrypt and streaming armor exist; see *The age layer* and *Streaming encrypt/decrypt*).
+**Where we are ahead:** the only Zig timelock implementation; interop-verified in both directions against a ciphertext produced by drand's Go `tle`, which caught a real Gt-representation divergence; constant-time `Fp12.pow` measured with ctgrind. **Where we are behind:** the G1-signature (quicknet) and the G2-signature (`pedersen-bls-unchained`) schemes, not BN254 (evmnet) and not the deprecated non-RFC `ShortSigSchemeID`; (the age layer, arbitrary-length payloads, streaming encrypt/decrypt and streaming armor exist; see *The age layer* and *Streaming encrypt/decrypt*).
 
 ## Scheme variant pinned: quicknet / `SigsOnG1ID`
 
@@ -40,7 +40,7 @@ drand runs four schemes; two are usable for timelock encryption at all
 (the chained default scheme folds the previous signature into its
 digest, so its "identity" for a future round is unknowable ahead of
 time — `drand/tlock`'s own `TimeLock`/`TimeUnlock` `switch` excludes
-it). Of the two usable ones this module targets **quicknet**'s
+it). Of the usable ones this module targets **quicknet**'s
 `SigsOnG1ID` (`"bls-unchained-g1-rfc9380"`) — confirmed
 against quicknet's chain-info endpoint (`https://api.drand.sh/v2/beacons/quicknet/info`)
 returning exactly that scheme name — NOT the older, deprecated
@@ -57,6 +57,24 @@ the per-round beacon signature (the BF-IBE private key) lives in `G1`
 ("Variant confirmation") for the byte-level evidence trail
 (`schemes.go`'s `KeyGroup = Pairing.G2()`, `SigGroup = Pairing.G1()`
 for this scheme).
+
+## The G2-signature scheme (`"pedersen-bls-unchained"`)
+
+drand's `UnchainedSchemeID` (kyber's `EncryptCCAonG1`) is quicknet with the two groups swapped: the
+beacon's public key and the ciphertext's `U` live in `G1` (48 bytes compressed), the identity is hashed
+onto `G2` under `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_` (`ciphersuite.h1SigG2`), and the round
+signature, the IBE private key, is a `G2` point (96 bytes). Everything else is the construction below:
+`Gid = e(P_pub, Qid)` (the same `pairing(G1, G2)` call and the same Gt cube), `U = r·G1_generator`, the FO
+check `U == r'·G1_generator`, `h2`/`h3`/`h4` unchanged. The wire ciphertext is `U (48) || V (16) || W (16)`
+= 80 bytes (`CiphertextSigG2`); the age stanza names no scheme, the body length tells (80 here, 128 for
+quicknet). API: `encryptSigG2`/`decryptSigG2` (core), `age.encryptSigG2`/`decryptSigG2`/`encryptAllocSigG2`/
+`decryptAllocSigG2`/`encryptStreamSigG2`/`decryptStreamSigG2`/`encryptedLenSigG2`; a stanza of the other
+scheme's body length is `error.InvalidCiphertext` through the function that does not match it.
+
+**Sources (none of kyber's MPL-2.0 code was read for this):** `drand/tlock`'s `tlock.go` (MIT OR Apache-2.0:
+`UnchainedSchemeID` routed through `EncryptCCAonG1`/`DecryptCCAonG1`, `KeyGroup` `G1`, signatures `KyberG2`)
+and `drand/tlock-js`'s `src/crypto/ibe.ts` (`encryptOnG1`/`decryptOnG1`, MIT OR Apache-2.0: the DST, the
+pairing argument order, `U` in `G1`). The deprecated `ShortSigSchemeID` and BN254 are not implemented.
 
 ## The construction (Boneh-Franklin "FullIdent", CRYPTO 2001 §4.2)
 
@@ -175,6 +193,16 @@ cannot find it; only a genuine drand ciphertext can:
   end-to-end with the pinned round-5423142 signature and compares with `lorem.txt`
   (so armor, header MAC and STREAM agree with Go, not just with the age spec),
   refuses it under another chain hash, and refuses a flipped payload byte.
+- **G2-signature scheme, byte-exact (EXTERNAL):** the retired testnet `testnet-unchained-3s` (chain
+  `7672797f…f5bf`, scheme `pedersen-bls-unchained`, period 3 s) as pinned in `drand/tlock-js` (MIT OR
+  Apache-2.0: `src/drand/defaults.ts` for the `G1` public key, `test/age/compatibility.test.ts` for round 1's
+  `G2` beacon signature and an armored age file the Go `tle` wrote, plaintext `Hello dranders\n`). The
+  signature verifies against the key (`e(G1gen, σ) == e(P_pub, h1SigG2(beaconId(1)))`, a test), the 80-byte
+  ciphertext decrypts to the file key that authenticates the file's header MAC, re-encrypting the recovered
+  `(filekey, sigma)` and the file's nonce reproduces the whole Go file byte for byte (whole-buffer and
+  streamed), a wrong signature, a flipped `V`/`W` and a `U` outside `G1` are refused, and the two schemes
+  refuse each other's stanza. The fixture is `src/testdata/tlock-js-testnet-unchained-3s-round1.tle`; the chain is no
+  longer served, so no live fetch can refresh it.
 - **Round trip against a real quicknet round signature:** `encrypt` a fixed
   `(message, sigma)` under the real mainnet quicknet `P_pub`, `decrypt` with the real
   round-1000 signature (`kat_test.zig`'s round-trip test); `encrypt` is
@@ -197,12 +225,14 @@ cannot find it; only a genuine drand ciphertext can:
 
 ## Constant-time measurement (ctgrind)
 
-Two targets run under memcheck with the secret tainted; their context counts are
+Four targets run under memcheck with the secret tainted; their context counts are
 pinned in `scripts/checks/ctgrind-expected.tsv`.
 
 | target | tainted | in-file contexts | read at |
 |---|---|---|---|
 | `fp12pow` | `sigma`, `message` (hence `r = H3(sigma, message)`) | 5 | in `tlock.zig`'s `encrypt`: the `H3` step and the `U = r·G2` scalar multiplication, + `Fr.fromBytes`'s accept/reject ×2, `U`'s compression bit |
+| `fp12pow_g2` | `sigma`, `message` of `encryptSigG2` | 3 | the same sites as `fp12pow` on `G1`: `h3`'s `Fr.fromBytes` accept/reject, `U = r·G1`'s `toAffine`, `U`'s compression bit |
+| `decrypt_g2` | the `G2` round signature handed to `pairing.pairing` in `decryptSigG2` | 6 | the same sites as `decrypt`: the pairing's final-exponentiation inverse, the `H3` re-derivation, the `U'` `toAffine` and compression bit |
 | `decrypt` | the round signature handed to `pairing.pairing` | 8 | in `tlock.zig`'s `decryptBody`: the pairing, the `H3` re-derivation and the `U` re-encryption, + the FO compare (`std.mem.eql`) ×2 and the output points' `toAffine`/compression |
 
 ⛔ These numbers are **not** a constant-time claim about the pairing.
@@ -225,7 +255,10 @@ read the contexts with `--stacks`.
 in it as an age `tlock` stanza and encrypts the file itself with age's STREAM, so a
 file of any length can be timelocked. `age.zig` reads and writes that format,
 written from the public age specification (C2SP `age.md`, `age-encryption.org/v1`);
-no age source was read (`src/age.zig`).
+no age source was read (`src/age.zig`). The stanza body is 128 bytes for quicknet and 80 for the
+G2-signature scheme; `Header.parse` tells by length and `Recipient.ciphertext` is the union `StanzaCiphertext`
+(`.sig_g1` / `.sig_g2`, `age.Scheme`), so `inspectAlloc` names the round and chain hash of either; the caller learns the
+scheme from the beacon's chain info, found by the chain hash, and calls the unsuffixed or the `SigG2` functions.
 
 ```
 age-encryption.org/v1
@@ -305,14 +338,14 @@ age-encryption.org/v1
 
 - **Run:** `scripts/modtest tlock`; the fuzz driver is `TLOCK_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver).
 - **Known answers:** the drand interop vector, the whole-file Go fixture and the live quicknet pairing sanity check, as listed under *Known answers*.
-- **Test classes:** the ciphersuite hashes, the `Ciphertext` codec, `encrypt`/`decrypt` round trips and FO/tamper rejection, the `Fp12.pow` law, the age layer (header parser, armor, STREAM payload, typed refusals) and streaming (byte equality with the whole-buffer functions through readers that hand out a few bytes at a time, chunk-boundary lengths, the Go fixture de-armored), and a stack-probe test for the dead-stack burn around the secret-bearing calls.
+- **Test classes:** the ciphersuite hashes, the `Ciphertext` codec, `encrypt`/`decrypt` round trips and FO/tamper rejection, the `Fp12.pow` law, the age layer (header parser, armor, STREAM payload, typed refusals) and streaming (byte equality with the whole-buffer functions through readers that hand out a few bytes at a time, chunk-boundary lengths, the Go fixture de-armored), the G2-signature scheme's mirror of each (the real-vector tests above), and a stack-probe test for the dead-stack burn around the secret-bearing calls (both schemes).
 - **Fuzz:** three harnesses (`tlock-age-decoders`, `tlock-age-file`, `tlock-ciphertext`), run by the deterministic driver; `tlock-age-file` runs at a reduced scale because each run is one pairing-heavy encrypt plus up to four decrypts. The card's Hardening line has the run.
-- **ct:** ctgrind with two targets (`fp12pow`, `decrypt`), see *Constant-time measurement*; the pins are `scripts/checks/ctgrind-expected.tsv`.
+- **ct:** ctgrind with four targets (`fp12pow`, `decrypt`, `fp12pow_g2`, `decrypt_g2`), see *Constant-time measurement*; the pins are `scripts/checks/ctgrind-expected.tsv`.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. The mutation runs covered `Ciphertext.fromBytes`, the FO check, `Fp12.pow`'s window and constant-time lookup, `gtToDrandRepr`, every hash's tag, DST, endianness, masking and truncation, and the streaming functions (the header write, the lookahead read and its carry, the last-chunk test at its boundary, the last flag, the payload key's nonce, the header read's end test and cap, the chain and MAC checks, the nonce shortfall). Equivalent mutants: the table lookup's `== idx` as `<= idx` (entries are merged in ascending order, so the last one taken is still `table[idx]` and every entry is still read); dropping the wipe of `message` on the FO-reject path (a stack local the caller never sees once `decrypt` returns the error: hygiene, not observable by value); `h.len != n` after `Header.parse` in the stream header read (the parser stops at the first line starting with `---`, exactly where the read loop stopped, so the two lengths cannot differ; defensive); the nonce read's `EndOfStream` arm (without it the call goes on with an unread nonce, but the reader is at its end, so the first payload read returns 0 bytes and the same `MalformedPayload` is raised). Not mutated: `writeHead` (the whole-buffer header code, every in-memory test pins its bytes).
 
 ## Backlog / deferred
 
-- **G2-signature scheme (`bls-unchained` testnet variant).** Supported by `drand/tlock` and `tlock_age`; mainnet uses G1 only, so low priority. Effort: medium (swap group roles); fits CONVENTIONS section 2.
+None open.
 
 ## Anchoring
 

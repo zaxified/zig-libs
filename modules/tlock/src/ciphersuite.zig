@@ -84,11 +84,11 @@ pub const Fp12 = bls12_381.Fp12;
 pub const dst_g1 = "BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_` — the RFC-9380-default
-/// `G2` DST. `SigsOnG1ID` never actually hashes anything onto `G2`
-/// itself (the master public key lives there but is never a
-/// hash-to-curve OUTPUT), but this is recorded for completeness/parity
-/// with the scheme's own constructor call and because a future sibling
-/// scheme (`ShortSigSchemeID`) would need it. Same source as `dst_g1`.
+/// `G2` DST. The quicknet scheme (`SigsOnG1ID`) never hashes onto `G2`
+/// (its master public key lives there but is never a hash-to-curve
+/// OUTPUT); the G2-signature scheme (`"pedersen-bls-unchained"`) hashes the
+/// beacon identity onto `G2` with it (`h1SigG2`), and the deprecated
+/// `ShortSigSchemeID` reuses it, wrongly, for `G1`. Same source as `dst_g1`.
 pub const dst_g2 = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
 
 /// Domain-separation tag for `h2` (hashing a `Gt` element to a mask).
@@ -152,6 +152,16 @@ pub fn beaconId(round: u64) [32]u8 {
 /// doc comment.
 pub fn h1(id: [32]u8) g1.Affine {
     return bls12_381.hash_to_curve.hashToCurveG1(&id, dst_g1);
+}
+
+/// `H1(id)` of the G2-signature scheme (drand's `"pedersen-bls-unchained"`):
+/// the identity hashed onto `G2` under `dst_g2` (`BLS_SIG_BLS12381G2_XMD:...`),
+/// because that network's beacon signatures live in `G2`. The mirror image of
+/// `h1`. Source: `drand/drand` `crypto/schemes.go`, `NewPedersenBLSUnchained`
+/// (`UnchainedSchemeID`: `bls.NewBLS12381Suite()`, RFC 9380 DSTs); the same hash
+/// is `drand/tlock-js`'s `encryptOnG1` (`hashToCurve` on `G2` with this DST).
+pub fn h1SigG2(id: [32]u8) g2.Affine {
+    return bls12_381.hash_to_curve.hashToCurveG2(&id, dst_g2);
 }
 
 // ── H2: Gt -> block (REAL) ───────────────────────────────────────────
