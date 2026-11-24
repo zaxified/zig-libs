@@ -179,7 +179,7 @@ Backreferences, lookaround, atomic groups, possessive quantifiers and recursion 
 nodes) in ~9 KiB of stack scratch, and only a larger one in a full `Builder` from the allocator.
 At compile time the program is analysed once: a pattern anchored at `\A`/`^` is tried at the
 start only; a literal prefix of two bytes or more is searched for by a 32-byte vector scan, a
-set of up to 32 literal prefixes (`ABCD|CDEF|…`, `(?i)abc`, `foo\d|bar\d`) by Teddy's SIMD
+set of up to 64 literal prefixes (`ABCD|CDEF|…`, `(?i)abc`, `foo\d|bar\d`) by Teddy's SIMD
 nibble tables, a single first byte by a scalar search. `isMatch`/`fullMatch` run a lazy DFA on the stack
 (programs up to 128 instructions; transitions on ASCII bytes cached). Searches with groups run on
 a bit-state backtracker over a window of 256 Kbit / instructions positions — a short match in a

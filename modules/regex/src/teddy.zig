@@ -30,7 +30,7 @@ const Range = syntax.Range;
 
 /// Prefixes kept, at most; past it the prefixes are cut shorter, and below
 /// two bytes there is no `Teddy`.
-pub const max_pats = 32;
+pub const max_pats = 64;
 /// Bytes kept of each prefix, at most.
 pub const max_len = 8;
 /// A class of more code points than this ends a prefix.

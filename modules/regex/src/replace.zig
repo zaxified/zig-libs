@@ -382,8 +382,18 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
 /// without consuming. An assertion stops the prefix (`stopped`), except `\A`
 /// at the start, which only makes it incomplete.
 fn reach(insts: []const syntax.Inst, set: *Bits, pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
+    // The stack holds at most one entry for the start and two per instruction
+    // walked, so it is sized by the program: ReleaseSafe fills an `undefined`
+    // array, and 16 KiB of it per call was a quarter of a short pattern's compile.
+    if (insts.len <= 64) return reachN(129, insts, set, pc0, at_start, complete, stopped);
+    if (insts.len <= 256) return reachN(513, insts, set, pc0, at_start, complete, stopped);
+    if (insts.len <= root.max_insts) return reachN(2 * root.max_insts + 1, insts, set, pc0, at_start, complete, stopped);
+    return reachN(8 * root.max_insts + 1, insts, set, pc0, at_start, complete, stopped);
+}
+
+fn reachN(comptime stack_len: usize, insts: []const syntax.Inst, set: *Bits, pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
     var seen: Bits = .init(insts.len);
-    var stack: [8 * root.max_insts]u16 = undefined;
+    var stack: [stack_len]u16 = undefined;
     var sp: usize = 1;
     stack[0] = pc0;
     while (sp != 0) {
