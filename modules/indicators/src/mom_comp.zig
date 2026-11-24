@@ -18,6 +18,7 @@ const rsi_ = @import("rsi.zig");
 const vs = @import("vs_kit.zig");
 const mu = @import("mom_util.zig");
 const xmath = @import("xmath.zig");
+const vmath = @import("vmath.zig");
 const Error = core.Error;
 const Unstable = core.Unstable;
 const MaType = core.MaType;
@@ -526,7 +527,80 @@ pub fn fisherLookback(p: FisherParams) Error!usize {
 }
 /// Outputs `fisher` and `trigger` (the previous Fisher value).
 pub fn fisher(comptime T: type, high: []const T, low: []const T, fish: []T, trigger: []T, p: FisherParams) Error!usize {
+    if (T == f64) {
+        core.checkFloat(T);
+        try FISHER.validate(p);
+        const n = high.len;
+        if (low.len != n or fish.len != n or trigger.len != n) return error.BadParam;
+        fisherRun(high, low, fish, trigger, p);
+        return FISHER.lookback(p);
+    }
     return vs.batch(T, FISHER, p, .{ .high = high, .low = low }, .{ fish, trigger });
+}
+
+/// The f64 batch of `FISHER.step`, bitwise: the smoothed ratio of a block of bars first (it does not depend
+/// on the log), then the block's logarithms four lanes at a time (`vmath.log4`, bit for bit `@log`), then the
+/// recurrence of the Fisher value.
+fn fisherRun(high: []const f64, low: []const f64, fish: []f64, trigger: []f64, p: FisherParams) void {
+    const n = high.len;
+    const per = p.period;
+    const l = FISHER.lookback(p);
+    const nan = std.math.nan(f64);
+    const block = 64;
+    var arg: [block]f64 = undefined;
+    var lg: [block]f64 = undefined;
+    var smoothed: f64 = 0.0;
+    var prev_fish: f64 = 0.0;
+    var start: usize = 0;
+    while (start < n) : (start += block) {
+        const len = @min(block, n - start);
+        for (0..len) |j| {
+            const i = start + j;
+            if (i + 1 < per) {
+                arg[j] = 1.5;
+                continue;
+            }
+            const price = (high[i] + low[i]) / 2.0;
+            var highest = price;
+            var lowest = price;
+            var w = i + 1 - per;
+            while (w < i) : (w += 1) {
+                const t = (high[w] + low[w]) / 2.0;
+                if (t > highest) highest = t;
+                if (t < lowest) lowest = t;
+            }
+            const range = highest - lowest;
+            const ratio = if (!zeroScaled(range, @abs(highest) + @abs(lowest))) (price - lowest) / range else 0.5;
+            smoothed = @mulAdd(f64, 0.67, smoothed, @as(f64, 0.33) * 2.0 * (ratio - 0.5));
+            if (smoothed > 0.99) smoothed = 0.999;
+            if (smoothed < -0.99) smoothed = -0.999;
+            arg[j] = (1.0 + smoothed) / (1.0 - smoothed);
+        }
+        @memset(arg[len..], 1.5);
+        var q: usize = 0;
+        while (q < block) : (q += 4) {
+            const v: vmath.V = arg[q..][0..4].*;
+            lg[q..][0..4].* = vmath.log4(v);
+        }
+        for (0..len) |j| {
+            const i = start + j;
+            if (i + 1 < per) {
+                fish[i] = nan;
+                trigger[i] = nan;
+                continue;
+            }
+            const f = @mulAdd(f64, 0.5, lg[j], 0.5 * prev_fish);
+            const trig = prev_fish;
+            prev_fish = f;
+            if (i < l) {
+                fish[i] = nan;
+                trigger[i] = nan;
+            } else {
+                fish[i] = f;
+                trigger[i] = trig;
+            }
+        }
+    }
 }
 pub fn FisherStream(comptime T: type) type {
     return vs.Stream(T, FISHER);
@@ -985,5 +1059,40 @@ test "apo / ppo: every MaType, batch == streaming, lookback == NaN lead" {
     inline for (comptime std.enums.values(MaType), 0..) |k, i| {
         try mu.checkCore(APO, .{ .fast = 3, .slow = 7, .kind = k }, 120, 100 + i);
         try mu.checkCore(PPO, .{ .fast = 3, .slow = 7, .kind = k }, 120, 200 + i);
+    }
+}
+
+test "fisher: the blocked f64 batch equals the core's steps bit for bit (flat stretches, small and large periods, unstable bars)" {
+    const th = @import("testhelp.zig");
+    var prng = std.Random.DefaultPrng.init(0xf15e);
+    const r = prng.random();
+    const n = 700;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: f64 = 100.0;
+    for (0..n) |i| {
+        if (i >= 300 and i < 380) {
+            // a flat stretch: the zero-range branch
+        } else {
+            c *= 1.0 + (r.float(f64) - 0.5) * 0.04;
+        }
+        h[i] = c * 1.001;
+        l[i] = c * 0.999;
+        if (i >= 300 and i < 380) {
+            h[i] = c;
+            l[i] = c;
+        }
+    }
+    const params = [_]FisherParams{ .{}, .{ .period = 2 }, .{ .period = 33, .unstable = .{ .bars = 7 } }, .{ .period = 10, .unstable = .auto4 } };
+    for (params) |p| {
+        var got = [2][n]f64{ undefined, undefined };
+        var want = [2][n]f64{ undefined, undefined };
+        const lb = try fisher(f64, &h, &l, &got[0], &got[1], p);
+        const lb2 = try vs.batch(f64, FISHER, p, .{ .high = @as([]const f64, &h), .low = @as([]const f64, &l) }, .{ @as([]f64, &want[0]), @as([]f64, &want[1]) });
+        try std.testing.expectEqual(lb2, lb);
+        for (0..n) |i| {
+            try std.testing.expect(th.sameBits(got[0][i], want[0][i]));
+            try std.testing.expect(th.sameBits(got[1][i], want[1][i]));
+        }
     }
 }
