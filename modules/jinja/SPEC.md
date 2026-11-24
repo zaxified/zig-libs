@@ -101,8 +101,8 @@ The obvious options were `std.json.Value`, `yaml.Value` (ordered pairs), or an
 interface with adapters. The decision is: **the render-time value is this
 module's own type, and ingress is a conversion** (`valueFrom` for Zig data,
 `valueFromJson` for `std.json.Value`, a documented ~20-line function for
-`yaml.Value`). The module takes no value-model dependency; its one dependency is
-`unitext`, for Unicode case mapping (D4).
+`yaml.Value`). The module takes no value-model dependency; its dependencies are
+`unitext`, for Unicode case mapping (D4), and `jsontext`, for the `tojson` string writer (ASCII-only, DEL and `<>&'` escaped as the reference's `htmlsafe_json_dumps` does; ill-formed UTF-8 is `error.BadArgument`).
 
 Three things drove it.
 

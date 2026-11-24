@@ -125,8 +125,8 @@ Maps are **ordered pair slices**, so the order you supply keys in is the order
 
 ### Using it with the `yaml` module
 
-`jinja` takes no value-model dependency (see `SPEC.md` §2); its only dependency is
-`unitext`, for Unicode case mapping. A context
+`jinja` takes no value-model dependency (see `SPEC.md` §2); its dependencies are
+`unitext`, for Unicode case mapping, and `jsontext`, for the `tojson` string writer. A context
 from `modules/yaml` is a twenty-line conversion, and ordering survives it
 because both sides keep mappings as ordered pairs:
 
