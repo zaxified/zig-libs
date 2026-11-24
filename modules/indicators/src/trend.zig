@@ -470,7 +470,9 @@ fn BlockExt(comptime is_max: bool) type {
         /// The better of two finite values, without a branch (a data-dependent
         /// `if` here mispredicts about half the time on a random walk).
         inline fn best(a: f64, b: f64) f64 {
-            return if (is_max) @max(a, b) else @min(a, b);
+            // A plain compare-select is one `maxsd` / `minsd`; `@max` / `@min` add the NaN
+            // fix-up (`cmpunordsd` + `blendvpd`) the finite input never needs.
+            return if (is_max) (if (a > b) a else b) else (if (a < b) a else b);
         }
         fn push(s: *@This(), v: f64) f64 {
             const w = s.buf.len;
@@ -558,6 +560,25 @@ fn ckspBlocks(comptime T: type, gpa: std.mem.Allocator, high: []const T, low: []
                 st.low_stop[i] = core.to(T, lm);
             }
         }
+
+        /// `feed` for a bar already known to be in phase `ph`: 0 before the extrema
+        /// start, 1 extrema only, 2 first stops (no output yet), 3 outputs.
+        inline fn feedPhase(st: *@This(), comptime ph: usize, i: usize, h: f64, l: f64, a: f64) void {
+            if (ph == 0) return;
+            const hv = st.hh.push(h);
+            const lv = st.ll.push(l);
+            if (ph == 1) return;
+            const band = st.mult * a;
+            const hsv = hv - band;
+            const lsv = lv + band;
+            st.finite = st.finite and std.math.isFinite(hsv) and std.math.isFinite(lsv);
+            const hm = st.hs.push(hsv);
+            const lm = st.ls.push(lsv);
+            if (ph == 3) {
+                st.high_stop[i] = core.to(T, hm);
+                st.low_stop[i] = core.to(T, lm);
+            }
+        }
     };
     var st: Stage = .{ .hh = &hh, .ll = &ll, .hs = &hs, .ls = &ls, .high_stop = high_stop, .low_stop = low_stop, .mult = p.multiplier, .win_start = first_stop + 1 - pp, .first_stop = first_stop, .lb = lb };
     var i: usize = 0;
@@ -572,18 +593,28 @@ fn ckspBlocks(comptime T: type, gpa: std.mem.Allocator, high: []const T, low: []
     var cy = atr.tr.prev_close;
     const beta = atr.beta;
     const alpha = atr.alpha;
-    while (i < n) : (i += 1) {
-        const h: f64 = high[i];
-        const l: f64 = low[i];
-        const cl: f64 = close[i];
-        var greatest = h - l;
-        const v2 = @abs(cy - h);
-        if (v2 > greatest) greatest = v2;
-        const v3 = @abs(cy - l);
-        if (v3 > greatest) greatest = v3;
-        cy = cl;
-        prev = @mulAdd(f64, beta, prev, alpha * greatest);
-        st.feed(i, h, l, prev);
+    // The steady loop in four phases (the extrema start, the first stops start, the stops
+    // are written), each with its own branch-free body.
+    inline for (0..4) |ph| {
+        const end = switch (ph) {
+            0 => @min(n, @max(i, st.win_start)),
+            1 => @min(n, @max(i, st.first_stop)),
+            2 => @min(n, @max(i, st.lb)),
+            else => n,
+        };
+        while (i < end) : (i += 1) {
+            const h: f64 = high[i];
+            const l: f64 = low[i];
+            const cl: f64 = close[i];
+            var greatest = h - l;
+            const v2 = @abs(cy - h);
+            if (v2 > greatest) greatest = v2;
+            const v3 = @abs(cy - l);
+            if (v3 > greatest) greatest = v3;
+            cy = cl;
+            prev = @mulAdd(f64, beta, prev, alpha * greatest);
+            st.feedPhase(ph, i, h, l, prev);
+        }
     }
     const finite = st.finite;
     if (!finite) return null;

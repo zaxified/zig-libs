@@ -19,6 +19,7 @@ const smooth = @import("smooth.zig");
 const vs = @import("vs_kit.zig");
 const mu = @import("mom_util.zig");
 const window = @import("window.zig");
+const vmath = @import("vmath.zig");
 const Error = core.Error;
 const Unstable = core.Unstable;
 const pf = core.pf;
@@ -1360,6 +1361,7 @@ pub fn chopLookback(p: ChopParams) Error!usize {
     return CHOP.lookback(p);
 }
 pub fn chop(comptime T: type, high: []const T, low: []const T, close: []const T, out: []T, p: ChopParams) Error!usize {
+    if (T == f64) return chopBlocked(false, high, low, close, out, p);
     return vs.batch(T, CHOP, p, .{ .high = high, .low = low, .close = close }, .{out});
 }
 pub fn ChopStream(comptime T: type) type {
@@ -1370,7 +1372,77 @@ pub fn choptrLookback(p: ChopParams) Error!usize {
     return CHOPTR.lookback(p);
 }
 pub fn choptr(comptime T: type, high: []const T, low: []const T, close: []const T, out: []T, p: ChopParams) Error!usize {
+    if (T == f64) return chopBlocked(true, high, low, close, out, p);
     return vs.batch(T, CHOPTR, p, .{ .high = high, .low = low, .close = close }, .{out});
+}
+
+/// The f64 batch of `ChopCore.step`, bitwise: the sums and extremes of a block of bars first, then the block's
+/// `log10` four lanes at a time (`vmath.log10_4`, bit for bit `@log10`).
+fn chopBlocked(comptime true_range: bool, high: []const f64, low: []const f64, close: []const f64, out: []f64, p: ChopParams) Error!usize {
+    const C = ChopCore(true_range);
+    try C.validate(p);
+    const n = high.len;
+    if (low.len != n or close.len != n or out.len != n) return error.BadParam;
+    const per = p.period;
+    const log_p = std.math.log10(pf(per));
+    const nan = std.math.nan(f64);
+    const block = 64;
+    var arg: [block]f64 = undefined;
+    var flat: [block]bool = undefined;
+    var lg: [block]f64 = undefined;
+    var start: usize = 0;
+    while (start < n) : (start += block) {
+        const len = @min(block, n - start);
+        for (0..len) |j| {
+            const today = start + j;
+            flat[j] = false;
+            arg[j] = 2.0;
+            if (today < per) continue;
+            var highest = high[today];
+            var lowest = low[today];
+            var sum_tr: f64 = 0.0;
+            var prev_close = close[today - per];
+            var i = per;
+            while (i > 0) {
+                i -= 1;
+                const t = today - i;
+                var th = high[t];
+                if (prev_close > th) th = prev_close;
+                var tl = low[t];
+                if (prev_close < tl) tl = prev_close;
+                sum_tr += th - tl;
+                if (true_range) {
+                    if (th > highest) highest = th;
+                    if (tl < lowest) lowest = tl;
+                } else {
+                    if (high[t] > highest) highest = high[t];
+                    if (low[t] < lowest) lowest = low[t];
+                }
+                prev_close = close[t];
+            }
+            if (true_range) {
+                if (sum_tr <= 0.0) {
+                    flat[j] = true;
+                    continue;
+                }
+            } else if (highest - lowest <= 0.0 or sum_tr <= 0.0) {
+                flat[j] = true;
+                continue;
+            }
+            arg[j] = sum_tr / (highest - lowest);
+        }
+        @memset(arg[len..], 2.0);
+        var q: usize = 0;
+        while (q < block) : (q += 4) {
+            const v: vmath.V = arg[q..][0..4].*;
+            lg[q..][0..4].* = vmath.log10_4(v);
+        }
+        for (0..len) |j| {
+            const today = start + j;
+            out[today] = if (today < per) nan else if (flat[j]) 100.0 else 100.0 * (lg[j] / log_p);
+        }
+    }
+    return C.lookback(p);
 }
 pub fn ChoptrStream(comptime T: type) type {
     return vs.Stream(T, CHOPTR);
@@ -1728,7 +1800,90 @@ pub fn ultoscLookback(p: UltoscParams) Error!usize {
     return ULTOSC.lookback(p);
 }
 pub fn ultosc(comptime T: type, high: []const T, low: []const T, close: []const T, out: []T, p: UltoscParams) Error!usize {
+    if (T == f64 and ULTOSC.sorted(p)[2] <= ultosc_ring) {
+        try ULTOSC.validate(p);
+        const n = high.len;
+        if (low.len != n or close.len != n or out.len != n) return error.BadParam;
+        ultoscRun(high, low, close, out, p);
+        return ULTOSC.lookback(p);
+    }
     return vs.batch(T, ULTOSC, p, .{ .high = high, .low = low, .close = close }, .{out});
+}
+
+/// The longest slowest period whose batch keeps the terms in a stack ring (TA-Lib's `term_*` arrays).
+const ultosc_ring = 256;
+
+/// The f64 batch of `ULTOSC.step`, bitwise: the same state machine over the slices with the state in locals,
+/// the three terms that leave the windows read back from a ring (the same doubles the core recomputes).
+fn ultoscRun(high: []const f64, low: []const f64, close: []const f64, out: []f64, p: UltoscParams) void {
+    const T = ULTOSC;
+    const n_bars = high.len;
+    const s = T.sorted(p);
+    const p1 = s[0];
+    const p2 = s[1];
+    const p3 = s[2];
+    const l = p3;
+    var ring_a: [ultosc_ring]f64 = undefined;
+    var ring_b: [ultosc_ring]f64 = undefined;
+    const mask = ultosc_ring - 1;
+    var a1: f64 = 0.0;
+    var b1: f64 = 0.0;
+    var a2: f64 = 0.0;
+    var b2: f64 = 0.0;
+    var a3: f64 = 0.0;
+    var b3: f64 = 0.0;
+    var null_run: usize = 0;
+    const nan = std.math.nan(f64);
+    if (n_bars > 0) out[0] = nan;
+    var n: usize = 1;
+    while (n < n_bars) : (n += 1) {
+        const t = T.term(.{ .high = high[n], .low = low[n], .close = close[n] }, .{ .high = high[n - 1], .low = low[n - 1], .close = close[n - 1] });
+        ring_a[n & mask] = t.cmtl;
+        ring_b[n & mask] = t.tr;
+        const live = !(t.tr + @abs(t.cmtl) <= 0.0);
+        null_run = if (live) 0 else null_run + 1;
+        if (n + p1 > l) {
+            a1 += t.cmtl;
+            b1 += t.tr;
+        }
+        if (n + p2 > l) {
+            a2 += t.cmtl;
+            b2 += t.tr;
+        }
+        a3 += t.cmtl;
+        b3 += t.tr;
+        if (n < l) {
+            out[n] = nan;
+            continue;
+        }
+        if (null_run >= p1) {
+            a1 = 0.0;
+            b1 = 0.0;
+        }
+        if (null_run >= p2) {
+            a2 = 0.0;
+            b2 = 0.0;
+        }
+        if (null_run >= p3) {
+            null_run = p3;
+            a3 = 0.0;
+            b3 = 0.0;
+        }
+        var output: f64 = 0.0;
+        if (b1 > 0.0) output += 4.0 * (a1 / b1);
+        if (b2 > 0.0) output += 2.0 * (a2 / b2);
+        if (b3 > 0.0) output += a3 / b3;
+        const q1 = (n + 1 - p1) & mask;
+        const q2 = (n + 1 - p2) & mask;
+        const q3 = (n + 1 - p3) & mask;
+        a1 -= ring_a[q1];
+        b1 -= ring_b[q1];
+        a2 -= ring_a[q2];
+        b2 -= ring_b[q2];
+        a3 -= ring_a[q3];
+        b3 -= ring_b[q3];
+        out[n] = 100.0 * (output / 7.0);
+    }
 }
 pub fn UltoscStream(comptime T: type) type {
     return vs.Stream(T, ULTOSC);
@@ -2087,5 +2242,73 @@ test "willr / cci batch equal the stepped core (cci bit for bit; willr where no 
             const want = s2.step(src, src.at(i));
             if (want) |w| try testing.expect(th_.sameBits(w, out2[i])) else try testing.expect(std.math.isNan(out2[i]));
         }
+    }
+}
+
+test "chop, choptr: the blocked f64 batch equals the core's steps bit for bit (flat stretches, periods)" {
+    const thp = @import("testhelp.zig");
+    var prng = std.Random.DefaultPrng.init(0xc409);
+    const r = prng.random();
+    const n = 700;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: [n]f64 = undefined;
+    var m: f64 = 100.0;
+    for (0..n) |i| {
+        if (i < 300 or i >= 380) m *= 1.0 + (r.float(f64) - 0.5) * 0.04;
+        h[i] = m * 1.001;
+        l[i] = m * 0.999;
+        c[i] = l[i] + (h[i] - l[i]) * r.float(f64);
+        if (i >= 300 and i < 380) {
+            h[i] = m;
+            l[i] = m;
+            c[i] = m;
+        }
+    }
+    const ins = .{ .high = @as([]const f64, &h), .low = @as([]const f64, &l), .close = @as([]const f64, &c) };
+    for ([_]usize{ 2, 14, 50 }) |per| {
+        const p: ChopParams = .{ .period = per };
+        var got: [n]f64 = undefined;
+        var want: [n]f64 = undefined;
+        const lb = try chop(f64, &h, &l, &c, &got, p);
+        const lb2 = try vs.batch(f64, CHOP, p, ins, .{@as([]f64, &want)});
+        try std.testing.expectEqual(lb2, lb);
+        for (0..n) |i| try std.testing.expect(thp.sameBits(got[i], want[i]));
+        const lt = try choptr(f64, &h, &l, &c, &got, p);
+        const lt2 = try vs.batch(f64, CHOPTR, p, ins, .{@as([]f64, &want)});
+        try std.testing.expectEqual(lt2, lt);
+        for (0..n) |i| try std.testing.expect(thp.sameBits(got[i], want[i]));
+    }
+}
+
+test "ultosc: the f64 batch over the slices equals the core's steps bit for bit (flat stretches, periods)" {
+    const thp = @import("testhelp.zig");
+    var prng = std.Random.DefaultPrng.init(0x0175);
+    const r = prng.random();
+    const n = 700;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: [n]f64 = undefined;
+    var m: f64 = 100.0;
+    for (0..n) |i| {
+        if (i < 300 or i >= 380) m *= 1.0 + (r.float(f64) - 0.5) * 0.04;
+        h[i] = m * 1.001;
+        l[i] = m * 0.999;
+        c[i] = l[i] + (h[i] - l[i]) * r.float(f64);
+        if (i >= 300 and i < 380) {
+            h[i] = m;
+            l[i] = m;
+            c[i] = m;
+        }
+    }
+    const ins = .{ .high = @as([]const f64, &h), .low = @as([]const f64, &l), .close = @as([]const f64, &c) };
+    const params = [_]UltoscParams{ .{}, .{ .period1 = 1, .period2 = 1, .period3 = 1 }, .{ .period1 = 20, .period2 = 3, .period3 = 9 }, .{ .period1 = 5, .period2 = 50, .period3 = 120 }, .{ .period1 = 5, .period2 = 50, .period3 = 300 } };
+    for (params) |p| {
+        var got: [n]f64 = undefined;
+        var want: [n]f64 = undefined;
+        const lb = try ultosc(f64, &h, &l, &c, &got, p);
+        const lb2 = try vs.batch(f64, ULTOSC, p, ins, .{@as([]f64, &want)});
+        try std.testing.expectEqual(lb2, lb);
+        for (0..n) |i| try std.testing.expect(thp.sameBits(got[i], want[i]));
     }
 }

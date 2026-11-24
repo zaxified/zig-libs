@@ -806,6 +806,7 @@ test {
     _ = cycle_;
     _ = mathtx_;
     _ = @import("xmath.zig");
+    _ = @import("vmath.zig");
     // END cycle tests
     // BEGIN vs tests
     _ = volume_;

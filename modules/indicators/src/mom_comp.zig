@@ -18,6 +18,7 @@ const rsi_ = @import("rsi.zig");
 const vs = @import("vs_kit.zig");
 const mu = @import("mom_util.zig");
 const xmath = @import("xmath.zig");
+const vmath = @import("vmath.zig");
 const Error = core.Error;
 const Unstable = core.Unstable;
 const MaType = core.MaType;
@@ -526,7 +527,80 @@ pub fn fisherLookback(p: FisherParams) Error!usize {
 }
 /// Outputs `fisher` and `trigger` (the previous Fisher value).
 pub fn fisher(comptime T: type, high: []const T, low: []const T, fish: []T, trigger: []T, p: FisherParams) Error!usize {
+    if (T == f64) {
+        core.checkFloat(T);
+        try FISHER.validate(p);
+        const n = high.len;
+        if (low.len != n or fish.len != n or trigger.len != n) return error.BadParam;
+        fisherRun(high, low, fish, trigger, p);
+        return FISHER.lookback(p);
+    }
     return vs.batch(T, FISHER, p, .{ .high = high, .low = low }, .{ fish, trigger });
+}
+
+/// The f64 batch of `FISHER.step`, bitwise: the smoothed ratio of a block of bars first (it does not depend
+/// on the log), then the block's logarithms four lanes at a time (`vmath.log4`, bit for bit `@log`), then the
+/// recurrence of the Fisher value.
+fn fisherRun(high: []const f64, low: []const f64, fish: []f64, trigger: []f64, p: FisherParams) void {
+    const n = high.len;
+    const per = p.period;
+    const l = FISHER.lookback(p);
+    const nan = std.math.nan(f64);
+    const block = 64;
+    var arg: [block]f64 = undefined;
+    var lg: [block]f64 = undefined;
+    var smoothed: f64 = 0.0;
+    var prev_fish: f64 = 0.0;
+    var start: usize = 0;
+    while (start < n) : (start += block) {
+        const len = @min(block, n - start);
+        for (0..len) |j| {
+            const i = start + j;
+            if (i + 1 < per) {
+                arg[j] = 1.5;
+                continue;
+            }
+            const price = (high[i] + low[i]) / 2.0;
+            var highest = price;
+            var lowest = price;
+            var w = i + 1 - per;
+            while (w < i) : (w += 1) {
+                const t = (high[w] + low[w]) / 2.0;
+                if (t > highest) highest = t;
+                if (t < lowest) lowest = t;
+            }
+            const range = highest - lowest;
+            const ratio = if (!zeroScaled(range, @abs(highest) + @abs(lowest))) (price - lowest) / range else 0.5;
+            smoothed = @mulAdd(f64, 0.67, smoothed, @as(f64, 0.33) * 2.0 * (ratio - 0.5));
+            if (smoothed > 0.99) smoothed = 0.999;
+            if (smoothed < -0.99) smoothed = -0.999;
+            arg[j] = (1.0 + smoothed) / (1.0 - smoothed);
+        }
+        @memset(arg[len..], 1.5);
+        var q: usize = 0;
+        while (q < block) : (q += 4) {
+            const v: vmath.V = arg[q..][0..4].*;
+            lg[q..][0..4].* = vmath.log4(v);
+        }
+        for (0..len) |j| {
+            const i = start + j;
+            if (i + 1 < per) {
+                fish[i] = nan;
+                trigger[i] = nan;
+                continue;
+            }
+            const f = @mulAdd(f64, 0.5, lg[j], 0.5 * prev_fish);
+            const trig = prev_fish;
+            prev_fish = f;
+            if (i < l) {
+                fish[i] = nan;
+                trigger[i] = nan;
+            } else {
+                fish[i] = f;
+                trigger[i] = trig;
+            }
+        }
+    }
 }
 pub fn FisherStream(comptime T: type) type {
     return vs.Stream(T, FISHER);
@@ -592,7 +666,60 @@ pub fn psoLookback(p: PsoParams) Error!usize {
     return PSO.lookback(p);
 }
 pub fn pso(comptime T: type, high: []const T, low: []const T, close: []const T, out: []T, p: PsoParams) Error!usize {
+    if (T == f64) {
+        core.checkFloat(T);
+        try PSO.validate(p);
+        const n = high.len;
+        if (low.len != n or close.len != n or out.len != n) return error.BadParam;
+        psoRun(high, low, close, out, p);
+        return PSO.lookback(p);
+    }
     return vs.batch(T, PSO, p, .{ .high = high, .low = low, .close = close }, .{out});
+}
+
+/// The f64 batch of `PSO.step`, bitwise: the fast %K and the two EMAs of a block of bars first, then the
+/// block's `tanh` four lanes at a time (`vmath.tanh4`, bit for bit `xmath.tanh`).
+fn psoRun(high: []const f64, low: []const f64, close: []const f64, out: []f64, p: PsoParams) void {
+    const n = high.len;
+    const per = p.fastk;
+    var e1 = ema(p.ema, p.unstable) catch unreachable;
+    var e2 = ema(p.ema, p.unstable) catch unreachable;
+    const nan = std.math.nan(f64);
+    const block = 64;
+    var cs: [block]f64 = undefined;
+    var has: [block]bool = undefined;
+    var ts: [block]f64 = undefined;
+    var start: usize = 0;
+    while (start < n) : (start += block) {
+        const len = @min(block, n - start);
+        for (0..len) |j| {
+            const i = start + j;
+            has[j] = false;
+            cs[j] = 0.5;
+            if (i + 1 < per) continue;
+            var highest = high[i];
+            var lowest = low[i];
+            var w = i + 1 - per;
+            while (w < i) : (w += 1) {
+                if (high[w] > highest) highest = high[w];
+                if (low[w] < lowest) lowest = low[w];
+            }
+            const range = highest - lowest;
+            const fast_k = if (!zeroScaled(range, @abs(highest) + @abs(lowest))) (close[i] - lowest) / range * 100.0 else 50.0;
+            const nsk = 0.1 * (fast_k - 50.0);
+            const a = e1.step(NoSrc{}, nsk) orelse continue;
+            const c = e2.step(NoSrc{}, a) orelse continue;
+            has[j] = true;
+            cs[j] = 0.5 * c;
+        }
+        @memset(cs[len..], 0.5);
+        var q: usize = 0;
+        while (q < block) : (q += 4) {
+            const v: vmath.V = cs[q..][0..4].*;
+            ts[q..][0..4].* = vmath.tanh4(v);
+        }
+        for (0..len) |j| out[start + j] = if (has[j]) ts[j] else nan;
+    }
 }
 pub fn PsoStream(comptime T: type) type {
     return vs.Stream(T, PSO);
@@ -795,6 +922,8 @@ pub const WAVETREND = struct {
         return struct { wt1: T, wt2: T };
     }
     ch: usize,
+    avg: usize,
+    un: Unstable,
     esa: EmaCore,
     d: EmaCore,
     wt1: EmaCore,
@@ -802,6 +931,7 @@ pub const WAVETREND = struct {
     ring: mu.Ring,
     prev_ap: f64 = 0.0,
     prev_esa: f64 = 0.0,
+    slot: usize = 0, // where the ring's next push lands (`ring.n % signal`, kept without the division)
     n: usize = 0,
     pub fn validate(p: Params) Error!void {
         try core.checkPeriod(p.channel, 2);
@@ -823,6 +953,8 @@ pub const WAVETREND = struct {
         if (scratch.len < p.signal) return error.BadParam;
         return .{
             .ch = p.channel,
+            .avg = p.average,
+            .un = p.unstable,
             .esa = try ema(p.channel, p.unstable),
             .d = try ema(p.channel, p.unstable),
             .wt1 = try ema(p.average, p.unstable),
@@ -839,8 +971,41 @@ pub const WAVETREND = struct {
         const ci = if (scaled > 0.0) num / scaled else 0.0;
         const w1 = self.wt1.step(NoSrc{}, ci) orelse return null;
         self.ring.push(w1);
+        self.slot = if (self.slot + 1 == self.ring.buf.len) 0 else self.slot + 1;
         const w2 = self.sig.step(self.ring.view(), w1) orelse return null;
         return .{ .wt1 = w1, .wt2 = w2 };
+    }
+    /// True once every further `step` is `steadyStep` (past the first output: the three averages are bare recurrences
+    /// and the signal window is full).
+    pub fn steady(self: *const Self) bool {
+        return self.n > lookback(.{ .channel = self.ch, .average = self.avg, .signal = self.ring.buf.len, .unstable = self.un });
+    }
+    /// `step` once `steady()`, bitwise: the same operations, the signal average's ring read at the slot after the one
+    /// just written (the bar that leaves the window) instead of through a modulo.
+    pub inline fn steadyStep(self: *Self, _: anytype, b: In) Out {
+        const n_ap = self.n;
+        self.n += 1;
+        const ap = (b.high + b.low + b.close) / 3.0;
+        const e = self.esa.stepSteady(ap);
+        var num = ap - e;
+        if (n_ap >= self.ch and ap == self.prev_ap and self.esa.prev == self.prev_esa) num = 0.0;
+        const dv = self.d.stepSteady(@abs(num));
+        const scaled = 0.015 * dv;
+        const ci = if (scaled > 0.0) num / scaled else 0.0;
+        const w1 = self.wt1.stepSteady(ci);
+        const buf = self.ring.buf;
+        const s = self.slot;
+        buf[s] = w1;
+        self.ring.n += 1;
+        const next = if (s + 1 == buf.len) 0 else s + 1;
+        self.slot = next;
+        self.sig.n += 1;
+        self.sig.sum += w1;
+        const t = self.sig.sum;
+        self.sig.sum -= buf[next];
+        self.prev_ap = ap;
+        self.prev_esa = self.esa.prev;
+        return .{ .wt1 = w1, .wt2 = t / pf(self.sig.p) };
     }
     pub fn step(self: *Self, _: anytype, b: In) ?Out {
         const n_ap = self.n;
@@ -947,5 +1112,71 @@ test "apo / ppo: every MaType, batch == streaming, lookback == NaN lead" {
     inline for (comptime std.enums.values(MaType), 0..) |k, i| {
         try mu.checkCore(APO, .{ .fast = 3, .slow = 7, .kind = k }, 120, 100 + i);
         try mu.checkCore(PPO, .{ .fast = 3, .slow = 7, .kind = k }, 120, 200 + i);
+    }
+}
+
+test "fisher: the blocked f64 batch equals the core's steps bit for bit (flat stretches, small and large periods, unstable bars)" {
+    const th = @import("testhelp.zig");
+    var prng = std.Random.DefaultPrng.init(0xf15e);
+    const r = prng.random();
+    const n = 700;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: f64 = 100.0;
+    for (0..n) |i| {
+        if (i >= 300 and i < 380) {
+            // a flat stretch: the zero-range branch
+        } else {
+            c *= 1.0 + (r.float(f64) - 0.5) * 0.04;
+        }
+        h[i] = c * 1.001;
+        l[i] = c * 0.999;
+        if (i >= 300 and i < 380) {
+            h[i] = c;
+            l[i] = c;
+        }
+    }
+    const params = [_]FisherParams{ .{}, .{ .period = 2 }, .{ .period = 33, .unstable = .{ .bars = 7 } }, .{ .period = 10, .unstable = .auto4 } };
+    for (params) |p| {
+        var got = [2][n]f64{ undefined, undefined };
+        var want = [2][n]f64{ undefined, undefined };
+        const lb = try fisher(f64, &h, &l, &got[0], &got[1], p);
+        const lb2 = try vs.batch(f64, FISHER, p, .{ .high = @as([]const f64, &h), .low = @as([]const f64, &l) }, .{ @as([]f64, &want[0]), @as([]f64, &want[1]) });
+        try std.testing.expectEqual(lb2, lb);
+        for (0..n) |i| {
+            try std.testing.expect(th.sameBits(got[0][i], want[0][i]));
+            try std.testing.expect(th.sameBits(got[1][i], want[1][i]));
+        }
+    }
+}
+
+test "pso: the blocked f64 batch equals the core's steps bit for bit (flat stretches, periods, unstable bars)" {
+    const th = @import("testhelp.zig");
+    var prng = std.Random.DefaultPrng.init(0x9507);
+    const r = prng.random();
+    const n = 700;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: [n]f64 = undefined;
+    var m: f64 = 100.0;
+    for (0..n) |i| {
+        if (i < 300 or i >= 380) m *= 1.0 + (r.float(f64) - 0.5) * 0.04;
+        h[i] = m * 1.001;
+        l[i] = m * 0.999;
+        c[i] = l[i] + (h[i] - l[i]) * r.float(f64);
+        if (i >= 300 and i < 380) {
+            h[i] = m;
+            l[i] = m;
+            c[i] = m;
+        }
+    }
+    const params = [_]PsoParams{ .{}, .{ .fastk = 1, .ema = 1 }, .{ .fastk = 20, .ema = 3, .unstable = .{ .bars = 7 } }, .{ .unstable = .auto4 } };
+    for (params) |p| {
+        var got: [n]f64 = undefined;
+        var want: [n]f64 = undefined;
+        const lb = try pso(f64, &h, &l, &c, &got, p);
+        const lb2 = try vs.batch(f64, PSO, p, .{ .high = @as([]const f64, &h), .low = @as([]const f64, &l), .close = @as([]const f64, &c) }, .{@as([]f64, &want)});
+        try std.testing.expectEqual(lb2, lb);
+        for (0..n) |i| try std.testing.expect(th.sameBits(got[i], want[i]));
     }
 }

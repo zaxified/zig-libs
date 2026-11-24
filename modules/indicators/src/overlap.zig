@@ -7,6 +7,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const smooth = @import("smooth.zig");
 const window = @import("window.zig");
+const vmath = @import("vmath.zig");
 const hist = @import("hist.zig");
 const th = @import("testhelp.zig");
 const Error = core.Error;
@@ -302,26 +303,50 @@ fn framaRun(high: []const f64, low: []const f64, out: []f64, p: FramaParams) voi
         }
         out[i] = std.math.nan(f64);
     }
+    // The ranges of a block of bars first (the automatons do not depend on the average), then the block's
+    // `exp(scale * log(q))` four lanes at a time (`vmath.log4` / `exp4`, bit for bit `@log` / `@exp`), then the
+    // recurrence of the average.
+    const block = 64;
+    var qs: [block]f64 = undefined;
+    var prices: [block]f64 = undefined;
+    var live: [block]bool = undefined;
+    var alphas: [block]f64 = undefined;
     var i = warm;
-    while (i < n) : (i += 1) {
-        const hi1 = h1.bar(f64, high, i);
-        const lo1 = l1.bar(f64, low, i);
-        const hi2 = h2.bar(f64, high, i - half);
-        const lo2 = l2.bar(f64, low, i - half);
-        const price = (high[i] + low[i]) / 2.0;
-        const r1 = hi1 - lo1;
-        const r2 = hi2 - lo2;
-        const e1: V = .{ hi1, -lo1 };
-        const e2: V = .{ hi2, -lo2 };
-        const e = @select(f64, e1 > e2, e1, e2);
-        const r = e[0] - (-e[1]);
-        if (r1 > 0.0 and r2 > 0.0 and r1 + r2 > r) {
-            const alpha = @exp(frama_scale * @log((r1 + r2) / r));
-            prev = @mulAdd(f64, 1.0 - alpha, prev, alpha * price);
-        } else {
-            prev = price;
+    while (i < n) {
+        const len = @min(block, n - i);
+        for (0..len) |j| {
+            const k = i + j;
+            const hi1 = h1.bar(f64, high, k);
+            const lo1 = l1.bar(f64, low, k);
+            const hi2 = h2.bar(f64, high, k - half);
+            const lo2 = l2.bar(f64, low, k - half);
+            prices[j] = (high[k] + low[k]) / 2.0;
+            const r1 = hi1 - lo1;
+            const r2 = hi2 - lo2;
+            const e1: V = .{ hi1, -lo1 };
+            const e2: V = .{ hi2, -lo2 };
+            const e = @select(f64, e1 > e2, e1, e2);
+            const r = e[0] - (-e[1]);
+            live[j] = r1 > 0.0 and r2 > 0.0 and r1 + r2 > r;
+            qs[j] = if (live[j]) (r1 + r2) / r else 1.5;
         }
-        out[i] = if (i >= lb) prev else std.math.nan(f64);
+        @memset(qs[len..], 1.5);
+        var q: usize = 0;
+        while (q < block) : (q += 4) {
+            const v: vmath.V = qs[q..][0..4].*;
+            alphas[q..][0..4].* = vmath.exp4(vmath.log4(v) * @as(vmath.V, @splat(frama_scale)));
+        }
+        for (0..len) |j| {
+            const k = i + j;
+            if (live[j]) {
+                const alpha = alphas[j];
+                prev = @mulAdd(f64, 1.0 - alpha, prev, alpha * prices[j]);
+            } else {
+                prev = prices[j];
+            }
+            out[k] = if (k >= lb) prev else std.math.nan(f64);
+        }
+        i += len;
     }
 }
 pub fn FramaStream(comptime T: type) type {
