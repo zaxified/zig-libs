@@ -41,7 +41,8 @@ test "Test Case 1: the HSS signature verifies" {
     try std.testing.expectEqual(@as(u8, 2), pk.levels);
     try std.testing.expectEqual(lms.ParamSet.sha256_m32_h5, pk.top.lms);
     try std.testing.expectEqual(lms.OtsParamSet.sha256_n32_w8, pk.top.ots);
-    try std.testing.expectEqualSlices(u8, &tc1_pub, &pk.toBytes());
+    var enc_1: [@TypeOf(pk).max_encoded_len]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &tc1_pub, pk.encode(&enc_1));
     try std.testing.expect(pk.verify(&tc1_msg, &tc1_sig));
     // The LMS layer alone: the final signature under the level-1 key.
     const l1 = tc1_sig[4 + 1292 ..][0..56];
@@ -76,14 +77,16 @@ test "Test Case 2: both public keys regenerate from the RFC's SEED and I (Append
     var sk: lms.SecretKey = undefined;
     try lms.SecretKey.init(&sk, gpa, &levels, &seed0, id0, null);
     defer sk.deinit();
-    try std.testing.expectEqualSlices(u8, &tc2_pub, &sk.publicKey().toBytes());
+    var enc_2: [@TypeOf(sk.publicKey()).max_encoded_len]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &tc2_pub, sk.publicKey().encode(&enc_2));
 
     // Second-level tree (H5/W8): its public key is the one inside the signature.
     var t1: lms.Tree = undefined;
     try lms.Tree.init(&t1, gpa, .sha256_m32_h5, .sha256_n32_w8, id1, &seed1);
     defer t1.deinit();
     const l1 = tc2_sig[4 + 2508 ..][0..56];
-    try std.testing.expectEqualSlices(u8, l1, &t1.publicKey().toBytes());
+    var enc_3: [@TypeOf(t1.publicKey()).max_encoded_len]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, l1, t1.publicKey().encode(&enc_3));
 
     // sig[0]: leaf 3 of the top tree signs the level-1 public key. Same q,
     // message and RFC randomizer C => identical bytes, auth path included.

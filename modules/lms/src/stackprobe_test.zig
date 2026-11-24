@@ -143,19 +143,19 @@ fn otsNeedles(n: *Needles, ots: lms.OtsParamSet, id: *const [16]u8, q: u32, seed
     const top: u16 = (@as(u16, 1) << w) - 1;
     var s: [34]u8 = undefined;
     if (msg) |m| {
-        const c = core.deriveRandomizer(id, q, seed);
-        s = core.withChecksum(ots, &core.messageHash(id, q, &c, m));
+        const c = core.deriveRandomizer(ots.hashFn(), id, q, seed);
+        s = core.withChecksum(ots, &core.messageHash(ots.hashFn(), id, q, &c, m));
     }
     var i: u16 = 0;
     while (i < ots.p()) : (i += 1) {
         const limit: u16 = if (msg != null) core.coef(&s, i, w) else top;
         var tmp: [32]u8 = undefined;
-        core.deriveX(&tmp, id, q, i, seed);
+        core.deriveX(ots.hashFn(), &tmp, id, q, i, seed);
         // a signature with a_i == 0 publishes x itself
         if (limit > 0) n.addImage("x_q[i]", &tmp);
         var j: u16 = 0;
         while (j + 1 < limit) : (j += 1) {
-            tmp = core.chainHash(id, q, i, @intCast(j), &tmp);
+            tmp = core.chainHash(ots.hashFn(), id, q, i, @intCast(j), &tmp);
             n.addFirst("chain", &tmp);
         }
     }
@@ -457,8 +457,9 @@ test "STACKPROBE: no seed, OTS private value or chain value on the dead stack or
         try skInit(&probe_sk, key_fba.allocator(), &cur_seed);
         defer probe_sk.deinit();
         _ = try probe_sk.sign(message, &sig_buf);
-        const child_pk = probe_sk.pubs[1].toBytes();
-        otsNeedles(n, ots_set, &cur_id, 0, &cur_seed, &child_pk);
+        var child_pk_buf: [@TypeOf(probe_sk.pubs[1]).max_encoded_len]u8 = undefined;
+        const child_pk = probe_sk.pubs[1].encode(&child_pk_buf);
+        otsNeedles(n, ots_set, &cur_id, 0, &cur_seed, child_pk);
         otsNeedles(n, ots_set, &child.id, 0, &child.seed, message);
         n.sort();
         bad += try runProbe("SecretKey.init + SigningKey.init/sign/deinit (HSS 2 levels, builds child)", callHssBuild, n, &heap_buf);

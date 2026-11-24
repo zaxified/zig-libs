@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 //! lms — LMS and HSS (RFC 8554, Leighton-Micali hash-based signatures):
-//! **stateful** post-quantum signatures over SHA-256, pure Zig over
+//! **stateful** post-quantum signatures over SHA-256 or SHAKE256, pure Zig over
 //! `std.crypto`. LMS is the tree scheme, HSS the hierarchy of up to eight
 //! LMS trees; both are the NIST SP 800-208 firmware-signing scheme (and, in
 //! its SHA-256/256 form with L = 1, CNSA 2.0's).
 //!
-//! Parameter sets: the RFC's SHA-256, n = m = 32 sets — LMS H5 / H10 / H15 /
-//! H20 / H25 (typecodes 5..9) and LM-OTS W1 / W2 / W4 / W8 (1..4). Any mix is
-//! accepted per HSS level.
+//! Parameter sets: RFC 8554's SHA-256, n = m = 32 sets — LMS H5 / H10 / H15 /
+//! H20 / H25 (typecodes 5..9) and LM-OTS W1 / W2 / W4 / W8 (1..4) — and RFC
+//! 9858's SHA-256/192, SHAKE256/256 and SHAKE256/192 sets (LMS 10..24, LM-OTS
+//! 5..16; NIST SP 800-208). Within one LMS key the LMS and LM-OTS sets use the
+//! same hash and length; levels of an HSS key may differ. A 24-byte set's SEED
+//! is the first 24 bytes of the 32-byte seed.
 //!
 //! What is here: RFC 8554 Algorithm 1–4b (LM-OTS), 5/6/6a (LMS), 7/8/§6.3
 //! (HSS), Appendix A pseudorandom key generation from a `(SEED, I)` pair,
@@ -31,14 +34,17 @@
 //! The LM-OTS randomizer `C` and the lower HSS trees are derived from SEED
 //! (see `core.deriveRandomizer`, `sign.zig`).
 //!
-//! Validated against RFC 8554 Appendix F Test Cases 1 and 2 (verification of
+//! Validated against RFC 9858 Appendix A Test Cases 1–4 (SHA-256/192,
+//! SHAKE256/192 and SHAKE256/256 H5 keys regenerated and signatures reproduced;
+//! the SHA-256/192 H20/W4 case verified, its LM-OTS part reproduced) and RFC
+//! 8554 Appendix F Test Cases 1 and 2 (verification of
 //! both HSS signatures; for Test Case 2 also regeneration of both public
 //! keys from the RFC's SEED and `I`, and byte-exact reproduction of both LMS
 //! signatures given the RFC's randomizer `C`). LM-OTS W1 and W2 have no RFC
 //! vector and are covered by round trips only.
 //!
 //! Zig std GAP: yes — std.crypto has no stateful hash-based signature (LMS
-//! or XMSS). Recon: `std.crypto.hash.sha2.Sha256` for H, `std.mem`
+//! or XMSS). Recon: `std.crypto.hash.sha2.Sha256` / `sha3.Shake256` for H, `std.mem`
 //! big-endian helpers for `u32str`/`u16str`.
 
 const std = @import("std");
@@ -52,7 +58,7 @@ pub const sign = @import("sign.zig");
 pub const meta = .{
     // The module catalog's one-line entry; README.md's table is rendered from
     // it by `zig build gen-catalog`.
-    .doc = "LMS / HSS (RFC 8554), SHA-256 — **stateful** hash-based signatures (SP 800-208, CNSA 2.0). A leaf signs once; `sign` advances the position first.",
+    .doc = "LMS / HSS (RFC 8554, RFC 9858), SHA-256 / SHA-256/192 / SHAKE256 — **stateful** hash-based signatures (SP 800-208, CNSA 2.0). A leaf signs once; `sign` advances the position first.",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -60,11 +66,13 @@ pub const meta = .{
     // No globals. A bare `SecretKey`/`LmsSecretKey` is caller-synchronised (two
     // racing `sign` calls could reuse a position); `SigningKey` locks.
     .concurrency = .reentrant,
-    .model_after = "RFC 8554 (LMS/HSS); RFC 8554 Appendix F as KAT source",
-    .deps = .{}, // std only (SHA-256)
+    .model_after = "RFC 8554 (LMS/HSS), RFC 9858 (additional parameter sets); RFC 8554 Appendix F and RFC 9858 Appendix A as KAT sources",
+    .deps = .{}, // std only (SHA-256, SHAKE256)
 };
 
 pub const n = params.n;
+pub const Hash = params.Hash;
+pub const HashFn = params.HashFn;
 pub const id_len = params.id_len;
 pub const max_levels = params.max_levels;
 
@@ -98,7 +106,7 @@ pub fn hssSignatureLength(levels: []const Level) usize {
     var len: usize = 4;
     for (levels, 0..) |lv, i| {
         len += lmsSignatureLength(lv.lms, lv.ots);
-        if (i + 1 < levels.len) len += LmsPublicKey.encoded_len;
+        if (i + 1 < levels.len) len += LmsPublicKey.encodedLenFor(levels[i + 1].lms);
     }
     return len;
 }
@@ -130,10 +138,12 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [96]u8 = undefined;
     const len = smith.slice(&buf);
     if (HssPublicKey.parse(buf[0..len])) |pk| {
-        _ = pk.toBytes();
+        var e: [HssPublicKey.max_encoded_len]u8 = undefined;
+        _ = pk.encode(&e);
     } else |_| {}
     if (LmsPublicKey.parse(buf[0..len])) |pk| {
-        _ = pk.toBytes();
+        var e: [LmsPublicKey.max_encoded_len]u8 = undefined;
+        _ = pk.encode(&e);
     } else |_| {}
 }
 
@@ -174,8 +184,8 @@ const Corpus = struct {
         self.push(&p2, &msg, &sig);
         self.push(&pk, &msg, sig[0 .. sig.len - 1]);
         // LMS only: level-1 key = bytes 4+1292 .. of the signature.
-        const l1 = sig[4 + 1292 ..][0..LmsPublicKey.encoded_len];
-        self.push(l1, &msg, sig[4 + 1292 + LmsPublicKey.encoded_len ..]);
+        const l1 = sig[4 + 1292 ..][0..LmsPublicKey.max_encoded_len];
+        self.push(l1, &msg, sig[4 + 1292 + LmsPublicKey.max_encoded_len ..]);
         return self.entries[0..self.count];
     }
 };
@@ -212,6 +222,8 @@ test {
     _ = params;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("kat_vectors_9858.zig");
+    _ = @import("kat9858_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("unit_test.zig");
     _ = @import("stackprobe_test.zig");

@@ -88,8 +88,8 @@ const tc_pk = kat.bytes(kat.tc1_pub);
 const tc_msg = kat.bytes(kat.tc1_msg);
 const tc_sig = kat.bytes(kat.tc1_sig);
 /// The LMS-only form of Test Case 1: the level-1 key and the final LMS signature.
-const lms_pk = tc_sig[4 + 1292 ..][0..core.LmsPublicKey.encoded_len].*;
-const lms_sig = tc_sig[4 + 1292 + core.LmsPublicKey.encoded_len ..].*;
+const lms_pk = tc_sig[4 + 1292 ..][0..core.LmsPublicKey.max_encoded_len].*;
+const lms_sig = tc_sig[4 + 1292 + core.LmsPublicKey.max_encoded_len ..].*;
 
 const VerifyMark = Marker(enum { hss_genuine_accepted, lms_genuine_accepted, hss_damaged_refused, lms_damaged_refused, wild_refused });
 
@@ -159,64 +159,81 @@ fn fuzzParse(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     } else len = src.slice(&buf);
     if (core.HssPublicKey.parse(buf[0..len])) |pk| {
         ParseMark.mark(.hss_accepted);
-        if (!std.mem.eql(u8, &pk.toBytes(), buf[0..len])) return error.NonCanonicalHssKeyAccepted;
+        var enc_1: [@TypeOf(pk).max_encoded_len]u8 = undefined;
+        if (!std.mem.eql(u8, pk.encode(&enc_1), buf[0..len])) return error.NonCanonicalHssKeyAccepted;
     } else |_| ParseMark.mark(.hss_refused);
     if (core.LmsPublicKey.parse(buf[0..len])) |pk| {
         ParseMark.mark(.lms_accepted);
-        if (!std.mem.eql(u8, &pk.toBytes(), buf[0..len])) return error.NonCanonicalLmsKeyAccepted;
+        var enc_2: [@TypeOf(pk).max_encoded_len]u8 = undefined;
+        if (!std.mem.eql(u8, pk.encode(&enc_2), buf[0..len])) return error.NonCanonicalLmsKeyAccepted;
     } else |_| ParseMark.mark(.lms_refused);
 }
 
 // ── sign + verify with this module's own signer ─────────────────────────────
 
-const ots_sets = [_]params.OtsParamSet{ .sha256_n32_w1, .sha256_n32_w2, .sha256_n32_w4, .sha256_n32_w8 };
-var trees: [4]?sign.Tree = @splat(null);
-const SignMark = Marker(enum { w1, w2, w4, w8, genuine_accepted, flipped_refused, truncated_refused, wrong_message_refused, wrong_root_refused });
+/// Every Winternitz width under SHA-256/256, and one set of each RFC 9858
+/// hash (SHA-256/192, SHAKE256/256, SHAKE256/192), all H5.
+const sets = [_]params.Level{
+    .{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w1 },
+    .{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w2 },
+    .{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w4 },
+    .{ .lms = .sha256_m32_h5, .ots = .sha256_n32_w8 },
+    .{ .lms = .sha256_m24_h5, .ots = .sha256_n24_w2 },
+    .{ .lms = .shake_m32_h5, .ots = .shake_n32_w4 },
+    .{ .lms = .shake_m24_h5, .ots = .shake_n24_w1 },
+};
+var trees: [sets.len]?sign.Tree = @splat(null);
+const SignMark = Marker(enum { w1, w2, w4, w8, sha256_n24, shake_n32, shake_n24, genuine_accepted, flipped_refused, truncated_refused, wrong_message_refused, wrong_root_refused });
 
 /// A leaf-`q` signature from `Tree.sign` verifies under the tree's public key;
 /// a flipped octet, a truncation, another message and another root do not.
 fn fuzzLmsSignVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
-    const which = src.index(4);
+    const which = src.index(sets.len);
     if (trees[which] == null) {
         var seed: [params.n]u8 = @splat(@intCast(which + 1));
         trees[which] = @as(sign.Tree, undefined);
-        try sign.Tree.init(&trees[which].?, std.heap.page_allocator, .sha256_m32_h5, ots_sets[which], @splat(@intCast(0x40 + which)), &seed); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
+        try sign.Tree.init(&trees[which].?, std.heap.page_allocator, sets[which].lms, sets[which].ots, @splat(@intCast(0x40 + which)), &seed); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     }
     const tree = &trees[which].?;
     switch (which) {
         0 => SignMark.mark(.w1),
         1 => SignMark.mark(.w2),
         2 => SignMark.mark(.w4),
-        else => SignMark.mark(.w8),
+        3 => SignMark.mark(.w8),
+        4 => SignMark.mark(.sha256_n24),
+        5 => SignMark.mark(.shake_n32),
+        else => SignMark.mark(.shake_n24),
     }
     var mbuf: [40]u8 = undefined;
     const ml = src.index(mbuf.len + 1);
     src.bytes(mbuf[0..ml]);
     const msg = mbuf[0..ml];
     const q = src.valueRangeAtMost(u32, 0, 31);
-    const sig_len = core.lmsSignatureLength(.sha256_m32_h5, ots_sets[which]);
+    const sig_len = core.lmsSignatureLength(sets[which].lms, sets[which].ots);
     var sig: [core.max_lms_signature_length]u8 = undefined;
     _ = try tree.sign(q, msg, sig[0..sig_len]);
-    const pk = tree.publicKey().toBytes();
-    if (!core.lmsVerify(&pk, msg, sig[0..sig_len])) return error.GenuineSignatureRefused;
+    var pk_buf: [@TypeOf(tree.publicKey()).max_encoded_len]u8 = undefined;
+    const pk = tree.publicKey().encode(&pk_buf);
+    if (!core.lmsVerify(pk, msg, sig[0..sig_len])) return error.GenuineSignatureRefused;
     SignMark.mark(.genuine_accepted);
 
     sig[src.index(sig_len)] ^= src.valueRangeAtMost(u8, 1, 255);
-    if (core.lmsVerify(&pk, msg, sig[0..sig_len])) return error.FlippedSignatureVerified;
+    if (core.lmsVerify(pk, msg, sig[0..sig_len])) return error.FlippedSignatureVerified;
     SignMark.mark(.flipped_refused);
     // (The flip stays: the truncation below is of a damaged copy, which must be refused all the more.)
-    if (core.lmsVerify(&pk, msg, sig[0..src.index(sig_len)])) return error.TruncatedSignatureVerified;
+    if (core.lmsVerify(pk, msg, sig[0..src.index(sig_len)])) return error.TruncatedSignatureVerified;
     SignMark.mark(.truncated_refused);
 
     _ = try tree.sign(q, msg, sig[0..sig_len]);
     var m2: [41]u8 = undefined;
     @memcpy(m2[0..ml], msg);
     m2[ml] = src.value(u8);
-    if (core.lmsVerify(&pk, m2[0 .. ml + 1], sig[0..sig_len])) return error.OtherMessageVerified;
+    if (core.lmsVerify(pk, m2[0 .. ml + 1], sig[0..sig_len])) return error.OtherMessageVerified;
     SignMark.mark(.wrong_message_refused);
-    var pk2 = pk;
-    pk2[24 + src.index(32)] ^= src.valueRangeAtMost(u8, 1, 255);
-    if (core.lmsVerify(&pk2, msg, sig[0..sig_len])) return error.OtherRootVerified;
+    var pk2_buf = pk_buf;
+    const pk2 = pk2_buf[0..pk.len];
+    pk2[24 + src.index(pk.len - 24)] ^= src.valueRangeAtMost(u8, 1, 255);
+    if (core.lmsVerify(pk2, msg, sig[0..sig_len])) return error.OtherRootVerified;
     SignMark.mark(.wrong_root_refused);
 }
 
@@ -248,20 +265,21 @@ fn fuzzHssSignVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!v
         },
         else => return e,
     };
-    const pk = hss_key.?.publicKey().toBytes();
-    if (!core.hssVerify(&pk, msg, got)) return error.GenuineSignatureRefused;
+    var pk_buf: [@TypeOf(hss_key.?.publicKey()).max_encoded_len]u8 = undefined;
+    const pk = hss_key.?.publicKey().encode(&pk_buf);
+    if (!core.hssVerify(pk, msg, got)) return error.GenuineSignatureRefused;
     HssMark.mark(.genuine_accepted);
 
     var m2: [41]u8 = undefined;
     @memcpy(m2[0..ml], msg);
     m2[ml] = src.value(u8);
-    if (core.hssVerify(&pk, m2[0 .. ml + 1], got)) return error.OtherMessageVerified;
+    if (core.hssVerify(pk, m2[0 .. ml + 1], got)) return error.OtherMessageVerified;
     HssMark.mark(.wrong_message_refused);
 
     got[src.index(got.len)] ^= src.valueRangeAtMost(u8, 1, 255);
-    if (core.hssVerify(&pk, msg, got)) return error.FlippedSignatureVerified;
+    if (core.hssVerify(pk, msg, got)) return error.FlippedSignatureVerified;
     HssMark.mark(.flipped_refused);
-    if (core.hssVerify(&pk, msg, got[0..src.index(got.len)])) return error.TruncatedSignatureVerified;
+    if (core.hssVerify(pk, msg, got[0..src.index(got.len)])) return error.TruncatedSignatureVerified;
     HssMark.mark(.truncated_refused);
 }
 
@@ -295,6 +313,6 @@ test "fuzz driver: LMS_FUZZ (HSS sign + verify)" {
 test "fuzz harness: lms, reaches every outcome" {
     try VerifyMark.reach(fuzzVerify, "lms-verify", 400);
     try ParseMark.reach(fuzzParse, "lms-parse", 400);
-    try SignMark.reach(fuzzLmsSignVerify, "lms-sign-verify", 40);
+    try SignMark.reach(fuzzLmsSignVerify, "lms-sign-verify", 80);
     try HssMark.reach(fuzzHssSignVerify, "hss-sign-verify", 20);
 }

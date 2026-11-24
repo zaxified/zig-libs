@@ -1,23 +1,24 @@
 # lms
 
 LMS and HSS (RFC 8554, Leighton-Micali hash-based signatures): **stateful**
-post-quantum signatures whose security rests on SHA-256 alone. Pure Zig over
+post-quantum signatures whose security rests on the hash alone (SHA-256 or SHAKE256). Pure Zig over
 `std.crypto`. This is the scheme NIST SP 800-208 and CNSA 2.0 approve for
 firmware signing (`slhdsa` is the stateless alternative; `xmss` the other
 stateful one). Small public key (60 bytes), 1.3 - 9 KB signatures, and a private
 key that is a **consumable**: every signature spends one one-time leaf, and using
 a leaf twice breaks the scheme.
 
-- **Parameter sets:** LMS `H5 / H10 / H15 / H20 / H25` (typecodes 5..9) and LM-OTS
-  `W1 / W2 / W4 / W8` (1..4), SHA-256, n = m = 32, any mix per level; HSS with
-  `L` = 1..8 levels. Not implemented: the SHA-256/192 and SHAKE sets (see SPEC.md).
+- **Parameter sets:** LMS `H5 / H10 / H15 / H20 / H25` and LM-OTS `W1 / W2 / W4 / W8`
+  over SHA-256 (n = m = 32, RFC 8554 typecodes) and RFC 9858's SHA-256/192, SHAKE256/256
+  and SHAKE256/192 (n = m = 24 or 32); one hash per LMS key, any mix across HSS levels
+  `L` = 1..8. A 24-byte set's SEED is the first 24 bytes of the 32-byte seed.
 - **Operations:** `hssVerify` / `lmsVerify` (no allocation, `false` for anything
   malformed), key generation from a `(SEED, I)` pair (RFC 8554 Appendix A), and
   `sign`, which advances the position **before** it produces a signature and
   returns `error.KeyExhausted` at the end.
-- **Model after:** RFC 8554, clean-room; validated on RFC 8554 Appendix F (both
-  HSS signatures verify, and Test Case 2's public keys and signatures are
-  reproduced byte for byte). See `NOTICE`.
+- **Model after:** RFC 8554 and RFC 9858, clean-room; validated on RFC 8554 Appendix F
+  (both HSS signatures verify, and Test Case 2's public keys and signatures are
+  reproduced byte for byte) and RFC 9858 Appendix A (all four cases). See `NOTICE`.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no globals; a bare `SecretKey` is
   caller-synchronised, `SigningKey` locks). **Deps:** none (std SHA-256).
 
@@ -36,11 +37,12 @@ var sk: lms.SecretKey = undefined;
 try lms.SecretKey.init(&sk, gpa, &levels, &seed, id, null);
 defer sk.deinit(); // wipes the seeds
 
-const pk = sk.publicKey().toBytes(); // 60 bytes: ship this
+var pk_buf: [lms.HssPublicKey.max_encoded_len]u8 = undefined;
+const pk = sk.publicKey().encode(&pk_buf); // 60 bytes (52 for a 24-byte set): ship this
 const buf = try gpa.alloc(u8, sk.signatureLength());
 const sig = try sk.sign(message, buf); // advances the position FIRST; PERSIST it!
 
-const ok = lms.hssVerify(&pk, message, sig); // on the device: no allocation
+const ok = lms.hssVerify(pk, message, sig); // on the device: no allocation
 ```
 
 **STATEFUL-KEY HAZARD.** `sign` mutates the key's position. Make the new position

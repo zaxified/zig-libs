@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-11-20 (214/221, 7 eq) · src 32409fa9c08b9790
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `lms-sign-verify` at scale 100 = 2,000 runs and `hss-sign-verify` at scale 200 = 1,000 runs, each a real signature, LMS_FUZZ) · ct 2026-10-10 (ctgrind: seed through LMS H5/W4 and 2-level HSS keygen + sign; `lms` 4 / `hss` 6 in-file = chain lengths from the message digest over the PUBLISHED randomizer C, an artefact)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `lms-sign-verify` at scale 100 = 2,000 runs and `hss-sign-verify` at scale 200 = 1,000 runs, each a real signature, LMS_FUZZ) · ct 2026-10-10 (ctgrind: seed through LMS H5/W4 and 2-level HSS keygen + sign; `lms` 4 / `hss` 4 in-file (6 before 2026-11-23: two inlined copies of the same loop) = chain lengths from the message digest over the PUBLISHED randomizer C, an artefact)
 **Performance:** not measured
 
 **Known defects:** none recorded
@@ -42,9 +42,9 @@ in the same collection; verification is allocation-free and total (every length 
 typecode checked before it indexes; a fuzz harness with a real-signature corpus);
 byte-exact against the RFC's Appendix F for verification, key regeneration and signature
 reproduction; the `SigningKey` handle writes the next position before any signature byte
-exists and has a lock and a copy guard; all HSS levels 1..8 with any parameter mix.
-**Where we are behind:** SHA-256/256 sets only (no SHA-256/192, no SHAKE256 sets — SP
-800-208 and the later additional-parameter-sets RFC); single-threaded key generation
+exists and has a lock and a copy guard; all HSS levels 1..8 with any parameter mix; every
+RFC 9858 set (SHA-256/192, SHAKE256/256, SHAKE256/192), byte-exact against its Appendix A.
+**Where we are behind:** single-threaded key generation
 (H20 takes hours, H25 days); no serialisation of the secret key beyond `(SEED, I,
 levels, position)`, which is deliberate but means every restart rebuilds the trees; no
 RFC vector for W1 and W2; never run against a foreign implementation as a black-box
@@ -139,6 +139,16 @@ scheme's security argument collapses per leaf, not per signature (RFC 8554 §5.4
 
 ## Validation — what is byte-exact and what is round-trip
 
+RFC 9858 Appendix A, transcribed by script into `src/kat_vectors_9858.zig`, tested in
+`src/kat9858_test.zig`: Test Cases 1 (SHA-256/192 H5/W8), 2 (SHAKE256/192 H5/W8) and 3
+(SHAKE256/256 H5/W8; the RFC titles it "SHA-256/256", its typecodes are the SHAKE ones)
+regenerate the public key from SEED and I and reproduce the LMS signature byte for byte
+with the RFC's `C`; Test Case 4 (SHA-256/192 H20/W4) verifies and its LM-OTS signature is
+reproduced from SEED, I and `C` (the 2^20-leaf tree is not rebuilt in a test). All four
+verify through HSS and refuse a flipped byte and a shortened message. Test Case 1's
+message bytes read "SHA256-192" where the RFC's ASCII column prints "SHA-256/192"; the hex
+is authoritative. SHA-256/192 is SHA-256 truncated (§2.1's "abc" vector is a test).
+
 RFC 8554 Appendix F, transcribed by script from the RFC text into `src/kat_vectors.zig`
 (each string is the in-order concatenation of the RFC's field values; sizes are asserted):
 
@@ -187,7 +197,7 @@ and every cached node against §5.3's recursive definition.
   the module's frames nor the caller's hold a copy. The secret-touching bodies (tree build,
   `Tree.sign` / `signWithRandomizer`, HSS `ensureTrees` with the child-seed derivation) run
   one frame down (`burn.zig`) and the stack they dirtied is zeroed after them; sizes are
-  measured (4 / 2 / 4 KiB, ReleaseFast). `core.deriveX` (the OTS private value `x_q[i]`)
+  measured (8 / 2 / 8 KiB, ReleaseFast). `core.deriveX` (the OTS private value `x_q[i]`)
   returns through an out-param too. `Tree.deinit` and `SecretKey.deinit` wipe the seeds;
   the node cache and the certificates are public hashes and are freed without wiping
   (the probe scans the freed heap to confirm). `SigningKey.init` moves the key from
@@ -207,9 +217,11 @@ and every cached node against §5.3's recursive definition.
 - **`OutOfMemory` while building a tree burns no leaf** (the trees are built before the
   position moves); a hook error likewise. A process killed after the hook returned and
   before the signature was delivered wastes that leaf — the safe direction.
-- **Unsupported typecodes** (0, the SHA-256/192 and SHAKE sets, anything unassigned) are
+- **Unsupported typecodes** (0, anything neither RFC 8554 nor RFC 9858 assigns) are
   `UnsupportedLmsType` / `UnsupportedOtsType` at parse and `false` at verify, never a
-  guessed layout.
+  guessed layout. An LMS key whose LMS and LM-OTS sets differ in hash or length is
+  `UnsupportedOtsType` too (one `H` per key, RFC 9858 §5); an HSS level list with such a
+  pair is `InvalidLevels` at `SecretKey.init`.
 
 ## Verification
 
@@ -265,13 +277,6 @@ and every cached node against §5.3's recursive definition.
 
 ## Backlog / deferred
 
-- **SHA-256/192 and SHAKE256 parameter sets (NIST SP 800-208; RFC 9858, October 2025, whose
-  Appendix A has four test cases with SEED and I: SHA-256/192 W8 and W4, SHAKE256/192,
-  SHAKE256/256)** *(survey 2026-09-30)*. hbs-lms-rust and
-  cisco/hash-sigs offer sets beyond the RFC 8554 SHA-256/256 ones *(inferred)*; a policy
-  that mandates 192-bit or SHAKE cannot use this module. Moderate: `n`, `m` and the hash
-  are module constants (`params.zig`, `core.zig`) and would become parameters; needs the
-  new sets' KATs from the standard, not from an implementation. Pure Zig.
 - **Parallel and hardware-hash key generation** *(survey 2026-09-30)*. cisco/hash-sigs
   threads key generation *(inferred)*; here H20 takes hours. Splitting `subtreeRoot` per
   worker is straightforward (each height-`c` subtree is independent) and `std.Io` group

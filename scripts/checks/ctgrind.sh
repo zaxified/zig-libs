@@ -316,7 +316,7 @@ declare -A TARGETS=(
     # ── 2026-10-10: ct-wave: SHA-2 message as the secret, HMAC over sha2 ──
     [sha2]="hash hmac"
     # ── 2026-10-10: ct-wave: LMS/HSS seed ──
-    [lms]="lms hss"
+    [lms]="lms hss shake n24"
     # ── 2026-10-10: ct-wave: XMSS SK_SEED/SK_PRF ──
     [xmss]="sign"
     # ── 2026-10-10: ct-wave: GOOSE/SV MAC keys ──
@@ -873,6 +873,8 @@ declare -A PATTERN=(
     [sha2/hmac]='root[.]zig'
     [lms/lms]='core[.]zig|sign[.]zig|params[.]zig|root[.]zig|burn[.]zig'
     [lms/hss]='core[.]zig|sign[.]zig|params[.]zig|root[.]zig|burn[.]zig'
+    [lms/shake]='core[.]zig|sign[.]zig|params[.]zig|root[.]zig|burn[.]zig'
+    [lms/n24]='core[.]zig|sign[.]zig|params[.]zig|root[.]zig|burn[.]zig'
     [xmss/sign]='root[.]zig|burn[.]zig'
     [iec62351/mac]='goose[.]zig|root[.]zig|burn[.]zig'
     [opcua/kdf]='security[.]zig|burn[.]zig'
@@ -1299,6 +1301,8 @@ declare -A LABEL=(
     [sha2/hmac]='sha2 HMAC-SHA256/512 over sha2 (key+message tainted)'
     [lms/lms]='lms H5/W4 keygen+sign (seed tainted)'
     [lms/hss]='lms HSS 2-level keygen+sign (seed tainted)'
+    [lms/shake]='lms SHAKE256/256 H5/W4 keygen+sign (seed tainted)'
+    [lms/n24]='lms SHA-256/192 H5/W4 keygen+sign (seed tainted)'
     [xmss/sign]='xmss h4 keyGen+5 signs (SK_SEED+SK_PRF tainted)'
     [iec62351/mac]='iec62351 GOOSE computeMac/verifyMac all algs (key tainted)'
     [opcua/kdf]='opcua deriveKeys P_SHA256 (nonces tainted)'

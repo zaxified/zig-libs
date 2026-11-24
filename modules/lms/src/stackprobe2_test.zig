@@ -6,6 +6,7 @@
 //! signing path: tight burn (`derive_burn`). ReleaseFast only
 //! (`skipUnlessOptimized`).
 
+const h32: core.HashFn = .{ .hash = .sha256, .len = 32 };
 const std = @import("std");
 const core = @import("core.zig");
 const sp = @import("testkit").stackprobe;
@@ -22,8 +23,8 @@ test "STACKPROBE: deriveX and deriveRandomizer leave no secret on the dead stack
     var h: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("lms probe2 id", &h, .{});
     @memcpy(&id, h[0..16]);
-    _ = try P.run("core.deriveX", core.deriveX, .{ &x, &id, @as(u32, 3), @as(u16, 5), &seed }, &.{ &seed, &x }, .{});
-    const c = try P.run("core.deriveRandomizer", core.deriveRandomizer, .{ &id, @as(u32, 3), &seed }, &.{&seed}, .{});
+    _ = try P.run("core.deriveX", core.deriveX, .{ h32, &x, &id, @as(u32, 3), @as(u16, 5), &seed }, &.{ &seed, &x }, .{});
+    const c = try P.run("core.deriveRandomizer", core.deriveRandomizer, .{ h32, &id, @as(u32, 3), &seed }, &.{&seed}, .{});
     _ = c;
 }
 

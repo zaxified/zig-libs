@@ -35,8 +35,9 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 
 /// `Tree.init` / `initCached`: the body (with the tree walk and the OTS chains)
 /// dirtied 2.2 KiB below the probe's call in ReleaseFast (the
-/// caller's frame and the entry point's are part of that).
-pub const init_burn = 4 * 1024;
+/// caller's frame and the entry point's are part of that); 4.7 KiB since the
+/// hash is dispatched per family (RFC 9858 SHA-256 / SHAKE256 sets, 2026-11-23).
+pub const init_burn = 8 * 1024;
 
 /// `Tree.sign` / `signWithRandomizer`: 1.2 KiB (LMS, h5/w4) and 1.5 KiB (HSS
 /// message signature) in ReleaseFast. Hits without a burn lay
@@ -44,8 +45,9 @@ pub const init_burn = 4 * 1024;
 pub const sign_burn = 2 * 1024;
 
 /// HSS `ensureTrees` (child seed derivation, child `Tree.init`, the parent's
-/// certificate signature): 3.1 KiB in ReleaseFast.
-pub const hss_burn = 4 * 1024;
+/// certificate signature): 3.1 KiB in ReleaseFast; 5.9 KiB with the per-family
+/// hash dispatch (2026-11-23).
+pub const hss_burn = 8 * 1024;
 
 /// `core.deriveX` / `core.deriveRandomizer`: one SHA-256 over `I || q || i ||
 /// 0xff || SEED`, called per chain on the signing path -- tight, not yet

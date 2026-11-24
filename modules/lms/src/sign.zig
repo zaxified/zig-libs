@@ -97,6 +97,10 @@ pub const Tree = struct {
     /// by pointer, so no frame of ours or the caller's holds the SEED; the
     /// stack the body dirtied is zeroed. On error `out` holds no secret
     /// (`deinit` on it is a no-op).
+    ///
+    /// `lms` and `ots` must use the same hash and length
+    /// (`lms.matches(ots)`, asserted). For a 24-byte set the SEED is
+    /// `seed[0..24]`.
     pub fn init(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8) Allocator.Error!void {
         return initCached(out, gpa, lms, ots, id, seed, cacheHeight(lms));
     }
@@ -111,6 +115,7 @@ pub const Tree = struct {
     fn build(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8, c: u5) Allocator.Error!void {
         const h = lms.height();
         std.debug.assert(c <= h);
+        std.debug.assert(lms.matches(ots)); // one H per key (RFC 9858 §5)
         const count: usize = (@as(usize, 1) << (h - c + 1)) - 1;
         const nodes = gpa.alloc([n]u8, count) catch |e| {
             out.* = .{ .gpa = gpa, .lms = lms, .ots = ots, .id = id, .seed = @splat(0), .cache_h = c, .nodes = &.{} };
@@ -126,7 +131,7 @@ pub const Tree = struct {
         // Above it, plain hashing.
         var r: usize = first - 1;
         while (r >= 1) : (r -= 1) {
-            nodes[r - 1] = core.intrHash(&out.id, @intCast(r), &nodes[2 * r - 1], &nodes[2 * r]);
+            nodes[r - 1] = core.intrHash(lms.hashFn(), &out.id, @intCast(r), &nodes[2 * r - 1], &nodes[2 * r]);
         }
     }
 
@@ -148,7 +153,7 @@ pub const Tree = struct {
 
     fn leafNode(self: *const Tree, idx: u32) [n]u8 {
         const k = core.otsPublicKeyHash(self.ots, &self.id, idx, &self.seed);
-        return core.leafHash(&self.id, self.lms.leaves() + idx, &k);
+        return core.leafHash(self.lms.hashFn(), &self.id, self.lms.leaves() + idx, &k);
     }
 
     /// Root of the subtree of height `k` whose leftmost leaf is `start`
@@ -167,7 +172,7 @@ pub const Tree = struct {
             while (sp > 0 and levels[sp - 1] == lvl) {
                 sp -= 1;
                 num >>= 1;
-                node = core.intrHash(&self.id, num, &stack[sp], &node);
+                node = core.intrHash(self.lms.hashFn(), &self.id, num, &stack[sp], &node);
                 lvl += 1;
             }
             stack[sp] = node;
@@ -202,7 +207,7 @@ pub const Tree = struct {
     }
 
     fn signDerived(self: *const Tree, q: u32, msg: []const u8, out: []u8) void {
-        const rnd = core.deriveRandomizer(&self.id, q, &self.seed);
+        const rnd = core.deriveRandomizer(self.ots.hashFn(), &self.id, q, &self.seed);
         self.signBody(q, msg, &rnd, out);
     }
 
@@ -225,16 +230,17 @@ pub const Tree = struct {
         core.otsSign(self.ots, &self.id, q, &self.seed, rnd, msg, out[4..][0..ots_len]);
         std.mem.writeInt(u32, out[4 + ots_len ..][0..4], self.lms.typecode(), .big);
         const path = out[8 + ots_len ..];
+        const m: usize = self.lms.mLen();
         const r: u32 = self.lms.leaves() + q;
         var i: u5 = 0;
         while (i < h) : (i += 1) {
             const sib: u32 = (r >> i) ^ 1; // node number of path[i]
-            const dst = path[@as(usize, i) * n ..][0..n];
+            const dst = path[@as(usize, i) * m ..][0..m];
             if (i >= c) {
-                dst.* = self.nodes[sib - 1];
+                @memcpy(dst, self.nodes[sib - 1][0..m]);
             } else {
                 const first_leaf = (sib - (self.lms.leaves() >> i)) << i;
-                dst.* = self.subtreeRoot(i, first_leaf);
+                @memcpy(dst, self.subtreeRoot(i, first_leaf)[0..m]);
             }
         }
     }
@@ -310,7 +316,8 @@ pub const Position = struct {
 };
 
 pub const InitError = Allocator.Error || error{
-    /// `levels.len` is not in 1..8.
+    /// `levels.len` is not in 1..8, or a level pairs an LMS and an LM-OTS
+    /// set of different hash or length (one `H` per key, RFC 9858 §5).
     InvalidLevels,
     /// A restored position has a leaf index beyond its tree.
     InvalidPosition,
@@ -364,6 +371,7 @@ pub const SecretKey = struct {
     pub fn init(out: *SecretKey, gpa: Allocator, levels: []const Level, seed: *const [n]u8, id: [id_len]u8, restore_at: ?Position) InitError!void {
         out.seed = @splat(0); // stays zero on every error return
         if (levels.len < 1 or levels.len > max_levels) return error.InvalidLevels;
+        for (levels) |lv| if (!lv.lms.matches(lv.ots)) return error.InvalidLevels;
         const pos = restore_at orelse Position{};
         if (!pos.exhausted) {
             for (levels, 0..) |lv, i| if (pos.q[i] >= lv.lms.leaves()) return error.InvalidPosition;
@@ -417,7 +425,7 @@ pub const SecretKey = struct {
         var len: usize = 4;
         for (self.levelList(), 0..) |lv, i| {
             len += core.lmsSignatureLength(lv.lms, lv.ots);
-            if (i + 1 < self.n_levels) len += LmsPublicKey.encoded_len;
+            if (i + 1 < self.n_levels) len += LmsPublicKey.encodedLenFor(self.levels[i + 1].lms);
         }
         return len;
     }
@@ -485,7 +493,8 @@ pub const SecretKey = struct {
                 return e;
             };
             const child_pub = tree.publicKey();
-            self.trees[i - 1].?.signUnchecked(d[i - 1], &child_pub.toBytes(), buf);
+            var enc: [LmsPublicKey.max_encoded_len]u8 = undefined;
+            self.trees[i - 1].?.signUnchecked(d[i - 1], child_pub.encode(&enc), buf);
             self.pubs[i] = child_pub;
             self.sigs[i - 1] = buf;
             self.path[i - 1] = d[i - 1];
@@ -522,8 +531,10 @@ pub const SecretKey = struct {
             const s = self.sigs[i].?;
             @memcpy(out[off..][0..s.len], s);
             off += s.len;
-            @memcpy(out[off..][0..LmsPublicKey.encoded_len], &self.pubs[i + 1].toBytes());
-            off += LmsPublicKey.encoded_len;
+            var enc: [LmsPublicKey.max_encoded_len]u8 = undefined;
+            const pb = self.pubs[i + 1].encode(&enc);
+            @memcpy(out[off..][0..pb.len], pb);
+            off += pb.len;
         }
         const bl = core.lmsSignatureLength(self.levels[last].lms, self.levels[last].ots);
         self.trees[last].?.signUnchecked(d[last], msg, out[off..][0..bl]);

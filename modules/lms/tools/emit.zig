@@ -56,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
     const sig = try sk.sign(msg, buf);
     var out = try cwd.openDir(io, args[3], .{});
     defer out.close(io);
-    try out.writeFile(io, .{ .sub_path = "key.pub", .data = &sk.publicKey().toBytes() });
+    var enc_1: [@TypeOf(sk.publicKey()).max_encoded_len]u8 = undefined;
+    try out.writeFile(io, .{ .sub_path = "key.pub", .data = sk.publicKey().encode(&enc_1) });
     try out.writeFile(io, .{ .sub_path = "msg.sig", .data = sig });
 }

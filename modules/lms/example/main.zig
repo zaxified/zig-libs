@@ -58,7 +58,8 @@ pub fn main() !void {
 
     // The public key is 60 bytes (L, LMS type, LM-OTS type, I, root): this is
     // what ships with the product.
-    const published = key.publicKey().toBytes();
+    var published_buf: [@TypeOf(key.publicKey()).max_encoded_len]u8 = undefined;
+    const published = key.publicKey().encode(&published_buf);
     std.debug.print("public key: {d} bytes, signature: {d} bytes\n", .{
         published.len,
         key.signatureLength(),
@@ -81,7 +82,7 @@ pub fn main() !void {
     };
     for (images) |image| {
         const sig = try signer.sign(image, sig_buf);
-        if (!lms.hssVerify(&published, image, sig)) return error.OwnSignatureRejected;
+        if (!lms.hssVerify(published, image, sig)) return error.OwnSignatureRejected;
         std.debug.print("signed: next leaf of the message tree is {d}, durable position written {d}x\n", .{
             store.next.q[1],
             store.writes,
@@ -116,18 +117,19 @@ pub fn main() !void {
     // ── verification, on the device ──────────────────────────────────────
     // The device holds 60 bytes and nothing else. `verify` allocates nothing and
     // answers false for every malformed input; it never errors.
-    const verifier_key = try lms.HssPublicKey.parse(&published);
+    const verifier_key = try lms.HssPublicKey.parse(published);
     const sig = try signer.sign(images[0], sig_buf);
     if (!verifier_key.verify(images[0], sig)) return error.HonestSignatureRejected;
     if (verifier_key.verify(images[1], sig)) return error.TamperedImageAccepted;
-    if (lms.hssVerify(&published, images[0], sig[0 .. sig.len - 1])) return error.TruncatedSignatureAccepted;
+    if (lms.hssVerify(published, images[0], sig[0 .. sig.len - 1])) return error.TruncatedSignatureAccepted;
     std.debug.print("tampered image and truncated signature rejected\n", .{});
 
-    // A public key for a parameter set this module does not implement (here:
-    // SHA-256/192, SP 800-208) is a typed error, never a silent mis-parse.
-    var foreign = published;
-    foreign[7] = 0x11; // LMS typecode 0x11: not in RFC 8554
-    if (lms.HssPublicKey.parse(&foreign)) |_| {
+    // A public key with an LMS typecode no RFC assigns (RFC 8554 ends at 9,
+    // RFC 9858 at 0x18) is a typed error, never a silent mis-parse.
+    var foreign_buf = published_buf;
+    const foreign = foreign_buf[0..published.len];
+    foreign[7] = 0x19;
+    if (lms.HssPublicKey.parse(foreign)) |_| {
         return error.ForeignTypecodeAccepted;
     } else |err| switch (err) {
         error.UnsupportedLmsType => std.debug.print("public key with an unsupported LMS typecode rejected\n", .{}),

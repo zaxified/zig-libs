@@ -2,6 +2,8 @@
 //! Round trips, the stateful discipline, structural rejections and the
 //! tree-cache differential. RFC vectors are in `kat_test.zig`.
 
+/// SHA-256, n = 32: the RFC 8554 sets these tests use.
+const h32: core.HashFn = .{ .hash = .sha256, .len = 32 };
 const std = @import("std");
 const builtin = @import("builtin");
 const lms = @import("root.zig");
@@ -55,7 +57,8 @@ test "LMS round trip for every LM-OTS w at H5, index strictly increasing" {
         var sk: lms.LmsSecretKey = undefined;
         try lms.LmsSecretKey.init(&sk, gpa, .sha256_m32_h5, o, idOf(7), &seedOf(9));
         defer sk.deinit();
-        const pk_bytes = sk.publicKey().toBytes();
+        var pk_bytes_buf: [@TypeOf(sk.publicKey()).max_encoded_len]u8 = undefined;
+        const pk_bytes = sk.publicKey().encode(&pk_bytes_buf);
         var buf: [lms.max_lms_signature_length]u8 = undefined;
         var last: ?u32 = null;
         for ([_][]const u8{ "first", "second", "" }) |msg| {
@@ -65,10 +68,10 @@ test "LMS round trip for every LM-OTS w at H5, index strictly increasing" {
             if (last) |l| try std.testing.expect(q > l);
             last = q;
             try std.testing.expectEqual(q + 1, sk.q); // advanced past the leaf just used
-            try std.testing.expect(lms.lmsVerify(&pk_bytes, msg, sig));
-            try std.testing.expect(!lms.lmsVerify(&pk_bytes, "other", sig));
+            try std.testing.expect(lms.lmsVerify(pk_bytes, msg, sig));
+            try std.testing.expect(!lms.lmsVerify(pk_bytes, "other", sig));
             // A wrong-length signature never verifies.
-            try std.testing.expect(!lms.lmsVerify(&pk_bytes, msg, sig[0 .. sig.len - 1]));
+            try std.testing.expect(!lms.lmsVerify(pk_bytes, msg, sig[0 .. sig.len - 1]));
         }
         try std.testing.expectEqual(@as(u32, 3), sk.q);
     }
@@ -128,7 +131,8 @@ test "Tree.sign refuses a leaf past 2^h and a short buffer, writes nothing, acce
     // The last leaf, into a longer buffer: the returned slice is exactly the signature.
     const sig = try t.sign(31, "m", &buf);
     try std.testing.expectEqual(len, sig.len);
-    try std.testing.expect(lms.lmsVerify(&t.publicKey().toBytes(), "m", sig));
+    var enc_1: [@TypeOf(t.publicKey()).max_encoded_len]u8 = undefined;
+    try std.testing.expect(lms.lmsVerify(t.publicKey().encode(&enc_1), "m", sig));
     try std.testing.expectEqual(@as(u8, 0xa5), buf[len]);
 }
 
@@ -159,11 +163,11 @@ fn recursiveNode(o: lms.OtsParamSet, h: u5, id: *const [16]u8, seed: *const [32]
     const leaves = @as(u32, 1) << h;
     if (r >= leaves) {
         const k = core.otsPublicKeyHash(o, id, r - leaves, seed);
-        return core.leafHash(id, r, &k);
+        return core.leafHash(o.hashFn(), id, r, &k);
     }
     const l = recursiveNode(o, h, id, seed, 2 * r);
     const rr = recursiveNode(o, h, id, seed, 2 * r + 1);
-    return core.intrHash(id, r, &l, &rr);
+    return core.intrHash(o.hashFn(), id, r, &l, &rr);
 }
 
 test "tree root equals the recursive definition of T[1] (§5.3)" {
@@ -191,7 +195,8 @@ test "HSS round trip for L = 1 .. 8 (H5, w1 at every level)" {
         var sk: lms.SecretKey = undefined;
         try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(count), idOf(count), null);
         defer sk.deinit();
-        const pk_bytes = sk.publicKey().toBytes();
+        var pk_bytes_buf: [@TypeOf(sk.publicKey()).max_encoded_len]u8 = undefined;
+        const pk_bytes = sk.publicKey().encode(&pk_bytes_buf);
         try std.testing.expectEqual(@as(u32, count), std.mem.readInt(u32, pk_bytes[0..4], .big));
         try std.testing.expectEqual(lms.hssSignatureLength(&levels), sk.signatureLength());
         const buf = try gpa.alloc(u8, sk.signatureLength());
@@ -199,8 +204,8 @@ test "HSS round trip for L = 1 .. 8 (H5, w1 at every level)" {
         for ([_][]const u8{ "alpha", "beta", "gamma" }) |msg| {
             const sig = try sk.sign(msg, buf);
             try std.testing.expectEqual(std.mem.readInt(u32, sig[0..4], .big), count - 1);
-            try std.testing.expect(lms.hssVerify(&pk_bytes, msg, sig));
-            try std.testing.expect(!lms.hssVerify(&pk_bytes, "delta", sig));
+            try std.testing.expect(lms.hssVerify(pk_bytes, msg, sig));
+            try std.testing.expect(!lms.hssVerify(pk_bytes, "delta", sig));
         }
     }
 }
@@ -218,7 +223,8 @@ test "HSS with mixed parameter sets per level, H10 and H5, w1/w2/w4" {
     defer gpa.free(buf);
     const sig = try sk.sign("mixed", buf);
     try std.testing.expect(sk.publicKey().verify("mixed", sig));
-    try std.testing.expect(lms.hssVerify(&sk.publicKey().toBytes(), "mixed", sig));
+    var enc_2: [@TypeOf(sk.publicKey()).max_encoded_len]u8 = undefined;
+    try std.testing.expect(lms.hssVerify(sk.publicKey().encode(&enc_2), "mixed", sig));
 }
 
 /// The leaf index used at every level, read out of a signature.
@@ -226,7 +232,7 @@ fn signatureQs(sig: []const u8, levels: []const Level, out: *[lms.max_levels]u32
     var off: usize = 4;
     for (levels, 0..) |lv, i| {
         out[i] = std.mem.readInt(u32, sig[off..][0..4], .big);
-        off += lms.lmsSignatureLength(lv.lms, lv.ots) + lms.LmsPublicKey.encoded_len;
+        off += lms.lmsSignatureLength(lv.lms, lv.ots) + lms.LmsPublicKey.max_encoded_len;
     }
 }
 
@@ -235,7 +241,8 @@ test "HSS L=2: the position increases strictly across a lower-tree boundary and 
     var sk: lms.SecretKey = undefined;
     try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(1), idOf(2), null);
     defer sk.deinit();
-    const pk = sk.publicKey().toBytes();
+    var pk_buf: [@TypeOf(sk.publicKey()).max_encoded_len]u8 = undefined;
+    const pk = sk.publicKey().encode(&pk_buf);
     const buf = try gpa.alloc(u8, sk.signatureLength());
     defer gpa.free(buf);
     var prev: [lms.max_levels]u32 = undefined;
@@ -252,7 +259,7 @@ test "HSS L=2: the position increases strictly across a lower-tree boundary and 
         }
         prev = qs;
         have = true;
-        try std.testing.expect(lms.hssVerify(&pk, "m", sig));
+        try std.testing.expect(lms.hssVerify(pk, "m", sig));
     }
     const pos = sk.position();
     try std.testing.expectEqual(@as(u32, 2), pos.q[0]);
@@ -265,12 +272,13 @@ test "HSS: an exhausted key refuses, after exactly the product of the tree sizes
     var sk: lms.SecretKey = undefined;
     try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(5), idOf(6), null);
     defer sk.deinit();
-    const pk = sk.publicKey().toBytes();
+    var pk_buf: [@TypeOf(sk.publicKey()).max_encoded_len]u8 = undefined;
+    const pk = sk.publicKey().encode(&pk_buf);
     const buf = try gpa.alloc(u8, sk.signatureLength());
     defer gpa.free(buf);
     for (0..1024) |i| {
         const sig = try sk.sign("m", buf);
-        if (i % 251 == 0 or i == 1023) try std.testing.expect(lms.hssVerify(&pk, "m", sig));
+        if (i % 251 == 0 or i == 1023) try std.testing.expect(lms.hssVerify(pk, "m", sig));
     }
     try std.testing.expect(sk.position().exhausted);
     try std.testing.expectError(error.KeyExhausted, sk.sign("m", buf));
@@ -427,7 +435,9 @@ test "SigningKey.initInPlace: the same key as SecretKey.init + SigningKey.init, 
     var b: lms.SigningKey = undefined;
     try lms.SigningKey.initInPlace(&b, gpa, &levels, &seedOf(7), idOf(7), null, null);
     defer b.deinit();
-    try std.testing.expectEqualSlices(u8, &a.sk.publicKey().toBytes(), &b.sk.publicKey().toBytes());
+    var enc_3: [@TypeOf(a.sk.publicKey()).max_encoded_len]u8 = undefined;
+    var enc_4: [@TypeOf(b.sk.publicKey()).max_encoded_len]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, a.sk.publicKey().encode(&enc_3), b.sk.publicKey().encode(&enc_4));
     const buf_a = try gpa.alloc(u8, a.sk.signatureLength());
     defer gpa.free(buf_a);
     const buf_b = try gpa.alloc(u8, b.sk.signatureLength());
@@ -469,15 +479,18 @@ test "deinit wipes the seeds" {
 }
 
 test "public-key parsers: every wrong length and typecode is a typed error" {
-    const good = (lms.LmsPublicKey{
+    const good_key: lms.LmsPublicKey = .{
         .lms = .sha256_m32_h10,
         .ots = .sha256_n32_w4,
         .id = idOf(1),
         .root = seedOf(2),
-    }).toBytes();
+    };
+    var good_buf: [lms.LmsPublicKey.max_encoded_len]u8 = undefined;
+    const good: [56]u8 = good_key.encode(&good_buf)[0..56].*;
     const parsed = try lms.LmsPublicKey.parse(&good);
     try std.testing.expectEqual(lms.ParamSet.sha256_m32_h10, parsed.lms);
-    try std.testing.expectEqualSlices(u8, &good, &parsed.toBytes());
+    var enc_5: [@TypeOf(parsed).max_encoded_len]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &good, parsed.encode(&enc_5));
     for ([_]usize{ 0, 1, 7 }) |l| try std.testing.expectError(error.InvalidLength, lms.LmsPublicKey.parse(good[0..l]));
     try std.testing.expectError(error.InvalidLength, lms.LmsPublicKey.parse(good[0..55]));
     var longer: [57]u8 = undefined;
@@ -485,12 +498,14 @@ test "public-key parsers: every wrong length and typecode is a typed error" {
     longer[56] = 0;
     try std.testing.expectError(error.InvalidLength, lms.LmsPublicKey.parse(&longer));
     var t = good;
-    for ([_]u32{ 0, 4, 10, 0xffffffff }) |code| {
+    for ([_]u32{ 0, 4, 25, 0xffffffff }) |code| {
         std.mem.writeInt(u32, t[0..4], code, .big);
         try std.testing.expectError(error.UnsupportedLmsType, lms.LmsPublicKey.parse(&t));
     }
     t = good;
-    for ([_]u32{ 0, 5, 0xffffffff }) |code| {
+    // 17 is past RFC 9858's last; 5 is RFC 9858's SHA-256/192 W1, which a
+    // SHA-256/256 LMS key cannot pair with (one H per key).
+    for ([_]u32{ 0, 5, 17, 0xffffffff }) |code| {
         std.mem.writeInt(u32, t[4..8], code, .big);
         try std.testing.expectError(error.UnsupportedOtsType, lms.LmsPublicKey.parse(&t));
     }
@@ -500,7 +515,8 @@ test "public-key parsers: every wrong length and typecode is a typed error" {
     @memcpy(h[4..], &good);
     const hp = try lms.HssPublicKey.parse(&h);
     try std.testing.expectEqual(@as(u8, 3), hp.levels);
-    try std.testing.expectEqualSlices(u8, &h, &hp.toBytes());
+    var enc_6: [@TypeOf(hp).max_encoded_len]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &h, hp.encode(&enc_6));
     for ([_]u32{ 0, 9, 0x01000002, 0xffffffff }) |lv| {
         std.mem.writeInt(u32, h[0..4], lv, .big);
         try std.testing.expectError(error.InvalidLevels, lms.HssPublicKey.parse(&h));
@@ -520,17 +536,18 @@ test "signature parsing: length, typecode, index and level-count lies are reject
     var sk: lms.SecretKey = undefined;
     try lms.SecretKey.init(&sk, gpa, &levels, &seedOf(1), idOf(1), null);
     defer sk.deinit();
-    const pk = sk.publicKey().toBytes();
+    var pk_buf: [@TypeOf(sk.publicKey()).max_encoded_len]u8 = undefined;
+    const pk = sk.publicKey().encode(&pk_buf);
     const good_buf = try gpa.alloc(u8, sk.signatureLength() + 1);
     defer gpa.free(good_buf);
     const good = try sk.sign("msg", good_buf);
-    try std.testing.expect(lms.hssVerify(&pk, "msg", good));
+    try std.testing.expect(lms.hssVerify(pk, "msg", good));
 
     // Length: shorter, longer, and every prefix of the fixed header.
-    try std.testing.expect(!lms.hssVerify(&pk, "msg", good[0 .. good.len - 1]));
+    try std.testing.expect(!lms.hssVerify(pk, "msg", good[0 .. good.len - 1]));
     good_buf[good.len] = 0;
-    try std.testing.expect(!lms.hssVerify(&pk, "msg", good_buf[0 .. good.len + 1]));
-    for (0..80) |l| try std.testing.expect(!lms.hssVerify(&pk, "msg", good[0..l]));
+    try std.testing.expect(!lms.hssVerify(pk, "msg", good_buf[0 .. good.len + 1]));
+    for (0..80) |l| try std.testing.expect(!lms.hssVerify(pk, "msg", good[0..l]));
 
     const bad = try gpa.dupe(u8, good);
     defer gpa.free(bad);
@@ -545,13 +562,13 @@ test "signature parsing: length, typecode, index and level-count lies are reject
     for ([_]u32{ 0, 2, 0xffffffff, 0x100 }) |v| {
         @memcpy(bad, good);
         w.put(bad, 0, v);
-        try std.testing.expect(!lms.hssVerify(&pk, "msg", bad));
+        try std.testing.expect(!lms.hssVerify(pk, "msg", bad));
     }
     // q of the first signature: the first invalid one, and the largest.
     for ([_]u32{ 32, 33, 0x80000000, 0xffffffff }) |v| {
         @memcpy(bad, good);
         w.put(bad, 4, v);
-        try std.testing.expect(!lms.hssVerify(&pk, "msg", bad));
+        try std.testing.expect(!lms.hssVerify(pk, "msg", bad));
     }
     // Typecodes inside the first signature (LM-OTS at +4, LMS at +4+ots_len).
     for ([_]usize{ 4 + 4, 4 + 4 + ots0 }) |off| {
@@ -560,7 +577,7 @@ test "signature parsing: length, typecode, index and level-count lies are reject
             const cur = std.mem.readInt(u32, bad[off..][0..4], .big);
             if (v == cur) continue;
             w.put(bad, off, v);
-            try std.testing.expect(!lms.hssVerify(&pk, "msg", bad));
+            try std.testing.expect(!lms.hssVerify(pk, "msg", bad));
         }
     }
     // The embedded level-1 public key: unsupported typecodes, and a foreign
@@ -570,31 +587,31 @@ test "signature parsing: length, typecode, index and level-count lies are reject
         for ([_]u32{ 0, 4, 99, 0xffffffff }) |v| {
             @memcpy(bad, good);
             w.put(bad, off, v);
-            try std.testing.expect(!lms.hssVerify(&pk, "msg", bad));
+            try std.testing.expect(!lms.hssVerify(pk, "msg", bad));
         }
     }
     @memcpy(bad, good);
     w.put(bad, pub1 + 4, lms.OtsParamSet.sha256_n32_w8.typecode());
-    try std.testing.expect(!lms.hssVerify(&pk, "msg", bad));
+    try std.testing.expect(!lms.hssVerify(pk, "msg", bad));
     // The last signature's q.
     const last = pub1 + 56;
     for ([_]u32{ 32, 0xffffffff }) |v| {
         @memcpy(bad, good);
         w.put(bad, last, v);
-        try std.testing.expect(!lms.hssVerify(&pk, "msg", bad));
+        try std.testing.expect(!lms.hssVerify(pk, "msg", bad));
     }
 }
 
 test "the LM-OTS randomizer is derived, deterministic and leaf-specific" {
-    const c0 = core.deriveRandomizer(&idOf(1), 0, &seedOf(2));
-    const c0b = core.deriveRandomizer(&idOf(1), 0, &seedOf(2));
-    const c1 = core.deriveRandomizer(&idOf(1), 1, &seedOf(2));
+    const c0 = core.deriveRandomizer(h32, &idOf(1), 0, &seedOf(2));
+    const c0b = core.deriveRandomizer(h32, &idOf(1), 0, &seedOf(2));
+    const c1 = core.deriveRandomizer(h32, &idOf(1), 1, &seedOf(2));
     try std.testing.expectEqualSlices(u8, &c0, &c0b);
     try std.testing.expect(!std.mem.eql(u8, &c0, &c1));
     // And distinct from every private chain start value x_q[i], i <= 264.
     for (0..265) |i| {
         var x: [32]u8 = undefined;
-        core.deriveX(&x, &idOf(1), 0, @intCast(i), &seedOf(2));
+        core.deriveX(h32, &x, &idOf(1), 0, @intCast(i), &seedOf(2));
         try std.testing.expect(!std.mem.eql(u8, &x, &c0));
     }
 }
@@ -638,17 +655,18 @@ test "HSS: every lower tree is its own tree, and its seed is not its public iden
     defer sk.deinit();
     const buf = try gpa.alloc(u8, sk.signatureLength());
     defer gpa.free(buf);
-    const pk = sk.publicKey().toBytes();
+    var pk_buf: [@TypeOf(sk.publicKey()).max_encoded_len]u8 = undefined;
+    const pk = sk.publicKey().encode(&pk_buf);
     // Level-1 / level-2 public keys embedded in three signatures.
     const one = lms.lmsSignatureLength(levels[0].lms, levels[0].ots);
-    var embedded: [3][2][lms.LmsPublicKey.encoded_len]u8 = undefined;
+    var embedded: [3][2][lms.LmsPublicKey.max_encoded_len]u8 = undefined;
     var k: usize = 0;
     for ([_]usize{ 0, 31, 1000 }) |extra| {
         for (0..extra) |_| _ = try sk.sign("skip", buf);
         const sig = try sk.sign("probe", buf);
-        try std.testing.expect(lms.hssVerify(&pk, "probe", sig));
-        embedded[k][0] = sig[4 + one ..][0..lms.LmsPublicKey.encoded_len].*;
-        embedded[k][1] = sig[4 + 2 * one + lms.LmsPublicKey.encoded_len ..][0..lms.LmsPublicKey.encoded_len].*;
+        try std.testing.expect(lms.hssVerify(pk, "probe", sig));
+        embedded[k][0] = sig[4 + one ..][0..lms.LmsPublicKey.max_encoded_len].*;
+        embedded[k][1] = sig[4 + 2 * one + lms.LmsPublicKey.max_encoded_len ..][0..lms.LmsPublicKey.max_encoded_len].*;
         // The tree actually built for this path: seed != identifier prefix.
         for (1..3) |lv| {
             const t = &sk.trees[lv].?;
@@ -700,7 +718,8 @@ test "HSS: out of memory while building a lower tree burns no leaf; staying in a
     signatureQs(sig, &levels, &qs);
     try std.testing.expectEqual(@as(u32, 1), qs[0]); // the leaf the failed calls did not spend
     try std.testing.expectEqual(@as(u32, 0), qs[1]);
-    try std.testing.expect(lms.hssVerify(&handle.sk.publicKey().toBytes(), "m", sig));
+    var enc_7: [@TypeOf(handle.sk.publicKey()).max_encoded_len]u8 = undefined;
+    try std.testing.expect(lms.hssVerify(handle.sk.publicKey().encode(&enc_7), "m", sig));
 
     // Inside the same lower tree no allocation is needed: the cached path is reused.
     fa.fail_index = fa.alloc_index;
@@ -850,12 +869,12 @@ test "the LM-OTS randomizer and the private values are the hashes the derivation
     @memcpy(buf[23..], &seed);
     var want: [32]u8 = undefined;
     Sha256.hash(&buf, &want, .{});
-    try std.testing.expectEqualSlices(u8, &want, &core.deriveRandomizer(&id, 7, &seed));
+    try std.testing.expectEqualSlices(u8, &want, &core.deriveRandomizer(h32, &id, 7, &seed));
     // x_q[i] = H(I || u32str(q) || u16str(i) || u8str(0xff) || SEED), here i = 3
     std.mem.writeInt(u16, buf[20..22], 3, .big);
     Sha256.hash(&buf, &want, .{});
     var x: [32]u8 = undefined;
-    core.deriveX(&x, &id, 7, 3, &seed);
+    core.deriveX(h32, &x, &id, 7, 3, &seed);
     try std.testing.expectEqualSlices(u8, &want, &x);
 }
 
@@ -883,16 +902,17 @@ fn handBuiltHss(alloc: std.mem.Allocator, n_levels: usize, msg: []const u8, top:
         built += 1;
     }
     const sl = lms.lmsSignatureLength(.sha256_m32_h5, .sha256_n32_w1);
-    const pk_len = lms.LmsPublicKey.encoded_len;
+    const pk_len = lms.LmsPublicKey.max_encoded_len;
     const out = try alloc.alloc(u8, 4 + sl * n_levels + pk_len * (n_levels - 1));
     errdefer alloc.free(out);
     std.mem.writeInt(u32, out[0..4], @intCast(n_levels - 1), .big);
     var off: usize = 4;
     for (0..n_levels - 1) |i| {
-        const child = trees[i + 1].publicKey().toBytes();
-        _ = try trees[i].sign(0, &child, out[off..][0..sl]);
+        var child_buf: [@TypeOf(trees[i + 1].publicKey()).max_encoded_len]u8 = undefined;
+        const child = trees[i + 1].publicKey().encode(&child_buf);
+        _ = try trees[i].sign(0, child, out[off..][0..sl]);
         off += sl;
-        @memcpy(out[off..][0..pk_len], &child);
+        @memcpy(out[off..][0..pk_len], child);
         off += pk_len;
     }
     _ = try trees[n_levels - 1].sign(0, msg, out[off..][0..sl]);
@@ -931,7 +951,7 @@ test "HSS: the lower trees are a fixed function of the master seed, the level an
     defer gpa.free(buf);
     const sig = try sk.sign("derivation pin", buf);
     const one = lms.lmsSignatureLength(levels[0].lms, levels[0].ots);
-    const child = sig[4 + one ..][0..lms.LmsPublicKey.encoded_len];
+    const child = sig[4 + one ..][0..lms.LmsPublicKey.max_encoded_len];
     var want_id: [16]u8 = undefined;
     _ = try std.fmt.hexToBytes(&want_id, "671bd4b4d343c24e2b00684f2969ccbe");
     var want_root: [32]u8 = undefined;

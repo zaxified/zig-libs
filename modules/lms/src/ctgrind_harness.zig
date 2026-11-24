@@ -31,7 +31,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const lms = @import("root.zig");
 
-const Target = enum { lms, hss };
+const Target = enum { lms, hss, shake, n24 };
 const Taint = enum { yes, no };
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -52,9 +52,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var sig: [8192]u8 = undefined;
 
     switch (target) {
-        .lms => {
+        .lms, .shake, .n24 => {
+            // RFC 8554's SHA-256/256, RFC 9858's SHAKE256/256 and SHA-256/192.
+            const sets: [2]u32 = switch (target) {
+                .shake => .{ @backingInt(lms.ParamSet.shake_m32_h5), @backingInt(lms.OtsParamSet.shake_n32_w4) },
+                .n24 => .{ @backingInt(lms.ParamSet.sha256_m24_h5), @backingInt(lms.OtsParamSet.sha256_n24_w4) },
+                else => .{ @backingInt(lms.ParamSet.sha256_m32_h5), @backingInt(lms.OtsParamSet.sha256_n32_w4) },
+            };
             var sk: lms.LmsSecretKey = undefined;
-            try sk.init(gpa, .sha256_m32_h5, .sha256_n32_w4, id, &seed);
+            try sk.init(gpa, lms.ParamSet.fromTypecode(sets[0]).?, lms.OtsParamSet.fromTypecode(sets[1]).?, id, &seed);
             defer sk.deinit();
             for ([_][]const u8{ "first message", "second message" }) |msg| {
                 const s = try sk.sign(msg, &sig);
