@@ -113,9 +113,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   is compared (`toBytes`, `isOdd`, `isZero`, `eql`, all through `canonical`), so the codec and those
   predicates behave as with always-canonical values; `fromBytes` and the constants are canonical, which is
   also weak. Code outside `field.zig` never reads `limbs`.
-- **Field operations.** `mul` is an 8×8-limb schoolbook multiply into 15 `u128` column accumulators, then
+- **Field operations.** `mul` is a Karatsuba split on the Goldilocks halves (`φ = 2^224`, `φ² ≡ φ + 1`: three 4×4-limb products, 48 instead of 64) into 15 `u128` column accumulators, then
   `reduceColumns` (the high columns folded onto `k-4` and `k-8`, one carry pass); `square` is its
-  squaring form, and `mulI`/`squareI` are forced-inline variants for the point formulas and the ladder
+  squaring form (three half squarings, 30 products), and `mulI`/`squareI` are forced-inline variants for the point formulas and the ladder
   step (inlining measured faster; other multiply layouts were measured and not kept, see `Fe.mul`'s doc
   comment). `invert` and `sqrt` use fixed addition chains over a shared head (`chainHead`: `e2` and `e222`):
   `invert` is Fermat `a^(p-2)` (RFC 8032 §5.2.1), `sqrt` is the `p ≡ 3 (mod 4)` candidate
