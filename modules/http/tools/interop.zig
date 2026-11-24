@@ -28,6 +28,12 @@
 //!                                               # sseclient-py + httpx-sse); see oracles.zig
 //!   zig build interop-http -- --phase sse --write   # re-take the frozen vectors
 //!   zig build interop-http -- --phase alpn      # Client over TLS + ALPN vs Go
+//!   zig build interop-http -- --phase h1parsers [--write]   # hyper + llhttp on the h1 wires
+//!
+//! The `h1parsers` phase (`tools/h1parsers.zig`; takes the verdicts again and compares
+//! them with `src/h1_parsers_vectors.zig`, `--write` replaces it) runs the Go
+//! oracle's h1 wires and the smuggling-shaped ones through hyper 1.11 and llhttp
+//! (Node.js, uvicorn); `src/h1_parsers.zig` replays them against this module.
 //!
 //! The `alpn` phase (in every full run) puts `Client` with `Options.http2`
 //! against Go's net/http over real TLS (`go_oracle -h2tls`, needs `go`): ALPN
@@ -38,6 +44,7 @@
 const std = @import("std");
 const http = @import("http");
 const oracles = @import("oracles.zig");
+const h1parsers = @import("h1parsers.zig");
 
 const Server = http.Server;
 const Writer = std.Io.Writer;
@@ -155,7 +162,7 @@ fn report(phase: []const u8, v: Verdict, allowed: []const []const u8) bool {
 }
 
 fn usage() u8 {
-    std.debug.print("usage: interop-http [--h2spec PATH] [--only SPEC] [--phase h2spec|go|problem|sse|alpn] [--write]\n", .{});
+    std.debug.print("usage: interop-http [--h2spec PATH] [--only SPEC] [--phase h2spec|go|problem|sse|alpn|h1parsers] [--write]\n", .{});
     return 2;
 }
 
@@ -216,7 +223,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var h2spec: []const u8 = "h2spec";
     var only: ?[]const u8 = null;
-    var phase: enum { all, h2spec, go, problem, sse, alpn } = .all;
+    var phase: enum { all, h2spec, go, problem, sse, alpn, h1parsers } = .all;
     var write = false;
     var args = init.args.iterate();
     _ = args.skip();
@@ -246,9 +253,11 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (phase == .problem) return if (try oracles.problemPhase(io, gpa, arena, &env, write)) 0 else 1;
     if (phase == .sse) return if (try oracles.ssePhase(io, gpa, arena, &env, write)) 0 else 1;
     if (phase == .alpn) return if (try alpnPhase(io, gpa, arena, &env)) 0 else 1;
+    if (phase == .h1parsers) return if (try h1parsers.phase(io, arena, &env, write)) 0 else 1;
     const go_ok = phase == .h2spec or try checkGoOracle(io, arena, &env);
     if (phase == .go) return if (go_ok) 0 else 1;
     const alpn_ok = phase == .h2spec or try alpnPhase(io, gpa, arena, &env);
+    const h1_ok = phase == .h2spec or try h1parsers.phase(io, arena, &env, false);
     const py_ok = phase == .h2spec or (try oracles.problemPhase(io, gpa, arena, &env, false) and
         try oracles.ssePhase(io, gpa, arena, &env, false));
 
@@ -285,7 +294,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     const a = report("shared h1/h2c port", shared, &.{shared_port_expected});
     const b = report("h2 only (serveStream)", h2only, &.{});
-    return if (a and b and go_ok and py_ok and alpn_ok) 0 else 1;
+    return if (a and b and go_ok and py_ok and alpn_ok and h1_ok) 0 else 1;
 }
 
 // ── phase alpn: Client + Options.http2 against Go over TLS ──────────────────

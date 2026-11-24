@@ -27,7 +27,7 @@ fn find(comptime T: type, table: []const T, id: []const u8) ?T {
 
 const max_calls = 8;
 
-const Call = struct {
+pub const Call = struct {
     method: []const u8,
     target: []const u8,
     body: ?[]const u8,
@@ -38,7 +38,7 @@ const Call = struct {
 const H1Run = struct {
     calls: [max_calls]Call = undefined,
     n: usize = 0,
-    text: [4096]u8 = undefined,
+    text: [32768]u8 = undefined,
     text_len: usize = 0,
 
     fn keep(r: *H1Run, s: []const u8) []const u8 {
@@ -75,18 +75,24 @@ fn h1Handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
     try rw.writeAll("ok");
 }
 
-const H1Outcome = struct { calls: []const Call, reject: u16 };
+pub const H1Outcome = struct { calls: []const Call, reject: u16 };
 
 fn replayH1(wire: []const u8, out_buf: []u8) H1Outcome {
+    var head_buf: [4096]u8 = undefined;
+    return replayH1Head(wire, out_buf, &head_buf);
+}
+
+/// `replayH1` with the caller's head buffer (the server's `max_header_bytes`):
+/// `h1_parsers.zig` replays at the real default.
+pub fn replayH1Head(wire: []const u8, out_buf: []u8, head_buf: []u8) H1Outcome {
     h1_run = .{};
     var in: std.Io.Reader = .fixed(wire);
     var out: std.Io.Writer = .fixed(out_buf);
-    var head_buf: [4096]u8 = undefined;
     var request_body_buf: [256]u8 = undefined;
     var response_body_buf: [256]u8 = undefined;
     var chunk_buf: [128]u8 = undefined;
     Server.serveStream(.{ .handler = h1Handler, .server_name = null }, &in, &out, .{
-        .head = &head_buf,
+        .head = head_buf,
         .request_body = &request_body_buf,
         .response_body = &response_body_buf,
         .chunk = &chunk_buf,
@@ -144,6 +150,10 @@ const h1_divergences = [_]H1Divergence{
     .{ .id = "connect-authority-userinfo", .reject = 400, .calls = 0, .why = "RFC 9112 §3.2.3: no userinfo in authority-form (h1.isValidHost, as for Host); Go passes u@x:443 on" },
     .{ .id = "target-high-byte", .reject = 400, .calls = 0, .why = "a raw byte >= 0x80 is not a URI (RFC 3986 §2); Go passes it to the handler" },
     .{ .id = "get-host-empty", .reject = 400, .calls = 0, .why = "h1.isValidHost refuses an empty Host on an origin-form request: an http(s) target always has an authority (RFC 9112 §3.2)" },
+    .{ .id = "leading-crlf", .reject = 0, .calls = 1, .why = "RFC 9112 §2.2: a server SHOULD ignore at least one empty line before the request-line; Go answers 400 (hyper and llhttp skip it, as here)" },
+    .{ .id = "leading-two-crlf", .reject = 0, .calls = 1, .why = "as leading-crlf, two empty lines (hyper and llhttp skip any number)" },
+    .{ .id = "chunk-ext-ws", .reject = 0, .calls = 1, .why = "RFC 9112 §7.1.1 allows BWS around ';' and '=' in a chunk extension (`5 ;a=b`); Go reads RFC 7230's grammar and fails the body" },
+    .{ .id = "chunk-trailer-bad", .reject = 0, .calls = 1, .why = "RFC 9112 §7.1.2: a trailer line is a field line, and `X T: 1` has no token name; Go skips a trailer it cannot read, hyper and llhttp refuse it, so do we" },
     .{ .id = "chunk-size-trailing-space", .reject = 0, .calls = 1, .why = "RFC 9112 §7.1: whitespace after chunk-size is only BWS before ';'; Go skips it, we fail the body" },
     // ── a different, legal choice ──
     .{ .id = "version-1.2", .reject = 505, .calls = 0, .why = "RFC 9110 §2.5 SHOULD treat 1.2 as 1.1; no HTTP/1.2 exists, refused on purpose (pinned in h1.zig)" },

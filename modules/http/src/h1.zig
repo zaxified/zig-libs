@@ -146,6 +146,11 @@ pub fn readHead(r: *Reader, buf: []u8) ReadHeadError![]const u8 {
         // never kept, so a head whose lines fill `buf` exactly still ends
         // successfully -- which is what the previous implementation did, and
         // the difference would otherwise be an off-by-two in the head limit.
+        // RFC 9112 §2.2: a recipient expecting a request-line SHOULD ignore
+        // at least one empty line before it (clients that append a CRLF to a
+        // body leave one in front of the next request). hyper and llhttp
+        // skip them; so does this, however many.
+        if (line.blank and len == 0) continue;
         if (line.blank) return buf[0..len];
         if (line.overflow) return error.HeadTooLarge;
         len += line.bytes.len;
@@ -955,7 +960,11 @@ pub const ChunkedReader = struct {
                     // line buffer and out again -- which also means a trailer
                     // line is bounded by the space left in it and not by the
                     // reader's buffer.
-                    const line = try c.takeLineRaw(c.trailer_buf[c.trailer_len..]);
+                    // Read into the capture buffer when there is one, else into
+                    // the scratch that holds a chunk-header line: either way the
+                    // line's first bytes are here to be judged (`validTrailerStart`).
+                    const dest = if (c.trailer_buf.len != 0) c.trailer_buf[c.trailer_len..] else c.line_buf[0..];
+                    const line = try c.takeLineRaw(dest);
                     // A1 http F5: `max_body_bytes` never saw these bytes —
                     // they never cross `Capped`'s outer `Reader` interface,
                     // they are consumed right here — so neither one oversize
@@ -976,6 +985,11 @@ pub const ChunkedReader = struct {
                     // 2026-10-19, O1-2). The blank terminator is never bare
                     // (`blank` wants exactly `\r\n`), so this only sees fields.
                     if (line.bare_lf) return c.fail(.malformed_chunk);
+                    // A trailer line is a field line (RFC 9112 §7.1.2): no
+                    // obs-fold, a token name and a colon. What a CRLF-only
+                    // parser reads as a field and this one skipped as noise
+                    // is a desync; hyper and llhttp refuse it as well.
+                    if (!line.blank and !validTrailerStart(line.bytes, line.overflow)) return c.fail(.malformed_chunk);
                     if (line.blank) {
                         c.state = .done;
                     } else if (c.trailer_buf.len != 0) {
@@ -986,6 +1000,17 @@ pub const ChunkedReader = struct {
                 },
             }
         }
+    }
+
+    /// Whether the start of a trailer line (`bytes`, as far as it was kept;
+    /// `cut`: the rest was dropped) can be a field line: a token, then a colon.
+    /// A line cut before a colon shows nothing wrong yet, so it passes.
+    fn validTrailerStart(bytes: []const u8, cut: bool) bool {
+        for (bytes, 0..) |ch, i| {
+            if (tchar_table[ch]) continue;
+            return ch == ':' and i > 0;
+        }
+        return cut or bytes.len == 0;
     }
 
     /// One line into `dest`, with this decoder's failure vocabulary.
@@ -1015,7 +1040,9 @@ pub const ChunkedReader = struct {
 /// (`chunk-size-trailing-space`). Between and inside extensions BWS is
 /// accepted as RFC 9110 §5.6.3 asks; whitespace that ends the line is not.
 fn isChunkExt(ext: []const u8) bool {
-    if (ext.len > 0 and ext[0] != ';') return false;
+    // `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`
+    // (RFC 9112 §7.1.1): whitespace may precede the first ';' too, but a size
+    // followed by whitespace alone is no extension.
     var i: usize = 0;
     while (i < ext.len) {
         i = skipBws(ext, i);
@@ -1929,6 +1956,10 @@ test "ChunkedReader: a chunk extension must be RFC 9112 §7.1.1 chunk-ext, not a
         "3;a=\"x y\"\r\nabc\r\n0\r\n\r\n",
         "3;a=\"q\\\"d\"\r\nabc\r\n0\r\n\r\n", // quoted-pair
         "3;a=\"\"\r\nabc\r\n0\r\n\r\n", // empty quoted-string
+        // BWS before the first ';' (RFC 9112 §7.1.1, June 2022: `*( BWS ";" ...`):
+        // hyper takes it, Go and llhttp still read RFC 7230's grammar.
+        "3 ;a\r\nabc\r\n0\r\n\r\n",
+        "3 \t;a = b ; c\r\nabc\r\n0\r\n\r\n",
     };
     for (accepted) |wire| try expectChunkedDecode(wire, "abc");
 
@@ -1942,7 +1973,6 @@ test "ChunkedReader: a chunk extension must be RFC 9112 §7.1.1 chunk-ext, not a
         "3;a=\"x\x01\"\r\nabc\r\n0\r\n\r\n", // control byte inside quotes
         "3;a=b c\r\nabc\r\n0\r\n\r\n", // a second word in a token value
         "3 \r\nabc\r\n0\r\n\r\n", // whitespace with no ';' after it
-        "3 ;a\r\nabc\r\n0\r\n\r\n", // BWS before the first ';': refused, as Go does (see isChunkExt)
         "3;a \r\nabc\r\n0\r\n\r\n", // whitespace ending the line
         "3,a\r\nabc\r\n0\r\n\r\n", // not ';'
     };
@@ -1958,6 +1988,50 @@ test "ChunkedReader: a chunk extension must be RFC 9112 §7.1.1 chunk-ext, not a
         };
         try testing.expectEqual(ChunkedReader.FailReason.malformed_chunk, cr.fail_reason.?);
     }
+}
+
+test "ChunkedReader: a trailer line must be a field line (RFC 9112 §7.1.2, §5.2)" {
+    const head = "3\r\nabc\r\n0\r\n";
+    const ok = [_][]const u8{
+        head ++ "\r\n",
+        head ++ "X-T: v\r\n\r\n",
+        head ++ "x:\r\n\r\n", // an empty value
+        head ++ "A: 1\r\nB: 2\r\n\r\n",
+    };
+    for (ok) |wire| try expectChunkedDecode(wire, "abc");
+    const bad = [_][]const u8{
+        head ++ "X T: 1\r\n\r\n", // not a token before the colon
+        head ++ "not a header\r\n\r\n", // no colon
+        head ++ "X-T: v\r\n w\r\n\r\n", // obs-fold
+        head ++ " X-T: v\r\n\r\n", // leading whitespace
+        head ++ ": v\r\n\r\n", // no name
+        head ++ "\x00: v\r\n\r\n",
+    };
+    for (bad) |wire| {
+        // Discarding the trailers and capturing them must judge alike.
+        for ([_]bool{ false, true }) |capture| {
+            var src: Reader = .fixed(wire);
+            var cbuf: [64]u8 = undefined;
+            var tbuf: [64]u8 = undefined;
+            var cr: ChunkedReader = if (capture) .initCapturingTrailers(&src, &cbuf, &tbuf) else .init(&src, &cbuf);
+            var out: [256]u8 = undefined;
+            var w: Writer = .fixed(&out);
+            testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w)) catch |e| {
+                std.debug.print("accepted: {f}\n", .{std.zig.fmtString(wire)});
+                return e;
+            };
+        }
+    }
+}
+
+test "readHead: empty lines before the request-line are skipped (RFC 9112 §2.2)" {
+    var buf: [128]u8 = undefined;
+    var r: Reader = .fixed("\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const head = try readHead(&r, &buf);
+    try testing.expectEqualStrings("GET / HTTP/1.1\r\nHost: x\r\n", head);
+    // Nothing but empty lines is still no head.
+    var r2: Reader = .fixed("\r\n\r\n");
+    try testing.expectError(error.ConnectionClosed, readHead(&r2, &buf));
 }
 
 test "ChunkedReader captures trailers when a buffer is provided" {

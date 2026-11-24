@@ -623,6 +623,7 @@ test {
     _ = gzip_interop;
     _ = h11_interop;
     _ = go_oracle;
+    _ = h1_parsers;
     _ = conneg_oracle;
     _ = problem_oracle;
     _ = sse_oracle;
@@ -662,6 +663,10 @@ const h11_interop = @import("h11_interop.zig");
 /// OFFLINE differential anchor against Go's standard library (verdicts
 /// captured by `tools/go_oracle`) — tests only, not public surface.
 const go_oracle = @import("go_oracle.zig");
+
+/// OFFLINE differential anchor against hyper and llhttp on the h1 wires (verdicts
+/// frozen by `tools/h1parsers.zig`) — tests only, not public surface.
+const h1_parsers = @import("h1_parsers.zig");
 
 test "protocolFromAlpn: exact ALPN ids dispatch, anything else is unknown" {
     try testing.expectEqual(AlpnProtocol.h2, protocolFromAlpn("h2"));

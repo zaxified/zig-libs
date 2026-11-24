@@ -372,7 +372,7 @@ GOBIN="$HOME/.local/share/zig-libs/oracle-bin/h2spec" \
     && sudo ln -sf "$HOME/.local/share/zig-libs/oracle-bin/h2spec/h2spec" /usr/local/bin/h2spec \
     && echo "h2spec: v2.2.1" || echo "h2spec: install failed"
 python3 -m venv "$ORACLE_VENVS/http" >/dev/null 2>&1 || true
-"$ORACLE_VENVS/http/bin/pip" -q install "sseclient-py==1.9.0" "httpx==0.28.1" "httpx-sse==0.4.3" >/dev/null 2>&1 \
+"$ORACLE_VENVS/http/bin/pip" -q install "sseclient-py==1.9.0" "httpx==0.28.1" "httpx-sse==0.4.3" "httptools==0.9.0" >/dev/null 2>&1 \
     && echo "http venv: OK" || echo "http venv: install failed"
 echo "::endgroup::"
 
@@ -519,7 +519,7 @@ echo "::group::interop: cargo registry (diagnostics regex), UCD (regex), pip pin
 # 0.8.11's extracted source from the registry, which the preceding
 # `rust_regex_oracle` build produces.
 for crate in modules/diagnostics/tools/codespan_bench modules/regex/tools/rust_regex_oracle \
-             modules/regex/tools/rust_unicode; do
+             modules/regex/tools/rust_unicode modules/http/tools/rust_fast_bench; do
     cargo fetch --locked --manifest-path "$crate/Cargo.toml" >/dev/null 2>&1 \
         && echo "cargo fetch $crate: OK" || echo "cargo fetch $crate: failed"
 done
