@@ -2327,10 +2327,10 @@ fn framePackets(out: []u8, payloads: []const []const u8) ![]const u8 {
 /// module's own `messages.writeString`, because a USERAUTH_REQUEST is five
 /// chained length-prefixed fields and arbitrary bytes are not one.
 const UserauthCorpus = struct {
-    store: [8192]u8 = undefined,
+    store: [16384]u8 = undefined,
     used: usize = 0,
-    entries: [12][]const u8 = undefined,
-    counts: [12]usize = undefined,
+    entries: [24][]const u8 = undefined,
+    counts: [24]usize = undefined,
     n: usize = 0,
 
     fn push(self: *UserauthCorpus, payloads: []const []const u8) void {
@@ -2376,6 +2376,61 @@ const UserauthCorpus = struct {
         for (&key, 0..) |*b, i| b.* = @truncate(i *% 7 +% 1);
         messages.writeString(&w, &key) catch unreachable;
         return w.buffered();
+    }
+
+    /// The fuzz host/user key (the client's key in the harness too).
+    fn fuzzKeyPair() std.crypto.sign.Ed25519.KeyPair {
+        return std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(5))) catch unreachable;
+    }
+
+    fn keyBlob(buf: []u8, kp: std.crypto.sign.Ed25519.KeyPair) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        messages.writeString(&w, "ssh-ed25519") catch unreachable;
+        messages.writeString(&w, &kp.public_key.toBytes()) catch unreachable;
+        return w.buffered();
+    }
+
+    /// The `ssh-ed25519` signature blob over `msg`.
+    fn sigBlob(buf: []u8, kp: std.crypto.sign.Ed25519.KeyPair, msg: []const u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        messages.writeString(&w, "ssh-ed25519") catch unreachable;
+        const sig = kp.sign(msg, null) catch unreachable;
+        messages.writeString(&w, &sig.toBytes()) catch unreachable;
+        return w.buffered();
+    }
+
+    /// A `hostbased` request tail (RFC 4252 §9): algorithm, host key blob,
+    /// client host, client user, signature (valid over the harness's session
+    /// id for user `user`; one octet short when `good` is false).
+    fn hostbasedTail(buf: []u8, user: []const u8, host: []const u8, cuser: []const u8, good: bool) []const u8 {
+        const kp = fuzzKeyPair();
+        var blob_buf: [128]u8 = undefined;
+        const blob = keyBlob(&blob_buf, kp);
+        var signed: [512]u8 = undefined;
+        var sw: std.Io.Writer = .fixed(&signed);
+        signedBlobHostbased(&sw, "fuzz-session-id", user, connection_service, "ssh-ed25519", blob, host, cuser) catch unreachable;
+        var sig_buf: [128]u8 = undefined;
+        var sig = sigBlob(&sig_buf, kp, sw.buffered());
+        if (!good) sig = sig[0 .. sig.len - 1];
+        var w: std.Io.Writer = .fixed(buf);
+        messages.writeString(&w, "ssh-ed25519") catch unreachable;
+        messages.writeString(&w, blob) catch unreachable;
+        messages.writeString(&w, host) catch unreachable;
+        messages.writeString(&w, cuser) catch unreachable;
+        messages.writeString(&w, sig) catch unreachable;
+        return w.buffered();
+    }
+
+    /// A SIGNED publickey tail whose signature the verifier accepts.
+    fn signedPublickeyTail(buf: []u8, user: []const u8) []const u8 {
+        const kp = fuzzKeyPair();
+        var blob_buf: [128]u8 = undefined;
+        const blob = keyBlob(&blob_buf, kp);
+        var signed: [512]u8 = undefined;
+        var sw: std.Io.Writer = .fixed(&signed);
+        signedBlob(&sw, "fuzz-session-id", user, connection_service, "ssh-ed25519", blob) catch unreachable;
+        var sig_buf: [128]u8 = undefined;
+        return publickeyTail(buf, true, "ssh-ed25519", blob, sigBlob(&sig_buf, kp, sw.buffered()));
     }
 
     fn build(self: *UserauthCorpus) []const []const u8 {
@@ -2438,6 +2493,64 @@ const UserauthCorpus = struct {
             c[3].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
         });
         self.push(&.{m[5].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes()});
+        // §9 hostbased: a valid request (the hook accepts, the signature
+        // verifies), a host the hook refuses, a short signature, a request cut
+        // off in the middle.
+        var h1: [256]u8 = undefined;
+        var h2: [256]u8 = undefined;
+        var h3: [256]u8 = undefined;
+        var h4: [256]u8 = undefined;
+        var t1: [256]u8 = undefined;
+        var t2: [256]u8 = undefined;
+        var t3: [256]u8 = undefined;
+        self.push(&.{request(&h1, "alice", "hostbased", hostbasedTail(&t1, "alice", "client.example.", "alice", true))});
+        self.push(&.{request(&h2, "alice", "hostbased", hostbasedTail(&t2, "alice", "bad.example", "root", true))});
+        self.push(&.{request(&h3, "alice", "hostbased", hostbasedTail(&t3, "alice", "client.example", "alice", false))});
+        const cut = hostbasedTail(&t1, "alice", "client.example.", "alice", true);
+        self.push(&.{request(&h4, "alice", "hostbased", cut[0 .. cut.len / 2])});
+        // §7 publickey with a `source-address` grant (the policy turns a user
+        // `sa=<list>` into a critical option): the query (checked before
+        // PK_OK) and the signed request, for a list that matches the
+        // harness's peer, one that does not, and a broken one.
+        var s1: [256]u8 = undefined;
+        var s2: [256]u8 = undefined;
+        var s3: [256]u8 = undefined;
+        var s4: [256]u8 = undefined;
+        var pk1: [256]u8 = undefined;
+        var pk2: [256]u8 = undefined;
+        var pk3: [256]u8 = undefined;
+        var q: [256]u8 = undefined;
+        var blob2: [128]u8 = undefined;
+        const kblob = keyBlob(&blob2, fuzzKeyPair());
+        self.push(&.{
+            request(&s1, "sa=192.0.2.0/24", "publickey", publickeyTail(&q, false, "ssh-ed25519", kblob, "")),
+            request(&s2, "sa=192.0.2.0/24", "publickey", signedPublickeyTail(&pk1, "sa=192.0.2.0/24")),
+        });
+        self.push(&.{request(&s3, "sa=10.0.0.0/8", "publickey", signedPublickeyTail(&pk2, "sa=10.0.0.0/8"))});
+        self.push(&.{request(&s4, "sa=192.0.2.0/24,garbage/99", "publickey", signedPublickeyTail(&pk3, "sa=192.0.2.0/24,garbage/99"))});
+        // Client side: password CHANGEREQs (PK_OK's number, `string prompt ||
+        // string language`), a partial-success FAILURE, SUCCESS to the
+        // hostbased step; and a CHANGEREQ with a cut-off tail.
+        var c2: [11]Msg = undefined;
+        const pk_ok = @backingInt(messages.MessageType.SSH_MSG_USERAUTH_PK_OK);
+        const ok = @backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS);
+        self.push(&.{
+            c2[0].failure("password,hostbased", false).bytes(),
+            c2[1].begin(pk_ok).str("expired").str("en").bytes(),
+            c2[2].failure("hostbased", true).bytes(),
+            c2[3].begin(ok).bytes(),
+        });
+        self.push(&.{
+            c2[4].failure("password", false).bytes(),
+            c2[5].begin(pk_ok).str("x").bytes(),
+            c2[6].begin(ok).bytes(),
+        });
+        self.push(&.{
+            c2[7].failure("password,hostbased", false).bytes(),
+            c2[8].begin(pk_ok).str("expired").str("en").bytes(),
+            c2[9].begin(pk_ok).str("again").str("").bytes(),
+            c2[10].failure("hostbased", false).bytes(),
+        });
         return self.entries[0..self.n];
     }
 };
@@ -2456,7 +2569,18 @@ fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
 }
 
 const fuzz_test = @import("fuzz_test.zig");
-const UserauthLabel = enum { failed, authenticated, replied, client_failed, client_authenticated };
+const UserauthLabel = enum {
+    failed,
+    authenticated,
+    replied,
+    client_failed,
+    client_authenticated,
+    hostbased_hook, // serveHostbased reached the host decision
+    hostbased_authenticated, // ... and the signature verified
+    source_address_granted, // a publickey grant carried a `source-address` list
+    password_change_asked, // the client's PasswordChanger was called
+    client_hostbased, // the client authenticated with `hostbased`
+};
 const userauth_reach = fuzz_test.Reach(UserauthLabel);
 
 /// The harness body, generic over its source (`testing.fuzz` hands it a
@@ -2492,6 +2616,7 @@ fn serveUserauthHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
         };
         // A success must never carry a user name longer than the declared bound.
         std.debug.assert(res.user().len <= max_user_len);
+        if (res.method == .hostbased) userauth_reach.mark(.hostbased_authenticated);
         userauth_reach.mark(.authenticated);
         if (sink.buffered().len > 0) userauth_reach.mark(.replied);
     }
@@ -2506,13 +2631,20 @@ fn serveUserauthHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
     ct.session_id = transport.SessionId.from("fuzz-session-id");
     const key: AuthKey = .{ .ed25519 = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(5))) catch unreachable };
     var answers: AnswerAll = .{ .answer = "a" };
+    var changer: FuzzChanger = .{};
     var progress: AuthProgress = .{};
     if (authenticateWith(&ct, gpa, "alice", &.{
         .{ .publickey = &.{&key} },
         .{ .password = "pw" },
         .{ .keyboard_interactive = .{ .ctx = &answers, .respondFn = AnswerAll.respond } },
-    }, .{ .request_service = false, .progress = &progress })) |_| {
+        .{ .hostbased = .{ .key = &key, .client_host = "client.example.", .client_user = "alice" } },
+    }, .{
+        .request_service = false,
+        .progress = &progress,
+        .password_change = .{ .ctx = &changer, .newFn = FuzzChanger.new },
+    })) |_| {
         std.debug.assert(progress.succeeded != null);
+        if (progress.succeeded == .hostbased) userauth_reach.mark(.client_hostbased);
         userauth_reach.mark(.client_authenticated);
     } else |_| {
         std.debug.assert(progress.succeeded == null);
@@ -2527,21 +2659,36 @@ fn serveUserauthHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
 /// "guest".
 const FuzzPolicy = struct {
     next: AuthCallbacks = .{},
+    sa: [1]Permissions.Option = undefined,
 
     fn config(self: *FuzzPolicy) AuthConfig {
         self.next = .{ .keyboard_interactive = .{ .decideFn = kbd } };
         return .{
             .callbacks = .{
-                .publickey = .{ .decideFn = struct {
-                    fn f(_: *anyopaque, _: *const AuthRequest, _: []const u8, _: []const u8) Decision {
-                        return Decision.accepted;
-                    }
-                }.f },
+                .publickey = .{ .ctx = self, .decideFn = publickey },
                 .password = .{ .ctx = self, .decideFn = password },
+                .hostbased = .{ .decideFn = hostbased },
             },
             .no_client_auth = true,
             .no_client_auth_callback = .{ .decideFn = none },
+            .remote_address = std.Io.net.IpAddress.parse("192.0.2.5", 0) catch unreachable,
         };
+    }
+    /// Accepts every key; a user `sa=<list>` is granted the critical option
+    /// `source-address` = `<list>` (an attacker-chosen string, as a
+    /// certificate's option would be), enforced by `serveUserauth`.
+    fn publickey(ctx: *anyopaque, req: *const AuthRequest, _: []const u8, _: []const u8) Decision {
+        const self: *FuzzPolicy = @ptrCast(@alignCast(ctx));
+        if (std.mem.startsWith(u8, req.user, "sa=")) {
+            self.sa[0] = .{ .name = source_address_option, .value = req.user[3..] };
+            userauth_reach.mark(.source_address_granted);
+            return .{ .accept = .{ .critical_options = &self.sa } };
+        }
+        return Decision.accepted;
+    }
+    fn hostbased(_: *anyopaque, _: *const AuthRequest, hb: *const HostbasedRequest) Decision {
+        userauth_reach.mark(.hostbased_hook);
+        return if (std.mem.eql(u8, hb.client_user, "root")) .reject else Decision.accepted;
     }
     fn password(ctx: *anyopaque, _: *const AuthRequest, pw: []const u8) Decision {
         const self: *FuzzPolicy = @ptrCast(@alignCast(ctx));
@@ -2557,6 +2704,22 @@ const FuzzPolicy = struct {
     }
     fn none(_: *anyopaque, req: *const AuthRequest) Decision {
         return if (std.mem.eql(u8, req.user, "guest")) Decision.accepted else .reject;
+    }
+};
+
+/// The client's password changer: a new password of the server's prompt
+/// length, and give up on every third request.
+const FuzzChanger = struct {
+    calls: usize = 0,
+
+    fn new(ctx: *anyopaque, _: []const u8, prompt: []const u8, _: []const u8, buf: []u8) ?usize {
+        const self: *FuzzChanger = @ptrCast(@alignCast(ctx));
+        userauth_reach.mark(.password_change_asked);
+        self.calls += 1;
+        if (self.calls % 3 == 0) return null;
+        const n = @min(prompt.len, buf.len);
+        @memset(buf[0..n], 'n');
+        return n;
     }
 };
 
@@ -2613,14 +2776,17 @@ test "corpus: the serveUserauth seeds deliver real requests, and the counts are 
         authenticated += 1;
         reply_octets += sink.buffered().len;
     }
-    try std.testing.expectEqual(@as(usize, 17), delivered);
-    // The password, the partial-success two-step and `guest`'s `none`.
-    try std.testing.expectEqual(@as(usize, 3), authenticated);
+    try std.testing.expectEqual(@as(usize, 36), delivered);
+    // The password, the partial-success two-step, `guest`'s `none`, the valid
+    // hostbased request, and the two signed publickey requests whose
+    // `source-address` list matches (the second has a garbage entry AFTER the
+    // match: first match wins).
+    try std.testing.expectEqual(@as(usize, 6), authenticated);
     // 192 since the transport answers an unrecognized message number itself
     // (RFC 4253 §11.4): the `0x00` seed now earns one SSH_MSG_UNIMPLEMENTED
     // (16 octets framed) and the stream continues, where it used to end in
     // a 56-octet DISCONNECT.
-    try std.testing.expectEqual(@as(usize, 456), reply_octets);
+    try std.testing.expectEqual(@as(usize, 912), reply_octets);
 }
 
 test "serveUserauth: an oversize peer string is a typed error, not a panic" {
