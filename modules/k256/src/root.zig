@@ -80,6 +80,7 @@ test {
     _ = group;
     _ = @import("ecmult.zig");
     _ = scalar;
+    _ = @import("modinv.zig");
     _ = sign;
     _ = ecdsa_recover;
     _ = @import("kat_vectors.zig");

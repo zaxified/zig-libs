@@ -487,17 +487,17 @@ k256	ReleaseFast	field	1	0	1798731813210e82	4f13cccddea81376
 #   ecdsa 10 -> 11   16/11/5/0 (G7 19a05328, `sign` handles R.x >= n).
 k256	ReleaseFast	mul	1	1	e0969c588c9c93b2	2e85d4bddb851304
 k256	ReleaseFast	comb	1	1	e0969c588c9c93b2	cdfc5773d52775d3
-k256	ReleaseFast	sign	1	11	9324a216ab78d520	bb06c2ed85209b8d
+k256	ReleaseFast	sign	1	11	89a94f2fede67b29	bb06c2ed85209b8d
 # Zig 0.17.0 (2026-10-18): ecdsa 11 -> 10 (decrease). One of signInner's five own contexts
 # (ecdsa_recover.zig) is gone in the LLVM 22 build; every other context has the same shape (the
 # harness frame now prints as `ctgrind_harness.main`). Normalised --stacks diff vs B0.
-k256	ReleaseFast	ecdsa	1	10	d521718b0df64e7d	8ff4812d21149442
+k256	ReleaseFast	ecdsa	1	10	248c019ea77f7485	8ff4812d21149442
 # k256 2026-11-21 — the blinded fixed-base paths (`Blinding`, libsecp256k1's context randomisation): scalar/key AND
 # the whole blinding state tainted. combblind = comb's one `rejectIdentityOneBranch` (on the final s·G); the
 # reduction of s + (n − b) is masked integer arithmetic (std's `Scalar.fromBytes64` read 2 more, removed).
 k256	ReleaseFast	combblind	1	1	e0969c588c9c93b2	31b63b5e1ab5d793
-k256	ReleaseFast	signblind	1	11	9324a216ab78d520	9bb769bcd1b73254
-k256	ReleaseFast	ecdsablind	1	10	d521718b0df64e7d	cdc0d7699f169fcf
+k256	ReleaseFast	signblind	1	11	89a94f2fede67b29	9bb769bcd1b73254
+k256	ReleaseFast	ecdsablind	1	10	248c019ea77f7485	cdc0d7699f169fcf
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,

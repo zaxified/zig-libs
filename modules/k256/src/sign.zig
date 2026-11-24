@@ -221,7 +221,7 @@ pub fn ecdsaVerifyPrehashed(pubkey_sec1: []const u8, digest: [32]u8, sig_rs: [64
 
     const e = reduceToScalar(digest);
 
-    const sinv = s.invert();
+    const sinv = scalarmod.invert(s);
     const uu1 = e.mul(sinv);
     const uu2 = r.mul(sinv);
 

@@ -235,7 +235,7 @@ noinline fn signInner(privkey_ptr: *const [32]u8, hash32: [32]u8, comptime commi
     // "signInner returned error.InvalidNonce for R.x >= n".
     const r = reduceToScalar(Ra.x.toBytes(.big));
     if (r.isZero()) return error.InvalidNonce;
-    const s = k.invert().mul(e.add(r.mul(d)));
+    const s = scalarmod.invert(k).mul(e.add(r.mul(d)));
     if (s.isZero()) return error.InvalidNonce;
 
     var recid: u2 = if (Ra.y.isOdd()) 1 else 0;
@@ -294,7 +294,7 @@ pub fn recoverPubkey(hash32: [32]u8, r: [32]u8, s: [32]u8, recid: u2) RecoverErr
     const R = Secp256k1.fromAffineCoordinates(.{ .x = x, .y = y }) catch return error.InvalidPoint;
 
     const e = reduceToScalar(hash32);
-    const r_inv = r_scalar.invert();
+    const r_inv = scalarmod.invert(r_scalar);
     const coeff_g = e.neg().mul(r_inv); // coefficient of G
     const coeff_r = s_scalar.mul(r_inv); // coefficient of R
     return Secp256k1.mulDoubleBasePublic(Secp256k1.basePoint, coeff_g.toBytes(.big), R, coeff_r.toBytes(.big), .big) catch
@@ -513,7 +513,7 @@ fn beOf(v: u256) [32]u8 {
 
 /// std's `r⁻¹·(s·R − e·G)` — what a correct recovery must return.
 fn stdRecover(hash: [32]u8, r: [32]u8, s: [32]u8, R: StdCurve) !StdCurve {
-    const r_inv = (try Scalar.fromBytes(r, .big)).invert();
+    const r_inv = (try Scalar.fromBytes(r, .big)).invert(); // std's, as the oracle
     const e = reduceToScalar(hash);
     const u_r = (try Scalar.fromBytes(s, .big)).mul(r_inv);
     const u_g = e.neg().mul(r_inv);
