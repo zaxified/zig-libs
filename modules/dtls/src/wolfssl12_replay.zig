@@ -14,9 +14,13 @@
 //! flights when `Config.max_datagram_len` was set, and both directions of
 //! application data — ECDHE_PSK, ECDHE_ECDSA (AES-128-GCM, AES-256-GCM /
 //! SHA-384, ChaCha20-Poly1305, secp256r1) and ECDHE_RSA, both roles, mutual
-//! authentication both ways, and our stateless HelloVerifyRequest server; and
-//! plain PSK against OpenSSL `s_server -listen` / `s_client`, both roles (the
-//! same file: those two cases are recorded by the same capture).
+//! authentication both ways, and our stateless HelloVerifyRequest server;
+//! plain PSK against OpenSSL `s_server -listen` / `s_client`, both roles; and
+//! the `-mbedtls` cases against Mbed TLS `ssl_server2` / `ssl_client2` (a
+//! second independent stack: ECDHE_PSK, plain PSK and ECDHE_ECDSA with
+//! CCM_8, and the RFC 9146 connection ID in both roles, symmetric and with a
+//! zero-length CID on either side). All of them are recorded by the same
+//! capture into the same file.
 
 const std = @import("std");
 const testing = std.testing;
@@ -29,6 +33,7 @@ const cert_kat = @import("certauth_kat_vectors.zig");
 const certverify = @import("tls13").certverify;
 const rsa = @import("rsa");
 const r13 = @import("wolfssl_replay.zig");
+const dtls12_suite = @import("suite12.zig");
 
 const arg = r13.arg;
 const hexArg = r13.hexArg;
@@ -39,7 +44,7 @@ const boolArg = r13.boolArg;
 const transcript = @embedFile("testdata/wolfssl12_transcript.txt");
 
 /// A floor, not a mirror (see `wolfssl_replay.zig`'s `recorded_cases_floor`).
-const recorded_cases_floor = 17;
+const recorded_cases_floor = 28;
 
 var client_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
 var server_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
@@ -68,6 +73,13 @@ const Recorded = struct {
     binding_buf: [128]u8 = @splat(0),
     binding_len: usize = 0,
     has_binding: bool = false,
+    /// `cid=`: `Config.connection_id` (may be empty); absent = no CID.
+    cid_buf: [32]u8 = @splat(0),
+    cid_len: usize = 0,
+    has_cid: bool = false,
+    /// `suites=`: `Config.cipher_suites12`, big-endian u16s; absent = default.
+    suites_buf: [16]dtls12_suite.CipherSuite12 = undefined,
+    suites_len: usize = 0,
 
     fn parse(line: []const u8) !Recorded {
         var r: Recorded = .{};
@@ -82,6 +94,17 @@ const Recorded = struct {
         r.psk_len = try copyHex(&r.psk_buf, arg(line, "psk") orelse return error.MissingArgument);
         r.hint_len = try copyHex(&r.hint_buf, arg(line, "psk_hint") orelse return error.MissingArgument);
         r.cookie_len = try copyHex(&r.cookie_buf, arg(line, "cookie_secret") orelse return error.MissingArgument);
+        if (arg(line, "cid")) |c| {
+            r.cid_len = try copyHex(&r.cid_buf, c);
+            r.has_cid = true;
+        }
+        if (arg(line, "suites")) |text| {
+            var raw: [32]u8 = undefined;
+            const n = try copyHex(&raw, text);
+            if (n % 2 != 0) return error.OddSuiteList;
+            for (0..n / 2) |i| r.suites_buf[i] = std.enums.fromInt(dtls12_suite.CipherSuite12, std.mem.readInt(u16, raw[2 * i ..][0..2], .big)) orelse return error.UnknownSuite;
+            r.suites_len = n / 2;
+        }
         return r;
     }
 
@@ -134,6 +157,8 @@ const Recorded = struct {
             .cookie_secret = self.cookie_buf[0..self.cookie_len],
             .peer_binding = self.binding_buf[0..self.binding_len],
         };
+        if (self.has_cid) c.connection_id = self.cid_buf[0..self.cid_len];
+        if (self.suites_len > 0) c.cipher_suites12 = self.suites_buf[0..self.suites_len];
         return c;
     }
 };
@@ -152,10 +177,11 @@ const Replay = struct {
     cases_seen: usize = 0,
     flows_seen: std.EnumSet(Flow) = .empty,
     kinds_seen: std.EnumSet(Kind) = .empty,
-    suites_seen: [8]u16 = undefined,
+    suites_seen: [16]u16 = undefined,
     suites_len: usize = 0,
     hvr_cases: usize = 0,
     mutual_cases: usize = 0,
+    cid_cases: usize = 0,
     fragmenting_cases: usize = 0,
     reassembling_cases: usize = 0,
     out: [8192]u8 = undefined,
@@ -194,6 +220,7 @@ const Replay = struct {
             self.flows_seen.insert(std.meta.stringToEnum(Flow, arg(line, "flow") orelse return error.MissingArgument) orelse return error.UnknownFlow);
             self.kinds_seen.insert(self.rec.kind);
             if (self.rec.mutual) self.mutual_cases += 1;
+            if (self.rec.has_cid) self.cid_cases += 1;
             if (self.rec.max_datagram != 0) self.fragmenting_cases += 1;
         } else if (std.mem.eql(u8, op, "client_init")) {
             self.deinit();
@@ -315,6 +342,14 @@ test "wolfSSL DTLS 1.2 transcript: every recorded exchange replays byte-for-byte
     for (r.suites_seen[0..r.suites_len]) |s| {
         if (s == 0x00a8) break;
     } else return error.TestExpectedPlainPsk;
+    // Mbed TLS: RFC 7925's two mandatory CCM_8 suites (0xc0a8, 0xc0ae) and the
+    // RFC 9146 connection ID in both roles, the only live peer the 1.2 CID has.
+    for ([_]u16{ 0xc0a8, 0xc0ae }) |want| {
+        for (r.suites_seen[0..r.suites_len]) |s| {
+            if (s == want) break;
+        } else return error.TestExpectedCcm8;
+    }
+    try testing.expect(r.cid_cases >= 4);
 }
 
 test "wolfSSL DTLS 1.2 transcript: the header names the release, the date and the command that took it" {
@@ -322,4 +357,5 @@ test "wolfSSL DTLS 1.2 transcript: the header names the release, the date and th
     try testing.expect(std.mem.find(u8, head, "wolfSSL:") != null);
     try testing.expect(std.mem.find(u8, head, "captured:") != null);
     try testing.expect(std.mem.find(u8, head, "zig build interop-dtls -- --capture --version 12") != null);
+    try testing.expect(std.mem.find(u8, head, "Mbed TLS") != null);
 }

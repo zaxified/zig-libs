@@ -68,6 +68,12 @@ so none of it carries an upstream condition.
     `tools/interop.zig`. It contains bytes wolfSSL emitted on a loopback
     socket; it contains no wolfSSL source, and wolfSSL is neither linked nor
     vendored here.
+  * `src/testdata/wolfssl12_transcript.txt` — the same kind of capture for
+    DTLS 1.2, against wolfSSL 5.9.1, OpenSSL 3.5 (`openssl s_server` /
+    `s_client`) and Mbed TLS 3.6.7 (`ssl_server2` / `ssl_client2`, built from
+    the release tarball by `tools/mbedtls.sh` into a gitignored directory). It
+    contains only bytes those programs emitted on a loopback socket; none of
+    their source is reproduced, linked or vendored here.
 
 `tools/wolfssl_peer.c` is original work written in this repository against
 wolfSSL's public API; it is not part of the shipped module and is compiled

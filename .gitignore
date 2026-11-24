@@ -57,3 +57,9 @@ tools/arrow-venv/
 # Bitcoin Core script_assets_test.json fetched by modules/bitcoinscript/tools/script_assets_fetch.sh (sha256-pinned, 9 MB).
 # Outside modules/: check-copyleft reads every file of a shipped module dir, ignored ones too.
 tools/script-assets/
+
+# Third-party live interop peers fetched and built from release tarballs, kept
+# outside modules/ so the repository's licence and catalogue checks (which walk
+# the file system) never see foreign source. dtls-mbedtls/ is Mbed TLS,
+# fetched, sha256-checked and built by modules/dtls/tools/mbedtls.sh.
+/.interop-peers/

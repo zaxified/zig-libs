@@ -289,6 +289,11 @@ authentication both ways, wolfSSL's HelloVerifyRequest and ours (stateless),
 wolfSSL fragmenting at a 256-byte MTU, and our side fragmenting at 200 bytes.
 Two more run plain PSK (`psk_with_aes_128_gcm_sha256`, which Debian's wolfSSL
 lacks) against OpenSSL 3.5's `s_server -listen` and `s_client`, both roles.
+Eleven more run against a second independent stack, Mbed TLS 3.6.7 (`ssl_server2` /
+`ssl_client2`, fetched, hash-checked and built by `tools/mbedtls.sh`), both roles:
+ECDHE_PSK, plain PSK and ECDHE_ECDSA with AES-128-CCM_8, ECDHE_ECDSA with AES-128-GCM,
+and the RFC 9146 connection ID — both CIDs non-empty, and a zero-length CID on
+either side.
 `src/wolfssl12_replay.zig` replays the recording on every test run.
 
 ## Import
@@ -411,6 +416,7 @@ zig build test-dtls        # includes the hermetic wolfSSL replay; needs nothing
 zig build check-interop    # compiles the live interop program without running it
 zig build interop-dtls     # runs the live wolfSSL handshakes (needs libwolfssl-dev + cc)
 zig build interop-dtls -- --capture   # ...and re-records src/testdata/wolfssl_transcript.txt
+modules/dtls/tools/mbedtls.sh         # fetches + builds the Mbed TLS peer the 1.2 table also needs
 ```
 
 ## Provenance

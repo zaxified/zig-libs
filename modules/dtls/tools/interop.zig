@@ -5,7 +5,11 @@
 //! transcript of their own) — against **wolfSSL**, over a real loopback UDP
 //! socket, and the recorder that turns each of those exchanges into a
 //! committed transcript the module can replay with no wolfSSL and no C
-//! compiler anywhere near it.
+//! compiler anywhere near it. The 1.2 table also runs plain PSK against
+//! OpenSSL and, since 2026-11-24, a second independent stack: Mbed TLS's
+//! `ssl_server2` / `ssl_client2`, which `tools/mbedtls.sh` fetches, checks
+//! against the release's sha256 and builds into the gitignored
+//! `.interop-peers/dtls-mbedtls/` at the repository root.
 //!
 //! ## Why this is a PROGRAM and not a test
 //!
@@ -187,6 +191,8 @@ const Case = struct {
 /// duplicated in `tools/wolfssl_peer.c`.
 const zig_cid = "zig-libs-cid";
 const wolf_cid = "wolf-cid-1";
+/// The CID the Mbed TLS peers ask for (`cid_val=`, hex of this).
+const mbed_cid = "mbedtls-cid";
 
 const cases = [_]Case{
     .{
@@ -1684,7 +1690,10 @@ const Kind12 = enum {
 
 /// Which foreign 1.2 stack a case runs against. OpenSSL covers what Debian's
 /// wolfSSL cannot (it is built without static PSK): plain PSK, both roles.
-const Peer12 = enum { wolfssl, openssl };
+/// Mbed TLS (`ssl_server2` / `ssl_client2`, built by `tools/mbedtls.sh`) is
+/// the second independent stack, and the RFC 9146 connection ID's only live
+/// peer (Debian's wolfSSL 5.9.1 fails the 1.2 CID).
+const Peer12 = enum { wolfssl, openssl, mbedtls };
 
 const Case12 = struct {
     name: []const u8,
@@ -1704,12 +1713,21 @@ const Case12 = struct {
     expect_group: u16 = x25519_group,
     /// Client flow: wolfSSL's 1.2 server always runs the cookie exchange.
     expect_hvr: bool = false,
-    /// RFC 9146: ask for `zig_cid`; the peer asks for `wolf_cid`. No case
-    /// sets it: Debian's wolfSSL 5.9.1 negotiates the 1.2 connection ID but
-    /// its client then fails `connect` with -320 (build message failure), and
-    /// its server goes silent at our CID-protected Finished — the 1.2 form has
-    /// no live wolfSSL peer (`12-*-cid` peer modes kept for a fixed build).
+    /// RFC 9146: ask for `cid_own`; the peer asks for `cid_peer`. Only the
+    /// Mbed TLS cases set it: Debian's wolfSSL 5.9.1 negotiates the 1.2
+    /// connection ID but its client then fails `connect` with -320 (build
+    /// message failure), and its server goes silent at our CID-protected
+    /// Finished (`12-*-cid` peer modes kept for a fixed build).
     cid: bool = false,
+    /// With `cid`: the CID this side asks for (`Config.connection_id`; may be
+    /// empty, RFC 9146 §3) and the one the peer asks for, which our records
+    /// must carry.
+    cid_own: []const u8 = zig_cid,
+    cid_peer: []const u8 = wolf_cid,
+    /// Non-null: `Config.cipher_suites12` (the opt-in CCM suites).
+    suites: ?[]const CipherSuite12 = null,
+    /// Mbed TLS peers: the `force_ciphersuite=` name.
+    mbed_suite: []const u8 = "",
     expect_peer_cert_subject: ?[]const u8 = null,
     /// RFC 5077: a second connection resumes the first one's ticket with an
     /// abbreviated handshake. Live-only, not recorded.
@@ -1912,6 +1930,147 @@ const cases12 = [_]Case12{
         .why = "an OpenSSL s_client offering only PSK-AES128-GCM-SHA256 completes against OUR server: the identity hint in ServerKeyExchange, its identity in ClientKeyExchange, the plain-PSK premaster",
     },
     .{
+        .name = "dtls12-psk-client-mbedtls",
+        .flow = .client,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x80,
+        .kind = .psk,
+        .mbed_suite = "TLS-ECDHE-PSK-WITH-CHACHA20-POLY1305-SHA256",
+        .expect_suite = .ecdhe_psk_with_chacha20_poly1305_sha256,
+        .expect_hvr = true,
+        .why = "ECDHE_PSK (RFC 5489) against a live Mbed TLS ssl_server2: a second independent stack's HelloVerifyRequest, ServerKeyExchange (empty hint) and Finished",
+    },
+    .{
+        .name = "dtls12-psk-server-mbedtls",
+        .flow = .server,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x81,
+        .kind = .psk,
+        .mbed_suite = "TLS-ECDHE-PSK-WITH-CHACHA20-POLY1305-SHA256",
+        .expect_suite = .ecdhe_psk_with_chacha20_poly1305_sha256,
+        .why = "an Mbed TLS ssl_client2 completes ECDHE_PSK against OUR server: our hint and ECDH params, its ClientKeyExchange, both Finished",
+    },
+    .{
+        .name = "dtls12-plainpsk-ccm8-client-mbedtls",
+        .flow = .client,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x82,
+        .kind = .psk,
+        .suites = &.{.psk_with_aes_128_ccm_8},
+        .mbed_suite = "TLS-PSK-WITH-AES-128-CCM-8",
+        .expect_suite = .psk_with_aes_128_ccm_8,
+        .expect_group = 0,
+        .expect_hvr = true,
+        .why = "plain PSK with AES-128-CCM_8 (RFC 7925 4.2's mandatory suite, RFC 6655 nonce, 8-byte tag) against a live peer for the first time",
+    },
+    .{
+        .name = "dtls12-plainpsk-ccm8-server-mbedtls",
+        .flow = .server,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x83,
+        .kind = .psk,
+        .suites = &.{.psk_with_aes_128_ccm_8},
+        .mbed_suite = "TLS-PSK-WITH-AES-128-CCM-8",
+        .expect_suite = .psk_with_aes_128_ccm_8,
+        .expect_group = 0,
+        .why = "an Mbed TLS client offering only PSK-AES-128-CCM-8 against OUR server: CCM_8 records both ways",
+    },
+    .{
+        .name = "dtls12-ecdsa-client-mbedtls",
+        .flow = .client,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x84,
+        .kind = .ecdsa,
+        .mbed_suite = "TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256",
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .expect_hvr = true,
+        .why = "ECDHE_ECDSA AES-128-GCM: Mbed TLS presents OUR fixture leaf and signs its ServerKeyExchange; we verify both",
+    },
+    .{
+        .name = "dtls12-ecdsa-server-mbedtls",
+        .flow = .server,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x85,
+        .kind = .ecdsa,
+        .mbed_suite = "TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256",
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .why = "an Mbed TLS client verifies OUR chain against the fixture anchor (auth_mode required, server_name dtls-test-server) and our signed ServerKeyExchange",
+    },
+    .{
+        .name = "dtls12-ecdsa-ccm8-server-mbedtls",
+        .flow = .server,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x86,
+        .kind = .ecdsa,
+        .suites = &.{.ecdhe_ecdsa_with_aes_128_ccm_8},
+        .mbed_suite = "TLS-ECDHE-ECDSA-WITH-AES-128-CCM-8",
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_ccm_8,
+        .why = "ECDHE_ECDSA with AES-128-CCM_8 (RFC 7251, RFC 7925 4.4's mandatory certificate suite) against a live client",
+    },
+    .{
+        .name = "dtls12-cid-client-mbedtls",
+        .flow = .client,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x87,
+        .kind = .psk,
+        .mbed_suite = "TLS-ECDHE-PSK-WITH-CHACHA20-POLY1305-SHA256",
+        .expect_suite = .ecdhe_psk_with_chacha20_poly1305_sha256,
+        .expect_hvr = true,
+        .cid = true,
+        .cid_peer = mbed_cid,
+        .why = "RFC 9146 connection ID, both CIDs non-empty, our client: tls12_cid records (inner type, the 5.3 additional data) from the Finished on, accepted by Mbed TLS, and its records carrying OUR CID accepted by us",
+    },
+    .{
+        .name = "dtls12-cid-server-mbedtls",
+        .flow = .server,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x88,
+        .kind = .psk,
+        .mbed_suite = "TLS-ECDHE-PSK-WITH-CHACHA20-POLY1305-SHA256",
+        .expect_suite = .ecdhe_psk_with_chacha20_poly1305_sha256,
+        .cid = true,
+        .cid_peer = mbed_cid,
+        .why = "RFC 9146 connection ID, OUR server answering an Mbed TLS client's connection_id extension: both directions of tls12_cid records",
+    },
+    .{
+        .name = "dtls12-cid-client-empty-peer-mbedtls",
+        .flow = .client,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x89,
+        .kind = .psk,
+        .mbed_suite = "TLS-ECDHE-PSK-WITH-CHACHA20-POLY1305-SHA256",
+        .expect_suite = .ecdhe_psk_with_chacha20_poly1305_sha256,
+        .expect_hvr = true,
+        .cid = true,
+        .cid_peer = "",
+        .why = "RFC 9146 3 asymmetric use: Mbed TLS asks for a zero-length CID, so we send plain records while it sends tls12_cid ones carrying our CID",
+    },
+    .{
+        .name = "dtls12-cid-server-empty-own-mbedtls",
+        .flow = .server,
+        .peer = .mbedtls,
+        .peer_mode = "",
+        .seed = 0x8a,
+        .kind = .ecdsa,
+        .mbed_suite = "TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256",
+        .expect_suite = .ecdhe_ecdsa_with_aes_128_gcm_sha256,
+        .cid = true,
+        .cid_own = "",
+        .cid_peer = mbed_cid,
+        .max_datagram = 200,
+        .why = "the other asymmetry, in certificate mode: OUR server asks for a zero-length CID and sends tls12_cid records with Mbed TLS's, its certificate flight fragmented at 200 bytes",
+    },
+    .{
         .name = "dtls12-ecdsa-client-resume",
         .flow = .client,
         .peer_mode = "12-server-ecdsa-resume",
@@ -1965,7 +2124,7 @@ fn clientHandshake12(io: std.Io, sock: net.Socket, server_addr: *const net.IpAdd
         if (steps > 40) return error.TooManyFlights;
         const incoming = try sock.receiveTimeout(io, rx, deadline(io, 10_000));
         const result = conn.handleFlight(incoming.data, rnd, 0, out) catch |err| {
-            std.debug.print("\n  our client rejected OpenSSL's flight ({t})\n", .{err});
+            std.debug.print("\n  our client rejected the {t} server's flight ({t})\n", .{ case.peer, err });
             return err;
         };
         rec.op("flight");
@@ -2123,6 +2282,308 @@ fn runServerFlowOpenssl12(io: std.Io, case: Case12, fx: *const Fixtures, rec: *R
     rec.note("peer exited 0 (not replayable): OpenSSL printed our echo and closed at end of input", .{});
 }
 
+// ── Mbed TLS: `ssl_server2` / `ssl_client2` as black boxes ─────────────────
+
+/// Where `tools/mbedtls.sh` leaves the two programs, relative to the scratch
+/// directory the peers run in (`.zig-cache/dtls-interop/` under the root).
+const mbed_bin_from_work = "../../.interop-peers/dtls-mbedtls/build/programs/ssl/";
+/// `tools/mbedtls.sh` writes the release and tarball hash it built here.
+const mbed_version_path = ".interop-peers/dtls-mbedtls/VERSION";
+
+/// Reads the peer's output byte by byte until it contains `needle`. Not line
+/// based: `ssl_server2` prints "Waiting for a remote connection ..." with no
+/// newline and flushes.
+fn awaitPeerText(reader: *std.Io.Reader, needle: []const u8) !void {
+    var window: [256]u8 = undefined;
+    std.debug.assert(needle.len <= window.len);
+    var len: usize = 0;
+    var seen: usize = 0;
+    while (seen < 64 * 1024) : (seen += 1) {
+        const b = reader.takeByte() catch return error.PeerNeverPrintedIt;
+        if (len == window.len) {
+            std.mem.copyForwards(u8, window[0 .. len - 1], window[1..len]);
+            len -= 1;
+        }
+        window[len] = b;
+        len += 1;
+        if (std.mem.endsWith(u8, window[0..len], needle)) return;
+    }
+    return error.PeerNeverPrintedIt;
+}
+
+/// RFC 9146 §4: once a non-empty CID is negotiated for the peer, our epoch-1
+/// records are `tls12_cid` (25); with a zero-length one they stay plain.
+fn expectRecordType12(case: Case12, record: []const u8) !void {
+    if (!case.cid) return;
+    const want: u16 = if (case.cid_peer.len > 0) 25 else 23;
+    try expectU16("our application-data record's content type", want, record[0]);
+}
+
+/// What `report_cid_usage` in both Mbed TLS programs prints for a negotiated
+/// CID: "Peer CID (length N Bytes): " and each byte as "%02x ".
+fn mbedCidLine(buf: []u8, cid: []const u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.print("Peer CID (length {d} Bytes): ", .{cid.len});
+    for (cid) |b| try w.print("{x:0>2} ", .{b});
+    return w.buffered();
+}
+
+/// The `key=value` arguments both Mbed TLS programs share for a case.
+const MbedArgs = struct {
+    list: [24][]const u8 = undefined,
+    len: usize = 0,
+    bufs: [4][160]u8 = undefined,
+
+    fn add(self: *MbedArgs, a: []const u8) void {
+        self.list[self.len] = a;
+        self.len += 1;
+    }
+
+    fn common(self: *MbedArgs, case: Case12, role: dtls.Role, port: u16, key_hex: []const u8) !void {
+        self.add(try std.mem.print(&self.bufs[0], "server_port={d}", .{port}));
+        self.add("server_addr=127.0.0.1");
+        self.add("dtls=1");
+        self.add("force_version=dtls12");
+        self.add(try std.mem.print(&self.bufs[1], "force_ciphersuite={s}", .{case.mbed_suite}));
+        // A peer that stops answering exits instead of waiting forever.
+        self.add("read_timeout=10000");
+        self.add("hs_timeout=1000-8000");
+        switch (case.kind) {
+            .psk => {
+                self.add(try std.mem.print(&self.bufs[2], "psk={s}", .{key_hex}));
+                self.add("psk_identity=" ++ psk_identity);
+                self.add("crt_file=none");
+                self.add("key_file=none");
+                self.add("ca_file=none");
+            },
+            .ecdsa => switch (role) {
+                // Mbed TLS serves OUR fixture leaf and key (DER files the
+                // wolfSSL peer also reads), so "we verified it" cannot mean
+                // "we trusted something else".
+                .server => {
+                    self.add("crt_file=server-cert.der");
+                    self.add("key_file=server-key.der");
+                    self.add("ca_file=none");
+                },
+                .client => {
+                    self.add("ca_file=anchor-cert.der");
+                    self.add("auth_mode=required");
+                    self.add("server_name=dtls-test-server");
+                    self.add("crt_file=none");
+                    self.add("key_file=none");
+                },
+            },
+            .rsa => return error.NoMbedRsaCase,
+        }
+        if (case.cid) {
+            self.add("cid=1");
+            var w: std.Io.Writer = .fixed(&self.bufs[3]);
+            try w.writeAll("cid_val=");
+            for (case.cid_peer) |b| try w.print("{x:0>2}", .{b});
+            self.add(w.buffered());
+        }
+    }
+};
+
+fn mbedProgram(buf: []u8, name: []const u8) []const u8 {
+    return std.mem.print(buf, "{s}{s}", .{ mbed_bin_from_work, name }) catch unreachable;
+}
+
+fn mbedMissing(err: anyerror) anyerror {
+    std.debug.print(
+        "\n  cannot start the Mbed TLS peer ({t}); build it first, from the repository root:\n" ++
+            "    modules/dtls/tools/mbedtls.sh\n",
+        .{err},
+    );
+    return error.NoMbedtls;
+}
+
+/// Our 1.2 client against `ssl_server2 dtls=1` (its default cookie exchange):
+/// our line goes up, the server answers with its HTTP-like page naming the
+/// suite it negotiated, and for a CID case its stdout must name OUR CID as the
+/// one it sends.
+fn runClientFlowMbed12(io: std.Io, work: std.Io.Dir, case: Case12, fx: *const Fixtures, rec: *Recorder) !void {
+    const port = try freeLoopbackPort(io);
+    const key_hex = pskHex();
+    var args: MbedArgs = .{};
+    var prog_buf: [128]u8 = undefined;
+    // Line-buffered: ssl_server2 calls fflush only at some of its prints.
+    args.add("stdbuf");
+    args.add("-oL");
+    args.add(mbedProgram(&prog_buf, "ssl_server2"));
+    try args.common(case, .server, port, &key_hex);
+    args.add("exchanges=1");
+    var child = std.process.spawn(io, .{
+        .argv = args.list[0..args.len],
+        .cwd = .{ .dir = work },
+        .environ_map = child_env,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch |err| return mbedMissing(err);
+    defer child.kill(io);
+    var out_buf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &out_buf);
+    awaitPeerText(&stdout_reader.interface, "Waiting for a remote connection") catch return mbedMissing(error.PeerNeverReady);
+
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    const server_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+
+    const seed = @as([32]u8, @splat(case.seed));
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    const rnd = seededForTest(&csprng);
+    recordConfig12(rec, case, seed);
+    var conn = try Connection12.clientInit(config12(case, .client, fx, null));
+    defer conn.deinit();
+    rec.op("client_init");
+    rec.end();
+
+    var out: [8192]u8 = undefined;
+    var rx: [4096]u8 = undefined;
+    try clientHandshake12(io, sock, &server_addr, &conn, rnd, case, &out, &rx, rec);
+    try expectState12(&conn, case);
+    try expectBool("HelloVerifyRequest seen", case.expect_hvr, conn.hvr_count > 0);
+    recordExpect12(rec, &conn);
+    rec.end();
+
+    const record = try conn.send(case.app_send, &out);
+    try expectRecordType12(case, record);
+    rec.op("send");
+    rec.hexArg("in", case.app_send);
+    rec.hexArg("out", record);
+    rec.end();
+    try sock.send(io, &server_addr, record);
+    var plain: [2048]u8 = undefined;
+    const page = try recvApplicationData12(io, sock, &conn, &rx, &plain, rec);
+    if (!std.mem.startsWith(u8, page, "HTTP/1.0 200 OK\r\n") or std.mem.find(u8, page, case.mbed_suite) == null) {
+        std.debug.print("  ssl_server2 answered \"{s}\", not its page naming {s}\n", .{ page, case.mbed_suite });
+        return error.Mismatch;
+    }
+    // ssl_server2 prints what it read before it answers.
+    try awaitPeerText(&stdout_reader.interface, case.app_send);
+    rec.note("peer stdout (not replayable): ssl_server2 printed our application data", .{});
+    if (case.cid) {
+        var line_buf: [160]u8 = undefined;
+        const line = try mbedCidLine(&line_buf, case.cid_own);
+        awaitPeerText(&stdout_reader.interface, line) catch {
+            std.debug.print("  ssl_server2 never printed \"{s}\"\n", .{line});
+            return error.PeerSawAnotherCid;
+        };
+        rec.note("peer stdout (not replayable): (initial handshake) {s}", .{line});
+    }
+}
+
+/// `ssl_client2 dtls=1` against our 1.2 server: it sends its GET line, prints
+/// the answer we send, closes and exits 0; its stdout is read after it exits.
+fn runServerFlowMbed12(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, case: Case12, fx: *const Fixtures, rec: *Recorder) !void {
+    const local: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try local.bind(io, .{ .mode = .dgram });
+    defer sock.close(io);
+    const key_hex = pskHex();
+    var args: MbedArgs = .{};
+    var prog_buf: [128]u8 = undefined;
+    args.add(mbedProgram(&prog_buf, "ssl_client2"));
+    try args.common(case, .client, sock.address.getPort(), &key_hex);
+    var child = std.process.spawn(io, .{
+        .argv = args.list[0..args.len],
+        .cwd = .{ .dir = work },
+        .environ_map = child_env,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch |err| return mbedMissing(err);
+    defer child.kill(io);
+
+    const seed = @as([32]u8, @splat(case.seed));
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    const rnd = seededForTest(&csprng);
+    recordConfig12(rec, case, seed);
+
+    var out: [8192]u8 = undefined;
+    var rx: [4096]u8 = undefined;
+    var peer_addr: net.IpAddress = undefined;
+    var conn: ?Connection12 = null;
+    defer if (conn) |*c| c.deinit();
+    var datagrams_out: usize = 0;
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        if (steps > 40) return error.TooManyFlights;
+        const incoming = sock.receiveTimeout(io, &rx, deadline(io, 10_000)) catch |err| {
+            std.debug.print("\n  ssl_client2 went silent during the handshake ({t})\n", .{err});
+            return err;
+        };
+        peer_addr = incoming.from;
+        if (conn == null) {
+            conn = try Connection12.serverInit(config12(case, .server, fx, null));
+            rec.op("server_init");
+            rec.end();
+        }
+        const result = conn.?.handleFlight(incoming.data, rnd, 0, &out) catch |err| {
+            std.debug.print("\n  our server rejected ssl_client2's flight ({t})\n", .{err});
+            return err;
+        };
+        rec.op("flight");
+        rec.hexArg("in", incoming.data);
+        rec.hexArg("out", result.out);
+        rec.numArg("more", @intFromBool(result.need_more_data));
+        rec.end();
+        if (result.out.len > 0) datagrams_out += try sendDatagrams(io, sock, &peer_addr, result.out, case.max_datagram);
+        if (conn.?.isConnected()) break;
+    }
+    try expectState12(&conn.?, case);
+    recordExpect12(rec, &conn.?);
+    if (case.max_datagram > 0 and datagrams_out < 3) return error.OurFlightWasNotFragmented;
+    rec.end();
+
+    var plain: [2048]u8 = undefined;
+    const request = try recvApplicationData12(io, sock, &conn.?, &rx, &plain, rec);
+    if (!std.mem.startsWith(u8, request, "GET / HTTP/1.0\r\n")) {
+        std.debug.print("  ssl_client2 sent \"{s}\", not its GET request\n", .{request});
+        return error.Mismatch;
+    }
+    const answer = try conn.?.send(case.app_send, &out);
+    try expectRecordType12(case, answer);
+    rec.op("send");
+    rec.hexArg("in", case.app_send);
+    rec.hexArg("out", answer);
+    rec.end();
+    try sock.send(io, &peer_addr, answer);
+
+    var out_buf: [4096]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &out_buf);
+    const said = try stdout_reader.interface.allocRemaining(gpa, .limited(256 * 1024));
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("  ssl_client2 exited {d}, not 0. It said:\n{s}\n", .{ code, said });
+            return error.PeerRejectedUs;
+        },
+        else => return error.PeerDiedAbnormally,
+    }
+    if (std.mem.find(u8, said, case.app_send) == null) {
+        std.debug.print("  ssl_client2 never printed our answer. It said:\n{s}\n", .{said});
+        return error.PeerNeverPrintedOurData;
+    }
+    rec.note("peer exited 0 (not replayable): ssl_client2 printed our answer and closed", .{});
+    if (case.cid) {
+        var line_buf: [160]u8 = undefined;
+        const line = try mbedCidLine(&line_buf, case.cid_own);
+        if (std.mem.find(u8, said, line) == null) {
+            std.debug.print("  ssl_client2 never printed \"{s}\". It said:\n{s}\n", .{ line, said });
+            return error.PeerSawAnotherCid;
+        }
+        rec.note("peer stdout (not replayable): (initial handshake) {s}", .{line});
+    }
+}
+
+/// The release `tools/mbedtls.sh` built, for the transcript header.
+fn readMbedVersion(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir) []const u8 {
+    const text = root.readFileAlloc(io, mbed_version_path, gpa, .limited(512)) catch return "unknown (run modules/dtls/tools/mbedtls.sh)";
+    return std.mem.trim(u8, text, " \r\n\t");
+}
+
 const v12_only = [_]dtls.ProtocolVersion{.dtls12};
 
 fn config12(case: Case12, role: dtls.Role, fx: *const Fixtures, binding: ?[]const u8) dtls.Config {
@@ -2161,7 +2622,8 @@ fn config12(case: Case12, role: dtls.Role, fx: *const Fixtures, binding: ?[]cons
         },
     }
     if (binding) |b| c.hello_retry = .{ .cookie_secret = cookie_secret, .peer_binding = b };
-    if (case.cid) c.connection_id = zig_cid;
+    if (case.cid) c.connection_id = case.cid_own;
+    if (case.suites) |list| c.cipher_suites12 = list;
     if (case.resumption) switch (role) {
         .client => c.session_tickets12 = true,
         .server => c.tickets = .{ .ticketer = InteropTicketer.ticketer() },
@@ -2181,7 +2643,12 @@ fn recordConfig12(rec: *Recorder, case: Case12, seed: [32]u8) void {
     rec.hexArg("psk", &psk);
     rec.hexArg("psk_hint", psk12_hint);
     rec.hexArg("cookie_secret", cookie_secret);
-    if (case.cid) rec.hexArg("cid", zig_cid);
+    if (case.cid) rec.hexArg("cid", case.cid_own);
+    if (case.suites) |list| {
+        var buf: [2 * 16]u8 = undefined;
+        for (list, 0..) |cs, i| std.mem.writeInt(u16, buf[2 * i ..][0..2], @backingInt(cs), .big);
+        rec.hexArg("suites", buf[0 .. 2 * list.len]);
+    }
     rec.end();
 }
 
@@ -2204,7 +2671,7 @@ fn expectState12(conn: *const Connection12, case: Case12) !void {
     try expectU16("negotiated suite", @backingInt(case.expect_suite), @backingInt(conn.negotiatedSuite() orelse return error.NotConnected));
     try expectU16("negotiated group", case.expect_group, conn.ecdhe_group);
     try expectBool("extended master secret", true, conn.ems);
-    if (case.cid) try expectBytes("the CID our records carry", wolf_cid, conn.peerConnectionId() orelse "");
+    if (case.cid) try expectBytes("the CID our records carry", case.cid_peer, conn.peerConnectionId() orelse "");
 }
 
 fn recordExpect12(rec: *Recorder, conn: *const Connection12) void {
@@ -2632,7 +3099,8 @@ const usage =
     \\  zig build interop-dtls -- --list        list the case names
     \\  zig build interop-dtls -- --repo-root P read wolfssl_peer.c and the fixtures from P
     \\
-    \\Needs a C compiler and libwolfssl-dev. The hermetic half of this — replaying
+    \\Needs a C compiler and libwolfssl-dev; the 1.2 table also needs `openssl` and
+    \\the Mbed TLS programs built by modules/dtls/tools/mbedtls.sh. The hermetic half of this — replaying
     \\what a capture recorded — is `zig build test-dtls` and needs neither.
     \\
 ;
@@ -2777,7 +3245,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         var rec: Recorder = .{ .enabled = capture, .out = &t12.writer };
         if (capture) {
             try writeHeader(&t12.writer, version, .v12);
-            try t12.writer.print("# The plain-PSK cases ran against {s} (`openssl s_server` / `s_client`).\n\n", .{readOpensslVersion(gpa, io)});
+            try t12.writer.print("# The plain-PSK cases ran against {s} (`openssl s_server` / `s_client`).\n", .{readOpensslVersion(gpa, io)});
+            try t12.writer.print("# The `-mbedtls` cases ran against {s} (`ssl_server2` / `ssl_client2`, built by modules/dtls/tools/mbedtls.sh).\n\n", .{readMbedVersion(gpa, io, root)});
         }
         for (cases12) |case| {
             if (!isSelected(selected[0..selected_len], case.name)) continue;
@@ -2794,6 +3263,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 .openssl => switch (case.flow) {
                     .client => runClientFlowOpenssl12(io, case, &fx, &rec),
                     .server, .server_cookie => runServerFlowOpenssl12(io, case, &fx, &rec),
+                },
+                .mbedtls => switch (case.flow) {
+                    .client => runClientFlowMbed12(io, work, case, &fx, &rec),
+                    .server, .server_cookie => runServerFlowMbed12(gpa, io, work, case, &fx, &rec),
                 },
             };
             ran += 1;
@@ -2813,7 +3286,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         std.debug.print("no case matched\n{s}", .{usage});
         return 2;
     }
-    std.debug.print("\n{d}/{d} cases passed against wolfSSL {s}\n", .{ ran - failed, ran, version });
+    std.debug.print("\n{d}/{d} cases passed (wolfSSL {s}; the 1.2 table also runs OpenSSL and Mbed TLS cases)\n", .{ ran - failed, ran, version });
 
     if (capture) {
         if (failed > 0) {
