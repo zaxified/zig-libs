@@ -3247,6 +3247,11 @@ fn buildTeddy(pf: *const Prefilter, insts: []const Inst, ranges: []const Range) 
 /// from the start and from after every consuming instruction, with `\z` as a
 /// wall and every other assertion passable.
 fn endAnchored(insts: []const Inst) bool {
+    // Without a `\z` nothing can wall off the match.
+    const has_end = for (insts) |inst| {
+        if (inst == .assert and inst.assert == .end_text) break true;
+    } else false;
+    if (!has_end) return false;
     var seen: std.StaticBitSet(max_insts) = .empty;
     // The start and every consuming instruction, then two per instruction walked.
     var stack: [3 * max_insts + 1]u16 = undefined;
@@ -3338,8 +3343,7 @@ fn lastBytes(insts: []const Inst, ranges: []const Range) ?[4]u64 {
         if (!reachesMatch(insts, @intCast(pc + 1))) continue;
         switch (inst) {
             .rune => |r| for (ranges[r.start..][0..r.len]) |rg| {
-                var c: u32 = rg.lo;
-                while (c <= @min(rg.hi, 0x7f)) : (c += 1) set[c >> 6] |= @as(u64, 1) << @truncate(c);
+                if (rg.lo <= 0x7f) setByteRange(&set, rg.lo, @min(rg.hi, 0x7f));
                 if (rg.hi >= 0x80) set[2] = ~@as(u64, 0); // 0x80..0xbf
                 if (rg.lo <= 0xfffd and 0xfffd <= rg.hi) set[3] = ~@as(u64, 0);
             },
@@ -3454,9 +3458,17 @@ fn addLeadBytes(set: *[4]u64, r: Range) void {
         const lo: u32 = @max(r.lo, band.lo);
         const hi: u32 = @min(r.hi, band.hi);
         if (lo > hi) continue;
-        var c: u32 = band.tag | (lo >> band.shift);
-        const last: u32 = band.tag | (hi >> band.shift);
-        while (c <= last) : (c += 1) set[c >> 6] |= @as(u64, 1) << @truncate(c);
+        setByteRange(set, band.tag | (lo >> band.shift), band.tag | (hi >> band.shift));
+    }
+}
+
+/// Add the bytes `lo..=hi` (both below 256) to `set`, a word at a time.
+fn setByteRange(set: *[4]u64, lo: u32, hi: u32) void {
+    var w = lo >> 6;
+    while (w <= hi >> 6) : (w += 1) {
+        const from: u6 = if (w == lo >> 6) @truncate(lo) else 0;
+        const to: u6 = if (w == hi >> 6) @truncate(hi) else 63;
+        set[w] |= (~@as(u64, 0) << from) & (~@as(u64, 0) >> (63 - to));
     }
 }
 
@@ -4653,6 +4665,29 @@ fn expectFind(pattern: []const u8, input: []const u8, want: ?[]const u8) !void {
         try testing.expectEqualStrings(w, got.?.slice(input));
     } else try testing.expectEqual(@as(?Span, null), got);
     try testing.expectEqual(want != null, re.isMatch(input));
+}
+
+test "setByteRange sets exactly lo..=hi, across word edges" {
+    for ([_]u32{ 0, 1, 62, 63, 64, 65, 127, 128, 200, 254, 255 }) |lo| {
+        for ([_]u32{ 0, 1, 62, 63, 64, 65, 127, 128, 200, 254, 255 }) |hi| {
+            if (hi < lo) continue;
+            var got: [4]u64 = .{ 0, 0, 0, 0 };
+            setByteRange(&got, lo, hi);
+            var want: [4]u64 = .{ 0, 0, 0, 0 };
+            var c = lo;
+            while (c <= hi) : (c += 1) want[c >> 6] |= @as(u64, 1) << @truncate(c);
+            try testing.expectEqualSlices(u64, &want, &got);
+        }
+    }
+}
+
+test "endAnchored: only a program with a `\\z` can be end-anchored" {
+    var re = try Regex.compile(testing.allocator, "[a-z]+x$");
+    defer re.deinit(testing.allocator);
+    try testing.expect(re.prefilter.end_anchored);
+    var re2 = try Regex.compile(testing.allocator, "[a-z]+x");
+    defer re2.deinit(testing.allocator);
+    try testing.expect(!re2.prefilter.end_anchored);
 }
 
 test "literals, classes, dot, anchors" {

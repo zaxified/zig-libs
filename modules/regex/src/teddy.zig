@@ -151,11 +151,8 @@ pub const ByteSet = struct {
         var n: u8 = 0;
         var bs: ByteSet = .{ .lo = @splat(0), .hi = @splat(0) };
         for (0..16) |h| {
-            var m: u16 = 0;
-            for (0..16) |l| {
-                const c = h << 4 | l;
-                if (set[c >> 6] & (@as(u64, 1) << @intCast(c & 63)) != 0) m |= @as(u16, 1) << @intCast(l);
-            }
+            // The 16 members of high nibble `h` are one aligned 16-bit group of the set.
+            const m: u16 = @truncate(set[h >> 2] >> @intCast((h & 3) * 16));
             if (m == 0) continue;
             const b = for (masks[0..n], 0..) |x, i| {
                 if (x == m) break i;
