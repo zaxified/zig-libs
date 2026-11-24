@@ -77,6 +77,36 @@ esac
 want() { [[ "$ROLE" == all || "$ROLE" == "$1" ]]; }
 echo "ci-environment: role=$ROLE"
 
+# ⭐ ONLY THE PEERS THE RUN WILL TAKE AGAINST (2026-11-25). The interop lane
+# installed every peer on every run -- 15 minutes of a 90-minute lane, 12.5 of
+# them the mqttz driver -- while the run re-took two programs (full CI
+# 45488535147). CI now asks `scripts/test.sh interop-pending` first and passes
+# the list as ZIGLIBS_INTEROP_ONLY; a group whose programs are not on it is
+# skipped and says so. UNSET means everything (a developer machine, role
+# `all`); set and empty means none. Cheap groups several programs share (the Go
+# module caches, which also fetch the pinned go1.26.0 toolchain other oracles
+# use, cargo fetch, apt-get update) stay unconditional: guarding them would buy
+# seconds and risk a hidden coupling.
+if [[ -n "${ZIGLIBS_INTEROP_ONLY+x}" ]]; then
+    _INTEROP_ONLY=" $(tr -s '[:space:]' ' ' <<< "$ZIGLIBS_INTEROP_ONLY") "
+    echo "interop takes this run:${_INTEROP_ONLY% }"
+fi
+# needs <module>...: true when any of them will be re-taken (or no list was given).
+needs() {
+    [[ -z "${ZIGLIBS_INTEROP_ONLY+x}" ]] && return 0
+    local m
+    for m in "$@"; do [[ "$_INTEROP_ONLY" == *" $m "* ]] && return 0; done
+    return 1
+}
+not_needed() { echo "skipped: no take of $* in this run"; }
+# ⭐ A BUILT PEER IS REBUILT ONLY WHEN ITS PIN MOVED (2026-11-25). Each build
+# below writes what it was built from into a marker next to its output, and
+# skips when the marker matches; CI restores those outputs from the
+# `interop-peers` cache (ci.yml), so the mqttz driver (9-12.5 minutes per run)
+# is built once per pin, not once per run.
+built_from() { [[ -f "$1/.zig-libs-built" && "$(cat "$1/.zig-libs-built" 2>/dev/null)" == "$2" ]]; }
+mark_built() { printf '%s\n' "$2" > "$1/.zig-libs-built"; }
+
 # Quiet, but not silent: `apt-get -qq` still lets dpkg print a twenty-four line
 # "(Reading database ... 5% ... 100%)" progress bar into a log that gets read by
 # hand. The pty is what produces it.
@@ -203,6 +233,7 @@ fi
 if want interop; then
 echo "::group::interop: C toolchain + wolfSSL"
 sudo apt-get update "${APT_QUIET[@]}" >/dev/null 2>&1 || true
+if needs dtls; then
 # dtls's live DTLS 1.3 peer, for `zig build interop-dtls` ONLY. wolfSSL
 # specifically, because OpenSSL 3.5 and GnuTLS 3.8 have no DTLS 1.3 at all.
 # ⚠ `test-dtls` has NOT needed this since 2026-09-06 -- it replays
@@ -215,11 +246,14 @@ sudo apt-get install "${APT_QUIET[@]}" build-essential libwolfssl-dev >/dev/null
     && echo "cc + wolfssl: OK" || echo "cc + wolfssl: install failed"
 command -v cc >/dev/null 2>&1 && echo "cc: $(cc --version | head -1)" || echo "cc: MISSING"
 [[ -e /usr/include/wolfssl/ssl.h ]] && echo "wolfssl headers: OK" || echo "wolfssl headers: MISSING"
+else not_needed dtls; fi
 # `zig build interop-wireguard` section D checks `conf` against the real `wg`;
 # without it the program fails with FileNotFound (run 41622100028).
+if needs wireguard; then
 sudo apt-get install "${APT_QUIET[@]}" wireguard-tools >/dev/null 2>&1 \
     && echo "wireguard-tools: OK" || echo "wireguard-tools: install failed"
 command -v wg >/dev/null 2>&1 && echo "wg: $(wg --version)" || echo "wg: MISSING"
+else not_needed wireguard; fi
 # The capability report in test.sh probes the websocket example's judge on
 # every lane that wants `websocket`, the interop one included; without this it
 # printed "1 MISSING PEER(S) THAT FAIL THE RUN" there (run 39169575780). Same
@@ -247,11 +281,16 @@ echo "::group::interop: python oracles"
 # Pinned to 7.36.2 on 2026-11-14 for one run, the reference turned stricter on
 # two edge cases (`nonminimal_tag_stricter`, `field_number_out_of_range_stricter`,
 # full CI 43645078985) -- a moved oracle. A bump re-takes the fixtures with it.
+if needs jinja poseidon brotli protobuf arrow; then
+if needs jinja poseidon brotli protobuf; then
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
     "jinja2==3.1.6" "sympy==1.14.0" "brotli==1.2.1" "protobuf==4.21.12" >/dev/null 2>&1 || true
+fi
 # `interop-arrow` reads the writer's files back with pyarrow (modules/arrow/tools/check_ours.py), the version the
 # arrow card's reference names. Its own install line: a resolver conflict here must not take the four above with it.
+if needs arrow; then
 sudo pip3 install --break-system-packages -q --root-user-action=ignore "pyarrow==26.0.1" >/dev/null 2>&1 || true
+fi
 python3 - <<'PY' || true
 for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
                    ("brotli", "brotli"), ("google.protobuf", "protobuf"),
@@ -263,24 +302,29 @@ for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
     except ImportError:
         print(f"{label}: MISSING")
 PY
+else not_needed jinja poseidon brotli protobuf arrow; fi
 
 # ⚠ `grpc` takes protobuf TOO, and a venv does not see system site-packages.
 # The first run of this script installed protobuf system-wide and grpcio into
 # the venv, so the venv's interpreter — the one interop-grpc actually spawns —
 # had grpcio and no `google.protobuf`, and the oracle script died on an import.
 # List everything a venv's own scripts import; nothing outside it will help.
+if needs grpc; then
 python3 -m venv "$HOME/.cache/zig-libs-grpc" >/dev/null 2>&1 || true
 "$HOME/.cache/zig-libs-grpc/bin/pip" -q install "grpcio==1.85.1" "protobuf==7.36.2" >/dev/null 2>&1 \
     && echo "grpc venv: OK" || echo "grpc venv: install failed"
+else not_needed grpc; fi
 # `interop-opcua` drives an asyncua peer; `scripts/test.sh interop` hands it
 # OPCUA_PYTHON, the same venv the `tests` role builds for the module's live
 # test. A venv and not the system pip above: asyncua pulls a newer
 # `cryptography` than the apt-installed one, pip cannot replace an apt
 # package, and the failed transaction took jinja2/sympy/brotli/protobuf down
 # with it (2026-09-18, the lane's first real run: sympy went MISSING).
+if needs opcua; then
 python3 -m venv "$HOME/.cache/zig-libs-opcua" >/dev/null 2>&1 || true
 "$HOME/.cache/zig-libs-opcua/bin/pip" -q install "asyncua==2.1.0" "cryptography==50.0.2" >/dev/null 2>&1 \
     && echo "opcua venv: OK" || echo "opcua venv: install failed"
+else not_needed opcua; fi
 echo "::endgroup::"
 
 echo "::group::interop: Pebble (acme)"
@@ -289,10 +333,18 @@ echo "::group::interop: Pebble (acme)"
 # the transcript records Pebble's behaviour, and a moved oracle must be a
 # deliberate bump. A failed install is not hidden: pebble.sh then fails the
 # interop-acme step by name.
-GOBIN="$HOME/.local/share/zig-libs/oracle-bin/pebble" \
-    go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1 \
-    github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@v2.10.1 >/dev/null 2>&1 \
-    && echo "pebble: v2.10.1" || echo "pebble: install failed"
+if needs acme acmedns; then
+PEBBLE_DIR="$HOME/.local/share/zig-libs/oracle-bin/pebble"
+if built_from "$PEBBLE_DIR" "pebble v2.10.1"; then
+    echo "pebble: v2.10.1 (cached)"
+else
+    GOBIN="$PEBBLE_DIR" \
+        go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1 \
+        github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@v2.10.1 >/dev/null 2>&1 \
+        && mark_built "$PEBBLE_DIR" "pebble v2.10.1" \
+        && echo "pebble: v2.10.1" || echo "pebble: install failed"
+fi
+else not_needed acme acmedns; fi
 echo "::endgroup::"
 
 # ⭐ THE FORMERLY LOCAL-ONLY ORACLES (2026-10-07). Until this day thirteen
@@ -302,6 +354,9 @@ echo "::endgroup::"
 # program is green on this lane. Versions are the ones the committed vectors
 # were taken with — a moved oracle must be a deliberate bump.
 echo "::group::interop: netns peers (nftables rawsock wireguard pathmtu traceroute)"
+# Every program that enters `unshare -rn` is listed, not only the five named
+# above: the others use `ip` from the same install.
+if needs nftables rawsock wireguard pathmtu traceroute dns dnssec netaddr sntp syslog; then
 sudo apt-get install "${APT_QUIET[@]}" iproute2 nftables iputils-ping iputils-tracepath traceroute >/dev/null 2>&1 \
     && echo "ip/nft/ping/tracepath/traceroute: OK" || echo "netns tools: install failed"
 # Loaded here because root inside an unprivileged user namespace cannot
@@ -309,9 +364,11 @@ sudo apt-get install "${APT_QUIET[@]}" iproute2 nftables iputils-ping iputils-tr
 for km in veth wireguard nf_tables; do
     sudo modprobe "$km" 2>/dev/null && echo "module $km: OK" || echo "module $km: not loadable"
 done
+else not_needed nftables rawsock wireguard pathmtu traceroute dns dnssec netaddr sntp syslog; fi
 echo "::endgroup::"
 
 echo "::group::interop: mqtt (mosquitto container + paho)"
+if needs mqtt; then
 # Pulled here, not by `podman run`: tools/interop.zig bounds every podman call,
 # and a first pull from docker.io is the slow one. The venv path is the fixed,
 # repo-relative one the program uses (this script runs from the checkout).
@@ -324,6 +381,12 @@ python3 -m venv .zig-cache/mqtt-interop/venv >/dev/null 2>&1 || true
 # run needs it; full CI 45100771036 had none: MqttzDriverMissing). Its own
 # toolchain is Zig 0.16.0 (pinned by the index.json shasum), the clone is
 # pinned to the commit mqttz.patch was written against.
+# Built from: the pinned commit, our patch and driver sources, the toolchain.
+MQTTZ_DRIVER=.zig-cache/mqtt-interop/driver
+MQTTZ_ID="mqttz cf8acd2 zig-0.16.0 $(cat modules/mqtt/tools/mqttz_driver/{mqttz.patch,main.zig,build.zig,build.zig.zon} 2>/dev/null | sha256sum | cut -c1-16)"
+if built_from "$MQTTZ_DRIVER" "$MQTTZ_ID"; then
+    echo "mqttz driver: cf8acd2 + mqttz.patch, zig 0.16.0 (cached)"
+else
 Z16="$HOME/.local/share/zig-libs/oracle-bin/zig-x86_64-linux-0.16.0"
 if [[ ! -x "$Z16/zig" ]]; then
     mkdir -p "$(dirname "$Z16")" \
@@ -338,7 +401,10 @@ if [[ "$(git -C "$MQTTZ" rev-parse HEAD 2>/dev/null)" != cf8acd2c1acae7f5c1c67b7
         && git -C "$MQTTZ" apply ../../../modules/mqtt/tools/mqttz_driver/mqttz.patch || true
 fi
 (cd modules/mqtt/tools/mqttz_driver && "$Z16/zig" build --prefix ../../../../.zig-cache/mqtt-interop/driver >/dev/null 2>&1) \
+    && mark_built "$MQTTZ_DRIVER" "$MQTTZ_ID" \
     && echo "mqttz driver: cf8acd2 + mqttz.patch, zig 0.16.0" || echo "mqttz driver: fetch or build failed"
+fi
+else not_needed mqtt; fi
 echo "::endgroup::"
 
 echo "::group::interop: dnssec (ldns-verify-zone, unbound-host), xmlenc (xmlsec1)"
@@ -346,10 +412,12 @@ echo "::group::interop: dnssec (ldns-verify-zone, unbound-host), xmlenc (xmlsec1
 # 45100771036: "ldns-verify-zone not found", "xmlsec1 not found"). dnssec's
 # unbound.zig half needs unbound-host; xmlenc needs xmlsec1 >= 1.3 with the
 # OpenSSL backend (Ubuntu's xmlsec1 package) and openssl.
+if needs dnssec xmlenc; then
 sudo apt-get install "${APT_QUIET[@]}" ldnsutils unbound-host xmlsec1 openssl >/dev/null 2>&1 \
     && echo "ldnsutils, unbound-host, xmlsec1: OK" || echo "ldnsutils/unbound-host/xmlsec1: install failed"
 command -v xmlsec1 >/dev/null 2>&1 && echo "xmlsec1: $(xmlsec1 --version 2>&1 | head -1)" || echo "xmlsec1: MISSING"
 command -v ldns-verify-zone >/dev/null 2>&1 && echo "ldns-verify-zone: OK" || echo "ldns-verify-zone: MISSING"
+else not_needed dnssec xmlenc; fi
 echo "::endgroup::"
 
 ORACLE_VENVS="$HOME/.local/share/zig-libs/oracle-venvs"
@@ -357,23 +425,36 @@ echo "::group::interop: openapi (openapi-spec-validator + FastAPI)"
 # The validator is imported by the SYSTEM python3 (tools/spec_oracle.py), so it
 # goes there — in a pip call of its own: a failed transaction must not take the
 # python-oracle set above down with it (the asyncua lesson, 2026-09-18).
+if needs openapi; then
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
     "openapi-spec-validator==0.7.1" >/dev/null 2>&1 \
     && echo "openapi-spec-validator: 0.7.1" || echo "openapi-spec-validator: install failed"
+else not_needed openapi; fi
+# validate judges pydantic in this venv too (installed further below).
+if needs openapi validate; then
 python3 -m venv "$ORACLE_VENVS/fastapi" >/dev/null 2>&1 || true
 "$ORACLE_VENVS/fastapi/bin/pip" -q install "fastapi==0.142.2" >/dev/null 2>&1 \
     && echo "fastapi venv: 0.142.2" || echo "fastapi venv: install failed"
+else not_needed openapi validate; fi
 echo "::endgroup::"
 
 echo "::group::interop: http (h2spec, SSE venv, Go 1.26.0)"
+if needs http; then
 # h2spec is found on PATH only; v2.2.1 is the build the vectors were taken with.
-GOBIN="$HOME/.local/share/zig-libs/oracle-bin/h2spec" \
-    go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1+incompatible >/dev/null 2>&1 \
-    && sudo ln -sf "$HOME/.local/share/zig-libs/oracle-bin/h2spec/h2spec" /usr/local/bin/h2spec \
-    && echo "h2spec: v2.2.1" || echo "h2spec: install failed"
+H2SPEC_DIR="$HOME/.local/share/zig-libs/oracle-bin/h2spec"
+if built_from "$H2SPEC_DIR" "h2spec v2.2.1"; then
+    sudo ln -sf "$H2SPEC_DIR/h2spec" /usr/local/bin/h2spec && echo "h2spec: v2.2.1 (cached)"
+else
+    GOBIN="$H2SPEC_DIR" \
+        go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1+incompatible >/dev/null 2>&1 \
+        && sudo ln -sf "$H2SPEC_DIR/h2spec" /usr/local/bin/h2spec \
+        && mark_built "$H2SPEC_DIR" "h2spec v2.2.1" \
+        && echo "h2spec: v2.2.1" || echo "h2spec: install failed"
+fi
 python3 -m venv "$ORACLE_VENVS/http" >/dev/null 2>&1 || true
 "$ORACLE_VENVS/http/bin/pip" -q install "sseclient-py==1.9.0" "httpx==0.28.1" "httpx-sse==0.4.3" "httptools==0.9.0" >/dev/null 2>&1 \
     && echo "http venv: OK" || echo "http venv: install failed"
+else not_needed http; fi
 echo "::endgroup::"
 
 echo "::group::interop: sntp (chronyd copy, ntplib, Go module cache)"
@@ -381,6 +462,7 @@ echo "::group::interop: sntp (chronyd copy, ntplib, Go module cache)"
 # distribution AppArmor profile attached by path cannot confine it; the
 # package's own service is stopped — it is installed for the binary and its
 # libraries, not to discipline the runner's clock.
+if needs sntp; then
 sudo apt-get install "${APT_QUIET[@]}" chrony >/dev/null 2>&1 \
     && sudo systemctl disable --now chrony >/dev/null 2>&1; true
 CHRONY_DIR="$HOME/.local/share/zig-libs/oracle-bin/chrony/usr/sbin"
@@ -389,6 +471,7 @@ mkdir -p "$CHRONY_DIR" && cp /usr/sbin/chronyd "$CHRONY_DIR/" 2>/dev/null \
 python3 -m venv "$ORACLE_VENVS/ntplib" >/dev/null 2>&1 || true
 "$ORACLE_VENVS/ntplib/bin/pip" -q install "ntplib==0.4.0" >/dev/null 2>&1 \
     && echo "ntplib venv: 0.4.0" || echo "ntplib venv: install failed"
+else not_needed sntp; fi
 # The oracle builds with GOPROXY=off (no network at gate time), so the module
 # cache — beevik/ntp and the pinned go1.26.0 toolchain itself — is filled here.
 (cd modules/sntp/tools/go_oracle && GOTOOLCHAIN=go1.26.0 go mod download >/dev/null 2>&1) \
@@ -413,25 +496,32 @@ echo "::endgroup::"
 echo "::group::interop: syslog (rsyslogd)"
 # Installed for /usr/sbin/rsyslogd and its plugins; tools/rsyslog_oracle.py
 # runs a copy, unconfined, inside `unshare -rn`. journald comes with systemd.
+if needs syslog; then
 sudo apt-get install "${APT_QUIET[@]}" rsyslog >/dev/null 2>&1 \
     && echo "rsyslogd: $(/usr/sbin/rsyslogd -v 2>/dev/null | head -1)" || echo "rsyslog: install failed"
+else not_needed syslog; fi
 echo "::endgroup::"
 
 echo "::group::interop: acmedns, brotli, b64ct peers"
 # acmedns: tools/peer.py (system python3 -I) needs dnspython, the Exec
 # publisher needs BIND's nsupdate; Pebble comes from the acme group above.
+# dns's oracles use both as well; libbrotli-dev is brotli's.
+if needs acmedns dns brotli; then
 sudo apt-get install "${APT_QUIET[@]}" bind9-dnsutils libbrotli-dev >/dev/null 2>&1 \
     && echo "nsupdate, libbrotli-dev: OK" || echo "nsupdate/libbrotli-dev: install failed"
 sudo pip3 install --break-system-packages -q --root-user-action=ignore "dnspython==2.8.0" >/dev/null 2>&1 \
     && echo "dnspython: 2.8.0" || echo "dnspython: install failed"
+else not_needed acmedns dns brotli; fi
 # b64ct: libsodium's codecs.c at the path tools/interop.zig reads, pinned by
 # hash (the program compiles it; the pin is the review).
+if needs b64ct; then
 SODIUM_DIR=.zig-cache/foreign/libsodium-1.0.22
 mkdir -p "$SODIUM_DIR" \
     && curl -fsSL -o "$SODIUM_DIR/codecs.c" \
         https://raw.githubusercontent.com/jedisct1/libsodium/1.0.22-RELEASE/src/libsodium/sodium/codecs.c \
     && echo "77e675be30ecd8776e0924596bbf305cbc44f41d8df3238fd65c03aa99091b3e  $SODIUM_DIR/codecs.c" | sha256sum -c --quiet \
     && echo "libsodium codecs.c: 1.0.22" || { rm -f "$SODIUM_DIR/codecs.c"; echo "libsodium codecs.c: fetch or hash check failed"; }
+else not_needed b64ct; fi
 echo "::endgroup::"
 
 echo "::group::interop: TA-Lib C (indicators)"
@@ -439,9 +529,17 @@ echo "::group::interop: TA-Lib C (indicators)"
 # default paths below. The release tarball is pinned by hash (the pin is the
 # review: audited 2026-11-15, no I/O, process or network calls in the compiled
 # set); it is compiled with our own cc line, TA-Lib's CMake/configure never runs.
+if needs indicators; then
 TALIB_VER=0.8.3
 TALIB_SRC="$HOME/.local/share/zig-libs/oracles/ta-lib-$TALIB_VER"
 TALIB_OUT="$HOME/.local/share/zig-libs/oracle-bin/ta-lib-$TALIB_VER"
+# The cc line is part of what the library IS (-ffp-contract=off moved seven
+# functions' results when it was missing), so it is in the marker too.
+TALIB_ID="ta-lib $TALIB_VER 28b1179b cc -O2 -ffp-contract=off -fno-math-errno -fPIC"
+# The program reads the headers from the source tree, so both halves must be there.
+if built_from "$TALIB_OUT" "$TALIB_ID" && [[ -e "$TALIB_SRC/src/ta-lib-$TALIB_VER/include/ta_libc.h" ]]; then
+    echo "ta-lib: $TALIB_VER (cached)"
+else
 mkdir -p "$TALIB_SRC/src" "$TALIB_OUT/obj" \
     && curl -fsSL -o "$TALIB_SRC/ta-lib-$TALIB_VER-src.tar.gz" \
         "https://github.com/TA-Lib/ta-lib/releases/download/v$TALIB_VER/ta-lib-$TALIB_VER-src.tar.gz" \
@@ -451,10 +549,15 @@ mkdir -p "$TALIB_SRC/src" "$TALIB_OUT/obj" \
     && ls "$T"/src/ta_common/*.c "$T"/src/ta_func/*.c \
         | xargs -P "$(nproc)" -I{} sh -c 'cc -O2 -ffp-contract=off -fno-math-errno -fPIC -I"$1/include" -I"$1/src/ta_common" -I"$1/src/ta_func" -c "$2" -o "$3/obj/$(basename "$2" .c).o"' _ "$T" {} "$TALIB_OUT" \
     && ar rcs "$TALIB_OUT/libta-lib.a" "$TALIB_OUT"/obj/*.o \
+    && mark_built "$TALIB_OUT" "$TALIB_ID" \
     && echo "ta-lib: $TALIB_VER" || echo "ta-lib: fetch, hash check or build failed"
+fi
+else not_needed indicators; fi
 echo "::endgroup::"
 
 echo "::group::interop: browser oracles (cors security-headers: bun + Chrome)"
+# bun: cors, security-headers, cookies, json5, poseidon, validate.
+if needs cors security-headers cookies json5 poseidon validate; then
 # bun lands in ~/.bun/bin, where tools/interop.zig looks after PATH. Chrome is
 # found on PATH; the hosted image ships google-chrome.
 curl -fsSL https://bun.sh/install 2>/dev/null | bash -s "bun-v1.3.12" >/dev/null 2>&1 \
@@ -471,6 +574,7 @@ BUN_SCRATCH="$(mktemp -d)"
 (cd "$BUN_SCRATCH" && "$HOME/.bun/bin/bun" add json5@2.2.3 ajv@8.20.0 >/dev/null 2>&1) \
     && echo "bun cache: json5 2.2.3, ajv 8.20.0" || echo "bun cache: install failed"
 rm -f "$BUN_SCRATCH"/* "$BUN_SCRATCH"/.[!.]* 2>/dev/null; rmdir "$BUN_SCRATCH" 2>/dev/null || true
+else not_needed cors security-headers cookies json5 poseidon validate; fi
 echo "::endgroup::"
 
 # ⭐ THE PEERS OF THE ELEVEN PROGRAMS THAT RAN ON NO RUNNER BEFORE 2026-11-01.
@@ -478,16 +582,20 @@ echo "::endgroup::"
 # after the lane's last green run (2026-10-19) and whose peers were never
 # installed here: each group below is one program's "Needs" line.
 echo "::group::interop: libseccomp (sandbox), zstd reference checkout"
+if needs sandbox; then
 sudo apt-get install "${APT_QUIET[@]}" libseccomp-dev >/dev/null 2>&1 \
     && echo "libseccomp-dev: OK" || echo "libseccomp-dev: install failed"
+else not_needed sandbox; fi
 # interop-zstd compiles this checkout's lib/ with `zig cc`; it refuses any
 # other commit (tag v1.5.7 = f8745da6ff1ad1e7bab384bd1f9d742439278e99).
+if needs zstd; then
 ZSTD_REF=.zig-cache/zstd-ref
 if [[ "$(git -C "$ZSTD_REF" rev-parse HEAD 2>/dev/null)" != f8745da6ff1ad1e7bab384bd1f9d742439278e99 ]]; then
     git clone -q --depth 1 --branch v1.5.7 https://github.com/facebook/zstd.git "$ZSTD_REF" >/dev/null 2>&1 || true
 fi
 [[ "$(git -C "$ZSTD_REF" rev-parse HEAD 2>/dev/null)" == f8745da6ff1ad1e7bab384bd1f9d742439278e99 ]] \
     && echo "zstd-ref: v1.5.7" || echo "zstd-ref: clone failed"
+else not_needed zstd; fi
 echo "::endgroup::"
 
 echo "::group::interop: lz4 CLI + python-lz4 (lz4)"
@@ -496,11 +604,13 @@ echo "::group::interop: lz4 CLI + python-lz4 (lz4)"
 # a skip (scheduled run 44076840159: the program was added with no peers here).
 # apt, not pip: Debian's python3-lz4 links the system liblz4 that ctypes loads,
 # so both halves of the oracle are the same library (the program's own claim).
+if needs lz4; then
 sudo apt-get install "${APT_QUIET[@]}" lz4 python3-lz4 >/dev/null 2>&1 \
     && echo "lz4, python3-lz4: OK" || echo "lz4/python3-lz4: install failed"
 command -v lz4 >/dev/null 2>&1 && echo "lz4: $(lz4 --version 2>&1 | head -1)" || echo "lz4: MISSING"
 python3 -I -c 'import lz4.frame, lz4.block; print("python-lz4:", __import__("lz4").__version__)' 2>/dev/null \
     || echo "python-lz4: MISSING"
+else not_needed lz4; fi
 echo "::endgroup::"
 
 echo "::group::interop: Go module caches (jwt tracecontext websocket validate)"
@@ -526,34 +636,46 @@ done
 # http's h1parsers phase runs hyper's verdicts from `h1_verdicts`; built here,
 # where cargo is known to run (the interop program's own `cargo build` died with
 # FileNotFound on the 2026-11-24 full lane), so the phase finds the binary.
+if needs http; then
 cargo build --release --offline --bin h1_verdicts \
     --manifest-path modules/http/tools/rust_fast_bench/Cargo.toml >/dev/null 2>&1 \
     && echo "h1_verdicts (hyper): OK" || echo "h1_verdicts (hyper): build failed"
+else not_needed http; fi
 # dtls's second DTLS 1.2 peer, Mbed TLS 3.6.7 (pinned tarball + sha256, reviewed;
 # black-box peer only): built into the gitignored .interop-peers/dtls-mbedtls/.
+if needs dtls; then
 bash modules/dtls/tools/mbedtls.sh >/dev/null 2>&1 \
     && echo "mbedtls 3.6.7 (dtls peer): OK" || echo "mbedtls 3.6.7 (dtls peer): build failed"
+else not_needed dtls; fi
 # regex compares its generator against UCD 16.0.0 (regex-syntax 0.8.11's version, the
 # rules check) and 18.0.0 (the tables' version) text files
 # (gitignored, fetched from unicode.org).
+if needs regex; then
 for ucd in 16.0.0 18.0.0; do
     [[ -e "modules/regex/tools/ucd_unicode/data/$ucd/UnicodeData.txt" ]] \
         || bash modules/regex/tools/ucd_unicode/fetch.sh "$ucd" >/dev/null 2>&1
     [[ -e "modules/regex/tools/ucd_unicode/data/$ucd/UnicodeData.txt" ]] \
         && echo "UCD $ucd: OK" || echo "UCD $ucd: fetch failed"
 done
+else not_needed regex; fi
 # validate: python-jsonschema is imported by the SYSTEM python3 (version is
 # part of the committed vectors' header: 4.19.2); pydantic is judged in the
-# fastapi venv (2.13.5, ditto).
+# fastapi venv (2.13.5, ditto). mcp's oracles import jsonschema as well.
+if needs validate mcp; then
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
     "jsonschema==4.19.2" >/dev/null 2>&1 \
     && echo "jsonschema: 4.19.2" || echo "jsonschema: install failed"
+else not_needed validate mcp; fi
+if needs validate; then
 "$ORACLE_VENVS/fastapi/bin/pip" -q install "pydantic==2.13.5" >/dev/null 2>&1 \
     && echo "pydantic: 2.13.5" || echo "pydantic: install failed"
+else not_needed validate; fi
 # mcp: the official Python SDK is the oracle; its version is in the vectors.
+if needs mcp mcp-http; then
 python3 -m venv "$ORACLE_VENVS/mcp" >/dev/null 2>&1 || true
 "$ORACLE_VENVS/mcp/bin/pip" -q install "mcp==2.3.0" >/dev/null 2>&1 \
     && echo "mcp venv: 2.3.0" || echo "mcp venv: install failed"
+else not_needed mcp mcp-http; fi
 echo "::endgroup::"
 fi
 

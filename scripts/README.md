@@ -44,7 +44,7 @@ and CI; nobody runs these by hand in the ordinary course of things.
 | `netns-run` | Runs a command in a private network namespace as the calling user: `lo` up and checked, ping sockets allowed, `ZIGLIBS_NETNS=1` (`testkit.loopbackSkip` then fails instead of skipping). `test.sh`, `dark-tests.sh` and `modtest` run the `.loopback` modules under it, so their loopback is not the host's (conntrack, firewall, ports). Needs unprivileged user namespaces; required on CI, a loud fallback to the host elsewhere. `--probe` says whether this host can. |
 | `dark-tests.sh` | Finds modules that DECLARE tests the test binary never ran — the failure that reads as a pass. |
 | `force-pubfn-reach.zig` | The second root `check-pubfn-reach` compiles over the module graph. Zig analyses a function body only when something references it, so a `pub fn` no test reaches is never type-checked at all; this file takes a reference to every one of them. |
-| `ci-environment.sh` | Installs the peers a hosted runner lacks. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. **Takes a ROLE since 2026-09-06** — `tests` (default), `interop`, or `all` — and the split is the whole point of the file now. `tests` is what a lane that RUNS tests or examples needs: the userns and ping sysctls, the yaml-test-suite corpus, opcua's open62541 container and its asyncua venv, imap's pymap venv, and the pinned `websockets` the websocket EXAMPLE judges itself against. `interop` is what only `zig build interop-<m>` reaches: a C compiler + wolfSSL headers (dtls) and `jinja2==3.1.6`/sympy/brotli/protobuf plus a grpcio venv (the five Python-driven ones). ⛔ **The `interop` half is not deletable.** Those six modules replay committed transcripts and pass on a host with no compiler and no Python — but a transcript nobody can RE-TAKE is a frozen anchor, extendable and correctable by nobody. `dnssec` lost one exactly that way and `gen-dnssec-oracle.sh` had to be written from nothing to get it back. |
+| `ci-environment.sh` | Installs the peers a hosted runner lacks. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. **Takes a ROLE since 2026-09-06** — `tests` (default), `interop`, or `all` — and the split is the whole point of the file now. `tests` is what a lane that RUNS tests or examples needs: the userns and ping sysctls, the yaml-test-suite corpus, opcua's open62541 container and its asyncua venv, imap's pymap venv, and the pinned `websockets` the websocket EXAMPLE judges itself against. `interop` is what only `zig build interop-<m>` reaches: a C compiler + wolfSSL headers (dtls) and `jinja2==3.1.6`/sympy/brotli/protobuf plus a grpcio venv (the five Python-driven ones). ⛔ **The `interop` half is not deletable.** Those six modules replay committed transcripts and pass on a host with no compiler and no Python — but a transcript nobody can RE-TAKE is a frozen anchor, extendable and correctable by nobody. `dnssec` lost one exactly that way and `gen-dnssec-oracle.sh` had to be written from nothing to get it back. **Since 2026-11-25 the `interop` role installs only what `ZIGLIBS_INTEROP_ONLY` (CI: `test.sh interop-pending`) names** (unset = everything), and the peers it BUILDS (mqttz driver, TA-Lib, Pebble, h2spec) carry a `.zig-libs-built` marker of their pin and are rebuilt only when it moved; CI restores them from the `interop-peers` cache. |
 | `fuzz-coverage.py` | The coverage report behind `modtest <m> --fuzz`: which harness reached which lines. Called by `modtest`, not meant for hand use (though it can be run). |
 
 **`checks/` — the gate's checks and the data they compare against.** Each is a
@@ -104,7 +104,7 @@ unused (see each row).
 | Everything, ignoring stamps | `scripts/test.sh all` | Every check and every module; stamps the `changed` lane for all of them |
 | Reproducing a CI lane | `scripts/test.sh modules -Doptimize=ReleaseFast -Dgroup=net` | The lane's own command and shard (see ci.yml); trailing args pass through to `zig build`. `ZIGLIBS_IGNORE_STAMPS=1` to run it regardless |
 | Investigating slowness | `scripts/test.sh time` | Serial per-module duration table |
-| Before cutting a tag | `scripts/test.sh interop` | Re-takes every `modules/*/tools/interop.zig` anchor against its REAL peer — see below. Needs `scripts/lib/ci-environment.sh interop`; ~35 s warm |
+| Before cutting a tag | `scripts/test.sh interop` | Re-takes every `modules/*/tools/interop.zig` anchor against its REAL peer — see below. Needs `scripts/lib/ci-environment.sh interop`. `ZIGLIBS_INTEROP_JOBS=N` runs N takes at once (fixed-port, container and timing programs stay serial); `scripts/test.sh interop-pending <file>` lists what a run would re-take, and CI installs only those programs' peers (`ZIGLIBS_INTEROP_ONLY`) |
 
 ### ⚠ `test.sh` is NOT the whole of CI
 
@@ -241,12 +241,14 @@ at its current fingerprint.
   option goes inside one. Editing the machinery still re-keys everything, as it must.
 - **A red run keeps what it proved** — `stamps_partial` reads `test-<m> success`
   from the build summary, `ctgrind_partial` the FAIL rows of a finished `--check`,
-  `cmd_interop` its failed list. CI uploads those stamps and saves the build tree
-  from a red lane too, so a fix re-runs what is left, not the lane.
+  `cmd_interop` each green batch and each green take as it happens. CI uploads those
+  stamps from a red AND a cancelled lane (a job timeout is a cancellation) and saves
+  the build tree from a red lane too, so a fix re-runs what is left, not the lane.
 - **Lanes** — `ctgrind` has each module's pinned rows in its fingerprint, so a re-pin
   re-measures that module. `interop` keeps two stamps: `check-interop` compiled it
   (by fingerprint), and the anchor was re-taken (by fingerprint and ISO week, since a
-  peer changes with no commit here; a tag re-takes all).
+  peer changes with no commit here; a tag re-takes all). CI pins its `-Dcpu`, so the
+  compile stamps key on the OS triple, not on whichever CPU the pool handed out.
 - **Stamp** — `<module> TAB <lane> TAB <fingerprint> TAB <time>` in
   `.stamps.local.tsv` (gitignored, deliberately NOT in `.zig-cache`, which gets
   deleted by hand) or wherever `ZIGLIBS_STAMPS` points; CI carries each lane's

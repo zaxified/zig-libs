@@ -2347,9 +2347,12 @@ cmd_ctgrind_portable() {
     summary
 }
 
-cmd_interop() {
-    set_extra_args "$@"
-    capability_check
+#
+# Sets the caller's `take_lane` and `take_todo` (declare them local first):
+# the lane key of the anchor re-takes and the programs that have no take stamp
+# in it. Shared by cmd_interop and cmd_interop_pending, so the peers CI
+# installs are decided by exactly the list the run will take.
+interop_take_plan() {
     local m progs=()
     for m in modules/*/tools/interop.zig; do
         [[ -e "$m" ]] || continue
@@ -2360,6 +2363,47 @@ cmd_interop() {
         echo "interop: no modules/*/tools/interop.zig in the tree — nothing to re-take" >&2
         exit 1
     fi
+    # The peers' pins live in ci-environment.sh (CI audit A8, 2026-11-14): a
+    # bumped pin is a moved oracle, so its digest is in the key too -- before,
+    # a bump waited up to a week to be judged against.
+    take_lane="interop week=$(date -u +%GW%V) peers=$(sha256sum scripts/lib/ci-environment.sh | cut -c1-12) $(uname -m)"
+    # Like every other lane key (stamps_lane_key): a dry pass must never stand
+    # in for a real take.
+    [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && take_lane="$take_lane DRY"
+    if [[ "${ZIGLIBS_STRICT_STAMPS:-0}" == 1 ]]; then
+        take_todo="${progs[*]}"
+    else
+        take_todo="$(stamps_pending "${progs[*]}" "$take_lane")"
+    fi
+}
+
+# ⭐ `test.sh interop-pending <file> [zig args]` (2026-11-25): writes the
+# modules whose anchors `test.sh interop` with the same stamps and arguments
+# would re-take, one line, to <file>. CI runs it BEFORE installing peers, so
+# `ci-environment.sh interop` installs only what those programs need
+# (ZIGLIBS_INTEROP_ONLY) -- the full set took 15 of a 90-minute lane while the
+# run re-took two programs (full CI 45488535147). A file, not stdout: test.sh
+# may print warnings before any command runs.
+cmd_interop_pending() {
+    local out="${1:-}"
+    if [[ -z "$out" ]]; then
+        echo "usage: scripts/test.sh interop-pending <file> [zig args]" >&2
+        exit 2
+    fi
+    shift
+    set_extra_args "$@"
+    fp_load
+    fp_use 4
+    local take_lane take_todo
+    interop_take_plan
+    printf '%s\n' "$take_todo" > "$out"
+    echo "interop-pending: $(wc -w <<< "$take_todo") anchor(s) to re-take: ${take_todo:-none}"
+}
+
+cmd_interop() {
+    set_extra_args "$@"
+    capability_check
+    local m progs=()
     # ⭐ STAMPED (2026-11-02), and two things rather than one. The lane compiled
     # every tools program (44 minutes, cold) and re-took every anchor on every
     # run, whatever had changed. A program is compiled again when its module's
@@ -2377,18 +2421,7 @@ cmd_interop() {
     compile_mods="$(lane_modules)"
     compile_todo="$(stamps_pending "$compile_mods" "$compile_lane")"
     local take_lane take_todo
-    # The peers' pins live in ci-environment.sh (CI audit A8, 2026-11-14): a
-    # bumped pin is a moved oracle, so its digest is in the key too -- before,
-    # a bump waited up to a week to be judged against.
-    take_lane="interop week=$(date -u +%GW%V) peers=$(sha256sum scripts/lib/ci-environment.sh | cut -c1-12) $(uname -m)"
-    # Like every other lane key (stamps_lane_key): a dry pass must never stand
-    # in for a real take.
-    [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && take_lane="$take_lane DRY"
-    if [[ "${ZIGLIBS_STRICT_STAMPS:-0}" == 1 ]]; then
-        take_todo="${progs[*]}"
-    else
-        take_todo="$(stamps_pending "${progs[*]}" "$take_lane")"
-    fi
+    interop_take_plan
     read -ra progs <<< "$take_todo"
     echo "interop: $(wc -w <<< "$compile_todo") of $(wc -w <<< "$compile_mods") modules' tools to compile; re-taking the anchors of ${#progs[@]} module(s) against real peers: ${progs[*]}"
     echo "  ⚠ these need the peers scripts/lib/ci-environment.sh installs under the \`interop\` role;"
@@ -2454,65 +2487,132 @@ cmd_interop() {
     # missing peer used to stop the lane at the first program (tag 2026-10-06:
     # accesslog, then acme), leaving every program after it unproven and each
     # one costing another full matrix to discover.
-    checks_begin
+    #
+    # ⭐ STAMPED PER PROGRAM (2026-11-25), not once at the end: a lane cancelled
+    # by its timeout kept no take at all, and the next run re-took everything.
+    #
+    # ⭐ IN PARALLEL WHEN ZIGLIBS_INTEROP_JOBS > 1 (2026-11-25; CI sets 3). The
+    # 66 takes ran one after another for 24 minutes on a 4-vCPU runner (full CI
+    # 45468661097), most of it waiting on a peer. `interop_exclusive` lists the
+    # programs that stay one at a time AFTER the pool: a fixed port (Pebble on
+    # 14000 for acme/acmedns, opcua 4841/4842, the TLS peers on 4433, the
+    # websocket oracle on 19000, cookies' on 18740, ssh's sshd on 23471-23474,
+    # the browser oracles and http's fixed-port Go peers), a podman container
+    # (mqtt, opcua), or a timing claim a loaded host could bend (pathmtu,
+    # traceroute, sntp, syslog). Every other program owns its ports (port 0)
+    # or a namespace of its own. A new program whose peer binds a fixed port
+    # goes on that list. The default stays 1 locally.
+    local -A interop_exclusive=(
+        [acme]=1 [acmedns]=1 [opcua]=1 [mqtt]=1 [tlsserver]=1 [tlsresume]=1
+        [websocket]=1 [cors]=1 [security-headers]=1 [http]=1 [cookies]=1 [ssh]=1
+        [pathmtu]=1 [traceroute]=1 [sntp]=1 [syslog]=1
+    )
+    local jobs="${ZIGLIBS_INTEROP_JOBS:-1}" pooled=() serial=()
     for m in "${progs[@]}"; do
-        # The program's own arguments go after `--`. `opcua`'s peer is asyncua,
-        # which lives in the venv OPCUA_PYTHON names (the module's live test
-        # reads the same variable); without it the program uses `python3`.
-        local prog_args=()
-        [[ "$m" == opcua && -n "${OPCUA_PYTHON:-}" ]] && prog_args=(--python "$OPCUA_PYTHON")
-        # ⭐ `--check` ON CI (2026-10-07): a program that has it compares the
-        # re-taken anchor with the committed one. Without it the run rewrites
-        # the committed vectors on the runner and only the peer's own verdict
-        # decides, so an oracle that moved — or a module that now answers
-        # differently — went green. Locally the default stays a re-take: the
-        # developer reads the diff.
-        # Detected by the argument PARSE (`eql(u8, a, "--check")`), not by the
-        # string: signal passes "--check" to its own Python driver and refuses
-        # it as an argument (probe run, 2026-10-07).
-        if [[ "${GITHUB_ACTIONS:-}" == true ]] && grep -qF -- '"--check")' "modules/$m/tools/interop.zig"; then
-            prog_args+=(--check)
-        fi
-        (( ${#prog_args[@]} )) && prog_args=(-- "${prog_args[@]}")
-        # nftables, rawsock and wireguard configure a network namespace of
-        # their own and refuse to start without euid 0 there (exit 2, "run it
-        # under `unshare -rn`"). `netns-run` does not fit: it maps the caller
-        # back to its own uid.
-        local wrap=()
-        case "$m" in nftables | rawsock | wireguard) wrap=(unshare -rn) ;; esac
-        # uci's oracle is libuci built from pinned source into .zig-cache; the
-        # recipe is idempotent, so a developer's existing build is reused.
-        if [[ "$m" == uci ]]; then
-            ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-uci-oracle" timeout -k 10 600 modules/uci/tools/build-oracle.sh
-        fi
-        # acme's program is a client of Pebble and cannot start it itself;
-        # tools/pebble.sh brings Pebble up and runs `zig build interop-acme`.
-        # `--check`: a live verdict, the committed transcript stays as it is.
-        if [[ "$m" == acme ]]; then
-            ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 modules/acme/tools/pebble.sh --check
-            continue
-        fi
-        # acmedns likewise: tools/interop.sh starts its DNS/API peer and Pebble
-        # (resolving through that peer), then runs `zig build interop-acmedns`
-        # with the ports. Called bare, the program only prints its usage.
-        if [[ "$m" == acmedns ]]; then
-            ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 modules/acmedns/tools/interop.sh
-            continue
-        fi
-        # `timeout`: a program whose peer never answers must fail by name, not
-        # hold the lane until the job is cancelled (interop-mqtt, 2026-10-07:
-        # 22 minutes, and every program after it never ran).
-        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 ${wrap[@]+"${wrap[@]}"} zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"}
+        if (( jobs > 1 )) && [[ -z "${interop_exclusive[$m]:-}" ]]; then pooled+=("$m"); else serial+=("$m"); fi
+    done
+    checks_begin
+    if (( ${#pooled[@]} )); then
+        echo "interop: ${#pooled[@]} program(s) ${jobs} at a time, then ${#serial[@]} one at a time"
+        local logdir done_pid rc running=0
+        logdir="$(mktemp -d)"
+        local -A pid_mod=()
+        for m in "${pooled[@]}"; do
+            while (( running >= jobs )); do
+                rc=0; wait -n -p done_pid || rc=$?
+                running=$((running - 1))
+                interop_take_collect "${pid_mod[$done_pid]}" "$rc" "$logdir"
+            done
+            # The subshell's own _ZL_FAILED dies with it: its exit status says
+            # whether any of its steps failed.
+            ( _ZL_FAILED=(); interop_take_one "$m"; (( ${#_ZL_FAILED[@]} == 0 )) ) >"$logdir/$m.log" 2>&1 &
+            pid_mod[$!]="$m"
+            running=$((running + 1))
+        done
+        while (( running > 0 )); do
+            rc=0; wait -n -p done_pid || rc=$?
+            running=$((running - 1))
+            interop_take_collect "${pid_mod[$done_pid]}" "$rc" "$logdir"
+        done
+        rmdir "$logdir" 2>/dev/null || true
+    fi
+    local nfail
+    for m in "${serial[@]}"; do
+        nfail=${#_ZL_FAILED[@]}
+        interop_take_one "$m"
+        if (( ${#_ZL_FAILED[@]} == nfail )); then stamps_record "$m" "$take_lane"; fi
     done
     # `step` carried on past a failure here, and `checks_end` stops the run: what
-    # is not on the failed list was taken and agreed.
-    local taken="" failed=" ${_ZL_FAILED[*]-} "
-    for m in "${progs[@]}"; do
-        case "$failed" in *" interop-$m "*) ;; *) taken="$taken $m" ;; esac
-    done
-    stamps_record "${taken# }" "$take_lane"
+    # is not on the failed list was taken, agreed and stamped above.
     checks_end
     summary
+}
+
+# The output of one pooled take, printed whole once it finished (so the log
+# reads like the serial run's), and its stamp or its failure recorded in THIS
+# shell -- stamps_record needs the fingerprints fp_load put here.
+interop_take_collect() {
+    local m="$1" rc="$2" logdir="$3"
+    cat "$logdir/$m.log"
+    rm -f "$logdir/$m.log"
+    if (( rc == 0 )); then
+        stamps_record "$m" "$take_lane"
+    else
+        _ZL_FAILED+=("interop-$m")
+    fi
+}
+
+# Re-takes one anchor: the program, against its real peer, with `step`
+# (inside checks_begin, so a failure is recorded and the caller carries on).
+interop_take_one() {
+    local m="$1"
+    # The program's own arguments go after `--`. `opcua`'s peer is asyncua,
+    # which lives in the venv OPCUA_PYTHON names (the module's live test
+    # reads the same variable); without it the program uses `python3`.
+    local prog_args=()
+    [[ "$m" == opcua && -n "${OPCUA_PYTHON:-}" ]] && prog_args=(--python "$OPCUA_PYTHON")
+    # ⭐ `--check` ON CI (2026-10-07): a program that has it compares the
+    # re-taken anchor with the committed one. Without it the run rewrites
+    # the committed vectors on the runner and only the peer's own verdict
+    # decides, so an oracle that moved — or a module that now answers
+    # differently — went green. Locally the default stays a re-take: the
+    # developer reads the diff.
+    # Detected by the argument PARSE (`eql(u8, a, "--check")`), not by the
+    # string: signal passes "--check" to its own Python driver and refuses
+    # it as an argument (probe run, 2026-10-07).
+    if [[ "${GITHUB_ACTIONS:-}" == true ]] && grep -qF -- '"--check")' "modules/$m/tools/interop.zig"; then
+        prog_args+=(--check)
+    fi
+    (( ${#prog_args[@]} )) && prog_args=(-- "${prog_args[@]}")
+    # nftables, rawsock and wireguard configure a network namespace of
+    # their own and refuse to start without euid 0 there (exit 2, "run it
+    # under `unshare -rn`"). `netns-run` does not fit: it maps the caller
+    # back to its own uid.
+    local wrap=()
+    case "$m" in nftables | rawsock | wireguard) wrap=(unshare -rn) ;; esac
+    # uci's oracle is libuci built from pinned source into .zig-cache; the
+    # recipe is idempotent, so a developer's existing build is reused.
+    if [[ "$m" == uci ]]; then
+        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-uci-oracle" timeout -k 10 600 modules/uci/tools/build-oracle.sh
+    fi
+    # acme's program is a client of Pebble and cannot start it itself;
+    # tools/pebble.sh brings Pebble up and runs `zig build interop-acme`.
+    # `--check`: a live verdict, the committed transcript stays as it is.
+    if [[ "$m" == acme ]]; then
+        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 modules/acme/tools/pebble.sh --check
+        return 0
+    fi
+    # acmedns likewise: tools/interop.sh starts its DNS/API peer and Pebble
+    # (resolving through that peer), then runs `zig build interop-acmedns`
+    # with the ports. Called bare, the program only prints its usage.
+    if [[ "$m" == acmedns ]]; then
+        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 modules/acmedns/tools/interop.sh
+        return 0
+    fi
+    # `timeout`: a program whose peer never answers must fail by name, not
+    # hold the lane until the job is cancelled (interop-mqtt, 2026-10-07:
+    # 22 minutes, and every program after it never ran).
+    ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 ${wrap[@]+"${wrap[@]}"} zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"}
 }
 
 # The `modules` lane: every module compiled and tested in ONE optimize mode.
@@ -2886,6 +2986,12 @@ Usage: scripts/test.sh [subcommand] [args]
                         can find that something new we send provokes a
                         different reaction, or that the peer moved. Needs
                         `scripts/lib/ci-environment.sh interop`.
+                        ZIGLIBS_INTEROP_JOBS=N runs up to N takes at once
+                        (programs with a fixed port, a container or a timing
+                        claim stay one at a time); default 1.
+  interop-pending <file> [zig args]
+                        write the modules `interop` would re-take (same stamps,
+                        same args) to <file>; CI installs only their peers.
   count [--advisory]    PRE-RELEASE ONLY — hold every module's instruction
                         counts per operation (`modules/<m>/tools/count.tsv`)
                         to their baseline via `scripts/count-insns`; a move of
@@ -2957,6 +3063,7 @@ main() {
         modules) cmd_modules "${rest[@]:-}" ;;
         examples) cmd_examples "${rest[@]:-}" ;;
         interop) cmd_interop "${rest[@]:-}" ;;
+        interop-pending) cmd_interop_pending "${rest[@]:-}" ;;
         ctgrind) cmd_ctgrind "${rest[@]:-}" ;;
         ctgrind-portable) cmd_ctgrind_portable "${rest[@]:-}" ;;
         count) cmd_count "${rest[@]:-}" ;;

@@ -898,7 +898,29 @@ jobs:
           # reasoning `skip_live` uses for opcua's emulated container.
           # Timeout 90 (was 30): on run 39006420736 (2026-10-17) the lane was
           # still compiling `check-interop` (98 steps) when 30 min ran out.
-          lanes+=('{"name":"interop ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"interop","cachekey":"interop","cache":false,"runner":"ubuntu-26.04","peers":"interop","tc":false,"timeout":90,"skip_live":""}')
+          #
+          # ⚠ THE "35 s, six programs" ABOVE IS LONG GONE. By 2026-11-24
+          # `check-interop` compiled every interop, live and bench program of
+          # 268 modules and 65 anchors were re-taken: 15 min environment +
+          # 75 min compile + 24 min takes, cancelled at the 90-minute cap
+          # (full CI 45488535147). Kept under it by four things, not by a
+          # bigger timeout (owner 2026-11-25: 90 min is the cap):
+          #
+          # ⭐ A PINNED `-Dcpu`, so its stamps survive the runner pool. Without
+          # one the lane key is the whole `native` target (CPU features, kernel,
+          # glibc: scripts/lib/stamps-key.sh), and 9 different keys turned up in
+          # two weeks -- the green run's stamps never matched the next runner,
+          # and a three-module change recompiled all 268. Interop asks whether
+          # our bytes and a peer's agree, which no CPU feature path changes
+          # (the same reasoning as amd64-only); the CPU-specific paths are the
+          # modules lanes' to prove. The examples lanes' pin, so the AVX2/AES/
+          # ADX paths are the ones compiled.
+          # ⭐ Stamps uploaded from a CANCELLED lane too (`Keep this lane's
+          # stamps`), so a cold run that times out leaves its work behind.
+          # ⭐ Peers installed only for the anchors this run re-takes, the built
+          # ones restored from a cache (`Which anchors this run re-takes`).
+          # ⭐ Takes 3 at a time (ZIGLIBS_INTEROP_JOBS on the Test step).
+          lanes+=('{"name":"interop ReleaseSafe amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseSafe","cmd":"interop","cachekey":"interop","cache":false,"runner":"ubuntu-26.04","peers":"interop","tc":false,"timeout":90,"skip_live":""}')
 
           # ⭐ THE CONSTANT-TIME MEASUREMENT, added 2026-09-08 (audit R14/1).
           # `check-ctgrind` in the `checks` lane only COMPILES the harnesses --
@@ -1181,6 +1203,50 @@ jobs:
       # cache state and could not be compared with each other anyway. The run
       # log is the measurement, it is per-lane and dated, and it costs nothing
       # to look at. Read it there.
+      # ⭐ STAMPS (2026-09-18): which modules this lane has already proven at
+      # their current fingerprint, carried between runs as an artifact -- see
+      # scripts/lib/ci-stamps.sh for why an artifact and whose artifacts count.
+      # None found = every module runs. BEFORE the environment step since
+      # 2026-11-25: the interop lane decides from them which peers to install.
+      - name: Fetch this lane's stamps
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/stamps"
+          bash scripts/lib/ci-stamps.sh fetch ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-full-${{ matrix.cachekey }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
+      # ⭐ ONLY THE PEERS THIS RUN TAKES AGAINST (2026-11-25). The interop lane
+      # installed all of them on every run, 15 minutes of a 90-minute lane, for
+      # a run that re-took two programs (full CI 45488535147). This asks
+      # test.sh which anchors it will re-take -- the same stamps, the same
+      # arguments -- and the environment step installs only their peers. A
+      # failure here installs everything, as before.
+      - name: Which anchors this run re-takes
+        id: takes
+        if: matrix.cmd == 'interop' && env.ZIGLIBS_DRY_RUN != '1'
+        continue-on-error: true
+        env:
+          ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
+        run: bash scripts/test.sh interop-pending "$RUNNER_TEMP/interop-takes.txt" ${{ matrix.args }}
+      # ⭐ THE PEERS WE BUILD, KEPT BETWEEN RUNS (2026-11-25). The mqttz driver
+      # took 9-12.5 minutes on every interop run; it, TA-Lib, Pebble and h2spec
+      # now carry a marker of what they were built from (ci-environment.sh
+      # `built_from`) and are restored here, so a pin builds once. The key is
+      # the markers' digest (see the save step), and the newest entry is taken
+      # by prefix: a stale item is rebuilt by its marker, the rest is reused.
+      # Tens of MB, against a 10 GB quota the build trees fill.
+      - name: Restore the built interop peers
+        id: peercache
+        if: matrix.cmd == 'interop' && env.ZIGLIBS_DRY_RUN != '1'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.local/share/zig-libs/oracle-bin/pebble
+            ~/.local/share/zig-libs/oracle-bin/h2spec
+            ~/.local/share/zig-libs/oracle-bin/ta-lib-0.8.3
+            ~/.local/share/zig-libs/oracles/ta-lib-0.8.3
+            .zig-cache/mqtt-interop/driver
+          key: interop-peers-${{ runner.arch }}-none
+          restore-keys: interop-peers-${{ runner.arch }}-
       - name: Close the environment gaps the gate reports
         # ⚠ NOT on the compile-only lane, nor on `checks`. Every one of these
         # installs exists to let something REACH a real peer, and those two
@@ -1204,17 +1270,40 @@ jobs:
         # push had none of it. Two copies of an install list drift; one script
         # that both jobs run cannot.
         continue-on-error: true
-        run: bash scripts/lib/ci-environment.sh ${{ matrix.peers }}
-      # ⭐ STAMPS (2026-09-18): which modules this lane has already proven at
-      # their current fingerprint, carried between runs as an artifact -- see
-      # scripts/lib/ci-stamps.sh for why an artifact and whose artifacts count.
-      # None found = every module runs.
-      - name: Fetch this lane's stamps
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$RUNNER_TEMP/stamps"
-          bash scripts/lib/ci-stamps.sh fetch ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-full-${{ matrix.cachekey }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
+          # The interop lane's list of takes, when the step above produced one;
+          # unset otherwise, which installs every peer.
+          if [[ "${{ steps.takes.outcome }}" == success && -f "$RUNNER_TEMP/interop-takes.txt" ]]; then
+            export ZIGLIBS_INTEROP_ONLY="$(cat "$RUNNER_TEMP/interop-takes.txt")"
+          fi
+          bash scripts/lib/ci-environment.sh ${{ matrix.peers }}
+      # Saved when what the markers say was built differs from what was
+      # restored: the key is their digest, so an unchanged set saves nothing
+      # and `cache-prune` keeps only the newest entry of the family.
+      - name: Key the built interop peers
+        id: peerkey
+        if: ${{ !cancelled() && matrix.cmd == 'interop' && env.ZIGLIBS_DRY_RUN != '1' }}
+        run: |
+          d=""
+          for f in ~/.local/share/zig-libs/oracle-bin/{pebble,h2spec,ta-lib-0.8.3}/.zig-libs-built .zig-cache/mqtt-interop/driver/.zig-libs-built; do
+            if [[ -f "$f" ]]; then d+="${f##*/zig-libs/}"$'\t'"$(cat "$f")"$'\n'; fi
+          done
+          if [[ -n "$d" ]]; then
+            echo "key=interop-peers-${{ runner.arch }}-$(printf '%s' "$d" | sha256sum | cut -c1-64)" >> "$GITHUB_OUTPUT"
+          fi
+          printf '%s\n' "${d:-no built peers}"
+      - name: Save the built interop peers
+        if: ${{ !cancelled() && steps.peerkey.outputs.key != '' && steps.peerkey.outputs.key != steps.peercache.outputs.cache-matched-key }}
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.local/share/zig-libs/oracle-bin/pebble
+            ~/.local/share/zig-libs/oracle-bin/h2spec
+            ~/.local/share/zig-libs/oracle-bin/ta-lib-0.8.3
+            ~/.local/share/zig-libs/oracles/ta-lib-0.8.3
+            .zig-cache/mqtt-interop/driver
+          key: ${{ steps.peerkey.outputs.key }}
       - name: Test (${{ matrix.name }})
         env:
           ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
@@ -1224,6 +1313,10 @@ jobs:
           # Empty for every lane but one; the lane table says which peer and
           # why. `run_modules` prints a line whenever it honours this.
           ZIGLIBS_SKIP_LIVE: ${{ matrix.skip_live }}
+          # The interop lane re-takes up to 3 anchors at once (cmd_interop
+          # keeps the fixed-port, container and timing ones serial): the 66
+          # takes ran one after another for 24 minutes (full CI 45468661097).
+          ZIGLIBS_INTEROP_JOBS: ${{ matrix.cmd == 'interop' && '3' || '' }}
         run: |
           # The imap peer is found at its default path; the opcua one is named
           # by an environment variable, so point it at the venv built above.
@@ -1234,6 +1327,7 @@ jobs:
           export OPCUA_PYTHON="$HOME/.cache/zig-libs-opcua/bin/python3"
           bash scripts/test.sh ${{ matrix.cmd }} ${{ matrix.args }}
       - name: tc action tests, as real root
+        id: tcroot
         # ⭐ THE LAST GAP, and the only one `unshare -rn` cannot close.
         # RTM_NEWACTION checks CAP_NET_ADMIN against the INITIAL user namespace,
         # so the sysctl that fixed every other netns module here does nothing
@@ -1323,13 +1417,28 @@ jobs:
         with:
           path: ${{ github.workspace }}/.zig-cache
           key: ${{ steps.zcache.outputs.cache-primary-key }}
+      # `tc`'s stamp from the module run claims the root half too, so it goes
+      # whenever that half did not pass -- also when it never ran because the
+      # Test step was red or cancelled (the root step's own `|| sed` covers
+      # only its own failure).
+      - name: Drop tc's stamp unless its root tests passed
+        if: ${{ always() && matrix.tc && steps.tcroot.outcome != 'success' }}
+        run: sed -i '/^tc\t/d' "$RUNNER_TEMP/stamps/stamps.tsv" 2>/dev/null || true
       # A red lane's too (2026-11-02): `stamps_partial` wrote only what passed, and
       # without them the next run repeats the whole lane. After the root `tc` step,
       # which takes `tc` back out when it fails. Only a push, tag, dispatch or
       # scheduled run shares what it proved; a pull request's stamps would be
       # discarded by the fetch anyway, so it does not upload them.
+      # ⭐ AND A CANCELLED ONE'S (2026-11-25): `always()`, not `!cancelled()`.
+      # A lane that hits its job timeout is CANCELLED, and the interop lane of
+      # full CI 45488535147 threw away 216 modules' compile stamps that way --
+      # so the next run started from zero and hit the same timeout. Every
+      # record in the file is a green batch or program (stamps_record runs
+      # after the step passed), so what a cancelled run uploads is as true as
+      # what a finished one does. `always()` steps do run after a job timeout:
+      # that run's footprint report below did.
       - name: Keep this lane's stamps
-        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        if: ${{ always() && github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-full-${{ matrix.cachekey }}-${{ runner.arch }}
