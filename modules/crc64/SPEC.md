@@ -6,7 +6,7 @@
 
 **Scope:** parity — liblzma 5.8.1 `lzma_crc64` (surveyed 2026-11-21)
 
-**Audit:** review 2026-11-24 · mutation 2026-11-24 (18/24, 6 eq) · src 76944a542effe233
+**Audit:** review 2026-11-24 · mutation 2026-11-24 (18/24, 6 eq) · src fe277bb2d70df600
 
 **Hardening:** fuzz none · ct n/a — checksum only, no secret · panic n/a — every length is a valid input; no cast, unwrap or assert on a data path
 
