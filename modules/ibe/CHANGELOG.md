@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-24** — **BEHAVIOURAL, not breaking:** `setup` and `extract` zero 40 KiB of stack after their body (were 16 KiB): bls12_381's fixed-window G2 multiply (2026-11-24) deepened `setup` to 26.8 KiB, and the ReleaseFast dead-stack probe's residue rule found secret-dependent bytes below the old burn. Same results.
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-20** — `encrypt`'s `Gid^r` is `bls12_381`'s new `Fp12.pow` (the same construction, moved upstream); the private `fp12Pow`/`fp12CtSelect` copy, its tests and the test hook `testing_fp12Pow` are gone (callers of the hook use `gid.pow(&r)`). Same ciphertexts.
 

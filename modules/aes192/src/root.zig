@@ -343,7 +343,9 @@ pub fn ctrXor(comptime Ctx: type, ctx: Ctx, dst: []u8, src: []const u8, counter:
     var counters: [16 * n]u8 = undefined;
     var i: usize = 0;
     while (i < src.len) : (i += 16 * n) {
-        if (lo <= std.math.maxInt(u64) - n) {
+        // `@as(u64, n)`: `n` is a comptime `usize`, so the subtraction would
+        // be typed `usize` and fail to compile where `usize` is 32 bits.
+        if (lo <= std.math.maxInt(u64) - @as(u64, n)) {
             // No carry into `hi` within this batch: each block is one vector
             // byte swap. Vector to vector `@bitCast` -- `@Vector(2, u64)`
             // straight to `[16]u8` is lowered byte by byte on 0.17 (#36256).

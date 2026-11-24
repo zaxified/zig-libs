@@ -53,14 +53,16 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 pub const keygen_burn = 12 * 1024;
 
 /// `skToPk` (a G2 multiply by SK) and `SecretKey.fromBytes`/`toBytes`:
-/// `skToPk` dirties 11.7 KiB, and its frames hold the G2 multiply's
-/// SK-dependent intermediates. At 4 KiB (until 2026-11-23) about 6.8 KiB of
-/// them stayed below the burn (residue rule).
-pub const key_burn = 24 * 1024;
+/// `skToPk` dirties 26.8 KiB since bls12_381's fixed-window G2 multiply
+/// (2026-11-24; 11.7 KiB before), and its frames hold the multiply's
+/// SK-dependent intermediates. At 24 KiB about 2.8 KiB stayed below the burn
+/// (residue rule, ReleaseFast).
+pub const key_burn = 56 * 1024;
 
 /// `sign`: message scalars, `SK || msgs`, `1/(SK+e)` and a G1 multiply;
-/// residue reached 1.3 KiB below the entry.
-pub const sign_burn = 8 * 1024;
+/// the body dirties 15.1 KiB since the fixed-window G1 multiply (2026-11-24;
+/// at 8 KiB, 7 KiB stayed below the burn).
+pub const sign_burn = 32 * 1024;
 
 /// `proofGen`: the blinding scalars, `r3`, `r1*r2` and the G1 multiplies by
 /// them; needle residue reached 4.4 KiB below the entry, the body dirties

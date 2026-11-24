@@ -40,17 +40,20 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 // `proveCredential`, 1.5 KiB in `keygen`, but the scalar multiplications below
 // them are fed secret scalars all the way down).
 
-/// `keygen` dirtied 13.9 KiB (the G2 multiplications of `fromSecret` /
-/// `fromShare`, 12.9 KiB, run inside it).
-pub const key_burn = 24 * 1024;
+/// `keygen` dirtied 28.9 KiB (the G2 multiplications of `fromSecret` /
+/// `fromShare`, 28.2 KiB, run inside it; `dkg.part1`/`part2` alike) since
+/// bls12_381's fixed-window multiply (2026-11-24; 13.9 KiB before).
+pub const key_burn = 52 * 1024;
 
-/// `psSignWithSecret` dirtied 6.4 KiB, `signPartial` 7.4 KiB (a G1 multiply by
-/// the signing exponent); `signingExponent` alone is a few field operations.
-pub const sign_burn = 12 * 1024;
+/// `blindSign` dirtied 17.0 KiB, `psSignWithSecret`/`signPartial` 13.2 KiB (a
+/// G1 multiply by the signing exponent) since the fixed-window multiply
+/// (2026-11-24); `signingExponent` alone is a few field operations.
+pub const sign_burn = 32 * 1024;
 
 /// `evalPoly`: Horner over `Fr`, no frame deeper than the field multiply.
 pub const eval_burn = 2 * 1024;
 
-/// `proveCredential` dirtied 20.2 KiB (G1/G2 multiplications by `r'`, `r`,
-/// `r~`, `m~_j`, the challenge hash).
-pub const prove_burn = 32 * 1024;
+/// `proveCredential` dirtied 32.7 KiB (G1/G2 multiplications by `r'`, `r`,
+/// `r~`, `m~_j`, the challenge hash) since the fixed-window multiply
+/// (2026-11-24; 20.2 KiB before).
+pub const prove_burn = 60 * 1024;

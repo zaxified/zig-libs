@@ -1954,7 +1954,7 @@ voprf	ReleaseFast	p256-keygen	1	12	a448ff40ae25f5e0	d26dc23c71b4c631
 voprf	ReleaseFast	p384-server	1	30	a448ff40ae25f5e0	5ed6c2e0c382fda2
 voprf	ReleaseFast	p384-client	1	15	a448ff40ae25f5e0	ff25c1410ee44fb9
 voprf	ReleaseFast	p384-keygen	1	3	a448ff40ae25f5e0	c65d6fb0102b9c90
-voprf	ReleaseFast	p521-server	1	26	a448ff40ae25f5e0	5a0178ab968c5fe9
+voprf	ReleaseFast	p521-server	1	24	a448ff40ae25f5e0	5a0178ab968c5fe9
 voprf	ReleaseFast	p521-client	1	7	a448ff40ae25f5e0	c519de5273b05353
 voprf	ReleaseFast	p521-keygen	1	3	a448ff40ae25f5e0	517083316574f2e7
 # smtp (2026-10-10) — auth: the password through plainResponse/loginResponse
@@ -2049,9 +2049,9 @@ snmp	ReleaseFast	des	1	256	736184775bd78bea	f7e7b8e6152d7073
 # code): 0 in-file. The software key expansion is still std's masked S-box
 # via subWord (std's soft expandKey has the same posture); see
 # modules/aes192/SPEC.md.
-aes192	ReleaseFast	enc	1	0	e34fdaf8f0489514	0c5f76d6ab016242
-aes192	ReleaseFast	dec	1	0	e34fdaf8f0489514	68602ef849690825
-aes192	ReleaseFast	bitsliced	1	0	afd4c1d207f501f7	5ea64f081b0ffcbb
+aes192	ReleaseFast	enc	1	0	690d1e5119f9b83a	0c5f76d6ab016242
+aes192	ReleaseFast	dec	1	0	690d1e5119f9b83a	68602ef849690825
+aes192	ReleaseFast	bitsliced	1	0	54ed5f212e4f0dd5	5ea64f081b0ffcbb
 # p521 (2026-10-10) — NIST P-521, new module. mul / keygen / sign / ecdh: the
 # secret (scalar, d, seed, ECDH secret) tainted end to end: 0 in-file on all
 # four. The branches the API reveals (range and identity verdicts, r = 0 /
@@ -2523,9 +2523,9 @@ dnp3	ReleaseFast	keys	1	121	7f24eea64435e887	d2337903af778cbe	cpu=x86_64 control
 dnp3	ReleaseFast	keys5	1	121	7f24eea64435e887	d56cf320bfeb21d5	cpu=x86_64 control=4 trap=61
 opcua	ReleaseFast	chunk	1	134	19e1a1c0ec210142	17e08703a66ffe0f	cpu=x86_64 control=2 trap=34
 snmp	ReleaseFast	aes	1	312	f7b2d59406205574	07f7c9867f83b17e	cpu=x86_64 control=12 trap=12
-aes192	ReleaseFast	enc	1	128	e34fdaf8f0489514	0c5f76d6ab016242	cpu=x86_64
-aes192	ReleaseFast	dec	1	304	e34fdaf8f0489514	68602ef849690825	cpu=x86_64
-aes192	ReleaseFast	bitsliced	1	128	afd4c1d207f501f7	5ea64f081b0ffcbb	cpu=x86_64
+aes192	ReleaseFast	enc	1	128	690d1e5119f9b83a	0c5f76d6ab016242	cpu=x86_64
+aes192	ReleaseFast	dec	1	304	690d1e5119f9b83a	68602ef849690825	cpu=x86_64
+aes192	ReleaseFast	bitsliced	1	128	54ed5f212e4f0dd5	5ea64f081b0ffcbb	cpu=x86_64
 # jwe, megolm, xmlenc (joined the portable lane 2026-11-18, wave 6). Attributed context by context
 # against a native --stacks run of the same rows; nothing is a branch of these modules' own on a key:
 #   A1  every claim context with a std/crypto/aes/soft.zig frame among its innermost four is a
@@ -2578,6 +2578,10 @@ xmlenc	ReleaseFast	kw	1	182	d6941608df256e41	65e898b409f3bf26	cpu=x86_64 control
 # ssh ecdh: no variant since 2026-11-18 -- the fromScalar zero verdict is declassified (ssh audit c1),
 # and portable now reads 20, equal to the plain row.
 ssh	ReleaseFast	pem	1	4	44bc21276091fd81	2ba7559fa99a2188	cpu=x86_64
+# opaque login/serverke2 x25519 (rows added 2026-11-24): B only -- the three std ladder identity checks of
+# the 3DH (ephemeral and static keys), +3 over the plain row; the voprf/recover/KE3 verdicts are unchanged.
+opaque	ReleaseFast	login_x25519	1	8	f5d9779d6e4f3a18	4dd6b390a25482a8	cpu=x86_64
+opaque	ReleaseFast	serverke2_x25519	1	4	f5d9779d6e4f3a18	28c4b4c908b2e302	cpu=x86_64
 ct25519	ReleaseFast	x25519	1	1	aaa45198aa7c91a1	8af2fe8213b778aa	cpu=x86_64
 hpke	ReleaseFast	x25519_decap	1	1	988bf797e9128852	c0cee0a8c6bf72c3	cpu=x86_64
 hpke	ReleaseFast	x25519_authdecap	1	2	988bf797e9128852	05af25d1d0e3943d	cpu=x86_64

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-24** — **BEHAVIOURAL, not breaking:** `skToPk` / `SecretKey.fromBytes` / `toBytes` zero 56 KiB of stack after their body (were 24 KiB) and `sign` 32 KiB (was 8 KiB): bls12_381's fixed-window scalar multiply (2026-11-24) deepened the bodies to 26.8 / 15.1 KiB, and the ReleaseFast dead-stack probe's residue rule found secret-dependent bytes below the old burns. Same results; a few microseconds more per call.
 - **2026-11-23** — **BEHAVIOURAL, not breaking:** `skToPk` / `SecretKey.fromBytes` / `toBytes` and `proofGen` zero 24 KiB of stack after their body (were 4 KiB and 8 KiB): the dead-stack probe's new residue rule (`testkit.stackprobe.residueOf` over its snapshots) found 6.8 KiB of `skToPk`'s G2-multiply frames and 3.9 KiB of `proofGen`'s below the old burns, intermediates the needle model does not name.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** `burn.WipeAllocator` is replaced by the shared `wipealloc` module's `WipingAllocator` (same code; new dependency `wipealloc`); the stack-burn helpers in `burn.zig` are unchanged. The moved code has its own whole-module mutation run (8/8 killed).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.

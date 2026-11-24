@@ -32,9 +32,10 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     return r;
 }
 
-/// `setup` (a G2 multiply by `msk`) dirtied 12.1 KiB, `extract` (a G1
-/// multiply) 7.5 KiB in ReleaseFast.
-pub const key_burn = 16 * 1024;
+/// `setup` (a G2 multiply by `msk`) dirtied 26.8 KiB since bls12_381's
+/// fixed-window multiply (2026-11-24; 12.1 KiB before), `extract` (a G1
+/// multiply) less, in ReleaseFast.
+pub const key_burn = 40 * 1024;
 
 /// `encrypt` (a pairing, a Gt exponentiation, a G2 multiply) dirtied 43.8 KiB,
 /// `decrypt` 28.5 KiB in ReleaseFast.
