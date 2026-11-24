@@ -17,9 +17,11 @@
 //! providers with mailboxes (`PROVIDER_CFG`, constant-size pulls),
 //! sender-chosen delays as deployed, END-TO-END sender anonymity
 //! (`measureEndToEnd`, `SenderBound`), n−1 detection from loop cover against a
-//! blocking attacker (`Attack`), and traffic cost (`TrafficStats`). Not
-//! modeled (SPEC.md § Backlog): other topologies, batch mixing, mix-originated
-//! loops, sender–receiver unlinkability, a PKI, real network I/O.
+//! blocking attacker (`Attack`), and traffic cost (`TrafficStats`). The
+//! other topologies (cascade, multi-cascade, free route), batch-and-reorder
+//! mixing, mix-originated loops, receiver anonymity and sender–receiver
+//! unlinkability follow Piotrowska's mix network simulator (arXiv 2107.12172).
+//! Not modeled: a PKI, real network I/O.
 
 const std = @import("std");
 const netsim = @import("netsim");
@@ -47,12 +49,17 @@ const types = @import("types.zig");
 pub const LoopixConfig = types.LoopixConfig;
 pub const AnonymityBound = types.AnonymityBound;
 pub const SenderBound = types.SenderBound;
+pub const ReceiverBound = types.ReceiverBound;
+pub const UnlinkBound = types.UnlinkBound;
+pub const Topology = types.Topology;
+pub const MixStrategy = types.MixStrategy;
 pub const MsgKind = types.MsgKind;
 pub const MixHeader = types.MixHeader;
 
 const routing = @import("routing.zig");
 pub const pickRoute = routing.pickRoute;
 pub const pickDestClient = routing.pickDestClient;
+pub const pickMixLoopRoute = routing.pickMixLoopRoute;
 pub const HopInstruction = routing.HopInstruction;
 
 /// The anonymity invariant + the global-passive adversary that measures it —
@@ -66,6 +73,9 @@ pub const measure = adversary.measure;
 pub const measureEndToEnd = adversary.measureEndToEnd;
 pub const Origin = adversary.Origin;
 pub const SenderResult = adversary.SenderResult;
+/// Receiver anonymity, composed forward through every layer.
+pub const measureReceiver = adversary.measureReceiver;
+pub const ReceiverResult = adversary.ReceiverResult;
 
 /// FABLE tier — see `mixing.zig`. These three are the irreducible mixing core;
 /// everything else in this module is fully real today.
@@ -75,6 +85,8 @@ pub const CoverEvent = mixing.CoverEvent;
 pub const sampleExpDelay = mixing.sampleExpDelay;
 pub const scheduleRelease = mixing.scheduleRelease;
 pub const nextCover = mixing.nextCover;
+pub const nextMixLoop = mixing.nextMixLoop;
+pub const shuffle = mixing.shuffle;
 
 const protocol = @import("protocol.zig");
 pub const Loopix = protocol.Loopix;
@@ -85,9 +97,12 @@ pub const DEFAULT_CFG = protocol.DEFAULT_CFG;
 /// Loopix as deployed: providers with mailboxes, sender-chosen holds.
 pub const PROVIDER_CFG = protocol.PROVIDER_CFG;
 pub const providerScenario = protocol.providerScenario;
+/// The scenario for any configuration (any topology, with or without providers).
+pub const scenarioFor = protocol.scenarioFor;
 /// An n−1 attacker blocking one mix, for the loop-cover detector to catch.
 pub const Attack = protocol.Attack;
 pub const Alarm = protocol.Alarm;
+pub const MixAlarm = protocol.MixAlarm;
 pub const Delivery = protocol.Delivery;
 pub const TrafficStats = protocol.TrafficStats;
 

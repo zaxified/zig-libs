@@ -104,6 +104,23 @@ pub fn nextCover(prng: *Prng, cfg: LoopixConfig) CoverEvent {
     return .{ .delay = gap, .kind = kind };
 }
 
+/// Delay to a mix's next own loop (mean `cfg.mix_loop_interval`): the same
+/// memoryless integer draw, clamped to >= 1 for the same reason as `nextCover`.
+pub fn nextMixLoop(prng: *Prng, cfg: LoopixConfig) Time {
+    return @max(1, sampleExpDelay(prng, cfg.mix_loop_interval));
+}
+
+/// A uniformly random permutation of `items` (Fisher-Yates) — the "reorder"
+/// of a batch mix, drawn from the seeded stream.
+pub fn shuffle(comptime T: type, prng: *Prng, items: []T) void {
+    var i = items.len;
+    while (i > 1) {
+        i -= 1;
+        const j: usize = @intCast(prng.next() % (i + 1));
+        std.mem.swap(T, &items[i], &items[j]);
+    }
+}
+
 // ── the Poisson mix hold/release decision (GATED) ────────────────────────────
 
 /// The memoryless per-hop delay primitive (implemented — see
@@ -247,4 +264,20 @@ test "Prng.next is splitmix64 (known answers for state 0)" {
     var p: Prng = .{ .state = 0 };
     try std.testing.expectEqual(@as(u64, 0xe220a8397b1dcdaf), p.next());
     try std.testing.expectEqual(@as(u64, 0x6e789e6aa1b965f4), p.next());
+}
+
+test "shuffle: a permutation, and every position is reachable" {
+    var p = Prng.init(9);
+    var seen: [4][4]bool = @splat(@splat(false));
+    for (0..400) |_| {
+        var a = [_]u8{ 0, 1, 2, 3 };
+        shuffle(u8, &p, &a);
+        var sum: u8 = 0;
+        for (a, 0..) |v, i| {
+            sum += v;
+            seen[i][v] = true;
+        }
+        try testing.expectEqual(@as(u8, 6), sum);
+    }
+    for (seen) |row| for (row) |x| try testing.expect(x);
 }

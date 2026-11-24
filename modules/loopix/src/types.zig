@@ -52,6 +52,40 @@ pub const MsgKind = enum(u8) {
     drop_cover,
 };
 
+/// How the mixes are wired and how a sender picks a route (Piotrowska 2021,
+/// arXiv 2107.12172, §3: cascade, multi-cascade, stratified, free-route / P2P).
+/// Node numbering is the same for all: mix `(layer, w)` is `layer*width + w`,
+/// and a route always has `layers` mix hops.
+pub const Topology = enum {
+    /// `layers` layers of `width` mixes, adjacent layers fully connected; the
+    /// sender picks one mix per layer (Loopix / Nym).
+    stratified,
+    /// One chain of `layers` mixes (`width` must be 1); every packet takes
+    /// the whole chain in order (Chaum-style cascade; Elixxir's cMix).
+    cascade,
+    /// `width` independent chains of `layers` mixes; the sender picks one
+    /// chain and the packet stays in it. No link joins two chains.
+    multi_cascade,
+    /// All `layers * width` mixes are interconnected and the sender picks
+    /// `layers` distinct mixes from all of them, in any order (a peer-to-peer
+    /// net such as HOPR). Any mix can be the first or the last hop.
+    free_route,
+};
+
+/// What a mix does with the packets it holds.
+pub const MixStrategy = enum {
+    /// Continuous time: every arrival is held an independent exponential
+    /// delay (Loopix). The default.
+    poisson,
+    /// Batch-and-reorder, threshold: the mix collects `threshold` packets,
+    /// then releases all of them at once in a random order (a Chaum /
+    /// cMix-style batch).
+    threshold,
+    /// Batch-and-reorder, timed: every `batch_period` ticks the mix releases
+    /// everything it holds, in a random order (empty rounds send nothing).
+    timed,
+};
+
 /// Static parameters of the mixnet + the harness's test-traffic generators.
 /// The delay/rate fields drive the (gated) Poisson mixing core; the `_period`
 /// fields drive the deterministic test-traffic timers (not part of the mixing
@@ -105,6 +139,25 @@ pub const LoopixConfig = struct {
     /// ...and a client raises an alarm once this many of its loops are lost.
     loop_alarm_lost: u32 = 2,
 
+    /// How the mixes are wired and how routes are picked.
+    topology: Topology = .stratified,
+    /// What a mix does with the packets it holds. Batch strategies ignore
+    /// `mean_delay` and `sender_chosen_delays`.
+    mix_strategy: MixStrategy = .poisson,
+    /// `threshold` strategy: packets collected before a batch is released.
+    threshold: u16 = 10,
+    /// `timed` strategy: ticks between two releases.
+    batch_period: Time = 40,
+    /// Mix-originated cover: when non-zero, every mix sends a loop through
+    /// the network back to itself with this mean inter-arrival time (a Poisson
+    /// process, like a client's cover). 0 = only clients send cover. The mixes
+    /// get links to every first- and last-hop mix their loops use (an overlay
+    /// leg: a mix's own loop starts and ends outside the layered wiring).
+    mix_loop_interval: Time = 0,
+    /// A mix raises its alarm once this many of its own loops are lost
+    /// (`loop_slack` applies as for clients).
+    mix_loop_alarm_lost: u32 = 2,
+
     pub const ConfigError = error{InvalidConfig};
 
     /// The ranges every field must be in for the header, the casts and the
@@ -118,7 +171,10 @@ pub const LoopixConfig = struct {
         // Holds are carried as u32 and drawn through f64; keep the mean far
         // from where either stops being exact.
         if (self.mean_delay > 1 << 20) return error.InvalidConfig;
-        if (self.loop_alarm_lost == 0) return error.InvalidConfig;
+        if (self.loop_alarm_lost == 0 or self.mix_loop_alarm_lost == 0) return error.InvalidConfig;
+        if (self.topology == .cascade and self.width != 1) return error.InvalidConfig;
+        if (self.topology == .free_route and self.mixCount() < self.layers) return error.InvalidConfig;
+        if (self.threshold == 0 or self.batch_period == 0 or self.batch_period > 1 << 20) return error.InvalidConfig;
         if (self.nodeCount() > 255) return error.InvalidConfig;
     }
 
@@ -144,6 +200,43 @@ pub const LoopixConfig = struct {
     pub fn layerOf(self: LoopixConfig, node: NodeId) ?u8 {
         if (node >= self.mixCount()) return null;
         return @intCast(node / self.width);
+    }
+
+    /// Is `node` a mix?
+    pub fn isMix(self: LoopixConfig, node: NodeId) bool {
+        return node < self.mixCount();
+    }
+
+    /// May `node` be the last mix of a route (the one that hands a packet to
+    /// its recipient or the recipient's provider)? The last layer in the
+    /// layered topologies, any mix in a free route.
+    pub fn isExitMix(self: LoopixConfig, node: NodeId) bool {
+        if (!self.isMix(node)) return false;
+        return self.topology == .free_route or self.layerOf(node).? == self.layers - 1;
+    }
+
+    /// Per node, the receiver the adversary can read off the link a last-hop
+    /// packet takes (row `node * clients ..` of the result): a client node is
+    /// its own receiver; with providers, a provider is every client it serves,
+    /// uniformly (a mailbox pull is padded, so which of them is not
+    /// observable). All other rows are 0. Caller frees.
+    pub fn exitRows(self: LoopixConfig, gpa: std.mem.Allocator) std.mem.Allocator.Error![]f64 {
+        const c: usize = self.clients;
+        const rows = try gpa.alloc(f64, self.nodeCount() * c);
+        @memset(rows, 0);
+        if (self.providers == 0) {
+            for (0..c) |i| rows[@as(usize, self.clientNode(@intCast(i))) * c + i] = 1;
+        } else {
+            for (0..self.providers) |p| {
+                const node: usize = self.providerNode(@intCast(p));
+                var k: f64 = 0;
+                for (0..c) |i| k += @floatFromInt(@intFromBool(i % self.providers == p));
+                for (0..c) |i| {
+                    if (i % self.providers == p) rows[node * c + i] = 1.0 / k;
+                }
+            }
+        }
+        return rows;
     }
 
     /// Is `node` a client (traffic source/sink)?
@@ -227,6 +320,24 @@ pub const AnonymityBound = struct {
 pub const SenderBound = struct {
     min_sender_set: f64 = 4.0,
     max_link_prob: f64 = 0.5,
+};
+
+/// The RECEIVER-side invariant (`adversary.measureReceiver`): for every real
+/// packet, the adversary's posterior over WHICH CLIENT it is for stays spread
+/// over at least `min_receiver_set` clients and puts at most `max_link_prob`
+/// on the true recipient. Defaults are set against `PROVIDER_CFG`
+/// (8 clients behind 2 providers: the receiver is only readable down to a
+/// provider's 4 clients, so the set is at most 4 there).
+pub const ReceiverBound = struct {
+    min_receiver_set: f64 = 2.0,
+    max_link_prob: f64 = 0.5,
+};
+
+/// Third-party sender–receiver unlinkability (`SenderResult.mean_epsilon`):
+/// the mean leakage `ε` (nats) between the true sender of a packet and any
+/// other client must stay at or below this.
+pub const UnlinkBound = struct {
+    max_mean_epsilon: f64 = 1.0,
 };
 
 // ── the in-sim mix header ────────────────────────────────────────────────────

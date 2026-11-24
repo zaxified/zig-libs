@@ -16,7 +16,11 @@ its contribution is the **anonymity strategy**:
   every mix's anonymity set large and detects active (n−1) attacks;
 - a **stratified** L-layer topology — every message traverses exactly one mix
   per layer, so all traffic shares the relay set and is mutually
-  indistinguishable at the link level.
+  indistinguishable at the link level. The simulator also runs the other
+  topologies of Piotrowska's mix network simulator (cascade, multi-cascade,
+  free route), batch-and-reorder mixing (threshold, timed), loops sent by the
+  mixes themselves, and measures receiver anonymity and third-party
+  sender–receiver unlinkability beside sender anonymity.
 
 **Status: core, as a simulator/analysis library** (graded against the Loopix
 authors' own mix network simulator — see SPEC.md "Compared with"). It does not
@@ -86,6 +90,13 @@ mix.attack = .{ .mix = loopix.PROVIDER_CFG.mixNode(1, 0), .start = 700, .stop = 
   `pickDestClient`, `HopInstruction`.
 - `sampleExpDelay` / `scheduleRelease` / `nextCover` — the mixing core.
   `Prng` / `CoverEvent` — the seeded randomness they use.
+- `LoopixConfig.topology` (`Topology`), `mix_strategy` (`MixStrategy`),
+  `threshold` / `batch_period`, `mix_loop_interval`; `scenarioFor(cfg)` builds
+  the netsim scenario of any configuration. `measureReceiver` / `ReceiverBound` /
+  `ReceiverResult` / `LoopixConfig.exitRows` — receiver anonymity;
+  `SenderResult.mean_epsilon` / `UnlinkBound` — sender–receiver leakage;
+  `DelayModel.batch` — the batch mix's law; `Loopix.mix_alarms` — a mix's own
+  loops lost.
 - `PROVIDER_CFG` / `providerScenario` — Loopix as deployed (clients behind
   providers with mailboxes, sender-chosen holds); `DEFAULT_CFG` / `scenario` —
   the plain stratified run with mix-chosen holds. `measureEndToEnd` /
@@ -99,8 +110,7 @@ mix.attack = .{ .mix = loopix.PROVIDER_CFG.mixNode(1, 0), .start = 700, .stop = 
 
 ## Not provided
 
-No real transport (it is a simulator, not a node), no PKI, no cascade or batch-and-reorder mixing, no
-receiver-side metric: see SPEC.md *What is deliberately not done*, *Backlog / deferred* and *Roadmap*.
+No real transport (it is a simulator, not a node), no PKI: see SPEC.md *What is deliberately not done* and *Roadmap*.
 
 Provenance: clean-room from the Loopix paper (Piotrowska et al., USENIX Security
 2017); Sphinx packet reused from this repo's `sphinx` module. No third-party

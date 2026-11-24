@@ -84,6 +84,10 @@ pub const Transit = struct {
     /// adversary sees as "this arrival came over that link from that
     /// departure" (see there).
     hop: u8 = 0,
+    /// Where the packet went on leaving the mix (the link it took: a next mix,
+    /// a provider or a client). The adversary watches every link, so this is
+    /// observable; `measureReceiver` reads the last hop's.
+    to: NodeId = 0,
 };
 
 /// The delay law the adversary links with. It knows the mix's strategy, so it
@@ -97,6 +101,21 @@ pub const DelayModel = union(enum) {
     /// A spike likelihood — only the departure whose hold matches gets weight,
     /// so the posterior collapses onto the true match ⇒ effective set 1.
     constant: struct { delta: Time, tol: Time },
+    /// A batch-and-reorder mix (threshold or timed): everything it holds is
+    /// released at ONE instant, in random order. The adversary sees the
+    /// release instants (departure times shared by a burst); a packet that
+    /// arrived at `a` leaves in the first release at or after `a`, and is
+    /// equally likely to be any packet of that burst. So its anonymity set is
+    /// the batch, and the linking probability `1/batch`.
+    batch,
+
+    /// The likelihood of a departure at `departure` for an arrival at
+    /// `arrival`; `flush` is the first release instant at or after `arrival`
+    /// (only read by `.batch`).
+    fn weight(self: DelayModel, arrival: Time, departure: Time, flush: Time) f64 {
+        if (self == .batch) return if (departure == flush) 1.0 else 0.0;
+        return self.kernel(@as(i128, @intCast(departure)) - @as(i128, @intCast(arrival)));
+    }
 
     fn kernel(self: DelayModel, hold: i128) f64 {
         if (hold < 0) return 0.0; // causal: a packet cannot depart before it arrived
@@ -108,9 +127,20 @@ pub const DelayModel = union(enum) {
                 const tol: f64 = @floatFromInt(c.tol);
                 break :blk if (@abs(d - target) <= tol) 1.0 else 0.0;
             },
+            .batch => unreachable, // `weight` answers for it
         };
     }
 };
+
+/// The first departure at or after `arrival` (`maxInt` if none): the release
+/// instant a batch mix lets an arrival leave in.
+fn firstFlush(deps: []const Time, arrival: Time) Time {
+    var f: Time = std.math.maxInt(Time);
+    for (deps) |d| {
+        if (d >= arrival and d < f) f = d;
+    }
+    return f;
+}
 
 /// Aggregate anonymity measured over every real target × every mix it
 /// transited. The `min_effective_set` / `max_link_prob` fields are the
@@ -175,12 +205,12 @@ pub fn measure(
         // weight. The true departure is t.departure (ground truth); when
         // several departures coincide in time we still credit exactly one
         // share to the true match (posterior mass at that timestamp / count).
+        const flush = if (model == .batch) firstFlush(deps, t.arrival) else 0;
         var total: f64 = 0;
         var true_weight: f64 = 0;
         var true_coincident: f64 = 0; // departures sharing the true timestamp
         for (deps) |d| {
-            const hold: i128 = @as(i128, @intCast(d)) - @as(i128, @intCast(t.arrival));
-            const w = model.kernel(hold);
+            const w = model.weight(t.arrival, d, flush);
             total += w;
             if (d == t.departure) {
                 true_weight = w;
@@ -194,8 +224,7 @@ pub fn measure(
         if (total > 0) {
             var h: f64 = 0;
             for (deps) |d| {
-                const hold: i128 = @as(i128, @intCast(d)) - @as(i128, @intCast(t.arrival));
-                const w = model.kernel(hold);
+                const w = model.weight(t.arrival, d, flush);
                 if (w <= 0) continue;
                 const p = w / total;
                 h -= p * std.math.log2(p);
@@ -256,8 +285,19 @@ pub fn measure(
 // adversary weaker in the tails it double-counts — the positive controls below
 // show it is still strong enough to pin a FIFO or cover-starved network.
 
-/// A packet's ground-truth sender (client index), as injected.
-pub const Origin = struct { id: u64, client: u8 };
+/// A packet's ground truth as injected: who sent it and, for application
+/// traffic, whom it is for.
+pub const Origin = struct {
+    id: u64,
+    /// The sending client (meaningless when `from_mix`).
+    client: u8,
+    /// The receiving client, when the packet is addressed to one.
+    recipient: ?u8 = null,
+    /// A loop a MIX sent to itself: no client sent it, so it carries no
+    /// sender mass at all (it blurs other packets' posteriors, which is what
+    /// mix-originated cover is for, but names nobody).
+    from_mix: bool = false,
+};
 
 pub const SenderResult = struct {
     targets: usize = 0,
@@ -271,10 +311,78 @@ pub const SenderResult = struct {
     min_sender_set: f64 = std.math.inf(f64),
     mean_link_prob: f64 = 0,
     max_link_prob: f64 = 0,
+    /// Third-party sender–receiver unlinkability (Piotrowska 2021, after the
+    /// Loopix paper): for every real packet, the leakage
+    /// `ε = ln(Pr[true sender] / Pr[S2])` against every other client `S2` the
+    /// adversary has not ruled out (`Pr` floored at `1e-12`, so a sender the
+    /// adversary pins gives ≈ 27.6 nats), averaged over those pairs and over
+    /// packets. 0 = the adversary cannot tell the true sender from anyone
+    /// else; the worst packet is `max_epsilon`.
+    mean_epsilon: f64 = 0,
+    max_epsilon: f64 = 0,
 
     pub fn holds(self: SenderResult, bound: types.SenderBound) bool {
         if (self.targets == 0) return true;
         return self.min_sender_set >= bound.min_sender_set and self.max_link_prob <= bound.max_link_prob;
+    }
+
+    /// Does the leakage stay below `bound.max_mean_epsilon`?
+    pub fn unlinkable(self: SenderResult, bound: types.UnlinkBound) bool {
+        return self.targets == 0 or self.mean_epsilon <= bound.max_mean_epsilon;
+    }
+};
+
+const eps_floor = 1e-12;
+
+fn groupKey(t: Transit) u64 {
+    return (@as(u64, t.mix) << 8) | t.hop;
+}
+
+/// What both end-to-end measures index: the passes of each (mix, hop) group,
+/// the pass of an id at a hop (the link observation) and, for a batch mix,
+/// each arrival's release instant. Grouping by hop as well as mix credits the
+/// adversary with knowing a pass's position in its route — which a layered
+/// topology gives away for free, and a free route does not (there it is a
+/// STRONGER adversary than the real one, so its anonymity is understated).
+const Index = struct {
+    const Key = struct { id: u64, hop: u8 };
+    at: std.AutoHashMapUnmanaged(Key, usize) = .empty,
+    groups: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)) = .empty,
+    flush: []Time = &.{},
+
+    fn init(gpa: Allocator, transits: []const Transit, model: DelayModel) Allocator.Error!Index {
+        var ix = Index{};
+        errdefer ix.deinit(gpa);
+        for (transits, 0..) |t, i| {
+            try ix.at.put(gpa, .{ .id = t.id, .hop = t.hop }, i);
+            const gop = try ix.groups.getOrPut(gpa, groupKey(t));
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(gpa, i);
+        }
+        ix.flush = try gpa.alloc(Time, transits.len);
+        @memset(ix.flush, 0);
+        if (model == .batch) {
+            var it = ix.groups.valueIterator();
+            while (it.next()) |list| {
+                for (list.items) |u| {
+                    var f: Time = std.math.maxInt(Time);
+                    for (list.items) |i| {
+                        const d = transits[i].departure;
+                        if (d >= transits[u].arrival and d < f) f = d;
+                    }
+                    ix.flush[u] = f;
+                }
+            }
+        }
+        return ix;
+    }
+
+    fn deinit(self: *Index, gpa: Allocator) void {
+        self.at.deinit(gpa);
+        var it = self.groups.valueIterator();
+        while (it.next()) |l| l.deinit(gpa);
+        self.groups.deinit(gpa);
+        gpa.free(self.flush);
     }
 };
 
@@ -291,29 +399,12 @@ pub fn measureEndToEnd(
 ) Allocator.Error!SenderResult {
     const c: usize = clients;
     const n = transits.len;
-    var origin_of: std.AutoHashMapUnmanaged(u64, u8) = .empty;
+    var origin_of: std.AutoHashMapUnmanaged(u64, Origin) = .empty;
     defer origin_of.deinit(gpa);
-    for (origins) |o| try origin_of.put(gpa, o.id, o.client);
+    for (origins) |o| try origin_of.put(gpa, o.id, o);
 
-    // (id, hop) → transit index: the link observation.
-    const Key = struct { id: u64, hop: u8 };
-    var at: std.AutoHashMapUnmanaged(Key, usize) = .empty;
-    defer at.deinit(gpa);
-    for (transits, 0..) |t, i| try at.put(gpa, .{ .id = t.id, .hop = t.hop }, i);
-
-    // Transits per mix (a mix sits in one layer, so all of a mix's transits
-    // share a hop).
-    var by_mix: std.AutoHashMapUnmanaged(NodeId, std.ArrayListUnmanaged(usize)) = .empty;
-    defer {
-        var it = by_mix.valueIterator();
-        while (it.next()) |l| l.deinit(gpa);
-        by_mix.deinit(gpa);
-    }
-    for (transits, 0..) |t, i| {
-        const gop = try by_mix.getOrPut(gpa, t.mix);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(gpa, i);
-    }
+    var ix = try Index.init(gpa, transits, model);
+    defer ix.deinit(gpa);
 
     const uniform = 1.0 / @as(f64, @floatFromInt(c));
     const dist_in = try gpa.alloc(f64, n * c);
@@ -332,11 +423,13 @@ pub fn measureEndToEnd(
             const row = dist_in[i * c ..][0..c];
             if (hop == 0) {
                 @memset(row, 0);
-                if (origin_of.get(t.id)) |src| row[src] = 1 else {
+                if (origin_of.get(t.id)) |o| {
+                    if (!o.from_mix) row[o.client] = 1;
+                } else {
                     @memset(row, uniform);
                     fallbacks += 1;
                 }
-            } else if (at.get(.{ .id = t.id, .hop = hop - 1 })) |prev| {
+            } else if (ix.at.get(.{ .id = t.id, .hop = hop - 1 })) |prev| {
                 @memcpy(row, dist_out[prev * c ..][0..c]);
             } else {
                 @memset(row, uniform);
@@ -344,7 +437,7 @@ pub fn measureEndToEnd(
             }
         }
         // What each departure from a mix of this layer could be.
-        var it = by_mix.valueIterator();
+        var it = ix.groups.valueIterator();
         while (it.next()) |list| {
             if (transits[list.items[0]].hop != hop) continue;
             for (list.items) |i| {
@@ -352,8 +445,7 @@ pub fn measureEndToEnd(
                 @memset(row, 0);
                 var total: f64 = 0;
                 for (list.items) |u| {
-                    const hold: i128 = @as(i128, @intCast(transits[i].departure)) - @as(i128, @intCast(transits[u].arrival));
-                    const w = model.kernel(hold);
+                    const w = model.weight(transits[u].arrival, transits[i].departure, ix.flush[u]);
                     if (w <= 0) continue;
                     total += w;
                     for (row, dist_in[u * c ..][0..c]) |*r, d| r.* += w * d;
@@ -371,27 +463,173 @@ pub fn measureEndToEnd(
     var res = SenderResult{ .fallbacks = fallbacks };
     var sum_set: f64 = 0;
     var sum_link: f64 = 0;
+    var sum_eps: f64 = 0;
     for (transits, 0..) |t, i| {
         if (t.kind != .real or t.hop != last_hop) continue;
-        const src = origin_of.get(t.id) orelse continue;
+        const o = origin_of.get(t.id) orelse continue;
+        if (o.from_mix) continue;
+        const src = o.client;
+        // The sender is a client (the packet is real), so condition on that:
+        // mass the adversary put on "a mix sent it" is not a client's.
         const row = dist_out[i * c ..][0..c];
+        var mass: f64 = 0;
+        for (row) |p| mass += p;
+        if (mass <= 0) continue;
         var h: f64 = 0;
-        for (row) |p| {
-            if (p > 0) h -= p * std.math.log2(p);
+        var eps: f64 = 0;
+        const p_true = @max(row[src] / mass, eps_floor);
+        for (row, 0..) |p, k| {
+            const q = p / mass;
+            if (q > 0) h -= q * std.math.log2(q);
+            if (k != src and c > 1) eps += @log(p_true / @max(q, eps_floor));
         }
+        if (c > 1) eps /= @as(f64, @floatFromInt(c - 1));
         const set = std.math.exp2(h);
-        const link = row[src];
+        const link = row[src] / mass;
         res.targets += 1;
         sum_set += set;
         sum_link += link;
+        sum_eps += eps;
         res.min_sender_set = @min(res.min_sender_set, set);
         res.max_link_prob = @max(res.max_link_prob, link);
+        res.max_epsilon = @max(res.max_epsilon, eps);
     }
     if (res.targets > 0) {
         const k: f64 = @floatFromInt(res.targets);
         res.mean_sender_set = sum_set / k;
         res.mean_link_prob = sum_link / k;
+        res.mean_epsilon = sum_eps / k;
     } else res.min_sender_set = 0;
+    return res;
+}
+
+pub const ReceiverResult = struct {
+    targets: usize = 0,
+    /// As in `SenderResult`: distributions that fell back to uniform.
+    fallbacks: usize = 0,
+    mean_receiver_set: f64 = 0,
+    min_receiver_set: f64 = std.math.inf(f64),
+    mean_link_prob: f64 = 0,
+    max_link_prob: f64 = 0,
+
+    pub fn holds(self: ReceiverResult, bound: types.ReceiverBound) bool {
+        if (self.targets == 0) return true;
+        return self.min_receiver_set >= bound.min_receiver_set and self.max_link_prob <= bound.max_link_prob;
+    }
+};
+
+/// RECEIVER anonymity of every real packet (sender known to the adversary:
+/// it sees which client transmitted): the posterior over which client it is
+/// for, composed FORWARD through every layer. At a mix, an arrival becomes
+/// departure `i` with probability `∝ weight(i)` (the mix's own hold law);
+/// a departure's link is observed, so the next layer's arrival is that same
+/// packet; a last-hop departure's link names the receiver — a client, or with
+/// providers every client of the provider uniformly (`exit_rows`, from
+/// `LoopixConfig.exitRows`: row `node * clients ..`). Scored per real
+/// packet: effective set `2^H` over the clients and the mass on the true
+/// recipient (`Origin.recipient`). `O(Σ_mix pool² × clients)`.
+pub fn measureReceiver(
+    gpa: Allocator,
+    transits: []const Transit,
+    origins: []const Origin,
+    exit_rows: []const f64,
+    clients: u8,
+    last_hop: u8,
+    model: DelayModel,
+) Allocator.Error!ReceiverResult {
+    const c: usize = clients;
+    const n = transits.len;
+    var origin_of: std.AutoHashMapUnmanaged(u64, Origin) = .empty;
+    defer origin_of.deinit(gpa);
+    for (origins) |o| try origin_of.put(gpa, o.id, o);
+
+    var ix = try Index.init(gpa, transits, model);
+    defer ix.deinit(gpa);
+
+    const uniform = 1.0 / @as(f64, @floatFromInt(c));
+    const r_in = try gpa.alloc(f64, n * c);
+    defer gpa.free(r_in);
+    @memset(r_in, uniform);
+    const r_out = try gpa.alloc(f64, n * c);
+    defer gpa.free(r_out);
+    @memset(r_out, uniform);
+    var fallbacks: usize = 0;
+
+    var hop_i: usize = @as(usize, last_hop) + 1;
+    while (hop_i > 0) {
+        hop_i -= 1;
+        const hop: u8 = @intCast(hop_i);
+        // Where each departure of this layer ends up.
+        for (transits, 0..) |t, i| {
+            if (t.hop != hop) continue;
+            const row = r_out[i * c ..][0..c];
+            if (hop == last_hop) {
+                if ((@as(usize, t.to) + 1) * c <= exit_rows.len) {
+                    @memcpy(row, exit_rows[@as(usize, t.to) * c ..][0..c]);
+                } else {
+                    @memset(row, uniform);
+                    fallbacks += 1;
+                }
+            } else if (ix.at.get(.{ .id = t.id, .hop = hop + 1 })) |next| {
+                @memcpy(row, r_in[next * c ..][0..c]);
+            } else {
+                @memset(row, uniform);
+                fallbacks += 1;
+            }
+        }
+        // What each arrival of this layer becomes.
+        var it = ix.groups.valueIterator();
+        while (it.next()) |list| {
+            if (transits[list.items[0]].hop != hop) continue;
+            for (list.items) |u| {
+                const row = r_in[u * c ..][0..c];
+                @memset(row, 0);
+                var total: f64 = 0;
+                for (list.items) |i| {
+                    const w = model.weight(transits[u].arrival, transits[i].departure, ix.flush[u]);
+                    if (w <= 0) continue;
+                    total += w;
+                    for (row, r_out[i * c ..][0..c]) |*r, d| r.* += w * d;
+                }
+                if (total > 0) {
+                    for (row) |*r| r.* /= total;
+                } else {
+                    @memset(row, uniform);
+                    fallbacks += 1;
+                }
+            }
+        }
+    }
+
+    var res = ReceiverResult{ .fallbacks = fallbacks };
+    var sum_set: f64 = 0;
+    var sum_link: f64 = 0;
+    for (transits, 0..) |t, i| {
+        if (t.kind != .real or t.hop != 0) continue;
+        const o = origin_of.get(t.id) orelse continue;
+        const dst = o.recipient orelse continue;
+        const row = r_in[i * c ..][0..c];
+        var mass: f64 = 0;
+        for (row) |p| mass += p;
+        if (mass <= 0) continue;
+        var h: f64 = 0;
+        for (row) |p| {
+            const q = p / mass;
+            if (q > 0) h -= q * std.math.log2(q);
+        }
+        const set = std.math.exp2(h);
+        const link = row[dst] / mass;
+        res.targets += 1;
+        sum_set += set;
+        sum_link += link;
+        res.min_receiver_set = @min(res.min_receiver_set, set);
+        res.max_link_prob = @max(res.max_link_prob, link);
+    }
+    if (res.targets > 0) {
+        const k: f64 = @floatFromInt(res.targets);
+        res.mean_receiver_set = sum_set / k;
+        res.mean_link_prob = sum_link / k;
+    } else res.min_receiver_set = 0;
     return res;
 }
 
@@ -664,4 +902,105 @@ test "measure: no real traffic is vacuously anonymous" {
     const r = try measure(gpa, &.{}, .{ .exponential = 40.0 });
     try testing.expectEqual(@as(usize, 0), r.targets);
     try testing.expect(r.holds(AnonymityBound{}));
+}
+
+test "measure: a batch mix hides a packet among its batch, 1/k each; a lone packet in a round is pinned" {
+    const gpa = testing.allocator;
+    // Round at t=50: four packets (arrivals 3..30) leave together. Round at t=90:
+    // one packet alone.
+    const ts = [_]Transit{ tr(0, 3, 50, 1), tr(0, 10, 50, 2), tr(0, 22, 50, 3), tr(0, 30, 50, 4), tr(0, 60, 90, 5) };
+    const r = try measure(gpa, &ts, .batch);
+    try testing.expectEqual(@as(usize, 5), r.targets);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), r.min_effective_set, 1e-9); // the lone one
+    try testing.expectApproxEqAbs(@as(f64, 1.0), r.max_link_prob, 1e-9);
+    // Without it, the batch of four is a uniform crowd.
+    const r4 = try measure(gpa, ts[0..4], .batch);
+    try testing.expectApproxEqAbs(@as(f64, 4.0), r4.min_effective_set, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0.25), r4.max_link_prob, 1e-9);
+}
+
+test "measureEndToEnd: batch law, and a pinned sender leaks the floor ε, a uniform one none" {
+    const gpa = testing.allocator;
+    // Two clients, one mix: both packets in one batch ⇒ sender 50/50, ε = 0.
+    const ts = [_]Transit{ trh(0, 0, 20, 1, 0, .real), trh(0, 5, 20, 2, 0, .real) };
+    const os = [_]Origin{ .{ .id = 1, .client = 0 }, .{ .id = 2, .client = 1 } };
+    const mixed = try measureEndToEnd(gpa, &ts, &os, 2, 0, .batch);
+    try testing.expectApproxEqAbs(@as(f64, 2.0), mixed.min_sender_set, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0.0), mixed.max_epsilon, 1e-9);
+    try testing.expect(mixed.unlinkable(.{ .max_mean_epsilon = 0.01 }));
+    // Two rounds of one packet each: pinned, ε = ln(1 / 1e-12).
+    const alone = [_]Transit{ trh(0, 0, 20, 1, 0, .real), trh(0, 25, 40, 2, 0, .real) };
+    const pinned = try measureEndToEnd(gpa, &alone, &os, 2, 0, .batch);
+    try testing.expectApproxEqAbs(@log(1.0 / eps_floor), pinned.mean_epsilon, 1e-6);
+    try testing.expect(!pinned.unlinkable(.{}));
+}
+
+test "measureEndToEnd: a mix's own loop carries no sender mass and is not scored" {
+    const gpa = testing.allocator;
+    // A client packet and a mix loop share one batch: the packet's sender is
+    // the client with certainty (the loop names nobody), and the loop is no target.
+    const ts = [_]Transit{ trh(0, 0, 20, 1, 0, .real), trh(0, 5, 20, 2, 0, .loop_cover) };
+    const os = [_]Origin{ .{ .id = 1, .client = 0 }, .{ .id = 2, .client = 0, .from_mix = true } };
+    const r = try measureEndToEnd(gpa, &ts, &os, 2, 0, .batch);
+    try testing.expectEqual(@as(usize, 1), r.targets);
+    try testing.expectEqual(@as(usize, 0), r.fallbacks);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), r.max_link_prob, 1e-9);
+}
+
+fn trTo(mix: NodeId, arr: Time, dep: Time, id: u64, hop: u8, to: NodeId) Transit {
+    return .{ .mix = mix, .arrival = arr, .departure = dep, .kind = .real, .id = id, .hop = hop, .to = to };
+}
+
+test "measureReceiver: an order-preserving mix pins the receiver; mixing and a shared provider spread it" {
+    const gpa = testing.allocator;
+    // Nodes 5 and 6 are the exits; 2 clients. Row of node n at n*2.
+    var rows: [7 * 2]f64 = @splat(0);
+    rows[5 * 2 + 0] = 1; // exit 5 = client 0
+    rows[6 * 2 + 1] = 1; // exit 6 = client 1
+    const os = [_]Origin{ .{ .id = 1, .client = 0, .recipient = 0 }, .{ .id = 2, .client = 1, .recipient = 1 } };
+    const fifo = [_]Transit{ trTo(0, 0, 10, 1, 0, 5), trTo(0, 3, 13, 2, 0, 6) };
+    const pinned = try measureReceiver(gpa, &fifo, &os, &rows, 2, 0, .{ .constant = .{ .delta = 10, .tol = 0 } });
+    try testing.expectEqual(@as(usize, 2), pinned.targets);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), pinned.min_receiver_set, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), pinned.max_link_prob, 1e-9);
+    try testing.expect(!pinned.holds(.{}));
+    // One batch, two exits: each packet is for either client with equal odds.
+    const batch = [_]Transit{ trTo(0, 0, 10, 1, 0, 5), trTo(0, 3, 10, 2, 0, 6) };
+    const mixed = try measureReceiver(gpa, &batch, &os, &rows, 2, 0, .batch);
+    try testing.expectApproxEqAbs(@as(f64, 2.0), mixed.min_receiver_set, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), mixed.max_link_prob, 1e-9);
+    try testing.expect(mixed.holds(.{ .min_receiver_set = 2.0, .max_link_prob = 0.5 }));
+    // A shared provider (row uniform over both clients) hides it even from a FIFO mix.
+    rows[5 * 2 + 0] = 0.5;
+    rows[5 * 2 + 1] = 0.5;
+    rows[6 * 2 + 0] = 0.5;
+    rows[6 * 2 + 1] = 0.5;
+    const provider = try measureReceiver(gpa, &fifo, &os, &rows, 2, 0, .{ .constant = .{ .delta = 10, .tol = 0 } });
+    try testing.expectApproxEqAbs(@as(f64, 2.0), provider.min_receiver_set, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), provider.max_link_prob, 1e-9);
+}
+
+test "measureReceiver: composes forward over two layers; an unobserved next hop is counted" {
+    const gpa = testing.allocator;
+    var rows: [8 * 2]f64 = @splat(0);
+    rows[6 * 2 + 0] = 1;
+    rows[7 * 2 + 1] = 1;
+    const os = [_]Origin{ .{ .id = 1, .client = 0, .recipient = 0 }, .{ .id = 2, .client = 1, .recipient = 1 } };
+    // Layer 0 batches both packets (mix 0, at 10); layer 1 is a FIFO (constant 5) that
+    // would pin them, but the batch already blurred which is which.
+    const ts = [_]Transit{
+        trTo(0, 0, 10, 1, 0, 3),  trTo(0, 4, 10, 2, 0, 4),
+        trTo(3, 12, 17, 1, 1, 6), trTo(4, 13, 18, 2, 1, 7),
+    };
+    // Different layer-1 mixes: layer 1 sees one packet each and pins its own
+    // packet's exit, so the layer-0 batch is the only blur: 50/50 between the two.
+    const r = try measureReceiver(gpa, &ts, &os, &rows, 2, 1, .{ .exponential = 5 });
+    try testing.expectEqual(@as(usize, 2), r.targets);
+    try testing.expectEqual(@as(usize, 0), r.fallbacks);
+    try testing.expect(r.min_receiver_set > 1.5);
+    // Drop the second-layer pass of packet 2: packet 1's chain is intact, but
+    // the departure that was packet 2 now has no observed continuation.
+    const cut = [_]Transit{ ts[0], ts[1], ts[2] };
+    const c = try measureReceiver(gpa, &cut, &os, &rows, 2, 1, .{ .exponential = 5 });
+    try testing.expect(c.fallbacks > 0);
 }

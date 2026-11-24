@@ -30,7 +30,7 @@ derived from anyone's code).
 
 Surveyed 2026-10-04 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date (GitHub API). Source of none of these was read.
 
-**What this module is compared AS.** The 2026-09-30 survey measured it against deployable mixnets (Nym, Katzenpost) and, unsurprisingly, found a poc: it carries no byte over a real network. That is not what it is for — its own description is "a model-checked simulation", and the user decided on 2026-10-04 to grade it as one. The yardstick is therefore the tool the Loopix authors themselves used to measure Loopix's anonymity: A. Piotrowska's discrete-event mix network simulator. A user wanting a mixnet to RUN still gets nothing here; that verdict stands under Backlog and in the row for Nym below.
+**What this module is compared AS.** The 2026-09-30 survey measured it against deployable mixnets (Nym, Katzenpost) and, unsurprisingly, found a poc: it carries no byte over a real network. That is not what it is for — its own description is "a model-checked simulation", and the user decided on 2026-10-04 to grade it as one. The yardstick is therefore the tool the Loopix authors themselves used to measure Loopix's anonymity: A. Piotrowska's discrete-event mix network simulator. A user wanting a mixnet to RUN still gets nothing here; that verdict stands under Roadmap and in the row for Nym below.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -39,7 +39,7 @@ Surveyed 2026-10-04 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [UCL-InfoSec/loopix](https://github.com/UCL-InfoSec/loopix) | Python | BSD-2-Clause | 75 | push 2017-09-19 | The authors' original prototype (a running system, not a simulator) *(inferred)*; dormant. |
 | [nymtech/nym](https://github.com/nymtech/nym) | Rust | mixed (per-file SPDX) | 1965 | push 2026-10-02 | The production Loopix descendant — a network you join. Not a simulator; listed so the "not deployable" gap stays visible. |
 
-**Where we are ahead:** a deterministic, replayable gate rather than a plotting tool — every guarantee is an invariant with POSITIVE CONTROLS that must fail it (FIFO mix, no cover, an order-preserving release, a blocked mix), run on every test pass; per-mix AND end-to-end metrics against the mix's own law; a direct memorylessness check (`reorderStats`); n−1 detection from loop cover, with a false-positive check (the reference models no active attacks); constant-size mailbox pulls checked; the `sphinx` round trip proving the modeled header stands in for a real onion. **Where we are behind (→ Backlog):** only the stratified topology (no cascade / multi-cascade / free-route), only Poisson mixing (no batch-and-reorder), cover only from clients (no mix-originated loops), no third-party sender–receiver unlinkability metric, overhead counted in packets not bytes, and the scale a netsim run reaches in a test (tens of nodes), not thousands of clients.
+**Where we are ahead:** a deterministic, replayable gate rather than a plotting tool — every guarantee is an invariant with POSITIVE CONTROLS that must fail it (FIFO mix, no cover, an order-preserving release, a blocked mix), run on every test pass; per-mix AND end-to-end metrics against the mix's own law; a direct memorylessness check (`reorderStats`); n−1 detection from loop cover, with a false-positive check (the reference models no active attacks); constant-size mailbox pulls checked; the `sphinx` round trip proving the modeled header stands in for a real onion. **Where we are behind:** the scale a netsim run reaches in a test (160 nodes, `LARGE_CFG`), not thousands of clients, and no peer-to-peer topology with a mix per user (the free route here is a fixed set of mixes).
 
 ## Design
 
@@ -207,6 +207,49 @@ mixing core itself — is where the design's weight lies.
   application message, cover and padding included. Bytes are those of the
   modeled `MixHeader` (`wire_len`); a real Sphinx packet is larger by a constant
   factor per packet, which does not change any ratio.
+- **Topologies** (`LoopixConfig.topology`, `scenarioFor(cfg)`; paper §3): `stratified` (default), `cascade`
+  (one chain, `width` must be 1), `multi_cascade` (`width` independent chains, no link between two chains)
+  and `free_route` (every mix linked to every other and to the edge; the route is `layers` DISTINCT mixes
+  out of all of them). Node numbering is the same; `routing.pickRoute` picks per topology and
+  `isExitMix` says which mixes may hand a packet to a provider (the last layer, or any mix in a free route).
+  Measured over 5 seeds with light cover (1 per 100 ticks per client; 8 clients, 2 providers, 9 mixes, 3
+  hops): mean per-mix set 38.0 (cascade: each mix carries all the traffic) against 13.3 for the others;
+  mean sender set of 8: 7.91 cascade / 7.86 stratified / 7.33 free / 7.07 multi-cascade; worst packet
+  6.97 / 5.01 / 1.66 / 2.00; mean leakage ε 0.00 / 0.02 / 0.27 / 0.50 nats — the paper's result that
+  multi-cascades and a peer-to-peer net spread traffic thin while stratified keeps a cascade's anonymity
+  and scales out. `measureEndToEnd` and `measureReceiver` group passes by (mix, hop): the adversary is
+  credited with knowing a pass's position in its route, which a layered net gives away and a free route
+  does not (there it is a stronger adversary than the real one, so its anonymity is understated).
+- **Mixing strategies** (`LoopixConfig.mix_strategy`; paper §3, "batch-and-reorder"): `poisson` (default),
+  `threshold` (a mix releases everything it holds, in a random order, once `threshold` packets are in) and
+  `timed` (every `batch_period` ticks). A batch leaves at ONE instant, so the adversary's law is
+  `DelayModel.batch`: a packet leaves in the first release at or after its arrival, uniformly among that
+  batch (set = batch size, linking probability `1/batch`). Measured: a threshold mix has set exactly `n`
+  and link `1/n` on every target (threshold 1 is pinned: the FIFO control again), latency 33 / 56 / 83 /
+  137 ticks for n = 1 / 5 / 10 / 20 — the trilemma; a timed batch has no floor (a short period leaves a
+  round with one packet: set 1.0), mean set 6.9 / 12.2 / 23.2 and latency 71 / 121 / 222 for period
+  20 / 40 / 80; without cover a threshold batch keeps its set but waits for traffic (latency 187 against
+  83). The shuffle is `mixing.shuffle` from the seeded stream.
+- **Mix-originated cover** (`LoopixConfig.mix_loop_interval`, 0 = off): every mix sends a Poisson stream of
+  loops through the network back to itself (route as a client's, destination the mix; the mixes get
+  overlay links to the first- and last-hop mixes their loops use). They are `loop_cover` transits that swell
+  pools and carry no sender mass (`Origin.from_mix`). A mix watches its own loops as a client does
+  (`Loopix.mix_alarms`, `mix_loop_alarm_lost`): known hold bound with sender-chosen delays or timed
+  batches, none for mix-chosen holds or threshold batches. Measured (5 seeds): 1386 of 1520 loops back
+  (the rest in flight at the horizon), no alarm on a clean network, mean per-mix set 30.9 → 36.2 → 47.6 for
+  none / one per 60 / one per 20 ticks; a mix that is blocked (`Attack`) alarms, as do the mixes whose
+  loops route through it, all after the attack began.
+- **Receiver anonymity and sender–receiver unlinkability** (paper §3 and App. A.2, after the Loopix paper):
+  `measureReceiver` composes the posterior FORWARD: a last-hop departure's link names its receiver (a
+  client, or with providers every client of that provider uniformly — `LoopixConfig.exitRows`; the
+  mailbox pull is padded, so no more is observable), and scores the set `2^H` over clients and the mass on
+  the true recipient (`ReceiverBound`). `SenderResult.mean_epsilon` / `max_epsilon` are the third-party
+  leakage `ε = ln(Pr[true sender] / Pr[S2])` averaged over the other clients `S2` and over packets
+  (`Pr` floored at 1e-12; `UnlinkBound`). Measured, clients on the last layer, 8 clients: Poisson worst
+  receiver set 7.47, mass 0.221, mean ε 0.001; FIFO set 1.00, mean ε 18.5; no cover: worst packet ε 23.1.
+  Behind providers a FIFO mix is traced to the provider and no further (set 4.00, mass 0.25).
+  Cover raises every measure: per-mix mean set 17.9 / 30.9 / 66.0 and worst linking 0.393 / 0.184 /
+  0.101 at one cover packet per 40 / 15 / 6 ticks per client.
 - **Scale** (`LARGE_CFG`, `largeScenario`): 3 layers × 10 mixes, 120 clients
   behind 10 providers, 160 nodes (the `u8` node id caps a network at 255).
 
@@ -219,15 +262,21 @@ mixing core itself — is where the design's weight lies.
 - **Adversary.** The measured guarantee is against a global passive adversary; the only active attacker
   modelled is one blocking a mix (`Attack`), and a blocking attack is detected only with sender-chosen
   delays — with mix-chosen delays nobody can know when a loop is due.
-- **Anonymity metrics.** Per-mix and end-to-end *sender* anonymity only; receiver-side and
-  sender–receiver unlinkability are not measured (see *Backlog / deferred*).
+- **Anonymity metrics.** Per-mix, end-to-end sender, receiver and pairwise sender leakage. Each treats a
+  mix's departures independently (a relaxation of the one-to-one matching) and credits the adversary with
+  a pass's route position. `measureReceiver` counts, as `fallbacks`, last-hop departures with no observed
+  next pass: packets still in flight at the horizon (they cannot be real targets once the window drops
+  them); a complete transcript has none.
+- **Batch mixes ignore sender-chosen delays** and `mean_delay`; a timed batch's first release is at
+  `batch_period`, so releases fall on multiples of it. An arrival on a release tick can land in either
+  batch; the adversary assumes the earlier.
 - **Mix-chosen holds** remain the `DEFAULT_CFG` variant; `PROVIDER_CFG` is the as-deployed one.
 
 ## What is deliberately not done
 
 - **A deployable Loopix node or client.** The module carries no real transport; the owner chose to
   grade it as a simulator and analysis library, not to build a node (the open question of whether a node is
-  wanted at all is under *Backlog / deferred*).
+  wanted at all is under *Roadmap*).
 
 ## Verification
 
@@ -242,6 +291,15 @@ is skipped.
   adversary cannot follow is counted, not silently uniform; no real traffic is vacuously anonymous.
 - **Positive controls end to end:** `FifoMix` through netsim fails both clauses, including under fuzzed
   faults over a seed sweep; the no-cover control fails the bound under identical measurement.
+- **Topologies, strategies, loops, receiver:** wiring link counts per topology; cascade order, one chain per
+  packet in a multi-cascade, no repeated mix in a free route; delivery and the per-mix and receiver bounds
+  through all three; the paper's comparison pinned (cascade pools 2.5x, stratified beats multi-cascade and
+  free route on sender anonymity and leakage); more cover, larger sets; threshold set `n` / link `1/n`,
+  threshold 1 and a short timed period fail the bound; latency and set grow with the batch; a batch leaves
+  in random order; mix loops come home, raise no false alarm, fill pools, alarm under `Attack`;
+  receiver and ε against FIFO and no-cover controls; synthetic transcripts for the batch law, the
+  receiver composition, ε and a mix loop's empty sender mass; the hostile-packet fuzz also runs a free route
+  with threshold batches and mix loops, and a multi-cascade with timed batches.
 - **Real mix:** the Poisson `Loopix` holds `AnonymityBound` across a seed sweep, reorders co-resident
   packets (`reorderStats` near 1/2 where order-preserving mixes score zero).
 - **Providers and end to end:** topology and mailbox ownership; every answer the same length and every
@@ -262,10 +320,7 @@ is skipped.
 
 ## Backlog / deferred
 
-- **Topologies beyond stratified:** cascade, multi-cascade, free-route — the reference simulates all four. Effort M (routing + scenario builder; the metrics are topology-agnostic once a mix's layer is not assumed). Fits §2.
-- **Batch-and-reorder (threshold/timed pool) mixing:** the reference's second mixing technique; here only as the order-preserving FIFO control. Effort M. Fits §2.
-- **Mix-originated cover (mix loops):** Loopix mixes send their own loops to detect attacks on themselves; here only clients do. Effort S–M. Fits §2.
-- **Sender–receiver third-party unlinkability and receiver anonymity:** the reference's second metric; here only sender anonymity end to end. Effort M. Fits §2.
+None.
 
 ## Roadmap
 

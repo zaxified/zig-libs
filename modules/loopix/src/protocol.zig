@@ -65,6 +65,8 @@ const RELEASE_TIMER: u64 = 0;
 const REAL_TIMER: u64 = 1;
 const COVER_TIMER: u64 = 2;
 const FETCH_TIMER: u64 = 3;
+const BATCH_TIMER: u64 = 4;
+const MIX_LOOP_TIMER: u64 = 5;
 
 /// Payload tags outside `MsgKind`'s range: a client asking its provider for
 /// its mailbox, and the provider's fixed-size answer.
@@ -90,7 +92,35 @@ pub fn providerScenario(sim: *Sim) anyerror!void {
     try buildTopology(sim, PROVIDER_CFG);
 }
 
+/// The scenario for any configuration: `Case.scenario` is a bare function
+/// pointer, so each configuration gets its own, built at compile time.
+pub fn scenarioFor(comptime cfg: LoopixConfig) netsim.Scenario {
+    return struct {
+        fn build(sim: *Sim) anyerror!void {
+            try buildTopology(sim, cfg);
+        }
+    }.build;
+}
+
+/// Adds each directed link once, whichever wiring rule asks for it.
+const Wiring = struct {
+    sim: *Sim,
+    done: std.bit_set.ArrayBitSet(usize, 256 * 256) = .empty,
+
+    fn bi(self: *Wiring, a: NodeId, b: NodeId) anyerror!void {
+        if (!self.done.isSet(@as(usize, a) * 256 + b)) {
+            self.done.set(@as(usize, a) * 256 + b);
+            try self.sim.addLink(a, b, LINK);
+        }
+        if (!self.done.isSet(@as(usize, b) * 256 + a)) {
+            self.done.set(@as(usize, b) * 256 + a);
+            try self.sim.addLink(b, a, LINK);
+        }
+    }
+};
+
 fn buildTopology(sim: *Sim, cfg: LoopixConfig) anyerror!void {
+    var wire = Wiring{ .sim = sim };
     var i: usize = 0;
     while (i < cfg.nodeCount()) : (i += 1) _ = try sim.addNode(.{});
 
@@ -111,26 +141,64 @@ fn buildTopology(sim: *Sim, cfg: LoopixConfig) anyerror!void {
             edges += 1;
         }
         var c: u8 = 0;
-        while (c < cfg.clients) : (c += 1) try sim.addBiLink(cfg.clientNode(c), cfg.providerOf(c), LINK);
+        while (c < cfg.clients) : (c += 1) try wire.bi(cfg.clientNode(c), cfg.providerOf(c));
     }
-    for (edge[0..edges]) |e| {
-        var w: u8 = 0;
-        while (w < cfg.width) : (w += 1) try sim.addBiLink(e, cfg.mixNode(0, w), LINK);
+    switch (cfg.topology) {
+        .stratified => {
+            for (edge[0..edges]) |e| {
+                var w: u8 = 0;
+                while (w < cfg.width) : (w += 1) try wire.bi(e, cfg.mixNode(0, w));
+            }
+            // adjacent mix layers, fully connected
+            var l: u8 = 0;
+            while (l + 1 < cfg.layers) : (l += 1) {
+                var a: u8 = 0;
+                while (a < cfg.width) : (a += 1) {
+                    var b: u8 = 0;
+                    while (b < cfg.width) : (b += 1) try wire.bi(cfg.mixNode(l, a), cfg.mixNode(l + 1, b));
+                }
+            }
+            // last layer ↔ the receiving edge (a no-op for a 1-layer net already linked)
+            var w: u8 = 0;
+            while (w < cfg.width) : (w += 1) {
+                for (edge[0..edges]) |e| try wire.bi(cfg.mixNode(cfg.layers - 1, w), e);
+            }
+        },
+        .cascade, .multi_cascade => {
+            // `width` chains; a link joins consecutive mixes of ONE chain only.
+            var w: u8 = 0;
+            while (w < cfg.width) : (w += 1) {
+                for (edge[0..edges]) |e| {
+                    try wire.bi(e, cfg.mixNode(0, w));
+                    try wire.bi(cfg.mixNode(cfg.layers - 1, w), e);
+                }
+                var l: u8 = 0;
+                while (l + 1 < cfg.layers) : (l += 1) try wire.bi(cfg.mixNode(l, w), cfg.mixNode(l + 1, w));
+            }
+        },
+        .free_route => {
+            // every mix reaches every other, and the edge reaches every mix
+            const m: NodeId = @intCast(cfg.mixCount());
+            var a: NodeId = 0;
+            while (a < m) : (a += 1) {
+                for (edge[0..edges]) |e| try wire.bi(e, a);
+                var b: NodeId = a + 1;
+                while (b < m) : (b += 1) try wire.bi(a, b);
+            }
+        },
     }
-    // adjacent mix layers, fully connected
-    var l: u8 = 0;
-    while (l + 1 < cfg.layers) : (l += 1) {
-        var a: u8 = 0;
-        while (a < cfg.width) : (a += 1) {
-            var b: u8 = 0;
-            while (b < cfg.width) : (b += 1) try sim.addBiLink(cfg.mixNode(l, a), cfg.mixNode(l + 1, b), LINK);
-        }
-    }
-    // last layer ↔ the receiving edge (a no-op for a 1-layer net already linked)
-    if (cfg.layers > 1) {
-        var w: u8 = 0;
-        while (w < cfg.width) : (w += 1) {
-            for (edge[0..edges]) |e| try sim.addBiLink(cfg.mixNode(cfg.layers - 1, w), e, LINK);
+    if (cfg.mix_loop_interval > 0) {
+        // A mix's own loop leaves it for a first-hop mix and returns from a
+        // last-hop mix: overlay legs outside the layered wiring.
+        var a: NodeId = 0;
+        while (a < cfg.mixCount()) : (a += 1) {
+            // ...and a mix can be both ends of its own loop's first or last leg.
+            try wire.bi(a, a);
+            var b: NodeId = 0;
+            while (b < cfg.mixCount()) : (b += 1) {
+                if (a != b and (cfg.layerOf(b).? == 0 or cfg.isExitMix(a)))
+                    try wire.bi(a, b);
+            }
         }
     }
 }
@@ -154,7 +222,9 @@ pub const TrafficStats = struct {
     real_sent: usize = 0,
     real_delivered: usize = 0,
     cover_sent: usize = 0,
-    /// Cover packets per real packet — the bandwidth overhead of the cover.
+    /// Loops the MIXES sent to themselves (`LoopixConfig.mix_loop_interval`).
+    mix_cover_sent: usize = 0,
+    /// Cover packets (clients' and mixes') per real packet — the bandwidth overhead of the cover.
     overhead: f64 = 0,
     mean_latency: f64 = 0,
     max_latency: Time = 0,
@@ -170,6 +240,9 @@ pub const TrafficStats = struct {
 };
 
 const Sent = struct { client: u8, at: Time, kind: MsgKind, recipient: NodeId };
+
+/// A loop a mix sent to itself.
+const MixSent = struct { mix: NodeId, at: Time };
 
 /// The stash/release/forward/transcript machinery, the providers and the
 /// traffic originators. The hold-delay decision is NOT here — each protocol
@@ -190,6 +263,9 @@ const Relay = struct {
     transcript: std.ArrayListUnmanaged(Transit) = .empty,
     origins: std.ArrayListUnmanaged(adversary.Origin) = .empty,
     sent: std.AutoHashMapUnmanaged(u64, Sent) = .empty,
+    /// Mixes' own loops in flight or home, and when each came home.
+    mix_sent: std.AutoHashMapUnmanaged(u64, MixSent) = .empty,
+    mix_returned: std.AutoHashMapUnmanaged(u64, Time) = .empty,
     deliveries: std.ArrayListUnmanaged(Delivery) = .empty,
     delivered: std.AutoHashMapUnmanaged(u64, Time) = .empty,
     /// Length of every mailbox answer a provider sent (must all be equal).
@@ -207,6 +283,7 @@ const Relay = struct {
     next_id: u64 = 1,
     real_seq: u64 = 0,
     cover_seq: u64 = 0,
+    mix_loop_seq: u64 = 0,
 
     fn init(gpa: Allocator, cfg: LoopixConfig) InitError!Relay {
         try cfg.validate();
@@ -227,6 +304,8 @@ const Relay = struct {
         self.transcript.deinit(gpa);
         self.origins.deinit(gpa);
         self.sent.deinit(gpa);
+        self.mix_sent.deinit(gpa);
+        self.mix_returned.deinit(gpa);
         self.deliveries.deinit(gpa);
         self.delivered.deinit(gpa);
         self.fetch_lens.deinit(gpa);
@@ -239,6 +318,8 @@ const Relay = struct {
         self.transcript.clearRetainingCapacity();
         self.origins.clearRetainingCapacity();
         self.sent.clearRetainingCapacity();
+        self.mix_sent.clearRetainingCapacity();
+        self.mix_returned.clearRetainingCapacity();
         self.deliveries.clearRetainingCapacity();
         self.delivered.clearRetainingCapacity();
         self.fetch_lens.clearRetainingCapacity();
@@ -249,6 +330,7 @@ const Relay = struct {
         self.next_id = 1;
         self.real_seq = 0;
         self.cover_seq = 0;
+        self.mix_loop_seq = 0;
     }
 
     /// Every send of the protocol goes through here, so the byte count is
@@ -277,7 +359,11 @@ const Relay = struct {
         hdr.encode(&buf);
         const first = if (self.cfg.providers > 0) self.cfg.providerOf(src_client) else hdr.route[0];
         try self.send(sim, self.cfg.clientNode(src_client), first, &buf);
-        try self.origins.append(self.gpa, .{ .id = hdr.id, .client = src_client });
+        try self.origins.append(self.gpa, .{
+            .id = hdr.id,
+            .client = src_client,
+            .recipient = if (self.cfg.isClient(hdr.recipient)) self.cfg.clientIndex(hdr.recipient) else null,
+        });
         try self.sent.put(self.gpa, hdr.id, .{ .client = src_client, .at = sim.timeNow(), .kind = kind, .recipient = hdr.recipient });
         return hdr;
     }
@@ -299,6 +385,58 @@ const Relay = struct {
         else
             routing.pickDestClient(self.cfg, key, client);
         return self.originate(sim, client, dest, kind, key, delays);
+    }
+
+    /// A MIX sends a loop through the network back to itself. With `delays`
+    /// (and `sender_chosen_delays`) it draws every hop's hold, like a client.
+    /// It leaves for the first hop directly. Returns the header.
+    fn originateMixLoop(self: *Relay, sim: *Sim, mix: NodeId, delays: ?*mixing.Prng) anyerror!MixHeader {
+        var hdr = MixHeader{ .kind = .loop_cover, .id = self.next_id, .hop = 0, .n_hops = 0, .route = undefined };
+        @memset(&hdr.route, 0);
+        self.next_id += 1;
+        self.mix_loop_seq += 1;
+        routing.pickMixLoopRoute(self.cfg, (@as(u64, mix) << 40) | (self.mix_loop_seq << 1) | 1, mix, &hdr);
+        if (self.cfg.sender_chosen_delays) {
+            if (delays) |prng| {
+                hdr.has_delays = true;
+                for (hdr.delays[0..hdr.n_hops]) |*d| d.* = @intCast(mixing.sampleExpDelay(prng, self.cfg.mean_delay));
+            }
+        }
+        var buf: [MixHeader.wire_len]u8 = undefined;
+        hdr.encode(&buf);
+        try self.send(sim, mix, hdr.route[0], &buf);
+        try self.origins.append(self.gpa, .{ .id = hdr.id, .client = 0, .from_mix = true });
+        try self.mix_sent.put(self.gpa, hdr.id, .{ .mix = mix, .at = sim.timeNow() });
+        return hdr;
+    }
+
+    /// A packet that ends at this mix: one of ITS OWN loops coming home.
+    /// True when `payload` was exactly that (and records it).
+    fn mixLoopReturn(self: *Relay, node: NodeId, payload: []const u8) bool {
+        const hdr = MixHeader.decode(payload) catch return false;
+        if (hdr.hop != hdr.n_hops or hdr.route[hdr.n_hops] != node) return false;
+        const s = self.mix_sent.get(hdr.id) orelse return false;
+        if (s.mix != node) return false;
+        if (self.mix_returned.contains(hdr.id)) {
+            self.misdelivered += 1;
+            return true;
+        }
+        self.mix_returned.put(self.gpa, hdr.id, 0) catch return false;
+        return true;
+    }
+
+    /// Batch strategies: hold the packet until the batch is released.
+    fn stashBatch(self: *Relay, sim: *Sim, node: NodeId, hdr: MixHeader) anyerror!void {
+        const now = sim.timeNow();
+        try self.queues[node].append(self.gpa, .{ .arrival = now, .release_at = now, .hdr = hdr });
+    }
+
+    /// Release EVERYTHING the mix holds, now, in a random order.
+    fn flushBatch(self: *Relay, sim: *Sim, node: NodeId, prng: *mixing.Prng) anyerror!void {
+        const q = &self.queues[node];
+        mixing.shuffle(Stashed, prng, q.items);
+        for (q.items) |s| try self.forward(sim, node, s);
+        q.clearRetainingCapacity();
     }
 
     /// A mix received a packet: stash it (stamped with its own absolute release
@@ -330,19 +468,27 @@ const Relay = struct {
             if (s.release_at == now) break i;
         } else return; // a partition/crash may have voided it
         const s = q.orderedRemove(idx);
+        try self.forward(sim, node, s);
+    }
+
+    /// Log the completed pass of `s` through `node` and send it on.
+    fn forward(self: *Relay, sim: *Sim, node: NodeId, s: Stashed) anyerror!void {
         var hdr = s.hdr;
         // Record the completed pass through THIS mix (the adversary's raw
-        // material — timing only; id/kind are the harness's oracle labels).
+        // material — timing and the link taken; id/kind are the harness's
+        // oracle labels).
+        const hop = hdr.hop;
+        hdr.hop += 1; // advance to the next relay (route[hop] now the successor)
+        const next = hdr.route[hdr.hop];
         try self.transcript.append(self.gpa, .{
             .mix = node,
             .arrival = s.arrival,
             .departure = sim.timeNow(),
             .kind = hdr.kind,
             .id = hdr.id,
-            .hop = hdr.hop,
+            .hop = hop,
+            .to = next,
         });
-        hdr.hop += 1; // advance to the next relay (route[hop] now the successor)
-        const next = hdr.route[hdr.hop];
         var buf: [MixHeader.wire_len]u8 = undefined;
         hdr.encode(&buf);
         try self.send(sim, node, next, &buf);
@@ -395,7 +541,7 @@ const Relay = struct {
             hdr.encode(&buf);
             try self.send(sim, node, hdr.route[0], &buf);
         } else if (hdr.n_hops > 0 and hdr.hop == hdr.n_hops and hdr.route[hdr.n_hops] == node and
-            cfg.layerOf(from) == cfg.layers - 1 and cfg.isClient(hdr.recipient) and
+            cfg.isExitMix(from) and cfg.isClient(hdr.recipient) and
             cfg.providerOf(cfg.clientIndex(hdr.recipient)) == node)
         {
             // Only out of the last layer, only to this provider, only for one
@@ -474,7 +620,8 @@ const Relay = struct {
             st.max_latency = @max(st.max_latency, lat);
         }
         if (st.real_delivered > 0) st.mean_latency = sum / @as(f64, @floatFromInt(st.real_delivered));
-        if (st.real_sent > 0) st.overhead = @as(f64, @floatFromInt(st.cover_sent)) / @as(f64, @floatFromInt(st.real_sent));
+        if (st.real_sent > 0) st.overhead = @as(f64, @floatFromInt(st.cover_sent + self.mix_sent.count())) / @as(f64, @floatFromInt(st.real_sent));
+        st.mix_cover_sent = self.mix_sent.count();
         st.link_bytes = self.link_bytes;
         st.fetch_bytes = self.fetch_bytes;
         if (st.real_delivered > 0) st.bytes_per_real = @as(f64, @floatFromInt(self.link_bytes)) / @as(f64, @floatFromInt(st.real_delivered));
@@ -560,7 +707,11 @@ pub const Attack = struct { mix: NodeId, start: Time, stop: Time };
 
 pub const Alarm = struct { client: u8, at: Time };
 
+/// A mix that gave up on its own loops (`LoopixConfig.mix_loop_alarm_lost`).
+pub const MixAlarm = struct { mix: NodeId, at: Time };
+
 const LoopWatch = struct { client: u8, deadline: Time };
+const MixLoopWatch = struct { mix: NodeId, deadline: Time };
 
 /// The real thing: exponential per-hop holds + a Poisson cover process.
 /// Structurally identical to `FifoMix` — the ONLY difference is the hold law —
@@ -590,13 +741,24 @@ pub const Loopix = struct {
     loops_watched: u64 = 0,
     loops_returned: u64 = 0,
     alarms: std.ArrayListUnmanaged(Alarm) = .empty,
+    /// The mixes' own loops in flight (`LoopixConfig.mix_loop_interval`), the
+    /// loops each mix has given up on, those watched / that came home, and
+    /// the mixes' alarms.
+    mix_loops: std.AutoHashMapUnmanaged(u64, MixLoopWatch) = .empty,
+    mix_lost: []u32,
+    mix_loops_watched: u64 = 0,
+    mix_loops_returned: u64 = 0,
+    mix_alarms: std.ArrayListUnmanaged(MixAlarm) = .empty,
 
     pub fn init(gpa: Allocator, cfg: LoopixConfig, rng_seed: u64) InitError!Loopix {
         var relay = try Relay.init(gpa, cfg);
         errdefer relay.deinit(gpa);
         const lost = try gpa.alloc(u32, cfg.clients);
+        errdefer gpa.free(lost);
         @memset(lost, 0);
-        return .{ .relay = relay, .prng = mixing.Prng.init(rng_seed), .rng_seed = rng_seed, .lost = lost };
+        const mix_lost = try gpa.alloc(u32, cfg.mixCount());
+        @memset(mix_lost, 0);
+        return .{ .relay = relay, .prng = mixing.Prng.init(rng_seed), .rng_seed = rng_seed, .lost = lost, .mix_lost = mix_lost };
     }
     /// The no-cover control (see `cover_enabled`).
     pub fn initNoCover(gpa: Allocator, cfg: LoopixConfig, rng_seed: u64) InitError!Loopix {
@@ -607,6 +769,9 @@ pub const Loopix = struct {
     pub fn deinit(self: *Loopix, gpa: Allocator) void {
         self.loops.deinit(gpa);
         self.alarms.deinit(gpa);
+        self.mix_loops.deinit(gpa);
+        self.mix_alarms.deinit(gpa);
+        gpa.free(self.mix_lost);
         gpa.free(self.lost);
         self.relay.deinit(gpa);
         self.* = undefined;
@@ -641,11 +806,20 @@ pub const Loopix = struct {
         self.loops.clearRetainingCapacity();
         @memset(self.lost, 0);
         self.alarms.clearRetainingCapacity();
+        self.mix_loops.clearRetainingCapacity();
+        @memset(self.mix_lost, 0);
+        self.mix_loops_watched = 0;
+        self.mix_loops_returned = 0;
+        self.mix_alarms.clearRetainingCapacity();
     }
 
     fn onStart(ctx: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
         const self = cast(ctx);
         const cfg = self.relay.cfg;
+        if (cfg.isMix(node)) {
+            if (cfg.mix_strategy == .timed) try sim.setTimer(node, cfg.batch_period, BATCH_TIMER);
+            if (cfg.mix_loop_interval > 0) try sim.setTimer(node, mixing.nextMixLoop(&self.prng, cfg), MIX_LOOP_TIMER);
+        }
         if (cfg.isClient(node)) {
             try sim.setTimer(node, cfg.real_period, REAL_TIMER);
             try self.relay.startClient(sim, node);
@@ -669,7 +843,7 @@ pub const Loopix = struct {
             COVER_TIMER => {
                 const ev = mixing.nextCover(&self.prng, cfg);
                 const hdr = try self.relay.originateCover(sim, cfg.clientIndex(node), ev.kind, &self.prng);
-                if (ev.kind == .loop_cover and hdr.has_delays) try self.watchLoop(sim, cfg.clientIndex(node), hdr);
+                if (ev.kind == .loop_cover) try self.watchLoop(sim, cfg.clientIndex(node), hdr);
                 try self.checkLoops(sim, cfg.clientIndex(node));
                 try sim.setTimer(node, ev.delay, COVER_TIMER);
             },
@@ -678,6 +852,16 @@ pub const Loopix = struct {
                 try self.checkLoops(sim, cfg.clientIndex(node));
             },
             RELEASE_TIMER => try self.relay.release(sim, node),
+            BATCH_TIMER => {
+                try self.relay.flushBatch(sim, node, &self.prng);
+                try sim.setTimer(node, cfg.batch_period, BATCH_TIMER);
+            },
+            MIX_LOOP_TIMER => {
+                const hdr = try self.relay.originateMixLoop(sim, node, &self.prng);
+                try self.watchMixLoop(sim, node, hdr);
+                try self.checkMixLoops(sim, node);
+                try sim.setTimer(node, mixing.nextMixLoop(&self.prng, cfg), MIX_LOOP_TIMER);
+            },
             else => {},
         }
     }
@@ -695,14 +879,74 @@ pub const Loopix = struct {
                 return;
             }
         }
+        // One of this mix's own loops coming home.
+        if (cfg.mix_loop_interval > 0 and self.relay.mixLoopReturn(node, payload)) return;
         const hdr = self.relay.acceptAtMix(node, payload) orelse return;
-        // The Poisson mix's independent exponential hold: the sender's draw if
-        // the packet carries one, else the mix's own.
-        const hold: Time = if (hdr.has_delays)
-            hdr.delays[hdr.hop]
-        else
-            mixing.scheduleRelease(&self.prng, cfg, now) - now;
-        try self.relay.stashAndArm(sim, node, hdr, hold);
+        switch (cfg.mix_strategy) {
+            .poisson => {
+                // The Poisson mix's independent exponential hold: the
+                // sender's draw if the packet carries one, else the mix's own.
+                const hold: Time = if (hdr.has_delays)
+                    hdr.delays[hdr.hop]
+                else
+                    mixing.scheduleRelease(&self.prng, cfg, now) - now;
+                try self.relay.stashAndArm(sim, node, hdr, hold);
+            },
+            .threshold => {
+                try self.relay.stashBatch(sim, node, hdr);
+                if (self.relay.queues[node].items.len >= cfg.threshold) try self.relay.flushBatch(sim, node, &self.prng);
+            },
+            .timed => try self.relay.stashBatch(sim, node, hdr), // the batch timer releases it
+        }
+    }
+
+    /// The latest a packet can be home once its route is fixed, in hold time
+    /// alone: the sender's own draws (Poisson with sender-chosen holds), one
+    /// full period per hop (timed batches). `null` when the holds cannot be
+    /// known (mix-chosen holds; a threshold batch waits for traffic).
+    fn holdBound(self: *const Loopix, hdr: MixHeader) ?Time {
+        var bound: Time = 0;
+        switch (self.relay.cfg.mix_strategy) {
+            .poisson => {
+                if (!hdr.has_delays) return null;
+                for (hdr.delays[0..hdr.n_hops]) |d| bound += d;
+            },
+            .timed => bound = @as(Time, hdr.n_hops) * self.relay.cfg.batch_period,
+            .threshold => return null,
+        }
+        return bound;
+    }
+
+    /// A mix's loop is watched like a client's, minus the provider legs: it
+    /// goes mix → first hop → … → last hop → mix, `n_hops + 1` links.
+    fn watchMixLoop(self: *Loopix, sim: *Sim, mix: NodeId, hdr: MixHeader) anyerror!void {
+        const cfg = self.relay.cfg;
+        const hold = self.holdBound(hdr) orelse return;
+        const bound = hold + (@as(Time, hdr.n_hops) + 1) * max_link_latency;
+        try self.mix_loops.put(self.relay.gpa, hdr.id, .{ .mix = mix, .deadline = sim.timeNow() + bound + cfg.loop_slack });
+        self.mix_loops_watched += 1;
+    }
+
+    /// Settle `mix`'s loops, as `checkLoops` does for a client.
+    fn checkMixLoops(self: *Loopix, sim: *Sim, mix: NodeId) anyerror!void {
+        const now = sim.timeNow();
+        var done: std.ArrayListUnmanaged(u64) = .empty;
+        defer done.deinit(self.relay.gpa);
+        var it = self.mix_loops.iterator();
+        while (it.next()) |kv| {
+            const w = kv.value_ptr.*;
+            if (w.mix != mix) continue;
+            if (self.relay.mix_returned.contains(kv.key_ptr.*)) {
+                try done.append(self.relay.gpa, kv.key_ptr.*);
+                self.mix_loops_returned += 1;
+            } else if (now > w.deadline) {
+                try done.append(self.relay.gpa, kv.key_ptr.*);
+                self.mix_lost[mix] += 1;
+                if (self.mix_lost[mix] == self.relay.cfg.mix_loop_alarm_lost)
+                    try self.mix_alarms.append(self.relay.gpa, .{ .mix = mix, .at = now });
+            }
+        }
+        for (done.items) |id| _ = self.mix_loops.remove(id);
     }
 
     /// A sender-chosen-delay loop is fully predictable to its sender: the sum
@@ -711,8 +955,7 @@ pub const Loopix = struct {
     /// `loop_slack`, it is lost.
     fn watchLoop(self: *Loopix, sim: *Sim, client: u8, hdr: MixHeader) anyerror!void {
         const cfg = self.relay.cfg;
-        var bound: Time = 0;
-        for (hdr.delays[0..hdr.n_hops]) |d| bound += d;
+        var bound: Time = self.holdBound(hdr) orelse return;
         // Links: client→(provider→)mixes→(provider)→client, plus the fetch
         // request/answer round trip behind a provider.
         const legs: Time = @as(Time, hdr.n_hops) + 1 + if (cfg.providers > 0) @as(Time, 3) else 0;
@@ -1403,7 +1646,11 @@ test "a client takes a packet once, and only one addressed to it; a provider sto
 
 const fz = @import("fuzz_test.zig");
 const testkit = @import("testkit");
-const InjectMark = fz.Marker(enum { fifo, poisson, direct, providers, malformed_counted, stashed_at_mix, mailbox_filled, fetch_answered, delivered });
+const InjectMark = fz.Marker(enum { fifo, poisson, direct, providers, malformed_counted, stashed_at_mix, mailbox_filled, fetch_answered, delivered, free_threshold, multi_timed, batch_flushed });
+
+/// The other topologies, batch strategies and mix loops, for the hostile-packet harness.
+const FUZZ_FREE = LoopixConfig{ .topology = .free_route, .mix_strategy = .threshold, .threshold = 3, .mix_loop_interval = 10, .clients = 4, .providers = 2 };
+const FUZZ_MULTI = LoopixConfig{ .topology = .multi_cascade, .mix_strategy = .timed, .mix_loop_interval = 10, .clients = 4 };
 
 fn hostilePayload(comptime S: type, src: *S, cfg: LoopixConfig, node_ptr: *NodeId, from_ptr: *NodeId, buf: []u8) []const u8 {
     const node = node_ptr.*;
@@ -1494,6 +1741,7 @@ fn injectInto(comptime M: type, mix: *M, cfg: LoopixConfig, comptime scen: anyty
         InjectMark.mark(.stashed_at_mix);
         break;
     };
+    if (relay.transcript.items.len != 0) InjectMark.mark(.batch_flushed);
     for (relay.mailboxes) |m| if (m.items.len != 0) {
         InjectMark.mark(.mailbox_filled);
         break;
@@ -1510,6 +1758,21 @@ fn fuzzInject(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     if (poisson) InjectMark.mark(.poisson) else InjectMark.mark(.fifo);
     if (providers) InjectMark.mark(.providers) else InjectMark.mark(.direct);
     const seed = src.value(u64);
+    const variant = src.index(3); // 0: as before; 1, 2: the other topologies and strategies
+    if (poisson and variant != 0) {
+        if (variant == 1) {
+            InjectMark.mark(.free_threshold);
+            var mix = try Loopix.init(gpa, FUZZ_FREE, seed);
+            defer mix.deinit(gpa);
+            try injectInto(Loopix, &mix, FUZZ_FREE, scenarioFor(FUZZ_FREE), S, src, gpa);
+        } else {
+            InjectMark.mark(.multi_timed);
+            var mix = try Loopix.init(gpa, FUZZ_MULTI, seed);
+            defer mix.deinit(gpa);
+            try injectInto(Loopix, &mix, FUZZ_MULTI, scenarioFor(FUZZ_MULTI), S, src, gpa);
+        }
+        return;
+    }
     if (providers) {
         const cfg = PROVIDER_CFG;
         if (poisson) {
@@ -1551,4 +1814,433 @@ test "fuzz driver: LOOPIX_FUZZ (inject)" {
 
 test "fuzz harness: hostile packets, 300 seeds, reaches every outcome" {
     try InjectMark.reach(fuzzInject, "loopix-inject", 300);
+}
+
+// ── topologies, batch mixing, mix loops, receiver metrics ────────────────────
+//
+// Reference: A. Piotrowska, "Studying the anonymity trilemma with a
+// discrete-event mix network simulator" (arXiv 2107.12172): cascade,
+// multi-cascade, stratified and free-route (P2P) topologies; Poisson and
+// batch-and-reorder mixing; cover traffic from clients or mixes; Shannon
+// entropy and sender-receiver third-party unlinkability. Same measurement
+// basis as above: a clean run, the steady-state window, each mix scored with
+// its own law.
+
+const CASCADE = LoopixConfig{ .topology = .cascade, .width = 1, .clients = 8, .providers = 2, .sender_chosen_delays = true };
+const MULTI = LoopixConfig{ .topology = .multi_cascade, .clients = 8, .providers = 2, .sender_chosen_delays = true };
+const FREE = LoopixConfig{ .topology = .free_route, .clients = 8, .providers = 2, .sender_chosen_delays = true };
+const STRAT = PROVIDER_CFG;
+
+/// Run `cfg` clean for `until` ticks (any topology: the scenario is built from
+/// `cfg`). The caller owns the result.
+fn simulate(gpa: Allocator, comptime cfg: LoopixConfig, seed: u64, until: Time, cover: bool, attack: ?Attack) !Loopix {
+    var mix = if (cover) try Loopix.init(gpa, cfg, seed) else try Loopix.initNoCover(gpa, cfg, seed);
+    errdefer mix.deinit(gpa);
+    mix.attack = attack;
+    _ = try netsim.replay(gpa, .{ .seed = seed, .scenario = scenarioFor(cfg), .protocol = mix.protocol(), .until = until }, &.{}, null);
+    return mix;
+}
+
+/// The law the adversary links a configuration's mixes with.
+fn lawOf(cfg: LoopixConfig) adversary.DelayModel {
+    return switch (cfg.mix_strategy) {
+        .poisson => .{ .exponential = @floatFromInt(cfg.mean_delay) },
+        .threshold, .timed => .batch,
+    };
+}
+
+/// Relabel real transits that started too late to clear before `until` (see
+/// `measureSteadyState`), keeping the caller's order. Caller frees.
+fn windowTranscript(gpa: Allocator, mix: *const Loopix, until: Time, cool: Time) ![]Transit {
+    const out = try gpa.dupe(Transit, mix.transcript());
+    for (out) |*t| {
+        if (t.kind == .real and t.arrival + cool > until) t.kind = .drop_cover;
+    }
+    return out;
+}
+
+/// Clients straight on the mixes: a last-hop link names its receiver.
+const DIRECT8 = LoopixConfig{ .clients = 8 };
+
+fn withCover(cfg: LoopixConfig, n: Time) LoopixConfig {
+    var c = cfg;
+    c.cover_mean_interval = n;
+    return c;
+}
+
+fn withBatch(cfg: LoopixConfig, strategy: types.MixStrategy, threshold: u16, period: Time) LoopixConfig {
+    var c = cfg;
+    c.mix_strategy = strategy;
+    c.threshold = threshold;
+    c.batch_period = period;
+    return c;
+}
+
+fn withLoops(cfg: LoopixConfig, n: Time) LoopixConfig {
+    var c = cfg;
+    c.mix_loop_interval = n;
+    return c;
+}
+
+const seeds_per_score = 5;
+
+/// Everything the topology / batch / mix-loop / receiver tests read off a
+/// configuration, over `seeds_per_score` clean seeds (worst case of the
+/// worst-case measures, mean of the means).
+const Score = struct {
+    mix_mean_set: f64 = 0,
+    mix_min_set: f64 = std.math.inf(f64),
+    mix_max_link: f64 = 0,
+    recv_min_set: f64 = std.math.inf(f64),
+    recv_max_link: f64 = 0,
+    e2e_mean_set: f64 = 0,
+    e2e_min_set: f64 = std.math.inf(f64),
+    e2e_max_link: f64 = 0,
+    eps_mean: f64 = 0,
+    eps_max: f64 = 0,
+    latency: f64 = 0,
+    /// Real packets due before the horizon that were not delivered.
+    missing: usize = 0,
+    /// Packets dropped as malformed + delivered wrongly + e2e fallbacks.
+    bad: u64 = 0,
+    loops_watched: u64 = 0,
+    loops_returned: u64 = 0,
+    alarms: usize = 0,
+};
+
+fn score(gpa: Allocator, comptime cfg: LoopixConfig, cover: bool, attack: ?Attack) !Score {
+    var sc = Score{};
+    const k: f64 = seeds_per_score;
+    for (1..seeds_per_score + 1) |seed| {
+        var mix = try simulate(gpa, cfg, seed, UNTIL, cover, attack);
+        defer mix.deinit(gpa);
+        const tr = try windowTranscript(gpa, &mix, UNTIL, COOLDOWN);
+        defer gpa.free(tr);
+        const m = try adversary.measure(gpa, tr, lawOf(cfg));
+        const e = try adversary.measureEndToEnd(gpa, tr, mix.origins(), cfg.clients, cfg.layers - 1, lawOf(cfg));
+        const rows = try cfg.exitRows(gpa);
+        defer gpa.free(rows);
+        const r = try adversary.measureReceiver(gpa, tr, mix.origins(), rows, cfg.clients, cfg.layers - 1, lawOf(cfg));
+        sc.mix_mean_set += m.mean_effective_set / k;
+        sc.mix_min_set = @min(sc.mix_min_set, m.min_effective_set);
+        sc.mix_max_link = @max(sc.mix_max_link, m.max_link_prob);
+        sc.recv_min_set = @min(sc.recv_min_set, r.min_receiver_set);
+        sc.recv_max_link = @max(sc.recv_max_link, r.max_link_prob);
+        sc.e2e_mean_set += e.mean_sender_set / k;
+        sc.e2e_min_set = @min(sc.e2e_min_set, e.min_sender_set);
+        sc.e2e_max_link = @max(sc.e2e_max_link, e.max_link_prob);
+        sc.eps_mean += e.mean_epsilon / k;
+        sc.eps_max = @max(sc.eps_max, e.max_epsilon);
+        sc.latency += mix.stats().mean_latency / k;
+        sc.bad += mix.relay.malformed + mix.relay.misdelivered + e.fallbacks;
+        sc.loops_watched += mix.mix_loops_watched;
+        sc.loops_returned += mix.mix_loops_returned;
+        sc.alarms += mix.mix_alarms.items.len;
+        var due: usize = 0;
+        var it = mix.relay.sent.iterator();
+        while (it.next()) |kv| {
+            const s = kv.value_ptr.*;
+            if (s.kind == .real and s.at + 2 * COOLDOWN <= UNTIL) {
+                due += 1;
+                if (!mix.relay.delivered.contains(kv.key_ptr.*)) sc.missing += 1;
+            }
+        }
+    }
+    return sc;
+}
+
+/// The FIFO positive control over `cfg`, scored the same way.
+fn scoreFifo(gpa: Allocator, comptime cfg: LoopixConfig) !Score {
+    var sc = Score{};
+    const k: f64 = seeds_per_score;
+    for (1..seeds_per_score + 1) |seed| {
+        var mix = try FifoMix.init(gpa, cfg);
+        defer mix.deinit(gpa);
+        _ = try netsim.replay(gpa, .{ .seed = seed, .scenario = scenarioFor(cfg), .protocol = mix.protocol(), .until = UNTIL }, &.{}, null);
+        const tr = try gpa.dupe(Transit, mix.transcript());
+        defer gpa.free(tr);
+        for (tr) |*t| {
+            if (t.kind == .real and t.arrival + COOLDOWN > UNTIL) t.kind = .drop_cover;
+        }
+        const law = adversary.DelayModel{ .constant = .{ .delta = cfg.fifo_delay, .tol = 0 } };
+        const e = try adversary.measureEndToEnd(gpa, tr, mix.origins(), cfg.clients, cfg.layers - 1, law);
+        const rows = try cfg.exitRows(gpa);
+        defer gpa.free(rows);
+        const r = try adversary.measureReceiver(gpa, tr, mix.origins(), rows, cfg.clients, cfg.layers - 1, law);
+        sc.recv_min_set = @min(sc.recv_min_set, r.min_receiver_set);
+        sc.recv_max_link = @max(sc.recv_max_link, r.max_link_prob);
+        sc.eps_mean += e.mean_epsilon / k;
+        sc.eps_max = @max(sc.eps_max, e.max_epsilon);
+    }
+    return sc;
+}
+
+// ── item 1: topologies beyond stratified ─────────────────────────────────────
+
+test "topologies: the wiring has exactly the links each one needs" {
+    const gpa = testing.allocator;
+    // Directed links. Every case: 8 clients ↔ 2 providers = 16.
+    //   cascade (3 in a chain):   providers ↔ first, last 4+4, chain 2 pairs · 2 = 4
+    //   multi-cascade (3 chains): 12 + 12, chains 3 · 2 pairs · 2 = 12
+    //   free route (9 mixes):     providers ↔ every mix 2·9·2 = 36, every mix pair 36 · 2 = 72
+    const Case = struct { cfg: LoopixConfig, links: usize };
+    inline for ([_]Case{ .{ .cfg = CASCADE, .links = 16 + 8 + 4 }, .{ .cfg = MULTI, .links = 16 + 24 + 12 }, .{ .cfg = FREE, .links = 16 + 36 + 72 } }) |c| {
+        var mix = try Loopix.init(gpa, c.cfg, 1);
+        defer mix.deinit(gpa);
+        const topo = try netsim.snapshotTopo(gpa, .{ .seed = 0, .scenario = scenarioFor(c.cfg), .protocol = mix.protocol(), .until = UNTIL });
+        defer gpa.free(topo.links);
+        try testing.expectEqual(c.cfg.nodeCount(), topo.node_count);
+        try testing.expectEqual(c.links, topo.links.len);
+    }
+}
+
+test "topologies: a cascade keeps the chain order, a multi-cascade keeps each packet in one chain, a free route repeats no mix" {
+    const gpa = testing.allocator;
+    inline for (.{ CASCADE, MULTI, FREE }) |cfg| {
+        var mix = try simulate(gpa, cfg, 2, UNTIL, true, null);
+        defer mix.deinit(gpa);
+        var chain_of: std.AutoHashMapUnmanaged(u64, NodeId) = .empty;
+        defer chain_of.deinit(gpa);
+        var seen_at: std.AutoHashMapUnmanaged(u64, std.StaticBitSet(256)) = .empty;
+        defer seen_at.deinit(gpa);
+        try testing.expect(mix.transcript().len > 500);
+        for (mix.transcript()) |t| {
+            switch (cfg.topology) {
+                .cascade, .multi_cascade => {
+                    try testing.expectEqual(@as(?u8, t.hop), cfg.layerOf(t.mix)); // hop h = layer h
+                    const w = t.mix % cfg.width;
+                    const gop = try chain_of.getOrPut(gpa, t.id);
+                    if (gop.found_existing) try testing.expectEqual(gop.value_ptr.*, w) else gop.value_ptr.* = w;
+                },
+                else => {
+                    const gop = try seen_at.getOrPut(gpa, t.id);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try testing.expect(!gop.value_ptr.isSet(t.mix)); // never the same mix twice
+                    gop.value_ptr.set(t.mix);
+                },
+            }
+        }
+    }
+}
+
+test "topologies: every due packet is delivered through a cascade, a multi-cascade and a free route" {
+    const gpa = testing.allocator;
+    inline for (.{ CASCADE, MULTI, FREE }) |cfg| {
+        const sc = try score(gpa, cfg, true, null);
+        try testing.expectEqual(@as(usize, 0), sc.missing);
+        try testing.expectEqual(@as(u64, 0), sc.bad);
+        // The per-mix invariant and the receiver bound hold with cover.
+        try testing.expect(sc.mix_min_set >= (types.AnonymityBound{}).min_effective_set + 0.5);
+        try testing.expect(sc.mix_max_link <= (types.AnonymityBound{}).max_link_prob - 0.05);
+        try testing.expect(sc.recv_min_set >= (types.ReceiverBound{}).min_receiver_set + 1);
+        try testing.expect(sc.recv_max_link <= (types.ReceiverBound{}).max_link_prob);
+    }
+}
+
+test "topologies compared (the paper's scalability result): a cascade pools every packet in each mix, multi-cascade and free route spread traffic thin" {
+    const gpa = testing.allocator;
+    // Light cover (1 per 100 ticks per client) so the topology, not the chaff, decides.
+    const cascade = try score(gpa, comptime withCover(CASCADE, 100), true, null);
+    const multi = try score(gpa, comptime withCover(MULTI, 100), true, null);
+    const free = try score(gpa, comptime withCover(FREE, 100), true, null);
+    const strat = try score(gpa, comptime withCover(STRAT, 100), true, null);
+    // Measured (5 seeds): mean per-mix set 38.0 / 13.3 / 13.3 / 13.4; mean sender
+    // set 7.91 / 7.07 / 7.33 / 7.86 of 8; mean leakage ε 0.00 / 0.50 / 0.27 / 0.02 nats.
+    // A cascade's mixes each carry all the traffic, so their sets are ~3x the others'.
+    try testing.expect(cascade.mix_mean_set > 2.5 * strat.mix_mean_set);
+    try testing.expect(@abs(multi.mix_mean_set - strat.mix_mean_set) < 0.1 * strat.mix_mean_set);
+    // Stratified mixes across chains; a multi-cascade's packets only ever meet
+    // their own chain's traffic, a free route's mixes see few packets at a time.
+    try testing.expect(strat.e2e_mean_set > multi.e2e_mean_set + 0.4);
+    try testing.expect(strat.e2e_mean_set > free.e2e_mean_set + 0.3);
+    try testing.expect(multi.eps_mean > strat.eps_mean + 0.2);
+    try testing.expect(free.eps_mean > strat.eps_mean + 0.1);
+    try testing.expect(cascade.e2e_mean_set >= strat.e2e_mean_set);
+    // Worst packet's sender set (of 8) 6.97 / 2.00 / 1.66 / 5.01: only the
+    // cascade and the stratified net keep every packet in a real crowd.
+    try testing.expect(cascade.e2e_min_set > 6 and strat.e2e_min_set > (types.SenderBound{}).min_sender_set);
+    try testing.expect(multi.e2e_min_set < 2.5 and free.e2e_min_set < 2.5);
+}
+
+// ── item 5: anonymity rises with the cover rate (the paper's cover-traffic result) ──
+
+test "cover: more cover, larger sets and smaller linking probability" {
+    const gpa = testing.allocator;
+    const low = try score(gpa, comptime withCover(STRAT, 40), true, null);
+    const mid = try score(gpa, STRAT, true, null);
+    const high = try score(gpa, comptime withCover(STRAT, 6), true, null);
+    // Measured: mean per-mix set 17.9 / 30.9 / 66.0; worst link 0.393 / 0.184 / 0.101;
+    // worst sender set 6.48 / 6.55 / 7.43.
+    try testing.expect(low.mix_mean_set < mid.mix_mean_set and mid.mix_mean_set < high.mix_mean_set);
+    try testing.expect(high.mix_mean_set > 3 * low.mix_mean_set);
+    try testing.expect(low.mix_max_link > mid.mix_max_link and mid.mix_max_link > high.mix_max_link);
+    try testing.expect(low.e2e_min_set < high.e2e_min_set);
+}
+
+// ── item 2: batch-and-reorder mixing ────────────────────────────────────────
+
+test "batch: a threshold mix holds every packet in a batch of exactly the threshold; threshold 1 mixes nothing" {
+    const gpa = testing.allocator;
+    const bound = types.AnonymityBound{};
+    // Measured: set = n and linking probability = 1/n on every target.
+    const one = try score(gpa, comptime withBatch(STRAT, .threshold, 1, 40), true, null);
+    const ten = try score(gpa, comptime withBatch(STRAT, .threshold, 10, 40), true, null);
+    try testing.expect(one.mix_min_set < 1.01 and one.mix_max_link > 0.99); // a degenerate batch is pinned
+    try testing.expect(one.e2e_min_set < 1.01 and one.eps_max > 20);
+    try testing.expect(ten.mix_min_set > 9.99 and ten.mix_max_link < 0.1001);
+    try testing.expect(ten.mix_min_set >= bound.min_effective_set and ten.mix_max_link <= bound.max_link_prob);
+    try testing.expectEqual(@as(u64, 0), ten.bad);
+}
+
+test "batch: the trilemma — a bigger batch buys anonymity and costs latency" {
+    const gpa = testing.allocator;
+    // Measured: latency 33 / 56 / 83 / 137, set 1 / 5 / 10 / 20 for threshold 1 / 5 / 10 / 20.
+    var prev_lat: f64 = 0;
+    var prev_set: f64 = 0;
+    inline for (.{ 1, 5, 10, 20 }) |n| {
+        const sc = try score(gpa, comptime withBatch(STRAT, .threshold, n, 40), true, null);
+        try testing.expect(sc.latency > prev_lat + 15);
+        try testing.expect(sc.mix_min_set > prev_set);
+        prev_lat = sc.latency;
+        prev_set = sc.mix_min_set;
+    }
+    // Same for the timed batch, by its period: set 6.9 / 12.2 / 23.2, latency 71 / 121 / 222.
+    prev_lat = 0;
+    prev_set = 0;
+    inline for (.{ 20, 40, 80 }) |period| {
+        const sc = try score(gpa, comptime withBatch(STRAT, .timed, 10, period), true, null);
+        try testing.expect(sc.latency > prev_lat + 30);
+        try testing.expect(sc.mix_mean_set > prev_set + 4);
+        prev_lat = sc.latency;
+        prev_set = sc.mix_mean_set;
+    }
+}
+
+test "batch: a timed batch gives no floor (a quiet round leaves a packet alone); a threshold batch always does" {
+    const gpa = testing.allocator;
+    const timed = try score(gpa, comptime withBatch(STRAT, .timed, 10, 20), true, null);
+    // Measured: a short period has rounds of one packet: set 1.00, link 1.00.
+    try testing.expect(timed.mix_min_set < 1.01 and timed.mix_max_link > 0.99);
+    try testing.expect(timed.mix_min_set < (types.AnonymityBound{}).min_effective_set);
+}
+
+test "batch: without cover a batch waits for traffic (latency), but its set does not shrink" {
+    const gpa = testing.allocator;
+    const cfg = comptime withBatch(STRAT, .threshold, 10, 40);
+    const with = try score(gpa, cfg, true, null);
+    const without = try score(gpa, cfg, false, null);
+    // Measured latency 83 vs 187; set 10.00 either way.
+    try testing.expect(without.latency > 1.5 * with.latency);
+    try testing.expect(without.mix_min_set > 9.99);
+}
+
+test "batch: a released batch leaves in random order, not arrival order" {
+    const gpa = testing.allocator;
+    var mix = try simulate(gpa, comptime withBatch(STRAT, .threshold, 10, 40), 3, UNTIL, true, null);
+    defer mix.deinit(gpa);
+    // Adjacent passes of one release (same mix, same tick) in transcript order:
+    // how often is the later one the later ARRIVAL? An order-preserving flush
+    // says 1.0.
+    var asc: usize = 0;
+    var pairs: usize = 0;
+    const ts = mix.transcript();
+    for (ts[0 .. ts.len - 1], ts[1..]) |a, b| {
+        if (a.mix != b.mix or a.departure != b.departure or a.arrival == b.arrival) continue;
+        pairs += 1;
+        if (a.arrival < b.arrival) asc += 1;
+    }
+    try testing.expect(pairs > 500);
+    const f = @as(f64, @floatFromInt(asc)) / @as(f64, @floatFromInt(pairs));
+    try testing.expect(f > 0.4 and f < 0.6);
+}
+
+// ── item 3: mix-originated cover ────────────────────────────────────────────
+
+const LOOPS = withLoops(STRAT, 60);
+
+test "mix loops: a clean network gets every loop home, raises no alarm, and the pools fill up" {
+    const gpa = testing.allocator;
+    const plain = try score(gpa, STRAT, true, null);
+    const some = try score(gpa, LOOPS, true, null);
+    const more = try score(gpa, comptime withLoops(STRAT, 20), true, null);
+    // Measured: 1386 of 1520 watched loops back (the rest still in flight at the
+    // horizon), 0 alarms; per-mix mean set 30.9 / 36.2 / 47.6.
+    try testing.expect(some.loops_watched > 1000);
+    try testing.expect(some.loops_returned * 10 >= some.loops_watched * 8);
+    try testing.expectEqual(@as(usize, 0), some.alarms);
+    try testing.expectEqual(@as(u64, 0), some.bad);
+    try testing.expectEqual(@as(usize, 0), more.alarms);
+    try testing.expect(plain.mix_mean_set + 3 < some.mix_mean_set and some.mix_mean_set + 8 < more.mix_mean_set);
+    try testing.expect(some.mix_min_set >= (types.AnonymityBound{}).min_effective_set + 0.5);
+    // A mix loop names no client: sender and receiver anonymity are unharmed.
+    try testing.expect(some.e2e_min_set >= (types.SenderBound{}).min_sender_set);
+    try testing.expectEqual(@as(usize, 0), some.missing);
+}
+
+test "mix loops: a mix that is blocked loses its own loops and the others' through it, and they alarm during the attack" {
+    const gpa = testing.allocator;
+    var seed: u64 = 1;
+    while (seed <= 5) : (seed += 1) {
+        var mix = try simulate(gpa, LOOPS, seed, UNTIL, true, ATTACK);
+        defer mix.deinit(gpa);
+        try testing.expect(mix.attack_dropped > 20);
+        try testing.expect(mix.mix_alarms.items.len > 0);
+        var attacked_alarmed = false;
+        var seen: [256]bool = @splat(false);
+        for (mix.mix_alarms.items) |a| {
+            try testing.expect(a.at > ATTACK.start); // none before the attack began
+            try testing.expect(!seen[a.mix]); // once per mix
+            seen[a.mix] = true;
+            if (a.mix == ATTACK.mix) attacked_alarmed = true;
+        }
+        // The blocked mix cannot get its own loops home.
+        try testing.expect(attacked_alarmed);
+    }
+}
+
+test "mix loops: stats count them as cover, and only a watchable strategy watches" {
+    const gpa = testing.allocator;
+    var mix = try simulate(gpa, LOOPS, 1, UNTIL, true, null);
+    defer mix.deinit(gpa);
+    const st = mix.stats();
+    try testing.expectEqual(mix.relay.mix_sent.count(), st.mix_cover_sent);
+    try testing.expect(st.mix_cover_sent > 250);
+    // Timed batches have a known worst hold (one period a hop): watched, none lost.
+    const timed = try score(gpa, comptime withLoops(withBatch(STRAT, .timed, 10, 40), 60), true, null);
+    try testing.expect(timed.loops_watched > 1000 and timed.alarms == 0);
+    // A threshold batch waits for traffic: nothing can be called overdue.
+    const thr = try score(gpa, comptime withLoops(withBatch(STRAT, .threshold, 10, 40), 60), true, null);
+    try testing.expectEqual(@as(u64, 0), thr.loops_watched);
+}
+
+// ── item 4: receiver anonymity and sender–receiver unlinkability ───────────
+
+test "receiver: the Poisson mix hides the recipient; FIFO pins it; a provider hides it down to its own clients" {
+    const gpa = testing.allocator;
+    const rb = types.ReceiverBound{};
+    // Clients straight on the last layer: a link names its receiver.
+    const poisson = try score(gpa, DIRECT8, true, null);
+    const fifo = try scoreFifo(gpa, DIRECT8);
+    // Measured: Poisson worst set 7.47 of 8, worst mass on the recipient 0.221; FIFO 1.00 / 1.00.
+    try testing.expect(poisson.recv_min_set >= rb.min_receiver_set + 3 and poisson.recv_max_link <= rb.max_link_prob - 0.2);
+    try testing.expect(fifo.recv_min_set < 1.01 and fifo.recv_max_link > 0.99);
+    // Behind providers a FIFO mix is traced to the provider and no further: its
+    // 4 clients, 1/4 each, whatever the mailbox pulls look like.
+    const prov = try scoreFifo(gpa, STRAT);
+    try testing.expectApproxEqAbs(@as(f64, 4.0), prov.recv_min_set, 0.01);
+    try testing.expectApproxEqAbs(@as(f64, 0.25), prov.recv_max_link, 0.001);
+}
+
+test "unlinkability: third-party leakage ε is ~0 for the Poisson mix, large for FIFO and for a cover-starved network's worst packet" {
+    const gpa = testing.allocator;
+    const ub = types.UnlinkBound{};
+    const poisson = try score(gpa, DIRECT8, true, null);
+    const nocover = try score(gpa, DIRECT8, false, null);
+    const fifo = try scoreFifo(gpa, DIRECT8);
+    // Measured (mean ε, worst packet, nats): Poisson 0.001 / 0.86, no cover 0.037 / 23.1, FIFO 18.5 / 27.6.
+    try testing.expect(poisson.eps_mean <= ub.max_mean_epsilon / 10 and poisson.eps_max < 2);
+    try testing.expect(fifo.eps_mean > 10 * ub.max_mean_epsilon);
+    try testing.expect(nocover.eps_max > 20); // some packet's sender is pinned...
+    try testing.expect(nocover.e2e_min_set < (types.SenderBound{}).min_sender_set); // ...and the sender-set bound sees it too
+    try testing.expect(poisson.e2e_min_set >= (types.SenderBound{}).min_sender_set);
 }
