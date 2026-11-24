@@ -3913,6 +3913,54 @@ test "held listen: notifications pushed from another thread stream live, finishA
     try testing.expectEqual(@as(usize, 0), after);
 }
 
+fn twoListens(l: *Listens) bool {
+    return l.count() == 2;
+}
+
+test "held listen: two listens on one server each get only what they asked for" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    server.push = true;
+    var listens = Listens.init(gpa);
+    defer listens.deinit();
+    var spin: SpinLock = .{};
+    var transport = Transport{ .gpa = gpa, .server = &server, .listens = &listens, .lock = spin.iface() };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    const wire_b = postHeaders("Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\n", "{\"jsonrpc\":\"2.0\",\"id\":\"listen-2\",\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"resourceSubscriptions\":[\"file:///b\"]}}}");
+    const a = try live.connect();
+    defer a.close(io);
+    try sendAll(io, a, listen_wire);
+    try waitFor(io, &listens, oneListen);
+    const b = try live.connect();
+    defer b.close(io);
+    try sendAll(io, b, wire_b);
+    try waitFor(io, &listens, twoListens);
+
+    transport.lock.acquire();
+    const n = server.notifyResourceUpdated(transport.pushSink(), "file:///b");
+    transport.lock.release();
+    try testing.expectEqual(@as(usize, 1), n);
+    listens.finishAll();
+
+    var abuf: [8192]u8 = undefined;
+    const got_a = readToEnd(io, a, &abuf);
+    var bbuf: [8192]u8 = undefined;
+    const got_b = readToEnd(io, b, &bbuf);
+    try testing.expect(std.mem.find(u8, got_a, "notifications/resources/updated") == null);
+    try testing.expect(std.mem.find(u8, got_b, "notifications/resources/updated") != null);
+    try testing.expect(std.mem.find(u8, got_b, "\"id\":\"listen-2\",\"result\"") != null);
+    try testing.expect(std.mem.find(u8, got_a, "\"id\":\"listen-1\",\"result\"") != null);
+    try waitFor(io, &listens, noListen);
+}
+
 test "held listen: the client closing ends it and drops the subscription" {
     const gpa = testing.allocator;
     var server = try buildServer(gpa);
