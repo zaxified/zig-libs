@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BN254_FUZZ; ecadd and ecmul at 1/4, ecpairing at 1/10, algebra at 1/100 of it) · ct 2026-10-02 (ctgrind)
 
-**Performance:** not measured
+**Performance:** ref 1.84–1.93× gnark-crypto v0.19.2 · fastest ? (measured 2026-11-24)
 
 **Known defects:** none recorded
 
@@ -223,8 +223,15 @@ gnark output was available to pin it against.
 - Every pinned KAT hex vector's own byte-parse/round-trip.
 
 **Cores:**
-- `millerLoop(p, q) Fp12` — the per-pair `6x+2` Miller walk (plain
-  binary MSB→LSB over `6x+2`; NAF is a deferred optimization) with the
+- The Miller walk (`millerLoopBatch`, under `multiMillerLoop`) — the
+  `6x+2` walk in NAF (`ate_naf`: 66 digits, 22 nonzero against 37 set
+  bits) shared by up to 8 pairs (one accumulator squaring per digit), each
+  pair's `T` in Jacobian coordinates (`doublingStepJac`/`additionStepJac`:
+  the line multiplied through by an `Fp2` factor the final exponentiation
+  removes, no inversion), lines folded by the sparse `mulByLine` (13
+  `Fp2.mul` instead of 18). The per-pair binary affine walk with dense
+  folds (`millerLoopBinaryRef`) is its oracle; both give the same pairing
+  (tests + the KATs). Then the
   BN-specific "Frobenius tail" (`Q1 = π(Q)`, `Q2 = π²(Q)`, then
   `f·line(T,Q1)`, `T+=Q1`, `f·line(T,−Q2)`). The KAT-caught subtlety
   the pass had to resolve: BN254's twist constant is `b' = 3/ξ`, so the
@@ -252,8 +259,13 @@ Both cores' doc comments in `pairing.zig` carry the full construction,
 the sign/Frobenius-power-ordering footgun, and the numeric
 re-verification — byte-exact-checked against the pinned KAT vectors.
 
-`millerLoop` is the plain binary walk; the sparse-line multiplication, the NAF walk and
-a shared multi-pairing walk are optimizations not done (→ *Backlog / deferred*).
+**Performance.** `zig build bench-bn254` (`tools/bench.zig`, Go side `tools/go_bench`, gnark-crypto v0.19.2 from the
+module cache, offline): e(P, Q), the two-pair check and the two-pair Miller loop; the sides agree on the check's
+verdict (gnark's final exponentiation returns a fixed power of the canonical pairing, so values are not compared).
+2026-11-24: 1.84–1.93× gnark (the card line). Before the walk changes the same bench read 3.49–4.95×. In-process
+A/B (`BN254_BENCH=1`, `pairing.zig`'s bench test, 2-pair Miller loop): projective steps 0.33×, NAF 0.91×, sparse
+fold 0.92×, shared walk 0.96× (the last three within the loaded host's spread individually), all together 0.23×
+(2-pair pairing check 0.35×).
 
 ## Part 4 — KAT generation
 
@@ -707,8 +719,7 @@ and the scalar 2^253 (top window); empty input, length mismatch, all-zero scalar
 
 ## Backlog / deferred
 
-- **Pairing optimizations (idea, cost-only):** `millerLoop` is the plain binary `6x+2` walk, and `multiMillerLoop` runs one full walk per pair. The sparse-line multiplication, a NAF walk and a
-  shared multi-pairing walk are the optimizations `pairing.zig`'s header comment lists as remaining `// TODO`s. The card's `**Performance:**` is `not measured`, so none is scheduled.
+(none)
 
 ## Anchoring
 

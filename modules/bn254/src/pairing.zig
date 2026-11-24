@@ -50,8 +50,9 @@
 //! already real (`fp12.zig`, built ahead of schedule during Part 3's
 //! field-tower pass, Granger-Scott construction, generic in the tower's
 //! non-residues); this file imports it as-is, no new implementation.
-//! Remaining `// TODO`s are optimizations only (sparse line
-//! multiplication, NAF walk, shared multi-pairing walk).
+//! The walk is the shared multi-pairing NAF walk with sparse line
+//! products (`millerLoopBatch`); the plain per-pair binary walk with dense
+//! line products stays as its oracle (`millerLoopBinaryRef`).
 //!
 //! **KAT sourcing.** Every pinned `Fp12` hex vector below was computed with
 //! `ethereum/py_ecc`'s `bn128` module (`py_ecc.bn128.bn128_pairing.pairing`,
@@ -130,15 +131,15 @@ pub const bn_x: u64 = 4965661367192848881;
 /// a container-width subtlety worth flagging explicitly, since BLS12-381's
 /// analogous `bls_x_abs` fits comfortably in a `u64` and a reader coming
 /// from that file might reach for the same width here without checking.
-/// This is the loop-length constant `millerLoop`'s NAF walk (see that
-/// function's doc comment) is over.
+/// This is the loop-length constant the Miller walk runs over, in NAF
+/// (`ate_naf`).
 pub const bn_ate_loop_param: u128 = 6 * @as(u128, bn_x) + 2;
 
 // ── Miller loop (core, part 1 of 2) ──────────────────────────────
 
-/// The construction below, transcribed exactly; the plain-binary (non-NAF) walk option the
-/// construction explicitly sanctions is the one implemented (see the
-/// body's comment).
+/// The construction below, transcribed exactly, in the plain-binary
+/// (non-NAF) walk option the construction sanctions: the per-pair oracle of
+/// the shipped shared NAF walk (`millerLoopBatch`).
 ///
 /// The single-pair Miller loop: accumulates the (NOT-final-exponentiated)
 /// rational-function value the optimal ate pairing's first stage produces
@@ -231,17 +232,17 @@ pub const bn_ate_loop_param: u128 = 6 * @as(u128, bn_x) + 2;
 /// module-wide trust-boundary convention, `SPEC.md`) — NOT re-validated
 /// here; a caller crossing a trust boundary must call `subgroupCheck`
 /// first (mandatory for `G2`, `g2.zig`'s module doc comment).
-fn millerLoop(p: g1.Affine, q: g2.Affine) Fp12 {
-    // multiMillerLoop (the only caller) skips infinity pairs before ever
-    // calling here, and on-curve/subgroup membership is the module-wide
-    // caller obligation (doc comment above) — so p/q are live, affine,
-    // order-r points from this point on.
+fn millerLoopBinaryRef(p: g1.Affine, q: g2.Affine) Fp12 {
+    // multiMillerLoopBinaryRef (the only caller) skips infinity pairs
+    // before ever calling here, and on-curve/subgroup membership is the
+    // module-wide caller obligation (doc comment above) — so p/q are live,
+    // affine, order-r points from this point on.
     var t: TwistPoint = .{ .x = q.x, .y = q.y };
     var f = Fp12.one;
 
     // Plain binary MSB->LSB walk of 6x+2 (doc comment step 2 — which
-    // explicitly sanctions binary over NAF; the NAF walk is a deferred
-    // performance optimization, not a correctness requirement). The top
+    // explicitly sanctions binary over NAF; the shipped walk is the NAF
+    // one, `millerLoopBatch`). The top
     // bit (bit 64 — 6x+2 exceeds u64, see bn_ate_loop_param's doc
     // comment) is implicit in the `T = Q, f = 1` initialization.
     // NOT CONSTANT-TIME: the walk branches on the loop parameter's bits
@@ -252,9 +253,9 @@ fn millerLoop(p: g1.Affine, q: g2.Affine) Fp12 {
     var bit: u7 = second_highest_bit;
     while (true) : (bit -= 1) {
         f = f.square();
-        f = f.mul(doublingStep(&t, p));
+        f = f.mul(lineValue(doublingStep(&t, p)));
         if ((bn_ate_loop_param >> bit) & 1 == 1) {
-            f = f.mul(additionStep(&t, .{ .x = q.x, .y = q.y }, p));
+            f = f.mul(lineValue(additionStep(&t, .{ .x = q.x, .y = q.y }, p)));
         }
         if (bit == 0) break;
     }
@@ -269,19 +270,16 @@ fn millerLoop(p: g1.Affine, q: g2.Affine) Fp12 {
     // is the documented no-op for the pairing value (harmless).
     const q1 = twistFrobenius(.{ .x = q.x, .y = q.y });
     const q2 = twistFrobenius(q1);
-    f = f.mul(additionStep(&t, q1, p));
-    f = f.mul(additionStep(&t, .{ .x = q2.x, .y = q2.y.neg() }, p));
+    f = f.mul(lineValue(additionStep(&t, q1, p)));
+    f = f.mul(lineValue(additionStep(&t, .{ .x = q2.x, .y = q2.y.neg() }, p)));
     return f;
 }
 
-/// A mutable affine point on the sextic twist `E'(Fp2)` — the running
-/// accumulator `T` the Miller loop's doubling/addition steps advance
-/// (and the shape the Frobenius-tail points `Q1`/`-Q2` take). Affine
-/// (not Jacobian) is DELIBERATE for the correctness-first baseline,
-/// same reasoning as `bls12_381.pairing.TwistPoint`: the chord/tangent
-/// slope `λ` the line function needs is explicit in affine form, at the
-/// cost of one `Fp2.inv` per step (see `doublingStep`/`additionStep`
-/// for why those inversions are total on subgroup inputs).
+/// An affine point on the sextic twist `E'(Fp2)`: the shape of the
+/// Frobenius-tail points `Q1`/`-Q2` and of `T` in the affine steps
+/// (`doublingStep`/`additionStep`, one `Fp2.inv` per step), which the
+/// oracle walk `millerLoopBinaryRef` runs. The shipped walk keeps `T` in
+/// Jacobian coordinates (`doublingStepJac`/`additionStepJac`).
 const TwistPoint = struct {
     x: Fp2,
     y: Fp2,
@@ -352,24 +350,65 @@ fn twistFrobenius(pt: TwistPoint) TwistPoint {
 /// ```
 /// l = y_P + (−λ·x_P)·w + (λ·x_ref − y_ref)·w^3
 /// ```
-/// — nonzero `Fp2` coefficients only in tower slots `c0.c0` (`1`),
-/// `c1.c0` (`w`), `c1.c1` (`w^3 = v·w`); promoted dense here — the
-/// sparse-mul fast path is the deferred `// TODO` in `multiMillerLoop`'s
-/// doc comment. This is the EXACT untwisted chord/tangent line (no
+/// — nonzero `Fp2` coefficients only in tower slots `c0.c0` (`1`, an `Fp`
+/// value), `c1.c0` (`w`), `c1.c1` (`w^3 = v·w`), returned as a `Line` that
+/// `mulByLine` multiplies in sparsely (`lineValue` is the dense promotion,
+/// its oracle). This is the EXACT untwisted chord/tangent line (no
 /// residual per-line `w`-power factor at all, so nothing extra is left
 /// for the final exponentiation to kill). `x_P, y_P ∈ Fp` embed as
 /// `Fp2` values with zero `u` part, so the two `λ` products are
 /// componentwise `Fp.mul`s.
-fn lineEval(lambda: Fp2, x_ref: Fp2, y_ref: Fp2, p: g1.Affine) Fp12 {
-    const c11 = lambda.mul(x_ref).sub(y_ref); // w^3 coefficient
-    const c10 = Fp2{ // w coefficient
-        .c0 = lambda.c0.mul(p.x).neg(),
-        .c1 = lambda.c1.mul(p.x).neg(),
-    };
-    const c00 = Fp2{ .c0 = p.y, .c1 = Fp.zero }; // constant term
+fn lineEval(lambda: Fp2, x_ref: Fp2, y_ref: Fp2, p: g1.Affine) Line {
     return .{
-        .c0 = .{ .c0 = c00, .c1 = Fp2.zero, .c2 = Fp2.zero },
-        .c1 = .{ .c0 = c10, .c1 = c11, .c2 = Fp2.zero },
+        .c00 = .{ .c0 = p.y, .c1 = Fp.zero }, // constant term (y_P ∈ Fp)
+        .c10 = .{ .c0 = lambda.c0.mul(p.x).neg(), .c1 = lambda.c1.mul(p.x).neg() }, // w
+        .c11 = lambda.mul(x_ref).sub(y_ref), // w^3
+    };
+}
+
+/// A line value's nonzero coefficients: `c00` in slot `1`, `c10` in slot
+/// `w`, `c11` in slot `w³ = v·w` (see `lineEval`). The affine steps give
+/// `c00 = y_P ∈ Fp`; the projective steps the same line times an `Fp2`
+/// factor (see `doublingStepJac`).
+const Line = struct { c00: Fp2, c10: Fp2, c11: Fp2 };
+
+/// The line promoted to a dense `Fp12`: the oracle of `mulByLine`.
+fn lineValue(l: Line) Fp12 {
+    return .{
+        .c0 = .{ .c0 = l.c00, .c1 = Fp2.zero, .c2 = Fp2.zero },
+        .c1 = .{ .c0 = l.c10, .c1 = l.c11, .c2 = Fp2.zero },
+    };
+}
+
+/// `f · l` for a sparse line `l = c00 + (c10 + c11 v) w`: the Karatsuba
+/// `Fp12.mul` with the zero coefficients dropped. `f.c0 · c00` scales by an
+/// `Fp2` value (three `Fp2.mul`), `f.c1 · (c10 + c11 v)` and
+/// `(f.c0 + f.c1) · (c00 + c10 + c11 v)` multiply by an `Fp6` with a zero
+/// `v²` slot (`mulBy01`, five `Fp2.mul` each instead of six): 13 `Fp2.mul`
+/// instead of the dense 18. gnark-crypto's `MulBy034` is the same step for
+/// its line shape (named, not read).
+fn mulByLine(f: Fp12, l: Line) Fp12 {
+    const v0 = f.c0.mulByFp2(l.c00);
+    const v1 = mulBy01(f.c1, l.c10, l.c11);
+    const c00_plus_c10 = l.c10.add(l.c00);
+    return .{
+        .c0 = v0.add(v1.mulByNonresidue()),
+        .c1 = mulBy01(f.c0.add(f.c1), c00_plus_c10, l.c11).sub(v0).sub(v1),
+    };
+}
+
+fn mulByFp(a: Fp2, s: Fp) Fp2 {
+    return .{ .c0 = a.c0.mul(s), .c1 = a.c1.mul(s) };
+}
+
+/// `a · (b0 + b1 v)` in `Fp6` (`Fp6.mul`'s formula with `b2 = 0`).
+fn mulBy01(a: Fp6, b0: Fp2, b1: Fp2) Fp6 {
+    const t0 = a.c0.mul(b0);
+    const t1 = a.c1.mul(b1);
+    return .{
+        .c0 = a.c2.mul(b1).mulByNonresidue().add(t0),
+        .c1 = a.c0.add(a.c1).mul(b0.add(b1)).sub(t0).sub(t1),
+        .c2 = a.c2.mul(b0).add(t1),
     };
 }
 
@@ -384,7 +423,7 @@ fn lineEval(lambda: Fp2, x_ref: Fp2, y_ref: Fp2, p: g1.Affine) Fp12 {
 /// off-curve/non-subgroup `q` voids this — exactly the trust boundary
 /// `SPEC.md` and `g2.zig`'s `subgroupCheck` obligation already draw,
 /// and a panic (not a silently wrong pairing) is the failure mode.
-fn doublingStep(t: *TwistPoint, p: g1.Affine) Fp12 {
+fn doublingStep(t: *TwistPoint, p: g1.Affine) Line {
     const xx = t.x.square();
     const three_xx = xx.add(xx).add(xx);
     const two_y = t.y.add(t.y);
@@ -412,12 +451,62 @@ fn doublingStep(t: *TwistPoint, p: g1.Affine) Fp12 {
 /// with independent big-integer arithmetic during this pass). Only an
 /// on-curve-but-non-subgroup `q` could trigger the panic — the same
 /// excluded-input class as `doublingStep`'s.
-fn additionStep(t: *TwistPoint, q: TwistPoint, p: g1.Affine) Fp12 {
+fn additionStep(t: *TwistPoint, q: TwistPoint, p: g1.Affine) Line {
     const lambda = t.y.sub(q.y).mul(t.x.sub(q.x).inv() catch unreachable);
     const line = lineEval(lambda, q.x, q.y, p);
     const x3 = lambda.square().sub(t.x).sub(q.x);
     const y3 = lambda.mul(t.x.sub(x3)).sub(t.y);
     t.* = .{ .x = x3, .y = y3 };
+    return line;
+}
+
+/// Projective Miller doubling step: the tangent line at `T` (Jacobian,
+/// `x = X/Z²`, `y = Y/Z³`) evaluated at `p`, then `T <- 2T` with
+/// `g2.Jacobian.double` — no inversion. The affine line of `doublingStep`
+/// has `λ = 3x²/(2y) = 3X²/(2YZ)`; multiplied through by `2YZ³ ∈ Fp2`:
+/// ```
+/// c00 = 2YZ³·y_P,   c10 = −3X²Z²·x_P,   c11 = 3X³ − 2Y²
+/// ```
+/// The factor is in `Fp2 ⊂ Fp6`, which the final exponentiation's `p⁶ − 1`
+/// sends to 1 (the argument `bls12_381.pairing` makes for its own
+/// projective steps), so the pairing is unchanged. `2YZ³ ≠ 0` for the
+/// same reason `doublingStep`'s `2y` is invertible.
+fn doublingStepJac(t: *g2.Jacobian, p: g1.Affine) Line {
+    std.debug.assert(!t.y.isZero() and !t.z.isZero());
+    const xx = t.x.square();
+    const yy = t.y.square();
+    const zz = t.z.square();
+    const three_xx = xx.add(xx).add(xx);
+    const y_z3 = t.y.mul(zz.mul(t.z));
+    const line: Line = .{
+        .c00 = mulByFp(y_z3.add(y_z3), p.y),
+        .c10 = mulByFp(three_xx.mul(zz), p.x).neg(),
+        .c11 = three_xx.mul(t.x).sub(yy.add(yy)),
+    };
+    t.* = t.double();
+    return line;
+}
+
+/// Projective Miller addition step: the chord through `T` (Jacobian) and
+/// the affine `q`, evaluated at `p`, then `T <- T + q` with
+/// `g2.Jacobian.add`. With `h = x_q Z² − X`, `r = y_q Z³ − Y`,
+/// `λ = r/(Z h)`; the affine line (reference point `q`) times `Z h`:
+/// ```
+/// c00 = Z h·y_P,   c10 = −r·x_P,   c11 = r x_q − y_q Z h
+/// ```
+/// `h ≠ 0` for the same reason `additionStep`'s `x_T − x_q` is invertible.
+fn additionStepJac(t: *g2.Jacobian, q: TwistPoint, p: g1.Affine) Line {
+    const zz = t.z.square();
+    const h = q.x.mul(zz).sub(t.x);
+    const r = q.y.mul(zz).mul(t.z).sub(t.y);
+    std.debug.assert(!h.isZero());
+    const z_h = t.z.mul(h);
+    const line: Line = .{
+        .c00 = mulByFp(z_h, p.y),
+        .c10 = mulByFp(r, p.x).neg(),
+        .c11 = r.mul(q.x).sub(q.y.mul(z_h)),
+    };
+    t.* = t.add(g2.Jacobian.fromAffine(.{ .x = q.x, .y = q.y }));
     return line;
 }
 
@@ -431,27 +520,138 @@ fn additionStep(t: *TwistPoint, q: TwistPoint, p: g1.Affine) Fp12 {
 /// `bls12_381.pairing.multiMillerLoop`'s own doc comment): a pair with
 /// `p.infinity` or `q.infinity` contributes the trivial factor `Fp12.one`
 /// to the product (a pairing with either input at infinity is defined to
-/// be `1`) and is SKIPPED — `millerLoop` is never called for it, so the
+/// be `1`) and is SKIPPED — the walk never steps its point, so the
 /// line-evaluation formulas (undefined at infinity) never run on such a
 /// pair; an all-infinity `pairs` slice returns `Fp12.one` — see this
 /// file's `"multiMillerLoop never touches the stub on an all-infinity
 /// input"` test (it is the ungated proof that this wiring does not depend on
 /// the core).
 ///
-/// **`// TODO` (deferred performance optimization):** this baseline pays
-/// one FULL, independent Miller walk per live pair — `N` pairs cost `N`
-/// times the work of one. The actual algorithmic payoff of "multi"-pairing
-/// (sharing ONE seed-bit walk and ONE squaring per bit across every pair,
-/// same construction as `bls12_381.pairing.multiMillerLoop`'s own doc
-/// comment describes) is a follow-up optimization, not a correctness
-/// requirement (per-pair values multiply to the exact same product
-/// regardless of walk-sharing, so this baseline's OUTPUT is already
-/// exactly right, merely not optimally fast).
+/// Pairs are walked in batches of up to `miller_batch_max` that share ONE
+/// walk and ONE accumulator squaring per digit (`millerLoopBatch`, the
+/// construction of `bls12_381.pairing.multiMillerLoop`); the batch products
+/// multiply together. The value equals the product of the per-pair Miller
+/// values up to factors the final exponentiation removes (see
+/// `millerLoopBatch`), so `pairing`/`pairingCheck` are unchanged.
 pub fn multiMillerLoop(pairs: []const PairingPair) Fp12 {
+    var f = Fp12.one;
+    var i: usize = 0;
+    while (i < pairs.len) : (i += miller_batch_max) {
+        const end = @min(i + miller_batch_max, pairs.len);
+        f = f.mul(millerLoopBatch(pairs[i..end]));
+    }
+    return f;
+}
+
+/// The single-pair Miller value (the `N = 1` batch).
+fn millerLoop(p: g1.Affine, q: g2.Affine) Fp12 {
+    return millerLoopBatch(&.{.{ .p = p, .q = q }});
+}
+
+/// Pairs per shared walk; the accumulator points live in a fixed stack
+/// array, as in `bls12_381.pairing`.
+const miller_batch_max = 8;
+
+/// `6x+2` in non-adjacent form, least significant digit first: 66 digits,
+/// 22 of them nonzero against 37 set bits in binary — 21 addition steps
+/// (each an `Fp2` inversion here) instead of 36. Comptime-derived from
+/// `bn_ate_loop_param` and checked against it by test.
+const ate_naf: [66]i2 = blk: {
+    var digits: [66]i2 = @splat(0);
+    var v: i256 = bn_ate_loop_param;
+    var k: usize = 0;
+    while (v != 0) : (k += 1) {
+        if (v & 1 == 1) {
+            const d: i256 = 2 - @mod(v, 4); // 1 or -1
+            digits[k] = @intCast(d);
+            v -= d;
+        }
+        v = @divExact(v, 2);
+    }
+    break :blk digits;
+};
+
+/// One shared Miller walk for up to `miller_batch_max` pairs, each pair's
+/// `T` in Jacobian coordinates (`doublingStepJac`/`additionStepJac`, no
+/// inversion): per NAF digit ONE squaring of the accumulator, then every
+/// live pair's doubling line,
+/// and on a nonzero digit every pair's addition line with `±Q`; each line
+/// folded in by the sparse `mulByLine`. Then each pair's Frobenius tail
+/// (`Q1 = π(Q)`, `−Q2 = −π²(Q)`). The NAF chain reaches `[6x+2]Q` through
+/// different intermediate points than the binary chain, so the raw value
+/// differs from `millerLoopBinaryRef`'s by line-denominator factors the
+/// final exponentiation removes (`p⁶ − 1` kills every `Fp6` factor, as in
+/// `bls12_381.pairing`); the pairing is identical (tests: the byte-exact
+/// py_ecc KATs, and the reduced value against the binary per-pair walk).
+fn millerLoopBatch(pairs: []const PairingPair) Fp12 {
+    return millerLoopBatchImpl(.{}, pairs);
+}
+
+/// What `millerLoopBatchImpl` runs: the shipped walk is all three; the
+/// others are the bench's attribution variants and the tests' oracles.
+const WalkOpts = struct { naf: bool = true, sparse: bool = true, projective: bool = true };
+
+fn millerLoopBatchImpl(comptime opts: WalkOpts, pairs: []const PairingPair) Fp12 {
+    std.debug.assert(pairs.len <= miller_batch_max);
+    const T = if (opts.projective) g2.Jacobian else TwistPoint;
+    var ts: [miller_batch_max]T = undefined;
+    var live = @as([miller_batch_max]bool, @splat(false));
+    for (pairs, 0..) |pair, j| {
+        live[j] = !(pair.p.infinity or pair.q.infinity);
+        if (live[j]) ts[j] = if (opts.projective) g2.Jacobian.fromAffine(pair.q) else .{ .x = pair.q.x, .y = pair.q.y };
+    }
+    const dbl = if (opts.projective) doublingStepJac else doublingStep;
+    const addStep = if (opts.projective) additionStepJac else additionStep;
+    const digits = comptime if (opts.naf) ate_naf else ate_binary;
+    var f = Fp12.one;
+    // The top digit is 1: implicit in T = Q, f = 1.
+    comptime std.debug.assert(digits[digits.len - 1] == 1);
+    var k: usize = digits.len - 1;
+    while (k > 0) {
+        k -= 1;
+        f = f.square();
+        for (pairs, 0..) |pair, j| {
+            if (!live[j]) continue;
+            f = fold(opts.sparse, f, dbl(&ts[j], pair.p));
+        }
+        const d = digits[k];
+        if (d != 0) {
+            for (pairs, 0..) |pair, j| {
+                if (!live[j]) continue;
+                const q: TwistPoint = .{ .x = pair.q.x, .y = if (d > 0) pair.q.y else pair.q.y.neg() };
+                f = fold(opts.sparse, f, addStep(&ts[j], q, pair.p));
+            }
+        }
+    }
+    for (pairs, 0..) |pair, j| {
+        if (!live[j]) continue;
+        const q1 = twistFrobenius(.{ .x = pair.q.x, .y = pair.q.y });
+        const q2 = twistFrobenius(q1);
+        f = fold(opts.sparse, f, addStep(&ts[j], q1, pair.p));
+        f = fold(opts.sparse, f, addStep(&ts[j], .{ .x = q2.x, .y = q2.y.neg() }, pair.p));
+    }
+    return f;
+}
+
+inline fn fold(comptime sparse: bool, f: Fp12, l: Line) Fp12 {
+    return if (sparse) mulByLine(f, l) else f.mul(lineValue(l));
+}
+
+/// `6x+2` in binary, least significant digit first (the bench's and the
+/// tests' non-NAF variant of the shared walk).
+const ate_binary: [65]i2 = blk: {
+    var digits: [65]i2 = undefined;
+    for (&digits, 0..) |*d, i| d.* = @intCast((bn_ate_loop_param >> i) & 1);
+    break :blk digits;
+};
+
+/// The walk before the shared NAF walk and the sparse fold: one binary
+/// walk per pair, dense line products. The oracle and bench baseline.
+fn multiMillerLoopBinaryRef(pairs: []const PairingPair) Fp12 {
     var f = Fp12.one;
     for (pairs) |pair| {
         if (pair.p.infinity or pair.q.infinity) continue;
-        f = f.mul(millerLoop(pair.p, pair.q));
+        f = f.mul(millerLoopBinaryRef(pair.p, pair.q));
     }
     return f;
 }
@@ -852,6 +1052,122 @@ test "final exponentiation lands in the order-r subgroup: e(G1,G2)^r == 1" {
     const e = pairing(g1.Affine.generator, g2.Affine.generator);
     const scalar_mod = @import("scalar.zig");
     try std.testing.expect(powBig(e, &scalar_mod.r_bytes).eql(Fp12.one));
+}
+
+test "ate_naf: Σ d_k·2^k == 6x+2, digits in {-1, 0, 1}, no two adjacent nonzero" {
+    var v: i256 = 0;
+    var k: usize = ate_naf.len;
+    var nonzero: usize = 0;
+    while (k > 0) {
+        k -= 1;
+        v = 2 * v + ate_naf[k];
+        if (ate_naf[k] != 0) nonzero += 1;
+        if (k > 0) try std.testing.expect(ate_naf[k] == 0 or ate_naf[k - 1] == 0);
+    }
+    try std.testing.expectEqual(@as(i256, bn_ate_loop_param), v);
+    try std.testing.expectEqual(@as(usize, 22), nonzero);
+}
+
+fn randomPair(rand: std.Random) PairingPair {
+    var a: [31]u8 = undefined;
+    var b: [31]u8 = undefined;
+    rand.bytes(&a);
+    rand.bytes(&b);
+    return .{ .p = g1Gen().scalarMulBytes(&a).toAffine(), .q = g2Gen().scalarMulBytes(&b).toAffine() };
+}
+
+test "sparse line multiply == dense Fp12.mul by the promoted line" {
+    var prng = std.Random.DefaultPrng.init(0xb5a75e);
+    const rand = prng.random();
+    for (0..12) |_| {
+        const pr = randomPair(rand);
+        const f = multiMillerLoopBinaryRef(&.{pr});
+        var t: TwistPoint = .{ .x = pr.q.x, .y = pr.q.y };
+        const ld = doublingStep(&t, pr.p);
+        const la = additionStep(&t, .{ .x = pr.q.x, .y = pr.q.y }, pr.p);
+        try std.testing.expect(mulByLine(f, ld).eql(f.mul(lineValue(ld))));
+        try std.testing.expect(mulByLine(f, la).eql(f.mul(lineValue(la))));
+        var tj = g2.Jacobian.fromAffine(pr.q);
+        const ldj = doublingStepJac(&tj, pr.p); // c00 a full Fp2 value
+        const laj = additionStepJac(&tj, .{ .x = pr.q.x, .y = pr.q.y }, pr.p);
+        try std.testing.expect(mulByLine(f, ldj).eql(f.mul(lineValue(ldj))));
+        try std.testing.expect(mulByLine(f, laj).eql(f.mul(lineValue(laj))));
+        // each coefficient alone, so a slot mix-up cannot cancel out
+        for ([_]Line{ .{ .c00 = ld.c00, .c10 = Fp2.zero, .c11 = Fp2.zero }, .{ .c00 = Fp2.zero, .c10 = ld.c10, .c11 = Fp2.zero }, .{ .c00 = Fp2.zero, .c10 = Fp2.zero, .c11 = ld.c11 } }) |l| {
+            try std.testing.expect(mulByLine(f, l).eql(f.mul(lineValue(l))));
+        }
+    }
+}
+
+test "the shared NAF walk pairs identically to the per-pair binary walk (1..9 pairs, infinity mixed in)" {
+    if (!gate.pairing_core_implemented) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xb5a760);
+    const rand = prng.random();
+    var pairs: [9]PairingPair = undefined;
+    for (&pairs) |*pr| pr.* = randomPair(rand);
+    pairs[4].p = g1.Affine.identity;
+    for ([_]usize{ 1, 2, 3, 5, 9 }) |n| {
+        const want = finalExponentiation(multiMillerLoopBinaryRef(pairs[0..n]));
+        try std.testing.expect(finalExponentiation(multiMillerLoop(pairs[0..n])).eql(want));
+    }
+    // The shared binary walk's raw value IS the per-pair product (same
+    // chain, squaring distributes); the sparse fold changes no raw value.
+    const want3 = multiMillerLoopBinaryRef(pairs[0..3]);
+    try std.testing.expect(millerLoopBatchImpl(.{ .naf = false, .sparse = false, .projective = false }, pairs[0..3]).eql(want3));
+    try std.testing.expect(millerLoopBatchImpl(.{ .naf = false, .sparse = true, .projective = false }, pairs[0..3]).eql(want3));
+    try std.testing.expect(millerLoopBatchImpl(.{ .naf = true, .sparse = false }, pairs[0..3]).eql(millerLoopBatchImpl(.{}, pairs[0..3])));
+    // projective vs affine steps: the raw values differ by Fp2 factors, the
+    // pairing does not
+    const affine3 = millerLoopBatchImpl(.{ .projective = false }, pairs[0..3]);
+    try std.testing.expect(finalExponentiation(affine3).eql(finalExponentiation(millerLoopBatchImpl(.{}, pairs[0..3]))));
+    try std.testing.expect(finalExponentiation(affine3).eql(finalExponentiation(want3)));
+}
+
+test "bench: Miller loop, per-pair binary dense vs shared NAF sparse (opt-in BN254_BENCH)" {
+    const bench = @import("bench.zig");
+    if (!bench.enabled()) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xbe7c);
+    const rand = prng.random();
+    const pairs = [2]PairingPair{ randomPair(rand), randomPair(rand) };
+    const one = [1]PairingPair{pairs[0]};
+    const S = struct {
+        fn old2(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(multiMillerLoopBinaryRef(ps));
+        }
+        fn new2(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(multiMillerLoop(ps));
+        }
+        fn old1(ps: *const [1]PairingPair) void {
+            std.mem.doNotOptimizeAway(multiMillerLoopBinaryRef(ps));
+        }
+        fn new1(ps: *const [1]PairingPair) void {
+            std.mem.doNotOptimizeAway(multiMillerLoop(ps));
+        }
+        fn oldCheck(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(finalExponentiation(multiMillerLoopBinaryRef(ps)));
+        }
+        fn newCheck(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(finalExponentiation(multiMillerLoop(ps)));
+        }
+    };
+    const V = struct {
+        fn sharedBinDense(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(millerLoopBatchImpl(.{ .naf = false, .sparse = false, .projective = false }, ps));
+        }
+        fn sharedBinSparse(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(millerLoopBatchImpl(.{ .naf = false, .sparse = true, .projective = false }, ps));
+        }
+        fn sharedNafSparseAffine(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(millerLoopBatchImpl(.{ .projective = false }, ps));
+        }
+    };
+    bench.ab("miller 1-pair (A binary dense, B NAF sparse)", 20, &one, S.old1, S.new1);
+    bench.ab("miller 2-pair (A per-pair binary dense, B shared NAF sparse)", 10, &pairs, S.old2, S.new2);
+    bench.ab("pairing check 2-pair (A old walk, B new walk)", 10, &pairs, S.oldCheck, S.newCheck);
+    bench.ab("shared walk alone (A per-pair binary dense, B shared binary dense)", 10, &pairs, S.old2, V.sharedBinDense);
+    bench.ab("sparse fold alone (A shared binary dense, B shared binary sparse)", 10, &pairs, V.sharedBinDense, V.sharedBinSparse);
+    bench.ab("NAF alone (A shared binary sparse affine, B shared NAF sparse affine)", 10, &pairs, V.sharedBinSparse, V.sharedNafSparseAffine);
+    bench.ab("projective alone (A shared NAF sparse affine, B projective)", 10, &pairs, V.sharedNafSparseAffine, S.new2);
 }
 
 test "pairing bilinearity: e([a]P, [b]Q) == e(P,Q)^(a*b) for small a=3, b=5" {
