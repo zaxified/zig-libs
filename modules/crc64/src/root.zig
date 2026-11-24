@@ -271,7 +271,9 @@ fn fuzzOne(_: void, smith: *std.testing.Smith) !void {
     const n = smith.slice(&buf);
     const want = std.hash.crc.@"CRC-64/XZ".hash(buf[0..n]);
     try std.testing.expectEqual(want, Crc64.hash(buf[0..n]));
-    const k = smith.index(n + 1);
+    // The split point comes from the drawn bytes themselves: a ranged `Smith`
+    // draw after the slice collapses every seed (`check-fuzz-reach`).
+    const k = if (n == 0) 0 else @as(usize, buf[0]) * n / 255;
     var c = Crc64.init();
     c.update(buf[0..k]);
     c.update(buf[k..n]);
