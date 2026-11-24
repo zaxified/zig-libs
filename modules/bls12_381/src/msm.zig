@@ -85,9 +85,15 @@ pub fn mixedAddVartime(comptime G: type, a: G.Jacobian, b: G.Affine) G.Jacobian 
     return .{ .x = x3, .y = y3, .z = z3 };
 }
 
-/// Pippenger window width `c` for `n` points: `c ≈ log2(n) - 4`, capped at
-/// 8 so the bucket array stays small.
+/// Pippenger window width `c` for `n` points with signed digits: one
+/// more than the unsigned `windowBitsUnsigned`, so `2^(c-1)` buckets — the
+/// same count as before — and fewer windows.
 fn windowBits(n: usize) usize {
+    return windowBitsUnsigned(n) + 1;
+}
+
+/// The unsigned window width `c ≈ log2(n) - 4`, capped at 8.
+fn windowBitsUnsigned(n: usize) usize {
     if (n < 4) return 2;
     if (n < 16) return 3;
     if (n < 64) return 4;
@@ -98,7 +104,7 @@ fn windowBits(n: usize) usize {
 }
 
 /// Bits `[bit_off, bit_off + c)` of a 32-byte big-endian scalar, as the
-/// little-endian window digit the bucket phase consumes.
+/// little-endian window digit.
 fn windowDigit(bytes: *const [32]u8, bit_off: usize, c: usize) usize {
     var digit: usize = 0;
     for (0..c) |i| {
@@ -110,30 +116,56 @@ fn windowDigit(bytes: *const [32]u8, bit_off: usize, c: usize) usize {
     return digit;
 }
 
+/// The signed base-`2^c` digits of a 256-bit scalar, least significant
+/// first: `s = Σ d_w·2^(c·w)` with `d_w ∈ [-2^(c-1), 2^(c-1))` (a raw digit
+/// `≥ 2^(c-1)` becomes `raw - 2^c` and carries 1 into the next window).
+/// `out.len` must be `ceil(256 / c) + 1` (the last window takes the carry).
+fn signedDigits(bytes: *const [32]u8, c: usize, out: []i16) void {
+    const half: i32 = @as(i32, 1) << @as(u5, @intCast(c - 1));
+    var carry: i32 = 0;
+    for (out, 0..) |*d, w| {
+        var v: i32 = @as(i32, @intCast(windowDigit(bytes, w * c, c))) + carry;
+        carry = 0;
+        if (v >= half) {
+            v -= 2 * half;
+            carry = 1;
+        }
+        d.* = @intCast(v);
+    }
+    std.debug.assert(carry == 0);
+}
+
 /// `sum_i scalars[i] * points[i]` in the group `G` (the `g1` or `g2`
-/// namespace). Pippenger: each 256-bit scalar is cut into `c`-bit windows;
-/// per window every point goes into the bucket of its digit, the buckets
-/// are summed with the running-sum trick (`sum_d d * bucket[d]` in
-/// `2 * (2^c - 1)` additions), and windows are folded most significant
+/// namespace). Pippenger over SIGNED `c`-bit digits (`signedDigits`): per
+/// window a point goes into bucket `|d|` (negated for `d < 0`), so
+/// `2^(c-1)` buckets do the work of `2^c - 1` unsigned ones and `c` can be
+/// one larger for the same bucket count (fewer windows). The buckets are
+/// summed with the running-sum trick (`sum_d d * bucket[d]` in
+/// `2 * 2^(c-1)` additions), and windows are folded most significant
 /// first with `c` doublings between them — `O(n * 256 / c)` additions
-/// against naive double-and-add's `O(n * 256)`. An empty input is the
-/// identity; identity points and zero scalars drop out. Allocates the
-/// scalar bytes and the buckets. Public data only.
+/// against naive double-and-add's `O(n * 256)`. The signed-digit form is
+/// what blst's and arkworks' Pippenger use (named, not read); the unsigned
+/// form this replaced stays as `msmUnsignedRef`, the bench baseline. An
+/// empty input is the identity; identity points and zero scalars drop
+/// out. Allocates the digits and the buckets. Public data only.
 pub fn msm(comptime G: type, allocator: std.mem.Allocator, points: []const G.Affine, scalars: []const Fr) MsmError!G.Jacobian {
     if (points.len != scalars.len) return error.LengthMismatch;
     if (points.len == 0) return G.Jacobian.identity;
 
-    // Serialize every scalar once up front (each window re-reads them).
-    const scalar_bytes = try allocator.alloc([32]u8, scalars.len);
-    defer allocator.free(scalar_bytes);
-    for (scalar_bytes, scalars) |*bytes, s| bytes.* = s.toBytes();
-
     const c = windowBits(points.len);
-    const n_buckets = (@as(usize, 1) << @as(std.math.Log2Int(usize), @intCast(c))) - 1; // digit 0 excluded
+    const n_windows = (256 + c - 1) / c + 1;
+    // Every scalar's signed digits once up front (each window re-reads them).
+    const digits = try allocator.alloc(i16, n_windows * scalars.len);
+    defer allocator.free(digits);
+    for (scalars, 0..) |s, i| {
+        const bytes = s.toBytes();
+        signedDigits(&bytes, c, digits[i * n_windows ..][0..n_windows]);
+    }
+
+    const n_buckets = @as(usize, 1) << @as(std.math.Log2Int(usize), @intCast(c - 1));
     const buckets = try allocator.alloc(G.Jacobian, n_buckets);
     defer allocator.free(buckets);
 
-    const n_windows = (256 + c - 1) / c;
     var acc = G.Jacobian.identity;
     var w = n_windows;
     while (w > 0) {
@@ -144,15 +176,61 @@ pub fn msm(comptime G: type, allocator: std.mem.Allocator, points: []const G.Aff
 
         @memset(buckets, G.Jacobian.identity);
         var any = false;
-        for (points, scalar_bytes) |point, *bytes| {
-            const digit = windowDigit(bytes, w * c, c);
-            if (digit == 0) continue;
-            buckets[digit - 1] = mixedAddVartime(G, buckets[digit - 1], point);
+        for (points, 0..) |point, i| {
+            const d = digits[i * n_windows + w];
+            if (d == 0) continue;
+            const b: usize = @abs(d) - 1;
+            const q = if (d > 0) point else negAffine(G, point);
+            buckets[b] = mixedAddVartime(G, buckets[b], q);
             any = true;
         }
         if (!any) continue;
 
         // sum_d (d+1) * buckets[d] via the running-sum trick.
+        var running = G.Jacobian.identity;
+        var window_sum = G.Jacobian.identity;
+        var d = n_buckets;
+        while (d > 0) {
+            d -= 1;
+            running = addVartime(G.Jacobian, running, buckets[d]);
+            window_sum = addVartime(G.Jacobian, window_sum, running);
+        }
+        acc = addVartime(G.Jacobian, acc, window_sum);
+    }
+    return acc;
+}
+
+fn negAffine(comptime G: type, p: G.Affine) G.Affine {
+    if (p.infinity) return p;
+    return .{ .x = p.x, .y = p.y.neg(), .infinity = false };
+}
+
+/// The unsigned-digit Pippenger `msm` ran before the signed digits
+/// (`windowBitsUnsigned`, `2^c - 1` buckets): the bench baseline.
+fn msmUnsignedRef(comptime G: type, allocator: std.mem.Allocator, points: []const G.Affine, scalars: []const Fr) MsmError!G.Jacobian {
+    if (points.len != scalars.len) return error.LengthMismatch;
+    if (points.len == 0) return G.Jacobian.identity;
+    const scalar_bytes = try allocator.alloc([32]u8, scalars.len);
+    defer allocator.free(scalar_bytes);
+    for (scalar_bytes, scalars) |*bytes, s| bytes.* = s.toBytes();
+    const c = windowBitsUnsigned(points.len);
+    const n_buckets = (@as(usize, 1) << @as(std.math.Log2Int(usize), @intCast(c))) - 1;
+    const buckets = try allocator.alloc(G.Jacobian, n_buckets);
+    defer allocator.free(buckets);
+    const n_windows = (256 + c - 1) / c;
+    var acc = G.Jacobian.identity;
+    var w = n_windows;
+    while (w > 0) {
+        w -= 1;
+        if (w != n_windows - 1) {
+            for (0..c) |_| acc = acc.double();
+        }
+        @memset(buckets, G.Jacobian.identity);
+        for (points, scalar_bytes) |point, *bytes| {
+            const digit = windowDigit(bytes, w * c, c);
+            if (digit == 0) continue;
+            buckets[digit - 1] = mixedAddVartime(G, buckets[digit - 1], point);
+        }
         var running = G.Jacobian.identity;
         var window_sum = G.Jacobian.identity;
         var d = n_buckets;
@@ -257,4 +335,91 @@ test "addVartime / mixedAddVartime agree with the constant-time add on every deg
         try testing.expectEqual(want, g2.toBytesCompressed(addVartime(g2.Jacobian, cs[0], cs[1]).toAffine()));
         try testing.expectEqual(want, g2.toBytesCompressed(mixedAddVartime(g2, cs[0], cs[1].toAffine()).toAffine()));
     }
+}
+
+test "signedDigits: digits in range and Σ d_w·2^(c·w) == the scalar, every window width" {
+    var prng = std.Random.DefaultPrng.init(0x516e);
+    const rnd = prng.random();
+    for (0..64) |t| {
+        var wide: [64]u8 = undefined;
+        rnd.bytes(&wide);
+        const s: Fr = switch (t) {
+            0 => Fr.zero,
+            1 => Fr.one,
+            2 => Fr.zero.sub(Fr.one), // r - 1
+            else => Fr.reduceWide(&wide),
+        };
+        const bytes = s.toBytes();
+        const want = std.mem.readInt(u256, &bytes, .big);
+        for (2..10) |c| {
+            var digits: [130]i16 = undefined;
+            const nw = (256 + c - 1) / c + 1;
+            signedDigits(&bytes, c, digits[0..nw]);
+            var got: i512 = 0;
+            var w = nw;
+            while (w > 0) {
+                w -= 1;
+                const d = digits[w];
+                try testing.expect(d >= -(@as(i32, 1) << @intCast(c - 1)) and d < (@as(i32, 1) << @intCast(c - 1)));
+                got = got * (@as(i512, 1) << @intCast(c)) + d;
+            }
+            try testing.expectEqual(@as(i512, want), got);
+        }
+    }
+}
+
+test "signed-digit msm == the unsigned Pippenger it replaced (G1 n = 300, G2 n = 40)" {
+    var prng = std.Random.DefaultPrng.init(0x516f);
+    const rnd = prng.random();
+    inline for (.{ .{ g1, 300 }, .{ g2, 40 } }) |gc| {
+        const G = gc[0];
+        const n = gc[1];
+        var points: [n]G.Affine = undefined;
+        var scalars: [n]Fr = undefined;
+        var p = G.Jacobian.fromAffine(G.Affine.generator);
+        for (&points, &scalars, 0..) |*pt, *s, i| {
+            pt.* = p.toAffine();
+            p = p.add(G.Jacobian.fromAffine(G.Affine.generator)).double();
+            var wide: [64]u8 = undefined;
+            rnd.bytes(&wide);
+            s.* = if (i % 9 == 0) Fr.zero.sub(Fr.one) else Fr.reduceWide(&wide);
+        }
+        const got = (try msm(G, testing.allocator, &points, &scalars)).toAffine();
+        const want = (try msmUnsignedRef(G, testing.allocator, &points, &scalars)).toAffine();
+        try testing.expectEqual(G.toBytesCompressed(want), G.toBytesCompressed(got));
+    }
+}
+
+test "bench: msm, unsigned vs signed digits (opt-in BLS12_381_BENCH)" {
+    const bench = @import("bench.zig");
+    if (!bench.enabled()) return error.SkipZigTest;
+    const n = 4096; // a blob's Lagrange basis
+    const gpa = std.heap.page_allocator; // global-alloc-ok: opt-in bench, one 400 KiB buffer outside the leak checker
+    const points = try gpa.alloc(g1.Affine, n);
+    defer gpa.free(points);
+    const scalars = try gpa.alloc(Fr, n);
+    defer gpa.free(scalars);
+    var prng = std.Random.DefaultPrng.init(0xbe7c);
+    const rnd = prng.random();
+    var p = g1.Jacobian.fromAffine(g1.Affine.generator);
+    for (points, scalars) |*pt, *s| {
+        pt.* = p.toAffine();
+        p = p.add(g1.Jacobian.fromAffine(g1.Affine.generator)).double();
+        var wide: [64]u8 = undefined;
+        rnd.bytes(&wide);
+        s.* = Fr.reduceWide(&wide);
+    }
+    const Ctx = struct { gpa: std.mem.Allocator, points: []const g1.Affine, scalars: []const Fr };
+    const S = struct {
+        fn unsigned(c: *const Ctx) void {
+            std.mem.doNotOptimizeAway(msmUnsignedRef(g1, c.gpa, c.points, c.scalars) catch unreachable);
+        }
+        fn signed(c: *const Ctx) void {
+            std.mem.doNotOptimizeAway(msm(g1, c.gpa, c.points, c.scalars) catch unreachable);
+        }
+    };
+    const ctx: Ctx = .{ .gpa = gpa, .points = points, .scalars = scalars };
+    bench.ab("G1 msm n=4096 (A unsigned, B signed)", 4, &ctx, S.unsigned, S.signed);
+    const small: Ctx = .{ .gpa = gpa, .points = points[0..64], .scalars = scalars[0..64] };
+    bench.ab("G1 msm n=64 (A unsigned, B signed)", 20, &small, S.unsigned, S.signed);
 }

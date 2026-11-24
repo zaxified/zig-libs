@@ -9,7 +9,8 @@ and ECDSA-P521 (RFC 6979), with the API shape of `std.crypto.ecc.P384` and
 
 - **Model after:** std's `P384` / `Ecdsa` (API); FIPS 186-5, SP 800-186, SEC 1,
   RFC 6979 (algorithms); OpenSSL `ecp_nistp521` as the differential oracle.
-- **Platform:** any (portable Zig, no asm). **Role:** crypto primitive.
+- **Platform:** any; on x86-64 with BMI2 the field multiply/square run an inline-asm MULX core,
+  elsewhere portable Zig. **Role:** crypto primitive.
   **Concurrency:** reentrant. **Deps:** `entropy` (fail-closed key generation).
 
 Provenance: original work of the zig-libs authors (MIT), written from the public

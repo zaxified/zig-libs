@@ -29,9 +29,8 @@
 //! was NOT used); the easy part was already real from the scaffold.
 //! Verified by the bilinearity property suite below PLUS a byte-exact
 //! `e(G1,G2)` KAT sourced from `ethereum/py_ecc` (see the KAT test's
-//! comment and `NOTICE`). Remaining `// TODO`s are optimizations only
-//! (sparse line multiplication, `pairingCheck`'s skip-the-hard-part
-//! shortcut).
+//! comment and `NOTICE`). The one remaining `// TODO` is an optimization
+//! (`pairingCheck`'s skip-the-hard-part shortcut).
 //!
 //! Zig std GAP: yes — nothing in `std` supplies pairing-friendly curve
 //! machinery; this file (and the field/group tower it sits on) is this
@@ -152,10 +151,9 @@ pub const PairingPair = struct {
 ///       values for — `doublingStep` fuses the two).
 ///    b. `f <- f^2 * l_0 * l_1 * ... * l_{n-1}` — ONE shared squaring of
 ///       the accumulator per bit (the "multi" payoff described above),
-///       times every pair's sparse line value from step (a). (Baseline,
-///       CORRECTNESS-FIRST path: `f.square()` then `f.mul(l_i)` for each
-///       `i`, using `Fp12`'s general `mul`/`square` — both real,
-///       `fp12.zig`.)
+///       times every pair's sparse line value from step (a), each folded in
+///       by the sparse multiply `mulByLine` (13 `Fp2.mul` instead of a
+///       dense `Fp12.mul`'s 18; the dense fold stays as its oracle).
 ///    c. **Addition step**, only on SET bits of `bls_x_abs`, once per
 ///       pair `i`: compute the line through `T_i` AND `Q_i` (NOT `2T_i`
 ///       and `Q_i` — `Q_i` itself, the FIXED original point for pair
@@ -178,26 +176,10 @@ pub const PairingPair = struct {
 ///    comment for why sharing exactly one final exponentiation over the
 ///    whole product matters) turns it into an actual `Gt` element.
 ///
-/// `// TODO`: step 2(b)'s baseline uses `Fp12.mul`/`.square` for every
-/// fold — the standard optimization (every serious pairing
-/// implementation applies it) is that a freshly-computed line value
-/// `l_i` is SPARSE (3 of its 6 `Fp2` coefficients nonzero — the "014"
-/// shape `lineValue` documents), so `f.mul(l_i)` could use a dedicated
-/// sparse-multiplication routine (far cheaper than `Fp12.mul`'s general
-/// 3x `Fp6.mul` Karatsuba) instead of promoting `l_i` to a dense
-/// `Fp12`. Deferred follow-up optimization, not a correctness issue —
-/// same "correct-simple first, fast-path later" policy `g1.zig`/
-/// `g2.zig`'s `subgroupCheck`/`clearCofactor` apply to their own
-/// deferred Bowe fast paths (`SPEC.md` Backlog).
-///
-/// ⚠ Measured before assuming it is the big one (ReleaseFast, `drand`'s 2-pair beacon check): dense `Fp12.mul` is
-/// 7.7 µs and the walk makes ~137 of them = 1.06 ms, plus 63 squarings
-/// at 5.7 µs = 0.36 ms. A sparse multiply saves a fraction of the
-/// former — worth roughly 0.3 ms of a then-10.01 ms verification. The
-/// INVERSIONS the affine point steps used to pay were worth 5.82 ms
-/// (see `TwistPoint`), twenty times more, and `SPEC.md` Backlog 1 had
-/// them the other way round: sparse multiplication as the headline,
-/// projective steps as a trailing clause. Fixed there too.
+/// What the walk costs (ReleaseFast, `drand`'s 2-pair beacon check): ~137
+/// line folds and 63 accumulator squarings per verification, after the
+/// point steps went inversion-free (see `TwistPoint`); the sparse fold is
+/// timed against the dense one by the opt-in bench test below.
 ///
 /// Special case handled explicitly (not merely falling out of the
 /// formulas above): a pair with `p.infinity` or `q.infinity` contributes
@@ -261,6 +243,13 @@ const TwistPoint = g2.Jacobian;
 /// are skipped entirely (contribute the factor `1` — the special case
 /// the doc comment requires to be explicit).
 fn millerLoopBatch(pairs: []const PairingPair) Fp12 {
+    return millerLoopBatchImpl(true, pairs);
+}
+
+/// `sparse = false` folds every line in as a dense `Fp12` (`lineValue` +
+/// `Fp12.mul`): the reference the sparse multiply is tested and benched
+/// against.
+fn millerLoopBatchImpl(comptime sparse: bool, pairs: []const PairingPair) Fp12 {
     std.debug.assert(pairs.len <= miller_batch_max);
     var ts: [miller_batch_max]TwistPoint = undefined;
     var live = @as([miller_batch_max]bool, @splat(false));
@@ -275,17 +264,58 @@ fn millerLoopBatch(pairs: []const PairingPair) Fp12 {
         f = f.square();
         for (pairs, 0..) |pair, j| {
             if (!live[j]) continue;
-            f = f.mul(doublingStep(&ts[j], pair.p));
+            f = fold(sparse, f, doublingStep(&ts[j], pair.p));
         }
         if ((bls_x_abs >> bit) & 1 == 1) {
             for (pairs, 0..) |pair, j| {
                 if (!live[j]) continue;
-                f = f.mul(additionStep(&ts[j], pair.q, pair.p));
+                f = fold(sparse, f, additionStep(&ts[j], pair.q, pair.p));
             }
         }
         if (bit == 0) break;
     }
     return f;
+}
+
+/// A line value's three nonzero `Fp2` coefficients (tower slots `c0.c0`,
+/// `c0.c1`, `c1.c1`; see `lineValue`).
+const Line = struct { c00: Fp2, c01: Fp2, c11: Fp2 };
+
+inline fn fold(comptime sparse: bool, f: Fp12, l: Line) Fp12 {
+    return if (sparse) mulByLine(f, l) else f.mul(lineValue(l.c00, l.c01, l.c11));
+}
+
+/// `f · l` for a sparse line value `l = (c00 + c01 v) + (c11 v) w`: the
+/// Karatsuba `Fp12.mul` with the zero coefficients dropped. `f.c0 · l.c0`
+/// and `(f.c0 + f.c1) · (l.c0 + l.c1)` multiply by an `Fp6` with a zero `v²`
+/// slot (`mulBy01`, 5 `Fp2.mul` instead of 6), `f.c1 · l.c1` by a lone `v`
+/// slot (`mulBy1`, 3): 13 `Fp2.mul` instead of the dense 18. The standard
+/// sparse step of every BLS12-381 Miller loop (blst's `mul_by_xy00z0`,
+/// zkcrypto's `mul_by_014`; named, not read); the dense product is the
+/// test oracle ("sparse line multiply == dense").
+fn mulByLine(f: Fp12, l: Line) Fp12 {
+    const v0 = mulBy01(f.c0, l.c00, l.c01);
+    const v1 = mulBy1(f.c1, l.c11);
+    return .{
+        .c0 = v0.add(v1.mulByNonresidue()),
+        .c1 = mulBy01(f.c0.add(f.c1), l.c00, l.c01.add(l.c11)).sub(v0).sub(v1),
+    };
+}
+
+/// `a · (b0 + b1 v)` in `Fp6` (`Fp6.mul`'s formula with `b2 = 0`).
+fn mulBy01(a: Fp6, b0: Fp2, b1: Fp2) Fp6 {
+    const t0 = a.c0.mul(b0);
+    const t1 = a.c1.mul(b1);
+    return .{
+        .c0 = a.c2.mul(b1).mulByNonresidue().add(t0),
+        .c1 = a.c0.add(a.c1).mul(b0.add(b1)).sub(t0).sub(t1),
+        .c2 = a.c2.mul(b0).add(t1),
+    };
+}
+
+/// `a · (b1 v)` in `Fp6`: `(ξ a2 b1, a0 b1, a1 b1)`.
+fn mulBy1(a: Fp6, b1: Fp2) Fp6 {
+    return .{ .c0 = a.c2.mul(b1).mulByNonresidue(), .c1 = a.c0.mul(b1), .c2 = a.c1.mul(b1) };
 }
 
 /// Builds the (dense-`Fp12`-promoted) D-type-twist line value: the line
@@ -307,7 +337,8 @@ fn millerLoopBatch(pairs: []const PairingPair) Fp12 {
 /// ```
 /// i.e. nonzero `Fp2` coefficients only at `1`, `v` (= `w^2`), and
 /// `v·w` (= `w^3`) — tower slots `c0.c0`, `c0.c1`, `c1.c1` (the sparse
-/// "014" shape; promoted dense here, see `multiMillerLoop`'s TODO).
+/// "014" shape `mulByLine` multiplies by; this dense promotion is its
+/// test oracle).
 /// `x_P, y_P ∈ Fp` embed as `Fp2` elements with zero `u` component, so
 /// the two products with `λ` are componentwise `Fp.mul`s.
 ///
@@ -365,7 +396,7 @@ fn mulByFp(a: Fp2, s: Fp) Fp2 {
 /// this — `pairing`'s inputs are on-curve by every decode path's
 /// `isOnCurve` check, and subgroup membership at trust boundaries is
 /// already the module-wide caller obligation, `SPEC.md`.)
-fn doublingStep(t: *TwistPoint, p: g1.Affine) Fp12 {
+fn doublingStep(t: *TwistPoint, p: g1.Affine) Line {
     std.debug.assert(!t.y.isZero() and !t.z.isZero());
     const xx = t.x.square();
     const yy = t.y.square();
@@ -379,7 +410,7 @@ fn doublingStep(t: *TwistPoint, p: g1.Affine) Fp12 {
     const c11 = mulByFp(two_y_z3, p.y);
 
     t.* = t.double();
-    return lineValue(c00, c01, c11);
+    return .{ .c00 = c00, .c01 = c01, .c11 = c11 };
 }
 
 /// Miller addition step: the chord line through `T` and the FIXED
@@ -407,7 +438,7 @@ fn doublingStep(t: *TwistPoint, p: g1.Affine) Fp12 {
 /// input the module-wide subgroup-check obligation (`SPEC.md`'s threat
 /// model) already excludes at trust boundaries, and a trap (not a
 /// silently wrong pairing) is the failure mode if violated.
-fn additionStep(t: *TwistPoint, q: g2.Affine, p: g1.Affine) Fp12 {
+fn additionStep(t: *TwistPoint, q: g2.Affine, p: g1.Affine) Line {
     const zz = t.z.square();
     const h = q.x.mul(zz).sub(t.x);
     const r = q.y.mul(zz).mul(t.z).sub(t.y);
@@ -419,7 +450,7 @@ fn additionStep(t: *TwistPoint, q: g2.Affine, p: g1.Affine) Fp12 {
     const c11 = mulByFp(z_h, p.y);
 
     t.* = t.add(TwistPoint.fromAffine(q));
-    return lineValue(c00, c01, c11);
+    return .{ .c00 = c00, .c01 = c01, .c11 = c11 };
 }
 
 /// The single-pair Miller loop `e`'s FIRST stage computes for `(p, q)` —
@@ -908,6 +939,76 @@ test "an Fp2 factor on a line value does not change the pairing" {
     // exactly the argument `lineValue`'s doc comment already makes for
     // the twisted-image evaluation's own `w^3` factor.
     try std.testing.expect(!finalExponentiation(raw.mul(raw)).eql(base));
+}
+
+test "sparse line multiply == dense Fp12.mul by the promoted line" {
+    var prng = std.Random.DefaultPrng.init(0x5ba75e);
+    const rand = prng.random();
+    for (0..16) |_| {
+        var a: [31]u8 = undefined;
+        var b: [31]u8 = undefined;
+        rand.bytes(&a);
+        rand.bytes(&b);
+        const p = g1Gen().scalarMulBytes(&a).toAffine();
+        const q = g2Gen().scalarMulBytes(&b).toAffine();
+        // A dense accumulator (a raw Miller value) and real line values from
+        // both step kinds, at a T that is not Q.
+        const f = millerLoop(p, q);
+        var t = TwistPoint.fromAffine(q);
+        const ld = doublingStep(&t, p);
+        const la = additionStep(&t, q, p);
+        try std.testing.expect(mulByLine(f, ld).eql(f.mul(lineValue(ld.c00, ld.c01, ld.c11))));
+        try std.testing.expect(mulByLine(f, la).eql(f.mul(lineValue(la.c00, la.c01, la.c11))));
+        // Every coefficient on its own, so a slot mix-up cannot cancel out.
+        const z = Fp2.zero;
+        for ([_]Line{ .{ .c00 = ld.c00, .c01 = z, .c11 = z }, .{ .c00 = z, .c01 = ld.c01, .c11 = z }, .{ .c00 = z, .c01 = z, .c11 = ld.c11 } }) |l| {
+            try std.testing.expect(mulByLine(f, l).eql(f.mul(lineValue(l.c00, l.c01, l.c11))));
+        }
+    }
+}
+
+test "the sparse Miller walk returns the dense walk's raw value" {
+    var prng = std.Random.DefaultPrng.init(0x5ba75f);
+    const rand = prng.random();
+    var pairs: [3]PairingPair = undefined;
+    for (&pairs) |*pr| {
+        var a: [31]u8 = undefined;
+        var b: [31]u8 = undefined;
+        rand.bytes(&a);
+        rand.bytes(&b);
+        pr.* = .{ .p = g1Gen().scalarMulBytes(&a).toAffine(), .q = g2Gen().scalarMulBytes(&b).toAffine() };
+    }
+    for (1..pairs.len + 1) |n| {
+        try std.testing.expect(millerLoopBatchImpl(true, pairs[0..n]).eql(millerLoopBatchImpl(false, pairs[0..n])));
+    }
+}
+
+test "bench: Miller loop, sparse vs dense line multiply (opt-in BLS12_381_BENCH)" {
+    const bench = @import("bench.zig");
+    if (!bench.enabled()) return error.SkipZigTest;
+    // drand's beacon check: two pairs, one shared walk.
+    var a: [31]u8 = @splat(0x11);
+    const b: [31]u8 = @splat(0x22);
+    var pairs: [2]PairingPair = undefined;
+    pairs[0] = .{ .p = g1Gen().scalarMulBytes(&a).toAffine(), .q = g2.Affine.generator };
+    a[0] = 0x33;
+    pairs[1] = .{ .p = g1Gen().scalarMulBytes(&a).toAffine(), .q = g2Gen().scalarMulBytes(&b).toAffine() };
+    const S = struct {
+        fn dense(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(millerLoopBatchImpl(false, ps));
+        }
+        fn sparse(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(millerLoopBatchImpl(true, ps));
+        }
+        fn checkDense(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(finalExponentiation(millerLoopBatchImpl(false, ps).conjugate()));
+        }
+        fn checkSparse(ps: *const [2]PairingPair) void {
+            std.mem.doNotOptimizeAway(finalExponentiation(millerLoopBatchImpl(true, ps).conjugate()));
+        }
+    };
+    bench.ab("miller 2-pair (A dense, B sparse)", 50, &pairs, S.dense, S.sparse);
+    bench.ab("pairing check 2-pair (A dense, B sparse)", 30, &pairs, S.checkDense, S.checkSparse);
 }
 
 const testkit = @import("testkit");

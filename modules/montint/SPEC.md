@@ -536,9 +536,11 @@ Consumer build options (CONVENTIONS §4.2):
 
 ## Backlog / deferred
 
-- *BOUNCED (owner):* **L=16 REDC + `condSubInto` (speed beyond P2)** — deferred by the owner until the http TLS server exists and is measured:
-  the REDC rows are 54 % of `pow` at L=16 (latency-bound `u = w·n0inv` chain) and `condSubInto` 7.7 %; estimate 10–20 %
-  on an RSA-2048 signature, unmeasured. No grade effect (P2 already).
+- *BOUNCED (quiet host):* **L=16 REDC + `condSubInto` (speed beyond P2).** The premise (a latency-bound `u = w·n0inv`
+  chain) does not hold: the block REDC's first chunk costs the same per product as the later ones, and the REDC is ~50 %
+  of a square because it is 256 of its ~392 products; `powMont`'s ladder already runs the top-only subtract
+  (`condSubTopInto`, ~4.6 %), not `condSubInto`. What is left is a few per cent at most, below this host's run-to-run
+  spread under load (`bench-montint` 4–45 %, `bench-rsa sign_2048` 15–21 % on 2026-11-24). No grade effect (P2 already).
 - *BOUNCED (hardware):* **aarch64 asm core (`UMULH`/`ADCS`)** (survey 2026-09-30): arm64 servers and phones run the portable CIOS only (~1.5×
   slower than amd64 asm at 2048 bits, by the module's own ff→portable→asm ratios). Effort M-L, untestable without arm64
   CI. Fits §2.

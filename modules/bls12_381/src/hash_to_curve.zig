@@ -26,23 +26,25 @@
 //!     shape over `Fp2`, onto the 3-isogenous curve `E2'` → 3-isogeny map
 //!     → `clear_cofactor` by that suite's own `h_eff`.
 //!
-//! **`clear_cofactor` here is `h_eff`-multiplication, NOT Part 1's
-//! `clearCofactor`** (which multiplies by the plain cofactor `h`): RFC
-//! 9380 §7 defines `clear_cofactor(P) := h_eff * P` with `h_eff` a
-//! FIXED suite parameter (§8.8.1: `0xd201000000010001`; §8.8.2: a
-//! 636-bit value), and states that when a suite's `h_eff` comes from a
-//! fast cofactor-clearing method — both BLS12-381 suites' do (Scott
-//! [WB19] for `G1`, Budroni-Pintore [BP17] for `G2`, per the RFC's own
-//! notes) — "scalar multiplication by the cofactor h does not
-//! generally give the same result as the fast method and MUST NOT be
-//! used". Confirmed empirically during this pass (`NOTICE`): `[h]R !=
-//! [h_eff]R` for the RFC's own vector points, both groups —
-//! multiplying by `h` lands in the right subgroup but on a DIFFERENT
-//! point, silently breaking suite conformance (the scaffold's original
-//! plan to reuse `g1.Jacobian.clearCofactor` here was therefore wrong
-//! and was corrected; `g1`/`g2`'s own `clearCofactor` remains correct
-//! for its own purpose — landing arbitrary points in the subgroup — it
-//! just is not RFC 9380's `clear_cofactor`).
+//! **`clear_cofactor` is `h_eff`-multiplication** (RFC 9380 §7:
+//! `clear_cofactor(P) := h_eff * P`, `h_eff` a FIXED suite parameter —
+//! §8.8.1: `0xd201000000010001`; §8.8.2: a 636-bit value). Both suites'
+//! `h_eff` come from a fast cofactor-clearing method (Scott [WB19] for
+//! `G1`, Budroni-Pintore [BP17] for `G2`), and "scalar multiplication by
+//! the cofactor h does not generally give the same result as the fast
+//! method and MUST NOT be used" (`[h]R != [h_eff]R` for the RFC's own
+//! vector points, both groups). `g1`/`g2`'s `Jacobian.clearCofactor` IS
+//! that fast method (`P + [|z|]P` for `G1`, RFC 9380 Appendix G.3's
+//! ψ-based chain for `G2`), so the suites call it; the test "clearCofactor
+//! == [h_eff]P" pins it against the plain `h_eff` multiplication on points
+//! outside the subgroup.
+//!
+//! **The isogeny maps run inversion-free** in the hash/encode pipelines
+//! (`isogenyMap11Jac`/`isogenyMap3Jac`: the rational map's denominators go
+//! into the Jacobian `Z`), so a `hash_to_curve` pays one inversion, the
+//! final `toAffine`, plus the SSWU's own `inv0` and square roots. The
+//! affine `isogenyMap11`/`isogenyMap3` stay public and pinned to the
+//! RFC's `Q0`/`Q1`.
 //!
 //! **`expand_message_xmd`** is the collection's one generic copy,
 //! `sha2.expandMessageXmd` (RFC 9380 §5.3.1, over std's `Sha256`); the
@@ -310,6 +312,12 @@ pub const g1_iso_b: Fp = Fp.fromBytes(hexBytes(48, "12e2908d11688030018b12e8753e
 /// the intermediate `sswuG1` produces and `isogenyMap11` consumes.
 pub const E1PrimeAffine = struct { x: Fp, y: Fp };
 
+/// `-B'/A'` for `E1'` (SSWU's `x1` factor), precomputed: `0x0793…9c7c`
+/// (derived with Python big integers; the test "SSWU -B/A constants"
+/// checks `A'·c == -B'`).
+const g1_sswu_neg_b_over_a: Fp = Fp.fromBytes(hexBytes(48, "0793154fd85631d966ef2470460c78f6a928ad9f5bdbfac21df39753aa278ba751bdfcf95a84188e29d670675e4c9c7c")) catch
+    @compileError("bls12_381: bad G1 SSWU -B/A");
+
 /// Simplified SWU (RFC 9380 §6.6.2 `map_to_curve_simple_swu`) mapping
 /// `u ∈ Fp` onto `E1': y'^2 = x'^3 + A'x' + B'` (`A' = g1_iso_a`,
 /// `B' = g1_iso_b`, `Z = g1_iso_z`).
@@ -342,7 +350,7 @@ pub fn sswuG1(u: Fp) E1PrimeAffine {
         // unreachable from here.
         g1_iso_b.mul(g1_iso_z.mul(g1_iso_a).inv0())
     else
-        g1_iso_b.neg().mul(g1_iso_a.inv0()).mul(Fp.one.add(tv1)); // (-B/A)(1 + tv1)
+        g1_sswu_neg_b_over_a.mul(Fp.one.add(tv1)); // (-B/A)(1 + tv1)
     const gx1 = x1.square().mul(x1).add(g1_iso_a.mul(x1)).add(g1_iso_b);
 
     const xy: E1PrimeAffine = if (gx1.sqrt()) |s|
@@ -477,6 +485,24 @@ pub fn isogenyMap11(p: E1PrimeAffine) g1.Affine {
     };
 }
 
+/// `isogenyMap11` without its two inversions, in Jacobian coordinates:
+/// with `Z = x_den·y_den`, `X = x_num·x_den·y_den²` and
+/// `Y = y'·y_num·x_den³·y_den²`, `X/Z² = x_num/x_den` and
+/// `Y/Z³ = y'·y_num/y_den`. A zero denominator gives `Z = 0`, the
+/// identity, as in `isogenyMap11`.
+fn isogenyMap11Jac(p: E1PrimeAffine) g1.Jacobian {
+    const x_num = evalPolyFp(&g1_iso_x_num, false, p.x);
+    const x_den = evalPolyFp(&g1_iso_x_den, true, p.x);
+    const y_num = evalPolyFp(&g1_iso_y_num, false, p.x);
+    const y_den = evalPolyFp(&g1_iso_y_den, true, p.x);
+    const xd_yd2 = x_den.mul(y_den.square());
+    return .{
+        .x = x_num.mul(xd_yd2),
+        .y = p.y.mul(y_num).mul(x_den.square()).mul(xd_yd2),
+        .z = x_den.mul(y_den),
+    };
+}
+
 /// `map_to_curve` for `G1` (RFC 9380 §8.8.1's `f`): `sswuG1` then
 /// `isogenyMap11` — the composition RFC 9380 §6.6.3 operations 1-2
 /// define. Pinned byte-exact against RFC 9380 Appendix J.9.1's
@@ -521,6 +547,15 @@ pub const g2_iso_b: Fp2 = .{
 /// `isogenyMap3` consumes.
 pub const E2PrimeAffine = struct { x: Fp2, y: Fp2 };
 
+/// `-B'/A'` for `E2'`: `-1012(1 + I)/(240 I) = (253/60)(-1 + I)`,
+/// precomputed (see `g1_sswu_neg_b_over_a`).
+const g2_sswu_neg_b_over_a: Fp2 = .{
+    .c0 = Fp.fromBytes(hexBytes(48, "083c12791abdd5d2fe2f284f0cc6e5aa9b8c2d3f6f3f792302cf75e62bfc4df1d6834443da498888725d8cccccccb1c3")) catch
+        @compileError("bls12_381: bad G2 SSWU -B/A"),
+    .c1 = Fp.fromBytes(hexBytes(48, "11c4ff711ec210c74cec7f673684c72cc8eb1e458445999c64615cbacab4a8324828bbbad70a777747a173333332f8e8")) catch
+        @compileError("bls12_381: bad G2 SSWU -B/A"),
+};
+
 /// Simplified SWU (RFC 9380 §6.6.2) mapping `u ∈ Fp2` onto
 /// `E2': y'^2 = x'^3 + A'x' + B'` (`A' = g2_iso_a`, `B' = g2_iso_b`,
 /// `Z = g2_iso_z`). Identical operation sequence to `sswuG1`'s doc
@@ -540,7 +575,7 @@ pub fn sswuG2(u: Fp2) E2PrimeAffine {
         // this x1 for E2' (verified numerically — see NOTICE).
         g2_iso_b.mul(g2_iso_z.mul(g2_iso_a).inv0())
     else
-        g2_iso_b.neg().mul(g2_iso_a.inv0()).mul(Fp2.one.add(tv1)); // (-B/A)(1 + tv1)
+        g2_sswu_neg_b_over_a.mul(Fp2.one.add(tv1)); // (-B/A)(1 + tv1)
     const gx1 = x1.square().mul(x1).add(g2_iso_a.mul(x1)).add(g2_iso_b);
 
     const xy: E2PrimeAffine = if (gx1.sqrt()) |s|
@@ -667,6 +702,20 @@ fn evalPolyFp2(coeffs: []const Fp2, monic: bool, x: Fp2) Fp2 {
     return acc;
 }
 
+/// `isogenyMap3` without its two inversions (see `isogenyMap11Jac`).
+fn isogenyMap3Jac(p: E2PrimeAffine) g2.Jacobian {
+    const x_num = evalPolyFp2(&g2_iso_x_num, false, p.x);
+    const x_den = evalPolyFp2(&g2_iso_x_den, true, p.x);
+    const y_num = evalPolyFp2(&g2_iso_y_num, false, p.x);
+    const y_den = evalPolyFp2(&g2_iso_y_den, true, p.x);
+    const xd_yd2 = x_den.mul(y_den.square());
+    return .{
+        .x = x_num.mul(xd_yd2),
+        .y = p.y.mul(y_num).mul(x_den.square()).mul(xd_yd2),
+        .z = x_den.mul(y_den),
+    };
+}
+
 /// `map_to_curve` for `G2` (RFC 9380 §8.8.2's `f`): `sswuG2` then
 /// `isogenyMap3`. Pinned byte-exact against RFC 9380 Appendix
 /// J.10.1's `Q0`/`Q1` intermediates (all 5 messages) by the tests
@@ -680,27 +729,22 @@ pub fn mapToCurveG2(u: Fp2) g2.Affine {
 /// `h_eff` for the `G1` suites (RFC 9380 §8.8.1): `0xd201000000010001`
 /// (= `1 - z` for BLS12-381's defining parameter `z` — the Scott
 /// [WB19] fast-clearing scalar), cited from the RFC's own text;
-/// big-endian, fed straight to `scalarMulBytes`. See the module doc
-/// comment for why RFC 9380's `clear_cofactor` MUST multiply by this
-/// and not by the plain cofactor `h1`.
+/// big-endian. `g1.Jacobian.clearCofactor` computes `[h_eff]P`; this
+/// value is the test oracle ("clearCofactor == [h_eff]P").
 const g1_h_eff_bytes: [8]u8 = hexBytes(8, "d201000000010001");
 
 /// `h_eff` for the `G2` suites (RFC 9380 §8.8.2) — the Budroni-Pintore
 /// [BP17] fast-clearing scalar, a 636-bit value cited from the RFC's
-/// own text (left-padded one nibble to 80 whole bytes); big-endian.
+/// own text (left-padded one nibble to 80 whole bytes); big-endian. The
+/// test oracle of `g2.Jacobian.clearCofactor`.
 const g2_h_eff_bytes: [80]u8 = hexBytes(80, "0bc69f08f2ee75b3584c6a0ea91b352888e2a8e9145ad7689986ff031508ffe1329c2f178731db956d82bf015d1212b02ec0ec69d7477c1ae954cbc06689f6a359894c0adebbf6b4e8020005aaa95551");
 
 /// `hash_to_curve` (RFC 9380 §3) for `G1`, suite
 /// `BLS12381G1_XMD:SHA-256_SSWU_RO_`: `hash_to_field(msg, 2)` → map each
 /// of the two field elements onto `E` via `mapToCurveG1` → add the two
-/// points (RFC 9380 §6.6.3's note: `iso_map` is a group homomorphism, so
-/// adding on `E1'` before applying it would save one `iso_map`
-/// evaluation — a documented optimization, NOT taken here; this
-/// baseline maps-then-adds on `E` for clarity, matching §3's literal
-/// algorithm) → `clear_cofactor`, i.e. multiplication by the suite's
-/// `h_eff` (RFC 9380 §7 — NOT `g1.Jacobian.clearCofactor`'s plain-`h1`
-/// multiplication, which §7 forbids for this suite and which produces
-/// a different point; see the module doc comment).
+/// points (inversion-free, `isogenyMap11Jac`; §3's literal order:
+/// map, then add on `E`) → `clear_cofactor`, i.e. `[h_eff]` by
+/// `g1.Jacobian.clearCofactor` (see the module doc comment).
 ///
 /// Pinned byte-exact against RFC 9380 Appendix J.9.1's final `P` (all
 /// 5 published messages) by the tests below.
@@ -719,9 +763,9 @@ pub fn hashToCurveG1Parts(parts: []const []const u8, dst: []const u8) g1.Affine 
 /// `expand_message` differs.
 pub fn hashToCurveG1PartsWith(comptime expander: Expander, parts: []const []const u8, dst: []const u8) g1.Affine {
     const u = hashToFieldFpPartsWith(expander, 2, parts, dst);
-    const q0 = g1.Jacobian.fromAffine(mapToCurveG1(u[0]));
-    const q1 = g1.Jacobian.fromAffine(mapToCurveG1(u[1]));
-    return q0.add(q1).scalarMulBytes(&g1_h_eff_bytes).toAffine();
+    const q0 = isogenyMap11Jac(sswuG1(u[0]));
+    const q1 = isogenyMap11Jac(sswuG1(u[1]));
+    return q0.add(q1).clearCofactor().toAffine();
 }
 
 /// `encode_to_curve` (RFC 9380 §3) for `G1`: the NONUNIFORM one-element
@@ -734,7 +778,7 @@ pub fn hashToCurveG1PartsWith(comptime expander: Expander, parts: []const []cons
 /// `BLS12381G1_XMD:SHA-256_SSWU_NU_`).
 pub fn encodeToCurveG1(msg: []const u8, dst: []const u8) g1.Affine {
     const u = hashToFieldFp(1, msg, dst);
-    return g1.Jacobian.fromAffine(mapToCurveG1(u[0])).scalarMulBytes(&g1_h_eff_bytes).toAffine();
+    return isogenyMap11Jac(sswuG1(u[0])).clearCofactor().toAffine();
 }
 
 /// `hash_to_curve` (RFC 9380 §3) for `G2`, suite
@@ -749,9 +793,9 @@ pub fn hashToCurveG2(msg: []const u8, dst: []const u8) g2.Affine {
 /// `hashToCurveG2` of `parts[0] || parts[1] || ...`, without concatenating.
 pub fn hashToCurveG2Parts(parts: []const []const u8, dst: []const u8) g2.Affine {
     const u = hashToFieldFp2Parts(2, parts, dst);
-    const q0 = g2.Jacobian.fromAffine(mapToCurveG2(u[0]));
-    const q1 = g2.Jacobian.fromAffine(mapToCurveG2(u[1]));
-    return q0.add(q1).scalarMulBytes(&g2_h_eff_bytes).toAffine();
+    const q0 = isogenyMap3Jac(sswuG2(u[0]));
+    const q1 = isogenyMap3Jac(sswuG2(u[1]));
+    return q0.add(q1).clearCofactor().toAffine();
 }
 
 /// `encode_to_curve` (RFC 9380 §3) for `G2` — see `encodeToCurveG1`'s
@@ -759,7 +803,7 @@ pub fn hashToCurveG2Parts(parts: []const []const u8, dst: []const u8) g2.Affine 
 /// `BLS12381G2_XMD:SHA-256_SSWU_NU_`).
 pub fn encodeToCurveG2(msg: []const u8, dst: []const u8) g2.Affine {
     const u = hashToFieldFp2(1, msg, dst);
-    return g2.Jacobian.fromAffine(mapToCurveG2(u[0])).scalarMulBytes(&g2_h_eff_bytes).toAffine();
+    return isogenyMap3Jac(sswuG2(u[0])).clearCofactor().toAffine();
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -1391,6 +1435,104 @@ test "expandMessageXof(SHAKE-256): a DST over 255 bytes is reduced per RFC 9380 
     h2.update(at_limit);
     h2.squeeze(&r255);
     try std.testing.expect(!std.mem.eql(u8, &expandMessageXof(0x40, "msg", &r255), &expandMessageXof(0x40, "msg", at_limit)));
+}
+
+test "SSWU -B/A constants: A'·c == -B' for both iso curves" {
+    try std.testing.expect(g1_iso_a.mul(g1_sswu_neg_b_over_a).eql(g1_iso_b.neg()));
+    try std.testing.expect(g2_iso_a.mul(g2_sswu_neg_b_over_a).eql(g2_iso_b.neg()));
+}
+
+test "inversion-free isogeny maps == the affine maps (RFC Q0/Q1 pinned)" {
+    var prng = std.Random.DefaultPrng.init(0x15011);
+    const rand = prng.random();
+    for (0..24) |t| {
+        var b: [64]u8 = undefined;
+        rand.bytes(&b);
+        const u = hashToFieldFp(1, &b, "ISO-JAC-TEST")[0];
+        const v = hashToFieldFp2(1, &b, "ISO-JAC-TEST")[0];
+        const u_ = if (t == 0) Fp.zero else u;
+        const v_ = if (t == 0) Fp2.zero else v;
+        const a1 = isogenyMap11(sswuG1(u_));
+        const j1 = isogenyMap11Jac(sswuG1(u_)).toAffine();
+        try std.testing.expect(a1.infinity == j1.infinity);
+        if (!a1.infinity) try std.testing.expect(a1.x.eql(j1.x) and a1.y.eql(j1.y));
+        const a2 = isogenyMap3(sswuG2(v_));
+        const j2 = isogenyMap3Jac(sswuG2(v_)).toAffine();
+        try std.testing.expect(a2.infinity == j2.infinity);
+        if (!a2.infinity) try std.testing.expect(a2.x.eql(j2.x) and a2.y.eql(j2.y));
+    }
+}
+
+test "clearCofactor == [h_eff]P on points outside the subgroup (both groups)" {
+    var prng = std.Random.DefaultPrng.init(0xC1EA7);
+    const rand = prng.random();
+    var outside1: usize = 0;
+    var outside2: usize = 0;
+    for (0..12) |_| {
+        var b: [64]u8 = undefined;
+        rand.bytes(&b);
+        // map_to_curve outputs are on E/E' but in general NOT in G1/G2.
+        const p1 = g1.Jacobian.fromAffine(mapToCurveG1(hashToFieldFp(1, &b, "COFACTOR-TEST")[0]));
+        const p2 = g2.Jacobian.fromAffine(mapToCurveG2(hashToFieldFp2(1, &b, "COFACTOR-TEST")[0]));
+        if (!p1.subgroupCheck()) outside1 += 1;
+        if (!p2.subgroupCheck()) outside2 += 1;
+        const c1 = p1.clearCofactor();
+        const c2 = p2.clearCofactor();
+        try std.testing.expect(eqlAffine1(c1.toAffine(), p1.scalarMulBytes(&g1_h_eff_bytes).toAffine()));
+        try std.testing.expect(eqlAffine2(c2.toAffine(), p2.scalarMulBytes(&g2_h_eff_bytes).toAffine()));
+        try std.testing.expect(c1.subgroupCheck() and c2.subgroupCheck());
+        // and NOT the plain cofactor multiple (RFC 9380 §7's warning)
+        try std.testing.expect(!eqlAffine2(c2.toAffine(), p2.scalarMulBytes(&g2.cofactor_bytes).toAffine()));
+    }
+    try std.testing.expect(outside1 > 0 and outside2 > 0);
+    try std.testing.expect(g1.Jacobian.identity.clearCofactor().isIdentity());
+    try std.testing.expect(g2.Jacobian.identity.clearCofactor().isIdentity());
+}
+
+fn eqlAffine1(a: g1.Affine, b: g1.Affine) bool {
+    if (a.infinity or b.infinity) return a.infinity == b.infinity;
+    return a.x.eql(b.x) and a.y.eql(b.y);
+}
+
+fn eqlAffine2(a: g2.Affine, b: g2.Affine) bool {
+    if (a.infinity or b.infinity) return a.infinity == b.infinity;
+    return a.x.eql(b.x) and a.y.eql(b.y);
+}
+
+test "bench: hash_to_curve, previous pipeline vs inversion-free isogeny + fast cofactor clearing (opt-in BLS12_381_BENCH)" {
+    const bench = @import("bench.zig");
+    if (!bench.enabled()) return error.SkipZigTest;
+    const dst = "QUUX-V01-CS02-with-BLS12381G2_XMD:SHA-256_SSWU_RO_";
+    const msg: []const u8 = "abcdef0123456789";
+    const S = struct {
+        fn oldG2(m: []const u8) void {
+            const u = hashToFieldFp2(2, m, dst);
+            const q0 = g2.Jacobian.fromAffine(mapToCurveG2(u[0]));
+            const q1 = g2.Jacobian.fromAffine(mapToCurveG2(u[1]));
+            std.mem.doNotOptimizeAway(q0.add(q1).scalarMulBytes(&g2_h_eff_bytes).toAffine());
+        }
+        fn newG2(m: []const u8) void {
+            std.mem.doNotOptimizeAway(hashToCurveG2(m, dst));
+        }
+        fn oldG1(m: []const u8) void {
+            const u = hashToFieldFp(2, m, dst);
+            const q0 = g1.Jacobian.fromAffine(mapToCurveG1(u[0]));
+            const q1 = g1.Jacobian.fromAffine(mapToCurveG1(u[1]));
+            std.mem.doNotOptimizeAway(q0.add(q1).scalarMulBytes(&g1_h_eff_bytes).toAffine());
+        }
+        fn newG1(m: []const u8) void {
+            std.mem.doNotOptimizeAway(hashToCurveG1(m, dst));
+        }
+        fn isoAff(m: []const u8) void {
+            std.mem.doNotOptimizeAway(isogenyMap3(sswuG2(hashToFieldFp2(1, m, dst)[0])));
+        }
+        fn isoJac(m: []const u8) void {
+            std.mem.doNotOptimizeAway(isogenyMap3Jac(sswuG2(hashToFieldFp2(1, m, dst)[0])));
+        }
+    };
+    bench.ab("hashToCurveG2 (A previous, B new)", 40, msg, S.oldG2, S.newG2);
+    bench.ab("hashToCurveG1 (A previous, B new)", 100, msg, S.oldG1, S.newG1);
+    bench.ab("G2 hash+sswu+iso one point (A affine iso, B Jacobian iso)", 100, msg, S.isoAff, S.isoJac);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

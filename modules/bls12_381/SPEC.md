@@ -149,8 +149,11 @@ design" below.
   untwisted line by a fixed `w^3` factor per line, which the final
   exponentiation provably kills (`(w^3)^((p^12-1)/r) = 1`, derivation in
   `lineEval`'s doc comment) — giving the sparse `c0.c0/c0.c1/c1.c1`
-  ("014") shape, promoted to a dense `Fp12.mul` (`pairing.zig`; the
-  sparse multiply is open, Backlog). Multi-pairing shares one seed-bit
+  ("014") shape, folded into the accumulator by the sparse multiply
+  `mulByLine` (`pairing.zig`: `Fp6` products by `(b0, b1, 0)` and `(0, b1, 0)`,
+  13 `Fp2.mul` instead of a dense `Fp12.mul`'s 18; the dense fold is its
+  oracle — same raw Miller value). Measured (in-process A/B, two runs):
+  a 2-pair Miller loop 0.81–0.83×, a 2-pair pairing check 0.88–0.93×. Multi-pairing shares one seed-bit
   walk + one accumulator per batch of up to 8 pairs
   (`miller_batch_max`, `pairing.zig`; fixed stack storage,
   allocation-free; the batch product is exact — squaring distributes — so
@@ -208,21 +211,33 @@ design" below.
   Appendix E.2/E.3 rational isogeny maps back onto `G1`/`G2`'s actual
   curves — Horner evaluation over the 53-/13-coefficient tables, monic
   leading denominator terms implicit, zero-denominator exceptional case
-  → identity). The SSWU `tv1 == 0` exceptional branch's totality (its
+  → identity). Inside `hash_to_curve`/`encode_to_curve` the maps run
+  inversion-free (`isogenyMap11Jac`/`isogenyMap3Jac`: `Z = x_den·y_den`,
+  `X = x_num·x_den·y_den²`, `Y = y'·y_num·x_den³·y_den²`; a zero denominator
+  is `Z = 0`, the identity), and SSWU's `-B'/A'` is a precomputed constant,
+  so a hash pays the SSWU `inv0`s and square roots plus one final
+  `toAffine` inversion. The SSWU `tv1 == 0` exceptional branch's totality (its
   `g(B/(Z*A))` is always a QR, so the gx2 fallback never fails) was
   verified numerically — see `NOTICE`.
 - **`clear_cofactor` = `h_eff` multiplication, NOT plain-cofactor
-  multiplication.** Reusing Part 1's `clearCofactor` (multiply by the true cofactor `h`) as "valid per §7" is WRONG for these suites: §7 pins `clear_cofactor(P) := h_eff * P` (a fixed suite
-  parameter, §8.8.1/§8.8.2) and explicitly says plain-`h` multiplication
-  "does not generally give the same result ... and MUST NOT be used"
-  when `h_eff` comes from a fast clearing method (both BLS12-381
-  suites' do). Confirmed empirically: `[h]R != [h_eff]R` on the RFC's
-  own vector points, both groups — same subgroup, different point, so
-  the J.9.1/J.10.1 final-`P` KATs would fail with `h`. The compositions
-  multiply by the suites' `h_eff` via `scalarMulBytes` (`NOTICE`
-  entry 21); `g1`/`g2.Jacobian.clearCofactor` remains what it always
-  was — a correct way to land arbitrary points in the subgroup — it
-  just is not RFC 9380's `clear_cofactor`.
+  multiplication.** §7 pins `clear_cofactor(P) := h_eff * P` (a fixed suite
+  parameter, §8.8.1/§8.8.2) and says plain-`h` multiplication "does not
+  generally give the same result ... and MUST NOT be used" when `h_eff`
+  comes from a fast clearing method (both BLS12-381 suites' do). Confirmed
+  empirically: `[h]R != [h_eff]R` on the RFC's own vector points, both
+  groups (`NOTICE` entry 21). `g1`/`g2.Jacobian.clearCofactor` compute
+  `[h_eff]P` by the fast methods, which the compositions call: `G1` is
+  `P + [|z|]P` (Scott [WB19], `h_eff = 1 − z`), `G2` RFC 9380 Appendix G.3's
+  ψ chain (Budroni-Pintore [BP17]: two `[|z|]` chains, three ψ, five
+  additions) — the same `[h_eff]` blst's hash-to-curve, zkcrypto's
+  `clear_cofactor` and gnark-crypto's `ClearCofactor` compute. Both use the
+  complete branchless group law over the fixed public `|z|`, so they stay
+  constant time in the point. Test "clearCofactor == [h_eff]P" pins them
+  against the plain `[h_eff]` multiplication on points outside the
+  subgroup. Measured (in-process A/B, two runs, against the previous
+  pipeline: affine isogeny + 636-/64-bit `h_eff` double-and-add-always):
+  `hashToCurveG2` 2.41–2.44 ms → 0.93 ms (0.38×), `hashToCurveG1` 398–402 →
+  241 µs (0.60×).
 - **`expand_message_xof` (SHAKE-256)**: RFC 9380 §5.3.2, for the
   `BLS12381G1_XOF:SHAKE-256_SSWU_RO_` suite of draft-irtf-cfrg-bbs-signatures
   Appendix A.1 (`hashToCurveG1PartsWith(.xof_shake256, ..)`; G2 has no XOF
@@ -422,7 +437,7 @@ design" below.
 - **Part 4 constant-time choices.** The SECRET-key
   paths — `keyGen`, `skToPk`, `sign`, `popProve` — touch `sk` only via
   `Fr`'s constant-time arithmetic (`montint.Field`; `std.crypto.ff` is not constant-time — see above) and Part 1's constant-time
-  double-and-add-always `scalarMul` (`skToPk` on `G1`, `sign`/`popProve`
+  fixed-window `scalarMul` (`skToPk` on `G1`, `sign`/`popProve`
   on `G2`); they contain no secret-dependent branches or memory
   accesses (`keyGen`'s retry loop branches only on the derived scalar
   being exactly zero — probability ~2^-255, and the draft's own
@@ -489,7 +504,8 @@ design" below.
     scalar multiplications stay on the constant-time engine (not worth
     a vartime path).
   - **`g1Msm` is Pippenger's bucket method** over the vartime helpers:
-    `c`-bit windows (`c` by input size, capped at 8), per-window bucket
+    signed `c`-bit digits (`c` by input size, capped at 9; `2^(c-1)`
+    buckets, a negative digit adds the negated point), per-window bucket
     accumulation via mixed addition, running-sum aggregation,
     most-significant-window-first folding with `c` doublings between
     windows — `O(n·256/c)` mixed additions versus naive double-and-add's
@@ -577,7 +593,7 @@ design" below.
     arithmetic; loop bound and evaluation point are public.
   - `feldmanCommitCoefficient` (`[coeff]G1` for a secret coefficient):
     `g1.Jacobian.scalarMul`, Part 1's constant-time
-    double-and-add-always ladder — exactly `bls_sig.skToPk`'s path.
+    fixed-window multiply — exactly `bls_sig.skToPk`'s path.
   - `partialSign` (secret share scalar): reuses Part 4's `bls_sig.sign`
     wholesale, i.e. `g2.zig`'s constant-time `scalarMul`.
   - `combineSignatures`' Lagrange coefficients are computed from PUBLIC
@@ -666,11 +682,15 @@ design" below.
   - `Fp2.sqrt`/`recoverY`/`toAffine`/deserialization are public-input
     paths and may branch (they do: on QR-ness, the sort bit, and
     identity).
-  - `G1`/`G2` `scalarMul`/`scalarMulBytes` are constant-time
-    double-and-add-ALWAYS: one `double` + one complete `add` +
-    `ctSelect` accumulator update per bit, no secret-dependent branch
-    or memory access (only the scalar's LENGTH, static per call site,
-    is visible). Point `add` is COMPLETE via branchless resolution:
+  - `G1`/`G2` `scalarMul`/`scalarMulBytes` are a constant-time FIXED
+    4-bit WINDOW: a 16-entry table `[0]P … [15]P`, then per nibble four
+    doublings, a `ctSelect` scan of all 16 entries (no secret-indexed
+    load) and one complete `add` — no secret-dependent branch or memory
+    access (only the scalar's LENGTH, static per call site, is visible).
+    The binary double-and-add-always form (one `double` + one `add` +
+    `ctSelect` per bit) is the test oracle `scalarMulBytesBinary`; against
+    it a 256-bit scalar costs 0.44–0.46× in `G1` and `G2` (in-process A/B,
+    two runs). Point `add` is COMPLETE via branchless resolution:
     the general `add-2007-bl` result and `double(a)` are both fully
     computed, then the degenerate cases (identity operands, `P == Q`,
     `P == -Q`) are folded in with `ctSelect` masks — no branch on which
@@ -869,6 +889,15 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
 - **Other hash-to-curve suites.** The two `_XMD:SHA-256_SSWU_RO_`/`_NU_` pairs and the `G1` SHAKE-256
   suite (BBS) are implemented; no `G2` XOF variant (no consumer).
 - **Constant-time pairing, hash-to-curve, KZG.** They operate on public data; see the threat model.
+- **Hash-to-curve add-before-isogeny** (RFC 9380 §6.6.3's note: add `Q0 + Q1` on `E1'`/`E2'`, map
+  once). With the inversion-free isogeny maps the saved evaluation is one polynomial set — ~13
+  `Fp2.mul` for `G2`, ~53 `Fp.mul` for `G1`, a few µs of a 0.93 ms / 241 µs hash — and the
+  addition on `E'` (`a ≠ 0`) needs its own Jacobian formula plus a homogenised map: no measurable
+  gain for a second group law.
+- **A cached bit-reversal-permuted Lagrange basis on `TrustedSetup`** (c-kzg-4844 stores
+  `g1_values_lagrange_brp`). The per-call permutation measured 246 µs against a 95.8 ms blob
+  commitment (0.26 %; A/B 1.001×, in-process), below the run-to-run spread, and caching it beside
+  the natural-order `g1_lagrange` would add 4096 points (~400 KiB) to every setup.
 - **Variable-time public-scalar `scalarMul`, a secret-exponent `Fp2.pow` ladder, a cheaper
   `pairingCheck` not-equal-to-one test** as public API: no consumer asks for them, and blst (the
   reference) exposes none of the three (its `blst_p1_mult`/`blst_p2_mult` are the constant-time
@@ -876,24 +905,11 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
 
 ## Backlog / deferred
 
-- **Sparse Miller-loop multiplication.** A fresh line value is structurally sparse (3 nonzero `Fp2`
-  coefficients of 6, the "014" shape `lineValue` documents); the baseline promotes it to a dense
-  `Fp12` (`pairing.zig`). A dedicated sparse multiply is a well-known follow-up
-  (`multiMillerLoop`'s own `TODO`), a fraction of the verification cost now that the point steps are
-  inversion-free; measure before building.
-- **Fast cofactor clearing.** `g1`/`g2` `clearCofactor` multiply by the plain cofactor
-  (`g2.zig`); Bowe's untwist-Frobenius-twist technique is cheaper. For hash-to-curve the same
-  holds for the `h_eff` step (Scott [WB19] for `G1`, Budroni-Pintore [BP17]/Appendix G.3 for `G2`):
-  today it is the generic constant-time `scalarMulBytes`, and `G2`'s 636-bit `h_eff` is the dominant
-  hash-to-curve cost.
-- **Hash-to-curve: add-before-isogeny.** §6.6.3's homomorphism trick (add on `E1'` before `iso_map`)
-  saves one isogeny evaluation per `hash_to_curve`; a variable-time public-scalar multiplication for
-  the `h_eff` step (the message is public).
-- **Fixed-window scalar multiplication** (currently constant-time double-and-add-always,
-  `g1.zig`).
-- **MSM beyond baseline Pippenger.** Signed/NAF digits, affine batch-inverted bucket additions,
-  per-window parallelism (each addition still pays full Jacobian arithmetic); a cached
-  bit-reversal-permuted Lagrange basis on `TrustedSetup` (currently re-permuted per commitment/proof).
+- **MSM beyond signed-digit Pippenger.** Affine batch-inverted bucket additions and per-window
+  parallelism (each bucket addition still pays a Jacobian mixed addition). The batch inversion
+  amortizes one `Fp.inv` — Fermat's `a^(p-2)`, about 450 multiplications here — over the batch, so
+  it pays only with batches of ~100+ distinct buckets; a fast variable-time inversion would lower
+  that bar.
 
 ## Roadmap
 

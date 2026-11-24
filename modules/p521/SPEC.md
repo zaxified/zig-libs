@@ -34,8 +34,7 @@ source was read: OpenSSL and Go by their documentation and `openssl speed` / Go'
 operation (ECDH 0.97×, sign 0.74×, verify 0.84×) and 3–5× faster than Go's standard library on the
 same host; RFC 6979 signatures byte-identical to OpenSSL's; ctgrind-checked
 secret paths and a dead-stack burn (neither Go nor RustCrypto states a machine check).
-**Where we are behind:** no measured fastest (aws-lc's s2n-bignum kernels; the portable field
-multiply has no MULX/ADX path → Backlog), no hash-to-curve (→ *What is deliberately not done*; none of the compared
+**Where we are behind:** no measured fastest (aws-lc's s2n-bignum kernels → Backlog), no hash-to-curve (→ *What is deliberately not done*; none of the compared
 libraries ships it for P-521 either). Key codecs (PKCS#8/SPKI/PEM) deliberately live with the
 consumers, as Go keeps them in `crypto/x509`.
 
@@ -50,7 +49,7 @@ is that curve, with std's API shape so the consumers swap a type.
 
 Wired into ssh, x509, jwt, hpke and acme (their `p521` dependency).
 
-**Not here:** asm; hash-to-curve (RFC 9380
+**Not here:** hash-to-curve (RFC 9380
 P521_XMD:SHA-512_SSWU, which `voprf` implements for its P521 suite; *What is deliberately not done*); PKCS#8/SPKI key codecs
 (the consumers own their ASN.1); point compression on the ECDH *output*
 (ECDH returns the x-coordinate only, as SEC 1 specifies).
@@ -77,6 +76,24 @@ x519, then ·2² ·a). Square root: a^((p+1)/4) = a^(2^519), checked by squaring
 Hand-written from the definition (owner decision 2026-10-10: Mersenne,
 clean-room, no vendored fiat-crypto); held by a wide-integer differential and a
 worst-case-limb test (*Anchoring*).
+
+**amd64 MULX core** (`field.zig`, `mulx_core`: x86-64 with BMI2, LLVM backend):
+`mul`/`sq` run the same nine u128 columns in inline asm. The operands stay in
+memory (`mul`: `b` and `2b` side by side, so column `k`'s product with `a[i]`
+reads a fixed offset for every `i`; `sq`: `a`, `2a`, `4a`); `rdx` is loaded once
+per pair of columns and each product is `mulx` + `add`/`adc` into one of two
+independent accumulator pairs. `reduceWide`'s carry chain runs in the same asm,
+column by column, so nothing is stored and reloaded; the limbs equal the
+portable ones bit for bit (differential "MULX core == portable", 20 000 cases up
+to the `2^61` input bound, plus every test above, which runs the core on such
+a host). Straight-line, no secret-dependent address or branch. The portable
+forms stay as `mulPortable`/`sqPortable` (every other target, and the oracle).
+Measured (in-process A/B on the same host, ReleaseFast, best of 5 × 200, three
+interleaved rounds, the portable side inlined exactly as before): sign 159 →
+134–141 µs (0.84×), key generation 124–133 → 107–121 µs (0.86×), ECDH 362–371 →
+345–362 µs (~0.95×), verify 420–441 → 414–418 µs (~0.98×). The latency-chained
+`fe.sq` micro-bench is no faster in asm (34–38 vs 34–37 ns): the gain comes in
+the inlined point formulas, where LLVM spilled the portable schoolbook.
 
 **Scalars** (`scalar.zig`) — n has no special form: Montgomery, nine 64-bit
 limbs, R = 2^576, CIOS with one masked final subtraction (valid for a < R,
@@ -149,7 +166,8 @@ positive control `vartime` (a tainted scalar into `mulPublic`) reports in-file c
 `>=1`) — the harness does see this module.
 Every secret-bit mask in field, scalar and group goes through
 `ct.blackBox` (an empty inline-asm barrier, so LLVM cannot turn a mask back into a branch); the remaining `if`s test
-public values (encodings, error paths).
+public values (encodings, error paths). The amd64 MULX core is straight-line asm (`mulx`/`add`/`adc`/`and`/`shr`/`shrd`/
+`mov`, fixed offsets from pinned pointers); the rows above measure it on the CPU they run on (ADX/BMI2 present).
 
 **Declassified, not absent** (`ct.zig`; each a value the API reveals):
 
@@ -227,7 +245,8 @@ by-value forms carry `secret-api-ok` with the `*Into` twin named).
 
 `P521_BENCH=1 scripts/modtest p521 -Doptimize=ReleaseFast` (`src/bench.zig`) against `openssl speed -seconds 2
 ecdsap521 ecdhp521` on the same host: ECDH, sign and verify against OpenSSL's `ecp_nistp521`, and key generation;
-the card's `**Performance:**` line holds the current figures. The fastest implementation in the field is not
+the card's `**Performance:**` line holds the current figures (measured before the MULX core; its own A/B is under
+*Algorithm*). The field bench times `mul`/`sq` next to `mulPortable`/`sqPortable` in the same run. The fastest implementation in the field is not
 measured (aws-lc is the likely one).
 
 ## Build options
@@ -252,8 +271,5 @@ Performance line is measured on it.
 
 ## Backlog / deferred
 
-- **amd64 MULX/ADX field multiply** — the portable u128 schoolbook only
-  (LLVM spills it: 543 instructions for 81 `mulx`). The lever for P1 (fastest
-  ≤ 1.25×) once aws-lc is measured.
 - **Measure the fastest in the field** — aws-lc's P-521
   (s2n-bignum) is the likely candidate; until then the card says `fastest ?`.

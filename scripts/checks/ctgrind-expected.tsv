@@ -658,8 +658,8 @@ bls12_381	ReleaseFast	field	1	1	34554e58b5249b0f	c1e8a3c184eada53
 # the authorities); ibe's Miller loop over `d_id` (the pairing makes no
 # constant-time claim — ibe SPEC); and the FO re-encryption compare in ibe/tlock
 # decrypt (`std.mem.eql`, accept/reject public by the code's own comment).
-bls12_381	ReleaseFast	g1_scalarmul	1	2	a53afeb243631625	b53b0d7808e48c1c
-bls12_381	ReleaseFast	g2_scalarmul	1	2	f52d92eaa06ff72f	7f4e15a241002b3f
+bls12_381	ReleaseFast	g1_scalarmul	1	2	31721074ff468564	b53b0d7808e48c1c
+bls12_381	ReleaseFast	g2_scalarmul	1	2	8603d8cf833d0d9b	7f4e15a241002b3f
 # Re-pin 2026-09-15. Every moved bound below was diffed context-by-context
 # against a --stacks run of the tree at 0c0ef527:
 #   bip340 sign 79 -> 80   The F5 seam (f3c75612) moved sign's body into
@@ -2066,12 +2066,12 @@ aes192	ReleaseFast	bitsliced	1	0	afd4c1d207f501f7	5ea64f081b0ffcbb
 # limbs and the product now comes back as (X·Z : Y : Z³) of the Jacobian
 # point — the same point (tests compare SEC1 bytes against the old RCB
 # ladder); `ecdh`/`keygen`/`sign` print affine bytes and did not move.
-p521	ReleaseFast	mul	1	0	81f19c2525402551	7bcb91b4acac23e9
-p521	ReleaseFast	keygen	1	0	cd16839139d26b25	b44de7eb8b02a855
-p521	ReleaseFast	sign	1	0	35463104fcf3387e	b620c1c667ef0084
-p521	ReleaseFast	ecdh	1	0	81f19c2525402551	a348bd01a2bccfcc
-p521	ReleaseFast	vartime	1	>=1	cc94666020cafe57	11557f4b46d4c2af
-p521	ReleaseFast	cmov	1	0	3751c0b8139c4367	d38ed19668c79445
+p521	ReleaseFast	mul	1	0	9602bed138bb6e45	7bcb91b4acac23e9
+p521	ReleaseFast	keygen	1	0	7d55dea7b8eac13a	b44de7eb8b02a855
+p521	ReleaseFast	sign	1	0	71ff6bce22c0b20b	b620c1c667ef0084
+p521	ReleaseFast	ecdh	1	0	9602bed138bb6e45	a348bd01a2bccfcc
+p521	ReleaseFast	vartime	1	>=1	efd2338233d4c6ab	11557f4b46d4c2af
+p521	ReleaseFast	cmov	1	0	3dbfafe786e653d5	d38ed19668c79445
 # p384 (2026-10-13) — NIST P-384, new module (p521's algorithms over a Montgomery
 # field with an amd64 MULX/ADX core, fast_core.zig — CPU skylake has ADX, so the
 # asm path is the one measured). mul / keygen / sign / ecdh: secret tainted end to

@@ -25,6 +25,7 @@
 //! no limb goes negative.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ct = @import("ct.zig");
 const NonCanonicalError = std.crypto.errors.NonCanonicalError;
 const NotSquareError = std.crypto.errors.NotSquareError;
@@ -206,6 +207,18 @@ pub const Fe = struct {
     }
 
     pub fn mul(a: Fe, b: Fe) Fe {
+        if (comptime mulx_core) return mulMulx(a, b);
+        return @call(.always_inline, mulPortable, .{ a, b });
+    }
+
+    pub fn sq(a: Fe) Fe {
+        if (comptime mulx_core) return sqMulx(a);
+        return @call(.always_inline, sqPortable, .{a});
+    }
+
+    /// The portable u128 schoolbook `mul`: every target without the amd64
+    /// core, and the oracle the core is tested against.
+    pub fn mulPortable(a: Fe, b: Fe) Fe {
         var b2: [9]u64 = undefined;
         inline for (0..9) |i| b2[i] = b.l[i] << 1;
         var c: [9]u128 = undefined;
@@ -226,7 +239,8 @@ pub const Fe = struct {
         return reduceWide(c);
     }
 
-    pub fn sq(a: Fe) Fe {
+    /// The portable u128 `sq` (see `mulPortable`).
+    pub fn sqPortable(a: Fe) Fe {
         var a2: [9]u64 = undefined;
         var a4: [9]u64 = undefined;
         inline for (0..9) |i| {
@@ -323,6 +337,186 @@ pub const Fe = struct {
     }
 };
 
+// ── amd64 MULX core ─────────────────────────────────────────────────────────
+//
+// The same nine u128 columns `mulPortable`/`sqPortable` sum, in inline asm:
+// LLVM keeps the 27 operand words (a, b, 2b) and the column accumulators in
+// registers it does not have and spills (543 instructions for 81 `mulx`).
+// Here the operands stay in memory and each product is
+//
+//   mulx <operand word>, lo, hi · add lo → acc_lo · adc hi → acc_hi
+//
+// with `rdx` loaded once per pair of columns: columns k and k+1 share every
+// `a[i]`, so the two accumulator pairs (r8:r9, r10:r11) are independent
+// add/adc chains. The column bound is the portable one (< 2^126.2 for limbs
+// < 2^61), so a column fits its two words and `adc` never carries out.
+// `reduceWide`'s carry chain is streamed in the same asm (`finishColumn`):
+// each finished column takes the previous carry, stores its limb and passes
+// its own carry on, so no column is stored and reloaded and the limbs are
+// the portable ones bit for bit.
+//
+// Operand layout. `mul`: e[0..9) = 2b (the folded terms, 2^522 ≡ 2),
+// e[9..18) = b; product a[i]·b-side of column k is e[9 + k − i] for every i
+// (i ≤ k reads b[k − i], i > k reads 2b[k + 9 − i]). `sq`: s[0..9) = a,
+// s[9..18) = 2a, s[18..27) = 4a; pair (i ≤ j) of column (i + j) mod 9 reads
+// s[9·log2(f) + j] with f = (i ≠ j ? 2 : 1)·(i + j ≥ 9 ? 2 : 1).
+//
+// Constant time: straight-line code, every address a fixed offset from a
+// pinned pointer, only MULX/ADD/ADC/AND/SHR/SHRD/MOV/XOR (data-independent
+// timing).
+// self-hosted backend: off (the edit loop only), as for p256's `fast_core`.
+
+/// Whether `mul`/`sq` run the MULX core (x86-64 with BMI2, LLVM backend).
+pub const mulx_core = builtin.cpu.arch == .x86_64 and
+    builtin.zig_backend != .stage2_x86_64 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2);
+
+const core_clobbers: std.builtin.assembly.Clobbers = .{
+    .rax = true,
+    .rbx = true,
+    .rdx = true,
+    .r8 = true,
+    .r9 = true,
+    .r10 = true,
+    .r11 = true,
+    .r12 = true,
+    .r13 = true,
+    .r14 = true,
+    .cc = true,
+    .memory = true,
+};
+
+/// One column pair's text: for each (rdx source, operand offsets) of `terms`.
+fn emitColumns(comptime s: []const u8, comptime k: usize, comptime terms: []const [3]?usize) []const u8 {
+    // terms[t] = .{ rdx offset, operand offset for column k, operand offset for column k + 1 }
+    comptime var out: []const u8 = s ++ " xorl %%r8d, %%r8d\n xorl %%r9d, %%r9d\n xorl %%r10d, %%r10d\n xorl %%r11d, %%r11d\n";
+    inline for (terms) |t| {
+        out = out ++ std.fmt.comptimePrint(" movq {d}(%%rsi), %%rdx\n", .{t[0].?});
+        if (t[1]) |o| out = out ++ std.fmt.comptimePrint(" mulxq {d}(%%rcx), %%rax, %%rbx\n addq %%rax, %%r8\n adcq %%rbx, %%r9\n", .{o});
+        if (t[2]) |o| out = out ++ std.fmt.comptimePrint(" mulxq {d}(%%rcx), %%rax, %%rbx\n addq %%rax, %%r10\n adcq %%rbx, %%r11\n", .{o});
+    }
+    out = out ++ finishColumn(k, "%%r8", "%%r9");
+    if (k + 1 < 9) out = out ++ finishColumn(k + 1, "%%r10", "%%r11");
+    return out;
+}
+
+/// `reduceWide`'s carry step for column `k`, streamed: (hi:lo) += carry
+/// (r12:r13), limb k = lo & mask → z[k], carry = (hi:lo) >> width. After
+/// column 8 the top carry re-enters limbs 0 and 1 (2^521 ≡ 1), exactly as
+/// `reduceWide` does it, so the limbs equal the portable ones bit for bit.
+/// r14 holds M58 (M57 for the top limb is M58 >> 1, built in rax).
+fn finishColumn(comptime k: usize, comptime lo: []const u8, comptime hi: []const u8) []const u8 {
+    comptime {
+        const w: usize = if (k == 8) 57 else 58;
+        var t: []const u8 = "";
+        if (k > 0) t = t ++ " addq %%r12, " ++ lo ++ "\n adcq %%r13, " ++ hi ++ "\n";
+        if (k == 8) {
+            t = t ++ " movq %%r14, %%rax\n shrq $1, %%rax\n andq " ++ lo ++ ", %%rax\n";
+        } else {
+            t = t ++ " movq %%r14, %%rax\n andq " ++ lo ++ ", %%rax\n";
+        }
+        t = t ++ std.fmt.comptimePrint(" movq %%rax, {d}(%%rdi)\n shrdq ${d}, ", .{ 8 * k, w }) ++ hi ++ ", " ++ lo ++
+            std.fmt.comptimePrint("\n shrq ${d}, ", .{w}) ++ hi ++ "\n movq " ++ lo ++ ", %%r12\n movq " ++ hi ++ ", %%r13\n";
+        if (k == 8) {
+            // limb 0 += top carry; limb 1 += (limb 0 >> 58); limb 0 &= M58.
+            t = t ++ " xorl %%ebx, %%ebx\n addq 0(%%rdi), %%r12\n adcq %%rbx, %%r13\n" ++
+                " movq %%r14, %%rax\n andq %%r12, %%rax\n movq %%rax, 0(%%rdi)\n" ++
+                " shrdq $58, %%r13, %%r12\n addq %%r12, 8(%%rdi)\n";
+        }
+        return t;
+    }
+}
+
+const mask_prologue = " movabsq $0x3ffffffffffffff, %%r14\n";
+
+fn mulText() []const u8 {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var s: []const u8 = mask_prologue;
+        var k: usize = 0;
+        while (k < 9) : (k += 2) {
+            var terms: [9][3]?usize = undefined;
+            for (0..9) |i| {
+                terms[i] = .{ 8 * i, 8 * (9 + k - i), if (k + 1 < 9) 8 * (9 + k + 1 - i) else null };
+            }
+            s = emitColumns(s, k, &terms);
+        }
+        const out = s[0..s.len].*;
+        return &out;
+    }
+}
+
+fn sqText() []const u8 {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var s: []const u8 = mask_prologue;
+        var k: usize = 0;
+        while (k < 9) : (k += 2) {
+            // Each rdx = a[i] serves the pair of column k and/or k + 1.
+            var terms: [9][3]?usize = undefined;
+            var n: usize = 0;
+            for (0..9) |i| {
+                var t: [3]?usize = .{ 8 * i, null, null };
+                for (0..2) |c| {
+                    const col = k + c;
+                    if (col >= 9) continue;
+                    for (i..9) |j| {
+                        if ((i + j) % 9 != col) continue;
+                        const f: usize = (if (i != j) 2 else 1) * (if (i + j >= 9) 2 else 1);
+                        const fi: usize = switch (f) {
+                            1 => 0,
+                            2 => 1,
+                            4 => 2,
+                            else => unreachable,
+                        };
+                        t[1 + c] = 8 * (9 * fi + j);
+                    }
+                }
+                if (t[1] != null or t[2] != null) {
+                    terms[n] = t;
+                    n += 1;
+                }
+            }
+            s = emitColumns(s, k, terms[0..n]);
+        }
+        const out = s[0..s.len].*;
+        return &out;
+    }
+}
+
+fn mulMulx(a: Fe, b: Fe) Fe {
+    var e: [18]u64 = undefined;
+    inline for (0..9) |j| {
+        e[j] = b.l[j] << 1;
+        e[9 + j] = b.l[j];
+    }
+    var r: Fe = undefined;
+    asm volatile (mulText()
+        :
+        : [z] "{rdi}" (&r.l),
+          [a] "{rsi}" (&a.l),
+          [e] "{rcx}" (&e),
+        : core_clobbers);
+    return r;
+}
+
+fn sqMulx(a: Fe) Fe {
+    var s: [27]u64 = undefined;
+    inline for (0..9) |j| {
+        s[j] = a.l[j];
+        s[9 + j] = a.l[j] << 1;
+        s[18 + j] = a.l[j] << 2;
+    }
+    var r: Fe = undefined;
+    asm volatile (sqText()
+        :
+        : [z] "{rdi}" (&r.l),
+          [a] "{rsi}" (&a.l),
+          [s] "{rcx}" (&s),
+        : core_clobbers);
+    return r;
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -397,6 +591,43 @@ test "field: differential against wide integer arithmetic" {
         try testing.expectEqualSlices(u8, &want_be, &be);
         try expectFe(av, try Fe.fromBytes(be, .big));
         try expectFe(av, try Fe.fromBytes(a.toBytes(.little), .little));
+    }
+}
+
+test "field: MULX core == portable mul/sq, limb for limb, up to the 2^61 input bound" {
+    if (comptime !mulx_core) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x521_A5);
+    const r = prng.random();
+    const lim: u64 = (1 << 61) - 1;
+    for (0..20_000) |t| {
+        var a: Fe = undefined;
+        var b: Fe = undefined;
+        for (&a.l, &b.l) |*x, *y| switch (t % 5) {
+            0 => {
+                x.* = r.int(u64) & M58;
+                y.* = r.int(u64) & M58;
+            },
+            1 => { // the whole accepted input range
+                x.* = r.uintAtMost(u64, lim);
+                y.* = r.uintAtMost(u64, lim);
+            },
+            2 => { // saturated: every column at its bound
+                x.* = lim;
+                y.* = lim;
+            },
+            3 => { // sparse: single limbs, zeros elsewhere
+                x.* = if (r.boolean()) r.uintAtMost(u64, lim) else 0;
+                y.* = if (r.boolean()) lim else 0;
+            },
+            else => {
+                x.* = (r.int(u64) & M58) | (@as(u64, r.int(u2)) << 58);
+                y.* = r.int(u64) & M58;
+            },
+        };
+        try testing.expectEqualSlices(u64, &a.mulPortable(b).l, &mulMulx(a, b).l);
+        try testing.expectEqualSlices(u64, &b.mulPortable(a).l, &mulMulx(b, a).l);
+        try testing.expectEqualSlices(u64, &a.sqPortable().l, &sqMulx(a).l);
+        try testing.expectEqualSlices(u64, &a.mulPortable(a).l, &mulMulx(a, a).l);
     }
 }
 
