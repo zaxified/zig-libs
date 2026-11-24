@@ -272,6 +272,48 @@ connections are not tracked (Go does not either): the shutdown hook is how they
 learn. A connection accepted while a shutdown runs sees it at its first wait
 and closes.
 
+### Held-open responses and a gone peer (SSE push, long poll, cancellation)
+
+The handler stays in the handler, as in Go. `Server.Hold` keeps a response open
+and writes what other threads hand it; `Server.PeerWatch` tells a running
+handler that its client went away (Go's `Request.Context().Done()` and
+`context.AfterFunc`).
+
+```zig
+fn events(req: *http.Server.Request, rw: *http.Server.ResponseWriter) !void {
+    var es = try http.sse.EventStream.start(rw); // status + headers, nothing sent
+    var queue: [16 * 1024]u8 = undefined;
+    var hold: http.Server.Hold = .{};
+    hold.begin(req, rw, &queue, .{ .heartbeat_ms = 15_000, .heartbeat = ": ping\n\n" }) catch |e| switch (e) {
+        error.TooManyHeld => { rw.setStatus(503); return; },
+        else => return e,
+    };
+    defer hold.end();
+    hub.add(&hold); // other threads: hold.send("data: ...\n\n"), hold.finish()
+    defer hub.remove(&hold);
+    if (hold.run() == .shutdown) es.data("bye") catch {};
+}
+```
+
+- `run` returns `.finished` (after `finish`, queue written), `.peer_gone`,
+  `.shutdown` (`shutdownGraceful`/`close` wake every held response), `.idle`
+  (`idle_timeout_ms`), `.overflow` or `.write_failed`.
+- `send` copies one message into the caller's queue, whole or not at all. A
+  message that does not fit fails `error.Full`; `on_full = .end_stream` (default)
+  then ends the stream (`.overflow`), `.reject` keeps it open for the feeder to
+  drop or retry. (Go's writer blocks, hyper/axum's `Sse` is a bounded channel the
+  producer awaits; a feeder thread here has no `Io` to block on.)
+- `begin` lifts `response_timeout_ms` for the response; `write_timeout_ms` still
+  bounds each write. `Options.max_held_responses` caps held responses
+  server-wide (default none: `error.TooManyHeld` past it).
+- `PeerWatch.start(req, hook)` after the body is read (`error.BodyUnread`
+  otherwise); `gone()`; `stop()` before the handler returns. HTTP/1.1: a peer
+  that closes or half-closes is gone, a pipelined next request is not. HTTP/2: a
+  reset stream or an ended connection.
+- HTTP/2 needs `Options.h2_dispatcher` (OS threads for `Hold`); without it both
+  are `error.Unsupported`, as is `PeerWatch` socket-free. A socket-free `Hold`
+  works without peer detection. Linux.
+
 ### Methods, CONNECT and tunnels
 
 Every method token reaches the handler, as in Go: the standard ones as

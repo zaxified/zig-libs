@@ -618,6 +618,7 @@ test {
     _ = @import("hostguard.zig");
     _ = @import("servecontent.zig");
     _ = @import("rebody.zig");
+    _ = @import("held.zig");
     _ = curl_interop;
     _ = gzip_interop;
     _ = h11_interop;

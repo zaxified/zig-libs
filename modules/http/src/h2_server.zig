@@ -197,6 +197,7 @@ const hpack = @import("hpack.zig");
 const zeroize = @import("zeroize.zig");
 const gzip = @import("gzip.zig");
 const Server = @import("Server.zig");
+const held = @import("held.zig");
 const Allocator = std.mem.Allocator;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
@@ -760,6 +761,20 @@ const Job = struct {
     /// until the handler returns — `serveJob` holds slices into it — so the
     /// reader and the response framer poll this instead.
     rst: bool = false,
+    /// A `PeerWatch` / `Hold` of the handler running this job (dispatcher
+    /// only), fired when `rst` is set or the connection ends. Set and
+    /// cleared under the session lock, fired under it.
+    watcher: ?*held.Watcher = null,
+
+    /// Mark the stream dead under its handler and tell a watching one.
+    /// **Caller holds the session lock.**
+    fn kill(job: *Job) void {
+        job.rst = true;
+        if (job.watcher) |w| {
+            job.watcher = null;
+            w.fire();
+        }
+    }
 
     fn deinit(job: *Job, gpa: Allocator) void {
         job.headers.deinit(gpa);
@@ -1055,6 +1070,7 @@ const Session = struct {
             if (s.io) |io| {
                 s.io_mu.lockUncancelable(io);
                 defer s.io_mu.unlock(io);
+                s.killWatched();
                 s.announce(); // wakes workers parked in `waitForPeer`
                 while (s.inflight != 0) s.moved.waitUncancelable(io, &s.io_mu);
             } else {
@@ -1062,6 +1078,7 @@ const Session = struct {
                 // uncancelable: the Session must not be freed under a
                 // handler still running on it.
                 s.lock();
+                s.killWatched();
                 s.announce(); // wakes workers parked in `waitForPeer`
                 s.parked += 1;
                 while (s.inflight != 0) {
@@ -1544,7 +1561,7 @@ const Session = struct {
                 // Overloaded. The window has not been re-advertised, so
                 // dropping is safe accounting-wise; fail the read instead of
                 // silently truncating the body.
-                job.rst = true;
+                job.kill();
             };
             return;
         }
@@ -1697,10 +1714,35 @@ const Session = struct {
     /// `dispatched` is set under `mu` before the worker is spawned, so there
     /// is no window in which a job is on its way to a thread and still
     /// looks free.
+    /// The connection ends: every watched handler hears its peer is gone.
+    /// **Caller holds the session lock.**
+    fn killWatched(s: *Session) void {
+        for (s.jobs.values()) |*job| if (job.watcher != null) job.kill();
+    }
+
+    /// `held.StreamLiveness` over this session (dispatcher only).
+    fn attachWatcher(ctx: *anyopaque, id: u31, w: *held.Watcher) bool {
+        const s: *Session = @ptrCast(@alignCast(ctx));
+        s.lock();
+        defer s.unlock();
+        if (s.gone.load(.acquire)) return false;
+        const job = s.jobs.getPtr(id) orelse return false;
+        if (job.rst) return false;
+        job.watcher = w;
+        return true;
+    }
+
+    fn detachWatcher(ctx: *anyopaque, id: u31) void {
+        const s: *Session = @ptrCast(@alignCast(ctx));
+        s.lock();
+        defer s.unlock();
+        if (s.jobs.getPtr(id)) |job| job.watcher = null;
+    }
+
     fn dropJob(s: *Session, id: u31) void {
         if (s.jobs.getPtr(id)) |job| {
             if (job.dispatched) {
-                job.rst = true;
+                job.kill();
                 return;
             }
         }
@@ -2186,6 +2228,18 @@ const Session = struct {
             .conn_request_index = req_index,
             .stream_id = id,
         };
+        // Dispatched handlers run beside the connection task, which sees a
+        // reset or the end of the connection: `PeerWatch` / `Hold` attach
+        // here. Sequential handlers own the connection's only reader.
+        const live: held.StreamLiveness = .{
+            .ctx = s,
+            .id = id,
+            .server = if (s.opts.control) |c| c.server else null,
+            .can_block = s.io == null,
+            .attachFn = attachWatcher,
+            .detachFn = detachWatcher,
+        };
+        if (s.opts.dispatcher != null and s.threaded) req.h2_live = &live;
         // Inbound gzip decoding, as `Server.serveOne` wires it: the handler's
         // `req.reader()` reads the plaintext through the flate decoder under
         // the decompressed-byte cap, while `body` stays the raw source. The
@@ -9773,4 +9827,159 @@ test "dispatcher (fibers): a handler waiting for credit is released when the con
     try testing.expectEqual(@as(u16, 200), c.status);
     try testing.expectEqual(@as(usize, 0), c.body.items.len);
     try testing.expect(!c.end);
+}
+
+// ── held responses and peer watching on HTTP/2 (dispatcher) ─────────────────
+
+const LiveProbe = struct {
+    io: std.Io,
+    started: std.atomic.Value(bool) = .init(false),
+    saw_gone: std.atomic.Value(bool) = .init(false),
+    hook_ran: std.atomic.Value(bool) = .init(false),
+    hold: std.atomic.Value(?*Server.Hold) = .init(null),
+    end: std.atomic.Value(u8) = .init(0xff),
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+
+    fn onGone(ctx: ?*anyopaque) void {
+        const p: *LiveProbe = @ptrCast(@alignCast(ctx.?));
+        p.hook_ran.store(true, .release);
+    }
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *LiveProbe = @ptrCast(@alignCast(req.context.?));
+        defer p.done.store(true, .release);
+        if (std.mem.eql(u8, req.path, "/watch")) {
+            var pw: Server.PeerWatch = .{};
+            pw.start(req, .{ .ctx = p, .f = onGone }) catch |e| {
+                p.err = e;
+                return;
+            };
+            defer pw.stop();
+            p.started.store(true, .release);
+            var waited: u32 = 0;
+            while (!pw.gone() and waited < 5000) : (waited += 2) {
+                const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(2), .clock = .awake };
+                d.sleep(p.io) catch {};
+            }
+            p.saw_gone.store(pw.gone(), .release);
+        } else {
+            try rw.setHeader("content-type", "text/event-stream");
+            var q: [64]u8 = undefined;
+            var h: Server.Hold = .{};
+            h.begin(req, rw, &q, .{}) catch |e| {
+                p.err = e;
+                return;
+            };
+            defer h.end();
+            p.hold.store(&h, .release);
+            const e = h.run();
+            p.hold.store(null, .release);
+            p.end.store(@backingInt(e), .release);
+        }
+    }
+};
+
+test "PeerWatch over h2 (dispatcher): RST_STREAM on the stream fires the hook" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/watch");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    try peer.conn.sendRstStream(&peer.wire, sid, .cancel);
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var probe: LiveProbe = .{ .io = io };
+    var rbuf: [4096]u8 = undefined;
+    // The connection stays open until the handler is done: the hook must
+    // come from the reset, not from the connection ending.
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .gate = &probe.started, .bytes = stage1 },
+        .{ .gate = &probe.done, .bytes = "" },
+    }, &rbuf);
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var pd = try PoolDispatcher.init(gpa, io, 2, 4);
+    defer pd.deinit();
+    serve(gpa, .{ .handler = LiveProbe.handler, .context = &probe, .dispatcher = pd.iface(4) }, &sr.reader, &fw.writer);
+
+    try testing.expectEqual(@as(?anyerror, null), probe.err);
+    try testing.expect(probe.saw_gone.load(.acquire));
+    try testing.expect(probe.hook_ran.load(.acquire));
+}
+
+test "PeerWatch / Hold over h2 without a dispatcher: Unsupported" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    _ = try stageGet(&peer, "/watch");
+    _ = try stageGet(&peer, "/hold");
+    var probe: LiveProbe = .{ .io = std.Io.Threaded.global_single_threaded.io() };
+    var in: Reader = .fixed(peer.wire.items);
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    serve(gpa, .{ .handler = LiveProbe.handler, .context = &probe }, &in, &fw.writer);
+    try testing.expectEqual(@as(?anyerror, error.Unsupported), probe.err);
+}
+
+test "Hold over h2 (dispatcher): sends from another thread become DATA, finish ends the stream" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/hold");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+
+    var probe: LiveProbe = .{ .io = io };
+    const Feeder = struct {
+        fn run(p: *LiveProbe) void {
+            const h = while (true) {
+                if (p.hold.load(.acquire)) |h| break h;
+                std.atomic.spinLoopHint();
+            };
+            h.send("data: one\n\n") catch {};
+            h.send("data: two\n\n") catch {};
+            h.finish();
+        }
+    };
+    const feeder = try std.Thread.spawn(.{}, Feeder.run, .{&probe});
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .gate = &probe.done, .bytes = "" },
+    }, &rbuf);
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var pd = try PoolDispatcher.init(gpa, io, 2, 4);
+    defer pd.deinit();
+    serve(gpa, .{ .handler = LiveProbe.handler, .context = &probe, .dispatcher = pd.iface(4) }, &sr.reader, &fw.writer);
+    feeder.join();
+
+    try testing.expectEqual(@as(?anyerror, null), probe.err);
+    try testing.expectEqual(@backingInt(Server.Hold.End.finished), probe.end.load(.acquire));
+    try peer.feed(fw.buf.items);
+    const r = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), r.status);
+    try testing.expectEqualStrings("data: one\n\ndata: two\n\n", r.body.items);
+    try testing.expect(r.data_end_stream);
 }

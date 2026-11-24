@@ -290,6 +290,33 @@ What each feature is and the decisions behind it. When each landed is in `CHANGE
 - *HTTP/1.0 `Connection: keep-alive`* is honoured, echoed, and the connection closed when the body has no known
   length (RFC 9112 §9.3).
 
+**Held-open responses and peer liveness (`src/held.zig`).** Go's shape: the handler stays on its own task. Reference:
+Go `net/http` (`Request.Context().Done()`, cancelled by the connection's background read once the body hit EOF or by
+an h2 reset / connection end; `context.AfterFunc`; `http.Flusher`, `ResponseController.SetWriteDeadline`; no cap on
+streaming handlers, shutdown left to `RegisterOnShutdown`); hyper/axum `Sse` (a bounded stream the server polls,
+`KeepAlive` ping opt-in) and Starlette `StreamingResponse` (cancelled on `http.disconnect`).
+- *`PeerWatch`* (`start(req, hook)`/`gone`/`stop`, handler-owned storage): HTTP/1.1 over a socket runs one task on the
+  server's `Io` blocked in poll(2) on the socket's `POLLRDHUP`/`POLLHUP`/`POLLERR` and an eventfd for `stop`. It
+  consumes no byte, so a pipelined request or a TLS record stays for the serving loop and only a close, half-close
+  (Go's EOF) or reset counts. The body must be read to its end first (`BodyUnread`; Go starts its background read
+  there). HTTP/2 under `h2_dispatcher`: `Job.watcher` is fired by the connection task, under the session lock, when
+  the stream is reset (`Job.kill`) or the connection ends (`killWatched`); no task. Socket-free and h2 without a
+  dispatcher: `Unsupported`. The hook runs on another thread and must be short.
+- *`Hold`* (`begin`/`run`/`end` by the owner, `send`/`finish`/`gone` from any thread): `begin` flushes the head, lifts
+  `response_timeout_ms` (the write stall stays) and registers with the server; `run` writes the queue and waits in
+  poll(2) on an eventfd (plus the socket's hang-up on h1, the job's watcher on h2), returning
+  `finished | peer_gone | shutdown | idle | overflow | write_failed`; the handler may write a last event after it.
+  The queue is a ring over the caller's buffer, one message copied whole or not at all; the owner writes a segment
+  without holding the lock (feeders only fill the free part). A full queue is `error.Full`; `Options.on_full`:
+  `.end_stream` (default, `.overflow`: a slow consumer is disconnected and re-subscribes rather than missing events
+  unseen) or `.reject` (the feeder decides). A bounded queue rather than Go's blocking write or axum's awaited
+  channel because a feeder thread here has no `Io` to block on. `shutdownGraceful`/`close` wake every `Hold`
+  (`.shutdown`): built in, where Go needs `RegisterOnShutdown`. Limits opt-in, the references having none:
+  `Options.max_held_responses` (`TooManyHeld`), `Hold.Options.idle_timeout_ms` (since the last `send`),
+  `heartbeat_ms` + `heartbeat` bytes (axum/sse-starlette 15 s when enabled). h2 needs the dispatcher on OS threads
+  (a fiber `Dispatcher.io` would block the thread its fibers share; without a dispatcher the connection's only
+  reader would stop): `Unsupported` otherwise. Socket-free a `Hold` works with no peer detection.
+
 **Response encoding.** `Server.EncoderProvider` (`acquire`/`release` per response, no codec linked here) in
 `Options`, `StreamOptions` and `h2_server.Options` as `encoder_provider`: `preferredBy` is the q-value choice
 against gzip (a tie goes to the provider, an absent header admits nothing); acquired only past the eligibility
@@ -542,6 +569,14 @@ under *Anchoring*.
   END_STREAM, and the split of returned credit between stream and connection windows (the only observable that
   tells consumption- from arrival-driven crediting). Offline byte goldens pin the h1 trailer layout and the h2
   END_STREAM placement; the forbidden-field policy has rejection tests for both gates.
+- **Held-open responses and peer liveness** (`src/held.zig`, `src/h2_server.zig`): over loopback, events sent from
+  another thread reach the client in order and `finish` ends the chunked body; a pipelined next request is neither
+  a gone peer for a `Hold` nor for a `PeerWatch` and is served after the held response; the peer closing ends `run`
+  with `peer_gone`; `shutdownGraceful` ends it with `shutdown` and the handler's last event goes out;
+  `max_held_responses` answers the next one 503; idle timeout and heartbeat; a half-close fires the `PeerWatch` hook
+  while the response still goes out. h2 with a dispatcher: RST_STREAM fires the hook with the connection still
+  open, held DATA from another thread ends with END_STREAM; without a dispatcher both are `Unsupported`.
+  Socket-free: `on_full` `.reject` keeps the stream, `.end_stream` ends it `overflow`.
 - **Reverse proxy and h2 upstream:** loopback h1-proxy → h2c-backend end to end (forwarded headers, hop-by-hop
   strip, large-body flow control, concurrent clients over one shared upstream connection, 502 on a dead backend);
   pool-level multiplexing (two streams in flight on one connection), sequential reuse, buffer-pool reuse and
