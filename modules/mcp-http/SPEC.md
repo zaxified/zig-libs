@@ -46,10 +46,19 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `mcp` Python SDK (see Verification below).
 - **Sessions (optional):** an `Mcp-Session-Id` is minted at `initialize` and validated thereafter
   (unknown → 404); `GET /mcp` opens a server→client SSE stream; `DELETE /mcp` tears it down.
-- **`GET` is drain-and-close, not held-open** — the stream drains the buffered queue and closes;
-  EventSource auto-reconnect + `Last-Event-ID` replay (bounded per-session buffer) makes delivery
-  lossless. `Sessions.push` is callable from any thread (one spinlock; snapshot-under-lock so a
-  concurrent `DELETE` can't UAF).
+- **`GET` is held open, as the reference's** (`Transport.hold_get`, default on): over a real connection
+  the stream replays what is queued after `Last-Event-ID`, then stays open on an `http.Server.Hold` and
+  carries every message the session is sent (`Sessions.push`, `pushTag`, `mcp` notifications) as an SSE
+  event with an `id:` the moment it is enqueued; one stream per session (a second `GET` while one is open is
+  409 `Conflict: Only one SSE stream is allowed per session`, as the Python and TypeScript SDKs answer); it
+  ends when the client leaves (the session stays), on `DELETE` / `Sessions.close` / eviction, at server
+  shutdown, or when its queue (`listen_queue_bytes`) overflows -- the client reconnects with
+  `Last-Event-ID` and replays from the bounded per-session buffer, which keeps every event either way.
+  Socket-free (`serveStream`), `hold_get = false` and a refused hold (`max_held_responses`, h2 without a
+  dispatcher) fall back to the drain-and-close long-poll the module had before 2026-11-24.
+  `Sessions.push` is callable from any thread (one spinlock; snapshot-under-lock so a concurrent `DELETE`
+  can't UAF; `attachHold` snapshots the replay and registers the stream under one lock, so no event falls
+  between them).
 - **Server→client requests (sampling / elicitation)** are supported to exactly the degree HTTP
   allows: the client's answer is a *later, separate POST*, so nothing parks waiting for it (the same
   constraint the drain-and-close `GET` documents). Three concrete pieces: (1) each session's numeric
@@ -77,7 +86,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   a stateless endpoint, which has no channel for them). Returning the whole capture would concatenate
   several objects into one body.
 - **Session teardown.** `DELETE /mcp` (204) and `Sessions.close` both end a session; `close` marks it
-  closing, and its next `GET` drains what is queued, ends, and destroys it. Teardown and idle
+  closing, and its held `GET` (or the next one) writes what is queued, ends, and destroys it. Teardown and idle
   eviction call `mcp.Server.forgetPeer` with the session's peer handle: the server keeps per-peer
   handshake state and has no other way to learn that a session is gone, so without it dead sessions
   would walk into `Server.max_peers` and new handshakes would be refused.
@@ -260,8 +269,7 @@ through this module's own `Transport` and assert:
 | `tools/call` (`work`) | the two `notifications/progress` SSE frames are asserted as literal substrings of this module's own output; the field order (`jsonrpc, method, params.{progressToken,progress,total,message}`) is identical to the reference server's, a byte-exact match |
 
 Differences the capture surfaced, all benign: the reference server's `GET` stream never closes on its
-own (a held-open long-poll) where this module is deliberately drain-and-close (an io-less handler
-cannot park a connection); `DELETE` got `200 OK` from the reference and `204 No Content` here (both
+own, and neither does this module's over a real connection (`Transport.hold_get`); `DELETE` got `200 OK` from the reference and `204 No Content` here (both
 valid 2xx); the reference names every SSE event `event: message` explicitly and this module omits
 `event:`, which WHATWG SSE defines as the same default type. The SDK ran as a black-box test
 oracle only: no SDK or other MCP-transport source was ported or copied. The capture is of the
@@ -277,7 +285,7 @@ session-era shape; the 2026-07-28 transport has its own SDK run, below.
 tools with structured output, live progress, a multi round-trip tool, a held `subscriptions/listen` that
 receives a pushed `tools/list_changed` and ends with the graceful-close result, a `tools/call` the client
 abandons, whose tool must see `ToolCall.cancelled()` — the SDK closes the connection and sends no
-`notifications/cancelled`), then the session era (`initialize`, the `GET` stream, `DELETE`). 27 typed
+`notifications/cancelled`), then the session era (`initialize`, the held `GET` stream receiving a pushed `tools/list_changed`, `DELETE`). 29 typed
 checks. The program records every exchange (request method, target, MCP headers, body; response status,
 content type, body) and, only when every check passed, writes `src/sdk_oracle_vectors.zig`; `--check`
 re-takes and compares with session ids masked. `src/sdk_oracle.zig` replays every request through
@@ -287,9 +295,7 @@ tools that reach the transport or wait for a cancellation).
 
 ## Backlog / deferred
 
-- **Held-open session `GET` stream.** The reference server keeps the 2025-06-18 `GET` stream open (the captured
-  session above); here it drains and closes. `http.Server.Hold` now makes the held stream possible (as for
-  `subscriptions/listen`); it changes the GET's behaviour for every session-era client, so it is a decision of its own.
+None.
 
 ## Anchoring
 

@@ -8,7 +8,8 @@ talks to 127.0.0.1:PORT through its own Streamable HTTP client, once per era:
     progress, a held `subscriptions/listen` that receives a pushed
     `notifications/tools/list_changed` and ends with the graceful close, and a
     `tools/call` the client cancels;
-  * session (2025-11-25 and earlier): `initialize`, then the same methods.
+  * session (2025-11-25 and earlier): `initialize`, then the same methods, and a
+    notification pushed to the session that arrives on the held `GET` stream.
 
 Every answer is parsed by the SDK's typed models and checked here. Exit 0 only
 when every check passed; the SDK version goes to WORKDIR/sdk-version.
@@ -121,9 +122,29 @@ async def listen_and_cancel(s):
     check(era, "slow cancelled", text_of(res) == "yes", res)
 
 
+async def session_push(s, got):
+    """Session era: a notification the server issues while the client is
+    connected arrives on the held `GET` stream (the SDK opens it after
+    `initialize`) -- the reference holds it open, so it must arrive live."""
+    era = "session"
+    res = await s.call_tool("touch", {})
+    check(era, "touch reached the session", text_of(res) == "1", res)
+    for _ in range(500):
+        if any("tools/list_changed" in repr(m) or "ToolListChanged" in repr(m) for m in got):
+            break
+        await anyio.sleep(0.01)
+    check(era, "list_changed pushed on the GET stream", any("tools/list_changed" in repr(m) or "ToolListChanged" in repr(m) for m in got), got)
+
+
 async def run_era(era):
+    got = []
+
+    async def on_message(msg):
+        if not isinstance(msg, Exception):
+            got.append(msg)
+
     async with streamable_http_client(URL) as (r, w):
-        async with ClientSession(r, w, elicitation_callback=elicit) as s:
+        async with ClientSession(r, w, elicitation_callback=elicit, message_handler=on_message) as s:
             if era == "session":
                 init = await s.initialize()
                 check(era, "initialize", init.server_info.name == "oracle-http", init)
@@ -131,6 +152,8 @@ async def run_era(era):
                 disc = await s.discover()
                 check(era, "discover", "2026-07-28" in (disc.supported_versions or []), disc)
             await common(era, s)
+            if era == "session":
+                await session_push(s, got)
             if era == "modern":
                 await listen_and_cancel(s)
 

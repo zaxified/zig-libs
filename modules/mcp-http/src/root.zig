@@ -180,14 +180,21 @@ fn monoNs() u64 {
 /// client re-initializes), tears a session down on `DELETE`, and serves
 /// server→client messages on `GET /mcp`.
 ///
-/// **Delivery model — the `GET` stream is drain-and-close** (a long-poll over
-/// SSE): a GET replays every event queued since the request's `Last-Event-ID`
-/// and then closes; the client's `EventSource` auto-reconnects (with
-/// `Last-Event-ID`) to receive later events. This fits the io-less handler
-/// model — a handler cannot cleanly park a connection waiting for a future push
-/// — and MCP's low-frequency server→client traffic. Nothing is lost within the
-/// bounded replay buffer (`replay_depth`); a client gone longer than that many
-/// events loses the overflow, so size it for your burst.
+/// **Delivery model — the `GET` stream is held open** (as the reference
+/// SDKs' Streamable HTTP servers do): over a real connection a `GET` replays
+/// every event queued after its `Last-Event-ID` and then stays open
+/// (`http.Server.Hold`, see `Transport.hold_get`); each later `push` /
+/// `pushTag` / `mcp` notification reaches it at once, with an `id:` for
+/// resumption. One stream per session: a second `GET` while one is open is
+/// 409. It ends when the client leaves, the session ends (`DELETE`,
+/// `close`, eviction), the server shuts down or its queue overflows
+/// (`Transport.listen_queue_bytes`); the client's `EventSource` reconnects
+/// with `Last-Event-ID` and replays what it missed. Where no connection can
+/// be held (socket-free `serveStream`, `hold_get = false`, a refused hold)
+/// the stream is a drain-and-close long-poll: replay, then close, the client
+/// reconnects for more. Events are buffered either way; nothing is lost
+/// within the bounded replay buffer (`replay_depth`); a client gone longer
+/// than that many events loses the overflow, so size it for your burst.
 ///
 /// Thread-safe: all state sits behind one spinlock (short critical sections —
 /// a map touch / an event copy, never socket I/O). `push` may be called from
@@ -225,6 +232,9 @@ pub const Sessions = struct {
         /// explicit `DELETE` ever freed a session
         /// (W2 re-audit 2026-09-02, `mcp-http` F2).
         last_seen_ns: u64,
+        /// The `GET` stream held open on this session (`heldGet`), or null.
+        /// Set and cleared under the registry lock; `enqueue` feeds it.
+        held: ?*http.Server.Hold = null,
     };
     const StoredEvent = struct { id: u64, data: []const u8 }; // data gpa-owned
 
@@ -242,6 +252,8 @@ pub const Sessions = struct {
     }
 
     fn freeSession(self: *Sessions, s: *Session) void {
+        // A held `GET` ends (its owner finds the session gone and writes no more).
+        if (s.held) |h| h.finish();
         for (s.events.items) |e| self.gpa.free(e.data);
         s.events.deinit(self.gpa);
         self.gpa.free(s.id);
@@ -413,14 +425,74 @@ pub const Sessions = struct {
             _ = s.events.orderedRemove(0);
         }
         try s.events.append(self.gpa, .{ .id = s.next_event_id, .data = copy });
+        const id = s.next_event_id;
         s.next_event_id += 1;
+        // A held `GET` gets it at once; the buffer keeps it for a reconnect
+        // (`Last-Event-ID`). A queue overflow ends that stream: the client
+        // reconnects and replays.
+        if (s.held) |h| {
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            defer aw.deinit();
+            var idbuf: [24]u8 = undefined;
+            const idstr = std.mem.print(&idbuf, "{d}", .{id}) catch unreachable;
+            http.sse.writeEvent(&aw.writer, .{ .id = idstr, .data = copy }) catch return;
+            h.send(aw.written()) catch {};
+        }
     }
 
     /// Mark a session closing — its next `GET` drains what is queued and ends.
     pub fn close(self: *Sessions, id: []const u8) void {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        if (self.map.get(id)) |s| s.closing = true;
+        if (self.map.get(id)) |s| {
+            s.closing = true;
+            if (s.held) |h| h.finish();
+        }
+    }
+
+    const Attach = union(enum) { unknown, conflict, ok: struct { closing: bool } };
+
+    /// Start holding `hold` as the session's `GET` stream: under one lock,
+    /// snapshot every event after `after` into `out` and make `hold` the
+    /// stream later events go to, so none falls between the replay and the
+    /// live feed. `.conflict` when another stream is held and its peer is
+    /// still there (one stream per session, as the reference SDKs).
+    fn attachHold(
+        self: *Sessions,
+        id: []const u8,
+        hold: *http.Server.Hold,
+        after: u64,
+        arena: std.mem.Allocator,
+        out: *std.ArrayList(StoredEvent),
+    ) error{OutOfMemory}!Attach {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        const s = self.map.get(id) orelse return .unknown;
+        if (s.held) |h| if (!h.gone()) return .conflict;
+        for (s.events.items) |e| {
+            if (e.id > after)
+                try out.append(arena, .{ .id = e.id, .data = try arena.dupe(u8, e.data) });
+        }
+        s.held = hold;
+        return .{ .ok = .{ .closing = s.closing } };
+    }
+
+    /// Stop feeding `hold`; whether the session is closing (or gone: false).
+    /// After this returns no feeder touches `hold`.
+    fn detachHold(self: *Sessions, id: []const u8, hold: *http.Server.Hold) bool {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        const s = self.map.get(id) orelse return false;
+        if (s.held == hold) s.held = null;
+        return s.closing;
+    }
+
+    /// Whether a `GET` stream is held on the session now (null: unknown session).
+    fn heldNow(self: *Sessions, id: []const u8) ?bool {
+        lockSpin(&self.lock);
+        defer self.lock.unlock();
+        const s = self.map.get(id) orelse return null;
+        return if (s.held) |h| !h.gone() else false;
     }
 
     /// Snapshot (into `arena`) every event with id > `after`, returning them via
@@ -613,6 +685,15 @@ pub const Transport = struct {
     /// `on_full` is always `.end_stream`). Default: neither, as the
     /// reference SDKs.
     listen_hold: http.Server.Hold.Options = .{},
+    /// With `sessions`: hold the session's `GET` stream open over a real
+    /// connection (`http.Server.Hold`), as the reference SDKs do, so
+    /// server-initiated messages reach the client at once; `listen_queue_bytes`
+    /// and `listen_hold` apply to it too. A second `GET` while one is held
+    /// is 409. False: each `GET` replays what is queued and closes (the
+    /// client's `EventSource` reconnects), the behaviour before 2026-11-24.
+    /// Socket-free (`serveStream` without a socket) and refused holds
+    /// (`max_held_responses`, h2 without a dispatcher) fall back to it.
+    hold_get: bool = true,
 
     pub const StreamMode = enum { auto, off };
 
@@ -844,6 +925,7 @@ fn handleGet(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     const sessions = t.sessions.?;
     const sid = ctx.req.header("mcp-session-id") orelse return notFound(ctx);
     const after = parseLastEventId(ctx.req);
+    if (t.hold_get and try heldGet(t, ctx, sessions, sid, after)) return;
 
     var arena_state = std.heap.ArenaAllocator.init(t.gpa);
     defer arena_state.deinit();
@@ -876,6 +958,62 @@ fn handleGet(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     // Everything queued has now been written, so the session has nothing left
     // to deliver and can go.
     if (closing) forgetSession(t, sessions, sid);
+}
+
+/// `GET /mcp` held open: replay what is queued after `Last-Event-ID`, then
+/// keep the stream and write every message the session is sent
+/// (`Sessions.enqueue`) until the client leaves, the session ends (`DELETE`,
+/// `Sessions.close`, eviction), the server shuts down or the queue overflows.
+/// False: not held (no real connection, or the server refuses a hold): the
+/// caller drains and closes instead.
+fn heldGet(t: *const Transport, ctx: *router.Ctx, sessions: *Sessions, sid: []const u8, after: u64) anyerror!bool {
+    switch (sessions.heldNow(sid) orelse {
+        try notFound(ctx);
+        return true;
+    }) {
+        true => {
+            ctx.res.setStatus(409);
+            try ctx.res.setHeader("Content-Type", "application/json");
+            try ctx.res.writeAll("{\"jsonrpc\":\"2.0\",\"id\":\"server-error\",\"error\":{\"code\":-32600,\"message\":\"Conflict: Only one SSE stream is allowed per session\"}}");
+            return true;
+        },
+        false => {},
+    }
+    const queue = try t.gpa.alloc(u8, @max(t.listen_queue_bytes, 1));
+    defer t.gpa.free(queue);
+    var es = try http.sse.EventStream.start(ctx.res);
+    var hold: http.Server.Hold = .{};
+    var opts = t.listen_hold;
+    opts.on_full = .end_stream;
+    hold.begin(ctx.req, ctx.res, queue, opts) catch return false;
+    if (hold.source == null) {
+        hold.end();
+        return false;
+    }
+    defer hold.end();
+
+    var arena_state = std.heap.ArenaAllocator.init(t.gpa);
+    defer arena_state.deinit();
+    var batch: std.ArrayList(Sessions.StoredEvent) = .empty;
+    const attached = try sessions.attachHold(sid, &hold, after, arena_state.allocator(), &batch);
+    var closing = false;
+    switch (attached) {
+        .ok => |a| closing = a.closing,
+        // Gone or taken in the meantime: the head is out, the stream ends empty.
+        .unknown, .conflict => return true,
+    }
+    var send_failed = false;
+    for (batch.items) |e| {
+        var idbuf: [24]u8 = undefined;
+        const idstr = std.mem.print(&idbuf, "{d}", .{e.id}) catch unreachable;
+        es.send(.{ .id = idstr, .data = e.data }) catch {
+            send_failed = true;
+            break;
+        };
+    }
+    if (!send_failed and !closing) _ = hold.run();
+    if (sessions.detachHold(sid, &hold) or closing) forgetSession(t, sessions, sid);
+    return true;
 }
 
 /// Destroy a session AND drop the server-side handshake state that belongs to
@@ -4130,4 +4268,173 @@ test "topLevelId: string and integer ids, nothing else" {
     try testing.expect(topLevelId(a, "{\"id\":null}") == null);
     try testing.expect(topLevelId(a, "{\"a\":}") == null);
     try testing.expect(topLevelId(a, "[1]") == null);
+}
+
+// ── the held session GET stream ─────────────────────────────────────────────
+
+fn getWire(buf: []u8, sid: []const u8, last_event_id: ?u64) []const u8 {
+    if (last_event_id) |n| return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nLast-Event-ID: {d}\r\n\r\n", .{ sid, n }) catch unreachable;
+    return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n\r\n", .{sid}) catch unreachable;
+}
+
+const HeldGetRig = struct {
+    server: mcp.Server,
+    sessions: Sessions,
+    spin: SpinLock = .{},
+    transport: Transport = undefined,
+    r: router.Router = undefined,
+    live: Live = undefined,
+
+    fn start(rig: *HeldGetRig, gpa: std.mem.Allocator, hold_get: bool) !bool {
+        rig.server = try buildServer(gpa);
+        rig.sessions = Sessions.init(gpa);
+        rig.spin = .{};
+        rig.transport = .{ .gpa = gpa, .server = &rig.server, .sessions = &rig.sessions, .lock = rig.spin.iface(), .hold_get = hold_get };
+        rig.r = router.Router.init(gpa);
+        try rig.r.use(rig.transport.middleware());
+        if (!try rig.live.start(&rig.r)) {
+            rig.deinit();
+            return false;
+        }
+        return true;
+    }
+
+    fn stop(rig: *HeldGetRig) void {
+        rig.live.stop();
+        rig.deinit();
+    }
+
+    fn deinit(rig: *HeldGetRig) void {
+        rig.r.deinit();
+        rig.sessions.deinit();
+        rig.server.deinit();
+    }
+};
+
+const HeldProbe = struct { s: *Sessions, sid: []const u8, want: bool };
+
+fn heldIs(p: HeldProbe) bool {
+    return (p.s.heldNow(p.sid) orelse false) == p.want;
+}
+
+test "held GET: a message pushed to the session reaches the open stream, then Sessions.close ends it" {
+    var rig: HeldGetRig = undefined;
+    if (!try rig.start(testing.allocator, true)) return error.SkipZigTest;
+    defer rig.stop();
+    const io = rig.live.io();
+    const created = try rig.sessions.create();
+    var wbuf: [256]u8 = undefined;
+    const stream = try rig.live.connect();
+    defer stream.close(io);
+    try sendAll(io, stream, getWire(&wbuf, created.id, null));
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = true }, heldIs);
+    // Still open well after the head (a drain-and-close would have ended).
+    sleepMs(io, 150);
+    try testing.expect(rig.sessions.heldNow(created.id).?);
+
+    try testing.expect(try rig.sessions.push(created.id, "{\"n\":1}"));
+    try testing.expect(try rig.sessions.pushTag(created.tag, "{\"n\":2}"));
+    rig.sessions.close(created.id);
+
+    var buf: [4096]u8 = undefined;
+    const got = readToEnd(io, stream, &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.find(u8, got, "text/event-stream") != null);
+    const one = std.mem.find(u8, got, "id: 1\ndata: {\"n\":1}\n\n").?;
+    const two = std.mem.find(u8, got, "id: 2\ndata: {\"n\":2}\n\n").?;
+    try testing.expect(one < two);
+    try testing.expect(std.mem.endsWith(u8, got, "0\r\n\r\n"));
+}
+
+test "held GET: Last-Event-ID replays what is newer, then the stream goes live" {
+    var rig: HeldGetRig = undefined;
+    if (!try rig.start(testing.allocator, true)) return error.SkipZigTest;
+    defer rig.stop();
+    const io = rig.live.io();
+    const created = try rig.sessions.create();
+    for ([_][]const u8{ "{\"n\":1}", "{\"n\":2}", "{\"n\":3}" }) |m| _ = try rig.sessions.push(created.id, m);
+    var wbuf: [256]u8 = undefined;
+    const stream = try rig.live.connect();
+    defer stream.close(io);
+    try sendAll(io, stream, getWire(&wbuf, created.id, 1));
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = true }, heldIs);
+    _ = try rig.sessions.push(created.id, "{\"n\":4}");
+    rig.sessions.close(created.id);
+    var buf: [4096]u8 = undefined;
+    const got = readToEnd(io, stream, &buf);
+    try testing.expect(std.mem.find(u8, got, "{\"n\":1}") == null);
+    const two = std.mem.find(u8, got, "id: 2\n").?;
+    const three = std.mem.find(u8, got, "id: 3\n").?;
+    const four = std.mem.find(u8, got, "id: 4\ndata: {\"n\":4}").?;
+    try testing.expect(two < three and three < four);
+}
+
+test "held GET: a second GET on the session is 409; after the first one leaves a new one is held" {
+    var rig: HeldGetRig = undefined;
+    if (!try rig.start(testing.allocator, true)) return error.SkipZigTest;
+    defer rig.stop();
+    const io = rig.live.io();
+    const created = try rig.sessions.create();
+    var wbuf: [256]u8 = undefined;
+    const first = try rig.live.connect();
+    try sendAll(io, first, getWire(&wbuf, created.id, null));
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = true }, heldIs);
+
+    const second = try rig.live.connect();
+    defer second.close(io);
+    try sendAll(io, second, getWire(&wbuf, created.id, null));
+    var buf: [2048]u8 = undefined;
+    const got = readToEnd(io, second, &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 409"));
+    try testing.expect(std.mem.find(u8, got, "Only one SSE stream is allowed per session") != null);
+
+    first.close(io);
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = false }, heldIs);
+    const third = try rig.live.connect();
+    defer third.close(io);
+    try sendAll(io, third, getWire(&wbuf, created.id, null));
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = true }, heldIs);
+}
+
+test "held GET: DELETE ends the open stream and the session is gone" {
+    var rig: HeldGetRig = undefined;
+    if (!try rig.start(testing.allocator, true)) return error.SkipZigTest;
+    defer rig.stop();
+    const io = rig.live.io();
+    const created = try rig.sessions.create();
+    var wbuf: [256]u8 = undefined;
+    const stream = try rig.live.connect();
+    defer stream.close(io);
+    try sendAll(io, stream, getWire(&wbuf, created.id, null));
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = true }, heldIs);
+
+    const del = try rig.live.connect();
+    defer del.close(io);
+    const dwire = try std.mem.print(&wbuf, "DELETE /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{created.id});
+    try sendAll(io, del, dwire);
+    var dbuf: [512]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, readToEnd(io, del, &dbuf), "HTTP/1.1 204"));
+
+    var buf: [2048]u8 = undefined;
+    const got = readToEnd(io, stream, &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, got, "0\r\n\r\n"));
+    try testing.expect(rig.sessions.heldNow(created.id) == null);
+}
+
+test "held GET: hold_get = false drains and closes as before" {
+    var rig: HeldGetRig = undefined;
+    if (!try rig.start(testing.allocator, false)) return error.SkipZigTest;
+    defer rig.stop();
+    const io = rig.live.io();
+    const created = try rig.sessions.create();
+    _ = try rig.sessions.push(created.id, "{\"n\":1}");
+    var wbuf: [256]u8 = undefined;
+    const stream = try rig.live.connect();
+    defer stream.close(io);
+    try sendAll(io, stream, getWire(&wbuf, created.id, null));
+    var buf: [2048]u8 = undefined;
+    const got = readToEnd(io, stream, &buf); // returns: the response ended by itself
+    try testing.expect(std.mem.find(u8, got, "id: 1\ndata: {\"n\":1}") != null);
+    try testing.expect(rig.sessions.heldNow(created.id).? == false);
 }
