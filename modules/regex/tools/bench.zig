@@ -60,6 +60,15 @@ const workloads = [_]Workload{
     .{ .name = "cz_words", .mode = .findall, .pattern = "\\b\\w+\\b", .text = .{ .file = "cz" } },
     .{ .name = "cz_icase", .mode = .findall, .pattern = "(?i)žluť\\w*", .text = .{ .file = "cz" } },
     .{ .name = "cz_digits", .mode = .findall, .pattern = "[0-9]+", .text = .{ .file = "cz" } },
+    // A class just before the end: the tail filter passes, so the backward
+    // DFA runs, its table empty at every call (per-call cost, 27 bytes).
+    .{ .name = "rev_cls", .mode = .match, .pattern = "[A-Z]+XYZ$", .text = .{ .literal = "the quick brown fox ABCXYZ" } },
+    // Many literal prefixes (past Teddy's 32): 40 six-letter words, each with its own two first bytes, over noise.
+    .{ .name = "teddy40", .mode = .findall, .pattern = "aaqzxv|abqzxv|acqzxv|adqzxv|aeqzxv|baqzxv|bbqzxv|bcqzxv|bdqzxv|beqzxv|caqzxv|cbqzxv|ccqzxv|cdqzxv|ceqzxv|daqzxv|dbqzxv|dcqzxv|ddqzxv|deqzxv|eaqzxv|ebqzxv|ecqzxv|edqzxv|eeqzxv|faqzxv|fbqzxv|fcqzxv|fdqzxv|feqzxv|gaqzxv|gbqzxv|gcqzxv|gdqzxv|geqzxv|haqzxv|hbqzxv|hcqzxv|hdqzxv|heqzxv", .text = .{ .file = "rnd" } },
+    // A working set that fits 255 states by itself, with the mid-sequence states of two-byte code points over it.
+    .{ .name = "fwd_mid", .mode = .findall, .pattern = "[čřšžťďň].{6}x", .text = .{ .file = "cz" } },
+    // A working set past the forward DFA's 255 states, over two-byte code points.
+    .{ .name = "fwd_wide", .mode = .findall, .pattern = "[čřšžťďň].{9}x", .text = .{ .file = "cz" } },
     // Short strings: per-call overhead.
     .{ .name = "anch_all", .mode = .findall, .pattern = "^[a-z]+", .text = .{ .literal = "hello world 123" } },
     .{ .name = "sub_short", .mode = .submatch, .pattern = "(\\d+)-(\\d+)", .text = .{ .literal = "abc 123-456 def" } },

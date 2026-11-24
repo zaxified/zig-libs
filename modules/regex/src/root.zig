@@ -3247,6 +3247,11 @@ fn buildTeddy(pf: *const Prefilter, insts: []const Inst, ranges: []const Range) 
 /// from the start and from after every consuming instruction, with `\z` as a
 /// wall and every other assertion passable.
 fn endAnchored(insts: []const Inst) bool {
+    // Without a `\z` nothing can wall off the match.
+    const has_end = for (insts) |inst| {
+        if (inst == .assert and inst.assert == .end_text) break true;
+    } else false;
+    if (!has_end) return false;
     var seen: std.StaticBitSet(max_insts) = .empty;
     // The start and every consuming instruction, then two per instruction walked.
     var stack: [3 * max_insts + 1]u16 = undefined;
@@ -3338,8 +3343,7 @@ fn lastBytes(insts: []const Inst, ranges: []const Range) ?[4]u64 {
         if (!reachesMatch(insts, @intCast(pc + 1))) continue;
         switch (inst) {
             .rune => |r| for (ranges[r.start..][0..r.len]) |rg| {
-                var c: u32 = rg.lo;
-                while (c <= @min(rg.hi, 0x7f)) : (c += 1) set[c >> 6] |= @as(u64, 1) << @truncate(c);
+                if (rg.lo <= 0x7f) setByteRange(&set, rg.lo, @min(rg.hi, 0x7f));
                 if (rg.hi >= 0x80) set[2] = ~@as(u64, 0); // 0x80..0xbf
                 if (rg.lo <= 0xfffd and 0xfffd <= rg.hi) set[3] = ~@as(u64, 0);
             },
@@ -3454,9 +3458,17 @@ fn addLeadBytes(set: *[4]u64, r: Range) void {
         const lo: u32 = @max(r.lo, band.lo);
         const hi: u32 = @min(r.hi, band.hi);
         if (lo > hi) continue;
-        var c: u32 = band.tag | (lo >> band.shift);
-        const last: u32 = band.tag | (hi >> band.shift);
-        while (c <= last) : (c += 1) set[c >> 6] |= @as(u64, 1) << @truncate(c);
+        setByteRange(set, band.tag | (lo >> band.shift), band.tag | (hi >> band.shift));
+    }
+}
+
+/// Add the bytes `lo..=hi` (both below 256) to `set`, a word at a time.
+fn setByteRange(set: *[4]u64, lo: u32, hi: u32) void {
+    var w = lo >> 6;
+    while (w <= hi >> 6) : (w += 1) {
+        const from: u6 = if (w == lo >> 6) @truncate(lo) else 0;
+        const to: u6 = if (w == hi >> 6) @truncate(hi) else 63;
+        set[w] |= (~@as(u64, 0) << from) & (~@as(u64, 0) >> (63 - to));
     }
 }
 
@@ -4653,6 +4665,48 @@ fn expectFind(pattern: []const u8, input: []const u8, want: ?[]const u8) !void {
         try testing.expectEqualStrings(w, got.?.slice(input));
     } else try testing.expectEqual(@as(?Span, null), got);
     try testing.expectEqual(want != null, re.isMatch(input));
+}
+
+test "Teddy takes up to 64 prefixes at the full cut (40 words with distinct first two bytes)" {
+    var pat: std.ArrayList(u8) = .empty;
+    defer pat.deinit(testing.allocator);
+    for ("abcdefgh") |a| for ("abcde") |b| {
+        if (pat.items.len != 0) try pat.append(testing.allocator, '|');
+        try pat.appendSlice(testing.allocator, &.{ a, b, 'q', 'z', 'x', 'v' });
+    };
+    var re = try Regex.compile(testing.allocator, pat.items);
+    defer re.deinit(testing.allocator);
+    const t = re.prefilter.teddy orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 40), t.n);
+    try testing.expectEqual(@as(u8, 6), t.lens[0]);
+    const text = "the quick brown fox hbqzxv jumps over the lazy dog hexqzx";
+    try testing.expectEqual(@as(?usize, 20), t.find(text, 0));
+    const m = (try re.find(testing.allocator, text)).?;
+    try testing.expectEqual(@as(usize, 20), m.start);
+    try testing.expect(!re.isMatch("abqzx abqzv bqzxv hexqzx"));
+}
+
+test "setByteRange sets exactly lo..=hi, across word edges" {
+    for ([_]u32{ 0, 1, 62, 63, 64, 65, 127, 128, 200, 254, 255 }) |lo| {
+        for ([_]u32{ 0, 1, 62, 63, 64, 65, 127, 128, 200, 254, 255 }) |hi| {
+            if (hi < lo) continue;
+            var got: [4]u64 = .{ 0, 0, 0, 0 };
+            setByteRange(&got, lo, hi);
+            var want: [4]u64 = .{ 0, 0, 0, 0 };
+            var c = lo;
+            while (c <= hi) : (c += 1) want[c >> 6] |= @as(u64, 1) << @truncate(c);
+            try testing.expectEqualSlices(u64, &want, &got);
+        }
+    }
+}
+
+test "endAnchored: only a program with a `\\z` can be end-anchored" {
+    var re = try Regex.compile(testing.allocator, "[a-z]+x$");
+    defer re.deinit(testing.allocator);
+    try testing.expect(re.prefilter.end_anchored);
+    var re2 = try Regex.compile(testing.allocator, "[a-z]+x");
+    defer re2.deinit(testing.allocator);
+    try testing.expect(!re2.prefilter.end_anchored);
 }
 
 test "literals, classes, dot, anchors" {
@@ -5962,7 +6016,7 @@ test "prefilter: the literal prefixes of every match, searched for together (Ted
         .{ .p = "ABCD|CDEF|EFGH|GHIJ|IJKL|KLMN|MNOP|OPQR|QRST|STUV|UVWX|WXYZ", .n = 12, .masks = 3 },
         .{ .p = "(?i)abc", .n = 8, .masks = 3 },
         .{ .p = "(?i)abcdefghij", .n = 16, .masks = 3 }, // 2^8 at eight bytes: cut to four
-        .{ .p = "[ab][cd][ef][gh][ij][kl]", .n = 16, .masks = 3 },
+        .{ .p = "[ab][cd][ef][gh][ij][kl]", .n = 64, .masks = 3 }, // 2^6 at six bytes: all 64 kept
         .{ .p = "foo\\d|bar\\d", .n = 2, .masks = 3 },
         .{ .p = "é|ü", .n = 2, .masks = 2 },
         .{ .p = "ab|abcd|cd", .n = 2, .masks = 2 }, // `abcd` is covered by `ab`
@@ -7854,6 +7908,30 @@ test "mutation M: expand after $$, a bad name byte, a cut sequence, a short grou
     // two-byte form) ends the name, and the bytes are copied as they are.
     try re.expand(&out.writer, "$x\xed\xa0\x80|$1\xc0\x80", input, &groups);
     try testing.expectEqualStrings("a\xed\xa0\x80|a\xc0\x80", out.written());
+}
+
+test "literalPrefix of literals at each size of the prefix walk's work stack" {
+    const gpa = testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    for ([_]usize{ 1, 60, 62, 63, 64, 120, 254, 255, 256, 600, 1020, 1022, 1023, 1030, 2000 }) |n| {
+        const lit = try gpa.alloc(u8, n);
+        defer gpa.free(lit);
+        @memset(lit, 'q');
+        var re = try Regex.compile(gpa, lit);
+        defer re.deinit(gpa);
+        out.clearRetainingCapacity();
+        try testing.expect(try re.literalPrefix(&out.writer));
+        try testing.expectEqualSlices(u8, lit, out.written());
+        // A class at the end ends the prefix there and makes it incomplete.
+        const alt = try std.fmt.allocPrint(gpa, "{s}[ab]", .{lit});
+        defer gpa.free(alt);
+        var re2 = try Regex.compile(gpa, alt);
+        defer re2.deinit(gpa);
+        out.clearRetainingCapacity();
+        try testing.expect(!try re2.literalPrefix(&out.writer));
+        try testing.expectEqualSlices(u8, lit, out.written());
+    }
 }
 
 test "mutation M: literalPrefix of a long literal and around the surrogates" {

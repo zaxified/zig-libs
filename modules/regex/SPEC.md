@@ -12,7 +12,7 @@
 
 **Hardening:** fuzz 2026-10-28 (240,000 runs clean (REGEX_FUZZ), ReleaseSafe) · ct n/a — regex engine (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point, 2 MED fixed in `b2b6086e`)
 
-**Performance:** ref 0.00–0.57× Go regexp go1.26 · fastest 0.05–1.24× Rust regex 1.13.1 (measured 2026-10-28)
+**Performance:** ref 0.00–0.65× Go regexp go1.26 · fastest 0.04–10.93× Rust regex 1.13.1 (measured 2026-11-24)
 
 **Known defects:** none recorded
 
@@ -153,12 +153,12 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   there is no such literal and the match can start anywhere = the literal prefixes every match
   begins with (`src/teddy.zig`): a walk of every path from the start through assertions, a class
   of up to 4 code points forking it, ending at 8 bytes, a larger class, `.` or the match — none
-  when a path ends empty or at a class holding U+FFFD; cut to 4, 3, 2 bytes while over 32
+  when a path ends empty or at a class holding U+FFFD; cut to 4, 3, 2 bytes while over 64
   prefixes; none under two bytes. Searched for with Teddy (Hyperscan's SIMD literal search, as
   the Rust `aho-corasick` crate documents it; no source ported): the sorted prefixes in 8
   buckets, per byte position (2–3, up to the shortest prefix) two 16-entry nibble tables of
   bucket bits, 32 positions per step (`vpshufb` with AVX2, a select tree elsewhere), each
-  candidate checked against its buckets' prefixes in full. Out of line (`?*const`, ~400 B):
+  candidate checked against its buckets' prefixes in full. Out of line (`?*const`, ~800 B):
   most programs have none. Consulted only while no thread
   is alive, so it changes where the search looks, never which match it finds; a skip lands on an
   ASCII or lead byte, which always begins a code point the VM would decode.
@@ -400,35 +400,39 @@ Consumer build options (CONVENTIONS §4.2), after Rust `regex-syntax`'s `unicode
 - **`MarshalText`/`UnmarshalText`** — Go's encoding interfaces; `source` and `compile` are the same pair.
 - **Hand-written `Regex` values** — a `Regex` built by writing its fields is outside the guarantee.
 - **Sibling modules adopting `regex`:** `validate` (`Pattern.matcher` takes a caller-supplied matcher today), `jsonshape` (RFC 9535 `match()`/`search()` need I-Regexp), `tsdb` (regex label matchers) and `probe` (`expect` regex) each carry that as their own backlog item; they are not this module's work.
+- **A full forward table that keeps caching two-byte steps** (`FindDfa.midAfter` has no room when `limit` states are held,
+  so a two-byte code point from an existing state is stepped uncached) — measured, no gain. Flushing from `midAfter` as a
+  new state does (same `flush`, the target interned again): `fwd_mid` (`[čřšžťďň].{6}x` over Czech text, a working set that
+  fits 255 states) 2.31 ms -> 2.34-2.36 ms (+1.5-2.5 %, spread 0.5 %), `fwd_wide` (`[čřšžťďň].{9}x`, over 2^9 states, which
+  thrash whatever the policy) 15.9 ms -> 16.7 ms (+4.5 %). `fwd_mid` is already 1.01-1.03x Rust and `fwd_wide` 0.45x Go;
+  the 7x to Rust there is the 255-state limit (Rust's lazy DFA keeps megabytes), a `u16` row-offset design choice.
+- **A cheaper backward search per call** (`runRevDfa`: a closure per consuming instruction for each new state, the table
+  empty at every call; `rev_cls`, `[A-Z]+XYZ$` on a 26-byte text, 335-358 ns, 0.58x Go, 11x Rust) — a per-call cache of
+  each instruction's follow set (`closureOf`, for programs with no assertion) gave 351 / 324 ns against 358 / 335 (-2 to
+  -3 %, spread 7 %): no effect. Storing the sets in the `Regex` (~2 KiB each) could save only the first-use closures that
+  cache already left, so it is not built.
+- **An ASCII bitmap per class (or a shorter class scan)** — the binary search of `inRanges` is ~13 % of the backtracker's
+  time on `sub_email`. A linear scan for up to six ranges (what a bitmap would replace for short classes): `sub_email`
+  408 / 432 ns -> 338 / 368 (-17 %), but `inv_sub` 68.7 / 69.5 us -> 70.3 / 75.0 (+2 to +8 %) in the same build, and the
+  same two builds padded for the JCC erratum give `sub_email` -5 % and `inv_sub` +5-10 %: layout, not the class test. The
+  DFA and one-pass rows read tables and never call it. No bitmap (16 bytes per class in every `Regex`) for a row-local
+  gain that does not survive padding.
+- **Padding the scan loops against the Intel JCC erratum** (`.p2align 5` in inline asm at a loop head) — the same bench
+  built with `-Djcc-safe` and without: the `$`-anchored rows `easy0`..`icase` 6.3 -> 5.0 ns (-20 %), but they are the
+  bench's own timing loop around an inlined `isMatch` (the whole row is `bench.runOnce`), not module code; the DFA and
+  find-all rows move -5 to -8 % (`dense_AZ`, `cz_words`, `cz_letters`, `cz_digits`), `hard1` +1.5 %. `FindDfa.span`
+  holds 43 branch sites that cross or end on a 32-byte boundary and `Matcher.Iterator.advance` 20, its hot inner loop
+  none: a pad per site is an edit that moves them all (`asm volatile(".p2align 5")` at a loop head also runs its nops on
+  every back edge). A consumer that wants the padding builds with the assembler's `-mbranches-within-32B-boundaries`.
+- **Teddy's fat variant (16 buckets) and a NEON lookup** — the slim variant now takes 64 prefixes (`teddy.max_pats`),
+  `teddy40` (40 six-byte words, each with its own first two bytes, over noise) went from 47-93 ms (no Teddy: the prefixes
+  were cut to nothing) to 0.12 ms, 0.54x Rust's 0.23 ms; no gap is left to measure the fat variant against. The portable
+  lookup (a select tree) is not measured on AArch64: no aarch64 host here.
 
 ## Backlog / deferred
 
 Open items.
 
-- *BOUNCED (quiet-host):* **A full forward table can stop caching two-byte steps** (perf only) — when `FindDfa` holds `limit` states and the next
-  state already exists, `intern` does not empty the table, but `midAfter` has no room: every two-byte code point from that
-  state is stepped uncached until some new state forces a flush. Not seen in the bench (<= 20 states). Flushing from
-  `midAfter` is a few lines but thrashes where the old policy keeps the first states cached (a working set past the
-  limit); a fix needs a measured bench with a working set just past 255 states and a give-up heuristic (Rust's lazy DFA
-  quits when it clears too often). *needs a quiet machine; measured in the perf phase.*
-- *BOUNCED (quiet-host):* **The backward search's per-call cost** — when the tail filter passes, each new backward state costs a closure per
-  consuming instruction (~100 ns) and the table starts empty on every call (no allocator, no cache between calls): ~1.2 us for
-  ten states. The `tail` filter answers the common shapes in nanoseconds; a class near the end (`[A-Z]+XYZ$` on a text ending
-  `…XYZ`) still runs the DFA. Precomputing each instruction's follow set at compile time would cut the per-state cost at
-  ~2 KiB per `Regex`. *needs a quiet machine; measured in the perf phase.*
-- *BOUNCED (quiet-host):* **Teddy past 32 prefixes, and on NEON** — Rust's slim Teddy takes 64 patterns and its fat variant 16 buckets; past 32
-  here the prefixes are cut shorter, and with fewer than two bytes the first-byte set is used. Non-x86 targets look the
-  nibbles up by a select tree (AArch64 has `tbl`), unmeasured. *needs a quiet machine; measured in the perf phase.*
-- *BOUNCED (quiet-host):* **Intel JCC erratum in the prefilter scan** — `Prefilter.next`'s `cmp;jne` back-edge (31-40 % of `isMatch` samples) and a loop
-  in `runDfa` cross a 32-byte boundary in the current layout: a mitigated build ran in 0.825-0.856x the cycles. Layout luck,
-  moves with any edit. Plan (user-approved): the scan loop in inline asm behind `.p2align 5`, or at least
-  `asm volatile(".p2align 5")` as the FIRST statement of the loop body (never before the loop); re-check with `jcc-scan.py`
-  after each compiler bump. *needs a quiet machine; measured in the perf phase.*
-- *BOUNCED (quiet-host):* **An ASCII bitmap per class** — smaller constant factors. *needs a quiet machine; measured in the perf phase.*
-- *BOUNCED (quiet-host):* **Per-call compile + match in ReleaseSafe** — 1.1-3.7x slower than the other Zig engine measured in ReleaseSafe
-  (about 70 % `compiler_rt.memset`: safety fills `undefined` of the ~9 KiB `Builder` and the DFA scratch), 2-7x faster in
-  ReleaseFast/ReleaseSmall. Matters only to consumers that ship ReleaseSafe and compile per call; a fix would keep those
-  scratches out of safety's `undefined` fill. Not measured here yet. *needs a quiet machine; measured in the perf phase.*
 - *BOUNCED (waits-external):* **The next Unicode version** — `tools/ucd_unicode/fetch.sh <v>` and `gen.py --ucd data/<v> -out src`; re-run the Go replay
   (its UNICODE_VERSION count moves) and check new binary properties or property values against regex-syntax once it carries
   that version.

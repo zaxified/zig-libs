@@ -266,19 +266,78 @@ pub fn prefixInto(insts: []const syntax.Inst, ranges: []const syntax.Range, buf:
     return n;
 }
 
+/// A set of instruction indices, `Bits.init(n)` for a program of `n`
+/// instructions: only the words that index can reach are cleared and
+/// scanned (`std.StaticBitSet(4 * max_insts)` is 512 bytes to clear and 64
+/// words to scan however short the program).
+const Bits = struct {
+    words: [4 * root.max_insts / 64]u64,
+    n: usize,
+
+    fn init(ninsts: usize) Bits {
+        var b: Bits = undefined;
+        b.n = (ninsts + 63) / 64;
+        @memset(b.words[0..b.n], 0);
+        return b;
+    }
+
+    fn clear(b: *Bits) void {
+        @memset(b.words[0..b.n], 0);
+    }
+
+    fn set(b: *Bits, i: usize) void {
+        b.words[i >> 6] |= @as(u64, 1) << @truncate(i);
+    }
+
+    fn isSet(b: *const Bits, i: usize) bool {
+        return b.words[i >> 6] & (@as(u64, 1) << @truncate(i)) != 0;
+    }
+
+    fn count(b: *const Bits) usize {
+        var c: usize = 0;
+        for (b.words[0..b.n]) |w| c += @popCount(w);
+        return c;
+    }
+
+    fn iterator(b: *const Bits) Iterator {
+        return .{ .b = b, .word = 0, .rest = if (b.n != 0) b.words[0] else 0 };
+    }
+
+    const Iterator = struct {
+        b: *const Bits,
+        word: usize,
+        rest: u64,
+
+        fn next(it: *Iterator) ?usize {
+            while (it.rest == 0) {
+                it.word += 1;
+                if (it.word >= it.b.n) return null;
+                it.rest = it.b.words[it.word];
+            }
+            const i = it.word * 64 + @ctz(it.rest);
+            it.rest &= it.rest - 1;
+            return i;
+        }
+    };
+};
+
 /// `literalPrefix` over a program, writing through `sink.put` (false: stop).
 fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: anytype) !bool {
-    var cur: std.StaticBitSet(4 * root.max_insts) = .empty;
-    var nxt: std.StaticBitSet(4 * root.max_insts) = .empty;
+    // Only the words the program's instructions index are cleared and scanned
+    // (a short pattern's program is a few words, the table is 64).
+    var set_a: Bits = .init(insts.len);
+    var set_b: Bits = .init(insts.len);
+    var cur = &set_a;
+    var nxt = &set_b;
     var complete = true;
     var stopped = false;
     // At the start: `\A` may be passed.
-    reach(insts, &cur, 0, true, &complete, &stopped);
+    reach(insts, cur, 0, true, &complete, &stopped);
     var steps: usize = 0;
     while (!stopped and steps <= 4 * root.max_insts) : (steps += 1) {
         var single: ?u21 = null;
         var ended = false;
-        var it = cur.iterator(.{});
+        var it = cur.iterator();
         while (it.next()) |pc| switch (insts[pc]) {
             .match => ended = true,
             .rune => |r| {
@@ -293,7 +352,7 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
             // Complete only when nothing but the match is left.
             if (complete) {
                 var only_match = cur.count() == 1;
-                var it2 = cur.iterator(.{});
+                var it2 = cur.iterator();
                 while (it2.next()) |pc| if (insts[pc] != .match) {
                     only_match = false;
                 };
@@ -311,10 +370,10 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
             break :blk 1;
         } else std.unicode.utf8Encode(cp, &buf) catch unreachable;
         if (!try sink.put(buf[0..n])) return false;
-        nxt = .empty;
-        var it3 = cur.iterator(.{});
-        while (it3.next()) |pc| reach(insts, &nxt, @intCast(pc + 1), false, &complete, &stopped);
-        std.mem.swap(std.StaticBitSet(4 * root.max_insts), &cur, &nxt);
+        nxt.clear();
+        var it3 = cur.iterator();
+        while (it3.next()) |pc| reach(insts, nxt, @intCast(pc + 1), false, &complete, &stopped);
+        std.mem.swap(*Bits, &cur, &nxt);
     }
     return false;
 }
@@ -322,9 +381,19 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
 /// Add to `set` the consuming states and the match reachable from `pc0`
 /// without consuming. An assertion stops the prefix (`stopped`), except `\A`
 /// at the start, which only makes it incomplete.
-fn reach(insts: []const syntax.Inst, set: *std.StaticBitSet(4 * root.max_insts), pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
-    var seen: std.StaticBitSet(4 * root.max_insts) = .empty;
-    var stack: [8 * root.max_insts]u16 = undefined;
+fn reach(insts: []const syntax.Inst, set: *Bits, pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
+    // The stack holds at most one entry for the start and two per instruction
+    // walked, so it is sized by the program: ReleaseSafe fills an `undefined`
+    // array, and 16 KiB of it per call was a quarter of a short pattern's compile.
+    if (insts.len <= 64) return reachN(129, insts, set, pc0, at_start, complete, stopped);
+    if (insts.len <= 256) return reachN(513, insts, set, pc0, at_start, complete, stopped);
+    if (insts.len <= root.max_insts) return reachN(2 * root.max_insts + 1, insts, set, pc0, at_start, complete, stopped);
+    return reachN(8 * root.max_insts + 1, insts, set, pc0, at_start, complete, stopped);
+}
+
+fn reachN(comptime stack_len: usize, insts: []const syntax.Inst, set: *Bits, pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
+    var seen: Bits = .init(insts.len);
+    var stack: [stack_len]u16 = undefined;
     var sp: usize = 1;
     stack[0] = pc0;
     while (sp != 0) {
