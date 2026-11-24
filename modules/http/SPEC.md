@@ -83,7 +83,7 @@ thread-safe slab pool wired via `Client.Options.buffer_pool`, backing h2 upstrea
 gateway that churns h2 connections reuses `O(peak)` slabs instead of allocating one per dial (h1's
 idle `Pool` already recycles whole warm connections, so it does not need it). **Trailers, both directions, both protocols:** the read side captures an incoming chunked trailer
 section (h1) or request trailer HEADERS frame (h2) behind one handler surface
-(`Request.trailer`/`iterateTrailers`/`trailers`); the write side is
+(`Request.trailer`/`iterateTrailers`/`trailers`; an h1 trailer line that is not a field line -- obs-fold, no token name, no colon -- fails the body, RFC 9112 §7.1.2 / §5.2); the write side is
 `ResponseWriter.declareTrailers` + `setTrailer`, emitted after the terminating chunk on h1 (RFC 9112
 §7.1.2) and as a trailing HEADERS frame carrying END_STREAM on h2 (RFC 9113 §8.1 — the final DATA
 frame then does *not* carry it). Declaring trailers commits the response to chunked framing, so
@@ -600,7 +600,7 @@ under *Anchoring*.
   frozen into `src/go_oracle_vectors.zig` and replayed by `src/go_oracle.zig` with no Go at test time; every
   disagreement is a per-area table entry with the RFC rule, which side is off it and what we answer — a case that
   diverges without an entry fails, and so does an entry whose case agrees again; a fresh `--phase go` run fails
-  when it differs from the committed vectors. **TLS + ALPN against Go** (`--phase alpn`): two Go httptest TLS
+  when it differs from the committed vectors. **hyper and llhttp on the h1 wires** (`--phase h1parsers`, 2026-11-24): the Go oracle's wires plus 50 smuggling-shaped ones (Content-Length with Transfer-Encoding in obfuscated shapes, obs-fold, bare LF and CR, bad chunk sizes and trailers, over-long lines) through hyper 1.11 (`tools/rust_fast_bench/src/bin/h1_verdicts.rs`, the bench's crate tree built `--offline`) and llhttp 9.4 (the parser of Node.js and uvicorn, Python package `httptools` 0.9.0 in the http oracle venv, `tools/h1_llhttp.py`), frozen into `src/h1_parsers_vectors.zig` and replayed by `src/h1_parsers.zig` with the same rule (a divergence without an entry fails; an entry whose case agrees again fails). Decided by RFC 9112, spec-MANDATORY first, then the majority: it found and fixed three things (below) and left 40 hyper and 29 llhttp rows as listed, deliberate differences (Host, bare LF, CL.TE, transfer codings this server does not implement, asterisk/authority forms, head limits, llhttp's fixed method table). **TLS + ALPN against Go** (`--phase alpn`): two Go httptest TLS
   listeners (h2, and HTTP/1.1 only); `Client` with `Options.http2` must land on each, read trailers, decode gzip,
   follow a redirect, stream an upload and keep one connection, and the request Go's server sees from us must
   equal the one from Go's own Transport (`User-Agent` aside). This is where ALPN itself is tested against a foreign server
@@ -720,11 +720,6 @@ same thread).
 
 ## Backlog / deferred
 
-- *BOUNCED (owner):* **Differential oracle against karlseguin/http.zig (httpz)** — feed the same raw request bytes to both h1 parsers and
-  compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers), as a `tools/`
-  oracle (MIT, Zig 0.16). Blocked: building a fresh third-party checkout was refused in the agent sandbox; it needs an
-  owner OK (recipe: clone at a pinned commit into a gitignored `tools/` directory, build it there, run both sides from
-  `tools/interop.zig` as a new `--phase`).
 
 ## Anchoring
 

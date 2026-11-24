@@ -23,10 +23,12 @@ match the id. Set `stateless_responses = .single_client` to opt back in when
 the endpoint really does serve one client — see [Security](#security). Set a `*Sessions` to enable the full session model: an
 `Mcp-Session-Id` assigned at `initialize` and validated on later requests
 (unknown → 404, so the client re-initializes), `DELETE /mcp` teardown, and a
-server→client **`GET /mcp` stream**. That stream is **drain-and-close** (a
-long-poll over SSE): it replays every event queued since the request's
-`Last-Event-ID`, then closes; the client's `EventSource` auto-reconnects (with
-`Last-Event-ID`) for more. Nothing is lost within the bounded resumable
+server→client **`GET /mcp` stream**. That stream is **held open** over a real connection, as the reference SDKs'
+servers hold it: it replays every event queued since the request's
+`Last-Event-ID`, then stays open and carries each message the session is sent
+the moment it is enqueued (one stream per session: a second `GET` is 409);
+when it ends (client gone, queue overflow) the client's `EventSource`
+reconnects with `Last-Event-ID` and the bounded resumable
 replay buffer. Enqueue a message from any thread with `Sessions.push(id, data)`.
 
 ```zig
@@ -186,5 +188,4 @@ session-era clients on the same endpoint:
 
 TLS, rate limiting and authentication (compose `ratelimit`, `aaa-gate` /
 `jwt`; SPEC *What is deliberately not done*), the older HTTP+SSE dual-endpoint
-transport, and, open work (SPEC *Backlog / deferred*), a held-open session `GET`
-stream.
+transport.

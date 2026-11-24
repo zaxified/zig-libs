@@ -280,7 +280,9 @@ checked (no regex in the subset); cancellation over stdio only takes effect betw
   cursor is an opaque base64url position, valid for the list that minted it only and only in its canonical form; any
   other cursor is -32602, as pagination.mdx asks. With pagination off a request's cursor is ignored.
 - **Cancellation.** `ToolCall.cancelled()` is a flag the handler polls; `Server.cancelInflight(peer, id)` sets it and is
-  safe from another thread. A cancelled request gets no response. Only a transport that reads while a handler runs can
+  safe from another thread; a cancel for an unknown or finished id is ignored (the spec). `cancelInflightSticky` is the
+  transport variant for a peer handle it owns: a cancel that beats the call's registration is kept in a bounded ring (newest
+  32, dropped by `forgetPeer`) and applied when the call registers. A cancelled request gets no response. Only a transport that reads while a handler runs can
   deliver it in time; `serve` reads one line at a time, so on stdio a cancel lands after the call and is ignored, as
   the spec allows.
 - **Tool registration.** `Server.addTool` compiles the input and output schemas once and keeps

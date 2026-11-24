@@ -9,8 +9,9 @@
 //! what a real client of both eras understands.
 //!
 //! Not replayed: the exchanges that depend on the live run (a held
-//! `subscriptions/listen`, the tools that reach the transport or wait for a
-//! cancellation; `sdk_oracle_catalog.live_only`) -- the live run checked them.
+//! `subscriptions/listen`, the session era's held `GET` stream, the tools that
+//! reach the transport or wait for a cancellation;
+//! `sdk_oracle_catalog.live_only`) -- the live run checked them.
 //! Session ids are random: a request naming the live run's session names the
 //! replay's.
 
@@ -33,9 +34,22 @@ fn headerOf(block: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn liveOnly(ex: vectors.Exchange) bool {
+    // The session era's `GET` stream is held open in the live run (it carried the
+    // pushed notification and ended with the session's `DELETE`); socket-free it
+    // would be drain-and-close, which is not what was recorded.
+    if (std.mem.eql(u8, ex.method, "GET")) return true;
     if (std.mem.eql(u8, headerOf(ex.headers, "mcp-method") orelse "", "subscriptions/listen")) return true;
-    const name = headerOf(ex.headers, "mcp-name") orelse return false;
-    for (catalog.live_only) |n| if (std.mem.eql(u8, n, name)) return true;
+    if (headerOf(ex.headers, "mcp-name")) |name| {
+        for (catalog.live_only) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+    // The session era names no tool in a header: it is in the body.
+    if (std.mem.find(u8, ex.body, "\"method\":\"tools/call\"") == null) return false;
+    for (catalog.live_only) |n| {
+        var pat: [64]u8 = undefined;
+        const needle = std.mem.print(&pat, "\"name\":\"{s}\"", .{n}) catch continue;
+        if (std.mem.find(u8, ex.body, needle) != null) return true;
+    }
     return false;
 }
 

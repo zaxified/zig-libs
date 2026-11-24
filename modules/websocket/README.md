@@ -136,5 +136,5 @@ RSV/opcode/length-encoding/size-cap/fragmentation-sequencing/UTF-8 rejections, e
 positive control), every RFC 7692 §7.2.3 example, and deterministic fuzz harnesses over the
 handshake, the frame and close codecs, `Connection`, the extension grammar, `inflate`, a deflate
 `Connection` and `Conn`'s direct-payload path. `zig build interop-websocket` runs coder/websocket
-and gorilla/websocket as live peers in both directions. See SPEC.md for the full security-rule
+and gorilla/websocket (and, when built, karlseguin/websocket.zig) as live peers in both directions. See SPEC.md for the full security-rule
 rationale and what's deliberately out of scope.
