@@ -1514,7 +1514,17 @@ fn evalExpr(ctx: *Ctx, cur: J, e: *const Expr, depth: u32) Error!bool {
         },
         .not => |inner| !try evalExpr(ctx, cur, inner, depth),
         .exists => |q| (try runQuery(ctx, cur, q, 1, depth)).n > 0,
-        .cmp => |c| try compare(ctx, try evalComparable(ctx, cur, c.l, depth), c.op, try evalComparable(ctx, cur, c.r, depth)),
+        .cmp => |c| blk: {
+            // A query (never empty here: `@` alone is the generic path) against a
+            // literal, the commonest filter: the node stays a pointer into the
+            // document instead of a copy of its value.
+            if (c.l == .query and c.r == .lit and c.l.query.segs.len > 0) {
+                const p = try singularPtr(ctx, cur, c.l.query, depth);
+                if (try compareLit(ctx, p, c.op, c.r.lit)) |v| break :blk v;
+                break :blk try compare(ctx, if (p) |n| n.* else null, c.op, try evalComparable(ctx, cur, c.r, depth));
+            }
+            break :blk try compare(ctx, try evalComparable(ctx, cur, c.l, depth), c.op, try evalComparable(ctx, cur, c.r, depth));
+        },
         .regex => |r| {
             const subject = (try evalComparable(ctx, cur, r.subject, depth)) orelse return false;
             if (subject != .string) return false;
@@ -1548,6 +1558,85 @@ fn runQuery(ctx: *Ctx, cur: J, q: Query, stop_after: usize, depth: u32) Error!Ct
     return sub;
 }
 
+/// `singularFound` for a singular query of at least one segment, as a pointer
+/// to the node inside the document (the `Query` of a comparison is singular by
+/// construction: the parser refuses any other).
+fn singularPtr(ctx: *Ctx, cur: J, q: Query, depth: u32) Error!?*const J {
+    var holder: J = if (q.absolute) ctx.root else cur;
+    var node: *const J = &holder;
+    var d = depth + 1;
+    for (q.segs) |seg| {
+        const sels = switch (seg) {
+            .child => |sels| sels,
+            else => unreachable,
+        };
+        try ctx.work.charge(1); // evalSegs, charged first
+        if (d > MAX_PATH_DEPTH) return Error.DepthLimit;
+        try ctx.work.charge(1); // one lookup per selector
+        switch (sels[0]) {
+            .name => |k| switch (node.*) {
+                .object => |o| {
+                    try ctx.work.charge(k.len / 64); // hashing the name
+                    node = o.getPtr(k) orelse return null;
+                },
+                else => return null,
+            },
+            .index => |idx| switch (node.*) {
+                .array => |arr| node = &arr.items[normIndex(idx, arr.items.len) orelse return null],
+                else => return null,
+            },
+            else => unreachable,
+        }
+        d += 1;
+    }
+    try ctx.work.charge(1); // the call that records the match
+    if (d > MAX_PATH_DEPTH) return Error.DepthLimit;
+    if (ctx.limit == 0) return Error.TooManyMatches;
+    return node;
+}
+
+/// `runQuery(ctx, cur, q, 1, depth).found` for a singular query, walked
+/// directly: the same work charges, depth checks and `max_matches` check as
+/// `evalSegs` in the same order, without a sub-`Ctx`. A segment that is not a
+/// single name or index selector (never, for a parsed comparison) goes on
+/// through `evalSegs` from where the walk stands.
+fn singularFound(ctx: *Ctx, cur: J, q: Query, depth: u32) Error!?J {
+    var node = if (q.absolute) ctx.root else cur;
+    var d = depth + 1;
+    for (q.segs, 0..) |seg, i| {
+        const sels = switch (seg) {
+            .child => |sels| if (sels.len == 1 and (sels[0] == .name or sels[0] == .index)) sels else null,
+            else => null,
+        } orelse {
+            var sub: Ctx = .{ .a = ctx.a, .root = ctx.root, .stop_after = 1, .limit = ctx.limit, .work = ctx.work };
+            try evalSegs(&sub, node, q.segs[i..], d);
+            return sub.found;
+        };
+        try ctx.work.charge(1); // evalSegs, charged first
+        if (d > MAX_PATH_DEPTH) return Error.DepthLimit;
+        try ctx.work.charge(1); // one lookup per selector
+        switch (sels[0]) {
+            .name => |k| switch (node) {
+                .object => |o| {
+                    try ctx.work.charge(k.len / 64); // hashing the name
+                    node = o.get(k) orelse return null;
+                },
+                else => return null,
+            },
+            .index => |idx| switch (node) {
+                .array => |arr| node = arr.items[normIndex(idx, arr.items.len) orelse return null],
+                else => return null,
+            },
+            else => unreachable,
+        }
+        d += 1;
+    }
+    try ctx.work.charge(1); // the call that records the match
+    if (d > MAX_PATH_DEPTH) return Error.DepthLimit;
+    if (ctx.limit == 0) return Error.TooManyMatches;
+    return node;
+}
+
 /// A comparable's value; null is RFC 9535's "Nothing" (no node), distinct
 /// from a JSON `null`.
 fn evalComparable(ctx: *Ctx, cur: J, c: Comparable, depth: u32) Error!?J {
@@ -1559,7 +1648,7 @@ fn evalComparable(ctx: *Ctx, cur: J, c: Comparable, depth: u32) Error!?J {
             .boolean => |b| J{ .bool = b },
             .null => J.null,
         },
-        .query => |q| (try runQuery(ctx, cur, q, 1, depth)).found,
+        .query => |q| try singularFound(ctx, cur, q, depth),
         .length => |arg| switch ((try evalComparable(ctx, cur, arg.*, depth)) orelse return null) {
             .string => |s| blk: {
                 try ctx.work.charge(s.len); // O(len) per evaluation
@@ -1574,6 +1663,60 @@ fn evalComparable(ctx: *Ctx, cur: J, c: Comparable, depth: u32) Error!?J {
             const r = try runQuery(ctx, cur, q, 2, depth);
             break :blk if (r.n == 1) r.found else null;
         },
+    };
+}
+
+/// `compare(ctx, l, op, lit)` for the two commonest shapes, a number against a
+/// number literal and a boolean against a boolean literal, without building the
+/// literal's value: the same charge (`jsonEq`'s one step) and the same answer.
+/// Null for any other pair, which `compare` decides.
+fn compareLit(ctx: *Ctx, l: ?*const J, op: CmpOp, lit: Lit) Error!?bool {
+    const v = (l orelse return null).*;
+    switch (lit) {
+        .boolean => |x| {
+            if (v != .bool) return null;
+            try ctx.work.charge(1);
+            const eq = v.bool == x;
+            return switch (op) {
+                .eq, .le, .ge => eq,
+                .ne => !eq,
+                .lt, .gt => false,
+            };
+        },
+        .integer => |n| switch (v) {
+            .integer => |i| {
+                try ctx.work.charge(1);
+                return cmpOrd(op, std.math.order(i, n));
+            },
+            .float => |f| {
+                try ctx.work.charge(1);
+                return cmpOrd(op, std.math.order(f, @as(f64, @floatFromInt(n))));
+            },
+            else => return null,
+        },
+        .number => |n| {
+            const x: f64 = switch (v) {
+                .integer => |i| @floatFromInt(i),
+                .float => |f| f,
+                else => return null,
+            };
+            try ctx.work.charge(1);
+            return cmpOrd(op, std.math.order(x, n));
+        },
+        else => return null,
+    }
+}
+
+/// A comparison operator applied to the order of its operands; `compare`'s
+/// reading of `<`, `<=`, `>`, `>=` (`<=` is `<` or `==`).
+inline fn cmpOrd(op: CmpOp, o: std.math.Order) bool {
+    return switch (op) {
+        .eq => o == .eq,
+        .ne => o != .eq,
+        .lt => o == .lt,
+        .le => o != .gt,
+        .gt => o == .gt,
+        .ge => o != .lt,
     };
 }
 
@@ -2959,4 +3102,87 @@ test "a declared nested column over no rows, and the work budget over a big node
         .max_work = 100_000,
         .columns = &.{.{ .name = "b", .key = "$.big", .type = .list }},
     }));
+}
+
+test "singularFound and compareLit are runQuery(...).found and compare, with the same work charged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(J, a, "{\"a\":{\"b\":[10,20.5,{\"c\":true}]},\"s\":\"x\",\"n\":null}", .{});
+    const nm = struct {
+        fn n(k: []const u8) Selector {
+            return .{ .name = k };
+        }
+    }.n;
+    const single = struct {
+        fn f(al: std.mem.Allocator, sel: Selector) *const [1]Selector {
+            const p = al.create([1]Selector) catch unreachable;
+            p[0] = sel;
+            return p;
+        }
+    }.f;
+    const child = struct {
+        fn f(al: std.mem.Allocator, sel: Selector) Seg {
+            return .{ .child = single(al, sel) };
+        }
+    }.f;
+    const queries = [_]Query{
+        .{ .absolute = false, .segs = &.{} },
+        .{ .absolute = true, .segs = &.{child(a, nm("a"))} },
+        .{ .absolute = true, .segs = &.{ child(a, nm("a")), child(a, nm("b")), child(a, .{ .index = 1 }) } },
+        .{ .absolute = true, .segs = &.{ child(a, nm("a")), child(a, nm("b")), child(a, .{ .index = -1 }), child(a, nm("c")) } },
+        .{ .absolute = true, .segs = &.{ child(a, nm("a")), child(a, nm("b")), child(a, .{ .index = 7 }) } },
+        .{ .absolute = true, .segs = &.{ child(a, nm("s")), child(a, nm("t")) } },
+        .{ .absolute = true, .segs = &.{ child(a, nm("zz")), child(a, nm("t")) } },
+        // not a single selector: the walk hands over to evalSegs
+        .{ .absolute = true, .segs = &.{ child(a, nm("a")), .{ .child = &.{ nm("b"), nm("x") } } } },
+        .{ .absolute = true, .segs = &.{ child(a, nm("a")), .{ .child = &.{.wildcard} } } },
+    };
+    for (queries) |q| for ([_]usize{ 0, 1, 5, 1000 }) |limit| for ([_]usize{ 3, 9, 1 << 20 }) |budget| {
+        var w1: Work = .{ .limit = budget };
+        var c1: Ctx = .{ .a = a, .root = parsed, .limit = limit, .work = &w1 };
+        var w2: Work = .{ .limit = budget };
+        var c2: Ctx = .{ .a = a, .root = parsed, .limit = limit, .work = &w2 };
+        const want: Error!?J = if (runQuery(&c1, parsed, q, 1, 0)) |r| r.found else |e| e;
+        const got = singularFound(&c2, parsed, q, 0);
+        if (want) |wv| {
+            const gv = try got;
+            try std.testing.expectEqual(wv == null, gv == null);
+            if (wv) |x| try std.testing.expect(std.meta.eql(x, gv.?));
+        } else |e| try std.testing.expectError(e, got);
+        try std.testing.expectEqual(w1.used, w2.used);
+        if (q.segs.len > 0 and q.isSingular()) {
+            var w3: Work = .{ .limit = budget };
+            var c3: Ctx = .{ .a = a, .root = parsed, .limit = limit, .work = &w3 };
+            const gp = singularPtr(&c3, parsed, q, 0);
+            if (want) |wv| {
+                const gv = try gp;
+                try std.testing.expectEqual(wv == null, gv == null);
+                if (wv) |x| try std.testing.expect(std.meta.eql(x, gv.?.*));
+            } else |e| try std.testing.expectError(e, gp);
+            try std.testing.expectEqual(w1.used, w3.used);
+        }
+    };
+
+    const lits = [_]Lit{ .{ .integer = 20 }, .{ .integer = 10 }, .{ .number = 20.5 }, .{ .number = 3.25 }, .{ .boolean = true }, .{ .boolean = false }, .{ .string = "x" }, .null };
+    const vals = [_]?J{ null, J{ .integer = 10 }, J{ .integer = 21 }, J{ .float = 20.5 }, J{ .float = -1.5 }, J{ .number_string = "123456789012345678901" }, J{ .bool = true }, J{ .bool = false }, J{ .string = "x" }, J.null };
+    const ops = [_]CmpOp{ .eq, .ne, .lt, .le, .gt, .ge };
+    for (vals) |v| for (lits) |lit| for (ops) |op| {
+        const lv: J = switch (lit) {
+            .integer => |n| .{ .integer = n },
+            .number => |n| .{ .float = n },
+            .string => |s| .{ .string = s },
+            .boolean => |b| .{ .bool = b },
+            .null => J.null,
+        };
+        var w1: Work = .{ .limit = 1 << 20 };
+        var c1: Ctx = .{ .a = a, .root = parsed, .limit = 1, .work = &w1 };
+        var w2: Work = .{ .limit = 1 << 20 };
+        var c2: Ctx = .{ .a = a, .root = parsed, .limit = 1, .work = &w2 };
+        const want = try compare(&c1, v, op, lv);
+        if (try compareLit(&c2, if (v) |*x| x else null, op, lit)) |got| {
+            try std.testing.expectEqual(want, got);
+            try std.testing.expectEqual(w1.used, w2.used);
+        }
+    };
 }

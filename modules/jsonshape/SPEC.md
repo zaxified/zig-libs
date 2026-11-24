@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-11-02 (`JSONSHAPE_FUZZ=3000000`, 3M seeds clean after the review fixes, ReleaseSafe, every reach label hit) · ct n/a — JSON shape checks (keyword review, 2026-10-07) · panic 2026-11-02 (sweep tests over `compile`, `query`, `queryFirst`, `queryLocated`, `parseDocument`, hostile paths and patterns, OOM at every allocation; before it 2026-10-31, sweep + blind review: `max_work` budget over every step, comparison, conversion and output cell (`WorkLimit`), `max_depth` 512 pre-scan and path depth 64 → `DepthLimit`, iterative `||`/`&&`; delta audit 62/62)
 
-**Performance:** ref 0.00–0.62× theory/jsonpath v0.12.2 (`zig build bench-jsonshape -Djcc-safe`, 5 rounds, wall time, same document and paths on every side, each over its language's usual tree; read the verdict from the worst row, `compile_regex` 0.62×, which includes one regex compile here and not on the foreign sides, and among evaluations `eval_filter` 0.57×; `eval_name` 0.20×, `eval_wild` 0.34×, `eval_slice` 0.31×, `eval_desc` 0.14×, `eval_desc_all` 0.07×, `eval_filter_len` 0.37×, `eval_filter_sub` 0.27×; Normalized Paths `located_wild` 0.14×; path parsing, stated apart, `compile_simple` 0.20×, `compile_filter` 0.28×; `eval_match` 0.05× and `eval_search` under 0.0001× (218 µs against 6.0 s) pair a pattern precompiled here against a compile per node there, a design difference, not engine speed, and are why the low end of the range says nothing; machine under load, spread up to 78 %) · fastest 1.76× serde_json_path 0.7.2 (worst row `eval_filter`, 353 µs against 200 µs; then `compile_regex` 1.42× ojg v1.28.9, the same one regex compile on our side only; `eval_filter_sub` 1.01× serde_json_path; every other row at most 0.89× across serde_json_path, ojg and jsonpath-rust 1.0.12) (measured 2026-11-02)
+**Performance:** ref 0.00–0.52× theory/jsonpath v0.12.2 (`zig build bench-jsonshape -Djcc-safe`, 5 rounds, wall time, same document and paths on every side, each over its language's usual tree; read the verdict from the worst row, `compile_regex` 0.52×, which includes one regex compile here and not on the foreign sides, and among evaluations `eval_filter_len` 0.34×; `eval_name` 0.16×, `eval_wild` 0.26×, `eval_slice` 0.24×, `eval_desc` 0.14×, `eval_desc_all` 0.06×, `eval_filter` 0.23×, `eval_filter_sub` 0.26×; Normalized Paths `located_wild` 0.11×; path parsing, stated apart, `compile_simple` 0.19×, `compile_filter` 0.26×; `eval_match` 0.03× and `eval_search` under 0.0001× (231 µs against 6.2 s) pair a pattern precompiled here against a compile per node there, a design difference, not engine speed, and are why the low end of the range says nothing; pinned core, spread up to 7 % on our side) · fastest 1.25× ojg v1.28.9 (worst row `compile_regex`, 1.43 µs against 1.13 µs, the same one regex compile on our side only, which is the sibling `regex` engine's `compileUsing`; `eval_filter_sub` 1.01× serde_json_path; `eval_filter` 0.84×; every other row at most 0.97× across serde_json_path, ojg and jsonpath-rust 1.0.12) (measured 2026-11-24)
 
 **Known defects:** none recorded
 
@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-02; stars and
 | [besok/zig-jsonpath](https://github.com/besok/zig-jsonpath) | Zig | MIT [V] | 21 | push 2026-05-09, no release | README: "fully compliant with RFC 9535"; asks for Zig 0.12+, current-Zig compatibility not checked. No typed rows. [I] |
 | Zig `std.json` | Zig | MIT | — | Zig 0.17.0 | Parses to a dynamic `Value` or a struct; no path query API. [I: file list] This module's document tree is its `Value`. |
 
-**Where we are ahead:** the only Zig entry that goes from a JSON document to **typed rows in one declared call**; bounded by construction, where the surveyed libraries recurse and walk without a limit [I: no such option in their APIs]: `max_work` over every step, `max_matches`, path depth 64, a refusal rather than a stack overflow; at most 0.62× the reference on every row measured (`**Performance:**`), and document parsing, which is `std.json`, 0.59× (info row `doc_parse`, not on the card). **Where we are behind:** the verdicts below are all refusals, not gaps left open; on speed, `eval_filter` against serde_json_path (→ *Backlog / deferred*).
+**Where we are ahead:** the only Zig entry that goes from a JSON document to **typed rows in one declared call**; bounded by construction, where the surveyed libraries recurse and walk without a limit [I: no such option in their APIs]: `max_work` over every step, `max_matches`, path depth 64, a refusal rather than a stack overflow; at most 0.52× the reference on every row measured (`**Performance:**`), and document parsing, which is `std.json`, 0.59× (info row `doc_parse`, not on the card). **Where we are behind:** the verdicts below are all refusals, not gaps left open; on speed, only `compile_regex` against ojg, at the bound (the regex engine's compile, not this module's code).
 
 Every gap, with its verdict:
 
@@ -237,7 +237,7 @@ Residual risks a caller owns (not fixable here, or bounded by the caller's limit
 
 `zig build bench-jsonshape -Djcc-safe` (see `tools/README.md`) runs the same document and paths on every
 side, each over its language's usual tree, wall time over rounds. The card's `**Performance:**` line carries the
-ratios, the worst row and the measurement date; it is authoritative. `eval_match` and `eval_search` pair a
+ratios, the worst row and the measurement date; it is authoritative. A comparison of a singular query with a number or boolean literal (the commonest filter) walks the query as a pointer into the document without a sub-evaluation or a copy of the value, with the work charges of the generic walk; `compile_regex` against ojg (1.25×) is the sibling `regex` engine's compile, outside this module. `eval_match` and `eval_search` pair a
 pattern precompiled here against a compile per node on the foreign sides, a design difference, not engine speed.
 
 ## What is deliberately not done
@@ -268,9 +268,6 @@ pattern precompiled here against a compile per node on the foreign sides, a desi
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **Speed: `eval_filter` against serde_json_path** — quiet-host phase (a speedup claim needs numbers a loaded host cannot give). The one like-with-like row over 1.25× the fastest (see the
-  card's Performance line). A singular query in a comparison builds a sub-`Ctx` and walks through `evalSegs`; a
-  direct walk for singular queries is the first thing to try, keeping the work charges the sweep tests pin.
 - **The card's one unexplained mutation survivor** (from the first whole-module run, which did not record which
   mutant it was): decide it as equivalent or kill it with a test at the next whole-module run.
 
