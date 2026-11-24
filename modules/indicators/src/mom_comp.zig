@@ -666,7 +666,60 @@ pub fn psoLookback(p: PsoParams) Error!usize {
     return PSO.lookback(p);
 }
 pub fn pso(comptime T: type, high: []const T, low: []const T, close: []const T, out: []T, p: PsoParams) Error!usize {
+    if (T == f64) {
+        core.checkFloat(T);
+        try PSO.validate(p);
+        const n = high.len;
+        if (low.len != n or close.len != n or out.len != n) return error.BadParam;
+        psoRun(high, low, close, out, p);
+        return PSO.lookback(p);
+    }
     return vs.batch(T, PSO, p, .{ .high = high, .low = low, .close = close }, .{out});
+}
+
+/// The f64 batch of `PSO.step`, bitwise: the fast %K and the two EMAs of a block of bars first, then the
+/// block's `tanh` four lanes at a time (`vmath.tanh4`, bit for bit `xmath.tanh`).
+fn psoRun(high: []const f64, low: []const f64, close: []const f64, out: []f64, p: PsoParams) void {
+    const n = high.len;
+    const per = p.fastk;
+    var e1 = ema(p.ema, p.unstable) catch unreachable;
+    var e2 = ema(p.ema, p.unstable) catch unreachable;
+    const nan = std.math.nan(f64);
+    const block = 64;
+    var cs: [block]f64 = undefined;
+    var has: [block]bool = undefined;
+    var ts: [block]f64 = undefined;
+    var start: usize = 0;
+    while (start < n) : (start += block) {
+        const len = @min(block, n - start);
+        for (0..len) |j| {
+            const i = start + j;
+            has[j] = false;
+            cs[j] = 0.5;
+            if (i + 1 < per) continue;
+            var highest = high[i];
+            var lowest = low[i];
+            var w = i + 1 - per;
+            while (w < i) : (w += 1) {
+                if (high[w] > highest) highest = high[w];
+                if (low[w] < lowest) lowest = low[w];
+            }
+            const range = highest - lowest;
+            const fast_k = if (!zeroScaled(range, @abs(highest) + @abs(lowest))) (close[i] - lowest) / range * 100.0 else 50.0;
+            const nsk = 0.1 * (fast_k - 50.0);
+            const a = e1.step(NoSrc{}, nsk) orelse continue;
+            const c = e2.step(NoSrc{}, a) orelse continue;
+            has[j] = true;
+            cs[j] = 0.5 * c;
+        }
+        @memset(cs[len..], 0.5);
+        var q: usize = 0;
+        while (q < block) : (q += 4) {
+            const v: vmath.V = cs[q..][0..4].*;
+            ts[q..][0..4].* = vmath.tanh4(v);
+        }
+        for (0..len) |j| out[start + j] = if (has[j]) ts[j] else nan;
+    }
 }
 pub fn PsoStream(comptime T: type) type {
     return vs.Stream(T, PSO);
@@ -1094,5 +1147,36 @@ test "fisher: the blocked f64 batch equals the core's steps bit for bit (flat st
             try std.testing.expect(th.sameBits(got[0][i], want[0][i]));
             try std.testing.expect(th.sameBits(got[1][i], want[1][i]));
         }
+    }
+}
+
+test "pso: the blocked f64 batch equals the core's steps bit for bit (flat stretches, periods, unstable bars)" {
+    const th = @import("testhelp.zig");
+    var prng = std.Random.DefaultPrng.init(0x9507);
+    const r = prng.random();
+    const n = 700;
+    var h: [n]f64 = undefined;
+    var l: [n]f64 = undefined;
+    var c: [n]f64 = undefined;
+    var m: f64 = 100.0;
+    for (0..n) |i| {
+        if (i < 300 or i >= 380) m *= 1.0 + (r.float(f64) - 0.5) * 0.04;
+        h[i] = m * 1.001;
+        l[i] = m * 0.999;
+        c[i] = l[i] + (h[i] - l[i]) * r.float(f64);
+        if (i >= 300 and i < 380) {
+            h[i] = m;
+            l[i] = m;
+            c[i] = m;
+        }
+    }
+    const params = [_]PsoParams{ .{}, .{ .fastk = 1, .ema = 1 }, .{ .fastk = 20, .ema = 3, .unstable = .{ .bars = 7 } }, .{ .unstable = .auto4 } };
+    for (params) |p| {
+        var got: [n]f64 = undefined;
+        var want: [n]f64 = undefined;
+        const lb = try pso(f64, &h, &l, &c, &got, p);
+        const lb2 = try vs.batch(f64, PSO, p, .{ .high = @as([]const f64, &h), .low = @as([]const f64, &l), .close = @as([]const f64, &c) }, .{@as([]f64, &want)});
+        try std.testing.expectEqual(lb2, lb);
+        for (0..n) |i| try std.testing.expect(th.sameBits(got[i], want[i]));
     }
 }

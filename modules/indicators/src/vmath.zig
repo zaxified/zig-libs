@@ -16,6 +16,7 @@
 //! random arguments, so a change of the library's algorithm shows up here as a failure.
 
 const std = @import("std");
+const xmath = @import("xmath.zig");
 
 pub const V = @Vector(4, f64);
 const VI = @Vector(4, i64);
@@ -252,6 +253,84 @@ pub fn exp4(x_in: V) V {
     return out;
 }
 
+const expm1_q = [5]f64{
+    -3.33333333333331316428e-02,
+    1.58730158725481460165e-03,
+    -7.93650757867487942473e-05,
+    4.00821782732936239552e-06,
+    -2.01099218183624371326e-07,
+};
+
+/// `std.math.expm1(x)` for lanes in 2^-54 < |x| < 38 whose reduction is not `k == 1` (the others are answered
+/// by the scalar function, `ok` says which).
+fn expm1x(x_in: V, ok_out: *@Vector(4, bool)) V {
+    const ux0: VU = @bitCast(x_in);
+    const hx0: VU = (ux0 >> @splat(32)) & @as(VU, @splat(0x7FFFFFFF));
+    const sign0: VU = ux0 >> @splat(63);
+    const ok = (hx0 >= @as(VU, @splat(0x3C900000))) & (hx0 < @as(VU, @splat(0x4043687A))) &
+        ((sign0 != @as(VU, @splat(0))) | (hx0 <= @as(VU, @splat(0x3FD62E42))) | (hx0 >= @as(VU, @splat(0x3FF0A2B2))));
+    ok_out.* = ok;
+    const x0 = @select(f64, ok, x_in, splat(-0.1));
+    const ux: VU = @bitCast(x0);
+    const hx: VU = (ux >> @splat(32)) & @as(VU, @splat(0x7FFFFFFF));
+    const sign: VU = ux >> @splat(63);
+    const big = hx > @as(VU, @splat(0x3FD62E42));
+    const near = hx < @as(VU, @splat(0x3FF0A2B2));
+    const half: V = @select(f64, sign == @as(VU, @splat(0)), splat(0.5), splat(-0.5));
+    const k_far: VI = @intFromFloat(splat(1.44269504088896338700e+00) * x0 + half);
+    const k_near: VI = splati(1) - @as(VI, @bitCast(sign)) - @as(VI, @bitCast(sign));
+    const k = @select(i64, big, @select(i64, near, k_near, k_far), splati(0));
+    const t = @as(V, @floatFromInt(k));
+    const hi = x0 - t * splat(6.93147180369123816490e-01);
+    const lo = t * splat(1.90821492927058770002e-10);
+    const x = @select(f64, big, hi - lo, x0);
+    const c = @select(f64, big, (hi - x) - lo, splat(0.0));
+    const hfx = splat(0.5) * x;
+    const hxs = x * hfx;
+    const r1 = splat(1.0) + hxs * (splat(expm1_q[0]) + hxs * (splat(expm1_q[1]) + hxs * (splat(expm1_q[2]) + hxs * (splat(expm1_q[3]) + hxs * splat(expm1_q[4])))));
+    const tt = splat(3.0) - r1 * hfx;
+    const e0 = hxs * ((r1 - tt) / (splat(6.0) - x * tt));
+    const res0 = x - (x * e0 - hxs);
+    const e1 = x * (e0 - c) - c;
+    const e = e1 - hxs;
+    const res_m1 = splat(0.5) * (x - e) - splat(0.5);
+    const twopk: V = @bitCast((k +% splati(0x3FF)) << @splat(52));
+    const y = (x - e + splat(1.0)) * twopk - splat(1.0);
+    const uf: V = @bitCast((splati(0x3FF) -% k) << @splat(52));
+    const mid_lo = (x - e + (splat(1.0) - uf)) * twopk;
+    const mid_hi = (x - (e + uf) + splat(1.0)) * twopk;
+    const neg_or_huge = (k < splati(0)) | (k > splati(56));
+    var res = @select(f64, k < splati(20), mid_lo, mid_hi);
+    res = @select(f64, neg_or_huge, y, res);
+    res = @select(f64, k == splati(-1), res_m1, res);
+    res = @select(f64, k == splati(0), res0, res);
+    return res;
+}
+
+/// `xmath.tanh(x)` (fdlibm's: `expm1` below 22) for the four lanes; the scalar function answers a lane
+/// outside the fast range.
+pub fn tanh4(x_in: V) V {
+    const ux: VU = @bitCast(x_in);
+    const ix: VU = (ux >> @splat(32)) & @as(VU, @splat(0x7FFFFFFF));
+    const in_range = (ix >= @as(VU, @splat(0x3c800000))) & (ix < @as(VU, @splat(0x40360000)));
+    const x = @select(f64, in_range, x_in, splat(0.5));
+    const ax = @abs(x);
+    const ge1 = ix >= @as(VU, @splat(0x3ff00000));
+    const arg = @select(f64, ge1, splat(2.0) * ax, splat(-2.0) * ax);
+    var ok: @Vector(4, bool) = undefined;
+    const t = expm1x(arg, &ok);
+    const z = @select(f64, ge1, splat(1.0) - splat(2.0) / (t + splat(2.0)), -t / (t + splat(2.0)));
+    const neg: @Vector(4, bool) = (ux >> @splat(63)) != @as(VU, @splat(0));
+    var out = @select(f64, neg, -z, z);
+    const good = in_range & ok;
+    if (!@reduce(.And, good)) {
+        inline for (0..4) |l| {
+            if (!good[l]) out[l] = xmath.tanh(x_in[l]);
+        }
+    }
+    return out;
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 fn sameBits(a: f64, b: f64) bool {
@@ -314,6 +393,32 @@ test "exp4 equals @exp bit for bit (the FRAMA range, the wide range, and the sca
         const ga: [4]f64 = exp4(x);
         for (0..4) |l| {
             if (!sameBits(ga[l], @exp(xa[l]))) bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "tanh4 equals the scalar tanh bit for bit (PSO's range, the wide range, and the scalar lanes)" {
+    var prng = std.Random.DefaultPrng.init(0x7a47);
+    const r = prng.random();
+    var bad: usize = 0;
+    for (0..250_000) |_| {
+        var xa: [4]f64 = undefined;
+        for (0..4) |l| {
+            const mode = r.uintLessThan(u8, 7);
+            xa[l] = switch (mode) {
+                0 => (r.float(f64) - 0.5) * 5.0,
+                1 => (r.float(f64) - 0.5) * 2.0,
+                2 => (r.float(f64) - 0.5) * 60.0,
+                3 => (r.float(f64) - 0.5) * 1e-6,
+                4 => (r.float(f64) - 0.5) * 1e-12,
+                5 => (r.float(f64) - 0.5) * 0.7,
+                else => @as(f64, @bitCast(r.int(u64))),
+            };
+        }
+        const ga: [4]f64 = tanh4(xa);
+        for (0..4) |l| {
+            if (!sameBits(ga[l], xmath.tanh(xa[l]))) bad += 1;
         }
     }
     try std.testing.expectEqual(@as(usize, 0), bad);

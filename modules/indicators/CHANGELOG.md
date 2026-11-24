@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-24** — Batch speed, bit for bit unchanged: `pso` (f64) computes the fast %K and the two EMAs of a block of 64 bars first and takes the block's `tanh` four lanes at a time (`vmath.tanh4`: `expm1` and the `tanh` formula in vector form, tested bit for bit against `xmath.tanh`; the scalar function answers a lane outside the fast range); 1.75x to 0.97x TA-Lib at 1e5 bars (shield, spread < 1 %).
 - **2026-11-24** — Batch speed, bit for bit unchanged: `fisher` (f64) computes the smoothed ratios of a block of 64 bars first and takes the block's logarithms four lanes at a time (`vmath.log4`, the arithmetic of compiler-rt's `log` in vector form, tested bit for bit against `@log` over a million arguments); 1.81x to 1.08x TA-Lib at 1e5 bars (shield, spread < 1 %).
 - **2026-11-24** — Batch speed, bit for bit unchanged: `frama` (f64) collects the fractal-dimension ratios of a block of 64 bars, then computes `exp(scale * log(q))` four lanes at a time (`vmath.log4` / `exp4`, bit for bit `@log` / `@exp`, the scalar function answering any lane outside the fast range); 1.97x to 1.25x TA-Lib at 1e5 bars (shield, spread < 1 %).
 - **2026-11-24** — Batch speed, bit for bit unchanged: `rvi` runs its steady bars as one loop with the deviation window, the two Wilder recurrences and the up/down side (a vector select, not a branch on the sign of the close change) in registers; 1.86x to 0.67x TA-Lib at 1e5 bars (shield, spread < 1 %).
