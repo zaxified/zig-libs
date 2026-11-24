@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-24** — **NO CONSUMER-VISIBLE CHANGE:** the private JSON string writer is now `jsontext.writeString` (`escape_all_high_if_invalid`, `escape_del`, `short_escapes = .tnr`); output byte-identical to the old copy (differential over 400,000 random and edge strings, run before the copy was deleted). New dependency: `jsontext`.
 - **2026-10-29** — **Fix (no-panic sweep):** `Health.respond(.startup, …)` on a `Health` without `startup` answers 404 instead of unwrapping null.
 - **2026-10-24** — **Behaviour change (fix):** with more than 256 readiness checks the JSON `details`
   ends in one `"(N more)": {"status": "up"|"down"}` entry for the unlisted ones (they were left out, so a

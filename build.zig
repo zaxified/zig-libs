@@ -197,7 +197,7 @@ pub const module_list = [_]Module{
     .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http", "procnet", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr", "datefmt" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "openapi", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http", "jsontext" } },
     .{ .name = "requestid", .libs = &.{"web"}, .deps = &.{ "router", "http", "clock" } },
     .{ .name = "linkheader", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "cookies", .libs = &.{"format"}, .deps = &.{ "http", "aesgcm", "datefmt", "unitext" }, .test_deps = &.{"testkit"} },
