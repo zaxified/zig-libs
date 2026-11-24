@@ -361,15 +361,17 @@ pub const Fe = struct {
         return sub(Fe.zero, a);
     }
 
-    /// `a * b (mod p)`, weakly reduced. Construction: full 8×8-limb
-    /// schoolbook multiplication into 15 `u128` column accumulators, then
+    /// `a * b (mod p)`, weakly reduced. Construction: a Karatsuba
+    /// split on the Goldilocks halves (three 4×4-limb schoolbook products,
+    /// 48 instead of 64) into 15 `u128` column accumulators, then
     /// `reduceColumns` (the Goldilocks fold `2^448 ≡ 2^224 + 1` applied to
     /// the columns, one carry pass). Design references: Mike Hamburg's
     /// Goldilocks paper / `libdecaf`'s 64-bit `p448` backend, cited in
     /// `NOTICE`; NOT ported source. Constant-time.
     ///
-    /// Bound: weakly reduced inputs have limbs `< 2^57`, so each product is
-    /// `< 2^114` and a column of at most 8 products `< 2^117`.
+    /// Bound: weakly reduced inputs have limbs `< 2^57` (`< 2^58` for the
+    /// half sums), so each product is `< 2^116` and every column fed to
+    /// `reduceColumns` is `< 2^119`.
     ///
     /// Three other layouts were measured on 2026-11-13 (`bench-ed448`, same
     /// host) and not kept: limb-by-limb product scanning with the fold
@@ -379,26 +381,50 @@ pub const Fe = struct {
     /// as this one within noise but a 4.7 GB, 3× longer compile once
     /// inlined into the point formulas (`mulI`).
     pub fn mul(a: Fe, b: Fe) Fe {
+        // Karatsuba on the Goldilocks halves, `x = x0 + x1 * phi`, `phi = 2^224`,
+        // `phi^2 = 2^448 == phi + 1`: `a*b == a0*b0 + a1*b1 + (M - a0*b0) * phi`
+        // with `M = (a0 + a1)(b0 + b1)`. Three 4x4 products (48 instead of 64);
+        // `M - a0*b0` is non-negative column by column (every product is).
+        const half = num_limbs / 2;
+        var sa: [half]u64 = undefined;
+        var sb: [half]u64 = undefined;
+        inline for (0..half) |i| {
+            sa[i] = a.limbs[i] + a.limbs[i + half];
+            sb[i] = b.limbs[i] + b.limbs[i + half];
+        }
+        const p0 = mulHalf(a.limbs[0..half].*, b.limbs[0..half].*);
+        const p2 = mulHalf(a.limbs[half..].*, b.limbs[half..].*);
+        const m = mulHalf(sa, sb);
         var cols = @as([15]u128, @splat(0));
-        inline for (0..num_limbs) |i| {
-            inline for (0..num_limbs) |j| {
-                cols[i + j] += @as(u128, a.limbs[i]) * b.limbs[j];
-            }
+        inline for (0..2 * half - 1) |k| {
+            cols[k] += p0[k] + p2[k];
+            cols[k + half] += m[k] - p0[k];
         }
         return reduceColumns(cols);
     }
 
+    /// The 4x4 schoolbook product of `mul`'s Karatsuba split (7 columns).
+    inline fn mulHalf(x: [num_limbs / 2]u64, y: [num_limbs / 2]u64) [num_limbs - 1]u128 {
+        var cols = @as([num_limbs - 1]u128, @splat(0));
+        inline for (0..num_limbs / 2) |i| {
+            inline for (0..num_limbs / 2) |j| {
+                cols[i + j] += @as(u128, x[i]) * y[j];
+            }
+        }
+        return cols;
+    }
+
     /// Shared tail of `mul`/`square`: 15 double-width columns (each
-    /// `< 2^118`) to a weakly reduced `Fe`.
+    /// `< 2^119`) to a weakly reduced `Fe`.
     ///
     /// 1. Fold the high columns, highest first: column `k >= 8` stands for
     ///    `2^(56k) = 2^448 * 2^(56(k-8)) ≡ 2^(56(k-4)) + 2^(56(k-8))`, so it
     ///    is added to columns `k-4` and `k-8`; columns 12..14 land on 8..10,
     ///    which are folded in turn. No limb shifting: every term lands on a
     ///    limb boundary (the point of the 56-bit layout). Each of columns
-    ///    0..7 ends as a sum of at most four inputs: `< 2^120`.
+    ///    0..7 ends as a sum of at most four inputs: `< 2^121`.
     /// 2. ONE sequential carry pass over the 8 columns. Its carry-out is
-    ///    `< 2^65`; folded into limbs 0 and 4, and the (`< 2^10`) carries
+    ///    `< 2^66`; folded into limbs 0 and 4, and the (`< 2^11`) carries
     ///    out of those two into limbs 1 and 5. Every limb ends `< 2^57`.
     ///
     /// Until 2026-11-13 every product was carried through all 15 columns
@@ -429,19 +455,39 @@ pub const Fe = struct {
 
     /// `a^2 (mod p)`, weakly reduced. Dedicated squaring: each off-diagonal
     /// cross product is computed ONCE and doubled (28 cross products + 8
-    /// diagonals vs 64). Structurally symmetric and data-independent ⇒
+    /// diagonals vs 64), and the same Karatsuba split as `mul` (three
+    /// half squarings of 10 products: 30 in all). Structurally symmetric and data-independent ⇒
     /// constant-time in the base. Column bound for limbs `< 2^57`: one
     /// diagonal (`< 2^114`) plus ≤ 4 doubled cross products (`< 2^115`
-    /// each) ⇒ `< 2^118`, inside `reduceColumns`'s contract.
+    /// each) ⇒ `< 2^118` (`< 2^119` after the Karatsuba
+    /// recombination, whose half sums have limbs `< 2^58`), inside
+    /// `reduceColumns`'s contract.
     pub fn square(a: Fe) Fe {
+        // Same Karatsuba split as `mul`: three half squarings of 10 products each.
+        const half = num_limbs / 2;
+        var sa: [half]u64 = undefined;
+        inline for (0..half) |i| sa[i] = a.limbs[i] + a.limbs[i + half];
+        const p0 = squareHalf(a.limbs[0..half].*);
+        const p2 = squareHalf(a.limbs[half..].*);
+        const m = squareHalf(sa);
         var cols = @as([15]u128, @splat(0));
-        inline for (0..num_limbs) |i| {
-            cols[2 * i] += @as(u128, a.limbs[i]) * a.limbs[i];
-            inline for (i + 1..num_limbs) |j| {
-                cols[i + j] += 2 * (@as(u128, a.limbs[i]) * a.limbs[j]);
-            }
+        inline for (0..2 * half - 1) |k| {
+            cols[k] += p0[k] + p2[k];
+            cols[k + half] += m[k] - p0[k];
         }
         return reduceColumns(cols);
+    }
+
+    /// The 4-limb squaring of `square`'s Karatsuba split (7 columns).
+    inline fn squareHalf(x: [num_limbs / 2]u64) [num_limbs - 1]u128 {
+        var cols = @as([num_limbs - 1]u128, @splat(0));
+        inline for (0..num_limbs / 2) |i| {
+            cols[2 * i] += @as(u128, x[i]) * x[i];
+            inline for (i + 1..num_limbs / 2) |j| {
+                cols[i + j] += 2 * (@as(u128, x[i]) * x[j]);
+            }
+        }
+        return cols;
     }
 
     /// `mul` forced inline at the call site, for the point formulas and the
