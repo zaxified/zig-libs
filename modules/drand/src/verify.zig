@@ -428,9 +428,9 @@ test "verifyRound: an unsupported scheme (unknown label) → UnsupportedScheme" 
 
 // ── bls-unchained-on-g1: the deprecated non-conformant DST ────────────
 //
-// ⚠ NO EXTERNAL ANCHOR. The repository holds no genuine beacon of a
-// `bls-unchained-on-g1` network, and none is invented here: these are
-// SELF-CONSISTENCY tests. A known secret scalar signs `beaconId(round)`
+// One GENUINE fastnet beacon (round 2, copied from `drand/tlock-js`'s tests) is the
+// external anchor of the first test below; the rest are SELF-CONSISTENCY
+// tests. A known secret scalar signs `beaconId(round)`
 // through `bls12_381.hash_to_curve` (the reference hash-to-`G1` with a
 // caller-chosen DST) and a scalar multiply; verification goes through
 // `verifyRound`. They pin the construction as drand's source states it
@@ -473,6 +473,40 @@ fn deprecatedInfo() !ChainInfo {
     try testing.expect(info.pubkey_g2 != null); // same key group as quicknet
     info.pubkey_g2 = deprecatedPublicKey();
     return info;
+}
+
+/// fastnet's `/info` (the retired League of Entropy chain `dbd506d6…c493`, period 3 s), copied from
+/// `drand/tlock-js` (MIT OR Apache-2.0), `src/drand/defaults.ts` (`MAINNET_CHAIN_INFO_NON_RFC`). The
+/// relays no longer serve it (drand: "fastnet is no longer being relayed", 2024-10-07), so it is pinned here.
+const fastnet_info_json =
+    \\{
+    \\  "public_key": "a0b862a7527fee3a731bcb59280ab6abd62d5c0b6ea03dc4ddf6612fdfc9d01f01c31542541771903475eb1ec6615f8d0df0b8b6dce385811d6dcf8cbefb8759e5e616a3dfd054c928940766d9a5b9db91e3b697e5d70a975181e007f87fca5e",
+    \\  "period": 3,
+    \\  "genesis_time": 1677685200,
+    \\  "hash": "dbd506d6ef76e5f386f41c651dcb808c5bcbd75471cc4eafa3f4df7ad4e4c493",
+    \\  "groupHash": "a81e9d63f614ccdb144b8ff79fbd4d5a2d22055c0bfe4ee9a8092003dab1c6c0",
+    \\  "schemeID": "bls-unchained-on-g1",
+    \\  "metadata": { "beaconID": "fastnet" }
+    \\}
+;
+
+/// fastnet round 2, from `drand/tlock-js` `test/age/compatibility.test.ts` (a beacon the test pairs with a
+/// Go-`tle`-produced file for that round).
+const fastnet_round_2_json =
+    \\{"round":2,"randomness":"08eb40c1dff4076da53d222b2076f06c144391445cfac750815d5cacf51bf7c2","signature":"a050676d1a1b6ceedb5fb3281cdfe88695199971426ff003c0862460b3a72811328a07ecd53b7d57fc82bb67f35efaf1"}
+;
+
+test "bls-unchained-on-g1: a GENUINE fastnet beacon verifies (the external anchor of the deprecated scheme)" {
+    const info = try chaininfo.parseInfo(testing.allocator, fastnet_info_json);
+    try testing.expectEqual(chaininfo.Scheme.bls_unchained_on_g1, info.scheme);
+    var rnd = try round_mod.parseRound(testing.allocator, fastnet_round_2_json);
+    try verifyRound(&info, &rnd);
+    // The randomness is SHA-256 of the signature (checked by `parseRound`), the round is part of the message.
+    var other = rnd;
+    other.round = 3;
+    try testing.expectError(error.InvalidSignature, verifyRound(&info, &other));
+    // Under the RFC 9380 G1 tag (quicknet's) the same signature does not verify: the deprecated DST is what drand signed.
+    try testing.expect(!verifyRoundPoints(info.pubkey_g2.?, 2, rnd.sig_g1.?));
 }
 
 test "bls-unchained-on-g1: the deprecated DST is the G2 tag and differs from the RFC 9380 G1 tag" {

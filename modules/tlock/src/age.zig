@@ -59,6 +59,7 @@ const burn = @import("burn.zig");
 const g1 = bls12_381.g1;
 const g2 = bls12_381.g2;
 const Ciphertext = tlock_mod.Ciphertext;
+const CiphertextSigG2 = tlock_mod.CiphertextSigG2;
 const Aead = chachapoly.ChaCha20Poly1305;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -88,6 +89,46 @@ pub const max_stanza_args = 16;
 
 pub const armor_begin = "-----BEGIN AGE ENCRYPTED FILE-----";
 pub const armor_end = "-----END AGE ENCRYPTED FILE-----";
+
+/// Which drand scheme a `tlock` stanza belongs to. The stanza names no scheme: the
+/// body length tells (128 bytes: `sig_g1`; 80 bytes: `sig_g2`), and the caller knows
+/// the scheme from the beacon's chain info, found by the stanza's chain hash.
+pub const Scheme = enum {
+    /// quicknet (`"bls-unchained-g1-rfc9380"`): public key in `G2`, round signature in `G1`;
+    /// the stanza body is `U (G2, 96) || V || W` = 128 bytes. The functions without a suffix.
+    sig_g1,
+    /// `"pedersen-bls-unchained"`: public key in `G1`, round signature in `G2`;
+    /// the stanza body is `U (G1, 48) || V || W` = 80 bytes. The functions with a `SigG2` suffix.
+    sig_g2,
+};
+
+/// The types and the BF-IBE calls of one scheme.
+fn Of(comptime s: Scheme) type {
+    return switch (s) {
+        .sig_g1 => struct {
+            const Ct = Ciphertext;
+            const PubKey = g2.Affine;
+            const Signature = g1.Affine;
+            fn encrypt(p_pub: PubKey, round: u64, m: *const [file_key_bytes]u8, sigma: *const [file_key_bytes]u8) Ct {
+                return tlock_mod.encrypt(p_pub, round, m, sigma);
+            }
+            fn decrypt(out: *[file_key_bytes]u8, sig: Signature, ct: Ct) tlock_mod.DecryptError!void {
+                return tlock_mod.decrypt(out, sig, ct);
+            }
+        },
+        .sig_g2 => struct {
+            const Ct = CiphertextSigG2;
+            const PubKey = g1.Affine;
+            const Signature = g2.Affine;
+            fn encrypt(p_pub: PubKey, round: u64, m: *const [file_key_bytes]u8, sigma: *const [file_key_bytes]u8) Ct {
+                return tlock_mod.encryptSigG2(p_pub, round, m, sigma);
+            }
+            fn decrypt(out: *[file_key_bytes]u8, sig: Signature, ct: Ct) tlock_mod.DecryptError!void {
+                return tlock_mod.decryptSigG2(out, sig, ct);
+            }
+        },
+    };
+}
 
 pub const HeaderError = error{
     /// The first line is not `age-encryption.org/v1`.
@@ -139,8 +180,14 @@ pub const Recipient = struct {
     round: u64,
     /// The beacon's chain hash (identifies the network: quicknet, ...).
     chain_hash: [chain_hash_bytes]u8,
-    /// The BF-IBE ciphertext of the file key.
-    ciphertext: Ciphertext,
+    /// The BF-IBE ciphertext of the file key; the tag is the scheme the body length says.
+    ciphertext: StanzaCiphertext,
+};
+
+/// The stanza body, decoded by its length.
+pub const StanzaCiphertext = union(Scheme) {
+    sig_g1: Ciphertext,
+    sig_g2: CiphertextSigG2,
 };
 
 /// A parsed age header.
@@ -190,7 +237,7 @@ pub const Header = struct {
             if (std.mem.eql(u8, args[0], "scrypt")) saw_scrypt = true;
 
             // Body: base64 lines of exactly `columns`, ended by a shorter one.
-            var body: [Ciphertext.encoded_bytes]u8 = undefined;
+            var body: [Ciphertext.encoded_bytes]u8 = undefined; // the longer of the two bodies
             var body_len: usize = 0;
             var body_ok = true;
             while (true) {
@@ -208,11 +255,16 @@ pub const Header = struct {
 
             if (is_tlock) {
                 if (found != null) return error.MultipleTlockStanzas;
-                if (n_args != 3 or !body_ok or body_len != body.len) return error.MalformedTlockStanza;
+                if (n_args != 3 or !body_ok) return error.MalformedTlockStanza;
+                const ct: StanzaCiphertext = switch (body_len) {
+                    Ciphertext.encoded_bytes => .{ .sig_g1 = Ciphertext.fromBytes(body) catch return error.InvalidCiphertext },
+                    CiphertextSigG2.encoded_bytes => .{ .sig_g2 = CiphertextSigG2.fromBytes(body[0..CiphertextSigG2.encoded_bytes].*) catch return error.InvalidCiphertext },
+                    else => return error.MalformedTlockStanza,
+                };
                 found = .{
                     .round = parseRound(args[1]) orelse return error.MalformedTlockStanza,
                     .chain_hash = parseChainHash(args[2]) orelse return error.MalformedTlockStanza,
-                    .ciphertext = Ciphertext.fromBytes(body) catch return error.InvalidCiphertext,
+                    .ciphertext = ct,
                 };
             }
             line = r.next() orelse return truncated(file);
@@ -463,21 +515,30 @@ pub const Randomness = struct {
     }
 };
 
-fn stanzaBodyLen() usize {
-    const enc = b64_raw.Encoder.calcSize(Ciphertext.encoded_bytes);
+fn stanzaBodyLen(comptime sch: Scheme) usize {
+    const enc = b64_raw.Encoder.calcSize(Of(sch).Ct.encoded_bytes);
     return enc + enc / columns + 1; // LF per full line, plus the short (maybe empty) last line's
 }
 
-fn headerLen(round: u64) usize {
+fn headerLenOf(comptime sch: Scheme, round: u64) usize {
     return version_line.len + 1 +
         "-> tlock ".len + std.fmt.count("{d}", .{round}) + 1 + 2 * chain_hash_bytes + 1 +
-        stanzaBodyLen() +
+        stanzaBodyLen(sch) +
         "--- ".len + b64_raw.Encoder.calcSize(mac_bytes) + 1;
+}
+
+fn headerLen(round: u64) usize {
+    return headerLenOf(.sig_g1, round);
 }
 
 /// Exact size of `encrypt`'s (binary, unarmored) output.
 pub fn encryptedLen(round: u64, plaintext_len: usize) usize {
     return headerLen(round) + nonce_bytes + sealedLen(plaintext_len);
+}
+
+/// `encryptedLen` of the G2-signature scheme (an 80-byte stanza body).
+pub fn encryptedLenSigG2(round: u64, plaintext_len: usize) usize {
+    return headerLenOf(.sig_g2, round) + nonce_bytes + sealedLen(plaintext_len);
 }
 
 /// Encrypt `plaintext` to `round` of the beacon with public key `p_pub` and
@@ -491,31 +552,56 @@ pub fn encrypt(
     chain_hash: [chain_hash_bytes]u8,
     rnd: *const Randomness,
 ) error{NoSpaceLeft}![]u8 {
-    const total = encryptedLen(round, plaintext.len);
+    return encryptOf(.sig_g1, out, plaintext, p_pub, round, chain_hash, rnd);
+}
+
+/// `encrypt` for the G2-signature scheme (`"pedersen-bls-unchained"`): `p_pub` is the
+/// beacon's `G1` public key, the stanza body 80 bytes (`encryptedLenSigG2`).
+pub fn encryptSigG2(
+    out: []u8,
+    plaintext: []const u8,
+    p_pub: g1.Affine,
+    round: u64,
+    chain_hash: [chain_hash_bytes]u8,
+    rnd: *const Randomness,
+) error{NoSpaceLeft}![]u8 {
+    return encryptOf(.sig_g2, out, plaintext, p_pub, round, chain_hash, rnd);
+}
+
+fn encryptOf(
+    comptime sch: Scheme,
+    out: []u8,
+    plaintext: []const u8,
+    p_pub: Of(sch).PubKey,
+    round: u64,
+    chain_hash: [chain_hash_bytes]u8,
+    rnd: *const Randomness,
+) error{NoSpaceLeft}![]u8 {
+    const total = headerLenOf(sch, round) + nonce_bytes + sealedLen(plaintext.len);
     if (out.len < total) return error.NoSpaceLeft;
     // The body runs one frame down and is burned after (`burn.zig`): it holds
     // the file key, the header-MAC and payload keys.
-    burn.run(burn.crypt_burn, void, encryptBody, .{ out[0..total], plaintext, p_pub, round, chain_hash, rnd });
+    burn.run(burn.crypt_burn, void, encryptBody, .{ sch, out[0..total], plaintext, p_pub, round, chain_hash, rnd });
     return out[0..total];
 }
 
-fn encryptBody(out: []u8, plaintext: []const u8, p_pub: g2.Affine, round: u64, chain_hash: [chain_hash_bytes]u8, rnd: *const Randomness) void {
-    const head_len = headerLen(round) + nonce_bytes;
-    writeHead(out[0..head_len], p_pub, round, chain_hash, rnd);
+fn encryptBody(comptime sch: Scheme, out: []u8, plaintext: []const u8, p_pub: Of(sch).PubKey, round: u64, chain_hash: [chain_hash_bytes]u8, rnd: *const Randomness) void {
+    const head_len = headerLenOf(sch, round) + nonce_bytes;
+    writeHead(sch, out[0..head_len], p_pub, round, chain_hash, rnd);
     var key = payloadKey(rnd.file_key, rnd.nonce);
     defer std.crypto.secureZero(u8, &key);
     sealPayloadBody(out[head_len..], &key, plaintext);
 }
 
 /// The header (with its MAC) and the payload nonce into `out`, which is
-/// exactly `headerLen(round) + nonce_bytes` long.
-fn writeHead(out: []u8, p_pub: g2.Affine, round: u64, chain_hash: [chain_hash_bytes]u8, rnd: *const Randomness) void {
-    const ct = tlock_mod.encrypt(p_pub, round, &rnd.file_key, &rnd.sigma).toBytes();
+/// exactly `headerLenOf(sch, round) + nonce_bytes` long.
+fn writeHead(comptime sch: Scheme, out: []u8, p_pub: Of(sch).PubKey, round: u64, chain_hash: [chain_hash_bytes]u8, rnd: *const Randomness) void {
+    const ct = Of(sch).encrypt(p_pub, round, &rnd.file_key, &rnd.sigma).toBytes();
 
     var w: std.Io.Writer = .fixed(out);
     const chain_hex = std.fmt.bytesToHex(chain_hash, .lower);
     w.print("{s}\n-> {s} {d} {s}\n", .{ version_line, stanza_type, round, &chain_hex }) catch unreachable;
-    var enc: [b64_raw.Encoder.calcSize(Ciphertext.encoded_bytes)]u8 = undefined;
+    var enc: [b64_raw.Encoder.calcSize(Of(sch).Ct.encoded_bytes)]u8 = undefined;
     _ = b64_raw.Encoder.encode(&enc, &ct);
     var i: usize = 0;
     while (true) : (i += columns) {
@@ -546,8 +632,34 @@ pub fn encryptAlloc(
     rnd: *const Randomness,
     opts: EncryptOptions,
 ) error{OutOfMemory}![]u8 {
-    const bin = try gpa.alloc(u8, encryptedLen(round, plaintext.len));
-    _ = encrypt(bin, plaintext, p_pub, round, chain_hash, rnd) catch unreachable;
+    return encryptAllocOf(.sig_g1, gpa, plaintext, p_pub, round, chain_hash, rnd, opts);
+}
+
+/// `encryptAlloc` for the G2-signature scheme.
+pub fn encryptAllocSigG2(
+    gpa: std.mem.Allocator,
+    plaintext: []const u8,
+    p_pub: g1.Affine,
+    round: u64,
+    chain_hash: [chain_hash_bytes]u8,
+    rnd: *const Randomness,
+    opts: EncryptOptions,
+) error{OutOfMemory}![]u8 {
+    return encryptAllocOf(.sig_g2, gpa, plaintext, p_pub, round, chain_hash, rnd, opts);
+}
+
+fn encryptAllocOf(
+    comptime sch: Scheme,
+    gpa: std.mem.Allocator,
+    plaintext: []const u8,
+    p_pub: Of(sch).PubKey,
+    round: u64,
+    chain_hash: [chain_hash_bytes]u8,
+    rnd: *const Randomness,
+    opts: EncryptOptions,
+) error{OutOfMemory}![]u8 {
+    const bin = try gpa.alloc(u8, headerLenOf(sch, round) + nonce_bytes + sealedLen(plaintext.len));
+    _ = encryptOf(sch, bin, plaintext, p_pub, round, chain_hash, rnd) catch unreachable;
     if (!opts.armor) return bin;
     defer gpa.free(bin);
     const arm = try gpa.alloc(u8, armoredLen(bin.len));
@@ -577,10 +689,27 @@ pub fn decryptedLen(file: []const u8) DecryptError!usize {
 ///
 /// The key schedule runs one frame down and is burned after (`burn.zig`).
 pub fn decrypt(out: []u8, file: []const u8, round_signature: g1.Affine, opts: DecryptOptions) DecryptError![]u8 {
-    return burn.run(burn.crypt_burn, DecryptError![]u8, decryptBody, .{ out, file, round_signature, opts });
+    return decryptOf(.sig_g1, out, file, round_signature, opts);
 }
 
-fn decryptBody(out: []u8, file: []const u8, round_signature: g1.Affine, opts: DecryptOptions) DecryptError![]u8 {
+/// `decrypt` for the G2-signature scheme: `round_signature` is the beacon's `G2`
+/// signature; a stanza body that is not the 80 bytes of that scheme is
+/// `error.InvalidCiphertext` (as `decrypt` for an 80-byte one).
+pub fn decryptSigG2(out: []u8, file: []const u8, round_signature: g2.Affine, opts: DecryptOptions) DecryptError![]u8 {
+    return decryptOf(.sig_g2, out, file, round_signature, opts);
+}
+
+fn decryptOf(comptime sch: Scheme, out: []u8, file: []const u8, round_signature: Of(sch).Signature, opts: DecryptOptions) DecryptError![]u8 {
+    return burn.run(burn.crypt_burn, DecryptError![]u8, decryptBody, .{ sch, out, file, round_signature, opts });
+}
+
+/// The stanza's ciphertext as scheme `sch`'s type, or `InvalidCiphertext` when its body was the other scheme's.
+fn stanzaCt(comptime sch: Scheme, r: Recipient) HeaderError!Of(sch).Ct {
+    if (r.ciphertext != sch) return error.InvalidCiphertext;
+    return @field(r.ciphertext, @tagName(sch));
+}
+
+fn decryptBody(comptime sch: Scheme, out: []u8, file: []const u8, round_signature: Of(sch).Signature, opts: DecryptOptions) DecryptError![]u8 {
     const h = try Header.parse(file);
     if (opts.chain_hash) |want| {
         if (!std.mem.eql(u8, &want, &h.recipient.chain_hash)) return error.WrongChainHash;
@@ -591,7 +720,7 @@ fn decryptBody(out: []u8, file: []const u8, round_signature: g1.Affine, opts: De
     if (out.len < n) return error.NoSpaceLeft;
 
     var file_key: [file_key_bytes]u8 = undefined;
-    try tlock_mod.decrypt(&file_key, round_signature, h.recipient.ciphertext);
+    try Of(sch).decrypt(&file_key, round_signature, try stanzaCt(sch, h.recipient));
     defer std.crypto.secureZero(u8, &file_key);
     const mac = headerMac(file_key, file[0..h.mac_input_len]);
     if (!macEql(mac, h.mac)) return error.HeaderMacMismatch;
@@ -605,6 +734,15 @@ fn decryptBody(out: []u8, file: []const u8, round_signature: g1.Affine, opts: De
 /// `decrypt` for a binary OR armored file (detected by `isArmored`), into a
 /// fresh allocation the caller frees.
 pub fn decryptAlloc(gpa: std.mem.Allocator, file: []const u8, round_signature: g1.Affine, opts: DecryptOptions) (DecryptError || ArmorError || error{OutOfMemory})![]u8 {
+    return decryptAllocOf(.sig_g1, gpa, file, round_signature, opts);
+}
+
+/// `decryptAlloc` for the G2-signature scheme.
+pub fn decryptAllocSigG2(gpa: std.mem.Allocator, file: []const u8, round_signature: g2.Affine, opts: DecryptOptions) (DecryptError || ArmorError || error{OutOfMemory})![]u8 {
+    return decryptAllocOf(.sig_g2, gpa, file, round_signature, opts);
+}
+
+fn decryptAllocOf(comptime sch: Scheme, gpa: std.mem.Allocator, file: []const u8, round_signature: Of(sch).Signature, opts: DecryptOptions) (DecryptError || ArmorError || error{OutOfMemory})![]u8 {
     var scratch: ?[]u8 = null;
     defer if (scratch) |s| gpa.free(s);
     var bin = file;
@@ -614,7 +752,7 @@ pub fn decryptAlloc(gpa: std.mem.Allocator, file: []const u8, round_signature: g
     }
     const out = try gpa.alloc(u8, try decryptedLen(bin));
     errdefer gpa.free(out);
-    _ = try decrypt(out, bin, round_signature, opts);
+    _ = try decryptOf(sch, out, bin, round_signature, opts);
     return out;
 }
 
@@ -676,22 +814,36 @@ pub fn encryptStream(
     chain_hash: [chain_hash_bytes]u8,
     rnd: *const Randomness,
 ) EncryptStreamError!void {
-    return burn.run(burn.crypt_burn, EncryptStreamError!void, encryptStreamBody, .{ gpa, w, r, p_pub, round, chain_hash, rnd });
+    return burn.run(burn.crypt_burn, EncryptStreamError!void, encryptStreamBody, .{ .sig_g1, gpa, w, r, p_pub, round, chain_hash, rnd });
 }
 
-fn encryptStreamBody(
+/// `encryptStream` for the G2-signature scheme.
+pub fn encryptStreamSigG2(
     gpa: std.mem.Allocator,
     w: *std.Io.Writer,
     r: *std.Io.Reader,
-    p_pub: g2.Affine,
+    p_pub: g1.Affine,
     round: u64,
     chain_hash: [chain_hash_bytes]u8,
     rnd: *const Randomness,
 ) EncryptStreamError!void {
-    const head_max = comptime headerLen(std.math.maxInt(u64)) + nonce_bytes;
-    const head_len = headerLen(round) + nonce_bytes;
+    return burn.run(burn.crypt_burn, EncryptStreamError!void, encryptStreamBody, .{ .sig_g2, gpa, w, r, p_pub, round, chain_hash, rnd });
+}
+
+fn encryptStreamBody(
+    comptime sch: Scheme,
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    p_pub: Of(sch).PubKey,
+    round: u64,
+    chain_hash: [chain_hash_bytes]u8,
+    rnd: *const Randomness,
+) EncryptStreamError!void {
+    const head_max = comptime headerLenOf(sch, std.math.maxInt(u64)) + nonce_bytes;
+    const head_len = headerLenOf(sch, round) + nonce_bytes;
     var head: [head_max]u8 = undefined;
-    writeHead(head[0..head_len], p_pub, round, chain_hash, rnd);
+    writeHead(sch, head[0..head_len], p_pub, round, chain_hash, rnd);
     try w.writeAll(head[0..head_len]);
 
     var key = payloadKey(rnd.file_key, rnd.nonce);
@@ -743,14 +895,26 @@ pub fn decryptStream(
     round_signature: g1.Affine,
     opts: DecryptOptions,
 ) DecryptStreamError!void {
-    return burn.run(burn.crypt_burn, DecryptStreamError!void, decryptStreamBody, .{ gpa, w, r, round_signature, opts });
+    return burn.run(burn.crypt_burn, DecryptStreamError!void, decryptStreamBody, .{ .sig_g1, gpa, w, r, round_signature, opts });
 }
 
-fn decryptStreamBody(
+/// `decryptStream` for the G2-signature scheme.
+pub fn decryptStreamSigG2(
     gpa: std.mem.Allocator,
     w: *std.Io.Writer,
     r: *std.Io.Reader,
-    round_signature: g1.Affine,
+    round_signature: g2.Affine,
+    opts: DecryptOptions,
+) DecryptStreamError!void {
+    return burn.run(burn.crypt_burn, DecryptStreamError!void, decryptStreamBody, .{ .sig_g2, gpa, w, r, round_signature, opts });
+}
+
+fn decryptStreamBody(
+    comptime sch: Scheme,
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    round_signature: Of(sch).Signature,
     opts: DecryptOptions,
 ) DecryptStreamError!void {
     // The header, up to and including the LF of its MAC line.
@@ -788,7 +952,7 @@ fn decryptStreamBody(
     };
 
     var file_key: [file_key_bytes]u8 = undefined;
-    try tlock_mod.decrypt(&file_key, round_signature, h.recipient.ciphertext);
+    try Of(sch).decrypt(&file_key, round_signature, try stanzaCt(sch, h.recipient));
     defer std.crypto.secureZero(u8, &file_key);
     const mac = headerMac(file_key, head[0..h.mac_input_len]);
     if (!macEql(mac, h.mac)) return error.HeaderMacMismatch;
@@ -977,7 +1141,7 @@ test "age: tlock stanza body is the genuine tle fixture's 128 bytes (EXTERNAL), 
 
     const h = try Header.parse(file);
     try testing.expectEqual(qt_round, h.recipient.round);
-    try testing.expectEqualSlices(u8, &want_body, &h.recipient.ciphertext.toBytes());
+    try testing.expectEqualSlices(u8, &want_body, &h.recipient.ciphertext.sig_g1.toBytes());
     try testing.expectEqual(headerLen(qt_round), h.len);
 
     // ...and it opens under the genuine published round signature.
@@ -1361,6 +1525,8 @@ test "age: Header.parse refuses malformed headers with typed errors" {
         .{ E.MalformedTlockStanza, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\nAAAA\n") }, // body too short
         .{ E.MalformedTlockStanza, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 64) ++ "\n\n") }, // too long
         .{ E.InvalidCiphertext, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 43) ++ "\n") }, // U all-zero, no flag bits
+        .{ E.InvalidCiphertext, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 43) ++ "\n") }, // an 80-byte body (G2-signature scheme), U all-zero
+        .{ E.MalformedTlockStanza, headerText("-> tlock 1 " ++ qt_chain_hex ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 64) ++ "\n" ++ strRepeat("A", 6) ++ "\n") }, // 100 bytes: neither scheme's length
     };
     inline for (cases) |c| {
         try testing.expectError(c[0], Header.parse(c[1]));

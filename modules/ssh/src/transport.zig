@@ -42,7 +42,8 @@ const P384 = std.crypto.ecc.P384;
 const p521 = @import("p521");
 const EcdsaP521 = p521.EcdsaP521Sha512;
 const Aes128 = std.crypto.core.aes.Aes128;
-const Aes192 = @import("aes192").Aes192;
+const aes192 = @import("aes192");
+const Aes192 = aes192.Aes192;
 const Aes256 = std.crypto.core.aes.Aes256;
 const Aes256Gcm = @import("aesgcm").Aes256Gcm; // zig-libs aesgcm (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 const Aes128Gcm = @import("aesgcm").Aes128Gcm;
@@ -857,23 +858,13 @@ fn seqNonce(seq: u32) [8]u8 {
     return n;
 }
 
-/// AES-CTR keystream XOR over `data` (`ctx` an AES-128 or AES-256 encryption
-/// context), advancing `counter` (big-endian, full 128-bit block) one step per
-/// 16-byte block consumed.
+/// AES-CTR keystream XOR over `data` in place (`ctx` an AES-128, -192 or -256
+/// encryption context), advancing `counter` (big-endian, full 128-bit block) one
+/// step per 16-byte block consumed. `aes192.ctrXor` runs the blocks at std's
+/// pipeline width (AES-NI keeps several in flight) with a two-`u64` counter;
+/// std's `modes.ctr` stores the counter byte by byte on Zig 0.17 (#36256).
 fn aesCtrXor(ctx: anytype, counter: *[16]u8, data: []u8) void {
-    var i: usize = 0;
-    while (i < data.len) : (i += 16) {
-        var ks: [16]u8 = undefined;
-        ctx.encrypt(&ks, counter);
-        const n = @min(@as(usize, 16), data.len - i);
-        for (0..n) |j| data[i + j] ^= ks[j];
-        var k: usize = 16;
-        while (k > 0) {
-            k -= 1;
-            counter[k] +%= 1;
-            if (counter[k] != 0) break;
-        }
-    }
+    aes192.ctrXor(@TypeOf(ctx), ctx, data, data, counter);
 }
 
 /// Read one binary packet (RFC 4253 §6.1) from `r` under `cipher`'s state,
@@ -5817,6 +5808,41 @@ test "aesCtrXor: the 128-bit counter carries through every byte and wraps to zer
     counter[14] = 0xff;
     aesCtrXor(ctx, &counter, &data);
     try t.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 }, &counter);
+}
+
+test "aesCtrXor equals std modes.ctr over one counter running across packet-sized calls, all three key sizes" {
+    const t = std.testing;
+    const aes = std.crypto.core.aes;
+    var prng = std.Random.DefaultPrng.init(0x4344);
+    const rnd = prng.random();
+    inline for (.{ aes.Aes128, Aes192, aes.Aes256 }) |A| {
+        var key: [A.key_bits / 8]u8 = undefined;
+        rnd.bytes(&key);
+        const ctx = A.initEnc(key);
+        // The counter starts three blocks short of the full 128-bit wrap.
+        var iv: [16]u8 = @splat(0xff);
+        iv[15] = 0xfd;
+        var stream: [48 + 16 * 40]u8 = undefined;
+        rnd.bytes(&stream);
+        var want: [stream.len]u8 = undefined;
+        std.crypto.core.modes.ctr(@TypeOf(ctx), ctx, &want, &stream, iv, .big);
+        // Packets are whole blocks (the transport's contract): the split
+        // lengths below are 16, 32, 48, ... and a long one.
+        var counter = iv;
+        var off: usize = 0;
+        var step: usize = 16;
+        while (off < stream.len) {
+            const n = @min(step, stream.len - off);
+            aesCtrXor(ctx, &counter, stream[off..][0..n]);
+            off += n;
+            step += 16;
+        }
+        try t.expectEqualSlices(u8, &want, &stream);
+        var end = iv;
+        const sum = std.mem.readInt(u128, &end, .big) +% stream.len / 16;
+        std.mem.writeInt(u128, &end, sum, .big);
+        try t.expectEqualSlices(u8, &end, &counter);
+    }
 }
 
 test "readPacket (none): the length bounds — maximum, exact buffer" {

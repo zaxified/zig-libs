@@ -76,6 +76,9 @@ pub const Aes192EncryptCtx = struct {   // = std's AesEncryptCtx(Aes) shape
     pub fn wipe(ctx: *Aes192EncryptCtx) void;
 };
 
+/// CTR over any context of std's shape (also std's Aes128/Aes256), in place allowed, advances `counter`.
+pub fn ctrXor(comptime Ctx: type, ctx: Ctx, dst: []u8, src: []const u8, counter: *[16]u8) void;
+
 pub const Aes192DecryptCtx = struct {   // = std's AesDecryptCtx(Aes) shape
     pub fn initFromEnc(ctx: Aes192EncryptCtx) Aes192DecryptCtx;
     pub fn init(key: [24]u8) Aes192DecryptCtx;

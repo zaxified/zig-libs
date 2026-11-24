@@ -235,12 +235,38 @@ fn fixtureCiphertext() tlock.Ciphertext {
     return tlock.encrypt(p_pub, fixture_round, &message, &sigma);
 }
 
-const Target = enum { fp12pow, decrypt };
+/// `round_signature` of the G2-signature scheme (`decrypt_g2`): `[sk] * H1SigG2(beaconId(round))`,
+/// a `G2` point, tainted at the `Fp` limb level of both coordinates' two components.
+fn secretRoundSignatureG2(tainted: bool) g2.Affine {
+    const qid = ciphersuite.h1SigG2(ciphersuite.beaconId(fixture_round));
+    var sig = g2.Jacobian.fromAffine(qid).scalarMul(fixtureSk()).toAffine();
+    const vp: *const volatile g2.Affine = &sig;
+    sig = vp.*;
+    if (tainted) {
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&sig.x.c0.limbs));
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&sig.x.c1.limbs));
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&sig.y.c0.limbs));
+        std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&sig.y.c1.limbs));
+    }
+    return sig;
+}
+
+/// `fixtureCiphertext` of the G2-signature scheme: encrypted to `[sk]G1` at `fixture_round`.
+fn fixtureCiphertextG2() tlock.CiphertextSigG2 {
+    const p_pub = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(fixtureSk()).toAffine();
+    const message = @as([ciphersuite.block_bytes]u8, @splat(0x5a));
+    const sigma = @as([ciphersuite.block_bytes]u8, @splat(0x11));
+    return tlock.encryptSigG2(p_pub, fixture_round, &message, &sigma);
+}
+
+const Target = enum { fp12pow, decrypt, fp12pow_g2, decrypt_g2 };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "fp12pow")) return .fp12pow;
     if (std.mem.eql(u8, s, "decrypt")) return .decrypt;
+    if (std.mem.eql(u8, s, "fp12pow_g2")) return .fp12pow_g2;
+    if (std.mem.eql(u8, s, "decrypt_g2")) return .decrypt_g2;
     return error.UnknownTarget;
 }
 
@@ -272,6 +298,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // Propagation witness: non-constant-time hex formatting of the
             // (tainted, if taint=yes) ciphertext bytes.
             std.debug.print("ct={x}\n", .{ct.toBytes()});
+        },
+        .fp12pow_g2 => {
+            // The G2-signature scheme's `encryptSigG2`: the `G1` generator stands in for the public key.
+            const message = secretBlock("ctgrind-tlock-harness-message-v1", tainted);
+            const sigma = secretBlock("ctgrind-tlock-harness-sigma-v1", tainted);
+            const ct = tlock.encryptSigG2(g1.Affine.generator, 1000, &message, &sigma);
+            std.debug.print("ct={x}\n", .{ct.toBytes()});
+        },
+        .decrypt_g2 => {
+            const round_signature = secretRoundSignatureG2(tainted);
+            const ct = fixtureCiphertextG2();
+            var message: [ciphersuite.block_bytes]u8 = undefined;
+            if (tlock.decryptSigG2(&message, round_signature, ct)) |_| {
+                std.debug.print("message={x}\n", .{message});
+            } else |err| {
+                std.debug.print("decrypt_error={t}\n", .{err});
+            }
         },
         .decrypt => {
             const round_signature = secretRoundSignature(tainted);

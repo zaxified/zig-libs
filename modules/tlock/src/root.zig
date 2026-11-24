@@ -41,6 +41,9 @@
 //!   (128 bytes, byte-for-byte drand's own wire format); the two
 //!   **FABLE CORE** functions `encrypt`/`decrypt` (REAL) + the private
 //!   `Fp12.pow`/`gtToDrandRepr` Gt helpers.
+//!   The G2-signature scheme (`"pedersen-bls-unchained"`) is the same
+//!   construction with the groups swapped: `CiphertextSigG2` (`U ∈ G1`, 80
+//!   bytes), `encryptSigG2`/`decryptSigG2`.
 //! - `age.zig` — the age v1 envelope `tle` writes: `tlock` stanza,
 //!   HKDF/HMAC header MAC, ChaCha20-Poly1305 STREAM payload in 64 KiB
 //!   chunks, ASCII armor — arbitrary-length files.
@@ -103,6 +106,10 @@ pub const block_bytes = tlock_mod.block_bytes;
 pub const encrypt = tlock_mod.encrypt;
 /// FABLE CORE — see `tlock.zig`.
 pub const decrypt = tlock_mod.decrypt;
+/// The G2-signature scheme (`pedersen-bls-unchained`) — see `tlock.zig`.
+pub const CiphertextSigG2 = tlock_mod.CiphertextSigG2;
+pub const encryptSigG2 = tlock_mod.encryptSigG2;
+pub const decryptSigG2 = tlock_mod.decryptSigG2;
 
 /// Re-exported: the sibling module this module builds on.
 pub const bls12_381 = @import("bls12_381");

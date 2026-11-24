@@ -40,6 +40,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `transport.zig` + `server.zig`), RFC 4252 user authentication (part 2, `userauth.zig`) and the
   RFC 4254 connection protocol (part 3, `connection.zig`), all implemented for **both roles**.
   There are no `@panic` stubs left in this module.
+- **`aes{128,192,256}-ctr` (RFC 4344) keep ONE 128-bit counter per direction across packets**; a packet's
+  keystream is `aes192.ctrXor` over the context (pipeline width of std's AES block, two-`u64` counter: std's
+  `modes.ctr` writes the counter byte by byte on Zig 0.17, #36256), 0.15× the time of the one-block-per-call
+  loop it replaced at 1504 bytes (`tools/ctr_bench.zig` is the A/B program, header says how to build it). Test: equals
+  std's `modes.ctr` over a counter that runs on across packet-sized calls and wraps, for all three key sizes.
 - **Layering mirrors the RFCs themselves:** version exchange (§4.2) → KEXINIT algorithm negotiation
   (§7.1) → key exchange → SSH_MSG_NEWKEYS both ways → the Binary Packet Protocol (§6) carries every
   subsequent message, in the clear before NEWKEYS and encrypted after — through the *same*
@@ -464,10 +469,6 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
 
 ## Backlog / deferred
 
-- **`aes*-ctr` one block at a time.** `aesCtrXor` (`src/transport.zig`) encrypts one block per call and
-  carries the counter byte by byte, so it never pipelines AES-NI. `aes192.Aes192EncryptCtx.ctr` (0.96x
-  OpenSSL EVP CTR at 16 KiB) is the shape for aes192, and the same counter over std's `AesEncryptCtx` for
-  aes128/256 (std's own `modes.ctr` is 2.3x slower on Zig 0.17, #36256). Needs a packet-rate bench first.
 - **Userauth methods and callbacks not provided:** `hostbased` (RFC 4252 §9), the §8 password-change
   sub-protocol (SSH_MSG_USERAUTH_PASSWD_CHANGEREQ is rejected, not handled), and from Go's server a
   per-connection `BannerCallback` (the banner is a static `AuthConfig.banner`), `AuthLogCallback` for

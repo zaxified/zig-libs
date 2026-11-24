@@ -346,6 +346,99 @@ fn decryptBody(out: *[block_bytes]u8, round_signature: g1.Affine, ct: Ciphertext
     }
 }
 
+// ── the G2-signature scheme ("pedersen-bls-unchained") ──────────────
+
+/// The `(U, V, W)` ciphertext of the **G2-signature** scheme (drand's
+/// `UnchainedSchemeID` / `"pedersen-bls-unchained"`, kyber's `EncryptCCAonG1`):
+/// the roles of the two groups are swapped against `Ciphertext`. The beacon's
+/// master public key and `U` live in `G1` (48 bytes compressed), the identity
+/// is hashed onto `G2` and the round signature, the IBE private key, is a `G2`
+/// point (96 bytes). `U (48) || V (16) || W (16)` = 80 bytes, byte for byte
+/// `tlock.go`'s `CiphertextToBytes` for that scheme (`KeyGroup` = `G1`).
+pub const CiphertextSigG2 = struct {
+    /// `r * G1_generator`; `decryptSigG2`'s FO check recomputes it.
+    u: g1.Affine,
+    v: [block_bytes]u8,
+    w: [block_bytes]u8,
+
+    pub const encoded_bytes = g1.compressed_bytes + block_bytes + block_bytes; // 48 + 16 + 16 = 80
+
+    pub fn toBytes(self: CiphertextSigG2) [encoded_bytes]u8 {
+        var out: [encoded_bytes]u8 = undefined;
+        out[0..g1.compressed_bytes].* = g1.toBytesCompressed(self.u);
+        out[g1.compressed_bytes..][0..block_bytes].* = self.v;
+        out[g1.compressed_bytes + block_bytes ..][0..block_bytes].* = self.w;
+        return out;
+    }
+
+    /// `g1.fromBytesCompressed` refuses a `U` outside `G1`.
+    pub fn fromBytes(bytes: [encoded_bytes]u8) g1.G1Error!CiphertextSigG2 {
+        const u = try g1.fromBytesCompressed(bytes[0..g1.compressed_bytes].*);
+        return .{
+            .u = u,
+            .v = bytes[g1.compressed_bytes..][0..block_bytes].*,
+            .w = bytes[g1.compressed_bytes + block_bytes ..][0..block_bytes].*,
+        };
+    }
+};
+
+/// BF-IBE FullIdent encryption for the G2-signature scheme: `encrypt` with the
+/// groups swapped. `p_pub` is the beacon's `G1` public key. The construction
+/// (cross-checked against `drand/tlock-js`'s `encryptOnG1`, MIT OR Apache-2.0,
+/// and the genuine Go-produced ciphertext in `kat_test.zig`):
+///
+///   `Qid = h1SigG2(beaconId(round)) ∈ G2`,
+///   `Gid = e(p_pub, Qid)` (`pairing(G1, G2)` again, the orientation of the
+///   pairing call is the same as `encrypt`'s), `r = h3(sigma, message)`,
+///   `U = r·G1_generator`, `V = sigma XOR h2(Gid^r)`, `W = message XOR h4(sigma)`.
+///
+/// `h2`/`h3`/`h4` and the Gt representation (`gtToDrandRepr`) are exactly
+/// `encrypt`'s. Randomness, secrecy and the dead-stack burn: as `encrypt`.
+pub fn encryptSigG2(p_pub: g1.Affine, round: u64, message: *const [block_bytes]u8, sigma: *const [block_bytes]u8) CiphertextSigG2 {
+    return burn.run(burn.crypt_burn, CiphertextSigG2, encryptSigG2Body, .{ p_pub, round, message, sigma });
+}
+
+fn encryptSigG2Body(p_pub: g1.Affine, round: u64, message: *const [block_bytes]u8, sigma: *const [block_bytes]u8) CiphertextSigG2 {
+    const qid = ciphersuite.h1SigG2(ciphersuite.beaconId(round));
+    const gid = pairing.pairing(p_pub, qid);
+    const r = ciphersuite.h3(sigma, message);
+    const u = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(r).toAffine();
+    const gid_r = gid.pow(&r);
+    var v = ciphersuite.h2(block_bytes, gtToDrandRepr(gid_r));
+    for (&v, sigma) |*b, s| b.* ^= s;
+    var w = ciphersuite.h4(block_bytes, sigma);
+    for (&w, message) |*b, m| b.* ^= m;
+    return .{ .u = u, .v = v, .w = w };
+}
+
+/// BF-IBE FullIdent decryption + the Fujisaki-Okamoto check for the
+/// G2-signature scheme. `round_signature` is the beacon's `G2` signature for
+/// the round (the IBE private key); the check is `U == r'·G1_generator`.
+/// Errors, wiping and burn: as `decrypt`.
+pub fn decryptSigG2(out: *[block_bytes]u8, round_signature: g2.Affine, ct: CiphertextSigG2) DecryptError!void {
+    burn.run(burn.crypt_burn, DecryptError!void, decryptSigG2Body, .{ out, round_signature, ct }) catch |e| {
+        std.crypto.secureZero(u8, out);
+        return e;
+    };
+}
+
+fn decryptSigG2Body(out: *[block_bytes]u8, round_signature: g2.Affine, ct: CiphertextSigG2) DecryptError!void {
+    const gid_r = pairing.pairing(ct.u, round_signature);
+    var sigma = ciphersuite.h2(block_bytes, gtToDrandRepr(gid_r));
+    defer std.crypto.secureZero(u8, &sigma);
+    for (&sigma, ct.v) |*b, x| b.* ^= x;
+    const message = out;
+    message.* = ciphersuite.h4(block_bytes, &sigma);
+    for (message, ct.w) |*b, x| b.* ^= x;
+    var r_check = ciphersuite.h3(&sigma, message);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&r_check));
+    const u_check = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(r_check).toAffine();
+    if (!std.mem.eql(u8, &g1.toBytesCompressed(u_check), &g1.toBytesCompressed(ct.u))) {
+        std.crypto.secureZero(u8, message);
+        return error.FoCheckFailed;
+    }
+}
+
 // ── tests: Ciphertext codec (REAL, ungated) ─────────────────────────
 
 test "Ciphertext.encoded_bytes is 128 (96 G2 + 16 V + 16 W), matching drand's tlock.go wire format" {

@@ -297,6 +297,18 @@ fn apiEncrypt(pub_key: g2.Affine, rnd_round: u64, m: *const [B]u8, sigma: *const
 fn apiDecrypt(out: *[B]u8, sig: g1.Affine, ct: tlock.Ciphertext) void {
     tlock.decrypt(out, sig, ct) catch unreachable;
 }
+fn apiEncryptG2(pub_key: g1.Affine, rnd_round: u64, m: *const [B]u8, sigma: *const [B]u8) tlock.CiphertextSigG2 {
+    return tlock.encryptSigG2(pub_key, rnd_round, m, sigma);
+}
+fn apiDecryptG2(out: *[B]u8, sig: g2.Affine, ct: tlock.CiphertextSigG2) void {
+    tlock.decryptSigG2(out, sig, ct) catch unreachable;
+}
+fn apiAgeEncryptG2(out: []u8, pt: []const u8, pub_key: g1.Affine, rnd_round: u64, rnd: *const age.Randomness) []u8 {
+    return age.encryptSigG2(out, pt, pub_key, rnd_round, chain_hash, rnd) catch unreachable;
+}
+fn apiAgeDecryptG2(out: []u8, file: []const u8, sig: g2.Affine) []u8 {
+    return age.decryptSigG2(out, file, sig, .{}) catch unreachable;
+}
 fn apiRandomSigma(out: *[B]u8, io: std.Io) void {
     cs.randomSigma(out, io);
 }
@@ -334,6 +346,11 @@ var cur_file_len: usize = 0;
 var cur_sealed: [age.sealedLen(200)]u8 = undefined;
 var beacon_pub: g2.Affine = undefined;
 var round_sig: g1.Affine = undefined;
+// The G2-signature scheme's beacon: the key in G1, the round signature in G2.
+var beacon_pub_g2: g1.Affine = undefined;
+var round_sig_g2: g2.Affine = undefined;
+var cur_ct_g2: tlock.CiphertextSigG2 = undefined;
+var ct_g2_sink: tlock.CiphertextSigG2 = undefined;
 const probe_round: u64 = 1000;
 const chain_hash: [32]u8 = @splat(0x5c);
 
@@ -368,6 +385,22 @@ noinline fn callEncrypt() void {
 noinline fn callDecrypt() void {
     apiDecrypt(&block_sink, round_sig, cur_ct);
     std.mem.doNotOptimizeAway(&block_sink);
+}
+noinline fn callEncryptG2() void {
+    ct_g2_sink = apiEncryptG2(beacon_pub_g2, probe_round, &cur_msg, &cur_sigma);
+    std.mem.doNotOptimizeAway(&ct_g2_sink);
+}
+noinline fn callDecryptG2() void {
+    apiDecryptG2(&block_sink, round_sig_g2, cur_ct_g2);
+    std.mem.doNotOptimizeAway(&block_sink);
+}
+noinline fn callAgeEncryptG2() void {
+    const f = apiAgeEncryptG2(&file_sink, &cur_pt, beacon_pub_g2, probe_round, &cur_rnd);
+    std.mem.doNotOptimizeAway(f.ptr);
+}
+noinline fn callAgeDecryptG2() void {
+    const p = apiAgeDecryptG2(&pt_sink, cur_file[0..cur_file_len], round_sig_g2);
+    std.mem.doNotOptimizeAway(p.ptr);
 }
 noinline fn callRandomSigma() void {
     apiRandomSigma(&block_sink, fakeIo());
@@ -417,6 +450,23 @@ fn coreNeedles(n: *Needles, m: *const [B]u8, sigma: *const [B]u8, ct: tlock.Ciph
     n.addBoth("H4 mask", &mask_w);
 }
 
+/// `coreNeedles` of the G2-signature scheme (the pairing value is `e(U, σ_round)`).
+fn coreNeedlesG2(n: *Needles, m: *const [B]u8, sigma: *const [B]u8, ct: tlock.CiphertextSigG2) void {
+    n.addBoth("message", m);
+    n.addBoth("sigma", sigma);
+    n.addFr("r", cs.h3(sigma, m));
+    const gt = bls12_381.pairing.pairing(ct.u, round_sig_g2);
+    n.addImage("Gid^r", std.mem.asBytes(&gt));
+    const cube = gt.square().mul(gt);
+    n.addImage("Gid^r (drand)", std.mem.asBytes(&cube));
+    var mask_v: [B]u8 = undefined;
+    for (&mask_v, ct.v, sigma) |*o, v, s| o.* = v ^ s;
+    n.addBoth("H2 mask", &mask_v);
+    var mask_w: [B]u8 = undefined;
+    for (&mask_w, ct.w, m) |*o, w, x| o.* = w ^ x;
+    n.addBoth("H4 mask", &mask_w);
+}
+
 /// age's key schedule from the file key: the header-MAC key and (for
 /// `nonce`) the payload key.
 fn keyScheduleNeedles(n: *Needles, file_key: *const [16]u8, nonce: *const [16]u8) void {
@@ -439,6 +489,8 @@ test "STACKPROBE: no message, sigma, r, pairing value, file/payload key or plain
     const beacon_sk = try Fr.fromBytes(beacon_sk_bytes);
     beacon_pub = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(beacon_sk).toAffine();
     round_sig = g1.Jacobian.fromAffine(cs.h1(cs.beaconId(probe_round))).scalarMul(beacon_sk).toAffine();
+    beacon_pub_g2 = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(beacon_sk).toAffine();
+    round_sig_g2 = g2.Jacobian.fromAffine(cs.h1SigG2(cs.beaconId(probe_round))).scalarMul(beacon_sk).toAffine();
 
     for (0..2) |ci| {
         const c: u8 = @intCast(ci);
@@ -461,6 +513,15 @@ test "STACKPROBE: no message, sigma, r, pairing value, file/payload key or plain
         bad += try runProbe("encrypt", callEncrypt, &nd);
         bad += try runProbe("decrypt", callDecrypt, &nd);
 
+        // The same for the G2-signature scheme.
+        cur_ct_g2 = apiEncryptG2(beacon_pub_g2, probe_round, &cur_msg, &cur_sigma);
+        nd.reset();
+        coreNeedlesG2(&nd, &cur_msg, &cur_sigma, cur_ct_g2);
+        nd.sort();
+        leak_src = (cur_msg ++ cur_sigma);
+        bad += try runProbe("encryptSigG2", callEncryptG2, &nd);
+        bad += try runProbe("decryptSigG2", callDecryptG2, &nd);
+
         nd.reset();
         nd.addBoth("rng", cur_seed[0..32]);
         nd.addBoth("rng", cur_seed[32..64]);
@@ -473,7 +534,7 @@ test "STACKPROBE: no message, sigma, r, pairing value, file/payload key or plain
         apiDraw(&cur_rnd, fakeIo());
         const file = apiAgeEncrypt(&cur_file, &cur_pt, beacon_pub, probe_round, &cur_rnd);
         cur_file_len = file.len;
-        const age_ct = (try age.Header.parse(file)).recipient.ciphertext;
+        const age_ct = (try age.Header.parse(file)).recipient.ciphertext.sig_g1;
         nd.reset();
         keyScheduleNeedles(&nd, &cur_rnd.file_key, &cur_rnd.nonce);
         coreNeedles(&nd, &cur_rnd.file_key, &cur_rnd.sigma, age_ct);
@@ -482,6 +543,19 @@ test "STACKPROBE: no message, sigma, r, pairing value, file/payload key or plain
         leak_src = cur_pt[0..LEAK].*;
         bad += try runProbe("age.encrypt", callAgeEncrypt, &nd);
         bad += try runProbe("age.decrypt", callAgeDecrypt, &nd);
+
+        // age, whole file, G2-signature scheme.
+        const file_g2 = apiAgeEncryptG2(&cur_file, &cur_pt, beacon_pub_g2, probe_round, &cur_rnd);
+        cur_file_len = file_g2.len;
+        const age_ct_g2 = (try age.Header.parse(file_g2)).recipient.ciphertext.sig_g2;
+        nd.reset();
+        keyScheduleNeedles(&nd, &cur_rnd.file_key, &cur_rnd.nonce);
+        coreNeedlesG2(&nd, &cur_rnd.file_key, &cur_rnd.sigma, age_ct_g2);
+        nd.addImage("plaintext", &cur_pt);
+        nd.sort();
+        leak_src = cur_pt[0..LEAK].*;
+        bad += try runProbe("age.encryptSigG2", callAgeEncryptG2, &nd);
+        bad += try runProbe("age.decryptSigG2", callAgeDecryptG2, &nd);
 
         // age, payload layer on its own.
         apiSeal(&cur_sealed, &cur_key, &cur_pt);

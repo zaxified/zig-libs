@@ -486,6 +486,179 @@ test "drand interop: the fixture rejects under a mismatched round signature (FO 
     try std.testing.expectError(error.FoCheckFailed, testDecrypt(round1000Signature(), ct));
 }
 
+// ── the G2-signature scheme: drand's testnet-unchained-3s ("pedersen-bls-unchained") ──
+//
+// Vector source: `github.com/drand/tlock-js` (MIT OR Apache-2.0), `src/drand/defaults.ts`
+// (`TESTNET_CHAIN_INFO`: public key, chain hash `7672797f…f5bf`, scheme
+// `pedersen-bls-unchained`, period 3 s) and `test/age/compatibility.test.ts` ("payloads
+// encrypted with the go impl should decrypt successfully with G2 beacon": round 1's beacon
+// signature and an armored age file the Go `tle` produced, plaintext `Hello dranders\n`).
+// The testnet chain is retired and no longer served, so these are pinned copies.
+
+const g2sig_chain_hash_hex = "7672797f548f3f4748ac4bf3352fc6c6b6468c9ad40ad456a397545c6e2df5bf";
+/// The chain's public key, a `G1` point (48 bytes).
+const g2sig_pubkey_hex = "8200fc249deb0148eb918d6e213980c5d01acd7fc251900d9260136da3b54836ce125172399ddc69c4e3e11429b62c11";
+const g2sig_round: u64 = 1;
+/// Round 1's beacon signature, a `G2` point (96 bytes).
+const g2sig_round_sig_hex =
+    "86ecea71376e78abd19aaf0ad52f462a6483626563b1023bd04815a7b953da88" ++
+    "8c74f5bf6ee672a5688603ab310026230522898f33f23a7de363c66f90ffd49e" ++
+    "c77ebf7f6c1478a9ecd6e714b4d532ab43d044da0a16fed13b4791d7fc999e2b";
+const g2sig_file = @embedFile("testdata/tlock-js-testnet-unchained-3s-round1.tle");
+const g2sig_plaintext = "Hello dranders\n";
+
+fn g2sigPubkey() g1.Affine {
+    return g1.fromBytesCompressed(hexBytes(48, g2sig_pubkey_hex)) catch unreachable;
+}
+
+fn g2sigRoundSignature() g2.Affine {
+    return g2.fromBytesCompressed(hexBytes(96, g2sig_round_sig_hex)) catch unreachable;
+}
+
+test "G2-signature scheme provenance: the round-1 signature verifies against the chain key, e(G1gen, sig) == e(P_pub, h1SigG2(beaconId(1))) (no IBE core)" {
+    const qid = ciphersuite.h1SigG2(ciphersuite.beaconId(g2sig_round));
+    const neg_gen = g1.Jacobian.fromAffine(g1.Affine.generator).negate().toAffine();
+    try std.testing.expect(pairing.pairingCheck(&.{
+        .{ .p = neg_gen, .q = g2sigRoundSignature() },
+        .{ .p = g2sigPubkey(), .q = qid },
+    }));
+    // A wrong round does not verify.
+    const wrong = ciphersuite.h1SigG2(ciphersuite.beaconId(g2sig_round + 1));
+    try std.testing.expect(!pairing.pairingCheck(&.{
+        .{ .p = neg_gen, .q = g2sigRoundSignature() },
+        .{ .p = g2sigPubkey(), .q = wrong },
+    }));
+}
+
+/// The Go ciphertext's raw 80-byte BF-IBE body `U || V || W` (the age stanza body).
+const g2sig_ct_hex =
+    "b2ff9b58e60b86edef8b292b1e053f138020b868381daa21d9c881698f65747d" ++
+    "c454dc43c3b1d38cbab3ee11f38efeb550a871c15554eabc959220819df79a14" ++
+    "4363af8f18ee5a901e8308d8f2e1f45b";
+/// The age file key it wraps and the `sigma` the Go side drew (recovered from the ciphertext,
+/// as for the quicknet vector); the file key authenticates the header MAC below.
+const g2sig_filekey_hex = "a10c53c178b6787855d927e2b74e6bd0";
+const g2sig_sigma_hex = "e6616dcf3d9fa7cb43936b985a1b6770";
+
+test "G2-signature scheme interop: decrypt a genuine Go-tle-produced 80-byte ciphertext with the real round-1 signature" {
+    const ct = try tlock.CiphertextSigG2.fromBytes(hexBytes(80, g2sig_ct_hex));
+    var out: [tlock.block_bytes]u8 = undefined;
+    try tlock.decryptSigG2(&out, g2sigRoundSignature(), ct);
+    try std.testing.expectEqualSlices(u8, &hexBytes(16, g2sig_filekey_hex), &out);
+    try std.testing.expectEqualSlices(u8, &hexBytes(80, g2sig_ct_hex), &ct.toBytes());
+}
+
+test "G2-signature scheme interop: re-encrypting the recovered (filekey, sigma) reproduces the Go ciphertext byte-exactly" {
+    const m = hexBytes(16, g2sig_filekey_hex);
+    const sigma = hexBytes(16, g2sig_sigma_hex);
+    const ct = tlock.encryptSigG2(g2sigPubkey(), g2sig_round, &m, &sigma);
+    try std.testing.expectEqualSlices(u8, &hexBytes(80, g2sig_ct_hex), &ct.toBytes());
+}
+
+test "G2-signature scheme: refuses a wrong round signature, a tampered V or W, and a U outside G1" {
+    const good = try tlock.CiphertextSigG2.fromBytes(hexBytes(80, g2sig_ct_hex));
+    var out: [tlock.block_bytes]u8 = undefined;
+    // The signature of another round (quicknet's G1 round-1000 signature does not even have the type):
+    // a different G2 point, here the generator, is a wrong key and FO rejects it, wiping `out`.
+    try std.testing.expectError(error.FoCheckFailed, tlock.decryptSigG2(&out, g2.Affine.generator, good));
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &out);
+    var bad = good;
+    bad.v[0] ^= 1;
+    try std.testing.expectError(error.FoCheckFailed, tlock.decryptSigG2(&out, g2sigRoundSignature(), bad));
+    bad = good;
+    bad.w[15] ^= 0x80;
+    try std.testing.expectError(error.FoCheckFailed, tlock.decryptSigG2(&out, g2sigRoundSignature(), bad));
+    var raw = hexBytes(80, g2sig_ct_hex);
+    raw[0] = 0xff; // invalid flag combination
+    try std.testing.expectError(error.InvalidEncoding, tlock.CiphertextSigG2.fromBytes(raw));
+}
+
+test "G2-signature scheme interop: a whole Go-tle-produced armored file decrypts to its published plaintext (age layer), also streamed" {
+    const gpa = std.testing.allocator;
+    const chain = hexBytes(32, g2sig_chain_hash_hex);
+
+    const pt = try tlock.age.decryptAllocSigG2(gpa, g2sig_file, g2sigRoundSignature(), .{ .chain_hash = chain });
+    defer gpa.free(pt);
+    try std.testing.expectEqualSlices(u8, g2sig_plaintext, pt);
+
+    var other = chain;
+    other[0] ^= 1;
+    try std.testing.expectError(error.WrongChainHash, tlock.age.decryptAllocSigG2(gpa, g2sig_file, g2sigRoundSignature(), .{ .chain_hash = other }));
+
+    const bin_buf = try gpa.alloc(u8, tlock.age.dearmoredLenMax(g2sig_file.len));
+    defer gpa.free(bin_buf);
+    const bin = try tlock.age.dearmor(bin_buf, g2sig_file);
+    var src: std.Io.Reader = .fixed(bin);
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try tlock.age.decryptStreamSigG2(gpa, &sink.writer, &src, g2sigRoundSignature(), .{ .chain_hash = chain });
+    try std.testing.expectEqualSlices(u8, g2sig_plaintext, sink.written());
+
+    // A flipped payload byte is refused; so is the header MAC (the file key authenticates it).
+    var bad = try gpa.dupe(u8, bin);
+    defer gpa.free(bad);
+    bad[bad.len - 1] ^= 1;
+    try std.testing.expectError(error.PayloadAuthenticationFailed, tlock.age.decryptAllocSigG2(gpa, bad, g2sigRoundSignature(), .{}));
+}
+
+test "G2-signature scheme interop: inspect names round 1 and the 80-byte stanza; the two schemes refuse each other's files" {
+    const gpa = std.testing.allocator;
+    const rec = try tlock.age.inspectAlloc(gpa, g2sig_file);
+    try std.testing.expectEqual(g2sig_round, rec.round);
+    try std.testing.expectEqualSlices(u8, &hexBytes(32, g2sig_chain_hash_hex), &rec.chain_hash);
+    try std.testing.expect(rec.ciphertext == .sig_g2);
+    try std.testing.expectEqualSlices(u8, &hexBytes(80, g2sig_ct_hex), &rec.ciphertext.sig_g2.toBytes());
+    const quicknet_rec = try tlock.age.inspectAlloc(gpa, interop_tle_file);
+    try std.testing.expect(quicknet_rec.ciphertext == .sig_g1);
+
+    // An 80-byte stanza opened as quicknet, a 128-byte one opened as the G2-signature scheme.
+    try std.testing.expectError(error.InvalidCiphertext, tlock.age.decryptAlloc(gpa, g2sig_file, interopRoundSignature(), .{}));
+    try std.testing.expectError(error.InvalidCiphertext, tlock.age.decryptAllocSigG2(gpa, interop_tle_file, g2sigRoundSignature(), .{}));
+}
+
+test "G2-signature scheme interop: re-encrypting the recovered (filekey, sigma, nonce) reproduces the Go file byte-exactly, whole and streamed" {
+    const gpa = std.testing.allocator;
+    const bin_buf = try gpa.alloc(u8, tlock.age.dearmoredLenMax(g2sig_file.len));
+    defer gpa.free(bin_buf);
+    const bin = try tlock.age.dearmor(bin_buf, g2sig_file);
+    const head = try tlock.age.Header.parse(bin);
+    const rnd: tlock.age.Randomness = .{
+        .file_key = hexBytes(16, g2sig_filekey_hex),
+        .sigma = hexBytes(16, g2sig_sigma_hex),
+        .nonce = bin[head.len..][0..16].*,
+    };
+    const chain = hexBytes(32, g2sig_chain_hash_hex);
+    try std.testing.expectEqual(bin.len, tlock.age.encryptedLenSigG2(g2sig_round, g2sig_plaintext.len));
+
+    const mine = try tlock.age.encryptAllocSigG2(gpa, g2sig_plaintext, g2sigPubkey(), g2sig_round, chain, &rnd, .{});
+    defer gpa.free(mine);
+    try std.testing.expectEqualSlices(u8, bin, mine);
+
+    var src: std.Io.Reader = .fixed(g2sig_plaintext);
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try tlock.age.encryptStreamSigG2(gpa, &sink.writer, &src, g2sigPubkey(), g2sig_round, chain, &rnd);
+    try std.testing.expectEqualSlices(u8, bin, sink.written());
+}
+
+test "G2-signature scheme: round trip under the real chain key, deterministic for a fixed sigma, two encryptions of one block differ in U" {
+    const m = hexBytes(16, "00112233445566778899aabbccddeeff");
+    const s1 = hexBytes(16, "0f0e0d0c0b0a09080706050403020100");
+    const s2 = hexBytes(16, "ffeeddccbbaa99887766554433221100");
+    const c1 = tlock.encryptSigG2(g2sigPubkey(), g2sig_round, &m, &s1);
+    const c1b = tlock.encryptSigG2(g2sigPubkey(), g2sig_round, &m, &s1);
+    const c2 = tlock.encryptSigG2(g2sigPubkey(), g2sig_round, &m, &s2);
+    try std.testing.expectEqualSlices(u8, &c1.toBytes(), &c1b.toBytes());
+    try std.testing.expect(!std.mem.eql(u8, &c1.toBytes(), &c2.toBytes()));
+    // Only the real round-1 signature opens round 1 (the chain's real key makes this the real thing).
+    var out: [tlock.block_bytes]u8 = undefined;
+    try tlock.decryptSigG2(&out, g2sigRoundSignature(), c1);
+    try std.testing.expectEqualSlices(u8, &m, &out);
+    // Another round's ciphertext is not opened by round 1's signature.
+    const c3 = tlock.encryptSigG2(g2sigPubkey(), g2sig_round + 1, &m, &s1);
+    try std.testing.expectError(error.FoCheckFailed, tlock.decryptSigG2(&out, g2sigRoundSignature(), c3));
+}
+
 // ── fuzz: Ciphertext.fromBytes / decrypt on hostile ciphertext bytes ────
 //
 // `decrypt` (and the `Ciphertext.fromBytes` decode step in front of it)

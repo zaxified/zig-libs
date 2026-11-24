@@ -81,10 +81,12 @@ the upper 96 bits alone. The x86 kernel's counter is inc32 already
 (`ctrAdd`); it hashes the nonce with its own aggregated GHASH (`ghashBytes`,
 then the length block `lengths(0, n)` times H), so the stateless path builds
 `noncePowers(n)` powers as well as the message's. The generic backend hashes
-it with std's `Ghash` and splits std's `modes.ctr` — which increments all 128
+it with std's `Ghash` and splits `aes192.ctrXor` (std's `modes.ctr` stream with a
+two-`u64` counter: std's per-block `writeInt(u128)` is byte-wise on Zig 0.17, #36256,
+and 2.2–2.8× slower) — which increments all 128
 bits — where the low word would wrap, restarting it at 0 for the rest
 (`gctr`); with a 96-bit nonce the low word starts at 2 and `max_message_len`
-keeps it from wrapping, so that path is one `modes.ctr` call as before.
+keeps it from wrapping, so that path is one `ctrXor` call.
 The stateless generic path uses std's AEAD only for the default shape.
 
 **Shorter tags.** Computed in full, truncated on output; on decryption the
@@ -133,7 +135,7 @@ first `t` bytes are compared with `timing_safe.eql` over `[t]u8`.
   when the build target has AVX, legacy SSE otherwise. The compiler schedules
   and allocates registers.
 
-**`.generic`**: std's `crypto.core.aes` context (kept), `crypto.core.modes.ctr`
+**`.generic`**: std's `crypto.core.aes` context (kept), `aes192.ctrXor`
 and `crypto.onetimeauth.Ghash.initForBlockCount` per message from the kept H —
 std's `aes_gcm` code path minus the key expansion and the `E(K, 0)`.
 
@@ -360,7 +362,6 @@ byte-array to wider-lane vector `@bitCast` byte by byte.
 
 ## Backlog / deferred
 
-- **Generic backend's GCTR on Zig 0.17**: `Generic.gctr` (`src/root.zig`, the non-AES-NI path) runs std's `crypto.core.modes.ctr`, whose per-block `mem.writeInt(u128, …, .big)` 0.17 lowers byte by byte (#36256) — measured on `aes192`'s bench: 2.32× OpenSSL at 16 KiB, against 0.96× for `Aes192EncryptCtx.ctr`'s two-`u64`, vector-byte-swap counter. Port that counter (inc32 only: the low 32 bits) when the generic path is next measured; the stitched AES-NI kernel is unaffected.
 - *BOUNCED (tool):* **Performance P2 → P1: measure the fastest in the field**: ours is about 1.0× OpenSSL 3.5.5 at 16 KiB and
   faster below; P1 needs `fastest ≤ 1.25×`, and no other implementation is measured. Candidates: aws-lc / BoringSSL (same CRYPTOGAMS kernel
   family as OpenSSL, plus VAES paths), Go `crypto/cipher`. Add them as an `alt` side in

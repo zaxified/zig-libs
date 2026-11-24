@@ -215,7 +215,7 @@ declare -A TARGETS=(
     [bulletproofs]="rangeproof ipa party"
     [paillier]="crt noncrt mul addm keygen"
     [aescbc]="pkcs7 xmlenc x923 iso7816 zero"
-    [tlock]="fp12pow decrypt"
+    [tlock]="fp12pow decrypt fp12pow_g2 decrypt_g2"
     [ibe]="extract decrypt fp12pow"
     # ── round 4, 2026-09-09: the secp256k1 signing family ──────────────────
     # ⭐ All three of bip340/musig2/adaptor spend ~79% of their contexts in a
@@ -634,6 +634,8 @@ declare -A PATTERN=(
     [aescbc/zero]='root[.]zig'
     [tlock/fp12pow]='tlock[.]zig|ciphersuite[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [tlock/decrypt]='tlock[.]zig|ciphersuite[.]zig|pairing[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|g1[.]zig|scalar[.]zig|mem[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [tlock/fp12pow_g2]='tlock[.]zig|ciphersuite[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
+    [tlock/decrypt_g2]='tlock[.]zig|ciphersuite[.]zig|pairing[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|g1[.]zig|scalar[.]zig|mem[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [ibe/extract]='ibe[.]zig|g1[.]zig|fp[.]zig|scalar[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [ibe/decrypt]='ibe[.]zig|ciphersuite[.]zig|pairing[.]zig|fp[.]zig|fp2[.]zig|fp6[.]zig|fp12[.]zig|g1[.]zig|g2[.]zig|scalar[.]zig|sha2[.]zig|field[.]zig|montint[.]zig|limbs[.]zig'
     [ibe/fp12pow]='ibe[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig'
@@ -1029,6 +1031,8 @@ declare -A LABEL=(
     [aescbc/zero]='aescbc unpadZero (trailing zeros secret)'
     [tlock/fp12pow]='tlock encrypt r->Fp12.pow (F3)'
     [tlock/decrypt]='tlock decrypt+bls12_381 pairing'
+    [tlock/fp12pow_g2]='tlock encryptSigG2 r->Fp12.pow'
+    [tlock/decrypt_g2]='tlock decryptSigG2+bls12_381 pairing'
     [ibe/extract]='ibe extract (msk -> G1)'
     [ibe/decrypt]='ibe decrypt (d_id -> pairing+FO)'
     [ibe/fp12pow]='ibe -> bls12_381 Fp12.pow (Gt windowed, F4)'

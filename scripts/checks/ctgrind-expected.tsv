@@ -266,7 +266,7 @@ oscore	ReleaseFast	unprotect	1	1	5348e0af1901ba83	ed85db89e3d7e9fd
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
 isis	ReleaseFast	md5	1	0	c2d6c36db32da8b6	348beddaddc06aa1
 isis	ReleaseFast	sha256	1	0	c2d6c36db32da8b6	a8ea418331958712
-ssh	ReleaseFast	dh	1	4	4955fcb9a013ec1a	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	f5e786ba243bd2ed	95639ff37028e502
 # Zig 0.17.0 (2026-10-18): ffpow 3 -> 17, still the positive control (>=1). 0.17 std ff pow's
 # table select is now `cmov(ct.eql(k, i+1))` (ff.zig `powWithEncodedExponentInternal` -> `cmov`) and compiles to a jump per
 # table entry (16) instead of 2 `eql` jumps: std ff pow leaks the secret exponent's window values
@@ -293,8 +293,8 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # montint's DynModint (the server-chosen prime; group14 and group16 primes
 # here) — 0 contexts in dyn/montint/limbs; the 2 in-file are stripLeadingZeros
 # on e and K (RFC 4251 §5 mpint length, as `dh`).
-ssh	ReleaseFast	gex	1	2	4955fcb9a013ec1a	2d8d321e6c103efe
-ssh	ReleaseFast	ecdh	1	20	4955fcb9a013ec1a	8683e4aaf784b64c
+ssh	ReleaseFast	gex	1	2	f5e786ba243bd2ed	2d8d321e6c103efe
+ssh	ReleaseFast	ecdh	1	20	f5e786ba243bd2ed	8683e4aaf784b64c
 # ssh pem / pemstd (2026-10-18): HostKey.fromOpenSSH on the ed25519 fixture with the base64
 # characters carrying only seed bits tainted (44 - 2 edge characters; the edges share bits with
 # the private string's 0x40 length and the public-key copy, and tainting them made every later
@@ -568,8 +568,8 @@ p256	ReleaseFast	ecdh	1	3	da3a49b9da38a504	7746c55c1426e84a
 # 2026-10-14: crt 2 -> 1: the doubled FaultDetected verdict context is gone
 # (privateOpCrtPtr restructured for CRT-domain blinding); the 1 left is the
 # F3 verdict, privateOpCrtPtr in root.zig (--stacks).
-rsa	ReleaseFast	crt	1	1	5fcb9cad9ce55a92	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	5fcb9cad9ce55a92	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	1	47e69cee6f003abf	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	47e69cee6f003abf	d4057b00f9df7b56
 # rsa crtbl / crtcache (2026-10-18) — the CRT op with base blinding: `.csprng`
 # (2 = the F3 verdict root.zig `MontParams.eql(&chk, &c)` + drawBlindingPair's
 # one redraw verdict `ok == 0`, a decision about the random r) and `.cached`
@@ -580,8 +580,8 @@ rsa	ReleaseFast	noncrt	1	0	5fcb9cad9ce55a92	d4057b00f9df7b56
 # `if (self.serves(sk))` in `BlindingCache.next` (root.zig) is now tainted
 # on the second op, where `n`/`e` already match. Stacks re-read: the other three
 # are the documented ones (root.zig `drawBlindingPair` draw, `privateOpCrtPtr` F3 twice).
-rsa	ReleaseFast	crtbl	1	2	5fcb9cad9ce55a92	d4057b00f9df7b56
-rsa	ReleaseFast	crtcache	1	4	5fcb9cad9ce55a92	d4057b00f9df7b56
+rsa	ReleaseFast	crtbl	1	2	47e69cee6f003abf	d4057b00f9df7b56
+rsa	ReleaseFast	crtcache	1	4	47e69cee6f003abf	d4057b00f9df7b56
 # rsa oaepnf (2026-11-13) — rsa.decryptOaepHNoFail end to end (CRT op + OAEP unpad)
 # on a real 32-byte-CEK ciphertext, p/q/dp/dq/qinv tainted. The 1 in-file context
 # is privateOpCrtPtr's F3 verdict (root.zig, reached from the private-op entry points), the same
@@ -590,7 +590,7 @@ rsa	ReleaseFast	crtcache	1	4	5fcb9cad9ce55a92	d4057b00f9df7b56
 # is returned as data (before 2026-11-13: `if (valid == 1)` + a copy from a
 # secret offset, 2 contexts at root.zig `ctEqMaskUsize`). The 21 witness contexts are
 # the harness's std.debug.print of ok/msg/raw.
-rsa	ReleaseFast	oaepnf	1	1	5fcb9cad9ce55a92	7e7c9776c2e11410
+rsa	ReleaseFast	oaepnf	1	1	47e69cee6f003abf	7e7c9776c2e11410
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code.
@@ -605,14 +605,14 @@ rsa	ReleaseFast	oaepnf	1	1	5fcb9cad9ce55a92	7e7c9776c2e11410
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont and ffModulusSecret's limb count (length verdicts: the key size); the
 # verdicts p, q odd, p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=80	5fcb9cad9ce55a92	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=80	47e69cee6f003abf	2cb28867b78d48a6
 # rsa pemenc (2026-11-17) — SecretKey.toPem(.pkcs1) of the KAT key, d/dP/dQ/qInv
 # and the primes (with their Montgomery params) tainted. 0 in-file: marshal's
 # INTEGER trim is branch-free and declassifies only what DER publishes (the
 # length and the 0x00 sign pad; before 2026-11-17: 8 contexts at its
 # `while field[z] == 0` / `field[z] & 0x80`); base64 is b64ct. Witness: the
 # harness printing the text.
-rsa	ReleaseFast	pemenc	1	0	e9b1133b23a0c949	c782967c3894b9d5
+rsa	ReleaseFast	pemenc	1	0	e6f1d91d723ef52e	c782967c3894b9d5
 # rsa pemdec (2026-11-17) — SecretKey.fromPem of an untainted key's PEM text with
 # exactly the base64 characters whose six bits all lie in the CONTENT of d, dP,
 # dQ, qInv tainted (p, q untainted on purpose: fromPem re-derives the key from
@@ -623,7 +623,7 @@ rsa	ReleaseFast	pemenc	1	0	e9b1133b23a0c949	c782967c3894b9d5
 # (2) montint nt.divExact's divisibility verdict (d − dP by p−1, d − dQ by q−1),
 # folded into checkWireFields' single verdict and constant for a valid key. That
 # verdict itself is declassified (the call's result). Witness: printing d.
-rsa	ReleaseFast	pemdec	1	2	d1baf2db51f91c8e	2cb28867b78d48a6
+rsa	ReleaseFast	pemdec	1	2	be58f7ef17eebc96	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	960caaf9efdcbd42	e0fdde7f5c62a2d6
 # Zig 0.17.0 (2026-10-18): prf 8 -> 9, BENIGN (public by the scheme). The +1 is xmssPkFromSig's
 # auth-path direction test `(idx >> k) & 1` (engine.zig `xmssPkFromSig`) at a fourth address (loop unrolled).
@@ -1018,8 +1018,10 @@ paillier	ReleaseFast	keygen	1	270	14b7f5ff2a91b536	61a35e2d95a376cf
 # fp12pow, and the pairing final-exp inv, (the FO
 # re-encryption compare: toBytesCompressed + mem.eql) for decrypt; the leaves
 # are in bls12_381 (field/fp/fp2/g2.zig) since tlock moved onto it.
-tlock	ReleaseFast	fp12pow	1	5	9522b0f9f51b0762	b904bd817d356db7
-tlock	ReleaseFast	decrypt	1	8	9522b0f9f51b0762	3a939f7ff5b39d03
+tlock	ReleaseFast	fp12pow	1	5	92592bb5e0058dc7	b904bd817d356db7
+tlock	ReleaseFast	decrypt	1	8	92592bb5e0058dc7	3a939f7ff5b39d03
+tlock	ReleaseFast	fp12pow_g2	1	3	92592bb5e0058dc7	f9eec98083832b27
+tlock	ReleaseFast	decrypt_g2	1	6	92592bb5e0058dc7	3a939f7ff5b39d03
 ibe	ReleaseFast	extract	1	1	ed4966aba724ecd3	686f0732e74c5ef7
 # Zig 0.17.0 (2026-10-18): decrypt 10 -> 8 (decrease, inlining only): millerLoopBatch's 3
 # contexts are one in multiMillerLoop (merged by inlining), and the FO compare's 2 `eqlBytes`
@@ -1471,9 +1473,9 @@ btcaddr	ReleaseFast	wif	1	0	b19fa46ba92994de	3724f47a31d201ab
 # 2026-10-10: AES-192 added to the harness (Aes192Gcm; generic over the aes192
 # module, kernel with Nr = 12) -- 4 -> 6 per row, the same tag-check line for
 # the third key size, nothing else.
-aesgcm	ReleaseFast	ctx	1	6	96d433b8d464dac1	b60805fea700d105
-aesgcm	ReleaseFast	stateless	1	6	96d433b8d464dac1	b60805fea700d105
-aesgcm	ReleaseFast	generic	1	6	96d433b8d464dac1	b60805fea700d105
+aesgcm	ReleaseFast	ctx	1	6	f53f30679e9e0b14	b60805fea700d105
+aesgcm	ReleaseFast	stateless	1	6	f53f30679e9e0b14	b60805fea700d105
+aesgcm	ReleaseFast	generic	1	6	f53f30679e9e0b14	b60805fea700d105
 # groth16 (2026-10-09): the zkey prover's `.constant_time` MSM choice
 # (`zkprove.proveWith`). zkprove_ct pins 6 in-file, all at the public end:
 # `toAffine` on the three proof points (zkprove.zig, the return) -- the identity
@@ -2036,9 +2038,9 @@ snmp	ReleaseFast	des	1	256	736184775bd78bea	f7e7b8e6152d7073
 # code): 0 in-file. The software key expansion is still std's masked S-box
 # via subWord (std's soft expandKey has the same posture); see
 # modules/aes192/SPEC.md.
-aes192	ReleaseFast	enc	1	0	91e9bb5ec00b01a9	0c5f76d6ab016242
-aes192	ReleaseFast	dec	1	0	91e9bb5ec00b01a9	68602ef849690825
-aes192	ReleaseFast	bitsliced	1	0	ba4c8387c14267e7	5ea64f081b0ffcbb
+aes192	ReleaseFast	enc	1	0	e34fdaf8f0489514	0c5f76d6ab016242
+aes192	ReleaseFast	dec	1	0	e34fdaf8f0489514	68602ef849690825
+aes192	ReleaseFast	bitsliced	1	0	afd4c1d207f501f7	5ea64f081b0ffcbb
 # p521 (2026-10-10) — NIST P-521, new module. mul / keygen / sign / ecdh: the
 # secret (scalar, d, seed, ECDH secret) tainted end to end: 0 in-file on all
 # four. The branches the API reveals (range and identity verdicts, r = 0 /
@@ -2471,7 +2473,7 @@ oscore	ReleaseFast	protect	1	80	5348e0af1901ba83	6eac6a90e3479ab8	cpu=x86_64 con
 oscore	ReleaseFast	unprotect	1	81	5348e0af1901ba83	ed85db89e3d7e9fd	cpu=x86_64 control=1 trap=1
 fss	ReleaseFast	gen	1	0	128aeb9126f237e0	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
 fss	ReleaseFast	eval	1	0	128aeb9126f237e0	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
-aesgcm	ReleaseFast	generic	1	226	96d433b8d464dac1	b60805fea700d105	cpu=x86_64 control=8 trap=8
+aesgcm	ReleaseFast	generic	1	226	f53f30679e9e0b14	b60805fea700d105	cpu=x86_64 control=8 trap=8
 # aesccm on x86_64 (2026-11-21, full CI 44922862032 ctgrind-portable; read with --stacks and
 # valgrind --track-origins): claim 192 in-file = 184 A1 (std soft.zig `expandKey` masked S-box loads
 # via root.zig `init`, key tainted; native AES-NI has none) + 8 the tag verdict (root.zig `open`
@@ -2510,9 +2512,9 @@ dnp3	ReleaseFast	keys	1	121	7f24eea64435e887	d2337903af778cbe	cpu=x86_64 control
 dnp3	ReleaseFast	keys5	1	121	7f24eea64435e887	d56cf320bfeb21d5	cpu=x86_64 control=4 trap=61
 opcua	ReleaseFast	chunk	1	134	19e1a1c0ec210142	17e08703a66ffe0f	cpu=x86_64 control=2 trap=34
 snmp	ReleaseFast	aes	1	312	f7b2d59406205574	07f7c9867f83b17e	cpu=x86_64 control=12 trap=12
-aes192	ReleaseFast	enc	1	128	91e9bb5ec00b01a9	0c5f76d6ab016242	cpu=x86_64
-aes192	ReleaseFast	dec	1	304	91e9bb5ec00b01a9	68602ef849690825	cpu=x86_64
-aes192	ReleaseFast	bitsliced	1	128	ba4c8387c14267e7	5ea64f081b0ffcbb	cpu=x86_64
+aes192	ReleaseFast	enc	1	128	e34fdaf8f0489514	0c5f76d6ab016242	cpu=x86_64
+aes192	ReleaseFast	dec	1	304	e34fdaf8f0489514	68602ef849690825	cpu=x86_64
+aes192	ReleaseFast	bitsliced	1	128	afd4c1d207f501f7	5ea64f081b0ffcbb	cpu=x86_64
 # jwe, megolm, xmlenc (joined the portable lane 2026-11-18, wave 6). Attributed context by context
 # against a native --stacks run of the same rows; nothing is a branch of these modules' own on a key:
 #   A1  every claim context with a std/crypto/aes/soft.zig frame among its innermost four is a

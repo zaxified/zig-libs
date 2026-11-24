@@ -86,6 +86,14 @@ FIPS-197 (2001; 2023 update `-upd1`), Nk = 6, Nr = 12.
   `ctr` over this context is 2.32× OpenSSL's EVP CTR at 16 KiB, this one 0.96×. The counter is
   two `u64` halves; while the low half cannot carry inside a batch (public), each counter block
   is one vector byte swap with a vector-to-vector `@bitCast`.
+- **`ctrXor(Ctx, ctx, dst, src, counter)`** is the same stream over ANY encryption context of std's shape
+  (`block.parallel`, `encryptWide`, `xorWide`: this module's, or std's `AesEncryptCtx(Aes128)` / `(Aes256)`), `dst` may be
+  `src`, and it advances `counter` by one per 16-byte block consumed (a final partial block counts) so a protocol that keeps ONE counter across
+  messages continues the stream (the SSH transport; the GCM generic backend and the encrypted-key reader use it too). `Aes192EncryptCtx.ctr` is
+  `ctrXor` over a copy of `iv`. Tests: SP 800-38A F.5.1/F.5.5 through std's contexts, in place and the counter advance; every length
+  against std's `modes.ctr` for Aes128/192/256 at random lengths and IVs across the half carry and the full wrap, and the advance.
+  A/B against std's `modes.ctr` over the same context (Zig 0.17.1, ReleaseFast, 16 KiB packets): 0.35–0.46× of std's time for
+  AES-128/192/256 (spread ≤ 8 %), at an SSH-sized 1504-byte packet 0.37–0.46×.
 - **Backend = std's, at compile time**, by the same switch as for `Aes128`/`Aes256`
   (`has_hardware_support` re-exported).
 - **Dead stack** (`CONVENTIONS.md` §2.1.1): `init`/`initInto` of both contexts (and the

@@ -9,7 +9,8 @@ the round signature IS the IBE private key. Builds directly on the
 finished `bls12_381` module. Models `drand/tlock` (Go,
 Gailly/Melissaris/Romailler) and `drand/kyber`'s `encrypt/ibe` package,
 targeting the League of Entropy's **quicknet** beacon
-(`SigsOnG1ID`/`"bls-unchained-g1-rfc9380"` scheme).
+(`SigsOnG1ID`/`"bls-unchained-g1-rfc9380"` scheme) and, with the group roles swapped,
+drand's G2-signature scheme (`"pedersen-bls-unchained"`: `encryptSigG2`/`decryptSigG2`, 80-byte ciphertext).
 
 **Status: REAL — interop-verified.** The ciphersuite machinery
 (`beaconId`/`h1`/`h2`/`h3`/`h4`) and the `Ciphertext` wire struct +

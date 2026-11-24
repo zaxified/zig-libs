@@ -95,7 +95,7 @@ pub fn AesGcm(comptime key_bits: u16, comptime opts: Options) type {
 }
 
 pub const Backend = enum {
-    /// std's `crypto.core.aes` block cipher, `modes.ctr` and `Ghash`, with
+    /// std's `crypto.core.aes` block cipher and `Ghash` under `aes192.ctrXor`, with
     /// the key schedule and GHASH key cached. Any CPU; hardware AES and
     /// PMULL on arm64 when the build target has `aes`.
     generic,
@@ -386,7 +386,9 @@ fn AesGcmImpl(comptime key_bits: u16, comptime nl: usize, comptime tl: usize) ty
             }
 
             /// GCTR from inc32(J0) (SP 800-38D §6.5): the counter is the low
-            /// 32 bits only. std's `modes.ctr` increments all 128, which is
+            /// 32 bits only. `aes192.ctrXor` (std's `modes.ctr`'s result, minus
+            /// its per-block byte-wise counter store on Zig 0.17, #36256)
+            /// increments all 128, which is
             /// the same as long as the low word does not wrap — always, for a
             /// 96-bit IV (it starts at 2 and `max_message_len` stops it at
             /// 2³² − 1) — so the message is split where it would wrap, and
@@ -397,10 +399,11 @@ fn AesGcmImpl(comptime key_bits: u16, comptime nl: usize, comptime tl: usize) ty
                 mem.writeInt(u32, cb[12..16], low, .big);
                 const room = (@as(u64, 1) << 32) - low; // blocks before the wrap
                 const split: usize = @intCast(@min(@as(u64, src.len), room * 16));
-                crypto.core.modes.ctr(@TypeOf(g.aes), g.aes, dst[0..split], src[0..split], cb, .big);
+                var first = cb; // `ctrXor` advances its counter (a carry would reach the IV bytes)
+                aes192.ctrXor(@TypeOf(g.aes), g.aes, dst[0..split], src[0..split], &first);
                 if (split == src.len) return;
                 mem.writeInt(u32, cb[12..16], 0, .big);
-                crypto.core.modes.ctr(@TypeOf(g.aes), g.aes, dst[split..], src[split..], cb, .big);
+                aes192.ctrXor(@TypeOf(g.aes), g.aes, dst[split..], src[split..], &cb);
             }
 
             fn seal(g: *const Generic, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8) void {

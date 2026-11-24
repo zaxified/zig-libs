@@ -386,9 +386,6 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **PEM `aes256-ctr` decryption on Zig 0.17.** The encrypted-OpenSSH-key path (`std.crypto.core.modes.ctr` over std `Aes256`
-  in `src/root.zig`) pays 0.17's byte-wise `writeInt(u128)` counter (#36256; 2.3× on `aes192`'s CTR bench). Cold path (once per
-  key load), so not urgent; the fix is `aes192`'s `ctr` shape (two `u64` halves, vector byte swap). A performance item, to be measured on a quiet host.
 - *BOUNCED (quiet-host):* **Performance, remaining lever:** the modexp itself (REDC is about 54 % of it at L = 16, i.e. 2048-bit keys); the blinded
   `.csprng` rows additionally carry the stateless draw (the inverse and `r^e`, ~4.7 % of cycles), which `.cached` removes.
   A performance item, to be measured on a quiet host.

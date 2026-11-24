@@ -36,6 +36,13 @@ source, fetched 2026-07-16:
   through `EncryptCCAonG2`/`DecryptCCAonG2` despite the `SigsOnG1ID`
   scheme name (see `ciphersuite.zig`'s module doc comment, "Variant
   confirmation" section).
+- `github.com/drand/tlock-js` (MIT OR Apache-2.0; read 2026-11-24 for the G2-signature scheme),
+  `src/crypto/ibe.ts` (`encryptOnG1`/`decryptOnG1`: the DST, the pairing argument order, `U`
+  in `G1`), `src/drand/defaults.ts` and `test/age/compatibility.test.ts` (the retired testnet
+  `testnet-unchained-3s`'s public key, round 1's signature and a Go-`tle`-produced armored file, pinned
+  as test data in `src/kat_test.zig` and `src/testdata/tlock-js-testnet-unchained-3s-round1.tle`).
+  `github.com/drand/tlock` `tlock.go` (read again): `UnchainedSchemeID` routed through
+  `EncryptCCAonG1`. No kyber source was read for this scheme.
 - `github.com/drand/kyber-bls12381` (MIT — its `LICENSE`; corrected 2026-09-30 from "Apache-2.0/MIT dual"),
   `kyber_g1.go`/`kyber_g2.go`/`kyber_gt.go`/`kyber_scalar.go`. Read to
   confirm: point serialization is compressed (matches
