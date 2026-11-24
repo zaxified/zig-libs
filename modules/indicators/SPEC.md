@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-11-15 (1,080,000 runs clean in three verdicts of 4 jobs, INDICATORS_FUZZ, ReleaseSafe; reach on every function: all 237 entries x f64 / f32 x stream, per-function counts printed; the whole surface — every batch function, `Lookback`, every streaming type with `bufLen` / `init` / `update` / `peek` / `value` / `clone` — under NaN / inf / -0 / denormal / huge data, lengths 0 .. 600, parameters at and beyond every range, mismatched slice lengths, short buffers, a failing allocator and in-place calls; batch == stream, `peek` == `update`, the NaN lead == the lookback, no unwritten output slot; the harness checked by 11 planted mutants) · ct n/a — no secret enters an indicator · panic 2026-11-15 (every entry point and every `@intFromFloat` / `@intCast` / `unreachable` / `.?` / allocation site swept, all 237 functions called by the fuzz harness: MEDIAN / PERCENTILE no longer index out of the sorted copy when the data holds a NaN; BBW / PERCENTB streams keep a ring as long as their average needs (KAMA / ZLEMA / VIDYA were wrong and `peek` differed from `update`); ZIGZAG's `pivot_idx` saturates at 2^31 - 1 instead of trapping)
 
-**Performance:** ref 0.43–1.9× TA-Lib 0.8.3 batch API (114 workloads over 88 functions, 1e3–1e6 bars, f64; worst STC 1.9×, FRAMA 1.9×, RVI 1.8×, FISHER 1.8×, MAMA 1.8×; 31 of 88 functions over 1.1×; streaming 0.36–0.67×; i7-7920HQ, by cycles; the 18 rows of the third P-gap round re-measured 2026-11-16 under load 3-4 against both sides in the same run, the rest from the second round's run of the same day) · fastest ? (measured 2026-11-16)
+**Performance:** ref 0.43–1.8× TA-Lib 0.8.3 batch API (116 workloads over 90 functions, 1e3–1e6 bars, f64; worst MAMA 1.8×, CKSP 1.8×, MACD 1.8× (1e3 bars), STC 1.6×, PPO 1.6×; 26 of 90 functions over 1.1×; streaming 0.37–0.65×; i7-7920HQ, by cycles, in the bench shield with 5 rounds) · fastest ? (measured 2026-11-24)
 
 **Known defects:** none recorded
 
@@ -412,6 +412,14 @@ inputs with NaN or infinite bars, settings with factors above 2 or periods above
 - **Process-global configuration** (the unstable period, the candle settings): options are per call.
 - **In-place calls (`out` aliasing `in`).** TA-Lib allows them because its output is compact: `out[0]` is the value at bar `outBegIdx`, so a write never lands on an input a later window still reads. Here `out[i]` is the value at bar `i` (the lookback lead is NaN, `out.len == in.len`), so writing it destroys `in[i]`, which every windowed function reads again `period - 1` bars later and every batch function reads once more through its lead fill; making a call alias-safe would cost a copy of the input per call (or an allocator in every signature). The caller who wants it passes a copy. The fuzz harness pins that an aliased call never crashes, not what it answers.
 - **`nan = .skip` on the windowed functions (KAMA, ZLEMA, VIDYA, the window family).** The option exists only here (TA-Lib has no NaN handling to follow), and for a function that reads a window "the bar does not count" has no single meaning: the window either keeps the NaN bar's slot or closes over it, and the answer differs between those. The recursive functions that never read history have it (see *Limits*); a caller of a windowed one drops the NaN bars before the call.
+- **Batch speed gaps that stay against TA-Lib** (bench shield, ratio ours / TA-Lib at 1e5 bars unless noted; each was profiled, and a lever that showed no effect was dropped):
+  - MAMA 1.78, HT_DCPERIOD / HT_PHASOR 1.43, HT_TRENDLINE 1.43: the correctly rounded `atan` (`xmath.atan`, Ziv's strategy) is 54 % of the cycles (perf) and lies on the period recurrence's critical path; trading two of its divisions for products measured +1 % (1.431 to 1.417, MAMA 1.774 to 1.78), so it was dropped. TA-Lib's glibc `atan` is faster per call, the result is the same double.
+  - STC 1.60 (1.90 before: leaving the generic step once steady): what is left is the two-stage stochastic with its divisions in the recurrence.
+  - MFI 1.50: the loop is TA-Lib's own already; a mask formulation of the flow selects measured 1.51 to 1.32 at 1e3 bars but 1.49 to 1.97 at 1e5, and was dropped.
+  - CCI 1.43: the window sums are serial in the order TA-Lib's circular buffer visits them (the bits depend on it), the same chain TA-Lib runs.
+  - MACD 1.77 at 1e3 bars (1.38 at 1e5), PPO 1.58, TSF 1.31, BBANDS 1.42 at 1e3: the steady loops are TA-Lib-shaped already; the 1e3 rows are dominated by the warm-up through the generic step.
+  - CKSP 1.78 (2.40 before), FRAMA 1.25 (1.97), ULTOSC 1.10 (1.40), WAVETREND 1.15 (1.65) are the remainders of the levers that were taken.
+- **A timing of `kand`.** The crate is a Rust re-implementation of TA-Lib's function list, not a port: timing it needs a Rust build of third-party code (fetch, source review, `cargo` through the job queue) and a driver; its results are not comparable bit for bit, so it could only answer a speed question, and the module's reference (TA-Lib, which the module ports) is the only one timed. `tools/bench.zig` keeps its (empty) alternative column for it.
 
 ## Open
 
@@ -431,7 +439,7 @@ inputs with NaN or infinite bars, settings with factors above 2 or periods above
 
 `zig build bench-indicators` (`tools/bench.zig`, C side `tools/bench_talib.c` with the rows in `tools/bench_rows.h`; kept
 instrument kind 3, CONVENTIONS.md §9). Reference: TA-Lib C 0.8.3, the module's own model; no other candidate is timed
-(`kand`, the speed candidate, is not: see Backlog). The figures are the card's `**Performance:**` line; this section
+(`kand`, the speed candidate, is not: see *What is deliberately not done*). The figures are the card's `**Performance:**` line; this section
 holds only the method.
 
 **Method.** Both sides run one BATCH call over the first n bars of the same seeded random-walk OHLCV series (f64, file
@@ -457,7 +465,9 @@ built ReleaseFast for the native CPU. A distribution's TA-Lib is the same C comp
 machine is shared, so ratios are by user-mode cycles (time-slicing does not enter, cache and SMT contention does; the spread
 is the larger of the two sides' best-to-worst over the rounds). Ratios under 1.0 are ours faster.
 
-**PSO and CKSP rows.** Both are in the table (`pso`, `cksp`, parameters 8 / 5 and 10 / 1.0 / 9; the card's range predates them, measured alone at 1e5 bars: PSO 1.5x, CKSP 2.1x TA-Lib). CKSP's batch is one pass of four van Herk / Gil-Werman block-wise extrema and the Wilder ATR inline, as TA-Lib's own `ta_CKSP.c`, for finite non-zero input (a zero's sign under a +0.0 / -0.0 tie would depend on the window's shape; any other input runs `CkspCore`, bit for bit the stream): 4.25 ms before, 1.66 ms now (5.9x to 2.1x; the two ends are measured at spreads of 18 % and 6 %, so the 2.5x between them stands). What is left of the gap is the generic ATR seed (`AtrCore.step` until steady) and the four extrema pushes.
+**PSO and CKSP rows.** Both are in the table (`pso`, `cksp`, parameters 8 / 5 and 10 / 1.0 / 9). CKSP's batch is one pass of four van Herk / Gil-Werman block-wise extrema and the Wilder ATR inline, as TA-Lib's own `ta_CKSP.c`, for finite non-zero input (a zero's sign under a +0.0 / -0.0 tie would depend on the window's shape; any other input runs `CkspCore`, bit for bit the stream): 2.5x faster than the generic core at 1e5 bars. What is left of the gap (1.8x) is the generic ATR seed (`AtrCore.step` until steady) and the four extrema pushes. PSO takes its `tanh` four lanes at a time (see *Vector `log` / `exp` / `tanh`*).
+
+**Vector `log` / `exp` / `tanh`.** FRAMA, FISHER, PSO and CHOP / CHOPTR take their `exp`, `log`, `tanh` and `log10` from `vmath.zig` for a block of 64 bars at a time: four-lane versions of Zig's own scalar functions (compiler-rt's table-driven `log`, its fdlibm-style `exp` and `log10`, `xmath.tanh` over `expm1`), the same operations in the same order, so the bits are the scalar functions' and the tests compare them over a million random arguments each (a lane the fast formula does not cover is answered by the scalar function). This is possible where the argument does not depend on the previous bar's result: the block's arguments are collected first.
 
 **Caveats.** f64 only (the module's f32 path converts to f64 and back; not timed); no NaN inputs; one parameter set per function (the defaults
 of TA-Lib where it has them); STOCH, STOCHF, STOCHRSI, MACDEXT, KDJ, MEDIAN, PERCENTILE, STC, ALMA, CRSI, WAVETREND take a `gpa` in this
@@ -467,5 +477,4 @@ after the pre-check).
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **Batch speed gaps against TA-Lib** — quiet-host phase (every item needs A/B timings and bit-identical results; a loaded host cannot give either a ratio or a spread). (the ratios are on the card; worst first). STC (state kept in memory across the per-bar `step`), FRAMA and FISHER (`exp` / `log` per bar: Zig's are 1.5-2.5x glibc's per call and the bits must stay; FISHER's window rescan through vector selects, also as two chains, measured no faster), RVI (two recurrences through generic cores), MAMA and the Hilbert family, WAVETREND, PPO, MFI (the generic `vs` driver), CHOP, ULTOSC and CCI, BBANDS (the SMA middle's generic step, `sqrt`, three stores), KC, LINEARREG / TSF, DONCHIAN (TA-Lib runs the automaton too; a block scan would change NaN windows against the reference), MAX / MIN at 1e5 (`hiLoBlocks` with its stack suffix arrays measured the same as `extBatch` on MINMAX, so the parked suffixes are not the cost), PERCENTILE (the `@memmove` call per bar), STOCH / STOCHF / KDJ.
-- *BOUNCED (quiet-host):* **A timing of `kand`** — quiet-host phase (a timing). (the speed candidate; TA-Lib is the only reference timed).
+None open.
