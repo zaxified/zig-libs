@@ -15,7 +15,9 @@
 //!   zig build interop-websocket -- deflate  # only the rows whose id contains "deflate"
 //!   zig build interop-websocket -- --capture  # also rewrite src/testdata/interop/
 //!
-//! Three families:
+//! Three families (plus `client-ks` / `server-ks` when `tools/ks_build.sh` has built
+//! karlseguin/websocket.zig's peer `tools/ks_peer.zig`; its own client and server
+//! are that column's judges):
 //!
 //! - `client`: this module's client (`handshake` + `conn.Conn`) against the
 //!   coder and gorilla servers. The judge is the server library's own client
@@ -352,6 +354,11 @@ const Env = struct {
     coder_port: u16,
     gorilla_port: u16,
     our_port: u16,
+    /// karlseguin/websocket.zig (`ks_peer.zig`): its WebSocket port, its
+    /// report port, and the binary (0 / "" when the third column is off).
+    ks_port: u16 = 0,
+    ks_report_port: u16 = 0,
+    ks_exe: []const u8 = "",
     obs: *Obs,
     prng: std.Random.DefaultPrng = .init(0x6455),
     capture: bool = false,
@@ -361,12 +368,14 @@ const Impl = enum {
     ours,
     coder,
     gorilla,
+    ks,
 
     fn port(i: Impl, env: *const Env) u16 {
         return switch (i) {
             .ours => env.our_port,
             .coder => env.coder_port,
             .gorilla => env.gorilla_port,
+            .ks => env.ks_port,
         };
     }
 };
@@ -496,9 +505,41 @@ fn goClient(env: *Env, lib: Impl, port: u16, scenario: []const u8, id: []const u
     return std.mem.trim(u8, r.stdout, " \n");
 }
 
+/// `ks_peer client` (karlseguin/websocket.zig's client) against `port`.
+fn ksClient(env: *Env, port: u16, scenario: []const u8, id: []const u8) []const u8 {
+    const url = env.arena.print("ws://127.0.0.1:{d}{s}?case={s}&sc={s}", .{ port, scenarioPath(scenario), id, scenario }) catch return "err OOM";
+    const r = std.process.run(env.arena, env.io, .{
+        .argv = &.{ env.ks_exe, "client", url, scenario },
+        .environ_map = env.env_map,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+    }) catch |err| return env.arena.print("err ks client: {t}", .{err}) catch "err OOM";
+    return std.mem.trim(u8, r.stdout, " \n");
+}
+
+/// `line` without its ` <key>=<value>` token (the ks client cannot read the
+/// handshake response, so its line has no `ext=` / `proto=`).
+fn dropToken(arena: std.mem.Allocator, line: []const u8, key: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, line, ' ');
+    while (it.next()) |t| {
+        if (std.mem.startsWith(u8, t, key)) continue;
+        if (out.items.len != 0) out.append(arena, ' ') catch return line;
+        out.appendSlice(arena, t) catch return line;
+    }
+    return out.items;
+}
+
+/// The value of `key=` in `text` ("" when absent).
+fn tokenValue(text: []const u8, key: []const u8) []const u8 {
+    var it = std.mem.tokenizeScalar(u8, text, ' ');
+    while (it.next()) |t| if (std.mem.startsWith(u8, t, key)) return t[key.len..];
+    return "";
+}
+
 /// The server's record of case `id`.
 fn report(env: *Env, server: Impl, id: []const u8) []const u8 {
     if (server == .ours) return env.obs.take(env.io, id, env.arena) catch "none";
+    if (server == .ks) return goReport(env, env.ks_report_port, id) catch |err| env.arena.print("report: {t}", .{err}) catch "none";
     return goReport(env, server.port(env), id) catch |err| env.arena.print("report: {t}", .{err}) catch "none";
 }
 
@@ -781,6 +822,18 @@ fn matches(filters: []const [:0]const u8, id: []const u8) bool {
     return false;
 }
 
+/// A loopback port nothing listens on right now.
+fn freePort(io: std.Io) !u16 {
+    var l = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true });
+    defer l.deinit(io);
+    return l.socket.address.getPort();
+}
+
+/// The scenarios the ks client runs against this module's server: the library
+/// cannot compress, so a `deflate` offer it made would be answered with
+/// compressed frames it cannot read.
+const ks_server_scenarios = [_][]const u8{ "echo", "frag", "ping", "close", "servclose", "subproto" };
+
 const client_scenarios = [_][]const u8{ "echo", "deflate", "frag", "frag-deflate", "sping", "close", "servclose", "subproto" };
 const server_scenarios = [_][]const u8{ "echo", "deflate", "frag", "frag-deflate", "ping", "close", "servclose", "subproto" };
 
@@ -850,6 +903,36 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
+    // karlseguin/websocket.zig as the third peer: `KS_PEER=<binary>` (built by
+    // `tools/ks_build.sh`), else the build script's default place.
+    const ks_exe: []const u8 = init.environ_map.get("KS_PEER") orelse ".zig-cache/ks-work/bin/bin/ks_peer";
+    var ks_child: ?std.process.Child = null;
+    defer if (ks_child) |*k| k.kill(io);
+    var ks_port: u16 = 0;
+    var ks_report_port: u16 = 0;
+    if (cwd.access(io, ks_exe, .{})) |_| {
+        ks_port = try freePort(io);
+        ks_report_port = try freePort(io);
+        const pa = try arena.print("{d}", .{ks_port});
+        const pb = try arena.print("{d}", .{ks_report_port});
+        ks_child = try std.process.spawn(io, .{
+            .argv = &.{ ks_exe, "serve", pa, pb },
+            .environ_map = &env_map,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        });
+        var buf: [256]u8 = undefined;
+        var r = ks_child.?.stdout.?.reader(io, &buf);
+        const line = (try r.interface.takeDelimiter('\n')) orelse {
+            std.debug.print("interop-websocket: ks_peer exited before it was ready\n", .{});
+            return 1;
+        };
+        if (!std.mem.startsWith(u8, line, "READY")) return error.BadOracleBanner;
+    } else |_| {
+        std.debug.print("interop-websocket: no ks_peer at {s} (tools/ks_build.sh builds it): the karlseguin column is skipped\n", .{ks_exe});
+    }
+
     var obs: Obs = .{ .capture_io = if (capture) io else null };
     // http.Server's default 16 KiB read buffer: `Conn` reads a payload
     // that does not fit it straight into `message_buf` (the suite sends
@@ -874,6 +957,9 @@ pub fn main(init: std.process.Init) !u8 {
         .coder_port = coder_port,
         .gorilla_port = gorilla_port,
         .our_port = ours.boundAddress().getPort(),
+        .ks_port = ks_port,
+        .ks_report_port = ks_report_port,
+        .ks_exe = ks_exe,
         .obs = &obs,
         .capture = capture,
     };
@@ -928,6 +1014,58 @@ pub fn main(init: std.process.Init) !u8 {
         try o.row(id, "server", .agree, go_line, our_line, surprise, our_rep);
     };
 
+    // karlseguin/websocket.zig, client family: this module's client against
+    // its server. The judge is its own client on the same server and scenario:
+    // what the server recorded must match, and so must the client's line once
+    // the tokens the ks client cannot learn (`ext=`, `proto=`: it does not
+    // expose the handshake response) are dropped; those two are checked
+    // against the server's record instead.
+    if (ks_port != 0) for (client_scenarios) |sc| {
+        const id = try arena.print("client-{s}@ks", .{sc});
+        if (!matches(filters, id)) continue;
+        caseStart(io, id);
+        const ref_id = try arena.print("{s}-ref", .{id});
+        const ks_line = ksClient(&env, ks_port, sc, ref_id);
+        const ks_rep = report(&env, .ks, ref_id);
+        const our_line = ourClient(&env, ks_port, sc, id);
+        const our_rep = report(&env, .ks, id);
+        const surprise: ?[]const u8 = if (!std.mem.startsWith(u8, ks_line, "ok"))
+            try arena.print("the ks client fails: {s}", .{ks_line})
+        else if (!std.mem.eql(u8, ks_line, dropToken(arena, dropToken(arena, our_line, "ext="), "proto=")))
+            try arena.print("ks client: {s} | ours: {s}", .{ ks_line, our_line })
+        else if (!std.mem.eql(u8, ks_rep, our_rep))
+            try arena.print("server saw ks client: {s} | ours: {s}", .{ ks_rep, our_rep })
+        else if (!std.mem.eql(u8, tokenValue(our_line, "ext="), tokenValue(our_rep, "ext=")))
+            try arena.print("ours read ext={s}, the server says {s}", .{ tokenValue(our_line, "ext="), tokenValue(our_rep, "ext=") })
+        else if (std.mem.eql(u8, sc, "subproto") and !std.mem.eql(u8, tokenValue(our_line, "proto="), tokenValue(our_rep, "proto=")))
+            try arena.print("ours read proto={s}, the server says {s}", .{ tokenValue(our_line, "proto="), tokenValue(our_rep, "proto=") })
+        else
+            null;
+        try o.row(id, "client-ks", .agree, ks_line, our_line, surprise, our_rep);
+    };
+
+    // server family: the ks client against this module's server; the judge
+    // is the same client against the ks server.
+    if (ks_port != 0) for (ks_server_scenarios) |sc| {
+        const id = try arena.print("server-{s}@ks", .{sc});
+        if (!matches(filters, id)) continue;
+        caseStart(io, id);
+        const ref_id = try arena.print("{s}-ref", .{id});
+        const ks_line = ksClient(&env, ks_port, sc, ref_id);
+        const ks_rep = report(&env, .ks, ref_id);
+        const our_line = ksClient(&env, env.our_port, sc, id);
+        const our_rep = report(&env, .ours, id);
+        const surprise: ?[]const u8 = if (!std.mem.startsWith(u8, ks_line, "ok"))
+            try arena.print("the ks pair fails: {s}", .{ks_line})
+        else if (!std.mem.eql(u8, ks_line, our_line))
+            try arena.print("ks client vs its server: {s} | vs ours: {s}", .{ ks_line, our_line })
+        else if (!std.mem.eql(u8, ks_rep, our_rep))
+            try arena.print("ks server saw: {s} | ours saw: {s}", .{ ks_rep, our_rep })
+        else
+            null;
+        try o.row(id, "server-ks", .agree, ks_line, our_line, surprise, our_rep);
+    };
+
     // raw: the same bytes to all three servers.
     for (try rawCases(arena)) |*c| {
         if (!matches(filters, try arena.print("raw-{s}", .{c.id}))) continue;
@@ -961,9 +1099,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     const w = &stdout.interface;
     try w.print("\nGo {s}: coder/websocket v1.8.15, gorilla/websocket v1.5.3; {d} rows\n", .{ go_version, o.total.cases });
-    try w.print("{s:<8} {s:>6} {s:>9} {s:>9} {s:>8}\n", .{ "family", "rows", "surprises", "stricter", "differs" });
-    for (o.families.keys(), o.families.values()) |k, v| try w.print("{s:<8} {d:>6} {d:>9} {d:>9} {d:>8}\n", .{ k, v.cases, v.surprises, v.stricter, v.differs });
-    try w.print("{s:<8} {d:>6} {d:>9} {d:>9} {d:>8}\n", .{ "total", o.total.cases, o.total.surprises, o.total.stricter, o.total.differs });
+    try w.print("{s:<10} {s:>6} {s:>9} {s:>9} {s:>8}\n", .{ "family", "rows", "surprises", "stricter", "differs" });
+    for (o.families.keys(), o.families.values()) |k, v| try w.print("{s:<10} {d:>6} {d:>9} {d:>9} {d:>8}\n", .{ k, v.cases, v.surprises, v.stricter, v.differs });
+    try w.print("{s:<10} {d:>6} {d:>9} {d:>9} {d:>8}\n", .{ "total", o.total.cases, o.total.surprises, o.total.stricter, o.total.differs });
     try w.print("verdicts: {s}/verdicts.tsv\n", .{work_dir});
     try w.flush();
     return if (o.total.surprises == 0) 0 else 1;

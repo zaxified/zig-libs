@@ -81,6 +81,10 @@ over loopback: this module's client against both Go servers, both Go clients aga
 module's server (`http.Server` + `respondUpgraded` + `Conn`, 16 KiB buffers), and fixed raw
 handshakes and frames sent to all three servers. Expectations are `agree`, `stricter` (the
 card's `**Ahead:**` rows) or `differs` (documented); anything else is a SURPRISE and exit 1.
+A fourth peer, karlseguin/websocket.zig, adds the families `client-ks` and `server-ks` when its
+binary exists (`tools/ks_build.sh` builds `ks_peer.zig` against a clone outside the repository and
+prints the path; `KS_PEER=<binary>` overrides the default `.zig-cache/ks-work/bin/bin/ks_peer`);
+its own client on its own server is the judge, as the Go libraries are for theirs.
 Verdicts: `.zig-cache/interop-websocket/verdicts.tsv`.
 
 `-- --capture` rewrites `src/testdata/interop/*.bin`: the bytes the Go libraries sent after the
