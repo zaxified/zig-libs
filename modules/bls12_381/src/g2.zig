@@ -255,7 +255,7 @@ pub const Jacobian = struct {
     /// `scalarMul` takes `Fr` by value, so the caller's frame keeps the copy
     /// it passed; this form reads the scalar through the pointer, wipes its
     /// encoding, and zeroes the stack the multiply dirtied
-    /// (`stackprobe_test.zig`). Same constant-time double-and-add-always.
+    /// (`stackprobe_test.zig`). Same constant-time fixed window.
     pub fn scalarMulInto(p: Jacobian, out: *Jacobian, s: *const Fr) void {
         burn.run(burn.sign_burn, void, scalarMulIntoBody, .{ p, out, s });
     }
@@ -267,10 +267,29 @@ pub const Jacobian = struct {
     }
 
     /// `[s]P` for an arbitrary-width big-endian scalar byte string —
-    /// see `g1.zig`'s `scalarMulBytes` (identical constant-time
-    /// double-and-add-always construction, over `Fp2` point
-    /// arithmetic).
+    /// see `g1.zig`'s `scalarMulBytes` (identical constant-time fixed
+    /// 4-bit window, over `Fp2` point arithmetic).
     pub fn scalarMulBytes(p: Jacobian, s: []const u8) Jacobian {
+        var table: [16]Jacobian = undefined;
+        table[0] = identity;
+        table[1] = p;
+        for (2..16) |k| table[k] = if (k % 2 == 0) table[k / 2].double() else table[k - 1].add(p);
+        var acc = identity;
+        for (s) |byte| {
+            inline for (.{ 4, 0 }) |sh| {
+                acc = acc.double().double().double().double();
+                const nibble: u8 = (byte >> sh) & 0xf;
+                var sel = identity;
+                for (table, 0..) |t, k| sel = ctSelect(nibble == k, t, sel);
+                acc = acc.add(sel);
+            }
+        }
+        return acc;
+    }
+
+    /// The binary double-and-add-always `scalarMulBytes` ran before the
+    /// fixed window: the window's test oracle and bench baseline.
+    fn scalarMulBytesBinary(p: Jacobian, s: []const u8) Jacobian {
         var acc = identity;
         for (s) |byte| {
             var bit: u3 = 7;
@@ -363,16 +382,27 @@ pub const Jacobian = struct {
         return x_eq and y_eq;
     }
 
-    /// Multiplies by the cofactor `h2` (`cofactor_bytes`, 64 bytes) —
-    /// see `g1.zig`'s `Jacobian.clearCofactor` for the identical
-    /// "not `Fr`-reduced, plain big-integer scalar" caveat, one tower
-    /// level up and with a much wider (~636-bit) cofactor here.
+    /// Clears the cofactor of an arbitrary `E'(Fp2)` point: `[h_eff]P`
+    /// with RFC 9380 §8.8.2's 636-bit `h_eff` (Budroni-Pintore [BP17]),
+    /// which lands every twist point in `G2` — what blst's hash-to-curve,
+    /// zkcrypto's `G2Projective::clear_cofactor` and gnark-crypto's
+    /// `ClearCofactor` compute (named, not read); NOT `[h2]P`, a different
+    /// point of `G2`. RFC 9380 Appendix G.3's chain with `c1 = z = −|z|`:
+    /// ```
+    /// t1 = [z]P, t2 = ψ(P), t3 = ψ²(2P) − t2, t2 = [z](t1 + t2),
+    /// Q = t3 + t2 − t1 − P
+    /// ```
+    /// two `[|z|]` chains (`mulByAbsXPublic`, fixed public `|z|`), three ψ
+    /// and five additions instead of a 636-bit double-and-add-always;
+    /// complete branchless `double`/`add` throughout, so constant time in
+    /// the point. Pinned against the plain `[h_eff]P` by the hash-to-curve
+    /// test "clearCofactor == [h_eff]P".
     pub fn clearCofactor(self: Jacobian) Jacobian {
-        // Plain big-integer scalar-mul by h2's ~636-bit value.
-        // TODO: the untwist-Frobenius-twist trick gives a much cheaper
-        // cofactor clearing (same Bowe reference as subgroupCheck) —
-        // deferred optimization, per SPEC.md's Backlog.
-        return scalarMulBytes(self, &cofactor_bytes);
+        const t1 = mulByAbsXPublic(self).negate(); // [z]P
+        const psi_p = endomorphismPsi(self);
+        const t3 = endomorphismPsi(endomorphismPsi(self.double())).add(psi_p.negate());
+        const t2 = mulByAbsXPublic(t1.add(psi_p)).negate(); // [z](t1 + ψ(P))
+        return t3.add(t2).add(t1.negate()).add(self.negate());
     }
 };
 
@@ -692,6 +722,46 @@ test "G2 KAT: [k]G2 compressed matches the independent cross-check vector" {
     const expected = hexBytes(compressed_bytes, k_g_compressed_hex);
     const kg = jacGen().scalarMul(k).toAffine();
     try std.testing.expectEqualSlices(u8, &expected, &toBytesCompressed(kg));
+}
+
+test "G2 fixed-window scalarMulBytes == binary double-and-add-always" {
+    var prng = std.Random.DefaultPrng.init(0x22d0);
+    const rng = prng.random();
+    const g = Jacobian.fromAffine(Affine.generator);
+    // Every nibble value in every window position, the all-ones and the
+    // all-zero strings, odd lengths, and points outside the subgroup.
+    var edge: [32]u8 = undefined;
+    for (0..17) |k| {
+        for (&edge, 0..) |*e, i| e.* = @truncate((k * 17 + i) & 0xff);
+        if (k == 15) edge = @splat(0xff);
+        if (k == 16) edge = @splat(0);
+        try std.testing.expect(Jacobian.eqlPoints(g.scalarMulBytes(&edge), Jacobian.scalarMulBytesBinary(g, &edge)));
+    }
+    for (0..12) |i| {
+        var s: [33]u8 = undefined;
+        rng.bytes(&s);
+        const lens = [_]usize{ 32, 16, 1, 33 };
+        const len = lens[i % 4];
+        const p = if (i % 2 == 0) g else randomTwistPoint(rng);
+        try std.testing.expect(Jacobian.eqlPoints(p.scalarMulBytes(s[0..len]), Jacobian.scalarMulBytesBinary(p, s[0..len])));
+    }
+    try std.testing.expect(Jacobian.identity.scalarMulBytes(&edge).isIdentity());
+}
+
+test "bench: G2 scalarMul, binary ladder vs fixed window (opt-in BLS12_381_BENCH)" {
+    const bench = @import("bench.zig");
+    if (!bench.enabled()) return error.SkipZigTest;
+    const S = struct {
+        const k: [32]u8 = @splat(0x5a);
+        fn binary(p: *const Jacobian) void {
+            std.mem.doNotOptimizeAway(Jacobian.scalarMulBytesBinary(p.*, &k));
+        }
+        fn window(p: *const Jacobian) void {
+            std.mem.doNotOptimizeAway(p.scalarMulBytes(&k));
+        }
+    };
+    const g = Jacobian.fromAffine(Affine.generator);
+    bench.ab("G2 scalarMul 256-bit (A binary, B window)", 30, &g, S.binary, S.window);
 }
 
 test "G2 scalarMul edge cases and distributivity" {
