@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-24** — Batch speed, bit for bit unchanged: `cksp`'s block-wise pass takes the better of two finite values with a plain compare-select (one `maxsd`/`minsd`, not `@max`'s NaN fix-up) and runs the steady bars in four phases with a branch-free body each; 2.40x to 1.74x TA-Lib at 1e5 bars (shield, spread < 4 %).
 - **2026-11-21** — Batch speed, bit for bit unchanged: `cksp` on finite, non-zero input runs one pass of four block-wise rolling extrema and the inline Wilder ATR (as TA-Lib's own CKSP) instead of five generic cores, 2.5x faster at 1e5 bars (5.9x to 2.1x TA-Lib); it takes `2 * (period + stop_period)` f64 of scratch from the allocator (the generic core, `2 * stop_period`, answers when that is not available or the input has a zero, a NaN or an overflow). Benchmark rows `pso` and `cksp` added.
 - **2026-11-21** — **API addition:** `MavpStream(T)` (and `MavpIn`), the streaming MAVP: a bank of one moving average per period in `min_period..max_period` as in TA-Lib 0.8's `TA_MAVP_Update`, `update(.{ .close, .period })`, bit for bit the batch `mavp`, `peek`, `clone`. Its buffer holds the bank (one `MaCore` per period): `bufLen` is megabytes for a wide range. Every one of the 237 functions now has a streaming type.
 - **2026-11-16** — Batch speed (third round, bit for bit unchanged): MINMAX (period <= 256) takes both extremes from one block
