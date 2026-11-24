@@ -12,7 +12,7 @@
 
 **Hardening:** fuzz 2026-10-28 (240,000 runs clean (REGEX_FUZZ), ReleaseSafe) · ct n/a — regex engine (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point, 2 MED fixed in `b2b6086e`)
 
-**Performance:** ref 0.00–0.57× Go regexp go1.26 · fastest 0.05–1.24× Rust regex 1.13.1 (measured 2026-10-28)
+**Performance:** ref 0.00–0.65× Go regexp go1.26 · fastest 0.04–10.93× Rust regex 1.13.1 (measured 2026-11-24)
 
 **Known defects:** none recorded
 
