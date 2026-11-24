@@ -137,6 +137,7 @@ fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
 /// head (A1 http F4 again). The reader is left mid-head either way.
 pub fn readHead(r: *Reader, buf: []u8) ReadHeadError![]const u8 {
     var len: usize = 0;
+    var skipped: usize = 0;
     while (true) {
         const line = takeLineInto(r, buf[len..]) catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
@@ -149,8 +150,13 @@ pub fn readHead(r: *Reader, buf: []u8) ReadHeadError![]const u8 {
         // RFC 9112 §2.2: a recipient expecting a request-line SHOULD ignore
         // at least one empty line before it (clients that append a CRLF to a
         // body leave one in front of the next request). hyper and llhttp
-        // skip them; so does this, however many.
-        if (line.blank and len == 0) continue;
+        // skip them; so does this, but the skipped bytes count against the
+        // head limit, so a peer cannot keep the reader busy on blank lines.
+        if (line.blank and len == 0) {
+            skipped += 2;
+            if (skipped > buf.len) return error.HeadTooLarge;
+            continue;
+        }
         if (line.blank) return buf[0..len];
         if (line.overflow) return error.HeadTooLarge;
         len += line.bytes.len;
@@ -2032,6 +2038,13 @@ test "readHead: empty lines before the request-line are skipped (RFC 9112 §2.2)
     // Nothing but empty lines is still no head.
     var r2: Reader = .fixed("\r\n\r\n");
     try testing.expectError(error.ConnectionClosed, readHead(&r2, &buf));
+    // The skipped lines count against the head limit: a stream of blank lines
+    // longer than the buffer is refused instead of being read forever.
+    var small: [8]u8 = undefined;
+    var r3: Reader = .fixed("\r\n\r\n\r\n\r\n\r\nGET / HTTP/1.1\r\n\r\n");
+    try testing.expectError(error.HeadTooLarge, readHead(&r3, &small));
+    var r4: Reader = .fixed("\r\n\r\n\r\n\r\nGET /\r\n\r\n");
+    try testing.expectEqualStrings("GET /\r\n", try readHead(&r4, &small));
 }
 
 test "ChunkedReader captures trailers when a buffer is provided" {
