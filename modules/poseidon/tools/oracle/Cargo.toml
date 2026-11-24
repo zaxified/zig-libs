@@ -1,0 +1,28 @@
+[package]
+name = "poseidon-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Foreign sides of `zig build bench-poseidon` and the live-vector generator:
+#  - neptune (Filecoin / Lurk Poseidon over BLS12-381; MIT OR Apache-2.0), pinned
+#    to one commit; the BLS12-381 scalar field comes from blstrs (blst, C + asm).
+#  - light-poseidon (circom-compatible Poseidon over BN254; Apache-2.0).
+# `Cargo.lock` pins every transitive crate; build with `--offline` only after
+# the sources were fetched and reviewed (see ../../SPEC.md, Performance).
+[dependencies]
+neptune = { git = "https://github.com/argumentcomputer/neptune", rev = "b06f03c5abcb6ff72625349572b21241956d55df", default-features = false, features = ["bls"] }
+blstrs = "0.7"
+ff = "0.13"
+generic-array = "1"
+light-poseidon = "=0.4.0"
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

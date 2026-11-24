@@ -18,8 +18,10 @@
 //!
 //! Key generation always computes all `2^h` LM-OTS public keys once. That is
 //! the cost the RFC's Table 3 lists (minutes for H20 with hardware SHA-256 and
-//! threads); this module is single-threaded, so H20 takes hours and H25 days
-//! — use HSS with a small top tree (`H5`/`H10`/`H15`) instead, which is what
+//! threads). The default is single-threaded, so H20 takes hours and H25 days;
+//! `Parallel` (`Tree.initParallel`, `SecretKey.initParallel`) spreads the
+//! independent height-`c` subtrees over the tasks of a caller's `std.Io`, and
+//! HSS with a small top tree (`H5`/`H10`/`H15`) avoids the cost, which is what
 //! HSS exists for.
 //!
 //! ## HSS
@@ -76,6 +78,49 @@ pub const TreeSignError = error{
     OutputTooSmall,
 };
 
+/// Opt-in multi-task key generation (cisco/hash-sigs' thread count): the
+/// `2^(h-c)` height-`c` subtrees of a `Tree` are independent, so up to `threads`
+/// tasks of `io` (the calling thread is one of them) take them from a shared
+/// counter. The keys and every signature are byte-identical to the serial
+/// build. An `io` that cannot start a concurrent task (single-threaded) just
+/// leaves the work to the calling thread. Every worker wipes the stack its
+/// hashing dirtied before it ends.
+pub const Parallel = struct {
+    io: std.Io,
+    /// Tasks including the caller; 0 = the CPU count.
+    threads: usize = 0,
+
+    fn taskCount(self: Parallel) usize {
+        if (self.threads != 0) return self.threads;
+        return std.Thread.getCpuCount() catch 1;
+    }
+};
+
+/// The shared state of one parallel `Tree.build`: workers take subtree
+/// numbers from `next` until `count` is reached.
+const BuildJob = struct {
+    tree: *const Tree,
+    nodes: [][n]u8,
+    first: usize,
+    c: u5,
+    count: u32,
+    next: std.atomic.Value(u32) = .init(0),
+
+    /// Runs in the calling thread and in the group's tasks; the body runs one
+    /// frame down and its stack is wiped (the seed is hashed here).
+    fn work(job: *BuildJob) void {
+        burn.run(burn.init_burn, void, workBody, .{job});
+    }
+
+    fn workBody(job: *BuildJob) void {
+        while (true) {
+            const j = job.next.fetchAdd(1, .monotonic);
+            if (j >= job.count) return;
+            job.nodes[job.first + j - 1] = job.tree.subtreeRoot(job.c, j << job.c);
+        }
+    }
+};
+
 /// One LMS tree with the secret seed and a cache of its public nodes. It has
 /// **no** signing state: `sign` takes the leaf index and does not remember
 /// it. Use `LmsSecretKey` or HSS `SecretKey` for the stateful discipline.
@@ -105,14 +150,25 @@ pub const Tree = struct {
         return initCached(out, gpa, lms, ots, id, seed, cacheHeight(lms));
     }
 
+    /// `init` with the subtrees spread over `par.io`'s tasks (see `Parallel`);
+    /// the result is byte-identical to `init`.
+    pub fn initParallel(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8, par: Parallel) Allocator.Error!void {
+        return initCachedParallel(out, gpa, lms, ots, id, seed, cacheHeight(lms), par);
+    }
+
     /// `init` with an explicit cache height `c <= h`: nodes at heights `>= c`
     /// are kept (`2^(h-c+1) - 1` of them), the `c` lowest path levels are
     /// recomputed per signature. Signatures are identical for every `c`.
     pub fn initCached(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8, c: u5) Allocator.Error!void {
-        return burn.run(burn.init_burn, Allocator.Error!void, build, .{ out, gpa, lms, ots, id, seed, c });
+        return burn.run(burn.init_burn, Allocator.Error!void, build, .{ out, gpa, lms, ots, id, seed, c, null });
     }
 
-    fn build(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8, c: u5) Allocator.Error!void {
+    /// `initCached` with the subtrees spread over `par.io`'s tasks.
+    pub fn initCachedParallel(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8, c: u5, par: Parallel) Allocator.Error!void {
+        return burn.run(burn.init_burn, Allocator.Error!void, build, .{ out, gpa, lms, ots, id, seed, c, par });
+    }
+
+    fn build(out: *Tree, gpa: Allocator, lms: ParamSet, ots: OtsParamSet, id: [id_len]u8, seed: *const [n]u8, c: u5, par: ?Parallel) Allocator.Error!void {
         const h = lms.height();
         std.debug.assert(c <= h);
         std.debug.assert(lms.matches(ots)); // one H per key (RFC 9858 §5)
@@ -124,9 +180,24 @@ pub const Tree = struct {
         out.* = .{ .gpa = gpa, .lms = lms, .ots = ots, .id = id, .seed = seed.*, .cache_h = c, .nodes = nodes };
         // Level c: each node is the root of a 2^c-leaf subtree.
         const first: usize = @as(usize, 1) << (h - c);
-        var j: u32 = 0;
-        while (j < first) : (j += 1) {
-            nodes[first + j - 1] = out.subtreeRoot(c, j << c);
+        if (par) |p| {
+            var job: BuildJob = .{ .tree = out, .nodes = nodes, .first = first, .c = c, .count = @intCast(first) };
+            const tasks: usize = @min(p.taskCount(), first);
+            var group: std.Io.Group = .init;
+            var started: usize = 1; // the calling thread
+            while (started < tasks) : (started += 1) {
+                group.concurrent(p.io, BuildJob.work, .{&job}) catch break;
+            }
+            job.work();
+            // Every task has run when `await` returns, cancelled or not (they
+            // hold no cancellation point); a cancellation request stays armed
+            // for the caller's next cancellation point.
+            group.await(p.io) catch p.io.recancel();
+        } else {
+            var j: u32 = 0;
+            while (j < first) : (j += 1) {
+                nodes[first + j - 1] = out.subtreeRoot(c, j << c);
+            }
         }
         // Above it, plain hashing.
         var r: usize = first - 1;
@@ -359,6 +430,9 @@ pub const SecretKey = struct {
     /// Number of levels currently built (>= 1) and the path they were built for.
     built: u8 = 0,
     path: [max_levels]u32 = @splat(0),
+    /// Set by `initParallel`: builds every tree of this key, the lower ones
+    /// on the signing path too, over these tasks.
+    par: ?Parallel = null,
 
     /// Generate the key into `out`: builds only the top tree (RFC 8554 §6.1
     /// says the lower ones may wait for the first signature, and they do).
@@ -369,6 +443,20 @@ pub const SecretKey = struct {
     /// secret.
     // secret-api-ok: the seed arrives by pointer, is copied only into the caller's `out`, and the tree build runs under `Tree.initCached`'s burn
     pub fn init(out: *SecretKey, gpa: Allocator, levels: []const Level, seed: *const [n]u8, id: [id_len]u8, restore_at: ?Position) InitError!void {
+        return initImpl(out, gpa, levels, seed, id, restore_at, null);
+    }
+
+    /// `init` that builds the top tree, and every lower tree the signing path
+    /// later needs, over `par.io`'s tasks (see `Parallel`). `par.io` must
+    /// outlive the key. The key, its signatures and its public key are
+    /// byte-identical to `init`'s.
+    // secret-api-ok: same as `init` -- the seed goes by pointer into `initImpl`
+    pub fn initParallel(out: *SecretKey, gpa: Allocator, levels: []const Level, seed: *const [n]u8, id: [id_len]u8, restore_at: ?Position, par: Parallel) InitError!void {
+        return initImpl(out, gpa, levels, seed, id, restore_at, par);
+    }
+
+    // secret-api-ok: the seed arrives by pointer, is copied only into the caller's `out`, and the tree build runs under `Tree.initCached`'s burn
+    fn initImpl(out: *SecretKey, gpa: Allocator, levels: []const Level, seed: *const [n]u8, id: [id_len]u8, restore_at: ?Position, par: ?Parallel) InitError!void {
         out.seed = @splat(0); // stays zero on every error return
         if (levels.len < 1 or levels.len > max_levels) return error.InvalidLevels;
         for (levels) |lv| if (!lv.lms.matches(lv.ots)) return error.InvalidLevels;
@@ -382,10 +470,15 @@ pub const SecretKey = struct {
             .levels = undefined,
             .n_levels = @intCast(levels.len),
             .pos = pos,
+            .par = par,
         };
         @memcpy(out.levels[0..levels.len], levels);
         out.trees[0] = @as(Tree, undefined);
-        Tree.init(&out.trees[0].?, gpa, levels[0].lms, levels[0].ots, id, seed) catch |e| {
+        const built = if (par) |p|
+            Tree.initParallel(&out.trees[0].?, gpa, levels[0].lms, levels[0].ots, id, seed, p)
+        else
+            Tree.init(&out.trees[0].?, gpa, levels[0].lms, levels[0].ots, id, seed);
+        built catch |e| {
             out.trees[0] = null;
             std.crypto.secureZero(u8, &out.seed);
             return e;
@@ -482,7 +575,11 @@ pub const SecretKey = struct {
             const lv = self.levels[i];
             self.trees[i] = @as(Tree, undefined);
             const tree = &self.trees[i].?;
-            Tree.init(tree, self.gpa, lv.lms, lv.ots, child_id, &child_seed) catch |e| {
+            const built = if (self.par) |p|
+                Tree.initParallel(tree, self.gpa, lv.lms, lv.ots, child_id, &child_seed, p)
+            else
+                Tree.init(tree, self.gpa, lv.lms, lv.ots, child_id, &child_seed);
+            built catch |e| {
                 self.trees[i] = null;
                 return e;
             };
@@ -583,6 +680,26 @@ pub const SigningKey = struct {
         persist: ?Persist,
     ) InitError!void {
         try SecretKey.init(&dst.sk, gpa, levels, seed, id, restore_at);
+        dst.home = dst;
+        dst.busy = .init(false);
+        dst.io_mu = .init;
+        dst.persist = persist;
+    }
+
+    /// `initInPlace` with the key built over `par.io`'s tasks (see
+    /// `SecretKey.initParallel`).
+    // secret-api-ok: the seed arrives by pointer and goes only into `dst.sk` through `SecretKey.initParallel`
+    pub fn initInPlaceParallel(
+        dst: *SigningKey,
+        gpa: Allocator,
+        levels: []const Level,
+        seed: *const [n]u8,
+        id: [id_len]u8,
+        restore_at: ?Position,
+        persist: ?Persist,
+        par: Parallel,
+    ) InitError!void {
+        try SecretKey.initParallel(&dst.sk, gpa, levels, seed, id, restore_at, par);
         dst.home = dst;
         dst.busy = .init(false);
         dst.io_mu = .init;

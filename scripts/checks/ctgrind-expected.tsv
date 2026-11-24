@@ -2001,11 +2001,11 @@ xmss	ReleaseFast	sign	1	2	aa27b304fc4c6fd9	eb0cb3d6777ae4c6
 # the seed but published in the signature. Same artefact as xmss.
 # 2026-11-23 (RFC 9858 sets, hash dispatched per family): hss 6 -> 4, the same
 # otsSign chain-loop context at one code location instead of two inlined copies.
-lms	ReleaseFast	lms	1	4	090fe004d6674abc	570900fe0d49b5a9
-lms	ReleaseFast	hss	1	4	090fe004d6674abc	43dd64bf2e77e52a
+lms	ReleaseFast	lms	1	4	58bda66eb8526cf3	570900fe0d49b5a9
+lms	ReleaseFast	hss	1	4	58bda66eb8526cf3	43dd64bf2e77e52a
 # RFC 9858 sets (2026-11-23): SHAKE256/256 and SHA-256/192 H5/W4, the same 4 otsSign chain-loop contexts.
-lms	ReleaseFast	shake	1	4	090fe004d6674abc	7e6656d92a385acb
-lms	ReleaseFast	n24	1	4	090fe004d6674abc	7444bf492bb5ddf0
+lms	ReleaseFast	shake	1	4	58bda66eb8526cf3	7e6656d92a385acb
+lms	ReleaseFast	n24	1	4	58bda66eb8526cf3	7444bf492bb5ddf0
 # timelock_envelope (2026-10-10) — kdf: s_time + s_pq through deriveKeys and
 # deriveStreamKey: 0. env: Envelope128 seal (randomness + plaintext tainted)
 # and open (HQC dk tainted). 8, none in this module's own code: the AEAD

@@ -30,9 +30,9 @@ pub const N_ROUNDS_F: u10 = 8;
 /// ⚠ The *hash* framing (`hash`/`compress`: state `[0] ++ inputs`, first
 /// output element) has **no deployed counterpart on this field** — only the
 /// raw permutation is externally anchored. Before interoperating with
-/// somebody else's BLS12-381 Poseidon (Filecoin's `neptune`, dusk,
-/// arkworks…), check their domain-tag and padding conventions: they differ
-/// from each other and from this one.
+/// somebody else's BLS12-381 Poseidon (dusk, arkworks…), check their domain-tag
+/// and padding conventions: they differ from each other and from this one.
+/// Filecoin's `neptune` has its own parameters and framing in `neptune.zig`.
 pub fn Perm(comptime t: u12) type {
     const r_p: u10 = switch (t) {
         3 => 57, // poseidonperm_x5_255_3

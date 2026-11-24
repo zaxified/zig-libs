@@ -82,11 +82,14 @@ fn drawInput(comptime S: type, src: *S, buf: []u8) usize {
 
 const Policy = enum { replace, escape_bytes };
 
+/// One element of the input as a WHATWG-style decoder sees it: a well-formed
+/// sequence (an ASCII byte or one scalar) or one maximal ill-formed subpart.
+const Item = struct { bytes: []const u8, bad: bool };
+
 /// WHATWG Encoding Standard UTF-8 decoder, as a byte-at-a-time state machine:
-/// the expected decoded text of `in`, as UTF-8, where an error is U+FFFD
-/// (`.replace`) or one U+00XX per byte of the offending subpart (`.escape_bytes`).
-fn refDecode(a: std.mem.Allocator, in: []const u8, comptime policy: Policy) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
+/// the input split into `Item`s (slices of `in`).
+fn refItems(a: std.mem.Allocator, in: []const u8) ![]Item {
+    var out: std.ArrayList(Item) = .empty;
     errdefer out.deinit(a);
     var needed: u8 = 0;
     var lower: u8 = 0x80;
@@ -98,7 +101,7 @@ fn refDecode(a: std.mem.Allocator, in: []const u8, comptime policy: Policy) ![]u
         if (needed == 0) {
             start = i;
             switch (b) {
-                0x00...0x7F => try out.append(a, b),
+                0x00...0x7F => try out.append(a, .{ .bytes = in[i .. i + 1], .bad = false }),
                 0xC2...0xDF => needed = 1,
                 0xE0 => {
                     lower = 0xA0;
@@ -118,14 +121,14 @@ fn refDecode(a: std.mem.Allocator, in: []const u8, comptime policy: Policy) ![]u
                     upper = 0x8F;
                     needed = 3;
                 },
-                else => try refError(a, &out, in[i .. i + 1], policy),
+                else => try out.append(a, .{ .bytes = in[i .. i + 1], .bad = true }),
             }
             i += 1;
             continue;
         }
         if (b < lower or b > upper) {
             // The sequence in progress ends here; `b` is looked at again.
-            try refError(a, &out, in[start..i], policy);
+            try out.append(a, .{ .bytes = in[start..i], .bad = true });
             needed = 0;
             lower = 0x80;
             upper = 0xBF;
@@ -135,22 +138,124 @@ fn refDecode(a: std.mem.Allocator, in: []const u8, comptime policy: Policy) ![]u
         upper = 0xBF;
         needed -= 1;
         i += 1;
-        if (needed == 0) try out.appendSlice(a, in[start..i]);
+        if (needed == 0) try out.append(a, .{ .bytes = in[start..i], .bad = false });
     }
-    if (needed != 0) try refError(a, &out, in[start..], policy);
+    if (needed != 0) try out.append(a, .{ .bytes = in[start..], .bad = true });
     return out.toOwnedSlice(a);
 }
 
-fn refError(a: std.mem.Allocator, out: *std.ArrayList(u8), bad: []const u8, comptime policy: Policy) !void {
-    switch (policy) {
-        .replace => try out.appendSlice(a, "\u{fffd}"),
-        .escape_bytes => for (bad) |b| {
-            var tmp: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(b, &tmp) catch unreachable;
-            try out.appendSlice(a, tmp[0..n]);
-        },
+/// The expected decoded text of `in`, as UTF-8, where an error is U+FFFD
+/// (`.replace`) or one U+00XX per byte of the offending subpart (`.escape_bytes`).
+fn refDecode(a: std.mem.Allocator, in: []const u8, comptime policy: Policy) ![]u8 {
+    const items = try refItems(a, in);
+    defer a.free(items);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for (items) |it| {
+        if (!it.bad) {
+            try out.appendSlice(a, it.bytes);
+            continue;
+        }
+        switch (policy) {
+            .replace => try out.appendSlice(a, "\u{fffd}"),
+            .escape_bytes => for (it.bytes) |b| {
+                var tmp: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(b, &tmp) catch unreachable;
+                try out.appendSlice(a, tmp[0..n]);
+            },
+        }
     }
+    return out.toOwnedSlice(a);
 }
+
+fn appendUnit(a: std.mem.Allocator, out: *std.ArrayList(u8), unit: u16) !void {
+    var tmp: [6]u8 = undefined;
+    _ = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{unit}) catch unreachable;
+    try out.appendSlice(a, &tmp);
+}
+
+const Modelled = struct { out: []u8, rejected: bool };
+
+/// The exact bytes `writeString(in, opts)` must produce, written from the
+/// documented option semantics over `refItems`, not from `root.zig`'s loop.
+/// With `.reject` and an ill-formed sequence: everything before it, no closing
+/// quote, `rejected` set.
+fn modelWrite(a: std.mem.Allocator, items: []const Item, opts: jsontext.StringOptions) !Modelled {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.append(a, '"');
+    var any_bad = false;
+    for (items) |it| any_bad = any_bad or it.bad;
+    const all_high = opts.invalid_utf8 == .escape_all_high_if_invalid and any_bad;
+    const verbatim_high = opts.invalid_utf8 == .verbatim;
+    for (items) |it| {
+        if (it.bad) {
+            switch (opts.invalid_utf8) {
+                .reject => return .{ .out = try out.toOwnedSlice(a), .rejected = true },
+                .verbatim => try out.appendSlice(a, it.bytes),
+                .replace => try out.appendSlice(a, if (opts.ascii_only) "\\ufffd" else "\u{fffd}"),
+                .replace_per_byte => for (it.bytes) |_|
+                    try out.appendSlice(a, if (opts.ascii_only) "\\ufffd" else "\u{fffd}"),
+                .escape_bytes, .escape_all_high_if_invalid => for (it.bytes) |b| try appendUnit(a, &out, b),
+            }
+            continue;
+        }
+        if (it.bytes.len > 1) { // one well-formed scalar
+            if (all_high) {
+                for (it.bytes) |b| try appendUnit(a, &out, b);
+            } else if (verbatim_high) {
+                try out.appendSlice(a, it.bytes);
+            } else if (opts.ascii_only) {
+                const cp = std.unicode.utf8Decode(it.bytes) catch unreachable;
+                if (cp >= 0x10000) {
+                    try appendUnit(a, &out, @intCast(0xD800 + ((cp - 0x10000) >> 10)));
+                    try appendUnit(a, &out, @intCast(0xDC00 + ((cp - 0x10000) & 0x3FF)));
+                } else try appendUnit(a, &out, @intCast(cp));
+            } else if (opts.html_safe and std.unicode.utf8Decode(it.bytes) catch unreachable == 0x2028) {
+                try out.appendSlice(a, "\\u2028");
+            } else if (opts.html_safe and std.unicode.utf8Decode(it.bytes) catch unreachable == 0x2029) {
+                try out.appendSlice(a, "\\u2029");
+            } else try out.appendSlice(a, it.bytes);
+            continue;
+        }
+        const c = it.bytes[0];
+        const extra = std.mem.findScalar(u8, opts.escape_chars, c) != null;
+        switch (c) {
+            '"' => try out.appendSlice(a, "\\\""),
+            '\\' => try out.appendSlice(a, "\\\\"),
+            0x08 => if (opts.short_escapes == .all) try out.appendSlice(a, "\\b") else try appendUnit(a, &out, c),
+            0x09 => if (opts.short_escapes != .none) try out.appendSlice(a, "\\t") else try appendUnit(a, &out, c),
+            0x0A => if (opts.short_escapes != .none) try out.appendSlice(a, "\\n") else try appendUnit(a, &out, c),
+            0x0C => if (opts.short_escapes == .all) try out.appendSlice(a, "\\f") else try appendUnit(a, &out, c),
+            0x0D => if (opts.short_escapes != .none) try out.appendSlice(a, "\\r") else try appendUnit(a, &out, c),
+            else => if (c < 0x20 or extra or (c == 0x7F and opts.escape_del) or
+                (opts.html_safe and (c == '<' or c == '>' or c == '&')))
+                try appendUnit(a, &out, c)
+            else
+                try out.append(a, c),
+        }
+    }
+    try out.append(a, '"');
+    return .{ .out = try out.toOwnedSlice(a), .rejected = false };
+}
+
+/// Option sets whose exact output the model predicts: every `InvalidUtf8`
+/// mode alone and with ASCII-only / HTML-safe (`.verbatim` refuses those),
+/// then the control-character options over the default and `.reject` modes.
+const model_configs = blk: {
+    var list: []const jsontext.StringOptions = &.{};
+    const modes = [_]jsontext.InvalidUtf8{ .replace, .escape_bytes, .reject, .replace_per_byte, .escape_all_high_if_invalid, .verbatim };
+    for (modes) |m| for ([_]bool{ false, true }) |asc| for ([_]bool{ false, true }) |html| {
+        if (m == .verbatim and (asc or html)) continue;
+        list = list ++ [_]jsontext.StringOptions{.{ .invalid_utf8 = m, .ascii_only = asc, .html_safe = html }};
+    };
+    for ([_]jsontext.ShortEscapes{ .all, .tnr, .none }) |se| for ([_]bool{ false, true }) |del| for ([_][]const u8{ "", "<", "'/\x01\x0a" }) |ec| {
+        if (se == .all and !del and ec.len == 0) continue; // the default, already listed
+        list = list ++ [_]jsontext.StringOptions{.{ .short_escapes = se, .escape_del = del, .escape_chars = ec }};
+        list = list ++ [_]jsontext.StringOptions{.{ .invalid_utf8 = .escape_bytes, .ascii_only = true, .html_safe = true, .short_escapes = se, .escape_del = del, .escape_chars = ec }};
+    };
+    break :blk list;
+};
 
 /// The largest nesting `depthWithin` must tolerate: strings are skipped by
 /// finding their end, closers saturate at zero.
@@ -218,6 +323,33 @@ fn fuzzOne(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             }
         }
     };
+
+    // The exact bytes, option set by option set, against the model.
+    const items = try refItems(gpa, in);
+    defer gpa.free(items);
+    inline for (model_configs) |opts| {
+        const m = try modelWrite(gpa, items, opts);
+        defer gpa.free(m.out);
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        const r = jsontext.writeString(&aw.writer, in, opts);
+        if (m.rejected) {
+            fuzz_driver.hit("model-reject-partial");
+            try testing.expectError(error.InvalidUtf8, r);
+            if (!std.mem.eql(u8, aw.written(), m.out)) return error.RejectPartialDiffers;
+        } else {
+            try r;
+            if (!std.mem.eql(u8, aw.written(), m.out)) {
+                std.debug.print("opts {any}\nin  {any}\ngot {s}\nwant {s}\n", .{ opts, in, aw.written(), m.out });
+                return error.ModelDiffers;
+            }
+            if (opts.invalid_utf8 == .escape_all_high_if_invalid and !valid) fuzz_driver.hit("model-all-high");
+            if (opts.invalid_utf8 == .replace_per_byte and !valid) fuzz_driver.hit("model-per-byte");
+            if (opts.escape_del and std.mem.findScalar(u8, in, 0x7F) != null) fuzz_driver.hit("model-del");
+            if (opts.short_escapes != .all and std.mem.findAny(u8, in, "\x08\x0c") != null) fuzz_driver.hit("model-short");
+            if (opts.escape_chars.len != 0 and std.mem.findAny(u8, in, opts.escape_chars) != null) fuzz_driver.hit("model-escape-chars");
+        }
+    }
 
     // depthWithin against the reference, on the raw bytes and on the same
     // bytes mapped onto a bracket/quote/escape alphabet.

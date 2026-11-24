@@ -94,6 +94,7 @@ pub const SecretKey = sign.SecretKey;
 pub const SigningKey = sign.SigningKey;
 pub const Position = sign.Position;
 pub const Persist = sign.Persist;
+pub const Parallel = sign.Parallel;
 pub const SignError = sign.SignError;
 pub const TreeSignError = sign.TreeSignError;
 pub const HssError = sign.HssError;

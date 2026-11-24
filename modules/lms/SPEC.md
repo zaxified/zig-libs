@@ -44,8 +44,8 @@ byte-exact against the RFC's Appendix F for verification, key regeneration and s
 reproduction; the `SigningKey` handle writes the next position before any signature byte
 exists and has a lock and a copy guard; all HSS levels 1..8 with any parameter mix; every
 RFC 9858 set (SHA-256/192, SHAKE256/256, SHAKE256/192), byte-exact against its Appendix A.
-**Where we are behind:** single-threaded key generation
-(H20 takes hours, H25 days); no serialisation of the secret key beyond `(SEED, I,
+**Where we are behind:** key generation is single-threaded unless the caller passes `Parallel` (H20 takes hours on one
+thread, H25 days); no serialisation of the secret key beyond `(SEED, I,
 levels, position)`, which is deliberate but means every restart rebuilds the trees; no
 RFC vector for W1 and W2; never run against a foreign implementation as a black-box
 oracle (→ Backlog).
@@ -94,7 +94,21 @@ computation).
   builds one H5 tree with `c` = 0, 2, 3, 5 and compares every root and a spread of
   signatures byte for byte, because H20/H25 (the only sets with `c > 0` by default) are
   not built in tests. Key generation is `2^h` LM-OTS public keys — `p (2^w - 1) + p`
-  hashes each — and is not parallel.
+  hashes each. It is serial by default; `Parallel` (below) opts into tasks.
+- **Parallel key generation (opt-in).** `Parallel{ .io, .threads }` (`threads` includes the calling thread, 0 = the CPU
+  count) is accepted by `Tree.initParallel` / `initCachedParallel`, `SecretKey.initParallel` and
+  `SigningKey.initInPlaceParallel`. The `2^(h-c)` height-`c` subtrees are independent, so the caller and up to
+  `threads - 1` `Io.Group.concurrent` tasks take subtree numbers from one atomic counter and write disjoint node slots;
+  the tree, every signature and the public key are byte-identical to the serial build (tests compare the node cache and
+  signatures at 0, 1, 2, 3 and 16 tasks, three cache heights, all hash families, a single-threaded `Io`, and an HSS key
+  across a lower-tree boundary and from a restored position). An `Io` that cannot start a task leaves everything to
+  the caller. `SecretKey.initParallel` keeps `par` in the key, so lower trees built at signing time use it too (the
+  `Io` must outlive the key). Every worker body runs under the same dead-stack burn as `Tree.init`, so a pool thread's
+  stack is wiped of hash state before the task ends. `Group.await`'s `error.Canceled` is not reported (the build cannot
+  fail half-way and the tasks have no cancellation point): the request is re-armed with `io.recancel()`. Measured
+  (ReleaseFast, one H15/W4 tree, 8-core host shared with other jobs, one run each rep, 3 reps): 10.0 s serial, 2 tasks
+  5.1 s, 4 tasks 3.1 s, 8 tasks 2.7 s (3.7x). Reference: cisco/hash-sigs threads key generation *(inferred)*. Hardware
+  SHA is `std.crypto`'s business (its SHA-256 uses the CPU extensions where present), not a layer here.
 - **HSS state.** The private key is `(SEED, I_0, level list, Position)`, `Position`
   being the leaf index used at every level for the *next* signature. The tree at level
   `i >= 1` for a position is a pure function of `SEED` and the parents' leaf path
@@ -272,15 +286,14 @@ and every cached node against §5.3's recursive definition.
 - **Fast HSS restart (serialised node caches or traversal state).** Every restart rebuilds the top tree and, on the
   first signature, the current lower trees. Making it cheap needs a documented encoding of the signing state, which is
   the secret-key serialisation this module declines (a stale cache is not a secret, but a stale *position* is the
-  hazard); `xmss` makes the same call. Pre-generating the next lower tree in a second thread (so the boundary
-  signature is not `O(2^h)`) is a speed item and sits with the parallel key generation in *Backlog*.
+  hazard); `xmss` makes the same call. Pre-generating the next lower tree in a background task (so the boundary
+  signature is not `O(2^h)`) is not done: it needs a lifetime and cancellation story for a task that outlives `sign`,
+  and `Parallel` already divides that boundary cost by the task count.
 
 ## Backlog / deferred
 
-- **Parallel and hardware-hash key generation** *(survey 2026-09-30)*. cisco/hash-sigs
-  threads key generation *(inferred)*; here H20 takes hours. Splitting `subtreeRoot` per
-  worker is straightforward (each height-`c` subtree is independent) and `std.Io` group
-  primitives fit; SHA-NI use is already up to `std.crypto`. Moderate.
+None open.
+
 ## Anchoring
 
 **Anchor grade:** class B · oracle MIXED
