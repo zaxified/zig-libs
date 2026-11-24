@@ -69,6 +69,7 @@ pub const meta = .{
 test {
     _ = field;
     _ = scalar;
+    _ = @import("modinv.zig");
     _ = group;
     _ = sign;
     _ = @import("kat_test.zig");

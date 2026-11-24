@@ -33,6 +33,9 @@ const P_INT: u384 = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 /// Montgomery arithmetic mod p (−p⁻¹ mod 2^64 = 2^32 + 1).
 const A = mont.Mont(P_INT);
 
+/// The safegcd inverse mod p (see `modinv.zig`).
+const Safegcd = @import("modinv.zig").Safegcd(P_INT);
+
 /// An element of GF(p), Montgomery form, canonical.
 pub const Fe = struct {
     limbs: Limbs,
@@ -177,9 +180,17 @@ pub const Fe = struct {
         return .{ .x1 = a, .x2 = x2, .x15 = x15, .x30 = x30, .x32 = x32, .x255 = x255 };
     }
 
-    /// a^(p−2) = a⁻¹ (0 for 0), by a fixed addition chain: constant time.
-    /// p − 2 from the top: 255 ones, 0, 32 ones, 64 zeros, 30 ones, 0, 1.
+    /// a⁻¹ (0 for 0), constant time in `a`: the safegcd inverse
+    /// (`modinv.zig`) of the plain value, taken back into Montgomery form.
     pub fn invert(a: Fe) Fe {
+        const inv = Safegcd.invert(A.fromMont(a.limbs));
+        return .{ .limbs = A.mul(inv, A.R2) };
+    }
+
+    /// a^(p−2) = a⁻¹ (0 for 0), by a fixed addition chain; the differential
+    /// oracle for `invert`. p − 2 from the top: 255 ones, 0, 32 ones, 64
+    /// zeros, 30 ones, 0, 1.
+    fn invertFermat(a: Fe) Fe {
         const x = runs(a);
         var r = x.x255.sqn(1 + 32).mul(x.x32);
         r = r.sqn(64 + 30).mul(x.x30);
@@ -317,6 +328,46 @@ test "field: differential against wide integer arithmetic" {
         try testing.expect(a.equivalent(try Fe.fromBytes(be, .big)));
         try testing.expect(a.equivalent(try Fe.fromBytes(a.toBytes(.little), .little)));
     }
+}
+
+test "field: safegcd invert == Fermat chain on edges and random values" {
+    var prng = std.Random.DefaultPrng.init(0x3841);
+    const r = prng.random();
+    const p: u384 = P_INT;
+    const edges = [_]u384{ 0, 1, 2, p - 1, p - 2, p >> 1, (p >> 1) + 1, 1 << 32, 1 << 64, 1 << 128, 1 << 255, 1 << 383, (1 << 383) - 1, (1 << 192) - 1 };
+    inline for (edges) |x| {
+        const a = try Fe.fromInt(x);
+        try testing.expect(a.invert().equivalent(a.invertFermat()));
+    }
+    for (0..300) |_| {
+        const a = randFe(r);
+        try testing.expect(a.invert().equivalent(a.invertFermat()));
+    }
+}
+
+test "bench field invert: safegcd vs Fermat, interleaved (opt-in via P384_BENCH)" {
+    if (@import("builtin").target.os.tag != .linux or std.testing.environ.getPosix("P384_BENCH") == null) return error.SkipZigTest;
+    const n = 2000;
+    var prng = std.Random.DefaultPrng.init(0x3842);
+    var a = randFe(prng.random());
+    var best_g: u64 = std.math.maxInt(u64);
+    var best_f: u64 = std.math.maxInt(u64);
+    for (0..7) |_| {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t0 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        for (0..n) |_| a = a.invert();
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_g = @min(best_g, t1 - t0);
+        t0 = t1;
+        for (0..n) |_| a = a.invertFermat();
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_f = @min(best_f, t1 - t0);
+    }
+    std.mem.doNotOptimizeAway(&a);
+    std.debug.print("\nfield invert: safegcd {d:.2} us, Fermat {d:.2} us (best of 7 x {d})\n", .{ @as(f64, @floatFromInt(best_g)) / n / 1000.0, @as(f64, @floatFromInt(best_f)) / n / 1000.0, n });
 }
 
 test "field: invert and sqrt against generic exponentiation" {
