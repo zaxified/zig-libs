@@ -471,6 +471,9 @@ fn addSecretsOf(n: *Needles, comptime T: type, v: *const T) void {
             tecdsa.KeyShare => addKeyShare(n, x),
             Participant, reshare.ReshareDealer, reshare.ReshareReceiver => addSecretsOf(n, f.type, x),
             *const aux_info.LocalAux => addLocalAux(n, x.*),
+            ?*const aux_info.LocalAux => if (x.*) |l| addLocalAux(n, l),
+            ?reshare.ReshareDealer => if (x.*) |*d| addSecretsOf(n, reshare.ReshareDealer, d),
+            ?reshare.ReshareReceiver => if (x.*) |*r| addSecretsOf(n, reshare.ReshareReceiver, r),
             else => {},
         }
     }
@@ -504,6 +507,7 @@ const Op = enum { start, advance, handle };
 var probe_target: *anyopaque = undefined;
 var probe_from: u32 = 0;
 var probe_sender: reshare.Sender = undefined;
+var probe_member: ecdsa_reshare.Member = .{};
 
 fn Driver(comptime P: type) type {
     return struct {
@@ -519,6 +523,8 @@ fn Driver(comptime P: type) type {
             const p: *P = @ptrCast(@alignCast(probe_target));
             if (P == reshare.ReshareReceiver)
                 p.handle(probe_sender, cur_bytes) catch @panic("handle")
+            else if (P == ecdsa_reshare.EcdsaReshare)
+                p.handle(probe_member, cur_bytes) catch @panic("handle")
             else
                 p.handle(probe_from, cur_bytes) catch @panic("handle");
         }
@@ -702,6 +708,37 @@ fn fillTaken(n: *Needles) void {
     fillKeygen(n);
     for (kshares[0 .. cur_party + 1]) |*k| addKeyShare(n, k);
 }
+const ecdsa_reshare = @import("ecdsa_reshare.zig");
+/// The resharing of the keygen's shares (2-of-3) to a new 2-of-3 committee:
+/// P1 old 1 + new 1, P2 old 2 + new 2, P3 old 3 only, P4 new 3 only; the
+/// new seats use `locals[3..6]`.
+const reshare_roles = [4]ecdsa_reshare.Member{ .{ .old = 1, .new = 1 }, .{ .old = 2, .new = 2 }, .{ .old = 3 }, .{ .new = 3 } };
+var rsparties: [4]ecdsa_reshare.EcdsaReshare = undefined;
+var rsshares: [3]tecdsa.KeyShare = undefined;
+var rsmade: usize = 0;
+const rs_dealers = [_]u32{ 1, 2, 3 };
+
+fn reshareParams() ecdsa_reshare.Params {
+    return .{
+        .old = .{ .t = 2, .n = 3 },
+        .new = .{ .t = 2, .n = 3 },
+        .dealers = &rs_dealers,
+        .group_public_key = kshares[0].group_public_key,
+        .old_public_keys = kshares[0].public_keys,
+    };
+}
+
+fn fillReshareEcdsa(n: *Needles) void {
+    for (rsparties[0..rsmade]) |*p| addSecretsOf(n, ecdsa_reshare.EcdsaReshare, p);
+    for (locals[3..6]) |*l| addLocalAux(n, l);
+    for (&kshares) |*k| addKeyShare(n, k);
+}
+
+fn fillReshareTaken(n: *Needles) void {
+    fillReshareEcdsa(n);
+    for (rsshares[0 .. cur_party + 1]) |*k| addKeyShare(n, k);
+}
+
 fn fillRefresh(n: *Needles) void {
     for (rparties[0..rmade]) |*p| addSecretsOf(n, ecdsa_refresh.EcdsaRefresh, p);
     for (locals[3..6]) |*l| addLocalAux(n, l);
@@ -715,6 +752,18 @@ noinline fn callKeygenInit() void {
 noinline fn callRefreshInit() void {
     rmade = cur_party + 1;
     rparties[cur_party] = ecdsa_refresh.EcdsaRefresh.init(std.testing.allocator, &kshares[cur_party], "stackprobe refresh", &locals[3 + cur_party], recorder.random()) catch @panic("EcdsaRefresh.init");
+}
+noinline fn callReshareInit() void {
+    rsmade = cur_party + 1;
+    const r = reshare_roles[cur_party];
+    const seat: ?ecdsa_reshare.NewSeat = if (r.new) |j| .{ .index = j, .local = &locals[3 + j - 1] } else null;
+    const share: ?*const tecdsa.KeyShare = if (r.old) |i| &kshares[i - 1] else null;
+    rsparties[cur_party] = ecdsa_reshare.EcdsaReshare.init(std.testing.allocator, reshareParams(), "stackprobe reshare", share, seat, recorder.random()) catch @panic("EcdsaReshare.init");
+}
+/// New parties of the resharing, in the order of `rsshares`: P1, P2, P4.
+const reshare_taker = [3]usize{ 0, 1, 3 };
+noinline fn callReshareTake() void {
+    if (!rsparties[reshare_taker[cur_party]].takeKeyShare(&rsshares[cur_party])) @panic("takeKeyShare");
 }
 noinline fn callKeygenTake() void {
     if (!kparties[cur_party].takeKeyShare(&kshares[cur_party])) @panic("takeKeyShare");
@@ -764,7 +813,37 @@ fn runProbed(comptime P: type, allocator: std.mem.Allocator, group: []P, name: [
     return total;
 }
 
-test "STACKPROBE: no secret on the dead stack after any ECDSA keygen or refresh call" {
+/// `runProbed` for the resharing: senders are `Member`s, a `.party = j`
+/// frame goes to the process whose NEW id is `j`.
+fn runProbedReshare(allocator: std.mem.Allocator) !usize {
+    const P = ecdsa_reshare.EcdsaReshare;
+    var total: usize = 0;
+    var label_buf: [80]u8 = undefined;
+    for (&rsparties, 1..) |*p, i| total += Driver(P).probe(.start, p, try std.mem.print(&label_buf, "reshare {d} start", .{i}), fillReshareEcdsa);
+    var rounds: usize = 0;
+    while (true) : (rounds += 1) {
+        try std.testing.expect(rounds < 16);
+        for (&rsparties, reshare_roles, 1..) |*src, src_m, from| {
+            const msgs = try src.takeOutgoing();
+            defer wire.freeOutgoing(allocator, msgs);
+            for (msgs) |m| for (&rsparties, reshare_roles, 1..) |*dst, dst_m, to| {
+                if (to == from) continue;
+                switch (m.to) {
+                    .broadcast => {},
+                    .party => |j| if (dst_m.new == null or dst_m.new.? != j) continue,
+                }
+                probe_member = src_m;
+                cur_bytes = m.bytes;
+                total += Driver(P).probe(.handle, dst, try std.mem.print(&label_buf, "reshare {d} handle round {d} from {d}", .{ to, rounds, from }), fillReshareEcdsa);
+            };
+        }
+        if (rsparties[0].phase() == .done) break;
+        for (&rsparties, 1..) |*p, i| total += Driver(P).probe(.advance, p, try std.mem.print(&label_buf, "reshare {d} advance round {d}", .{ i, rounds }), fillReshareEcdsa);
+    }
+    return total;
+}
+
+test "STACKPROBE: no secret on the dead stack after any ECDSA keygen, refresh or reshare call" {
     if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     {
@@ -809,7 +888,23 @@ test "STACKPROBE: no secret on the dead stack after any ECDSA keygen or refresh 
         s.paillier_secret.deinit();
         allocator.free(s.public_keys.entries);
     };
-    if (verbose or total != 0) std.debug.print("TOTAL residue copies (ecdsa keygen/refresh): {d}\n", .{total});
+
+    // The resharing (old shares = the keygen's `kshares`, new seats = `locals[3..6]`).
+    for (0..4) |i| {
+        cur_party = i;
+        total += probePlain(try std.mem.print(&label_buf, "EcdsaReshare.init {d}", .{i + 1}), callReshareInit, fillReshareEcdsa);
+    }
+    defer for (&rsparties) |*p| p.deinit();
+    total += try runProbedReshare(allocator);
+    for (0..3) |i| {
+        cur_party = i;
+        total += probePlain(try std.mem.print(&label_buf, "EcdsaReshare.takeKeyShare {d}", .{reshare_taker[i] + 1}), callReshareTake, fillReshareTaken);
+    }
+    defer for (&rsshares) |*s| {
+        s.paillier_secret.deinit();
+        allocator.free(s.public_keys.entries);
+    };
+    if (verbose or total != 0) std.debug.print("TOTAL residue copies (ecdsa keygen/refresh/reshare): {d}\n", .{total});
     try std.testing.expectEqual(@as(usize, 0), total);
 }
 

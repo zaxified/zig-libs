@@ -1018,3 +1018,271 @@ test "reshare: init and frame guards — roles, ids of the wrong committee, fram
     try peer.handle(.{ .new = 1 }, ann[0].bytes);
     try testing.expectError(error.DuplicateMessage, peer.handle(.{ .new = 1 }, ann[0].bytes));
 }
+
+// ── fuzz: `handle` over arbitrary frames from arbitrary members ────────────
+//
+// The harness drives one process of the (2,3) -> (2,3) resharing of the tests
+// above (P1 old+new, P2 old+new, P3 old only, P4 new only) at the start of
+// any round, with a frame from any `Member` (old, new, both or neither). The
+// honest frames of every round are captured once from a lockstep run in which
+// each process has its own PRNG, so a process replayed to round `p` from its
+// captured inbox is identical to the one of the run. A frame is
+//
+//   - a captured frame with 0-3 octets damaged or the tail cut, sent by its
+//     real sender or by a drawn member (3 in 4), or
+//   - drawn bytes, behind the run's own tag half of the time and with a kind
+//     byte of a real kind, so the body decoders see them.
+//
+// Oracles: nothing panics; every refusal leaves the process exactly as it
+// was (`handle`'s documented contract: the slot is checked before and after
+// and stays in use), and `advance` then runs on one input in sixteen (it moves
+// the process, the slot is rebuilt). A process built for (target, round) is
+// reused while it is pristine; one that accepted a frame or advanced is
+// rebuilt on its next use, so a seed's outcome never depends on an earlier one.
+
+const fz = @import("fuzz_test.zig");
+const FzMark = fz.Marker(enum {
+    corpus_frame,
+    raw_frame,
+    raw_tagged,
+    foreign_member,
+    frame_accepted,
+    frame_refused,
+    refusal_inert,
+    advance_ok,
+    advance_err,
+});
+
+const FzFrame = struct { from: Member, bytes: []u8 };
+
+const FzSlot = struct {
+    prng: std.Random.DefaultPrng,
+    p: EcdsaReshare,
+};
+
+const FzWorld = struct {
+    const pa = std.heap.page_allocator; // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
+    const roles = [4]Member{ .{ .old = 1, .new = 1 }, .{ .old = 2, .new = 2 }, .{ .old = 3 }, .{ .new = 3 } };
+    const sid = "reshare-fuzz";
+
+    kg: tecdsa.signing.TestKeygen,
+    locals: [3]aux_info.LocalAux,
+    /// `rounds[r][k]`: what process k is sent after the r-th start/advance.
+    rounds: [][4][]FzFrame,
+    all: []FzFrame,
+    slots: [4][]?*FzSlot,
+
+    fn params(self: *const FzWorld) Params {
+        const S = struct {
+            const dealers = [_]u32{ 1, 2, 3 };
+        };
+        return .{
+            .old = .{ .t = 2, .n = 3 },
+            .new = .{ .t = 2, .n = 3 },
+            .dealers = &S.dealers,
+            .group_public_key = self.kg.key_shares[0].group_public_key,
+            .old_public_keys = self.kg.key_shares[0].public_keys,
+        };
+    }
+
+    /// Process `k` (not started), its PRNG seeded by its index alone.
+    fn make(self: *const FzWorld, k: usize) !*FzSlot {
+        const slot = try pa.create(FzSlot);
+        errdefer pa.destroy(slot);
+        slot.prng = std.Random.DefaultPrng.init(0xF0_0000 + k);
+        const r = roles[k];
+        const seat: ?NewSeat = if (r.new) |j| .{ .index = j, .local = &self.locals[j - 1] } else null;
+        const share: ?*const tecdsa.KeyShare = if (r.old) |i| &self.kg.key_shares[i - 1] else null;
+        slot.p = try EcdsaReshare.init(pa, self.params(), sid, share, seat, slot.prng.random());
+        return slot;
+    }
+
+    fn destroy(slot: *FzSlot) void {
+        slot.p.deinit();
+        pa.destroy(slot);
+    }
+
+    fn build() !FzWorld {
+        var w: FzWorld = undefined;
+        var prng = std.Random.DefaultPrng.init(0xF0_5EED);
+        const random = prng.random();
+        w.kg = try tecdsa.signing.testKeygen(pa, random, 2, 3);
+        for (&w.locals) |*l| l.* = try quickLocal(pa, random);
+        var procs: [4]*FzSlot = undefined;
+        for (&procs, 0..) |*s, k| s.* = try w.make(k);
+        for (procs) |s| try s.p.start();
+        var rounds: std.ArrayList([4][]FzFrame) = .empty;
+        var all: std.ArrayList(FzFrame) = .empty;
+        while (true) {
+            var per: [4]std.ArrayList(FzFrame) = @splat(.empty);
+            for (procs, 0..) |src, si| {
+                const msgs = try src.p.takeOutgoing();
+                defer wire.freeOutgoing(pa, msgs);
+                for (msgs) |m| for (procs, 0..) |dst, di| {
+                    if (di == si) continue;
+                    switch (m.to) {
+                        .broadcast => {},
+                        .party => |j| if (dst.p.me_new == null or dst.p.me_new.? != j) continue,
+                    }
+                    const f: FzFrame = .{ .from = roles[si], .bytes = try pa.dupe(u8, m.bytes) };
+                    try per[di].append(pa, f);
+                    try all.append(pa, f);
+                    try dst.p.handle(roles[si], m.bytes);
+                };
+            }
+            var round: [4][]FzFrame = undefined;
+            for (&round, &per) |*r, *l| r.* = try l.toOwnedSlice(pa);
+            try rounds.append(pa, round);
+            if (procs[0].p.phase() == .done) break;
+            for (procs) |s| try s.p.advance();
+        }
+        for (procs) |s| destroy(s);
+        w.rounds = try rounds.toOwnedSlice(pa);
+        w.all = try all.toOwnedSlice(pa);
+        for (&w.slots) |*s| {
+            s.* = try pa.alloc(?*FzSlot, w.rounds.len);
+            @memset(s.*, null);
+        }
+        return w;
+    }
+
+    /// Process `k` at the start of round `p`: every earlier round's frames
+    /// delivered and advanced, round `p`'s frames not yet. A process that is
+    /// not pristine (it accepted a frame or advanced) is rebuilt.
+    fn at(self: *FzWorld, k: usize, p: usize) !*FzSlot {
+        if (self.slots[k][p]) |s| return s;
+        const s = try self.make(k);
+        errdefer destroy(s);
+        try s.p.start();
+        for (self.rounds[0..p], 0..) |round, r| {
+            for (round[k]) |f| try s.p.handle(f.from, f.bytes);
+            _ = r;
+            try s.p.advance();
+        }
+        self.slots[k][p] = s;
+        return s;
+    }
+
+    fn retire(self: *FzWorld, k: usize, p: usize) void {
+        if (self.slots[k][p]) |s| destroy(s);
+        self.slots[k][p] = null;
+    }
+};
+
+var fz_world: ?FzWorld = null;
+
+fn fzWorld() *FzWorld {
+    if (fz_world == null) fz_world = FzWorld.build() catch |e| std.debug.panic("fuzz world: {t}", .{e});
+    return &fz_world.?;
+}
+
+/// What `handle` may not change when it refuses a frame.
+fn fzState(p: *const EcdsaReshare) [6]usize {
+    var ann: usize = 0;
+    for (p.announcements) |a| ann += @intFromBool(a != null);
+    var fac: usize = 0;
+    for (p.fac) |a| fac += @intFromBool(a != null);
+    var conf: usize = 0;
+    for (p.confirms) |a| conf += @intFromBool(a != null);
+    return .{ @backingInt(p.phase_), p.culprit_ orelse 0, p.outbox.items.len, ann, fac, conf };
+}
+
+fn fuzzReshareSmith(_: void, smith: *testing.Smith) !void {
+    try fuzzReshareHandle(testing.Smith, smith, testing.allocator);
+}
+
+fn fuzzReshareHandle(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const world = fzWorld();
+    var buf: [1536]u8 = undefined;
+    var from: Member = undefined;
+    var len: usize = undefined;
+    var k: usize = undefined;
+    var p: usize = undefined;
+    if (S == fz.fuzz_driver.Rng and src.valueRangeAtMost(u8, 0, 3) != 0) {
+        k = src.index(4);
+        p = src.index(world.rounds.len);
+        // One time in four the frame is one this process is about to be sent in
+        // round `p` (a damaged one, mostly; undamaged it is the honest next step).
+        const mine = world.rounds[p][k];
+        const c = if (mine.len != 0 and src.valueRangeAtMost(u8, 0, 3) == 0) mine[src.index(mine.len)] else world.all[src.index(world.all.len)];
+        len = fz.damage(src, &buf, c.bytes);
+        from = c.from;
+        if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+            from = .{
+                .old = if (src.value(bool)) src.valueRangeAtMost(u32, 0, 4) else null,
+                .new = if (src.value(bool)) src.valueRangeAtMost(u32, 0, 4) else null,
+            };
+            FzMark.mark(.foreign_member);
+        }
+        FzMark.mark(.corpus_frame);
+    } else {
+        len = src.slice(&buf);
+        from = .{
+            .old = if (src.value(bool)) @intCast(src.value(u64) % 5) else null,
+            .new = if (src.value(bool)) @intCast(src.value(u64) % 5) else null,
+        };
+        FzMark.mark(.raw_frame);
+        k = @intCast(src.value(u64) % 4);
+        p = @intCast(src.value(u64) % world.rounds.len);
+    }
+    const slot = try world.at(k, p);
+    if (len >= ecdsa_keygen.run_tag_len + 1 and src.value(bool)) {
+        // Behind the run's tag, with a real kind: the body decoders run.
+        buf[0..ecdsa_keygen.run_tag_len].* = slot.p.tag;
+        if (src.value(bool)) {
+            const kinds = [_]u8{ 16, 17, 18, 19, 32, 33, 34 };
+            buf[ecdsa_keygen.run_tag_len] = kinds[src.index(kinds.len)];
+        }
+        FzMark.mark(.raw_tagged);
+    }
+
+    const before = fzState(&slot.p);
+    var dirty = false;
+    if (slot.p.handle(from, buf[0..len])) |_| {
+        FzMark.mark(.frame_accepted);
+        dirty = true;
+    } else |_| {
+        FzMark.mark(.frame_refused);
+        if (!std.meta.eql(before, fzState(&slot.p))) return error.RefusalMovedTheState;
+        FzMark.mark(.refusal_inert);
+    }
+    if (src.valueRangeAtMost(u8, 0, 15) == 0) {
+        dirty = true;
+        if (slot.p.advance()) |_| {
+            FzMark.mark(.advance_ok);
+        } else |_| FzMark.mark(.advance_err);
+    }
+    if (dirty) world.retire(k, p);
+}
+
+test "fuzz driver: DKG_FUZZ (ecdsa reshare handle)" {
+    // The world (2048-bit keys, one honest run) is built before the watchdog
+    // starts counting; an input that rebuilds a process replays up to six
+    // rounds of proofs, so the limit per input is generous.
+    if (std.testing.environ.getPosix("DKG_FUZZ") != null) _ = fzWorld();
+    try fz.fuzz_driver.run(fuzzReshareHandle, .{ .prefix = "DKG_FUZZ", .name = "dkg-ecdsa-reshare-handle", .scale = 20, .default_limit_ms = 60_000 });
+}
+
+test "fuzz harness: ecdsa reshare handle, seeds in every test run, reaches every outcome" {
+    try FzMark.reach(fuzzReshareHandle, "dkg-ecdsa-reshare-handle", 40);
+}
+
+test "fuzz: EcdsaReshare.handle never panics, from any member, in any round" {
+    const w = fzWorld();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    // The Smith input is `slice` first: a captured frame (a few of them: the
+    // heavy world is built once, a Smith replay is one input each).
+    var seeds: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < w.all.len) : (i += @max(1, w.all.len / 6)) {
+        const f = w.all[i];
+        const buf = try aa.alloc(u8, 4 + f.bytes.len + 16 + 24);
+        std.mem.writeInt(u32, buf[0..4], @intCast(f.bytes.len), .little);
+        @memcpy(buf[4..][0..f.bytes.len], f.bytes);
+        @memset(buf[4 + f.bytes.len ..], 0);
+        try seeds.append(aa, buf);
+    }
+    try testing.fuzz({}, fuzzReshareSmith, .{ .corpus = seeds.items });
+}

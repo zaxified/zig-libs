@@ -431,7 +431,10 @@ proves interop). `zig build interop-ssh` drives the Go `x/crypto/ssh` oracle (`t
 - **Fuzz** (`SSH_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver, ReleaseSafe; never
   `zig build --fuzz`): `ssh-readstring`, `ssh-readmpint`, `ssh-kexinit`, `ssh-readpacket`,
   `ssh-keyload`, `ssh-pubkey`, `ssh-userauth` (both roles over one stream, with corpus seeds and reach
-  labels) and `ssh-session`. The card's Hardening line has the budget.
+  labels: hostbased requests with valid, refused and cut-off signatures, `publickey` grants carrying an
+  attacker-chosen `source-address` list, the client's `PasswordChanger` answering CHANGEREQ streams),
+  `ssh-sourceaddr` (`sourceAddressAllowed` over built and raw lists and every peer shape, against a
+  masked-compare model) and `ssh-session`. The card's Hardening line has the budget.
 - **Constant time (ctgrind):** rows `dh` (the montint kernel; the remaining contexts are the mpint length
   of `e`/`K`, inherent to RFC 4251), `gex`, `ecdh` (`fromScalar` declassifies only its zero verdict) and
   `pem` (the host-key PEM decode on the ed25519 fixture), with positive controls `ffpow` (the old

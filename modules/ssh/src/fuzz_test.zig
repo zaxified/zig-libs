@@ -12,7 +12,7 @@
 //! Drivers: `SSH_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there); harness names `ssh-
 //! readstring`, `ssh-readmpint`, `ssh-kexinit`, `ssh-readpacket`,
-//! `ssh-session`, `ssh-userauth`, `ssh-keyload`, `ssh-pubkey`.
+//! `ssh-session`, `ssh-userauth`, `ssh-keyload`, `ssh-pubkey`, `ssh-sourceaddr`.
 
 const std = @import("std");
 const testing = std.testing;
@@ -501,4 +501,191 @@ test "fuzz driver: SSH_FUZZ (ssh-pubkey)" {
 
 test "fuzz harness: 300 public-key seeds in every test run, and they get everywhere" {
     try reachSeeds(pub_reach, "ssh-pubkey", pubKeyHarness, 300);
+}
+
+// ── the `source-address` critical option ────────────────────────────────────
+//
+// `userauth.sourceAddressAllowed` parses an option string that a deciding
+// callback took from the PEER's certificate (or its own database): a comma
+// list of addresses and CIDR blocks, matched against the connection's peer.
+// Shapes:
+//
+//   0   the list is drawn bytes, the peer drawn;
+//   1   the list is BUILT from drawn entries (v4/v6 address or block, host
+//       bits set, or a garbage entry), the peer drawn, and an independent
+//       model (masked compare on the octets) gives the verdict;
+//   either shape: 0-2 octets of the list damaged afterwards.
+//
+// Oracles: never a panic; the model's verdict on built lists; a match
+// survives appended garbage (first match wins) and is lost under prepended
+// garbage (an unparseable entry refuses); no option allows every peer, no
+// peer address refuses every option.
+
+pub const SaLabel = enum { raw, model_allowed, model_denied, model_garbage, v6_peer, mapped_peer, no_peer, damaged };
+pub const sa_reach = Reach(SaLabel);
+
+const SaEntry = struct {
+    v6: bool,
+    block: bool,
+    garbage: bool,
+    bits: u8,
+    addr: [16]u8,
+
+    fn write(e: SaEntry, w: *std.Io.Writer) !void {
+        if (e.garbage) return w.writeAll(if (e.bits & 1 == 0) "10.0.0.256/8" else "2001:db8::/129x");
+        if (e.v6) {
+            for (0..8) |i| {
+                if (i != 0) try w.writeByte(':');
+                try w.print("{x}", .{std.mem.readInt(u16, e.addr[i * 2 ..][0..2], .big)});
+            }
+        } else try w.print("{d}.{d}.{d}.{d}", .{ e.addr[0], e.addr[1], e.addr[2], e.addr[3] });
+        if (e.block) try w.print("/{d}", .{e.bits});
+    }
+
+    /// The model: does the entry match a peer of `family` with octets `peer`?
+    fn matches(e: SaEntry, v6_peer: bool, peer: [16]u8) bool {
+        if (e.v6 != v6_peer) return false;
+        const len: usize = if (e.v6) 16 else 4;
+        const bits: usize = if (!e.block) len * 8 else e.bits;
+        var i: usize = 0;
+        while (i < bits) : (i += 1) {
+            const m: u8 = @as(u8, 0x80) >> @intCast(i % 8);
+            if ((e.addr[i / 8] ^ peer[i / 8]) & m != 0) return false;
+        }
+        return true;
+    }
+};
+
+fn saAllowed(list: ?[]const u8, remote: ?std.Io.net.IpAddress) bool {
+    var opt: [1]userauth.Permissions.Option = undefined;
+    const perms: userauth.Permissions = if (list) |l| blk: {
+        opt[0] = .{ .name = userauth.source_address_option, .value = l };
+        break :blk .{ .critical_options = &opt };
+    } else .{};
+    return userauth.sourceAddressAllowed(perms, remote);
+}
+
+pub fn sourceAddressHarness(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    // The peer.
+    var peer: [16]u8 = undefined;
+    src.bytes(&peer);
+    const pshape = src.valueRangeAtMost(u8, 0, 3);
+    var v6_peer = false;
+    var remote: ?std.Io.net.IpAddress = null;
+    switch (pshape) {
+        0 => sa_reach.mark(.no_peer),
+        1 => remote = .{ .ip4 = .{ .bytes = peer[0..4].*, .port = 22 } },
+        2 => {
+            v6_peer = true;
+            peer[0] = 0x20; // not ::ffff:0:0/96
+            remote = .{ .ip6 = .{ .bytes = peer, .port = 22 } };
+            sa_reach.mark(.v6_peer);
+        },
+        else => {
+            // an IPv4-mapped IPv6 peer is matched as IPv4
+            var mapped: [16]u8 = @splat(0);
+            mapped[10] = 0xff;
+            mapped[11] = 0xff;
+            @memcpy(mapped[12..], peer[0..4]);
+            remote = .{ .ip6 = .{ .bytes = mapped, .port = 22 } };
+            sa_reach.mark(.mapped_peer);
+        },
+    }
+
+    var list_buf: [512]u8 = undefined;
+    var list_len: usize = 0;
+    var model: ?bool = null;
+    var any_garbage = false;
+    if (src.valueRangeAtMost(u8, 0, 1) == 0) {
+        sa_reach.mark(.raw);
+        list_len = src.slice(list_buf[0..96]);
+    } else {
+        var w: std.Io.Writer = .fixed(&list_buf);
+        const n = src.valueRangeAtMost(u8, 1, 4);
+        var hit = false;
+        var settled = false; // the first entry that matches or is garbage decides
+        for (0..n) |i| {
+            var e: SaEntry = undefined;
+            const kind = src.valueRangeAtMost(u8, 0, 5);
+            e.garbage = kind == 5;
+            e.v6 = kind >= 3 and kind != 5;
+            e.block = kind == 1 or kind == 2 or kind == 4;
+            e.bits = src.value(u8);
+            src.bytes(&e.addr);
+            if (e.v6) e.addr[0] = 0x20;
+            e.bits = if (e.v6) e.bits % 129 else e.bits % 33;
+            // Half the entries are the peer's own address with host bits set.
+            if (!e.garbage and src.value(bool)) {
+                const keep: usize = if (e.v6) 16 else 4;
+                const fam_peer = v6_peer == e.v6 and remote != null;
+                if (fam_peer) @memcpy(e.addr[0..keep], peer[0..keep]);
+            }
+            if (i != 0) try w.writeByte(',');
+            try e.write(&w);
+            if (!settled) {
+                if (e.garbage) {
+                    any_garbage = true;
+                    settled = true;
+                } else if (remote != null and e.matches(v6_peer, peer)) {
+                    hit = true;
+                    settled = true;
+                }
+            }
+        }
+        list_len = w.end;
+        model = hit;
+    }
+
+    var list = list_buf[0..list_len];
+    var damaged = false;
+    var k = src.valueRangeAtMost(u8, 0, 2);
+    while (k > 0 and list.len > 0) : (k -= 1) {
+        list[src.index(list.len)] ^= src.valueRangeAtMost(u8, 1, 255);
+        damaged = true;
+    }
+
+    const got = saAllowed(list, remote);
+    if (damaged) sa_reach.mark(.damaged);
+    if (remote == null) {
+        if (got) return error.AllowedWithoutPeer;
+        return;
+    }
+    if (!damaged) if (model) |m| {
+        if (m != got) return error.ModelDisagrees;
+        if (m) sa_reach.mark(.model_allowed) else if (any_garbage) sa_reach.mark(.model_garbage) else sa_reach.mark(.model_denied);
+    };
+    // No option: nothing to enforce.
+    if (!saAllowed(null, remote)) return error.OptionlessRefused;
+    // First match wins: a match survives a garbage tail; a garbage head refuses.
+    var tail_buf: [560]u8 = undefined;
+    if (got) {
+        const t = std.fmt.bufPrint(&tail_buf, "{s},garbage", .{list}) catch return;
+        if (!saAllowed(t, remote)) return error.MatchLostToTail;
+    }
+    const h = std.fmt.bufPrint(&tail_buf, "garbage,{s}", .{list}) catch return;
+    if (saAllowed(h, remote)) return error.GarbageHeadAllowed;
+}
+
+fn fuzzSourceAddress(_: void, smith: *testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n = smith.slice(&script);
+    var src: ScriptSource = .{ .cur = .{ .bytes = script[0..n] } };
+    return sourceAddressHarness(ScriptSource, &src, testing.allocator);
+}
+
+const sa_seeds = [_][]const u8{
+    testkit.fuzz.seedHex("0a0102030405060708090a0b0c0d0e0f01010101"),
+    testkit.fuzz.seed(""),
+};
+
+test "fuzz: the source-address option never panics, whatever list and peer" {
+    try testing.fuzz({}, fuzzSourceAddress, .{ .corpus = &sa_seeds });
+}
+
+test "fuzz driver: SSH_FUZZ (ssh-sourceaddr)" {
+    try fuzz_driver.run(sourceAddressHarness, .{ .prefix = "SSH_FUZZ", .name = "ssh-sourceaddr" });
+}
+
+test "fuzz harness: 300 source-address seeds in every test run, and they get everywhere" {
+    try reachSeeds(sa_reach, "ssh-sourceaddr", sourceAddressHarness, 300);
 }
