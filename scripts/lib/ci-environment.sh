@@ -523,6 +523,16 @@ for crate in modules/diagnostics/tools/codespan_bench modules/regex/tools/rust_r
     cargo fetch --locked --manifest-path "$crate/Cargo.toml" >/dev/null 2>&1 \
         && echo "cargo fetch $crate: OK" || echo "cargo fetch $crate: failed"
 done
+# http's h1parsers phase runs hyper's verdicts from `h1_verdicts`; built here,
+# where cargo is known to run (the interop program's own `cargo build` died with
+# FileNotFound on the 2026-11-24 full lane), so the phase finds the binary.
+cargo build --release --offline --bin h1_verdicts \
+    --manifest-path modules/http/tools/rust_fast_bench/Cargo.toml >/dev/null 2>&1 \
+    && echo "h1_verdicts (hyper): OK" || echo "h1_verdicts (hyper): build failed"
+# dtls's second DTLS 1.2 peer, Mbed TLS 3.6.7 (pinned tarball + sha256, reviewed;
+# black-box peer only): built into the gitignored .interop-peers/dtls-mbedtls/.
+bash modules/dtls/tools/mbedtls.sh >/dev/null 2>&1 \
+    && echo "mbedtls 3.6.7 (dtls peer): OK" || echo "mbedtls 3.6.7 (dtls peer): build failed"
 # regex compares its generator against UCD 16.0.0 (regex-syntax 0.8.11's version, the
 # rules check) and 18.0.0 (the tables' version) text files
 # (gitignored, fetched from unicode.org).
