@@ -84,7 +84,12 @@ Run: `scripts/modtest jsontext`.
 - **Fuzz:** the deterministic driver, `JSONTEXT_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver), harness
   `jsontext-string-depth`: every option combination must yield a literal that decodes to the reference text (an oracle written
   for the harness: a WHATWG-style decoder state machine, `std.json`, an independent depth scan), with every writer capacity from
-  0 to the output size; reach counters over valid / ill-formed / reject-error / short-writer / deep inputs.
+  0 to the output size; reach counters over valid / ill-formed / reject-error / short-writer / deep inputs. A second
+  check compares the EXACT output bytes with a model over the same decoder's items, for 6 `invalid_utf8` modes x
+  `ascii_only` x `html_safe` (`.verbatim` only plain) and `short_escapes` x `escape_del` x `escape_chars` (three sets) on
+  the default and the `.escape_bytes` + ASCII + HTML modes (a hand-flipped `\f` condition in `root.zig` is caught at seed 6);
+  under `.reject` the partial output before the bad sequence must equal the model's prefix. Reach labels for the new
+  options (`model-reject-partial`, `model-per-byte`, `model-all-high`, `model-del`, `model-short`, `model-escape-chars`).
 - **Comparative bench:** `bench-jsontext` (see *Performance*).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
