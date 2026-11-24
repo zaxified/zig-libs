@@ -105,7 +105,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 - `scalar.zig` now carries the whole scalar field on top of the width
   bridge: `negate`/`sub` (byte borrow chain + `ed448.scalar.add`),
-  `invert` (Fermat, `a^(l-2)`, `invert(0) == 0`), `reduce(n, bytes)` for
+  `invert` (constant-time safegcd, `modinv.zig`; `invert(0) == 0`, any 56-byte input accepted), `reduce(n, bytes)` for
   `n <= 114` and `fromWide` (114 bytes) over `ed448.scalar.reduceWide`, and
   `random(io)` — 114 bytes from `io.randomSecure` (fail-closed; error
   returned, not swallowed), wide-reduced. No new number theory: everything
@@ -196,7 +196,7 @@ Run: `scripts/modtest decaf448`. `gate.core_implemented` is `true`; with it `fal
 - **Fuzz:** the deterministic driver, `DECAF448_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver), over
   `decaf448-decode` (accepted encodings re-encode canonically, a damaged one names another element; at 1/2 of
   the budget), `decaf448-group` (the group law; 1/8) and `decaf448-hash` (typed errors; 1/4).
-- **ctgrind:** `ctgrind_harness.zig` over `Element.scalarMul`; the row is in `scripts/checks/ctgrind-expected.tsv`
+- **ctgrind:** `ctgrind_harness.zig` over `Element.scalarMul` and `scalar.invert`; the row is in `scripts/checks/ctgrind-expected.tsv`
   (see *Constant-time note*).
 - **Dead-stack probe:** `stackprobe_test.zig` for `Element.scalarMul`, `scalar.invert` and `scalar.random`.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
@@ -216,15 +216,16 @@ Run: `scripts/modtest decaf448`. `gate.core_implemented` is `true`; with it `fal
 
 ## Constant-time note (measured)
 
-*Scope of the measurement below: `Element.scalarMul` only.* The scalar
-operations beyond `scalarMul` are constant-time **by construction, not
+*Scope of the measurement below: `Element.scalarMul` and `scalar.invert`.* The scalar
+operations beyond those are constant-time **by construction, not
 measured**: `negate` is a fixed 57-byte borrow chain plus `ed448.scalar.add`'s
-mask-select; `invert` is square-and-multiply over the PUBLIC exponent `l - 2`
-(its one branch reads a bit of that constant), every step an
-`ed448.scalar.mul`; `reduce`/`fromWide`/`random` are `ed448.scalar.reduceWide`'s
+mask-select; `reduce`/`fromWide`/`random` are `ed448.scalar.reduceWide`'s
 fixed-iteration reduction. `ctgrind_harness.zig` does not drive them, so
-no ctgrind row covers them (`scripts/checks/ctgrind-expected.tsv` is
-unchanged). The hash functions take public inputs.
+no ctgrind row covers them. `invert` is the safegcd routine of `modinv.zig`
+(Bernstein–Yang divsteps, 1062 steps in 18 batches of 59, every decision a masked select on a
+laundered mask; ≈ 4 µs against ≈ 9.6 ms for the former Fermat chain over the bit-serial
+`ed448.scalar.mul`, which stays in `scalar.zig` as the test oracle). It has its own row, `invert`
+(scalar tainted: 0 in-file, the printed inverse is digest-pinned). The hash functions take public inputs.
 
 
 `Element.scalarMul` is safe for a SECRET scalar, and that is measured
@@ -273,9 +274,6 @@ no error union at all.
 
 ## Backlog / deferred
 
-- **Faster scalar inversion:** `invert` is ~450 squarings + ~220 multiplications through `ed448.scalar.mul`'s
-  bit-serial reduction. An addition chain or a Montgomery/Barrett `mul` in `ed448.scalar` would cut it several-fold.
-  Effort: small-medium. Fits §2.
 
 
 ## Anchoring

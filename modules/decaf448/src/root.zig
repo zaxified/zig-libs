@@ -75,6 +75,7 @@ pub const hashToScalar = hash.hashToScalar;
 test {
     _ = gate;
     _ = scalar;
+    _ = @import("modinv.zig");
     _ = element;
     _ = hash;
     _ = @import("kat_vectors.zig");

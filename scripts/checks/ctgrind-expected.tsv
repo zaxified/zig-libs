@@ -350,7 +350,8 @@ ct25519	ReleaseFast	msm	1	0	aaa45198aa7c91a1	09aa32de83cec03a
 # positive controls in SPEC.md § P6: without the declassify 1 in-file at that
 # line, a branching cswap 1 in-file at the swap (native and -mcpu=x86_64_v3).
 ct25519	ReleaseFast	x25519	1	0	aaa45198aa7c91a1	8af2fe8213b778aa
-decaf448	ReleaseFast	scalarmul	1	0	43963c0c719ebae4	77a1bd1038ca1053
+decaf448	ReleaseFast	scalarmul	1	0	89ee227f5f43c8f1	77a1bd1038ca1053
+decaf448	ReleaseFast	invert	1	0	a63581db68d54fc0	3108a171dc3725b6
 # ecvrf prove 3 -> 0 (4db1e627): the three contexts were try-and-increment
 # branches on H, which is derived from the PUBLIC key. The harness now
 # declassifies Y, so what remains is a claim about the secret alone.
@@ -491,13 +492,13 @@ k256	ReleaseFast	sign	1	11	89a94f2fede67b29	bb06c2ed85209b8d
 # Zig 0.17.0 (2026-10-18): ecdsa 11 -> 10 (decrease). One of signInner's five own contexts
 # (ecdsa_recover.zig) is gone in the LLVM 22 build; every other context has the same shape (the
 # harness frame now prints as `ctgrind_harness.main`). Normalised --stacks diff vs B0.
-k256	ReleaseFast	ecdsa	1	10	248c019ea77f7485	8ff4812d21149442
+k256	ReleaseFast	ecdsa	1	10	47b9da782decca5d	8ff4812d21149442
 # k256 2026-11-21 — the blinded fixed-base paths (`Blinding`, libsecp256k1's context randomisation): scalar/key AND
 # the whole blinding state tainted. combblind = comb's one `rejectIdentityOneBranch` (on the final s·G); the
 # reduction of s + (n − b) is masked integer arithmetic (std's `Scalar.fromBytes64` read 2 more, removed).
 k256	ReleaseFast	combblind	1	1	e0969c588c9c93b2	31b63b5e1ab5d793
 k256	ReleaseFast	signblind	1	11	89a94f2fede67b29	9bb769bcd1b73254
-k256	ReleaseFast	ecdsablind	1	10	248c019ea77f7485	cdc0d7699f169fcf
+k256	ReleaseFast	ecdsablind	1	10	47b9da782decca5d	cdc0d7699f169fcf
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
@@ -2055,7 +2056,7 @@ aes192	ReleaseFast	bitsliced	1	0	ba4c8387c14267e7	5ea64f081b0ffcbb
 # ladder); `ecdh`/`keygen`/`sign` print affine bytes and did not move.
 p521	ReleaseFast	mul	1	0	81f19c2525402551	7bcb91b4acac23e9
 p521	ReleaseFast	keygen	1	0	cd16839139d26b25	b44de7eb8b02a855
-p521	ReleaseFast	sign	1	0	cd16839139d26b25	b620c1c667ef0084
+p521	ReleaseFast	sign	1	0	35463104fcf3387e	b620c1c667ef0084
 p521	ReleaseFast	ecdh	1	0	81f19c2525402551	a348bd01a2bccfcc
 p521	ReleaseFast	vartime	1	>=1	cc94666020cafe57	11557f4b46d4c2af
 p521	ReleaseFast	cmov	1	0	3751c0b8139c4367	d38ed19668c79445
@@ -2068,10 +2069,10 @@ p521	ReleaseFast	cmov	1	0	3751c0b8139c4367	d38ed19668c79445
 # it — the comb now uses `addMixedComplete` from a valid default entry
 # (tlsclient's P-384 comb had the same finding on std's addMixed, 2026-10-11).
 # `vartime` is the POSITIVE CONTROL (11 in-file: wNAF and Jacobian branches).
-p384	ReleaseFast	mul	1	0	ea3c58b107bf087e	c6ed226b169947b1
-p384	ReleaseFast	keygen	1	0	8807b44ebfebe0e2	c28d014cde15df1e
-p384	ReleaseFast	sign	1	0	8807b44ebfebe0e2	d03df64890394e70
-p384	ReleaseFast	ecdh	1	0	ea3c58b107bf087e	cbf100ff8ddb053f
+p384	ReleaseFast	mul	1	0	e28ebfc4d52660ca	c6ed226b169947b1
+p384	ReleaseFast	keygen	1	0	4178f4d7e4240595	c28d014cde15df1e
+p384	ReleaseFast	sign	1	0	4178f4d7e4240595	d03df64890394e70
+p384	ReleaseFast	ecdh	1	0	e28ebfc4d52660ca	cbf100ff8ddb053f
 p384	ReleaseFast	vartime	1	>=1	e398ac4687109545	38cf29c815d8f1f4
 # tlsresume (2026-10-13) — the STEK, the resumption secret / PSK / binder key and the
 # 0-RTT key schedule through the module's public API; SHA-256 and SHA-384 suites.

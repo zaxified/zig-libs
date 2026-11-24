@@ -174,7 +174,7 @@ declare -A TARGETS=(
     # `precompute` table) added 2026-09-16; see modules/ct25519/SPEC.md § C3.
     [ct25519]="ct25519 std comb ladderbase ladder msm x25519"
     [mlkem]="keygen512 keygen768 keygen1024 encaps512 encaps768 encaps1024 decaps512 decaps768 decaps1024 fromBytes512 fromBytes768 fromBytes1024"
-    [decaf448]="scalarmul"
+    [decaf448]="scalarmul invert"
     [bn254]="field scalarmul"
     # `verify` (A1 E15) added 2026-09-16 is DOCUMENTARY: verify has no secret,
     # the target taints the public `alpha` to list its input-dependent
@@ -537,6 +537,7 @@ declare -A PATTERN=(
     [ct25519/msm]='root[.]zig'
     [ct25519/x25519]='root[.]zig|field[.]zig'
     [decaf448/scalarmul]='element[.]zig|ed448[.]zig|field[.]zig|scalar[.]zig'
+    [decaf448/invert]='scalar[.]zig|modinv[.]zig|burn[.]zig'
     [ecvrf/prove]='ecvrf[.]zig'
     [ecvrf/verify]='ecvrf[.]zig'
     [ecvrf/p256_tai]='p256vrf[.]zig'
@@ -554,10 +555,10 @@ declare -A PATTERN=(
     [k256/mul]='group[.]zig|field[.]zig|fast_core[.]zig'
     [k256/comb]='group[.]zig|field[.]zig|fast_core[.]zig'
     [k256/sign]='sign[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
-    [k256/ecdsa]='ecdsa_recover[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [k256/ecdsa]='ecdsa_recover[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|modinv[.]zig'
     [k256/combblind]='group[.]zig|field[.]zig|fast_core[.]zig'
     [k256/signblind]='sign[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
-    [k256/ecdsablind]='ecdsa_recover[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [k256/ecdsablind]='ecdsa_recover[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|modinv[.]zig'
     # montint: `montint.zig` is the portable CIOS + powMont, `asm_core.zig` the
     # gated amd64 core, `limbs.zig` the add/sub/select primitives underneath
     # both. All three are montint's own files; nothing in std shares a basename
@@ -901,13 +902,13 @@ declare -A PATTERN=(
     # RFC 6979 DRBG on the sign path -- that HMAC is this module's nonce
     # derivation, so its contexts are this module's.
     [p521/mul]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
-    [p384/mul]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
+    [p384/mul]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig|modinv[.]zig'
     [p521/keygen]='field[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig'
-    [p384/keygen]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig'
-    [p521/sign]='field[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig|hmac[.]zig|sha2[.]zig'
-    [p384/sign]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig|hmac[.]zig|sha2[.]zig'
+    [p384/keygen]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig|modinv[.]zig'
+    [p521/sign]='field[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig|hmac[.]zig|sha2[.]zig|modinv[.]zig'
+    [p384/sign]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|sign[.]zig|ct[.]zig|burn[.]zig|hmac[.]zig|sha2[.]zig|modinv[.]zig'
     [p521/ecdh]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
-    [p384/ecdh]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig'
+    [p384/ecdh]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig|ct[.]zig|burn[.]zig|modinv[.]zig'
     [p521/vartime]='field[.]zig|scalar[.]zig|group[.]zig'
     [p521/cmov]='field[.]zig|scalar[.]zig|group[.]zig|ct[.]zig'
     [p384/vartime]='field[.]zig|mont[.]zig|fast_core[.]zig|scalar[.]zig|group[.]zig'
@@ -1106,6 +1107,7 @@ declare -A LABEL=(
     [mlkem/fromBytes768]='mlkem SecretKey.fromBytes (s + z secret) 768'
     [mlkem/fromBytes1024]='mlkem SecretKey.fromBytes (s + z secret) 1024'
     [decaf448/scalarmul]='decaf448+ed448'
+    [decaf448/invert]='decaf448 scalar.invert (scalar tainted)'
     [ecvrf/prove]='ecvrf KeyPair (sk; Y declassified)'
     [ecvrf/verify]='ecvrf verify (public alpha; DOCUMENTARY)'
     [ecvrf/p256_tai]='ecvrf P-256 TAI KeyPair.init + prove (sk; Y declassified)'

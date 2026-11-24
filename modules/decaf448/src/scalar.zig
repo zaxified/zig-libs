@@ -33,6 +33,7 @@
 const std = @import("std");
 const ed448 = @import("ed448");
 const burn = @import("burn.zig");
+const modinv = @import("modinv.zig");
 
 /// 56-byte little-endian wire encoding of a decaf448 scalar (RFC 9496
 /// §5.4) — narrower than `ed448.scalar.CompressedScalar`'s 57 bytes; see
@@ -110,42 +111,52 @@ pub fn sub(a: CompressedScalar, b: CompressedScalar) CompressedScalar {
     return add(a, negate(b));
 }
 
-/// `l - 2`, the Fermat exponent `invert` raises to (`l` is prime, so
-/// `a^(l-2) == a^-1` for `a != 0`). `l`'s low byte is `0xf3`, so
-/// subtracting 2 borrows from nothing.
-const l_minus_2: CompressedScalar = blk: {
-    var e = fromEd448(ed448.scalar.l_bytes);
-    e[0] -= 2;
-    break :blk e;
-};
+/// The safegcd inverse mod l (see `modinv.zig`).
+const Safegcd = modinv.Safegcd(std.mem.readInt(u456, &ed448.scalar.l_bytes, .little));
 
-/// `a^-1 (mod l)` by Fermat's little theorem, `a^(l-2)`. Constant-time with
-/// respect to `a`: plain left-to-right square-and-multiply over the PUBLIC,
-/// fixed exponent `l - 2` — the only branch is on a bit of that constant,
-/// and every step is `ed448.scalar.mul`, itself constant-time (fixed
-/// schoolbook multiply plus fixed-iteration reduction).
+/// `a^-1 (mod l)`, constant-time safegcd (`modinv.zig`: Bernstein–Yang
+/// divsteps, 1062 steps for the 446-bit `l`). Any 56-byte value is accepted
+/// (as the old Fermat path did) — the step bound covers the whole 448-bit
+/// range, and a multiple of `l` inverts to `0`.
 ///
-/// `invert(0)` returns `0` (there is no inverse; `0^(l-2) == 0`). A caller
-/// for which a zero scalar is an error must check for it — e.g. RFC 9497's
-/// `Blind` redraws a zero blind before it is ever inverted.
+/// `invert(0)` returns `0` (there is no inverse). A caller for which a zero
+/// scalar is an error must check for it — e.g. RFC 9497's `Blind` redraws a
+/// zero blind before it is ever inverted.
 ///
-/// Burned (`burn.zig`): the square-and-multiply chain left both `a` and its
-/// inverse on the dead stack (`stackprobe_test.zig`) — the
-/// inverse of a blind is as secret as the blind.
+/// Burned (`burn.zig`): the inversion left both `a` and its inverse on the
+/// dead stack (`stackprobe_test.zig`) — the inverse of a blind is as secret
+/// as the blind.
 pub fn invert(a: CompressedScalar) CompressedScalar {
-    const r = invertUnburned(&a);
+    var in = a;
+    const r = invertUnburned(&in);
+    // `in` lives in this frame, above the burn: zero it by hand.
+    std.crypto.secureZero(u8, &in);
     burn.stack(burn.scalar_burn);
     return r;
 }
 
 noinline fn invertUnburned(a: *const CompressedScalar) CompressedScalar {
-    const a57 = toEd448(a.*);
+    comptime std.debug.assert(8 * encoded_bytes <= 64 * Safegcd.words and (45907 * 448 + 26313) / 19929 <= 59 * Safegcd.batches);
+    var words: Safegcd.Word = undefined;
+    inline for (0..Safegcd.words) |i| words[i] = std.mem.readInt(u64, a[8 * i ..][0..8], .little);
+    const inv = Safegcd.invert(words);
+    var out: CompressedScalar = undefined;
+    inline for (0..Safegcd.words) |i| std.mem.writeInt(u64, out[8 * i ..][0..8], inv[i], .little);
+    return out;
+}
+
+/// Fermat's `a^(l-2)`, the differential oracle for `invert`: square-and-
+/// multiply over the PUBLIC exponent through `ed448.scalar.mul`.
+fn invertFermat(a: CompressedScalar) CompressedScalar {
+    var e = ed448.scalar.l_bytes;
+    e[0] -= 2; // l's low byte is 0xf3: no borrow
+    const a57 = toEd448(a);
     var acc = toEd448(one);
     var bit: usize = 8 * encoded_bytes;
     while (bit > 0) {
         bit -= 1;
         acc = ed448.scalar.mul(acc, acc);
-        if ((l_minus_2[bit / 8] >> @intCast(bit % 8)) & 1 == 1) {
+        if ((e[bit / 8] >> @intCast(bit % 8)) & 1 == 1) {
             acc = ed448.scalar.mul(acc, a57);
         }
     }
@@ -321,6 +332,48 @@ test "invert: a * invert(a) == 1, and matches the big-integer oracle (SELF-DERIV
         // oracle: a * inv == 1 (mod l), checked in u1024
         try std.testing.expectEqual(@as(Big, 1), (bigOf(a) * bigOf(inv)) % l_big);
     }
+}
+
+test "invert: safegcd == Fermat on edges, non-canonical 56-byte values and random scalars" {
+    var prng = std.Random.DefaultPrng.init(0x00de_caf4);
+    const r = prng.random();
+    // Non-canonical inputs (any 56-byte value is accepted): l, l + 1, 2l,
+    // 2^448 - 1 and an all-ones string reduce first, as the Fermat path does.
+    const edges = [_]Big{ 0, 1, 2, l_big - 1, l_big - 2, l_big >> 1, (l_big >> 1) + 1, l_big, l_big + 1, 2 * l_big, 3 * l_big + 5, (1 << 448) - 1, 1 << 445, (1 << 256) - 1 };
+    for (edges) |x| {
+        var a: CompressedScalar = undefined;
+        std.mem.writeInt(u448, &a, @intCast(x), .little);
+        try std.testing.expectEqualSlices(u8, &invertFermat(a), &invert(a));
+    }
+    for (0..40) |_| {
+        var a: CompressedScalar = undefined;
+        r.bytes(&a);
+        try std.testing.expectEqualSlices(u8, &invertFermat(a), &invert(a));
+    }
+}
+
+test "bench scalar invert: safegcd vs Fermat, interleaved (opt-in via DECAF448_BENCH)" {
+    if (@import("builtin").target.os.tag != .linux or std.testing.environ.getPosix("DECAF448_BENCH") == null) return error.SkipZigTest;
+    const n = 200;
+    var a = scalarOf(0x1234567890abcdef1234567890abcdef1234567890abcdef);
+    var best_g: u64 = std.math.maxInt(u64);
+    var best_f: u64 = std.math.maxInt(u64);
+    for (0..7) |_| {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t0 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        for (0..n) |_| a = invert(a);
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        var t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_g = @min(best_g, t1 - t0);
+        t0 = t1;
+        for (0..n) |_| a = invertFermat(a);
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        t1 = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        best_f = @min(best_f, t1 - t0);
+    }
+    std.mem.doNotOptimizeAway(&a);
+    std.debug.print("\nscalar invert: safegcd {d:.2} us, Fermat {d:.2} us (best of 7 x {d})\n", .{ @as(f64, @floatFromInt(best_g)) / n / 1000.0, @as(f64, @floatFromInt(best_f)) / n / 1000.0, n });
 }
 
 test "invert edge values: 0 -> 0, 1 -> 1, l-1 -> l-1, 2 -> (l+1)/2" {
