@@ -121,6 +121,14 @@ const datefmt = @import("datefmt");
 const netaddr = @import("netaddr");
 const proxyproto = @import("proxyproto");
 pub const tls_listener = @import("tls_listener.zig");
+const held_mod = @import("held.zig");
+/// Long-lived responses (see `held.zig`): Go's `Request.Context().Done()` +
+/// `context.AfterFunc` (`PeerWatch`) and a response held open and fed from
+/// other threads (`Hold`).
+pub const PeerWatch = held_mod.PeerWatch;
+pub const Hold = held_mod.Hold;
+pub const GoneHook = held_mod.GoneHook;
+pub const PeerWatchError = held_mod.StartError;
 const flate = std.compress.flate;
 const net = std.Io.net;
 const Reader = std.Io.Reader;
@@ -839,6 +847,11 @@ pub const Options = struct {
     /// dispatcher is installed. This does NOT affect HTTP/1.1, which is
     /// already one connection per thread.
     h2_dispatcher: ?H2Dispatcher = null,
+    /// Most responses held open at once (`Hold.begin`) over the whole
+    /// server; one more fails `error.TooManyHeld` (the handler answers 503).
+    /// Null (the default) = no cap, as Go, hyper and Starlette, which bound
+    /// streaming handlers only through their connection limits.
+    max_held_responses: ?u32 = null,
 };
 
 /// Re-export of `h2_server.Limits` for `Options.h2_limits`.
@@ -895,6 +908,9 @@ pub fn activeConnections(s: *const Server) usize {
 const Registry = struct {
     mutex: std.Io.Mutex = .init,
     list: std.DoublyLinkedList = .{},
+    /// Responses held open (`Hold`), woken by a shutdown.
+    holds: std.DoublyLinkedList = .{},
+    holds_len: usize = 0,
     hooks: [max_shutdown_hooks]ShutdownHook = undefined,
     hooks_len: usize = 0,
 };
@@ -917,7 +933,8 @@ pub const ShutdownError = error{
 /// connection sends GOAWAY and finishes its open streams). Returns once no
 /// connection is left, or `error.DeadlineExceeded` after `timeout_ms`
 /// (0 = wait as long as it takes). Callable from any thread while `serve`
-/// runs; `serve` returns when its connections are gone. Hijacked
+/// runs; `serve` returns when its connections are gone. Held responses
+/// (`Hold`) are woken and end with `.shutdown`. Hijacked
 /// connections (`ResponseWriter.upgrade`, a detached response) are the
 /// hooks' to end — Go does not track them either.
 pub fn shutdownGraceful(s: *Server, timeout_ms: u32) ShutdownError!void {
@@ -928,6 +945,7 @@ pub fn shutdownGraceful(s: *Server, timeout_ms: u32) ShutdownError!void {
     const hooks_len = s.registry.hooks_len;
     s.registry.mutex.unlock(s.io);
     for (hooks[0..hooks_len]) |h| h.f(h.ctx);
+    s.wakeHolds();
 
     const deadline_ns: u64 = if (timeout_ms == 0) 0 else nowNs(s.io) + @as(u64, timeout_ms) * std.time.ns_per_ms;
     while (true) {
@@ -947,7 +965,45 @@ pub fn shutdownGraceful(s: *Server, timeout_ms: u32) ShutdownError!void {
 pub fn close(s: *Server) void {
     s.draining.store(true, .seq_cst);
     s.shutdown();
+    s.wakeHolds();
     s.closeConnections(.any);
+}
+
+/// Every held response ends its `run` with `.shutdown`.
+fn wakeHolds(s: *Server) void {
+    s.registry.mutex.lockUncancelable(s.io);
+    defer s.registry.mutex.unlock(s.io);
+    var it = s.registry.holds.first;
+    while (it) |n| : (it = n.next) {
+        const h: *Hold = @fieldParentPtr("node", n);
+        h.wakeForShutdown();
+    }
+}
+
+/// `Hold.begin`: count the response against `Options.max_held_responses`.
+/// A server already draining still admits it, ended at once (`.shutdown`).
+pub fn registerHold(s: *Server, h: *Hold) error{TooManyHeld}!void {
+    s.registry.mutex.lockUncancelable(s.io);
+    defer s.registry.mutex.unlock(s.io);
+    if (s.options.max_held_responses) |max| if (s.registry.holds_len >= max) return error.TooManyHeld;
+    s.registry.holds.append(&h.node);
+    s.registry.holds_len += 1;
+    if (s.draining.load(.seq_cst)) h.shutdown.store(true, .release);
+}
+
+/// `Hold.end`.
+pub fn unregisterHold(s: *Server, h: *Hold) void {
+    s.registry.mutex.lockUncancelable(s.io);
+    defer s.registry.mutex.unlock(s.io);
+    s.registry.holds.remove(&h.node);
+    s.registry.holds_len -= 1;
+}
+
+/// Responses held open now (`Hold`). Thread-safe.
+pub fn heldResponses(s: *Server) usize {
+    s.registry.mutex.lockUncancelable(s.io);
+    defer s.registry.mutex.unlock(s.io);
+    return s.registry.holds_len;
 }
 
 /// Whether `shutdownGraceful`/`close` has begun — for a long-running handler
@@ -3157,6 +3213,9 @@ pub const Request = struct {
     /// response (`ResponseWriter.detach`) can name the stream to
     /// `h2_server.Detached.push` later. Null on HTTP/1.1.
     stream_id: ?u32 = null,
+    /// HTTP/2 under `Options.h2_dispatcher`: how `PeerWatch` and `Hold` learn
+    /// that the stream was reset or the connection ended. Null elsewhere.
+    h2_live: ?*const held_mod.StreamLiveness = null,
 
     /// The socket peer address (the direct client — meaningful as a client
     /// identity only when no trusted proxy sits in front; `ratelimit` /

@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [modelcontextprotocol/java-sdk](https://github.com/modelcontextprotocol/java-sdk) | Java | MIT per API (source not read) | 3.7k | v2.0.1 (2026-08-19) | Official Java SDK *(inferred: HTTP transports)*. |
 | [muhammad-fiaz/mcp.zig](https://github.com/muhammad-fiaz/mcp.zig) | Zig | MIT | 39 | 0.0.6 (2026-09-14) | The only Zig MCP library found; HTTP through a separate httpx.zig dependency (per the sibling `mcp` survey, README only). |
 
-**Where we are ahead:** the only Zig Streamable HTTP server that is a `router` middleware over this repo's own `http`/`router`/`mcp`, with no other dependency; the 2025-06-18 contract is anchored to captured bytes of the official Python SDK; Origin allowlist built in, per-session peer scoping so one client cannot answer another's sampling request, bounded replay buffer and session cap, body cap (413), live progress over SSE. **Where we are behind:** `subscriptions/listen` acknowledges nothing and closes at once, because `mcp` emits no change notifications to carry — a held-open listen stream waits on both; closing an SSE response cancels nothing inside a running handler (no cancellation seam in `mcp` yet); the session-era drain-and-close GET is not a held-open stream.
+**Where we are ahead:** the only Zig Streamable HTTP server that is a `router` middleware over this repo's own `http`/`router`/`mcp`, with no other dependency; the 2025-06-18 contract is anchored to captured bytes of the official Python SDK; Origin allowlist built in, per-session peer scoping so one client cannot answer another's sampling request, bounded replay buffer and session cap, body cap (413), live progress over SSE. **Where we are behind:** the session-era `GET` stream is drain-and-close, where the reference holds it open (see *Backlog*).
 
 ## Design & invariants
 
@@ -46,10 +46,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `mcp` Python SDK (see Verification below).
 - **Sessions (optional):** an `Mcp-Session-Id` is minted at `initialize` and validated thereafter
   (unknown → 404); `GET /mcp` opens a server→client SSE stream; `DELETE /mcp` tears it down.
-- **`GET` is drain-and-close, not held-open** — io-less handlers can't park a connection on a
-  future push, so the stream drains the buffered queue and closes; EventSource auto-reconnect +
-  `Last-Event-ID` replay (bounded per-session buffer) makes delivery lossless. `Sessions.push` is
-  callable from any thread (one spinlock; snapshot-under-lock so a concurrent `DELETE` can't UAF).
+- **`GET` is drain-and-close, not held-open** — the stream drains the buffered queue and closes;
+  EventSource auto-reconnect + `Last-Event-ID` replay (bounded per-session buffer) makes delivery
+  lossless. `Sessions.push` is callable from any thread (one spinlock; snapshot-under-lock so a
+  concurrent `DELETE` can't UAF).
 - **Server→client requests (sampling / elicitation)** are supported to exactly the degree HTTP
   allows: the client's answer is a *later, separate POST*, so nothing parks waiting for it (the same
   constraint the drain-and-close `GET` documents). Three concrete pieces: (1) each session's numeric
@@ -113,11 +113,26 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `application/json`, since an SSE stream is committed to 200 and a client decides its era fallback
   from the status. Pre-response lines in JSON mode are dropped (no GET stream in that revision).
 - **Cancellation:** a failed write after the stream started is the client closing it — the spec's
-  cancellation — so nothing more is sent and it is not an error of the request. The running handler
-  is not interrupted (no seam in `mcp`).
-- **`subscriptions/listen`** is answered by `mcp` with two lines (the acknowledgment of an empty
-  filter, then the graceful-close result); here they are one SSE stream. See `mcp`'s SPEC for why it
-  does not hold the stream open.
+  cancellation — so nothing more is sent and it is not an error of the request. A 2026-07-28
+  `tools/call` with an id is also watched while it runs (`http.Server.PeerWatch`, JSON and SSE
+  alike): the connection closing fires `mcp.Server.cancelInflight`, so the tool sees
+  `ToolCall.cancelled()` at once, not at its next write. The call is served on a private peer handle
+  (from 2^62 up; 2026-07-28 requests otherwise share peer 0), so one client's close cannot cancel
+  another client's call with the same id. Not on the session path: 2025-06-18 says a disconnect is
+  not a cancellation (`notifications/cancelled` is). Over a socket only; socket-free there is no
+  peer to watch.
+- **`subscriptions/listen` held open (`Transport.listens`).** With `mcp.Server.push` on, `mcp`
+  acknowledges a listen and keeps it open. With a `Listens` registry the POST then stays open on an
+  `http.Server.Hold`: the listen gets a private peer handle, is registered under it in the same
+  `lock` section as the call (so no notification falls between the acknowledgment and the
+  registration), and `Transport.pushSink()` is the `mcp.PushSink` that routes a listen's
+  notifications as SSE events onto its stream (and a session peer's onto its `GET` queue). The
+  client closing the stream (its cancellation) ends it silently and drops the subscription
+  (`forgetPeer`); the server shutting down, `Listens.finishAll`, `listen_hold.idle_timeout_ms` or a
+  burst past `listen_queue_bytes` (64 KiB) ends it with the graceful-close result, after which the
+  client re-subscribes (subscriptions.mdx "Graceful Closure"). Without a registry, or with push
+  off, a listen is answered at once as before; one that cannot be held (`max_held_responses`) is
+  closed gracefully at once.
 
 ## Threat model / limits
 
@@ -191,6 +206,11 @@ Run: `scripts/modtest mcp-http`; the example (`example/main.zig`) is built by
   sessions configured, the 400/404/200 statuses, SSE versus a lone-response `application/json`,
   the `subscriptions/listen` stream, a two-round multi round-trip tool, and the session era
   unchanged under a session-revision header.
+- **Held listens and cancellation, over a real `http.Server` on loopback:** a listen's notifications pushed from
+  another thread (`notifyListChanged` / `notifyResourceUpdated` through `pushSink`) arrive after the
+  acknowledgment, a kind it did not ask for does not, `Listens.finishAll` ends it with the graceful-close result and
+  the subscription is gone; the client closing it drops the subscription; without `listens` the old ack-and-close
+  shape. A modern `tools/call` whose connection the client closes sees `ToolCall.cancelled()` (JSON and SSE).
 - **Fuzz:** the deterministic driver `MCP_HTTP_FUZZ=<runs>[,<first seed>]` (testkit; `_ONLY` selects
   a harness) over `mcp-http-pre-parse` (the two JSON scanners) and `mcp-http-wire` (whole raw HTTP
   requests against a router with two live sessions: a forged session id is 404, a foreign Origin
@@ -240,26 +260,31 @@ cannot park a connection); `DELETE` got `200 OK` from the reference and `204 No 
 valid 2xx); the reference names every SSE event `event: message` explicitly and this module omits
 `event:`, which WHATWG SSE defines as the same default type. The SDK ran as a black-box test
 oracle only: no SDK or other MCP-transport source was ported or copied. The capture is of the
-session-era shape; the stateless-revision transport is anchored to the specification text, not to
-an SDK run (see *Backlog / deferred*).
+session-era shape; the 2026-07-28 transport has its own SDK run, below.
+
+### Oracle: the official Python SDK 2.3.0 client over a socket, both revisions
+
+`tools/interop.zig` (`zig build interop-mcp-http [-- --check]`, venv
+`~/.local/share/zig-libs/oracle-venvs/mcp` or `MCP_ORACLE_VENV`, `pip install mcp==2.3.0`) serves
+`tools/sdk_oracle/catalog.zig` through this module's `Transport` (sessions, held listens) on a real
+`http.Server` on 127.0.0.1 and runs `tools/sdk_oracle/drive.py`, which drives it with the SDK's own
+`streamable_http_client` + `ClientSession` (black box, source not read): 2026-07-28 (`discover`, lists,
+tools with structured output, live progress, a multi round-trip tool, a held `subscriptions/listen` that
+receives a pushed `tools/list_changed` and ends with the graceful-close result, a `tools/call` the client
+abandons, whose tool must see `ToolCall.cancelled()` — the SDK closes the connection and sends no
+`notifications/cancelled`), then the session era (`initialize`, the `GET` stream, `DELETE`). 27 typed
+checks. The program records every exchange (request method, target, MCP headers, body; response status,
+content type, body) and, only when every check passed, writes `src/sdk_oracle_vectors.zig`; `--check`
+re-takes and compares with session ids masked. `src/sdk_oracle.zig` replays every request through
+`Transport` over the catalog's copy `src/sdk_oracle_catalog.zig` and requires the same status, content
+type and body byte for byte, except the exchanges that depend on the live run (the held listen, the
+tools that reach the transport or wait for a cancellation).
 
 ## Backlog / deferred
 
-- *BOUNCED (other):* **Held-open `subscriptions/listen`** (2026-07-28's only push channel: list-changed, resource
-  updates). Today `subscriptions/listen` is acknowledged with its filter and then closed
-  gracefully (test "subscriptions/listen is the acknowledgment then the graceful close"); a
-  held-open stream needs change notifications in `mcp` and a held-open response API in `http` (the
-  io-less handler cannot park a connection today, see *GET is drain-and-close*). Effort: large;
-  depends on `http` and `mcp`. *the held-open response API is a design of the `http` module, not of this one;
-  `mcp`'s side (`PushSink`, `notifyListChanged`, `notifyResourceUpdated`) is complete.*
-- *BOUNCED (other):* **Cancellation reaching a running handler.** A closed SSE response stops the writes but cannot
-  interrupt the handler. `mcp`'s seam exists (`ToolCall.cancelled()`, `Server.cancelInflight(peer, id)`, safe from another
-  thread); what is missing is `http` telling a running handler that its connection went away (a liveness probe or a close
-  callback), which the io-less handler contract does not have. *an `http` seam, not this module's.*
-- **A differential run against an official SDK client speaking 2026-07-28.** The python-sdk oracle
-  above is the 2025-06-18 capture; the 2026-07-28 rules are anchored to the specification text. The oracle venv's Python SDK
-  2.3.0 names the 2026-07-28 revision in its source, so a live run is possible: a server binary over `http` and a driver, as
-  `mcp`'s `tools/sdk_oracle` does for stdio. *Not attempted (wave 15, budget).*
+- **Held-open session `GET` stream.** The reference server keeps the 2025-06-18 `GET` stream open (the captured
+  session above); here it drains and closes. `http.Server.Hold` now makes the held stream possible (as for
+  `subscriptions/listen`); it changes the GET's behaviour for every session-era client, so it is a decision of its own.
 
 ## Anchoring
 
@@ -268,4 +293,4 @@ an SDK run (see *Backlog / deferred*).
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/oracle_vectors.zig freezes one real Streamable-HTTP session with the python MCP SDK and root.zig's `oracle:` tests replay it; the unbacked mcp_dart parity claim was retracted rather than counted, and the remaining HTTP/SSE framing paths are self-tested
+**What the tests actually contain.** src/oracle_vectors.zig freezes one real Streamable-HTTP session with the python MCP SDK and root.zig's `oracle:` tests replay it; src/sdk_oracle_vectors.zig freezes the python SDK 2.3.0 client's exchanges of both revisions over a socket (`tools/interop.zig`), replayed byte for byte by src/sdk_oracle.zig; the unbacked mcp_dart parity claim was retracted rather than counted, and the remaining HTTP/SSE framing paths are self-tested
