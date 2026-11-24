@@ -51,7 +51,7 @@ the leaf unconsumed). Initialise it in place with `SigningKey.init(&handle, &sk,
 persist)`. A bare `SecretKey` is not thread-safe: two racing `sign` calls are a
 memory-safety hazard, not only an index-reuse one.
 
-**Not provided:** XMSS^MT (multi-tree), SHA-512/SHAKE suites, a serialisation of the secret key (see SPEC.md
+**Not provided:** XMSS^MT (multi-tree), a serialisation of the secret key (see SPEC.md
 *Backlog / deferred* and *What is deliberately not done*).
 
 **Auth-path traversal is BDS (Buchmann–Dahmen–Schneider), not a naive

@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Rust ecosystem | Rust | — | — | — | No maintained crate found: a GitHub search for `xmss` in Rust returns only research repos of 1–9 stars (e.g. `thomwiggers/xmss-rs`, CC0, last push 2023-02). |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No stateful hash-based signatures at all (LMS or XMSS), per this module's README. |
 
-**Where we are ahead:** the only XMSS in pure Zig with no OpenSSL; verified byte-exact against the reference (F/H/H_msg/PRF, WOTS+, keygen+sign at h = 4, and two real reference-generated h = 10 signatures); BDS traversal so signing is O(h) not O(2^h); a `SigningKey` handle with a persist hook that writes the next index *before* any signature is released, a lock, and a copy guard — none of that is in the reference or (as far as its README shows) in go-xmssmt. **Where we are behind:** only the SHA-256, n = 32 sets (3 of the RFC's 12 single-tree sets by OID; the SHA-512 and SHAKE ones and SP 800-208's 24-byte ones are missing); no XMSS^MT; no serialisation of the secret key (only of the public key — a stated design choice, see *Design & invariants*); no LMS/HSS in this module (the sibling module `lms` (RFC 8554) covers them).
+**Where we are ahead:** the only XMSS in pure Zig with no OpenSSL; verified byte-exact against the reference (F/H/H_msg/PRF, WOTS+, keygen+sign at h = 4, and two real reference-generated h = 10 signatures); BDS traversal so signing is O(h) not O(2^h); a `SigningKey` handle with a persist hook that writes the next index *before* any signature is released, a lock, and a copy guard — none of that is in the reference or (as far as its README shows) in go-xmssmt. Every single-tree set of RFC 8391 and SP 800-208 (21 by OID), the non-SHA-256 ones byte-exact against a second implementation (RustCrypto `xmss`). **Where we are behind:** no XMSS^MT; no serialisation of the secret key (only of the public key — a stated design choice, see *Design & invariants*); no LMS/HSS in this module (the sibling module `lms` (RFC 8554) covers them).
 
 ## Design & invariants
 
@@ -75,8 +75,10 @@ len_1 = 64, len_2 = 3, len = 67):
   O(target·h) resync.
 
 **Not implemented:** XMSS^MT (§4.2 multi-tree — different OID space and
-hypertree signing); the SHA-512 and SHAKE suites (§5 OPTIONAL; RFC only
-REQUIRES the SHA2-256 sets).
+hypertree signing). Every single-tree set is: the RFC's REQUIRED SHA2-256 ones,
+its OPTIONAL SHA-512 and SHAKE ones (OIDs 0x04..0x0c) and SP 800-208's
+SHA-256/192, SHAKE256/256 and SHAKE256/192 (0x0d..0x15), through the generic
+`suite.zig` / `scheme.zig`.
 
 **CNSA 2.0 posture — the scope above happens to be exactly the approved
 one.** NSA's CNSA 2.0 FAQ (v2.1) approves the two NIST SP 800-208 stateful
@@ -213,6 +215,14 @@ scheme's security argument collapses per-index, not per-signature.
 ## Verification
 
 - **Run:** `scripts/modtest xmss` (the module is `heavy`).
+- **Second oracle, the other suites:** the RustCrypto `xmss` crate 0.1.0-pre.0 (a Rust port of xmss-reference,
+  crates.io; its crate and dependencies reviewed before the build: no `unsafe`, no build script in it, the
+  dependencies' build scripts only probe `rustc`), driven with `KeyPair::from_seed` (seed byte i = i) and two
+  detached signatures per suite at h = 10, `src/kat_suites_vectors.zig`. `src/kat_suites_test.zig`: for
+  SHA2_10_512, SHAKE_10_256, SHAKE_10_512, SHA2_10_192, SHAKE256_10_256 and SHAKE256_10_192 (plus SHA2_10_256
+  as the control, whose root also equals the C reference's) the signatures verify and a flipped byte does not,
+  `keyGen` gives the same wire public key and `sign` reproduces both signatures byte for byte (ReleaseSafe;
+  skipped in Debug). h = 16 / 20 are the same code at another height.
 - **Oracle:** the official XMSS reference implementation (github.com/XMSS/xmss-reference, built unmodified
   against OpenSSL's SHA-256), driven with fixed deterministic inputs; the generator conventions are documented in
   `src/kat_vectors.zig`. Byte-exact against it (`src/kat_test.zig`):
@@ -279,15 +289,6 @@ scheme's security argument collapses per-index, not per-signature.
   comptime code path, exercised only at h <= 10.
 
 ## Backlog / deferred
-
-- **SHA-512, SHAKE128/SHAKE256 suites (RFC 8391 OIDs 4–12) and SP 800-208's 24-byte and
-  SHAKE256 sets (0x0d–0x15)**: the code is generic since 2026-11-23 (`suite.zig`,
-  `Xmss(suite.<set>, h, oid)`; `toByte(i, padding_len)` with padding 4 for n = 24, as
-  xmss-reference) and every suite signs and verifies at h = 4. What is missing is the
-  evidence: byte-exact KATs per suite from xmss-reference (CC0; a C driver over
-  `xmss_parse_oid` + `xmssmt_core_seed_keypair` + `xmss_core_sign` at h = 4 and h = 10,
-  seed byte i = i) and then the named OID exports (`XmssSha2_10_512` …). The reference run
-  is a foreign binary and waits for the owner's approval.
 
 ## Roadmap
 

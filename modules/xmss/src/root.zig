@@ -55,9 +55,9 @@
 //! Hash suites: the code is generic over the suite (`suite.zig`: SHA-256,
 //! SHA-512, SHAKE128, SHAKE256 at n = 24 / 32 / 64, the RFC 8391 OPTIONAL and
 //! NIST SP 800-208 sets) through `Xmss(suite.<set>, h, oid)`. Only the SHA-256
-//! sets are exported by name and validated against xmss-reference; the others
-//! sign and verify (round trips at h = 4) but have no reference KAT yet, so no
-//! named OID is exported for them.
+//! sets are validated against xmss-reference; every other RFC 8391 / SP 800-208
+//! set (`XmssSha2_10_512` … `XmssShake256_20_192`) against the RustCrypto
+//! `xmss` crate (keygen from a seed, signatures, verification; h = 10).
 //! Out of scope: XMSS^MT (§4.2 multi-tree).
 //! Not constant-time hardened (hash-based; no secret-dependent branching
 //! beyond the hash inputs themselves — verify is public-data only).
@@ -78,7 +78,7 @@ const burn = @import("burn.zig");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "XMSS (RFC 8391), single-tree SHA-256 — **stateful** hash-based signatures. Index reuse breaks the scheme; `sign` advances the index first.",
+    .doc = "XMSS (RFC 8391, NIST SP 800-208), single-tree, every SHA-2 / SHAKE set — **stateful** hash-based signatures. Index reuse breaks the scheme; `sign` advances the index first.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -95,8 +95,8 @@ pub const meta = .{
     // Debug and a **SIGSEGV in ReleaseFast**, the shipping mode. `SigningKey`
     // is the hardened handle that IS safe to share — see its doc comment.
     .concurrency = .reentrant,
-    .model_after = "RFC 8391 (XMSS); XMSS/xmss-reference as KAT oracle",
-    .deps = .{}, // std only (SHA-256)
+    .model_after = "RFC 8391 (XMSS), NIST SP 800-208; XMSS/xmss-reference and RustCrypto xmss as KAT oracles",
+    .deps = .{}, // std only (SHA-2, SHAKE)
 };
 
 pub const suite = @import("suite.zig");
@@ -145,6 +145,35 @@ pub const XmssSha2_16_256 = XmssSha2(16, 0x00000002);
 /// 2^20 signatures. Keygen ≈ 1.3e9 hashes; naive auth paths make signing
 /// O(2^20) hashing too — practical only with out-of-band caching.
 pub const XmssSha2_20_256 = XmssSha2(20, 0x00000003);
+
+// ── RFC 8391 OPTIONAL and NIST SP 800-208 parameter sets (IANA OIDs) ──
+// Byte-exact against the RustCrypto `xmss` crate at h = 10
+// (`kat_suites_test.zig`); h = 16 / 20 are the same code at another height.
+
+/// XMSS-SHA2_h_512 (RFC 8391 §5.3, OIDs 0x04..0x06): SHA-512, n = 64.
+pub const XmssSha2_10_512 = Xmss(suite.sha2_512, 10, 0x00000004);
+pub const XmssSha2_16_512 = Xmss(suite.sha2_512, 16, 0x00000005);
+pub const XmssSha2_20_512 = Xmss(suite.sha2_512, 20, 0x00000006);
+/// XMSS-SHAKE_h_256 (RFC 8391 §5.3, OIDs 0x07..0x09): SHAKE128, n = 32.
+pub const XmssShake_10_256 = Xmss(suite.shake128_256, 10, 0x00000007);
+pub const XmssShake_16_256 = Xmss(suite.shake128_256, 16, 0x00000008);
+pub const XmssShake_20_256 = Xmss(suite.shake128_256, 20, 0x00000009);
+/// XMSS-SHAKE_h_512 (RFC 8391 §5.3, OIDs 0x0a..0x0c): SHAKE256, n = 64.
+pub const XmssShake_10_512 = Xmss(suite.shake256_512, 10, 0x0000000a);
+pub const XmssShake_16_512 = Xmss(suite.shake256_512, 16, 0x0000000b);
+pub const XmssShake_20_512 = Xmss(suite.shake256_512, 20, 0x0000000c);
+/// XMSS-SHA2_h_192 (SP 800-208 §5.1, OIDs 0x0d..0x0f): SHA-256/192, n = 24.
+pub const XmssSha2_10_192 = Xmss(suite.sha2_192, 10, 0x0000000d);
+pub const XmssSha2_16_192 = Xmss(suite.sha2_192, 16, 0x0000000e);
+pub const XmssSha2_20_192 = Xmss(suite.sha2_192, 20, 0x0000000f);
+/// XMSS-SHAKE256_h_256 (SP 800-208 §5.3, OIDs 0x10..0x12): SHAKE256, n = 32.
+pub const XmssShake256_10_256 = Xmss(suite.shake256_256, 10, 0x00000010);
+pub const XmssShake256_16_256 = Xmss(suite.shake256_256, 16, 0x00000011);
+pub const XmssShake256_20_256 = Xmss(suite.shake256_256, 20, 0x00000012);
+/// XMSS-SHAKE256_h_192 (SP 800-208 §5.4, OIDs 0x13..0x15): SHAKE256/192, n = 24.
+pub const XmssShake256_10_192 = Xmss(suite.shake256_192, 10, 0x00000013);
+pub const XmssShake256_16_192 = Xmss(suite.shake256_192, 16, 0x00000014);
+pub const XmssShake256_20_192 = Xmss(suite.shake256_192, 20, 0x00000015);
 
 test "API surface: RFC 8391 sizes" {
     // §4.1.8: |Sig| = 4 + n + (len + h)*n; Table 3 |Sig| column.
@@ -582,6 +611,7 @@ test "corpus: the XMSS seeds reach the signature parser, and the counts are pinn
 }
 
 test {
+    _ = @import("kat_suites_test.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
@@ -589,7 +619,7 @@ test {
     _ = @import("stackprobe2_test.zig");
 }
 
-// ── the generic suites: round trips (byte-exact KATs from xmss-reference pending) ──
+// ── the generic suites: round trips at h = 4 (KATs in kat_suites_test.zig) ──
 
 fn suiteRoundTrip(comptime cfg: suite.Config) !void {
     const X = Xmss(cfg, 4, 0xDDDDDDDE);

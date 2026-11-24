@@ -641,7 +641,7 @@ Every one of the 267 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`webauthn`](modules/webauthn/README.md) | 3 (S,H,P) | WebAuthn / FIDO2 Relying-Party **verifier** (W3C Level 3) — assertion + registration ceremony checks, plus attestation verification. Verification only. | any | cbor, rsa, p256, p384, p521, x509 |
 | [`wipealloc`](modules/wipealloc/README.md) | 3 (S,A,P) | Allocator adapter that zeroes every block before it is freed and refuses resize/remap, so a growing secret-holding buffer never leaves an unwiped copy in the child allocator. | any (portable) | — |
 | [`x509`](modules/x509/README.md) | 2 (A) | X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates, plus CRL revocation checking (RFC 5280 §6.3). | any | rsa, slhdsa, p521, p256, netaddr |
-| [`xmss`](modules/xmss/README.md) | 4 (S) | XMSS (RFC 8391), single-tree SHA-256 — **stateful** hash-based signatures. Index reuse breaks the scheme; `sign` advances the index first. | any | — |
+| [`xmss`](modules/xmss/README.md) | 4 (S) | XMSS (RFC 8391, NIST SP 800-208), single-tree, every SHA-2 / SHAKE set — **stateful** hash-based signatures. Index reuse breaks the scheme; `sign` advances the index first. | any | — |
 
 **Also worth reaching for from `crypto`** — these are filed under another library (in brackets), and appear here because a consumer working in `crypto` has a use for them:
 
