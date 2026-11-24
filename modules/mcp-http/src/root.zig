@@ -2975,6 +2975,7 @@ test "close() actually ends the session it marks" {
 test {
     _ = modern;
     _ = sidhex;
+    _ = @import("sdk_oracle.zig");
 }
 
 /// A POST with arbitrary extra header lines (each ending `\r\n`).

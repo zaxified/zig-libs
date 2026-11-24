@@ -92,6 +92,11 @@ a black-box test oracle.
   Python SDK** (initialize, `notifications/initialized`, `tools/list`, two
   `tools/call`s — one with live progress notifications — all byte-exact
   against the captured request/response bytes; see `oracle_vectors.zig`).
+- a replay of every exchange the **official Python SDK 2.3.0** client made over a
+  socket in both revisions (`sdk_oracle_vectors.zig`, taken by
+  `zig build interop-mcp-http`, which also checks a held listen and a
+  cancelled call live).
+- held listens and cancellation over a real `http.Server`.
 
 Fuzz: `MCP_HTTP_FUZZ=<runs>`. SPEC *Verification* has the rest.
 

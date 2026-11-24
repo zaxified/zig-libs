@@ -260,18 +260,31 @@ cannot park a connection); `DELETE` got `200 OK` from the reference and `204 No 
 valid 2xx); the reference names every SSE event `event: message` explicitly and this module omits
 `event:`, which WHATWG SSE defines as the same default type. The SDK ran as a black-box test
 oracle only: no SDK or other MCP-transport source was ported or copied. The capture is of the
-session-era shape; the stateless-revision transport is anchored to the specification text, not to
-an SDK run (see *Backlog / deferred*).
+session-era shape; the 2026-07-28 transport has its own SDK run, below.
+
+### Oracle: the official Python SDK 2.3.0 client over a socket, both revisions
+
+`tools/interop.zig` (`zig build interop-mcp-http [-- --check]`, venv
+`~/.local/share/zig-libs/oracle-venvs/mcp` or `MCP_ORACLE_VENV`, `pip install mcp==2.3.0`) serves
+`tools/sdk_oracle/catalog.zig` through this module's `Transport` (sessions, held listens) on a real
+`http.Server` on 127.0.0.1 and runs `tools/sdk_oracle/drive.py`, which drives it with the SDK's own
+`streamable_http_client` + `ClientSession` (black box, source not read): 2026-07-28 (`discover`, lists,
+tools with structured output, live progress, a multi round-trip tool, a held `subscriptions/listen` that
+receives a pushed `tools/list_changed` and ends with the graceful-close result, a `tools/call` the client
+abandons, whose tool must see `ToolCall.cancelled()` — the SDK closes the connection and sends no
+`notifications/cancelled`), then the session era (`initialize`, the `GET` stream, `DELETE`). 27 typed
+checks. The program records every exchange (request method, target, MCP headers, body; response status,
+content type, body) and, only when every check passed, writes `src/sdk_oracle_vectors.zig`; `--check`
+re-takes and compares with session ids masked. `src/sdk_oracle.zig` replays every request through
+`Transport` over the catalog's copy `src/sdk_oracle_catalog.zig` and requires the same status, content
+type and body byte for byte, except the exchanges that depend on the live run (the held listen, the
+tools that reach the transport or wait for a cancellation).
 
 ## Backlog / deferred
 
 - **Held-open session `GET` stream.** The reference server keeps the 2025-06-18 `GET` stream open (the captured
   session above); here it drains and closes. `http.Server.Hold` now makes the held stream possible (as for
   `subscriptions/listen`); it changes the GET's behaviour for every session-era client, so it is a decision of its own.
-- **A differential run against an official SDK client speaking 2026-07-28.** The python-sdk oracle
-  above is the 2025-06-18 capture; the 2026-07-28 rules are anchored to the specification text. The oracle venv's Python SDK
-  2.3.0 names the 2026-07-28 revision in its source, so a live run is possible: a server binary over `http` and a driver, as
-  `mcp`'s `tools/sdk_oracle` does for stdio. *Not attempted (wave 15, budget).*
 
 ## Anchoring
 
@@ -280,4 +293,4 @@ an SDK run (see *Backlog / deferred*).
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/oracle_vectors.zig freezes one real Streamable-HTTP session with the python MCP SDK and root.zig's `oracle:` tests replay it; the unbacked mcp_dart parity claim was retracted rather than counted, and the remaining HTTP/SSE framing paths are self-tested
+**What the tests actually contain.** src/oracle_vectors.zig freezes one real Streamable-HTTP session with the python MCP SDK and root.zig's `oracle:` tests replay it; src/sdk_oracle_vectors.zig freezes the python SDK 2.3.0 client's exchanges of both revisions over a socket (`tools/interop.zig`), replayed byte for byte by src/sdk_oracle.zig; the unbacked mcp_dart parity claim was retracted rather than counted, and the remaining HTTP/SSE framing paths are self-tested
