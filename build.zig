@@ -986,6 +986,16 @@ pub fn build(b: *std.Build) void {
                 b.fmt("bench-{s}", .{m.name}),
                 b.fmt("Benchmark {s} against the foreign implementations its maturity card compares with (needs them)", .{m.name}),
             ).dependOn(&bench_run.step);
+            // `install-bench-<m>` (2026-11-24): build only, into zig-out/bench/,
+            // so the binary can run OUTSIDE the build's own cgroup -- inside a
+            // cpuset shield that fences the desktop and the build jobs off the
+            // measured core. Run it from the repository root like the step does.
+            b.step(
+                b.fmt("install-bench-{s}", .{m.name}),
+                b.fmt("Install the {s} benchmark program into zig-out/bench/ (build only)", .{m.name}),
+            ).dependOn(&b.addInstallArtifact(bench_exe, .{
+                .dest_dir = .{ .override = .{ .custom = "bench" } },
+            }).step);
             if (in_group) check_interop.dependOn(&bench_exe.step);
         }
 
