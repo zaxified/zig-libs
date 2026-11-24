@@ -48,6 +48,8 @@ encoder is the same. A string with nothing to escape skips the staging block and
 
 RFC 8259 §7. The string literal is `"` + contents + `"`. Contents: `"` → `\"`, `\` → `\\`, `0x08 0x09 0x0A 0x0C 0x0D` → `\b \t \n \f \r`, every other byte below 0x20 → `\u00xx` (lowercase hex), everything else verbatim unless an option applies. UTF-8 classification follows Unicode 16.0 Table 3-7 and the maximal-subpart rule of §3.9 (`utf8Step`). `ascii_only` writes a scalar above U+FFFF as the UTF-16 surrogate pair `\ud83d\ude00` (lowercase hex); `html_safe` adds `<`, `>`, `&` (`\u003c`, `\u003e`, `\u0026`) and U+2028 / U+2029.
 
+Further switches, each added for an in-repo consumer whose private copy moved here (byte-identity differentials against the copies were run before they were deleted): `escape_del` (DEL as `\u007f`, CPython's `ensure_ascii`); `short_escapes` (`.all` default, `.tnr` leaves `\b` `\f` as `\u0008` `\u000c`, `.none` writes every control as `\u00XX`); `escape_chars` (a comptime set of extra ASCII bytes as `\u00XX`, e.g. `"<"` for a script literal or `"<>&'"` for an attribute-safe one); and three more `invalid_utf8` policies: `replace_per_byte` (one U+FFFD per ill-formed byte, Go's), `escape_all_high_if_invalid` (once any byte is ill-formed every byte >= 0x80 is `\u00XX`, valid sequences too; one extra validation pass) and `verbatim` (bytes >= 0x80 pass through untouched; incompatible with `ascii_only` / `html_safe`, a compile error).
+
 The scan is table-driven: one lookup per byte for the verbatim set; a well-formed run is handed over in one piece when an escape interrupts. Escapes and runs under 64 bytes are gathered in a 256-byte block on the stack (`Pending`) and written to the writer in blocks, longer runs go straight through after what is pending, so the output order is the call order. Nothing is allocated.
 
 `depthWithin(bytes, max)` is one pass tracking `in_string` / `escaped`; `[`/`{` outside a string increase depth, `]`/`}` decrease it (saturating at 0). It does not validate — the doc comment lists exactly what it accepts.
@@ -62,9 +64,9 @@ The scan is table-driven: one lookup per byte for the verbatim set; a well-forme
 
 - **Number formatting, key ordering, pretty printing, object writers, a streaming `Encoder` object.** `std.json.Stringify` owns them
   (use it for values; this module is for a string that arrives as bytes). *Never* in this module: it would make it a second JSON library.
-- **Escaping DEL (0x7F).** RFC 8259 §7 does not list it; Go and serde_json do not escape it. CPython's `ensure_ascii` does. Not now; if a consumer needs it, add `StringOptions.escape_del`.
+- **Escaping DEL (0x7F) by default.** RFC 8259 §7 does not list it; Go and serde_json do not escape it. CPython's `ensure_ascii` does, hence the opt-in `escape_del`.
 - **Lone surrogates.** A Zig `[]const u8` is UTF-8, where a surrogate (`ED A0..BF`) is ill-formed and goes through the `invalid_utf8` policy. There is no WTF-8 mode. Never (no caller has WTF-8).
-- **A per-byte U+FFFD policy (Go's).** Refused: the maximal-subpart policy is the Unicode / WHATWG recommendation. The two differ only on a truncated valid prefix; the tests pin the difference.
+- **A per-byte U+FFFD policy (Go's) as the default.** The maximal-subpart policy is the Unicode / WHATWG recommendation and stays the default; `replace_per_byte` is opt-in (Go's behaviour, and what the in-repo writers that moved here had). The two differ only on a truncated valid prefix; the tests pin the difference.
 - **Escaping `/`.** Never written as `\/`; only needed inside `</script>`, which `html_safe` already covers by escaping `<`.
 
 ## Verification
@@ -72,7 +74,7 @@ The scan is table-driven: one lookup per byte for the verbatim set; a well-forme
 Run: `scripts/modtest jsontext`.
 
 - **Exact-byte tests** (`src/root.zig`): quotes, escapes and the C0 controls; one U+FFFD per maximal subpart; `escape_bytes`;
-  `reject`; `ascii_only` with surrogate pairs; `html_safe`; every option combination round-tripped through `std.json`;
+  `reject`; `ascii_only` with surrogate pairs; `html_safe`; `escape_del`, `short_escapes`, `escape_chars`, `replace_per_byte`, `escape_all_high_if_invalid`, `verbatim`; every option combination round-tripped through `std.json`;
   ill-formed input always yields a parseable document; `utf8Step` against `std.unicode` over an exhaustive byte sweep and
   its maximal subpart brute-forced; `decodeScalar` over every Unicode scalar value; escapes beyond one pending block and long
   runs keep their order; a clean string is one write; `depthWithin` (strings are text, braces count like brackets,
@@ -107,15 +109,7 @@ The generator asserts the CPython claim the maximal-subpart policy rests on (`E2
 
 ## Backlog / deferred
 
-- **Options that would let the remaining private JSON-string writers move here** (health, jinja, dataframe `jsonio`, cbor diag, json5,
-  openapi; each copy is kept because no option set is byte-identical): `escape_del` (health, cbor diag escape 0x7f);
-  `short_escapes = false` — `\u0008`/`\u000c` instead of `\b`/`\f` (dataframe jsonio, json5, openapi); a per-BYTE
-  U+FFFD replace (dataframe, cbor) beside today's per-maximal-subpart one; `.escape_all_high_if_invalid` (health: every
-  byte ≥ 0x80 as `\u00XX` once any byte is ill-formed, including valid sequences — `escape_bytes` here escapes only the
-  ill-formed bytes, a deliberate narrowing the health move must accept); a verbatim-bytes mode (json5, openapi pass non-ASCII and
-  invalid bytes through); a caller-chosen extra escape set (openapi only `<`; jinja `tojson` `<>&'`); jinja's error
-  mapping (truncated sequence = error, bad lead = `\u00XX`). Each is small; add one only together with the consumer
-  that moves onto it (and a byte-identity differential against the copy before deleting it).
+None open.
 
 ## Open
 
