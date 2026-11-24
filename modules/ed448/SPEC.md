@@ -234,7 +234,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `decaf448`'s `Element.encode`/`oneWayMap` on secret values by `voprf`'s ctgrind rows (`ed448`'s own
   rows never reached it with a tainted condition). The same barrier on `scalar.zig`'s `condSubL` moved a
   scalar copy into a frame `decaf448`'s `scalar.invert` stack probe reads, so `condSubL`'s mask is not
-  laundered (*Backlog / deferred*). The `Fe.fromBytes` canonical verdict `voprf` also reports is a
+  laundered (*What is deliberately not done*). The `Fe.fromBytes` canonical verdict `voprf` also reports is a
   verdict on whether an encoding is `< p`; on the `decaf448` path that rebuilds an element from computed
   bytes, it always passes.
 - **Dead stack.** `Point.mul`, `Point.mulBasePoint`, Ed448 signing and key creation, and
@@ -309,6 +309,13 @@ measured on it.
   the select is branch-free as compiled; a compiler that branched there would move the pinned count. Laundering
   it anyway moved `decaf448`'s `scalar.invert` dead-stack probe (the scalar found 167–199 B below the region top)
   and would need a deeper burn there.
+
+- **Mixed (`Z = 1`) additions for `verify`'s base-point table.** `mulDoubleBaseVartime` adds entries of the
+  comptime `baseOdd` table (about 56 of the ~190 additions); normalizing them to `Z = 1` at comptime and
+  dropping the `Z1 * Z2` product saves one multiplication in fourteen of those additions, about 1 % of
+  `verify`. Measured in the shield (ABAB, same host): 236.6 and 241.0 µs against 232.4 and 228.6 µs without it,
+  so no gain; the table was left projective (and 16 s of compile time, one comptime inversion per entry,
+  stay out).
 
 - **A cofactorless `verifyStrict`** (RFC 8032 §5.2.7's `[S]B = R + [k]A'`): `verify`/`verifyPh` are
   cofactored only, as `std.crypto.sign.Ed25519.verify` is (see *Threat model*).
@@ -388,8 +395,7 @@ forced-inline `mulI`/`squareI`) are in *Design*.
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **Speed leftovers** (verify at 1.03–1.07× OpenSSL). Perf, to be measured A/B on a quiet
-  host. Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
+None open.
 
 ## Anchoring
 
