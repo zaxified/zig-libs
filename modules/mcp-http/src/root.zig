@@ -1287,7 +1287,7 @@ const CallCancel = struct {
 
     fn fire(ctx: ?*anyopaque) void {
         const c: *CallCancel = @ptrCast(@alignCast(ctx.?));
-        _ = c.server.cancelInflight(c.peer, c.id);
+        _ = c.server.cancelInflightSticky(c.peer, c.id);
     }
 };
 

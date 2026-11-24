@@ -2437,6 +2437,16 @@ fn outputFailure(arena: std.mem.Allocator, schema: *const schema_check.Schema, t
     return try arena.print("Output validation error: {s}{s}{s}", .{ f.pointer, if (f.pointer.len != 0) ": " else "", f.message });
 }
 
+const tombstone_cap = 32;
+
+/// A cancel that arrived before its call registered (`Server.cancelInflightSticky`).
+const Tombstone = struct {
+    used: bool = false,
+    peer: u64 = 0,
+    len: u8 = 0,
+    id: [128]u8 = undefined,
+};
+
 const Inflight = struct {
     peer: u64,
     /// The request id as compact JSON (`7`, `"abc"`), arena-owned by the call.
@@ -3627,6 +3637,11 @@ pub const Server = struct {
     /// transport delivers a cancel while a handler holds that one.
     inflight: std.ArrayList(Inflight) = .empty,
     inflight_lock: std.atomic.Mutex = .unlocked,
+    /// Cancels `cancelInflightSticky` found no call for (the call has not
+    /// registered yet), consulted by `registerInflight`. A ring of the newest
+    /// `tombstone_cap`; guarded by `inflight_lock`.
+    tombstones: [tombstone_cap]Tombstone = @splat(.{}),
+    tombstone_next: usize = 0,
     /// Change notifications (R12): when true the server advertises
     /// `listChanged` on tools/prompts/resources and `resources.subscribe`,
     /// answers `resources/subscribe`/`unsubscribe`, and holds a 2026-07-28
@@ -3723,6 +3738,11 @@ pub const Server = struct {
     /// does not accumulate them. Dropped pending entries are *not* handed to
     /// their `on_response` handler — the peer is gone, there is no answer.
     pub fn forgetPeer(self: *Server, peer: u64) void {
+        self.lockInflight();
+        for (&self.tombstones) |*t| {
+            if (t.used and t.peer == peer) t.used = false;
+        }
+        self.inflight_lock.unlock();
         self.dropPeerSubscriptions(peer);
         var i: usize = self.pending.items.len;
         while (i > 0) {
@@ -3892,6 +3912,23 @@ pub const Server = struct {
     /// response stream of a 2026-07-28 request. Returns whether a call was
     /// found.
     pub fn cancelInflight(self: *Server, peer: u64, request_id: std.json.Value) bool {
+        return self.cancelInflightImpl(peer, request_id, false);
+    }
+
+    /// `cancelInflight` for a transport that cancels a call of a peer handle
+    /// it owns (`mcp-http`'s private per-request peer): when no call is in
+    /// flight yet, the cancel is remembered and applied the moment the call
+    /// registers, so a client that left just before the handler started does
+    /// not lose its cancel. The memory is a ring of the newest 32 and is
+    /// dropped by `forgetPeer(peer)`, so the transport must use it only for a
+    /// peer handle that is never reused for a later request with the same id
+    /// (a stale entry would cancel that one). Returns whether a running call
+    /// was found.
+    pub fn cancelInflightSticky(self: *Server, peer: u64, request_id: std.json.Value) bool {
+        return self.cancelInflightImpl(peer, request_id, true);
+    }
+
+    fn cancelInflightImpl(self: *Server, peer: u64, request_id: std.json.Value, remember: bool) bool {
         // An array/object/non-finite id was never issued (and would recurse in
         // the serializer): nothing to cancel.
         if (!conformingId(request_id)) return false;
@@ -3907,6 +3944,14 @@ pub const Server = struct {
                 return true;
             }
         }
+        if (remember) {
+            const t = &self.tombstones[self.tombstone_next];
+            self.tombstone_next = (self.tombstone_next + 1) % tombstone_cap;
+            t.used = true;
+            t.peer = peer;
+            t.len = @intCast(key.len);
+            @memcpy(t.id[0..key.len], key);
+        }
         return false;
     }
 
@@ -3914,6 +3959,12 @@ pub const Server = struct {
         self.lockInflight();
         defer self.inflight_lock.unlock();
         self.inflight.append(self.gpa, .{ .peer = peer, .id_json = id_json, .flag = flag }) catch return false;
+        for (&self.tombstones) |*t| {
+            if (t.used and t.peer == peer and std.mem.eql(u8, t.id[0..t.len], id_json)) {
+                t.used = false;
+                flag.store(true, .release);
+            }
+        }
         return true;
     }
 
@@ -6721,6 +6772,59 @@ test "cancellation: Server.cancelInflight from another thread stops a running to
     , "");
     th.join();
     try testing.expect(!s.cancelInflight(0, .{ .string = "job-1" })); // gone once finished
+}
+
+fn reportCancelTool(_: ?*anyopaque, call: *ToolCall) bool {
+    call.print("{}", .{call.cancelled()});
+    return false;
+}
+
+test "cancellation: a sticky cancel that arrives before the call registers is applied at registration" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "r", .description = "", .input_schema = "{}", .handler = reportCancelTool });
+    const call7 =
+        \\{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"r","arguments":{}}}
+    ;
+    // Nothing in flight: reported as not found, but remembered.
+    try testing.expect(!s.cancelInflightSticky(0, .{ .integer = 7 }));
+    // The call registers afterwards and is cancelled: no response.
+    try expectResponse(&s, call7, "");
+    // The tombstone is consumed: the same id again runs normally.
+    try expectResponse(&s, call7,
+        \\{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"false"}],"isError":false}}
+        \\
+    );
+    // The plain cancel (a client's notifications/cancelled) is not remembered.
+    try testing.expect(!s.cancelInflight(0, .{ .integer = 7 }));
+    try expectResponse(&s, call7,
+        \\{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"false"}],"isError":false}}
+        \\
+    );
+    // Another peer's call, and forgetPeer, leave no stale cancel behind.
+    try testing.expect(!s.cancelInflightSticky(5, .{ .integer = 7 }));
+    try expectResponse(&s, call7,
+        \\{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"false"}],"isError":false}}
+        \\
+    );
+    s.forgetPeer(5);
+    try testing.expect(!s.cancelInflightSticky(6, .{ .string = "x" }));
+    s.forgetPeer(6);
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":"x","method":"tools/call","params":{"name":"r","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":"x","result":{"content":[{"type":"text","text":"false"}],"isError":false}}
+        \\
+    );
+    // Bounded: only the newest tombstone_cap are kept.
+    var i: i64 = 0;
+    while (i < tombstone_cap + 1) : (i += 1) _ = s.cancelInflightSticky(0, .{ .integer = 100 + i });
+    var live: usize = 0;
+    for (s.tombstones) |t| {
+        if (t.used) live += 1;
+    }
+    try testing.expectEqual(@as(usize, tombstone_cap), live);
+    try testing.expectEqual(@as(usize, 0), s.inflight.items.len);
 }
 
 const TestSink = struct {

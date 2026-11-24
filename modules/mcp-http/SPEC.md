@@ -120,7 +120,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (from 2^62 up; 2026-07-28 requests otherwise share peer 0), so one client's close cannot cancel
   another client's call with the same id. Not on the session path: 2025-06-18 says a disconnect is
   not a cancellation (`notifications/cancelled` is). A client already gone when the call gets the
-  transport lock (the watch fired before any call was in flight to cancel) never runs it. Over a
+  transport lock (the watch fired before any call was in flight to cancel) never runs it, and a disconnect that
+  beats the call's registration inside `mcp` is kept (`cancelInflightSticky`) and cancels the call at once. Over a
   socket only; socket-free there is no peer to watch.
 - **`subscriptions/listen` held open (`Transport.listens`).** With `mcp.Server.push` on, `mcp`
   acknowledges a listen and keeps it open. With a `Listens` registry the POST then stays open on an
