@@ -139,6 +139,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("rejection_test.zig");
     _ = @import("mds_replay_test.zig");
+    _ = @import("sparse_test.zig");
     _ = @import("small_field.zig");
 }
 

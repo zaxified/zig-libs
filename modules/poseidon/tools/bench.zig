@@ -20,8 +20,8 @@
 //!   neptune_a2 / _a4 / _a8   2 / 4 / 8 inputs, Merkle tag, standard strength
 //! Not the same: the reference's per-hash setup differs (neptune re-fills a
 //! `Poseidon` buffer and runs its preprocessed sparse-matrix schedule;
-//! light-poseidon allocates a result vector); ours runs the plain schedule on
-//! `permute`. Instance construction (the Grain derivation) is not timed on any
+//! light-poseidon allocates a result vector); ours runs the optimised partial-round schedule
+//! of `permute`, as neptune does. Instance construction (the Grain derivation) is not timed on any
 //! side. Wall time only (the foreign side counts no cycles). Ratios are
 //! ours/reference.
 

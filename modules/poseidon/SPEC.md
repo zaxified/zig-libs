@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, POSEIDON_FUZZ) · ct n/a — public-input hash (keyword review, 2026-10-07) · panic 2026-11-14 (sweep of every pub entry point: typed `Fr` and comptime widths leave no data path; LOW `mds_security.Checks` took a runtime `t` that indexed past fixed buffers above `n_max` and underflowed at 0, now a checked panic at all 9 entry points; LOW `grain.derive` looped forever on a zero modulus and dropped bits above 256, now `@compileError`)
 
-**Performance:** ref 0.65–3.23× light-poseidon 0.4.0 (BN254 rows 0.65–0.75×) and neptune 14.0.0 (BLS12-381 rows 1.56–3.23×: its preprocessed sparse-matrix partial rounds and blst assembly; see Performance) · fastest ? (measured 2026-11-24; host shared with other jobs, best-of-rounds ratios repeat within 2 % across two runs)
+**Performance:** ref 0.38–1.15× light-poseidon 0.4.0 (BN254 rows 0.38–0.47×) and neptune 14.0.0 (BLS12-381 rows 1.09–1.17×; see Performance) · fastest ? (measured 2026-11-24; host shared with other jobs, two runs of 9 rounds agree within 6 % per row)
 
 **Known defects:** none recorded
 
@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [Plonky3/Plonky3](https://github.com/Plonky3/Plonky3), [Consensys/gnark-crypto](https://github.com/Consensys/gnark-crypto), [HorizenLabs/poseidon2](https://github.com/HorizenLabs/poseidon2) | Rust / Go / Rust | Apache-2.0 each (API) | 852 / 600 / 76 | v0.8.0 (2026-09-23) / v0.21.0 (2026-08-10) / push 2024-11-25 | The ZK stacks that have moved to **Poseidon2** over BabyBear/Goldilocks/BN254 *(inferred from names and descriptions, not read)*. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No algebraic hash. |
 
-**Where we are ahead:** of the Zig alternatives, the only Poseidon that reaches the deployed circom widths t = 2..17 and also covers BLS12-381, that derives its round constants from the authors' Grain-LFSR generator (with the MDS subspace-trail checks and rejection loop) instead of shipping a table, and whose permutation is built on constant-time field arithmetic. **Where we are behind:** no Poseidon2 (the direction newer ZK stacks are going); no variable-length sponge (a stated refusal, see *What is deliberately not done*); `bls12_381.Perm` only at t = 3 and 5 (Filecoin/neptune's arities 1..36 and domain tags are `poseidon.neptune`); field elements in and out (byte conversion is `bn254.Fr.toBytes`/`fromBytes` in the sibling), no `hash_bytes`-style convenience. (→ Backlog item: optimised partial rounds)
+**Where we are ahead:** of the Zig alternatives, the only Poseidon that reaches the deployed circom widths t = 2..17 and also covers BLS12-381, that derives its round constants from the authors' Grain-LFSR generator (with the MDS subspace-trail checks and rejection loop) instead of shipping a table, and whose permutation is built on constant-time field arithmetic. **Where we are behind:** no Poseidon2 (the direction newer ZK stacks are going); no variable-length sponge (a stated refusal, see *What is deliberately not done*); `bls12_381.Perm` only at t = 3 and 5 (Filecoin/neptune's arities 1..36 and domain tags are `poseidon.neptune`); field elements in and out (byte conversion is `bn254.Fr.toBytes`/`fromBytes` in the sibling), no `hash_bytes`-style convenience.
 
 ## What the hard part actually is
 
@@ -125,6 +125,29 @@ form is what it should emit — and the reference form is what would check it.
 
 Nothing here is Poseidon2 (Grassi/Khovratovich/Schofnegger 2023), which is a
 genuinely different permutation with a different linear layer. Not implemented (see *Backlog / deferred*).
+
+### Optimised partial rounds — followed: the paper's equivalent form, plain schedule kept as the differential
+
+`Permutation.permute` does not run the textbook schedule on the partial rounds. It runs the
+equivalent form of the Poseidon paper's appendix, as neptune's `preprocessing.rs` / `matrix.rs` do,
+built once in `init()` from the same tables (`round_constants` and `mds` are unchanged and still
+the externally anchored ones):
+
+- with `M = [[m00, w^T], [v, H]]`, the `R_P` partial rounds `M S0 (. + a_p e0)` are one dense
+  pre-matrix `diag(1, H^R_P)` followed by `R_P` sparse rounds whose matrix `Sp_k = [[m00, w^T H^-k],
+  [H^(k-1) v, I]]` has a dense first row and column and the identity elsewhere (`O(t)` multiplications
+  instead of `t^2`); `diag(1, .)` commutes with the first-element S-box and with adding a scalar to
+  element 0, which is what lets the factors travel;
+- the constants of elements 1.. are carried forward through `M` into the next round's constant, so
+  a partial round adds one scalar; what is left after the last partial round is folded into the first
+  full round after it (`tail_c`);
+- `H` is a submatrix of an MDS (Cauchy) matrix, hence invertible; `init` inverts it once
+  (Gauss-Jordan) and `initChecked` reports `NotInvertible` otherwise.
+
+`permutePlain` is the textbook schedule; `src/sparse_test.zig` checks the two agree on random states
+for every BN254 width 2..17, BLS12-381 `t = 3, 5`, ten neptune arities in both strengths and round
+shapes no shipped set has (no partial rounds, odd `R_F`, no full rounds), on top of every pinned
+vector and the neptune transcript running through `permute`.
 
 ### 2. `R_P` rounded up to a multiple of `t` — followed: circomlib
 
@@ -373,24 +396,25 @@ BLS12-381, standard strength), built offline from the pinned `Cargo.lock` in
 and proc-macro crate of the 95-package tree was read for network and out-of-tree
 access; the only process spawns are `rustc --version` probes and the C compiler `cc`
 runs for blst, the only file writes are into `OUT_DIR`). Both sides end every op on the same
-digest (the count column), so the bench is also a cross-check. Two runs, 5 and 9
-rounds, wall time, on a host shared with other jobs (spreads 5–74 %), best of
+digest (the count column), so the bench is also a cross-check. Two runs of 9
+rounds, wall time, on a host shared with other jobs (spreads 10–67 %), best of
 rounds each side:
 
-| row | ours ns/op | reference ns/op | ours/ref (5 rounds, 9 rounds) |
+| row | ours ns/op | reference ns/op | ours/ref (run 1, run 2) |
 |---|--:|--:|--:|
-| `bn254_t3` (2 inputs) | 390 597 | 602 879 | 0.648, 0.655 |
-| `bn254_t5` (4 inputs) | 975 648 | 1 292 588 | 0.755, 0.753 |
-| `neptune_a2` | 390 427 | 251 134 | 1.555, 1.577 |
-| `neptune_a4` | 932 012 | 424 403 | 2.196, 2.235 |
-| `neptune_a8` | 2 794 915 | 848 304 | 3.295, 3.231 |
+| `bn254_t3` (2 inputs) | 285 363 | 608 354 | 0.469, 0.474 |
+| `bn254_t5` (4 inputs) | 505 140 | 1 285 760 | 0.393, 0.382 |
+| `neptune_a2` | 281 061 | 253 052 | 1.111, 1.093 |
+| `neptune_a4` | 482 834 | 413 371 | 1.168, 1.144 |
+| `neptune_a8` | 1 002 793 | 903 275 | 1.110, 1.152 |
 
 Against light-poseidon we are ahead (one op = 16 hashes: 24 µs per `t = 3` hash).
-Against neptune we are behind and the gap grows with the width: neptune applies the
-paper's optimised equivalent (the partial rounds as one sparse `O(t)` product,
-constants folded forward), where `perm.zig` runs the plain `O(t²)` round; blst's
-assembly field also helps. That gap is the Backlog item. Not measured: `init()`
-alone, and neptune's other hash modes. For `init()`: `Perm(t).init()` runs the Grain LFSR once and then the MDS security checks,
+Against neptune we are 9–17 % behind, which is blst's assembly field against
+`std.crypto.ff` (the gap is flat in the width). `permute` runs the paper's optimised
+equivalent form, as neptune does (see *Optimised partial rounds* below); before it
+did, the plain `O(t^2)` partial rounds put us at 1.56× (2 inputs) to 3.2× (8 inputs).
+Not measured: `init()`
+alone (it now also builds the sparse tables, `O(t^3 + R_P t^2)`), and neptune's other hash modes. For `init()`: `Perm(t).init()` runs the Grain LFSR once and then the MDS security checks,
 and the checks dominate: about 70 000 field multiplications at `t = 17`, which is
 70 ms at ReleaseSafe and 850 ms in Debug (`std.crypto.ff`'s constant-time multiply
 costs about 0.8 us optimized and 9.6 us unoptimized). At `t = 3`, the case a Merkle
@@ -455,12 +479,7 @@ hold them. A consumer builds one instance per width and holds it.
 
 ## Backlog / deferred
 
-- **Optimised partial rounds** (measured gap to neptune: 1.56× at 2 inputs, 3.2× at 8). The paper's equivalent
-  form: fold the round constants forward through the MDS inverse and replace each partial round's `t × t` product
-  with a sparse one (first row and column plus a diagonal), `O(t)` per round instead of `O(t²)` over the `R_P`
-  partial rounds; neptune does exactly this (`preprocessing.rs`, `matrix.rs`). The output must stay byte-identical
-  to the plain schedule (the existing vectors and the neptune transcript are the test). Moderate; the
-  per-width precomputation goes into `init()`.
+None.
 
 ## Roadmap
 
