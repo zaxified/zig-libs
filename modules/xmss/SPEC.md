@@ -280,13 +280,14 @@ scheme's security argument collapses per-index, not per-signature.
 
 ## Backlog / deferred
 
-- **SHA-512 and SHAKE256 suites (RFC 8391 OIDs 4–12) and SP 800-208's 24-byte
-  (SHA-256/192, SHAKE256/192) sets**. The reference and
-  go-xmssmt offer all of them; a deployment whose policy fixes another hash, or an
-  SP 800-208 profile that uses the 192-bit sets, cannot use this module. Moderate:
-  `n = 32` and SHA-256 are module-level constants (`root.zig` `n`, `hashF`…), so
-  the whole file would need a hash/`n` parameter; needs a hash/`n` parameter and one
-  cross-checked KAT per suite from the reference. Fits CONVENTIONS §2 (pure Zig).
+- **SHA-512, SHAKE128/SHAKE256 suites (RFC 8391 OIDs 4–12) and SP 800-208's 24-byte and
+  SHAKE256 sets (0x0d–0x15)**: the code is generic since 2026-11-23 (`suite.zig`,
+  `Xmss(suite.<set>, h, oid)`; `toByte(i, padding_len)` with padding 4 for n = 24, as
+  xmss-reference) and every suite signs and verifies at h = 4. What is missing is the
+  evidence: byte-exact KATs per suite from xmss-reference (CC0; a C driver over
+  `xmss_parse_oid` + `xmssmt_core_seed_keypair` + `xmss_core_sign` at h = 4 and h = 10,
+  seed byte i = i) and then the named OID exports (`XmssSha2_10_512` …). The reference run
+  is a foreign binary and waits for the owner's approval.
 
 ## Roadmap
 

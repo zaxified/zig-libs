@@ -1991,7 +1991,7 @@ sha2	ReleaseFast	hmac	1	0	89b56d53e80d1e69	f0186875cfa058e3
 # base-w digit of H_msg(r, root, idx, M), and r = PRF(SK_PRF, idx) is
 # tainted though it is PUBLISHED in the signature. An artefact of tainting
 # SK_PRF, not a leak.
-xmss	ReleaseFast	sign	1	2	889173339a34ea5d	eb0cb3d6777ae4c6
+xmss	ReleaseFast	sign	1	2	0a792068b33c417e	eb0cb3d6777ae4c6
 # lms (2026-10-10) — lms: H5/W4 keygen + 2 signs; hss: 2-level H5/W4 keygen
 # + 2 signs; seed tainted. lms 4 / hss 6 = the LM-OTS chain loop (core.zig `otsSign`)
 # whose count is a digit of Q = H(I||q||D_MESG||C||msg); C is derived from
