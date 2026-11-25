@@ -6,7 +6,7 @@
 
 **Scope:** core — liblz4 1.10.0 and its lz4 CLI (surveyed 2026-11-17)
 
-**Audit:** review 2026-11-17 · mutation 2026-11-17 (142/161, 18 eq) · src e9e621a6e4cdcdc0
+**Audit:** review 2026-11-17 · mutation 2026-11-25 (282/330, 46 eq) · src 0a91b3b966b2714d
 
 **Hardening:** fuzz 2026-11-17 (three verdict runs over disjoint seed ranges, the last on the final code, each 400,000 frame-decoder + 400,000 block-decoder + 50,000 round-trip runs in 29–42 s, all clean; a fourth after `decompressInto` (its result checked against `decompress` under the same cap on every frame-decoder input): 400,000 + 400,000 + 50,000 runs, decode 43 s, clean; a fifth after the review fixes, with `decompress` and `decompressInto` both judged by the independent frame model `modelFrames`: 400,000 + 400,000 + 50,000 runs, decode 43 s, clean; two more after the speed work (the decoder's fast loop, the encoder's new paths), the second on the final code: 400,000 + 400,000 + 50,000 runs each, decode 40–41 s, clean; LZ4_FUZZ, every reach label hit; arbitrary, mutated and structure-aimed frames, synthetic token streams judged against a byte-at-a-time model, glued skippable/legacy frames, failing allocator; 3,000 seeds in every test run) · ct n/a — compression only, no secret is processed · panic 2026-11-17 (self-review at creation: every length, offset and size from the input is checked before use; the only asserts are on internal callers' arguments, never reachable with caller data through the public API; oversized inputs are `error.InputTooLarge`)
 
@@ -230,6 +230,7 @@ and python3 with python-lz4, `tools/README.md`) and `zig build bench-lz4` are th
   the other arm, skip an assignment, error remap), over the decoder fast loop, `wildMatch`, `copyLong` and the encoder's
   sequence writer, search loop and back-extension too. The surviving equivalents are cost-only or ratio-only (the fast
   loop only changes speed; the encoder's parse is free within the format) or unobservable (an input over 2 GiB).
+- **Whole-module mutation 2026-11-25** (HC 10..12 and the optimal parser, dictionaries, `stream.zig`, `decompressInto`, the asm fast loop): 330 mutants over `block.zig`, `frame.zig`, `stream.zig` and `root.zig` (303, plus 27 on the Zig fast loop built with the asm path off); 282 killed (2 by hang), 43 equivalent, 3 unobservable (96, 132, 210: private guards, the injection each needs is in the audit table), 2 OPEN (Backlog B7). Tests: `src/mutation_test.zig` (guard-page decoder and length-run tests, the one-shot-vs-stream differential over header bit flips, cuts and trailing bytes, encoder output pins, a 2 GiB lazy-mmap largest-block test in optimized modes). The differential found a real defect on the unmutated code: the streaming decoder's 11-byte descriptor buffer (CHANGELOG 2026-11-25).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## What is deliberately not done
@@ -246,6 +247,7 @@ and python3 with python-lz4, `tools/README.md`) and `zig build bench-lz4` are th
 
 ## Backlog / deferred
 
+- **B7** Two mutants of the 2026-11-25 run are OPEN: 118 (`encodeOpt`: `mm.len >= target` → `>`; needs an input whose match is exactly the level's target length where pricing the match beats forcing it, plus a pin of the output) and 143 (`decompressDict` empty-dictionary path dropped: same output, only the allocation differs; a `FailingAllocator` test exists in `src/mutation_test.zig` but was not run against the mutant).
 - **B6** Speed, what is left: (a) the decoder's layout lottery is closed by the asm fast loop (Speed); the ENCODER is
   still compiled Zig and moves with layout — `runs` compress 0.99× padded, 1.06–1.09× in a default build (shield
   2026-11-25); the same cure (its match-finding loop as an aligned asm block) would be a larger change than the

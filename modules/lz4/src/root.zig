@@ -101,4 +101,5 @@ test {
     _ = @import("shapes.zig");
     _ = @import("golden_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("mutation_test.zig");
 }
