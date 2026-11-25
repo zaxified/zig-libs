@@ -33,6 +33,9 @@ notes and the threat model.
   `nonce`/`seal`/`open` — AEAD with `nonce = iv XOR left-pad(packet_number,
   12)` and the unprotected header as additional data. `open` returns a typed
   `error.DecryptionFailed`, never a panic.
+  `Protection(Aead).Keyed` is the same seal/open with the AEAD key schedule kept per key epoch
+  (`Keyed.initInto(&k, &key, iv)`, `k.seal(pn, header, payload, out)`, `k.wipe()`); for AES-GCM it
+  halves the per-packet cost at 64 B and saves ~25% at 1200-1400 B.
 - **`src/headerprot.zig` — §5.4 header protection.** `computeMaskAes` /
   `computeMaskChaCha20` (16-byte sample → 5-byte mask) + `apply` (send) and
   `remove` (receive). `remove` models the §5.4.1 ordering hazard: unmask the

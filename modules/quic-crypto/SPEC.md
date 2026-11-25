@@ -257,6 +257,23 @@ never `zig build --fuzz`); constant time: `scripts/checks/ctgrind.sh quic-crypto
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
 
+## Performance
+
+No foreign reference is benchmarked (the card line stays "not measured"); `tools/bench.zig` (`zig build install-bench-quic-crypto`) compares the module with itself, 2026-11-25, in the bench shield (taskset core 3, 5 rounds, user-mode cycles):
+`Protection(A).Keyed` (key schedule expanded once per key epoch) against the stateless `Protection(A).seal`/`open` (key expansion and GHASH key setup on every packet).
+
+| row (payload bytes) | stateless ns | keyed ns | keyed / stateless | spread |
+|---|--:|--:|--:|--:|
+| seal AES-128-GCM 64 | 242.0 | 115.5 | 0.481 | 0.2% |
+| open AES-128-GCM 64 | 245.3 | 118.3 | 0.482 | 0.2% |
+| seal AES-128-GCM 1200 | 456.0 | 323.1 | 0.710 | 0.7% |
+| open AES-128-GCM 1200 | 470.6 | 329.1 | 0.707 | 0.2% |
+| seal AES-128-GCM 1400 | 519.6 | 381.5 | 0.736 | 0.1% |
+| open AES-128-GCM 1400 | 497.2 | 367.1 | 0.738 | 0.4% |
+| seal/open ChaCha20-Poly1305 64 / 1200 / 1400 | 213-911 | same | 0.997-1.001 | <= 1.3% |
+
+An AES-GCM consumer binds `Keyed`. ChaCha20-Poly1305 has no per-key state to cache, so `Keyed` only holds its key there (ratio 1.00, as expected). Header protection (`computeMaskAes`) still expands its AES key per packet; not measured here.
+
 ## What is deliberately not done
 
 - **Anything above the crypto seam** — no transport state, handshake bridge, packet-number reconstruction, version
@@ -265,7 +282,7 @@ never `zig build --fuzz`); constant time: `scripts/checks/ctgrind.sh quic-crypto
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **AES-GCM bulk path not re-measured** since AES-GCM moved to the `aesgcm` module (Zig 0.17 #36256). The module has no bench, and `Protection(Aead)` calls the stateless `encrypt`/`decrypt` of the AEAD type per packet, so every packet re-runs the key expansion (`dtls`'s `tools/bench.zig` measured cached/per-record at 0.20-0.65 for 64-1400 byte records); caching an `aesgcm.Context` per key needs an AEAD interface that carries one, and a quiet-machine A/B.
+- None open.
 
 ## Anchoring
 

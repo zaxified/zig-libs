@@ -150,6 +150,107 @@ pub fn Protection(comptime Aead: type) type {
                 return error.DecryptionFailed;
             return body_len;
         }
+
+        /// True when `Aead` carries a keyed `Context` (the zig-libs `aesgcm`
+        /// types): `Keyed` then expands the key once and every packet reuses
+        /// it. Other AEADs (std's, `chachapoly`) have no per-key state worth
+        /// caching and `Keyed` keeps the key itself.
+        pub const keyed_context = @hasDecl(Aead, "Context") and
+            @hasDecl(Aead.Context, "initInto") and
+            @hasDecl(Aead.Context, "encrypt") and
+            @hasDecl(Aead.Context, "decrypt") and
+            @hasDecl(Aead.Context, "wipe");
+
+        /// One packet-protection key (+ iv) with its AEAD key schedule kept
+        /// between packets: `seal`/`open` are `Protection.seal`/`open` minus
+        /// the per-packet key expansion and GHASH key setup (same bytes on
+        /// the wire, same errors). Make one per key epoch (Initial, 1-RTT
+        /// phase) and `wipe` it where the raw key is wiped; a key update
+        /// is a new `initInto`. Holds the expanded key — a secret: keep it
+        /// off the stack of anything that is not wiped (init in place with
+        /// `initInto`), and never copy it.
+        pub const Keyed = struct {
+            iv: [nonce_length]u8,
+            state: if (keyed_context) Aead.Context else [key_length]u8,
+
+            /// `out` ← the packet protection for `*key` / `iv`.
+            pub fn initInto(out: *Keyed, key: *const [key_length]u8, iv: [nonce_length]u8) void {
+                out.iv = iv;
+                if (keyed_context) {
+                    Aead.Context.initInto(&out.state, key);
+                } else {
+                    out.state = key.*;
+                }
+            }
+
+            /// Zero the key schedule and the iv; unusable afterwards.
+            pub fn wipe(self: *Keyed) void {
+                std.crypto.secureZero(u8, std.mem.asBytes(self));
+            }
+
+            /// `Protection.seal` under the cached key schedule.
+            pub fn seal(
+                self: *const Keyed,
+                packet_number: u64,
+                header: []const u8,
+                payload: []const u8,
+                out: []u8,
+            ) ProtectionError!usize {
+                return burn.run(burn.packet_burn, ProtectionError!usize, sealBodyK, .{ self, packet_number, header, payload, out });
+            }
+
+            fn sealBodyK(
+                self: *const Keyed,
+                packet_number: u64,
+                header: []const u8,
+                payload: []const u8,
+                out: []u8,
+            ) ProtectionError!usize {
+                const total = payload.len + tag_length;
+                if (out.len < total) return error.BufferTooShort;
+                const npub = nonce(self.iv, packet_number);
+                var tag: [tag_length]u8 = undefined;
+                if (keyed_context) {
+                    self.state.encrypt(out[0..payload.len], &tag, payload, header, npub);
+                } else {
+                    Aead.encrypt(out[0..payload.len], &tag, payload, header, npub, self.state);
+                }
+                @memcpy(out[payload.len..][0..tag_length], &tag);
+                return total;
+            }
+
+            /// `Protection.open` under the cached key schedule.
+            pub fn open(
+                self: *const Keyed,
+                packet_number: u64,
+                header: []const u8,
+                ciphertext: []const u8,
+                out: []u8,
+            ) ProtectionError!usize {
+                return burn.run(burn.packet_burn, ProtectionError!usize, openBodyK, .{ self, packet_number, header, ciphertext, out });
+            }
+
+            fn openBodyK(
+                self: *const Keyed,
+                packet_number: u64,
+                header: []const u8,
+                ciphertext: []const u8,
+                out: []u8,
+            ) ProtectionError!usize {
+                if (ciphertext.len < tag_length) return error.PacketTooShort;
+                const body_len = ciphertext.len - tag_length;
+                if (out.len < body_len) return error.BufferTooShort;
+                const npub = nonce(self.iv, packet_number);
+                var tag: [tag_length]u8 = undefined;
+                @memcpy(&tag, ciphertext[body_len..][0..tag_length]);
+                const r = if (keyed_context)
+                    self.state.decrypt(out[0..body_len], ciphertext[0..body_len], tag, header, npub)
+                else
+                    Aead.decrypt(out[0..body_len], ciphertext[0..body_len], tag, header, npub, self.state);
+                r catch return error.DecryptionFailed;
+                return body_len;
+            }
+        };
     };
 }
 
@@ -387,4 +488,77 @@ test "Protection.open: App. A.5 ChaCha20-Poly1305 round-trip + tamper->Decryptio
 
     // Wrong packet number => wrong nonce => open fails.
     try testing.expectError(error.DecryptionFailed, P.open(&rfc_a5_key, rfc_a5_iv, rfc_a5_pn + 1, &rfc_a5_header, &rfc_a5_ct, &back));
+}
+
+// ── Keyed (cached key schedule) ──────────────────────────────────────────
+
+fn keyedAgainstStateless(comptime A: type, comptime expect_ctx: bool) !void {
+    const P = Protection(A);
+    try testing.expectEqual(expect_ctx, P.keyed_context);
+    var key: [A.key_length]u8 = undefined;
+    var iv: [12]u8 = undefined;
+    var pt: [1400]u8 = undefined;
+    for (&pt, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
+    const header = [_]u8{ 0x41, 0xab, 0xab, 0xab, 0xab, 0x12, 0x34 };
+    var keyed: P.Keyed = undefined;
+    // Three key epochs on ONE Keyed (re-init in place, as a key update does);
+    // 40 packets each, every size class, every byte compared with the
+    // stateless path, both directions, plus a tamper per epoch.
+    for (0..3) |epoch| {
+        for (&key, 0..) |*b, i| b.* = @truncate(i *% 5 +% epoch *% 101 +% 1);
+        for (&iv, 0..) |*b, i| b.* = @truncate(i *% 13 +% epoch *% 7);
+        P.Keyed.initInto(&keyed, &key, iv);
+        for (0..40) |k| {
+            const len = (k * 37 + epoch * 211) % (pt.len + 1);
+            const pn: u64 = (@as(u64, epoch) << 40) + k * 1_000_003;
+            var a: [1416]u8 = undefined;
+            var b: [1416]u8 = undefined;
+            const na = try P.seal(&key, iv, pn, &header, pt[0..len], &a);
+            const nb = try keyed.seal(pn, &header, pt[0..len], &b);
+            try testing.expectEqual(na, nb);
+            try testing.expectEqualSlices(u8, a[0..na], b[0..nb]);
+            var oa: [1400]u8 = undefined;
+            var ob: [1400]u8 = undefined;
+            const ma = try P.open(&key, iv, pn, &header, a[0..na], &oa);
+            const mb = try keyed.open(pn, &header, b[0..nb], &ob);
+            try testing.expectEqual(ma, mb);
+            try testing.expectEqualSlices(u8, pt[0..len], ob[0..mb]);
+            try testing.expectEqualSlices(u8, oa[0..ma], ob[0..mb]);
+            // Refusals match: a flipped bit, a short ciphertext, a short out.
+            b[nb - 1] ^= 1;
+            try testing.expectError(error.DecryptionFailed, keyed.open(pn, &header, b[0..nb], &ob));
+            try testing.expectError(error.PacketTooShort, keyed.open(pn, &header, b[0..15], &ob));
+            if (len > 0) try testing.expectError(error.BufferTooShort, keyed.open(pn, &header, a[0..na], ob[0 .. len - 1]));
+            try testing.expectError(error.BufferTooShort, keyed.seal(pn, &header, pt[0..len], b[0 .. nb - 1]));
+        }
+    }
+    // The previous epoch's key no longer opens what the new one sealed.
+    var sealed: [64]u8 = undefined;
+    const ns = try keyed.seal(1, &header, pt[0..32], &sealed);
+    var old_key = key;
+    old_key[0] ^= 0xff;
+    var back: [64]u8 = undefined;
+    try testing.expectError(error.DecryptionFailed, P.open(&old_key, iv, 1, &header, sealed[0..ns], &back));
+    keyed.wipe();
+    for (std.mem.asBytes(&keyed)) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "Keyed: 120 packets over 3 key epochs are byte-identical to the stateless path (aesgcm, chachapoly, std)" {
+    try keyedAgainstStateless(aesgcm.Aes128Gcm, true);
+    try keyedAgainstStateless(aesgcm.Aes256Gcm, true);
+    try keyedAgainstStateless(ChaCha20Poly1305, false);
+    try keyedAgainstStateless(StdChaCha20Poly1305, false);
+}
+
+test "Keyed: RFC 9001 App. A.3 server Initial through the cached key" {
+    const P = Protection(Aes128Gcm);
+    var keyed: P.Keyed = undefined;
+    P.Keyed.initInto(&keyed, &rfc_server_key, rfc_server_iv);
+    defer keyed.wipe();
+    var out: [rfc_server_payload.len + 16]u8 = undefined;
+    const n = try keyed.seal(rfc_server_pn, &rfc_server_header, &rfc_server_payload, &out);
+    try testing.expectEqualSlices(u8, &rfc_server_ct, out[0..n]);
+    var back: [rfc_server_payload.len]u8 = undefined;
+    const m = try keyed.open(rfc_server_pn, &rfc_server_header, &rfc_server_ct, &back);
+    try testing.expectEqualSlices(u8, &rfc_server_payload, back[0..m]);
 }
