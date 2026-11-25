@@ -4862,3 +4862,86 @@ test "auth: an AuthInfo a caller's own middleware stored is passed to the handle
     const got = runWire(&r, post("/mcp", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}}"), &b);
     try testing.expect(std.mem.find(u8, got, "from-my-gate") != null);
 }
+
+// ── fuzz: the bearer gate (auth.zig) ────────────────────────────────────────
+
+const AuthMark = fz.Marker(enum { served, unauthenticated, invalid_token, insufficient_scope, unreadable });
+
+const auth_fuzz_bodies = [_][]const u8{
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+    "{\"params\":{\"arguments\":{},\"name\":\"whoami\"},\"id\":3,\"method\":\"tools/call\",\"jsonrpc\":\"2.0\"}",
+    "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"name\":\"x\"}}}",
+};
+
+const auth_fuzz_headers = [_][]const u8{
+    "",
+    "Authorization: Bearer good\r\n",
+    "Authorization: Bearer readonly\r\n",
+    "Authorization: Bearer nope\r\n",
+    "Authorization: bearer   readonly  \r\n",
+    "Authorization: Basic cmVhZG9ubHk6eA==\r\n",
+    "Authorization: Bearer readonly\r\nAuthorization: Bearer good\r\n",
+    "Authorization: Bearer\r\n",
+};
+
+/// Damaged bearer-gated requests: a token without `mcp:tools` must never run
+/// `tools/call` (whoever sent it, however the body is spelled), and every
+/// answer is one of the gate's statuses or the transport's own.
+pub fn fuzzAuth(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var server = try buildAuthServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .auth = &test_mcp_auth };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var body_buf: [4096]u8 = undefined;
+    const seed = auth_fuzz_bodies[src.index(auth_fuzz_bodies.len)];
+    var body_len: usize = 0;
+    // Sometimes a long key first (the HS-2 shape), sometimes damaged octets.
+    if (src.value(bool)) {
+        const pad = src.valueRangeAtMost(u16, 0, 3000);
+        const head = "{\"";
+        @memcpy(body_buf[0..head.len], head);
+        @memset(body_buf[head.len..][0..pad], 'k');
+        const tail = "\":0,";
+        @memcpy(body_buf[head.len + pad ..][0..tail.len], tail);
+        body_len = head.len + pad + tail.len;
+        @memcpy(body_buf[body_len..][0 .. seed.len - 1], seed[1..]);
+        body_len += seed.len - 1;
+    } else body_len = fz.damage(src, &body_buf, seed);
+    const body = body_buf[0..body_len];
+    const hdr = auth_fuzz_headers[src.index(auth_fuzz_headers.len)];
+
+    var req_buf: [8192]u8 = undefined;
+    const req = std.mem.print(&req_buf, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ hdr, body.len, body }) catch unreachable; // 8 KiB > every part
+    var out: [16 * 1024]u8 = undefined;
+    const got = runWire(&r, req, &out);
+    const status = statusOf(got) orelse return; // the wire codec dropped a damaged request
+    // The read-only token never reaches a tool call: `whoami` writes the
+    // caller's client id, "ro" for it.
+    if (std.mem.find(u8, got, ":\"ro\"") != null) {
+        std.debug.print("mcp-http-auth: a read-only token ran a tool: {s}\n", .{got});
+        return error.ScopeBypassed;
+    }
+    switch (status) {
+        200, 202 => AuthMark.mark(.served),
+        401 => if (std.mem.find(u8, got, "error=\"invalid_token\"") != null) AuthMark.mark(.invalid_token) else AuthMark.mark(.unauthenticated),
+        403 => AuthMark.mark(.insufficient_scope),
+        400 => if (std.mem.find(u8, got, "Unreadable request body") != null) AuthMark.mark(.unreadable),
+        404, 405, 413, 431 => {}, // the transport's and the codec's own answers to a damaged request
+        else => {
+            std.debug.print("mcp-http-auth: unexpected status {d}: {s}\n", .{ status, got });
+            return error.UnexpectedStatus;
+        },
+    }
+}
+
+test "fuzz driver: MCP_HTTP_FUZZ (auth)" {
+    try fz.fuzz_driver.run(fuzzAuth, .{ .prefix = "MCP_HTTP_FUZZ", .name = "mcp-http-auth" });
+}
+
+test "fuzz harness: auth, 400 seeds, reaches every outcome" {
+    try AuthMark.reach(fuzzAuth, "mcp-http-auth", 400);
+}
