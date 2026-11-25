@@ -42,12 +42,38 @@ try router.use(transport.middleware()); // after any auth / origin middleware
 
 ## Security
 
-This module does no authentication. Bind to loopback for a local integration,
-or put auth in front: register an `aaa-gate` / `jwt` middleware **before** this
-one (MCP has no read/write method split, so gate every POST). The MCP spec also
-requires validating the `Origin` header against DNS-rebinding for locally-bound
-servers: set `Transport.allowed_origins` (exact match; a present but unlisted
-`Origin` gets 403, no `Origin` is allowed, empty accepts every origin).
+**Authorization** (MCP authorization, resource-server side, as the official SDKs
+have it): set `Transport.auth` to an `mcp_http.auth.Auth`. Every request to the
+endpoint then needs `Authorization: Bearer <token>`, which your `verify` hook
+checks (a local JWT, RFC 7662 introspection, …); the transport answers 401/403
+with the RFC 6750 `WWW-Authenticate` challenge naming your RFC 9728 document,
+serves that document at `/.well-known/oauth-protected-resource<path>`, and hands
+the token's `mcp.AuthInfo` to every handler as `call.auth`.
+
+```zig
+fn verify(_: ?*anyopaque, arena: std.mem.Allocator, token: []const u8) error{ OutOfMemory, VerifierFailed }!mcp_http.auth.Verdict {
+    const claims = myJwtCheck(arena, token) orelse return .{ .invalid = "Invalid token" };
+    return .{ .ok = .{ .subject = claims.sub, .scopes = claims.scopes, .expires_at = claims.exp, .resource = claims.aud } };
+}
+const auth: mcp_http.auth.Auth = .{
+    .verify = verify,
+    .resource_metadata_url = "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+    .metadata = .{ .resource = "https://mcp.example.com/mcp", .authorization_servers = &.{"https://auth.example.com"} },
+    .expected_resource = "https://mcp.example.com/mcp", // RFC 8707 audience
+    .required_scopes = &.{"mcp"},
+};
+var transport: mcp_http.Transport = .{ .gpa = gpa, .server = &server, .auth = &auth };
+```
+
+`scope_for` adds per-operation scopes (403 before the handler runs). A
+middleware of your own that stores an `mcp.AuthInfo` with `ctx.setTyped` works
+too: the transport passes it on.
+
+**DNS rebinding.** `Transport.allowed_origins` (exact match; a present but
+unlisted `Origin` gets 403, no `Origin` is allowed, empty accepts every origin)
+and the `Host` half: `host_guard` (`http.HostGuard`) or, by default,
+`localhost_protection` — a request from a loopback peer with a non-loopback
+`Host` gets 403, as in the Go SDK.
 
 **Server→client answers need a session.** A stateless endpoint cannot attribute
 a client's response to a `sampling`/`elicitation` request — every POST is peer
@@ -186,6 +212,6 @@ session-era clients on the same endpoint:
 
 ## Not provided
 
-TLS, rate limiting and authentication (compose `ratelimit`, `aaa-gate` /
-`jwt`; SPEC *What is deliberately not done*), the older HTTP+SSE dual-endpoint
-transport.
+TLS, rate limiting, issuing tokens or an authorization server (SPEC *What is
+deliberately not done*), a pluggable event store for the session era across
+nodes, the older HTTP+SSE dual-endpoint transport.

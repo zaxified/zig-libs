@@ -115,6 +115,10 @@ pub const typed = @import("typed.zig");
 /// MCP Apps helpers (`io.modelcontextprotocol/ui`): tool and resource `_meta`,
 /// an HTML app resource, the client's declaration; see `apps.zig`.
 pub const apps = @import("apps.zig");
+/// MCP Skills (`io.modelcontextprotocol/skills`, SEP-2640): a catalog of
+/// Agent Skills served as `skill://` resources with `skills/list`,
+/// `skills/get` and `resources/directory/read`; see `skills.zig`.
+pub const skills = @import("skills.zig");
 /// The JSON Schema text for a Zig type, for `Tool.input_schema` /
 /// `Tool.output_schema` (see `typed.zig` for the mapping).
 pub const schemaOf = typed.schemaOf;
@@ -135,7 +139,7 @@ pub const meta = .{
     .role = .server,
     .concurrency = .reentrant, // no globals; one Server instance = one owner
     .model_after = "MCP spec 2026-07-28 (stateless) + 2025-11-25/2025-06-18 (initialize) + JSON-RPC 2.0",
-    .deps = .{"jsontext"}, // std.json + std.Io reader/writer; jsontext for the nesting prescan
+    .deps = .{ "jsontext", "yaml" }, // std.json + std.Io reader/writer; jsontext for the nesting prescan; yaml for Skills frontmatter
 };
 
 /// Latest MCP protocol revision we advertise. Older revisions we also accept
@@ -656,6 +660,32 @@ fn present(v: ?std.json.Value) ?std.json.Value {
 /// holds is a copy in `Server`-owned memory — see `dupe` — because the
 /// `std.json.Value` this is parsed from lives on the per-message arena and
 /// does not outlive `handleMessage`'s call.
+/// What a transport learnt when it authenticated a request (`mcp-http`'s
+/// bearer gate fills it from its token verifier; the TypeScript SDK's
+/// `AuthInfo`, the Python SDK's `AccessToken`). Handlers read it as
+/// `call.auth` / `req.auth`; it is null on stdio and on a transport without
+/// authorization. Every slice is the transport's, valid for the request.
+pub const AuthInfo = struct {
+    /// The OAuth client the token was issued to ("" when unknown).
+    client_id: []const u8 = "",
+    /// The end user or service the token stands for ("" when unknown).
+    subject: []const u8 = "",
+    /// Granted scopes.
+    scopes: []const []const u8 = &.{},
+    /// Unix seconds, when known.
+    expires_at: ?i64 = null,
+    /// The resource (RFC 8707 audience) the token was issued for, when known.
+    resource: ?[]const u8 = null,
+    /// Whatever else the verifier wants handlers to see.
+    extra: ?*const anyopaque = null,
+
+    /// Whether `scope` is among the granted scopes (exact match).
+    pub fn hasScope(self: *const AuthInfo, scope: []const u8) bool {
+        for (self.scopes) |s| if (std.mem.eql(u8, s, scope)) return true;
+        return false;
+    }
+};
+
 pub const ClientInfo = struct {
     name: []const u8,
     version: []const u8,
@@ -2650,6 +2680,9 @@ pub const ToolCall = struct {
     /// Set when this call arrived as a stateless 2026-07-28 request: what its
     /// `_meta` declared. Null = an `initialize`-session call. Arena lifetime.
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
     /// The multi round-trip side of a 2026-07-28 call: the answers this retry
     /// carries, and `ask`/`setState` for the next round. Asking anything turns
     /// the reply into an `InputRequiredResult`; the text written to `out` and
@@ -2952,6 +2985,9 @@ pub const ResourceRequest = struct {
     server: ?*Server = null,
     peer: u64 = 0,
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
     meta: std.json.Value = .null,
     /// Set by `failWith`/`failProtocol`: answer with this JSON-RPC error.
     protocol_error: ?ProtocolError = null,
@@ -3127,6 +3163,9 @@ pub const PromptRequest = struct {
     server: ?*Server = null,
     peer: u64 = 0,
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
     meta: std.json.Value = .null,
     /// Set by `failWith`/`failProtocol`: answer with this JSON-RPC error.
     protocol_error: ?ProtocolError = null,
@@ -3326,6 +3365,9 @@ pub const MethodRequest = struct {
     server: ?*Server = null,
     peer: u64 = 0,
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
     meta: std.json.Value = .null,
     protocol_error: ?ProtocolError = null,
 
@@ -3386,6 +3428,9 @@ pub const CompletionRequest = struct {
     server: ?*Server = null,
     peer: u64 = 0,
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
 
     /// Add one candidate (OOM swallowed).
     pub fn add(self: *CompletionRequest, v: []const u8) void {
@@ -3660,6 +3705,11 @@ pub const Server = struct {
     /// Default caching hint on a 2026-07-28 `resources/read`; a handler can
     /// override it per read (`ResourceRequest.cache`).
     read_cache: CacheHint = .{},
+    /// The `AuthInfo` of the message being handled, set by `handleMessageAs`
+    /// for the length of that one call (the same serialization as every other
+    /// `handleMessage*` call: one `Server` = one owner at a time). Each request
+    /// context copies it when it is built.
+    request_auth: ?*const AuthInfo = null,
     /// Cap on unanswered server→client requests **per peer**. A client that
     /// simply never answers must not grow this without bound; past the cap
     /// `send*` returns `error.TooManyPending`. Counted per peer so one
@@ -3889,6 +3939,7 @@ pub const Server = struct {
             .server = self,
             .peer = peer,
             .modern = modern,
+            .auth = self.request_auth,
         };
         // A known target without a completer simply has no suggestions.
         if (completer) |f| f(cctx, &req);
@@ -4053,6 +4104,7 @@ pub const Server = struct {
             .server = self,
             .peer = peer,
             .modern = modern,
+            .auth = self.request_auth,
             .meta = req_meta,
         };
         const ok = method.handler(method.ctx, &req);
@@ -4399,6 +4451,16 @@ pub const Server = struct {
     /// session cannot consume another session's sampling completion or the
     /// user's elicitation answer. Single-peer transports (stdio) pass 0, which
     /// is what `handleMessage` does.
+    /// `handleMessageFrom` for a request a transport authenticated: `auth`
+    /// reaches every handler of this message as `call.auth` / `req.auth`
+    /// (null = none). It must outlive the call; nothing keeps it after.
+    pub fn handleMessageAs(self: *Server, msg: []const u8, out: *std.Io.Writer, peer: u64, auth: ?*const AuthInfo) Error!void {
+        const prev = self.request_auth;
+        self.request_auth = auth;
+        defer self.request_auth = prev;
+        return self.handleMessageFrom(msg, out, peer);
+    }
+
     pub fn handleMessageFrom(self: *Server, msg: []const u8, out: *std.Io.Writer, peer: u64) Error!void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -5211,6 +5273,7 @@ pub const Server = struct {
             .transport = out,
             .peer = peer,
             .modern = modern,
+            .auth = self.request_auth,
             .input = round,
             .meta = req_meta,
         };
@@ -5339,6 +5402,7 @@ pub const Server = struct {
             .server = self,
             .peer = peer,
             .modern = modern_req,
+            .auth = self.request_auth,
             .meta = req_meta,
         };
         const found = blk: {
@@ -5464,6 +5528,7 @@ pub const Server = struct {
             .server = self,
             .peer = peer,
             .modern = modern_req,
+            .auth = self.request_auth,
             .meta = req_meta,
         };
         // A copy, taken before the handler runs: `prompt` points into
@@ -5957,6 +6022,7 @@ test {
     _ = uri_template;
     _ = typed;
     _ = apps;
+    _ = skills;
     _ = @import("sdk_oracle.zig");
 }
 
@@ -12429,6 +12495,92 @@ fn fuzzUriTemplate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     try tmpl.expand(&aw.writer, vars);
 }
 
+const fuzz_skill_mds = [_][]const u8{
+    "---\nname: a\ndescription: d\n---\nbody\n",
+    "---\r\nname: b-c\r\ndescription: Multi\r\nlicense: MIT\r\nmetadata:\r\n  k: \"1\"\r\n---\r\n",
+    "\xEF\xBB\xBF---\nname: a\ndescription: x\nlist: [1, 2.5, true, null, {k: v}]\n---\n",
+    "---\nname: a\ndescription: d\nnested: {a: {b: {c: [[[1]]]}}}\n---\n",
+    "---\nname: a\ndescription: &x d\nalias: *x\n---\n",
+};
+
+const fuzz_skill_paths = [_][]const u8{ "a", "b-c", "p/a", "p/q/a", "a/b-c", "a/a", "x y/a", "%/a" };
+
+const fuzz_skill_requests = [_][]const u8{
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"skills/list\",\"params\":{\"cursor\":\"czowOjI\"}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"skills/get\",\"params\":{\"uri\":\"skill://p/a/SKILL.md\"}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/directory/read\",\"params\":{\"uri\":\"skill://p\",\"cursor\":\"ZDowOjE\"}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"resources/read\",\"params\":{\"uri\":\"skill://a/SKILL.md\"}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"skills/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/directory/read\",\"params\":{\"uri\":\"skill://a\",\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}",
+};
+
+const SkillsLabel = enum { skill_served, skill_skipped, skills_load_refused, skills_reply_ok, skills_reply_error };
+var skills_reach: [@typeInfo(SkillsLabel).@"enum".field_names.len]usize = @splat(0);
+
+fn skillsMark(comptime l: SkillsLabel) void {
+    skills_reach[@backingInt(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+fn fuzzGenRead(_: ?*anyopaque, req: *ResourceRequest) bool {
+    req.text(req.uri, "", "generated");
+    return true;
+}
+
+/// The Skills extension: a catalog built from damaged `SKILL.md` texts and a
+/// random file tree must load or refuse without a crash and keep its
+/// invariants, and every damaged request against it must be answered with
+/// one well-formed line.
+fn fuzzSkills(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const n_files = src.valueRangeAtMost(u8, 0, 6);
+    const files = try arena.alloc(skills.File, n_files);
+    for (files) |*f| {
+        const dir = fuzz_skill_paths[src.index(fuzz_skill_paths.len)];
+        if (src.valueRangeAtMost(u8, 0, 2) != 0) {
+            const md = try arena.alloc(u8, 256);
+            f.* = .{ .path = try std.mem.concat(arena, u8, &.{ dir, "/SKILL.md" }), .bytes = md[0..damagedSeed(S, src, &fuzz_skill_mds, md)] };
+        } else {
+            const body = try arena.alloc(u8, src.valueRangeAtMost(u8, 0, 16));
+            src.bytes(body);
+            const name = if (src.value(bool)) "f.md" else "sub/x.bin";
+            f.* = .{ .path = try std.mem.concat(arena, u8, &.{ dir, "/", name }), .bytes = body };
+        }
+    }
+    const dyn: []const skills.Dynamic = if (src.value(bool)) &.{.{ .path = "g/a", .skill_md = fuzz_skill_mds[0], .read = fuzzGenRead }} else &.{};
+    var cat = skills.Catalog.load(gpa, files, dyn, .{ .strict = src.value(bool), .directory_read = src.value(bool) }) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return skillsMark(.skills_load_refused),
+    };
+    defer cat.deinit();
+    for (cat.skills()) |sk| {
+        skillsMark(.skill_served);
+        try testing.expect(std.mem.endsWith(u8, sk.path, sk.name));
+        const fm = try std.json.parseFromSliceLeaky(std.json.Value, arena, sk.frontmatter_json, .{});
+        try testing.expect(fm == .object);
+        if (sk.files) |m| try testing.expect(m.len >= 1 and m.len <= skills.max_resources_per_skill);
+    }
+    if (cat.skipped().len != 0) skillsMark(.skill_skipped);
+    var s = Server.init(gpa, .{ .name = "f", .version = "0" });
+    defer s.deinit();
+    s.page_size = src.valueRangeAtMost(u8, 0, 3);
+    try cat.attach(&s);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (0..src.valueRangeAtMost(u8, 1, 4)) |_| {
+        var buf: [512]u8 = undefined;
+        const line = buf[0..damagedSeed(S, src, &fuzz_skill_requests, &buf)];
+        out.clearRetainingCapacity();
+        try s.handleMessage(line, &out.writer);
+        const w = out.written();
+        if (w.len == 0) continue; // a damaged line may have become a notification
+        try testing.expect(w[w.len - 1] == '\n' and std.mem.findScalar(u8, w[0 .. w.len - 1], '\n') == null);
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, w[0 .. w.len - 1], .{});
+        if (v.object.get("error") != null) skillsMark(.skills_reply_error) else skillsMark(.skills_reply_ok);
+    }
+}
+
 test "fuzz: handleMessage, damaged corpus lines" {
     try testing.fuzz({}, fuzzScript(fuzzHandleMessageMutated), .{});
 }
@@ -12440,7 +12592,24 @@ test "fuzz driver: MCP_FUZZ" {
         .{ fuzzSchemaCheck, .{ .prefix = "MCP_FUZZ", .name = "mcp-schema-check" } },
         .{ fuzzUriTemplate, .{ .prefix = "MCP_FUZZ", .name = "mcp-uri-template" } },
         .{ fuzzClientResponse, .{ .prefix = "MCP_FUZZ", .name = "mcp-client-response", .scale = 4 } },
+        .{ fuzzSkills, .{ .prefix = "MCP_FUZZ", .name = "mcp-skills" } },
     });
+}
+
+test "fuzz harness: mcp-skills reaches load, skip, refusal and both reply kinds in 400 seeds" {
+    skills_reach = @splat(0);
+    for (0..400) |sd| {
+        var prng = std.Random.DefaultPrng.init(sd);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        fuzzSkills(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("mcp-skills seed {d}: {t}\n", .{ sd, err });
+            return err;
+        };
+    }
+    for (skills_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: {t} never hit in 400 seeds\n", .{@as(SkillsLabel, @fromBackingInt(@intCast(i)))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
@@ -14421,4 +14590,158 @@ test "ToolCall.writeJson: appends, omits null optionals, survives OOM" {
     var c3 = typedCall(fa0.allocator(), .null, &o3, &s, &sink.writer);
     c3.writeJson(TypedOut{ .city = "Brno", .days = 3 });
     try testing.expectEqual(@as(usize, 0), o3.items.len);
+}
+
+fn whoAmI(_: ?*anyopaque, call: *ToolCall) bool {
+    const a = call.auth orelse {
+        call.write("anonymous");
+        return false;
+    };
+    call.print("{s} admin={}", .{ a.client_id, a.hasScope("admin") });
+    return false;
+}
+
+fn whoAmIResource(_: ?*anyopaque, req: *ResourceRequest) bool {
+    req.text(req.uri, "text/plain", if (req.auth) |a| a.subject else "anonymous");
+    return true;
+}
+
+test "handleMessageAs: handlers see the transport's AuthInfo for that one message only" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "whoami", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = whoAmI });
+    try s.addResource(.{ .uri = "x://me", .name = "me", .handler = whoAmIResource });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const scopes = [_][]const u8{ "read", "admin" };
+    const info: AuthInfo = .{ .client_id = "cli-7", .subject = "ada", .scopes = &scopes };
+    const call_line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}," ++
+        "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}";
+    try s.handleMessageAs(call_line, &out.writer, 0, &info);
+    try testing.expect(std.mem.find(u8, out.written(), "cli-7 admin=true") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "\"isError\":false") != null);
+    try testing.expect(s.request_auth == null); // reset after the call
+    out.clearRetainingCapacity();
+    try s.handleMessage(call_line, &out.writer);
+    try testing.expect(std.mem.find(u8, out.written(), "anonymous") != null);
+    out.clearRetainingCapacity();
+    try s.handleMessageAs("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{\"uri\":\"x://me\"," ++
+        "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}", &out.writer, 0, &info);
+    try testing.expect(std.mem.find(u8, out.written(), "\"text\":\"ada\"") != null);
+    const none: AuthInfo = .{};
+    try testing.expect(!none.hasScope("read"));
+}
+
+fn authProbeMethod(_: ?*anyopaque, req: *MethodRequest) bool {
+    req.write(if (req.auth != null) "{\"seen\":\"yes\"}" else "{\"seen\":\"no\"}");
+    return true;
+}
+
+fn authProbePrompt(_: ?*anyopaque, req: *PromptRequest) bool {
+    req.message(.user, if (req.auth != null) "seen-yes" else "seen-no");
+    return true;
+}
+
+fn authProbeCompleter(_: ?*anyopaque, req: *CompletionRequest) void {
+    req.add(if (req.auth != null) "seen-yes" else "seen-no");
+}
+
+test "mutation 2026-11-25: method, prompt and completion handlers see the transport's AuthInfo, and hasScope is an exact match" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addMethod(.{ .name = "acme/who", .handler = authProbeMethod });
+    try s.addPrompt(.{ .name = "p", .handler = authProbePrompt, .completer = authProbeCompleter });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const scopes = [_][]const u8{ "read", "admin" };
+    const info: AuthInfo = .{ .subject = "ada", .scopes = &scopes };
+    try testing.expect(info.hasScope("admin"));
+    try testing.expect(!info.hasScope("adm")); // exact match, not a prefix
+    try testing.expect(!info.hasScope("admins"));
+    const lines = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/who\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\",\"params\":{\"name\":\"p\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"\"}}}",
+    };
+    for (lines) |line| {
+        out.clearRetainingCapacity();
+        try s.handleMessageAs(line, &out.writer, 0, &info);
+        try testing.expect(std.mem.find(u8, out.written(), "yes") != null);
+        out.clearRetainingCapacity();
+        try s.handleMessage(line, &out.writer);
+        try testing.expect(std.mem.find(u8, out.written(), "no") != null);
+        try testing.expect(std.mem.find(u8, out.written(), "yes") == null);
+    }
+}
+
+const NestedAuth = struct {
+    s: *Server,
+    inner: *const AuthInfo,
+    before: ?*const AuthInfo = null,
+    after: ?*const AuthInfo = null,
+};
+
+fn nestedAuthTool(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const n: *NestedAuth = @ptrCast(@alignCast(ctx.?));
+    n.before = n.s.request_auth;
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    n.s.handleMessageAs("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"acme/who\"}", &sink.writer, 0, n.inner) catch {};
+    n.after = n.s.request_auth;
+    call.write("done");
+    return false;
+}
+
+test "mutation 2026-11-25: handleMessageAs restores the previous AuthInfo, not null, after a nested call" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addMethod(.{ .name = "acme/who", .handler = authProbeMethod });
+    const outer: AuthInfo = .{ .subject = "outer" };
+    const inner: AuthInfo = .{ .subject = "inner" };
+    var n: NestedAuth = .{ .s = &s, .inner = &inner };
+    try s.addTool(.{ .name = "nest", .description = "", .input_schema = "{}", .handler = nestedAuthTool, .ctx = &n });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try s.handleMessageAs("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"nest\"}}", &out.writer, 0, &outer);
+    try testing.expect(n.before == &outer);
+    try testing.expect(n.after == &outer); // not null: the nested call put the outer one back
+    try testing.expect(s.request_auth == null);
+}
+
+test "mutation 2026-11-25: tombstones: forgetPeer purges only that peer's, an id mismatch is not cancelled, a non-conforming id is not remembered" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "r", .description = "", .input_schema = "{}", .handler = reportCancelTool });
+    const call7 =
+        \\{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"r","arguments":{}}}
+    ;
+    const call8 =
+        \\{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"r","arguments":{}}}
+    ;
+    // A boolean/array/object id was never issued: it never reaches the ring.
+    try testing.expect(!s.cancelInflightSticky(0, .{ .bool = true }));
+    var live: usize = 0;
+    for (s.tombstones) |t| {
+        if (t.used) live += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), live);
+    // A remembered cancel of id 7 does not touch the call with id 8 ...
+    try testing.expect(!s.cancelInflightSticky(0, .{ .integer = 7 }));
+    try expectResponse(&s, call8,
+        \\{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"false"}],"isError":false}}
+        \\
+    );
+    // ... forgetting another peer leaves it alone ...
+    s.forgetPeer(5);
+    try expectResponse(&s, call7, "");
+    // ... and forgetting its own peer removes it for good.
+    try testing.expect(!s.cancelInflightSticky(5, .{ .integer = 7 }));
+    s.forgetPeer(5);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessageFrom(call7, &aw.writer, 5);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"false"}],"isError":false}}
+        \\
+    , aw.written());
 }

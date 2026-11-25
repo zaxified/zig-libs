@@ -32,6 +32,9 @@ pub const mime_type = "text/html;profile=mcp-app";
 /// The uri scheme reserved for app resources.
 pub const uri_scheme = "ui://";
 /// `Server.setCapabilityExtras`' first argument for a server that serves apps.
+/// That call replaces the whole extensions object: on a server that also
+/// serves Skills, make it before `skills.Catalog.attach`, which merges its own
+/// entry into what is there.
 pub const extensions_json = "{\"" ++ extension_id ++ "\":{}}";
 
 pub const Visibility = enum {
@@ -156,8 +159,10 @@ fn writeResourceMeta(jw: *std.json.Stringify, ui: ResourceUi) std.Io.Writer.Erro
     try jw.endObject();
 }
 
-/// A fixed HTML document served as an app resource. Keep it alive as long as
-/// the server: `resource` borrows it.
+/// A fixed HTML document served as an app resource. Keep it alive, at one
+/// address, as long as the server: `resource` stores a pointer to it (never
+/// call it on a temporary). `html` must be UTF-8 — it is served as `text`, and
+/// JSON text cannot carry other bytes.
 pub const HtmlResource = struct {
     /// A `ui://` uri.
     uri: []const u8,
@@ -201,7 +206,9 @@ pub fn clientSupportsApps(caps: root.ClientCapabilities) bool {
 
 /// The checks the Python SDK makes when a server takes its `Apps`: every tool
 /// that names a UI resource finds it registered, and every `ui://` resource has
-/// the app mime type. Call after the last `addTool` / `addResource`.
+/// the app mime type. Call after the last `addTool` / `addResource`. Only
+/// static resources count: a UI page served by a resource template is
+/// reported as `UnboundUiResource`.
 pub fn verify(server: *const root.Server) Error!void {
     for (server.resources.items) |r| {
         if (std.mem.startsWith(u8, r.uri, uri_scheme) and !std.mem.eql(u8, r.mime_type, mime_type)) return error.WrongMimeType;
@@ -330,4 +337,34 @@ test "clientSupportsApps: only an extensions entry listing the app mime type cou
         const v = try std.json.parseFromSliceLeaky(std.json.Value, st.allocator(), c.json, .{});
         try testing.expectEqual(c.want, clientSupportsApps(root.ClientCapabilities.parse(v)));
     }
+}
+
+fn noopResource(_: ?*anyopaque, _: *root.ResourceRequest) bool {
+    return true;
+}
+
+test "mutation 2026-11-25: verify: only ui:// resources need the app mime type, only a malformed ui _meta is InvalidMeta; HtmlResource carries its size" {
+    // A tool without _meta and a resource outside ui:// with another mime type are fine.
+    var s = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "plain", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = noopTool });
+    try s.addResource(.{ .uri = "x://doc", .name = "doc", .mime_type = "text/plain", .handler = noopResource });
+    try verify(&s);
+    // `ui` that is not an object is "not an app tool"; a non-string resourceUri, a non-object _meta and bad JSON are InvalidMeta.
+    const ok = [_][]const u8{"{\"ui\":5}"};
+    for (ok) |m| {
+        var s2 = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+        defer s2.deinit();
+        try s2.addTool(.{ .name = "x", .description = "d", .input_schema = "{\"type\":\"object\"}", .meta_json = m, .handler = noopTool });
+        try verify(&s2);
+    }
+    const bad = [_][]const u8{ "[1]", "{", "{\"ui\":{\"resourceUri\":5}}" };
+    for (bad) |m| {
+        var s3 = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+        defer s3.deinit();
+        try s3.addTool(.{ .name = "x", .description = "d", .input_schema = "{\"type\":\"object\"}", .meta_json = m, .handler = noopTool });
+        try testing.expectError(error.InvalidMeta, verify(&s3));
+    }
+    const page: HtmlResource = .{ .uri = "ui://a/b.html", .name = "n", .html = "12345" };
+    try testing.expectEqual(@as(u64, 5), (try page.resource()).size.?);
 }

@@ -88,12 +88,14 @@ const State = enum {
     end,
 };
 
-const TagDirective = struct { handle: []const u8, prefix: []const u8 };
-
 /// Bound on the state stack — the parser is iterative, so this only caps
 /// memory, and matches the scanner's own nesting cap.
 const max_depth = scanner.max_depth;
 
+/// The event parser. Besides the nesting caps, the resolved tags of one parse
+/// may total at most `max(1 MiB, 16 x source length)` bytes (a long `%TAG`
+/// prefix is copied into every node that uses it); past that `next` fails with
+/// `error.InvalidYaml`, `problem` "tag expansion over budget".
 pub const Parser = struct {
     arena_state: std.heap.ArenaAllocator,
     src: []const u8,
@@ -105,7 +107,11 @@ pub const Parser = struct {
 
     state: State = .stream_start,
     states: std.ArrayList(State) = .empty,
-    tag_directives: std.ArrayList(TagDirective) = .empty,
+    /// Handle -> prefix for the current document. A hash map, not a list: the
+    /// number of distinct `%TAG` handles is bounded only by the input, and a
+    /// list made both the duplicate check and every tag lookup O(directives)
+    /// (sweep YS-1).
+    tag_directives: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Set once the stream has ended or errored; `next` then keeps returning
     /// null / the same error rather than walking off the end.
     done: bool = false,
@@ -118,6 +124,10 @@ pub const Parser = struct {
     /// parsed yet, or the last document was closed by an explicit `...`. See
     /// `parseDocumentStart`.
     footer_seen: bool = true,
+
+    /// Bytes of resolved tags (`prefix ++ suffix`) allocated so far; bounded by
+    /// `tagBudget` (sweep YS-8).
+    tag_bytes: usize = 0,
 
     problem: []const u8 = "",
     problem_mark: Mark = .{},
@@ -322,7 +332,13 @@ pub const Parser = struct {
             try self.skip();
             explicit = true;
         }
-        self.tag_directives.clearRetainingCapacity();
+        // Clearing a map is O(capacity): after a document with many `%TAG`
+        // directives that would be paid again for every later document.
+        if (self.tag_directives.capacity() > 32) {
+            self.tag_directives = .empty;
+        } else {
+            self.tag_directives.clearRetainingCapacity();
+        }
         self.state = .document_start;
         // Only an explicit `...` re-opens the between-documents position.
         self.footer_seen = explicit;
@@ -640,10 +656,8 @@ pub const Parser = struct {
     }
 
     fn addDefault(self: *Self, handle: []const u8, prefix: []const u8) Error!void {
-        for (self.tag_directives.items) |d| {
-            if (std.mem.eql(u8, d.handle, handle)) return;
-        }
-        try self.tag_directives.append(self.arena, .{ .handle = handle, .prefix = prefix });
+        const gop = try self.tag_directives.getOrPut(self.arena, handle);
+        if (!gop.found_existing) gop.value_ptr.* = prefix;
     }
 
     fn processDirectives(self: *Self) Error!void {
@@ -671,11 +685,9 @@ pub const Parser = struct {
                     const handle = tok.handle;
                     const prefix = tok.suffix;
                     const start = tok.start;
-                    for (self.tag_directives.items) |d| {
-                        if (std.mem.eql(u8, d.handle, handle))
-                            return self.fail("found duplicate %TAG directive", start);
-                    }
-                    try self.tag_directives.append(self.arena, .{ .handle = handle, .prefix = prefix });
+                    const gop = try self.tag_directives.getOrPut(self.arena, handle);
+                    if (gop.found_existing) return self.fail("found duplicate %TAG directive", start);
+                    gop.value_ptr.* = prefix;
                     try self.skip();
                 },
                 else => break,
@@ -684,13 +696,22 @@ pub const Parser = struct {
         try self.applyDefaultTagDirectives();
     }
 
+    /// Most bytes of resolved tags one parse may allocate: 1 MiB, or 16 times the
+    /// source if that is more (an ordinary document spends a few bytes per tag).
+    fn tagBudget(src: []const u8) usize {
+        return @max(1 << 20, src.len *| 16);
+    }
+
     fn resolveTag(self: *Self, handle: []const u8, suffix: []const u8, m: Mark) Error![]const u8 {
         if (handle.len == 0) return suffix; // verbatim `!<…>`
-        for (self.tag_directives.items) |d| {
-            if (std.mem.eql(u8, d.handle, handle)) {
-                if (suffix.len == 0) return d.prefix;
-                return std.mem.concat(self.arena, u8, &.{ d.prefix, suffix }) catch return error.OutOfMemory;
-            }
+        if (self.tag_directives.get(handle)) |prefix| {
+            if (suffix.len == 0) return prefix;
+            // A long `%TAG` prefix is re-copied into every node that uses it, so the
+            // total, not the prefix, is what is bounded.
+            const need = prefix.len +| suffix.len;
+            if (need > tagBudget(self.src) -| self.tag_bytes) return self.fail("tag expansion over budget", m);
+            self.tag_bytes += need;
+            return std.mem.concat(self.arena, u8, &.{ prefix, suffix }) catch return error.OutOfMemory;
         }
         return self.fail("found undefined tag handle", m);
     }

@@ -314,6 +314,20 @@ Not implemented: sampling-with-tools (`tools`/`toolChoice`), `includeContext`,
   `ui://` resource, `HtmlResource` for a fixed page served as `text/html;profile=mcp-app`,
   `extensions_json` for `setCapabilityExtras`, `ClientCapabilities.apps` for what the client
   declared, `verify(&server)` for unbound or mis-typed `ui://` resources.
+  **MCP Skills** (`mcp.skills`, SEP-2640): a `Catalog` of Agent Skills from in-memory files
+  (`Catalog.load`) or a directory tree (`Catalog.loadDir`), plus generated skills
+  (`Dynamic`, `"resources":"dynamic"`); `catalog.attach(&server)` serves `skills/list`,
+  `skills/get`, `resources/directory/read` and the `skill://{+path}` files and declares the
+  extension. A broken skill is left out (`catalog.skipped()`) or refused under `.strict`.
+
+```zig
+var catalog = try mcp.skills.Catalog.load(gpa, &.{
+    .{ .path = "git-workflow/SKILL.md", .bytes = "---\nname: git-workflow\ndescription: Our Git conventions\n---\n..." },
+    .{ .path = "git-workflow/scripts/check.sh", .bytes = check_sh },
+}, &.{}, .{});
+defer catalog.deinit();
+try catalog.attach(&server); // keep `catalog` at this address while the server runs
+```
 
 Tests: `zig build test-mcp` — JSON-RPC parse/encode incl. all standard error
 codes, version negotiation, golden `tools/list`/`initialize` JSON, ctx-pointer
