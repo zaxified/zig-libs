@@ -6,7 +6,7 @@
 
 **Scope:** parity — Rust `std::time` (`Instant`, `SystemTime`) 1.93, Go `time.Now` (monotonic + wall readings) 1.26, quanta 0.12 (`Clock`, `Mock`, coarse `recent`) (surveyed 2026-11-08)
 
-**Audit:** review 2026-11-08 · mutation 2026-11-08 (42/47, 1 eq) · src 41edb1b68ed4a09f
+**Audit:** review 2026-11-08 · mutation 2026-11-25 (43/49, 2 eq) · src b5f5abdc8335af68
 
 **Hardening:** fuzz n/a — no parser or untrusted input: every function is a total map from an OS reading or two integers · ct n/a — no secret is read or computed · panic 2026-11-08 (sweep of every pub entry point: `monotonicNs`/`monotonicCoarseNs`/`realtimeNs`/`Ms`/`S` read an OS clock and convert with saturating or widening arithmetic only (a failed read returns 0, a negative field maps to 0, the QPC path divides by a guarded non-zero in `u128`, `@divFloor` by a positive constant cannot trap); `elapsedNs`/`Clock.since` saturate; `Clock`/`WallClock.now*` call the stored function, which is a required field; `ManualClock`/`ManualWallClock` `init`/`now`/`advance`/`set`/`clock` saturate and take a bounded spin lock whose critical sections are two instructions. No allocation, no loop on input, no recursion; the only unbounded wait is the spin lock, held for two instructions by a test fixture)
 
@@ -81,6 +81,9 @@ zig-libs authors (MIT); the README's `Provenance:` line.
   the lock orderings and unlocked `get` / `put` in `Locked`, which only a weak-memory or 32-bit host exposes
   (see *Backlog / deferred*); the unlocked `put` is a real lost-update window that no x86-64 test schedule
   reaches.
+- **Delta mutation 2026-11-25** (`boottimeNs`): 2 mutants, 1 killed, 1 unobservable: reading `CLOCK_MONOTONIC`
+  instead of `CLOCK_BOOTTIME` differs only by the time spent suspended; seeing it needs an injected `clock_gettime` or a
+  host that has suspended.
 - **Fuzz / constant time:** n/a (see the card's Hardening line).
 - **Bench:** `zig build bench-clock` (`tools/bench.zig`, with a Rust std reference under `tools/rust_bench/`).
 
