@@ -73,7 +73,8 @@ on:
           - ctgrind amd64
           - ctgrind portable amd64
           - count amd64
-          - small amd64
+          - small amd64 [1/2]
+          - small amd64 [2/2]
   # ⭐ THE ROUTE TO A TAG (owner, 2026-11-02; CONVENTIONS §8). Every other day the
   # full matrix runs over main; green, the commit it tested gets a dated tag and a
   # Release. Tags had stalled for two weeks and 555 commits at 2026-10-19 because a
@@ -987,7 +988,11 @@ jobs:
           # amd64 module lanes (x86_64_v3 has BMI2, +adx: montint's asm path,
           # where rsa's knob saves most, is the one tested). Its own cache key;
           # 50 modules at the first count (rsa's closure), 90 min like a shard.
-          lanes+=('{"name":"small amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx","cmd":"small","cachekey":"small","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          # Two jobs since 2026-11-25 (ZIGLIBS_SPLIT by module-name hash, own
+          # stamps and cache each): one job compiled 65 re-keyed modules for 67
+          # minutes after a ct25519 change, and its 5.6 GB tree was over the cap.
+          lanes+=('{"name":"small amd64 [1/2]","args":"-Dcpu=x86_64_v3+aes+pclmul+adx","cmd":"small","split":"1/2","cachekey":"small-1","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"small amd64 [2/2]","args":"-Dcpu=x86_64_v3+aes+pclmul+adx","cmd":"small","split":"2/2","cachekey":"small-2","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
 
           # Every shard set must cover the whole collection: per `base`, the
           # union of its `-Dgroup=` values must equal every primary lib in
@@ -1317,6 +1322,8 @@ jobs:
           # keeps the fixed-port, container and timing ones serial): the 66
           # takes ran one after another for 24 minutes (full CI 45468661097).
           ZIGLIBS_INTEROP_JOBS: ${{ matrix.cmd == 'interop' && '3' || '' }}
+          # Set by the lanes that run as several jobs (small); empty elsewhere.
+          ZIGLIBS_SPLIT: ${{ matrix.split || '' }}
         run: |
           # The imap peer is found at its default path; the opcua one is named
           # by an environment variable, so point it at the venv built above.

@@ -2177,8 +2177,14 @@ cmd_small() {
     local -a args=(-Doptimize=ReleaseSafe -Dprofile=small)
     closure="$(small_closure)"
     for m in $closure; do args+=("-Dmodule=$m"); done
-    echo "small: $(wc -w <<< "$closure") module(s) -- the zl_options readers and their dependents"
-    step "small-sizes" ./scripts/checks/small-sizes.sh
+    echo "small: $(wc -w <<< "$closure") module(s) -- the zl_options readers and their dependents${ZIGLIBS_SPLIT:+ (this job: split ${ZIGLIBS_SPLIT})}"
+    # The size gate is one measurement of the whole profile: the first half of
+    # a split runs it, the other does not repeat it.
+    if [[ -z "${ZIGLIBS_SPLIT:-}" || "${ZIGLIBS_SPLIT%/*}" == 1 ]]; then
+        step "small-sizes" ./scripts/checks/small-sizes.sh
+    else
+        echo "small: small-sizes runs in split 1/${ZIGLIBS_SPLIT#*/}"
+    fi
     cmd_modules "${args[@]}" "$@"
 }
 
@@ -2632,7 +2638,12 @@ cmd_modules() {
     set_extra_args "$@"
     graph_load
     local lane_mods todo lane
-    lane_mods="$(lane_modules)"
+    # ZIGLIBS_SPLIT (2026-11-25): the `small` lane runs as two jobs. A change to
+    # a widely used module re-keys most of its 92 modules -- 65 in full lane
+    # 45552313195, 67 minutes of compiling in one job -- and the one tree grew
+    # past the cache cap (5.6 GB > 4 GB), so it was never saved. Each half keeps
+    # its own stamps and cache (cachekey small-1 / small-2).
+    lane_mods="$(split_modules "$(lane_modules)")"
     lane="$(stamps_lane_key modules)"
     fp_load   # here, in THIS shell: see stamps_record
     todo="$(stamps_pending "$lane_mods" "$lane")"
