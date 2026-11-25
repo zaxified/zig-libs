@@ -219,7 +219,7 @@ pub const module_list = [_]Module{
     .{ .name = "seqmap", .libs = &.{"net"} },
     .{ .name = "icmp", .libs = &.{"net"}, .deps = &.{ "seqmap", "netaddr", "clock" }, .test_deps = &.{"testkit"}, .timing = true, .loopback = true },
     .{ .name = "mcp", .libs = &.{"os"}, .deps = &.{ "jsontext", "yaml" }, .test_deps = &.{"testkit"} },
-    .{ .name = "mcp-http", .libs = &.{"os"}, .deps = &.{ "router", "http", "mcp", "clock" }, .test_deps = &.{"testkit"} },
+    .{ .name = "mcp-http", .libs = &.{"os"}, .deps = &.{ "router", "http", "mcp", "clock", "aaa-gate" }, .test_deps = &.{"testkit"} },
     .{ .name = "coap", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "crc32", .libs = &.{ "format", "storage" }, .test_deps = &.{"testkit"} },
     .{ .name = "crc32c", .libs = &.{ "format", "storage" }, .test_deps = &.{"testkit"} },

@@ -660,6 +660,32 @@ fn present(v: ?std.json.Value) ?std.json.Value {
 /// holds is a copy in `Server`-owned memory — see `dupe` — because the
 /// `std.json.Value` this is parsed from lives on the per-message arena and
 /// does not outlive `handleMessage`'s call.
+/// What a transport learnt when it authenticated a request (`mcp-http`'s
+/// bearer gate fills it from its token verifier; the TypeScript SDK's
+/// `AuthInfo`, the Python SDK's `AccessToken`). Handlers read it as
+/// `call.auth` / `req.auth`; it is null on stdio and on a transport without
+/// authorization. Every slice is the transport's, valid for the request.
+pub const AuthInfo = struct {
+    /// The OAuth client the token was issued to ("" when unknown).
+    client_id: []const u8 = "",
+    /// The end user or service the token stands for ("" when unknown).
+    subject: []const u8 = "",
+    /// Granted scopes.
+    scopes: []const []const u8 = &.{},
+    /// Unix seconds, when known.
+    expires_at: ?i64 = null,
+    /// The resource (RFC 8707 audience) the token was issued for, when known.
+    resource: ?[]const u8 = null,
+    /// Whatever else the verifier wants handlers to see.
+    extra: ?*const anyopaque = null,
+
+    /// Whether `scope` is among the granted scopes (exact match).
+    pub fn hasScope(self: *const AuthInfo, scope: []const u8) bool {
+        for (self.scopes) |s| if (std.mem.eql(u8, s, scope)) return true;
+        return false;
+    }
+};
+
 pub const ClientInfo = struct {
     name: []const u8,
     version: []const u8,
@@ -2654,6 +2680,9 @@ pub const ToolCall = struct {
     /// Set when this call arrived as a stateless 2026-07-28 request: what its
     /// `_meta` declared. Null = an `initialize`-session call. Arena lifetime.
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
     /// The multi round-trip side of a 2026-07-28 call: the answers this retry
     /// carries, and `ask`/`setState` for the next round. Asking anything turns
     /// the reply into an `InputRequiredResult`; the text written to `out` and
@@ -2956,6 +2985,9 @@ pub const ResourceRequest = struct {
     server: ?*Server = null,
     peer: u64 = 0,
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
     meta: std.json.Value = .null,
     /// Set by `failWith`/`failProtocol`: answer with this JSON-RPC error.
     protocol_error: ?ProtocolError = null,
@@ -3131,6 +3163,9 @@ pub const PromptRequest = struct {
     server: ?*Server = null,
     peer: u64 = 0,
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
     meta: std.json.Value = .null,
     /// Set by `failWith`/`failProtocol`: answer with this JSON-RPC error.
     protocol_error: ?ProtocolError = null,
@@ -3330,6 +3365,9 @@ pub const MethodRequest = struct {
     server: ?*Server = null,
     peer: u64 = 0,
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
     meta: std.json.Value = .null,
     protocol_error: ?ProtocolError = null,
 
@@ -3390,6 +3428,9 @@ pub const CompletionRequest = struct {
     server: ?*Server = null,
     peer: u64 = 0,
     modern: ?*const ModernRequest = null,
+    /// Who the transport authenticated this request as (`Server.handleMessageAs`),
+    /// or null: stdio, or a transport without authorization.
+    auth: ?*const AuthInfo = null,
 
     /// Add one candidate (OOM swallowed).
     pub fn add(self: *CompletionRequest, v: []const u8) void {
@@ -3664,6 +3705,11 @@ pub const Server = struct {
     /// Default caching hint on a 2026-07-28 `resources/read`; a handler can
     /// override it per read (`ResourceRequest.cache`).
     read_cache: CacheHint = .{},
+    /// The `AuthInfo` of the message being handled, set by `handleMessageAs`
+    /// for the length of that one call (the same serialization as every other
+    /// `handleMessage*` call: one `Server` = one owner at a time). Each request
+    /// context copies it when it is built.
+    request_auth: ?*const AuthInfo = null,
     /// Cap on unanswered server→client requests **per peer**. A client that
     /// simply never answers must not grow this without bound; past the cap
     /// `send*` returns `error.TooManyPending`. Counted per peer so one
@@ -3893,6 +3939,7 @@ pub const Server = struct {
             .server = self,
             .peer = peer,
             .modern = modern,
+            .auth = self.request_auth,
         };
         // A known target without a completer simply has no suggestions.
         if (completer) |f| f(cctx, &req);
@@ -4057,6 +4104,7 @@ pub const Server = struct {
             .server = self,
             .peer = peer,
             .modern = modern,
+            .auth = self.request_auth,
             .meta = req_meta,
         };
         const ok = method.handler(method.ctx, &req);
@@ -4403,6 +4451,16 @@ pub const Server = struct {
     /// session cannot consume another session's sampling completion or the
     /// user's elicitation answer. Single-peer transports (stdio) pass 0, which
     /// is what `handleMessage` does.
+    /// `handleMessageFrom` for a request a transport authenticated: `auth`
+    /// reaches every handler of this message as `call.auth` / `req.auth`
+    /// (null = none). It must outlive the call; nothing keeps it after.
+    pub fn handleMessageAs(self: *Server, msg: []const u8, out: *std.Io.Writer, peer: u64, auth: ?*const AuthInfo) Error!void {
+        const prev = self.request_auth;
+        self.request_auth = auth;
+        defer self.request_auth = prev;
+        return self.handleMessageFrom(msg, out, peer);
+    }
+
     pub fn handleMessageFrom(self: *Server, msg: []const u8, out: *std.Io.Writer, peer: u64) Error!void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -5215,6 +5273,7 @@ pub const Server = struct {
             .transport = out,
             .peer = peer,
             .modern = modern,
+            .auth = self.request_auth,
             .input = round,
             .meta = req_meta,
         };
@@ -5343,6 +5402,7 @@ pub const Server = struct {
             .server = self,
             .peer = peer,
             .modern = modern_req,
+            .auth = self.request_auth,
             .meta = req_meta,
         };
         const found = blk: {
@@ -5468,6 +5528,7 @@ pub const Server = struct {
             .server = self,
             .peer = peer,
             .modern = modern_req,
+            .auth = self.request_auth,
             .meta = req_meta,
         };
         // A copy, taken before the handler runs: `prompt` points into
@@ -14529,4 +14590,43 @@ test "ToolCall.writeJson: appends, omits null optionals, survives OOM" {
     var c3 = typedCall(fa0.allocator(), .null, &o3, &s, &sink.writer);
     c3.writeJson(TypedOut{ .city = "Brno", .days = 3 });
     try testing.expectEqual(@as(usize, 0), o3.items.len);
+}
+
+fn whoAmI(_: ?*anyopaque, call: *ToolCall) bool {
+    const a = call.auth orelse {
+        call.write("anonymous");
+        return true;
+    };
+    call.print("{s} admin={}", .{ a.client_id, a.hasScope("admin") });
+    return true;
+}
+
+fn whoAmIResource(_: ?*anyopaque, req: *ResourceRequest) bool {
+    req.text(req.uri, "text/plain", if (req.auth) |a| a.subject else "anonymous");
+    return true;
+}
+
+test "handleMessageAs: handlers see the transport's AuthInfo for that one message only" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "whoami", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = whoAmI });
+    try s.addResource(.{ .uri = "x://me", .name = "me", .handler = whoAmIResource });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const scopes = [_][]const u8{ "read", "admin" };
+    const info: AuthInfo = .{ .client_id = "cli-7", .subject = "ada", .scopes = &scopes };
+    const call_line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}," ++
+        "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}";
+    try s.handleMessageAs(call_line, &out.writer, 0, &info);
+    try testing.expect(std.mem.find(u8, out.written(), "cli-7 admin=true") != null);
+    try testing.expect(s.request_auth == null); // reset after the call
+    out.clearRetainingCapacity();
+    try s.handleMessage(call_line, &out.writer);
+    try testing.expect(std.mem.find(u8, out.written(), "anonymous") != null);
+    out.clearRetainingCapacity();
+    try s.handleMessageAs("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{\"uri\":\"x://me\"," ++
+        "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}", &out.writer, 0, &info);
+    try testing.expect(std.mem.find(u8, out.written(), "\"text\":\"ada\"") != null);
+    const none: AuthInfo = .{};
+    try testing.expect(!none.hasScope("read"));
 }

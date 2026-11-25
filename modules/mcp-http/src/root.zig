@@ -107,6 +107,9 @@ const router = @import("router");
 const http = @import("http");
 const mcp = @import("mcp");
 const modern = @import("modern.zig");
+/// MCP authorization, resource-server side: the bearer gate and the RFC 9728
+/// document (`Transport.auth`); see `auth.zig`.
+pub const auth = @import("auth.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -123,7 +126,7 @@ pub const meta = .{
     // http.Server (documented).
     .concurrency = .reentrant,
     .model_after = "MCP Streamable HTTP transport (2026-07-28 and 2025-06-18); python-sdk captured session as oracle",
-    .deps = .{ "router", "http", "mcp", "clock" },
+    .deps = .{ "router", "http", "mcp", "clock", "aaa-gate" },
 };
 
 /// Serialization seam for the shared `mcp.Server` under a multi-threaded
@@ -656,6 +659,21 @@ pub const Transport = struct {
     /// attack this blocks is browser-driven. List full origins,
     /// e.g. `"http://localhost:7717"`.
     allowed_origins: []const []const u8 = &.{},
+    /// Allowed `Host` header values (case-insensitive, with the port as the
+    /// client sends it: `"localhost:7717"`, `"127.0.0.1:7717"`, `"[::1]:7717"`)
+    /// — the second half of the DNS-rebinding defense for a server bound to
+    /// localhost (the TypeScript SDK's `hostHeaderValidation`, the Python SDK's
+    /// `allowed_hosts`): a rebound name reaches the socket with the attacker's
+    /// `Host`. **Empty ⇒ every host is accepted.** When non-empty, a request
+    /// whose `Host` is absent or not listed gets **403**.
+    allowed_hosts: []const []const u8 = &.{},
+    /// Authorization (`auth.Auth`): with it every request to `path` needs a
+    /// valid bearer token, the RFC 9728 document is served, and handlers see
+    /// the token's `mcp.AuthInfo` as `call.auth`. Null (the default): no
+    /// authorization, though an `mcp.AuthInfo` a middleware of the caller's
+    /// own stored with `ctx.setTyped` is still passed on. Must outlive the
+    /// Router.
+    auth: ?*const auth.Auth = null,
     /// Response delivery policy. `.auto` (default): when the client's `Accept`
     /// header includes `text/event-stream`, the POST response is delivered as
     /// an **SSE stream** so a tool call's `notifications/progress` reach the
@@ -753,21 +771,96 @@ pub const Transport = struct {
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const t: *const Transport = @ptrCast(@alignCast(state.?));
 
+    if (t.auth) |a| if (a.metadata) |*md| {
+        var pbuf: [1024]u8 = undefined;
+        if (auth.metadataPath(&pbuf, t.path)) |mp| if (std.mem.eql(u8, ctx.req.path, mp)) return serveMetadata(ctx, md);
+    };
+
     if (!std.mem.eql(u8, ctx.req.path, t.path)) return next.run(ctx);
 
-    if (!originAllowed(t, ctx.req)) {
+    if (!hostAllowed(t, ctx.req) or !originAllowed(t, ctx.req)) {
         ctx.res.setStatus(403);
         try ctx.res.setHeader("Content-Type", "text/plain");
         try ctx.res.writeAll("Forbidden\n");
         return;
     }
 
+    if (t.auth) |a| {
+        var arena_state = std.heap.ArenaAllocator.init(t.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var fields = ctx.req.headerAll("authorization");
+        const first = fields.next();
+        const repeated = fields.next() != null;
+        const outcome = auth.check(a, arena, first, repeated) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.VerifierFailed => return authServerError(ctx),
+        };
+        var info: mcp.AuthInfo = switch (outcome) {
+            .refused => |r| return refuseAuth(ctx, arena, a, r),
+            .ok => |i| i,
+        };
+        const prev = ctx.setTyped(mcp.AuthInfo, &info) catch return authServerError(ctx);
+        defer _ = ctx.setTyped(mcp.AuthInfo, prev) catch {};
+        return dispatch(t, ctx);
+    }
+    return dispatch(t, ctx);
+}
+
+fn dispatch(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     switch (ctx.req.method) {
         .post => return handlePost(t, ctx),
         .get => if (t.sessions != null) return handleGet(t, ctx) else return methodNotAllowed(t, ctx),
         .delete => if (t.sessions != null) return handleDelete(t, ctx) else return methodNotAllowed(t, ctx),
         else => return methodNotAllowed(t, ctx),
     }
+}
+
+/// The RFC 9728 document: unauthenticated, readable cross-origin (a
+/// browser-based client fetches it from the challenge's URL).
+fn serveMetadata(ctx: *router.Ctx, md: *const auth.ProtectedResourceMetadata) anyerror!void {
+    if (ctx.req.method != .get) {
+        ctx.res.setStatus(405);
+        try ctx.res.setHeader("Allow", "GET");
+        try ctx.res.setHeader("Content-Type", "text/plain");
+        try ctx.res.writeAll("Method Not Allowed\n");
+        return;
+    }
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    md.write(&w) catch return authServerError(ctx); // a document over 8 KiB: misconfigured
+    try ctx.res.setHeader("Content-Type", "application/json");
+    try ctx.res.setHeader("Access-Control-Allow-Origin", "*");
+    try ctx.res.setHeader("Cache-Control", "max-age=3600");
+    try ctx.res.writeAll(w.buffered());
+}
+
+/// 401/403 with the RFC 6750 challenge and the TypeScript SDK's JSON body.
+fn refuseAuth(ctx: *router.Ctx, arena: std.mem.Allocator, a: *const auth.Auth, r: auth.Refusal) anyerror!void {
+    var hv: std.Io.Writer.Allocating = .init(arena);
+    try auth.challenge(&hv.writer, a, r);
+    var body: std.Io.Writer.Allocating = .init(arena);
+    try auth.refusalBody(&body.writer, r);
+    ctx.res.setStatus(r.status);
+    try ctx.res.setHeader("WWW-Authenticate", hv.written());
+    try ctx.res.setHeader("Content-Type", "application/json");
+    try ctx.res.writeAll(body.written());
+}
+
+fn authServerError(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(500);
+    try ctx.res.setHeader("Content-Type", "application/json");
+    try ctx.res.writeAll("{\"error\":\"server_error\",\"error_description\":\"Token verification failed\"}");
+}
+
+/// DNS-rebinding guard, `Host` half (see `Transport.allowed_hosts`).
+fn hostAllowed(t: *const Transport, req: *const http.Server.Request) bool {
+    if (t.allowed_hosts.len == 0) return true;
+    const host = std.mem.trim(u8, req.header("host") orelse return false, " \t");
+    for (t.allowed_hosts) |allowed| {
+        if (std.ascii.eqlIgnoreCase(allowed, host)) return true;
+    }
+    return false;
 }
 
 fn methodNotAllowed(t: *const Transport, ctx: *router.Ctx) anyerror!void {
@@ -1055,6 +1148,16 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     };
     defer t.gpa.free(body);
 
+    // Per-operation scopes (`auth.Auth.scope_for`): the token was accepted
+    // in `middlewareRun`; this operation may need more.
+    if (t.auth) |a| if (a.scope_for != null) if (ctx.getTyped(mcp.AuthInfo)) |info| {
+        var arena_state = std.heap.ArenaAllocator.init(t.gpa);
+        defer arena_state.deinit();
+        const op = try auth.operationOf(t.gpa, arena_state.allocator(), body);
+        if (auth.checkOperation(a, .{ .method = op.method, .target = op.target, .auth = info })) |r|
+            return refuseAuth(ctx, arena_state.allocator(), a, r);
+    };
+
     // Spec 2026-07-28: a request whose body carries the `_meta` protocol
     // version is served statelessly, whatever sessions are configured — no
     // session is required, none is minted, `Mcp-Session-Id` is ignored — once
@@ -1152,7 +1255,7 @@ fn jsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8, sid: ?[
     defer out.deinit();
 
     t.lock.acquire();
-    const rc = t.server.handleMessageFrom(body, &out.writer, peer);
+    const rc = t.server.handleMessageAs(body, &out.writer, peer, ctx.getTyped(mcp.AuthInfo));
     t.lock.release();
     // handleMessage only fails on OOM or a transport write failure; the
     // Allocating writer fails solely on OOM, so both surface as a 500.
@@ -1197,7 +1300,7 @@ fn streamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8, peer:
     defer adapter.deinit();
 
     t.lock.acquire();
-    const rc = t.server.handleMessageFrom(body, &adapter.writer, peer);
+    const rc = t.server.handleMessageAs(body, &adapter.writer, peer, ctx.getTyped(mcp.AuthInfo));
     t.lock.release();
     adapter.writer.flush() catch {}; // drain any bytes still buffered
     adapter.finish(); // emit a trailing partial line (defensive; mcp ends with \n)
@@ -1252,7 +1355,7 @@ fn modernJsonResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8) a
         t.lock.release();
         return;
     }
-    const rc = t.server.handleMessageFrom(body, &out.writer, peer);
+    const rc = t.server.handleMessageAs(body, &out.writer, peer, ctx.getTyped(mcp.AuthInfo));
     t.lock.release();
     rc catch return error.OutOfMemory; // see `jsonResponse`
 
@@ -1312,7 +1415,7 @@ fn modernStreamResponse(t: *const Transport, ctx: *router.Ctx, body: []const u8)
         t.lock.release();
         return;
     }
-    const rc = t.server.handleMessageFrom(body, &adapter.writer, peer);
+    const rc = t.server.handleMessageAs(body, &adapter.writer, peer, ctx.getTyped(mcp.AuthInfo));
     t.lock.release();
     adapter.writer.flush() catch {};
     adapter.finish();
@@ -1367,7 +1470,7 @@ fn heldListen(t: *const Transport, ctx: *router.Ctx, body: []const u8) anyerror!
     // under `lock` too).
     var holding = false;
     t.lock.acquire();
-    const rc = t.server.handleMessageFrom(body, &adapter.writer, peer);
+    const rc = t.server.handleMessageAs(body, &adapter.writer, peer, ctx.getTyped(mcp.AuthInfo));
     adapter.writer.flush() catch {};
     adapter.finish();
     if (rc) |_| {
@@ -4437,4 +4540,177 @@ test "held GET: hold_get = false drains and closes as before" {
     const got = readToEnd(io, stream, &buf); // returns: the response ended by itself
     try testing.expect(std.mem.find(u8, got, "id: 1\ndata: {\"n\":1}") != null);
     try testing.expect(rig.sessions.heldNow(created.id).? == false);
+}
+
+// ── authorization (auth.zig) over the wire ──────────────────────────────────
+
+const auth_scopes = [_][]const u8{ "mcp:read", "mcp:tools" };
+
+fn authTestVerify(_: ?*anyopaque, _: std.mem.Allocator, token: []const u8) error{ OutOfMemory, VerifierFailed }!auth.Verdict {
+    if (std.mem.eql(u8, token, "good")) return .{ .ok = .{ .client_id = "cli-9", .scopes = &auth_scopes, .expires_at = std.math.maxInt(i64), .resource = "https://mcp.example/mcp" } };
+    if (std.mem.eql(u8, token, "readonly")) return .{ .ok = .{ .client_id = "ro", .scopes = auth_scopes[0..1], .expires_at = std.math.maxInt(i64), .resource = "https://mcp.example/mcp" } };
+    if (std.mem.eql(u8, token, "boom")) return error.VerifierFailed;
+    return .{ .invalid = "Unknown token" };
+}
+
+fn toolsNeedToolsScope(_: ?*anyopaque, op: auth.Operation) []const []const u8 {
+    if (std.mem.eql(u8, op.method, "tools/call")) return auth_scopes[1..2];
+    return &.{};
+}
+
+fn whoAmITool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
+    call.write(if (call.auth) |a| a.client_id else "anonymous");
+    return true;
+}
+
+fn buildAuthServer(gpa: std.mem.Allocator) !mcp.Server {
+    var server = try buildServer(gpa);
+    errdefer server.deinit();
+    try server.addTool(.{ .name = "whoami", .description = "who", .input_schema = "{\"type\":\"object\"}", .handler = whoAmITool });
+    return server;
+}
+
+const auth_as = [_][]const u8{"https://auth.example"};
+const test_mcp_auth: auth.Auth = .{
+    .verify = authTestVerify,
+    .resource_metadata_url = "https://mcp.example/.well-known/oauth-protected-resource/mcp",
+    .metadata = .{ .resource = "https://mcp.example/mcp", .authorization_servers = &auth_as, .scopes_supported = &auth_scopes },
+    .required_scopes = auth_scopes[0..1],
+    .expected_resource = "https://mcp.example/mcp",
+    .scope_for = toolsNeedToolsScope,
+};
+
+fn postAuth(comptime authz: []const u8, comptime json: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        "POST /mcp HTTP/1.1\r\nHost: t\r\nAuthorization: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ authz, json.len, json },
+    );
+}
+
+test "auth: RFC 9728 document, 401 challenges, 403 scopes, handlers see the token's AuthInfo" {
+    const gpa = testing.allocator;
+    var server = try buildAuthServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .auth = &test_mcp_auth };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    const meta_url = "resource_metadata=\"https://mcp.example/.well-known/oauth-protected-resource/mcp\"";
+
+    // The metadata document: unauthenticated, path-aware, readable cross-origin.
+    var b0: [4096]u8 = undefined;
+    const md = runWire(&r, "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &b0);
+    try testing.expectEqual(@as(?u16, 200), statusOf(md));
+    try testing.expectEqualStrings("*", headerValue(md, "access-control-allow-origin").?);
+    try testing.expectEqualStrings(
+        \\{"resource":"https://mcp.example/mcp","authorization_servers":["https://auth.example"],"scopes_supported":["mcp:read","mcp:tools"],"bearer_methods_supported":["header"]}
+    , bodyOf(md));
+    var b0b: [4096]u8 = undefined;
+    const md_post = runWire(&r, post("/.well-known/oauth-protected-resource/mcp", "{}"), &b0b);
+    try testing.expectEqual(@as(?u16, 405), statusOf(md_post));
+
+    // No token: 401, the challenge names the metadata and the scope, no error code.
+    var b1: [4096]u8 = undefined;
+    const none = runWire(&r, post("/mcp", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"), &b1);
+    try testing.expectEqual(@as(?u16, 401), statusOf(none));
+    const ch = headerValue(none, "www-authenticate").?;
+    try testing.expect(std.mem.startsWith(u8, ch, "Bearer scope=\"mcp:read\", "));
+    try testing.expect(std.mem.find(u8, ch, meta_url) != null);
+    try testing.expect(std.mem.find(u8, ch, "error=") == null);
+
+    // Unknown token: 401 invalid_token, with the verifier's reason.
+    var b2: [4096]u8 = undefined;
+    const bad = runWire(&r, postAuth("Bearer nope", "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"), &b2);
+    try testing.expectEqual(@as(?u16, 401), statusOf(bad));
+    try testing.expect(std.mem.find(u8, headerValue(bad, "www-authenticate").?, "error=\"invalid_token\", error_description=\"Unknown token\"") != null);
+    try testing.expectEqualStrings("{\"error\":\"invalid_token\",\"error_description\":\"Unknown token\"}", bodyOf(bad));
+
+    // A valid token: the list is served and the tool sees who called it.
+    var b3: [4096]u8 = undefined;
+    const ok = runWire(&r, postAuth("Bearer good", "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}}"), &b3);
+    try testing.expectEqual(@as(?u16, 200), statusOf(ok));
+    try testing.expect(std.mem.find(u8, ok, "cli-9") != null);
+
+    // Per-operation scope: a read-only token may list but not call.
+    var b4: [4096]u8 = undefined;
+    const ro_list = runWire(&r, postAuth("Bearer readonly", "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\"}"), &b4);
+    try testing.expectEqual(@as(?u16, 200), statusOf(ro_list));
+    var b5: [4096]u8 = undefined;
+    const ro_call = runWire(&r, postAuth("Bearer readonly", "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}}"), &b5);
+    try testing.expectEqual(@as(?u16, 403), statusOf(ro_call));
+    try testing.expect(std.mem.find(u8, headerValue(ro_call, "www-authenticate").?, "error=\"insufficient_scope\"") != null);
+    try testing.expect(std.mem.find(u8, headerValue(ro_call, "www-authenticate").?, "scope=\"mcp:tools\"") != null);
+
+    // A verifier that cannot decide is a 500, never an accepted request.
+    var b6: [4096]u8 = undefined;
+    const boom = runWire(&r, postAuth("Bearer boom", "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/list\"}"), &b6);
+    try testing.expectEqual(@as(?u16, 500), statusOf(boom));
+
+    // Two Authorization fields are refused.
+    var b7: [4096]u8 = undefined;
+    const two = runWire(&r, "POST /mcp HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer good\r\nAuthorization: Bearer good\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", &b7);
+    try testing.expectEqual(@as(?u16, 401), statusOf(two));
+}
+
+test "auth: GET and DELETE of a session endpoint are gated too" {
+    const gpa = testing.allocator;
+    var server = try buildAuthServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions, .auth = &test_mcp_auth };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var b1: [4096]u8 = undefined;
+    try testing.expectEqual(@as(?u16, 401), statusOf(runWire(&r, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: x\r\nConnection: close\r\n\r\n", &b1)));
+    var b2: [4096]u8 = undefined;
+    try testing.expectEqual(@as(?u16, 401), statusOf(runWire(&r, "DELETE /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: x\r\nConnection: close\r\n\r\n", &b2)));
+    var b3: [4096]u8 = undefined;
+    try testing.expectEqual(@as(?u16, 404), statusOf(runWire(&r, "GET /mcp HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer good\r\nMcp-Session-Id: x\r\nConnection: close\r\n\r\n", &b3)));
+}
+
+test "Host allowlist: listed (any case) → served, other → 403, absent → 400" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    const hosts = [_][]const u8{ "localhost:7717", "127.0.0.1:7717" };
+    var transport = Transport{ .gpa = gpa, .server = &server, .allowed_hosts = &hosts };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    const cases = [_]struct { []const u8, u16 }{
+        .{ "Host: LocalHost:7717\r\n", 200 },
+        .{ "Host: 127.0.0.1:7717\r\n", 200 },
+        .{ "Host: evil.example:7717\r\n", 403 },
+        .{ "Host: localhost:7718\r\n", 403 },
+        .{ "", 400 }, // HTTP/1.1 without Host: http.Server's own 400 (RFC 9112 §3.2), before the allowlist
+    };
+    inline for (cases) |c| {
+        var b: [4096]u8 = undefined;
+        const got = runWire(&r, std.fmt.comptimePrint("POST /mcp HTTP/1.1\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ c[0], body.len, body }), &b);
+        try testing.expectEqual(@as(?u16, c[1]), statusOf(got));
+    }
+}
+
+fn ownAuthMiddleware(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    var info: mcp.AuthInfo = .{ .client_id = "from-my-gate" };
+    const prev = try ctx.setTyped(mcp.AuthInfo, &info);
+    defer _ = ctx.setTyped(mcp.AuthInfo, prev) catch {};
+    return next.run(ctx);
+}
+
+test "auth: an AuthInfo a caller's own middleware stored is passed to the handlers" {
+    const gpa = testing.allocator;
+    var server = try buildAuthServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(.{ .run = ownAuthMiddleware });
+    try r.use(transport.middleware());
+    var b: [4096]u8 = undefined;
+    const got = runWire(&r, post("/mcp", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}}"), &b);
+    try testing.expect(std.mem.find(u8, got, "from-my-gate") != null);
 }
