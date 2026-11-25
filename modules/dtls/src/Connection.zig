@@ -1297,6 +1297,18 @@ const DirKeys = struct {
     iv: [12]u8 = undefined,
     sn_key: [32]u8 = undefined,
     sn_len: u8 = 0,
+    /// The AES-GCM key schedule expanded once per epoch by `installDir`
+    /// (in place: an expanded key is a secret and is never copied through a
+    /// return slot), so a record skips the AES key expansion and the GHASH
+    /// key setup. `.none` for the other suites and for `DirKeys` built by
+    /// hand: the dispatch then takes the stateless per-record call.
+    gcm: GcmCtx = .none,
+};
+
+const GcmCtx = union(enum) {
+    none,
+    g128: Aes128Gcm.Context,
+    g256: Aes256Gcm.Context,
 };
 
 /// Per-epoch record-layer sequence-number bookkeeping (send + receive-side
@@ -2399,7 +2411,7 @@ pub const Connection = struct {
         suitehash.earlySecret(alg, &es, t.psk[0..alg.len()]);
         var th_buf: Secret = undefined;
         suitehash.clientEarlyTrafficSecret(alg, &cets, &es, self.transcript.currentHash(alg, &th_buf));
-        self.early_keys = deriveDir(alg, params, &cets);
+        installDir(&self.early_keys, alg, params, &cets);
         var cursor = record_bytes.len;
         var rest = self.config.early_data;
         while (rest.len > 0) {
@@ -2740,8 +2752,8 @@ pub const Connection = struct {
 
         @memcpy(self.ap_write_secret[0..n], my_secret[0..n]);
         @memcpy(self.ap_read_secret[0..n], peer_secret[0..n]);
-        self.write_keys = deriveDir(alg, params, &self.ap_write_secret);
-        self.read_keys = deriveDir(alg, params, &self.ap_read_secret);
+        installDir(&self.write_keys, alg, params, &self.ap_write_secret);
+        installDir(&self.read_keys, alg, params, &self.ap_read_secret);
         self.suite = suite;
         self.epoch = application_epoch;
         self.write_epoch = application_epoch;
@@ -2902,7 +2914,7 @@ pub const Connection = struct {
         const params = suiteParams(self.suite).?;
         suitehash.nextApplicationTrafficSecret(self.suite.hash(), &self.ap_write_secret);
         secureZeroDirKeys(&self.write_keys);
-        self.write_keys = deriveDir(self.suite.hash(), params, &self.ap_write_secret);
+        installDir(&self.write_keys, self.suite.hash(), params, &self.ap_write_secret);
         self.write_epoch += 1;
         self.send_seq = 0;
         self.ku_state = .idle;
@@ -3045,7 +3057,7 @@ pub const Connection = struct {
             .recv_window = self.recv_window,
         };
         suitehash.nextApplicationTrafficSecret(self.suite.hash(), &self.ap_read_secret);
-        self.read_keys = deriveDir(self.suite.hash(), params, &self.ap_read_secret);
+        installDir(&self.read_keys, self.suite.hash(), params, &self.ap_read_secret);
         self.read_epoch += 1;
         self.recv_max_seq = 0;
         self.recv_seen_any = false;
@@ -5272,7 +5284,7 @@ pub const Connection = struct {
                 defer std.crypto.secureZero(u8, &cets);
                 var th_ch: Secret = undefined;
                 suitehash.clientEarlyTrafficSecret(alg, &cets, &es, self.transcript.currentHash(alg, &th_ch));
-                self.early_keys = deriveDir(alg, params, &cets);
+                installDir(&self.early_keys, alg, params, &cets);
                 self.early_accepted = true;
                 var scratch: [max_flight_bytes]u8 = undefined;
                 _ = try self.takeEarlyRecords(datagram[ch_pos..], &scratch);
@@ -5368,8 +5380,8 @@ pub const Connection = struct {
         if (dhe_shared) |*s| std.crypto.secureZero(u8, &s.bytes); // forward secrecy: drop the (EC)DHE shared secret
         suitehash.deriveHandshakeTrafficSecrets(alg, &self.hs_traffic_client, &self.hs_traffic_server, &hs_secret, th_through_sh);
         const params = suiteParams(suite) orelse return error.UnsupportedSuite;
-        self.hs_write_keys = deriveDir(alg, params, &self.hs_traffic_server);
-        self.hs_read_keys = deriveDir(alg, params, &self.hs_traffic_client);
+        installDir(&self.hs_write_keys, alg, params, &self.hs_traffic_server);
+        installDir(&self.hs_read_keys, alg, params, &self.hs_traffic_client);
 
         // EncryptedExtensions: empty, or the RFC 7301 selection (a list of
         // exactly one name).
@@ -5960,8 +5972,8 @@ pub const Connection = struct {
         const th_through_sh = self.transcript.currentHash(alg, &th_buf);
         suitehash.deriveHandshakeTrafficSecrets(alg, &self.hs_traffic_client, &self.hs_traffic_server, &hs_secret, th_through_sh);
         const params = suiteParams(suite).?;
-        self.hs_write_keys = deriveDir(alg, params, &self.hs_traffic_client);
-        self.hs_read_keys = deriveDir(alg, params, &self.hs_traffic_server);
+        installDir(&self.hs_write_keys, alg, params, &self.hs_traffic_client);
+        installDir(&self.hs_read_keys, alg, params, &self.hs_traffic_server);
 
         var ee_msg_buf: [ee_recv_cap]u8 = undefined;
         var ee_received_buf: [ee_recv_cap]bool = undefined;
@@ -6086,7 +6098,7 @@ const Aes128Ccm8 = @import("aesccm").Aes128Ccm8;
 // which stays reachable there as the OpenSSL-anchored oracle.
 const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
 
-const SuiteParams = struct { key_len: u8, sn_len: u8, tag_len: u8, is_chacha: bool };
+const SuiteParams = struct { key_len: u8, sn_len: u8, tag_len: u8, is_chacha: bool, gcm: u8 = 0 };
 
 /// Returns the record-layer parameters for the suites whose 12-byte-nonce
 /// AEAD is validated here, or `null` for suites this pass does not wire
@@ -6101,9 +6113,9 @@ fn minInnerLen(params: SuiteParams) usize {
 
 fn suiteParams(suite: CipherSuite) ?SuiteParams {
     return switch (suite) {
-        .aes_128_gcm_sha256 => .{ .key_len = 16, .sn_len = 16, .tag_len = 16, .is_chacha = false },
+        .aes_128_gcm_sha256 => .{ .key_len = 16, .sn_len = 16, .tag_len = 16, .is_chacha = false, .gcm = 16 },
         // RFC 9147 §4.2.3: the AES sn key is the AEAD key's length.
-        .aes_256_gcm_sha384 => .{ .key_len = 32, .sn_len = 32, .tag_len = 16, .is_chacha = false },
+        .aes_256_gcm_sha384 => .{ .key_len = 32, .sn_len = 32, .tag_len = 16, .is_chacha = false, .gcm = 32 },
         .chacha20_poly1305_sha256 => .{ .key_len = 32, .sn_len = 32, .tag_len = 16, .is_chacha = true },
         // RFC 9147 §4.2.3: CCM is AES-based, so the AES sn mask and a key-length sn key.
         .aes_128_ccm_sha256 => .{ .key_len = 16, .sn_len = 16, .tag_len = 16, .is_chacha = false },
@@ -6121,6 +6133,27 @@ fn secureZeroDirKeys(d: *DirKeys) void {
     std.crypto.secureZero(u8, &d.key);
     std.crypto.secureZero(u8, &d.iv);
     std.crypto.secureZero(u8, &d.sn_key);
+    std.crypto.secureZero(u8, std.mem.asBytes(&d.gcm));
+    d.gcm = .none;
+}
+
+/// `dst.* = deriveDir(...)`, wiping what `dst` held first (an old epoch's
+/// expanded key schedule must not outlive the epoch), then expanding the
+/// AES-GCM key schedule in place.
+fn installDir(dst: *DirKeys, alg: HashAlg, params: SuiteParams, secret: *const Secret) void {
+    secureZeroDirKeys(dst);
+    dst.* = deriveDir(alg, params, secret);
+    switch (params.gcm) {
+        16 => {
+            dst.gcm = .{ .g128 = undefined };
+            Aes128Gcm.Context.initInto(&dst.gcm.g128, dst.key[0..16]);
+        },
+        32 => {
+            dst.gcm = .{ .g256 = undefined };
+            Aes256Gcm.Context.initInto(&dst.gcm.g256, dst.key[0..32]);
+        },
+        else => {},
+    }
 }
 
 fn deriveDir(alg: HashAlg, params: SuiteParams, secret: *const Secret) DirKeys {
@@ -6141,8 +6174,8 @@ fn protectDispatch(
     out: []u8,
 ) !usize {
     return switch (suite) {
-        .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).protect(keys.key[0..16], keys.iv, epoch, seq, inner, aad, out),
-        .aes_256_gcm_sha384 => aead.Protection(Aes256Gcm).protect(keys.key[0..32], keys.iv, epoch, seq, inner, aad, out),
+        .aes_128_gcm_sha256 => if (keys.gcm == .g128) aead.Protection(Aes128Gcm).protectCtx(&keys.gcm.g128, keys.iv, epoch, seq, inner, aad, out) else aead.Protection(Aes128Gcm).protect(keys.key[0..16], keys.iv, epoch, seq, inner, aad, out),
+        .aes_256_gcm_sha384 => if (keys.gcm == .g256) aead.Protection(Aes256Gcm).protectCtx(&keys.gcm.g256, keys.iv, epoch, seq, inner, aad, out) else aead.Protection(Aes256Gcm).protect(keys.key[0..32], keys.iv, epoch, seq, inner, aad, out),
         .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).protect(keys.key[0..32], keys.iv, epoch, seq, inner, aad, out),
         .aes_128_ccm_sha256 => aead.Protection(Aes128Ccm).protect(keys.key[0..16], keys.iv, epoch, seq, inner, aad, out),
         .aes_128_ccm_8_sha256 => aead.Protection(Aes128Ccm8).protect(keys.key[0..16], keys.iv, epoch, seq, inner, aad, out),
@@ -6159,8 +6192,8 @@ fn unprotectDispatch(
     out: []u8,
 ) !usize {
     return switch (suite) {
-        .aes_128_gcm_sha256 => aead.Protection(Aes128Gcm).unprotect(keys.key[0..16], keys.iv, epoch, seq, ct, aad, out),
-        .aes_256_gcm_sha384 => aead.Protection(Aes256Gcm).unprotect(keys.key[0..32], keys.iv, epoch, seq, ct, aad, out),
+        .aes_128_gcm_sha256 => if (keys.gcm == .g128) aead.Protection(Aes128Gcm).unprotectCtx(&keys.gcm.g128, keys.iv, epoch, seq, ct, aad, out) else aead.Protection(Aes128Gcm).unprotect(keys.key[0..16], keys.iv, epoch, seq, ct, aad, out),
+        .aes_256_gcm_sha384 => if (keys.gcm == .g256) aead.Protection(Aes256Gcm).unprotectCtx(&keys.gcm.g256, keys.iv, epoch, seq, ct, aad, out) else aead.Protection(Aes256Gcm).unprotect(keys.key[0..32], keys.iv, epoch, seq, ct, aad, out),
         .chacha20_poly1305_sha256 => aead.Protection(ChaCha20Poly1305).unprotect(keys.key[0..32], keys.iv, epoch, seq, ct, aad, out),
         .aes_128_ccm_sha256 => aead.Protection(Aes128Ccm).unprotect(keys.key[0..16], keys.iv, epoch, seq, ct, aad, out),
         .aes_128_ccm_8_sha256 => aead.Protection(Aes128Ccm8).unprotect(keys.key[0..16], keys.iv, epoch, seq, ct, aad, out),
@@ -6214,6 +6247,44 @@ test "protectDispatch(chacha20_poly1305_sha256): byte-identical to Protection(ch
     var open_dispatch: [inner.len]u8 = undefined;
     const m1 = try unprotectDispatch(.chacha20_poly1305_sha256, &keys, epoch, seq, via_dispatch[0..n1], aad, &open_dispatch);
     try std.testing.expectEqualSlices(u8, inner, open_dispatch[0..m1]);
+}
+
+test "installDir: the cached AES-GCM key schedule seals and opens byte for byte like the stateless call, across key updates; the wipe clears it" {
+    inline for (.{ CipherSuite.aes_128_gcm_sha256, CipherSuite.aes_256_gcm_sha384 }) |suite| {
+        const params = suiteParams(suite).?;
+        const alg = suite.hash();
+        var secret: Secret = undefined;
+        for (&secret, 0..) |*b, i| b.* = @intCast((i * 7 + 3) & 0xff);
+        var keys: DirKeys = .{};
+        var stateless: DirKeys = undefined;
+        for (0..3) |update| {
+            installDir(&keys, alg, params, &secret);
+            try std.testing.expect(keys.gcm != .none);
+            stateless = deriveDir(alg, params, &secret);
+            try std.testing.expect(stateless.gcm == .none);
+            var inner: [1400]u8 = undefined;
+            for (&inner, 0..) |*b, i| b.* = @truncate(i *% 31 +% update);
+            const aad = "unified header";
+            for ([_]usize{ 0, 1, 16, 64, 255, 1400 }, 0..) |len, k| {
+                const seq: u48 = @intCast(k * 1000 + update);
+                var a: [1400 + 16]u8 = undefined;
+                var b: [1400 + 16]u8 = undefined;
+                const na = try protectDispatch(suite, &keys, 3, seq, inner[0..len], aad, &a);
+                const nb = try protectDispatch(suite, &stateless, 3, seq, inner[0..len], aad, &b);
+                try std.testing.expectEqualSlices(u8, b[0..nb], a[0..na]);
+                var o: [1400]u8 = undefined;
+                const m = try unprotectDispatch(suite, &keys, 3, seq, a[0..na], aad, &o);
+                try std.testing.expectEqualSlices(u8, inner[0..len], o[0..m]);
+                a[0] ^= 1;
+                try std.testing.expectError(error.DecryptionFailed, unprotectDispatch(suite, &keys, 3, seq, a[0..na], aad, &o));
+            }
+            suitehash.nextApplicationTrafficSecret(alg, &secret);
+        }
+        secureZeroDirKeys(&keys);
+        try std.testing.expect(keys.gcm == .none);
+        // `.none` is tag 0, so the wiped payload and the tag are all zero bytes.
+        try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&keys.gcm), 0));
+    }
 }
 
 /// RFC 9147 §4.5.1 sliding anti-replay window check-and-update, shared by

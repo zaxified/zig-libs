@@ -134,6 +134,72 @@ pub fn Protection(comptime Aead: type) type {
                 return error.DecryptionFailed;
             return body_len;
         }
+
+        /// `protect` under a key schedule expanded once per epoch (`Aead.Context`,
+        /// the `aesgcm` types): the same bytes, without the per-record AES key
+        /// expansion and GHASH key setup.
+        pub fn protectCtx(
+            ctx: *const Aead.Context,
+            static_iv: [nonce_length]u8,
+            epoch: u64,
+            sequence_number: u64,
+            plaintext: []const u8,
+            additional_data: []const u8,
+            out: []u8,
+        ) RecordProtectionError!usize {
+            return burn.run(burn.aead_burn, RecordProtectionError!usize, protectCtxBody, .{ ctx, static_iv, epoch, sequence_number, plaintext, additional_data, out });
+        }
+
+        fn protectCtxBody(
+            ctx: *const Aead.Context,
+            static_iv: [nonce_length]u8,
+            epoch: u64,
+            sequence_number: u64,
+            plaintext: []const u8,
+            additional_data: []const u8,
+            out: []u8,
+        ) RecordProtectionError!usize {
+            const total = plaintext.len + tag_length;
+            if (out.len < total) return error.BufferTooShort;
+            const npub = nonce(static_iv, epoch, sequence_number);
+            var tag: [tag_length]u8 = undefined;
+            ctx.encrypt(out[0..plaintext.len], &tag, plaintext, additional_data, npub);
+            @memcpy(out[plaintext.len..][0..tag_length], &tag);
+            return total;
+        }
+
+        /// `unprotect` under a key schedule expanded once per epoch; same bytes and errors.
+        pub fn unprotectCtx(
+            ctx: *const Aead.Context,
+            static_iv: [nonce_length]u8,
+            epoch: u64,
+            sequence_number: u64,
+            ciphertext: []const u8,
+            additional_data: []const u8,
+            out: []u8,
+        ) RecordProtectionError!usize {
+            return burn.run(burn.aead_burn, RecordProtectionError!usize, unprotectCtxBody, .{ ctx, static_iv, epoch, sequence_number, ciphertext, additional_data, out });
+        }
+
+        fn unprotectCtxBody(
+            ctx: *const Aead.Context,
+            static_iv: [nonce_length]u8,
+            epoch: u64,
+            sequence_number: u64,
+            ciphertext: []const u8,
+            additional_data: []const u8,
+            out: []u8,
+        ) RecordProtectionError!usize {
+            if (ciphertext.len < tag_length) return error.RecordTooShort;
+            const body_len = ciphertext.len - tag_length;
+            if (out.len < body_len) return error.BufferTooShort;
+            const npub = nonce(static_iv, epoch, sequence_number);
+            var tag: [tag_length]u8 = undefined;
+            @memcpy(&tag, ciphertext[body_len..][0..tag_length]);
+            ctx.decrypt(out[0..body_len], ciphertext[0..body_len], tag, additional_data, npub) catch
+                return error.DecryptionFailed;
+            return body_len;
+        }
     };
 }
 

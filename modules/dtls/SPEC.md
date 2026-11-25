@@ -928,6 +928,11 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
 - **Bench:** `zig build bench-dtls` (`tools/bench.zig`, ReleaseFast, no foreign side): the per-record AEAD call
   against a cached AES-GCM context, seal and open at 64..1400 bytes, gated on identical output, and the whole
   `send` + `recv` of a connected pair; prints the ratio and the spread of the rounds.
+- **Record protection keeps the AES-GCM key schedule per epoch** (DTLS 1.3): `installDir` expands it in place when
+  the epoch's keys are installed (and wipes the previous epoch's first), so a record skips the AES key expansion and
+  the GHASH key setup. Bench shield ABAB 2026-11-26, a whole `send` + `recv` on AES-128-GCM: 64 B 1168 → 883 ns,
+  256 B 1285 → 988, 1024 B 1597 → 1300, 1400 B 1780 → 1486 (spread ≤ 0.4 %); ChaCha20-Poly1305 has no per-key state and
+  is unchanged. The DTLS 1.2 record layer and the AES sequence-number mask still expand their keys per record.
 - **Fuzz:** `DTLS_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver; `_ONLY` selects a harness):
   `dtls-handshake` (PSK, HelloRetryRequest cookie, (EC)DHE, a certificate handshake whose leaf entry carries an OCSP
   staple and an SCT list, and a ticket resumption with 0-RTT early data, with one flight damaged; damage to the early
@@ -969,10 +974,4 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **AEAD record protection is the stateless per-record call** of the `aesgcm` module: every record re-runs the
-  AES key expansion and the GHASH key setup. `zig build bench-dtls` (`tools/bench.zig`) measures it against a cached
-  `aesgcm` `Context` (first run, 2026-11-21, ReleaseFast, 3 rounds on a loaded machine, spread up to 40 %): cached /
-  per-record 0.20–0.23 at 64-byte records, 0.31–0.35 at 256, 0.52–0.58 at 1024, 0.61–0.65 at 1400 (AES-128 and
-  AES-256, seal and open); a whole `send` + `recv` of 64 bytes on AES-128-GCM is ~1.2 µs, of which ~0.6 µs is the two
-  per-record AEAD calls. The rewrite (per-epoch `Context` storage behind `Protection(Aead)`, which ChaCha20 shares
-  without needing it) waits for a quiet-machine A/B with the spread below the effect.
+None open.
