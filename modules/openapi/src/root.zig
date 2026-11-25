@@ -4352,3 +4352,10 @@ test "docs page: the spec path is spliced as a JS string -- only quote, backslas
     try writeScriptString(&aw.writer, "a b\x1f\x01\"\\<c");
     try testing.expectEqualStrings("\"a b\\u001f\\u0001\\\"\\\\\\u003cc\"", aw.written());
 }
+
+test "mutation 2026-11-25: docs page script string keeps every control as \\u00XX (no short escapes) and invalid UTF-8 verbatim" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeScriptString(&aw.writer, "a\n\t\r\x08\x0cb\xff\xc3(c");
+    try testing.expectEqualStrings("\"a\\u000a\\u0009\\u000d\\u0008\\u000cb\xff\xc3(c\"", aw.written());
+}

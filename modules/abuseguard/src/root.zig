@@ -4645,3 +4645,19 @@ test "middleware: the 4xx range is 400..499 -- 399 never strikes, 499 does" {
     try expectStatus(runWirePeer(&r, wire("/s499", ""), &buf, mkPeer4("203.0.113.82", 1)), "499");
     try testing.expect(g.isGreylisted(mkIp("203.0.113.82")));
 }
+
+test "mutation 2026-11-25: hooks key an IPv6 peer by its own address (ipOf keeps the v6 bytes)" {
+    var tc: TestClock = .{};
+    var g = try Guard.init(testing.allocator, .{ .max_conns_per_ip = 1, .clock = tc.clock() });
+    defer g.deinit();
+    const p1 = try net.IpAddress.parse("2001:db8:1::1", 1111);
+    const p2 = try net.IpAddress.parse("2001:db8:2::1", 1111);
+    try testing.expectEqual(http.Server.ConnDecision.accept, hookConnect(&g, p1));
+    try testing.expectEqual(http.Server.ConnDecision.accept, hookConnect(&g, p2)); // another /64: its own entry
+    try testing.expectEqual(http.Server.ConnDecision.reject, hookConnect(&g, p1)); // the same address: at the cap
+    try testing.expectEqual(@as(u32, 1), g.connCount(mkIp("2001:db8:1::1")));
+    try testing.expectEqual(@as(u32, 1), g.connCount(mkIp("2001:db8:2::1")));
+    hookState(&g, p1, .closed);
+    try testing.expectEqual(@as(u32, 0), g.connCount(mkIp("2001:db8:1::1")));
+    try testing.expectEqual(@as(u32, 1), g.connCount(mkIp("2001:db8:2::1")));
+}

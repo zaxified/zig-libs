@@ -1108,3 +1108,10 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "mutation 2026-11-25: check names write backspace and form feed as \\u00XX (only \\n \\r \\t are short)" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeJsonString(&aw.writer, "a\x08\x0cb");
+    try testing.expectEqualStrings("\"a\\u0008\\u000cb\"", aw.written());
+}
