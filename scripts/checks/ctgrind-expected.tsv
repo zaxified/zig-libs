@@ -1970,7 +1970,7 @@ smtp	ReleaseFast	auth	1	6	ab732595c5522595	58737f369d111669
 # mcp-http (2026-10-10) — sid: the 16 CSPRNG bytes of an Mcp-Session-Id
 # through sidhex.encode (what Sessions.create runs). FIX: it used std.fmt
 # "{x}", a digit table indexed by the secret nibble. 0.
-mcp-http	ReleaseFast	sid	1	0	fc0090511906531f	693d310c7437c6ed
+mcp-http	ReleaseFast	sid	1	0	477093e3b583837a	693d310c7437c6ed
 # dnp3 (2026-10-10) — mac: SA session key through mac.compute/verify (all
 # HMAC truncations + AES-GMAC) and computeReplyMac/verifyReplyMac: 0.
 # keys: update + session keys through wrapSessionKeys/unwrapSessionKeys
@@ -2437,8 +2437,8 @@ webhooksig	ReleaseFast	ed25519	1	30	09ef5762426cb579	0ddab6b90956b2fe
 # control >=1 = POSITIVE CONTROL: the same HMAC under the tainted key compared with an
 #   early-exit `std.mem.eql` in the harness; its branch on the key-derived tag must flag,
 #   or the zeros of the other rows would mean "the taint never arrived".
-mcp	ReleaseFast	seal	1	16	cb250fbb1d735baa	e0ed633eec25c1a0
-mcp	ReleaseFast	open	1	4	cb250fbb1d735baa	68a492911d53a84a
+mcp	ReleaseFast	seal	1	16	2563978f54c0ba4b	e0ed633eec25c1a0
+mcp	ReleaseFast	open	1	4	2563978f54c0ba4b	68a492911d53a84a
 mcp	ReleaseFast	control	1	>=1	f58c2a60efeb0f78	77618407a4b8daaf
 # xmlenc, 2026-11-13 (sweep hB): the RSA private key (OAEP, v1.5), the KEK (kw-aes) and
 # through them the CEK, driven through `decryptData` on a real EncryptedData. NO context is
