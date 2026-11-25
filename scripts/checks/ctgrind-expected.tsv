@@ -1551,8 +1551,8 @@ mqtt	ReleaseFast	pwverify	1	0	59f0f38ee60f886c	bcc95d04fa79c847
 # (curve25519.zig `ladder`; 2 ephemeral keygens + 4 DH) + 2 x the AEAD tag-verify
 # outcome (std chacha20.zig `decrypt` via chachapoly); transport 6 = the tag-verify
 # outcome of the 6 decryptions.
-noise	ReleaseFast	hs	1	8	8348f4118b1b4abd	95912b58e70d0846
-noise	ReleaseFast	transport	1	6	52e4f61d12470285	b4443cf65f6c3849
+noise	ReleaseFast	hs	1	8	6293fa39097f925d	95912b58e70d0846
+noise	ReleaseFast	transport	1	6	b823fa5ab2bbb60b	b4443cf65f6c3849
 # tlsclient (2026-10-10) — kex: Client.initInto on a canned ServerHello with
 # the key-share secrets (entropy[64..240]) tainted; cv: signCertificateVerify
 # with the client key tainted (P-256, P-384, Ed25519). No context is a branch
@@ -1864,14 +1864,14 @@ aeadframe	ReleaseFast	aes	1	5	fcb76a730014f644	9e2cdfce46f95d92
 # AEAD tag-verify outcome (via noise -> chachapoly) + 1 = the verdict on
 # the constant-time compare of the decrypted initiator static against the
 # provisioned one (root.zig `writeMessage1Body`).
-tenantkex	ReleaseFast	ik	1	9	4ca8cd518a96d519	85fb9350a2be9ee1
+tenantkex	ReleaseFast	ik	1	9	325202bf0939ab5b	85fb9350a2be9ee1
 # xx (2026-11-17): the XX mode (`XxInitiator`/`XxResponder`), same taint. 9,
 # the same classes as ik, read from --stacks: 6 x std X25519 identity-point
 # check (2 ephemeral keygens, 4 DH contexts) + 2 x the AEAD tag-verify outcome
 # (XxInitiator.readMessage2: encrypted `s` and payload, via noise ->
 # chachapoly) + 1 = the verdict on the constant-time compare of the decrypted
 # initiator static against the provisioned one (root.zig, readMessage3).
-tenantkex	ReleaseFast	xx	1	9	4ca8cd518a96d519	e3759d838e3b1880
+tenantkex	ReleaseFast	xx	1	9	325202bf0939ab5b	e3759d838e3b1880
 # ctap2 (2026-10-10) — pin: an 8-byte PIN + the ECDH shared secret tainted
 # through validateNewPin, padPin, pinHash, SharedSecret.encrypt/authenticate
 # (protocols One and Two); token: the shared secret through decryptToken +

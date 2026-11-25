@@ -225,8 +225,7 @@ fn wipeHs(hs: *HS) void {
     if (hs.s != null) std.crypto.secureZero(u8, &hs.s.?.secret_key);
     if (hs.e != null) std.crypto.secureZero(u8, &hs.e.?.secret_key);
     std.crypto.secureZero(u8, &hs.symmetric_state.ck);
-    std.crypto.secureZero(u8, &hs.symmetric_state.cipher_state.k);
-    hs.symmetric_state.cipher_state.has_key = false;
+    hs.symmetric_state.cipher_state.wipe();
 }
 
 /// The initiating provider edge. Owns one session's handshake state; drive it

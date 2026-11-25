@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — Speed, same bytes: `CipherState` over an AEAD with a keyed `Context` (`aesgcm.Aes256Gcm`, the AESGCM suites) keeps the expanded key schedule (new field `ctx`, set by `initializeKey` and `rekey`), so a transport message skips the AES key expansion and the GHASH key setup: 0.51× at 64 B, 0.73–0.79× at 1 KiB (`zig build bench-noise`, new). **Wipe a `CipherState` with the new `wipe()`**: zeroing `k` alone leaves the expanded schedule in `ctx` on AESGCM suites (`HandshakeState`'s own wipe uses it). ChaChaPoly suites are unchanged (`ctx` is `void`).
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 
 - **2026-10-19** — AES-GCM (`AESGCM` cipher, spec §4.2) now comes from the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (new dep; Zig 0.17 #36256). `Suite` still accepts std's `Aes256Gcm` identically; vectors and the stack probe run on `aesgcm`. Same bytes on the wire.

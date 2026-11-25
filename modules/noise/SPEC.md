@@ -122,6 +122,15 @@ Run: `scripts/modtest noise`; fuzz: `NOISE_FUZZ=<runs>[,<first seed>]` (testkit'
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
 
+## Speed
+
+`zig build bench-noise` (`tools/bench.zig`, ReleaseFast, no foreign side) times `CipherState.encryptWithAd` /
+`decryptWithAd` on AESGCM with the key schedule kept in the `CipherState` against the same AEAD without it (the
+stateless per-message call), gated on identical bytes. Bench shield ABAB 2026-11-26 (ratio keyed / stateless, spread
+≤ 0.6 %): 64 B 0.51 (encrypt) / 0.53 (decrypt), 1024 B 0.73 / 0.79, 65519 B 0.99 (the cipher itself dominates).
+ChaChaPoly has no per-key state to keep. `scripts/checks/ctgrind.sh noise` runs the default (ChaChaPoly) suite only;
+the cached AES-GCM path is the `aesgcm` module's `Context`, measured by that module's rows.
+
 ## Secret residue on the dead stack
 
 A probe (`src/stackprobe_test.zig`, ReleaseFast only) runs a full `XXpsk3` handshake on `DefaultSuite` and scans
@@ -171,7 +180,7 @@ NOT covered, honestly:
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **AES-GCM bulk path not re-measured** since the cipher moved to the `aesgcm` module (Zig 0.17 #36256). The module has no bench, and `CipherState` calls the stateless `encrypt`/`decrypt` of the AEAD type per message, so every message re-runs the key expansion (`dtls`'s `tools/bench.zig` measured cached/per-record at 0.20-0.65 for 64-1400 byte records); caching an `aesgcm.Context` per key needs an AEAD interface that carries one, and a quiet-machine A/B.
+None open.
 
 ## Anchoring
 

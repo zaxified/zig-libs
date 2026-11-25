@@ -164,6 +164,11 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
 
         const Hmac = std.crypto.auth.hmac.Hmac(Hash);
 
+        /// `Cipher` carries a keyed `Context` (the `aesgcm` types): `CipherState`
+        /// then keeps the expanded key schedule next to `k`.
+        const keyed_cipher = @hasDecl(Cipher, "Context") and @hasDecl(Cipher.Context, "initInto") and
+            @hasDecl(Cipher.Context, "encrypt") and @hasDecl(Cipher.Context, "decrypt");
+
         /// This suite's dead-stack burn sizes (`burn.Sizes`), from the stack
         /// its three primitives dirty (`stack_bytes`).
         pub const burns = burn.Sizes.of(stack_bytes.dh(DH), stack_bytes.cipher(Cipher), stack_bytes.hash(Hash));
@@ -224,6 +229,12 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             k: [32]u8 = @as([32]u8, @splat(0)),
             n: u64 = 0,
             has_key: bool = false,
+            /// For an AEAD with a keyed `Context` (the `aesgcm` types): the key
+            /// schedule, expanded by `initializeKey` / `rekey` so a message
+            /// skips the AES key expansion and the GHASH key setup. A secret
+            /// like `k`: wipe a `CipherState` with `wipe()`, not by zeroing
+            /// `k` alone. `void` for the other AEADs.
+            ctx: if (keyed_cipher) Cipher.Context else void = if (keyed_cipher) undefined else {},
 
             /// §5.1 `InitializeKey(key)`: sets `k = key`, `n = 0`. The key is
             /// taken by pointer so the call leaves no copy in a dead frame.
@@ -231,6 +242,16 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 self.k = key.*;
                 self.n = 0;
                 self.has_key = true;
+                if (keyed_cipher) Cipher.Context.initInto(&self.ctx, &self.k);
+            }
+
+            /// Zero the key, its expanded schedule and the nonce; the state is
+            /// "empty" afterwards (`hasKey()` false).
+            pub fn wipe(self: *CipherState) void {
+                std.crypto.secureZero(u8, &self.k);
+                if (keyed_cipher) std.crypto.secureZero(u8, std.mem.asBytes(&self.ctx));
+                self.n = 0;
+                self.has_key = false;
             }
 
             /// §5.1 `HasKey()`: true unless `k` is still "empty".
@@ -280,14 +301,18 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 }
                 if (self.n == max_nonce) return error.NonceExhausted;
                 if (out.len < plaintext.len + TAGLEN) return error.BufferTooSmall;
-                Cipher.encrypt(
-                    out[0..plaintext.len],
-                    out[plaintext.len..][0..TAGLEN],
-                    plaintext,
-                    ad,
-                    nonceBytes(self.n),
-                    self.k,
-                );
+                if (keyed_cipher) {
+                    self.ctx.encrypt(out[0..plaintext.len], out[plaintext.len..][0..TAGLEN], plaintext, ad, nonceBytes(self.n));
+                } else {
+                    Cipher.encrypt(
+                        out[0..plaintext.len],
+                        out[plaintext.len..][0..TAGLEN],
+                        plaintext,
+                        ad,
+                        nonceBytes(self.n),
+                        self.k,
+                    );
+                }
                 self.n += 1;
             }
 
@@ -323,14 +348,18 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 if (self.n == max_nonce) return error.NonceExhausted;
                 const msg_len = ciphertext.len - TAGLEN;
                 if (out.len < msg_len) return error.BufferTooSmall;
-                Cipher.decrypt(
-                    out[0..msg_len],
-                    ciphertext[0..msg_len],
-                    ciphertext[msg_len..][0..TAGLEN].*,
-                    ad,
-                    nonceBytes(self.n),
-                    self.k,
-                ) catch return error.DecryptionFailed;
+                const r = if (keyed_cipher)
+                    self.ctx.decrypt(out[0..msg_len], ciphertext[0..msg_len], ciphertext[msg_len..][0..TAGLEN].*, ad, nonceBytes(self.n))
+                else
+                    Cipher.decrypt(
+                        out[0..msg_len],
+                        ciphertext[0..msg_len],
+                        ciphertext[msg_len..][0..TAGLEN].*,
+                        ad,
+                        nonceBytes(self.n),
+                        self.k,
+                    );
+                r catch return error.DecryptionFailed;
                 self.n += 1;
             }
 
@@ -354,6 +383,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 );
                 self.k = ct[0..32].*;
                 std.crypto.secureZero(u8, &ct);
+                if (keyed_cipher) Cipher.Context.initInto(&self.ctx, &self.k);
             }
         };
 
@@ -764,8 +794,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
             fn wipe(self: *HandshakeState) void {
                 if (self.e != null) std.crypto.secureZero(u8, &self.e.?.secret_key);
                 std.crypto.secureZero(u8, &self.symmetric_state.ck);
-                std.crypto.secureZero(u8, &self.symmetric_state.cipher_state.k);
-                self.symmetric_state.cipher_state.has_key = false;
+                self.symmetric_state.cipher_state.wipe();
             }
 
             /// §5.3 `WriteMessage(payload)`: processes the next message
@@ -1723,4 +1752,46 @@ test "corpus: every handshake seed reaches readMessage, and the payload recovere
     try testing.expectEqual(seeds.len - 1, nonempty); // the deliberate empty seed
     try testing.expectEqual(@as(usize, 5), accepted); // all but the DHLEN-1 truncation and the empty seed
     try testing.expectEqual(@as(usize, 257), payload_octets); // 11 + 0 + 11 + 11 + 224
+}
+
+test "CipherState over aesgcm (cached key schedule) is byte for byte the stateless std AES-256-GCM, across rekey; wipe clears it" {
+    const Keyed = Suite(std.crypto.dh.X25519, aesgcm.Aes256Gcm, std.crypto.hash.sha2.Sha256);
+    const Plain = Suite(std.crypto.dh.X25519, std.crypto.aead.aes_gcm.Aes256Gcm, std.crypto.hash.sha2.Sha256);
+    comptime std.debug.assert(Keyed.keyed_cipher and !Plain.keyed_cipher);
+    var key: [32]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @intCast(i * 5 + 1);
+    var a: Keyed.CipherState = .{};
+    var b: Plain.CipherState = .{};
+    a.initializeKey(&key);
+    b.initializeKey(&key);
+    var pt: [1500]u8 = undefined;
+    for (&pt, 0..) |*x, i| x.* = @truncate(i *% 13);
+    for (0..3) |round| {
+        for ([_]usize{ 0, 1, 64, 1024, 1500 }) |len| {
+            var ca: [1500 + 16]u8 = undefined;
+            var cb: [1500 + 16]u8 = undefined;
+            try a.encryptWithAd("ad", pt[0..len], ca[0 .. len + 16]);
+            try b.encryptWithAd("ad", pt[0..len], cb[0 .. len + 16]);
+            try std.testing.expectEqualSlices(u8, cb[0 .. len + 16], ca[0 .. len + 16]);
+            // the receiving side, through a second keyed state on the same key
+            var r: Keyed.CipherState = .{};
+            r.initializeKey(&a.k);
+            r.setNonce(a.n - 1);
+            var back: [1500]u8 = undefined;
+            try r.decryptWithAd("ad", ca[0 .. len + 16], back[0..len]);
+            try std.testing.expectEqualSlices(u8, pt[0..len], back[0..len]);
+            ca[0] ^= 1;
+            r.setNonce(a.n - 1);
+            try std.testing.expectError(error.DecryptionFailed, r.decryptWithAd("ad", ca[0 .. len + 16], back[0..len]));
+            r.wipe();
+        }
+        _ = round;
+        a.rekey();
+        b.rekey();
+        try std.testing.expectEqualSlices(u8, &b.k, &a.k);
+    }
+    a.wipe();
+    try std.testing.expect(!a.hasKey());
+    try std.testing.expect(std.mem.allEqual(u8, &a.k, 0));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&a.ctx), 0));
 }
