@@ -514,6 +514,33 @@ test "STACKPROBE: no SK, e, 1/(SK+e), message scalar, blinding scalar or key mat
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
 
+var enc_sink: [keys.SecretKey.encoded_bytes]u8 = undefined;
+var enc_src: [keys.SecretKey.encoded_bytes]u8 = undefined;
+noinline fn callToBytes() void {
+    cur_sk.toBytes(&enc_sink);
+    std.mem.doNotOptimizeAway(&enc_sink);
+}
+noinline fn callFromBytes() void {
+    keys.SecretKey.fromBytes(&sk_sink, &enc_src) catch unreachable;
+    std.mem.doNotOptimizeAway(&sk_sink);
+}
+
+test "mutation 2026-11-25: STACKPROBE: SecretKey.toBytes and fromBytes leave no SK residue on the dead stack" {
+    try skipUnlessOptimized();
+    Sha256.hash("bbs-mutation-key", cur_km[0..32], .{});
+    Sha256.hash(cur_km[0..32], cur_km[32..64], .{});
+    apiKeyGen(&cur_sk, &cur_km, probe_info);
+    nd.reset();
+    nd.addFr("sk", cur_sk.scalar);
+    nd.sort();
+    var bad: usize = 0;
+    leak_src = cur_sk.scalar.toBytes();
+    bad += try runProbe("SecretKey.toBytes", callToBytes, &nd);
+    enc_src = cur_sk.scalar.toBytes();
+    bad += try runProbe("SecretKey.fromBytes", callFromBytes, &nd);
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
 // ── residue rule (`testkit.stackprobe.residueOf`, 2026-11-23) ───────────────
 //
 // The needles above are a model of the secrets. The shared engine's residue
