@@ -822,3 +822,62 @@ test "EpochTree: deriving one leaf keeps its sibling subtrees and deletes the an
     try testing.expectEqualSlices(u8, &(try tNode(TestSuite, es, 4, 5)), &t.nodes[5].?);
     try testing.expectError(error.NodeIndexOutOfRange, EpochTree(TestSuite, 2).init(testing.allocator, &es, 0, 1));
 }
+
+test "mutation 2026-11-25: EpochTree wipes every consumed node secret, refuses a tree with no held ancestor, and nulls a fresh slot array itself" {
+    const es = @as([TestSuite.Nh]u8, @splat(0x37));
+    var t = try EpochTree(TestSuite, 2).init(testing.allocator, &es, 4, default_max_forward_jump);
+    defer t.deinit();
+    _ = try t.ratchet(0, .handshake);
+    // Root (3), its left child (1) and the leaf (0) were consumed: each slot is
+    // null, and its payload bytes are zero (at most the tag byte is nonzero).
+    for ([_]usize{ 3, 1, 0 }) |i| {
+        try testing.expect(t.nodes[i] == null);
+        var nonzero: usize = 0;
+        for (std.mem.asBytes(&t.nodes[i])) |b| nonzero += @intFromBool(b != 0);
+        try testing.expect(nonzero <= 1);
+    }
+
+    // No node holds a secret on the leaf's path: refused, not an out-of-bounds walk.
+    var u = try EpochTree(TestSuite, 2).init(testing.allocator, &es, 4, default_max_forward_jump);
+    defer u.deinit();
+    u.nodes[treemath.root(4)] = null;
+    try testing.expectError(error.NodeIndexOutOfRange, u.ratchet(0, .application));
+}
+
+/// Hands out memory filled with 0xff, so a slot array that is not initialised by
+/// its owner reads as non-null (the testing allocator's own 0xaa fill has a clear
+/// low bit, which reads as a null optional).
+const FfFillAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *FfFillAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FfFillAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, a, ra) orelse return null;
+        @memset(p[0..len], 0xff);
+        return p;
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *FfFillAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(m, a, n, ra);
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *FfFillAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, a, ra);
+    }
+};
+
+test "mutation 2026-11-25: EpochTree.init does not depend on the allocator's fill (every non-root slot starts null)" {
+    const es = @as([TestSuite.Nh]u8, @splat(0x4c));
+    var fill: FfFillAllocator = .{ .child = testing.allocator };
+    var t = try EpochTree(TestSuite, 2).init(fill.allocator(), &es, 3, 5);
+    defer t.deinit();
+    const w = try t.ratchet(2, .application);
+    const want = try tBase(TestSuite, es, 3, 2, .application);
+    try testing.expectEqualSlices(u8, &want, &w.ratchet.secret);
+}

@@ -1814,10 +1814,10 @@ megolm	ReleaseFast	pickle	1	26	4bcd2cc0b8d7321d	f06f4b1b938d2036
 # contexts (sign's KeyMismatch compare, pcMul16 rejectIdentity) are gone from
 # priv (4 -> 2) and group (2 -> 0); the cpu=x86_64 rows (5, 3: std's portable
 # field added one) now equal native and were dropped.
-mls	ReleaseFast	ks	1	0	df492aff818cd381	cbdae823f31fa99e
-mls	ReleaseFast	tree	1	0	df492aff818cd381	22ea84b82599122e
-mls	ReleaseFast	priv	1	2	df492aff818cd381	616cb338b933af50
-mls	ReleaseFast	group	1	0	3d7734bfb5a8e5d3	f4c3dc710c6be88a
+mls	ReleaseFast	ks	1	0	bf06bfea4819661e	cbdae823f31fa99e
+mls	ReleaseFast	tree	1	0	bf06bfea4819661e	22ea84b82599122e
+mls	ReleaseFast	priv	1	2	bf06bfea4819661e	616cb338b933af50
+mls	ReleaseFast	group	1	0	d63f6bc3f4d3dd03	f4c3dc710c6be88a
 # otp (2026-10-10) — code: the shared secret through hotp/totp/hotpFmt/
 # totpVerify for SHA-1/256/512. FIX: the RFC 4226 dynamic truncation read
 # mac[offset..][0..4] with offset = the MAC's low nibble, a load address

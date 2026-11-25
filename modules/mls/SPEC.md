@@ -6,7 +6,7 @@
 
 **Scope:** mvp — OpenMLS v0.9.0, RFC 9420 (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation 2026-11-17 (53/54, 1 eq) · src b7fe37e50bdfd4ca
+**Audit:** review 2026-08-11 · mutation 2026-11-25 (213/239, 26 eq) · src a12f45bd73dc8564
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean at `.scale` 8 = 25,000 runs each — a run is a whole group exchange, MLS_FUZZ) · ct 2026-10-10 (ctgrind: key schedule, secret tree + ratchets, PrivateMessage protect/decrypt, since 2026-11-21 `Group.protectApplication` from a real group; `ks` 0 / `tree` 0 / `priv` 2 / `group` 0 in-file — AEAD tag verdicts; signing on `ct25519.signEd25519` since 2026-11-25; TreeKEM/HPKE via hpke)
 **Performance:** ref 0.49–0.72× OpenMLS 0.9.0 (openmls_rust_crypto 0.6.0) · fastest ? (measured 2026-11-25 in the bench shield, 5 rounds, wall time; suite 0x0001 application messages: protect+open 64 B 0.64×, 1 KiB 0.67×, 16 KiB 0.72×, protect alone 64 B 0.49×, 16 KiB 0.68×; Ed25519 on `ct25519` since 2026-11-25)
@@ -1501,6 +1501,12 @@ key and nonce as needles); `createSuccessor` is `create` plus the resumption
 PSK, both probed on their own (`Group.create`, `keyschedule.pskSecret`). 0
 residues expected.
 
+- **Delta mutation 2026-11-25** (secret tree in `Group`, 7.5 leaf changes, 7.3/10.1 admission validation, suites
+  0x0004/0x0006, one-epoch state, ReInit and branch, signing on ct25519): 185 mutants, 160 killed, 13 equivalent,
+  12 unobservable, 0 open; 81 survived the old suite (mostly missing negative tests), 13 new tests in `group.zig`,
+  `secrettree.zig`, `suite.zig` ("mutation 2026-11-25: …"). Unobservable: the credential-type overflow path (needs a
+  ninth credential type; `Credential` has two arms), two secret-tree slot wipes followed by a `null` store that
+  already zeroes the slot, and seven heap wipes right before `free` (see Backlog).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
   the last whole-module mutation run and the delta runs after it.
 
@@ -1630,4 +1636,7 @@ Gaps that are unverified rather than unbuilt:
 
 ## Backlog / deferred
 
-None open.
+- **Heap wipes before free are unobserved** (2026-11-25 delta mutation, mutants 22-24, 69, 87, 105, 108: the
+  secret tree's nodes and ratchets, sent-private records, application data, epoch history). In safe builds
+  `Allocator.free` overwrites the bytes first, so no test can see the wipe; a ReleaseFast test with a spy allocator
+  that checks the bytes at `free` would.

@@ -530,3 +530,8 @@ test "default suite: hash() is plain SHA-256" {
     };
     try testing.expectEqualSlices(u8, &want, &got);
 }
+
+test "mutation 2026-11-25: Ed448 PublicKey.fromBytes refuses a 57-byte string that is not a curve point" {
+    const bad: [57]u8 = @splat(0xff);
+    if (Ed448.PublicKey.fromBytes(bad)) |_| return error.TestUnexpectedResult else |_| {}
+}

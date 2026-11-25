@@ -9650,3 +9650,483 @@ test "low-order X25519 keys: a Welcome whose ratchet tree carries one is refused
         return error.TestUnexpectedResult;
     } else |e| try testing.expectEqual(error.LeafNodeInvalid, e);
 }
+
+// ── mutation 2026-11-25 (delta audit): the checks the delta run found untested ──
+
+const MutPair = struct { a: Group(TestSuite), b: Group(TestSuite) };
+
+/// Alice creates `gid` and adds bob; both end at epoch 1.
+fn mutPair(gpa: std.mem.Allocator, io: std.Io, gid: []const u8, alice: TestClient, bob: TestClient) !MutPair {
+    var a = try tCreate(gpa, .{ .io = io, .group_id = gid, .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    errdefer a.deinit();
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }} });
+    defer c.deinit(gpa);
+    const b = try bob.join(gpa, c.welcome.?, &.{});
+    return .{ .a = a, .b = b };
+}
+
+test "mutation 2026-11-25: the group's secret tree spans the group and takes the encryption secret" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alice = try TestClient.init(arena.allocator(), "alice", 1);
+    const bob = try TestClient.init(arena.allocator(), "bob", 2);
+    var p = try mutPair(gpa, threaded.io(), "sec", alice, bob);
+    defer p.a.deinit();
+    defer p.b.deinit();
+    const zero: [TestSuite.Nh]u8 = @splat(0);
+    try testing.expect(!std.mem.eql(u8, &zero, &p.a.secrets.encryption_secret));
+    const st = try p.a.secretTree();
+    try testing.expectEqual(p.a.treeSize(), st.n_leaves);
+    try testing.expectEqualSlices(u8, &zero, &p.a.secrets.encryption_secret);
+}
+
+test "mutation 2026-11-25: application messages — forged signature, spent ratchet, padding, trailing bytes, handshake type, ReInit" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    var p = try mutPair(gpa, io, "app", alice, bob);
+    defer p.a.deinit();
+    defer p.b.deinit();
+    const a = &p.a;
+    const b = &p.b;
+
+    // A message sealed with alice's keys but signed by someone else is refused.
+    {
+        const gc = try a.groupContextAlloc(gpa);
+        defer gpa.free(gc);
+        const fc: framing.FramedContent = .{
+            .group_id = a.group_id,
+            .epoch = a.epoch,
+            .sender = .{ .member = a.my_leaf_index },
+            .authenticated_data = &.{},
+            .body = .{ .application = "forged" },
+        };
+        const mallory = try TestSuite.Sig.KeyPair.generateDeterministic(@splat(77));
+        const msg = try a.sealPrivate(gpa, .{ .io = io }, &mallory, fc, null, null, gc);
+        defer gpa.free(msg);
+        if (b.unprotectApplication(gpa, msg)) |m| {
+            m.deinit(gpa);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+
+    // Padding is applied.
+    const plain = try a.protectApplication(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .data = "pad" });
+    defer gpa.free(plain);
+    const padded = try a.protectApplication(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .data = "pad", .padding_len = 64 });
+    defer gpa.free(padded);
+    try testing.expect(padded.len >= plain.len + 64);
+
+    // Trailing bytes after the MLSMessage are refused (and consume nothing).
+    {
+        const longer = try gpa.alloc(u8, plain.len + 1);
+        defer gpa.free(longer);
+        @memcpy(longer[0..plain.len], plain);
+        longer[plain.len] = 0;
+        try testing.expectError(error.Malformed, b.unprotectApplication(gpa, longer));
+    }
+    // (the forged one consumed generation 0 of alice's ratchet for nobody: `plain` is generation 1,
+    // `padded` generation 2 — both still open)
+    for ([_][]const u8{ plain, padded }) |m| {
+        const got = try b.unprotectApplication(gpa, m);
+        got.deinit(gpa);
+    }
+
+    // A handshake PrivateMessage handed to unprotectApplication is refused, twice the same way:
+    // it must not use up the ratchet key the Commit path needs.
+    const prop = try a.createProposal(gpa, .{
+        .signature_key_pair = &alice.sig,
+        .proposal = .{ .group_context_extensions = &.{} },
+        .framing = .{ .private_message = .{ .io = io } },
+    });
+    defer gpa.free(prop);
+    try testing.expectError(error.WrongContentType, b.unprotectApplication(gpa, prop));
+    try testing.expectError(error.WrongContentType, b.unprotectApplication(gpa, prop));
+    const gcb = try b.groupContextAlloc(gpa);
+    defer gpa.free(gcb);
+    // ... and the by-reference path may open it any number of times (it peeks).
+    _ = try b.authenticateProposalMessage(aa, gpa, prop, gcb);
+    _ = try b.authenticateProposalMessage(aa, gpa, prop, gcb);
+
+    // A spent final generation is RatchetExhausted.
+    const w = try (try a.secretTree()).ratchet(a.my_leaf_index, .application);
+    w.final_spent = true;
+    try testing.expectError(error.RatchetExhausted, a.protectApplication(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .data = "x" }));
+    w.final_spent = false;
+
+    // After a committed ReInit this member proposes nothing.
+    a.reinit = .{ .group_id = "x", .cipher_suite = TestSuite.id };
+    try testing.expectError(error.GroupReinitialized, a.createProposal(gpa, .{ .signature_key_pair = &alice.sig, .proposal = .{ .group_context_extensions = &.{} } }));
+    a.reinit = null;
+}
+
+test "mutation 2026-11-25: a Commit's GroupContext extensions outlive the Commit that carried them" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alice = try TestClient.init(arena.allocator(), "alice", 1);
+    const bob = try TestClient.init(arena.allocator(), "bob", 2);
+    var p = try mutPair(gpa, io, "gce", alice, bob);
+    defer p.a.deinit();
+    defer p.b.deinit();
+    const c = try p.a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = &alice.sig,
+        .proposals = &.{.{ .by_value = .{ .group_context_extensions = &.{.{ .extension_type = 0xf000, .extension_data = "persist-me" }} } }},
+    });
+    defer c.deinit(gpa);
+    try p.b.processCommit(.{ .commit_msg = c.commit });
+    for ([_]*const Group(TestSuite){ &p.a, &p.b }) |g| {
+        try testing.expectEqual(@as(usize, 1), g.extensions.len);
+        try testing.expectEqualStrings("persist-me", g.extensions[0].extension_data);
+    }
+}
+
+test "mutation 2026-11-25: an unsent PrivateMessage proposal is released with the group" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alice = try TestClient.init(arena.allocator(), "alice", 1);
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "unsent", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    const prop = try a.createProposal(gpa, .{
+        .signature_key_pair = &alice.sig,
+        .proposal = .{ .group_context_extensions = &.{} },
+        .framing = .{ .private_message = .{ .io = io } },
+    });
+    gpa.free(prop);
+    try testing.expectEqual(@as(usize, 1), a.sent_private.items.len);
+}
+
+test "mutation 2026-11-25: a proposal message of the wrong type is WrongContentType before its tag or key is looked at" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    var p = try mutPair(gpa, io, "wrongtype", alice, bob);
+    defer p.a.deinit();
+    defer p.b.deinit();
+    const gc = try p.b.groupContextAlloc(gpa);
+    defer gpa.free(gc);
+    {
+        const c = try p.a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig });
+        defer c.deinit(gpa);
+        const bad = try gpa.dupe(u8, c.commit);
+        defer gpa.free(bad);
+        bad[bad.len - 1] ^= 1; // the membership tag
+        try testing.expectError(error.WrongContentType, p.b.authenticateProposalMessage(aa, gpa, bad, gc));
+    }
+    {
+        const c = try p.a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .framing = .{ .private_message = .{ .io = io } } });
+        defer c.deinit(gpa);
+        const bad = try gpa.dupe(u8, c.commit);
+        defer gpa.free(bad);
+        bad[bad.len - 1] ^= 1; // the ciphertext
+        try testing.expectError(error.WrongContentType, p.b.authenticateProposalMessage(aa, gpa, bad, gc));
+    }
+}
+
+test "mutation 2026-11-25: checkSuccessor refuses every way a successor can disagree with its predecessor" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alice = try TestClient.init(arena.allocator(), "alice", 1);
+    const bob = try TestClient.init(arena.allocator(), "bob", 2);
+    var p = try mutPair(gpa, threaded.io(), "succ", alice, bob);
+    defer p.a.deinit();
+    defer p.b.deinit();
+    const g = &p.a; // epoch 1
+    const G = Group(TestSuite);
+    const secret: [TestSuite.Nh]u8 = @splat(5);
+    const nonce: [TestSuite.Nh]u8 = @splat(7);
+    const ids = struct {
+        fn one(usage: keyschedule.ResumptionPskUsage, gid: []const u8, epoch: u64, n: []const u8) [1]keyschedule.PreSharedKeyId {
+            return .{.{ .id = .{ .resumption = .{ .usage = usage, .psk_group_id = gid, .psk_epoch = epoch } }, .psk_nonce = n }};
+        }
+    };
+    const inv = error.InvalidSuccessor;
+
+    // ReInit.
+    const re_ok: content.ReInit = .{ .group_id = g.group_id, .cipher_suite = TestSuite.id };
+    const sc_re: G.Successor = .{
+        .psk = .{ .usage = .reinit, .group_id = "pred", .epoch = 5, .secret = &secret },
+        .reinit = re_ok,
+        .predecessor_suite = TestSuite.id,
+    };
+    const ok_ids = ids.one(.reinit, "pred", 5, &nonce);
+    try g.checkSuccessor(gpa, sc_re, &ok_ids);
+    g.epoch = 2;
+    try testing.expectError(inv, g.checkSuccessor(gpa, sc_re, &ok_ids));
+    g.epoch = 1;
+    // The Welcome names a different usage / epoch / group's PSK, only an external one, or none.
+    try testing.expectError(inv, g.checkSuccessor(gpa, sc_re, &ids.one(.branch, "pred", 5, &nonce)));
+    try testing.expectError(inv, g.checkSuccessor(gpa, sc_re, &ids.one(.reinit, "pred", 6, &nonce)));
+    try testing.expectError(inv, g.checkSuccessor(gpa, sc_re, &ids.one(.reinit, "other", 5, &nonce)));
+    try testing.expectError(inv, g.checkSuccessor(gpa, sc_re, &.{.{ .id = .{ .external = "x" }, .psk_nonce = &nonce }}));
+    try testing.expectError(inv, g.checkSuccessor(gpa, sc_re, &.{}));
+    // The ReInit's version, suite, group id and extensions must match.
+    {
+        var sc = sc_re;
+        sc.reinit.?.version = @fromBackingInt(@intCast(2));
+        try testing.expectError(inv, g.checkSuccessor(gpa, sc, &ok_ids));
+    }
+    {
+        var sc = sc_re;
+        sc.reinit.?.cipher_suite = @fromBackingInt(@intCast(3));
+        try testing.expectError(inv, g.checkSuccessor(gpa, sc, &ok_ids));
+    }
+    {
+        var sc = sc_re;
+        sc.reinit.?.group_id = "elsewhere";
+        try testing.expectError(inv, g.checkSuccessor(gpa, sc, &ok_ids));
+    }
+    {
+        var sc = sc_re;
+        sc.reinit.?.extensions = &.{.{ .extension_type = 9, .extension_data = "x" }};
+        try testing.expectError(inv, g.checkSuccessor(gpa, sc, &ok_ids));
+    }
+    // Branch: same suite and version as the predecessor.
+    const sc_br: G.Successor = .{
+        .psk = .{ .usage = .branch, .group_id = "pred", .epoch = 5, .secret = &secret },
+        .predecessor_suite = TestSuite.id,
+        .predecessor_tree = &p.b.ratchet_tree,
+    };
+    const br_ids = ids.one(.branch, "pred", 5, &nonce);
+    try g.checkSuccessor(gpa, sc_br, &br_ids);
+    {
+        var sc = sc_br;
+        sc.predecessor_suite = @fromBackingInt(@intCast(3));
+        try testing.expectError(inv, g.checkSuccessor(gpa, sc, &br_ids));
+    }
+    {
+        var sc = sc_br;
+        sc.predecessor_version = @fromBackingInt(@intCast(2));
+        try testing.expectError(inv, g.checkSuccessor(gpa, sc, &br_ids));
+    }
+    // Any other usage is no successor.
+    {
+        var sc = sc_br;
+        sc.psk.usage = .application;
+        try testing.expectError(inv, g.checkSuccessor(gpa, sc, &ids.one(.application, "pred", 5, &nonce)));
+    }
+}
+
+test "mutation 2026-11-25: reinitialize and createSuccessor guard what they take, and leave no successor state behind" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    var p = try mutPair(gpa, io, "old", alice, bob);
+    defer p.a.deinit();
+    defer p.b.deinit();
+    const a = &p.a;
+    {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .reinit = .{ .group_id = "renewed", .cipher_suite = TestSuite.id } } }} });
+        defer c.deinit(gpa);
+        try p.b.processCommit(.{ .commit_msg = c.commit });
+    }
+    const alice2 = try TestClient.init(aa, "alice", 21);
+    const bob2 = try TestClient.init(aa, "bob", 22);
+    var r: Group(TestSuite) = undefined;
+    const base: Group(TestSuite).SuccessorParams = .{
+        .create = .{ .io = io, .group_id = "renewed", .key_package_msg = alice2.kp_msg, .encryption_priv = &alice2.enc_priv },
+        .signature_key_pair = &alice2.sig,
+        .members = &.{bob2.kp},
+        .predecessor = undefined,
+    };
+    // An unknown ReInit version, or other extensions, are refused.
+    a.reinit.?.version = @fromBackingInt(@intCast(2));
+    try testing.expectError(error.NotReinitialized, a.reinitialize(TestSuite, gpa, gpa, base, &r));
+    a.reinit.?.version = .mls10;
+    var other = base;
+    other.create.extensions = &.{.{ .extension_type = 9, .extension_data = "x" }};
+    try testing.expectError(error.NotReinitialized, a.reinitialize(TestSuite, gpa, gpa, other, &r));
+    // createSuccessor takes reinit or branch only.
+    {
+        var out: Group(TestSuite) = undefined;
+        var bad = base;
+        bad.create.group_id = "succ-app";
+        bad.predecessor = a.successorPsk(.application);
+        if (Group(TestSuite).createSuccessor(gpa, gpa, bad, &out)) |created| {
+            created.deinit(gpa);
+            out.deinit();
+            return error.TestUnexpectedResult;
+        } else |e| try testing.expectEqual(error.InvalidSuccessor, e);
+    }
+    // The real one: a fresh psk_nonce, and nothing left over on the new group.
+    const created = try a.reinitialize(TestSuite, gpa, gpa, base, &r);
+    defer created.deinit(gpa);
+    defer r.deinit();
+    const zeros: [TestSuite.Nh]u8 = @splat(0);
+    try testing.expect(std.mem.indexOf(u8, created.commit, &zeros) == null);
+    try testing.expect(r.successor_usage == null);
+    try testing.expectEqual(@as(usize, 0), r.successor_psks.len);
+}
+
+test "mutation 2026-11-25: sameExtensions and sameCredential compare length, type and content" {
+    const gpa = testing.allocator;
+    const e1 = [_]tree.Extension{.{ .extension_type = 1, .extension_data = "a" }};
+    try testing.expect(try sameExtensions(gpa, &e1, &e1));
+    try testing.expect(!try sameExtensions(gpa, &e1, &.{}));
+    try testing.expect(!try sameExtensions(gpa, &e1, &.{.{ .extension_type = 2, .extension_data = "a" }}));
+    try testing.expect(!try sameExtensions(gpa, &e1, &.{.{ .extension_type = 1, .extension_data = "b" }}));
+    var c1 = [_][]const u8{"c1"};
+    var c1b = [_][]const u8{"c1x"};
+    var c12 = [_][]const u8{ "c1", "c2" };
+    try testing.expect(try sameCredential(gpa, .{ .x509 = &c1 }, .{ .x509 = &c1 }));
+    try testing.expect(!try sameCredential(gpa, .{ .basic = "c1" }, .{ .x509 = &c1 }));
+    try testing.expect(!try sameCredential(gpa, .{ .x509 = &c1 }, .{ .x509 = &c12 }));
+    try testing.expect(!try sameCredential(gpa, .{ .x509 = &c1 }, .{ .x509 = &c1b }));
+    try testing.expect(!try sameCredential(gpa, .{ .basic = "a" }, .{ .basic = "b" }));
+}
+
+test "mutation 2026-11-25: checkLifetime's bounds and checkTreeCapabilities' required_capabilities encoding" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    var a = try tCreate(gpa, .{ .io = threaded.io(), .group_id = "caps2", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+
+    const kp = try tKeyPackage(aa, 9, .{ .basic = "x" }, &.{1}, .{ .not_before = 100, .not_after = 200 });
+    try checkLifetime(kp.leaf_node, 100);
+    try checkLifetime(kp.leaf_node, 200);
+    try testing.expectError(error.LeafNodeInvalid, checkLifetime(kp.leaf_node, 99));
+    try testing.expectError(error.LeafNodeInvalid, checkLifetime(kp.leaf_node, 201));
+    var no_lt = kp.leaf_node;
+    no_lt.lifetime = null;
+    try testing.expectError(error.LeafNodeInvalid, checkLifetime(no_lt, 150));
+
+    const T = struct {
+        fn caps(t: *const tree.RatchetTree, data: []const u8) !void {
+            return checkTreeCapabilities(.{}, t, &.{.{ .extension_type = 3, .extension_data = data }});
+        }
+    };
+    const t = &a.ratchet_tree;
+    // An extension of another type is none of required_capabilities' business.
+    try checkTreeCapabilities(.{}, t, &.{.{ .extension_type = 2, .extension_data = &.{ 0xff, 0xff } }});
+    // Encoding: trailing bytes, an odd-length vector in each of the three positions.
+    try testing.expectError(error.Malformed, T.caps(t, &.{ 0, 0, 0, 0 }));
+    try testing.expectError(error.Malformed, T.caps(t, &.{ 1, 5, 0, 0 }));
+    try testing.expectError(error.Malformed, T.caps(t, &.{ 0, 1, 5, 0 }));
+    try testing.expectError(error.Malformed, T.caps(t, &.{ 0, 0, 1, 5 }));
+    // Proposal and credential types: an unlisted one is refused, a default / listed one passes.
+    try testing.expectError(error.LeafNodeInvalid, T.caps(t, &.{ 0, 2, 0, 0xff, 0 }));
+    try T.caps(t, &.{ 0, 2, 0, 1, 0 });
+    try testing.expectError(error.LeafNodeInvalid, T.caps(t, &.{ 0, 0, 2, 0, 0xff }));
+    try T.caps(t, &.{ 0, 0, 2, 0, 1 });
+}
+
+test "mutation 2026-11-25: receivers apply §7.3 to joined trees, Commits, KeyPackage lifetimes and path leaves" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    const carol = try TestClient.init(aa, "carol", 3);
+    const req_unmet = [_]u8{ 2, 0xff, 0x01, 0, 0 };
+    const gce_unmet: content.Proposal = .{ .group_context_extensions = &.{.{ .extension_type = 3, .extension_data = &req_unmet }} };
+
+    // A joiner checks the tree it joins against the GroupContext's required_capabilities.
+    {
+        var a = try tCreate(gpa, .{ .io = io, .group_id = "join-caps", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+        defer a.deinit();
+        a.policy.check_capabilities = false;
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{ .{ .by_value = .{ .add = carol.kp } }, .{ .by_value = gce_unmet } } });
+        defer c.deinit(gpa);
+        try testing.expectError(error.LeafNodeInvalid, tFromWelcome(gpa, .{
+            .welcome_msg = c.welcome.?,
+            .key_package_msg = carol.kp_msg,
+            .init_priv = &carol.init_priv,
+            .encryption_priv = &carol.enc_priv,
+        }));
+    }
+    // A receiver of a Commit checks the finished tree.
+    {
+        var p = try mutPair(gpa, io, "recv-caps", alice, bob);
+        defer p.a.deinit();
+        defer p.b.deinit();
+        p.a.policy.check_capabilities = false;
+        const c = try p.a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = gce_unmet }} });
+        defer c.deinit(gpa);
+        try testing.expectError(error.LeafNodeInvalid, p.b.processCommit(.{ .commit_msg = c.commit }));
+    }
+    // A receiver checks the lifetime of an added KeyPackage when told the time, unless its policy says no.
+    {
+        var p = try mutPair(gpa, io, "recv-life", alice, bob);
+        defer p.a.deinit();
+        defer p.b.deinit();
+        p.a.policy.check_lifetime = false;
+        const dave = try tKeyPackage(aa, 9, .{ .basic = "dave" }, &.{1}, .{ .not_before = 0, .not_after = 100 });
+        const c = try p.a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = dave } }} });
+        defer c.deinit(gpa);
+        try testing.expectError(error.LeafNodeInvalid, p.b.processCommit(.{ .commit_msg = c.commit, .now = 1000 }));
+        p.b.policy.check_lifetime = false;
+        try p.b.processCommit(.{ .commit_msg = c.commit, .now = 1000 });
+    }
+    // A receiver checks the new path leaf's extensions against its own capabilities.
+    {
+        var p = try mutPair(gpa, io, "recv-leaf", alice, bob);
+        defer p.a.deinit();
+        defer p.b.deinit();
+        p.a.policy.check_leaf_extensions_supported = false;
+        const c = try p.a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = &alice.sig,
+            .leaf_content = .{ .extensions = &.{.{ .extension_type = 0xf0f0, .extension_data = "x" }} },
+        });
+        defer c.deinit(gpa);
+        try testing.expectError(error.LeafNodeInvalid, p.b.processCommit(.{ .commit_msg = c.commit }));
+    }
+    // New leaf content forces a path even when the proposals would allow omitting it.
+    {
+        var p = try mutPair(gpa, io, "leaf-content", alice, bob);
+        defer p.a.deinit();
+        defer p.b.deinit();
+        const c = try p.a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = &alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = carol.kp } }},
+            .omit_path_when_allowed = true,
+            .leaf_content = .{ .credential = .{ .basic = "alice-renamed" } },
+        });
+        defer c.deinit(gpa);
+        try p.b.processCommit(.{ .commit_msg = c.commit });
+        const leaf = p.b.ratchet_tree.leafNode(p.a.my_leaf_index).?;
+        try testing.expectEqualStrings("alice-renamed", leaf.credential.basic);
+    }
+}
