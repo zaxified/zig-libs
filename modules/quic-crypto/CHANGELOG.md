@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-25** — New `Protection(Aead).Keyed` (`initInto`, `seal`, `open`, `wipe`): packet protection with the AEAD key schedule kept per key epoch, so an `aesgcm` `Context` is expanded once, not on every packet (keyed/stateless 0.48 at 64 B, 0.71-0.74 at 1200-1400 B; ChaCha20-Poly1305 has no per-key state, ratio 1.00). Same bytes and errors as `seal`/`open`; additive, `Protection.seal`/`open` unchanged. New `tools/bench.zig`; the ctgrind receiver opens through `Keyed`.
+
 - **2026-11-20** — **SOURCE-BREAKING (error set):** `headerprot.HeaderProtectionError.SampleTooShort` is removed. Nothing returned it: the sample is a `[16]u8` argument of `computeMaskAes`/`computeMaskChaCha20`, and `apply`/`remove` take the computed mask and return only `PacketTooShort`. Code that names `error.SampleTooShort` (e.g. a `switch` arm) must drop it; behaviour is unchanged.
 
 - **2026-10-19** — AES-GCM in tests, probes and docs moved from `std.crypto.aead.aes_gcm` to the zig-libs `aesgcm` module (new dep; Zig 0.17 #36256). `Protection(Aead)` is generic and unchanged; std AEAD types still work. Same bytes on the wire.

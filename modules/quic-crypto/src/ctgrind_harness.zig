@@ -86,7 +86,12 @@ fn run(comptime key_len: usize, comptime Aead: type, comptime mask: anytype, sec
     std.valgrind.memcheck.makeMemDefined(pkt[0 .. pn_off + 4]);
     var plain: [payload.len]u8 = undefined;
     const hl = pn_off + rm.pn_len;
-    _ = try P.open(&keys.key, keys.iv, pn, pkt[0..hl], pkt[hl..total], &plain);
+    // The receiver opens through the cached key schedule (`Keyed`): the
+    // expanded key is tainted by the tainted traffic secret.
+    var rx: P.Keyed = undefined;
+    P.Keyed.initInto(&rx, &keys.key, keys.iv);
+    defer rx.wipe();
+    _ = try rx.open(pn, pkt[0..hl], pkt[hl..total], &plain);
 
     std.debug.print("ctgrind_result={x}\n", .{pkt[0..total]});
     std.debug.print("ctgrind_result={x}\n", .{plain});
