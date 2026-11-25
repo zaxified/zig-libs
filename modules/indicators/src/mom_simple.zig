@@ -1260,10 +1260,54 @@ pub fn cci(comptime T: type, high: []const T, low: []const T, close: []const T, 
     // TA-Lib's circular-buffer slot order, which is bars `n-cur .. n`, then bars
     // `n-p+1 .. n-cur-1` (`cur = n % p`), as two contiguous runs.
     for (high, low, close, out) |h, l, c, *o| o.* = CCI.tp(.{ .high = h, .low = l, .close = c });
+    // Each sum is one serial chain (TA-Lib's order), so a bar is latency-bound.
+    // Two neighbours `i` and `i - 1` with `cur = i % per > 0` walk the same slot
+    // order except one slot (slot `cur`: bar `i` vs bar `i - per`), so they run
+    // as two independent chains in one pass over shared loads — each chain's
+    // order unchanged, so bitwise the single-bar form below.
     var i = n;
     while (i >= per) {
         i -= 1;
         const cur = i % per;
+        if (cur != 0 and i >= per) {
+            const shared_a = out[i - cur .. i];
+            const shared_b = out[i + 1 - per .. i - cur];
+            const xi = out[i];
+            const xj = out[i - per];
+            const last_j = out[i - 1];
+            var avg_i: f64 = 0;
+            var avg_j: f64 = 0;
+            for (shared_a) |v| {
+                avg_i += v;
+                avg_j += v;
+            }
+            avg_i += xi;
+            avg_j += xj;
+            for (shared_b) |v| {
+                avg_i += v;
+                avg_j += v;
+            }
+            avg_i /= pf(per);
+            avg_j /= pf(per);
+            var dev_i: f64 = 0;
+            var dev_j: f64 = 0;
+            for (shared_a) |v| {
+                dev_i += @abs(v - avg_i);
+                dev_j += @abs(v - avg_j);
+            }
+            dev_i += @abs(xi - avg_i);
+            dev_j += @abs(xj - avg_j);
+            for (shared_b) |v| {
+                dev_i += @abs(v - avg_i);
+                dev_j += @abs(v - avg_j);
+            }
+            dev_i /= pf(per);
+            dev_j /= pf(per);
+            out[i] = cciOut(xi, avg_i, dev_i);
+            out[i - 1] = cciOut(last_j, avg_j, dev_j);
+            i -= 1;
+            continue;
+        }
         const a = out[i - cur .. i + 1];
         const b = out[i + 1 - per .. i - cur];
         const last = out[i];
@@ -1275,12 +1319,15 @@ pub fn cci(comptime T: type, high: []const T, low: []const T, close: []const T, 
         for (a) |v| dev += @abs(v - avg);
         for (b) |v| dev += @abs(v - avg);
         dev /= pf(per);
-        const t = last - avg;
-        const scale = @abs(avg);
-        out[i] = if (!zeroScaled(t, scale) and !zeroScaled(dev, scale) and 0.015 * dev != 0.0) t / (0.015 * dev) else 0.0;
+        out[i] = cciOut(last, avg, dev);
     }
     @memset(out[0..@min(per - 1, n)], std.math.nan(f64));
     return CCI.lookback(p);
+}
+inline fn cciOut(last: f64, avg: f64, dev: f64) f64 {
+    const t = last - avg;
+    const scale = @abs(avg);
+    return if (!zeroScaled(t, scale) and !zeroScaled(dev, scale) and 0.015 * dev != 0.0) t / (0.015 * dev) else 0.0;
 }
 pub fn CciStream(comptime T: type) type {
     return vs.Stream(T, CCI);

@@ -610,3 +610,25 @@ test "stc: the second stochastic is seeded with its first value (cycle 2: 0 or 1
     }
     try testing.expect(hundreds > 0);
 }
+
+test "cci: the two-bar batch pass is bitwise the stream at every period and length parity" {
+    // The batch computes neighbours i, i - 1 (i % period != 0) in one pass; each sum must keep TA-Lib's slot
+    // order exactly, so every output equals the one-bar stream's bits, whatever the period and the bar count.
+    var h: [301]f64 = undefined;
+    var l: [301]f64 = undefined;
+    var c: [301]f64 = undefined;
+    th.walkBars(&h, &l, &c, 97);
+    var out: [301]f64 = undefined;
+    const S = ind.CciStream(f64);
+    for ([_]usize{ 2, 3, 4, 7, 14, 20, 21, 64, 150, 300, 301 }) |p| {
+        for ([_]usize{ 301, 300, 299 }) |n| {
+            if (n < p) continue;
+            _ = try ind.cci(f64, h[0..n], l[0..n], c[0..n], out[0..n], .{ .period = p });
+            const buf = try testing.allocator.alloc(f64, try S.bufLen(.{ .period = p }));
+            defer testing.allocator.free(buf);
+            var st = try S.init(.{ .period = p }, buf);
+            for (h[0..n], l[0..n], c[0..n], out[0..n]) |hh, ll, cc, w|
+                try testing.expect(th.sameOpt(st.update(.{ .high = hh, .low = ll, .close = cc }), w));
+        }
+    }
+}
