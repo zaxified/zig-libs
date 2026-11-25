@@ -2382,16 +2382,53 @@ interop_take_plan() {
     # The peers' pins live in ci-environment.sh (CI audit A8, 2026-11-14): a
     # bumped pin is a moved oracle, so its digest is in the key too -- before,
     # a bump waited up to a week to be judged against.
-    take_lane="interop week=$(date -u +%GW%V) peers=$(sha256sum scripts/lib/ci-environment.sh | cut -c1-12) $(uname -m)"
+    # ⭐ PER MODULE (2026-11-25). The digest was sha(whole ci-environment.sh), so
+    # any edit there -- a comment, the mqttz pin, a tests-role line -- re-took
+    # all 65 programs (~50 of a 90-minute lane). interop-peer-keys.py digests
+    # only the lines a module's take can see: the `if needs` blocks naming it
+    # plus the interop role's shared lines, no comments. An unreadable layout
+    # falls back to the whole-file digest, never to a weaker key.
+    local week arch dry="" keys m d
+    week="$(date -u +%GW%V)"
+    arch="$(uname -m)"
     # Like every other lane key (stamps_lane_key): a dry pass must never stand
     # in for a real take.
-    [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && take_lane="$take_lane DRY"
+    [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && dry=" DRY"
+    if ! keys="$(python3 -I scripts/lib/interop-peer-keys.py scripts/lib/ci-environment.sh "${progs[@]}")"; then
+        echo "interop: scripts/lib/interop-peer-keys.py failed -- refusing to guess which anchors are proven" >&2
+        exit 1
+    fi
+    _INTEROP_TAKE_LANE=()
+    local -A group=()
+    while IFS=$'\t' read -r m d; do
+        [[ -n "$m" ]] || continue
+        _INTEROP_TAKE_LANE[$m]="interop week=$week peers=$d $arch$dry"
+        group[$d]="${group[$d]:-} $m"
+    done <<< "$keys"
+    for m in "${progs[@]}"; do
+        if [[ -z "${_INTEROP_TAKE_LANE[$m]:-}" ]]; then
+            echo "interop: no peer key for $m -- refusing to guess" >&2
+            exit 1
+        fi
+    done
+    # For the log only; stamps use the module's own key (interop_lane_of).
+    take_lane="interop week=$week peers=<per module, ${#group[@]} distinct> $arch$dry"
     if [[ "${ZIGLIBS_STRICT_STAMPS:-0}" == 1 ]]; then
         take_todo="${progs[*]}"
     else
-        take_todo="$(stamps_pending "${progs[*]}" "$take_lane")"
+        local pending=" "
+        for d in "${!group[@]}"; do
+            pending="$pending$(stamps_pending "${group[$d]# }" "interop week=$week peers=$d $arch$dry") "
+        done
+        take_todo=""
+        for m in "${progs[@]}"; do
+            if [[ "$pending" == *" $m "* ]]; then take_todo="$take_todo${take_todo:+ }$m"; fi
+        done
     fi
 }
+# Module -> its interop take lane key, set by interop_take_plan in THIS shell.
+declare -A _INTEROP_TAKE_LANE=()
+interop_lane_of() { printf '%s' "${_INTEROP_TAKE_LANE[$1]}"; }
 
 # ⭐ `test.sh interop-pending <file> [zig args]` (2026-11-25): writes the
 # modules whose anchors `test.sh interop` with the same stamps and arguments
@@ -2556,7 +2593,7 @@ cmd_interop() {
     for m in "${serial[@]}"; do
         nfail=${#_ZL_FAILED[@]}
         interop_take_one "$m"
-        if (( ${#_ZL_FAILED[@]} == nfail )); then stamps_record "$m" "$take_lane"; fi
+        if (( ${#_ZL_FAILED[@]} == nfail )); then stamps_record "$m" "$(interop_lane_of "$m")"; fi
     done
     # `step` carried on past a failure here, and `checks_end` stops the run: what
     # is not on the failed list was taken, agreed and stamped above.
@@ -2572,7 +2609,7 @@ interop_take_collect() {
     cat "$logdir/$m.log"
     rm -f "$logdir/$m.log"
     if (( rc == 0 )); then
-        stamps_record "$m" "$take_lane"
+        stamps_record "$m" "$(interop_lane_of "$m")"
     else
         _ZL_FAILED+=("interop-$m")
     fi

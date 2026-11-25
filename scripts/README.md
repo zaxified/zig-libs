@@ -30,6 +30,7 @@ and CI; nobody runs these by hand in the ordinary course of things.
 | File | What it is |
 |------|------------|
 | `test-lib.sh` | The driver's shared shell library (steps, the memory cap, the netns set read from `module-graph`). |
+| `interop-peer-keys.py` | Per-module digest of `ci-environment.sh` for the interop take key: the `if needs` blocks naming the module plus the interop role's shared lines, comments and other roles excluded. An edit there re-takes only the programs it can affect; a layout it cannot read falls back to the whole-file digest. |
 | `with-decoy-gitdir.sh` | Runs a self-test that builds throwaway git repos with `GIT_DIR` exported at a decoy repository, as the pre-push hook starts it, and fails when the decoy changed. `checks-fast` wraps the three such self-tests in it (2026-11-15: an inherited `GIT_DIR` let them write into the real repository). |
 | `test-tag.sh` | Self-test for `auto-release.sh`. Runs inside the driver, because a release tool whose refusal path is untested refuses nothing. |
 | `tag-lib.sh` | What cutting a tag means, sourced by `auto-release.sh`: the dry-run refusal, the tag's name, the pin rewrite and bump, the annotated tag with generated notes. |
@@ -246,8 +247,10 @@ at its current fingerprint.
   the build tree from a red lane too, so a fix re-runs what is left, not the lane.
 - **Lanes** — `ctgrind` has each module's pinned rows in its fingerprint, so a re-pin
   re-measures that module. `interop` keeps two stamps: `check-interop` compiled it
-  (by fingerprint), and the anchor was re-taken (by fingerprint and ISO week, since a
-  peer changes with no commit here; a tag re-takes all). CI pins its `-Dcpu`, so the
+  (by fingerprint), and the anchor was re-taken (by fingerprint, ISO week, since a
+  peer changes with no commit here, and the digest of that module's own peer lines in
+  `ci-environment.sh` from `lib/interop-peer-keys.py`, so a pin bump re-takes only the
+  programs that use it; a tag re-takes all). CI pins its `-Dcpu`, so the
   compile stamps key on the OS triple, not on whichever CPU the pool handed out.
 - **Stamp** — `<module> TAB <lane> TAB <fingerprint> TAB <time>` in
   `.stamps.local.tsv` (gitignored, deliberately NOT in `.zig-cache`, which gets
