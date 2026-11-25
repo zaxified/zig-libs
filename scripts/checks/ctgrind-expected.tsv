@@ -1275,8 +1275,8 @@ dkg	ReleaseFast	reshare	1	<=110	2ed9dd9a627070d3	4c309a20403322dc
 # failure reason, and the scan loop contributes 0 contexts, so there is neither.
 # ⚠ The same `u1`-flag idiom did NOT survive the compiler in fss
 # (`dpf.zig` xorMasked), which is why this is measured rather than reviewed.
-aescbc	ReleaseFast	pkcs7	1	1	bbfbc79a7cb8464c	c4046968725e140d
-aescbc	ReleaseFast	xmlenc	1	1	bbfbc79a7cb8464c	c4046968725e140d
+aescbc	ReleaseFast	pkcs7	1	1	add6b50430679402	c4046968725e140d
+aescbc	ReleaseFast	xmlenc	1	1	add6b50430679402	c4046968725e140d
 # 2026-10-16: the three strippers added for RustCrypto parity, same shape. x923
 # and iso7816 end in the same accept/reject branch (1); unpadZero never
 # rejects an aligned buffer, so it has no decision to disclose and measures 0
@@ -1289,9 +1289,9 @@ aescbc	ReleaseFast	xmlenc	1	1	bbfbc79a7cb8464c	c4046968725e140d
 # stripper). iso7816: LLVM split `if (scan | ~seen)` into two jumps, a path per failure reason --
 # fixed in the source (`rejectIf` asm barrier, all four rejecting strippers; old harness + barrier
 # measured 5/1). All five rows back at 5/1 (zero 4/0), same out_sha.
-aescbc	ReleaseFast	x923	1	1	bbfbc79a7cb8464c	c4046968725e140d
-aescbc	ReleaseFast	iso7816	1	1	bbfbc79a7cb8464c	c4046968725e140d
-aescbc	ReleaseFast	zero	1	0	bbfbc79a7cb8464c	c4046968725e140d
+aescbc	ReleaseFast	x923	1	1	add6b50430679402	c4046968725e140d
+aescbc	ReleaseFast	iso7816	1	1	add6b50430679402	c4046968725e140d
+aescbc	ReleaseFast	zero	1	0	add6b50430679402	c4046968725e140d
 # ── sealedbox: the secret-key text codecs ──────────────────────────────────
 # ⭐ These four were 8 / 7 / 43 / 47 until 2026-09-09, all of it std's
 # table-driven base64 and hex reached with a SECRET argument: 95 of the 105

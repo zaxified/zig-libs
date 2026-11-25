@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-25** — **NO CONSUMER-VISIBLE CHANGE:** `encryptCts` runs its CBC head through the `encryptChain` function (`never_inline`) instead of folding the loop into the body; output byte-identical. Bench `cts_enc_1000` 1.22× -> 1.02× OpenSSL 3.5.5 (ABAB in the shield: 1360/1401 ns -> 1151/1157 ns).
+
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GU). `Stream.maxUpdateLen`, `paddedLenPkcs7` and `paddedLenZero` saturate instead of wrapping for a size near `maxInt(usize)` (pad functions then answer `BufferTooSmall`); the `pad*` functions accept `out` overlapping `msg` (in-place padding panicked in `@memcpy`, UB in ReleaseFast). Tests: `src/sweep_test.zig`.
 
 
