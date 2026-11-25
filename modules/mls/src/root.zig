@@ -432,9 +432,9 @@ test {
     _ = @import("stackprobe_test.zig");
 }
 
-test "meta.deps is exactly {\"hpke\", \"aesgcm\", \"p256\", \"p384\", \"p521\", \"ed448\"}" {
-    try std.testing.expectEqual(@as(usize, 6), meta.deps.len);
-    inline for (.{ "hpke", "aesgcm", "p256", "p384", "p521", "ed448" }, 0..) |want, i| {
+test "meta.deps is exactly {\"hpke\", \"aesgcm\", \"p256\", \"p384\", \"p521\", \"ed448\", \"ct25519\"}" {
+    try std.testing.expectEqual(@as(usize, 7), meta.deps.len);
+    inline for (.{ "hpke", "aesgcm", "p256", "p384", "p521", "ed448", "ct25519" }, 0..) |want, i| {
         try std.testing.expectEqualStrings(want, meta.deps[i]);
     }
 }
