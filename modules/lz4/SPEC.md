@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-11-17 (three verdict runs over disjoint seed ranges, the last on the final code, each 400,000 frame-decoder + 400,000 block-decoder + 50,000 round-trip runs in 29–42 s, all clean; a fourth after `decompressInto` (its result checked against `decompress` under the same cap on every frame-decoder input): 400,000 + 400,000 + 50,000 runs, decode 43 s, clean; a fifth after the review fixes, with `decompress` and `decompressInto` both judged by the independent frame model `modelFrames`: 400,000 + 400,000 + 50,000 runs, decode 43 s, clean; two more after the speed work (the decoder's fast loop, the encoder's new paths), the second on the final code: 400,000 + 400,000 + 50,000 runs each, decode 40–41 s, clean; LZ4_FUZZ, every reach label hit; arbitrary, mutated and structure-aimed frames, synthetic token streams judged against a byte-at-a-time model, glued skippable/legacy frames, failing allocator; 3,000 seeds in every test run) · ct n/a — compression only, no secret is processed · panic 2026-11-17 (self-review at creation: every length, offset and size from the input is checked before use; the only asserts are on internal callers' arguments, never reachable with caller data through the public API; oversized inputs are `error.InputTooLarge`)
 
-**Performance:** ref 0.94–1.10× liblz4 1.10.0 (`lz4 -b1 -B65536`, 64 KiB independent blocks of three 8 MiB payloads; compress 0.97–1.04×, decompress 0.94–1.10×; per payload the median of 3 runs of `zig build bench-lz4 -Djcc-safe`, all 3 runs within 0.92–1.12×; ours padded against the Intel JCC erratum, the distro `lz4` not; unpadded, this build's layout puts the decoder at 1.20–1.35×, see Speed) · fastest ? (measured 2026-11-17)
+**Performance:** ref 0.73–1.02× liblz4 1.10.0 (`lz4 -b1 -B65536`, 64 KiB independent blocks of three 8 MiB payloads; compress 0.94–0.99×, decompress 0.73–1.02×; three runs of `bench-lz4 -Djcc-safe` in the bench shield, all within those ranges; ours padded against the Intel JCC erratum, the distro `lz4` not; unpadded — a default build — decompress 0.75–1.02× since the x86-64 fast loop is one aligned asm block, compress 0.95–1.09×, see Speed) · fastest ? (measured 2026-11-25)
 
 **Known defects:** none recorded
 
@@ -34,8 +34,8 @@ from their own documentation.
 | [allyourcodebase/lz4](https://github.com/allyourcodebase/lz4) | Zig build + C | MIT | 11 | push 2026-10-20 | liblz4 packaged for `build.zig`: liblz4 itself, linked. |
 | Zig `std.compress` | Zig | MIT | — | Zig 0.17.1 | `flate`, `lzma`, `lzma2`, `xz`, `zstd`; no LZ4. `std.hash.XxHash32` is there and is what this module uses. |
 
-**Where we are ahead:** nothing measured. **Where we are behind:** speed is level with liblz4 when both are measured padded
-against the JCC erratum and behind in an unlucky code layout (the card's Performance line, Speed, B6).
+**Where we are ahead:** decoding runs of short repeats (`runs` 0.73–0.75× liblz4). **Where we are behind:** the encoder
+in a default (unpadded) build on the `runs` payload, up to 1.09× (layout, B6); elsewhere level with liblz4.
 
 ## What this module is, and what it is not
 
@@ -163,7 +163,7 @@ Bench: `tools/bench.zig` (`zig build bench-lz4`), `compressBlock` / `decompressB
 8 MiB payloads against `lz4 -b1 -B65536` (liblz4 from the distro). The figures are the card's `Performance` line
 (ratio = our time / liblz4's, ours padded against the Intel JCC erratum with `-Djcc-safe`, as the card's convention asks for
 ratios near 1.0; the distro `lz4` cannot be padded). Unpadded, the decoder's loop is sensitive to where its branches fall
-against 32-byte boundaries and the same code can be well behind (B6).
+against 32-byte boundaries and the same code can be well behind (B6) — the decoder no longer, see below.
 
 The techniques, each kept with an instruction-count A/B and a bench run (liblz4's `lz4.c` read as the design reference for
 the techniques, no code copied; see NOTICE):
@@ -177,6 +177,18 @@ the techniques, no code copied; see NOTICE):
   error path and no call; every verdict is the tail loop's (pinned by a test that cuts a block at
   every byte and its output at every size near the end, against the byte-at-a-time model).
   liblz4 jumps into its safe loop mid-sequence; the rewind is the same idea without `goto`.
+- **The x86-64 fast loop as one aligned asm block** (2026-11-25, `fastLoopAsm`, x86-64 with SSSE3 and the LLVM
+  backend; the Zig loop stays for every other target and is the model the asm transcribes). The compiled Zig loop was a
+  JCC-erratum lottery: in a default build `perf` counted 39 % of its µops from the legacy decoder (3 % padded) and 18 %
+  more cycles for the same instructions, 1.22–1.27× liblz4 on `text`/`noisy`. The asm block starts behind `.p2align 5`
+  with fixed registers, so its layout is its own text: every branch in it was checked not to cross or end on a 32-byte
+  boundary (`objdump -d` of the bench binary, the block from `cmp %r8,%rsi` to the hand-back `mov %r15,%rsi`; one fused
+  `cmp`+`je` did, and was moved by computing the match source before it). Same checks in the same order, same copies
+  and overshoot, same hand-back as the Zig loop; the short-offset pattern is `pshufb` with a table row per offset.
+  Shield ABAB, default build: decompress `text` 1.25 → 1.01×, `noisy` 1.22 → 0.99×, `runs` 1.01 → 0.75× liblz4 —
+  faster than the padded Zig loop (1.08 / 1.05 / 0.88×). Anchored by the block tests (every cut of a block against the
+  byte model), the fuzz verdict (400,000 block + 400,000 frame decodes against the models, ReleaseSafe) and a baseline
+  `-Dcpu=x86_64` test run, which takes the Zig loop. An edit of the asm text must repeat the layout check.
 - **Long matches out of line.** The rest of a match over 32 bytes is copied by a separate function;
   inlined, its unrolled loop took the registers of the short-match path, which then spilled.
 - **liblz4's `byU16` table for a small block** (`compress` under 65547 bytes): twice the entries in
@@ -234,15 +246,12 @@ and python3 with python-lz4, `tools/README.md`) and `zig build bench-lz4` are th
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **B6** Speed, what is left (not attempted in wave 14: a perf claim needs interleaved ReleaseFast A/B runs
-  with a spread below the effect, and the benchmark queue was shared with other agents' jobs, so a spread
-  that small could not be had): (a) the decoder's loop is a JCC-erratum layout lottery on
-  Skylake-family hosts (well behind liblz4 unpadded across builds of nearly the same code, level with it
-  padded; the card's Performance line has the figures); crc32c fixed the same thing with its hot loop as one aligned inline-asm block, which
-  for a decoder with a dozen bound checks per sequence is a larger and riskier change. (b) Frames
-  and blocks of 65547 bytes and more keep the 4-byte hash into 4096 u32 positions; liblz4's
-  `byU32` path hashes 5 bytes on 64-bit targets (`LZ4_hash5`), which changes frame output and was
-  not measured. (c) No corpus beyond the three generated payloads (no Silesia-like files).
+- **B6** Speed, what is left: (a) the decoder's layout lottery is closed by the asm fast loop (Speed); the ENCODER is
+  still compiled Zig and moves with layout — `runs` compress 0.99× padded, 1.06–1.09× in a default build (shield
+  2026-11-25); the same cure (its match-finding loop as an aligned asm block) would be a larger change than the
+  decoder's. (b) Frames and blocks of 65547 bytes and more keep the 4-byte hash into 4096 u32 positions; liblz4's
+  `byU32` path hashes 5 bytes on 64-bit targets (`LZ4_hash5`), which changes frame output and was not measured.
+  (c) No corpus beyond the three generated payloads (no Silesia-like files).
 
 ## Open
 

@@ -15,6 +15,7 @@
 //! liblz4's `LZ4_decompress_safe`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Error = error{
     /// The block ends inside a sequence (a length, the literals or the
@@ -94,7 +95,9 @@ pub fn decodeInto(src: []const u8, out: []u8, start: usize, prefix_start: usize)
     if (src.len > fast_in and out.len >= fast_out) {
         const in_end = src.len - fast_in; // ip < in_end: more than fast_in left
         const out_end = out.len - fast_out; // op <= out_end: fast_out left
-        while (ip < in_end and op <= out_end) {
+        if (comptime fast_asm) {
+            fastLoopAsm(src, out, &ip, &op, in_end, out_end, prefix_start);
+        } else while (ip < in_end and op <= out_end) {
             const seq = ip;
             const token = src[ip];
             ip += 1;
@@ -226,6 +229,182 @@ inline fn wildMatch(out: []u8, op: usize, offset: usize, len: usize) void {
 noinline fn copyLong(out: []u8, op: usize, m: usize, len: usize) void {
     var i: usize = 32;
     while (i < len) : (i += 16) out[op + i ..][0..16].* = out[m + i ..][0..16].*;
+}
+
+/// Whether `decodeInto`'s fast loop runs as `fastLoopAsm` (x86-64 with SSSE3
+/// for `pshufb`, LLVM backend for `.p2align`) instead of the Zig loop.
+const fast_asm = builtin.cpu.arch == .x86_64 and
+    std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3) and
+    builtin.zig_backend == .stage2_llvm;
+
+/// `wildMatch`'s short-offset tables for `fastLoopAsm`: bytes 16·o .. 16·o+15
+/// are the lanes `i % o` of offset `o` (1..15; row 0 unused), bytes 256 + o
+/// the stride `o · ⌊16 / o⌋`.
+const short_offset_tables: [16 * 16 + 16]u8 align(16) = blk: {
+    var t: [16 * 16 + 16]u8 = @splat(0);
+    for (1..16) |o| {
+        for (0..16) |i| t[16 * o + i] = @intCast(i % o);
+        t[256 + o] = @intCast(o * (16 / o));
+    }
+    break :blk t;
+};
+
+/// `decodeInto`'s fast loop, the same steps in the same order (each check,
+/// each copy and its overshoot, the hand-back to the sequence's token), as
+/// ONE asm block behind `.p2align 5` with fixed registers, so its layout is
+/// the text below and not where the linker happens to put it.
+///
+/// Why: Intel's JCC erratum (Skylake … Cascade Lake microcode) sends a jump
+/// that crosses or ends on a 32-byte boundary to the legacy decoder. The
+/// compiled Zig loop ran 1.22–1.25× liblz4 in a default build and level with
+/// it only when padded (`-Djcc-safe`): `perf` 2026-11-25, 39 % of its µops
+/// from the legacy decoder unpadded against 3 % padded, 18 % more cycles for
+/// the same instructions. `crc32c` fixed the same thing the same way.
+///
+/// The length sums of `readLength` are not checked for overflow here: they
+/// grow by at most 255 per input byte, so they cannot wrap below 2^56 bytes
+/// of input. Every other verdict is the Zig loop's.
+fn fastLoopAsm(src: []const u8, out: []u8, ip: *usize, op: *usize, in_end: usize, out_end: usize, prefix_start: usize) void {
+    var ipp: [*]const u8 = src.ptr + ip.*;
+    var opp: [*]u8 = out.ptr + op.*;
+    asm volatile (
+    // ── hot path: one sequence with short lengths ─────────────────────
+        \\ .p2align 5
+        \\ 1:
+        \\ cmpq %%r8, %%rsi
+        \\ jae 9f
+        \\ cmpq %%r9, %%rdi
+        \\ ja 9f
+        \\ movq %%rsi, %%r15
+        \\ movzbl (%%rsi), %%eax
+        \\ incq %%rsi
+        \\ movl %%eax, %%ecx
+        \\ shrl $4, %%ecx
+        \\ andl $15, %%eax
+        \\ cmpl $15, %%ecx
+        \\ je 20f
+        \\ movdqu (%%rsi), %%xmm0
+        \\ movdqu %%xmm0, (%%rdi)
+        \\ 2:
+        \\ addq %%rcx, %%rsi
+        \\ leaq (%%rdi,%%rcx), %%rdx
+        \\ movzwl (%%rsi), %%ecx
+        \\ addq $2, %%rsi
+        \\ movq %%rdx, %%r14
+        \\ subq %%r10, %%r14
+        \\ decq %%rcx
+        \\ cmpq %%r14, %%rcx
+        \\ jae 8f
+        \\ incq %%rcx
+        \\ addl $4, %%eax
+        \\ movq %%rdx, %%r14
+        \\ subq %%rcx, %%r14
+        \\ cmpl $19, %%eax
+        \\ je 30f
+        \\ 3:
+        \\ cmpq $16, %%rcx
+        \\ jb 40f
+        \\ movdqu (%%r14), %%xmm0
+        \\ movdqu %%xmm0, (%%rdx)
+        \\ movdqu 16(%%r14), %%xmm0
+        \\ movdqu %%xmm0, 16(%%rdx)
+        \\ cmpq $32, %%rax
+        \\ ja 50f
+        \\ 4:
+        \\ leaq (%%rdx,%%rax), %%rdi
+        \\ jmp 1b
+        // ── offset 1..15: a pshufb pattern every stride bytes ───────────
+        \\ .p2align 4
+        \\ 40:
+        \\ movdqu (%%r14), %%xmm0
+        \\ movq %%rcx, %%r15
+        \\ shlq $4, %%r15
+        \\ movdqu (%%r13,%%r15), %%xmm1
+        \\ pshufb %%xmm1, %%xmm0
+        \\ movzbl 256(%%r13,%%rcx), %%r15d
+        \\ xorl %%r14d, %%r14d
+        \\ 41:
+        \\ movdqu %%xmm0, (%%rdx,%%r14)
+        \\ addq %%r15, %%r14
+        \\ cmpq %%rax, %%r14
+        \\ jb 41b
+        \\ jmp 4b
+        // ── the rest of a match over 32 bytes, offset >= 16 ─────────────
+        \\ .p2align 4
+        \\ 50:
+        \\ movl $32, %%r15d
+        \\ 51:
+        \\ movdqu (%%r14,%%r15), %%xmm0
+        \\ movdqu %%xmm0, (%%rdx,%%r15)
+        \\ addq $16, %%r15
+        \\ cmpq %%rax, %%r15
+        \\ jb 51b
+        \\ jmp 4b
+        // ── literal length bytes (lit = 15 + ...) ────────────────────────
+        \\ .p2align 4
+        \\ 20:
+        \\ cmpq %%r11, %%rsi
+        \\ jae 8f
+        \\ movzbl (%%rsi), %%edx
+        \\ incq %%rsi
+        \\ addq %%rdx, %%rcx
+        \\ cmpl $255, %%edx
+        \\ je 20b
+        \\ movq %%r11, %%rdx
+        \\ subq %%rsi, %%rdx
+        \\ cmpq $16, %%rdx
+        \\ jb 8f
+        \\ subq $16, %%rdx
+        \\ cmpq %%rcx, %%rdx
+        \\ jb 8f
+        \\ movq %%r12, %%rdx
+        \\ subq %%rdi, %%rdx
+        \\ subq $64, %%rdx
+        \\ cmpq %%rcx, %%rdx
+        \\ jb 8f
+        \\ xorl %%edx, %%edx
+        \\ 21:
+        \\ movdqu (%%rsi,%%rdx), %%xmm0
+        \\ movdqu %%xmm0, (%%rdi,%%rdx)
+        \\ addq $16, %%rdx
+        \\ cmpq %%rcx, %%rdx
+        \\ jb 21b
+        \\ jmp 2b
+        // ── match length bytes (ml = 19 + ...) ───────────────────────────
+        \\ .p2align 4
+        \\ 30:
+        \\ cmpq %%r11, %%rsi
+        \\ jae 8f
+        \\ movzbl (%%rsi), %%r14d
+        \\ incq %%rsi
+        \\ addq %%r14, %%rax
+        \\ cmpl $255, %%r14d
+        \\ je 30b
+        \\ movq %%r12, %%r14
+        \\ subq %%rdx, %%r14
+        \\ subq $32, %%r14
+        \\ cmpq %%r14, %%rax
+        \\ ja 8f
+        \\ movq %%rdx, %%r14
+        \\ subq %%rcx, %%r14
+        \\ jmp 3b
+        // ── hand back: the sequence starts again at its token ───────────
+        \\ 8:
+        \\ movq %%r15, %%rsi
+        \\ 9:
+        : [ip] "={rsi}" (ipp),
+          [op] "={rdi}" (opp),
+        : [ip_in] "0" (ipp),
+          [op_in] "1" (opp),
+          [in_end] "{r8}" (src.ptr + in_end),
+          [out_end] "{r9}" (out.ptr + out_end),
+          [prefix] "{r10}" (out.ptr + prefix_start),
+          [src_end] "{r11}" (src.ptr + src.len),
+          [out_lim] "{r12}" (out.ptr + out.len),
+          [tables] "{r13}" (&short_offset_tables),
+        : .{ .rax = true, .rcx = true, .rdx = true, .r14 = true, .r15 = true, .xmm0 = true, .xmm1 = true, .cc = true, .memory = true });
+    ip.* = @intFromPtr(ipp) - @intFromPtr(src.ptr);
+    op.* = @intFromPtr(opp) - @intFromPtr(out.ptr);
 }
 
 /// Copy `len` bytes from `op - offset` to `op`, overlap allowed (the copy is
