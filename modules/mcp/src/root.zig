@@ -14631,3 +14631,117 @@ test "handleMessageAs: handlers see the transport's AuthInfo for that one messag
     const none: AuthInfo = .{};
     try testing.expect(!none.hasScope("read"));
 }
+
+fn authProbeMethod(_: ?*anyopaque, req: *MethodRequest) bool {
+    req.write(if (req.auth != null) "{\"seen\":\"yes\"}" else "{\"seen\":\"no\"}");
+    return true;
+}
+
+fn authProbePrompt(_: ?*anyopaque, req: *PromptRequest) bool {
+    req.message(.user, if (req.auth != null) "seen-yes" else "seen-no");
+    return true;
+}
+
+fn authProbeCompleter(_: ?*anyopaque, req: *CompletionRequest) void {
+    req.add(if (req.auth != null) "seen-yes" else "seen-no");
+}
+
+test "mutation 2026-11-25: method, prompt and completion handlers see the transport's AuthInfo, and hasScope is an exact match" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addMethod(.{ .name = "acme/who", .handler = authProbeMethod });
+    try s.addPrompt(.{ .name = "p", .handler = authProbePrompt, .completer = authProbeCompleter });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const scopes = [_][]const u8{ "read", "admin" };
+    const info: AuthInfo = .{ .subject = "ada", .scopes = &scopes };
+    try testing.expect(info.hasScope("admin"));
+    try testing.expect(!info.hasScope("adm")); // exact match, not a prefix
+    try testing.expect(!info.hasScope("admins"));
+    const lines = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"acme/who\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\",\"params\":{\"name\":\"p\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"\"}}}",
+    };
+    for (lines) |line| {
+        out.clearRetainingCapacity();
+        try s.handleMessageAs(line, &out.writer, 0, &info);
+        try testing.expect(std.mem.find(u8, out.written(), "yes") != null);
+        out.clearRetainingCapacity();
+        try s.handleMessage(line, &out.writer);
+        try testing.expect(std.mem.find(u8, out.written(), "no") != null);
+        try testing.expect(std.mem.find(u8, out.written(), "yes") == null);
+    }
+}
+
+const NestedAuth = struct {
+    s: *Server,
+    inner: *const AuthInfo,
+    before: ?*const AuthInfo = null,
+    after: ?*const AuthInfo = null,
+};
+
+fn nestedAuthTool(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const n: *NestedAuth = @ptrCast(@alignCast(ctx.?));
+    n.before = n.s.request_auth;
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    n.s.handleMessageAs("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"acme/who\"}", &sink.writer, 0, n.inner) catch {};
+    n.after = n.s.request_auth;
+    call.write("done");
+    return false;
+}
+
+test "mutation 2026-11-25: handleMessageAs restores the previous AuthInfo, not null, after a nested call" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addMethod(.{ .name = "acme/who", .handler = authProbeMethod });
+    const outer: AuthInfo = .{ .subject = "outer" };
+    const inner: AuthInfo = .{ .subject = "inner" };
+    var n: NestedAuth = .{ .s = &s, .inner = &inner };
+    try s.addTool(.{ .name = "nest", .description = "", .input_schema = "{}", .handler = nestedAuthTool, .ctx = &n });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try s.handleMessageAs("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"nest\"}}", &out.writer, 0, &outer);
+    try testing.expect(n.before == &outer);
+    try testing.expect(n.after == &outer); // not null: the nested call put the outer one back
+    try testing.expect(s.request_auth == null);
+}
+
+test "mutation 2026-11-25: tombstones: forgetPeer purges only that peer's, an id mismatch is not cancelled, a non-conforming id is not remembered" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "r", .description = "", .input_schema = "{}", .handler = reportCancelTool });
+    const call7 =
+        \\{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"r","arguments":{}}}
+    ;
+    const call8 =
+        \\{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"r","arguments":{}}}
+    ;
+    // A boolean/array/object id was never issued: it never reaches the ring.
+    try testing.expect(!s.cancelInflightSticky(0, .{ .bool = true }));
+    var live: usize = 0;
+    for (s.tombstones) |t| {
+        if (t.used) live += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), live);
+    // A remembered cancel of id 7 does not touch the call with id 8 ...
+    try testing.expect(!s.cancelInflightSticky(0, .{ .integer = 7 }));
+    try expectResponse(&s, call8,
+        \\{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"false"}],"isError":false}}
+        \\
+    );
+    // ... forgetting another peer leaves it alone ...
+    s.forgetPeer(5);
+    try expectResponse(&s, call7, "");
+    // ... and forgetting its own peer removes it for good.
+    try testing.expect(!s.cancelInflightSticky(5, .{ .integer = 7 }));
+    s.forgetPeer(5);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessageFrom(call7, &aw.writer, 5);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"false"}],"isError":false}}
+        \\
+    , aw.written());
+}

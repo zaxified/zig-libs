@@ -338,3 +338,33 @@ test "clientSupportsApps: only an extensions entry listing the app mime type cou
         try testing.expectEqual(c.want, clientSupportsApps(root.ClientCapabilities.parse(v)));
     }
 }
+
+fn noopResource(_: ?*anyopaque, _: *root.ResourceRequest) bool {
+    return true;
+}
+
+test "mutation 2026-11-25: verify: only ui:// resources need the app mime type, only a malformed ui _meta is InvalidMeta; HtmlResource carries its size" {
+    // A tool without _meta and a resource outside ui:// with another mime type are fine.
+    var s = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "plain", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = noopTool });
+    try s.addResource(.{ .uri = "x://doc", .name = "doc", .mime_type = "text/plain", .handler = noopResource });
+    try verify(&s);
+    // `ui` that is not an object is "not an app tool"; a non-string resourceUri, a non-object _meta and bad JSON are InvalidMeta.
+    const ok = [_][]const u8{"{\"ui\":5}"};
+    for (ok) |m| {
+        var s2 = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+        defer s2.deinit();
+        try s2.addTool(.{ .name = "x", .description = "d", .input_schema = "{\"type\":\"object\"}", .meta_json = m, .handler = noopTool });
+        try verify(&s2);
+    }
+    const bad = [_][]const u8{ "[1]", "{", "{\"ui\":{\"resourceUri\":5}}" };
+    for (bad) |m| {
+        var s3 = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+        defer s3.deinit();
+        try s3.addTool(.{ .name = "x", .description = "d", .input_schema = "{\"type\":\"object\"}", .meta_json = m, .handler = noopTool });
+        try testing.expectError(error.InvalidMeta, verify(&s3));
+    }
+    const page: HtmlResource = .{ .uri = "ui://a/b.html", .name = "n", .html = "12345" };
+    try testing.expectEqual(@as(u64, 5), (try page.resource()).size.?);
+}

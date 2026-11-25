@@ -1622,3 +1622,284 @@ test "mimeTypeFor: by extension, case-insensitive, text/binary fallback" {
     try testing.expectEqualStrings("application/octet-stream", mimeTypeFor("a/x.unknown", false));
     try testing.expectEqualStrings("text/plain", mimeTypeFor("a.d/noext", true));
 }
+
+// ── mutation 2026-11-25 ─────────────────────────────────────────────────────
+
+const md_min = "---\nname: x\ndescription: d\n---\n";
+
+test "mutation 2026-11-25: attach: one server per catalog, the attached flag, a non-object extensions text" {
+    var cat = try Catalog.load(testing.allocator, &.{.{ .path = "pdf-processing/SKILL.md", .bytes = spec_skill_md }}, &.{}, .{});
+    defer cat.deinit();
+    var s = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try cat.attach(&s);
+    try testing.expect(cat.attached);
+    // Another server is refused too (its extensions object does not name the extension).
+    var s2 = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s2.deinit();
+    try testing.expectError(error.AlreadyAttached, cat.attach(&s2));
+    try testing.expectEqual(@as(usize, 0), s2.custom_methods.items.len);
+    // An extensions text that is not an object (set past setCapabilityExtras' own check).
+    var cat2 = try Catalog.load(testing.allocator, &.{}, &.{}, .{});
+    defer cat2.deinit();
+    var s3 = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s3.deinit();
+    s3.extensions_json = "[1]";
+    try testing.expectError(error.InvalidCapabilityJson, cat2.attach(&s3));
+}
+
+fn aliasChainMd(a: std.mem.Allocator, n: usize, comptime mapping: bool) ![]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    try b.appendSlice(a, "---\nname: x\ndescription: d\n");
+    try b.appendSlice(a, if (mapping) "c0: &c0 {k: 1}\n" else "c0: &c0 [1]\n");
+    for (1..n + 1) |i| try b.print(a, if (mapping) "c{d}: &c{d} {{k: *c{d}}}\n" else "c{d}: &c{d} [*c{d}]\n", .{ i, i, i - 1 });
+    try b.appendSlice(a, "---\n");
+    return b.items;
+}
+
+fn listMd(a: std.mem.Allocator, n: usize) ![]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    try b.appendSlice(a, "---\nname: x\ndescription: d\nlist: [");
+    for (0..n) |i| try b.appendSlice(a, if (i == 0) "1" else ",1");
+    try b.appendSlice(a, "]\n---\n");
+    return b.items;
+}
+
+fn padMd(a: std.mem.Allocator, n: usize) ![]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    try b.appendSlice(a, "---\nname: x\ndescription: d\na: \"");
+    try b.appendNTimes(a, 'p', n);
+    try b.appendSlice(a, "\"\nb: 1\n---\n");
+    return b.items;
+}
+
+/// null = the skill loaded; else why it was left out.
+fn frontProblem(md: []const u8) !?Problem {
+    var cat = try Catalog.load(testing.allocator, &.{.{ .path = "x/SKILL.md", .bytes = md }}, &.{}, .{});
+    defer cat.deinit();
+    if (cat.skills().len == 1) return null;
+    return cat.skipped()[0].problem;
+}
+
+test "mutation 2026-11-25: frontmatter edges: depth 64, 10000 values, 256 KiB of JSON; the opening delimiter; an empty name" {
+    var st: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    // Depth: an alias chain is a few lines and expands n + 3 levels deep.
+    try testing.expectEqual(@as(?Problem, null), try frontProblem(try aliasChainMd(a, 61, false)));
+    try testing.expectEqual(@as(?Problem, .frontmatter_too_large), try frontProblem(try aliasChainMd(a, 62, false)));
+    try testing.expectEqual(@as(?Problem, null), try frontProblem(try aliasChainMd(a, 61, true)));
+    try testing.expectEqual(@as(?Problem, .frontmatter_too_large), try frontProblem(try aliasChainMd(a, 62, true)));
+    // Values: the document, name, description, the list and its n elements.
+    try testing.expectEqual(@as(?Problem, null), try frontProblem(try listMd(a, max_frontmatter_nodes - 4)));
+    try testing.expectEqual(@as(?Problem, .frontmatter_too_large), try frontProblem(try listMd(a, max_frontmatter_nodes - 3)));
+    // Bytes: the check runs before each value, over what is written so far.
+    var small = try Catalog.load(testing.allocator, &.{.{ .path = "x/SKILL.md", .bytes = try padMd(a, 10) }}, &.{}, .{});
+    const j0 = small.skills()[0].frontmatter_json.len;
+    small.deinit();
+    // `limit` is the pad at which the check first fires; one less and the JSON written before the
+    // check was exactly at the cap (`:1}` still follows it: 3 bytes).
+    var limit: usize = max_frontmatter_json_bytes + 12 - j0 - 24;
+    while (try frontProblem(try padMd(a, limit)) == null) : (limit += 1) {
+        try testing.expect(limit < max_frontmatter_json_bytes + 12);
+    }
+    try testing.expectEqual(@as(?Problem, .frontmatter_too_large), try frontProblem(try padMd(a, limit)));
+    var last = try Catalog.load(testing.allocator, &.{.{ .path = "x/SKILL.md", .bytes = try padMd(a, limit - 1) }}, &.{}, .{});
+    const j_last = last.skills()[0].frontmatter_json.len;
+    last.deinit();
+    try testing.expectEqual(@as(usize, max_frontmatter_json_bytes + 3), j_last);
+    // The block must open the file; an empty name is no name.
+    try testing.expectEqual(@as(?Problem, .no_frontmatter), try frontProblem("intro\n---\nname: x\ndescription: d\n---\n"));
+    try testing.expectEqual(@as(?Problem, .bad_name), try frontProblem("---\nname: \"\"\ndescription: d\n---\n"));
+}
+
+test "mutation 2026-11-25: uris keep '+' and encode '%'; a sibling directory is not inside a skill; files are sorted before duplicates are looked for; mime by the last dot" {
+    var cat = try Catalog.load(testing.allocator, &.{
+        .{ .path = "x/z.md", .bytes = "z" },
+        .{ .path = "x/SKILL.md", .bytes = md_min },
+        .{ .path = "x/p+q%r", .bytes = "p" },
+        .{ .path = "x/a.md", .bytes = "a" },
+        .{ .path = "xy/data.txt", .bytes = "not in skill x" },
+    }, &.{}, .{});
+    defer cat.deinit();
+    const s = cat.skills()[0];
+    const want = [_][]const u8{ "skill://x/SKILL.md", "skill://x/a.md", "skill://x/p+q%25r", "skill://x/z.md" };
+    try testing.expectEqual(want.len, s.files.?.len);
+    for (want, s.files.?) |w, m| try testing.expectEqualStrings(w, cat.state.files[m].uri);
+    try testing.expectEqual(want.len, cat.state.files.len);
+    try testing.expectError(error.DuplicatePath, Catalog.load(testing.allocator, &.{
+        .{ .path = "x/b", .bytes = "1" },
+        .{ .path = "x/SKILL.md", .bytes = md_min },
+        .{ .path = "x/b", .bytes = "2" },
+    }, &.{}, .{}));
+    try testing.expectEqualStrings("text/javascript", mimeTypeFor("a/x.min.js", true));
+}
+
+fn anyRead(_: ?*anyopaque, req: *root.ResourceRequest) bool {
+    req.text(req.uri, "text/plain", "dyn");
+    return true;
+}
+
+test "mutation 2026-11-25: dynamic skills: bad path, overlaps in either order, a duplicate, a wrong name; reads only under their own directory" {
+    var st: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    try testing.expectError(error.BadPath, Catalog.load(testing.allocator, &.{}, &.{.{ .path = "a/../x", .skill_md = md_min }}, .{}));
+    try testing.expectError(error.OverlappingDynamicSkill, Catalog.load(testing.allocator, &.{}, &.{ .{ .path = "x/y/x", .skill_md = md_min }, .{ .path = "x", .skill_md = md_min } }, .{}));
+    try testing.expectError(error.OverlappingDynamicSkill, Catalog.load(testing.allocator, &.{}, &.{ .{ .path = "x", .skill_md = md_min }, .{ .path = "x", .skill_md = md_min } }, .{}));
+    var wrong = try Catalog.load(testing.allocator, &.{}, &.{.{ .path = "reports/daily", .skill_md = md_min }}, .{});
+    defer wrong.deinit();
+    try testing.expectEqual(@as(usize, 0), wrong.skills().len);
+    try testing.expectEqual(Problem.name_mismatch, wrong.skipped()[0].problem);
+    // Reads: one dynamic skill answers everything under its directory, another has no handler.
+    const dyn = [_]Dynamic{
+        .{ .path = "reports/daily", .skill_md = "---\nname: daily\ndescription: d\n---\n", .read = anyRead },
+        .{ .path = "zbare/skill", .skill_md = "---\nname: skill\ndescription: d\n---\n" },
+    };
+    var cat = try Catalog.load(testing.allocator, &.{.{ .path = "pdf-processing/SKILL.md", .bytes = spec_skill_md }}, &dyn, .{});
+    defer cat.deinit();
+    var s = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try cat.attach(&s);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const inside = try parsed(a, try call(&s, &out, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"skill://reports/daily/x.md\"}}"));
+    try testing.expectEqualStrings("dyn", inside.object.get("result").?.object.get("contents").?.array.items[0].object.get("text").?.string);
+    for ([_][]const u8{ "skill://pdf-processing/nope.md", "skill://zbare/skill/other.md" }) |uri| {
+        const v = try parsed(a, try call(&s, &out, try a.print("{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\",\"params\":{{\"uri\":\"{s}\"}}}}", .{uri})));
+        try testing.expect(v.object.get("error") != null);
+    }
+}
+
+test "mutation 2026-11-25: load copies the file bytes it serves" {
+    const skill = try testing.allocator.dupe(u8, md_min);
+    defer testing.allocator.free(skill);
+    const payload = try testing.allocator.dupe(u8, "payload");
+    defer testing.allocator.free(payload);
+    var cat = try Catalog.load(testing.allocator, &.{ .{ .path = "x/SKILL.md", .bytes = skill }, .{ .path = "x/data.txt", .bytes = payload } }, &.{}, .{});
+    defer cat.deinit();
+    @memset(skill, 'Z');
+    @memset(payload, 'Z');
+    try testing.expectEqual(@as(usize, 2), cat.state.files.len);
+    try testing.expectEqualStrings(md_min, cat.state.files[0].bytes);
+    try testing.expectEqualStrings("payload", cat.state.files[1].bytes);
+}
+
+test "mutation 2026-11-25: a file inside nested skills is stored once" {
+    var cat = try Catalog.load(testing.allocator, &.{
+        .{ .path = "outer/SKILL.md", .bytes = "---\nname: outer\ndescription: o\n---\n" },
+        .{ .path = "outer/inner/SKILL.md", .bytes = "---\nname: inner\ndescription: i\n---\n" },
+        .{ .path = "outer/inner/ref.md", .bytes = "r" },
+    }, &.{}, .{});
+    defer cat.deinit();
+    try testing.expectEqual(@as(usize, 3), cat.state.files.len);
+    try testing.expectEqual(@as(usize, 3), cat.skills()[0].files.?.len);
+    try testing.expectEqual(@as(usize, 2), cat.skills()[1].files.?.len);
+}
+
+test "mutation 2026-11-25: loadDir: a file over the limit makes its skill too_large, and its path must be valid too" {
+    const io = testing.io;
+    const huge = try testing.allocator.alloc(u8, max_skill_bytes + 2);
+    defer testing.allocator.free(huge);
+    @memset(huge, 0);
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "big");
+    try tmp.dir.writeFile(io, .{ .sub_path = "big/SKILL.md", .data = "---\nname: big\ndescription: d\n---\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "big/huge.bin", .data = huge });
+    var cat = try Catalog.loadDir(testing.allocator, io, tmp.dir, &.{}, .{});
+    defer cat.deinit();
+    try testing.expectEqual(@as(usize, 0), cat.skills().len);
+    try testing.expectEqual(Problem.too_large, cat.skipped()[0].problem);
+    // The same file under a name that is not UTF-8.
+    var tmp2 = testing.tmpDir(.{ .iterate = true });
+    defer tmp2.cleanup();
+    try tmp2.dir.createDirPath(io, "ok");
+    try tmp2.dir.writeFile(io, .{ .sub_path = "ok/SKILL.md", .data = "---\nname: ok\ndescription: d\n---\n" });
+    try tmp2.dir.writeFile(io, .{ .sub_path = "ok/b\xff.bin", .data = huge });
+    try testing.expectError(error.BadPath, Catalog.loadDir(testing.allocator, io, tmp2.dir, &.{}, .{}));
+}
+
+fn b64(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    return enc.encode(try a.alloc(u8, enc.calcSize(raw.len)), raw);
+}
+
+test "mutation 2026-11-25: cursors are refused by length, tag, scope and trailing field; a cursor at the end is an empty page; paging off ignores cursors" {
+    var st: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    var files: std.ArrayList(File) = .empty;
+    for (0..5) |i| {
+        const name = try a.print("s{d}", .{i});
+        try files.append(a, .{ .path = try a.print("{s}/SKILL.md", .{name}), .bytes = try a.print("---\nname: {s}\ndescription: d\n---\n", .{name}) });
+    }
+    var cat = try Catalog.load(testing.allocator, files.items, &.{}, .{});
+    defer cat.deinit();
+    var s = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.page_size = 2;
+    try cat.attach(&s);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const long = try a.alloc(u8, 60);
+    @memset(long, '9');
+    @memcpy(long[0..4], "s:0:");
+    const bad = [_][]const u8{
+        try b64(a, long), // decodes to more than a cursor can be
+        try b64(a, "s:0:2:x"), // a trailing field
+        try b64(a, "ss:0:2"), // a two-character tag
+        try cursor(a, 'd', 0, 2), // another tag, the right scope
+        try cursor(a, 's', fnv("skill://s0"), 2), // the right tag, another scope
+    };
+    for (bad) |c| {
+        const v = try parsed(a, try call(&s, &out, try a.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"skills/list\",\"params\":{{\"cursor\":\"{s}\"}}}}", .{c})));
+        try testing.expectEqual(@as(i64, -32602), v.object.get("error").?.object.get("code").?.integer);
+    }
+    // A directory cursor of another directory (same tag) is refused as well.
+    const other_dir = try cursor(a, 'd', fnv("skill://s1"), 0);
+    const dv = try parsed(a, try call(&s, &out, try a.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/directory/read\",\"params\":{{\"uri\":\"skill://s0\",\"cursor\":\"{s}\"}}}}", .{other_dir})));
+    try testing.expectEqual(@as(i64, -32602), dv.object.get("error").?.object.get("code").?.integer);
+    // A cursor at the very end is a valid, empty last page.
+    const end = try parsed(a, try call(&s, &out, try a.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"skills/list\",\"params\":{{\"cursor\":\"{s}\"}}}}", .{try cursor(a, 's', 0, 5)})));
+    const r = end.object.get("result").?.object;
+    try testing.expectEqual(@as(usize, 0), r.get("skills").?.array.items.len);
+    try testing.expect(r.get("nextCursor") == null);
+    // With paging off a cursor is ignored, even a forged one.
+    s.page_size = 0;
+    const all = try parsed(a, try call(&s, &out, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"skills/list\",\"params\":{\"cursor\":\"zzz\"}}"));
+    try testing.expectEqual(@as(usize, 5), all.object.get("result").?.object.get("skills").?.array.items.len);
+}
+
+test "mutation 2026-11-25: skills/list and directory reads carry list_cache, skills/get carries read_cache; a directory pages to its end" {
+    var st: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    var cat = try Catalog.load(testing.allocator, &.{
+        .{ .path = "p/SKILL.md", .bytes = "---\nname: p\ndescription: d\n---\n" },
+        .{ .path = "p/a.md", .bytes = "a" },
+        .{ .path = "p/b.md", .bytes = "b" },
+    }, &.{}, .{});
+    defer cat.deinit();
+    var s = root.Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.list_cache = .{ .ttl_ms = 111, .scope = .public };
+    s.read_cache = .{ .ttl_ms = 222, .scope = .public };
+    s.page_size = 2;
+    try cat.attach(&s);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const list = try parsed(a, try call(&s, &out, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"skills/list\",\"params\":{" ++ meta_2026 ++ "}}"));
+    try testing.expectEqual(@as(i64, 111), list.object.get("result").?.object.get("ttlMs").?.integer);
+    const get = try parsed(a, try call(&s, &out, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"skills/get\",\"params\":{" ++ meta_2026 ++ ",\"uri\":\"skill://p/SKILL.md\"}}"));
+    try testing.expectEqual(@as(i64, 222), get.object.get("result").?.object.get("ttlMs").?.integer);
+    const page1 = try parsed(a, try call(&s, &out, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/directory/read\",\"params\":{" ++ meta_2026 ++ ",\"uri\":\"skill://p\"}}"));
+    const r1 = page1.object.get("result").?.object;
+    try testing.expectEqual(@as(i64, 111), r1.get("ttlMs").?.integer);
+    try testing.expectEqual(@as(usize, 2), r1.get("resources").?.array.items.len);
+    const nc = r1.get("nextCursor").?.string;
+    const page2 = try parsed(a, try call(&s, &out, try std.mem.concat(a, u8, &.{ "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"resources/directory/read\",\"params\":{", meta_2026, ",\"uri\":\"skill://p\",\"cursor\":\"", nc, "\"}}" })));
+    const r2 = page2.object.get("result").?.object;
+    try testing.expectEqual(@as(usize, 1), r2.get("resources").?.array.items.len);
+    try testing.expect(r2.get("nextCursor") == null);
+}
