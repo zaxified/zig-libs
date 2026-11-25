@@ -2331,20 +2331,20 @@ cmd_ctgrind_portable() {
     # undefined where the no-`-fvalgrind` trap cannot declassify it, so those
     # contexts were UNATTRIBUTED. The harnesses now use the length they sent;
     # every remaining context is attributed in their variant rows.
-    set_extra_args "$@"
-    local mods=() m
-    for m in modules/*/src/ctgrind_harness.zig; do
-        [[ -e "$m" ]] || continue
-        m="${m#modules/}"; m="${m%%/*}"
-        mods+=("$m")
-    done
-    echo "ctgrind-portable: CTGRIND_CPU=x86_64 (no AES-NI/ADX/BMI2/AVX) for ${#mods[@]} modules"
-    echo "  ⚠ needs valgrind (scripts/lib/ci-environment.sh ctgrind)"
-    _ZL_KEEP_OUT="$(mktemp)"
+    #
+    # ⭐ STAMPED (2026-11-25), through `cmd_ctgrind` itself: its lane key already
+    # carries `cpu=${CTGRIND_CPU}`, so the portable measurement gets stamps of its
+    # own (`ctgrind cpu=x86_64 drv=… valgrind … x86_64`), never the native lane's,
+    # and the per-module fingerprint covers the module's closure and its own rows
+    # of ctgrind-expected.tsv (the `cpu=x86_64` variants included). Until then it
+    # measured every harness on every full run: 41 min of full lane #4
+    # (2026-11-25), while the stamped native lane took 14.
+    echo "ctgrind-portable: CTGRIND_CPU=x86_64 (no AES-NI/ADX/BMI2/AVX)"
     export CTGRIND_CPU=x86_64
-    ZL_STEP_STDERR_IS_OUTPUT=1 step "ctgrind-portable" scripts/checks/ctgrind.sh --check "${mods[@]}"
+    local rc=0
+    cmd_ctgrind "$@" || rc=$?
     unset CTGRIND_CPU
-    summary
+    return "$rc"
 }
 
 #
