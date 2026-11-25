@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-16 (200,000-run budget per harness clean, AESCBC_FUZZ: cbc, padding, cts, stream) · ct 2026-10-18 on Zig 0.17.0 (ctgrind: all five unpadders, 1 in-file context each = the accept/reject verdict, 0 for unpadZero; the verdict goes through the `rejectIf` asm barrier since 0.17 split iso7816's into two jumps, see `root.zig` `rejectIf`) · panic 2026-10-30 (sweep + blind review: length sums saturate, in-place padding total (`placeMsg`); delta audit 8/9 + 1 eq)
 
-**Performance:** ref 0.20–0.77× Go 1.26.8 crypto/cipher · fastest 1.20× OpenSSL 3.5.5 (measured 2026-10-20)
+**Performance:** ref 0.22–0.83× Go 1.26.8 crypto/cipher · fastest 1.02× OpenSSL 3.5.5 (measured 2026-11-25)
 
 **Known defects:** none recorded
 
@@ -273,4 +273,4 @@ Run with `scripts/modtest aescbc`; the deterministic fuzz drivers run as `AESCBC
 
 ## Backlog / deferred
 
-- **CTS encrypt is 1.20× OpenSSL** (`cts_enc_1000`; `cts_dec_1000` is 0.98×): the one-shot `encryptCts` pays the key expansion and a 1536-byte burn per call over a latency-bound CBC chain (63 blocks); OpenSSL's provider path is ~200 ns cheaper per call. Counts for the card's `fastest` figure only (Go has no CTS), so it blocks P1, not P2. Candidates: a smaller burn sized to the body, or a keyed CTS context.
+- **Keyed CTS context** (key schedule once, like `Encryptor`): the one-shot `encryptCts`/`decryptCts` expand the key and burn 1.5 KiB per call; at 1.02× / 1.02× OpenSSL on 1000 B (2026-11-25) there is no measured gap left to close.

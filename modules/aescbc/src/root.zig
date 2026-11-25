@@ -232,7 +232,10 @@ fn encryptCtsBody(
     const n = (in.len + block_len - 1) / block_len;
     const d = in.len - (n - 1) * block_len;
     const head = (n - 2) * block_len;
-    encryptChain(&ctx, &chain, in[0..head], out[0..head]);
+    // Not inlined: with the chain loop folded into this body the same 61 blocks
+    // ran ~18% slower (1.22x OpenSSL, perf: 94% of the body's samples in that
+    // loop; 1.02x as its own function). Code layout, no change in what runs.
+    @call(.never_inline, encryptChain, .{ &ctx, &chain, in[0..head], out[0..head] });
     var p_last: [block_len]u8 = @splat(0);
     @memcpy(p_last[0..d], in[head + block_len ..][0..d]);
     var c_prev: [block_len]u8 = @as(V, in[head..][0..block_len].*) ^ @as(V, chain);
