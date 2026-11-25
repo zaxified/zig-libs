@@ -22,6 +22,7 @@ try C.encrypt(ct, &tag16, msg, ad, nonce13, key32);
 ```
 
 Presets: `Aes128Ccm`, `Aes128Ccm8`, `Aes256Ccm`, `Aes256Ccm8` (12-byte nonce),
+`Aes192Ccm`, `Aes192Ccm8` (AES-192, over the `aes192` module),
 `Aes128Ccm8Nonce13` (COSE AES-CCM-16-64-128 / OSCORE). Errors instead of
 asserts: `BufferSizeMismatch`, `MessageTooLong`, `AuthenticationFailed` (the
 plaintext buffer is zeroed on it).

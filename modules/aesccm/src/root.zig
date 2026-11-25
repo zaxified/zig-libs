@@ -13,6 +13,9 @@
 //! stateless `encrypt` / `decrypt` do the same for one message. Presets:
 //! `Aes128Ccm`, `Aes128Ccm8`, `Aes256Ccm`, `Aes256Ccm8` (12-byte nonce, the
 //! TLS profile) and `Aes128Ccm8Nonce13` (COSE algorithm 10, OSCORE's AEAD).
+//! AES-192 (OpenSSL and Python `cryptography` accept 24-byte keys) is
+//! `Aes192Ccm` / `Aes192Ccm8`, or `Ccm(aes192.Aes192, ...)`, over the sibling
+//! `aes192` module's block cipher (std ships none).
 //!
 //! Errors, not asserts, at the boundary: a ciphertext buffer of the wrong
 //! length is `error.BufferSizeMismatch`, a message longer than the L-byte
@@ -23,6 +26,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const mem = std.mem;
+const aes192 = @import("aes192");
 
 pub const meta = .{
     .doc = "AES-CCM AEAD (NIST SP 800-38C / RFC 3610) with any nonce length 7..13 and tag 4..16 — the 12-byte-nonce TLS/DTLS 1.3 CCM and CCM_8 profile std lacks, plus COSE/OSCORE's 13-byte one",
@@ -32,7 +36,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "NIST SP 800-38C / RFC 3610 AES-CCM (OpenSSL / Python cryptography AESCCM)",
-    .deps = .{},
+    .deps = .{"aes192"}, // the AES-192 block cipher for Aes192Ccm (std ships none)
 };
 
 pub const Error = error{ BufferSizeMismatch, MessageTooLong };
@@ -44,11 +48,14 @@ pub const Aes128Ccm = Ccm(crypto.core.aes.Aes128, 16, 12);
 pub const Aes128Ccm8 = Ccm(crypto.core.aes.Aes128, 8, 12);
 pub const Aes256Ccm = Ccm(crypto.core.aes.Aes256, 16, 12);
 pub const Aes256Ccm8 = Ccm(crypto.core.aes.Aes256, 8, 12);
+/// AES-192 counterparts (24-byte key), over the `aes192` module's block cipher.
+pub const Aes192Ccm = Ccm(aes192.Aes192, 16, 12);
+pub const Aes192Ccm8 = Ccm(aes192.Aes192, 8, 12);
 /// COSE algorithm 10, AES-CCM-16-64-128 (RFC 8152 §10.2): OSCORE's mandatory AEAD.
 pub const Aes128Ccm8Nonce13 = Ccm(crypto.core.aes.Aes128, 8, 13);
 
-/// AES-CCM over the block cipher `Aes` (`std.crypto.core.aes.Aes128` or
-/// `Aes256`), with a `tag_len`-byte tag and a `nonce_len`-byte nonce.
+/// AES-CCM over the block cipher `Aes` (`std.crypto.core.aes.Aes128` /
+/// `Aes256` or `aes192.Aes192`), with a `tag_len`-byte tag and a `nonce_len`-byte nonce.
 pub fn Ccm(comptime Aes: type, comptime tag_len: usize, comptime nonce_len: usize) type {
     comptime {
         if (tag_len < 4 or tag_len > 16 or tag_len % 2 != 0) @compileError("CCM tag length must be 4, 6, ..., 16");
@@ -64,7 +71,7 @@ pub fn Ccm(comptime Aes: type, comptime tag_len: usize, comptime nonce_len: usiz
         /// The longest message an L-byte length field can describe.
         pub const max_message_len: u64 = if (L >= 8) std.math.maxInt(u64) else (@as(u64, 1) << @as(u6, @intCast(8 * L))) - 1;
 
-        ctx: crypto.core.aes.AesEncryptCtx(Aes),
+        ctx: @TypeOf(Aes.initEnc(@as([Aes.key_bits / 8]u8, undefined))),
 
         pub fn init(key: [key_length]u8) Self {
             return .{ .ctx = Aes.initEnc(key) };
@@ -274,6 +281,18 @@ const kats = [_]Kat{
     .{ .key_len = 16, .tag_len = 8, .nonce_len = 12, .ad_len = 70000, .pt_len = 40, .out = "21ff5372fc6f9ac1e16d7b8dd041340cd2d7c3ae3aec29fff6ede71f18e8f07df6fbe1c71dc848b4cec7e70b624d0edb" },
 };
 
+/// AES-192 rows of the same table (`tools/ccm_kats.py`, key length 24).
+const kats192 = [_]Kat{
+    .{ .key_len = 24, .tag_len = 8, .nonce_len = 12, .ad_len = 0, .pt_len = 0, .out = "37dff99ffdff293d" },
+    .{ .key_len = 24, .tag_len = 8, .nonce_len = 12, .ad_len = 13, .pt_len = 33, .out = "3ec6d6d4d9ab0aa2a691a930446fce5b6c21a1ab011d6ffb0f694bcfd419fde7156f9e2989cb1feaf6" },
+    .{ .key_len = 24, .tag_len = 16, .nonce_len = 12, .ad_len = 20, .pt_len = 16, .out = "3ec6d6d4d9ab0aa2a691a930446fce5b15e3a813756900c243f986ce3ce8fbd5" },
+    .{ .key_len = 24, .tag_len = 16, .nonce_len = 12, .ad_len = 300, .pt_len = 64, .out = "3ec6d6d4d9ab0aa2a691a930446fce5b6c21a1ab011d6ffb0f694bcfd419fde71512fa5285c3914887d37c96012ceb08b2f25d9e4f9a63a6899f33597ad5114b706aab3d2a1bc2a8a6adb99bd22fba58" },
+    .{ .key_len = 24, .tag_len = 8, .nonce_len = 13, .ad_len = 8, .pt_len = 31, .out = "b7a2e2bbaccbe13072fba0a0ce892061b770b7fec3644df39c4ff834208a0cba3bc056d71af507" },
+    .{ .key_len = 24, .tag_len = 8, .nonce_len = 13, .ad_len = 70000, .pt_len = 17, .out = "b7a2e2bbaccbe13072fba0a0ce892061b755cbf45dfcbfa617" },
+    .{ .key_len = 24, .tag_len = 16, .nonce_len = 13, .ad_len = 5, .pt_len = 1, .out = "b7287dda176a912782dc14d922fbfefa6d" },
+    .{ .key_len = 24, .tag_len = 16, .nonce_len = 13, .ad_len = 0, .pt_len = 40, .out = "b7a2e2bbaccbe13072fba0a0ce892061b770b7fec3644df39c4ff834208a0c30c90e345cf61bcc21c8d6f3b02139b4dde3e69b32aad86689" },
+};
+
 fn runKat(comptime C: type, k: Kat) !void {
     const gpa = testing.allocator;
     var key: [C.key_length]u8 = undefined;
@@ -312,6 +331,46 @@ test "KATs against OpenSSL (Python cryptography AESCCM)" {
                 }
             }
         }
+    }
+}
+
+test "AES-192 KATs against OpenSSL (Python cryptography AESCCM)" {
+    inline for (.{ 8, 16 }) |t| {
+        inline for (.{ 12, 13 }) |n| {
+            const C = Ccm(aes192.Aes192, t, n);
+            var ran: usize = 0;
+            for (kats192) |k| {
+                if (k.tag_len == t and k.nonce_len == n) {
+                    try runKat(C, k);
+                    ran += 1;
+                }
+            }
+            try testing.expect(ran > 0);
+        }
+    }
+    try testing.expectEqual(@as(usize, 24), Aes192Ccm.key_length);
+}
+
+test "AES-192 CCM: every single-bit flip of ciphertext and tag is refused" {
+    const key: [24]u8 = @splat(7);
+    const nonce: [12]u8 = @splat(8);
+    const pt = "twenty-four byte key data";
+    var c: [pt.len]u8 = undefined;
+    var tag: [8]u8 = undefined;
+    try Aes192Ccm8.encrypt(&c, &tag, pt, "aad", nonce, key);
+    var m: [pt.len]u8 = undefined;
+    try Aes192Ccm8.decrypt(&m, &c, tag, "aad", nonce, key);
+    try testing.expectEqualStrings(pt, &m);
+    for (0..c.len * 8) |bit| {
+        var bad = c;
+        bad[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+        try testing.expectError(error.AuthenticationFailed, Aes192Ccm8.decrypt(&m, &bad, tag, "aad", nonce, key));
+        try testing.expect(std.mem.allEqual(u8, &m, 0));
+    }
+    for (0..tag.len * 8) |bit| {
+        var bad = tag;
+        bad[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+        try testing.expectError(error.AuthenticationFailed, Aes192Ccm8.decrypt(&m, &c, bad, "aad", nonce, key));
     }
 }
 
