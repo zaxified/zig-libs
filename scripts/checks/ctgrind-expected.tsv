@@ -1837,7 +1837,7 @@ aeskw	ReleaseFast	wrap	1	12	88dac35c72f0539b	23036d19c2656c6a
 # aesccm (2026-11-21) — aead: key + plaintext tainted, AES-128/256 with tags
 # 8/16 (12-byte nonce): seal, open, tampered open. 8 = the tag verdict after
 # the timing-safe compare (root.zig `open`), accept + reject per profile.
-aesccm	ReleaseFast	aead	1	8	e36c5e8d79e2c281	d38f305d54b5a2c3
+aesccm	ReleaseFast	aead	1	8	1ad5df867460895e	d38f305d54b5a2c3
 # wireguard (2026-11-03) — messages and public keys declassified where they leave the
 # function that made them (they go on the wire). Read off the --stacks log:
 # keyb64 1, keyhex 1 = the codec's accept/reject. handshake 4 = three AEAD tag
@@ -2497,7 +2497,7 @@ aesgcm	ReleaseFast	generic	1	226	f53f30679e9e0b14	b60805fea700d105	cpu=x86_64 co
 # `expected` tag comes from std soft `encrypt` of the counter block, whose stack-allocated padding
 # lanes are `undefined`, origin soft.zig:610, so the compare branches on them without any taint)
 # + 8 witness (the printed tag/plaintext), trap +16 more witness prints (nothing declassified).
-aesccm	ReleaseFast	aead	1	192	e36c5e8d79e2c281	d38f305d54b5a2c3	cpu=x86_64 control=16 trap=32
+aesccm	ReleaseFast	aead	1	192	1ad5df867460895e	d38f305d54b5a2c3	cpu=x86_64 control=16 trap=32
 dtls	ReleaseFast	hs	1	302	9b98087d58fe60cb	61a204df8edf79a0	cpu=x86_64 control=177 trap=179
 dtls	ReleaseFast	app	1	278	9b98087d58fe60cb	70da17057fd7a044	cpu=x86_64 control=279 trap=279
 # 2026-11-21 (connection ID work): ku +1 in the tainted, the untainted and the no-fvalgrind rows alike (296/299/299 ->

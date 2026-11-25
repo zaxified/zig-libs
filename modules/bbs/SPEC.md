@@ -6,7 +6,7 @@
 
 **Scope:** core — draft-irtf-cfrg-bbs-signatures -12 and zkryptium (draft-10) (surveyed 2026-09-30; mvp -> core 2026-10-06 after the pin moved to -12 and the SHAKE-256 suite landed, both suites byte-exact on the draft's vectors)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-20 (133/136, 1 eq) · src 848849db9039e22a
+**Audit:** review 2026-09-09 · mutation 2026-11-25 (141/144, 1 eq) · src 38e399850e24b8ab
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; the two verify oracles at scale 200 = 1,000 runs each (a sign or proof plus up to five pairing checks per run), BBS_FUZZ) · ct 2026-10-06 (ctgrind)
 
@@ -182,6 +182,9 @@ Every line below holds for both suites (the §8.3/D.1 vectors mirror §8.4/D.2).
   selecting the hash-to-scalar domain. Equivalent: the MSM crossover (`msmLoop` and Pippenger give the same
   point; the F4 oracle pins it). Unobservable: `sign` accepting an identity `A` and `keyGen` accepting a zero key
   (each needs a hash or a message set that lands on a discrete-log relation, probability about `2^-255`).
+- **Delta mutation 2026-11-25** (the stack-burn sizes and their five call sites, ReleaseFast): 8 mutants, 8 killed,
+  0 open. Skipping the wipe in `SecretKey.toBytes` / `fromBytes` first survived — the stack probe never called them; a
+  new probe test covers both.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
 
