@@ -1928,8 +1928,21 @@ pub const Ed25519SignError = std.crypto.errors.IdentityElementError ||
 /// `key_pair.public_key` exactly as far as std does: it is compared with the
 /// copy embedded in `secret_key` (`error.KeyMismatch`), not re-derived from
 /// the seed. `noise = null` is the deterministic RFC 8032 signature.
-/// Secret intermediates are wiped; the comb burns its own frames.
+/// Secret intermediates are wiped, and the body runs one frame down with its
+/// dead stack burned after it (`burn.sign_burn`): SHA-512's frames, the
+/// by-value scalar copies of `mulBaseEncode`/`reduce64`/`mulAdd` are below
+/// the reach of any local wipe.
 pub fn signEd25519(
+    key_pair: *const std.crypto.sign.Ed25519.KeyPair,
+    msg: []const u8,
+    noise: ?[std.crypto.sign.Ed25519.noise_length]u8,
+) Ed25519SignError!std.crypto.sign.Ed25519.Signature {
+    const sig = signEd25519Unburned(key_pair, msg, noise);
+    burn.stack(burn.sign_burn);
+    return sig;
+}
+
+noinline fn signEd25519Unburned(
     key_pair: *const std.crypto.sign.Ed25519.KeyPair,
     msg: []const u8,
     noise: ?[std.crypto.sign.Ed25519.noise_length]u8,
@@ -1956,6 +1969,8 @@ pub fn signEd25519(
 
     // r = SHA-512([noise] || prefix || M) mod L — std's order, noise first.
     var nh = Sha512.init(.{});
+    // Its buffer holds the tail of [noise] || prefix || M.
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&nh));
     if (noise) |*z| nh.update(z);
     nh.update(az[32..64]);
     nh.update(msg);
@@ -2089,6 +2104,7 @@ test {
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("mutation_test.zig");
     _ = @import("fuzz_test.zig");
 }
 
@@ -2869,7 +2885,7 @@ const field_edges = blk: {
 
 /// One operation on fresh copies of `x`, `y` in slots `p`, `q`; `o` chooses
 /// the output slot, so the aliasing cases (`o` = an input) run too.
-fn fieldOp(comptime adx: bool, comptime op: enum { mul, sq, add, sub, mul121665, invert, addsub_sum, addsub_diff }, comptime o: fe64.Slot, x: u256, y: u256) u512 {
+fn fieldOp(comptime adx: bool, comptime op: enum { mul, sq, add, sub, mul121665, invert, addsub_sum, addsub_diff, addsub_sum_other, addsub_diff_other }, comptime o: fe64.Slot, x: u256, y: u256) u512 {
     const F = fe64.Ops(adx);
     var st: fe64.State = undefined;
     for (&st) |*l| l.* = .{ 0xdead, 0xbeef, 0xdead, 0xbeef }; // no stale answer to find
@@ -2883,10 +2899,17 @@ fn fieldOp(comptime adx: bool, comptime op: enum { mul, sq, add, sub, mul121665,
         .mul121665 => F.mul121665(&st, o, .p),
         .invert => F.invert(&st, o, .p),
         // the other output goes to `t` (or to `r` when `o` is `t`)
-        .addsub_sum => F.addsub(&st, o, if (o == .t) .r else .t, .p, .q),
-        .addsub_diff => F.addsub(&st, if (o == .t) .r else .t, o, .p, .q),
+        .addsub_sum, .addsub_sum_other => F.addsub(&st, o, if (o == .t) .r else .t, .p, .q),
+        .addsub_diff, .addsub_diff_other => F.addsub(&st, if (o == .t) .r else .t, o, .p, .q),
     }
-    return canonical(st[@backingInt(o)]);
+    // mutation 2026-11-25: addsub must survive o/q aliasing a/b — the `_other`
+    // variants read the OTHER output, so an add-then-sub (or sub-then-add)
+    // that lets one output overwrite an input of the other is seen.
+    const out: fe64.Slot = switch (op) {
+        .addsub_sum_other, .addsub_diff_other => if (o == .t) .r else .t,
+        else => o,
+    };
+    return canonical(st[@backingInt(out)]);
 }
 
 fn checkFieldPair(comptime adx: bool, x: u256, y: u256) !void {
@@ -2913,6 +2936,13 @@ fn checkFieldPair(comptime adx: bool, x: u256, y: u256) !void {
         .{ .name = "addsub -", .got = fieldOp(adx, .addsub_diff, .r, x, y), .want = want_sub },
         .{ .name = "addsub - q=a", .got = fieldOp(adx, .addsub_diff, .p, x, y), .want = want_sub },
         .{ .name = "addsub - q=b", .got = fieldOp(adx, .addsub_diff, .q, x, y), .want = want_sub },
+        // mutation 2026-11-25: addsub must survive o/q aliasing a/b (the other output too)
+        .{ .name = "addsub + other", .got = fieldOp(adx, .addsub_sum_other, .r, x, y), .want = want_sub },
+        .{ .name = "addsub + o=a other", .got = fieldOp(adx, .addsub_sum_other, .p, x, y), .want = want_sub },
+        .{ .name = "addsub + o=b other", .got = fieldOp(adx, .addsub_sum_other, .q, x, y), .want = want_sub },
+        .{ .name = "addsub - other", .got = fieldOp(adx, .addsub_diff_other, .r, x, y), .want = want_add },
+        .{ .name = "addsub - q=a other", .got = fieldOp(adx, .addsub_diff_other, .p, x, y), .want = want_add },
+        .{ .name = "addsub - q=b other", .got = fieldOp(adx, .addsub_diff_other, .q, x, y), .want = want_add },
         .{ .name = "mul121665", .got = fieldOp(adx, .mul121665, .r, x, y), .want = want_a24 },
         .{ .name = "mul121665 in place", .got = fieldOp(adx, .mul121665, .p, x, y), .want = want_a24 },
         .{ .name = "toBytes", .got = canonical(limbsOf(x)), .want = X % p25519 },

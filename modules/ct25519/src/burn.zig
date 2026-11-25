@@ -44,6 +44,13 @@ pub const x25519_base_burn = 16 * 1024;
 /// digits) below `fastBaseMul`'s state wipe.
 pub const mul_burn = 16 * 1024;
 
+/// `signEd25519`: the body (two SHA-512 states and their compression frames,
+/// the comb call, `reduce64`/`mulAdd`) left the seed, SHA-512(seed)'s low
+/// half, the clamped scalar and the nonce 0.6..1.8 KiB below its caller with
+/// no burn (ReleaseFast probe, delta mutation audit 2026-11-25). Sized like
+/// `mul_burn`'s margin over the comb's own 2.4 KiB.
+pub const sign_burn = 8 * 1024;
+
 /// `mulBase` / `mulRistrettoBase` / `mulBaseEncode` / `mulBaseEncode2` (the
 /// comb): the body dirtied 2.4 KiB in ReleaseFast (2026-11-23).
 pub const base_burn = 4 * 1024;
