@@ -276,13 +276,25 @@ fn into(comptime T: type, arena: Allocator, v: Value, options: Options, budget: 
 
 // ── Zig value → Value ──────────────────────────────────────────────────────
 
+/// Deepest nesting `toValue` follows; the scanner reads 4096 levels at most, so
+/// deeper output could not be read back anyway.
+const max_to_value_depth: usize = 4096;
+
 /// The `Value` for `x` (allocated in `arena`; may alias `x`'s slices). A
 /// struct's `null` optional fields are left out.
+///
+/// Caller contract: `x` must not nest deeper than 4096 levels, which a cyclic
+/// structure (a pointer chain that loops) always does; that is a checked
+/// `@panic("yaml: typed.toValue: ...")`, not a stack overflow.
 pub fn toValue(arena: Allocator, x: anytype) Allocator.Error!Value {
-    return from(@TypeOf(x), arena, x);
+    return from(@TypeOf(x), arena, x, 0) catch |err| switch (err) {
+        error.TooDeep => @panic("yaml: typed.toValue: value nested deeper than 4096 levels (cyclic?)"),
+        error.OutOfMemory => |oom| return oom,
+    };
 }
 
-/// `toValue` then the emitter: YAML text in a new `gpa`-owned slice.
+/// `toValue` then the emitter: YAML text in a new `gpa`-owned slice. Same
+/// 4096-level caller contract as `toValue` (a composed tree never reaches it).
 pub fn stringify(gpa: Allocator, x: anytype) (Allocator.Error || @import("emit.zig").Error)![]u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -290,8 +302,12 @@ pub fn stringify(gpa: Allocator, x: anytype) (Allocator.Error || @import("emit.z
     return @import("emit.zig").stringify(gpa, v);
 }
 
-fn from(comptime T: type, arena: Allocator, x: T) Allocator.Error!Value {
+const FromError = Allocator.Error || error{TooDeep};
+
+fn from(comptime T: type, arena: Allocator, x: T, depth: usize) FromError!Value {
     if (T == Value) return x;
+    // A cyclic or absurdly deep Zig value would recurse until the stack ends.
+    if (depth > max_to_value_depth) return error.TooDeep;
     switch (@typeInfo(T)) {
         .bool => return .{ .bool = x },
         .void, .null => return .null,
@@ -299,12 +315,12 @@ fn from(comptime T: type, arena: Allocator, x: T) Allocator.Error!Value {
         .comptime_int => return .{ .int = x },
         .float => return .{ .float = @floatCast(x) },
         .comptime_float => return .{ .float = x },
-        .optional => |info| return if (x) |c| from(info.child, arena, c) else .null,
+        .optional => |info| return if (x) |c| from(info.child, arena, c, depth + 1) else .null,
         .@"enum" => return .{ .string = @tagName(x) },
         .enum_literal => return .{ .string = @tagName(x) },
         .array => |info| {
             const out = try arena.alloc(Value, info.len);
-            for (out, x) |*o, it| o.* = try from(info.child, arena, it);
+            for (out, x) |*o, it| o.* = try from(info.child, arena, it, depth + 1);
             return .{ .sequence = out };
         },
         .pointer => |info| switch (info.size) {
@@ -313,12 +329,12 @@ fn from(comptime T: type, arena: Allocator, x: T) Allocator.Error!Value {
                     const s: []const u8 = x;
                     return .{ .string = s };
                 }
-                return from(info.child, arena, x.*);
+                return from(info.child, arena, x.*, depth + 1);
             },
             .slice => {
                 if (info.child == u8) return .{ .string = x };
                 const out = try arena.alloc(Value, x.len);
-                for (out, x) |*o, it| o.* = try from(info.child, arena, it);
+                for (out, x) |*o, it| o.* = try from(info.child, arena, it, depth + 1);
                 return .{ .sequence = out };
             },
             else => @compileError("yaml.typed: only one-item pointers and slices are mapped, not " ++ @typeName(T)),
@@ -326,7 +342,7 @@ fn from(comptime T: type, arena: Allocator, x: T) Allocator.Error!Value {
         .@"struct" => |info| {
             if (info.is_tuple) {
                 const out = try arena.alloc(Value, info.field_names.len);
-                inline for (fieldRecs(info), 0..) |f, i| out[i] = try from(f.type, arena, x[i]);
+                inline for (fieldRecs(info), 0..) |f, i| out[i] = try from(f.type, arena, x[i], depth + 1);
                 return .{ .sequence = out };
             }
             var n: usize = 0;
@@ -338,7 +354,7 @@ fn from(comptime T: type, arena: Allocator, x: T) Allocator.Error!Value {
             inline for (fieldRecs(info)) |f| {
                 const fv = @field(x, f.name);
                 if (!isNull(fv)) {
-                    out[i] = .{ .key = .{ .string = comptime keyName(T, f.name) }, .value = try from(f.type, arena, fv) };
+                    out[i] = .{ .key = .{ .string = comptime keyName(T, f.name) }, .value = try from(f.type, arena, fv, depth + 1) };
                     i += 1;
                 }
             }
@@ -350,7 +366,7 @@ fn from(comptime T: type, arena: Allocator, x: T) Allocator.Error!Value {
                 inline else => |payload, tag| {
                     if (@TypeOf(payload) == void) return .{ .string = @tagName(tag) };
                     const out = try arena.alloc(Pair, 1);
-                    out[0] = .{ .key = .{ .string = @tagName(tag) }, .value = try from(@TypeOf(payload), arena, payload) };
+                    out[0] = .{ .key = .{ .string = @tagName(tag) }, .value = try from(@TypeOf(payload), arena, payload, depth + 1) };
                     return .{ .mapping = out };
                 },
             }
@@ -365,4 +381,17 @@ fn isNull(x: anytype) bool {
         .null => true,
         else => false,
     };
+}
+
+test "toValue refuses a pointer cycle instead of recursing until the stack ends (sweep YS-6)" {
+    const Node = struct { next: ?*const @This() = null };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var a: Node = .{};
+    a.next = &a; // a cycle
+    try std.testing.expectError(error.TooDeep, from(Node, arena.allocator(), a, 0));
+    // A finite chain just under the cap is fine.
+    const chain = try arena.allocator().alloc(Node, 1000);
+    for (chain, 0..) |*n, i| n.* = .{ .next = if (i + 1 < chain.len) &chain[i + 1] else null };
+    _ = try toValue(arena.allocator(), chain[0]);
 }

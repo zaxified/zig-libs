@@ -220,6 +220,65 @@ fn dupEql(
     };
 }
 
+const HashMemo = std.AutoHashMapUnmanaged(usize, u64);
+
+/// A structural hash of `v` that is equal for any two values `dupEql` calls
+/// equal (so `-0.0` and `0.0` hash alike; a NaN never equals anything, any
+/// hash will do). Collections are memoized by slice address, so a node shared
+/// by aliases is hashed once however often it is reached, and the recursion is
+/// depth-bounded like `dupEql`'s (`error.TooDeep`).
+fn valueHash(v: Value, memo: *HashMemo, alloc: std.mem.Allocator, depth: usize, max_depth: usize, steps: *usize) Error!u64 {
+    if (depth > max_depth) return error.TooDeep;
+    steps.* += 1;
+    var h = std.hash.Wyhash.init(0);
+    switch (v) {
+        .null => h.update("n"),
+        .bool => |x| h.update(&[_]u8{ 'b', @intFromBool(x) }),
+        .int => |x| {
+            h.update("i");
+            h.update(std.mem.asBytes(&x));
+        },
+        .float => |x| {
+            const bits: u64 = if (x == 0) 0 else @bitCast(x);
+            h.update("f");
+            h.update(std.mem.asBytes(&bits));
+        },
+        .string => |x| {
+            h.update("s");
+            h.update(x);
+        },
+        .sequence => |s| {
+            h.update("q");
+            if (s.len != 0) {
+                if (memo.get(@intFromPtr(s.ptr))) |c| return c;
+                for (s) |x| {
+                    const c = try valueHash(x, memo, alloc, depth + 1, max_depth, steps);
+                    h.update(std.mem.asBytes(&c));
+                }
+                const r = h.final();
+                try memo.put(alloc, @intFromPtr(s.ptr), r);
+                return r;
+            }
+        },
+        .mapping => |m| {
+            h.update("m");
+            if (m.len != 0) {
+                if (memo.get(@intFromPtr(m.ptr))) |c| return c;
+                for (m) |p| {
+                    const ck = try valueHash(p.key, memo, alloc, depth + 1, max_depth, steps);
+                    const cv = try valueHash(p.value, memo, alloc, depth + 1, max_depth, steps);
+                    h.update(std.mem.asBytes(&ck));
+                    h.update(std.mem.asBytes(&cv));
+                }
+                const r = h.final();
+                try memo.put(alloc, @intFromPtr(m.ptr), r);
+                return r;
+            }
+        },
+    }
+    return h.final();
+}
+
 /// Per-mapping duplicate-key tracker. Scalar keys (the overwhelming majority
 /// in real documents) are deduplicated in O(1) amortized via `scalars`, a
 /// hash set — closing the O(k²) linear-scan cost that F2 measured at 352× on
@@ -230,11 +289,19 @@ fn dupEql(
 /// stack-overflow (F3), only cost O(m) per key for m prior non-scalar keys.
 const DupTracker = struct {
     scalars: std.HashMapUnmanaged(ScalarKey, void, ScalarKeyContext, std.hash_map.default_max_load_percentage) = .empty,
-    collections: std.ArrayList(Value) = .empty,
+    /// Sequence/mapping keys, bucketed by `valueHash`: only keys of one bucket
+    /// are compared with `dupEql`. A flat list made m collection keys cost
+    /// O(m^2) comparisons, each leaving a memo entry (sweep YS-4).
+    collections: std.AutoHashMapUnmanaged(u64, std.ArrayList(Value)) = .empty,
     memo: std.AutoHashMapUnmanaged(PtrPair, bool) = .empty,
+    /// The composer's hash memo (pointer of a collection's slice -> its hash),
+    /// shared by every tracker of the document.
+    hashes: *HashMemo,
 
     fn deinit(self: *DupTracker, alloc: std.mem.Allocator) void {
         self.scalars.deinit(alloc);
+        var it = self.collections.valueIterator();
+        while (it.next()) |b| b.deinit(alloc);
         self.collections.deinit(alloc);
         self.memo.deinit(alloc);
     }
@@ -252,10 +319,14 @@ const DupTracker = struct {
                 return gop.found_existing;
             },
             .sequence, .mapping => {
-                for (self.collections.items) |prev| {
+                var hash_steps: usize = 0; // memoized, so linear; not part of the `dupEql` bound
+                const h = try valueHash(k, self.hashes, alloc, 0, max_depth, &hash_steps);
+                const gop = try self.collections.getOrPut(alloc, h);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                for (gop.value_ptr.items) |prev| {
                     if (try dupEql(prev, k, &self.memo, alloc, 0, max_depth, steps)) return true;
                 }
-                try self.collections.append(alloc, k);
+                try gop.value_ptr.append(alloc, k);
                 return false;
             },
         }
@@ -263,7 +334,15 @@ const DupTracker = struct {
 };
 
 /// Structural equality between two composed `Value`s — kept for the small,
-/// trusted-input `defined == via_alias` regression test below. ⚠ Not used
+/// trusted-input `defined == via_alias` regression test below.
+///
+/// Trusted trees only; exponential on alias-heavy DAGs without the identity fast
+/// path. Caller contract: do not call it on a tree built from untrusted input. It
+/// walks the alias DAG as a tree (two *different* shared nodes that are equal
+/// cost 2^n for an n-level alias chain) and recurses once per nesting level
+/// with no bound beyond the stack: a hand-built tree nested past 4096 levels
+/// may overflow it (a composed tree is capped at 1024, so composed input never
+/// gets there). Comparing the same shared node with itself is O(1). ⚠ Not used
 /// on untrusted input: it has neither the depth bound nor the memoization
 /// `dupEql` (above) has, and the duplicate-key check in `composeNode` does
 /// NOT call this function precisely because untrusted input is what it must
@@ -277,11 +356,13 @@ pub fn valueEql(a: Value, b: Value) bool {
         .string => |av| b == .string and std.mem.eql(u8, av, b.string),
         .sequence => |av| blk: {
             if (b != .sequence or av.len != b.sequence.len) break :blk false;
+            if (av.ptr == b.sequence.ptr) break :blk true; // the same shared node
             for (av, b.sequence) |x, y| if (!valueEql(x, y)) break :blk false;
             break :blk true;
         },
         .mapping => |av| blk: {
             if (b != .mapping or av.len != b.mapping.len) break :blk false;
+            if (av.ptr == b.mapping.ptr) break :blk true; // the same shared node
             for (av, b.mapping) |x, y| {
                 if (!valueEql(x.key, y.key) or !valueEql(x.value, y.value)) break :blk false;
             }
@@ -578,6 +659,8 @@ const Composer = struct {
     /// duplicate-key check (F1/F2/F3 in the A1 audit) on a deterministic
     /// number instead of a stopwatch.
     dup_probes: usize = 0,
+    /// See `valueHash`; one memo for the whole composition.
+    hash_memo: HashMemo = .empty,
     nodes: usize = 0,
     /// One-event pushback, so a collection can test for its end marker.
     peeked: ?Event = null,
@@ -608,7 +691,14 @@ const Composer = struct {
                 .document_start => {
                     // Anchors do not cross document boundaries (YAML 1.2 §3.2.2).
                     self.anchors.clearRetainingCapacity();
-                    self.anchor_index.clearRetainingCapacity();
+                    // `HashMap.clearRetainingCapacity` is O(capacity): after one
+                    // document with many anchors it would be paid again for every
+                    // later document, however small (sweep YS-2).
+                    if (self.anchor_index.capacity() > 64) {
+                        self.anchor_index = .empty;
+                    } else {
+                        self.anchor_index.clearRetainingCapacity();
+                    }
                     const root = try self.composeNode(0);
                     const end = (try self.next()) orelse return error.InvalidYaml;
                     if (end != .document_end) return error.InvalidYaml;
@@ -698,7 +788,7 @@ const Composer = struct {
             .mapping_start => |c| {
                 const slot = try self.beginAnchor(c.anchor);
                 var pairs: std.ArrayList(Pair) = .empty;
-                var dup: DupTracker = .{};
+                var dup: DupTracker = .{ .hashes = &self.hash_memo };
                 defer dup.deinit(self.alloc);
                 // Index in `pairs` of each `<<` pair (merge_keys only).
                 var merges: std.ArrayList(usize) = .empty;
@@ -735,7 +825,7 @@ const Composer = struct {
     /// shared anchor into many mappings costs time linear in what is added
     /// (and what is added is charged to `max_heap_bytes`).
     fn applyMerges(self: *Composer, pairs: []const Pair, merges: []const usize) Error![]const Pair {
-        var seen: DupTracker = .{};
+        var seen: DupTracker = .{ .hashes = &self.hash_memo };
         defer seen.deinit(self.alloc);
         var m: usize = 0;
         for (pairs, 0..) |p, i| {
@@ -775,7 +865,7 @@ const Composer = struct {
     /// `!!omap` (YAML 1.1 type spec): a sequence of single-pair mappings with
     /// no repeated key across the whole sequence. The value stays a sequence.
     fn checkOmap(self: *Composer, items: []const Value) Error!void {
-        var seen: DupTracker = .{};
+        var seen: DupTracker = .{ .hashes = &self.hash_memo };
         defer seen.deinit(self.alloc);
         for (items) |it| {
             const pairs = switch (it) {
@@ -2168,4 +2258,38 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "anchors of one document do not make every later document pay for them (sweep YS-2)" {
+    const gpa = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "[");
+    for (0..5000) |i| try src.print(gpa, "&a{d} x,", .{i});
+    try src.appendSlice(gpa, "]\n");
+    for (0..10) |_| try src.appendSlice(gpa, "---\n");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var p = parser.Parser.init(arena.allocator(), src.items);
+    defer p.deinit();
+    var c: Composer = .{ .alloc = arena.allocator(), .p = &p, .options = .{} };
+    const docs = try c.run();
+    try testing.expectEqual(@as(usize, 11), docs.len);
+    // The index table is dropped, not cleared in O(capacity) per document.
+    try testing.expect(c.anchor_index.capacity() <= 64);
+}
+
+test "valueEql: a shared node equals itself in O(1) even in a billion-laughs chain (sweep YS-7)" {
+    const gpa = testing.allocator;
+    const n = 40;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "- &a0 [x, x]\n");
+    for (1..n) |i| try src.print(gpa, "- &a{d} [*a{d}, *a{d}]\n", .{ i, i - 1, i - 1 });
+    try src.print(gpa, "- *a{d}\n", .{n - 1});
+    const d = try compose(gpa, src.items, .{});
+    defer d.deinit();
+    const items = d.root.sequence;
+    // items[n-1] and items[n] are the same shared node: 2^40 tree paths.
+    try testing.expect(valueEql(items[n - 1], items[n]));
 }

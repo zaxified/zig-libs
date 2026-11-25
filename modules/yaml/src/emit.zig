@@ -28,7 +28,8 @@
 //! Output is therefore linear in the composed size, not the expanded one.
 //!
 //! Recursion follows the `Value`'s depth — bounded by `ComposeOptions.
-//! max_depth` for a composed tree; a hand-built one is the caller's.
+//! max_depth` for a composed tree. Caller contract for a hand-built one: at
+//! most 4096 levels; deeper is a checked `@panic("yaml: emit: ...")`.
 
 const std = @import("std");
 const compose = @import("compose.zig");
@@ -40,6 +41,16 @@ pub const Error = Io.Writer.Error || std.mem.Allocator.Error || error{
     /// A string that is not valid UTF-8 (only a hand-built `Value` can hold one).
     InvalidUtf8,
 };
+
+/// Deepest nesting the emitter writes (the scanner reads 4096 levels at most).
+/// A composed tree is capped at `ComposeOptions.max_depth` (<= 1024); only a
+/// hand-built `Value` can exceed this, and then `writeValue` panics with a
+/// message rather than overflowing the stack.
+const max_depth: usize = 4096;
+
+/// `count` also reports a too-deep value; the public entry points turn that
+/// into the documented panic.
+const CountError = Error || error{TooDeep};
 
 const NodeKey = struct { ptr: usize, len: usize };
 const NodeState = struct { count: u32 = 0, anchor: u32 = 0, written: bool = false };
@@ -64,7 +75,10 @@ const Emitter = struct {
     }
 
     /// First pass: how often is each shareable node reached?
-    fn count(self: *Emitter, v: Value) Error!void {
+    fn count(self: *Emitter, v: Value, depth: usize) CountError!void {
+        // The one pass that visits every node first, in the order the writer
+        // will: a value nested deeper than this is refused before any output.
+        if (depth > max_depth) return error.TooDeep;
         const k = keyOf(v) orelse return;
         const gop = try self.nodes.getOrPut(self.gpa, k);
         if (gop.found_existing) {
@@ -73,10 +87,10 @@ const Emitter = struct {
         }
         gop.value_ptr.* = .{ .count = 1 };
         switch (v) {
-            .sequence => |s| for (s) |x| try self.count(x),
+            .sequence => |s| for (s) |x| try self.count(x, depth + 1),
             .mapping => |m| for (m) |p| {
-                try self.count(p.key);
-                try self.count(p.value);
+                try self.count(p.key, depth + 1);
+                try self.count(p.value, depth + 1);
             },
             else => {},
         }
@@ -213,10 +227,17 @@ const Emitter = struct {
 };
 
 /// Write one document (`v` and a final newline).
+///
+/// Caller contract: `v` nests at most 4096 levels; deeper (only a hand-built
+/// value, a composed tree is capped at 1024) is a checked
+/// `@panic("yaml: emit: ...")`.
 pub fn writeValue(gpa: std.mem.Allocator, w: *Io.Writer, v: Value) Error!void {
     var e: Emitter = .{ .w = w, .gpa = gpa };
     defer e.deinit();
-    try e.count(v);
+    e.count(v, 0) catch |err| switch (err) {
+        error.TooDeep => @panic("yaml: emit: value nested deeper than 4096 levels"),
+        else => |other| return other,
+    };
     if (Emitter.isBlock(v)) {
         // A shared root cannot exist (no cycles), so no anchor is needed here.
         try e.block(v, 0);
@@ -226,7 +247,8 @@ pub fn writeValue(gpa: std.mem.Allocator, w: *Io.Writer, v: Value) Error!void {
     }
 }
 
-/// Write a stream: each document after a `---` line.
+/// Write a stream: each document after a `---` line. Same 4096-level caller
+/// contract as `writeValue`.
 pub fn writeAll(gpa: std.mem.Allocator, w: *Io.Writer, docs: []const Value) Error!void {
     for (docs) |d| {
         try w.writeAll("---\n");
@@ -234,7 +256,8 @@ pub fn writeAll(gpa: std.mem.Allocator, w: *Io.Writer, docs: []const Value) Erro
     }
 }
 
-/// `writeValue` into a new `gpa`-owned slice.
+/// `writeValue` into a new `gpa`-owned slice. Same 4096-level caller contract
+/// (checked panic; a composed tree never reaches it).
 pub fn stringify(gpa: std.mem.Allocator, v: Value) Error![]u8 {
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -356,4 +379,33 @@ fn writeFloat(w: *Io.Writer, x: f64) Error!void {
         const e = n - 1;
         try w.print("e{c}{d}", .{ @as(u8, if (e < 0) '-' else '+'), @abs(e) });
     }
+}
+
+test "count refuses a value nested past 4096 levels and accepts exactly 4096 (sweep YS-6)" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // `levels` nested one-element sequences around the integer 1.
+    const build = struct {
+        fn f(al: std.mem.Allocator, levels: usize) !Value {
+            var v: Value = .{ .int = 1 };
+            for (0..levels) |_| {
+                const one = try al.alloc(Value, 1);
+                one[0] = v;
+                v = .{ .sequence = one };
+            }
+            return v;
+        }
+    }.f;
+    var e: Emitter = .{ .w = undefined, .gpa = gpa };
+    defer e.deinit();
+    try e.count(try build(a, max_depth), 0);
+    var e2: Emitter = .{ .w = undefined, .gpa = gpa };
+    defer e2.deinit();
+    try std.testing.expectError(error.TooDeep, e2.count(try build(a, max_depth + 2), 0));
+    // The deepest accepted value really is written (stack-safe at the cap).
+    const text = try stringify(gpa, try build(a, max_depth));
+    defer gpa.free(text);
+    try std.testing.expect(text.len > max_depth);
 }

@@ -119,6 +119,16 @@ pub const Scanner = struct {
     simple_key_allowed: bool = true,
     flow_level: usize = 0,
     simple_keys: std.ArrayList(SimpleKey) = .empty,
+    /// The levels of `simple_keys` whose key is `possible`, ascending (a level
+    /// holds at most one key and only the innermost level is ever saved). The
+    /// staleness and "must the head token wait" checks run once per token and
+    /// used to walk every level -- up to `max_depth` of them, almost all with no
+    /// key -- which made a deeply nested document cost ~depth work per token
+    /// (sweep YS-5). They walk this list instead.
+    possible_levels: std.ArrayList(usize) = .empty,
+    /// Simple-key entries examined by the per-token checks above; a regression
+    /// test pins the cost class on this number instead of a stopwatch.
+    key_probes: usize = 0,
     /// Per open flow collection, innermost last: true for `[`, false for `{`.
     /// `simple_keys[i]` (i >= 1) lives inside `flow_is_seq[i - 1]`. Needed
     /// because the two collections give an implicit key *different* spans —
@@ -394,7 +404,9 @@ pub const Scanner = struct {
         if (self.queueLen() == 0) return true;
         // A queued token may still be *before* a simple key that has not been
         // resolved yet; in that case it cannot be handed out.
-        for (self.simple_keys.items) |sk| {
+        for (self.possible_levels.items) |i| {
+            self.key_probes += 1;
+            const sk = self.simple_keys.items[i];
             if (sk.possible and sk.token_number == self.tokens_parsed) return true;
         }
         return false;
@@ -564,7 +576,10 @@ pub const Scanner = struct {
     // ── simple keys ─────────────────────────────────────────────────────────
 
     fn staleSimpleKeys(self: *Self) Error!void {
-        for (self.simple_keys.items, 0..) |*sk, i| {
+        var kept: usize = 0;
+        for (self.possible_levels.items) |i| {
+            self.key_probes += 1;
+            const sk = &self.simple_keys.items[i];
             if (!sk.possible) continue;
             // How far an implicit key may reach before its `:` differs by
             // context, and YAML 1.2 §7.4 makes the distinction precisely:
@@ -589,8 +604,20 @@ pub const Scanner = struct {
                 if (sk.required)
                     return self.failAt("could not find expected ':'", self.mark());
                 sk.possible = false;
+            } else {
+                self.possible_levels.items[kept] = i;
+                kept += 1;
             }
         }
+        self.possible_levels.shrinkRetainingCapacity(kept);
+    }
+
+    /// Mark the innermost level's key as no longer possible.
+    fn clearTopKey(self: *Self) void {
+        const top = self.simple_keys.items.len - 1;
+        self.simple_keys.items[top].possible = false;
+        if (self.possible_levels.items.len > 0 and self.possible_levels.items[self.possible_levels.items.len - 1] == top)
+            _ = self.possible_levels.pop();
     }
 
     fn saveSimpleKey(self: *Self) Error!void {
@@ -603,7 +630,10 @@ pub const Scanner = struct {
                 .token_number = self.tokens_parsed + self.queueLen(),
                 .mark = self.mark(),
             };
-            self.simple_keys.items[self.simple_keys.items.len - 1] = sk;
+            const top = self.simple_keys.items.len - 1;
+            self.simple_keys.items[top] = sk;
+            if (self.possible_levels.items.len == 0 or self.possible_levels.items[self.possible_levels.items.len - 1] != top)
+                try self.possible_levels.append(self.arena, top);
         }
     }
 
@@ -611,7 +641,7 @@ pub const Scanner = struct {
         const sk = &self.simple_keys.items[self.simple_keys.items.len - 1];
         if (sk.possible and sk.required)
             return self.failAt("could not find expected ':'", self.mark());
-        sk.possible = false;
+        self.clearTopKey();
     }
 
     fn increaseFlowLevel(self: *Self, is_sequence: bool) Error!void {
@@ -623,6 +653,7 @@ pub const Scanner = struct {
 
     fn decreaseFlowLevel(self: *Self) void {
         if (self.flow_level > 0) {
+            self.clearTopKey();
             self.flow_level -= 1;
             _ = self.simple_keys.pop();
             _ = self.flow_is_seq.pop();
@@ -741,6 +772,7 @@ pub const Scanner = struct {
             if (sk.required) return self.failAt("could not find expected ':'", self.mark());
             sk.possible = false;
         }
+        self.possible_levels.clearRetainingCapacity();
         self.simple_key_allowed = false;
         const m = self.mark();
         self.stream_end_produced = true;
@@ -835,7 +867,7 @@ pub const Scanner = struct {
             try self.insertToken(offset, .{ .kind = .key, .start = sk.mark, .end = sk.mark });
             if (self.flow_level == 0)
                 try self.rollIndent(@intCast(sk.mark.column), .block_mapping_start, sk.mark, offset);
-            sk.possible = false;
+            self.clearTopKey();
             self.simple_key_allowed = false;
         } else {
             if (self.flow_level == 0) {
@@ -1447,6 +1479,11 @@ pub const Scanner = struct {
 
             if (!(self.blankAt(0) or self.breakAt(0))) break;
 
+            // Once the rest of this line is known to be blank it stays blank
+            // for every later blank on the line, so `restOfLineBlank` (a scan to
+            // the end of the blank run) is asked once per line, not once per tab:
+            // a line of n tabs cost O(n^2) (sweep YS-3).
+            var line_blank_known = false;
             while (self.blankAt(0) or self.breakAt(0)) {
                 if (self.blankAt(0)) {
                     // A tab cannot stand in for indentation — but a line that
@@ -1454,8 +1491,12 @@ pub const Scanner = struct {
                     // blanks are not indentation of anything, so a tab there is
                     // fine (`DK95/04`).
                     if (leading_blanks and @as(i64, @intCast(self.column)) < indent and
-                        self.at(0) == '\t' and !self.restOfLineBlank())
-                        return self.fail("found a tab character that violates indentation");
+                        self.at(0) == '\t' and !line_blank_known)
+                    {
+                        if (!self.restOfLineBlank())
+                            return self.fail("found a tab character that violates indentation");
+                        line_blank_known = true;
+                    }
                     if (!leading_blanks) try self.read(&whitespaces) else self.skip();
                 } else {
                     if (!leading_blanks) {
@@ -1465,6 +1506,7 @@ pub const Scanner = struct {
                     } else {
                         try self.readLine(&trailing_breaks);
                     }
+                    line_blank_known = false;
                 }
             }
 
