@@ -32,6 +32,9 @@ pub const mime_type = "text/html;profile=mcp-app";
 /// The uri scheme reserved for app resources.
 pub const uri_scheme = "ui://";
 /// `Server.setCapabilityExtras`' first argument for a server that serves apps.
+/// That call replaces the whole extensions object: on a server that also
+/// serves Skills, make it before `skills.Catalog.attach`, which merges its own
+/// entry into what is there.
 pub const extensions_json = "{\"" ++ extension_id ++ "\":{}}";
 
 pub const Visibility = enum {
@@ -156,8 +159,10 @@ fn writeResourceMeta(jw: *std.json.Stringify, ui: ResourceUi) std.Io.Writer.Erro
     try jw.endObject();
 }
 
-/// A fixed HTML document served as an app resource. Keep it alive as long as
-/// the server: `resource` borrows it.
+/// A fixed HTML document served as an app resource. Keep it alive, at one
+/// address, as long as the server: `resource` stores a pointer to it (never
+/// call it on a temporary). `html` must be UTF-8 — it is served as `text`, and
+/// JSON text cannot carry other bytes.
 pub const HtmlResource = struct {
     /// A `ui://` uri.
     uri: []const u8,
@@ -201,7 +206,9 @@ pub fn clientSupportsApps(caps: root.ClientCapabilities) bool {
 
 /// The checks the Python SDK makes when a server takes its `Apps`: every tool
 /// that names a UI resource finds it registered, and every `ui://` resource has
-/// the app mime type. Call after the last `addTool` / `addResource`.
+/// the app mime type. Call after the last `addTool` / `addResource`. Only
+/// static resources count: a UI page served by a resource template is
+/// reported as `UnboundUiResource`.
 pub fn verify(server: *const root.Server) Error!void {
     for (server.resources.items) |r| {
         if (std.mem.startsWith(u8, r.uri, uri_scheme) and !std.mem.eql(u8, r.mime_type, mime_type)) return error.WrongMimeType;

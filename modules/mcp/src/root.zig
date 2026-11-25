@@ -115,6 +115,10 @@ pub const typed = @import("typed.zig");
 /// MCP Apps helpers (`io.modelcontextprotocol/ui`): tool and resource `_meta`,
 /// an HTML app resource, the client's declaration; see `apps.zig`.
 pub const apps = @import("apps.zig");
+/// MCP Skills (`io.modelcontextprotocol/skills`, SEP-2640): a catalog of
+/// Agent Skills served as `skill://` resources with `skills/list`,
+/// `skills/get` and `resources/directory/read`; see `skills.zig`.
+pub const skills = @import("skills.zig");
 /// The JSON Schema text for a Zig type, for `Tool.input_schema` /
 /// `Tool.output_schema` (see `typed.zig` for the mapping).
 pub const schemaOf = typed.schemaOf;
@@ -135,7 +139,7 @@ pub const meta = .{
     .role = .server,
     .concurrency = .reentrant, // no globals; one Server instance = one owner
     .model_after = "MCP spec 2026-07-28 (stateless) + 2025-11-25/2025-06-18 (initialize) + JSON-RPC 2.0",
-    .deps = .{"jsontext"}, // std.json + std.Io reader/writer; jsontext for the nesting prescan
+    .deps = .{ "jsontext", "yaml" }, // std.json + std.Io reader/writer; jsontext for the nesting prescan; yaml for Skills frontmatter
 };
 
 /// Latest MCP protocol revision we advertise. Older revisions we also accept
@@ -5957,6 +5961,7 @@ test {
     _ = uri_template;
     _ = typed;
     _ = apps;
+    _ = skills;
     _ = @import("sdk_oracle.zig");
 }
 
@@ -12429,6 +12434,92 @@ fn fuzzUriTemplate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     try tmpl.expand(&aw.writer, vars);
 }
 
+const fuzz_skill_mds = [_][]const u8{
+    "---\nname: a\ndescription: d\n---\nbody\n",
+    "---\r\nname: b-c\r\ndescription: Multi\r\nlicense: MIT\r\nmetadata:\r\n  k: \"1\"\r\n---\r\n",
+    "\xEF\xBB\xBF---\nname: a\ndescription: x\nlist: [1, 2.5, true, null, {k: v}]\n---\n",
+    "---\nname: a\ndescription: d\nnested: {a: {b: {c: [[[1]]]}}}\n---\n",
+    "---\nname: a\ndescription: &x d\nalias: *x\n---\n",
+};
+
+const fuzz_skill_paths = [_][]const u8{ "a", "b-c", "p/a", "p/q/a", "a/b-c", "a/a", "x y/a", "%/a" };
+
+const fuzz_skill_requests = [_][]const u8{
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"skills/list\",\"params\":{\"cursor\":\"czowOjI\"}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"skills/get\",\"params\":{\"uri\":\"skill://p/a/SKILL.md\"}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/directory/read\",\"params\":{\"uri\":\"skill://p\",\"cursor\":\"ZDowOjE\"}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"resources/read\",\"params\":{\"uri\":\"skill://a/SKILL.md\"}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"skills/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/directory/read\",\"params\":{\"uri\":\"skill://a\",\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}",
+};
+
+const SkillsLabel = enum { skill_served, skill_skipped, skills_load_refused, skills_reply_ok, skills_reply_error };
+var skills_reach: [@typeInfo(SkillsLabel).@"enum".field_names.len]usize = @splat(0);
+
+fn skillsMark(comptime l: SkillsLabel) void {
+    skills_reach[@backingInt(l)] += 1;
+    fuzz_driver.hit(@tagName(l));
+}
+
+fn fuzzGenRead(_: ?*anyopaque, req: *ResourceRequest) bool {
+    req.text(req.uri, "", "generated");
+    return true;
+}
+
+/// The Skills extension: a catalog built from damaged `SKILL.md` texts and a
+/// random file tree must load or refuse without a crash and keep its
+/// invariants, and every damaged request against it must be answered with
+/// one well-formed line.
+fn fuzzSkills(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const n_files = src.valueRangeAtMost(u8, 0, 6);
+    const files = try arena.alloc(skills.File, n_files);
+    for (files) |*f| {
+        const dir = fuzz_skill_paths[src.index(fuzz_skill_paths.len)];
+        if (src.valueRangeAtMost(u8, 0, 2) != 0) {
+            const md = try arena.alloc(u8, 256);
+            f.* = .{ .path = try std.mem.concat(arena, u8, &.{ dir, "/SKILL.md" }), .bytes = md[0..damagedSeed(S, src, &fuzz_skill_mds, md)] };
+        } else {
+            const body = try arena.alloc(u8, src.valueRangeAtMost(u8, 0, 16));
+            src.bytes(body);
+            const name = if (src.value(bool)) "f.md" else "sub/x.bin";
+            f.* = .{ .path = try std.mem.concat(arena, u8, &.{ dir, "/", name }), .bytes = body };
+        }
+    }
+    const dyn: []const skills.Dynamic = if (src.value(bool)) &.{.{ .path = "g/a", .skill_md = fuzz_skill_mds[0], .read = fuzzGenRead }} else &.{};
+    var cat = skills.Catalog.load(gpa, files, dyn, .{ .strict = src.value(bool), .directory_read = src.value(bool) }) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return skillsMark(.skills_load_refused),
+    };
+    defer cat.deinit();
+    for (cat.skills()) |sk| {
+        skillsMark(.skill_served);
+        try testing.expect(std.mem.endsWith(u8, sk.path, sk.name));
+        const fm = try std.json.parseFromSliceLeaky(std.json.Value, arena, sk.frontmatter_json, .{});
+        try testing.expect(fm == .object);
+        if (sk.files) |m| try testing.expect(m.len >= 1 and m.len <= skills.max_resources_per_skill);
+    }
+    if (cat.skipped().len != 0) skillsMark(.skill_skipped);
+    var s = Server.init(gpa, .{ .name = "f", .version = "0" });
+    defer s.deinit();
+    s.page_size = src.valueRangeAtMost(u8, 0, 3);
+    try cat.attach(&s);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (0..src.valueRangeAtMost(u8, 1, 4)) |_| {
+        var buf: [512]u8 = undefined;
+        const line = buf[0..damagedSeed(S, src, &fuzz_skill_requests, &buf)];
+        out.clearRetainingCapacity();
+        try s.handleMessage(line, &out.writer);
+        const w = out.written();
+        if (w.len == 0) continue; // a damaged line may have become a notification
+        try testing.expect(w[w.len - 1] == '\n' and std.mem.findScalar(u8, w[0 .. w.len - 1], '\n') == null);
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, w[0 .. w.len - 1], .{});
+        if (v.object.get("error") != null) skillsMark(.skills_reply_error) else skillsMark(.skills_reply_ok);
+    }
+}
+
 test "fuzz: handleMessage, damaged corpus lines" {
     try testing.fuzz({}, fuzzScript(fuzzHandleMessageMutated), .{});
 }
@@ -12440,7 +12531,24 @@ test "fuzz driver: MCP_FUZZ" {
         .{ fuzzSchemaCheck, .{ .prefix = "MCP_FUZZ", .name = "mcp-schema-check" } },
         .{ fuzzUriTemplate, .{ .prefix = "MCP_FUZZ", .name = "mcp-uri-template" } },
         .{ fuzzClientResponse, .{ .prefix = "MCP_FUZZ", .name = "mcp-client-response", .scale = 4 } },
+        .{ fuzzSkills, .{ .prefix = "MCP_FUZZ", .name = "mcp-skills" } },
     });
+}
+
+test "fuzz harness: mcp-skills reaches load, skip, refusal and both reply kinds in 400 seeds" {
+    skills_reach = @splat(0);
+    for (0..400) |sd| {
+        var prng = std.Random.DefaultPrng.init(sd);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        fuzzSkills(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("mcp-skills seed {d}: {t}\n", .{ sd, err });
+            return err;
+        };
+    }
+    for (skills_reach, 0..) |n, i| if (n == 0) {
+        std.debug.print("reach: {t} never hit in 400 seeds\n", .{@as(SkillsLabel, @fromBackingInt(@intCast(i)))});
+        return error.HarnessDoesNotReach;
+    };
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {

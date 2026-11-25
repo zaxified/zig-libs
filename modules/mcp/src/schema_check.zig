@@ -49,9 +49,10 @@
 //!     `0.01`, which ajv and Python jsonschema refuse by default);
 //!   - `uniqueItems` charges one step per comparison, so it shares the budget;
 //!   - a string (`minLength` / `maxLength`) or a number literal is charged one
-//!     extra step per 4 KiB it holds, once per node it is checked at: the work is
-//!     linear in its size, so many keywords over one huge value end in the budget
-//!     rather than costing one step each;
+//!     extra step per 256 bytes it holds, once per node it is checked at: the
+//!     work is linear in its size, so many keywords over one huge value end in
+//!     the budget rather than costing one step each (the whole budget then scans
+//!     at most ~256 MB);
 //!   - `then` / `else` without `if` are compiled and ignored (as in the spec);
 //!   - instance nesting deeper than `max_depth` is a `depth` failure, never a
 //!     stack overflow.
@@ -76,7 +77,10 @@ pub const max_depth = 256;
 pub const max_steps: u32 = 1_000_000;
 
 /// A string or number literal is charged one step per `1 << size_shift` bytes.
-const size_shift = 12;
+/// 256 bytes: below it a scan rides on the application's own step, so the
+/// free work per step is bounded by it (4 KiB let 1M steps scan ~4 GB; review
+/// RV-14, 2026-11-25).
+const size_shift = 8;
 
 pub const CompileError = error{
     OutOfMemory,
@@ -1374,21 +1378,23 @@ test "step budget: a huge string or number literal is charged by its size, so ma
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const big = try a.alloc(u8, 1 << 20); // 256 steps per scan
+    const big = try a.alloc(u8, 1 << 20); // 4096 steps per scan
     @memset(big, 'a');
     const sv = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"minLength\":1,\"maxLength\":2000000}", .{});
     const sch = try Schema.compile(a, sv);
-    // Two scans of 1 MiB: 512 steps plus the application's own.
-    try testing.expect((try sch.validateBudget(a, .{ .string = big }, 600)) == null);
-    const f = (try sch.validateBudget(a, .{ .string = big }, 400)).?;
+    // Two scans of 1 MiB: 8192 steps plus the application's own.
+    try testing.expect((try sch.validateBudget(a, .{ .string = big }, 8300)) == null);
+    const f = (try sch.validateBudget(a, .{ .string = big }, 8000)).?;
     try testing.expectEqualStrings("budget", f.keyword);
     // The same string costs next to nothing when it is short.
-    try testing.expect((try sch.validateBudget(a, .{ .string = big[0..4000] }, 4)) == null);
-    // A number literal of a million digits is parsed at the node: 256 steps.
+    try testing.expect((try sch.validateBudget(a, .{ .string = big[0..250] }, 4)) == null);
+    // 4000 bytes, which rode free on 4 KiB granularity, now costs 15 per scan (RV-14).
+    try testing.expectEqualStrings("budget", (try sch.validateBudget(a, .{ .string = big[0..4000] }, 20)).?.keyword);
+    // A number literal of a million digits is parsed at the node: 4096 steps.
     const digits = try a.alloc(u8, 1 << 20);
     @memset(digits, '9');
     const nv = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"minimum\":0}", .{});
     const ns = try Schema.compile(a, nv);
-    try testing.expectEqualStrings("budget", (try ns.validateBudget(a, .{ .number_string = digits }, 200)).?.keyword);
-    try testing.expect((try ns.validateBudget(a, .{ .number_string = digits }, 300)) == null);
+    try testing.expectEqualStrings("budget", (try ns.validateBudget(a, .{ .number_string = digits }, 4000)).?.keyword);
+    try testing.expect((try ns.validateBudget(a, .{ .number_string = digits }, 4200)) == null);
 }
