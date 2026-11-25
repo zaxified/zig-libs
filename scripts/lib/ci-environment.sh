@@ -613,11 +613,16 @@ python3 -I -c 'import lz4.frame, lz4.block; print("python-lz4:", __import__("lz4
 else not_needed lz4; fi
 echo "::endgroup::"
 
-echo "::group::interop: Go module caches (jwt tracecontext websocket validate)"
+echo "::group::interop: Go module caches (jwt tracecontext websocket validate jwe accesslog)"
 # The programs build with GOPROXY=off, like sntp/netaddr/router above, so the
 # cache is filled here from each oracle's own go.mod/go.sum.
+# jwe (go-jose) and accesslog (go-logfmt) were missing until 2026-11-25: their
+# takes stayed stamped green until a change re-took jwe, and full lane
+# 45552313195 failed `interop-jwe` with "module lookup disabled by GOPROXY=off".
+# Every GOPROXY=off oracle with a `require` must be on this list.
 for gomod in modules/jwt/tools/go_oracle modules/tracecontext/tools/go_oracle \
-             modules/websocket/tools/go_oracle modules/validate/tools/go_formats; do
+             modules/websocket/tools/go_oracle modules/validate/tools/go_formats \
+             modules/jwe/tools/gojose modules/accesslog/tools/go_logfmt; do
     (cd "$gomod" && GOTOOLCHAIN=go1.26.0 go mod download >/dev/null 2>&1) \
         && echo "go modules $gomod: OK" || echo "go modules $gomod: download failed"
 done
