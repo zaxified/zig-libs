@@ -1768,8 +1768,8 @@ tlsserver	ReleaseFast	ech	1	456	82a28eda0eb571f6	c257fcbb1b68d8df
 # AEAD tag-verify outcome in open. The harness marks the unmasked header
 # defined before open; without that the AEAD's length handling on it adds ~50
 # artefacts.
-quic-crypto	ReleaseFast	aes	1	4	1ccd9cc4fbf9d862	4d96b4e7d3af1ed7
-quic-crypto	ReleaseFast	chacha	1	4	1ccd9cc4fbf9d862	d1cf9a5cadb2a284
+quic-crypto	ReleaseFast	aes	1	4	a9cfcb477cfbd6ba	4d96b4e7d3af1ed7
+quic-crypto	ReleaseFast	chacha	1	4	a9cfcb477cfbd6ba	d1cf9a5cadb2a284
 # megolm (2026-10-10) — msg: ratchet + Ed25519 signing key tainted through
 # encrypt/decrypt (the harness marks the wire message, the decrypted length
 # and its own allocator index defined: all public); skey: SessionKey and
@@ -2510,7 +2510,7 @@ dtls	ReleaseFast	ku	1	297	9b98087d58fe60cb	505aa3fdd426f98d	cpu=x86_64 control=3
 # length of the decrypted handshake message, a framing value that the record length already shows on
 # the wire; native lowers that memset without the size dispatch.
 dtls	ReleaseFast	hs12	1	48	94f8483bcb935fe3	d87712f4d6e60179	cpu=x86_64
-quic-crypto	ReleaseFast	aes	1	84	1ccd9cc4fbf9d862	4d96b4e7d3af1ed7	cpu=x86_64 control=3 trap=45
+quic-crypto	ReleaseFast	aes	1	84	a9cfcb477cfbd6ba	4d96b4e7d3af1ed7	cpu=x86_64 control=3 trap=45
 aeskw	ReleaseFast	wrap	1	694	88dac35c72f0539b	23036d19c2656c6a	cpu=x86_64 control=8 trap=28
 aeadframe	ReleaseFast	aes	1	157	fcb76a730014f644	9e2cdfce46f95d92	cpu=x86_64 control=4 trap=4
 ctap2	ReleaseFast	pin	1	100	1a774f0de6a12bd1	01e08eb2902d2802	cpu=x86_64 control=6 trap=6
