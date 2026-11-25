@@ -172,7 +172,7 @@ declare -A TARGETS=(
     # window ladder over the comptime table, still reachable as
     # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
     # `precompute` table) added 2026-09-16; see modules/ct25519/SPEC.md § C3.
-    [ct25519]="ct25519 std comb ladderbase ladder msm x25519"
+    [ct25519]="ct25519 std comb ladderbase ladder msm x25519 sign"
     [mlkem]="keygen512 keygen768 keygen1024 encaps512 encaps768 encaps1024 decaps512 decaps768 decaps1024 fromBytes512 fromBytes768 fromBytes1024"
     [decaf448]="scalarmul invert"
     [bn254]="field scalarmul"
@@ -536,6 +536,7 @@ declare -A PATTERN=(
     [ct25519/ladder]='root[.]zig'
     [ct25519/msm]='root[.]zig'
     [ct25519/x25519]='root[.]zig|field[.]zig'
+    [ct25519/sign]='root[.]zig'
     [decaf448/scalarmul]='element[.]zig|ed448[.]zig|field[.]zig|scalar[.]zig'
     [decaf448/invert]='scalar[.]zig|modinv[.]zig|burn[.]zig'
     [ecvrf/prove]='ecvrf[.]zig'
@@ -1099,6 +1100,7 @@ declare -A LABEL=(
     [ct25519/ladder]='ct25519 ladder var'
     [ct25519/msm]='ct25519 straus msm'
     [ct25519/x25519]='ct25519 X25519 pubkey comb'
+    [ct25519/sign]='ct25519 signEd25519 (seed secret)'
     [mlkem/keygen512]='mlkem KeyGen (d ‖ z secret) 512'
     [mlkem/keygen768]='mlkem KeyGen (d ‖ z secret) 768'
     [mlkem/keygen1024]='mlkem KeyGen (d ‖ z secret) 1024'

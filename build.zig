@@ -425,7 +425,7 @@ pub const module_list = [_]Module{
     .{ .name = "dkg", .libs = &.{"crypto"}, .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "vdf", .libs = &.{"crypto"}, .deps = &.{"montint"}, .test_deps = &.{"testkit"} },
     .{ .name = "signal", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "ct25519", "entropy" }, .test_deps = &.{"testkit"} },
-    .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{ "hpke", "aesgcm", "p256", "p384", "p521", "ed448" }, .test_deps = &.{"testkit"} },
+    .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{ "hpke", "aesgcm", "p256", "p384", "p521", "ed448", "ct25519" }, .test_deps = &.{"testkit"} },
     .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy", "chachapoly", "b64ct" }, .test_deps = &.{"testkit"} },
     .{ .name = "ebpf", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "xdp-classifier", .libs = &.{"net"}, .deps = &.{"ebpf"}, .test_deps = &.{"testkit"} },

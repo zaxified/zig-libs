@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MONTINT_FUZZ) · ct 2026-10-26 (ctgrind) · panic 2026-10-30 (sweep + blind review: caller-contract asserts → checked panics (limbs, asm_core, safegcd nbits, Field.pow, fromElemUncheckedBits), even modulus folded into the safegcd verdict branch-free, `sqrt` work capped (`error.SqrtWorkLimit`), `stack_bytes` documented and probed; delta audit 46/48 + eq/NA)
 
-**Performance:** ref 0.91–1.02× OpenSSL 3.5.5 BN (Montgomery mul, constant-time and public-exponent modexp, 1024–4096 bit) · fastest ? (measured 2026-10-20; since 2026-11-15 `powMont` −1.8…−2.9 % cycles, A/B on a loaded host, see "Almost-Montgomery ladder")
+**Performance:** ref 0.91–1.01× OpenSSL 3.5.5 BN (Montgomery mul, constant-time and public-exponent modexp, 1024–4096 bit) · fastest ? (measured 2026-11-25 in the bench shield)
 
 **Evidence:** model-fuzz — CPython bignum KATs plus asm core vs portable oracle on random (a,b,N) differential
 **Model:** src/kat_test.zig
@@ -509,6 +509,12 @@ Consumer build options (CONVENTIONS §4.2):
 
 ## What is deliberately not done
 
+- **L=16 REDC + `condSubInto` (speed beyond P2).** The premise (a latency-bound `u = w·n0inv`
+  chain) does not hold: the block REDC's first chunk costs the same per product as the later ones, and the REDC is ~50 %
+  of a square because it is 256 of its ~392 products; `powMont`'s ladder already runs the top-only subtract
+  (`condSubTopInto`, ~4.6 %), not `condSubInto`. Measured in the bench shield 2026-11-25 (5 rounds, user-mode cycles):
+  every row 0.91–1.005× OpenSSL 3.5.5 BN (`exp_2048` 0.962, worst `exp_3072` 1.005 with spread 1.1 / 6.1 %), so the
+  few per cent left would not move the grade and sit at the spread.
 - **A non-unrolled generic path for all large `DynModint` slots by default.** Rejected: re-proving constant time for no
   default gain. The looped kernel is offered instead as the opt-in `montint-asm-unroll=false` / `-Dprofile=small`
   (see *Build options*); the default keeps the unrolled kernels because the grade is measured on them.
@@ -536,11 +542,6 @@ Consumer build options (CONVENTIONS §4.2):
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet host):* **L=16 REDC + `condSubInto` (speed beyond P2).** The premise (a latency-bound `u = w·n0inv`
-  chain) does not hold: the block REDC's first chunk costs the same per product as the later ones, and the REDC is ~50 %
-  of a square because it is 256 of its ~392 products; `powMont`'s ladder already runs the top-only subtract
-  (`condSubTopInto`, ~4.6 %), not `condSubInto`. What is left is a few per cent at most, below this host's run-to-run
-  spread under load (`bench-montint` 4–45 %, `bench-rsa sign_2048` 15–21 % on 2026-11-24). No grade effect (P2 already).
 - *BOUNCED (hardware):* **aarch64 asm core (`UMULH`/`ADCS`)** (survey 2026-09-30): arm64 servers and phones run the portable CIOS only (~1.5×
   slower than amd64 asm at 2048 bits, by the module's own ff→portable→asm ratios). Effort M-L, untestable without arm64
   CI. Fits §2.

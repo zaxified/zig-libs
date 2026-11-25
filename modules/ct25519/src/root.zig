@@ -104,7 +104,7 @@ const Fe = Edwards25519.Fe;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Constant-time-on-secrets scalar multiplication for Edwards25519/Ristretto255 (ladder `mul`/`mulRistretto`, fixed-base comb `mulBase`/`mulRistrettoBase`, Straus `mulMulti`/`mulMultiRistretto`) — drops std's secret-dependent `rejectIdentity` branch. Caller must validate points. `X25519` (key generation on the comb, 2.4× std; x86-64 MULX/ADX shared-secret ladder), `verifyEd25519Strict`, `mulBaseEncode` encoders.",
+    .doc = "Constant-time-on-secrets scalar multiplication for Edwards25519/Ristretto255 (ladder `mul`/`mulRistretto`, fixed-base comb `mulBase`/`mulRistrettoBase`, Straus `mulMulti`/`mulMultiRistretto`) — drops std's secret-dependent `rejectIdentity` branch. Caller must validate points. `X25519` (key generation on the comb, 2.4× std; x86-64 MULX/ADX shared-secret ladder), `verifyEd25519Strict`, `signEd25519` (std's `KeyPair.sign` bytes on the comb), `mulBaseEncode` encoders.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -1910,6 +1910,83 @@ pub fn mulRistrettoBase(s: [32]u8) Ristretto255 {
     return r;
 }
 
+/// Everything `std.crypto.sign.Ed25519.KeyPair.sign` can answer (the same
+/// set, so `signEd25519` drops in where that function's error set is named
+/// by type).
+pub const Ed25519SignError = std.crypto.errors.IdentityElementError ||
+    std.crypto.errors.NonCanonicalError ||
+    std.crypto.errors.KeyMismatchError ||
+    std.crypto.errors.WeakPublicKeyError;
+
+/// RFC 8032 §5.1.6 Ed25519 signing: `std.crypto.sign.Ed25519.KeyPair.sign`,
+/// faster. The same signature bytes and the same error for every key pair,
+/// message and `noise` (differentially tested against std below), with
+/// `[r]B` on the fixed-base comb (`mulBaseEncode`, no field inversion in
+/// std's `toBytes`) instead of std's window ladder.
+///
+/// Constant time in the seed, the secret scalar and the nonce. Trusts
+/// `key_pair.public_key` exactly as far as std does: it is compared with the
+/// copy embedded in `secret_key` (`error.KeyMismatch`), not re-derived from
+/// the seed. `noise = null` is the deterministic RFC 8032 signature.
+/// Secret intermediates are wiped; the comb burns its own frames.
+pub fn signEd25519(
+    key_pair: *const std.crypto.sign.Ed25519.KeyPair,
+    msg: []const u8,
+    noise: ?[std.crypto.sign.Ed25519.noise_length]u8,
+) Ed25519SignError!std.crypto.sign.Ed25519.Signature {
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    const sc = Edwards25519.scalar;
+    const pk = key_pair.public_key.toBytes();
+    // std's check, without its early-exit compare: both operands are PUBLIC
+    // keys, so the verdict is declassified for memcheck (a caller that taints
+    // its whole key pair, `mls`'s ctgrind rows, would otherwise see a branch).
+    var keys_match = std.crypto.timing_safe.eql([32]u8, key_pair.secret_key.publicKeyBytes(), pk);
+    std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&keys_match));
+    if (!keys_match) return error.KeyMismatch;
+
+    // RFC 8032 §5.1.5: a = clamp(low half of SHA-512(seed)), prefix = high half.
+    var az: [64]u8 = undefined;
+    defer std.crypto.secureZero(u8, &az);
+    var seed = key_pair.secret_key.seed();
+    defer std.crypto.secureZero(u8, &seed);
+    Sha512.hash(&seed, &az, .{});
+    var a: [32]u8 = az[0..32].*;
+    defer std.crypto.secureZero(u8, &a);
+    sc.clamp(&a);
+
+    // r = SHA-512([noise] || prefix || M) mod L — std's order, noise first.
+    var nh = Sha512.init(.{});
+    if (noise) |*z| nh.update(z);
+    nh.update(az[32..64]);
+    nh.update(msg);
+    var r64: [64]u8 = undefined;
+    defer std.crypto.secureZero(u8, &r64);
+    nh.final(&r64);
+    var r = sc.reduce64(r64);
+    defer std.crypto.secureZero(u8, &r);
+
+    const r_bytes = mulBaseEncode(r);
+    // std's `basePoint.mul` rejects R = O (r = 0 mod L, probability 2^-252);
+    // O encodes as y = 1, x = 0. The flag is computed without a branch; the
+    // one branch is on that flag, a function of `R` — the public half of the
+    // signature this function returns. It is therefore declassified for
+    // memcheck (a no-op without `-fvalgrind`), as `X25519.sharedSecret`'s.
+    var identity_encoding: [32]u8 = @splat(0);
+    identity_encoding[0] = 1;
+    var is_identity = std.crypto.timing_safe.eql([32]u8, r_bytes, identity_encoding);
+    std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&is_identity));
+    if (is_identity) return error.IdentityElement;
+
+    var kh = Sha512.init(.{});
+    kh.update(&r_bytes);
+    kh.update(&pk);
+    kh.update(msg);
+    var k64: [64]u8 = undefined;
+    kh.final(&k64);
+    const k = sc.reduce64(k64);
+    return .{ .r = r_bytes, .s = sc.mulAdd(k, a, r) };
+}
+
 // ── constant-time multi-scalar multiplication (audit `bulletproofs` B9) ───
 //
 // `Σ s_i·P_i` for SECRET scalars over caller-validated points, by Straus's
@@ -2975,6 +3052,44 @@ test "mulBaseEncode2 equals two mulBaseEncode" {
         try testing.expectEqualSlices(u8, &mulBaseEncode(a), &got[0]);
         try testing.expectEqualSlices(u8, &mulBaseEncode(b), &got[1]);
     }
+}
+
+test "signEd25519 is byte-identical to std's KeyPair.sign on 4000 keys, messages and noises" {
+    const Ed = std.crypto.sign.Ed25519;
+    var prng = std.Random.DefaultPrng.init(0x5191_ED25);
+    const rnd = prng.random();
+    var n: usize = 0;
+    while (n < 4000) : (n += 1) {
+        var seed: [32]u8 = undefined;
+        rnd.bytes(&seed);
+        const kp = try Ed.KeyPair.generateDeterministic(seed);
+        var msg: [300]u8 = undefined;
+        rnd.bytes(&msg);
+        // 0..299 bytes: the empty message, one SHA-512 block and past it.
+        const m = msg[0..rnd.uintLessThan(usize, msg.len)];
+        var noise: [Ed.noise_length]u8 = undefined;
+        rnd.bytes(&noise);
+        const z: ?[Ed.noise_length]u8 = if (n % 2 == 0) null else noise;
+        const want = try kp.sign(m, z);
+        const got = try signEd25519(&kp, m, z);
+        try testing.expectEqualSlices(u8, &want.toBytes(), &got.toBytes());
+        try got.verifyStrict(m, kp.public_key);
+    }
+}
+
+test "signEd25519 reproduces RFC 8032 section 7.1 TEST 1 and refuses a key pair whose public halves disagree" {
+    const Ed = std.crypto.sign.Ed25519;
+    var seed: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+    var want: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+    const kp = try Ed.KeyPair.generateDeterministic(seed);
+    try testing.expectEqualSlices(u8, &want, &(try signEd25519(&kp, "", null)).toBytes());
+
+    var other = kp;
+    other.public_key = (try Ed.KeyPair.generateDeterministic(@splat(7))).public_key;
+    try testing.expectError(error.KeyMismatch, other.sign("m", null));
+    try testing.expectError(error.KeyMismatch, signEd25519(&other, "m", null));
 }
 
 test "verifyEd25519Strict agrees with std verifyStrict on 12000 valid, mutated and degenerate inputs" {

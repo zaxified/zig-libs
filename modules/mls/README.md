@@ -108,7 +108,8 @@ is the application's `credential_validator`).
 - **Deps:** `hpke` (the sibling module supplies every suite's DHKEM and
   HPKE machinery via `sealBase`/`openBase`/`setupBaseS`/`setupBaseR`, and the
   ChaCha20-Poly1305 AEAD of suites `0x0003`/`0x0006`), `aesgcm`, `p256`/`p384`/
-  `p521` for the ECDSA suites' signatures, and `ed448` for the Ed448 ones. MLS's own
+  `p521` for the ECDSA suites' signatures, `ed448` for the Ed448 ones, and `ct25519`
+  for the Ed25519 suites' signing and (strict, as OpenMLS) verification. MLS's own
   `ExpandWithLabel`/`RefHash`/`SignWithLabel` are a SEPARATE wire encoding from
   HPKE's own labeling, see `crypto.zig`'s module doc comment.
 
