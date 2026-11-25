@@ -120,6 +120,24 @@ test "Decompressor: concatenated frames, skippable frames, empty frame; dictiona
     }
 }
 
+test "Decompressor: a header with both content size and dictionary id (15-byte descriptor)" {
+    // Regression 2026-11-25 (lz4 mutation audit): the descriptor buffer held 11
+    // bytes, so FLG 0x08|0x01 indexed out of bounds (a panic in safe builds,
+    // an out-of-bounds write in ReleaseFast).
+    const dict = try lz4.interop_corpus.generate(gpa, .{ .name = "d", .kind = .text, .len = 8_000, .seed = 3 });
+    defer gpa.free(dict);
+    const data = try lz4.interop_corpus.generate(gpa, .{ .name = "d", .kind = .text, .len = 50_000, .seed = 3 });
+    defer gpa.free(data);
+    const z = try lz4.compressDict(gpa, data, dict, 0xA1B2C3D4, .{ .content_size = true });
+    defer gpa.free(z);
+    try testing.expectEqual(@as(u8, 0x09), z[4] & 0x09);
+    for ([_]usize{ 1, 7, 4096 }) |chunk| {
+        const got = try decompressStream(z, .{ .dictionary = dict }, chunk);
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u8, data, got);
+    }
+}
+
 test "Decompressor: malformed input is ReadFailed with the reason in err; the output cap holds" {
     const data = try lz4.interop_corpus.generate(gpa, .{ .name = "t", .kind = .text, .len = 100_000 });
     defer gpa.free(data);

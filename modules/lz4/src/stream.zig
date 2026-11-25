@@ -315,7 +315,8 @@ pub const Decompressor = struct {
             return self.fail(if (self.first_frame) error.BadMagic else error.TrailingData);
         }
         self.first_frame = false;
-        var d: [11]u8 = undefined;
+        // FLG, BD, content size (8), dictionary id (4), HC: 15 with both.
+        var d: [15]u8 = undefined;
         try self.readExact(d[0..2]);
         const flg = d[0];
         const bd = d[1];
