@@ -357,9 +357,17 @@ formulas in nistz256's operation order, the Jacobian windowed multiply and comb)
 
 ## Backlog / deferred
 
-- **ECDH lever.** About 1.05× OpenSSL, not re-profiled since the generated point formulas. Candidates: keep the CIOS output
+- **ECDH lever — the uop cache (measured 2026-11-25).** ECDH is 1.054× OpenSSL 3.5.5 in the bench shield (spread
+  0.6–0.9 %). `perf` with front-end counters: `mulUnburned` took 97 % of its µops from the legacy decoder (14.5 G
+  `idq.mite_uops` against 0.5 G `idq.dsb_uops`), OpenSSL's nistz256 almost all from the uop cache. The generated point
+  programs are straight-line (eight Montgomery multiplies/squares expanded per doubling) and `dblTimes(5)` unrolled five
+  of them into the window body; nistz256 CALLS one `mul_mont`/`sqr_mont` routine. One out-of-line doubling called five
+  times was tried: still 93 % MITE inside the single doubling, shield ABAB 1.054 → 1.065× (no gain, not kept). The
+  lever left is structural: `point_asm` emitting each `mul`/`sq` as a call to one shared routine per program (operands by
+  register-held frame offsets), trading the op-to-op register forwarding for a body that stays in the uop cache. Older
+  candidates, now second-order: keep the CIOS output
   in r8..r11 so a multiply's result forwards into a following add/sub without moves; fuse the `3·M` and `2·S` add chains;
-  nistz256's `mul_by_2`/`mul_by_3` shapes. Measure the doubling's cycles in isolation first. None is needed for P2.
+  nistz256's `mul_by_2`/`mul_by_3` shapes. None is needed for P2; for P1 (ref ≤ 1.0) the call-shaped programs are the likeliest route (unmeasured).
 - **Smaller levers**, each estimated: comb w = 7 (37 windows, 151 KB table) ≈ −3 µs on sign for +63 KB; an addition chain for
   `sqrt` (compressed-key decoding) ≈ −2 µs. std's `EcdsaP256Sha256.sign` spends ~8 µs over `ecdsaSign` in its generic nonce
   derivation and codecs, which this module cannot reach.

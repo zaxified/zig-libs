@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, K256_FUZZ; mul at 1/4, sign at 1/4 of it) · ct 2026-09-15 (ctgrind)
 
-**Performance:** ref 0.69–1.01× libsecp256k1 v0.8.0 schnorrsig (keypair, sign and verify through `bip340`'s `bench-bip340`, which runs this module's field, GLV and comb code; no bench of its own) · fastest ? (measured 2026-11-13)
+**Performance:** ref 0.73–1.00× libsecp256k1 v0.8.0 schnorrsig (keypair 0.73×, sign 0.77×, verify 1.00×, through `bip340`'s `bench-bip340`, which runs this module's field, GLV and comb code; no bench of its own) · fastest ? (measured 2026-11-25 in the bench shield)
 
 **Known defects:** none recorded
 
