@@ -28,6 +28,14 @@
 //!   zig build interop-mcp-http -- --check   # re-take, compare with the committed one
 //!
 //! `MCP_ORACLE_VENV` overrides the venv path.
+//!
+//! `-- --ts` runs the second SDK instead: the official TypeScript SDK's client
+//! (@modelcontextprotocol/client 2.4.0 on Node, black box) through
+//! `tools/ts_oracle/drive.mjs PORT` against the same catalog, plus a second
+//! endpoint `/mcp-auth` behind `Transport.auth` (bearer token `oracle-token`,
+//! RFC 9728 document). Its verdict is the exit code; no transcript is written.
+//! Node at `MCP_ORACLE_NODE` (default ~/.local/share/zig-libs/oracle-bin/node/bin/node),
+//! the SDK as `tools/ts_oracle/drive.mjs` describes.
 
 const std = @import("std");
 const http = @import("http");
@@ -37,6 +45,25 @@ const mcphttp = @import("mcp-http");
 const catalog = @import("sdk_oracle/catalog.zig");
 
 const script = "modules/mcp-http/tools/sdk_oracle/drive.py";
+const ts_script = "modules/mcp-http/tools/ts_oracle/drive.mjs";
+
+const oracle_scopes = [_][]const u8{"mcp:tools"};
+const oracle_as = [_][]const u8{"https://auth.oracle.example"};
+
+fn oracleVerify(_: ?*anyopaque, _: std.mem.Allocator, token: []const u8) error{ OutOfMemory, VerifierFailed }!mcphttp.auth.Verdict {
+    if (std.mem.eql(u8, token, "oracle-token")) return .{ .ok = .{ .client_id = "ts-oracle", .scopes = &oracle_scopes, .expires_at = std.math.maxInt(i64) } };
+    return .{ .invalid = "Unknown token" };
+}
+
+/// The gate of `--ts`'s `/mcp-auth` endpoint. The metadata URL names port 0:
+/// the driver reads it from the challenge only to check its shape and
+/// fetches the document from the port it knows.
+const oracle_auth: mcphttp.auth.Auth = .{
+    .verify = oracleVerify,
+    .resource_metadata_url = "http://127.0.0.1/.well-known/oauth-protected-resource/mcp-auth",
+    .metadata = .{ .resource = "http://127.0.0.1/mcp-auth", .authorization_servers = &oracle_as, .scopes_supported = &oracle_scopes, .resource_name = "oracle" },
+    .required_scopes = &oracle_scopes,
+};
 const work_dir = ".zig-cache/sdk-oracle-http";
 const out_path = "modules/mcp-http/src/sdk_oracle_vectors.zig";
 
@@ -153,12 +180,16 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     _ = args.next();
     var check = false;
+    var ts = false;
     if (args.next()) |a| {
-        if (!std.mem.eql(u8, a, "--check")) {
-            std.debug.print("usage: interop-mcp-http [--check]\n", .{});
+        if (std.mem.eql(u8, a, "--check")) {
+            check = true;
+        } else if (std.mem.eql(u8, a, "--ts")) {
+            ts = true;
+        } else {
+            std.debug.print("usage: interop-mcp-http [--check | --ts]\n", .{});
             return 2;
         }
-        check = true;
     }
     const env = try init.environ.createMap(arena);
     const venv = env.get("MCP_ORACLE_VENV") orelse blk: {
@@ -195,6 +226,21 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer r.deinit();
     try r.use(rec.middleware());
     try r.use(transport.middleware());
+    // `--ts` only: the same server behind the bearer gate, stateless.
+    var auth_transport: mcphttp.Transport = .{
+        .gpa = gpa,
+        .server = &server,
+        .path = "/mcp-auth",
+        .lock = transport.lock,
+        .auth = &oracle_auth,
+    };
+    if (ts) {
+        try r.use(auth_transport.middleware());
+        // A queue too small for one event: every push ends the held GET with
+        // the graceful close, so the client must reconnect with
+        // `Last-Event-ID` and get the rest replayed (checked below).
+        transport.listen_queue_bytes = 1;
+    }
 
     var hs = http.Server.init(io, gpa, .{ .handler = r.handler(), .context = &r, .server_name = null, .emit_date = false });
     try hs.bind();
@@ -204,6 +250,33 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     std.Io.Dir.cwd().createDirPath(io, work_dir) catch {};
     var port_buf: [8]u8 = undefined;
     const port_s = try std.mem.print(&port_buf, "{d}", .{port});
+    if (ts) {
+        const node = env.get("MCP_ORACLE_NODE") orelse try std.fmt.allocPrint(arena, "{s}/.local/share/zig-libs/oracle-bin/node/bin/node", .{env.get("HOME") orelse ""});
+        std.debug.print("interop-mcp-http: MCP TypeScript SDK ({s}) against 127.0.0.1:{d} ...\n", .{ node, port });
+        var ts_ok = false;
+        if (std.process.spawn(io, .{ .argv = &.{ node, ts_script, port_s }, .stdin = .close })) |child_v| {
+            var child = child_v;
+            ts_ok = switch (try child.wait(io)) {
+                .exited => |code| code == 0,
+                else => false,
+            };
+        } else |e| std.debug.print("interop-mcp-http: could not run {s} ({t})\n", .{ node, e });
+        hs.shutdownGraceful(2000) catch {};
+        hs.shutdown();
+        thread.join();
+        hs.deinit();
+        // The replay path: at least one GET came back with Last-Event-ID.
+        var resumed: usize = 0;
+        for (rec.list.items) |ex| {
+            if (std.mem.eql(u8, ex.method, "GET") and std.mem.find(u8, ex.headers, "last-event-id: ") != null) resumed += 1;
+        }
+        if (resumed == 0) {
+            std.debug.print("interop-mcp-http: the client never resumed a GET stream with Last-Event-ID\n", .{});
+            ts_ok = false;
+        } else std.debug.print("interop-mcp-http: {d} GET stream(s) resumed with Last-Event-ID\n", .{resumed});
+        std.debug.print("interop-mcp-http: TypeScript SDK oracle {s}\n", .{if (ts_ok) "passed" else "FAILED"});
+        return if (ts_ok) 0 else 1;
+    }
     std.debug.print("interop-mcp-http: MCP Python SDK ({s}) against 127.0.0.1:{d} ...\n", .{ venv, port });
     var ok = false;
     if (std.process.spawn(io, .{ .argv = &.{ python, script, port_s, work_dir }, .stdin = .close })) |child_v| {

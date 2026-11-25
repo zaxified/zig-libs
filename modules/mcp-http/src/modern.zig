@@ -70,6 +70,11 @@ pub fn classify(arena: std.mem.Allocator, headers: Headers, body: []const u8, se
         std.mem.find(u8, body, mcp.meta_key.protocol_version) == null and
         !headerClaimsModern(headers)) return .legacy;
 
+    // `mcp` refuses text nested deeper than `max_json_depth` before it parses;
+    // this parse, which runs first (and under the caller's lock), must not
+    // build a `Value` tree for what `mcp` will refuse anyway: a 4 MiB run of
+    // `[` is ~4M tree levels (sweep HS-1). Treated as "not JSON", below.
+    if (!mcp.jsonDepthOk(body)) return headerOnlyVerdict(arena, headers, null);
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Not JSON: nothing to mirror. A modern-claiming header is still a
@@ -163,7 +168,8 @@ fn expectOne(arena: std.mem.Allocator, headers: Headers, comptime name: []const 
     const n = headers.count(name);
     if (n == 0) return .{ .refused = try mismatchLine(arena, id, "missing required header " ++ name) };
     if (n > 1) return .{ .refused = try mismatchLine(arena, id, "duplicated header " ++ name) };
-    const v = headers.get(name).?;
+    // `count` said one; a `Headers` whose `get` disagrees is refused, not trusted.
+    const v = headers.get(name) orelse return .{ .refused = try mismatchLine(arena, id, "missing required header " ++ name) };
     if (!headerSafe(v)) return .{ .refused = try mismatchLine(arena, id, "invalid characters in header " ++ name) };
     return .{ .value = v };
 }
@@ -259,7 +265,7 @@ fn checkParamHeaders(arena: std.mem.Allocator, headers: Headers, input_schema: [
             continue;
         }
         if (n == 0) return try mismatchLineFmt(arena, id, "missing header {s}", .{hname});
-        const raw = headers.get(hname).?;
+        const raw = headers.get(hname) orelse return try mismatchLineFmt(arena, id, "missing header {s}", .{hname});
         if (!headerSafe(raw)) return try mismatchLineFmt(arena, id, "invalid characters in header {s}", .{hname});
         const got = (try decodeValue(arena, raw)) orelse
             return try mismatchLineFmt(arena, id, "{s} header is not a valid Base64 sentinel value", .{hname});
@@ -695,4 +701,62 @@ test "annotation chains are followed to max_chain properties deep, no further" {
         const found = try paramHeaders(arena, text.items);
         try testing.expectEqual(c.found, found.len);
     }
+}
+
+test "a deeply nested body is not parsed into a tree: legacy, without allocating (sweep HS-1)" {
+    const gpa = testing.allocator;
+    // The backslash sends the body down the full-parse path.
+    const body = try gpa.alloc(u8, 100_001);
+    defer gpa.free(body);
+    @memset(body, '[');
+    body[body.len - 1] = '\\';
+    var small: [64 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&small);
+    var s = try testServer();
+    defer s.deinit();
+    const fh: FakeHeaders = .{ .pairs = &.{} };
+    // A 100k-level tree does not fit 64 KiB: an OutOfMemory here is the defect.
+    try testing.expectEqual(Verdict.legacy, try classify(fba.allocator(), fh.headers(), body, &s));
+    // The same body under a modern-claiming header is a mismatch, as for any non-JSON.
+    const claim: FakeHeaders = .{ .pairs = &.{.{ "MCP-Protocol-Version", "2026-07-28" }} };
+    fba.reset();
+    try expectMismatch(try classify(fba.allocator(), claim.headers(), body, &s), "does not carry");
+}
+
+/// A `Headers` whose `count` and `get` disagree: counts one, finds none.
+const LyingHeaders = struct {
+    fn headers() Headers {
+        return .{ .ctx = &dummy, .getFn = getImpl, .countFn = countImpl };
+    }
+    const dummy: u8 = 0;
+    fn getImpl(_: *const anyopaque, _: []const u8) ?[]const u8 {
+        return null;
+    }
+    fn countImpl(_: *const anyopaque, _: []const u8) usize {
+        return 1;
+    }
+};
+
+test "a Headers that counts a header it cannot return is a mismatch, not a panic (sweep HS-4)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var s = try testServer();
+    defer s.deinit();
+    // The version header is the first lookup.
+    try expectMismatch(try classify(a, LyingHeaders.headers(), sql_body, &s), "missing required header MCP-Protocol-Version");
+    // The `Mcp-Param-*` lookup: the three required headers present, the param one lying.
+    const Mixed = struct {
+        fn get(_: *const anyopaque, name: []const u8) ?[]const u8 {
+            if (std.ascii.eqlIgnoreCase(name, "MCP-Protocol-Version")) return "2026-07-28";
+            if (std.ascii.eqlIgnoreCase(name, "Mcp-Method")) return "tools/call";
+            if (std.ascii.eqlIgnoreCase(name, "Mcp-Name")) return "execute_sql";
+            return null;
+        }
+        fn count(_: *const anyopaque, _: []const u8) usize {
+            return 1;
+        }
+    };
+    const mixed: Headers = .{ .ctx = &LyingHeaders.dummy, .getFn = Mixed.get, .countFn = Mixed.count };
+    try expectMismatch(try classify(a, mixed, sql_body, &s), "missing header Mcp-Param-Region");
 }

@@ -14595,10 +14595,10 @@ test "ToolCall.writeJson: appends, omits null optionals, survives OOM" {
 fn whoAmI(_: ?*anyopaque, call: *ToolCall) bool {
     const a = call.auth orelse {
         call.write("anonymous");
-        return true;
+        return false;
     };
     call.print("{s} admin={}", .{ a.client_id, a.hasScope("admin") });
-    return true;
+    return false;
 }
 
 fn whoAmIResource(_: ?*anyopaque, req: *ResourceRequest) bool {
@@ -14619,6 +14619,7 @@ test "handleMessageAs: handlers see the transport's AuthInfo for that one messag
         "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}}";
     try s.handleMessageAs(call_line, &out.writer, 0, &info);
     try testing.expect(std.mem.find(u8, out.written(), "cli-7 admin=true") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "\"isError\":false") != null);
     try testing.expect(s.request_auth == null); // reset after the call
     out.clearRetainingCapacity();
     try s.handleMessage(call_line, &out.writer);

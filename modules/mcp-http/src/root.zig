@@ -107,6 +107,7 @@ const router = @import("router");
 const http = @import("http");
 const mcp = @import("mcp");
 const modern = @import("modern.zig");
+const netaddr = @import("netaddr");
 /// MCP authorization, resource-server side: the bearer gate and the RFC 9728
 /// document (`Transport.auth`); see `auth.zig`.
 pub const auth = @import("auth.zig");
@@ -126,7 +127,7 @@ pub const meta = .{
     // http.Server (documented).
     .concurrency = .reentrant,
     .model_after = "MCP Streamable HTTP transport (2026-07-28 and 2025-06-18); python-sdk captured session as oracle",
-    .deps = .{ "router", "http", "mcp", "clock", "aaa-gate" },
+    .deps = .{ "router", "http", "mcp", "clock", "aaa-gate", "netaddr" },
 };
 
 /// Serialization seam for the shared `mcp.Server` under a multi-threaded
@@ -207,6 +208,9 @@ pub const Sessions = struct {
     gpa: std.mem.Allocator,
     lock: std.atomic.Mutex = .unlocked,
     map: std.StringHashMapUnmanaged(*Session) = .empty,
+    /// Peer handle -> session, so `pushTag`/`hasTag` (once per notified peer)
+    /// are O(1) instead of a scan of the whole table (sweep HS-5).
+    by_tag: std.AutoHashMapUnmanaged(u64, *Session) = .empty,
     seq: u64 = 0,
     /// Buffered events retained per session for resumable replay. Older events
     /// are evicted; a client reconnecting past this depth loses them.
@@ -250,6 +254,7 @@ pub const Sessions = struct {
         var it = self.map.valueIterator();
         while (it.next()) |sp| self.freeSession(sp.*);
         self.map.deinit(self.gpa);
+        self.by_tag.deinit(self.gpa);
         self.lock.unlock();
         self.* = undefined;
     }
@@ -257,6 +262,7 @@ pub const Sessions = struct {
     fn freeSession(self: *Sessions, s: *Session) void {
         // A held `GET` ends (its owner finds the session gone and writes no more).
         if (s.held) |h| h.finish();
+        _ = self.by_tag.remove(s.tag);
         for (s.events.items) |e| self.gpa.free(e.data);
         s.events.deinit(self.gpa);
         self.gpa.free(s.id);
@@ -326,6 +332,8 @@ pub const Sessions = struct {
         // seq is allocated under the lock and never reused, so it is a unique
         // peer handle for this session's lifetime.
         s.* = .{ .id = id, .tag = self.seq, .last_seen_ns = monoNs() };
+        try self.by_tag.put(self.gpa, s.tag, s);
+        errdefer _ = self.by_tag.remove(s.tag);
         try self.map.put(self.gpa, id, s);
         return .{ .id = id, .tag = s.tag, .evicted = evicted };
     }
@@ -402,34 +410,38 @@ pub const Sessions = struct {
     pub fn pushTag(self: *Sessions, tag: u64, data: []const u8) error{OutOfMemory}!bool {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        var it = self.map.valueIterator();
-        while (it.next()) |sp| if (sp.*.tag == tag) {
-            try self.enqueue(sp.*, data);
-            return true;
-        };
-        return false;
+        const s = self.by_tag.get(tag) orelse return false;
+        try self.enqueue(s, data);
+        return true;
     }
 
     /// Whether `tag` names a live session.
     fn hasTag(self: *Sessions, tag: u64) bool {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        var it = self.map.valueIterator();
-        while (it.next()) |sp| if (sp.*.tag == tag) return true;
-        return false;
+        return self.by_tag.contains(tag);
     }
 
     /// Caller holds the lock.
     fn enqueue(self: *Sessions, s: *Session, data: []const u8) error{OutOfMemory}!void {
         const copy = try self.gpa.dupe(u8, data);
         errdefer self.gpa.free(copy);
-        if (s.events.items.len >= self.replay_depth) {
+        defer if (self.replay_depth == 0) self.gpa.free(copy); // not stored
+        // `replay_depth == 0` keeps no replay buffer at all (a held `GET` still
+        // gets the event live); it used to index `items[0]` of an empty list.
+        while (s.events.items.len > 0 and s.events.items.len >= self.replay_depth) {
             self.gpa.free(s.events.items[0].data);
             _ = s.events.orderedRemove(0);
         }
-        try s.events.append(self.gpa, .{ .id = s.next_event_id, .data = copy });
         const id = s.next_event_id;
         s.next_event_id += 1;
+        if (self.replay_depth > 0) {
+            // The id is consumed only once the event is stored (or deliberately not).
+            s.events.append(self.gpa, .{ .id = id, .data = copy }) catch |e| {
+                s.next_event_id -= 1;
+                return e;
+            };
+        }
         // A held `GET` gets it at once; the buffer keeps it for a reconnect
         // (`Last-Event-ID`). A queue overflow ends that stream: the client
         // reconnects and replays.
@@ -659,14 +671,22 @@ pub const Transport = struct {
     /// attack this blocks is browser-driven. List full origins,
     /// e.g. `"http://localhost:7717"`.
     allowed_origins: []const []const u8 = &.{},
-    /// Allowed `Host` header values (case-insensitive, with the port as the
-    /// client sends it: `"localhost:7717"`, `"127.0.0.1:7717"`, `"[::1]:7717"`)
-    /// — the second half of the DNS-rebinding defense for a server bound to
-    /// localhost (the TypeScript SDK's `hostHeaderValidation`, the Python SDK's
-    /// `allowed_hosts`): a rebound name reaches the socket with the attacker's
-    /// `Host`. **Empty ⇒ every host is accepted.** When non-empty, a request
-    /// whose `Host` is absent or not listed gets **403**.
-    allowed_hosts: []const []const u8 = &.{},
+    /// The `Host` half of the DNS-rebinding defense (the TypeScript SDK's
+    /// `hostHeaderValidation`, the Python SDK's `allowed_hosts`): a page that
+    /// rebinds a name of its own to the server's address reaches it with the
+    /// attacker's `Host`. With a guard every request's `Host` must pass it
+    /// (`http.HostGuard`: names without the port, `.example.org` for
+    /// subdomains, IP literals and `localhost` allowed unless turned off),
+    /// else **403**.
+    host_guard: ?http.HostGuard = null,
+    /// Without `host_guard`: a request that arrives from a loopback address
+    /// must carry a loopback `Host` (`localhost`, `127.0.0.1`, `[::1]`, any
+    /// port), else **403** — the Go SDK's default DNS-rebinding protection (its
+    /// `DisableLocalhostProtection` turns it off; so does `false` here). A
+    /// reverse proxy on the same machine that forwards a public `Host` needs a
+    /// `host_guard` naming it, or this off. Requests from other addresses, and
+    /// socket-free ones, are not checked.
+    localhost_protection: bool = true,
     /// Authorization (`auth.Auth`): with it every request to `path` needs a
     /// valid bearer token, the RFC 9728 document is served, and handlers see
     /// the token's `mcp.AuthInfo` as `call.auth`. Null (the default): no
@@ -853,14 +873,15 @@ fn authServerError(ctx: *router.Ctx) anyerror!void {
     try ctx.res.writeAll("{\"error\":\"server_error\",\"error_description\":\"Token verification failed\"}");
 }
 
-/// DNS-rebinding guard, `Host` half (see `Transport.allowed_hosts`).
+/// DNS-rebinding guard, `Host` half (see `Transport.host_guard` and
+/// `localhost_protection`).
 fn hostAllowed(t: *const Transport, req: *const http.Server.Request) bool {
-    if (t.allowed_hosts.len == 0) return true;
-    const host = std.mem.trim(u8, req.header("host") orelse return false, " \t");
-    for (t.allowed_hosts) |allowed| {
-        if (std.ascii.eqlIgnoreCase(allowed, host)) return true;
-    }
-    return false;
+    if (t.host_guard) |*g| return g.check(req);
+    if (!t.localhost_protection) return true;
+    const peer = req.peer orelse return true;
+    if (!netaddr.Ip.fromStd(peer).isLoopback()) return true;
+    const loopback_only: http.HostGuard = .{};
+    return loopback_only.check(req);
 }
 
 fn methodNotAllowed(t: *const Transport, ctx: *router.Ctx) anyerror!void {
@@ -1153,7 +1174,18 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     if (t.auth) |a| if (a.scope_for != null) if (ctx.getTyped(mcp.AuthInfo)) |info| {
         var arena_state = std.heap.ArenaAllocator.init(t.gpa);
         defer arena_state.deinit();
-        const op = try auth.operationOf(t.gpa, arena_state.allocator(), body);
+        const op = auth.operationOf(t.gpa, arena_state.allocator(), body) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Fail closed: `scope_for` is never asked about an operation that
+            // could not be read. `mcp` answers such a body with a parse error
+            // anyway, so no legitimate request is lost (sweep HS-2).
+            error.Unreadable => {
+                ctx.res.setStatus(400);
+                try ctx.res.setHeader("Content-Type", "application/json");
+                try ctx.res.writeAll("{\"error\":\"invalid_request\",\"error_description\":\"Unreadable request body\"}");
+                return;
+            },
+        };
         if (auth.checkOperation(a, .{ .method = op.method, .target = op.target, .auth = info })) |r|
             return refuseAuth(ctx, arena_state.allocator(), a, r);
     };
@@ -1758,21 +1790,21 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
 
 fn post(comptime target: []const u8, comptime json: []const u8) []const u8 {
     return std.fmt.comptimePrint(
-        "POST {s} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ target, json.len, json },
     );
 }
 
 fn postOrigin(comptime origin: []const u8, comptime json: []const u8) []const u8 {
     return std.fmt.comptimePrint(
-        "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ origin, json.len, json },
     );
 }
 
 fn postAccept(comptime accept: []const u8, comptime json: []const u8) []const u8 {
     return std.fmt.comptimePrint(
-        "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ accept, json.len, json },
     );
 }
@@ -1801,20 +1833,20 @@ const list_body =
 ;
 
 fn postWithSession(buf: []u8, sid: []const u8, json: []const u8) []const u8 {
-    return std.mem.print(buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n" ++
+    return std.mem.print(buf, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: {s}\r\n" ++
         "Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ sid, json.len, json }) catch unreachable;
 }
 
 fn getWithSession(buf: []u8, sid: []const u8, last_event_id: ?[]const u8) []const u8 {
     if (last_event_id) |lei| {
-        return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n" ++
+        return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: {s}\r\n" ++
             "Last-Event-ID: {s}\r\nConnection: close\r\n\r\n", .{ sid, lei }) catch unreachable;
     }
-    return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
+    return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
 }
 
 fn deleteWithSession(buf: []u8, sid: []const u8) []const u8 {
-    return std.mem.print(buf, "DELETE /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
+    return std.mem.print(buf, "DELETE /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
 }
 
 fn hApp(ctx: *router.Ctx) anyerror!void {
@@ -1931,11 +1963,11 @@ test "non-/mcp path passes through; GET /mcp → 405" {
     try r.get("/", hApp);
 
     var buf: [2048]u8 = undefined;
-    const app = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    const app = runWire(&r, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", &buf);
     try testing.expectEqualStrings("app", bodyOf(app));
 
     var buf2: [2048]u8 = undefined;
-    const get = runWire(&r, "GET /mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf2);
+    const get = runWire(&r, "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", &buf2);
     try testing.expect(std.mem.startsWith(u8, get, "HTTP/1.1 405"));
     try testing.expect(std.mem.find(u8, get, "Allow: POST") != null);
 }
@@ -3233,7 +3265,7 @@ test {
 /// A POST with arbitrary extra header lines (each ending `\r\n`).
 fn postHeaders(comptime headers: []const u8, comptime json: []const u8) []const u8 {
     return std.fmt.comptimePrint(
-        "POST /mcp HTTP/1.1\r\nHost: t\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ headers, json.len, json },
     );
 }
@@ -3752,7 +3784,7 @@ pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
         .origin => {
             const bad = [_][]const u8{ "https://evil.example", "https://ok.example.evil", "null", "" };
             const o = bad[src.index(bad.len)];
-            const got = runWire(&r, std.mem.print(&req_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nMcp-Session-Id: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ o, sid_a, list_body.len, list_body }) catch unreachable, &out);
+            const got = runWire(&r, std.mem.print(&req_buf, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {s}\r\nMcp-Session-Id: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ o, sid_a, list_body.len, list_body }) catch unreachable, &out);
             if (statusOf(got) != 403) return error.ForeignOriginAccepted;
             WireMark.mark(.origin_refused);
         },
@@ -3851,7 +3883,7 @@ test "405 names the methods the endpoint takes, and a full session table is 429"
     defer r1.deinit();
     try r1.use(plain.middleware());
     var buf: [2048]u8 = undefined;
-    const put = runWire(&r1, "PUT /mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    const put = runWire(&r1, "PUT /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, put, "HTTP/1.1 405"));
     try testing.expectEqualStrings("POST", headerValue(put, "allow").?);
 
@@ -3863,7 +3895,7 @@ test "405 names the methods the endpoint takes, and a full session table is 429"
     defer r2.deinit();
     try r2.use(with.middleware());
     var buf2: [2048]u8 = undefined;
-    const put2 = runWire(&r2, "PUT /mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf2);
+    const put2 = runWire(&r2, "PUT /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", &buf2);
     try testing.expectEqualStrings("POST, GET, DELETE", headerValue(put2, "allow").?);
 
     var rbuf: [1024]u8 = undefined;
@@ -4006,7 +4038,7 @@ test "a POST whose body ends before its Content-Length is a 400" {
     defer r.deinit();
     try r.use(transport.middleware());
     var buf: [2048]u8 = undefined;
-    const got = runWire(&r, "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{\"a\"", &buf);
+    const got = runWire(&r, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{\"a\"", &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
 }
 
@@ -4287,7 +4319,7 @@ test "2026-07-28: closing the connection of a running tools/call cancels it (Too
         slow_saw_cancel.store(false, .release);
         var wire_buf: [1024]u8 = undefined;
         const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}," ++ modern_meta ++ "}}";
-        const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\n{s}MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ accept, body.len, body });
+        const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ accept, body.len, body });
         const stream = try live.connect();
         try sendAll(io, stream, wire);
         try waitFor(io, {}, slowStarted);
@@ -4318,7 +4350,7 @@ test "2026-07-28: a client that left while its tools/call waited for the transpo
         slow_saw_cancel.store(false, .release);
         var wire_buf: [1024]u8 = undefined;
         const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}," ++ modern_meta ++ "}}";
-        const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\n{s}MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ accept, body.len, body });
+        const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ accept, body.len, body });
         // Another call holds the transport: the request waits for the lock
         // with its watch already running, and the client leaves meanwhile.
         transport.lock.acquire();
@@ -4351,7 +4383,7 @@ test "2026-07-28: a chunked tools/call body is still watched (cancellation reach
     slow_saw_cancel.store(false, .release);
     var wire_buf: [1024]u8 = undefined;
     const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}," ++ modern_meta ++ "}}";
-    const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\n", .{ body.len, body });
+    const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\n", .{ body.len, body });
     const stream = try live.connect();
     try sendAll(io, stream, wire);
     try waitFor(io, {}, slowStarted);
@@ -4376,8 +4408,8 @@ test "topLevelId: string and integer ids, nothing else" {
 // ── the held session GET stream ─────────────────────────────────────────────
 
 fn getWire(buf: []u8, sid: []const u8, last_event_id: ?u64) []const u8 {
-    if (last_event_id) |n| return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nLast-Event-ID: {d}\r\n\r\n", .{ sid, n }) catch unreachable;
-    return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n\r\n", .{sid}) catch unreachable;
+    if (last_event_id) |n| return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: {s}\r\nLast-Event-ID: {d}\r\n\r\n", .{ sid, n }) catch unreachable;
+    return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: {s}\r\n\r\n", .{sid}) catch unreachable;
 }
 
 const HeldGetRig = struct {
@@ -4513,7 +4545,7 @@ test "held GET: DELETE ends the open stream and the session is gone" {
 
     const del = try rig.live.connect();
     defer del.close(io);
-    const dwire = try std.mem.print(&wbuf, "DELETE /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{created.id});
+    const dwire = try std.mem.print(&wbuf, "DELETE /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{created.id});
     try sendAll(io, del, dwire);
     var dbuf: [512]u8 = undefined;
     try testing.expect(std.mem.startsWith(u8, readToEnd(io, del, &dbuf), "HTTP/1.1 204"));
@@ -4542,6 +4574,40 @@ test "held GET: hold_get = false drains and closes as before" {
     try testing.expect(rig.sessions.heldNow(created.id).? == false);
 }
 
+test "Sessions: replay_depth 0 keeps no buffer and does not index an empty list (sweep HS-3)" {
+    var sessions = Sessions.init(testing.allocator);
+    defer sessions.deinit();
+    sessions.replay_depth = 0;
+    const c = try sessions.create();
+    try testing.expect(try sessions.push(c.id, "{\"n\":1}"));
+    try testing.expect(try sessions.pushTag(c.tag, "{\"n\":2}"));
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var batch: std.ArrayList(Sessions.StoredEvent) = .empty;
+    _ = (try sessions.drainAfter(c.id, 0, arena_state.allocator(), &batch)).?;
+    try testing.expectEqual(@as(usize, 0), batch.items.len);
+}
+
+test "Sessions: the tag index follows create, destroy and eviction (sweep HS-5)" {
+    var sessions = Sessions.init(testing.allocator);
+    defer sessions.deinit();
+    sessions.max_sessions = 2;
+    sessions.max_idle_ns = 0; // anything may be evicted
+    const a = try sessions.create();
+    const b = try sessions.create();
+    try testing.expect(sessions.hasTag(a.tag) and sessions.hasTag(b.tag));
+    try testing.expect(try sessions.pushTag(b.tag, "x"));
+    try testing.expect(!try sessions.pushTag(b.tag +% 1000, "x"));
+    try testing.expectEqual(@as(?u64, b.tag), sessions.destroy(b.id));
+    try testing.expect(!sessions.hasTag(b.tag));
+    try testing.expect(!try sessions.pushTag(b.tag, "x"));
+    const c = try sessions.create(); // table has room again
+    const d = try sessions.create(); // full: the idlest (a) is evicted
+    try testing.expectEqual(@as(?u64, a.tag), d.evicted);
+    try testing.expect(!sessions.hasTag(a.tag));
+    try testing.expect(sessions.hasTag(c.tag) and sessions.hasTag(d.tag));
+}
+
 // ── authorization (auth.zig) over the wire ──────────────────────────────────
 
 const auth_scopes = [_][]const u8{ "mcp:read", "mcp:tools" };
@@ -4560,7 +4626,7 @@ fn toolsNeedToolsScope(_: ?*anyopaque, op: auth.Operation) []const []const u8 {
 
 fn whoAmITool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
     call.write(if (call.auth) |a| a.client_id else "anonymous");
-    return true;
+    return false;
 }
 
 fn buildAuthServer(gpa: std.mem.Allocator) !mcp.Server {
@@ -4582,7 +4648,7 @@ const test_mcp_auth: auth.Auth = .{
 
 fn postAuth(comptime authz: []const u8, comptime json: []const u8) []const u8 {
     return std.fmt.comptimePrint(
-        "POST /mcp HTTP/1.1\r\nHost: t\r\nAuthorization: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ authz, json.len, json },
     );
 }
@@ -4599,7 +4665,7 @@ test "auth: RFC 9728 document, 401 challenges, 403 scopes, handlers see the toke
 
     // The metadata document: unauthenticated, path-aware, readable cross-origin.
     var b0: [4096]u8 = undefined;
-    const md = runWire(&r, "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &b0);
+    const md = runWire(&r, "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", &b0);
     try testing.expectEqual(@as(?u16, 200), statusOf(md));
     try testing.expectEqualStrings("*", headerValue(md, "access-control-allow-origin").?);
     try testing.expectEqualStrings(
@@ -4648,8 +4714,56 @@ test "auth: RFC 9728 document, 401 challenges, 403 scopes, handlers see the toke
 
     // Two Authorization fields are refused.
     var b7: [4096]u8 = undefined;
-    const two = runWire(&r, "POST /mcp HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer good\r\nAuthorization: Bearer good\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", &b7);
+    const two = runWire(&r, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer good\r\nAuthorization: Bearer good\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", &b7);
     try testing.expectEqual(@as(?u16, 401), statusOf(two));
+}
+
+test "auth: scope_for cannot be evaded with long keys or unreadable bodies (sweep HS-2)" {
+    const gpa = testing.allocator;
+    var server = try buildAuthServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .auth = &test_mcp_auth };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    const out = try gpa.alloc(u8, 32 * 1024);
+    defer gpa.free(out);
+    const long = try gpa.alloc(u8, 9 * 1024);
+    defer gpa.free(long);
+    @memset(long, 'k');
+
+    const call = "\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}";
+    const bodies = [_][]const u8{
+        // 9 KiB key ahead of `method`: the old scan ended there with no operation.
+        try std.fmt.allocPrint(gpa, "{{\"{s}\":1,\"jsonrpc\":\"2.0\",\"id\":5,{s}}}", .{ long, call }),
+        // The same with the long key inside params.
+        try std.fmt.allocPrint(gpa, "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{{\"{s}\":1,\"name\":\"whoami\",\"arguments\":{{}}}}}}", .{long}),
+    };
+    defer for (bodies) |b| gpa.free(b);
+    for (bodies) |b| {
+        const req = try std.fmt.allocPrint(gpa, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer readonly\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ b.len, b });
+        defer gpa.free(req);
+        const got = runWire(&r, req, out);
+        try testing.expectEqual(@as(?u16, 403), statusOf(got));
+        try testing.expect(std.mem.find(u8, got, ":\"ro\"") == null);
+    }
+
+    // A body that is not one JSON object is refused 400 before scope_for or mcp.
+    const unreadable = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/list\"} trailing";
+    const req = try std.fmt.allocPrint(gpa, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer readonly\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ unreadable.len, unreadable });
+    defer gpa.free(req);
+    const got = runWire(&r, req, out);
+    try testing.expectEqual(@as(?u16, 400), statusOf(got));
+    try testing.expectEqualStrings("{\"error\":\"invalid_request\",\"error_description\":\"Unreadable request body\"}", bodyOf(got));
+
+    // A repeated `method` never runs the tool the scan did not see: the scan
+    // reads the last one, and `mcp` refuses the repeat outright.
+    const dup = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"method\":\"tools/list\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}}";
+    const req2 = try std.fmt.allocPrint(gpa, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer readonly\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ dup.len, dup });
+    defer gpa.free(req2);
+    const got2 = runWire(&r, req2, out);
+    try testing.expect(std.mem.find(u8, got2, ":\"ro\"") == null);
+    try testing.expect(std.mem.find(u8, got2, "-32700") != null); // mcp's parse refuses the repeated key
 }
 
 test "auth: GET and DELETE of a session endpoint are gated too" {
@@ -4663,34 +4777,68 @@ test "auth: GET and DELETE of a session endpoint are gated too" {
     defer r.deinit();
     try r.use(transport.middleware());
     var b1: [4096]u8 = undefined;
-    try testing.expectEqual(@as(?u16, 401), statusOf(runWire(&r, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: x\r\nConnection: close\r\n\r\n", &b1)));
+    try testing.expectEqual(@as(?u16, 401), statusOf(runWire(&r, "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: x\r\nConnection: close\r\n\r\n", &b1)));
     var b2: [4096]u8 = undefined;
-    try testing.expectEqual(@as(?u16, 401), statusOf(runWire(&r, "DELETE /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: x\r\nConnection: close\r\n\r\n", &b2)));
+    try testing.expectEqual(@as(?u16, 401), statusOf(runWire(&r, "DELETE /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: x\r\nConnection: close\r\n\r\n", &b2)));
     var b3: [4096]u8 = undefined;
-    try testing.expectEqual(@as(?u16, 404), statusOf(runWire(&r, "GET /mcp HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer good\r\nMcp-Session-Id: x\r\nConnection: close\r\n\r\n", &b3)));
+    try testing.expectEqual(@as(?u16, 404), statusOf(runWire(&r, "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer good\r\nMcp-Session-Id: x\r\nConnection: close\r\n\r\n", &b3)));
 }
 
-test "Host allowlist: listed (any case) → served, other → 403, absent → 400" {
+test "host_guard: listed names (any case, any port), IP literals and localhost served, other names 403" {
     const gpa = testing.allocator;
     var server = try buildServer(gpa);
     defer server.deinit();
-    const hosts = [_][]const u8{ "localhost:7717", "127.0.0.1:7717" };
-    var transport = Transport{ .gpa = gpa, .server = &server, .allowed_hosts = &hosts };
+    const names = [_][]const u8{"mcp.example"};
+    var transport = Transport{ .gpa = gpa, .server = &server, .host_guard = .{ .allowed = &names } };
     var r = router.Router.init(gpa);
     defer r.deinit();
     try r.use(transport.middleware());
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
     const cases = [_]struct { []const u8, u16 }{
-        .{ "Host: LocalHost:7717\r\n", 200 },
+        .{ "Host: MCP.example:7717\r\n", 200 },
+        .{ "Host: mcp.example\r\n", 200 },
         .{ "Host: 127.0.0.1:7717\r\n", 200 },
+        .{ "Host: localhost:1\r\n", 200 },
         .{ "Host: evil.example:7717\r\n", 403 },
-        .{ "Host: localhost:7718\r\n", 403 },
-        .{ "", 400 }, // HTTP/1.1 without Host: http.Server's own 400 (RFC 9112 §3.2), before the allowlist
+        .{ "Host: mcp.example.evil\r\n", 403 },
+        .{ "", 400 }, // HTTP/1.1 without Host: http.Server's own 400 (RFC 9112 §3.2), before the guard
     };
     inline for (cases) |c| {
         var b: [4096]u8 = undefined;
         const got = runWire(&r, std.fmt.comptimePrint("POST /mcp HTTP/1.1\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ c[0], body.len, body }), &b);
         try testing.expectEqual(@as(?u16, c[1]), statusOf(got));
+    }
+}
+
+test "localhost_protection: a loopback peer with a foreign Host is 403, with a loopback Host served, and off when disabled" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var spin: SpinLock = .{};
+    var transport = Transport{ .gpa = gpa, .server = &server, .lock = spin.iface() };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    const cases = [_]struct { []const u8, bool, u16 }{
+        .{ "rebound.evil.example:80", true, 403 },
+        .{ "localhost:9", true, 200 },
+        .{ "127.0.0.1:9", true, 200 },
+        .{ "[::1]:9", true, 200 },
+        .{ "rebound.evil.example:80", false, 200 },
+    };
+    for (cases) |c| {
+        transport.localhost_protection = c[1];
+        const stream = try live.connect();
+        defer stream.close(io);
+        var req_buf: [512]u8 = undefined;
+        try sendAll(io, stream, try std.mem.print(&req_buf, "POST /mcp HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ c[0], body.len, body }));
+        var buf: [4096]u8 = undefined;
+        try testing.expectEqual(@as(?u16, c[2]), statusOf(readToEnd(io, stream, &buf)));
     }
 }
 

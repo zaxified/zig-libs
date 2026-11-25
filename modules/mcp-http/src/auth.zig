@@ -87,8 +87,9 @@ pub const VerifyFn = *const fn (ctx: ?*anyopaque, arena: std.mem.Allocator, toke
 
 /// One operation the per-operation scope check is asked about.
 pub const Operation = struct {
-    /// The JSON-RPC method (`tools/call`), or "" for a `GET`/`DELETE` or a body
-    /// that is not a request.
+    /// The JSON-RPC method (`tools/call`), or "" when the body names none. The
+    /// check runs for POSTed JSON-RPC requests only: a `GET` stream and a
+    /// `DELETE` are gated by the token and `required_scopes`, not per operation.
     method: []const u8,
     /// `params.name` (a tool or prompt) or `params.uri` (a resource), when given.
     target: ?[]const u8,
@@ -255,62 +256,88 @@ pub fn refusalBody(w: *std.Io.Writer, r: Refusal) std.Io.Writer.Error!void {
 }
 
 /// The method and target of a JSON-RPC request body, for `scope_for`: a
-/// single-pass scan (the authoritative parse is `mcp`'s), bounded like the
-/// transport's other pre-parses: keys and the values it keeps at most 8 KiB.
-/// Anything it cannot read is `{ "", null }`.
+/// single-pass scan (the authoritative parse is `mcp`'s). The target is
+/// `params.uri` for a `resources/*` method and `params.name` otherwise, each
+/// falling back to the other when absent, so a body carrying both cannot make
+/// the check look at the field the method does not use. Strings of any length
+/// are read (a decoded token is never longer than its source, so the arena use
+/// is bounded by the body, which the transport caps with `max_body`); a method
+/// or target that is not a string is "" / null.
+///
+/// `error.Unreadable`: the body is not one well-formed JSON object. The
+/// transport then refuses the request (400) instead of asking `scope_for` about
+/// an operation it could not read -- `mcp` would answer such a body with a parse
+/// error anyway, so no legitimate request is lost. Reading must never give up
+/// early on a body that IS well-formed: an early "empty operation" is what let
+/// a request name an operation `scope_for` never saw (sweep HS-2).
+///
+/// A duplicate key does not make the scan and `mcp` disagree: `mcp`'s parse
+/// refuses an object with a repeated key, so the request that is executed has
+/// each key once.
 pub const RequestOp = struct { method: []const u8 = "", target: ?[]const u8 = null };
 
-pub fn operationOf(gpa: std.mem.Allocator, arena: std.mem.Allocator, body: []const u8) error{OutOfMemory}!RequestOp {
+pub fn operationOf(gpa: std.mem.Allocator, arena: std.mem.Allocator, body: []const u8) error{ OutOfMemory, Unreadable }!RequestOp {
     var scanner: std.json.Scanner = .initCompleteInput(gpa, body);
     defer scanner.deinit();
-    const none: RequestOp = .{};
     var method: []const u8 = "";
-    var target: ?[]const u8 = null;
-    if ((scanner.next() catch return none) != .object_begin) return none;
-    while (true) {
-        const key = (try takeString(&scanner, arena)) orelse return .{ .method = method, .target = target };
+    var name: ?[]const u8 = null;
+    var uri: ?[]const u8 = null;
+    if ((scanner.next() catch return error.Unreadable) != .object_begin) return error.Unreadable;
+    while (try takeKey(&scanner, arena)) |key| {
         if (std.mem.eql(u8, key, "method")) {
-            method = (try takeString(&scanner, arena)) orelse return none;
-        } else if (std.mem.eql(u8, key, "params")) {
-            if ((scanner.peekNextTokenType() catch return none) != .object_begin) {
-                if (!skipOne(&scanner)) return none;
-                continue;
+            method = (try takeValueString(&scanner, arena)) orelse "";
+        } else if (std.mem.eql(u8, key, "params") and (scanner.peekNextTokenType() catch return error.Unreadable) == .object_begin) {
+            _ = scanner.next() catch return error.Unreadable;
+            while (try takeKey(&scanner, arena)) |pk| {
+                if (std.mem.eql(u8, pk, "name")) {
+                    name = try takeValueString(&scanner, arena);
+                } else if (std.mem.eql(u8, pk, "uri")) {
+                    uri = try takeValueString(&scanner, arena);
+                } else try skipOne(&scanner);
             }
-            _ = scanner.next() catch return none;
-            while (true) {
-                const pk = (try takeString(&scanner, arena)) orelse break;
-                if (std.mem.eql(u8, pk, "name") or std.mem.eql(u8, pk, "uri")) {
-                    if ((scanner.peekNextTokenType() catch return none) == .string) {
-                        target = (try takeString(&scanner, arena)) orelse return none;
-                        continue;
-                    }
-                }
-                if (!skipOne(&scanner)) return none;
-            }
-        } else if (!skipOne(&scanner)) return none;
+        } else try skipOne(&scanner);
     }
+    if ((scanner.next() catch return error.Unreadable) != .end_of_document) return error.Unreadable;
+    const target = if (std.mem.startsWith(u8, method, "resources/")) uri orelse name else name orelse uri;
+    return .{ .method = method, .target = target };
 }
 
-/// The next token as a string (a key or a string value), or null at an object
-/// end, on a non-string or on a malformed body.
-fn takeString(scanner: *std.json.Scanner, arena: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
-    const tok = scanner.nextAllocMax(arena, .alloc_always, 8 * 1024) catch |e| switch (e) {
+/// The next object key, or null at the object's end. Anything else is unreadable.
+fn takeKey(scanner: *std.json.Scanner, arena: std.mem.Allocator) error{ OutOfMemory, Unreadable }!?[]const u8 {
+    const tok = scanner.nextAlloc(arena, .alloc_always) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
+        else => return error.Unreadable,
     };
     return switch (tok) {
         .allocated_string => |s| s,
-        else => null,
+        .object_end => null,
+        else => error.Unreadable,
     };
 }
 
-fn skipOne(scanner: *std.json.Scanner) bool {
-    switch (scanner.peekNextTokenType() catch return false) {
-        .object_end, .array_end, .end_of_document => return false,
+/// The next value when it is a string (null for any other well-formed value,
+/// which is consumed whole).
+fn takeValueString(scanner: *std.json.Scanner, arena: std.mem.Allocator) error{ OutOfMemory, Unreadable }!?[]const u8 {
+    if ((scanner.peekNextTokenType() catch return error.Unreadable) != .string) {
+        try skipOne(scanner);
+        return null;
+    }
+    const tok = scanner.nextAlloc(arena, .alloc_always) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Unreadable,
+    };
+    return switch (tok) {
+        .allocated_string => |s| s,
+        else => error.Unreadable,
+    };
+}
+
+fn skipOne(scanner: *std.json.Scanner) error{Unreadable}!void {
+    switch (scanner.peekNextTokenType() catch return error.Unreadable) {
+        .object_end, .array_end, .end_of_document => return error.Unreadable,
         else => {},
     }
-    scanner.skipValue() catch return false;
-    return true;
+    scanner.skipValue() catch return error.Unreadable;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -420,6 +447,37 @@ test "metadata: RFC 9728 document with only what is set, and its well-known path
     try testing.expect(metadataPath(&small, "/mcp") == null);
 }
 
+test "operationOf: a body that is not one JSON object is unreadable, not an empty operation" {
+    var st: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    for ([_][]const u8{ "[1]", "{\"method\":", "{\"a\":}", "", "{} x", "{\"method\":\"tools/call\"}{}", "{\"params\":{\"name\":}}" }) |bad|
+        try testing.expectError(error.Unreadable, operationOf(testing.allocator, a, bad));
+}
+
+test "operationOf: long keys and values are read, not given up on (sweep HS-2)" {
+    var st: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer st.deinit();
+    const a = st.allocator();
+    const long = try a.alloc(u8, 9 * 1024);
+    @memset(long, 'k');
+    // A 9 KiB top-level key ahead of `method`, a 9 KiB key inside `params`.
+    const b1 = try std.fmt.allocPrint(a, "{{\"{s}\":1,\"method\":\"tools/call\",\"params\":{{\"{s}\":[1,{{}}],\"name\":\"delete\"}}}}", .{ long, long });
+    const op1 = try operationOf(testing.allocator, a, b1);
+    try testing.expectEqualStrings("tools/call", op1.method);
+    try testing.expectEqualStrings("delete", op1.target.?);
+    // A 9 KiB uri and a 9 KiB ignored value are kept / skipped, whatever the order.
+    const b2 = try std.fmt.allocPrint(a, "{{\"params\":{{\"uri\":\"{s}\"}},\"x\":\"{s}\",\"method\":\"resources/read\"}}", .{ long, long });
+    const op2 = try operationOf(testing.allocator, a, b2);
+    try testing.expectEqualStrings("resources/read", op2.method);
+    try testing.expectEqualStrings(long, op2.target.?);
+    // A body with both `name` and `uri` is checked on the field its method uses.
+    const op3 = try operationOf(testing.allocator, a, "{\"method\":\"tools/call\",\"params\":{\"name\":\"delete\",\"uri\":\"x://a\"}}");
+    try testing.expectEqualStrings("delete", op3.target.?);
+    const op4 = try operationOf(testing.allocator, a, "{\"method\":\"resources/read\",\"params\":{\"uri\":\"x://a\",\"name\":\"n\"}}");
+    try testing.expectEqualStrings("x://a", op4.target.?);
+}
+
 test "operationOf: method and name/uri at the top level only, anything else empty" {
     var st: std.heap.ArenaAllocator = .init(testing.allocator);
     defer st.deinit();
@@ -431,9 +489,6 @@ test "operationOf: method and name/uri at the top level only, anything else empt
         .{ "{\"method\":\"tools/call\",\"params\":{\"name\":7}}", "tools/call", null },
         .{ "{\"method\":\"tools/call\",\"params\":[1]}", "tools/call", null },
         .{ "{\"id\":1,\"result\":{}}", "", null },
-        .{ "[1]", "", null },
-        .{ "{\"method\":", "", null },
-        .{ "{\"a\":}", "", null },
     };
     for (cases) |c| {
         const op = try operationOf(testing.allocator, a, c[0]);
