@@ -2263,19 +2263,29 @@ cmd_ctgrind() {
     # key whole, so re-pinning one module re-measured all 88: 64 minutes on every
     # run after a change to anything cryptographic, 4 runs of 4 measured. A
     # module's own rows now go into its fingerprint for this lane, below.
+    #
+    # ⭐ AND SO IS ITS RECIPE (2026-11-25). The driver hash covered the whole of
+    # ctgrind.sh, recipe tables included, so adding one module's target (ct25519
+    # `sign`) re-measured all 99: 73 minutes of full lane 45552313195. The
+    # one-line `[<module>…]=` entries of TARGETS/MODES/PATTERN/LABEL (all keyed
+    # by module name, none spanning lines) are cut out of the driver hash and
+    # folded into the fingerprint of the module they name; every other line of
+    # the script -- the classifier, the counting, WITNESS -- still keys the lane.
     local all=() m todo lane drv vg
+    local recipe_re='^[[:space:]]+\[[a-z0-9_-]+(/[^]]*)?\]='
     for m in modules/*/src/ctgrind_harness.zig; do
         [[ -e "$m" ]] || continue
         m="${m#modules/}"
         all+=("${m%%/*}")
     done
-    drv="$(sha256sum < scripts/checks/ctgrind.sh | cut -c1-12)"
+    drv="$(grep -Ev "$recipe_re" scripts/checks/ctgrind.sh | sha256sum | cut -c1-12)"
     vg="$(valgrind --version 2>/dev/null || echo no-valgrind)"
     lane="ctgrind cpu=${CTGRIND_CPU:-skylake} drv=$drv $vg $(uname -m)"
     fp_load   # here, in THIS shell: see stamps_record
     local rows="" digest
     for m in "${all[@]}"; do
-        digest="$(awk -F'\t' -v m="$m" '$1 == m' scripts/checks/ctgrind-expected.tsv | sha256sum | cut -c1-12)"
+        digest="$( { awk -F'\t' -v m="$m" '$1 == m' scripts/checks/ctgrind-expected.tsv
+                     grep -E "^[[:space:]]+\[$m(/[^]]*)?\]=" scripts/checks/ctgrind.sh; } | sha256sum | cut -c1-12)"
         rows+="$m"$'\t'"$digest"$'\n'
     done
     FP_TSV="$(awk -F'\t' -v OFS='\t' 'NR == FNR { r[$1] = $2; next } { print $1, ($1 in r) ? $2 "-" r[$1] : $2 }' \
