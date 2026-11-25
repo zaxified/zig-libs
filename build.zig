@@ -449,7 +449,7 @@ pub const module_list = [_]Module{
     .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "chachapoly", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "aesgcm", .libs = &.{ "crypto", "net" }, .deps = &.{"aes192"}, .test_deps = &.{"testkit"} }, // aes192: Aes192Gcm's generic backend
-    .{ .name = "aesccm", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
+    .{ .name = "aesccm", .libs = &.{"crypto"}, .deps = &.{"aes192"}, .test_deps = &.{"testkit"} },
     .{ .name = "k256", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "p256", .libs = &.{ "crypto", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "ripemd160", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },

@@ -20,7 +20,10 @@ def expand(label, n):
 
 CASES = [(16, 8, 12, 0, 0), (16, 8, 12, 13, 16), (16, 16, 12, 20, 33), (32, 16, 12, 0, 64),
          (32, 8, 12, 5, 1), (16, 16, 13, 8, 31), (32, 8, 13, 300, 17), (16, 8, 12, 70000, 40)]
+# AES-192 rows (`kats192`): all four tag/nonce combinations of the tests.
+CASES_192 = [(24, 8, 12, 0, 0), (24, 8, 12, 13, 33), (24, 16, 12, 20, 16), (24, 16, 12, 300, 64),
+             (24, 8, 13, 8, 31), (24, 8, 13, 70000, 17), (24, 16, 13, 5, 1), (24, 16, 13, 0, 40)]
 
-for kl, tl, nl, al, pl in CASES:
+for kl, tl, nl, al, pl in CASES + CASES_192:
     k, n, a, p = expand("key", kl), expand("nonce", nl), expand("ad", al), expand("pt", pl)
     print(kl, tl, nl, al, pl, AESCCM(k, tag_length=tl).encrypt(n, p, a).hex())
