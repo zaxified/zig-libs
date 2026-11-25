@@ -42,6 +42,7 @@
 
 const std = @import("std");
 const hpke = @import("hpke");
+const ct25519 = @import("ct25519");
 const codec = @import("codec.zig");
 const suite = @import("suite.zig");
 const burn = @import("burn.zig");
@@ -252,7 +253,25 @@ pub fn SignError(comptime S: type) type {
 }
 
 fn signBody(comptime S: type, key_pair: *const S.Sig.KeyPair, sign_content: []const u8) SignError(S)!S.Sig.Signature {
+    // Ed25519 suites: `ct25519.signEd25519` is std's `KeyPair.sign` with the
+    // same bytes and errors (differentially tested there), `[r]B` on the
+    // fixed-base comb — the larger half of a small message's fixed cost
+    // (shield 2026-11-25, SPEC § Performance).
+    if (comptime S.Sig == std.crypto.sign.Ed25519) return ct25519.signEd25519(key_pair, sign_content, null);
     return key_pair.sign(sign_content, null);
+}
+
+/// `Signature.Verify` (RFC 9420 §5.1.2). Ed25519 suites verify the way
+/// OpenMLS does (`ed25519-dalek`'s `verify_strict`): canonical `S` and `R`,
+/// neither `A` nor `R` the identity, `A` not of small order, and the
+/// cofactorless equation `[S]B = R + [k]A` — `ct25519.verifyEd25519Strict`
+/// (std's `verifyStrict` verdicts, 4×64 field). Every RFC 8032 signer's
+/// output passes; what it refuses beyond std's cofactored `verify` are
+/// signatures built with torsion components, which no honest signer makes.
+fn verifyBody(comptime S: type, public_key: S.Sig.PublicKey, sign_content: []const u8, signature: S.Sig.Signature) !void {
+    if (comptime S.Sig == std.crypto.sign.Ed25519)
+        return ct25519.verifyEd25519Strict(signature.toBytes(), sign_content, public_key.toBytes());
+    return signature.verify(sign_content, public_key);
 }
 
 /// RFC 9420 §5.1.2 `VerifyWithLabel(VerificationKey, Label, Content,
@@ -261,7 +280,7 @@ fn signBody(comptime S: type, key_pair: *const S.Sig.KeyPair, sign_content: []co
 pub fn VerifyWithLabel(comptime S: type, public_key: S.Sig.PublicKey, label: []const u8, content: []const u8, signature: S.Sig.Signature) !void {
     var buf: [label_scratch_len]u8 = undefined;
     const sign_content = encodeSignContent(&buf, label, content) catch return error.LabelTooLong;
-    try signature.verify(sign_content, public_key);
+    try verifyBody(S, public_key, sign_content, signature);
 }
 
 /// Exactly how many bytes `encodeSignContent(label, content)` needs.
@@ -309,7 +328,7 @@ pub fn VerifyWithLabelAlloc(
     const buf = try allocator.alloc(u8, try signContentLen(label, content));
     defer allocator.free(buf);
     const sign_content = try encodeSignContent(buf, label, content);
-    try signature.verify(sign_content, public_key);
+    try verifyBody(S, public_key, sign_content, signature);
 }
 
 // ── §5.1.3: EncryptWithLabel / DecryptWithLabel ───────────────────────────
@@ -424,6 +443,40 @@ pub fn DecryptWithLabel(
 
 const testing = std.testing;
 const TestSuite = suite.default;
+
+test "VerifyWithLabel (Ed25519) is strict like OpenMLS: an R carrying a torsion component, which std's cofactored verify accepts, is refused" {
+    const S = suite.default;
+    const Ed = std.crypto.sign.Ed25519;
+    const E = std.crypto.ecc.Edwards25519;
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    const kp = try Ed.KeyPair.generateDeterministic(@splat(0x42));
+    var az: [64]u8 = undefined;
+    Sha512.hash(&kp.secret_key.seed(), &az, .{});
+    var a: [32]u8 = az[0..32].*;
+    E.scalar.clamp(&a);
+    const r = E.scalar.reduce64(@splat(0x17));
+    // (sqrt(-1), 0): encoded y = 0, a point of order 4.
+    const t = try E.fromBytes(@splat(0));
+    const r_point = (try E.basePoint.mul(r)).add(t).toBytes();
+
+    var buf: [label_scratch_len]u8 = undefined;
+    const msg = try encodeSignContent(&buf, "test", "content");
+    var kh = Sha512.init(.{});
+    kh.update(&r_point);
+    kh.update(&kp.public_key.toBytes());
+    kh.update(msg);
+    var k64: [64]u8 = undefined;
+    kh.final(&k64);
+    const sig: Ed.Signature = .{ .r = r_point, .s = E.scalar.mulAdd(E.scalar.reduce64(k64), a, r) };
+
+    // [8]([S]B − R − [k]A) = [8](−T) = O: the cofactored check passes ...
+    try sig.verify(msg, kp.public_key);
+    // ... the cofactorless one does not, and neither does `VerifyWithLabel`.
+    try testing.expectError(error.SignatureVerificationFailed, sig.verifyStrict(msg, kp.public_key));
+    try testing.expectError(error.SignatureVerificationFailed, VerifyWithLabel(S, kp.public_key, "test", "content", sig));
+    // An honest signature over the same content still verifies.
+    try VerifyWithLabel(S, kp.public_key, "test", "content", try SignWithLabel(S, &kp, "test", "content"));
+}
 
 test "RefHash: empty label/value hashes RefHashInput = 0x00 0x00 (two zero-length varints)" {
     const got = try RefHash(TestSuite, "", "");

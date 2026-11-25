@@ -324,7 +324,7 @@ ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # "one witness context, zero in-file", never as "one expected context in
 # ct25519's own code" — that reading would describe the fragile
 # single-context pin this module deliberately does not have.
-ct25519	ReleaseFast	ct25519	1	0	aaa45198aa7c91a1	4e5e08fafcda58f8
+ct25519	ReleaseFast	ct25519	1	0	5161b366bbfc75fc	4e5e08fafcda58f8
 ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 # ct25519 targets added 2026-09-16, first pinned 2026-09-15 (A1 ct25519 C3/C4,
 # bulletproofs B9). All four claim zero in-file contexts, 2 witness each
@@ -336,10 +336,10 @@ ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 #               the same point as the `ct25519` row, so its output pin equals
 #               that row's.
 #   msm         `mulMultiRistretto` over 9 terms (B9).
-ct25519	ReleaseFast	comb	1	0	aaa45198aa7c91a1	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladderbase	1	0	aaa45198aa7c91a1	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladder	1	0	aaa45198aa7c91a1	4e5e08fafcda58f8
-ct25519	ReleaseFast	msm	1	0	aaa45198aa7c91a1	09aa32de83cec03a
+ct25519	ReleaseFast	comb	1	0	5161b366bbfc75fc	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladderbase	1	0	5161b366bbfc75fc	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladder	1	0	5161b366bbfc75fc	4e5e08fafcda58f8
+ct25519	ReleaseFast	msm	1	0	5161b366bbfc75fc	09aa32de83cec03a
 # x25519 (added 2026-09-28, pinned 2026-09-29 with P6): `X25519.recoverPublicKey`
 # (comb + Edwards->Montgomery map) and then `X25519.scalarmult` of the same
 # tainted key against RFC 7748 §6.1 Bob's public key -- the shared-secret
@@ -349,7 +349,10 @@ ct25519	ReleaseFast	msm	1	0	aaa45198aa7c91a1	09aa32de83cec03a
 # shape is declassified (a function of the public point only, SPEC.md § P6);
 # positive controls in SPEC.md § P6: without the declassify 1 in-file at that
 # line, a branching cswap 1 in-file at the swap (native and -mcpu=x86_64_v3).
-ct25519	ReleaseFast	x25519	1	0	aaa45198aa7c91a1	8af2fe8213b778aa
+ct25519	ReleaseFast	x25519	1	0	5161b366bbfc75fc	8af2fe8213b778aa
+# ct25519 sign (2026-11-25): signEd25519 with the seed tainted; 0 in-file (the R = O verdict is declassified, R is the
+# returned signature's public half; without the declassify that branch is 1 in-file context, measured).
+ct25519	ReleaseFast	sign	1	0	5161b366bbfc75fc	d582fbce54fcf8d1
 decaf448	ReleaseFast	scalarmul	1	0	89ee227f5f43c8f1	77a1bd1038ca1053
 decaf448	ReleaseFast	invert	1	0	a63581db68d54fc0	3108a171dc3725b6
 # ecvrf prove 3 -> 0 (4db1e627): the three contexts were try-and-increment
@@ -1802,17 +1805,19 @@ megolm	ReleaseFast	pickle	1	26	4bcd2cc0b8d7321d	f06f4b1b938d2036
 # under a tainted encryption secret; priv: protectPrivate with the content
 # key/nonce, sender-data secret and Ed25519 signing key tainted, then
 # decode (wire marked defined: public), decryptSenderData, decryptContent.
-# ks and tree: 0. priv 4 = std Ed25519 signing internals 2 (sign,
-# pcMul16 rejectIdentity) + the AES-GCM tag-verify outcome of the two
+# ks and tree: 0. priv 2 = the AES-GCM tag-verify outcome of the two
 # decryptions. TreeKEM/HPKE are the hpke module's rows.
 # group (2026-11-21): Group.protectApplication twice from alice (create + Add
 # bob untainted, then her EpochSecrets and Ed25519 key tainted; secret tree
-# built under taint, ratchet advanced); bob opens both untainted. 2 = std
-# Ed25519 signing internals (sign, pcMul16 rejectIdentity), as in priv.
-mls	ReleaseFast	ks	1	0	1f288358fcdb0505	cbdae823f31fa99e
-mls	ReleaseFast	tree	1	0	1f288358fcdb0505	22ea84b82599122e
-mls	ReleaseFast	priv	1	4	1f288358fcdb0505	616cb338b933af50
-mls	ReleaseFast	group	1	2	6885b2e94cda915c	f4c3dc710c6be88a
+# built under taint, ratchet advanced); bob opens both untainted. 0.
+# 2026-11-25: Ed25519 signing moved to ct25519.signEd25519 -> the 2 std signing
+# contexts (sign's KeyMismatch compare, pcMul16 rejectIdentity) are gone from
+# priv (4 -> 2) and group (2 -> 0); the cpu=x86_64 rows (5, 3: std's portable
+# field added one) now equal native and were dropped.
+mls	ReleaseFast	ks	1	0	d25730f0a5cf4b5d	cbdae823f31fa99e
+mls	ReleaseFast	tree	1	0	d25730f0a5cf4b5d	22ea84b82599122e
+mls	ReleaseFast	priv	1	2	d25730f0a5cf4b5d	616cb338b933af50
+mls	ReleaseFast	group	1	0	c0a32cb83f97c9e0	f4c3dc710c6be88a
 # otp (2026-10-10) — code: the shared secret through hotp/totp/hotpFmt/
 # totpVerify for SHA-1/256/512. FIX: the RFC 4226 dynamic truncation read
 # mac[offset..][0..4] with offset = the MAC's low nibble, a load address
@@ -2586,7 +2591,7 @@ opaque	ReleaseFast	serverke2_x25519	1	4	f5d9779d6e4f3a18	28c4b4c908b2e302	cpu=x8
 # variable-time addAffineVt (mulPublic on the PUBLIC composite scalars) reads 6 contexts without the
 # amd64 MULX field core (4 with it); nothing outside the documented classes.
 voprf	ReleaseFast	p521-server	1	26	a448ff40ae25f5e0	5a0178ab968c5fe9	cpu=x86_64
-ct25519	ReleaseFast	x25519	1	1	aaa45198aa7c91a1	8af2fe8213b778aa	cpu=x86_64
+ct25519	ReleaseFast	x25519	1	1	5161b366bbfc75fc	8af2fe8213b778aa	cpu=x86_64
 hpke	ReleaseFast	x25519_decap	1	1	988bf797e9128852	c0cee0a8c6bf72c3	cpu=x86_64
 hpke	ReleaseFast	x25519_authdecap	1	2	988bf797e9128852	05af25d1d0e3943d	cpu=x86_64
 hpke	ReleaseFast	xwing_decap	1	1	9792528fc668b453	a1bdb379c24261c4	cpu=x86_64
@@ -2594,8 +2599,6 @@ tlsclient	ReleaseFast	kex	1	5	e09520cb0a81b4fa	dcbfcf24be022c59	cpu=x86_64 contr
 tlsclient	ReleaseFast	cv	1	33	aeb841d005c8d4a6	a92e71f50313cf2b	cpu=x86_64
 tlsserver	ReleaseFast	hs	1	24	82a28eda0eb571f6	18b712e147be54c3	cpu=x86_64
 tlsserver	ReleaseFast	ech	1	442	82a28eda0eb571f6	c257fcbb1b68d8df	cpu=x86_64
-mls	ReleaseFast	priv	1	5	1f288358fcdb0505	616cb338b933af50	cpu=x86_64
-mls	ReleaseFast	group	1	3	6885b2e94cda915c	f4c3dc710c6be88a	cpu=x86_64
 wireguard	ReleaseFast	handshake	1	13	e3bba5e674102f92	40f18e84501394fa	cpu=x86_64
 wireguard	ReleaseFast	tunnel	1	14	e3bba5e674102f92	8f458611fc103bea	cpu=x86_64
 tls13	ReleaseFast	x25519_shared	1	1	4115b347f0c1b95d	d94c3e5680258153	cpu=x86_64

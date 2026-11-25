@@ -392,7 +392,7 @@ pub const meta = .{
     // `suite.CipherSuite(...)` is a comptime type, not an instance).
     .concurrency = .reentrant,
     .model_after = "RFC 9420 (Messaging Layer Security); treemath.zig ports Appendix C's own published Python reference verbatim",
-    .deps = .{ "hpke", "aesgcm", "p256", "p384", "p521", "ed448" }, // aesgcm: the AES-GCM suites' message AEAD; p256/p384/p521: the ECDSA suites' signatures; ed448: the X448/Ed448 suites' signatures
+    .deps = .{ "hpke", "aesgcm", "p256", "p384", "p521", "ed448", "ct25519" }, // aesgcm: the AES-GCM suites' message AEAD; p256/p384/p521: the ECDSA suites' signatures; ed448: the X448/Ed448 suites' signatures; ct25519: the Ed25519 suites' signing and strict verification
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────

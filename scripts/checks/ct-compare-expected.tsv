@@ -18,6 +18,7 @@ modules/blindrsa/src/root.zig	1
 modules/chachapoly/src/root.zig	1
 modules/coap/src/echo.zig	1
 modules/cookies/src/secure.zig	1
+modules/ct25519/src/root.zig	2
 modules/ctap2pin/src/root.zig	3
 modules/dkg/src/core.zig	2
 modules/dkg/src/echo.zig	1

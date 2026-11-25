@@ -115,7 +115,13 @@ fn reloadVolatile(s: *const [32]u8) [32]u8 {
 ///   whatever backend this build dispatches to (the 4×64 MULX/ADX asm on an
 ///   x86-64 target with BMI2, P6). Both results are printed (`result=`,
 ///   `shared=`), so the witness covers both paths.
-const Target = enum { ct25519, std_mul, comb, ladderbase, ladder, msm, x25519 };
+/// `sign` — `signEd25519` (2026-11-25): a key pair derived untainted from the
+///   fixed seed, then its whole `secret_key` tainted (seed and the embedded
+///   public half the `KeyMismatch` check reads), so SHA-512 of
+///   the seed, the clamped scalar `a`, the nonce `r`, the comb's `[r]B` and
+///   `S = k·a + r` all run on secret data. `sig=` and `result=` (`S`) are the
+///   printed witness.
+const Target = enum { ct25519, std_mul, comb, ladderbase, ladder, msm, x25519, sign };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -126,6 +132,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "ladder")) return .ladder;
     if (std.mem.eql(u8, s, "msm")) return .msm;
     if (std.mem.eql(u8, s, "x25519")) return .x25519;
+    if (std.mem.eql(u8, s, "sign")) return .sign;
     return error.UnknownTarget;
 }
 
@@ -226,6 +233,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
             for (&epoints, points) |*e, r| e.* = r.p;
             const qe = ct25519.mulMulti(&scalars, &epoints);
             std.debug.print("edwards={x}\n", .{qe.toBytes()});
+        },
+        .sign => {
+            // A fresh, untainted copy of the seed: std's key generation is not
+            // under test, only the signing that follows it.
+            const clean = secretScalar();
+            var kp = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(reloadVolatile(&clean)) catch @panic("seed gives the identity");
+            // The WHOLE secret key, its embedded public half included (as
+            // `mls`'s rows taint a key pair): the `KeyMismatch` compare reads it.
+            if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&kp.secret_key.bytes);
+            const sig = ct25519.signEd25519(&kp, "ctgrind sign target", null) catch @panic("key pair is consistent");
+            std.debug.print("sig={x}\n", .{sig.toBytes()});
+            out_bytes = sig.s;
         },
         .std_mul => {
             if (Ristretto255.basePoint.mul(sec)) |q| {

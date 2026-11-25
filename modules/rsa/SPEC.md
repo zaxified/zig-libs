@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-11-17 (ctgrind; private-key PEM rows `pemenc` 0 / `pemdec` 2 added) · panic 2026-10-30 (sweep + blind review: e ≥ 2^32 private keys rejected (were catch unreachable on every private op), nested-SPKI recursion removed, short modulus_len primitives → error, PSS/byteLen/modinverse asserts → errors; delta audit 19/20 + 1 eq)
 
-**Performance:** ref 0.84–1.08× OpenSSL 3.5.5 · fastest ? (measured 2026-10-18; `.cached` blinding 1.02–1.03× at 2048)
+**Performance:** ref 0.80–1.03× OpenSSL 3.5.5 · fastest ? (measured 2026-11-25 in the bench shield; worst `decbl_2048` = the `.csprng` blinding draw, `.cached` 0.98×)
 
 **Known defects:** none recorded
 
@@ -316,6 +316,10 @@ What the figures depend on:
 
 ## What is deliberately not done
 
+- **A faster modexp than montint's (measured 2026-11-25, bench shield, 5 rounds, user-mode cycles).** Every row is
+  0.80–1.03× OpenSSL 3.5.5; the worst, `decbl_2048` 1.025 (spread 0.6 / 4.6 %), is the `.csprng` blinding's stateless
+  draw (the inverse and `r^e`, ~4.7 % of cycles), which `.cached` removes (`decca_2048` 0.977). The modexp itself is
+  montint's `powMont`, at 0.96–1.01× OpenSSL BN in the same shield (montint SPEC); no lever is left above the spread.
 - **`p ≡ 3 (mod 4)` candidates** (so Miller-Rabin's `s = v2(p − 1)` is always 1): it would narrow the key distribution
   to half of the primes, which no reference does (Go's `crypto/rsa`, BoringSSL and OpenSSL draw from all odd
   candidates; FIPS 186-5 B.3.3 does not restrict it); the squaring count reveals a few low bits of `p − 1` of a prime
@@ -386,9 +390,7 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 
 ## Backlog / deferred
 
-- *BOUNCED (quiet-host):* **Performance, remaining lever:** the modexp itself (REDC is about 54 % of it at L = 16, i.e. 2048-bit keys); the blinded
-  `.csprng` rows additionally carry the stateless draw (the inverse and `r^e`, ~4.7 % of cycles), which `.cached` removes.
-  A performance item, to be measured on a quiet host.
+None open.
 
 ## Anchoring
 
