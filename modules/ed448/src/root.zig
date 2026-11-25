@@ -70,6 +70,7 @@ test {
     _ = scalar;
     _ = h2c;
     _ = @import("h2c_test.zig");
+    _ = @import("mutation_test.zig");
     _ = @import("kat_vectors.zig");
     _ = @import("rfc8032_vectors.zig");
     _ = @import("wycheproof_vectors.zig");

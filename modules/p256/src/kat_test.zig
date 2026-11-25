@@ -149,3 +149,20 @@ test "positive control: wrong Solinas constant DISAGREES with std (harness has t
     // The wrong constant must produce visible disagreement on almost every input.
     try std.testing.expect(disagreements > 400);
 }
+
+test "mutation 2026-11-25: rfc6979NonceInto reproduces the RFC 6979 A.2.5 nonces (key by pointer, nonce through out)" {
+    const scalarmod = @import("scalar.zig");
+    const sk = hexBytes(32, kv.secret_key);
+    const cases = [_]struct { msg: []const u8, k: []const u8 }{
+        .{ .msg = "sample", .k = "A6E3C57DD01ABE90086538398355DD4C3B17AA873382B0F24D6129493D8AAD60" },
+        .{ .msg = "test", .k = "D16B6AE827F17175E040871A1C7EC3500192C4C92677336EC2537ACAEE0008E0" },
+    };
+    for (cases) |c| {
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(c.msg, &h, .{});
+        var out: scalarmod.Scalar = undefined;
+        sign.rfc6979NonceInto(&out, &sk, &h);
+        const want = hexBytes(32, c.k);
+        try std.testing.expectEqualSlices(u8, &want, &out.toBytes(.big));
+    }
+}

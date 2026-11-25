@@ -89,3 +89,17 @@ test "ctr: a dst shorter than src is a checked aes192 panic (sweep A9-1)" {
     try expectPanicMessage(ctrShortDst, needle_ctr);
     try expectPanicMessage(ctrEmptyDst, needle_ctr);
 }
+
+const needle_ctr_xor = "aes192: ctrXor dst shorter than src";
+
+fn ctrXorShortDst() void {
+    const ctx = root.Aes192.initEnc(key);
+    var dst: [31]u8 = undefined;
+    const src: [32]u8 = @splat(0);
+    var counter = iv;
+    root.ctrXor(@TypeOf(ctx), ctx, &dst, &src, &counter);
+}
+
+test "mutation 2026-11-25: ctrXor called directly checks dst against src itself (its own panic, not ctr's)" {
+    try expectPanicMessage(ctrXorShortDst, needle_ctr_xor);
+}
