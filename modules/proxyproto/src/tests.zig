@@ -926,3 +926,29 @@ test "uniqueId: the specification's 128 bytes pass, 129 are refused" {
         try testing.expectEqual(n, (try h.tlv(pp.tlv_type.unique_id)).?.len);
     }
 }
+
+test "mutation 2026-11-25: cloud-provider ids at the length edges (empty, sub-type only, one byte too long)" {
+    // AWS: the sub-type byte alone is a valid empty id.
+    const aws1 = comptime hex.literal("ea0001" ++ "01");
+    const b1 = tlvHeader(&aws1);
+    const h1 = (try expectHeader(try pp.parse(&b1))).h;
+    try testing.expectEqual(@as(usize, 0), (try h1.awsVpceId()).?.len);
+    // Azure: an empty value is malformed, another sub-type alone is skipped, a LinkID one byte too long is malformed.
+    const az0 = comptime hex.literal("ee0000");
+    const b2 = tlvHeader(&az0);
+    const h2 = (try expectHeader(try pp.parse(&b2))).h;
+    try testing.expectError(error.Malformed, h2.azureLinkId());
+    const az1 = comptime hex.literal("ee0001" ++ "02");
+    const b3 = tlvHeader(&az1);
+    const h3 = (try expectHeader(try pp.parse(&b3))).h;
+    try testing.expect((try h3.azureLinkId()) == null);
+    const az6 = comptime hex.literal("ee0006" ++ "01" ++ "78563412" ++ "00");
+    const b4 = tlvHeader(&az6);
+    const h4 = (try expectHeader(try pp.parse(&b4))).h;
+    try testing.expectError(error.Malformed, h4.azureLinkId());
+    // GCP: nine bytes is malformed, not "the first eight".
+    const gcp9 = comptime hex.literal("e00009" ++ "0102030405060708" ++ "09");
+    const b5 = tlvHeader(&gcp9);
+    const h5 = (try expectHeader(try pp.parse(&b5))).h;
+    try testing.expectError(error.Malformed, h5.gcpPscConnectionId());
+}

@@ -358,6 +358,50 @@ test "combine on version 2 merges TX_MODIFIABLE as Bitcoin Core does: AND, excep
     }
 }
 
+/// `p` with one more global record appended (the map is not re-sorted: `combine` sorts its result).
+fn withGlobalRecord(a: std.mem.Allocator, p: *psbt.Psbt, r: psbt.Record) !void {
+    const records = try a.alloc(psbt.Record, p.global.records.len + 1);
+    @memcpy(records[0..p.global.records.len], p.global.records);
+    records[p.global.records.len] = r;
+    p.global.records = records;
+}
+
+test "mutation 2026-11-25: combine rewrites only the TX_MODIFIABLE record with an empty key, on version 2 only" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Version 2: the other global records and a keyed record of the same type stay as `a` has them.
+    var p1 = try v2.create(a, 2, null, 3);
+    try v2.addInput(a, &p1, .{ .txid = txid_a, .vout = 0 });
+    try withGlobalRecord(a, &p1, .{ .keytype = psbt.global_key.TX_MODIFIABLE, .keydata = "x", .value = &.{0x07} });
+    var p2 = try v2.create(a, 2, null, 1);
+    try v2.addInput(a, &p2, .{ .txid = txid_a, .vout = 0 });
+    const m = try psbt.combine(a, p1, p2);
+    try testing.expectEqual(@as(?u8, 1), v2.txModifiable(m));
+    for (p1.global.records) |r| {
+        if (r.keytype == psbt.global_key.TX_MODIFIABLE and r.keydata.len == 0) continue;
+        var found = false;
+        for (m.global.records) |mr| {
+            if (mr.keytype == r.keytype and std.mem.eql(u8, mr.keydata, r.keydata)) {
+                found = true;
+                try testing.expectEqualSlices(u8, r.value, mr.value);
+            }
+        }
+        try testing.expect(found);
+    }
+
+    // Version 0: a stray TX_MODIFIABLE record is `a`'s as it is, not merged.
+    const v0_raw = try hexToBytesAlloc(a, kat.finalize_combined_hex);
+    var q1 = try psbt.parse(a, v0_raw);
+    var q2 = try psbt.parse(a, v0_raw);
+    try withGlobalRecord(a, &q1, .{ .keytype = psbt.global_key.TX_MODIFIABLE, .keydata = "", .value = &.{0x03} });
+    try withGlobalRecord(a, &q2, .{ .keytype = psbt.global_key.TX_MODIFIABLE, .keydata = "", .value = &.{0x01} });
+    const qm = try psbt.combine(a, q1, q2);
+    const flag_rec = qm.global.find(psbt.global_key.TX_MODIFIABLE).?;
+    try testing.expectEqualSlices(u8, &.{0x03}, flag_rec.value);
+}
+
 // ── finalize / extract on version 2 ─────────────────────────────────────
 
 test "a version 2 PSBT of BIP174's finalize example finalizes and extracts to the same transaction" {
