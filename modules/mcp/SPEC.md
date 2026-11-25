@@ -483,6 +483,14 @@ a tool naming a `ui://` resource finds it registered (`UnboundUiResource`), and 
 (`WrongMimeType`). Tests: golden meta text, an end-to-end `tools/list` + `resources/read` + `resources/list`, `verify`, ten
 shapes of the client declaration. The iframe bridge belongs to the host and the view.
 
+**Authorization context (`AuthInfo`, `Server.handleMessageAs`).** A transport that authenticated a request (`mcp-http`'s
+bearer gate, or the consumer's own) passes an `AuthInfo` (client id, subject, scopes, expiry, RFC 8707 resource, an opaque
+`extra`) with the message; every handler of that message sees it as `call.auth` / `req.auth`, as the TypeScript SDK's
+`ctx.http.authInfo` and the Python SDK's `get_access_token()`. It lives on the `Server` only for the call
+(`request_auth`, restored on return), under the same one-owner-at-a-time rule as every `handleMessage*` call, and each
+request context copies the pointer when it is built, so nothing outlives the message. Test: a tool and a resource read
+see it through `handleMessageAs` and not through `handleMessage`.
+
 **MCP Skills (`skills.zig`, SEP-2640, ext-skills `specification/beta/skills.mdx` against base 2026-07-28).** The
 TypeScript SDK 2.4.0 `SkillsExtension` (`load(files)`, `attach(server)`, `loadSkills(folder)`, `SkillSource`) over
 `addMethod`, `addResourceTemplate` and `setCapabilityExtras`:

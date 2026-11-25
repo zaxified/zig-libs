@@ -51,7 +51,7 @@ serves that document at `/.well-known/oauth-protected-resource<path>`, and hands
 the token's `mcp.AuthInfo` to every handler as `call.auth`.
 
 ```zig
-fn verify(_: ?*anyopaque, arena: std.mem.Allocator, token: []const u8) !mcp_http.auth.Verdict {
+fn verify(_: ?*anyopaque, arena: std.mem.Allocator, token: []const u8) error{ OutOfMemory, VerifierFailed }!mcp_http.auth.Verdict {
     const claims = myJwtCheck(arena, token) orelse return .{ .invalid = "Invalid token" };
     return .{ .ok = .{ .subject = claims.sub, .scopes = claims.scopes, .expires_at = claims.exp, .resource = claims.aud } };
 }
