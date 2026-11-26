@@ -2273,3 +2273,149 @@ test "mutation 2026-11-26: DTLS 1.3 server resumes only from a ticket state whos
     try testing.expect(try resumesFromState13(&tkr, 32)); // control: a well-formed state
     try testing.expect(!(try resumesFromState13(&tkr, 31)));
 }
+
+// ── wipes of state and of decrypt output (2026-11-26, burn/wipe batch) ───────────────────────────────
+
+fn allZero(b: []const u8) bool {
+    return std.mem.allEqual(u8, b, 0);
+}
+
+test "mutation 2026-11-26: SessionTicket.wipe and SessionTicket12.wipe clear the stored secret" {
+    var t: conn13.SessionTicket = .{ .suite = .aes_128_gcm_sha256, .psk = @splat(0x11), .ticket = @splat(0xab), .ticket_len = 32, .ticket_age_add = 7, .lifetime_s = 3600, .received_at_s = 0, .max_early_data = 0 };
+    try testing.expect(!allZero(&t.psk));
+    t.wipe();
+    try testing.expect(allZero(&t.psk));
+    var t12: conn13.SessionTicket12 = .{ .suite = .psk_with_aes_128_gcm_sha256, .master = @splat(0x22), .ems = true, .ticket = @splat(0xcd), .ticket_len = 32, .lifetime_hint_s = 0, .received_at_s = 0 };
+    try testing.expect(!allZero(&t12.master));
+    t12.wipe();
+    try testing.expect(allZero(&t12.master));
+}
+
+test "mutation 2026-11-26: DirKeys.wipe clears the key, the IV and the expanded AES-GCM schedule" {
+    inline for (.{ record12.Bulk.aes_128_gcm, record12.Bulk.aes_256_gcm }) |bulk| {
+        var k: record12.DirKeys = .{ .bulk = bulk };
+        for (&k.key, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+        for (&k.iv, 0..) |*b, i| b.* = @truncate(i * 5 + 3);
+        k.prepare();
+        try testing.expect(!allZero(&k.key));
+        try testing.expect(!allZero(&k.iv));
+        try testing.expect(!allZero(std.mem.asBytes(&k.gcm)));
+        k.wipe();
+        try testing.expect(allZero(&k.key));
+        try testing.expect(allZero(&k.iv));
+        try testing.expect(allZero(std.mem.asBytes(&k.gcm)));
+        try testing.expect(k.gcm == .none);
+    }
+}
+
+fn ecdhePskCfg(role: conn13.Role) conn13.Config {
+    var c = pskCfg(role);
+    c.cipher_suites12 = &.{.ecdhe_psk_with_chacha20_poly1305_sha256};
+    return c;
+}
+
+test "mutation 2026-11-26: Connection12 wipes the server's ECDHE secret after the ClientKeyExchange and every secret on deinit" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5d)));
+    const rnd: conn13.Entropy = .{ .seeded_for_test = csprng.random() };
+    var a: [8192]u8 = undefined;
+    var b: [8192]u8 = undefined;
+
+    // ECDHE_PSK: the server holds its ECDHE secret between its first flight and the ClientKeyExchange.
+    var ec = try c12.Connection12.clientInit(ecdhePskCfg(.client));
+    var es = try c12.Connection12.serverInit(ecdhePskCfg(.server));
+    const ch = try ec.startHandshake(rnd, 0, &a);
+    const f1 = try es.handleFlight(ch, rnd, 0, &b);
+    try testing.expect(es.ecdhe_live);
+    try testing.expect(!allZero(&es.ecdhe_secret));
+    const f2 = try ec.handleFlight(f1.out, rnd, 0, &a);
+    _ = try es.handleFlight(f2.out, rnd, 0, &b);
+    try testing.expect(!es.ecdhe_live);
+    try testing.expect(allZero(&es.ecdhe_secret));
+
+    // deinit while the secret is live
+    var ec2 = try c12.Connection12.clientInit(ecdhePskCfg(.client));
+    var es2 = try c12.Connection12.serverInit(ecdhePskCfg(.server));
+    const ch2 = try ec2.startHandshake(rnd, 0, &a);
+    _ = try es2.handleFlight(ch2, rnd, 0, &b);
+    try testing.expect(!allZero(&es2.ecdhe_secret));
+    es2.deinit();
+    try testing.expect(allZero(&es2.ecdhe_secret));
+
+    // deinit of a connected client holding a session ticket: master secret and the ticket's copy
+    var ring = newRing();
+    const tkr: TestTicketer12 = .{ .ring = &ring };
+    var cl = try c12.Connection12.clientInit(pskTicketCfg(.client, &tkr));
+    var sv = try c12.Connection12.serverInit(pskTicketCfg(.server, &tkr));
+    try driveFull(&cl, &sv, rnd);
+    try testing.expect(cl.sessionTicket() != null);
+    try testing.expect(!allZero(&cl.master));
+    try testing.expect(!allZero(&cl.ticket.master));
+    cl.deinit();
+    try testing.expect(allZero(&cl.master));
+    try testing.expect(allZero(&cl.ticket.master));
+}
+
+test "mutation 2026-11-26: DTLS 1.3 server wipes the kept master secret once the client's Finished is processed" {
+    var ring = ring13();
+    const tkr: TestTicketer12 = .{ .ring = &ring };
+    var scfg = certServer13();
+    scfg.tickets = .{ .ticketer = tkr.ticketer() };
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5e)));
+    const rnd: conn13.Entropy = .{ .seeded_for_test = csprng.random() };
+    var cl = try conn13.Connection.clientInit(certClient13());
+    var sv = try conn13.Connection.serverInit(scfg);
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    const ch = try cl.startHandshake(rnd, 0, &b1);
+    const f2 = try sv.handleFlight(ch, rnd, 0, &b2);
+    try testing.expect(sv.master_live);
+    try testing.expect(!allZero(&sv.master_secret));
+    const cf = try cl.handleFlight(f2.out, rnd, 0, &b1);
+    const sf = try sv.handleFlight(cf.out, rnd, 0, &b2);
+    try testing.expect(sf.done);
+    try testing.expect(!sv.master_live);
+    try testing.expect(allZero(&sv.master_secret));
+}
+
+test "mutation 2026-11-26: record12.open and openCid leave no plaintext in `out` when the tag fails" {
+    const pt = "the secret application data, longer than a block";
+    inline for (.{ record12.Bulk.aes_128_gcm, record12.Bulk.aes_256_gcm, record12.Bulk.aes_128_ccm, record12.Bulk.aes_128_ccm_8, record12.Bulk.chacha20_poly1305 }) |bulk| {
+        inline for (.{ false, true }) |prep| {
+            var k: record12.DirKeys = .{ .bulk = bulk };
+            for (&k.key, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+            for (&k.iv, 0..) |*b, i| b.* = @truncate(i * 5 + 3);
+            if (prep) k.prepare();
+            var wire: [256]u8 = undefined;
+            var out: [128]u8 = @splat(0xa5);
+
+            const sealed = try record12.seal(&k, 1, 2, 23, pt, &wire);
+            sealed[sealed.len - 1] ^= 1; // the last tag byte
+            const hdr = try record.decodePlaintext(sealed);
+            try testing.expectError(error.DecryptionFailed, record12.open(&k, hdr, sealed[record.plaintext_header_len..], &out));
+            try testing.expect(allZero(out[0..pt.len]));
+
+            const cid = [_]u8{ 1, 2, 3, 4 };
+            out = @splat(0xa5);
+            const sealed_cid = try record12.sealCid(&k, 1, 2, 23, pt, &cid, &wire);
+            sealed_cid[sealed_cid.len - 1] ^= 1;
+            const ch = try record12.decodeCidHeader(sealed_cid, cid.len);
+            try testing.expectError(error.DecryptionFailed, record12.openCid(&k, ch, sealed_cid[record12.CidHeader.len(cid.len)..][0..ch.length], &out));
+            try testing.expect(allZero(out[0 .. pt.len + 1]));
+        }
+    }
+}
+
+test "mutation 2026-11-26: Connection12.recv wipes the plaintext of a replayed record (RFC 6347 and CID forms)" {
+    inline for (.{ false, true }) |with_cid| {
+        var pair: Pair = undefined;
+        try pair.connect(with_cid);
+        var wire: [256]u8 = undefined;
+        const msg = "replay me, a secret payload";
+        const rec = try pair.client.send(msg, &wire);
+        var out: [128]u8 = undefined;
+        try testing.expectEqualStrings(msg, try pair.server.recv(rec, &out));
+        var out2: [128]u8 = @splat(0xa5);
+        try testing.expectError(error.ReplayedRecord, pair.server.recv(rec, &out2));
+        try testing.expect(allZero(out2[0..msg.len]));
+    }
+}
