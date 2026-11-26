@@ -678,6 +678,35 @@ test "STACKPROBE: no key, blind or nonce residue on the dead stack (decaf448, P-
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
 
+var oprf_server_sink: voprf.OprfServer = undefined;
+noinline fn callServerDeriveInto() void {
+    voprf.OprfServer.deriveInto(&oprf_server_sink, &seed, info) catch unreachable;
+}
+
+// `derive` is not probed: it returns the key by value, and that copy of its own result sits in its
+// frame above any burn (the caller holds it, as with bip32 `neuter`); `deriveInto` is the
+// out-pointer form with no such copy.
+test "mutation 2026-11-25: STACKPROBE: OprfServer.deriveInto leaves no server-key residue on the dead stack" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    for (0..n_cases) |ci| {
+        try setUp(@intCast(ci));
+        // The OPRF-mode server key (a different key from the VOPRF `sk` of setUp).
+        const server = try voprf.OprfServer.derive(&seed, info);
+        var n: Needles = .{};
+        n.addBytes("seed", &seed);
+        n.addBytes("server sk", &server.sk);
+        const dst = comptime "DeriveKeyPair" ++ voprf.contextString(.oprf);
+        var info_len: [2]u8 = undefined;
+        std.mem.writeInt(u16, &info_len, info.len, .big);
+        n.addBytes("wide", &voprf.expandMessageXmd(64, &.{ &seed, &info_len, info, &[1]u8{0} }, dst));
+        addCommon(&n);
+        n.sort();
+        bad += try runProbe("OprfServer.deriveInto", callServerDeriveInto, &n);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
 // ── residue rule (`testkit.stackprobe.residueOf`, 2026-11-23) ───────────────
 //
 // The needles above are a model of the secrets. The shared engine's residue

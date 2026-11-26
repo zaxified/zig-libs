@@ -1678,6 +1678,13 @@ test "serialNumber: Go-strict -- empty, non-minimal, negative or not an INTEGER 
     try testing.expect(!validSerialNumber(&.{}));
 }
 
+test "mutation 2026-11-25: parseShape checks the serial's tag before its value (WrongDataType, not InvalidLength)" {
+    const chain = @import("chain.zig");
+    // 04 01 80: not an INTEGER AND (read as one) negative. The tag check comes first.
+    const cert = testCertWithSerial(&[_]u8{ 0x04, 0x01, 0x80 });
+    try testing.expectError(error.CertificateFieldHasWrongDataType, chain.certSerialAndIssuer(&cert));
+}
+
 // (b) claimed `message_slice` (the bytes `Certificate.Parsed.verify` hashes)
 // is "correct because it comes from two validated tiles" without proof.
 // `std.crypto.Certificate.parse` builds it as

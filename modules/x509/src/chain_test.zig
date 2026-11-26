@@ -1373,3 +1373,50 @@ test "re-audit 2026-10-28: an unreadable anchor past the full parse memo is stil
     // surfaces as NoTrustedPath; without the guard std's parse panics.
     try testing.expectError(error.NoTrustedPath, chain_mod.verifyChain(testing.allocator, &.{leaf}, roots.items, .{ .now_sec = certgen.t_now }));
 }
+
+test "mutation 2026-11-25: diagnostics with several issuer candidates keep the first failure at a depth, a deeper one replaces it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const ca: []const []const u8 = &.{ try g.extCa(null), try g.extKuCa() };
+    const leaf_exts: []const []const u8 = &.{ try g.extSanDns("example.com"), try g.extKuLeaf() };
+    const root_name = try g.name("Test Root");
+    const int_name = try g.name("Test Int");
+    // A: two same-name anchors, neither signed the leaf. Both links fail at
+    // depth 0; the FIRST failure stays (the loop's own note, issuer r1).
+    {
+        const k_leaf = certgen.key(0x65);
+        const k_other = certgen.key(0x66);
+        const k1 = certgen.key(0x71);
+        const k2 = certgen.key(0x72);
+        const r1 = try g.cert(.{ .subject = root_name, .issuer = root_name, .key = &k1, .signer = &k1, .exts = ca });
+        const r2 = try g.cert(.{ .subject = root_name, .issuer = root_name, .key = &k2, .signer = &k2, .exts = ca });
+        const leaf = try g.cert(.{ .subject = try g.name("leaf"), .issuer = root_name, .key = &k_leaf, .signer = &k_other, .exts = leaf_exts });
+        var diag: chain_mod.Diagnostics = .{};
+        try testing.expectError(error.NoTrustedPath, chain_mod.verifyChain(testing.allocator, &.{leaf}, &.{ r1, r2 }, .{ .now_sec = certgen.t_now, .diagnostics = &diag }));
+        try testing.expect(diag.cause != null);
+        try testing.expectEqual(@as(u32, 0), diag.depth);
+        try testing.expectEqualSlices(u8, leaf, diag.subject.?);
+        try testing.expectEqualSlices(u8, r1, diag.issuer.?);
+    }
+    // B: two same-name intermediates; the first fails at depth 0 (the leaf is
+    // not signed by its key), the second passes that link but its own
+    // signature by the root is bad at depth 1. The deeper failure replaces
+    // the shallower one; the later depth-0 note of the second candidate does not.
+    {
+        const k_root = certgen.key(0x61);
+        const k_int = certgen.key(0x62);
+        const k_bad = certgen.key(0x73);
+        const k_wrong = certgen.key(0x74);
+        const root = try g.cert(.{ .subject = root_name, .issuer = root_name, .key = &k_root, .signer = &k_root, .exts = ca });
+        const int_bad = try g.cert(.{ .subject = int_name, .issuer = root_name, .key = &k_bad, .signer = &k_root, .exts = ca });
+        const int_good = try g.cert(.{ .subject = int_name, .issuer = root_name, .key = &k_int, .signer = &k_wrong, .exts = ca });
+        const leaf = try g.cert(.{ .subject = try g.name("leaf"), .issuer = int_name, .key = &certgen.key(0x65), .signer = &k_int, .exts = leaf_exts });
+        var diag: chain_mod.Diagnostics = .{};
+        try testing.expectError(error.NoTrustedPath, chain_mod.verifyChain(testing.allocator, &.{ leaf, int_bad, int_good }, &.{root}, .{ .now_sec = certgen.t_now, .diagnostics = &diag }));
+        try testing.expectEqual(@as(u32, 1), diag.depth);
+        try testing.expectEqualSlices(u8, int_good, diag.subject.?);
+        try testing.expectEqualSlices(u8, root, diag.issuer.?);
+        try testing.expect(diag.cause != null);
+    }
+}

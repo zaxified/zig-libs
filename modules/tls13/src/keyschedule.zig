@@ -1256,3 +1256,43 @@ test "deriveApplicationSecrets equals the application and exporter derivations o
         try testing.expectEqualSlices(u8, &e1, &alias);
     }
 }
+
+// ── 2026-11-25 delta mutation audit: the body's own wipe, probed without the burn ──
+// `verifyFinished` / `verifyPskBinder` burn the stack after their body, which hides a missing
+// `secureZero` of the expected MAC inside the body. Calling the body directly, there is no
+// burn: only the wipe stands between the expected MAC and the dead stack.
+
+const mut_sp = @import("testkit").stackprobe;
+const MutHmac384 = std.crypto.auth.hmac.sha2.HmacSha384;
+var mut_ks_key: [48]u8 = undefined;
+var mut_ks_th: [48]u8 = @splat(0x15);
+var mut_ks_expected: [48]u8 = undefined;
+var mut_ks_wrong: [48]u8 = @splat(0);
+
+fn mutVerifyFinishedBody() bool {
+    return verifyFinishedBody(MutHmac384, &mut_ks_key, &mut_ks_th, &mut_ks_wrong);
+}
+
+test "mutation 2026-11-25: STACKPROBE: verifyFinishedBody leaves no expected MAC on the dead stack (no burn)" {
+    try mut_sp.skipUnlessOptimized();
+    for (&mut_ks_key, 0..) |*b, i| b.* = @truncate(i *% 37 +% 0x4d);
+    computeFinishedVerifyData(MutHmac384, &mut_ks_expected, &mut_ks_key, &mut_ks_th);
+    const P = mut_sp.Probe(.{ .window = 64 * 1024 });
+    _ = try P.run("verifyFinishedBody", mutVerifyFinishedBody, .{}, &[_][]const u8{&mut_ks_expected}, .{ .burn = false, .residue = false });
+}
+
+fn mutVerifyPskBinderBody() bool {
+    return tls13.verifyPskBinderBody(HkdfSha256, HmacSha256, &mut_psk_key, &mut_psk_th, &mut_psk_wrong);
+}
+var mut_psk_key: [32]u8 = undefined;
+var mut_psk_th: [32]u8 = @splat(0x63);
+var mut_psk_expected: [32]u8 = undefined;
+var mut_psk_wrong: [32]u8 = @splat(0);
+
+test "mutation 2026-11-25: STACKPROBE: verifyPskBinderBody leaves no expected binder on the dead stack (no burn)" {
+    try mut_sp.skipUnlessOptimized();
+    for (&mut_psk_key, 0..) |*b, i| b.* = @truncate(i *% 29 +% 0x71);
+    tls13.pskBinder(HkdfSha256, HmacSha256, &mut_psk_expected, &mut_psk_key, &mut_psk_th);
+    const P = mut_sp.Probe(.{ .window = 64 * 1024 });
+    _ = try P.run("verifyPskBinderBody", mutVerifyPskBinderBody, .{}, &[_][]const u8{&mut_psk_expected}, .{ .burn = false, .residue = false });
+}
