@@ -3008,6 +3008,16 @@ test "recovery messages stay valid JSON: control bytes escaped, never half a cha
     }
 }
 
+test "mutation 2026-11-25: recovery messages escape \\b and \\f as \\u00xx, \\t as \\t, and copy a stray 0xff byte verbatim" {
+    // appendJsonStr goes through jsontext with `.tnr` short escapes and
+    // `.verbatim` invalid UTF-8: `.all` would write \b, `.none` \u0009, and
+    // `.replace` would swap the byte for U+FFFD.
+    const gpa = std.testing.allocator;
+    const out = try preprocess(gpa, "{a b\x08\x0c\t\xff}");
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a b\\u0008\\u000c\\t\xff --> missing colon") != null);
+}
+
 test "annotated: a missing-colon message caps the key too" {
     // Review: the plain entry point capped it, the annotated one
     // printed a 200 KB key into its "compact" message.
