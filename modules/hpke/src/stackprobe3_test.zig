@@ -159,31 +159,31 @@ test "mutation 2026-11-25: STACKPROBE: keySchedule, Context.seal and Context.ope
 // ── the schedule's entropy-drawing wrappers (X25519, AES-128-GCM) ───────────
 
 const Setup = schedule.Setup(X, Aes, 32);
-const psk = "0123456789abcdef0123456789abcdef";
+const probe_psk = "0123456789abcdef0123456789abcdef";
 
 fn setupBaseSW(out: *Setup, pkR: X.PublicKey, io: std.Io) !void {
     return schedule.setupBaseS(X, Aes, 32, out, pkR, io, info);
 }
 fn setupPskSW(out: *Setup, pkR: X.PublicKey, io: std.Io) !void {
-    return schedule.setupPskS(X, Aes, 32, out, pkR, io, info, psk, "id");
+    return schedule.setupPskS(X, Aes, 32, out, pkR, io, info, probe_psk, "id");
 }
 fn setupAuthSW(out: *Setup, pkR: X.PublicKey, skS: *const X.KeyPair, io: std.Io) !void {
     return schedule.setupAuthS(X, Aes, 32, out, pkR, skS, io, info);
 }
 fn setupAuthPskSW(out: *Setup, pkR: X.PublicKey, skS: *const X.KeyPair, io: std.Io) !void {
-    return schedule.setupAuthPskS(X, Aes, 32, out, pkR, skS, io, info, psk, "id");
+    return schedule.setupAuthPskS(X, Aes, 32, out, pkR, skS, io, info, probe_psk, "id");
 }
 fn sealBaseW(pkR: X.PublicKey, io: std.Io, out: *[10 + 16]u8) !void {
     _ = try schedule.sealBase(X, Aes, 32, pkR, io, info, "aad", "0123456789", out);
 }
 fn sealPskW(pkR: X.PublicKey, io: std.Io, out: *[10 + 16]u8) !void {
-    _ = try schedule.sealPsk(X, Aes, 32, pkR, io, info, psk, "id", "aad", "0123456789", out);
+    _ = try schedule.sealPsk(X, Aes, 32, pkR, io, info, probe_psk, "id", "aad", "0123456789", out);
 }
 fn sealAuthW(pkR: X.PublicKey, skS: *const X.KeyPair, io: std.Io, out: *[10 + 16]u8) !void {
     _ = try schedule.sealAuth(X, Aes, 32, pkR, skS, io, info, "aad", "0123456789", out);
 }
 fn sealAuthPskW(pkR: X.PublicKey, skS: *const X.KeyPair, io: std.Io, out: *[10 + 16]u8) !void {
-    _ = try schedule.sealAuthPsk(X, Aes, 32, pkR, skS, io, info, psk, "id", "aad", "0123456789", out);
+    _ = try schedule.sealAuthPsk(X, Aes, 32, pkR, skS, io, info, probe_psk, "id", "aad", "0123456789", out);
 }
 
 test "mutation 2026-11-25: STACKPROBE: the setup*S and seal* wrappers that draw their ephemeral leave nothing on the dead stack" {
