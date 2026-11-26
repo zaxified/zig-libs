@@ -451,7 +451,12 @@ const BlindingFactor = union(enum) {
 ///    public `e` only).
 /// 8. `z = (m · x) mod n`.
 /// 9. `blinded_msg = I2OSP(z, modulus_len)`.
-fn blindCore(
+///
+/// `noinline` is load-bearing: `blind` burns with `defer burnStack` in its OWN
+/// frame, so an inlined body would put `r`, `r⁻¹` and `m·r` in that frame,
+/// above the burned region (2026-11-26: a local ReleaseFast build left `r⁻¹`
+/// 17.8 KiB above the burn, where the burned region started).
+noinline fn blindCore(
     pk: rsa.PublicKey,
     comptime Hash: type,
     prepared_msg: []const u8,
