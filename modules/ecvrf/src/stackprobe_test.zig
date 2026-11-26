@@ -269,6 +269,14 @@ noinline fn callKeyPairProve() void {
     const pi = cur_kp.prove(alpha);
     std.mem.doNotOptimizeAway(&pi);
 }
+noinline fn callEll2Prove() void {
+    const pi = ev.ell2.prove(&cur_sk, alpha);
+    std.mem.doNotOptimizeAway(&pi);
+}
+noinline fn callEll2ProveKeyPair() void {
+    const pi = ev.ell2.proveKeyPair(&cur_kp, alpha);
+    std.mem.doNotOptimizeAway(&pi);
+}
 noinline fn callPublicKey() void {
     const pk = ev.publicKey(&cur_sk);
     std.mem.doNotOptimizeAway(&pk);
@@ -322,6 +330,24 @@ test "STACKPROBE: no key or nonce residue on the dead stack after prove and key 
         n.sort();
         bad += try runProbe("prove", callProve, &n);
         bad += try runProbe("KeyPair.prove", callKeyPairProve, &n);
+
+        // The ELL2 suite: its own H, hence its own nonce and response.
+        const h_e = ev.ell2.encodeToCurve(pk, alpha);
+        var k_string_e: [64]u8 = undefined;
+        ev.nonceGenerationString(&k_string_e, &cur_sk, h_e);
+        var k_e: [32]u8 = undefined;
+        ev.nonceGeneration(&k_e, &cur_sk, h_e);
+        const proof_e = ev.ell2.prove(&cur_sk, alpha);
+        const s_e = proof_e[ev.pt_len + ev.c_len ..][0..32].*;
+        const cx_e = Edwards25519.scalar.sub(s_e, k_e);
+        n = .{};
+        keyNeedles(&n);
+        n.addImage("k_string (ELL2)", &k_string_e);
+        addScalar(&n, "k (ELL2)", k_e);
+        addScalar(&n, "c*x (ELL2)", cx_e);
+        n.sort();
+        bad += try runProbe("ell2.prove", callEll2Prove, &n);
+        bad += try runProbe("ell2.proveKeyPair", callEll2ProveKeyPair, &n);
 
         n = .{};
         keyNeedles(&n);

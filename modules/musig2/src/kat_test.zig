@@ -993,3 +993,62 @@ test "deterministicSign: the partial signature completes a session with the othe
     const sig = try musig2.partialSigAgg(&.{ psig_a, det.psig }, ctx);
     try std.testing.expect(bip340.verify(try bip340.XOnlyPublicKey.fromBytes(aggpk), msg, try bip340.Signature.fromBytes(sig)));
 }
+
+test "mutation 2026-11-25: SessionContext.adaptor adds T to the final nonce, nonceNeedsNegation reads its parity, partialSigVerifyAdaptor checks against it" {
+    const Secp256k1 = k256.Secp256k1;
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const msg = "MuSig2 adaptor session";
+    var sks: [2]bip340.SecretKey = undefined;
+    var pks: [2]musig2.PlainPublicKey = undefined;
+    var secnonces: [2]musig2.SecNonce = undefined;
+    var pubnonces: [2]musig2.PubNonce = undefined;
+    for (0..2) |i| {
+        var sk_bytes = @as([32]u8, @splat(0x37));
+        sk_bytes[31] = @intCast(i + 1);
+        sks[i] = try bip340.SecretKey.fromBytes(sk_bytes);
+        pks[i] = try musig2.PlainPublicKey.fromBytes((try Secp256k1.combMulBase(sk_bytes, .big)).toCompressedSec1());
+        var ng: musig2.NonceGenResult = undefined;
+        try musig2.nonceGen(&ng, &sk_bytes, pks[i].bytes, null, msg, null, &@as([32]u8, @splat(@intCast(0x60 + i))), io);
+        secnonces[i] = ng.secnonce;
+        pubnonces[i] = ng.pubnonce;
+    }
+    const aggnonce = try musig2.nonceAgg(&pubnonces);
+    const plain = musig2.SessionContext{ .aggnonce = aggnonce, .pubkeys = &pks, .msg = msg };
+    const sv_plain = try musig2.getSessionValues(plain);
+
+    // R = R' + T for every adaptor point; nonceNeedsNegation is the parity of
+    // that R's y, and over a few adaptor points both parities occur.
+    var seen_odd = false;
+    var seen_even = false;
+    for (1..17) |t| {
+        var t_bytes: [32]u8 = @splat(0);
+        t_bytes[31] = @intCast(t);
+        const t_point = try Secp256k1.combMulBase(t_bytes, .big);
+        const T = try musig2.PlainPublicKey.fromBytes(t_point.toCompressedSec1());
+        var ctx = plain;
+        ctx.adaptor = T;
+        const sv = try musig2.getSessionValues(ctx);
+        const want = sv_plain.r.add(t_point);
+        try std.testing.expectEqualSlices(u8, &want.toCompressedSec1(), &sv.r.toCompressedSec1());
+        const odd = sv.r.affineCoordinates().y.isOdd();
+        try std.testing.expectEqual(odd, try musig2.nonceNeedsNegation(ctx));
+        if (odd) seen_odd = true else seen_even = true;
+    }
+    try std.testing.expect(seen_odd and seen_even);
+
+    // A session with an adaptor: the partial signatures verify against it and
+    // only against it.
+    var t_bytes: [32]u8 = @splat(0);
+    t_bytes[31] = 5;
+    const T = try musig2.PlainPublicKey.fromBytes((try Secp256k1.combMulBase(t_bytes, .big)).toCompressedSec1());
+    var ctx = plain;
+    ctx.adaptor = T;
+    const psig = try musig2.sign(&secnonces[0], &sks[0], ctx);
+    try musig2.partialSigVerifyAdaptor(psig, &pubnonces, &pks, &.{}, msg, T, 0);
+    try std.testing.expectError(error.InvalidPartialSignature, musig2.partialSigVerify(psig, &pubnonces, &pks, &.{}, msg, 0));
+    try std.testing.expectError(error.InvalidPartialSignature, musig2.partialSigVerifyAdaptor(psig, &pubnonces, &pks, &.{}, msg, null, 0));
+}

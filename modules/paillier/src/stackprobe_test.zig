@@ -113,7 +113,9 @@ inline fn measure(call: *const fn () void) void {
     paint();
     shim(call);
     snapshot();
-    if (call != &callInnocent and call != &callLeaky) residueCheck("a call `measure` ran");
+    // `pack`/`unpack` have no stack burn (their buffer is wiped by a defer, judged by the needle
+    // probe above): the residue rule judges burns, so a call without one is not measured here.
+    if (call != &callInnocent and call != &callLeaky and call != &callPack and call != &callUnpack) residueCheck("a call `measure` ran");
 }
 
 // ── needles ──────────────────────────────────────────────────────────────
@@ -250,7 +252,18 @@ const Io = struct {
     c: paillier.Ciphertext = undefined,
     c2: paillier.Ciphertext = undefined,
     plain: Fe = undefined,
+    packed_m: Fe = undefined,
+    packed_be: [paillier.modulus_bytes]u8 = undefined,
+    fp: paillier.KeyPair = undefined,
 };
+const pack_bits = 40;
+var pack_vals: [51]u64 = undefined;
+var unpack_out: [51]u64 = undefined;
+// Two 256-bit primes (openssl prime -generate), for `fromPrimes`.
+const fp_p_hex = "EFD3A86E148DB4D8B39B1A8DC26D62069BAE6C62E68C9E2AA993EB86E821A9EB";
+const fp_q_hex = "D187292DD392716662DF590F78650E1F7D6B56A6035482F890ED56DF06C0FB33";
+var fp_p: [32]u8 = undefined;
+var fp_q: [32]u8 = undefined;
 var io: Io = .{};
 
 noinline fn callGenerate() void {
@@ -279,6 +292,15 @@ noinline fn callDecrypt() void {
 }
 noinline fn callDecryptNoCrt() void {
     paillier.decrypt(&io.sk_back, io.c, &io.plain) catch @panic("decrypt (no CRT)");
+}
+noinline fn callPack() void {
+    io.packed_m = paillier.pack(io.kp.public, &pack_vals, pack_bits) catch @panic("pack");
+}
+noinline fn callUnpack() void {
+    paillier.unpack(io.kp.public, &io.packed_m, pack_bits, &unpack_out) catch @panic("unpack");
+}
+noinline fn callFromPrimes() void {
+    paillier.fromPrimes(&fp_p, &fp_q, &io.fp) catch @panic("fromPrimes");
 }
 noinline fn callAddPlaintext() void {
     io.c2 = paillier.addPlaintext(io.kp.public, io.c, &io.m) catch @panic("addPlaintext");
@@ -326,6 +348,11 @@ test "STACKPROBE: no Paillier secret on the dead stack after any entry point" {
     prng.random().bytes(&buf);
     io.k = try Fe.fromBytes(io.kp.public.n_sq, &buf, .big);
     try io.kp.public.nToBytes(&io.n_be);
+    for (&pack_vals) |*v| v.* = prng.random().int(u64) & ((@as(u64, 1) << pack_bits) - 1);
+    io.packed_m = try paillier.pack(io.kp.public, &pack_vals, pack_bits);
+    try io.packed_m.toBytes(&io.packed_be, .big);
+    _ = try std.fmt.hexToBytes(&fp_p, fp_p_hex);
+    _ = try std.fmt.hexToBytes(&fp_q, fp_q_hex);
 
     const F = struct {
         fn key(n: *Needles) void {
@@ -342,6 +369,15 @@ test "STACKPROBE: no Paillier secret on the dead stack after any entry point" {
             n.addRaw("r", std.mem.asBytes(&io.r));
             n.addRaw("k", std.mem.asBytes(&io.k));
             n.addRaw("decrypted", std.mem.asBytes(&io.plain));
+        }
+        fn packedPt(n: *Needles) void {
+            key(n);
+            n.addRaw("packed plaintext BE", &io.packed_be);
+        }
+        fn fromPrimesNeedles(n: *Needles) void {
+            addSecretKey(n, &io.fp.secret);
+            n.addRaw("p", &fp_p);
+            n.addRaw("q", &fp_q);
         }
         fn back(n: *Needles) void {
             plain(n);
@@ -374,10 +410,12 @@ test "STACKPROBE: no Paillier secret on the dead stack after any entry point" {
     total += probeCall("rerandomize", callRerandomize, F.plain);
     total += probeCall("decrypt (CRT)", callDecrypt, F.plain);
     total += probeCall("decrypt (no CRT)", callDecryptNoCrt, F.back);
+    total += probeCall("pack", callPack, F.packedPt);
+    total += probeCall("unpack", callUnpack, F.packedPt);
+    total += probeCall("fromPrimes", callFromPrimes, F.fromPrimesNeedles);
     total += probeCall("addPlaintext", callAddPlaintext, F.plain);
     total += probeCall("mulPlaintext", callMulPlaintext, F.plain);
-    // `fromPrimes` is `generate`'s last step (`fromPrimesImpl`), measured
-    // there: the module has no 1024-bit prime fixture to call it with.
+    // `fromPrimes` is also measured on its own, with two 256-bit primes.
     if (verbose or total != 0) std.debug.print("TOTAL residue copies: {d}\n", .{total});
     try std.testing.expectEqual(@as(usize, 0), total);
 }
