@@ -2496,6 +2496,47 @@ test "extra: the many-fields path agrees with the plain scan on repeats, case fo
     for (0..extra.len) |i| try testing.expectEqual(extraRenderable(&extra, i), seen.renderable(&extra, i));
 }
 
+/// Both writers on `extra` as given and on the fields the plain scan keeps: the bytes must agree.
+fn expectExtraLikePlainScan(extra: []const Field) !void {
+    var kept: [64]Field = undefined;
+    var n: usize = 0;
+    for (0..extra.len) |i| if (extraRenderable(extra, i)) {
+        kept[n] = extra[i];
+        n += 1;
+    };
+    var jb: [8192]u8 = undefined;
+    var lb: [8192]u8 = undefined;
+    var e = sampleEntry();
+    e.extra = extra;
+    const got = try renderBoth(e, &jb, &lb);
+    var jb2: [8192]u8 = undefined;
+    var lb2: [8192]u8 = undefined;
+    e.extra = kept[0..n];
+    const want = try renderBoth(e, &jb2, &lb2);
+    try testing.expectEqualStrings(want.json, got.json);
+    try testing.expectEqualStrings(want.logfmt, got.logfmt);
+}
+
+test "mutation 2026-11-25: extra: few fields never consult the filter; many fields prime it from the first sixteen" {
+    var store: [40][8]u8 = undefined;
+    var extra: [40]Field = undefined;
+    // Up to sixteen fields: every key repeated in another case (the filter holds no data here).
+    for (0..8) |i| {
+        extra[i] = .{ .key = std.mem.print(&store[i], "g{d}", .{i}) catch unreachable, .value = "v" };
+        extra[8 + i] = .{ .key = std.mem.print(&store[8 + i], "G{d}", .{i}) catch unreachable, .value = "w" };
+    }
+    try expectExtraLikePlainScan(extra[0..16]);
+    // Past sixteen: the first sixteen unique, field 16 unique and repeated by 17,
+    // then repeats of the first sixteen in another case, and a key past the 64-byte limit.
+    for (0..16) |i| extra[i] = .{ .key = std.mem.print(&store[i], "g{d}", .{i}) catch unreachable, .value = "v" };
+    extra[16] = .{ .key = "h16", .value = "v" };
+    extra[17] = .{ .key = "H16", .value = "w" };
+    for (0..10) |i| extra[18 + i] = .{ .key = std.mem.print(&store[18 + i], "G{d}", .{i}) catch unreachable, .value = "w" };
+    extra[28] = .{ .key = strRepeat("a", 70), .value = "v" };
+    extra[29] = .{ .key = "tail", .value = "v" };
+    try expectExtraLikePlainScan(extra[0..30]);
+}
+
 test "extra: empty, and a list of only unusable keys, change no output byte" {
     var jb: [1024]u8 = undefined;
     var lb: [1024]u8 = undefined;

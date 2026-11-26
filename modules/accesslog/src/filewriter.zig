@@ -780,6 +780,39 @@ test "RotatingFile: a failing slice keeps the size of the slices that did reach 
     try testing.expectEqual(@as(u64, 60), st.size);
 }
 
+test "mutation 2026-11-25: write() cuts a short write off the file; a failure that wrote nothing leaves it alone" {
+    const posix = std.posix;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "s.log", .{ .max_size = 0 });
+    defer rf.close();
+    try rf.write("0123456789");
+    // The method (not the Writer): the file size limit lets 90 of the next 100 bytes through.
+    const ign: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
+    var old_act: posix.Sigaction = undefined;
+    posix.sigaction(.XFSZ, &ign, &old_act);
+    defer posix.sigaction(.XFSZ, &old_act, null);
+    const old = try posix.getrlimit(.FSIZE);
+    try posix.setrlimit(.FSIZE, .{ .cur = 100, .max = old.max });
+    defer posix.setrlimit(.FSIZE, old) catch {};
+    const c: [100]u8 = @splat('c');
+    if (rf.write(&c)) |_| return error.TestUnexpectedResult else |_| {}
+    try posix.setrlimit(.FSIZE, old);
+    try testing.expect(rf.last_write_error != null);
+    try testing.expectEqual(@as(u64, 10), rf.size);
+    const st = try (rf.file orelse return error.TestUnexpectedResult).stat(testing.io);
+    try testing.expectEqual(@as(u64, 10), st.size);
+
+    // A write that fails without a short write (a read-only descriptor) is not
+    // followed by a truncation: that would only add a second failure.
+    const writable = rf.file orelse return error.TestUnexpectedResult;
+    rf.file = try tmp.dir.openFile(testing.io, "s.log", .{});
+    writable.close(testing.io);
+    if (rf.write("abc")) |_| return error.TestUnexpectedResult else |_| {}
+    const st2 = try (rf.file orelse return error.TestUnexpectedResult).stat(testing.io);
+    try testing.expectEqual(@as(u64, 10), st2.size);
+}
+
 test "RotatingFile: the Writer after close is WriteFailed, never a panic, even when it would rotate (audit H F1)" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

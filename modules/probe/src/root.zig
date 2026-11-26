@@ -1704,6 +1704,31 @@ test "live: probe a self-bound TCP listener → up" {
     try testing.expect(r.addr.?.eql(.{ .v4 = .{ 127, 0, 0, 1 } }));
 }
 
+test "mutation 2026-11-25: LiveConnector, bounded, passes no timeout for a zero budget; a host name std refuses is .error" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var addr = net.IpAddress.parse("127.0.0.1", 0) catch return error.SkipZigTest;
+    var server = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
+    defer server.socket.close(io);
+    const port = server.socket.address.ip4.port;
+
+    // `bounded` hands the budget to the connect, but a zero budget means "no
+    // budget": no `ConnectOptions.timeout` at all. `std.Io.Threaded` panics on
+    // any timeout (see `LiveConnector`), so a timeout set here would abort.
+    var lc: LiveConnector = .{ .io = io, .bounded = true };
+    const up = LiveConnector.connectImpl(&lc, .{ .host = "127.0.0.1", .port = port }, 0);
+    try testing.expectEqual(Status.up, up.status);
+
+    // A name `net.HostName.init` refuses (longer than a DNS name) is `.error`,
+    // decided before any lookup or connect; `.refused` is the definitive
+    // negative and must not be claimed for it.
+    const long: [300]u8 = @splat('a');
+    const bad = LiveConnector.connectImpl(&lc, .{ .host = &long, .port = port }, std.time.ns_per_s);
+    try testing.expectEqual(Status.@"error", bad.status);
+}
+
 test "overBudget: a slow success is a timeout, not an up" {
     // `LiveConnector` cannot abort the connect syscall, so the budget is
     // enforced on the outcome. Before this, `timeout_ns` was discarded and a
