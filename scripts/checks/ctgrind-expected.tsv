@@ -1880,8 +1880,8 @@ tenantkex	ReleaseFast	xx	1	9	7a4de1113a002fd8	e3759d838e3b1880
 # bytes (unicode.zig `utf8CountCodepoints`, ASCII fast path then a decode per sequence): pin
 # 1 -> 0 with the mask-only utf8CountCt (one verdict; the harness marks that
 # returned verdict defined before its own `try`).
-ctap2	ReleaseFast	pin	1	0	1a774f0de6a12bd1	01e08eb2902d2802
-ctap2	ReleaseFast	token	1	0	1a774f0de6a12bd1	e927dca40cedb432
+ctap2	ReleaseFast	pin	1	0	e20d2cc588863de8	01e08eb2902d2802
+ctap2	ReleaseFast	token	1	0	e20d2cc588863de8	e927dca40cedb432
 # base32 (2026-10-10) — encode: a tainted 20-byte secret (+ 1..4-byte tails)
 # through encode, std/hex alphabets, padded/unpadded, upper/lower case: 0.
 # decode: the tainted encoded text through decode (padding required/optional,
@@ -2016,11 +2016,11 @@ xmss	ReleaseFast	sign	1	2	aa27b304fc4c6fd9	eb0cb3d6777ae4c6
 # the seed but published in the signature. Same artefact as xmss.
 # 2026-11-23 (RFC 9858 sets, hash dispatched per family): hss 6 -> 4, the same
 # otsSign chain-loop context at one code location instead of two inlined copies.
-lms	ReleaseFast	lms	1	4	58bda66eb8526cf3	570900fe0d49b5a9
-lms	ReleaseFast	hss	1	4	58bda66eb8526cf3	43dd64bf2e77e52a
+lms	ReleaseFast	lms	1	4	069ba7b85280529e	570900fe0d49b5a9
+lms	ReleaseFast	hss	1	4	069ba7b85280529e	43dd64bf2e77e52a
 # RFC 9858 sets (2026-11-23): SHAKE256/256 and SHA-256/192 H5/W4, the same 4 otsSign chain-loop contexts.
-lms	ReleaseFast	shake	1	4	58bda66eb8526cf3	7e6656d92a385acb
-lms	ReleaseFast	n24	1	4	58bda66eb8526cf3	7444bf492bb5ddf0
+lms	ReleaseFast	shake	1	4	069ba7b85280529e	7e6656d92a385acb
+lms	ReleaseFast	n24	1	4	069ba7b85280529e	7444bf492bb5ddf0
 # timelock_envelope (2026-10-10) — kdf: s_time + s_pq through deriveKeys and
 # deriveStreamKey: 0. env: Envelope128 seal (randomness + plaintext tainted)
 # and open (HQC dk tainted). 8, none in this module's own code: the AEAD
@@ -2239,9 +2239,9 @@ jwt	ReleaseFast	rsa	1	3	92956f261e8c1e2f	f2bee89c3c58cdaf
 #    → pcMul16 `rejectIdentity` and → `PublicKey.fromBytes`, and the
 #    `timing_safe.eql` verdict "derived public half == stored public half"
 #    (NonCanonical or not). `fromSecretKey` is no longer called.
-minisign	ReleaseFast	sign	1	2	31c3876418f14bba	812c5ebd56623021
-minisign	ReleaseFast	seal	1	2	31c3876418f14bba	d241260799cd24a3
-minisign	ReleaseFast	open	1	6	31c3876418f14bba	1876f3ea9f53cddd
+minisign	ReleaseFast	sign	1	2	354b4fb14436cb8d	812c5ebd56623021
+minisign	ReleaseFast	seal	1	2	354b4fb14436cb8d	d241260799cd24a3
+minisign	ReleaseFast	open	1	6	354b4fb14436cb8d	1876f3ea9f53cddd
 # aaa-gate (2026-10-17) — the secrets are the gate's stored SHA-256 fingerprints
 # (tokens, API keys, Basic user:password), tainted in place; the presented value
 # is the client's own and the verdict is public. Each target verifies a good and
@@ -2516,8 +2516,8 @@ dtls	ReleaseFast	hs12	1	48	f663be99d2675b9d	d87712f4d6e60179	cpu=x86_64
 quic-crypto	ReleaseFast	aes	1	84	a9cfcb477cfbd6ba	4d96b4e7d3af1ed7	cpu=x86_64 control=3 trap=37
 aeskw	ReleaseFast	wrap	1	694	88dac35c72f0539b	23036d19c2656c6a	cpu=x86_64 control=8 trap=28
 aeadframe	ReleaseFast	aes	1	157	fcb76a730014f644	9e2cdfce46f95d92	cpu=x86_64 control=4 trap=4
-ctap2	ReleaseFast	pin	1	100	1a774f0de6a12bd1	01e08eb2902d2802	cpu=x86_64 control=6 trap=6
-ctap2	ReleaseFast	token	1	68	1a774f0de6a12bd1	e927dca40cedb432	cpu=x86_64 control=4 trap=4
+ctap2	ReleaseFast	pin	1	100	e20d2cc588863de8	01e08eb2902d2802	cpu=x86_64 control=6 trap=6
+ctap2	ReleaseFast	token	1	68	e20d2cc588863de8	e927dca40cedb432	cpu=x86_64 control=4 trap=4
 dnp3	ReleaseFast	keys	1	121	7f24eea64435e887	d2337903af778cbe	cpu=x86_64 control=2 trap=6
 # dnp3 keys5 on x86_64 (2026-11-19): tainted in-file 121, identical to keys
 # (nothing extra in sa.zig). control=4: std/Io/Writer.zig `printHex` (printing).
