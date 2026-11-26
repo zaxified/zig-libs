@@ -196,3 +196,24 @@ test "writeMessage/readMessage: a too small out buffer is refused at every stage
     try expectBufferEdges(patterns.IN, "");
     try expectBufferEdges(patterns.IN, "hello");
 }
+
+test "mutation 2026-11-25: CipherState.wipe zeroes the key and the nonce counter and empties the state" {
+    const S = TestSuite;
+    var cs: S.CipherState = .{};
+    const key: [32]u8 = @splat(9);
+    cs.initializeKey(&key);
+    var out: [4 + S.TAGLEN]u8 = undefined;
+    try cs.encryptWithAd("", "abcd", &out);
+    try cs.encryptWithAd("", "abcd", &out);
+    try testing.expectEqual(@as(u64, 2), cs.n);
+    cs.wipe();
+    try testing.expectEqual(@as(u64, 0), cs.n);
+    try testing.expect(!cs.hasKey());
+    try testing.expect(std.mem.allEqual(u8, &cs.k, 0));
+    // Empty again: encrypt is the identity, and re-keying starts a fresh counter.
+    var plain: [4]u8 = undefined;
+    try cs.encryptWithAd("", "abcd", &plain);
+    try testing.expectEqualSlices(u8, "abcd", &plain);
+    cs.initializeKey(&key);
+    try testing.expectEqual(@as(u64, 0), cs.n);
+}

@@ -116,3 +116,36 @@ test "STACKPROBE: per-packet AEAD and header-protection masks leave no key resid
     _ = try P.run("computeMaskAes 256", maskAes, .{ @as([]const u8, &key32), sample }, &.{&key32}, .{});
     _ = try P.run("computeMaskChaCha20", maskChacha, .{ @as([]const u8, &key32), sample }, &.{&key32}, .{});
 }
+
+var kd_gcm: Gcm.Keyed = undefined;
+var kd_chacha: Chacha.Keyed = undefined;
+fn kdGcmSeal(p: []const u8, o: []u8) !usize {
+    return kd_gcm.seal(7, &hdr, p, o);
+}
+fn kdGcmOpen(c: []const u8, o: []u8) !usize {
+    return kd_gcm.open(7, &hdr, c, o);
+}
+fn kdChachaSeal(p: []const u8, o: []u8) !usize {
+    return kd_chacha.seal(7, &hdr, p, o);
+}
+fn kdChachaOpen(c: []const u8, o: []u8) !usize {
+    return kd_chacha.open(7, &hdr, c, o);
+}
+
+test "mutation 2026-11-25: STACKPROBE: Keyed seal/open leave no key residue on the dead stack" {
+    try sp.skipUnlessOptimized();
+    fill();
+    // The Keyed objects are globals (init in place); the key schedule lives
+    // there, only the per-packet frames must be burned.
+    Gcm.Keyed.initInto(&kd_gcm, &key16, iv);
+    Chacha.Keyed.initInto(&kd_chacha, &key32, iv);
+    defer kd_gcm.wipe();
+    defer kd_chacha.wipe();
+
+    _ = try P.run("Keyed(Aes128Gcm).seal", kdGcmSeal, .{ &pt, &ct }, &.{&key16}, .{});
+    const n1 = try kdGcmSeal(&pt, &ct);
+    _ = try P.run("Keyed(Aes128Gcm).open", kdGcmOpen, .{ ct[0..n1], &back }, &.{&key16}, .{});
+    _ = try P.run("Keyed(ChaCha20Poly1305).seal", kdChachaSeal, .{ &pt, &ct }, &.{&key32}, .{});
+    const n2 = try kdChachaSeal(&pt, &ct);
+    _ = try P.run("Keyed(ChaCha20Poly1305).open", kdChachaOpen, .{ ct[0..n2], &back }, &.{&key32}, .{});
+}
