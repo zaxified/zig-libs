@@ -6,7 +6,7 @@
 
 **Scope:** core — Apache Arrow C++ / pyarrow (apache/arrow 26.0.1; arrow-rs `arrow-ipc` 60.1.0 as the closest-shaped permissive one) (surveyed 2026-11-17)
 
-**Audit:** review 2026-11-17 · mutation 2026-11-17 (454/494, 36 eq) · src 60f8533af681c34f
+**Audit:** review 2026-11-17 · mutation 2026-11-25 (499/545, 42 eq) · src 6058fe9e8655ee1e
 
 **Hardening:** fuzz 2026-11-17 (ARROW_FUZZ, harness `read`: 350k seeds, clean, re-run after the review fixes; again after the metadata / projection / Decimal32-256 / RunEndEncoded / view-type wave: 200k seeds in 24 s ReleaseSafe, clean; again after Map on read and the run-end metadata fold: 200k seeds in 35 s ReleaseSafe, clean, the Map golden reached; again after dictionary replacement and nested dictionaries: 200k seeds in 28 s ReleaseSafe, clean, the nested and shared dictionary goldens and a replacement stream reached; again after LZ4_FRAME and the dictionary-before-batch rule: 200k seeds in 19 s ReleaseSafe, clean, both LZ4 goldens and lz4-written streams in the corpus, the LZ4 stream and file goldens reached; again after the LZ4 level mapping and the ZSTD declared-0 rule: 200k seeds in 20 s ReleaseSafe, clean; reach: frames, files, batches, every error kind incl. InvalidUtf8 and UnknownColumn, frames from compressed inputs, projected frames, metadata reads, frames from the custom_metadata, Decimal32, Decimal256, RunEndEncoded, BinaryView/Utf8View, ListView, Map, nested and shared dictionary goldens, a dictionary replacement stream, LZ4 stream and file goldens; resource shapes the driver cannot make are in `src/hostile_test.zig`) · panic 2026-11-21 (sweep of the IPC reader and writer, then read again from scratch the same day by a second agent that had not written it, scope `fb`, `ipc`, `schema` in full and the whole reader and the writer's size and offset arithmetic of `stream`, nothing further found: every `unreachable` / `assert` / `.?` / `@intCast` / unchecked slice on attacker bytes or a caller-supplied frame in `fb`, `ipc`, `schema`, `stream`; the reader's offsets, vtables, lengths, counts and buffer ranges were already checked before use; `fb.Builder` and `ipc.writeMessage` contract asserts are now checked panics with a message, a `pushOffset` and `writeMessage` size edge is `OutOfMemory`, two length sums saturate; no other finding) · ct n/a — parses and writes data files, holds no secret
 
@@ -374,6 +374,11 @@ reads one batch on its own.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it (schemata over `fb.zig`, `schema.zig`, `ipc.zig`, `stream.zig`; the coverage-guided
   `testing.fuzz` entry point is skipped in the mutation copy).
+- **Delta mutation 2026-11-25:** 51 mutants, 45 killed (one as a hang), 6 equivalent (`swapBuf` / `swapField` guards
+  `checkBatch` makes unreachable; two operands that are themselves checked panics; `padded` is a multiple of 8 and
+  `maxInt(u32)` is odd), 0 open. New tests: builder and `writeMessage` contract panics (forked child), a builder at
+  the 2^32-byte limit, `writeMessage` checks before it allocates, length saturation at 2^63-1, big-endian views and
+  list views.
 - **Bench** (`zig build bench-arrow`, needs the pyarrow venv of `tools/interop.zig`'s header): `tools/bench.zig` against pyarrow 26.0.1
   on a 1 M-row table (Int64 with a null in every 13th row, Float64, Utf8), IPC stream of 65 536-row batches, single-threaded,
   alternating rounds, best of five: `write` 12.8x and `read` (chunks combined into contiguous columns, as a Frame holds them)

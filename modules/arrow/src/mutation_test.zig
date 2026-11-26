@@ -30,7 +30,7 @@ const Violation = enum {
 
 /// Does one contract violation and returns 0 if it survived (it must not).
 fn violate(v: Violation) u8 {
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: runs in a forked child that must panic; no leak check applies
     var b = fb.Builder.init(gpa);
     switch (v) {
         .string_in_table => {
