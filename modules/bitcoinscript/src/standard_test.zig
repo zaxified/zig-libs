@@ -173,3 +173,56 @@ test "extractDestination" {
     try t.expect(S.extractDestination(&[_]u8{0x6a}) == null);
     try t.expect(S.extractDestination(&[_]u8{0x51}) == null);
 }
+
+test "mutation 2026-11-25: solve rejects every one-byte deviation of the fixed templates and the 17th-key shapes" {
+    // P2SH: each of the three fixed bytes, and a longer script.
+    const p2sh = [_]u8{ 0xa9, 0x14 } ++ h20 ++ [_]u8{0x87};
+    var a0 = p2sh;
+    a0[0] = 0xaa;
+    var a1 = p2sh;
+    a1[1] = 0x15;
+    var a22 = p2sh;
+    a22[22] = 0x88;
+    const alonger = p2sh ++ [_]u8{0x00};
+    for ([_][]const u8{ &a0, &a1, &a22, &alonger }) |s| try t.expect(S.solve(s) == .nonstandard);
+    // Witness programs: the version and the length gate each template.
+    try t.expect(S.solve(&([_]u8{ 0x51, 0x14 } ++ h20)) == .witness_unknown); // v1, 20 bytes
+    try t.expect(S.solve(&([_]u8{ 0x52, 0x20 } ++ h32)) == .witness_unknown); // v2, 32 bytes
+    try t.expect(S.solve(&([_]u8{ 0x00, 0x21 } ++ rep(0, 33))) == .nonstandard); // v0, 33 bytes
+    try t.expect(S.solve(&[_]u8{ 0x52, 0x02, 0x4e, 0x73 }) == .witness_unknown); // v2 with the anchor program
+    try t.expect(S.solve(&[_]u8{ 0x51, 0x02, 0x00, 0x73 }) == .witness_unknown); // v1, other first byte
+    // Bare pubkey: header byte, trailing byte, longer script.
+    const pk65 = [_]u8{65} ++ key65 ++ [_]u8{0xac};
+    var p65h = pk65;
+    p65h[0] = 0x42;
+    var p65e = pk65;
+    p65e[66] = 0xad;
+    try t.expect(S.solve(&pk65) == .pubkey);
+    try t.expect(S.solve(&p65h) == .nonstandard);
+    try t.expect(S.solve(&p65e) == .nonstandard);
+    try t.expect(S.solve(&(pk65 ++ [_]u8{0x00})) == .nonstandard);
+    const pk33 = [_]u8{33} ++ key33 ++ [_]u8{0xac};
+    var p33h = pk33;
+    p33h[0] = 0x20;
+    try t.expect(S.solve(&pk33) == .pubkey);
+    try t.expect(S.solve(&p33h) == .nonstandard);
+    try t.expect(S.solve(&(pk33 ++ [_]u8{0x00})) == .nonstandard);
+    // P2PKH: each fixed byte and a longer script.
+    const p2pkh = [_]u8{ 0x76, 0xa9, 0x14 } ++ h20 ++ [_]u8{ 0x88, 0xac };
+    try t.expect(S.solve(&p2pkh) == .pubkeyhash);
+    var k0 = p2pkh;
+    k0[0] = 0x77;
+    var k1 = p2pkh;
+    k1[1] = 0xaa;
+    var k2 = p2pkh;
+    k2[2] = 0x15;
+    for ([_][]const u8{ &k0, &k1, &k2, &(p2pkh ++ [_]u8{0x00}) }) |s| try t.expect(S.solve(s) == .nonstandard);
+    // Bare multisig: a 66-byte "uncompressed" key is no key; the closing opcode must be OP_CHECKMULTISIG.
+    const key66 = key65 ++ [_]u8{0x00};
+    const bad_key = [_]u8{ 0x51, 66 } ++ key66 ++ [_]u8{ 0x51, 0xae };
+    try t.expect(S.solve(&bad_key) == .nonstandard);
+    const verify_form = [_]u8{ 0x51, 33 } ++ key33 ++ [_]u8{ 0x51, 0xaf };
+    try t.expect(S.solve(&verify_form) == .nonstandard);
+    const good = [_]u8{ 0x51, 33 } ++ key33 ++ [_]u8{ 0x51, 0xae };
+    try t.expect(S.solve(&good) == .multisig);
+}

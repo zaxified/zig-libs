@@ -417,3 +417,42 @@ test "invert: x·x⁻¹ ≡ 1 for random x and edges; invert(0) == 0" {
         }
     }
 }
+
+fn signedToInt(comptime S: type, v: S.Signed62) i2048 {
+    var r: i2048 = 0;
+    var i: usize = S.L;
+    while (i > 0) {
+        i -= 1;
+        r = (r << 62) + v[i];
+    }
+    return r;
+}
+
+test "mutation 2026-11-25: updateDE keeps d and e inside (-2m, m) through a whole inversion" {
+    const m = moduli[0];
+    const S = Safegcd(m);
+    const mm: i2048 = @intCast(m);
+    var prng = std.Random.DefaultPrng.init(0xde_e0_2b);
+    const rand = prng.random();
+    for (0..400) |round| {
+        var x: S.Word = undefined;
+        rand.bytes(std.mem.asBytes(&x));
+        if (round % 4 == 1) x[S.words - 1] >>= 40; // short inputs too
+        var d: S.Signed62 = @splat(0);
+        var e: S.Signed62 = @splat(0);
+        e[0] = 1;
+        var f = S.modulus;
+        var g = S.fromWords(x);
+        var zeta: i64 = -1;
+        for (0..S.batches) |_| {
+            const step = divsteps59(zeta, @bitCast(f[0]), @bitCast(g[0]));
+            zeta = step.zeta;
+            S.updateDE(&d, &e, step.t);
+            S.updateFG(&f, &g, step.t);
+            const dv = signedToInt(S, d);
+            const ev = signedToInt(S, e);
+            try std.testing.expect(dv > -2 * mm and dv < mm);
+            try std.testing.expect(ev > -2 * mm and ev < mm);
+        }
+    }
+}

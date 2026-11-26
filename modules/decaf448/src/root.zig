@@ -76,6 +76,7 @@ test {
     _ = gate;
     _ = scalar;
     _ = @import("modinv.zig");
+    _ = @import("mutation_test.zig");
     _ = element;
     _ = hash;
     _ = @import("kat_vectors.zig");

@@ -748,3 +748,24 @@ test "CHECKMULTISIG: key and signature counts one larger than the stack are refu
     try expectEvalError("21 CHECKMULTISIG", error.PubkeyCount);
     try expectEvalError("-1 CHECKMULTISIG", error.PubkeyCount);
 }
+
+test "mutation 2026-11-25: taproot initial stack of exactly 1000 elements runs; 1001 is StackSize" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const drops: [1000]u8 = @splat(0x75); // OP_DROP
+    // 1000 initial elements, 999 drops: one truthy element is left.
+    const s999 = try leafSetup(a, drops[0..999]);
+    var w999: [1002][]const u8 = undefined;
+    for (w999[0..1000]) |*e| e.* = "\x01";
+    w999[1000] = drops[0..999];
+    w999[1001] = &s999.control_block;
+    try vs2(a, &s999.script_pubkey, &w999, s999.ctx);
+    // 1001 initial elements: refused with StackSize (not CleanStack, and not run).
+    const s1000 = try leafSetup(a, &drops);
+    var w1000: [1003][]const u8 = undefined;
+    for (w1000[0..1001]) |*e| e.* = "\x01";
+    w1000[1001] = &drops;
+    w1000[1002] = &s1000.control_block;
+    try testing.expectError(error.StackSize, verify.verifyScript(a, &.{}, &s1000.script_pubkey, &w1000, taproot_flags, s1000.ctx));
+}

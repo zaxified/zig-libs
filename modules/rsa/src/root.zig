@@ -8757,3 +8757,79 @@ fn bytesModSlow(bytes: []const u8, d: u64) u64 {
     for (bytes) |b| r = @intCast(((@as(u128, r) << 8) | b) % d);
     return r;
 }
+
+// ── delta mutation 2026-11-25 (fromPrimes carriers, primality option, encrypted-key caps) ──
+
+fn expectSameModulus(want: Modulus, got: Modulus) !void {
+    try testing.expectEqual(want.v.limbs_len, got.v.limbs_len);
+    try testing.expectEqual(want.leading, got.leading);
+    try testing.expectEqual(want.m0inv, got.m0inv);
+    try testing.expectEqualSlices(u64, want.v.limbs_buffer[0..want.v.limbs_len], got.v.limbs_buffer[0..got.v.limbs_len]);
+    try testing.expectEqualSlices(u64, &want.rr.v.limbs_buffer, &got.rr.v.limbs_buffer);
+}
+
+test "mutation 2026-11-25: fromPrimes fills each ff carrier from ITS prime's bit length (unbalanced pair)" {
+    var prng = std.Random.DefaultPrng.init(0x17ba1);
+    var q_buf: [160]u8 = undefined; // a 1280-bit prime next to the 1024-bit kat2048.p
+    generatePrime(prng.random(), 1280, 65537, &q_buf);
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &kat2048.p, &q_buf, &kat2048.e);
+    defer sk.deinit();
+    try expectSameModulus(try Modulus.fromBytes(&kat2048.p, .big), sk.p);
+    try expectSameModulus(try Modulus.fromBytes(&q_buf, .big), sk.q);
+}
+
+test "mutation 2026-11-25: fromPrimes takes a composite factor by default; check_primality refuses small composites exactly" {
+    // A 1024-bit composite next to the real kat2048.p: the structural checks
+    // pass (qInv is Fermat mod the prime p), only the opt-in test can refuse.
+    var q2 = kat2048.q;
+    q2[q2.len - 1] += 2;
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk, &kat2048.p, &q2, &kat2048.e);
+    sk.deinit();
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &kat2048.p, &q2, &kat2048.e, .{ .check_primality = true }));
+    // Small composites, each the square or the multiple of a small prime
+    // (trial division starts at 3 and runs to sqrt(x) inclusive), either position.
+    const checked: SecretKey.FromPrimesOptions = .{ .insecure_allow_small_modulus = true, .check_primality = true };
+    for ([_]u8{ 9, 15, 21, 25, 27, 33, 49, 121 }) |c| {
+        try SecretKey.fromPrimesWith(&sk, &.{61}, &.{c}, &.{17}, small_test_key);
+        sk.deinit();
+        try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &.{61}, &.{c}, &.{17}, checked));
+        try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &.{c}, &.{61}, &.{17}, checked));
+    }
+    // Small primes pass (3 has an empty witness range, 5, 7 and 11 sit on the sqrt boundary).
+    for ([_]u8{ 3, 5, 7, 11, 13, 53 }) |c| {
+        try SecretKey.fromPrimesWith(&sk, &.{61}, &.{c}, &.{17}, checked);
+        sk.deinit();
+    }
+}
+
+test "mutation 2026-11-25: fromPrimes refuses an even or empty factor (no panic on the way to the later checks)" {
+    const e = [_]u8{ 0x01, 0x00, 0x01 };
+    const cases = [_][2][]const u8{
+        .{ &.{0x3c}, &.{0x3d} }, // 60, 61
+        .{ &.{0x3d}, &.{0x3c} },
+        .{ &.{0x3c}, &.{0x3a} },
+        .{ &.{}, &.{0x3d} },
+        .{ &.{0x3d}, &.{} },
+        .{ &.{ 0, 0 }, &.{0x3d} },
+    };
+    for (cases) |c| {
+        try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, c[0], c[1], &e, small_test_key));
+        try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, c[0], c[1], &e, .{ .insecure_allow_small_modulus = true, .check_primality = true }));
+    }
+}
+
+test "mutation 2026-11-25: a raised PBKDF2 cap is honoured by the KDF too; an oversized ciphertext is refused before any cap" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 0x110000 iterations > the default cap 2^20: refused by default, and with a
+    // raised cap the file reaches the KDF (wrong password: ciphertext is filler).
+    const big = try (Epki{ .iter = &.{ 0x11, 0x00, 0x00 } }).build(a);
+    try testing.expectError(error.KdfIterationsTooLarge, fromPkcs8Encrypted(&test_sk_out, big, "pw"));
+    try testing.expectError(error.IncorrectPasswordOrCorrupt, fromPkcs8EncryptedLimited(&test_sk_out, big, "pw", .{ .max_pbkdf2_iterations = 0x11_0000 }));
+    // An oversized ciphertext is refused by the structure walk before any cap is looked at.
+    const both = try (Epki{ .iter = &.{ 0x03, 0xe8 }, .data_len = max_pkcs8_der_len + 17 }).build(a);
+    try testing.expectError(error.InvalidDer, fromPkcs8EncryptedLimited(&test_sk_out, both, "pw", .{ .max_pbkdf2_iterations = 999 }));
+}

@@ -6,7 +6,7 @@
 
 **Scope:** core — dalek-cryptography/bulletproofs, single and aggregated proofs, batch verification (surveyed 2026-09-30, aggregation and batching 2026-10-02)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-20 (321/337, 13 eq) · src c9818b5d4d19b4c8
+**Audit:** review 2026-09-15 · mutation 2026-11-25 (417/439, 19 eq) · src d988faa029c58677
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BULLETPROOFS_FUZZ; rp-decode at 1/4, prove-verify at 1/40 of it) · ct 2026-09-15 (ctgrind)
 
@@ -388,6 +388,7 @@ cannot see an error both sides share.
   give a discrete-log relation among the NUMS generators) and `verifyBatch` ignoring `replayChallenges`' identity
   refusal (a valid range proof with an identity `L`/`R` cannot be made; the unrefused replay leaves the challenges undefined and the equation fails).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Delta mutation 2026-11-25:** 102 mutants over the whole of the new `mpc.zig` (multi-party aggregated range proof; additive, ~24 % of production lines, so a delta rather than a whole-module run; `rangeproof.zig` only gained two `pub`); 96 killed, 6 equivalent; new tests in `src/mpc_mutation_test.zig`.
 
 ## Backlog / deferred
 

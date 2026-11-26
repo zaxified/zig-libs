@@ -82,3 +82,18 @@ test "annexHash: compact-size prefix classes" {
         try testing.expectEqualSlices(u8, &want, &bip341.annexHash(annex));
     }
 }
+
+test "mutation 2026-11-25: annexHash prefixes a 4-byte length with 0xfe (65536 and 65537 bytes)" {
+    for ([_]usize{ 0x10000, 0x10001 }) |n| {
+        const annex = try testing.allocator.alloc(u8, n);
+        defer testing.allocator.free(annex);
+        @memset(annex, 0x50);
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        var prefix: [5]u8 = undefined;
+        prefix[0] = 0xfe;
+        std.mem.writeInt(u32, prefix[1..5], @intCast(n), .little);
+        h.update(&prefix);
+        h.update(annex);
+        try testing.expectEqualSlices(u8, &h.finalResult(), &bip341.annexHash(annex));
+    }
+}

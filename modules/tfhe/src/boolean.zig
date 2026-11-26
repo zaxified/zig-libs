@@ -591,3 +591,30 @@ test "at tfhe-rs's sets: KS-PBS gates under DEFAULT_PARAMETERS_KS_PBS, public-ke
         }
     }
 }
+
+test "mutation 2026-11-25: PublicKey holds zero_encryption_count zeros and encryptWith selects zero i by bit i % 64 of block i / 64's word" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ck = Small.ClientKey.generate(io);
+    defer ck.deinit();
+    const PK = PublicKey(Small, .small);
+    var pk = try PK.generate(testing.allocator, &ck, io);
+    defer pk.deinit(testing.allocator);
+    try testing.expectEqual(PK.zero_encryption_count, pk.zeros.len);
+    // The subset is a function of the random words: rebuild it bit by bit from a copy of the stream.
+    var p1 = std.Random.DefaultPrng.init(0x7f4a);
+    var p2 = p1;
+    const got = pk.encryptWith(true, p1.random());
+    var want = Small.lweTrivial(PK.dim, encode(true));
+    var word: u64 = 0;
+    for (pk.zeros, 0..) |*z, i| {
+        if (i % 64 == 0) word = p2.random().int(u64);
+        if ((word >> @intCast(i % 64)) & 1 == 1) {
+            for (&want.a, z.a) |*o, x| o.* +%= x;
+            want.b +%= z.b;
+        }
+    }
+    try testing.expectEqualSlices(T, &want.a, &got.a);
+    try testing.expectEqual(want.b, got.b);
+}

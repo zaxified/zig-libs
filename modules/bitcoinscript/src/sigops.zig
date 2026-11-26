@@ -151,8 +151,9 @@ fn witnessSigOps(version: u8, program: []const u8, witness: []const []const u8) 
 
 /// `CountWitnessSigOps(scriptSig, scriptPubKey, witness, flags)`: 0 unless
 /// `flags.witness`; a native witness program is counted directly, a
-/// P2SH-wrapped one (when `flags.p2sh`, `script_sig` push-only and its last
-/// push a witness program) through the redeem script.
+/// P2SH-wrapped one (`script_sig` push-only and its last push a witness
+/// program; like Core, `flags.p2sh` is not consulted, since segwit implies
+/// P2SH) through the redeem script.
 pub fn witnessCount(
     script_sig: []const u8,
     script_pubkey: []const u8,

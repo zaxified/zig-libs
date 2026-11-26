@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** killing tests from the 2026-11-25 whole-module mutation run (`modinv` updateDE / divsteps edges, scalar inversion).
 - **2026-11-24** — **Faster, same results:** `scalar.invert` is the constant-time safegcd inverse of the new `modinv.zig` (Bernstein–Yang divsteps) instead of a Fermat chain over the bit-serial `ed448.scalar.mul`: ≈ 9.6 ms → ≈ 4.3 µs (in-process A/B, ReleaseFast). Every 56-byte input is still accepted and a multiple of `l` still inverts to 0. The dead-stack burn grew 4 → 6 KiB (`burn.scalar_burn`, shared with `scalarMul` and `random`). New ctgrind row `invert` (0 in-file); `scalarmul` digest re-pinned.
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-16** — **BEHAVIOUR CHANGE:** a DST over 255 bytes is no longer refused with `DstTooLong`; `expandMessageXof`

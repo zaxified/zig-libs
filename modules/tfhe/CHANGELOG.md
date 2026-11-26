@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** killing test from the 2026-11-25 delta mutation run (`encryptWith`).
 - **2026-11-21** — Added: public-key encryption (`boolean.PublicKey`, `Tfhe(P).PublicKey`/`PublicKeyBig`: tfhe-rs's `(dim+1)·32+128` zero encryptions, branch-free random subset); `EncryptionKeyChoice::Big` (`boolean.EncryptionKeyChoice`, `KsPbsServerKey`: key switch before bootstrap; `ClientKey.encryptBig`/`decryptBig`; `params.tfhers_default_ks_pbs` = tfhe-rs 1.8.1 `DEFAULT_PARAMETERS_KS_PBS`).
 
 - **2026-10-18** — Ported to Zig 0.17.0: `Fn.params` -> `param_types` (test seam).

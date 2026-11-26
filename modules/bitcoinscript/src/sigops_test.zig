@@ -170,3 +170,74 @@ test "transactionCost: legacy x4, P2SH x4, witness x1; coinbase legacy only" {
     try t.expectEqual(@as(u64, 3 * 4), try sigops.transactionCost(cb, &.{}, .{ .p2sh = true, .witness = true }));
     try t.expectEqual(@as(u64, 0), try sigops.p2shCount(cb, &.{.{ .value = 0, .script_pubkey = &p2sh_spk }}));
 }
+
+test "mutation 2026-11-25: sigops count boundaries, the P2SH shape and the scriptSig walk" {
+    // OP_1 OP_CHECKMULTISIG: the accurate count is 1 (OP_1 itself is a key count).
+    try t.expectEqual(@as(u64, 1), sigops.countScript(&[_]u8{ 0x51, 0xae }, true));
+    try t.expectEqual(@as(u64, 20), sigops.countScript(&[_]u8{ 0x51, 0xae }, false));
+
+    // A scriptPubKey one byte off the P2SH shape is counted as itself (0 sigops),
+    // never through scriptSig's last push (which would count 3).
+    const p2sh = p2shOf(&s1);
+    const sig = [_]u8{ 0x00, s1.len } ++ s1;
+    try t.expectEqual(@as(u64, 3), sigops.countP2sh(&p2sh, &sig));
+    const longer = p2sh ++ [_]u8{0x00};
+    var b0 = p2sh;
+    b0[0] = 0xaa;
+    var b1 = p2sh;
+    b1[1] = 0x15;
+    var b22 = p2sh;
+    b22[22] = 0x88;
+    for ([_][]const u8{ &longer, &b0, &b1, &b22 }) |spk| {
+        try t.expectEqual(@as(u64, 0), sigops.countP2sh(spk, &sig));
+    }
+    // OP_16 in scriptSig is a push; the redeem script behind it is still counted.
+    try t.expectEqual(@as(u64, 3), sigops.countP2sh(&p2sh, &([_]u8{0x60} ++ sig)));
+    // A push followed by OP_N: the last instruction has no data, the redeem script is empty.
+    try t.expectEqual(@as(u64, 0), sigops.countP2sh(&p2sh, &(sig ++ [_]u8{0x51})));
+    // A truncated push after the redeem script: undecodable, 0 (not the redeem script's 3).
+    try t.expectEqual(@as(u64, 0), sigops.countP2sh(&p2sh, &(sig ++ [_]u8{0x4c})));
+
+    // witnessCount: OP_16 is push-only; a witness program followed by OP_1 is not "the last push";
+    // a scriptSig program under a scriptPubKey that is not P2SH counts nothing.
+    const items = [_][]const u8{ &dummy20, &wscript };
+    const sig_wpkh = [_]u8{wp_keyhash.len} ++ wp_keyhash;
+    const p2sh_wpkh = p2shOf(&wp_keyhash);
+    try t.expectEqual(@as(u64, 1), sigops.witnessCount(&([_]u8{0x60} ++ sig_wpkh), &p2sh_wpkh, &items, f_witness));
+    try t.expectEqual(@as(u64, 0), sigops.witnessCount(&(sig_wpkh ++ [_]u8{0x51}), &p2sh_wpkh, &items, f_witness));
+    const p2pkh = [_]u8{ 0x76, 0xa9, 0x14 } ++ dummy20 ++ [_]u8{ 0x88, 0xac };
+    try t.expectEqual(@as(u64, 0), sigops.witnessCount(&sig_wpkh, &p2pkh, &items, f_witness));
+}
+
+test "mutation 2026-11-25: legacyCount counts inaccurately, p2shCount/transactionCost shape rules" {
+    const multisig = [_]u8{ 0x51, 0xae }; // 1 accurate, 20 inaccurate
+    var vin_a = [_]bitcointx.TxIn{.{ .prevout = .{ .txid = @splat(1), .vout = 0 }, .script_sig = &multisig, .sequence = 0 }};
+    var vout_a = [_]bitcointx.TxOut{.{ .value = 1, .script_pubkey = &.{} }};
+    try t.expectEqual(@as(u64, 20), sigops.legacyCount(mkTx(&vin_a, &vout_a, &.{})));
+    var vin_b = [_]bitcointx.TxIn{.{ .prevout = .{ .txid = @splat(1), .vout = 0 }, .script_sig = &.{}, .sequence = 0 }};
+    var vout_b = [_]bitcointx.TxOut{.{ .value = 1, .script_pubkey = &multisig }};
+    try t.expectEqual(@as(u64, 20), sigops.legacyCount(mkTx(&vin_b, &vout_b, &.{})));
+
+    const p2sh_spk = p2shOf(&s1);
+    const p2pkh = [_]u8{ 0x76, 0xa9, 0x14 } ++ dummy20 ++ [_]u8{ 0x88, 0xac }; // 1 sigop as a script
+    const redeem_sig = [_]u8{ 0x00, s1.len } ++ s1;
+    // A mismatched spent-outputs slice is an error of p2shCount itself.
+    try t.expectError(error.SpentOutputsMismatch, sigops.p2shCount(mkTx(&vin_b, &vout_b, &.{}), &.{}));
+    // A spent output that is not P2SH adds nothing, whatever it contains.
+    const spent_p2pkh = [_]bitcointx.TxOut{.{ .value = 1, .script_pubkey = &p2pkh }};
+    try t.expectEqual(@as(u64, 0), try sigops.p2shCount(mkTx(&vin_b, &vout_b, &.{}), &spent_p2pkh));
+    // A coinbase has no spent output to speak of: 0 even when its scriptSig looks like a redeem push.
+    var cb_in = [_]bitcointx.TxIn{.{ .prevout = .{ .txid = @splat(0), .vout = 0xffffffff }, .script_sig = &redeem_sig, .sequence = 0 }};
+    const cb = mkTx(&cb_in, &vout_b, &.{});
+    const spent_p2sh = [_]bitcointx.TxOut{.{ .value = 0, .script_pubkey = &p2sh_spk }};
+    try t.expectEqual(@as(u64, 0), try sigops.p2shCount(cb, &spent_p2sh));
+    // transactionCost: the length check holds without the p2sh flag too.
+    var vin_c = [_]bitcointx.TxIn{
+        .{ .prevout = .{ .txid = @splat(1), .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+        .{ .prevout = .{ .txid = @splat(2), .vout = 0 }, .script_sig = &.{}, .sequence = 0 },
+    };
+    try t.expectError(error.SpentOutputsMismatch, sigops.transactionCost(mkTx(&vin_c, &vout_b, &.{}), &spent_p2pkh, .{}));
+    // A transaction whose witness slice is shorter than its inputs (here empty) is counted, not indexed.
+    const spent_wpkh = [_]bitcointx.TxOut{.{ .value = 1, .script_pubkey = &wp_keyhash }};
+    try t.expectEqual(@as(u64, 20 * 4 + 1), try sigops.transactionCost(mkTx(&vin_a, &vout_a, &.{}), &spent_wpkh, f_witness));
+}
