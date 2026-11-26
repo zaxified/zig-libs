@@ -442,8 +442,14 @@ pub fn blake2bVar(out: []u8, data: []const u8, params: Blake2bParams) Blake2bErr
     if (params.key.len > 64) return error.KeyTooLong;
     if (params.salt.len > 16) return error.SaltTooLong;
     if (params.personal.len > 16) return error.PersonalTooLong;
+    blake2bVarBody(out, data, params);
+    // The burn runs after the body's frame is dead: std's `Blake2b512.init` builds the padded key block as a local,
+    // and a burn deferred inside the frame that holds it zeroes only below it (a stack probe found the key there).
+    if (params.key.len != 0) burnStack();
+}
+
+noinline fn blake2bVarBody(out: []u8, data: []const u8, params: Blake2bParams) void {
     const keyed = params.key.len != 0;
-    defer if (keyed) burnStack();
     var salt: [16]u8 = @splat(0);
     var personal: [16]u8 = @splat(0);
     @memcpy(salt[0..params.salt.len], params.salt);

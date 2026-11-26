@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — Fix (secret residue): a keyed `blake2bVar` left the MAC key on the dead stack. std's `Blake2b512.init` builds the padded key block as a local in `blake2bVar`'s own frame, and the deferred burn zeroed only below that frame. The body now runs in a `noinline` function and the burn follows its return (a ReleaseFast stack probe found the key 600 B deep before, nothing after).
 - **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** a ctgrind harness (`src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh hashdigest`) for `blake3Keyed`, `blake3DeriveKey` and keyed `blake2bVar` (0 secret-dependent branches in-file); no library code changed.
 - **2026-11-21** — ADDED `blake2bVar(out, data, params)` with `Blake2bParams` and `Blake2bError`: BLAKE2b with a key (up to 64 bytes), a salt and a personalisation string (up to 16 bytes, zero-padded) and any output size 1..64 bytes, on std's engine, checked against OpenSSL's BLAKE2b; tests: all 35 input lengths of the official BLAKE3 vectors and XOF prefix agreement, the stack-burn probe on aarch64, arm, mips, mipsel, riscv64 and x86-32 under qemu-user.
 

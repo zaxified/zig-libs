@@ -2665,6 +2665,6 @@ rescue	ReleaseFast	sboxinv	1	0	84392a52cb56cee6	1b4260a7113d9ce0
 # hashdigest (2026-11-21) — keyed: blake3Keyed under a tainted 32-byte key over data of 0/63/64/1500 bytes and outputs of 16/32/100;
 # derive: blake3DeriveKey with tainted material (0/32/2000 bytes); blake2b: blake2bVar with a tainted 1/32/64-byte key. All 0 in-file
 # (std's BLAKE3 and our BLAKE2b are in the pattern).
-hashdigest	ReleaseFast	keyed	1	0	1b9775d1983282d3	702d2a054e07d5b9
-hashdigest	ReleaseFast	derive	1	0	1b9775d1983282d3	6b9f207e61359ff1
-hashdigest	ReleaseFast	blake2b	1	0	1b9775d1983282d3	374fd3c007d2890b
+hashdigest	ReleaseFast	keyed	1	0	8ded394f9dc4ab99	702d2a054e07d5b9
+hashdigest	ReleaseFast	derive	1	0	8ded394f9dc4ab99	6b9f207e61359ff1
+hashdigest	ReleaseFast	blake2b	1	0	8ded394f9dc4ab99	374fd3c007d2890b
