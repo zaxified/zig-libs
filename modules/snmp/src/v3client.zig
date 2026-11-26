@@ -2412,3 +2412,14 @@ test "v3 trap: refusals: unseeded engine, no sendFn, no salt seed at authPriv, r
     try testing.expectError(error.ReservedVarbind, plain.trap(.{ .uptime = 1, .trap_oid = n.trap_oid, .varbinds = &reserved }));
     try testing.expectEqual(@as(usize, 0), sink.sends);
 }
+
+test "mutation 2026-11-25: a v3 trap carries error-status 0 and error-index 0 (RFC 3416 §4.2.6)" {
+    var sink: SinkTransport = .{};
+    var c = V3Client.init(sink.transport(), .{ .name = "p" }, .{});
+    try c.seedEngine(&trap_engine_id, 1, 1);
+    try c.trap(.{ .uptime = 5, .trap_oid = try Oid.parse("1.3.6.1.6.3.1.1.5.3") });
+    const m = try v3.decode(sink.sent());
+    const t = m.data.plaintext.pdu.trap_v2;
+    try testing.expectEqual(message.ErrorStatus.no_error, t.error_status);
+    try testing.expectEqual(@as(u32, 0), t.error_index);
+}
