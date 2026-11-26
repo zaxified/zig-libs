@@ -213,3 +213,58 @@ test "STACKPROBE: generateWith leaves no residue below its burn" {
     _ = try P.run("generateWith", genWith, .{&kp}, &.{}, .{});
     kp.secret_key.deinit();
 }
+
+// ── second pass: the raw primitives, the blinded OAEP decryptors, generate ──
+
+var c256: [256]u8 = undefined;
+
+fn rsadpW(k: *const rsa.SecretKey) ![256]u8 {
+    return rsa.rsadp(256, c256, k);
+}
+fn rsadpCrtBlindedW(k: *const rsa.SecretKey) ![256]u8 {
+    return rsa.rsadpCrtBlinded(256, c256, k, .{ .csprng = prng.random() });
+}
+fn rsasp1W(k: *const rsa.SecretKey) ![256]u8 {
+    return rsa.rsasp1(256, c256, k);
+}
+fn decOaepBlindedW(k: *const rsa.SecretKey, o: []u8) ![]u8 {
+    return rsa.decryptOaepBlinded(k, Sha256, .{ .csprng = prng.random() }, &ct, "", o);
+}
+fn decOaepHBlindedW(k: *const rsa.SecretKey, o: []u8) ![]u8 {
+    return rsa.decryptOaepHBlinded(k, Sha256, Sha256, .{ .csprng = prng.random() }, &ct, "", o);
+}
+fn genW(o: *rsa.KeyPair) !void {
+    return rsa.generate(o, prng.random(), 2048, 65537);
+}
+
+test "STACKPROBE: rsadp / rsadpCrtBlinded / rsasp1, the blinded OAEP decryptors and generate leave no key on the dead stack" {
+    try sp.skipUnlessOptimized();
+    try rsa.SecretKey.fromPrimes(&sk, &kat_p, &kat_q, &kat_e);
+    defer sk.deinit();
+    p_le = kat_p;
+    std.mem.reverse(u8, &p_le);
+    q_le = kat_q;
+    std.mem.reverse(u8, &q_le);
+    try sk.d.toBytes(&d_be, .big);
+    try sk.dp.toBytes(&dp_be, .big);
+    try sk.dq.toBytes(&dq_be, .big);
+    try sk.qinv.toBytes(&qinv_be, .big);
+    const kn = keyNeedles();
+    const k: *const rsa.SecretKey = &sk;
+    const pk = try rsa.PublicKey.fromBytes(&kat_n, &kat_e);
+    // A value below n: the modulus with its top byte cleared.
+    c256 = kat_n;
+    c256[0] = 0;
+    failures = 0;
+
+    // By-value results land in the probe's call frame by shape: key needles only.
+    probe("rsadp", rsadpW, .{k}, &kn);
+    probe("rsadpCrtBlinded", rsadpCrtBlindedW, .{k}, &kn);
+    probe("rsasp1", rsasp1W, .{k}, &kn);
+    ct = (try rsa.encryptOaep(pk, Sha256, prng.random(), "secret plaintext", "", &out))[0..256].*;
+    probe("decryptOaepBlinded", decOaepBlindedW, .{ k, @as([]u8, &out) }, &(kn ++ [_][]const u8{out[0..16]}));
+    probe("decryptOaepHBlinded", decOaepHBlindedW, .{ k, @as([]u8, &out) }, &(kn ++ [_][]const u8{out[0..16]}));
+    try std.testing.expectEqual(@as(usize, 0), failures);
+    _ = try P.run("generate", genW, .{&kp}, &.{}, .{});
+    kp.secret_key.deinit();
+}

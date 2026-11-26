@@ -59,3 +59,38 @@ test "STACKPROBE: no channel key residue after any entry point" {
     try probeChannel("AesGcm", channel.AesGcmChannel);
     _ = root;
 }
+
+var new_key: [32]u8 = undefined;
+
+fn RekeyProbe(comptime Ch: type) type {
+    return struct {
+        var o: Ch.Opener = undefined;
+        var epoch: u32 = 1;
+        fn overlapW(k: *const [32]u8) !void {
+            epoch +%= 1;
+            return o.rekeyOverlap(k.*, epoch);
+        }
+        fn overlapIntoW(k: *const [32]u8) !void {
+            epoch +%= 1;
+            return o.rekeyOverlapInto(k, epoch);
+        }
+    };
+}
+
+// Coverage sweep 2026-11-26: `Opener.rekeyOverlap` / `rekeyOverlapInto`, which
+// the probe above does not call. The new key is copied into the opener (a
+// static here); the old one moves to `prev`.
+test "STACKPROBE: Opener.rekeyOverlap / rekeyOverlapInto leave no key on the dead stack" {
+    try sp.skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha256.hash("aeadframe probe rekey", &new_key, .{});
+    std.crypto.hash.sha2.Sha256.hash("aeadframe probe rekey old", &key, .{});
+    inline for (.{ channel.ChaChaChannel, channel.AesGcmChannel }) |Ch| {
+        const R = RekeyProbe(Ch);
+        Ch.Opener.initInto(&R.o, &key, 0);
+        // `rekeyOverlap` takes the key by value: its copy is the caller's by shape;
+        // the residue rule is the check for it.
+        _ = try P.run("Opener.rekeyOverlap", R.overlapW, .{&new_key}, &.{}, .{});
+        _ = try P.run("Opener.rekeyOverlapInto", R.overlapIntoW, .{&new_key}, &.{ &key, &new_key }, .{});
+        R.o.wipe();
+    }
+}

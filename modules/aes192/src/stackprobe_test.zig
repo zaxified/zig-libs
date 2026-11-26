@@ -32,3 +32,29 @@ test "STACKPROBE: no key or round-key residue after initEncInto / initDecInto" {
     _ = try P.run("initDecInto", root.Aes192.initDecInto, .{ &dec, &key }, &dec_secrets, .{});
     try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&dec.key_schedule), 0));
 }
+
+fn encInitW(k: *const [24]u8) root.Aes192EncryptCtx {
+    return root.Aes192EncryptCtx.init(k.*);
+}
+fn decInitW(k: *const [24]u8) root.Aes192DecryptCtx {
+    return root.Aes192DecryptCtx.init(k.*);
+}
+
+// Coverage sweep 2026-11-26: the context types' own `initInto` / `init` (the
+// `Aes192.initEncInto` / `initDecInto` above are their std-shaped aliases'
+// pointer twins). A by-value context lands in the probe's call frame by shape,
+// so `init` is checked by the residue rule only.
+test "STACKPROBE: Aes192EncryptCtx / Aes192DecryptCtx init and initInto leave no key schedule below their burn" {
+    try sp.skipUnlessOptimized();
+    var full: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("aes192 probe key 2", &full, .{});
+    key = full[0..24].*;
+    root.Aes192EncryptCtx.initInto(&enc, &key);
+    root.Aes192DecryptCtx.initInto(&dec, &key);
+    const enc_img = std.mem.toBytes(enc);
+    const dec_img = std.mem.toBytes(dec);
+    _ = try P.run("Aes192EncryptCtx.initInto", root.Aes192EncryptCtx.initInto, .{ &enc, &key }, &.{ &key, &enc_img }, .{});
+    _ = try P.run("Aes192DecryptCtx.initInto", root.Aes192DecryptCtx.initInto, .{ &dec, &key }, &.{ &key, &enc_img, &dec_img }, .{});
+    _ = try P.run("Aes192EncryptCtx.init", encInitW, .{&key}, &.{}, .{});
+    _ = try P.run("Aes192DecryptCtx.init", decInitW, .{&key}, &.{}, .{});
+}

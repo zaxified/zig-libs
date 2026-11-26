@@ -77,3 +77,19 @@ test "STACKPROBE: x448.KeyPair.generate leaves no seed on the dead stack" {
     // seed left in generate's own (unburned) frame by a missing wipe.
     _ = try P.run("x448.KeyPair.generate", x448.KeyPair.generate, .{ &x_out, std.testing.io }, &.{&x_out.secret_key}, .{});
 }
+
+var sk_bytes: [57]u8 = undefined;
+var sk_out: ed.SecretKey = undefined;
+var sk_bytes_out: [57]u8 = undefined;
+
+// Coverage sweep 2026-11-26: the seed codecs (copies, no burn by design): the
+// seed is the needle.
+test "STACKPROBE: SecretKey.fromBytesInto / toBytesInto leave no seed on the dead stack" {
+    try sp.skipUnlessOptimized();
+    var h: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash("ed448 probe2 sk bytes", &h, .{});
+    sk_bytes = h[0..57].*;
+    _ = try P.run("SecretKey.fromBytesInto", ed.SecretKey.fromBytesInto, .{ &sk_out, &sk_bytes }, &.{&sk_bytes}, .{ .burn = false });
+    _ = try P.run("SecretKey.toBytesInto", ed.SecretKey.toBytesInto, .{ &sk_bytes_out, &sk_out }, &.{&sk_bytes}, .{ .burn = false });
+    try std.testing.expectEqualSlices(u8, &sk_bytes, &sk_bytes_out);
+}

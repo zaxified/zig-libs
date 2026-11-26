@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack coverage sweep, wave 3: a `testkit.stackprobe` probe of the public secret entry points no probe called — `asymmetricDecrypt` / `asymmetricSign` on their own, `aes128CbcEncrypt` / `aes128CbcDecrypt` (appended to `src/stackprobe_test.zig`). Clean. Test only.
 - **2026-11-23** — **Added:** `security.deriveKeysInto(out, client_nonce, server_nonce, policy)`, the channel keys through `out` only; `deriveKeys` stays as its by-value wrapper. The client's OPN, the server's OPN and the server's chunk open/seal paths no longer copy `ChannelKeys` (or, for the client's asymmetric header, the whole `SecurityContext` with its RSA key) by value into their frames: they derive in place and read through pointers. Same bytes on the wire.
 - **2026-11-23** — **Changed (unreleased API, new on 2026-11-19):** `checkContextKeyLengths(ctx: *const SecurityContext)` takes the context by pointer: by value it copied the client's `rsa.SecretKey` (inside `credentials`) into the call. Never in a tag.
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the live interop tests run `docker.io/open62541/open62541` pinned by digest (`server_interop.image`, now shared with `root.zig`'s three live tests) instead of the floating tag `latest`; test-only.

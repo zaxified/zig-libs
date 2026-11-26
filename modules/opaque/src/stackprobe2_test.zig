@@ -41,6 +41,11 @@ fn Run(comptime O: type) type {
         var cid: []const u8 = undefined;
         var context: []const u8 = undefined;
         var oprf_seed: [O.Nh]u8 = undefined;
+        var fake: O.RegistrationRecord = undefined;
+
+        fn rpW(pw: []const u8, b: *const [O.Ns]u8, e: *const [O.Noe]u8) ![O.Nx]u8 {
+            return O.randomizedPassword(pw, b.*, e.*, O.Ksf.identity);
+        }
         var server_sk: [O.Nsk]u8 = undefined;
         var server_pk: [O.Npk]u8 = undefined;
         var blind_reg: [O.Ns]u8 = undefined;
@@ -84,6 +89,13 @@ fn Run(comptime O: type) type {
             _ = try P.run(name ++ " createRegistrationResponse", O.createRegistrationResponse, .{ request, server_pk, cid, &oprf_seed }, &.{&oprf_seed}, .{});
             response = try O.createRegistrationResponse(request, server_pk, cid, &oprf_seed);
             _ = try P.run(name ++ " finalizeRegistrationRequest", O.finalizeRegistrationRequest, .{ password, &blind_reg, response, ids, envelope_nonce, O.Ksf.identity, &reg }, &.{ password, &blind_reg, &reg.export_key, &reg.record.masking_key }, .{});
+
+            // Coverage sweep 2026-11-26: the registration-side helpers called on
+            // their own. `randomizedPassword` returns its secret by value (into
+            // the probe's call frame by shape) and takes `blind` by value: the
+            // password is its needle, the residue rule the rest.
+            _ = try P.run(name ++ " randomizedPassword", rpW, .{ password, &blind_reg, &response.evaluated_message }, &.{password}, .{});
+            _ = try P.run(name ++ " fakeRecord", O.fakeRecord, .{ &server_seed, &reg.record.masking_key, &fake }, &.{ &server_seed, &reg.record.masking_key }, .{});
 
             // Login, both sides.
             _ = try P.run(name ++ " generateKE1", O.generateKE1, .{ password, &blind_login, client_nonce, &client_seed, &ke1 }, &.{ password, &blind_login, &client_seed, &ke1.state.blind, &ke1.state.client_secret }, .{});

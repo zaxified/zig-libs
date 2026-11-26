@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack coverage sweep, wave 3: a `testkit.stackprobe` probe of the public secret entry points no probe called — `signPrehash` / `signPrehashDigest`, SHA2-128f and SHAKE-128f (`src/stackprobe2_test.zig`). Clean. Test only.
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 
 - **2026-10-18** — Ported to Zig 0.17.0: tests: `EnumSet.empty`, enum iteration via `field_values`.

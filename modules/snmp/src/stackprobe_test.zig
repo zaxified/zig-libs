@@ -91,3 +91,17 @@ test "STACKPROBE: no key residue after the USM key, digest and privacy paths" {
     _ = try P.run("des.cbcEncrypt", des.cbcEncrypt, .{ @as(*const [8]u8, &des_key), iv, @as([]const u8, &plain), @as([]u8, &cipher) }, &secrets, .{});
     _ = try P.run("des.cbcDecrypt", des.cbcDecrypt, .{ @as(*const [8]u8, &des_key), iv, @as([]const u8, cipher[0..plain.len]), @as([]u8, &decrypted) }, &secrets, .{});
 }
+
+var ext_buf: [64]u8 = undefined;
+
+// Coverage sweep 2026-11-26: `extendLocalizedKey` (AES-192/256 key
+// extension, both schemes), which the probe above does not call.
+test "STACKPROBE: extendLocalizedKey leaves no localized key on the dead stack" {
+    try sp.skipUnlessOptimized();
+    var h: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("snmp probe extend key", &h, .{});
+    inline for (.{ usm.KeyExtension.blumenthal, usm.KeyExtension.reeder }) |how| {
+        @memcpy(ext_buf[0..20], h[0..20]);
+        _ = try P.run("extendLocalizedKey " ++ @tagName(how), usm.extendLocalizedKey, .{ usm.AuthProtocol.hmac_sha1, how, @as([]const u8, &engine_id), @as([]u8, &ext_buf), @as(usize, 20), @as(usize, 32) }, &.{ h[0..20], ext_buf[0..32] }, .{});
+    }
+}

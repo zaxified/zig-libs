@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack coverage sweep, wave 3: a `testkit.stackprobe` probe of the public secret entry points no probe called — `failure.createPadded` (`src/stackprobe4_test.zig`). Clean. Test only.
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** route blinding gets its hardening rows: dead-stack probe `src/stackprobe3_test.zig` (`blinded.createPath` / `unblind`, needles `e_i`, `ss_i`, `rho_i`, both factors, `k_i`, `b_i`) and ctgrind targets `blind_create` / `unblind` (6 / 5 in-file contexts, all verdicts). The `construct` ctgrind row reads 5 (was 7): std's `cmovznzU64` branch is gone once `scalar.mul` is shared out of line; test and harness code only.
 - **2026-11-21** — New `sphinx.blinded`: BOLT#4 route blinding — `createPath` (first `path_key`, blinded node ids, `encrypted_recipient_data`) and `unblind` (plaintext, blinded private key for `process`, next `path_key`), byte-exact against BOLT#4 `route-blinding-test.json`. Additive.

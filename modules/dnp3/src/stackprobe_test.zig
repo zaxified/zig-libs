@@ -58,3 +58,28 @@ test "STACKPROBE: no key residue after the SA MAC and session-key paths" {
     wrapped_status_len = (try sa.wrapSessionKeysWithStatus(&update_key, &control_key, &monitoring_key, status_message, &again)).len;
     _ = try P.run("unwrapSessionKeysWithStatus", sa.unwrapSessionKeysWithStatus, .{ @as([]const u8, &update_key), @as([]const u8, wrapped_status[0..wrapped_status_len]), @as([]const u8, status_message), @as([]u8, &unwrapped) }, &unwrap_secrets, .{});
 }
+
+var vkey: [32]u8 = undefined;
+var vmac: [32]u8 = undefined;
+
+// Coverage sweep 2026-11-26: the MAC verifiers and the reply-MAC pair, which
+// the probe above does not call. Each recomputes the MAC under the key.
+test "STACKPROBE: mac.verify / verifyTwo / computeReplyMac / verifyReplyMac leave no session key on the dead stack" {
+    try sp.skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha256.hash("dnp3 probe verify key", &vkey, .{});
+    const k: []const u8 = &vkey;
+    const ks = [_][]const u8{&vkey};
+    const h256 = sa.HmacAlgorithm.hmac_sha256_trunc_16;
+    const good = try sa.mac.compute(h256, k, asdu, null, &vmac);
+    _ = try P.run("mac.verify hmac_sha256_trunc_16", sa.mac.verify, .{ h256, k, @as([]const u8, asdu), @as(?[12]u8, null), @as([]const u8, good) }, &ks, .{});
+    var gmac: [32]u8 = undefined;
+    const g = try sa.mac.compute(.aes_gmac_trunc_12, k, asdu, iv, &gmac);
+    _ = try P.run("mac.verify aes_gmac_trunc_12", sa.mac.verify, .{ sa.HmacAlgorithm.aes_gmac_trunc_12, k, @as([]const u8, asdu), @as(?[12]u8, iv), @as([]const u8, g) }, &ks, .{});
+    var two: [32]u8 = undefined;
+    const t = try sa.mac.computeTwo(h256, k, challenge, asdu, &two);
+    _ = try P.run("mac.verifyTwo", sa.mac.verifyTwo, .{ h256, k, @as([]const u8, challenge), @as([]const u8, asdu), @as([]const u8, t) }, &ks, .{});
+    var reply: [32]u8 = undefined;
+    _ = try P.run("computeReplyMac", sa.computeReplyMac, .{ h256, k, @as([]const u8, challenge), @as([]const u8, asdu), @as([]u8, &reply) }, &ks, .{});
+    const r = try sa.computeReplyMac(h256, k, challenge, asdu, &reply);
+    _ = try P.run("verifyReplyMac", sa.verifyReplyMac, .{ h256, k, @as([]const u8, challenge), @as([]const u8, asdu), @as([]const u8, r) }, &ks, .{});
+}

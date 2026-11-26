@@ -146,6 +146,7 @@ test {
     _ = @import("armor_stream.zig");
     _ = kat_test;
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta.model_after names drand/tlock and drand/kyber" {

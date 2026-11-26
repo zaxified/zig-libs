@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack coverage sweep, wave 3: a `testkit.stackprobe` probe of the public secret entry points no probe called — `extendLocalizedKey`, both extension schemes (appended to `src/stackprobe_test.zig`). Clean. Test only.
 - **2026-11-21** — ADDED `V3Client.trap` (SNMPv2-Trap over SNMPv3 at any security level; the client represents the sending, authoritative engine through `seedEngine`; `reportable` is cleared for it). Tests in `v3client.zig`.
 
 

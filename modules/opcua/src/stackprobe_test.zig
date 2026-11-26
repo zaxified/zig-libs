@@ -116,3 +116,31 @@ test "STACKPROBE: no channel key, RSA key or password residue after any entry po
     };
     _ = try P.run("ClientCredentials.generateSelfSigned", security.ClientCredentials.generateSelfSigned, .{ gpa, prng.random(), opts, &generated }, &[_][]const u8{std.mem.asBytes(&generated.private_key)}, .{});
 }
+
+var key16: [16]u8 = undefined;
+var asym_ct: []u8 = &.{};
+
+fn asymDecW(ct: []const u8) !void {
+    const pt = try security.asymmetricDecrypt(gpa, .basic256sha256, ct, &server.private_key);
+    gpa.free(pt);
+}
+fn asymSignW(msg: []const u8) !void {
+    const sig = try security.asymmetricSign(gpa, .basic256sha256, msg, &client.private_key, prng.random());
+    gpa.free(sig);
+}
+
+// Coverage sweep 2026-11-26: the asymmetric primitives on their own and the
+// AES-128-CBC pair (Aes128_Sha256_RsaOaep), which the probe above reaches only
+// inside the message-level calls or not at all.
+test "STACKPROBE: asymmetricDecrypt / asymmetricSign / aes128CbcEncrypt / aes128CbcDecrypt leave no key on the dead stack" {
+    try sp.skipUnlessOptimized();
+    try setup();
+    fill(&key16, "opcua probe aes128 key");
+    const kb = &[_][]const u8{ &key16, &iv16 };
+    _ = try P.run("aes128CbcEncrypt", security.aes128CbcEncrypt, .{ &key16, &iv16, &cbc }, kb, .{});
+    _ = try P.run("aes128CbcDecrypt", security.aes128CbcDecrypt, .{ &key16, &iv16, &cbc }, kb, .{});
+
+    asym_ct = try security.asymmetricEncrypt(gpa, .basic256sha256, &password, server.public_key, prng.random());
+    _ = try P.run("asymmetricDecrypt", asymDecW, .{@as([]const u8, asym_ct)}, &.{ std.mem.asBytes(&server.private_key), &password }, .{});
+    _ = try P.run("asymmetricSign", asymSignW, .{@as([]const u8, "opcua probe message")}, &.{std.mem.asBytes(&client.private_key)}, .{});
+}

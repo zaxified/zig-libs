@@ -86,6 +86,7 @@ test {
     _ = @import("oracle_test.zig");
     _ = @import("client_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 // ── fuzz: every parser of authenticator bytes, and the client on top ────────
