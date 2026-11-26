@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — a finding that quotes a hostile key name (`key` + an OSC title change, BEL, a screen clear and the bidi override U+202E of "Trojan Source", CVE-2021-42574) in the source, the message, a label and a note: codespan-reporting 0.13.1, the reference, writes 16 raw ESC/BEL/U+202E characters to the terminal, this module none — the quoted line shows them as `?`, finding text as `\x1b`/`\u{202e}` (`zig build interop-diagnostics -- --lead`; tests "escaping: bidi controls, C1 controls and invalid bytes never reach the terminal", "control characters" in root.zig) (measured 2026-10-23)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (625/675, 50 eq) · src 69705356b0b4ba65
+**Audit:** review 2026-11-12 · mutation 2026-11-25 (640/692, 52 eq) · src 69705356b0b4ba65
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — diagnostic rendering (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no finding; extreme positions/options pinned by a seeded test)
 
@@ -104,6 +104,7 @@ Run: `scripts/modtest diagnostics`. The module has no fuzz obligation (the card'
 - **Speed:** `zig build bench-diagnostics` (`tools/bench.zig` + `tools/codespan_bench`, pinned codespan-reporting and annotate-snippets); the figures are on the card's Performance line.
 - **Mutation:** whole-module over the production part of `root.zig` and the lookup logic of `width_table.zig` (schemata, ReleaseSafe); format-string mutants converted to runtime-selected statements so they run. The equivalent mutants fall in these groups: a group with a multi-line span starts its window at 0; a cut window is at least 7 columns, so its end lies beyond the labels; contained spans leave `max_start`/`max_end` unchanged; loose labels have `sl = el = 0`; `0x80` escapes and displays the same in both branches; bytes at or above 0x80 always print two hex digits; the right-cut `total < 3` vs `<= 3` boundary; `satU32` (needs a line over 4 GiB); the binary search's midpoint rounding in `Source.location`; two `term_width` boundaries (equality yields the same window).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Delta mutation 2026-11-25:** 17 mutants, 15 killed, 2 equivalent (argued in the run's verdict table), 0 open.
 
 ## What is deliberately not done
 
