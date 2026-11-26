@@ -1789,3 +1789,33 @@ test "ext-value language: a Language-Tag structure, not just its alphabet" {
     try testing.expectError(error.InvalidLink, bufPrint(&buf, &.{.{ .uri = "/a", .rel = "next", .title_star = "UTF-8'en-'a" }}));
     _ = try bufPrint(&buf, &.{.{ .uri = "/a", .rel = "next", .title_star = "UTF-8'en-GB-oed'a" }});
 }
+
+test "mutation 2026-11-25: isLanguageTag production boundaries (extlang counts, region and variant classes, privateuse and extension edges)" {
+    const good = [_][]const u8{
+        "yue-cmn", // a 3-letter language takes an extlang
+        "zh-aaa-bbb-ccc", // three extlangs
+        "en-X-a", // upper-case X opens private use, a 1-char subtag may follow
+        "en-US-X-a",
+        "en-a-bb", // a 2-char extension subtag
+    };
+    for (good) |t| testing.expect(isLanguageTag(t)) catch |e| {
+        std.debug.print("not accepted: {s}\n", .{t});
+        return e;
+    };
+    const bad = [_][]const u8{
+        "en-123-US", // 123 is a region, not an extlang
+        "en-U1", // region 2ALPHA only
+        "en-1U",
+        "en-12", // region 3DIGIT only
+        "en-a1b", // 3 alphanumerics are neither extlang nor region
+        "de-CH-abcd-ef", // abcd is not a variant, not a singleton
+        "en-US-xyz-ab", // a leftover subtag starting with x is not private use
+        "xray-abc", // a language starting with x is not the x singleton
+        "de-CH-ab$de", // every subtag alphanumeric (variant length)
+        "en-US-1996$",
+    };
+    for (bad) |t| testing.expect(!isLanguageTag(t)) catch |e| {
+        std.debug.print("accepted: {s}\n", .{t});
+        return e;
+    };
+}
