@@ -396,3 +396,126 @@ test "invert: x·x⁻¹ ≡ 1 for random x and edges; invert(0) == 0" {
         }
     }
 }
+
+// ── mutation 2026-11-25: unit properties of the three batch steps ───────────
+
+fn sToInt(comptime S: type, s: S.Signed62) i2048 {
+    var v: i2048 = 0;
+    var i: usize = S.L;
+    while (i > 0) {
+        i -= 1;
+        v = (v << 62) + s[i];
+    }
+    return v;
+}
+
+/// Signed-62 limbs of `x` in the form the batch steps produce: every limb in
+/// `[0, 2^62)` except the top one, which carries the sign.
+fn intToS(comptime S: type, x: i2048) S.Signed62 {
+    var r: S.Signed62 = undefined;
+    var v = x;
+    for (0..S.L - 1) |i| {
+        r[i] = @intCast(v & M62);
+        v >>= 62;
+    }
+    r[S.L - 1] = @intCast(v);
+    return r;
+}
+
+test "mutation 2026-11-25: divsteps59 equals 59 reference divsteps over the integers (zeta and the 2^62-scaled matrix)" {
+    var prng = std.Random.DefaultPrng.init(0xD1_57_E9);
+    const rand = prng.random();
+    for (0..3000) |_| {
+        const f0: u64 = rand.int(u64) | 1;
+        const g0: u64 = rand.int(u64);
+        const zeta0: i64 = rand.intRangeAtMost(i64, -400, 400);
+        const step = divsteps59(zeta0, f0, g0);
+        // delta + 1/2 = D = -zeta; swap iff D > 0 and g odd (BY19 divstep).
+        var D: i128 = -@as(i128, zeta0);
+        var f: i128 = f0;
+        var g: i128 = g0;
+        for (0..59) |_| {
+            if (D >= 1 and g & 1 == 1) {
+                const nf = g;
+                g = @divExact(g - f, 2);
+                f = nf;
+                D = 2 - D;
+            } else {
+                if (g & 1 == 1) g += f;
+                g = @divExact(g, 2);
+                D += 1;
+            }
+        }
+        try std.testing.expectEqual(-D, @as(i128, step.zeta));
+        const t = step.t;
+        try std.testing.expectEqual(f << 62, @as(i128, t.u) * f0 + @as(i128, t.v) * g0);
+        try std.testing.expectEqual(g << 62, @as(i128, t.q) * f0 + @as(i128, t.r) * g0);
+    }
+}
+
+fn randIn(comptime m: u1024, rand: std.Random) i2048 {
+    // Uniform-ish in (-2m, m), with the two ends over-represented.
+    const span: u1100 = 3 * @as(u1100, m) - 1;
+    var raw: u1100 = 0;
+    rand.bytes(std.mem.asBytes(&raw)[0..140]);
+    raw %= span;
+    const base: i2048 = -2 * @as(i2048, m) + 1;
+    return switch (rand.uintLessThan(u8, 4)) {
+        0 => base + @as(i2048, @intCast(rand.int(u64))),
+        1 => @as(i2048, m) - 1 - @as(i2048, @intCast(rand.int(u64))),
+        else => base + @as(i2048, @intCast(raw)),
+    };
+}
+
+test "mutation 2026-11-25: updateDE keeps d and e in (-2m, m) and divides by 2^62 exactly" {
+    var prng = std.Random.DefaultPrng.init(0xDE_DE_62);
+    const rand = prng.random();
+    inline for (moduli) |m| {
+        const S = Safegcd(m);
+        const mi: i2048 = m;
+        const bound: i64 = 1 << 62;
+        for (0..2500) |_| {
+            const di = randIn(m, rand);
+            const ei = randIn(m, rand);
+            // A matrix with |u| + |v| <= 2^62 and |q| + |r| <= 2^62, the
+            // bound a divsteps59 matrix obeys; half of them at the extreme.
+            var tr: [4]i64 = undefined;
+            for ([_]usize{ 0, 2 }) |k| {
+                const big = rand.boolean();
+                const a: i64 = if (big) bound - rand.intRangeAtMost(i64, 0, 1000) else rand.intRangeAtMost(i64, 0, bound);
+                const b: i64 = rand.intRangeAtMost(i64, 0, bound - a);
+                tr[k] = if (rand.boolean()) a else -a;
+                tr[k + 1] = if (rand.boolean()) b else -b;
+            }
+            const t: Trans = .{ .u = tr[0], .v = tr[1], .q = tr[2], .r = tr[3] };
+            var d = intToS(S, di);
+            var e = intToS(S, ei);
+            S.updateDE(&d, &e, t);
+            const dn = sToInt(S, d);
+            const en = sToInt(S, e);
+            try std.testing.expect(dn > -2 * mi and dn < mi);
+            try std.testing.expect(en > -2 * mi and en < mi);
+            const two62: i2048 = @as(i2048, 1) << 62;
+            try std.testing.expectEqual(@as(i2048, 0), @mod(dn * two62 - (@as(i2048, t.u) * di + @as(i2048, t.v) * ei), mi));
+            try std.testing.expectEqual(@as(i2048, 0), @mod(en * two62 - (@as(i2048, t.q) * di + @as(i2048, t.r) * ei), mi));
+        }
+    }
+}
+
+test "mutation 2026-11-25: normalize reduces any value in (-2m, m), negated or not, into [0, m)" {
+    var prng = std.Random.DefaultPrng.init(0x40_12_AA);
+    const rand = prng.random();
+    inline for (moduli) |m| {
+        const S = Safegcd(m);
+        const mi: i2048 = m;
+        for (0..3000) |_| {
+            const x = randIn(m, rand);
+            const neg = rand.boolean();
+            var r = intToS(S, x);
+            // `sign` is the top limb of `f`: -1 for a negative f, 0 or 1 otherwise.
+            S.normalize(&r, if (neg) -1 else rand.intRangeAtMost(i64, 0, 1));
+            const want = @mod(if (neg) -x else x, mi);
+            try std.testing.expectEqual(want, sToInt(S, r));
+        }
+    }
+}

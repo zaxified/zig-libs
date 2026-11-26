@@ -124,6 +124,7 @@ test {
     _ = @import("stackprobe3_test.zig");
     _ = p256vrf;
     _ = @import("p256_kat_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 test "meta.deps is exactly {ct25519, sha2, p256, voprf} (the constant-time secret-scalar ladder, ELL2's expand_message_xmd, the P-256 suites' curve and SSWU map)" {

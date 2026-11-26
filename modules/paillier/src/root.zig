@@ -3568,6 +3568,7 @@ test "decrypt: no secret full-value copy survives on the dead stack (paillier F2
 
 test {
     _ = @import("stackprobe_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 // ── whole-module mutation round ─────────────────────────────────
