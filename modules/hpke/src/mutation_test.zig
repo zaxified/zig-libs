@@ -12,6 +12,7 @@ const kdf = @import("kdf.zig");
 const dhkem = @import("dhkem.zig");
 const schedule = @import("schedule.zig");
 const pq = @import("pq.zig");
+const agile = @import("agile.zig");
 
 const Aead = aesgcm.Aes128Gcm;
 
@@ -186,4 +187,258 @@ test "DHKEM X25519 AuthDecap: a low-order enc with a valid pkS is DhFailed" {
         try testing.expectError(error.DhFailed, K.authDecap(&ss, enc, &kp, sender.public_key));
         try expectZeroed(&ss);
     }
+}
+
+// ── whole-module run 2026-11-25: agile.zig / agile_set.zig ───────────────────
+
+// agile.Suite.encLength / tagLength: an id `init` refuses (built by hand, the
+// fields are public) has length 0, as documented.
+test "mutation 2026-11-25: Suite.encLength and tagLength are 0 for an unregistered KEM / AEAD id" {
+    const s: agile.Suite = .{ .kem = @fromBackingInt(0x1234), .kdf = .hkdf_sha256, .aead = @fromBackingInt(0x1234) };
+    try testing.expectEqual(@as(usize, 0), s.encLength());
+    try testing.expectEqual(@as(usize, 0), s.tagLength());
+}
+
+// agile_set.keyPairFromSecret: `out` is zeroed when the DHKEM scalar is refused.
+// The callee fails before it writes the payload, so what the zeroing makes
+// observable is the union tag: a zeroed KeyPair is the first variant (P-256),
+// not the P-384 variant `@unionInit` selected.
+test "mutation 2026-11-25: agile keyPairFromSecret zeroes out when the scalar is refused" {
+    var kp: agile.KeyPair = undefined;
+    @memset(std.mem.asBytes(&kp), 0xaa);
+    const zero_sk: [48]u8 = @splat(0);
+    try testing.expectError(error.DeserializeError, agile.keyPairFromSecret(&kp, .dhkem_p384_hkdf_sha384, &zero_sk));
+    try testing.expectEqual(agile.KemId.dhkem_p256_hkdf_sha256, kp.kemId());
+}
+
+// agile_set: the sender's / recipient's own keys must belong to the suite's KEM
+// (KemMismatch, before the inactive union field is touched); the recipient's
+// mode check (auth needs pkS, base takes none); `out` is zeroed on every error
+// of setupS / setupR; the exporter secret's tail past Nh is zero; an
+// export-only context has seq 0.
+test "mutation 2026-11-25: agile setup checks sender key KEM, recipient mode, zeroing and padding" {
+    var x: agile.KeyPair = undefined;
+    try agile.deriveKeyPair(&x, .dhkem_x25519_hkdf_sha256, "x");
+    var m: agile.KeyPair = undefined;
+    try agile.deriveKeyPair(&m, .ml_kem_768, "m");
+    const pkx = x.publicKey();
+    const pkm = m.publicKey();
+    const sx = try agile.Suite.init(0x0020, 1, 1);
+    var st: agile.Setup = undefined;
+    var c: agile.Context = undefined;
+
+    // skS of another KEM, pkS of another KEM.
+    try testing.expectError(error.KemMismatch, agile.setupSDeterministic(&st, sx, .auth, &pkx, &m, "e", "", "", ""));
+    try testing.expectError(error.KemMismatch, agile.setupR(&c, sx, .auth, pkx.slice(), &x, &pkm, "", "", ""));
+    // Recipient: auth without pkS, base with pkS.
+    try testing.expectError(error.UnsupportedMode, agile.setupR(&c, sx, .auth, pkx.slice(), &x, null, "", "", ""));
+    try testing.expectError(error.UnsupportedMode, agile.setupR(&c, sx, .base, pkx.slice(), &x, &pkx, "", "", ""));
+
+    // `out` zeroed on error.
+    @memset(std.mem.asBytes(&st), 0xaa);
+    try testing.expectError(error.KemMismatch, agile.setupSDeterministic(&st, sx, .base, &pkm, null, "e", "", "", ""));
+    try expectZeroed(&st);
+    @memset(std.mem.asBytes(&c), 0xaa);
+    try testing.expectError(error.InvalidLength, agile.setupR(&c, sx, .base, "short", &x, null, "", "", ""));
+    try expectZeroed(&c);
+
+    // The exporter secret past Nh (HKDF-SHA256: 32) is zero, sender and recipient.
+    @memset(std.mem.asBytes(&st), 0xaa);
+    try agile.setupSDeterministic(&st, sx, .base, &pkx, null, "e", "", "", "");
+    for (st.context.exporter_secret[32..]) |b| try testing.expectEqual(@as(u8, 0), b);
+    @memset(std.mem.asBytes(&c), 0xaa);
+    try agile.setupR(&c, sx, .base, st.encSlice(), &x, null, "", "", "");
+    for (c.exporter_secret[32..]) |b| try testing.expectEqual(@as(u8, 0), b);
+
+    // Export-only: seq() is 0.
+    const se = try agile.Suite.init(0x0020, 1, 0xffff);
+    try agile.setupSDeterministic(&st, se, .base, &pkx, null, "e", "", "", "");
+    try testing.expectEqual(@as(u64, 0), st.context.seq());
+}
+
+// agile_set.sealBase / openBase: an `out` shorter than `enc` (or a `sealed`
+// shorter than `enc`) is InvalidLength; at exactly `enc` length the error is the
+// context's (ExportOnly for an export-only suite, DecryptionFailed for an empty ciphertext).
+test "mutation 2026-11-25: agile sealBase / openBase length guards at the enc boundary" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var x: agile.KeyPair = undefined;
+    try agile.deriveKeyPair(&x, .dhkem_x25519_hkdf_sha256, "x");
+    const pkx = x.publicKey();
+    const s = try agile.Suite.init(0x0020, 1, 1);
+    const n = s.encLength();
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.InvalidLength, agile.sealBase(s, &pkx, io, "", "", "", buf[0 .. n - 1]));
+    const se = try agile.Suite.init(0x0020, 1, 0xffff);
+    try testing.expectError(error.ExportOnly, agile.sealBase(se, &pkx, io, "", "", "", buf[0..n]));
+
+    try agile.sealBase(s, &pkx, io, "", "", "x", buf[0 .. n + 1 + s.tagLength()]);
+    var back: [1]u8 = undefined;
+    try testing.expectError(error.InvalidLength, agile.openBase(s, &x, "", "", buf[0 .. n - 1], &back));
+    try testing.expectError(error.DecryptionFailed, agile.openBase(s, &x, "", "", buf[0..n], back[0..0]));
+}
+
+// ── whole-module run 2026-11-25: schedule.zig / pq.zig ───────────────────────
+
+// schedule.Context: `aead_key` records the key `aead_state` was expanded from.
+// The key schedule must (re)expand and record it (`expandAead`, both the two-stage
+// and the one-stage path), and `readyAead` must honour the record: a Context whose
+// `aead_key` already equals the freshly derived key but whose state is garbage
+// still seals correctly; a rewritten `key` that happens to equal a garbage
+// `aead_key` is not mistaken for the expanded one.
+test "mutation 2026-11-25: Context expandAead records aead_key and the key schedule re-expands over a poisoned state" {
+    inline for (.{ kdf.HkdfSha256, kdf.Shake256 }) |K| {
+        const C = schedule.Context(Aead, K);
+        const sid = suite.suiteId(0x0020, K.kdf_id, 0x0001);
+        const ss: [32]u8 = @splat(5);
+        var ref: C = undefined;
+        try schedule.keySchedule(Aead, K, &ref, .base, &sid, &ss, "i", "", "");
+        var ctx: C = undefined;
+        @memset(std.mem.asBytes(&ctx), 0xaa);
+        ctx.aead_key = ref.key; // claims an expansion that never happened
+        try schedule.keySchedule(Aead, K, &ctx, .base, &sid, &ss, "i", "", "");
+        var c1: [6 + 16]u8 = undefined;
+        var c2: [6 + 16]u8 = undefined;
+        try ref.seal("aad", "hello!", &c1);
+        try ctx.seal("aad", "hello!", &c2);
+        try testing.expectEqualSlices(u8, &c1, &c2);
+
+        // A rewritten key that equals the (garbage) pre-schedule aead_key.
+        var a: C = undefined;
+        var b: C = undefined;
+        @memset(std.mem.asBytes(&b), 0x55);
+        try schedule.keySchedule(Aead, K, &a, .base, &sid, &ss, "i", "", "");
+        try schedule.keySchedule(Aead, K, &b, .base, &sid, &ss, "i", "", "");
+        a.key = @splat(0x55);
+        b.key = @splat(0x55);
+        try a.seal("aad", "hello!", &c1);
+        try b.seal("aad", "hello!", &c2);
+        try testing.expectEqualSlices(u8, &c1, &c2);
+    }
+}
+
+// pq.zig HybridKem.encapBody: the ML-KEM half of the key is checked first and is
+// DeserializeError (not DhFailed), `out` zeroed.
+test "mutation 2026-11-25: hybrid encap: a non-canonical ML-KEM key half is DeserializeError and zeroes out" {
+    inline for (.{ pq.MlKem768P256Kem, pq.MlKem1024P384Kem, pq.MlKem768X25519Kem }) |K| {
+        var kp: K.KeyPair = undefined;
+        K.fromSeed(&kp, &@as([32]u8, @splat(3)));
+        var pk = kp.public_key;
+        pk[0] = 0xff;
+        pk[1] = 0xff;
+        pk[2] = 0xff; // two coefficients of 4095 >= q
+        const eph: K.Ephemeral = @splat(0x11);
+        var out: K.Encapped = undefined;
+        @memset(std.mem.asBytes(&out), 0xaa);
+        try testing.expectError(error.DeserializeError, K.encapDeterministic(&out, pk, &eph));
+        try expectZeroed(&out);
+        try K.encapDeterministic(&out, kp.public_key, &eph); // positive control
+    }
+}
+
+// ── whole-module run 2026-11-25: dhkem.zig ───────────────────────────────────
+
+// X448Kem: every failing entry point zeroes `out` (the sweep's out-zeroing test
+// predates X448), and the all-zero DH check looks at the WHOLE output: a DH
+// result that is non-zero but ends in a zero byte is a shared secret, not DhFailed.
+test "mutation 2026-11-25: X448 zeroes out on every failing entry point; a DH output ending in 0x00 is accepted" {
+    const K = dhkem.X448Kem;
+    var r: K.KeyPair = undefined;
+    K.deriveKeyPair(&r, "recipient");
+    var s: K.KeyPair = undefined;
+    K.deriveKeyPair(&s, "sender");
+    var e: K.KeyPair = undefined;
+    K.deriveKeyPair(&e, "ephemeral");
+    const low: K.PublicKey = @splat(0); // u = 0: low order, DH output all zero
+    var out: K.Encapped = undefined;
+    var ss: [K.Nsecret]u8 = undefined;
+
+    @memset(std.mem.asBytes(&out), 0xaa);
+    try testing.expectError(error.DhFailed, K.encapDeterministic(&out, low, &e));
+    try expectZeroed(&out);
+    @memset(&ss, 0xaa);
+    try testing.expectError(error.DhFailed, K.decap(&ss, low, &r));
+    try expectZeroed(&ss);
+    @memset(std.mem.asBytes(&out), 0xaa);
+    try testing.expectError(error.DhFailed, K.authEncapDeterministic(&out, low, &s, &e));
+    try expectZeroed(&out);
+    @memset(&ss, 0xaa);
+    try testing.expectError(error.DhFailed, K.authDecap(&ss, low, &r, s.public_key));
+    try expectZeroed(&ss);
+    @memset(&ss, 0xaa);
+    try testing.expectError(error.DhFailed, K.authDecap(&ss, e.public_key, &r, low));
+    try expectZeroed(&ss);
+
+    // DH(k, 5) for k = 1496 (LE) is non-zero with a zero last byte (RFC 7748
+    // ladder, checked independently): accepted.
+    var base: K.PublicKey = @splat(0);
+    base[0] = 5;
+    var eph: K.KeyPair = .{ .public_key = @splat(1), .secret_key = @splat(0) };
+    eph.secret_key[0] = 0xd8;
+    eph.secret_key[1] = 0x05;
+    try K.encapDeterministic(&out, base, &eph);
+}
+
+// P256Kem / P384Kem: the error class of each failing step in decap and the auth
+// modes (an undecodable point is DeserializeError, a zero scalar, i.e. an identity
+// DH result, is DhFailed).
+test "mutation 2026-11-25: DHKEM P-256 / P-384 decap and auth modes: error class per failing step" {
+    inline for (.{ dhkem.P256Kem, dhkem.P384Kem }) |K| {
+        var r: K.KeyPair = undefined;
+        K.deriveKeyPair(&r, "recipient");
+        var s: K.KeyPair = undefined;
+        K.deriveKeyPair(&s, "sender");
+        var e: K.KeyPair = undefined;
+        K.deriveKeyPair(&e, "ephemeral");
+        var bad: K.PublicKey = @splat(0);
+        bad[0] = 4;
+        bad[(K.Npk - 1) / 2] = 1;
+        bad[K.Npk - 1] = 1; // (1, 1): not on the curve ((0, 0) is p384's affine identity: DhFailed)
+        var r0 = r;
+        r0.secret_key = @splat(0);
+        var s0 = s;
+        s0.secret_key = @splat(0);
+        var e0 = e;
+        e0.secret_key = @splat(0);
+        var out: K.Encapped = undefined;
+        var ss: [K.Nsecret]u8 = undefined;
+
+        try testing.expectError(error.DeserializeError, K.authEncapDeterministic(&out, bad, &s, &e));
+        try testing.expectError(error.DhFailed, K.authEncapDeterministic(&out, r.public_key, &s, &e0));
+        try testing.expectError(error.DhFailed, K.authEncapDeterministic(&out, r.public_key, &s0, &e));
+        try testing.expectError(error.DhFailed, K.decap(&ss, e.public_key, &r0));
+        try testing.expectError(error.DeserializeError, K.authDecap(&ss, bad, &r, s.public_key));
+        try testing.expectError(error.DeserializeError, K.authDecap(&ss, e.public_key, &r, bad));
+        try testing.expectError(error.DhFailed, K.authDecap(&ss, e.public_key, &r0, s.public_key));
+        // (0, 0): p256 refuses it as a point, p384 decodes it as its affine identity (DH fails).
+        var origin: K.PublicKey = @splat(0);
+        origin[0] = 4;
+        const want: anyerror = if (K == dhkem.P384Kem) error.DhFailed else error.DeserializeError;
+        try testing.expectError(want, K.authDecap(&ss, e.public_key, &r, origin));
+        // positive control
+        try K.authEncapDeterministic(&out, r.public_key, &s, &e);
+        try K.authDecap(&ss, out.enc, &r, s.public_key);
+        try testing.expectEqualSlices(u8, &out.shared_secret, &ss);
+    }
+}
+
+// pq.zig NistGroup.dh: p384 decodes (0, 0) as its affine identity, so a hybrid key
+// or ciphertext carrying it fails the DH (DhFailed) where p256 refuses the
+// encoding (DeserializeError): the multiplication's identity error is reachable.
+test "mutation 2026-11-25: MLKEM1024-P384: an identity curve half is DhFailed on encap and decap" {
+    const K = pq.MlKem1024P384Kem;
+    const ek_pq_len = 1568;
+    var kp: K.KeyPair = undefined;
+    K.fromSeed(&kp, &@as([32]u8, @splat(9)));
+    var out: K.Encapped = undefined;
+    var bad_pk = kp.public_key;
+    @memset(bad_pk[ek_pq_len..], 0);
+    bad_pk[ek_pq_len] = 4;
+    const eph: K.Ephemeral = @splat(0x11);
+    try testing.expectError(error.DhFailed, K.encapDeterministic(&out, bad_pk, &eph));
+    var enc: K.EncappedKey = @splat(0);
+    enc[K.Nenc - 97] = 4;
+    var ss: [32]u8 = undefined;
+    try testing.expectError(error.DhFailed, K.decap(&ss, enc, &kp));
 }
