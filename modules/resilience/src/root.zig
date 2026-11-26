@@ -875,8 +875,8 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 /// Usage contract: pair every successful `tryAcquire()`/`acquire()` with
 /// exactly one `release()` — or use `run(op)`, which releases on the error
 /// path too. Thread-safe: a CAS loop on one atomic counter (the counter can
-/// never exceed the cap — the CAS refuses — nor go negative: `release`
-/// asserts in Debug and saturates at 0 in release builds). No allocation,
+/// never exceed the cap — the CAS refuses — nor go negative: an unmatched
+/// `release` is a no-op in every build mode). No allocation,
 /// nothing to deinit.
 pub const Bulkhead = struct {
     options: Options,

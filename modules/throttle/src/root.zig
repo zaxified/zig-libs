@@ -15,7 +15,7 @@
 //!   most `max_in_flight` slots out at once, lock-free (a CAS loop on one
 //!   atomic counter), zero allocation, no clock, no I/O. The counter can
 //!   never exceed the cap (the CAS refuses) nor go negative (`release`
-//!   asserts in Debug and saturates at 0 in release builds).
+//!   panics in Debug/ReleaseSafe and saturates at 0 in ReleaseFast/Small).
 //! - `Throttle.acquire()` — the bounded-wait variant (`max_wait_ms` > 0):
 //!   waits up to the deadline for a slot instead of shedding immediately,
 //!   with the waiter set itself capped (`max_waiters`) — an unbounded wait
@@ -294,15 +294,20 @@ pub const Throttle = struct {
     }
 
     /// Return a slot taken by a successful `tryAcquire`/`acquire`. Releasing
-    /// more than was acquired is a caller bug: asserts in Debug; in release
-    /// builds the counter saturates at 0 instead of wrapping (never
+    /// more than was acquired is a caller bug: panics in Debug/ReleaseSafe; in
+    /// ReleaseFast/Small the counter saturates at 0 instead of wrapping (never
     /// negative). Frees exactly one waiter batch: when waiters exist, the
     /// release generation is bumped and all of them are woken to re-contend.
     pub fn release(t: *Throttle) void {
         var cur = t.in_flight_count.load(.seq_cst);
         while (true) {
-            std.debug.assert(cur > 0); // release without a matching acquire
-            if (cur == 0) return; // ReleaseFast: saturate, don't wrap
+            // Release without a matching acquire. `std.debug.assert` would not do here: in
+            // ReleaseFast/ReleaseSmall it is `unreachable`, which the optimizer assumes, and it
+            // deleted the saturation below (the counter wrapped to 4294967295).
+            if (cur == 0) {
+                if (std.debug.runtime_safety) @panic("throttle: release without a matching acquire");
+                return; // ReleaseFast/Small: saturate, don't wrap
+            }
             cur = t.in_flight_count.cmpxchgWeak(cur, cur - 1, .seq_cst, .seq_cst) orelse
                 break;
         }
@@ -581,8 +586,10 @@ pub const Partitioned = struct {
         const b = &p.busy[partition];
         var cur = b.load(.seq_cst);
         while (true) {
-            std.debug.assert(cur > 0);
-            if (cur == 0) return;
+            if (cur == 0) { // see `Throttle.release`: an assert here is deleted by the optimizer in ReleaseFast
+                if (std.debug.runtime_safety) @panic("throttle: release without a matching acquire");
+                return;
+            }
             cur = b.cmpxchgWeak(cur, cur - 1, .seq_cst, .seq_cst) orelse break;
         }
         _ = p.total.fetchSub(1, .seq_cst);
@@ -1837,4 +1844,275 @@ test "adaptive middleware: a served request is a sample, a handler error is not,
     for (0..3) |_| try testing.expect(th.tryAcquire());
     try expectStatus(runWire(&r, wire("/t"), &buf), "503");
     for (0..3) |_| th.release();
+}
+
+// ── whole-module mutation tests (2026-11-25) ─────────────────────────────────
+
+// Pinned by a Python mirror of `sample` (same f64 operations, same order): each script is the shortest
+// found that separates the pristine arithmetic from one mutant of it; the expected limit is read after every sample.
+const Step = struct { rtt_ns: u64, in_flight: i64 = -1, dropped: bool = false };
+
+fn runScript(max: u32, init: u32, min: u32, script: []const Step, want: []const u32) !void {
+    var th: Throttle = .init(.{ .max_in_flight = max, .adaptive = .{ .initial_limit = init, .min_limit = min } });
+    defer th.deinit();
+    for (script, want) |s, w| {
+        th.sample(s.rtt_ns, if (s.in_flight < 0) th.limit() else @intCast(s.in_flight), s.dropped);
+        try testing.expectEqual(w, th.limit());
+    }
+}
+
+test "mutation 2026-11-25: gradient2 drops are ignored" {
+    const script = [_]Step{
+        .{ .rtt_ns = 15000000, .in_flight = 25, .dropped = true },
+        .{ .rtt_ns = 10000000, .in_flight = 50 },
+    };
+    const want = [_]u32{ 50, 50 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 a zero RTT is read as 1 ns" {
+    const script = [_]Step{
+        .{ .rtt_ns = 0 },
+        .{ .rtt_ns = 1 },
+    };
+    const want = [_]u32{ 50, 51 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 the warm-up mean covers exactly 10 samples" {
+    const script = [_]Step{
+        .{ .rtt_ns = 20000000 },
+        .{ .rtt_ns = 2 },
+        .{ .rtt_ns = 0 },
+        .{ .rtt_ns = 20000000 },
+        .{ .rtt_ns = 1 },
+        .{ .rtt_ns = 30000000, .in_flight = 50 },
+        .{ .rtt_ns = 15000000, .in_flight = 25 },
+        .{ .rtt_ns = 20000000 },
+        .{ .rtt_ns = 1, .in_flight = 25 },
+        .{ .rtt_ns = 2, .in_flight = 100 },
+        .{ .rtt_ns = 20000000, .in_flight = 25 },
+    };
+    const want = [_]u32{ 50, 51, 52, 50, 50, 47, 48, 48, 49, 49, 47 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 the long-term average uses alpha = 2 / (window + 1)" {
+    const script = [_]Step{
+        .{ .rtt_ns = 50000000, .in_flight = 50 },
+        .{ .rtt_ns = 10000000, .in_flight = 25 },
+        .{ .rtt_ns = 15000000 },
+        .{ .rtt_ns = 1000, .in_flight = 51 },
+        .{ .rtt_ns = 30000000, .in_flight = 51 },
+        .{ .rtt_ns = 10000000, .in_flight = 25 },
+        .{ .rtt_ns = 1, .in_flight = 50 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 0 },
+        .{ .rtt_ns = 1 },
+        .{ .rtt_ns = 500000000, .in_flight = 50 },
+        .{ .rtt_ns = 20000000 },
+    };
+    const want = [_]u32{ 50, 50, 51, 52, 53, 53, 53, 54, 55, 56, 51, 51 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 a long-term RTT above twice the current one is pulled down by 0.95" {
+    const script = [_]Step{
+        .{ .rtt_ns = 15000000 },
+        .{ .rtt_ns = 1000 },
+        .{ .rtt_ns = 100000000 },
+    };
+    const want = [_]u32{ 50, 51, 47 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 an idle application is in_flight < limit / 2 strictly" {
+    const script = [_]Step{
+        .{ .rtt_ns = 0, .in_flight = 25 },
+        .{ .rtt_ns = 30000000 },
+    };
+    const want = [_]u32{ 50, 49 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 the gradient is floored at 0.5" {
+    const script = [_]Step{
+        .{ .rtt_ns = 1, .in_flight = 100 },
+        .{ .rtt_ns = 1000 },
+        .{ .rtt_ns = 0 },
+        .{ .rtt_ns = 30000000 },
+    };
+    const want = [_]u32{ 50, 49, 49, 45 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 the gradient is capped at 1.0" {
+    const script = [_]Step{
+        .{ .rtt_ns = 100000000, .in_flight = 25 },
+        .{ .rtt_ns = 1 },
+    };
+    const want = [_]u32{ 50, 51 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 the gradient scales by rtt_tolerance" {
+    const script = [_]Step{
+        .{ .rtt_ns = 1, .in_flight = 25 },
+        .{ .rtt_ns = 2 },
+    };
+    const want = [_]u32{ 50, 51 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 the new estimate blends (1 - smoothing) old and smoothing raw" {
+    const script = [_]Step{
+        .{ .rtt_ns = 1 },
+        .{ .rtt_ns = 2, .in_flight = 100 },
+    };
+    const want = [_]u32{ 50, 51 };
+    try runScript(200, 50, 5, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 the estimate is clamped to the floor" {
+    const script = [_]Step{
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 500000000 },
+        .{ .rtt_ns = 500000000 },
+        .{ .rtt_ns = 500000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+    };
+    const want = [_]u32{ 50, 51, 52, 47, 45, 45, 45, 46 };
+    try runScript(200, 50, 45, &script, &want);
+}
+
+test "mutation 2026-11-25: gradient2 the estimate is clamped to the ceiling" {
+    const script = [_]Step{
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 50000000 },
+        .{ .rtt_ns = 10000000 },
+        .{ .rtt_ns = 10000000 },
+    };
+    const want = [_]u32{ 50, 51, 52, 53, 54, 54, 55, 50, 51, 51 };
+    try runScript(55, 50, 5, &script, &want);
+}
+
+fn hPartitionZero(ctx: *router.Ctx) anyerror!void {
+    const p: *Partitioned = @ptrCast(@alignCast(ctx.state.?));
+    if (p.inFlightIn(0) != 1 or p.inFlightIn(1) != 0) return error.WrongPartition;
+    try ctx.res.writeAll("ok");
+}
+
+test "mutation 2026-11-25: the adaptive default initial limit is 20, below a larger ceiling" {
+    var th: Throttle = .init(.{ .max_in_flight = 100, .adaptive = .{} });
+    defer th.deinit();
+    try testing.expectEqual(@as(u32, 20), th.limit());
+}
+
+test "mutation 2026-11-25: a static throttle never reads the clock, not even in releasePermit" {
+    var fc: FakeClock = .{ .step_ns = 0 };
+    var th: Throttle = .init(.{ .max_in_flight = 2, .clock = fc.clock() });
+    defer th.deinit();
+    const p = th.acquirePermit().?;
+    th.releasePermit(p, .success);
+    try testing.expectEqual(@as(u32, 0), fc.calls);
+}
+
+test "mutation 2026-11-25: a sample that finds another being applied is skipped, and the lock is released after a sample" {
+    var th: Throttle = .init(.{ .max_in_flight = 30, .adaptive = .{ .algorithm = .aimd, .initial_limit = 20, .min_limit = 10 } });
+    defer th.deinit();
+    th.adapt_busy.store(true, .seq_cst);
+    th.sample(1_000, 20, false); // would grow to 21
+    try testing.expectEqual(@as(u32, 20), th.limit());
+    th.adapt_busy.store(false, .seq_cst);
+    th.sample(1_000, 20, false);
+    try testing.expectEqual(@as(u32, 21), th.limit());
+    try testing.expect(!th.adapt_busy.load(.seq_cst));
+}
+
+test "mutation 2026-11-25: aimd: an RTT exactly at timeout_ms is not a timeout" {
+    var th: Throttle = .init(.{ .max_in_flight = 30, .adaptive = .{ .algorithm = .aimd, .initial_limit = 20, .min_limit = 10, .timeout_ms = 5_000 } });
+    defer th.deinit();
+    th.sample(5_000 * std.time.ns_per_ms, 1, false); // not > timeout, and under-used: no change
+    try testing.expectEqual(@as(u32, 20), th.limit());
+    th.sample(5_000 * std.time.ns_per_ms + 1, 1, false); // one ns past it: backs off to floor(20 * 0.9)
+    try testing.expectEqual(@as(u32, 18), th.limit());
+}
+
+test "mutation 2026-11-25: adaptive middleware: a handler error is no sample even when a sample would change the limit" {
+    var mc = clock_lib.ManualClock.init(1_000);
+    var th: Throttle = .init(.{
+        .max_in_flight = 10,
+        .clock = mc.clock(),
+        .adaptive = .{ .algorithm = .aimd, .initial_limit = 2, .min_limit = 1 },
+    });
+    defer th.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(th.middleware());
+    try r.get("/boom", hBoom);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("/boom"), &buf), "500");
+    try testing.expectEqual(@as(u32, 2), th.limit()); // a .success sample (1 * 2 >= 2) would have grown it to 3
+}
+
+test "mutation 2026-11-25: Partitioned: guarantees round down from max_in_flight * share / 100" {
+    var p = try Partitioned.init(.{ .max_in_flight = 99, .shares_percent = &.{ 50, 50 } });
+    defer p.deinit();
+    try testing.expectEqual(@as(u32, 49), p.guaranteed(0));
+    try testing.expectEqual(@as(u32, 49), p.guaranteed(1));
+}
+
+test "mutation 2026-11-25: Partitioned with the maximum number of partitions: the index equal to count is out of range" {
+    const shares: [max_partitions]u8 = @splat(6);
+    var p = try Partitioned.init(.{ .max_in_flight = 160, .shares_percent = &shares });
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 0), p.inFlightIn(max_partitions));
+    try testing.expectEqual(@as(u32, 0), p.guaranteed(max_partitions));
+    try testing.expectEqual(@as(u32, 9), p.guaranteed(max_partitions - 1));
+    try testing.expect(!p.tryAcquire(max_partitions));
+}
+
+test "mutation 2026-11-25: Partitioned.middleware without classify uses partition 0" {
+    var p = try Partitioned.init(.{ .max_in_flight = 2, .shares_percent = &.{ 50, 50 } });
+    defer p.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &p;
+    try r.use(p.middleware());
+    try r.get("/t", hPartitionZero);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("/t"), &buf), "200");
+    try testing.expectEqual(@as(usize, 0), p.inFlight());
+}
+
+test "mutation 2026-11-25: release without a matching acquire saturates at 0 in the release builds" {
+    // ReleaseSafe/Debug assert before the saturation line; only ReleaseFast/Small reach it.
+    const mode = @import("builtin").mode;
+    if (mode != .fast and mode != .small) return error.SkipZigTest;
+    var th: Throttle = .init(.{ .max_in_flight = 2 });
+    th.release();
+    try testing.expectEqual(@as(usize, 0), th.inFlight());
+    try testing.expect(th.tryAcquire());
+    th.release();
+    var p = try Partitioned.init(.{ .max_in_flight = 2, .shares_percent = &.{50} });
+    p.release(0);
+    try testing.expectEqual(@as(usize, 0), p.inFlight());
+    try testing.expectEqual(@as(usize, 0), p.inFlightIn(0));
+}
+
+test "mutation 2026-11-25: gradient2 first samples: a zero RTT is read as 1 ns (limit stays sane)" {
+    var th: Throttle = .init(.{ .max_in_flight = 200, .adaptive = .{ .initial_limit = 100, .min_limit = 5 } });
+    defer th.deinit();
+    th.sample(0, 100, false);
+    th.sample(1, 100, false);
+    try testing.expectEqual(@as(u32, 101), th.limit());
 }

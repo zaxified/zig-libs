@@ -78,6 +78,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("search.zig");
     _ = @import("distance.zig");
+    _ = @import("mutation_test.zig");
 }
 
 const testing = std.testing;

@@ -1888,6 +1888,7 @@ test "abac: missing attribute is Indeterminate, collapses to Deny" {
 
 test {
     _ = policy_text;
+    _ = @import("mutation_test.zig");
 }
 
 test "Decision.isPermit collapses non-permit results" {

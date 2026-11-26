@@ -1889,14 +1889,14 @@ ctap2	ReleaseFast	token	1	0	e20d2cc588863de8	e927dca40cedb432
 # test (root.zig `decode`, x3; for canonical text the '=' positions are fixed by
 # the public length, so the outcome carries nothing) + the validity verdict
 # taken once at the end (root.zig `decode`, x2).
-base32	ReleaseFast	encode	1	0	8f9de776f14328be	123eeef97ba0d81b
+base32	ReleaseFast	encode	1	0	f38db83bcf0db9e3	123eeef97ba0d81b
 # Zig 0.17.0 (2026-10-18): decode 5 -> 8 in-file, no new line and no new class. The three new
 # contexts are the same `c == '='` test in root.zig `decode` (once per decode call, x3), now at a SECOND
 # address: LLVM 22 emits the loop twice (a copy with the skip_whitespace `bt` test and one without),
 # each with its own `cmp $0x3d,%edi` / `je` (objdump 0x1076333 and 0x10764d3). Same per-character
 # padding test the 5 already counted, whose outcome the public length fixes for canonical text;
 # the validity verdict (root.zig `decode`, x2) unchanged.
-base32	ReleaseFast	decode	1	8	8f9de776f14328be	4b6a48f852c57125
+base32	ReleaseFast	decode	1	8	f38db83bcf0db9e3	4b6a48f852c57125
 # voprf (2026-10-10, ristretto255-SHA512) — server: skS + proof nonce through
 # blindEvaluate/Verifiable/Poprf, evaluate, evaluatePoprf; client: the
 # private input + blinds through blind/finalize/finalizeVerifiable/

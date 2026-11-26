@@ -911,12 +911,17 @@ pub const Pool = struct {
         // In-flight decrement LAST: it is the release of this call's hold
         // on `u` — once it reaches 0 a removed `u` may be freed by `reap`
         // on another thread, so nothing below may touch `u`. A report
-        // without a matching pick is a caller bug — assert in Debug,
-        // saturate at 0 in release builds.
+        // without a matching pick is a caller bug — panic in Debug/
+        // ReleaseSafe, saturate at 0 in ReleaseFast/Small.
         var cur = u.in_flight.load(.seq_cst);
         while (true) {
-            std.debug.assert(cur > 0);
-            if (cur == 0) break;
+            // Not `std.debug.assert(cur > 0)`: in ReleaseFast/Small an assert is
+            // `unreachable`, the optimizer then deletes the saturation below
+            // and an unmatched report wraps the counter to maxInt(u32).
+            if (cur == 0) {
+                if (std.debug.runtime_safety) @panic("upstream: report without a matching pick");
+                break;
+            }
             cur = u.in_flight.cmpxchgWeak(cur, cur - 1, .seq_cst, .seq_cst) orelse break;
         }
     }
@@ -1377,6 +1382,18 @@ test "add: parse errors, duplicate ids, and the fleet bound are typed errors" {
     try testing.expectEqual(2, pool.count());
     try testing.expect(pool.getById("b") != null);
     try testing.expectEqual(null, pool.getById("nope"));
+}
+
+test "a report without a matching pick saturates in_flight at 0 in the release builds" {
+    // Debug/ReleaseSafe trap on the caller bug instead (the panic above).
+    if (std.debug.runtime_safety) return error.SkipZigTest;
+    var pool: Pool = .init(testing.allocator, .{});
+    defer pool.deinit();
+    try addThree(&pool);
+    const u = pool.pick().?;
+    pool.report(u, true, null);
+    pool.report(u, true, null); // unmatched
+    try testing.expectEqual(@as(u32, 0), u.in_flight.load(.seq_cst));
 }
 
 test "round_robin cycles the healthy upstreams in order" {

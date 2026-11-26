@@ -2975,6 +2975,19 @@ test "ingest lock: with lock_timeout_ns a locker gives up with IngestLockTimeout
     timed.unlockIngest(g);
 }
 
+test "mutation 2026-11-25: initOptions carries lock_timeout_ns into the store (a store opened with it times out)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const plain = try testStore(&tmp, &bb);
+    try t.expectEqual(@as(u64, 0), plain.lock_timeout_ns);
+    const timed = try Store.initOptions(t.io, plain.base, .{ .lock_timeout_ns = 50 * std.time.ns_per_ms });
+    try t.expectEqual(@as(u64, 50 * std.time.ns_per_ms), timed.lock_timeout_ns);
+    const f = try plain.lockIngest();
+    defer plain.unlockIngest(f);
+    try t.expectError(error.IngestLockTimeout, timed.lockIngest());
+}
+
 test "gc: reaps exactly its own temps, counts each, and leaves strangers, young temps and live files alone" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

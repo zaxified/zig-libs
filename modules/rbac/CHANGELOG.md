@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** killing tests for `policy.zig` from the 2026-11-25 delta mutation run.
 - **2026-11-21** — **NEW: policy text and domains.** `rbac.Engine.loadPolicy` / `fromPolicy` / `savePolicy` read and write the policy as Casbin-style CSV (`p`, `g`, `g2`, `sod`, `r` records; comments, quoted fields; syntax checked before anything is applied, the line of an error in `rbac.PolicyDiag`; output sorted, load-then-save is a fixed point). `rbac.Domains` is one engine per tenant (Casbin's RBAC with domains): roles, permissions, hierarchy, SoD and assignments per domain, an unknown domain denies, `loadPolicy` / `savePolicy` take the domain field where Casbin puts it.
 - **2026-11-16** — Opt-in wildcard permissions: `rbac.Engine.initWithMatch(gpa, .key_match)` (and `Engine.match`, `rbac.Match`) make `check` treat stored permissions as `keyMatch` patterns (`*` = any run of bytes incl. `/`); public `rbac.keyMatch`. Matching is O(pattern x text), no exponential backtracking. Default `init` is unchanged (exact strings).
 - **2026-10-04** — Tests: first mutation run (55 mutants, 54 killed, 1 equivalent); 4 tests added

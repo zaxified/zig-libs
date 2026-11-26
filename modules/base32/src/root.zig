@@ -989,6 +989,7 @@ fn compareDecodes(got: []u8, want: []u8, text: []const u8, opts: DecodeOptions) 
 test {
     _ = @import("kat_vectors.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

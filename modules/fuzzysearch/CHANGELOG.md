@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** killing tests from the 2026-11-25 whole-module mutation run (UTF-8 shapes, codepoint distance, prefix search limits).
 - **2026-11-21** — **Additive (pub error set unchanged, `SearchOptions` gains a field):** `Frozen.searchPrefix` (keys with a prefix within `k` edits of the query, for typeahead), `SearchOptions.unit` (`.byte` default, `.codepoint`: an edit is a Unicode scalar value), `search.Unit` / `fuzzysearch.Unit` and `osaDistanceCodepoints`. Defaults leave every existing call unchanged. Tests: differential searches of both against brute-force OSA over both trie formats, including malformed UTF-8.
 - **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-10** — tests: deterministic fuzz driver `FUZZYSEARCH_FUZZ` over the existing harnesses (frozen-buffer loader + search on corpus-damaged bytes, and re-sealed mutations of a valid index); reach labels count real outcomes. No code or API change.

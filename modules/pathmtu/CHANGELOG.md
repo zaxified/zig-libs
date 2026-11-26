@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** killing tests from the 2026-11-25 delta mutation run.
 - **2026-11-20** — **Source-breaking (pub error set):** ADDED `ProbeError.DeadlineExceeded` (and so `HopsProbeError`'s), so an exhaustive `switch` needs the new value. ADDED `Options.probe_deadline_ms` (default 0 = no budget, behaviour unchanged): an opt-in wall-clock bound for `probe`, which then stops sending once it is spent and fails with the new error. Test in `root.zig`.
 - **2026-11-20** — **Behaviour change (cost only):** on the unprivileged ping-socket (DGRAM) lane, `probe` and `probeHops` read the next-hop MTU of a Fragmentation Needed / Packet Too Big from the error-queue entry (`icmp.Socket.ErrInfo.ee_info`) and use it as the search hint, as the RAW lane already did from the message: fewer probes, same answers (a hint only narrows the search and is probed, never adopted).
 - **2026-11-17** — Fix: `query(::1, .{ .iface = "lo" })` reported `cache_is_exception = true` with no PMTU exception, because the IPv4 cap of 65535 (`IP_MTU` cannot read above the 16-bit length field) was also applied to the interface MTU of an IPv6 query, while `IPV6_MTU` reads `lo`'s 65536 as is. The comparison is now capped for IPv4 only (`cacheIsException`). Behaviour change: only for an IPv6 query on an interface whose MTU exceeds 65535 (loopback). Tests: a pure test of both families and the live `::1` check; delta mutation 6/6 killed; card 349/396.

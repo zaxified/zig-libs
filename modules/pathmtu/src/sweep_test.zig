@@ -69,3 +69,36 @@ test "probeHops: option extremes are errors or bounded results, never a panic (s
     try testing.expect(!r.reached);
     try testing.expectEqual(@as(usize, 2), r.hops.len);
 }
+
+const icmp = @import("icmp");
+
+/// An `on_attempt` observer that burns `ns` of the monotonic clock per attempt.
+const SlowObserver = struct {
+    ns: i64,
+    calls: usize = 0,
+    fn f(ctx: *anyopaque, _: u16, _: root.ProbeOutcome) void {
+        const self: *SlowObserver = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const until = icmp.monoNow() + self.ns;
+        while (icmp.monoNow() < until) std.atomic.spinLoopHint();
+    }
+};
+
+test "mutation 2026-11-25: probe() with a spent probe_deadline_ms fails with DeadlineExceeded, a generous one answers" {
+    const dest: netaddr.Ip = .{ .v4 = .{ 127, 0, 0, 1 } };
+    // A 1 ms budget that every attempt overruns by 3 ms: whatever the search concluded from the
+    // starved probes is not an answer, so the result is the deadline error (never a Result or Unreachable).
+    var slow: SlowObserver = .{ .ns = 3 * std.time.ns_per_ms };
+    const spent = root.probe(dest, .{ .timeout_ms = 500, .retries = 0, .iface = "lo", .probe_deadline_ms = 1, .on_attempt = .{ .ctx = &slow, .onAttempt = SlowObserver.f } });
+    if (spent) |_| return error.TestUnexpectedResult else |e| switch (e) {
+        error.DeadlineExceeded => {},
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return e,
+    }
+    // The same call without the observer and a generous budget (60 s, in milliseconds) answers on loopback.
+    const ok = root.probe(dest, .{ .timeout_ms = 500, .retries = 1, .iface = "lo", .probe_deadline_ms = 60_000 }) catch |e| switch (e) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return e,
+    };
+    try testing.expect(ok.mtu >= root.min_mtu_v4);
+}
