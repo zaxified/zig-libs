@@ -861,8 +861,22 @@ test "STACKPROBE: VerifiedCache.init leaves no copy of its MAC key on the dead s
 // such a run (a call that does not burn) is not judged. Failures print here
 // and are asserted by the last test in this file.
 var residue_failures: usize = 0;
+/// Measured calls that are plain copies with no burn by design (burn-presence survey 2026-11-26).
+const no_burn_by_design = [_][]const u8{"parseJwks oct"};
+fn burnsByDesign(label: []const u8) bool {
+    for (no_burn_by_design) |e| if (std.mem.endsWith(u8, label, e)) return false;
+    return true;
+}
 fn residueCheck(label: []const u8) void {
     const r = @import("testkit").stackprobe.residueOf(&snap, 0xC7, 512);
+    // Burn presence (2026-11-26): a snapshot with no zero run is "not judged" by the residue rule, so a
+    // removed entry-point burn passed this probe unless a named needle survived (dtls 1.3, whole-module
+    // mutation run). Every measured call must burn.
+    if (r.burn_len == 0 and burnsByDesign(label)) {
+        residue_failures += 1;
+        std.debug.print("\n=== STACKPROBE burn missing ({t}): {s}: no zero run of the minimum burn length in the snapshot ===\n", .{ builtin.mode, label });
+        return;
+    }
     if (r.residue_bytes == 0) return;
     residue_failures += 1;
     std.debug.print("\n=== STACKPROBE residue rule ({t}): {s}: {d} B below the burn (burn {d} B from {d} B, deepest {d} B) ===\n", .{ builtin.mode, label, r.residue_bytes, r.burn_len, r.burn_top, r.residue_deepest });

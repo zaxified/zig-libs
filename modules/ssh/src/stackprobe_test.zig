@@ -1054,6 +1054,14 @@ test "STACKPROBE: no ephemeral secret, shared secret or traffic key on the dead 
 var residue_failures: usize = 0;
 fn residueCheck(label: []const u8) void {
     const r = @import("testkit").stackprobe.residueOf(&snap, 0xC7, 512);
+    // Burn presence (2026-11-26): a snapshot with no zero run is "not judged" by the residue rule, so a
+    // removed entry-point burn passed this probe unless a named needle survived (dtls 1.3, whole-module
+    // mutation run). Every measured call must burn.
+    if (r.burn_len == 0) {
+        residue_failures += 1;
+        std.debug.print("\n=== STACKPROBE burn missing ({t}): {s}: no zero run of the minimum burn length in the snapshot ===\n", .{ builtin.mode, label });
+        return;
+    }
     if (r.residue_bytes == 0) return;
     residue_failures += 1;
     std.debug.print("\n=== STACKPROBE residue rule ({t}): {s}: {d} B below the burn (burn {d} B from {d} B, deepest {d} B) ===\n", .{ builtin.mode, label, r.residue_bytes, r.burn_len, r.burn_top, r.residue_deepest });

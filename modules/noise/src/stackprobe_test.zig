@@ -110,7 +110,10 @@ inline fn measure(call: *const fn () void) void {
     paint();
     shim(call);
     snapshot();
-    if (call != &callInnocent and call != &callLeaky) residueCheck("a call `measure` ran");
+    if (call != &callInnocent and call != &callLeaky) {
+        burn_expected = burnsByDesign(call);
+        residueCheck("a call `measure` ran");
+    }
 }
 
 fn dirtyDepth() usize {
@@ -657,6 +660,8 @@ fn Coverage(comptime S: type) type {
 }
 
 fn primitiveDepth(call: *const fn () void) usize {
+    calibrating = true;
+    defer calibrating = false;
     measure(call);
     return dirtyDepth() - cal_offset;
 }
@@ -666,6 +671,8 @@ fn primitiveDepth(call: *const fn () void) usize {
 /// its burn depth in `dirtyDepth` whatever it computed; what it may leave is
 /// only the non-zero part.
 fn primitiveDepthNonZero(call: *const fn () void) usize {
+    calibrating = true;
+    defer calibrating = false;
     measure(call);
     var i: usize = 0;
     while (i < WINDOW and (snap[i] == 0xC7 or snap[i] == 0)) : (i += 1) {}
@@ -774,8 +781,26 @@ fn chachapolyType() type {
 // such a run (a call that does not burn) is not judged. Failures print here
 // and are asserted by the last test in this file.
 var residue_failures: usize = 0;
+/// Measured calls that are plain copies or wipes with no burn by design (burn-presence survey 2026-11-26).
+const no_burn_calls = [_]*const fn () void{&stepInitKey};
+/// `primitiveDepth*` measure raw std primitives to size the burns (calibration, no burn).
+var calibrating = false;
+var burn_expected = true;
+fn burnsByDesign(call: *const fn () void) bool {
+    if (calibrating) return false;
+    for (no_burn_calls) |c| if (c == call) return false;
+    return true;
+}
 fn residueCheck(label: []const u8) void {
     const r = @import("testkit").stackprobe.residueOf(&snap, 0xC7, 512);
+    // Burn presence (2026-11-26): a snapshot with no zero run is "not judged" by the residue rule, so a
+    // removed entry-point burn passed this probe unless a named needle survived (dtls 1.3, whole-module
+    // mutation run). Every measured call must burn.
+    if (r.burn_len == 0 and burn_expected) {
+        residue_failures += 1;
+        std.debug.print("\n=== STACKPROBE burn missing ({t}): {s}: no zero run of the minimum burn length in the snapshot ===\n", .{ builtin.mode, label });
+        return;
+    }
     if (r.residue_bytes == 0) return;
     residue_failures += 1;
     std.debug.print("\n=== STACKPROBE residue rule ({t}): {s}: {d} B below the burn (burn {d} B from {d} B, deepest {d} B) ===\n", .{ builtin.mode, label, r.residue_bytes, r.burn_len, r.burn_top, r.residue_deepest });
