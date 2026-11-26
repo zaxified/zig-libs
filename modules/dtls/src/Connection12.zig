@@ -1826,6 +1826,8 @@ pub const Connection12 = struct {
         @memcpy(sk.key[0..kl], kb[kl..][0..kl]);
         @memcpy(ck.iv[0..il], kb[2 * kl ..][0..il]);
         @memcpy(sk.iv[0..il], kb[2 * kl + il ..][0..il]);
+        self.write_keys.wipe();
+        self.read_keys.wipe();
         switch (self.role) {
             .client => {
                 self.write_keys = ck;
@@ -1838,6 +1840,8 @@ pub const Connection12 = struct {
         }
         ck.wipe();
         sk.wipe();
+        self.write_keys.prepare();
+        self.read_keys.prepare();
         self.keys_live = true;
     }
 

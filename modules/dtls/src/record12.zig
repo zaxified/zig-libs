@@ -81,10 +81,38 @@ pub const DirKeys = struct {
     bulk: Bulk = .aes_128_gcm,
     key: [32]u8 = undefined,
     iv: [12]u8 = undefined,
+    /// The AES-GCM key schedule, expanded in place by `prepare` so a record
+    /// skips the AES key expansion and the GHASH key setup. `.none` (the
+    /// default, and every non-GCM bulk cipher) takes the stateless call.
+    gcm: Gcm = .none,
+
+    pub const Gcm = union(enum) {
+        none,
+        g128: Aes128Gcm.Context,
+        g256: Aes256Gcm.Context,
+    };
+
+    /// Expand the AES-GCM key schedule of `key` in place (no-op for the other
+    /// bulk ciphers). Call it after setting `bulk` and `key`; `wipe` clears it.
+    pub fn prepare(self: *DirKeys) void {
+        switch (self.bulk) {
+            .aes_128_gcm => {
+                self.gcm = .{ .g128 = undefined };
+                Aes128Gcm.Context.initInto(&self.gcm.g128, self.key[0..16]);
+            },
+            .aes_256_gcm => {
+                self.gcm = .{ .g256 = undefined };
+                Aes256Gcm.Context.initInto(&self.gcm.g256, &self.key);
+            },
+            else => self.gcm = .none,
+        }
+    }
 
     pub fn wipe(self: *DirKeys) void {
         std.crypto.secureZero(u8, &self.key);
         std.crypto.secureZero(u8, &self.iv);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.gcm));
+        self.gcm = .none;
     }
 };
 
@@ -142,8 +170,8 @@ fn sealBody(keys: *const DirKeys, epoch: u16, seq: u48, content_type: u8, plaint
     var tag: [tag_len]u8 = undefined;
     const ct = body[0..plaintext.len];
     switch (keys.bulk) {
-        .aes_128_gcm => Aes128Gcm.encrypt(ct, &tag, plaintext, &ad, n, keys.key[0..16].*),
-        .aes_256_gcm => Aes256Gcm.encrypt(ct, &tag, plaintext, &ad, n, keys.key),
+        .aes_128_gcm => if (keys.gcm == .g128) keys.gcm.g128.encrypt(ct, &tag, plaintext, &ad, n) else Aes128Gcm.encrypt(ct, &tag, plaintext, &ad, n, keys.key[0..16].*),
+        .aes_256_gcm => if (keys.gcm == .g256) keys.gcm.g256.encrypt(ct, &tag, plaintext, &ad, n) else Aes256Gcm.encrypt(ct, &tag, plaintext, &ad, n, keys.key),
         .chacha20_poly1305 => ChaCha20Poly1305.encrypt(ct, &tag, plaintext, &ad, n, keys.key),
         .aes_128_ccm => Aes128Ccm.encrypt(ct, &tag, plaintext, &ad, n, keys.key[0..16].*) catch return error.BufferTooShort,
         .aes_128_ccm_8 => Aes128Ccm8.encrypt(ct, tag[0..8], plaintext, &ad, n, keys.key[0..16].*) catch return error.BufferTooShort,
@@ -179,8 +207,8 @@ fn openBody(keys: *const DirKeys, hdr: record.PlaintextHeader, fragment: []const
     const ad = additionalData(hdr.epoch, hdr.sequence_number, hdr.content_type, pt_len);
     const pt = out[0..pt_len];
     const r: anyerror!void = switch (keys.bulk) {
-        .aes_128_gcm => Aes128Gcm.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key[0..16].*),
-        .aes_256_gcm => Aes256Gcm.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key),
+        .aes_128_gcm => if (keys.gcm == .g128) keys.gcm.g128.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n) else Aes128Gcm.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key[0..16].*),
+        .aes_256_gcm => if (keys.gcm == .g256) keys.gcm.g256.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n) else Aes256Gcm.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key),
         .chacha20_poly1305 => ChaCha20Poly1305.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key),
         .aes_128_ccm => Aes128Ccm.decrypt(pt, body[0..pt_len], body[pt_len..][0..16].*, &ad, n, keys.key[0..16].*),
         .aes_128_ccm_8 => Aes128Ccm8.decrypt(pt, body[0..pt_len], body[pt_len..][0..8].*, &ad, n, keys.key[0..16].*),
@@ -285,8 +313,8 @@ fn sealCidBody(keys: *const DirKeys, epoch: u16, seq: u48, content_type: u8, pla
     inner[plaintext.len] = content_type;
     var tag: [tag_len]u8 = undefined;
     switch (keys.bulk) {
-        .aes_128_gcm => Aes128Gcm.encrypt(inner, &tag, inner, ad, n, keys.key[0..16].*),
-        .aes_256_gcm => Aes256Gcm.encrypt(inner, &tag, inner, ad, n, keys.key),
+        .aes_128_gcm => if (keys.gcm == .g128) keys.gcm.g128.encrypt(inner, &tag, inner, ad, n) else Aes128Gcm.encrypt(inner, &tag, inner, ad, n, keys.key[0..16].*),
+        .aes_256_gcm => if (keys.gcm == .g256) keys.gcm.g256.encrypt(inner, &tag, inner, ad, n) else Aes256Gcm.encrypt(inner, &tag, inner, ad, n, keys.key),
         .chacha20_poly1305 => ChaCha20Poly1305.encrypt(inner, &tag, inner, ad, n, keys.key),
         .aes_128_ccm => Aes128Ccm.encrypt(inner, &tag, inner, ad, n, keys.key[0..16].*) catch return error.BufferTooShort,
         .aes_128_ccm_8 => Aes128Ccm8.encrypt(inner, tag[0..8], inner, ad, n, keys.key[0..16].*) catch return error.BufferTooShort,
@@ -324,8 +352,8 @@ fn openCidBody(keys: *const DirKeys, hdr: CidHeader, fragment: []const u8, out: 
     const ad = additionalDataCid(hdr.epoch, hdr.sequence_number, hdr.cid, inner_len, &ad_buf);
     const pt = out[0..inner_len];
     const r: anyerror!void = switch (keys.bulk) {
-        .aes_128_gcm => Aes128Gcm.decrypt(pt, body[0..inner_len], body[inner_len..][0..16].*, ad, n, keys.key[0..16].*),
-        .aes_256_gcm => Aes256Gcm.decrypt(pt, body[0..inner_len], body[inner_len..][0..16].*, ad, n, keys.key),
+        .aes_128_gcm => if (keys.gcm == .g128) keys.gcm.g128.decrypt(pt, body[0..inner_len], body[inner_len..][0..16].*, ad, n) else Aes128Gcm.decrypt(pt, body[0..inner_len], body[inner_len..][0..16].*, ad, n, keys.key[0..16].*),
+        .aes_256_gcm => if (keys.gcm == .g256) keys.gcm.g256.decrypt(pt, body[0..inner_len], body[inner_len..][0..16].*, ad, n) else Aes256Gcm.decrypt(pt, body[0..inner_len], body[inner_len..][0..16].*, ad, n, keys.key),
         .chacha20_poly1305 => ChaCha20Poly1305.decrypt(pt, body[0..inner_len], body[inner_len..][0..16].*, ad, n, keys.key),
         .aes_128_ccm => Aes128Ccm.decrypt(pt, body[0..inner_len], body[inner_len..][0..16].*, ad, n, keys.key[0..16].*),
         .aes_128_ccm_8 => Aes128Ccm8.decrypt(pt, body[0..inner_len], body[inner_len..][0..8].*, ad, n, keys.key[0..16].*),
@@ -506,5 +534,40 @@ test "record12 CID: in-place sealing equals sealing from a separate buffer, ever
             try testing.expectEqualSlices(u8, ct[0 .. n + 1], rec[off..][0 .. n + 1]);
             try testing.expectEqualSlices(u8, tag[0..bulk.tagLen()], rec[off + n + 1 ..][0..bulk.tagLen()]);
         }
+    }
+}
+
+test "DirKeys.prepare: the cached AES-GCM key schedule seals and opens byte for byte like the stateless call (plain and CID records); wipe clears it" {
+    inline for (.{ Bulk.aes_128_gcm, Bulk.aes_256_gcm }) |bulk| {
+        var plain: DirKeys = .{ .bulk = bulk };
+        for (&plain.key, 0..) |*b, i| b.* = @intCast(i * 3 + 1);
+        for (&plain.iv, 0..) |*b, i| b.* = @intCast(0x40 + i);
+        var keyed = plain;
+        keyed.prepare();
+        try std.testing.expect(keyed.gcm != .none and plain.gcm == .none);
+        var msg: [1200]u8 = undefined;
+        for (&msg, 0..) |*b, i| b.* = @truncate(i *% 7);
+        for ([_]usize{ 0, 1, 100, 1200 }, 0..) |len, k| {
+            const seq: u48 = @intCast(k + 5);
+            var oa: [1300]u8 = undefined;
+            var ob: [1300]u8 = undefined;
+            const ra = try seal(&keyed, 1, seq, 23, msg[0..len], &oa);
+            const rb = try seal(&plain, 1, seq, 23, msg[0..len], &ob);
+            try std.testing.expectEqualSlices(u8, rb, ra);
+            const hdr = try record.decodePlaintext(ra);
+            var pt: [1300]u8 = undefined;
+            const back = try open(&keyed, hdr, ra[record.plaintext_header_len..], &pt);
+            try std.testing.expectEqualSlices(u8, msg[0..len], back);
+            const cid = [_]u8{ 9, 8, 7 };
+            const ca = try sealCid(&keyed, 1, seq, 23, msg[0..len], &cid, &oa);
+            const cb = try sealCid(&plain, 1, seq, 23, msg[0..len], &cid, &ob);
+            try std.testing.expectEqualSlices(u8, cb, ca);
+            const ch = try decodeCidHeader(ca, cid.len);
+            const opened = try openCid(&keyed, ch, ca[CidHeader.len(cid.len)..][0..ch.length], &pt);
+            try std.testing.expectEqualSlices(u8, msg[0..len], opened.plaintext);
+        }
+        keyed.wipe();
+        try std.testing.expect(keyed.gcm == .none);
+        try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&keyed.gcm), 0));
     }
 }

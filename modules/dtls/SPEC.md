@@ -932,7 +932,8 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
   the epoch's keys are installed (and wipes the previous epoch's first), so a record skips the AES key expansion and
   the GHASH key setup. Bench shield ABAB 2026-11-26, a whole `send` + `recv` on AES-128-GCM: 64 B 1168 → 883 ns,
   256 B 1285 → 988, 1024 B 1597 → 1300, 1400 B 1780 → 1486 (spread ≤ 0.4 %); ChaCha20-Poly1305 has no per-key state and
-  is unchanged. The DTLS 1.2 record layer and the AES sequence-number mask still expand their keys per record.
+  is unchanged. DTLS 1.2: `record12.DirKeys.prepare` expands the same schedule in place (`Connection12` calls it
+  when the key block is installed; `wipe` clears it; a `DirKeys` that was never prepared takes the stateless call).
 - **Fuzz:** `DTLS_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver; `_ONLY` selects a harness):
   `dtls-handshake` (PSK, HelloRetryRequest cookie, (EC)DHE, a certificate handshake whose leaf entry carries an OCSP
   staple and an SCT list, and a ticket resumption with 0-RTT early data, with one flight damaged; damage to the early
@@ -974,4 +975,9 @@ into a duplicate of the no-retry test if the exchange stops taking effect.
 
 ## Backlog / deferred
 
-None open.
+- **AES sequence-number mask key per epoch** (RFC 9147 §4.2.3): `snMaskDispatch` expands `sn_key` with std's AES on
+  every record. Keeping an `AesEncryptCtx` per epoch measured −12 % at 64 B and −6 % at 1400 B on a `send` + `recv`
+  (bench shield ABAB 2026-11-26), but `ctgrind.sh --check dtls` with `CTGRIND_CPU=x86_64` (soft AES) then reported
+  more contexts in the `hs` row (in-file 302 → 321, untainted control 177 → 269); native counts were unchanged. Not
+  kept until those contexts are read one by one and the portable expectation is either explained or avoided (e.g.
+  expanding the mask key through `aesgcm`'s constant-time core instead of std's table AES).
