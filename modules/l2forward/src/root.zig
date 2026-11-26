@@ -2324,3 +2324,30 @@ test "a move at a clock earlier than the window start stays inside the window (n
     try testing.expectEqual(LearnOutcome.moved, try t.learn(1, macOf(1), 2, 100)); // clock went back
     try testing.expectEqual(@as(u8, 2), t.moveCount(1, macOf(1)));
 }
+
+test "mutation 2026-11-25: removeMember purges only the PE-bound MACs and keeps the port-bound ones" {
+    var t = testTable();
+    defer t.deinit();
+    try t.addMember(5, 2);
+    try t.addMember(5, 3);
+    var buf: [16]PeId = undefined;
+    _ = try t.learnPort(5, macOf(0x10), 2, 0); // port number 2 equals the PE id 2 on purpose
+    _ = try t.learn(5, macOf(0x11), 2, 0);
+    _ = try t.learn(5, macOf(0x12), 3, 0);
+    t.removeMember(5, 2);
+    try testing.expectEqual(@as(?Location, .{ .port = 2 }), t.lookupLocation(5, macOf(0x10), 1));
+    try testing.expectEqual(@as(?Location, null), t.lookupLocation(5, macOf(0x11), 1));
+    try testing.expectEqual(@as(?Location, .{ .pe = 3 }), t.lookupLocation(5, macOf(0x12), 1));
+    try testing.expectEqual(Decision{ .local_port = 2 }, try t.forward(5, macOf(0x10), .access, 1, &buf));
+}
+
+test "mutation 2026-11-25: a core frame to a group address stays local_only even if the FDB holds a port entry for it" {
+    var t = testTable();
+    defer t.deinit();
+    try t.addMember(5, 2);
+    var buf: [16]PeId = undefined;
+    // `learn` refuses a group source, but `learnStaticPort` pins whatever the operator gives it.
+    try t.learnStaticPort(5, broadcast, 9, 0);
+    try testing.expectEqual(Decision.local_only, try t.forward(5, broadcast, .{ .core = 2 }, 1, &buf));
+    try testing.expectEqual(@as(usize, 1), (try t.forward(5, broadcast, .access, 1, &buf)).flood.len);
+}
