@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSL 4.1 `OPENSSL_clear_free` and libsodium 1.0.22 `sodium_free` (surveyed 2026-11-18)
 
-**Audit:** review none · mutation 2026-11-18 (8/8, 0 eq) · src 587079bec2c92279
+**Audit:** review none · mutation 2026-11-25 (29/32, 3 eq) · src 3cc41c5d711151c2
 
 **Hardening:** fuzz n/a — no input parsing, nothing to fuzz · ct n/a — the wipe's data-independent loop is not a secret-dependent branch (keyword review, 2026-11-18) · panic 2026-11-18 (every pub entry point read: no `assert`, `unreachable`, `@panic` or `.?` in `WipingAllocator`; every failure is the child's `null`); `SecureAllocator` (2026-11-21) panics by design on an overwritten canary in `free`, as libsodium aborts, and nowhere else
 
@@ -114,6 +114,10 @@ Our own reading of the contract.
 - **Fuzz / constant time:** n/a (see the card's `Hardening` line).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
+- **Mutation 2026-11-25** (whole module: `SecureAllocator` was ~53 % of it): 32 mutants, 29 killed, 2 equivalent (the
+  `dataLen` overflow checks are subsumed by the 1 TiB cap), 1 unobservable (the wipe before `munmap`: nothing can read
+  the pages in between without a seam), 0 open. New tests: rounding and the cap, a zero-length request, `mlock` (VmLck)
+  and `MADV_DONTDUMP` (smaps `dd`), `free` unmaps the whole mapping (mincore), a canary overwrite aborts (forked child).
 
 ## Backlog / deferred
 
