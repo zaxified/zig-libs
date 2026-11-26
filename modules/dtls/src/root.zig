@@ -462,6 +462,8 @@ test {
     _ = @import("Endpoint.zig");
     _ = @import("conn12_test.zig");
     _ = @import("audit_test.zig");
+    _ = @import("mutation_test.zig");
+    _ = @import("stackprobe3_test.zig");
     _ = @import("fuzz12_test.zig");
 }
 
