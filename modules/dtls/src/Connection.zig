@@ -12986,3 +12986,35 @@ test "OCSP staple and SCT list ride the leaf's CertificateEntry when asked for, 
     try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
     try testing.expect(client.peerOcspResponse() == null);
 }
+
+test "mutation 2026-11-25: installDir caches the schedule of the suite's own width; prepared and unprepared keys open each other's records; a re-key to a non-GCM suite leaves no old schedule" {
+    inline for (.{ CipherSuite.aes_128_gcm_sha256, CipherSuite.aes_256_gcm_sha384 }) |suite| {
+        const params = suiteParams(suite).?;
+        const alg = suite.hash();
+        var secret: Secret = undefined;
+        for (&secret, 0..) |*b, i| b.* = @intCast((i * 5 + 11) & 0xff);
+        var keys: DirKeys = .{};
+        installDir(&keys, alg, params, &secret);
+        // The cached variant is the suite's own (a cache of the other width is never consumed).
+        switch (suite) {
+            .aes_128_gcm_sha256 => try std.testing.expect(keys.gcm == .g128),
+            .aes_256_gcm_sha384 => try std.testing.expect(keys.gcm == .g256),
+            else => unreachable,
+        }
+        // Records cross between the prepared and the stateless keys in both directions.
+        const stateless = deriveDir(alg, params, &secret);
+        var a: [64]u8 = undefined;
+        var o: [64]u8 = undefined;
+        const na = try protectDispatch(suite, &keys, 3, 9, "hello", "aad", &a);
+        const ma = try unprotectDispatch(suite, &stateless, 3, 9, a[0..na], "aad", &o);
+        try std.testing.expectEqualStrings("hello", o[0..ma]);
+        const nb = try protectDispatch(suite, &stateless, 3, 9, "hello", "aad", &a);
+        const mb = try unprotectDispatch(suite, &keys, 3, 9, a[0..nb], "aad", &o);
+        try std.testing.expectEqualStrings("hello", o[0..mb]);
+        // Re-keying the same DirKeys to a suite with no cached schedule: nothing of the old one stays.
+        const cp = suiteParams(.chacha20_poly1305_sha256).?;
+        installDir(&keys, CipherSuite.chacha20_poly1305_sha256.hash(), cp, &secret);
+        try std.testing.expect(keys.gcm == .none);
+        try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&keys.gcm), 0));
+    }
+}

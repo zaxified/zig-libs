@@ -571,3 +571,26 @@ test "DirKeys.prepare: the cached AES-GCM key schedule seals and opens byte for 
         try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&keyed.gcm), 0));
     }
 }
+
+test "mutation 2026-11-25: DirKeys.prepare caches the variant of the bulk cipher and clears it for any other (a re-prepare after a bulk change)" {
+    var k: DirKeys = .{ .bulk = .aes_128_gcm };
+    for (&k.key, 0..) |*b, i| b.* = @intCast(i + 1);
+    k.prepare();
+    try std.testing.expect(k.gcm == .g128);
+    k.bulk = .aes_256_gcm;
+    k.prepare();
+    try std.testing.expect(k.gcm == .g256);
+    k.bulk = .chacha20_poly1305;
+    k.prepare();
+    try std.testing.expect(k.gcm == .none);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&k.gcm), 0));
+    // Never-prepared keys open what prepared keys seal, for the 256-bit key too.
+    k.bulk = .aes_256_gcm;
+    var prepared = k;
+    prepared.prepare();
+    var out: [64]u8 = undefined;
+    const sealed = try seal(&prepared, 1, 2, 23, "payload", &out);
+    const hdr = try record.decodePlaintext(sealed);
+    var pt: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("payload", try open(&k, hdr, sealed[record.plaintext_header_len..], &pt));
+}

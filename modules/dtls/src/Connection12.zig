@@ -2368,3 +2368,17 @@ const audit_kat = @import("certauth_kat_vectors.zig");
 fn auditCfg() Config {
     return .{ .role = .client, .versions = &.{.dtls12}, .psk_identity = "audit", .psk = "audit-psk" };
 }
+
+test "mutation 2026-11-25: installKeyBlock prepares both directions' AES-GCM schedule; a re-key to ChaCha20 leaves none of it" {
+    var c: Connection12 = .{ .role = .client, .config = auditCfg(), .suite = .ecdhe_ecdsa_with_aes_256_gcm_sha384 };
+    for (&c.master, 0..) |*b, i| b.* = @intCast(i + 1);
+    c.installKeyBlock();
+    try std.testing.expect(c.write_keys.gcm == .g256);
+    try std.testing.expect(c.read_keys.gcm == .g256);
+    c.suite = .ecdhe_ecdsa_with_chacha20_poly1305_sha256;
+    c.installKeyBlock();
+    try std.testing.expect(c.write_keys.gcm == .none);
+    try std.testing.expect(c.read_keys.gcm == .none);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&c.write_keys.gcm), 0));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&c.read_keys.gcm), 0));
+}

@@ -26,8 +26,9 @@ pub const oversize_dst_prefix = "H2C-OVERSIZE-DST-";
 /// reduced per §5.3.3; an empty `dst` is accepted (RFC 9380 §3.1 forbids
 /// empty tags for a suite, which is the caller's contract).
 ///
-/// The intermediate `b_0`/`b_i` are wiped before returning; the output is
-/// the caller's.
+/// The intermediate `b_0`/`b_i`, the `b_0 XOR b_(i-1)` blocks and every
+/// hasher state (the first one buffers the tail of the message, the others
+/// `b_0`) are wiped before returning; the output is the caller's.
 pub fn expandMessageXmd(
     comptime Hash: type,
     comptime len_in_bytes: usize,
@@ -49,6 +50,7 @@ pub fn expandMessageXmd(
         h.update(oversize_dst_prefix);
         h.update(dst);
         h.final(&reduced);
+        std.crypto.secureZero(u8, std.mem.asBytes(&h));
         break :blk &reduced;
     } else dst;
     const tag_len = [1]u8{@intCast(tag.len)}; // DST_prime = DST || I2OSP(len(DST), 1)
@@ -65,6 +67,7 @@ pub fn expandMessageXmd(
     h0.update(&tag_len);
     var b0: [b_in_bytes]u8 = undefined;
     h0.final(&b0);
+    std.crypto.secureZero(u8, std.mem.asBytes(&h0));
 
     var out: [len_in_bytes]u8 = undefined;
     var b_prev: [b_in_bytes]u8 = undefined;
@@ -74,10 +77,12 @@ pub fn expandMessageXmd(
     h1.update(tag);
     h1.update(&tag_len);
     h1.final(&b_prev);
+    std.crypto.secureZero(u8, std.mem.asBytes(&h1));
     {
         const n = @min(b_in_bytes, len_in_bytes);
         @memcpy(out[0..n], b_prev[0..n]);
     }
+    @setEvalBranchQuota(8 * ell + 1000); // the unrolled loop below, up to ell = 255
     comptime var i: usize = 2;
     inline while (i <= ell) : (i += 1) {
         var xored: [b_in_bytes]u8 = undefined;
@@ -88,6 +93,8 @@ pub fn expandMessageXmd(
         hi.update(tag);
         hi.update(&tag_len);
         hi.final(&b_prev);
+        std.crypto.secureZero(u8, std.mem.asBytes(&hi));
+        std.crypto.secureZero(u8, &xored);
         const offset = (i - 1) * b_in_bytes;
         const n = @min(b_in_bytes, len_in_bytes - offset);
         @memcpy(out[offset..][0..n], b_prev[0..n]);
