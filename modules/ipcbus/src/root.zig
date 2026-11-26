@@ -181,7 +181,10 @@ fn writeAllFdDeadline(fd: Fd, bytes: []const u8, deadline: Deadline) TransportEr
             off += rc;
             continue;
         }
-        const rc = linux.write(fd, bytes.ptr + off, bytes.len - off);
+        // MSG_NOSIGNAL: a peer that closed before reading must cost an error, not a SIGPIPE that ends the process.
+        // A non-socket `fd` (ENOTSOCK) takes write(2).
+        var rc = linux.sendto(fd, bytes.ptr + off, bytes.len - off, linux.MSG.NOSIGNAL, null, 0);
+        if (linux.errno(rc) == .NOTSOCK) rc = linux.write(fd, bytes.ptr + off, bytes.len - off);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
@@ -716,7 +719,9 @@ pub const Mux = struct {
     /// Write as much of the reply as the socket takes; close when it is all out.
     fn flushReply(self: *Mux, c: *Conn) void {
         while (c.out_off < c.out.len) {
-            const rc = linux.write(c.fd, c.out[c.out_off..].ptr, c.out.len - c.out_off);
+            // MSG_NOSIGNAL: a peer that closed without reading its reply is EPIPE (counted, dropped), not a SIGPIPE
+            // that ends the server.
+            const rc = linux.sendto(c.fd, c.out[c.out_off..].ptr, c.out.len - c.out_off, linux.MSG.NOSIGNAL, null, 0);
             switch (linux.errno(rc)) {
                 .SUCCESS => c.out_off += rc,
                 .INTR => continue,
@@ -1575,4 +1580,25 @@ test "Mux: a refused peer is counted and closed like acceptOne does; deinit clos
     try testing.expectEqual(@as(u64, 1), srv.refused);
     try testing.expectEqual(@as(usize, 0), mux.open);
     mux.deinit();
+}
+
+test "writeAllFd: a peer that closed before reading is WriteFailed, not a SIGPIPE that ends the process" {
+    // Zig programs ignore SIGPIPE by default (std.options.keep_sigpipe), so the child restores the default action
+    // first: a process that keeps SIGPIPE (or a C host) must not be killed by a peer that hung up.
+    const pid = linux.fork();
+    try testing.expect(linux.errno(pid) == .SUCCESS);
+    if (pid == 0) {
+        var act: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
+        _ = linux.sigaction(linux.SIG.PIPE, &act, null);
+        var fds: [2]i32 = undefined;
+        if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) != .SUCCESS) linux.exit(2);
+        _ = linux.close(fds[1]);
+        const ok = if (writeAllFd(fds[0], "reply nobody reads")) |_| false else |e| e == error.WriteFailed;
+        linux.exit(if (ok) 0 else 1);
+    }
+    var status: i32 = 0;
+    _ = linux.waitpid(@intCast(pid), &status, 0);
+    const st: u32 = @bitCast(status);
+    try testing.expect(linux.W.IFEXITED(st)); // not killed by SIGPIPE
+    try testing.expectEqual(@as(u32, 0), linux.W.EXITSTATUS(st));
 }
