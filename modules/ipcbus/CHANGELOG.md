@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** tests in `src/root.zig` from the 2026-11-25 whole-module mutation run (deadlines, `Server.admit`, `refillReadVec`, accept after a refusal, a 2 MiB write drain, the `Mux` reply paths); no production code changed.
 - **2026-11-21** — ADDED `Mux` and `MuxOptions`: a single-threaded poll loop serving many connections at once with per-connection deadlines, `max_conns`, a bad/slow/failing client closing only itself; `dispatch` still runs one request at a time. `acceptOne`/`handleOne` are unchanged. Tests in `root.zig`.
 - **2026-11-18** — **Behaviour change:** `Server.acceptOne` now checks the peer's `SO_PEERCRED` uid against a `PeerPolicy`; the default (`Server.listen`) admits only the server's own effective uid, like the D-Bus session bus (`EXTERNAL` auth: the identity is a Unix user taken from kernel-passed credentials). A refused peer is closed silently, counted in `Server.refused`, and `acceptOne` keeps waiting (it never returns an error for a refused peer, so a non-admitted local user cannot stop an accept loop that ends on `catch return`). Added `PeerPolicy` (`.same_uid`, `.uids = &.{..}`, `.any`), `Server.listenWithPolicy`, `Server.policy`/`own_uid`/`refused`. Opt out of the check with `Server.listenWithPolicy(path, .any)` (the previous behaviour). Security-triage row ipcbus:92. Delta mutation: 15/15 killed; one test added (the refused-peer fd is closed even when its credentials cannot be read).
 

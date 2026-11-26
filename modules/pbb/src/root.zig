@@ -1309,3 +1309,17 @@ test "peekCustomerTags: never panics on every short/tag-like prefix" {
     var buf: [8]u8 = .{ 0x88, 0xa8, 0xff, 0xff, 0x81, 0x00, 0xff, 0xff };
     for (0..buf.len + 1) |n| _ = peekCustomerTags(buf[0..n]);
 }
+
+test "mutation 2026-11-25: groupBMacIsid checks the second prefix octet" {
+    try testing.expectEqual(@as(?u24, null), groupBMacIsid(.{ 0x01, 0x1F, 0x83, 0, 0, 1 }));
+    try testing.expectEqual(@as(?u24, null), groupBMacIsid(.{ 0x01, 0x00, 0x83, 0, 0, 1 }));
+}
+
+test "mutation 2026-11-25: peekCustomerTags reports an S-tag as the inner tag of a C-tag outer" {
+    const f = [_]u8{ 0x81, 0x00, 0x00, 0x0a, 0x88, 0xa8, 0x20, 0x14, 0x08, 0x00 };
+    const r = peekCustomerTags(&f).?;
+    try testing.expect(!r.outer.isSTag());
+    try testing.expect(r.inner.?.isSTag());
+    try testing.expectEqual(@as(u12, 20), r.inner.?.vid);
+    try testing.expectEqual(@as(u3, 1), r.inner.?.pcp);
+}

@@ -2356,3 +2356,91 @@ test "lookup converts a Unicode query to the A-label form by default; idna = nul
     try testing.expectError(error.InvalidQuery, lookup(t, "bad\xff.example", .{ .root = "whois.example" }, &resp));
     _ = try lookup(t, "bad\xff.example", .{ .root = "whois.example", .idna = null }, &resp);
 }
+
+test "mutation 2026-11-25: idnQuery size boundaries, error mapping and the ASCII gate" {
+    var big: [2048]u8 = undefined;
+    // seven labels of 55 'a' + U+00FC, then a last label 'a' * j + U+00FC whose j we search so that the
+    // A-label form is exactly max_query_len bytes
+    var q: [1024]u8 = undefined;
+    var qlen: usize = 0;
+    for (0..7) |_| {
+        @memset(q[qlen..][0..55], 'a');
+        q[qlen + 55] = 0xc3;
+        q[qlen + 56] = 0xbc;
+        q[qlen + 57] = '.';
+        qlen += 58;
+    }
+    var exact_len: usize = 0;
+    var j: usize = 0;
+    while (j <= 60) : (j += 1) {
+        @memset(q[qlen..][0..j], 'a');
+        q[qlen + j] = 0xc3;
+        q[qlen + j + 1] = 0xbc;
+        const l = qlen + j + 2;
+        const out = try idnQuery(&big, q[0..l], .{});
+        if (out.len == max_query_len) {
+            exact_len = l;
+            break;
+        }
+    }
+    try testing.expect(exact_len != 0);
+    // exactly max_query_len: accepted when buf is large enough
+    try testing.expectEqual(@as(usize, max_query_len), (try idnQuery(&big, q[0..exact_len], .{})).len);
+    // one more letter makes the A-label longer than max_query_len
+    q[exact_len] = 0xc3;
+    q[exact_len + 1] = 0xbc;
+    try testing.expectError(error.QueryTooLong, idnQuery(&big, q[0 .. exact_len + 2], .{}));
+    // buf exactly the size of the result is enough, one byte less is not
+    var small: [21]u8 = undefined;
+    try testing.expectEqualStrings("xn--bcher-kva.example", try idnQuery(&small, "b\xc3\xbccher.example", .{}));
+    try testing.expectError(error.QueryTooLong, idnQuery(small[0..20], "b\xc3\xbccher.example", .{}));
+    // input beyond the scratch / output cap is QueryTooLong, not InvalidQuery
+    const huge = try testing.allocator.alloc(u8, 70000);
+    defer testing.allocator.free(huge);
+    for (0..huge.len / 2) |i| {
+        huge[2 * i] = 0xc3;
+        huge[2 * i + 1] = 0xbc;
+    }
+    try testing.expectError(error.QueryTooLong, idnQuery(&big, huge, .{}));
+    // a lone 0x80 byte is non-ASCII (invalid UTF-8); DEL is ASCII and passes through as is
+    try testing.expectError(error.InvalidQuery, idnQuery(&big, "a\x80.example", .{}));
+    const del = "a\x7f.example";
+    try testing.expectEqual(del.ptr, (try idnQuery(&big, del, .{})).ptr);
+}
+
+test "mutation 2026-11-25: jpnicEnglishQuery boundaries and each CR/LF refusal" {
+    var big: [1024]u8 = undefined;
+    var ip: [max_query_len - 2]u8 = undefined;
+    @memset(&ip, '1');
+    try testing.expectEqual(@as(usize, max_query_len - 2 + 4), (try jpnicEnglishQuery(&big, &ip)).len);
+    var ip2: [max_query_len - 1]u8 = undefined;
+    @memset(&ip2, '1');
+    try testing.expectError(error.QueryTooLong, jpnicEnglishQuery(&big, &ip2));
+    var b: [16]u8 = undefined;
+    try testing.expectEqualStrings("1.2.3.4/e\r\n", try jpnicEnglishQuery(b[0..11], "1.2.3.4"));
+    try testing.expectError(error.QueryTooLong, jpnicEnglishQuery(b[0..10], "1.2.3.4"));
+    try testing.expectError(error.QueryTooLong, jpnicEnglishQuery(b[0..9], "1.2.3.4"));
+    try testing.expectError(error.InvalidQuery, jpnicEnglishQuery(&b, "1.2.3.4\r"));
+    try testing.expectError(error.InvalidQuery, jpnicEnglishQuery(&b, "1.2.3.4\n"));
+}
+
+test "mutation 2026-11-25: lookup passes its own idna options to idnQuery" {
+    const Rec = struct {
+        var seen: [64]u8 = undefined;
+        var len: usize = 0;
+        fn exchange(_: *anyopaque, _: []const u8, _: u16, query: []const u8, out: []u8) TransportError!usize {
+            len = @min(query.len, seen.len);
+            @memcpy(seen[0..len], query[0..len]);
+            const reply = "domain: x\n";
+            @memcpy(out[0..reply.len], reply);
+            return reply.len;
+        }
+    };
+    var dummy: u8 = 0;
+    const t: Transport = .{ .ctx = &dummy, .exchangeFn = Rec.exchange };
+    var resp: [256]u8 = undefined;
+    // an empty label is fine without verify_dns_length, refused with it
+    _ = try lookup(t, "a..\xc3\xbc", .{ .root = "whois.example" }, &resp);
+    try testing.expectEqualStrings("a..xn--tda\r\n", Rec.seen[0..Rec.len]);
+    try testing.expectError(error.InvalidQuery, lookup(t, "a..\xc3\xbc", .{ .root = "whois.example", .idna = .{ .verify_dns_length = true } }, &resp));
+}

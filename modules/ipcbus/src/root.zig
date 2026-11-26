@@ -1417,6 +1417,387 @@ test "Server.acceptOne: an allowlist that names our uid admits us" {
     try testing.expectEqual(me, (try peerCred(a)).uid);
 }
 
+// ── mutation 2026-11-25: whole-module run, tests for the survivors ─────────────
+
+fn patternByte(i: usize) u8 {
+    return @truncate(i *% 7 +% i / 13);
+}
+
+fn sleepMs(ms: u32) void {
+    const ts: linux.timespec = .{ .sec = 0, .nsec = @as(isize, ms) * 1_000_000 };
+    _ = linux.nanosleep(&ts, null);
+}
+
+const DrainCtx = struct { fd: Fd, n: usize, ok: bool = false };
+
+fn drainVerify(c: *DrainCtx) void {
+    var buf: [4096]u8 = undefined;
+    var off: usize = 0;
+    while (off < c.n) {
+        const want = @min(buf.len, c.n - off);
+        readExact(c.fd, buf[0..want]) catch return;
+        for (buf[0..want], 0..) |b, i| if (b != patternByte(off + i)) return;
+        off += want;
+    }
+    c.ok = true;
+}
+
+test "mutation 2026-11-25: writeAllFd continues from the right offset across short writes, blocking and deadline paths" {
+    const n = 2 * 1024 * 1024;
+    const data = try testing.allocator.alloc(u8, n);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = patternByte(i);
+    inline for (.{ false, true }) |with_deadline| {
+        var fds: [2]i32 = undefined;
+        try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) == .SUCCESS);
+        var ctx = DrainCtx{ .fd = fds[1], .n = n };
+        const th = try std.Thread.spawn(.{}, drainVerify, .{&ctx});
+        if (with_deadline) try writeAllFdDeadline(fds[0], data, Deadline.after(20_000)) else try writeAllFd(fds[0], data);
+        th.join();
+        closeFd(fds[0]);
+        closeFd(fds[1]);
+        try testing.expect(ctx.ok);
+    }
+}
+
+test "mutation 2026-11-25: the Deadline clock counts nanoseconds and pollMs clamps to i32" {
+    const t0 = Deadline.nowNs();
+    const ts: linux.timespec = .{ .sec = 1, .nsec = 200_000_000 };
+    _ = linux.nanosleep(&ts, null);
+    const dt = Deadline.nowNs() - t0;
+    try testing.expect(dt >= 1_150_000_000 and dt < 4_000_000_000);
+    const d = Deadline.after(std.math.maxInt(u32));
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), d.pollMs());
+}
+
+fn nextFd() Fd {
+    const s = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    const fd: Fd = @intCast(s);
+    closeFd(fd);
+    return fd;
+}
+
+test "mutation 2026-11-25: connectUnix and listenUnix report their failures and leak no descriptor" {
+    const before = nextFd();
+    try testing.expectError(error.ConnectFailed, connectUnix("/nonexistent-ipcbus-dir/x.sock"));
+    try testing.expectEqual(before, nextFd());
+    try testing.expectError(error.BindFailed, listenUnix("/nonexistent-ipcbus-dir/x.sock"));
+    try testing.expectEqual(before, nextFd());
+}
+
+test "mutation 2026-11-25: Server.deinit closes the listen socket" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    const lfd = srv.listen_fd;
+    srv.deinit();
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(lfd, linux.F.GETFD, 0)));
+}
+
+test "mutation 2026-11-25: Server.admit with .any admits a descriptor that has no credentials" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listenWithPolicy(path, .any);
+    defer srv.deinit();
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) == .SUCCESS);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    try testing.expect(srv.admit(fds[0]));
+    try testing.expectEqual(@as(u64, 0), srv.refused);
+}
+
+const AcceptCtx = struct { srv: *Server, fd: ?Fd = null };
+
+fn acceptThread(c: *AcceptCtx) void {
+    c.fd = c.srv.acceptOne() catch null;
+}
+
+test "mutation 2026-11-25: acceptOne keeps waiting after it refused a peer and returns the next admitted one" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    const real = srv.own_uid;
+    srv.own_uid = real +% 1; // everybody is refused for now
+    var ctx = AcceptCtx{ .srv = &srv };
+    const th = try std.Thread.spawn(.{}, acceptThread, .{&ctx});
+    const a = try connectUnix(path);
+    defer closeFd(a);
+    var i: usize = 0;
+    while (@atomicLoad(u64, &srv.refused, .acquire) == 0 and i < 500) : (i += 1) sleepMs(10);
+    try testing.expectEqual(@as(u64, 1), @atomicLoad(u64, &srv.refused, .acquire));
+    @atomicStore(u32, &srv.own_uid, real, .release);
+    const b = try connectUnix(path);
+    defer closeFd(b);
+    th.join();
+    const got = ctx.fd orelse return error.TestUnexpectedResult;
+    defer closeFd(got);
+    try writeAllFd(b, "B");
+    var one: [1]u8 = undefined;
+    try readExact(got, &one);
+    try testing.expectEqual(@as(u8, 'B'), one[0]);
+}
+
+fn staticDispatch(_: void, _: []const u8, _: std.mem.Allocator) anyerror![]const u8 {
+    return "ok";
+}
+
+fn fillDispatch(fd: Fd, _: []const u8, _: std.mem.Allocator) anyerror![]const u8 {
+    // Fill the connection's send queue so that the reply cannot be flushed.
+    const junk: [4096]u8 = @splat(0xAA);
+    while (true) {
+        const rc = linux.sendto(fd, &junk, junk.len, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, null, 0);
+        if (linux.errno(rc) != .SUCCESS) break;
+    }
+    return "reply";
+}
+
+test "mutation 2026-11-25: handleOne frees its request buffer; a reply that cannot be flushed in time is Timeout" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) == .SUCCESS);
+    defer closeFd(fds[0]);
+    try writeAllFd(fds[0], &.{ 3, 0, 0, 0, 'a', 'b', 'c' });
+    try Server.handleOne(fds[1], {}, staticDispatch, testing.allocator, .{});
+    var out: [6]u8 = undefined;
+    try readExact(fds[0], &out);
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0, 'o', 'k' }, &out);
+
+    var fds2: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds2)) == .SUCCESS);
+    defer closeFd(fds2[0]);
+    try writeAllFd(fds2[0], &.{ 3, 0, 0, 0, 'a', 'b', 'c' });
+    try testing.expectError(error.Timeout, Server.handleOneWithOptions(fds2[1], fds2[1], fillDispatch, testing.allocator, .{}, .{ .timeout_ms = 150 }));
+}
+
+test "mutation 2026-11-25: Client.requestWithOptions: a request the peer never reads times out on the write" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path); // listens, never accepts or reads
+    defer srv.deinit();
+    const big = try testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 'q');
+    var reply: [16]u8 = undefined;
+    try testing.expectError(error.Timeout, Client.requestWithOptions(path, big, &reply, .{ .max_frame = 8 * 1024 * 1024 }, .{ .timeout_ms = 200 }));
+}
+
+test "mutation 2026-11-25: refillReadVec keeps the unread bytes when it rebases the buffer" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) == .SUCCESS);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    var buf: [16]u8 = undefined;
+    var fr = FdReader.init(fds[1], &buf);
+    for (buf[0..10], 0..) |*b, i| b.* = @intCast('a' + i);
+    fr.interface.seek = 3;
+    fr.interface.end = 10;
+    try writeAllFd(fds[0], "XYZ");
+    var one: [1]u8 = undefined;
+    var data = [_][]u8{&one};
+    _ = try refillReadVec(&fr.interface, &data);
+    try testing.expectEqualStrings("defghijXYZ", fr.interface.buffered());
+}
+
+fn allocDispatch(_: void, _: []const u8, a: std.mem.Allocator) anyerror![]const u8 {
+    const out = try a.alloc(u8, 8000);
+    @memset(out, 'x');
+    return out[0..4];
+}
+
+fn bigDispatch(_: void, _: []const u8, a: std.mem.Allocator) anyerror![]const u8 {
+    const out = try a.alloc(u8, 600 * 1024);
+    for (out, 0..) |*b, i| b.* = patternByte(i);
+    return out;
+}
+
+fn hugeReplyDispatch(_: void, _: []const u8, a: std.mem.Allocator) anyerror![]const u8 {
+    const out = try a.alloc(u8, 100);
+    @memset(out, 'h');
+    return out;
+}
+
+/// One client, one tiny request, stepped until `step` reports it dispatched; the reply must
+/// already be readable (it is written in the dispatching step). Returns the arena capacity.
+fn muxRoundTrip(mux: *Mux, arena: *std.heap.ArenaAllocator, path: [:0]const u8, comptime dispatch: fn (void, []const u8, std.mem.Allocator) anyerror![]const u8) !usize {
+    const c = try connectUnix(path);
+    defer closeFd(c);
+    try writeAllFd(c, &.{ 4, 0, 0, 0, 'p', 'i', 'n', 'g' });
+    var dispatched: usize = 0;
+    var i: usize = 0;
+    while (dispatched == 0 and i < 50) : (i += 1) dispatched += try mux.step({}, dispatch, arena, 50);
+    try testing.expectEqual(@as(usize, 1), dispatched);
+    var b: [8]u8 = undefined;
+    const rc = linux.recvfrom(c, &b, b.len, linux.MSG.DONTWAIT, null, null);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try testing.expectEqual(@as(usize, 8), rc);
+    return arena.queryCapacity();
+}
+
+test "mutation 2026-11-25: Mux step reports dispatched requests, flushes the reply in that step, resets its arena, sets CLOEXEC on accepted descriptors" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    var mux = try Mux.init(testing.allocator, &srv, .{});
+    defer mux.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cap1 = try muxRoundTrip(&mux, &arena, path, allocDispatch);
+    _ = try muxRoundTrip(&mux, &arena, path, allocDispatch);
+    const cap3 = try muxRoundTrip(&mux, &arena, path, allocDispatch);
+    try testing.expectEqual(cap1, cap3);
+
+    // an accepted descriptor is CLOEXEC
+    const idle = try connectUnix(path);
+    defer closeFd(idle);
+    _ = try mux.step({}, allocDispatch, &arena, 50);
+    try testing.expectEqual(@as(usize, 1), mux.open);
+    try testing.expect(try isCloexec(mux.conns[0].fd));
+}
+
+test "mutation 2026-11-25: Mux counts a failing dispatch as dispatched, an oversize reply as failed (no leak), an EOF mid-frame as failed" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    var mux = try Mux.init(testing.allocator, &srv, .{ .limits = .{ .max_frame = 16 } });
+    defer mux.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // dispatch fails: the step still reports the request, and the connection is closed
+    const c1 = try connectUnix(path);
+    defer closeFd(c1);
+    try writeAllFd(c1, &.{ 4, 0, 0, 0, 'b', 'o', 'o', 'm' });
+    var dispatched: usize = 0;
+    var i: usize = 0;
+    while (dispatched == 0 and i < 50) : (i += 1) dispatched += try mux.step({}, failingDispatch, &arena, 50);
+    try testing.expectEqual(@as(usize, 1), dispatched);
+    try testing.expectEqual(@as(u64, 1), mux.failed);
+
+    // the reply is over the frame cap: counted, closed, nothing leaked (testing allocator)
+    const c2 = try connectUnix(path);
+    defer closeFd(c2);
+    try writeAllFd(c2, &.{ 4, 0, 0, 0, 'p', 'i', 'n', 'g' });
+    i = 0;
+    while (mux.failed < 2 and i < 50) : (i += 1) _ = try mux.step({}, hugeReplyDispatch, &arena, 50);
+    try testing.expectEqual(@as(u64, 2), mux.failed);
+    try testing.expectEqual(@as(usize, 0), mux.open);
+
+    // the client closes in the middle of a frame
+    const c3 = try connectUnix(path);
+    try writeAllFd(c3, &.{ 10, 0, 0, 0, 'a' });
+    closeFd(c3);
+    i = 0;
+    while (mux.failed < 3 and i < 50) : (i += 1) _ = try mux.step({}, hugeReplyDispatch, &arena, 50);
+    try testing.expectEqual(@as(u64, 3), mux.failed);
+    try testing.expectEqual(@as(usize, 0), mux.open);
+}
+
+test "mutation 2026-11-25: Mux closes a timed-out client's socket and wakes at the nearest deadline even with poll_ms = -1; with no deadline step returns after poll_ms" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    {
+        var mux = try Mux.init(testing.allocator, &srv, .{ .timeout_ms = 100 });
+        defer mux.deinit();
+        const stalled = try connectUnix(path);
+        defer closeFd(stalled);
+        _ = try mux.step({}, echoDispatch, &arena, 50); // accepts it
+        try testing.expectEqual(@as(usize, 1), mux.open);
+        const t0 = Deadline.nowNs();
+        _ = try mux.step({}, echoDispatch, &arena, -1); // must end at the connection's deadline
+        try testing.expect(Deadline.nowNs() - t0 < 3_000_000_000);
+        try testing.expectEqual(@as(u64, 1), mux.timed_out);
+        var b: [1]u8 = undefined;
+        const rc = linux.recvfrom(stalled, &b, 1, linux.MSG.DONTWAIT, null, null);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        try testing.expectEqual(@as(usize, 0), rc); // the server closed its end: EOF, not "would block"
+    }
+    {
+        var mux = try Mux.init(testing.allocator, &srv, .{ .timeout_ms = null });
+        defer mux.deinit();
+        const idle = try connectUnix(path);
+        defer closeFd(idle);
+        _ = try mux.step({}, echoDispatch, &arena, 50);
+        try testing.expectEqual(@as(usize, 1), mux.open);
+        const t0 = Deadline.nowNs();
+        _ = try mux.step({}, echoDispatch, &arena, 30); // nothing to do: returns after ~30 ms
+        try testing.expect(Deadline.nowNs() - t0 < 3_000_000_000);
+    }
+}
+
+test "mutation 2026-11-25: Mux with max_conns = 0 still serves one connection" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    var mux = try Mux.init(testing.allocator, &srv, .{ .max_conns = 0 });
+    defer mux.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    _ = try muxRoundTrip(&mux, &arena, path, allocDispatch);
+}
+
+fn drainMux(mux: *Mux, arena: *std.heap.ArenaAllocator, c: Fd, got: []u8) !usize {
+    var n: usize = 0;
+    var rounds: usize = 0;
+    while (n < got.len and rounds < 300) : (rounds += 1) {
+        const rc = linux.recvfrom(c, got[n..].ptr, got.len - n, linux.MSG.DONTWAIT, null, null);
+        if (linux.errno(rc) == .SUCCESS and rc > 0) n += rc;
+        _ = try mux.step({}, bigDispatch, arena, 20);
+    }
+    return n;
+}
+
+test "mutation 2026-11-25: Mux writes a reply larger than the socket buffer across rounds, from the right offset, waiting for POLLOUT" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    var mux = try Mux.init(testing.allocator, &srv, .{});
+    defer mux.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const c = try connectUnix(path);
+    defer closeFd(c);
+    try writeAllFd(c, &.{ 4, 0, 0, 0, 'p', 'i', 'n', 'g' });
+    var i: usize = 0;
+    var dispatched: usize = 0;
+    while (dispatched == 0 and i < 50) : (i += 1) dispatched += try mux.step({}, bigDispatch, &arena, 50);
+    try testing.expectEqual(@as(usize, 1), dispatched);
+    // the client has read nothing: the reply is stuck half-written, the connection still in service
+    try testing.expectEqual(@as(usize, 1), mux.open);
+    try testing.expectEqual(@as(u64, 0), mux.served);
+    const total = 4 + 600 * 1024;
+    const got = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, total), try drainMux(&mux, &arena, c, got));
+    try testing.expectEqual(@as(u32, 600 * 1024), std.mem.readInt(u32, got[0..4], .little));
+    for (got[4..], 0..) |b, k| if (b != patternByte(k)) return error.TestUnexpectedResult;
+    i = 0;
+    while (mux.served < 1 and i < 20) : (i += 1) _ = try mux.step({}, bigDispatch, &arena, 20);
+    try testing.expectEqual(@as(u64, 1), mux.served);
+
+    // a client that goes away before its reply is written: write fails (SIGPIPE ignored for this
+    // test), the connection is counted failed and closed
+    const ign: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+    var old: linux.Sigaction = undefined;
+    _ = linux.sigaction(.PIPE, &ign, &old);
+    defer _ = linux.sigaction(.PIPE, &old, null);
+    const c2 = try connectUnix(path);
+    try writeAllFd(c2, &.{ 4, 0, 0, 0, 'p', 'i', 'n', 'g' });
+    closeFd(c2);
+    i = 0;
+    while (mux.failed < 1 and i < 50) : (i += 1) _ = try mux.step({}, bigDispatch, &arena, 50);
+    try testing.expectEqual(@as(u64, 1), mux.failed);
+    try testing.expectEqual(@as(usize, 0), mux.open);
+}
+
 // ── Mux tests ───────────────────────────────────────────────────────────────
 
 fn muxClient(path: [:0]const u8, msg: []const u8, out: *[]u8, buf: []u8, ok: *bool) void {
