@@ -771,6 +771,7 @@ const testing = std.testing;
 test {
     _ = @import("bench.zig");
     _ = @import("count.zig");
+    _ = @import("stackprobe_test.zig");
     _ = xmd;
 }
 
