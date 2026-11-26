@@ -910,3 +910,27 @@ test "portFor: the egress interface of a next-hop B-MAC; unbound is null; the fi
     try testing.expectEqual(@as(?u32, null), portFor(&ports, bmac(3)));
     try testing.expectEqual(@as(?u32, null), portFor(&.{}, bmac(1)));
 }
+
+test "mutation 2026-11-25: buildMcast carries spsourceid and isid through, and a repeated node keeps its first binding" {
+    const spf_ect = @import("spf-ect");
+    var g = spf_ect.Graph.init(testing.allocator);
+    defer g.deinit();
+    try g.addEdge(0, 1, 1);
+    var tree = try bumtree.build(testing.allocator, &g, 0, &.{1});
+    defer tree.deinit();
+    // Node 1 is bound twice: the first binding is the one the entry must use.
+    const map = [_]NodeBmac{
+        .{ .node = 0, .b_mac = bmac(0) },
+        .{ .node = 1, .b_mac = bmac(1) },
+        .{ .node = 1, .b_mac = bmac(9) },
+        .{ .node = 0, .b_mac = bmac(8) },
+    };
+    var root = (try buildMcast(testing.allocator, &tree, 0, 0x04001, 0x123456, 100, &map)).?;
+    defer root.deinit(testing.allocator);
+    try testing.expectEqual(@as(u20, 0x04001), root.spsourceid);
+    try testing.expectEqual(@as(u24, 0x123456), root.isid);
+    try testing.expectEqual(bmac(1), root.egress_bmacs[0]);
+    var leaf = (try buildMcast(testing.allocator, &tree, 1, 0x04001, 0x123456, 100, &map)).?;
+    defer leaf.deinit(testing.allocator);
+    try testing.expectEqual(@as(?BMac, bmac(0)), leaf.rpf_ingress_bmac);
+}

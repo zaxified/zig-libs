@@ -305,6 +305,26 @@ pub fn hand(gpa: Allocator, fields: []const schema.Field, batches: []const HandB
     return out.toOwnedSlice(gpa);
 }
 
+/// `hand` with a ready-made schema message (a schema `Schema` cannot describe, a big-endian one).
+pub fn handFrom(gpa: Allocator, schema_msg: []const u8, batches: []const HandBatch) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try ipc.writeMessage(gpa, &out, schema_msg, &.{});
+    for (batches) |hb| {
+        var body: ipc.BodyBuilder = .{};
+        defer body.deinit(gpa);
+        for (hb.bufs) |x| if (x.len == 0) try body.addEmpty(gpa) else try body.add(gpa, x);
+        var mb = fb.Builder.init(gpa);
+        defer mb.deinit();
+        const rb: ipc.RecordBatch = .{ .length = hb.length, .nodes = hb.nodes, .buffers = body.locs.items, .compression = hb.codec, .variadic_counts = hb.variadic };
+        const blen: i64 = @intCast(body.bytes.items.len);
+        const meta = try ipc.encodeRecordBatchMessage(&mb, rb, blen);
+        try ipc.writeMessage(gpa, &out, meta, body.bytes.items);
+    }
+    try ipc.writeEos(gpa, &out);
+    return out.toOwnedSlice(gpa);
+}
+
 pub fn bytesOf(comptime T: type, comptime xs: []const T) []const u8 {
     return std.mem.sliceAsBytes(xs);
 }

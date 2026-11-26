@@ -739,3 +739,95 @@ test "decoder: a Message without a version is V1, which is Unsupported" {
     const buf = try b.finish(try b.endTable());
     try testing.expectError(error.Unsupported, decodeMessage(buf));
 }
+
+test "mutation 2026-11-25: a big-endian stream of view and list-view columns is swapped buffer by buffer" {
+    const st = @import("stream_test.zig");
+    const stream = @import("stream.zig");
+    const ipc = @import("ipc.zig");
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const item = [_]Field{.{ .name = "item", .type = .{ .int = .{ .bits = 32, .signed = true } } }};
+    const fields = [_]Field{
+        .{ .name = "sv", .type = .utf8_view },
+        .{ .name = "lv", .type = .list_view, .children = &item },
+        .{ .name = "llv", .type = .large_list_view, .children = &item },
+    };
+    // A big-endian Schema message: `Schema.endianness` = 1, which `encodeSchema` never writes.
+    var b = fb.Builder.init(gpa);
+    defer b.deinit();
+    const fref = try encodeFields(&b, &fields, 0);
+    b.startTable();
+    try b.addScalarForce(0, i16, 1);
+    try b.addOffset(1, fref);
+    const sref = try b.endTable();
+    b.startTable();
+    try b.addScalarForce(0, MetadataVersion, .v5);
+    try b.addScalarForce(1, HeaderType, .schema);
+    try b.addOffset(2, sref);
+    try b.addScalar(3, i64, 0, 0);
+    const msg = try b.finish(try b.endTable());
+
+    const be = struct {
+        fn ints(al: std.mem.Allocator, comptime T: type, xs: []const T) ![]u8 {
+            const out = try al.alloc(u8, xs.len * @sizeOf(T));
+            for (xs, 0..) |x, i| std.mem.writeInt(T, out[i * @sizeOf(T) ..][0..@sizeOf(T)], x, .big);
+            return out;
+        }
+        /// `stream_test.view` in big endian: the length, and for a long value the buffer index and the offset.
+        fn view(data: []const u8, index: i32, offset: i32) [16]u8 {
+            var v = st.view(data, index, offset);
+            std.mem.reverse(u8, v[0..4]);
+            if (data.len > 12) {
+                std.mem.reverse(u8, v[8..12]);
+                std.mem.reverse(u8, v[12..16]);
+            }
+            return v;
+        }
+    };
+    // A short value, one of exactly 12 bytes (inline), one of 13 (in buffer 1), one at an offset of buffer 1.
+    const twelve = "abcdefghijkl";
+    const thirteen = "abcdefghijklm";
+    const long = "a string longer than twelve";
+    const views = be.view("short", 0, 0) ++ be.view(twelve, 0, 0) ++ be.view(thirteen, 1, 0) ++ be.view(long[2..], 1, 15);
+    const lv_off = try be.ints(a, i32, &.{ 2, 0, 1, 3 });
+    const lv_size = try be.ints(a, i32, &.{ 2, 1, 3, 0 });
+    const lv_child = try be.ints(a, i32, &.{ 10, 11, 12, 13, 14 });
+    const llv_off = try be.ints(a, i64, &.{ 1, 0, 2, 3 });
+    const llv_size = try be.ints(a, i64, &.{ 2, 1, 1, 0 });
+    const llv_child = try be.ints(a, i32, &.{ 20, 21, 22, 23, 24 });
+    const nd = struct {
+        fn f(len: i64) ipc.FieldNode {
+            return .{ .length = len, .null_count = 0 };
+        }
+    }.f;
+    const bytes = try st.handFrom(gpa, msg, &.{.{
+        .length = 4,
+        .variadic = &.{2},
+        .nodes = &.{ nd(4), nd(4), nd(5), nd(4), nd(5) },
+        .bufs = &.{
+            "",       &views,    "unused", thirteen ++ long,
+            "",       lv_off,    lv_size,  "",
+            lv_child, "",        llv_off,  llv_size,
+            "",       llv_child,
+        },
+    }});
+    defer gpa.free(bytes);
+    const f = try stream.readStream(a, bytes, .{});
+    try testing.expectEqualStrings("short", f.cell(0, "sv").?.text);
+    try testing.expectEqualStrings(twelve, f.cell(1, "sv").?.text);
+    try testing.expectEqualStrings(thirteen, f.cell(2, "sv").?.text);
+    try testing.expectEqualStrings(long[2..], f.cell(3, "sv").?.text);
+    const lv = [_][]const i64{ &.{ 12, 13 }, &.{10}, &.{ 11, 12, 13 }, &.{} };
+    const llv = [_][]const i64{ &.{ 21, 22 }, &.{20}, &.{22}, &.{} };
+    for (0..4) |r| {
+        const l1 = f.cell(r, "lv").?.list;
+        try testing.expectEqual(lv[r].len, l1.len());
+        for (lv[r], 0..) |w, k| try testing.expectEqual(w, l1.get(k).int);
+        const l2 = f.cell(r, "llv").?.list;
+        try testing.expectEqual(llv[r].len, l2.len());
+        for (llv[r], 0..) |w, k| try testing.expectEqual(w, l2.get(k).int);
+    }
+}

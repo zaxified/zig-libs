@@ -1974,3 +1974,106 @@ test "fuzz driver: NETCONF_FUZZ (client)" {
 test "fuzz harness: client, 500 seeds, reaches every outcome" {
     try ClientMark.reach(fuzzClient, "netconf-client", 500);
 }
+
+test "mutation 2026-11-25: receiveAnyReply drains buffered replies oldest first and refuses a closed session" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+
+    h.peer.hold_next_reply = true;
+    const id_a = try h.client.send(.discard_changes);
+    const id_b = try h.client.send(.discard_changes);
+    const id_c = try h.client.send(.discard_changes);
+    try h.peer.releaseHeld(); // the wire carries b, c, a
+    var a = try h.client.receiveReply(id_a); // buffers b, c
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 2), h.client.outstandingCount());
+    var first = try h.client.receiveAnyReply();
+    defer first.reply.deinit();
+    var second = try h.client.receiveAnyReply();
+    defer second.reply.deinit();
+    try testing.expectEqual(id_b, first.id);
+    try testing.expectEqual(id_c, second.id);
+    try testing.expectEqual(@as(usize, 0), h.client.outstandingCount());
+
+    // A closed session answers InvalidState even with replies still buffered.
+    h.peer.hold_next_reply = true;
+    const id_d = try h.client.send(.discard_changes);
+    _ = try h.client.send(.discard_changes);
+    try h.peer.releaseHeld(); // e, d
+    try h.client.closeSession(); // the close-session reply sits behind e, d: both are buffered
+    _ = id_d;
+    try testing.expectEqual(State.closed, h.client.state);
+    try testing.expectEqual(@as(usize, 2), h.client.pending_replies.items.len);
+    try testing.expectError(error.InvalidState, h.client.receiveAnyReply());
+}
+
+test "mutation 2026-11-25: receiveAnyReply queues interleaved notifications and rejects what is not a reply" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1, capabilities.cap_notification }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+
+    h.peer.notify_before_reply = true;
+    const id = try h.client.send(.discard_changes);
+    var done = try h.client.receiveAnyReply();
+    defer done.reply.deinit();
+    try testing.expectEqual(id, done.id);
+    var n = (try h.client.nextNotification()).?;
+    defer n.deinit();
+    try testing.expectEqualStrings("2026-07-22T10:00:00Z", n.event_time);
+
+    // A <hello> where a reply is due is UnexpectedMessage, not a state error.
+    h.peer.hold_next_reply = true;
+    _ = try h.client.send(.discard_changes);
+    try h.peer.emit("<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/></hello>");
+    try testing.expectError(error.UnexpectedMessage, h.client.receiveAnyReply());
+}
+
+test "mutation 2026-11-25: receiveAnyReply returns two-digit message ids as decimal" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+
+    h.peer.hold_next_reply = true;
+    const first = try h.client.send(.discard_changes);
+    var ids: [13]u64 = undefined;
+    for (&ids) |*slot| slot.* = try h.client.send(.discard_changes);
+    try h.peer.releaseHeld();
+    var f = try h.client.receiveReply(first); // buffers the thirteen others
+    defer f.deinit();
+    // Ids reach past 9, where a hexadecimal reading of "10" would be 16.
+    try testing.expect(ids[ids.len - 1] >= 10);
+    for (ids) |want| {
+        var got = try h.client.receiveAnyReply();
+        defer got.reply.deinit();
+        try testing.expectEqual(want, got.id);
+    }
+}
+
+test "mutation 2026-11-25: a notification whose queue slot cannot be allocated leaks nothing" {
+    const gpa = testing.allocator;
+    var k: usize = 0;
+    while (true) : (k += 1) {
+        const peer = try gpa.create(FakePeer);
+        peer.* = FakePeer.init(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1, capabilities.cap_notification });
+        defer {
+            peer.deinit();
+            gpa.destroy(peer);
+        }
+        var fa = std.testing.FailingAllocator.init(gpa, .{});
+        var client = try Client.init(fa.allocator(), peer.transport(), .{});
+        defer client.deinit();
+        try client.hello();
+        peer.notify_before_reply = true;
+        _ = try client.send(.discard_changes);
+        fa.fail_index = fa.alloc_index + k;
+        if (client.receiveAnyReply()) |done| {
+            var d = done;
+            d.reply.deinit();
+            break;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+}

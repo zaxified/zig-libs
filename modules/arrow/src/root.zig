@@ -65,4 +65,5 @@ test {
     _ = @import("guards_test.zig");
     _ = @import("dict_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("mutation_test.zig");
 }

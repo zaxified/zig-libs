@@ -92,3 +92,35 @@ test "padded Falcon-1024: sign/verify and the repacked compressed form" {
     padded[50] ^= 1;
     try std.testing.expect(std.meta.isError(pk.verifyPadded(msg, &padded)));
 }
+
+test "mutation 2026-11-25: verifyPadded names a non-canonical body InvalidSignature and checks the pad from its first byte" {
+    var kprng: sign.ShakePrng = undefined;
+    kprng.init("padded-test key 512");
+    defer kprng.deinit();
+    var sk: falcon.SigningKey = undefined;
+    var pk: falcon.PublicKey = undefined;
+    try falcon.generateKeyPair(kprng.random(), &sk, &pk);
+    defer sk.secureZero();
+    var sp: sign.ShakePrng = undefined;
+    sp.init("padded-test mutation 512");
+    defer sp.deinit();
+    const msg = "padded format";
+
+    var nonce: [40]u8 = undefined;
+    var field: [falcon.max_sig_field_length]u8 = undefined;
+    const flen = try falcon.signRandomized(&sk, msg, sp.random(), &nonce, &field);
+    const padded = repack(falcon.padded_sig_length, falcon.padded_sig_header, &nonce, field[0..flen]);
+    try pk.verifyPadded(msg, &padded);
+
+    // A body that is not a canonical compressed s2 is InvalidSignature (not a failed verification).
+    var junk = padded;
+    @memset(junk[41..], 0); // no unary terminator: the high part overflows
+    try std.testing.expectError(error.InvalidSignature, pk.verifyPadded(msg, &junk));
+
+    // The first byte after the compressed value (offset 41 + flen - 1) must be zero too.
+    const first_pad = 41 + flen - 1;
+    try std.testing.expect(first_pad < padded.len - 1);
+    var bad = padded;
+    bad[first_pad] = 1;
+    try std.testing.expectError(error.InvalidSignature, pk.verifyPadded(msg, &bad));
+}
