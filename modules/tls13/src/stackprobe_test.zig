@@ -224,6 +224,29 @@ test "STACKPROBE: no secret residue after the keyschedule steps of a handshake" 
     _ = try PKs.run("computeFinishedVerifyData", ksFinished, .{}, &outs, .{});
 }
 
+var mut_vd: [48]u8 = undefined;
+var mut_binder: [48]u8 = undefined;
+fn ksVerifyFinished() void {
+    std.mem.doNotOptimizeAway(ks.verifyFinished(std.crypto.auth.hmac.sha2.HmacSha384, &ks_secret, &ks_th, &mut_binder));
+}
+fn ksVerifyPskBinder() void {
+    std.mem.doNotOptimizeAway(ks.verifyPskBinder(Hkdf384, std.crypto.auth.hmac.sha2.HmacSha384, &ks_secret, &ks_th, &mut_vd));
+}
+
+test "mutation 2026-11-25: STACKPROBE: verifyFinished and verifyPskBinder burn the stack and leave no key or expected MAC" {
+    try sp.skipUnlessOptimized();
+    const Hmac384 = std.crypto.auth.hmac.sha2.HmacSha384;
+    ks.computeFinishedVerifyData(Hmac384, &mut_vd, &ks_secret, &ks_th);
+    ks.pskBinder(Hkdf384, Hmac384, &mut_binder, &ks_secret, &ks_th);
+    // HMAC's key pads (key ^ ipad, key ^ opad) are as good as the key.
+    var ipad: [48]u8 = ks_secret;
+    var opad: [48]u8 = ks_secret;
+    for (&ipad) |*b| b.* ^= 0x36;
+    for (&opad) |*b| b.* ^= 0x5c;
+    _ = try PKs.run("verifyFinished", ksVerifyFinished, .{}, &[_][]const u8{ &ks_secret, &mut_vd, &ipad, &opad }, .{});
+    _ = try PKs.run("verifyPskBinder", ksVerifyPskBinder, .{}, &[_][]const u8{ &ks_secret, &mut_binder, &ipad, &opad }, .{});
+}
+
 // ── stack requirement per entry point (`kex.stackRequirement`,
 // `certverify.signStackRequirement` / `verifyStackRequirement`) ──────────
 

@@ -319,3 +319,135 @@ test "sign: an all-zero `random` (rsa's bounded blinding draw gives up) is error
         try testing.expectError(error.EntropyFailure, certverify.sign(scheme, sk, .server, &kat.rsa_pss_sha256_server.transcript_hash, z.random(), &out));
     }
 }
+
+// ── 2026-11-25 delta mutation audit: publicKeyFromSpkiDer arms, P-521 signing options ──
+
+fn derTlv(a: std.mem.Allocator, tag: u8, parts: []const []const u8) ![]u8 {
+    var len: usize = 0;
+    for (parts) |p| len += p.len;
+    var hdr: [4]u8 = undefined;
+    hdr[0] = tag;
+    var hl: usize = 2;
+    if (len < 0x80) {
+        hdr[1] = @intCast(len);
+    } else if (len < 0x100) {
+        hdr[1] = 0x81;
+        hdr[2] = @intCast(len);
+        hl = 3;
+    } else {
+        hdr[1] = 0x82;
+        hdr[2] = @intCast(len >> 8);
+        hdr[3] = @intCast(len & 0xff);
+        hl = 4;
+    }
+    const out = try a.alloc(u8, hl + len);
+    @memcpy(out[0..hl], hdr[0..hl]);
+    var o: usize = hl;
+    for (parts) |p| {
+        @memcpy(out[o..][0..p.len], p);
+        o += p.len;
+    }
+    return out;
+}
+
+/// SubjectPublicKeyInfo { AlgorithmIdentifier { oid, [params] }, BIT STRING key }.
+fn spkiOf(a: std.mem.Allocator, oid: []const u8, params: ?[]const u8, key: []const u8) ![]u8 {
+    const o = try derTlv(a, 0x06, &.{oid});
+    const alg = if (params) |p| try derTlv(a, 0x30, &.{ o, p }) else try derTlv(a, 0x30, &.{o});
+    const bits = try derTlv(a, 0x03, &.{ &.{0x00}, key });
+    return derTlv(a, 0x30, &.{ alg, bits });
+}
+
+const oid_ec = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
+const oid_secp384r1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 };
+const oid_secp521r1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x23 };
+const oid_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+const oid_ed25519 = [_]u8{ 0x2b, 0x65, 0x70 };
+
+test "mutation 2026-11-25: publicKeyFromSpkiDer: RSA and P-521 keys decode and verify the KAT signatures, bad key bytes are InvalidPublicKey" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const null_params = [_]u8{ 0x05, 0x00 };
+
+    // RSA: RSAPublicKey ::= SEQUENCE { n INTEGER, e INTEGER }.
+    const n_int = try derTlv(a, 0x02, &.{ &.{0x00}, &kat.rsa_pss_sha256_server.n });
+    const e_int = try derTlv(a, 0x02, &.{&kat.rsa_pss_sha256_server.e});
+    const rsa_pub = try derTlv(a, 0x30, &.{ n_int, e_int });
+    const rsa_key = try certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid_rsa, &null_params, rsa_pub));
+    try testing.expect(rsa_key == .rsa);
+    try certverify.verify(.rsa_pss_rsae_sha256, rsa_key, .server, &kat.rsa_pss_sha256_server.transcript_hash, &kat.rsa_pss_sha256_server.signature);
+    // An RSAPublicKey that does not decode is a bad key, not an unsupported algorithm.
+    try testing.expectError(error.InvalidPublicKey, certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid_rsa, &null_params, &.{ 0x30, 0x00 })));
+
+    // P-521.
+    const curve521 = try derTlv(a, 0x06, &.{&oid_secp521r1});
+    const k521 = try certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid_ec, curve521, &kat.ecdsa_p521_server.public_key_uncompressed_sec1));
+    try testing.expect(k521 == .ecdsa_p521);
+    try certverify.verify(.ecdsa_secp521r1_sha512, k521, .server, &kat.ecdsa_p521_server.transcript_hash, &kat.ecdsa_p521_server.signature_der);
+    // A point that is not on the curve: P-384 and P-521 refuse it as InvalidPublicKey.
+    const curve384 = try derTlv(a, 0x06, &.{&oid_secp384r1});
+    const off384: [97]u8 = @splat(4);
+    try testing.expectError(error.InvalidPublicKey, certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid_ec, curve384, &off384)));
+    const off521: [133]u8 = @splat(4);
+    try testing.expectError(error.InvalidPublicKey, certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid_ec, curve521, &off521)));
+
+    // An Ed25519 key that is not a canonical point encoding (y >= p).
+    const bad_ed: [32]u8 = @splat(0xff);
+    try testing.expectError(error.InvalidPublicKey, certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid_ed25519, null, &bad_ed)));
+}
+
+test "mutation 2026-11-25: publicKeyFromSpkiDer: ML-DSA-44/65/87 map to their own arm, length-checked, parameters absent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03 };
+    const Case = struct { last: u8, len: usize };
+    const cases = [_]Case{ .{ .last = 0x11, .len = 1312 }, .{ .last = 0x12, .len = 1952 }, .{ .last = 0x13, .len = 2592 } };
+    for (cases) |c| {
+        const oid = base ++ [_]u8{c.last};
+        const key = try a.alloc(u8, c.len);
+        @memset(key, 0x5a);
+        const pk = try certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid, null, key));
+        switch (c.last) {
+            0x11 => try testing.expectEqual(@as(usize, 1312), pk.mldsa44.len),
+            0x12 => try testing.expectEqual(@as(usize, 1952), pk.mldsa65.len),
+            0x13 => try testing.expectEqual(@as(usize, 2592), pk.mldsa87.len),
+            else => unreachable,
+        }
+        // One octet short and one too long: a malformed key.
+        try testing.expectError(error.InvalidPublicKey, certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid, null, key[0 .. c.len - 1])));
+        const longer = try a.alloc(u8, c.len + 1);
+        @memset(longer, 0x5a);
+        try testing.expectError(error.InvalidPublicKey, certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid, null, longer)));
+        // RFC 9881 §2: the parameters MUST be absent.
+        try testing.expectError(error.InvalidPublicKey, certverify.publicKeyFromSpkiDer(try spkiOf(a, &oid, &.{ 0x05, 0x00 }, key)));
+    }
+}
+
+test "mutation 2026-11-25: sign (P-521): noise from `random` changes the signature, both verify; a scalar outside [1, n-1] is KeyMismatch" {
+    const p521 = @import("p521");
+    const EcdsaP521 = p521.EcdsaP521Sha512;
+    var b521: [66]u8 = undefined;
+    @memset(&b521, 0x11);
+    b521[0] = 0;
+    const sk = try EcdsaP521.SecretKey.fromBytes(b521);
+    var kp: EcdsaP521.KeyPair = undefined;
+    try EcdsaP521.KeyPair.fromSecretKeyInto(&kp, &sk);
+    const th: [64]u8 = @splat(0x33);
+    var det1: [certverify.max_signature_len]u8 = undefined;
+    var det2: [certverify.max_signature_len]u8 = undefined;
+    var rnd_out: [certverify.max_signature_len]u8 = undefined;
+    const d1 = try certverify.sign(.ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = &sk }, .server, &th, null, &det1);
+    const d2 = try certverify.sign(.ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = &sk }, .server, &th, null, &det2);
+    try testing.expectEqualSlices(u8, d1, d2); // RFC 6979 without noise
+    var prng = std.Random.DefaultPrng.init(0x521);
+    const r1 = try certverify.sign(.ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = &sk }, .server, &th, prng.random(), &rnd_out);
+    try testing.expect(!std.mem.eql(u8, d1, r1)); // §3.6 additional data
+    const pk: certverify.PublicKey = .{ .ecdsa_p521 = kp.public_key };
+    try certverify.verify(.ecdsa_secp521r1_sha512, pk, .server, &th, d1);
+    try certverify.verify(.ecdsa_secp521r1_sha512, pk, .server, &th, r1);
+    // The zero scalar is no key.
+    const zero: EcdsaP521.SecretKey = .{ .bytes = @splat(0) };
+    try testing.expectError(error.KeyMismatch, certverify.sign(.ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = &zero }, .server, &th, null, &det1));
+}
