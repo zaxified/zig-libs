@@ -6,7 +6,7 @@
 
 **Scope:** parity — Caffeine 3.3.0 (W-TinyLFU) (surveyed 2026-09-30, gaps closed 2026-10-11)
 
-**Audit:** review 2026-11-01 · mutation 2026-10-30 (460/486, 26 eq) · src 0aa3c2cde7c227ae
+**Audit:** review 2026-11-01 · mutation 2026-11-25 (488/514, 26 eq) · src 86396c353de71911
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, RAMCA_E_FUZZ) · ct n/a — in-memory cache (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + 2 blind reviews: max_key_len 4096 + max_pinned_bytes (= max_bytes) limits, hook re-entrancy UAF → checked panic, hook get no longer corrupts the window queues or drops stale entries, linear removeMatching, Sharded same-thread getOrLoad re-entry → LoadFailed, callback self-lock → panic, max_shards clamp; delta audit Cache 34/37 + 3 eq, Sharded 17/17)
 
@@ -321,6 +321,9 @@ threads, everything else injects `now_ns`/generation, so no real clock), `zig bu
   arithmetic, uncommitted reservations).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
   the last whole-module mutation run and the delta runs after it.
+- **Delta mutation 2026-11-25:** 28 mutants, 28 killed (three as hangs), 0 open. The epoch compare is killed only by a
+  test with keys that share a home slot (it checks std's probing layout first and skips if it finds no free stretch):
+  doubling growth never moves an unvisited entry behind the cursor.
 
 ## Performance
 
