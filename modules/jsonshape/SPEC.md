@@ -6,7 +6,7 @@
 
 **Scope:** parity — RFC 9535 JSONPath complete (official compliance suite 715/715) with the query surface of theory/jsonpath v0.12.2 and serde_json_path 0.7.2: strict compile with the failure's offset, compile once and query many, Normalized Paths, `match()`/`search()` over RFC 9485 I-Regexp; jq's JSON-to-JSON language is another tool, refused below (surveyed 2026-11-02, gaps closed 2026-11-02)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-19 (52/55, 2 eq) · src 56f33588988d47cf
+**Audit:** review 2026-10-04 · mutation 2026-11-25 (126/133, 6 eq) · src ebacb1b3fb41b374
 
 **Hardening:** fuzz 2026-11-02 (`JSONSHAPE_FUZZ=3000000`, 3M seeds clean after the review fixes, ReleaseSafe, every reach label hit) · ct n/a — JSON shape checks (keyword review, 2026-10-07) · panic 2026-11-02 (sweep tests over `compile`, `query`, `queryFirst`, `queryLocated`, `parseDocument`, hostile paths and patterns, OOM at every allocation; before it 2026-10-31, sweep + blind review: `max_work` budget over every step, comparison, conversion and output cell (`WorkLimit`), `max_depth` 512 pre-scan and path depth 64 → `DepthLimit`, iterative `||`/`&&`; delta audit 62/62)
 
@@ -230,6 +230,8 @@ Residual risks a caller owns (not fixable here, or bounded by the caller's limit
 - **Constant time:** n/a, JSON shape checks over public data.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
   mutation run and the delta runs after it.
+- **Delta mutation 2026-11-25:** 78 mutants, 74 killed, 3 equivalent (cost-only), 1 unobservable (the `segs.len > 0`
+  guard over a pointer to a dead local that stays intact in practice), 0 open; four new tests incl. `decodeNested`.
 - **Bench:** `zig build bench-jsonshape` (`tools/bench.zig`, `tools/README.md`) against theory/jsonpath,
   serde_json_path, ojg and jsonpath-rust.
 
