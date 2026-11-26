@@ -1543,6 +1543,38 @@ test "use_x_real_ip = false: X-Real-IP is ignored by clientIpWith and clientKeyW
     try expectClientIp(.loopback, "127.0.0.1:5000", "X-Real-IP: 203.0.113.7\r\n", "203.0.113.7");
 }
 
+fn hClientKeyDefault(ctx: *router.Ctx) anyerror!void {
+    var kbuf: [peer_key_len_max]u8 = undefined;
+    try ctx.res.writeAll(clientKey(ctx.req, &kbuf));
+}
+
+test "mutation 2026-11-25: clientKey honours X-Real-IP by default" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/t", hClientKeyDefault);
+    const p = try netaddr.parseAddrPort("127.0.0.1:5000").?.toStd();
+    var out: [1024]u8 = undefined;
+    const got = runWirePeer(&r, wire("X-Real-IP: 203.0.113.7\r\n"), &out, p);
+    const body = got[(std.mem.find(u8, got, "\r\n\r\n") orelse return error.NoBody) + 4 ..];
+    try testing.expectEqualStrings("203.0.113.7", body);
+}
+
+test "mutation 2026-11-25: Options.use_x_real_ip = false reaches every key mode (forwarded_ip, header fallback, forwarded_ip_trusted)" {
+    const keys = [_]KeySource{ .forwarded_ip, .{ .header = "x-api-key" }, .{ .forwarded_ip_trusted = .loopback } };
+    for (keys) |key| {
+        var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.001, .burst = 1, .use_x_real_ip = false, .key = key });
+        defer l.deinit();
+        var rl = try RouterUnderLimit.init(&l);
+        defer rl.deinit();
+        rl.start();
+        var out: [1024]u8 = undefined;
+        const peer = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 5000 } };
+        // Different X-Real-IP values, one peer: one bucket, since the header is not read.
+        try expectStatus(runWirePeer(&rl.r, wire("X-Real-IP: 5.5.5.5\r\n"), &out, peer), "200");
+        try expectStatus(runWirePeer(&rl.r, wire("X-Real-IP: 6.6.6.6\r\n"), &out, peer), "429");
+    }
+}
+
 fn expectClientIp(trusted: TrustedProxies, peer: ?[]const u8, comptime headers: []const u8, want: []const u8) !void {
     var t = trusted;
     var r = router.Router.init(testing.allocator);

@@ -5526,6 +5526,31 @@ test "hostile captures: a regexp constraint is anchored at both ends and matches
     try expectStatus(try dispatchDirect(&r, .get, "/u/\xe0\xa5\xa7\xe0\xa5\xa8", "/u/\xe0\xa5\xa7\xe0\xa5\xa8", &buf), "404");
 }
 
+test "mutation 2026-11-25: clearing an absent typed slot is a no-op even when all slots are taken; a wildcard prefix covers nothing" {
+    const A = struct { n: u8 };
+    const B = struct { n: u8 };
+    const C = struct { n: u8 };
+    const D = struct { n: u8 };
+    const E = struct { n: u8 };
+    var empty: Params = .{};
+    var ctx: Ctx = .{ .req = undefined, .res = undefined, .params = &empty, .state = null };
+    try testing.expectEqual(@as(?*E, null), try ctx.setTyped(E, null));
+    var a: A = .{ .n = 1 };
+    var b: B = .{ .n = 2 };
+    var c: C = .{ .n = 3 };
+    var d: D = .{ .n = 4 };
+    _ = try ctx.setTyped(A, &a);
+    _ = try ctx.setTyped(B, &b);
+    _ = try ctx.setTyped(C, &c);
+    _ = try ctx.setTyped(D, &d);
+    // All four slots are in use: clearing a type that holds none is still `null`, not TypedSlotsFull.
+    try testing.expectEqual(@as(?*E, null), try ctx.setTyped(E, null));
+    // `makeGroup` refuses wildcard prefixes; the lookup helper must not treat one as covering a path anyway.
+    try testing.expectEqual(@as(?usize, null), prefixCovers("/x/*", "/x/y"));
+    try testing.expectEqual(@as(?usize, null), prefixCovers("/x/*rest", "/x/y/z"));
+    try testing.expectEqual(@as(?usize, 1), prefixCovers("/x", "/x/y"));
+}
+
 test "typed slots: keyed by type, separate from data, restorable, bounded" {
     const A = struct { n: u8 };
     const B = struct { n: u8 };
