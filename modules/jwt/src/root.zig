@@ -7402,6 +7402,93 @@ fn resNoIdentityHandler(ctx: *router.Ctx) anyerror!void {
     try ctx.res.writeAll("open");
 }
 
+var res_slot_seen: ?bool = null;
+var res_shadow_target: u8 = 0;
+
+/// Outer link: a typed `Identity` slot already filled before the ResourceServer runs; the
+/// middleware must put it back when it returns.
+fn resOuterPreset(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    var other: Identity = undefined;
+    _ = try ctx.setTyped(Identity, &other);
+    defer _ = ctx.setTyped(Identity, null) catch {};
+    try next.run(ctx);
+    res_slot_seen = ctx.getTyped(Identity) == &other;
+}
+
+/// Outer link with an empty slot: it must be empty again afterwards (not left pointing at the
+/// middleware's stack `Identity`).
+fn resOuterEmpty(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    try next.run(ctx);
+    res_slot_seen = ctx.getTyped(Identity) == null;
+}
+
+/// Inner link after the ResourceServer: overwrites the raw `ctx.data` slot, as another
+/// identity-attaching middleware would.
+fn resInnerShadow(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    ctx.data = &res_shadow_target;
+    return next.run(ctx);
+}
+
+test "mutation 2026-11-25: identityOf reads the typed slot; the middleware restores the previous typed slot on exit" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .body = rs_jwks_json },
+    } };
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var rs = try ResourceServer.init(gpa, .{
+        .provider = &provider,
+        .claim_opts = .{ .issuer = .{ .required = "https://issuer.example" }, .audience = .{ .required = "api://svc" } },
+        .required_scopes = &.{"read"},
+        .clock = fc.clock(),
+    });
+    defer rs.deinit();
+    var tok_buf: [1024]u8 = undefined;
+    const good = mintRs256(&tok_buf, "{\"iss\":\"https://issuer.example\",\"aud\":\"api://svc\",\"sub\":\"alice\",\"exp\":2000,\"scope\":\"read write\"}");
+    var bearer_buf: [1100]u8 = undefined;
+    const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{good}) catch unreachable;
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+
+    // A later middleware replacing `ctx.data`: the handler still gets this module's Identity.
+    {
+        var r = router.Router.init(gpa);
+        defer r.deinit();
+        try r.use(rs.middleware());
+        try r.use(.{ .run = resInnerShadow });
+        try r.get("/data", resProtectedHandler);
+        res_test_hits = 0;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "200");
+        try testing.expectEqual(@as(u32, 1), res_test_hits);
+    }
+    // The previous typed slot value comes back after the middleware.
+    {
+        var r = router.Router.init(gpa);
+        defer r.deinit();
+        try r.use(.{ .run = resOuterPreset });
+        try r.use(rs.middleware());
+        try r.get("/data", resProtectedHandler);
+        res_slot_seen = null;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "200");
+        try testing.expectEqual(@as(?bool, true), res_slot_seen);
+    }
+    // And an empty slot is empty again.
+    {
+        var r = router.Router.init(gpa);
+        defer r.deinit();
+        try r.use(.{ .run = resOuterEmpty });
+        try r.use(rs.middleware());
+        try r.get("/data", resProtectedHandler);
+        res_slot_seen = null;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "200");
+        try testing.expectEqual(@as(?bool, true), res_slot_seen);
+    }
+}
+
 test "ResourceServer: valid token → 200 + identity; missing/invalid/expired/insufficient short-circuit" {
     const gpa = testing.allocator;
     var stub: ScriptFetcher = .{ .script = &.{

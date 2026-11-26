@@ -2414,6 +2414,58 @@ fn expectModel(want: ?u32, got: ?[]u8) !void {
     } else try testing.expect(got == null);
 }
 
+test "mutation 2026-11-25: a bucket deleted and created again starts with an empty change index" {
+    // `deleteIn` / re-create clear the bucket's ChangeLog: its hash index and its `indexed`
+    // watermark go with the list. A stale index entry answers for a key of the old life
+    // (items[old position]); a stale watermark leaves the new changes unindexed.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "idx2.kvt", .{});
+    defer db.close();
+    var txn = try db.begin();
+    errdefer txn.rollback();
+    var kb: [8]u8 = undefined;
+    const old = try txn.createBucket("b");
+    for (0..20) |i| try old.put(std.mem.print(&kb, "o{d:0>2}", .{i}) catch unreachable, "old");
+    // Index the 20 changes (more than the linear scan covers).
+    const o5 = (try old.get(testing.allocator, "o05")).?;
+    defer testing.allocator.free(o5);
+    try testing.expectEqualStrings("old", o5);
+    try txn.deleteBucket("b");
+    const fresh = try txn.createBucket("b");
+    for (0..20) |i| try fresh.put(std.mem.print(&kb, "n{d:0>2}", .{i}) catch unreachable, "new");
+    // A key only the old life had: a stale index entry would point into the new list.
+    try testing.expect((try fresh.get(testing.allocator, "o05")) == null);
+    // A key of the new life: found only when the new changes are indexed.
+    const got = (try fresh.get(testing.allocator, "n05")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("new", got);
+    txn.rollback();
+}
+
+test "mutation 2026-11-25: an out-of-memory index build falls back to the scan, it does not answer from a partial index" {
+    var fa = testing.FailingAllocator.init(testing.allocator, .{});
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(fa.allocator(), sim.storage(), "idx3.kvt", .{});
+    defer db.close();
+    var txn = try db.begin();
+    defer txn.rollback();
+    var kb: [8]u8 = undefined;
+    for (0..20) |i| try txn.put(std.mem.print(&kb, "k{d:0>2}", .{i}) catch unreachable, "v");
+    // The next allocation (the index's first growth) fails.
+    fa.fail_index = fa.alloc_index;
+    const got = (try txn.get(testing.allocator, "k00")).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("v", got);
+    fa.fail_index = std.math.maxInt(usize);
+    const again = (try txn.get(testing.allocator, "k19")).?;
+    defer testing.allocator.free(again);
+    try testing.expectEqualStrings("v", again);
+}
+
 test "one transaction, many changes per key: the last change of each key wins" {
     // `core.reduceChanges` folds a transaction's changes by key; each key here
     // takes ~80 changes with a DISTINCT value each (a put after a put is only

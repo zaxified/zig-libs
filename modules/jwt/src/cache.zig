@@ -1047,3 +1047,26 @@ test "VerifiedCache: the policy digest is length-delimited even when a policy st
     try testing.expect(!std.mem.eql(u8, &d1, &d2));
     try testing.expect(std.mem.eql(u8, &d1, &keyDigest(&key, "tok", p1)));
 }
+
+test "mutation 2026-11-25: the any-marker of issuer and audience is hashed, so a moved field boundary is a different digest" {
+    // `.any` hashes one 0 byte. Dropped for the issuer, (issuer x, audience any, token T) and
+    // (issuer any, audience x, token 0 ++ T) hash the same bytes; dropped for the audience,
+    // (issuer x, audience any, token enc(y) ++ T) and (issuer x, audience y, token T) do.
+    const key: [Mac.key_length]u8 = @splat(7);
+    const any: root.Options = .{ .now_s = 1000, .issuer = .any, .audience = .any };
+    var a = any;
+    a.issuer = .{ .required = "x" };
+    var b = any;
+    b.audience = .{ .required = "x" };
+    const d_a = keyDigest(&key, "T", a);
+    const d_b = keyDigest(&key, "\x00T", b);
+    try testing.expect(!std.mem.eql(u8, &d_a, &d_b));
+
+    var c = any;
+    c.issuer = .{ .required = "x" };
+    c.audience = .{ .required = "y" };
+    const enc_y = "\x01\x01\x00\x00\x00\x00\x00\x00\x00y";
+    const d_c = keyDigest(&key, "T", c);
+    const d_any = keyDigest(&key, enc_y ++ "T", a);
+    try testing.expect(!std.mem.eql(u8, &d_c, &d_any));
+}

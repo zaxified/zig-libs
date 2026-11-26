@@ -422,3 +422,144 @@ test "SecureAllocator: free wipes the block's pages before unmapping" {
     a.free(buf);
     try testing.expect(!readable(buf.ptr)); // unmapped: a stale pointer faults instead of reading a secret
 }
+
+// ── whole-module mutation run 2026-11-25 ────────────────────────────────────
+
+/// Contents of a /proc file (small or large), read through raw syscalls; the caller frees it.
+fn readProc(path: [*:0]const u8) ![]u8 {
+    const linux = std.os.linux;
+    const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = linux.read(fd, &chunk, chunk.len);
+        if (linux.errno(n) != .SUCCESS) return error.SkipZigTest;
+        if (n == 0) break;
+        try out.appendSlice(testing.allocator, chunk[0..n]);
+    }
+    return out.toOwnedSlice(testing.allocator);
+}
+
+/// `VmLck` of this process, in kB.
+fn vmLckKb() !usize {
+    const text = try readProc("/proc/self/status");
+    defer testing.allocator.free(text);
+    const at = std.mem.find(u8, text, "VmLck:") orelse return error.SkipZigTest;
+    var it = std.mem.tokenizeAny(u8, text[at + "VmLck:".len ..], " \t\n");
+    return std.fmt.parseInt(usize, it.next() orelse return error.SkipZigTest, 10) catch error.SkipZigTest;
+}
+
+test "mutation 2026-11-25: dataLen rounds the canary, the alignment slack and the last byte into whole pages, and caps at 1 TiB" {
+    const page = std.heap.pageSize();
+    // The canary needs room: len + 1 + 16 spills over a page for len in [page - 16, page - 1].
+    try testing.expectEqual(@as(?usize, 2 * page), SecureAllocator.dataLen(page - 5, 1, page));
+    // len + 17 is exactly one byte over a page: that byte needs the next page.
+    try testing.expectEqual(@as(?usize, 2 * page), SecureAllocator.dataLen(page - 16, 1, page));
+    try testing.expectEqual(@as(?usize, page), SecureAllocator.dataLen(page - 17, 1, page));
+    // The cap: exactly 1 TiB of data pages is allowed, one page more is not.
+    try testing.expectEqual(@as(?usize, 1 << 40), SecureAllocator.dataLen((1 << 40) - 17, 1, page));
+    try testing.expectEqual(@as(?usize, null), SecureAllocator.dataLen((1 << 40) - 16, 1, page));
+    try testing.expectEqual(@as(?usize, null), SecureAllocator.dataLen(std.math.maxInt(usize) - 20, 1, page));
+    try testing.expectEqual(@as(?usize, null), SecureAllocator.dataLen(std.math.maxInt(usize), 1, page));
+}
+
+test "mutation 2026-11-25: a zero-length request is refused by the allocator itself" {
+    var sa = try SecureAllocator.init(.off);
+    try testing.expect(sa.allocator().rawAlloc(0, .@"1", 0) == null);
+}
+
+test "mutation 2026-11-25: mlock is attempted for best_effort and required, never for off; blocks stay out of core dumps" {
+    const page = std.heap.pageSize();
+    var off = try SecureAllocator.init(.off);
+    var best = try SecureAllocator.init(.best_effort);
+
+    // Can this process lock memory at all (RLIMIT_MEMLOCK, capabilities)? Probe with a page of its own.
+    {
+        const probe = std.posix.mmap(null, page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch return error.SkipZigTest;
+        defer std.posix.munmap(probe);
+        if (std.os.linux.errno(std.os.linux.mlock(probe.ptr, page)) != .SUCCESS) return error.SkipZigTest;
+    }
+    const before = try vmLckKb();
+    const b_off = try off.allocator().alloc(u8, 100);
+    const with_off = try vmLckKb();
+    try testing.expectEqual(before, with_off); // .off locks nothing
+    const b_best = try best.allocator().alloc(u8, 100);
+    const with_best = try vmLckKb();
+    try testing.expect(with_best >= with_off + page / 1024);
+
+    // MADV_DONTDUMP: the block's mapping carries the `dd` flag in /proc/self/smaps.
+    const smaps = try readProc("/proc/self/smaps");
+    defer testing.allocator.free(smaps);
+    const addr = @intFromPtr(b_best.ptr);
+    var in_region = false;
+    var has_dd = false;
+    var lines = std.mem.splitScalar(u8, smaps, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.ascii.isHex(line[0]) and std.mem.findScalar(u8, line, '-') != null and std.mem.findScalar(u8, line, ' ') != null and !std.mem.startsWith(u8, line, "Vm")) {
+            const dash = std.mem.findScalar(u8, line, '-').?;
+            const sp = std.mem.findScalar(u8, line, ' ').?;
+            if (dash < sp) {
+                const lo = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+                const hi = std.fmt.parseInt(usize, line[dash + 1 .. sp], 16) catch continue;
+                in_region = addr >= lo and addr < hi;
+                continue;
+            }
+        }
+        if (in_region and std.mem.startsWith(u8, line, "VmFlags:")) {
+            var it = std.mem.tokenizeScalar(u8, line["VmFlags:".len..], ' ');
+            while (it.next()) |f| if (std.mem.eql(u8, f, "dd")) {
+                has_dd = true;
+            };
+        }
+    }
+    off.allocator().free(b_off);
+    best.allocator().free(b_best);
+    try testing.expect(has_dd);
+}
+
+test "mutation 2026-11-25: free unmaps the whole mapping, both guard pages and the data pages" {
+    var sa = try SecureAllocator.init(.off);
+    const a = sa.allocator();
+    const page = std.heap.pageSize();
+    const len: usize = 100;
+    const buf = try a.alloc(u8, len);
+    const end = std.mem.alignForward(usize, @intFromPtr(buf.ptr) + len, page);
+    const first_data = end - SecureAllocator.dataLen(len, 1, page).?;
+    a.free(buf);
+    var vec: [1]u8 = undefined;
+    // `mincore` answers ENOMEM for an address with no mapping at all (a PROT_NONE guard still counts as mapped).
+    for ([_]usize{ end, first_data - page, first_data }) |p| {
+        const rc = std.os.linux.mincore(@ptrFromInt(p), 1, &vec);
+        try testing.expectEqual(std.os.linux.E.NOMEM, std.os.linux.errno(rc));
+    }
+}
+
+test "mutation 2026-11-25: free of a block whose canary was overwritten aborts (child process)" {
+    const linux = std.os.linux;
+    const pid_rc = linux.fork();
+    if (linux.errno(pid_rc) != .SUCCESS) return error.SkipZigTest;
+    if (pid_rc == 0) {
+        // The child: silence stderr and core dumps, then do what must abort.
+        const null_fd = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        if (linux.errno(null_fd) == .SUCCESS) _ = linux.dup2(@intCast(null_fd), 2);
+        const no_core: linux.rlimit = .{ .cur = 0, .max = 0 };
+        _ = linux.setrlimit(.CORE, &no_core);
+        var sa = SecureAllocator.init(.off) catch linux.exit_group(3);
+        const a = sa.allocator();
+        const buf = a.alloc(u8, 32) catch linux.exit_group(4);
+        (buf.ptr - 1)[0] ^= 0xff; // a write that ran before the block
+        a.free(buf);
+        linux.exit_group(0);
+    }
+    var status: i32 = 0;
+    const w = linux.waitpid(@intCast(pid_rc), &status, 0);
+    try testing.expectEqual(@as(usize, @intCast(pid_rc)), w);
+    const st: u32 = @bitCast(status);
+    try testing.expect(linux.W.IFSIGNALED(st));
+    try testing.expectEqual(linux.SIG.ABRT, linux.W.TERMSIG(st));
+}

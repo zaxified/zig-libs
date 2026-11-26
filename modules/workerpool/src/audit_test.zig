@@ -776,3 +776,157 @@ test "submitBlocking: a caller blocked on a full queue is released with Shutdown
     try testing.expect(released);
     try testing.expectEqual(@as(u32, 2), b.result.load(.seq_cst));
 }
+
+// ── delta mutation run 2026-11-25: submitBlocking / drainTimeout wake-ups ───
+
+fn drainThread(pool: *WorkerPool) void {
+    pool.drain();
+}
+
+/// A full bounded pool (one worker held in a gated job, one queued job) with `n` callers blocked in
+/// `submitBlocking`. The queue never frees while the gate is closed, so only the lifecycle call's own
+/// wake can release them.
+fn fillAndBlock(io: std.Io, pool: *WorkerPool, g: *Gate, c: *Counter, bs: []Blocked, ts: []std.Thread) !void {
+    try pool.submit(.{ .func = gatedJob, .ctx = g });
+    awaitEntered(io, g);
+    try pool.submit(.{ .func = incr, .ctx = c });
+    for (bs, ts) |*b, *t| {
+        b.* = .{ .pool = pool, .job = .{ .func = incr, .ctx = c } };
+        t.* = try std.Thread.spawn(.{}, Blocked.run, .{b});
+    }
+    sleepMs(io, 30);
+    for (bs) |*b| try testing.expectEqual(@as(u32, 0), b.result.load(.seq_cst));
+}
+
+test "mutation 2026-11-25: drain releases every submitBlocking caller with Shutdown while the queue is still full" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var c = Counter{};
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_queued = 1 });
+    defer pool.deinit();
+    var g = Gate{ .io = io };
+    var bs: [2]Blocked = undefined;
+    var ts: [2]std.Thread = undefined;
+    try fillAndBlock(io, pool, &g, &c, &bs, &ts);
+    // `drain` joins the worker, which sits in the gated job: run it on a thread, and watch both
+    // blocked callers come back (a wake of one only, or none, leaves one of them parked).
+    const dt = try std.Thread.spawn(.{}, drainThread, .{pool});
+    const r0 = pollTrue(io, 5000, &bs[0].result);
+    const r1 = pollTrue(io, 5000, &bs[1].result);
+    g.release();
+    dt.join();
+    for (ts) |t| t.join();
+    try testing.expect(r0);
+    try testing.expect(r1);
+    try testing.expectEqual(@as(u32, 2), bs[0].result.load(.seq_cst));
+    try testing.expectEqual(@as(u32, 2), bs[1].result.load(.seq_cst));
+}
+
+test "mutation 2026-11-25: drainTimeout releases a submitBlocking caller with Shutdown even when it times out" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var c = Counter{};
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_queued = 1 });
+    defer pool.deinit();
+    var g = Gate{ .io = io };
+    var bs: [1]Blocked = undefined;
+    var ts: [1]std.Thread = undefined;
+    try fillAndBlock(io, pool, &g, &c, &bs, &ts);
+    try testing.expectError(error.Timeout, pool.drainTimeout(30 * std.time.ns_per_ms));
+    const released = pollTrue(io, 5000, &bs[0].result);
+    g.release();
+    ts[0].join();
+    try testing.expect(released);
+    try testing.expectEqual(@as(u32, 2), bs[0].result.load(.seq_cst));
+}
+
+const BlockedSub = struct {
+    sub: *root.Submitter,
+    job: root.Job,
+    /// 0 running, 1 accepted, 3 error.
+    result: std.atomic.Value(u32) = .init(0),
+    fn run(b: *BlockedSub) void {
+        b.sub.submitBlocking(b.job) catch {
+            b.result.store(3, .seq_cst);
+            return;
+        };
+        b.result.store(1, .seq_cst);
+    }
+};
+
+test "mutation 2026-11-25: Submitter.submitBlocking waits for room like the pool's, it does not return QueueFull" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var c = Counter{};
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .max_queued = 1, .max_submitters = 1 });
+    defer pool.deinit();
+    var sub = try pool.registerSubmitter();
+    defer sub.deinit();
+    var g = Gate{ .io = io };
+    try pool.submit(.{ .func = gatedJob, .ctx = &g });
+    awaitEntered(io, &g);
+    try pool.submit(.{ .func = incr, .ctx = &c });
+    var b = BlockedSub{ .sub = &sub, .job = .{ .func = incr, .ctx = &c } };
+    const t = try std.Thread.spawn(.{}, BlockedSub.run, .{&b});
+    sleepMs(io, 50);
+    const still_waiting = b.result.load(.seq_cst) == 0;
+    g.release();
+    t.join();
+    try testing.expect(still_waiting);
+    try testing.expectEqual(@as(u32, 1), b.result.load(.seq_cst));
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 2), c.n.load(.seq_cst));
+}
+
+test "mutation 2026-11-25: an unbounded pool never moves the bounded-queue slot counter" {
+    // `queued` counts reserved slots of a BOUNDED pool only; releasing a slot on an unbounded one
+    // would wrap it below zero (`queuedCount` reads the queue itself there, so only the field shows it).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var c = Counter{};
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = threaded.io(), .n_workers = 2, .max_queued = 0 });
+    defer pool.deinit();
+    for (0..50) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    try testing.expect(pool.wait());
+    try testing.expectEqual(@as(u64, 50), c.n.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 0), pool.queued.load(.seq_cst));
+}
+
+const BlockingCall = struct {
+    pool: *WorkerPool,
+    started: std.atomic.Value(u32) = .init(0),
+    filled: std.atomic.Value(u32) = .init(0),
+};
+
+fn submitBlockingFromOwnJob(ctx: *anyopaque) void {
+    const s: *BlockingCall = @ptrCast(@alignCast(ctx));
+    s.started.store(1, .seq_cst);
+    // Wait until the main thread has filled the one queue slot, then block on it from inside a job.
+    while (s.filled.load(.seq_cst) == 0) std.atomic.spinLoopHint();
+    s.pool.submitBlocking(.{ .func = noopJob, .ctx = s }) catch {};
+}
+
+fn noopJob(_: *anyopaque) void {}
+
+fn submitBlockingFromJobChild() u8 {
+    var threaded = std.Io.Threaded.init(std.heap.smp_allocator, .{}); // global-alloc-ok: a forked child, whose leak checks never run
+    const pool = WorkerPool.init(std.heap.smp_allocator, .{ .io = threaded.io(), .n_workers = 1, .max_queued = 1 }) catch return 3; // global-alloc-ok: same child
+    var s = BlockingCall{ .pool = pool };
+    pool.submit(.{ .func = submitBlockingFromOwnJob, .ctx = &s }) catch return 4;
+    while (s.started.load(.seq_cst) == 0) std.atomic.spinLoopHint();
+    pool.submit(.{ .func = noopJob, .ctx = &s }) catch return 5; // the one slot: the job's submitBlocking now finds the queue full
+    s.filled.store(1, .seq_cst);
+    _ = pool.wait();
+    return 0;
+}
+
+test "mutation 2026-11-25: submitBlocking from a job of the same pool, on a full queue, panics instead of deadlocking (child process)" {
+    // The job holds the pool's only worker, so the queue can never drain: without the check the
+    // child hangs (killed by the limit) instead of aborting with the checked panic.
+    if (!child.supported) return error.SkipZigTest;
+    const out = try child.run(submitBlockingFromJobChild, .{}, .{ .limit_ms = 5000 });
+    try testing.expect(out.eql(.{ .signaled = @backingInt(std.posix.SIG.ABRT) }));
+}
