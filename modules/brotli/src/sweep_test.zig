@@ -299,3 +299,148 @@ test "estimatePeakMemory bounds what compressWith allocates at its peak (output 
     try testing.expect(brotli.estimatePeakMemory(.{ .effort = .q9 }, 1 << 20) >= brotli.estimatePeakMemory(.{ .effort = .q9 }, 1 << 10));
     _ = brotli.estimatePeakMemory(.{ .effort = .q11, .window_bits = 30 }, std.math.maxInt(usize));
 }
+
+// ── delta mutation 2026-11-25 ───────────────────────────────────────────────
+
+test "mutation 2026-11-25: a StreamWriter sanitizes an unaligned NDIRECT like compressWith (bytes equal the one-shot stream)" {
+    const gpa = testing.allocator;
+    const input = try brotli.interop_corpus.fontLike(gpa, 30_000, 5);
+    defer gpa.free(input);
+    for (efforts) |effort| {
+        const opts: brotli.CompressOptions = .{ .effort = effort, .distance = .{ .npostfix = 2, .ndirect = 255 } };
+        const one = try brotli.compressWith(gpa, input, opts);
+        defer gpa.free(one);
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var sw = try brotli.StreamWriter.init(gpa, &out.writer, &.{}, .{ .effort = effort, .window_bits = 16, .size_hint = input.len, .distance = opts.distance });
+        defer sw.deinit();
+        try sw.writer.writeAll(input);
+        try sw.finish();
+        try testing.expectEqualSlices(u8, one, out.written());
+    }
+}
+
+test "mutation 2026-11-25: compressPart takes the distance, literal-context, mode and block-size options (a first-and-last part is compressWith's stream)" {
+    const gpa = testing.allocator;
+    const input = try brotli.interop_corpus.fontLike(gpa, 30_000, 5);
+    defer gpa.free(input);
+    const variants = [_]brotli.CompressOptions{
+        .{ .window_bits = 16, .distance = .{ .npostfix = 2, .ndirect = 8 } },
+        .{ .window_bits = 16, .literal_context_modeling = false },
+        .{ .window_bits = 16, .mode = .font },
+        .{ .window_bits = 16, .block_size = 6000 },
+    };
+    for (efforts) |effort| {
+        for (variants) |v| {
+            var opts = v;
+            opts.effort = effort;
+            const want = try brotli.compressWith(gpa, input, opts);
+            defer gpa.free(want);
+            const got = try brotli.parallel.compressPart(gpa, &.{}, input, opts, .{});
+            defer gpa.free(got);
+            try testing.expectEqualSlices(u8, want, got);
+        }
+    }
+}
+
+test "mutation 2026-11-25: compressPart refuses a prepared dictionary, uses its history for matches, and keeps copies inside the window" {
+    const gpa = testing.allocator;
+    var prepared = try brotli.PreparedDictionary.init(gpa, "some dictionary bytes to prepare, long enough to hash");
+    defer prepared.deinit(gpa);
+    try testing.expectError(error.Unsupported, brotli.parallel.compressPart(gpa, &.{}, "abc", .{ .window_bits = 16, .prepared_dictionary = &prepared }, .{}));
+
+    var prng = std.Random.DefaultPrng.init(0xd14);
+    const r = prng.random();
+    // 1. history is searched: the second part repeats the first, so it is a few copies, not a literal run.
+    const noise = try gpa.alloc(u8, 4000);
+    defer gpa.free(noise);
+    r.bytes(noise);
+    for ([_]brotli.Effort{ .q1, .q4, .q6, .q9 }) |effort| {
+        const opts: brotli.CompressOptions = .{ .effort = effort, .window_bits = 16 };
+        const first = try brotli.parallel.compressPart(gpa, &.{}, noise, opts, .{ .last = false });
+        defer gpa.free(first);
+        const second = try brotli.parallel.compressPart(gpa, noise, noise, opts, .{ .first = false });
+        defer gpa.free(second);
+        try testing.expect(second.len < 200);
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(gpa);
+        try joined.appendSlice(gpa, first);
+        try joined.appendSlice(gpa, second);
+        const both = try gpa.alloc(u8, 2 * noise.len);
+        defer gpa.free(both);
+        @memcpy(both[0..noise.len], noise);
+        @memcpy(both[noise.len..], noise);
+        const back = try brotli.decompress(gpa, joined.items, .{ .max_ratio = 1 << 30 });
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, both, back);
+    }
+    // 2. a window of 1 KiB reaches back at most 1008 bytes: the second part starts with bytes that sit
+    // exactly 1009 back in the history (one too far), followed by noise.
+    const hist = try gpa.alloc(u8, 3000);
+    defer gpa.free(hist);
+    r.bytes(hist);
+    const tail = try gpa.alloc(u8, 400);
+    defer gpa.free(tail);
+    r.bytes(tail);
+    var second_in: std.ArrayList(u8) = .empty;
+    defer second_in.deinit(gpa);
+    try second_in.appendSlice(gpa, hist[hist.len - 1009 ..][0..48]);
+    try second_in.appendSlice(gpa, tail);
+    for ([_]brotli.Effort{ .q1, .q4, .q6, .q9 }) |effort| {
+        const opts: brotli.CompressOptions = .{ .effort = effort, .window_bits = 10 };
+        const first = try brotli.parallel.compressPart(gpa, &.{}, hist, opts, .{ .last = false });
+        defer gpa.free(first);
+        const second = try brotli.parallel.compressPart(gpa, hist, second_in.items, opts, .{ .first = false });
+        defer gpa.free(second);
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(gpa);
+        try joined.appendSlice(gpa, first);
+        try joined.appendSlice(gpa, second);
+        const both = try gpa.alloc(u8, hist.len + second_in.items.len);
+        defer gpa.free(both);
+        @memcpy(both[0..hist.len], hist);
+        @memcpy(both[hist.len..], second_in.items);
+        const back = try brotli.decompress(gpa, joined.items, .{ .max_ratio = 1 << 30 });
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, both, back);
+    }
+}
+
+test "mutation 2026-11-25: parallel.compress hands the distance and literal-context options to every job" {
+    const gpa = testing.allocator;
+    const input = try brotli.interop_corpus.fontLike(gpa, 200_000, 9);
+    defer gpa.free(input);
+    for ([_]brotli.Effort{ .q6, .q9 }) |effort| {
+        const par: brotli.parallel.ParallelOptions = .{ .job_size = 64 << 10, .threads = 2 };
+        const plain = try brotli.parallel.compress(gpa, testing.io, input, .{ .effort = effort }, par);
+        defer gpa.free(plain);
+        const dist = try brotli.parallel.compress(gpa, testing.io, input, .{ .effort = effort, .distance = .{ .npostfix = 2, .ndirect = 8 } }, par);
+        defer gpa.free(dist);
+        const nolcm = try brotli.parallel.compress(gpa, testing.io, input, .{ .effort = effort, .literal_context_modeling = false }, par);
+        defer gpa.free(nolcm);
+        try testing.expect(!std.mem.eql(u8, plain, dist));
+        try testing.expect(!std.mem.eql(u8, plain, nolcm));
+        inline for (.{ dist, nolcm }) |stream| {
+            const back = try brotli.decompress(gpa, stream, .{ .max_ratio = 1 << 30 });
+            defer gpa.free(back);
+            try testing.expectEqualSlices(u8, input, back);
+        }
+    }
+}
+
+test "mutation 2026-11-25: estimatePeakMemory bounds the peak past 1 MiB too (the q1, q4 and q6 terms), within 2x" {
+    if (@import("builtin").mode == .debug) return error.SkipZigTest; // minutes in an unoptimized build
+    const gpa = testing.allocator;
+    const n: usize = 2 << 20; // the largest size the estimate covers
+    const input = try fill(gpa, 8, n, 1);
+    defer gpa.free(input);
+    for ([_]brotli.Effort{ .q0, .q1, .q4, .q6 }) |effort| {
+        var pk: Peak = .{ .backing = gpa };
+        const opts: brotli.CompressOptions = .{ .effort = effort };
+        const out = try brotli.compressWith(pk.allocator(), input, opts);
+        defer pk.allocator().free(out);
+        const est = brotli.estimatePeakMemory(opts, n);
+        try testing.expect(pk.peak <= est + brotli.maxCompressedSize(n, opts));
+        try testing.expect(est <= 2 * pk.peak);
+    }
+}

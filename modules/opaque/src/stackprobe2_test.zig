@@ -59,6 +59,7 @@ fn Run(comptime O: type) type {
         var ke2: O.GenerateKE2Result = undefined;
         var ke3: O.GenerateKE3Result = undefined;
         var server_session_key: [O.Nx]u8 = undefined;
+        var fake_kp: O.AkeKeyPair = undefined;
 
         fn load(v: anytype) void {
             const pw = field(v, "password");
@@ -95,7 +96,11 @@ fn Run(comptime O: type) type {
             // the probe's call frame by shape) and takes `blind` by value: the
             // password is its needle, the residue rule the rest.
             _ = try P.run(name ++ " randomizedPassword", rpW, .{ password, &blind_reg, &response.evaluated_message }, &.{password}, .{});
-            _ = try P.run(name ++ " fakeRecord", O.fakeRecord, .{ &server_seed, &reg.record.masking_key, &fake }, &.{ &server_seed, &reg.record.masking_key }, .{});
+            // mutation 2026-11-25: `fakeRecord` derives a key pair from `key_seed` (the private key is a
+            // secret of the call, the seed the secret it comes from) and burns the stack after.
+            try O.deriveAkeKeyPair(&server_seed, &fake_kp);
+            _ = try P.run(name ++ " fakeRecord", O.fakeRecord, .{ &server_seed, &reg.record.masking_key, &fake }, &.{ &server_seed, &reg.record.masking_key, &fake_kp.private_key }, .{});
+            try std.testing.expectEqualSlices(u8, &fake_kp.public_key, &fake.client_public_key);
 
             // Login, both sides.
             _ = try P.run(name ++ " generateKE1", O.generateKE1, .{ password, &blind_login, client_nonce, &client_seed, &ke1 }, &.{ password, &blind_login, &client_seed, &ke1.state.blind, &ke1.state.client_secret }, .{});

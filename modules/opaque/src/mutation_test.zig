@@ -175,3 +175,13 @@ test "a malformed evaluated element is InvalidMessage on both client paths (not 
     server.ke2.credential_response.evaluated_message = bad;
     try testing.expectError(error.InvalidMessage, shim.generateKE3(client.state, .{}, v.context, server.ke2, .identity));
 }
+
+test "mutation 2026-11-25: Argon2idKsf's RFC 9807 §7 parameter sets, all three fields" {
+    const A = opaque_pake.Argon2idKsf;
+    try std.testing.expectEqual(@as(u32, 1), A.rfc9807_params.t);
+    try std.testing.expectEqual(@as(u32, 1 << 21), A.rfc9807_params.m);
+    try std.testing.expectEqual(@as(u24, 4), A.rfc9807_params.p);
+    try std.testing.expectEqual(@as(u32, 3), A.rfc9807_low_memory_params.t);
+    try std.testing.expectEqual(@as(u32, 1 << 16), A.rfc9807_low_memory_params.m);
+    try std.testing.expectEqual(@as(u24, 4), A.rfc9807_low_memory_params.p);
+}

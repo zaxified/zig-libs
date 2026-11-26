@@ -850,3 +850,156 @@ test "AcmeDns.Store.toJson: one exact allocation for the bytes (no outgrown buff
     try testing.expectEqual(@as(usize, 1), fa.deallocations);
     try testing.expect(std.mem.endsWith(u8, json, "\n}\n"));
 }
+
+// ── delta mutation 2026-11-25 ───────────────────────────────────────────────
+
+test "mutation 2026-11-25: HttpReq and Exec hand their note to the solver through Publisher.note" {
+    var h = publishers.HttpReq.init(std.testing.io, testing.allocator, .{ .endpoint = "http://127.0.0.1:1/" });
+    defer h.deinit();
+    h.note = "http note";
+    try testing.expectEqualStrings("http note", h.publisher().note.?(h.publisher().ctx));
+    var e = publishers.Exec.init(std.testing.io, testing.allocator, .{ .program = "/nonexistent" });
+    e.note = "exec note";
+    try testing.expectEqualStrings("exec note", e.publisher().note.?(e.publisher().ctx));
+    var a = publishers.AcmeDns.init(std.testing.io, testing.allocator, .{ .server_url = "http://127.0.0.1:1", .accounts = &.{} });
+    defer a.deinit();
+    a.note = "acme-dns note";
+    try testing.expectEqualStrings("acme-dns note", a.publisher().note.?(a.publisher().ctx));
+}
+
+test "mutation 2026-11-25: Store holds max_accounts accounts; the 4097th new domain is refused, a replacement at the cap is not" {
+    const Store = publishers.AcmeDns.Store;
+    var st = Store.init(testing.allocator);
+    defer st.deinit();
+    const reg: publishers.AcmeDns.Registration = .{ .username = "u", .password = "p", .fulldomain = "f", .subdomain = "s" };
+    var nb: [32]u8 = undefined;
+    for (0..Store.max_accounts) |i| try st.put(try std.fmt.bufPrint(&nb, "h{d}.test", .{i}), reg);
+    try testing.expectEqual(Store.max_accounts, st.accounts().len);
+    try testing.expectError(error.TooManyAccounts, st.put("one-more.test", reg));
+    try st.put("h7.test", .{ .username = "u2", .password = "p", .fulldomain = "f", .subdomain = "s" });
+    try testing.expectEqual(Store.max_accounts, st.accounts().len);
+    try testing.expectEqualStrings("u2", st.find("h7.test").?.username);
+}
+
+test "mutation 2026-11-25: an account file of exactly max_file_bytes is read, one byte more is refused (parse and load)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Store = publishers.AcmeDns.Store;
+    const buf = try testing.allocator.alloc(u8, Store.max_file_bytes + 1);
+    defer testing.allocator.free(buf);
+    @memset(buf, ' ');
+    buf[0] = '{';
+    buf[Store.max_file_bytes - 1] = '}';
+    var ok = try Store.parse(testing.allocator, buf[0..Store.max_file_bytes]);
+    ok.deinit();
+    try testing.expectError(error.StreamTooLong, Store.parse(testing.allocator, buf));
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "exact.json", .data = buf[0..Store.max_file_bytes] });
+    var loaded = try Store.load(io, testing.allocator, tmp.dir, "exact.json");
+    loaded.deinit();
+    buf[Store.max_file_bytes] = ' ';
+    try tmp.dir.writeFile(io, .{ .sub_path = "over.json", .data = buf });
+    try testing.expectError(error.StreamTooLong, Store.load(io, testing.allocator, tmp.dir, "over.json"));
+}
+
+test "mutation 2026-11-25: Store.save leaves no .part behind when the rename fails" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var st = publishers.AcmeDns.Store.init(testing.allocator);
+    defer st.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The target is a directory: renaming a file over it fails.
+    try tmp.dir.createDir(io, "accounts.json", .default_dir);
+    try testing.expect(std.meta.isError(st.save(io, tmp.dir, "accounts.json")));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "accounts.json.part", .{}));
+}
+
+/// Allocator that records whether a block holding `needle` was freed (ReleaseFast tests only:
+/// in Debug/ReleaseSafe `free` scrubs the block itself).
+const MutScan = struct {
+    child: std.mem.Allocator,
+    needle: []const u8,
+    /// When not empty, only a freed block that STARTS with it counts (a body buffer, not a transport buffer).
+    prefix: []const u8 = "",
+    leaked: bool = false,
+    fn allocator(self: *MutScan) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *MutScan = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *MutScan = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *MutScan = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *MutScan = @ptrCast(@alignCast(ctx));
+        if (m.len >= self.needle.len and std.mem.startsWith(u8, m, self.prefix) and std.mem.find(u8, m, self.needle) != null) self.leaked = true;
+        self.child.rawFree(m, a, ra);
+    }
+};
+
+test "mutation 2026-11-25: Store wipes a password it lets go of (replace and deinit), load and parse wipe their buffers" {
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
+    const Store = publishers.AcmeDns.Store;
+    const password = "pbAXVjlIOE01xbut7YnAbkhMQIkcwoHO0ek2j4Q0";
+    const json = "{\"a.test\":{\"username\":\"u\",\"password\":\"" ++ password ++ "\",\"fulldomain\":\"f\",\"subdomain\":\"s\"}}";
+    // parse: the bytes are the caller's; the parsed arena (alloc_always strings) is wiped before it is freed.
+    var scan: MutScan = .{ .child = testing.allocator, .needle = password };
+    var st = try Store.parse(scan.allocator(), json);
+    try testing.expect(!scan.leaked);
+    // replacing the account frees the old one wiped
+    try st.put("a.test", .{ .username = "u", .password = "other", .fulldomain = "f", .subdomain = "s" });
+    try testing.expect(!scan.leaked);
+    st.deinit();
+    try testing.expect(!scan.leaked);
+    // deinit of a live account
+    var scan2: MutScan = .{ .child = testing.allocator, .needle = password };
+    var st2 = try Store.parse(scan2.allocator(), json);
+    st2.deinit();
+    try testing.expect(!scan2.leaked);
+    // load: the file's bytes are wiped before they are freed
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.json", .data = json });
+    var scan3: MutScan = .{ .child = testing.allocator, .needle = password };
+    var st3 = try Store.load(io, scan3.allocator(), tmp.dir, "a.json");
+    try testing.expect(!scan3.leaked); // the store's own copy is still live
+    st3.deinit();
+    try testing.expect(!scan3.leaked);
+}
+
+test "mutation 2026-11-25: AcmeDns.register wipes the reply body (it holds the password) before freeing it" {
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const password = "pbAXVjlIOE01xbut7YnAbkhMQIkcwoHO0ek2j4Q0";
+    const reply = "{\"username\":\"u\",\"password\":\"" ++ password ++ "\",\"fulldomain\":\"f.auth.test\",\"subdomain\":\"s\"}";
+    var peer: Peer = undefined;
+    peer = .{ .io = io, .listener = undefined, .serve = 1, .status = 201, .body = reply };
+    try peer.start(io);
+    defer peer.finish();
+    var ub: [64]u8 = undefined;
+    const url = try peer.url(&ub, "/");
+    // The http client's own buffers hold the same bytes (not this module's to wipe), so only a block that
+    // starts with the JSON object, the reply body itself, counts.
+    var scan: MutScan = .{ .child = testing.allocator, .needle = password, .prefix = "{\"username\"" };
+    var got = try publishers.AcmeDns.register(io, scan.allocator(), url, httpOpts(), &.{});
+    try testing.expectEqualStrings(password, got.value.password);
+    publishers.AcmeDns.deinitRegistration(&got);
+    peer.finish();
+    try testing.expect(!scan.leaked);
+}

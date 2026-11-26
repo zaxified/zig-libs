@@ -263,3 +263,172 @@ test "createResponse: an embedded certificate rides in certs" {
     const basic = (try ocsp.parseResponse(resp)).basic.?;
     try testing.expect(std.mem.eql(u8, basic.certs.?, ca256));
 }
+
+// ── delta mutation 2026-11-25 ───────────────────────────────────────────────
+
+/// DER TLV with a short or two-byte length (test fixtures only).
+fn tlv(gpa: std.mem.Allocator, tag: u8, parts: []const []const u8) ![]u8 {
+    var n: usize = 0;
+    for (parts) |p| n += p.len;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.append(gpa, tag);
+    if (n < 128) {
+        try out.append(gpa, @intCast(n));
+    } else {
+        try out.appendSlice(gpa, &.{ 0x82, @intCast(n >> 8), @intCast(n & 0xff) });
+    }
+    for (parts) |p| try out.appendSlice(gpa, p);
+    return out.toOwnedSlice(gpa);
+}
+
+/// One OCSPRequest built by hand, each structural element's tag and trailing bytes overridable.
+const Shape = struct {
+    outer_tag: u8 = 0x30,
+    tbs_tag: u8 = 0x30,
+    list_tag: u8 = 0x30,
+    req_tag: u8 = 0x30,
+    certid_tag: u8 = 0x30,
+    alg_tag: u8 = 0x30,
+    oid_tag: u8 = 0x06,
+    oid: []const u8 = &.{ 0x2b, 0x0e, 0x03, 0x02, 0x1a }, // sha1
+    alg_params: []const u8 = &.{ 0x05, 0x00 },
+    name_tag: u8 = 0x04,
+    key_tag: u8 = 0x04,
+    serial_tag: u8 = 0x02,
+    certid_trailing: []const u8 = "",
+    req_ext: []const u8 = "", // a whole TLV after the CertID inside the Request
+    req_trailing: []const u8 = "",
+    version: []const u8 = "", // a whole TLV before the request list
+    requestor: []const u8 = "",
+    exts: []const u8 = "", // a whole TLV after the request list
+    tbs_trailing: []const u8 = "",
+    sig: []const u8 = "", // a whole TLV after tbsRequest
+    outer_trailing: []const u8 = "",
+
+    fn build(s: Shape, gpa: std.mem.Allocator) ![]u8 {
+        const name_hash: [20]u8 = @splat(0x11);
+        const key_hash: [20]u8 = @splat(0x22);
+        const oid = try tlv(gpa, s.oid_tag, &.{s.oid});
+        defer gpa.free(oid);
+        const alg = try tlv(gpa, s.alg_tag, &.{ oid, s.alg_params });
+        defer gpa.free(alg);
+        const nh = try tlv(gpa, s.name_tag, &.{&name_hash});
+        defer gpa.free(nh);
+        const kh = try tlv(gpa, s.key_tag, &.{&key_hash});
+        defer gpa.free(kh);
+        const serial = try tlv(gpa, s.serial_tag, &.{&.{0x07}});
+        defer gpa.free(serial);
+        const certid = try tlv(gpa, s.certid_tag, &.{ alg, nh, kh, serial, s.certid_trailing });
+        defer gpa.free(certid);
+        const req = try tlv(gpa, s.req_tag, &.{ certid, s.req_ext, s.req_trailing });
+        defer gpa.free(req);
+        const list = try tlv(gpa, s.list_tag, &.{req});
+        defer gpa.free(list);
+        const tbs = try tlv(gpa, s.tbs_tag, &.{ s.version, s.requestor, list, s.exts, s.tbs_trailing });
+        defer gpa.free(tbs);
+        return tlv(gpa, s.outer_tag, &.{ tbs, s.sig, s.outer_trailing });
+    }
+
+    fn parse(s: Shape, gpa: std.mem.Allocator) !void {
+        const bytes = try s.build(gpa);
+        defer gpa.free(bytes);
+        const req = try ocsp.parseRequest(bytes);
+        _ = req;
+    }
+};
+
+test "mutation 2026-11-25: parseRequest and the CertID iterator check every tag and every closing length" {
+    const gpa = testing.allocator;
+    try (Shape{}).parse(gpa); // the base shape is valid
+    const bad = [_]Shape{
+        .{ .req_tag = 0x31 },
+        .{ .certid_tag = 0x31 },
+        .{ .alg_tag = 0x31 },
+        .{ .oid_tag = 0x04 },
+        .{ .alg_params = &.{ 0x05, 0x01, 0x00 } }, // NULL parameters with content
+        .{ .name_tag = 0x02 },
+        .{ .key_tag = 0x02 },
+        .{ .serial_tag = 0x04 },
+        .{ .certid_trailing = &.{ 0x05, 0x00 } },
+        .{ .req_ext = &.{ 0xa1, 0x00 } }, // singleRequestExtensions with the wrong tag
+        .{ .req_ext = &.{ 0xa0, 0x00 }, .req_trailing = &.{ 0x05, 0x00 } },
+        .{ .outer_tag = 0x31 },
+        .{ .tbs_tag = 0x31 },
+        .{ .sig = &.{ 0xa1, 0x00 } }, // optionalSignature with the wrong tag
+        .{ .sig = &.{ 0xa0, 0x00 }, .outer_trailing = &.{ 0x05, 0x00 } },
+        .{ .version = &.{ 0xa0, 0x03, 0x04, 0x01, 0x00 } }, // version holding an OCTET STRING
+        .{ .version = &.{ 0xa0, 0x05, 0x02, 0x01, 0x00, 0x05, 0x00 } }, // version with trailing bytes
+        .{ .list_tag = 0x31 },
+        .{ .exts = &.{ 0xa3, 0x02, 0x30, 0x00 } }, // requestExtensions with the wrong tag
+        .{ .exts = &.{ 0xa2, 0x02, 0x30, 0x00 }, .tbs_trailing = &.{ 0x05, 0x00 } },
+        .{ .exts = &.{ 0xa2, 0x02, 0x31, 0x00 } }, // Extensions as a SET
+        .{ .exts = &.{ 0xa2, 0x04, 0x30, 0x00, 0x05, 0x00 } },
+    };
+    for (bad, 0..) |s, i| {
+        s.parse(gpa) catch |err| {
+            try testing.expectEqual(error.Malformed, err);
+            continue;
+        };
+        std.debug.print("variant {d} was accepted\n", .{i});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "mutation 2026-11-25: parseRequest skips a version and a requestorName, then reads the list" {
+    const gpa = testing.allocator;
+    const s: Shape = .{
+        .version = &.{ 0xa0, 0x03, 0x02, 0x01, 0x00 },
+        .requestor = &.{ 0xa1, 0x05, 0x82, 0x03, 'a', '.', 'b' },
+    };
+    const bytes = try s.build(gpa);
+    defer gpa.free(bytes);
+    const id = try only(try ocsp.parseRequest(bytes));
+    try testing.expectEqualSlices(u8, &.{0x07}, id.serial);
+    try testing.expectEqualSlices(u8, &@as([20]u8, @splat(0x11)), id.issuer_name_hash);
+    try testing.expectEqualSlices(u8, &@as([20]u8, @splat(0x22)), id.issuer_key_hash);
+    // each alone as well
+    const only_version = try (Shape{ .version = s.version }).build(gpa);
+    defer gpa.free(only_version);
+    _ = try only(try ocsp.parseRequest(only_version));
+    const only_requestor = try (Shape{ .requestor = s.requestor }).build(gpa);
+    defer gpa.free(only_requestor);
+    _ = try only(try ocsp.parseRequest(only_requestor));
+}
+
+test "mutation 2026-11-25: CertId.namesIssuer wants an issuer name hash AND key hash AND a known hash algorithm" {
+    const id = try only(try ocsp.parseRequest(req256));
+    try testing.expect(id.namesIssuer(ca256));
+    var bad_name = id;
+    var name_hash: [20]u8 = undefined;
+    @memcpy(&name_hash, id.issuer_name_hash);
+    name_hash[0] ^= 1;
+    bad_name.issuer_name_hash = &name_hash;
+    try testing.expect(!bad_name.namesIssuer(ca256));
+    var bad_key = id;
+    var key_hash: [20]u8 = undefined;
+    @memcpy(&key_hash, id.issuer_key_hash);
+    key_hash[19] ^= 1;
+    bad_key.issuer_key_hash = &key_hash;
+    try testing.expect(!bad_key.namesIssuer(ca256));
+    // the right SHA-1 hashes under an algorithm identifier this module does not know
+    var unknown_algo = id;
+    unknown_algo.hash_oid = &.{ 0x2a, 0x03, 0x04 };
+    try testing.expect(!unknown_algo.namesIssuer(ca256));
+}
+
+test "mutation 2026-11-25: createResponse takes a time in year 9999 and refuses one before year 0" {
+    const gpa = testing.allocator;
+    const id = try only(try ocsp.parseRequest(req256));
+    const key: ocsp.SigningKey = .{ .ecdsa_p256 = ca256_key[0..32] };
+    const opts: ocsp.ResponseOptions = .{ .responder_cert_der = ca256, .produced_at_unix = produced };
+    var last = entryFor(id, ca256, .good, .sha1);
+    last.next_update_unix = 253402300799; // 9999-12-31T23:59:59Z
+    const resp = try ocsp.createResponse(gpa, &.{last}, key, opts);
+    defer gpa.free(resp);
+    const v = try ocsp.verify(try ocsp.parseResponse(resp), ca256, leaf256, .{ .now_unix = produced });
+    try testing.expectEqual(@as(?i64, 253402300799), v.next_update_unix);
+    var early = last;
+    early.next_update_unix = -62167219201; // 0000-12-31T23:59:59Z, one second before year 0... in year -1
+    try testing.expectError(error.Malformed, ocsp.createResponse(gpa, &.{early}, key, opts));
+}
