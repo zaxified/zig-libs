@@ -37,7 +37,7 @@
 
 const std = @import("std");
 const frost = @import("root.zig");
-const burnStack = @import("burn.zig").burnStack;
+const burnStack = @import("burn.zig").burnStackDkg; // 64 KiB: the parts reach 33-36 KB deep
 
 const Allocator = std.mem.Allocator;
 const Secp256k1 = frost.Secp256k1;

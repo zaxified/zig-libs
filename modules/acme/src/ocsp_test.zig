@@ -34,9 +34,21 @@ const Clock = struct {
 const Issuer = struct {
     ca: *signing_ca.SigningCa,
     calls: u8 = 0,
+    /// The issuer offers an ARI window (a far-future one), polled every `window_retry_s`.
+    with_ari: bool = false,
+    window_retry_s: u64 = 700,
+    window_calls: usize = 0,
 
     fn issuer(i: *Issuer) Manager.Issuer {
-        return .{ .ctx = i, .name = "sign", .issue = issue };
+        return .{ .ctx = i, .name = "sign", .issue = issue, .renewal_window = if (i.with_ari) window else null };
+    }
+
+    fn window(ctx: *anyopaque, chain_pem: []const u8, diag: *Manager.Diagnostics) Manager.IssueError!Manager.Window {
+        _ = chain_pem;
+        _ = diag;
+        const i: *Issuer = @ptrCast(@alignCast(ctx));
+        i.window_calls += 1;
+        return .{ .start = day0 + 80 * day, .end = day0 + 81 * day, .retry_after_s = i.window_retry_s };
     }
 
     fn issue(ctx: *anyopaque, gpa: Allocator, req: *const Manager.IssueRequest, diag: *Manager.Diagnostics) Manager.IssueError!Manager.Issued {
@@ -323,4 +335,271 @@ test "ocsp: after a restart the staple comes from storage without a request" {
     _ = m2.maintain(); // imports the stored staple, verifies it, keeps it
     try testing.expectEqual(@as(usize, 1), l.responder.calls);
     if (try l.staple(&m2)) |s| testing.allocator.free(s) else return error.StapleNotRestored;
+}
+
+// ── delta mutation run 2026-11-25: the schedule and the bookkeeping of the OCSP checks ──
+
+/// A stapler that answers as scripted and records its calls, so the Manager's own
+/// scheduling and bookkeeping can be pinned exactly (`CacheStapler` above is the real adapter).
+const Script = struct {
+    mode: enum { staple, keep, none, revoked, fail, fail_keep } = .staple,
+    until_s: i64 = 100000,
+    calls: usize = 0,
+    last_previous_null: bool = true,
+    /// Call `unmanage` on this manager from inside the check (the name is removed while it runs).
+    mgr: ?*Manager = null,
+
+    fn stapler(s: *Script) Manager.Stapler {
+        return .{ .ctx = s, .refresh = refresh };
+    }
+
+    fn refresh(ctx: ?*anyopaque, gpa: Allocator, leaf: []const u8, issuer: []const u8, previous: ?[]const u8, now: i64) Manager.StapleResult {
+        _ = leaf;
+        _ = issuer;
+        const s: *Script = @ptrCast(@alignCast(ctx.?));
+        s.calls += 1;
+        s.last_previous_null = previous == null;
+        if (s.mgr) |m| _ = m.unmanage("a.example");
+        return switch (s.mode) {
+            .staple => .{ .staple = .{ .der = gpa.dupe(u8, "STAPLE") catch return .none, .until = now + s.until_s } },
+            .keep => .{ .keep = now + s.until_s },
+            .none => .none,
+            .revoked => .revoked,
+            .fail => .{ .failed = .{ .problem = "scripted" } },
+            .fail_keep => .{ .failed = .{ .problem = "scripted", .keep_until = now + s.until_s } },
+        };
+    }
+};
+
+fn scriptedManager(l: *Lab, s: *Script, interval_s: u32, with_ari: bool) !Manager {
+    l.issuer.with_ari = with_ari;
+    var m = try Manager.init(l.threaded.io(), testing.allocator, .{
+        .storage = l.mem.storage(),
+        .clock = l.clock.clock(),
+        .on_event = l.events.hook(),
+        .random_seed = 3,
+        .node_id = "node-a",
+        .use_ari = with_ari,
+        .ocsp = .{ .stapler = s.stapler(), .interval_s = interval_s },
+    });
+    errdefer m.deinit();
+    try m.addIssuer(l.issuer.issuer());
+    try m.manage(names);
+    return m;
+}
+
+test "mutation 2026-11-25: the next OCSP check: after a staple or a keep one interval (at least 60 s), after a failure a tenth of it (at least 60 s), after none never" {
+    // staple: interval 100; the check is not made before it is due and is made when it is.
+    {
+        var l: Lab = undefined;
+        try l.init(true);
+        defer l.deinit();
+        var s: Script = .{ .mode = .staple };
+        var m = try scriptedManager(&l, &s, 100, false);
+        defer m.deinit();
+        _ = m.maintain(); // issues
+        const t0 = l.clock.t;
+        try testing.expectEqual(t0 + 100, m.maintain());
+        try testing.expectEqual(@as(usize, 1), s.calls);
+        l.clock.t = t0 + 99;
+        try testing.expectEqual(t0 + 100, m.maintain());
+        try testing.expectEqual(@as(usize, 1), s.calls);
+        l.clock.t = t0 + 100;
+        try testing.expectEqual(t0 + 200, m.maintain());
+        try testing.expectEqual(@as(usize, 2), s.calls);
+    }
+    // keep: interval 1000.
+    {
+        var l: Lab = undefined;
+        try l.init(true);
+        defer l.deinit();
+        var s: Script = .{ .mode = .keep };
+        var m = try scriptedManager(&l, &s, 1000, false);
+        defer m.deinit();
+        _ = m.maintain();
+        const t0 = l.clock.t;
+        try testing.expectEqual(t0 + 1000, m.maintain());
+    }
+    // failure: a tenth of the interval, but at least a minute.
+    inline for (.{ .{ 100, 60 }, .{ 1000, 100 } }) |c| {
+        var l: Lab = undefined;
+        try l.init(true);
+        defer l.deinit();
+        var s: Script = .{ .mode = .fail };
+        var m = try scriptedManager(&l, &s, c[0], false);
+        defer m.deinit();
+        _ = m.maintain();
+        const t0 = l.clock.t;
+        try testing.expectEqual(t0 + c[1], m.maintain());
+        try testing.expectEqual(@as(usize, 1), l.events.failed);
+    }
+    // none: nothing to staple, never asked again.
+    {
+        var l: Lab = undefined;
+        try l.init(true);
+        defer l.deinit();
+        var s: Script = .{ .mode = .none };
+        var m = try scriptedManager(&l, &s, 100, false);
+        defer m.deinit();
+        _ = m.maintain();
+        const t0 = l.clock.t;
+        try testing.expect(m.maintain() > t0 + day);
+        l.clock.t = t0 + 500;
+        try testing.expect(m.maintain() > t0 + day);
+        try testing.expectEqual(@as(usize, 1), s.calls);
+    }
+    // a chain without an issuer: the stapler is not asked, and not asked again.
+    {
+        var l: Lab = undefined;
+        try l.init(true);
+        defer l.deinit();
+        var s: Script = .{ .mode = .staple };
+        var m = try scriptedManager(&l, &s, 100, false);
+        defer m.deinit();
+        _ = m.maintain();
+        try testing.expectEqual(@as(usize, 1), l.events.installed);
+        // The installed chain is cut to its leaf: there is no issuer to ask the responder about.
+        {
+            const ct = &m.entries.items[0].cert.?;
+            const end_marker = "-----END CERTIFICATE-----\n";
+            const cut = (std.mem.find(u8, ct.chain_pem, end_marker) orelse return error.TestUnexpectedResult) + end_marker.len;
+            const only = try testing.allocator.dupe(u8, ct.chain_pem[0..cut]);
+            testing.allocator.free(@constCast(ct.chain_pem));
+            ct.chain_pem = only;
+        }
+        const t0 = l.clock.t;
+        try testing.expect(m.maintain() > t0 + day);
+        l.clock.t = t0 + 500;
+        try testing.expect(m.maintain() > t0 + day);
+        try testing.expectEqual(@as(usize, 0), s.calls);
+    }
+}
+
+test "mutation 2026-11-25: a staple is served up to and including its nextUpdate; a revocation drops it and its stored copy; a renewal starts without one" {
+    var l: Lab = undefined;
+    try l.init(true);
+    defer l.deinit();
+    var s: Script = .{ .mode = .staple, .until_s = 3600 };
+    var m = try scriptedManager(&l, &s, 100, false);
+    defer m.deinit();
+    _ = m.maintain();
+    _ = m.maintain();
+    const t_check = l.clock.t;
+    try testing.expectEqual(@as(usize, 1), l.events.stapled);
+    if (try l.staple(&m)) |x| testing.allocator.free(x) else return error.StapleMissing;
+    l.clock.t = t_check + 3600; // exactly nextUpdate: still servable
+    if (try l.staple(&m)) |x| testing.allocator.free(x) else return error.StapleDroppedEarly;
+    l.clock.t = t_check + 3601;
+    try testing.expect((try l.staple(&m)) == null);
+
+    // Revoked at the next check: the staple is gone at once, and so is its stored copy.
+    l.clock.t = t_check + 100;
+    if (try l.staple(&m)) |x| testing.allocator.free(x) else return error.StapleMissing;
+    s.mode = .revoked;
+    _ = m.maintain();
+    try testing.expectEqual(@as(usize, 1), l.events.revoked);
+    try testing.expect((try l.staple(&m)) == null);
+    s.mode = .staple;
+    _ = m.maintain(); // the replacement certificate
+    try testing.expectEqual(@as(u8, 2), l.issuer.calls);
+    _ = m.maintain(); // its first check
+    try testing.expectEqual(@as(usize, 3), s.calls); // the first check, the revoked answer, this check
+    try testing.expect(s.last_previous_null); // nothing left in storage to hand over
+}
+
+test "mutation 2026-11-25: a renewal drops the old certificate's staple until its own first check" {
+    var l: Lab = undefined;
+    try l.init(true);
+    defer l.deinit();
+    var s: Script = .{ .mode = .staple, .until_s = 90 * day };
+    var m = try scriptedManager(&l, &s, 1_000_000_000, false);
+    defer m.deinit();
+    _ = m.maintain();
+    _ = m.maintain();
+    if (try l.staple(&m)) |x| testing.allocator.free(x) else return error.StapleMissing;
+    l.clock.t += 61 * day; // past the renewal point
+    _ = m.maintain();
+    try testing.expectEqual(@as(u8, 2), l.issuer.calls);
+    try testing.expectEqual(@as(usize, 1), s.calls);
+    try testing.expect((try l.staple(&m)) == null);
+}
+
+test "mutation 2026-11-25: ARI polls and OCSP checks run on their own schedules, and a name with nothing to staple is not asked on ARI's" {
+    var l: Lab = undefined;
+    try l.init(true);
+    defer l.deinit();
+    var s: Script = .{ .mode = .staple };
+    var m = try scriptedManager(&l, &s, 1000, true);
+    defer m.deinit();
+    _ = m.maintain(); // issues
+    const t0 = l.clock.t;
+    try testing.expectEqual(t0 + 700, m.maintain()); // both are due once
+    try testing.expectEqual(@as(usize, 1), l.issuer.window_calls);
+    try testing.expectEqual(@as(usize, 1), s.calls);
+    l.clock.t = t0 + 700; // ARI due, OCSP not
+    try testing.expectEqual(t0 + 1000, m.maintain());
+    try testing.expectEqual(@as(usize, 2), l.issuer.window_calls);
+    try testing.expectEqual(@as(usize, 1), s.calls);
+    l.clock.t = t0 + 1000; // OCSP due, ARI not
+    _ = m.maintain();
+    try testing.expectEqual(@as(usize, 2), l.issuer.window_calls);
+    try testing.expectEqual(@as(usize, 2), s.calls);
+
+    // Nothing to staple: an ARI step does not ask the stapler.
+    var l2: Lab = undefined;
+    try l2.init(true);
+    defer l2.deinit();
+    var s2: Script = .{ .mode = .none };
+    var m2 = try scriptedManager(&l2, &s2, 1000, true);
+    defer m2.deinit();
+    _ = m2.maintain();
+    const t2 = l2.clock.t;
+    _ = m2.maintain();
+    try testing.expectEqual(@as(usize, 1), s2.calls);
+    l2.clock.t = t2 + 700;
+    _ = m2.maintain();
+    try testing.expectEqual(@as(usize, 2), l2.issuer.window_calls);
+    try testing.expectEqual(@as(usize, 1), s2.calls);
+}
+
+test "mutation 2026-11-25: a name removed while its OCSP check runs gets no staple event, no revocation event" {
+    inline for (.{ .staple, .revoked }) |mode| {
+        var l: Lab = undefined;
+        try l.init(true);
+        defer l.deinit();
+        var s: Script = .{ .mode = mode };
+        var m = try scriptedManager(&l, &s, 100, false);
+        defer m.deinit();
+        _ = m.maintain();
+        s.mgr = &m;
+        _ = m.maintain(); // the check unmanages the name
+        try testing.expectEqual(@as(usize, 1), s.calls);
+        try testing.expectEqual(@as(usize, 0), l.events.stapled);
+        try testing.expectEqual(@as(usize, 0), l.events.revoked);
+    }
+}
+
+test "mutation 2026-11-25: after a restart a kept or failed-but-servable staple from storage is adopted silently" {
+    inline for (.{ .keep, .fail_keep }) |mode| {
+        var l: Lab = undefined;
+        try l.init(true);
+        defer l.deinit();
+        {
+            var s1: Script = .{ .mode = .staple, .until_s = 90 * day };
+            var m1 = try scriptedManager(&l, &s1, 100, false);
+            defer m1.deinit();
+            _ = m1.maintain();
+            _ = m1.maintain();
+            try testing.expectEqual(@as(usize, 1), l.events.stapled);
+        }
+        var s2: Script = .{ .mode = mode, .until_s = 90 * day };
+        var m2 = try scriptedManager(&l, &s2, 100, false);
+        defer m2.deinit();
+        _ = m2.maintain(); // loads the stored certificate
+        _ = m2.maintain(); // its first check
+        try testing.expectEqual(@as(usize, 1), s2.calls);
+        try testing.expect(!s2.last_previous_null); // the stored staple was handed to the stapler
+        try testing.expectEqual(@as(usize, 1), l.events.stapled); // adopting it reports nothing
+        if (try l.staple(&m2)) |x| testing.allocator.free(x) else return error.StapleNotAdopted;
+    }
 }

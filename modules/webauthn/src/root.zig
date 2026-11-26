@@ -2177,3 +2177,255 @@ test "parseAuthenticatorData: a credential id cut short by one octet is Truncate
     raw[54] = 5;
     try std.testing.expectError(error.Truncated, parseAuthenticatorData(std.testing.allocator, &raw));
 }
+
+// ── delta mutation run 2026-11-25 (private DER / TPM / certificate-key helpers) ─
+
+test "mutation 2026-11-25: Tlv.read and Tlv.universal refuse every malformed encoding and read every width" {
+    const t = std.testing;
+    try t.expectError(error.InvalidCertificate, Tlv.read(&.{}));
+    try t.expectError(error.InvalidCertificate, Tlv.read(&.{0x30}));
+    // High tag number 702 = 5 * 128 + 62: class 2, constructed.
+    const hi = try Tlv.read(&.{ 0xBF, 0x85, 0x3E, 0x03, 0x02, 0x01, 0x00 });
+    try t.expectEqual(@as(u32, 702), hi.tag);
+    try t.expectEqual(@as(u2, 2), hi.class);
+    try t.expect(hi.constructed);
+    try t.expectEqual(@as(usize, 3), hi.content.len);
+    try t.expectEqual(@as(usize, 0), hi.rest.len);
+    // Tag bytes that run off the buffer, a tag past 2^24, a buffer ending right after the tag.
+    try t.expectError(error.InvalidCertificate, Tlv.read(&.{ 0x1f, 0x81 }));
+    try t.expectError(error.InvalidCertificate, Tlv.read(&.{ 0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x00 }));
+    try t.expectError(error.InvalidCertificate, Tlv.read(&.{ 0x1f, 0x01 }));
+    // Lengths: indefinite, five length bytes, length bytes missing, longer than the content.
+    try t.expectError(error.InvalidCertificate, Tlv.read(&.{ 0x30, 0x80, 0x00, 0x00 }));
+    try t.expectError(error.InvalidCertificate, Tlv.read(&.{ 0x30, 0x85, 0, 0, 0, 0, 2, 0xaa, 0xbb }));
+    try t.expectError(error.InvalidCertificate, Tlv.read(&.{ 0x30, 0x82, 0x01 }));
+    try t.expectError(error.InvalidCertificate, Tlv.read(&.{ 0x30, 0x05, 0x01 }));
+    // A two-byte length: 258, then one more octet that is the rest.
+    var big: [4 + 258 + 1]u8 = @splat(0);
+    big[0..4].* = .{ 0x30, 0x82, 0x01, 0x02 };
+    big[big.len - 1] = 0xEE;
+    const b = try Tlv.read(&big);
+    try t.expectEqual(@as(usize, 258), b.content.len);
+    try t.expectEqual(@as(usize, 1), b.rest.len);
+    // universal: the class and the tag number both count.
+    try t.expectError(error.InvalidCertificate, Tlv.universal(&.{ 0x30, 0x00 }, 0x11));
+    try t.expectError(error.InvalidCertificate, Tlv.universal(&.{ 0xB0, 0x00 }, 0x10)); // [16] context, not SEQUENCE
+    _ = try Tlv.universal(&.{ 0x30, 0x00 }, 0x10);
+    // derInteger: width and arithmetic.
+    try t.expectError(error.InvalidCertificate, derInteger(&.{}));
+    try t.expectError(error.InvalidCertificate, derInteger(&@as([9]u8, @splat(1))));
+    try t.expectEqual(@as(i64, 258), try derInteger(&.{ 0x01, 0x02 }));
+    try t.expectEqual(@as(i64, -1), try derInteger(&.{0xff}));
+}
+
+test "mutation 2026-11-25: readAuthList reads only context-class constructed fields" {
+    var al: AuthList = .{};
+    try readAuthList(&.{ 0x7F, 0x84, 0x58, 0x00 }, &al); // [APPLICATION 600], constructed
+    try std.testing.expect(!al.all_applications);
+    try readAuthList(&.{ 0x9F, 0x84, 0x58, 0x00 }, &al); // [600], primitive
+    try std.testing.expect(!al.all_applications);
+    try readAuthList(&.{ 0xBF, 0x84, 0x58, 0x00 }, &al); // [600], constructed
+    try std.testing.expect(al.all_applications);
+}
+
+test "mutation 2026-11-25: tpmNameHash returns the whole digest of each name algorithm" {
+    var out: [64]u8 = undefined;
+    const data = "pubArea";
+    var want: [64]u8 = undefined;
+    std.crypto.hash.Sha1.hash(data, want[0..20], .{});
+    try std.testing.expectEqualSlices(u8, want[0..20], tpmNameHash(0x0004, data, &out).?);
+    std.crypto.hash.sha2.Sha256.hash(data, want[0..32], .{});
+    try std.testing.expectEqualSlices(u8, want[0..32], tpmNameHash(0x000B, data, &out).?);
+    std.crypto.hash.sha2.Sha384.hash(data, want[0..48], .{});
+    try std.testing.expectEqualSlices(u8, want[0..48], tpmNameHash(0x000C, data, &out).?);
+    std.crypto.hash.sha2.Sha512.hash(data, want[0..64], .{});
+    try std.testing.expectEqualSlices(u8, want[0..64], tpmNameHash(0x000D, data, &out).?);
+    try std.testing.expect(tpmNameHash(0x0001, data, &out) == null);
+}
+
+fn mutTpm2b(list: *std.ArrayList(u8), a: Allocator, b: []const u8) !void {
+    try list.appendSlice(a, &.{ @intCast(b.len >> 8), @intCast(b.len & 0xff) });
+    try list.appendSlice(a, b);
+}
+
+test "mutation 2026-11-25: checkTpmPubArea pins every field of an RSA and an ECC public area" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = std.testing;
+    const modulus = try a.alloc(u8, 256);
+    for (modulus, 0..) |*m, i| m.* = @truncate(i *% 7 +% 1);
+    modulus[0] |= 0x80;
+    const rsa_key: CoseKey = .{ .rsa = .{ .alg = null, .n = modulus, .e = &.{ 0x01, 0x00, 0x01 } } };
+
+    const Rsa = struct {
+        fn area(al: Allocator, sym: u16, exp: u32, n: []const u8, trailing: bool) ![]u8 {
+            var l: std.ArrayList(u8) = .empty;
+            try l.appendSlice(al, &.{ 0x00, 0x01, 0x00, 0x0B, 0, 0, 0, 0 }); // type, nameAlg, attributes
+            try mutTpm2b(&l, al, &.{}); // authPolicy
+            try l.appendSlice(al, &.{ @intCast(sym >> 8), @intCast(sym & 0xff), 0x00, 0x10, 0x08, 0x00 }); // symmetric, scheme null, keyBits
+            var e: [4]u8 = undefined;
+            std.mem.writeInt(u32, &e, exp, .big);
+            try l.appendSlice(al, &e);
+            try mutTpm2b(&l, al, n);
+            if (trailing) try l.append(al, 0);
+            return l.items;
+        }
+    };
+    try t.expectEqual(@as(u16, 0x000B), try checkTpmPubArea(try Rsa.area(a, 0x0010, 0, modulus, false), rsa_key));
+    try t.expectError(error.InvalidAttestationStatement, checkTpmPubArea(try Rsa.area(a, 0x0006, 0, modulus, false), rsa_key)); // a symmetric algorithm
+    try t.expectError(error.InvalidAttestationStatement, checkTpmPubArea(try Rsa.area(a, 0x0010, 0, modulus, true), rsa_key)); // trailing octet
+    try t.expectError(error.InvalidAttestationStatement, checkTpmPubArea(try Rsa.area(a, 0x0010, 3, modulus, false), rsa_key)); // another exponent
+    const other = try a.dupe(u8, modulus);
+    other[255] ^= 1;
+    try t.expectError(error.InvalidAttestationStatement, checkTpmPubArea(try Rsa.area(a, 0x0010, 0, other, false), rsa_key)); // another modulus
+
+    const x: [32]u8 = @splat(0x11);
+    const y: [32]u8 = @splat(0x22);
+    const ec_key: CoseKey = .{ .ec2 = .{ .alg = null, .crv = cbor.cose.crv_p256, .x = &x, .y = &y } };
+    const Ecc = struct {
+        fn area(al: Allocator, sym: u16, curve: u16, px: []const u8, py: []const u8, trailing: bool) ![]u8 {
+            var l: std.ArrayList(u8) = .empty;
+            try l.appendSlice(al, &.{ 0x00, 0x23, 0x00, 0x0B, 0, 0, 0, 0 });
+            try mutTpm2b(&l, al, &.{});
+            try l.appendSlice(al, &.{ @intCast(sym >> 8), @intCast(sym & 0xff), 0x00, 0x10, @intCast(curve >> 8), @intCast(curve & 0xff), 0x00, 0x10 });
+            try mutTpm2b(&l, al, px);
+            try mutTpm2b(&l, al, py);
+            if (trailing) try l.append(al, 0);
+            return l.items;
+        }
+    };
+    try t.expectEqual(@as(u16, 0x000B), try checkTpmPubArea(try Ecc.area(a, 0x0010, 0x0003, &x, &y, false), ec_key));
+    try t.expectError(error.InvalidAttestationStatement, checkTpmPubArea(try Ecc.area(a, 0x0006, 0x0003, &x, &y, false), ec_key));
+    try t.expectError(error.InvalidAttestationStatement, checkTpmPubArea(try Ecc.area(a, 0x0010, 0x0003, &x, &y, true), ec_key));
+    try t.expectError(error.InvalidAttestationStatement, checkTpmPubArea(try Ecc.area(a, 0x0010, 0x0004, &x, &y, false), ec_key)); // P-384 area, P-256 key
+    var bad_x = x;
+    bad_x[31] ^= 1;
+    try t.expectError(error.InvalidAttestationStatement, checkTpmPubArea(try Ecc.area(a, 0x0010, 0x0003, &bad_x, &y, false), ec_key));
+    var bad_y = y;
+    bad_y[0] ^= 1;
+    try t.expectError(error.InvalidAttestationStatement, checkTpmPubArea(try Ecc.area(a, 0x0010, 0x0003, &x, &bad_y, false), ec_key));
+}
+
+test "mutation 2026-11-25: checkTpmCertInfo pins the attested name: its algorithm id and its digest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pub_area = "a public area";
+    var digest: [64]u8 = undefined;
+    const h = tpmNameHash(0x000B, pub_area, &digest).?;
+    const extra = "0123456789abcdef0123456789abcdef";
+    const Info = struct {
+        fn build(al: Allocator, name_alg: u16, dig: []const u8, ex: []const u8) ![]u8 {
+            var l: std.ArrayList(u8) = .empty;
+            try l.appendSlice(al, &.{ 0xff, 0x54, 0x43, 0x47, 0x80, 0x17 });
+            try mutTpm2b(&l, al, &.{}); // qualifiedSigner
+            try mutTpm2b(&l, al, ex);
+            try l.appendNTimes(al, 0, 17 + 8); // clockInfo, firmwareVersion
+            var name: std.ArrayList(u8) = .empty;
+            try name.appendSlice(al, &.{ @intCast(name_alg >> 8), @intCast(name_alg & 0xff) });
+            try name.appendSlice(al, dig);
+            try mutTpm2b(&l, al, name.items);
+            try mutTpm2b(&l, al, &.{}); // qualifiedName
+            return l.items;
+        }
+    };
+    try checkTpmCertInfo(try Info.build(a, 0x000B, h, extra), pub_area, 0x000B, extra);
+    // Another algorithm id in front of the right digest.
+    try std.testing.expectError(error.InvalidAttestationStatement, checkTpmCertInfo(try Info.build(a, 0x000C, h, extra), pub_area, 0x000B, extra));
+    // The right id, another digest.
+    var wrong: [32]u8 = undefined;
+    @memcpy(&wrong, h);
+    wrong[7] ^= 1;
+    try std.testing.expectError(error.InvalidAttestationStatement, checkTpmCertInfo(try Info.build(a, 0x000B, &wrong, extra), pub_area, 0x000B, extra));
+}
+
+/// The leaf of `attestation_object`'s `x5c`, from the fixtures.
+fn mutLeafOf(a: Allocator, attestation_object: []const u8) ![]const u8 {
+    const obj = try parseAttestationObject(a, attestation_object);
+    return (try firstX5cDer(obj.att_stmt, false)).?;
+}
+
+fn mutKeyCheck(leaf: []const u8, key: CoseKey) !bool {
+    var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+    const cert = try x509.safe.safeCertificate(leaf, &scratch);
+    return certKeyIsCredentialKey(try cert.parse(), key);
+}
+
+test "mutation 2026-11-25: certKeyIsCredentialKey compares the point prefix, x and y, the key family, and an RSA key's modulus and exponent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = std.testing;
+
+    // An EC P-256 certificate (the apple fixture) and its own key.
+    const apple_fx = @import("apple_fixture.zig");
+    const leaf = try a.dupe(u8, try mutLeafOf(a, &apple_fx.attestation_object));
+    var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+    const cert = try x509.safe.safeCertificate(leaf, &scratch);
+    const pk = (try cert.parse()).pubKey();
+    try t.expectEqual(@as(usize, 65), pk.len);
+    const key: CoseKey = .{ .ec2 = .{ .alg = null, .crv = cbor.cose.crv_p256, .x = pk[1..33], .y = pk[33..65] } };
+    const at = std.mem.find(u8, leaf, pk) orelse return error.TestUnexpectedResult;
+    try t.expect(try mutKeyCheck(leaf, key));
+    // The certificate's own point differs in its prefix octet, in x, in y.
+    for ([_]usize{ 0, 1, 64 }) |off| {
+        const edited = try a.dupe(u8, leaf);
+        edited[at + off] ^= 1;
+        try t.expect(!(try mutKeyCheck(edited, key)));
+    }
+    // An OKP key never matches an EC certificate, even when its x is the certificate's key bytes.
+    try t.expect(!(try mutKeyCheck(leaf, .{ .okp = .{ .alg = null, .crv = cbor.cose.crv_ed25519, .x = pk } })));
+
+    // Forged views of the same certificate (`Parsed` is a plain struct): the key family decides first.
+    var parsed = try cert.parse();
+    {
+        var p = parsed; // an EC key against a certificate that says RSA
+        p.pub_key_algo = .rsaEncryption;
+        try t.expect(!certKeyIsCredentialKey(p, key));
+        // ...and an RSA key against bytes that are no RSAPublicKey: not a match, not a panic.
+        try t.expect(!certKeyIsCredentialKey(p, .{ .rsa = .{ .alg = null, .n = pk, .e = &.{0x03} } }));
+    }
+    {
+        var p = parsed; // an Ed25519 certificate: the key bytes must be the OKP x
+        p.pub_key_algo = .curveEd25519;
+        try t.expect(certKeyIsCredentialKey(p, .{ .okp = .{ .alg = null, .crv = cbor.cose.crv_ed25519, .x = pk } }));
+        const other = try a.dupe(u8, pk);
+        other[3] ^= 1;
+        try t.expect(!certKeyIsCredentialKey(p, .{ .okp = .{ .alg = null, .crv = cbor.cose.crv_ed25519, .x = other } }));
+    }
+    {
+        parsed.pub_key_slice.end = parsed.pub_key_slice.start + 10; // an EC "point" far too short: false, never read past
+        try t.expect(!certKeyIsCredentialKey(parsed, key));
+    }
+
+    // An RSA certificate (a real TPM AIK) and its own key; another modulus or exponent is no match.
+    const tpm_fx = @import("tpm_fixtures.zig");
+    var found = false;
+    for (tpm_fx.fixtures) |f| {
+        const rleaf = try mutLeafOf(a, f.attestation_object);
+        var rscratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
+        const rcert = try x509.safe.safeCertificate(rleaf, &rscratch);
+        const rparsed = try rcert.parse();
+        if (rparsed.pub_key_algo != .rsaEncryption) continue;
+        found = true;
+        const comps = try std.crypto.Certificate.rsa.PublicKey.parseDer(rparsed.pubKey());
+        const rkey: CoseKey = .{ .rsa = .{ .alg = null, .n = comps.modulus, .e = comps.exponent } };
+        try t.expect(certKeyIsCredentialKey(rparsed, rkey));
+        const bad_n = try a.dupe(u8, comps.modulus);
+        bad_n[bad_n.len - 1] ^= 1;
+        try t.expect(!certKeyIsCredentialKey(rparsed, .{ .rsa = .{ .alg = null, .n = bad_n, .e = comps.exponent } }));
+        try t.expect(!certKeyIsCredentialKey(rparsed, .{ .rsa = .{ .alg = null, .n = comps.modulus, .e = &.{0x03} } }));
+        break;
+    }
+    try t.expect(found);
+}
+
+test "mutation 2026-11-25: parseExtensionOutputs refuses a credProtect above 255" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // {"credProtect": 256}
+    const raw = try cbor.encode(a, .{ .map = &.{.{ .key = .{ .text = "credProtect" }, .value = .{ .uint = 256 } }} }, .{});
+    try std.testing.expectError(error.WrongType, parseExtensionOutputs(a, raw));
+}

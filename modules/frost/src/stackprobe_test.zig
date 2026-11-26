@@ -279,6 +279,186 @@ test "STACKPROBE (audit 2026-10-08): no share or nonce residue on the dead stack
     try expectNoResidue("generateNonces", callGenerate);
 }
 
+// ── dkg parts (delta mutation run 2026-11-25) ───────────────────────────────
+//
+// `dkg.part1` / `part2` / `part3` each run their body one `noinline` frame down
+// and burn after it (`dkg.zig`); until this run nothing measured them, so a
+// deleted `burnStack()` there was invisible. Needles: the coefficients and the
+// nonce (part1), the coefficients and every share the polynomial yields
+// (part2), the received shares and the summed signing share (part3), in
+// big-endian, little-endian and `Scalar` images.
+
+const dkg = frost.dkg;
+const dkg_gpa = std.testing.allocator;
+
+var d_id1: frost.Identifier = undefined;
+var d_coeffs: [2]Scalar = undefined;
+var d_nonce: Scalar = undefined;
+var d_sec1: dkg.Round1SecretPackage = undefined;
+var d_pkg1: dkg.Round1Package = undefined;
+var d_r1: [2]dkg.Round1Received = undefined;
+var d_r2: [2]dkg.Round2Received = undefined;
+var d_sec1_in: dkg.Round1SecretPackage = undefined;
+var d_sec2_in: dkg.Round2SecretPackage = undefined;
+var d_sec2_out: dkg.Round2SecretPackage = undefined;
+var d_key_out: dkg.KeyPackage = undefined;
+
+noinline fn callPart1() void {
+    d_pkg1 = dkg.part1(dkg_gpa, &d_sec1, d_id1, 3, 2, &d_coeffs, &d_nonce) catch unreachable;
+    std.mem.doNotOptimizeAway(&d_pkg1);
+    d_pkg1.deinit(dkg_gpa);
+    d_sec1.deinit(dkg_gpa);
+}
+
+noinline fn callPart2() void {
+    const sent = dkg.part2(dkg_gpa, &d_sec2_out, &d_sec1_in, &d_r1, null) catch unreachable;
+    std.mem.doNotOptimizeAway(&sent);
+    dkg.freeRound2Packages(dkg_gpa, sent);
+    d_sec2_out.deinit(dkg_gpa);
+}
+
+noinline fn callPart3() void {
+    var pub_pkg = dkg.part3(dkg_gpa, &d_key_out, &d_sec2_in, &d_r1, &d_r2, null) catch unreachable;
+    std.mem.doNotOptimizeAway(&pub_pkg);
+    pub_pkg.deinit(dkg_gpa);
+    d_key_out.deinit();
+}
+
+fn dScalar(tag: u8, i: u8) Scalar {
+    return Scalar.fromBytes48(@as([48]u8, @splat(tag +% i)), .big);
+}
+
+/// 3 participants, 2-of-3; participant 1 is the one measured. `which` is 1, 2
+/// or 3 (the part). The other participants' round-1 packages and the shares
+/// they send to participant 1 are real, produced here.
+fn expectNoResidueDkg(label: []const u8, call: *const fn () void, which: u8) !void {
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
+    const gpa = dkg_gpa;
+    var secs1: [3]dkg.Round1SecretPackage = undefined;
+    var pkgs: [3]dkg.Round1Package = undefined;
+    var coefs: [3][2]Scalar = undefined;
+    for (0..3) |i| {
+        coefs[i] = .{ dScalar(0x21, @intCast(i)), dScalar(0x35, @intCast(i)) };
+        const nonce = dScalar(0x49, @intCast(i));
+        pkgs[i] = try dkg.part1(gpa, &secs1[i], try frost.Identifier.fromU16(@intCast(i + 1)), 3, 2, &coefs[i], &nonce);
+    }
+    defer for (0..3) |i| {
+        pkgs[i].deinit(gpa);
+        secs1[i].deinit(gpa);
+    };
+    // Round 1 as participant 1 receives it (senders 2 and 3).
+    d_r1 = .{
+        .{ .sender = try frost.Identifier.fromU16(2), .package = pkgs[1] },
+        .{ .sender = try frost.Identifier.fromU16(3), .package = pkgs[2] },
+    };
+    // Participant 1's part2 (needed by part3 and for the share needles).
+    var sec2_1: dkg.Round2SecretPackage = undefined;
+    const sent1 = try dkg.part2(gpa, &sec2_1, &secs1[0], &d_r1, null);
+    defer {
+        dkg.freeRound2Packages(gpa, sent1);
+        sec2_1.deinit(gpa);
+    }
+    // The shares participants 2 and 3 send to participant 1.
+    var recv: [2]dkg.Round2Received = undefined;
+    for ([_]usize{ 1, 2 }, 0..) |who, k| {
+        var other_r1: [2]dkg.Round1Received = undefined;
+        var n: usize = 0;
+        for (0..3) |i| {
+            if (i == who) continue;
+            other_r1[n] = .{ .sender = try frost.Identifier.fromU16(@intCast(i + 1)), .package = pkgs[i] };
+            n += 1;
+        }
+        var sec2: dkg.Round2SecretPackage = undefined;
+        const sent = try dkg.part2(gpa, &sec2, &secs1[who], &other_r1, null);
+        defer {
+            dkg.freeRound2Packages(gpa, sent);
+            sec2.deinit(gpa);
+        }
+        for (sent) |sp| {
+            if (std.mem.eql(u8, &sp.recipient.bytes, &(try frost.Identifier.fromU16(1)).bytes))
+                recv[k] = .{ .sender = try frost.Identifier.fromU16(@intCast(who + 1)), .signing_share = sp.signing_share };
+        }
+    }
+    d_r2 = recv;
+    // Static inputs of the measured calls.
+    d_id1 = try frost.Identifier.fromU16(1);
+    d_coeffs = coefs[0];
+    d_nonce = dScalar(0x49, 0);
+    d_sec1_in = secs1[0];
+    d_sec2_in = sec2_1;
+    // The signing share participant 1 ends with.
+    var key: dkg.KeyPackage = undefined;
+    var pub_pkg = try dkg.part3(gpa, &key, &sec2_1, &d_r1, &d_r2, null);
+    defer pub_pkg.deinit(gpa);
+    defer key.deinit();
+
+    // part1's intermediate `a_0 * c` (c public): with the published
+    // `mu = k + a_0 * c` it gives `k`, and with `k` the coefficient.
+    var preimage: [frost.Ns + 2 * frost.Ne]u8 = undefined;
+    preimage[0..frost.Ns].* = d_id1.toBytes();
+    preimage[frost.Ns..][0..frost.Ne].* = pkgs[0].commitment[0].toBytes();
+    preimage[frost.Ns + frost.Ne ..][0..frost.Ne].* = pkgs[0].proof_of_knowledge.r.toBytes();
+    const a0c = d_coeffs[0].mul(frost.hdkg(&preimage));
+    var secrets: [6]Scalar = undefined;
+    var ns: usize = 0;
+    switch (which) {
+        1 => for ([_]Scalar{ d_coeffs[0], d_coeffs[1], d_nonce, a0c }) |sc| {
+            secrets[ns] = sc;
+            ns += 1;
+        },
+        2 => for ([_]Scalar{ d_coeffs[0], d_coeffs[1], sec2_1.secret_share.scalar(), sent1[0].signing_share.scalar(), sent1[1].signing_share.scalar() }) |sc| {
+            secrets[ns] = sc;
+            ns += 1;
+        },
+        else => for ([_]Scalar{ recv[0].signing_share.scalar(), recv[1].signing_share.scalar(), sec2_1.secret_share.scalar(), key.signing_share.scalar() }) |sc| {
+            secrets[ns] = sc;
+            ns += 1;
+        },
+    }
+    var needles: Needles = undefined;
+    for (0..needle_count / 3) |i| needles[3 * i ..][0..3].* = three(secrets[@min(i, ns - 1)]);
+
+    leak_src = needles[0];
+    var scratch: [needle_count]usize = @splat(0);
+    measure(callInnocent);
+    const neg = countAll(&needles, &scratch);
+    measure(callLeaky);
+    const pos = countIn(&needles[0]);
+
+    var total: [needle_count]usize = @splat(0);
+    var sum: usize = 0;
+    resetDepths();
+    for (0..5) |_| {
+        measure(call);
+        sum += countAll(&needles, &total);
+    }
+    measure(call);
+    const depth = dirtyDepth();
+
+    errdefer {
+        std.debug.print("\n=== STACKPROBE frost dkg {s} ({t}, window {d} KiB) ===\n", .{ label, builtin.mode, WINDOW / 1024 });
+        std.debug.print("  NEG={d} POS={d} dirty below the call={d} B, hits {d}..{d} B\n", .{ neg, pos, depth, hit_min_depth, hit_max_depth });
+        for (total, 0..) |h, i| {
+            if (h != 0) std.debug.print("    RESIDUE needle {d} (secret {d}): {d} (5 calls)\n", .{ i, i / 3, h });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), neg);
+    try std.testing.expect(pos >= 1);
+    try std.testing.expectEqual(@as(usize, 0), sum);
+}
+
+test "STACKPROBE (mutation 2026-11-25): no coefficient or nonce residue on the dead stack after dkg.part1()" {
+    try expectNoResidueDkg("part1", callPart1, 1);
+}
+
+test "STACKPROBE (mutation 2026-11-25): no coefficient or share residue on the dead stack after dkg.part2()" {
+    try expectNoResidueDkg("part2", callPart2, 2);
+}
+
+test "STACKPROBE (mutation 2026-11-25): no share residue on the dead stack after dkg.part3()" {
+    try expectNoResidueDkg("part3", callPart3, 3);
+}
+
 // ── residue rule (`testkit.stackprobe.residueOf`, 2026-11-23) ───────────────
 //
 // The needles above are a model of the secrets. The shared engine's residue

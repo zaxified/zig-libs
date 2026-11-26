@@ -2498,3 +2498,191 @@ test "parseClientExtensionResults: credProps.rk" {
     try testing.expectEqual(@as(?bool, null), (try webauthn.parseClientExtensionResults(a, "{}")).cred_props_rk);
     try testing.expectError(error.InvalidJson, webauthn.parseClientExtensionResults(a, "{\"credProps\":{\"rk\":1}}"));
 }
+
+// ── delta mutation run 2026-11-25: certificate-embedded structures of apple, android-key and tpm ──
+
+fn mutLeaf(a: std.mem.Allocator, attestation_object: []const u8) ![]const u8 {
+    const decoded = try cbor.decode(a, attestation_object, .{});
+    for (decoded.map) |e| {
+        if (e.key != .text or !std.mem.eql(u8, e.key.text, "attStmt")) continue;
+        for (e.value.map) |se| {
+            if (se.key == .text and std.mem.eql(u8, se.key.text, "x5c")) return se.value.array[0].bytes;
+        }
+    }
+    return error.MissingField;
+}
+
+fn mutFind(hay: []const u8, needle: []const u8) !usize {
+    return std.mem.indexOf(u8, hay, needle) orelse error.EditNotFound;
+}
+
+fn mutExtension(a: std.mem.Allocator, oid_tlv: []const u8, critical: bool, value: []const u8) ![]u8 {
+    var content: std.ArrayList(u8) = .empty;
+    try content.appendSlice(a, oid_tlv);
+    if (critical) try content.appendSlice(a, &.{ 0x01, 0x01, 0xff });
+    try content.appendSlice(a, try derHeader(a, 0x04, value.len));
+    try content.appendSlice(a, value);
+    return std.mem.concat(a, u8, &.{ try derHeader(a, 0x30, content.items.len), content.items });
+}
+
+test "mutation 2026-11-25: apple: the nonce extension must be exactly SEQUENCE { [1] { OCTET STRING } }" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = &apple.attestation_object;
+    const cert = try mutLeaf(a, base);
+    const val = [_]u8{ 0x30, 0x24, 0xa1, 0x22, 0x04, 0x20 };
+    const at = try mutFind(cert, &val);
+
+    // Same-length edits of the context element's identifier octet: class, tag number, constructed bit.
+    for ([_]u8{ 0x61, 0xa2, 0x81 }) |bad| {
+        const m = try a.dupe(u8, cert);
+        m[at + 2] = bad;
+        try testing.expectError(error.InvalidCertificate, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), apple.client_data_hash));
+    }
+
+    // Extra elements: inside the SEQUENCE after the context element, after the SEQUENCE, inside the context element.
+    const nonce = cert[at + 6 ..][0..32];
+    const oid_tlv = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x08, 0x02 };
+    const ext_at = (try mutFind(cert, &oid_tlv)) - 2;
+    const ext_len = derElementLen(cert[ext_at..]);
+    const variants = [_][]const u8{
+        &([_]u8{ 0x30, 0x26, 0xa1, 0x22, 0x04, 0x20 } ++ nonce.* ++ [_]u8{ 0x05, 0x00 }),
+        &([_]u8{ 0x30, 0x24, 0xa1, 0x22, 0x04, 0x20 } ++ nonce.* ++ [_]u8{ 0x05, 0x00 }),
+        &([_]u8{ 0x30, 0x26, 0xa1, 0x24, 0x04, 0x20 } ++ nonce.* ++ [_]u8{ 0x05, 0x00 }),
+    };
+    // The re-encoder is neutral for the genuine value.
+    const same = try derReplace(a, cert, ext_at, ext_len, try mutExtension(a, &oid_tlv, false, &(val ++ nonce.*)));
+    _ = try webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, same), apple.client_data_hash);
+    for (variants) |v| {
+        const m = try derReplace(a, cert, ext_at, ext_len, try mutExtension(a, &oid_tlv, false, v));
+        try testing.expectError(error.InvalidCertificate, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), apple.client_data_hash));
+    }
+}
+
+test "mutation 2026-11-25: android-key: the challenge element and the purposes of the key description" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = &android.attestation_object;
+    const h = android.client_data_hash;
+    const cert = try mutLeaf(a, base);
+
+    // The attestationChallenge OCTET STRING: its class and its tag number.
+    const chal = try mutFind(cert, &([_]u8{ 0x04, 0x20 } ++ h));
+    for ([_]u8{ 0x84, 0x05 }) |bad| {
+        const m = try a.dupe(u8, cert);
+        m[chal] = bad;
+        try testing.expectError(error.InvalidCertificate, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), h));
+    }
+
+    // No purpose at all (neither sign nor anything else): the [1] purpose field is re-tagged [2],
+    // which the reader skips; the certificate keeps its length.
+    const purpose = [_]u8{ 0xa1, 0x05, 0x31, 0x03, 0x02, 0x01, 0x02 };
+    const m = try a.dupe(u8, cert);
+    var renamed: usize = 0;
+    while (std.mem.indexOf(u8, m, &purpose)) |at| {
+        m[at] = 0xa2;
+        renamed += 1;
+    }
+    try testing.expect(renamed >= 1);
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), h));
+}
+
+test "mutation 2026-11-25: tpm: the SAN directoryName must be a constructed context [4]; basicConstraints reads only a BOOLEAN first element" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = &vectors.tpm_es256_attestation_object;
+    const hash = clientDataHash(&vectors.tpm_es256_client_data_json);
+    const cert = try mutLeaf(a, base);
+
+    // The identifier octet of the one GeneralName: class, tag number, constructed bit.
+    const man = try mutFind(cert, &.{ 0x67, 0x81, 0x05, 0x02, 0x01 });
+    var gn: usize = man;
+    while (cert[gn] != 0xa4) gn -= 1;
+    for ([_]u8{ 0x64, 0xa5, 0x84 }) |bad| {
+        const m = try a.dupe(u8, cert);
+        m[gn] = bad;
+        try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), hash));
+    }
+
+    // basicConstraints whose first element is not "cA TRUE" is accepted: a context [1], an INTEGER,
+    // a BOOLEAN of two octets, a BOOLEAN FALSE.
+    const bc_ext = [_]u8{ 0x30, 0x0c, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff, 0x04, 0x02, 0x30, 0x00 };
+    const bc_at = try mutFind(cert, &bc_ext);
+    const oid_bc = [_]u8{ 0x06, 0x03, 0x55, 0x1d, 0x13 };
+    const firsts = [_][]const u8{
+        &.{ 0x81, 0x01, 0xff },
+        &.{ 0x02, 0x01, 0x05 },
+        &.{ 0x01, 0x02, 0xff, 0xff },
+        &.{ 0x01, 0x01, 0x00 },
+    };
+    for (firsts) |first| {
+        const value = try std.mem.concat(a, u8, &.{ &[_]u8{ 0x30, @intCast(first.len) }, first });
+        const m = try derReplace(a, cert, bc_at, bc_ext.len, try mutExtension(a, &oid_bc, true, value));
+        _ = try webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), hash);
+    }
+    // ...and the genuine "cA TRUE" is not.
+    const ca_true = try std.mem.concat(a, u8, &.{ &[_]u8{ 0x30, 0x03 }, &[_]u8{ 0x01, 0x01, 0xff } });
+    const m = try derReplace(a, cert, bc_at, bc_ext.len, try mutExtension(a, &oid_bc, true, ca_true));
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(a, try tpmAikWithCert(a, base, m), hash));
+}
+
+test "mutation 2026-11-25: tpm: an RSA AIK key below 2048 bits is InvalidKey; a flipped RSASSA-SHA-1 signature is BadSignature" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = tpm_fixtures.fixtures[0];
+    const hash = clientDataHash(f.client_data_json);
+    _ = try webauthn.verifyAttestation(a, f.attestation_object, hash);
+    const cert = try mutLeaf(a, f.attestation_object);
+
+    // The SubjectPublicKeyInfo replaced by one with a 1024-bit modulus.
+    const alg_id = [_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 };
+    const alg_at = try mutFind(cert, &alg_id);
+    const spki_at = alg_at - 4;
+    try testing.expectEqual(@as(u8, 0x30), cert[spki_at]);
+    var n: [128]u8 = @splat(0x5b);
+    n[0] = 0x80;
+    n[127] = 0x01;
+    const rsa_pub = try std.mem.concat(a, u8, &.{
+        &[_]u8{ 0x02, 0x81, 0x81, 0x00 }, &n, &[_]u8{ 0x02, 0x03, 0x01, 0x00, 0x01 },
+    });
+    const rsa_seq = try std.mem.concat(a, u8, &.{ try derHeader(a, 0x30, rsa_pub.len), rsa_pub });
+    const bits = try std.mem.concat(a, u8, &.{ try derHeader(a, 0x03, rsa_seq.len + 1), &[_]u8{0x00}, rsa_seq });
+    const spki_body = try std.mem.concat(a, u8, &.{ &alg_id, bits });
+    const spki = try std.mem.concat(a, u8, &.{ try derHeader(a, 0x30, spki_body.len), spki_body });
+    const small = try derReplace(a, cert, spki_at, derElementLen(cert[spki_at..]), spki);
+    try testing.expectError(error.InvalidKey, webauthn.verifyAttestation(a, try tpmAikWithCert(a, f.attestation_object, small), hash));
+
+    // An ES256 attestation whose AIK certificate carries a P-384 key is UnsupportedAlgorithm, not a signature failure.
+    {
+        const eb = &vectors.tpm_es256_attestation_object;
+        const ehash = clientDataHash(&vectors.tpm_es256_client_data_json);
+        const ecert = try mutLeaf(a, eb);
+        const old_spki = [_]u8{ 0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+        const at = try mutFind(ecert, &old_spki);
+        const p384_spki = try std.mem.concat(a, u8, &.{
+            &[_]u8{ 0x30, 0x76, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22, 0x03, 0x62, 0x00, 0x04 },
+            &@as([96]u8, @splat(0x3c)),
+        });
+        const swapped = try derReplace(a, ecert, at, derElementLen(ecert[at..]), p384_spki);
+        try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifyAttestation(a, try tpmAikWithCert(a, eb, swapped), ehash));
+    }
+
+    // One flipped octet of the AIK signature.
+    const sig = try stmtBytes(a, f.attestation_object, "sig");
+    const sm = try a.dupe(u8, sig);
+    sm[sm.len - 1] ^= 1;
+    try testing.expectError(error.BadSignature, webauthn.verifyAttestation(a, try withStmt(a, f.attestation_object, "sig", .{ .bytes = sm }), hash));
+}
+
+test "mutation 2026-11-25: verifyAttestationChain: an empty x5c array is NoCertificateChain" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const none_array: []const cbor.Value = &.{};
+    const obj = try withStmt(a, &vectors.packed_es256_full.attestation_object, "x5c", .{ .array = none_array });
+    try testing.expectError(error.NoCertificateChain, webauthn.verifyAttestationChain(testing.allocator, obj, &.{}, .{ .now_sec = 1_800_000_000 }));
+}

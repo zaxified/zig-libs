@@ -6371,8 +6371,10 @@ test "review L9: a directory whose meta is null, or a profile's description not 
         // Typed members read on their own: a wrong shape is left out, the others stay.
         "{\"newNonce\":\"http://a/n\",\"newAccount\":\"http://a/a\",\"newOrder\":\"http://a/o\",\"meta\":{\"termsOfService\":\"https://ca.example/tos\",\"website\":7,\"caaIdentities\":[\"ca.example\",5,\"ca2.example\"],\"externalAccountRequired\":true}}",
         "{\"newNonce\":\"http://a/n\",\"newAccount\":\"http://a/a\",\"newOrder\":\"http://a/o\",\"meta\":{\"termsOfService\":[],\"website\":\"https://ca.example\",\"caaIdentities\":\"x\",\"externalAccountRequired\":\"yes\"}}",
+        // mutation 2026-11-25: a meta that is not an object at all.
+        "{\"newNonce\":\"http://a/n\",\"newAccount\":\"http://a/a\",\"newOrder\":\"http://a/o\",\"meta\":7}",
     };
-    const want = [_]usize{ 0, 1, 0, 0 };
+    const want = [_]usize{ 0, 1, 0, 0, 0 };
     for (bodies, want, 0..) |body, n, case| {
         const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
         var listener = addr.listen(io, .{}) catch |err|
@@ -6402,7 +6404,7 @@ test "review L9: a directory whose meta is null, or a profile's description not 
         if (n == 1) try testing.expectEqualStrings("classic", got[0].name);
         const meta = try c.directoryMeta();
         switch (case) {
-            0, 1 => {
+            0, 1, 4 => {
                 try testing.expect(meta.terms_of_service == null and meta.website == null and !meta.external_account_required);
                 try testing.expectEqual(@as(usize, 0), meta.caa_identities.len);
             },

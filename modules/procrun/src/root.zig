@@ -4693,3 +4693,216 @@ test "PathPolicy: the same under rlimit's shell wrapper" {
     try testing.expect(r3.term == .exited and r3.term.exited == 0);
     r3.deinit(testing.allocator);
 }
+
+// ── delta mutation run 2026-11-25 (pidfd table, PathPolicy, writeStdinTimeout) ─
+
+fn mutDevNull() !std.posix.fd_t {
+    const linux = std.os.linux;
+    const rc = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    return @intCast(rc);
+}
+
+fn mutFdClosed(fd: std.posix.fd_t) bool {
+    const linux = std.os.linux;
+    return linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) == .BADF;
+}
+
+test "mutation 2026-11-25: PidfdTable replaces a recycled pid's entry and closes the old fd, closes an extra fd, forgets a removed pid" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var t: PidfdTable = .{};
+    const a = try mutDevNull();
+    const b = try mutDevNull();
+    t.add(5, a);
+    try testing.expectEqual(@as(usize, 1), t.count());
+    t.add(5, b); // pid 5 again: the old descriptor is replaced
+    try testing.expectEqual(@as(usize, 1), t.count());
+    try testing.expect(mutFdClosed(a));
+    try testing.expect(!mutFdClosed(b));
+    try testing.expectEqual(b, t.fds[0]);
+    // An unknown pid has no pidfd to signal and none that is alive.
+    try testing.expect(!t.signal(99, .TERM));
+    try testing.expect(!t.alive(99));
+    // A removed pid leaves its slot's pid behind but no descriptor: nothing to signal.
+    t.remove(5);
+    try testing.expectEqual(@as(usize, 0), t.count());
+    try testing.expect(mutFdClosed(b));
+    try testing.expect(!t.signal(5, .TERM));
+    try testing.expect(!t.alive(5));
+    // A full table closes the descriptor it cannot keep.
+    var fds: [PidfdTable.cap]std.posix.fd_t = undefined;
+    for (&fds, 0..) |*fd, i| {
+        fd.* = try mutDevNull();
+        t.add(@intCast(i + 1), fd.*);
+    }
+    const extra = try mutDevNull();
+    t.add(9999, extra);
+    try testing.expect(mutFdClosed(extra));
+    try testing.expectEqual(PidfdTable.cap, t.count());
+    for (1..PidfdTable.cap + 1) |i| t.remove(@intCast(i));
+    try testing.expectEqual(@as(usize, 0), t.count());
+}
+
+test "mutation 2026-11-25: a group signal reaches a child that has no pidfd entry, and none after the leader was reaped out of band" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!vfork_spawn.supported) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    ensureChildReaping();
+    const posix = std.posix;
+
+    // (a) A child the table does not know (full table, old kernel, std's
+    // spawner) is still signalled as a group through the `waitid` gate.
+    {
+        var child = try spawnChild(testing.allocator, io, .{
+            .argv = &.{ "sleep", "30" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .new_process_group = true,
+        });
+        pidfds.remove(child.id.?);
+        deliverGroup(&child, .kill, 0, true);
+        const gone = waitExitWithin(&child, 5 * std.time.ns_per_s, null);
+        if (!gone) deliver(&child, .kill, 0);
+        _ = waitTolerant(io, &child);
+        try testing.expect(gone);
+    }
+
+    // (b) The leader is reaped by somebody else while a descendant keeps the
+    // group alive: `deliverGroup` must not signal the (now free) group id.
+    {
+        var child = try spawnChild(testing.allocator, io, .{
+            .argv = &.{ "sh", "-c", "sleep 30 & exec sleep 31" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .new_process_group = true,
+        });
+        const pid = child.id.?;
+        sleepNs(300 * std.time.ns_per_ms); // the shell has forked the descendant and exec'd
+        _ = pidfds.signal(pid, .KILL);
+        var status: if (builtin.link_libc) c_int else i32 = undefined;
+        while (true) {
+            const rc = posix.system.wait4(pid, &status, 0, null);
+            if (posix.errno(rc) == .INTR) continue;
+            break;
+        }
+        deliverGroup(&child, .kill, 0, true);
+        sleepNs(200 * std.time.ns_per_ms);
+        const group_alive = posix.errno(posix.system.kill(-pid, @fromBackingInt(0))) == .SUCCESS;
+        _ = posix.system.kill(-pid, .KILL); // clean up the descendant either way
+        sleepNs(100 * std.time.ns_per_ms);
+        _ = waitTolerant(io, &child);
+        try testing.expect(group_alive);
+    }
+}
+
+test "mutation 2026-11-25: on a kernel with pidfd support the Linux spawner records its child's pidfd" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!vfork_spawn.supported) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const me = linux.pidfd_open(linux.getpid(), 0);
+    if (linux.errno(me) != .SUCCESS) return error.SkipZigTest; // no pidfd_open: nothing to require
+    _ = linux.close(@intCast(me));
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    ensureChildReaping();
+    const before = pidfds.count();
+    var child = try spawnChild(testing.allocator, io, .{ .argv = &.{ "sleep", "30" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    const entries = pidfds.count();
+    const alive = pidfds.alive(child.id.?);
+    deliver(&child, .kill, 0);
+    _ = waitTolerant(io, &child);
+    try testing.expectEqual(before + 1, entries);
+    try testing.expect(alive);
+    try testing.expectEqual(before, pidfds.count());
+}
+
+fn mutDecoyDir(io: std.Io, tmp: *std.testing.TmpDir, buf: []u8) ![]u8 {
+    const f = try tmp.dir.createFile(io, "mutdecoy", .{});
+    defer f.close(io);
+    var wbuf: [64]u8 = undefined;
+    var fw = f.writer(io, &wbuf);
+    try fw.interface.writeAll("#!/bin/sh\necho DECOY\n");
+    try fw.interface.flush();
+    try testing.expectEqual(@as(usize, 0), std.os.linux.fchmod(f.handle, 0o755));
+    const n = try tmp.dir.realPath(io, buf);
+    return buf[0..n];
+}
+
+test "mutation 2026-11-25: PathPolicy.none runs a program found only in the child's cwd (also under rlimit); child_env without a PATH falls back to the default PATH" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try mutDecoyDir(io, &tmp, &path_buf);
+
+    const lim: RlimitSpec = .{ .cpu_seconds = 10 };
+    for ([_]?RlimitSpec{ null, lim }) |rl| {
+        var out = try run(testing.allocator, io, .{ .argv = &.{"mutdecoy"}, .cwd = dir, .path_policy = .none, .rlimit = rl }, "");
+        defer out.deinit(testing.allocator);
+        try testing.expectEqualStrings("DECOY\n", out.stdout);
+    }
+
+    // The child's environment has no PATH at all: the default one applies.
+    var empty = std.process.Environ.Map.init(testing.allocator);
+    defer empty.deinit();
+    try empty.put("MUTFOO", "1"); // a non-null environment without a PATH
+    for ([_]?RlimitSpec{ null, lim }) |rl| {
+        var out = try run(testing.allocator, io, .{
+            .argv = &.{"true"},
+            .env = &empty,
+            .env_mode = .clear,
+            .path_policy = .child_env,
+            .rlimit = rl,
+        }, "");
+        defer out.deinit(testing.allocator);
+        try testing.expect(out.term == .exited and out.term.exited == 0);
+    }
+}
+
+const MutCollect = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+    fn onOut(cx: ?*anyopaque, chunk: []const u8) void {
+        const s: *MutCollect = @ptrCast(@alignCast(cx.?));
+        const n = @min(chunk.len, s.buf.len - s.len);
+        @memcpy(s.buf[s.len..][0..n], chunk[0..n]);
+        s.len += n;
+    }
+};
+
+test "mutation 2026-11-25: writeStdinTimeout delivers every byte once, restores the blocking flag, and reports BrokenPipe" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var got: MutCollect = .{};
+    const h = try spawnStreaming(testing.allocator, io, .{ .argv = &.{"cat"}, .stdin = .pipe }, .{ .ctx = &got, .on_stdout = MutCollect.onOut });
+    const fd = h.ctx.child.stdin.?.handle;
+    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    try testing.expectEqual(@as(usize, 0), linux.fcntl(fd, linux.F.GETFL, 0) & nonblock);
+    try h.writeStdinTimeout("0123456789abcdef", 5000);
+    try testing.expectEqual(@as(usize, 0), linux.fcntl(fd, linux.F.GETFL, 0) & nonblock); // restored
+    try h.closeStdin();
+    const t = h.wait();
+    try testing.expect(t == .exited and t.exited == 0);
+    try testing.expectEqualStrings("0123456789abcdef", got.buf[0..got.len]);
+
+    // A child that exited without reading: the pipe is broken.
+    var none: MutCollect = .{};
+    const h2 = try spawnStreaming(testing.allocator, io, .{ .argv = &.{"true"}, .stdin = .pipe }, .{ .ctx = &none, .on_stdout = MutCollect.onOut });
+    sleepNs(300 * std.time.ns_per_ms);
+    try testing.expectError(error.BrokenPipe, h2.writeStdinTimeout("x", 2000));
+    _ = h2.wait();
+}

@@ -53,7 +53,8 @@ for i in $ids; do
     # (`<n>/<m> <name>...OK|SKIP`): a passing test's NAME may contain any of
     # the markers below ("...not an integer overflow...OK" labelled all 33
     # dtls mutants "integer overflow", 2026-11-19).
-    cls="$(grep -vE '\.\.\.(OK|SKIP)[[:space:]]*$' "$log")"
+    # -a: a failure message can carry a NUL byte; without it grep prints "binary file matches" and the verdict is UNCLEAR.
+    cls="$(grep -avE '\.\.\.(OK|SKIP)[[:space:]]*$' "$log")"
     if (( rc == 0 )); then
         if [[ "$i" == 0 ]]; then v=PASS; else v=SURVIVED; fi
     elif (( rc == 124 || rc == 137 )); then
@@ -61,11 +62,11 @@ for i in $ids; do
     # A test binary run directly reports `<n>/<m> <name>...FAIL (<Err>)` and
     # `<k> failed.`; a panic or a safety check names itself. Match `panic: `
     # (the runtime's own wording), not a bare `panic`.
-    elif grep -qE "FAIL \(|[0-9]+ failed\.|panic: |Segmentation fault|reached unreachable|integer overflow|index out of bounds" <<< "$cls"; then
-        v=KILLED; reason="$(grep -m1 -oE "FAIL \([A-Za-z0-9_]+\)|[0-9]+ failed\.|panic: .{0,60}|Segmentation fault|reached unreachable|integer overflow|index out of bounds" <<< "$cls")"
+    elif grep -aqE "FAIL \(|[0-9]+ failed\.|panic: |Segmentation fault|reached unreachable|integer overflow|index out of bounds" <<< "$cls"; then
+        v=KILLED; reason="$(grep -a -m1 -oE "FAIL \([A-Za-z0-9_]+\)|[0-9]+ failed\.|panic: .{0,60}|Segmentation fault|reached unreachable|integer overflow|index out of bounds" <<< "$cls")"
     # The testing allocator's leak check fails a run with no failing test.
-    elif grep -qE "tests? leaked memory" <<< "$cls"; then
-        v=KILLED; reason="leak: $(grep -m1 -oE "[0-9]+ tests? leaked memory" <<< "$cls")"
+    elif grep -aqE "tests? leaked memory" <<< "$cls"; then
+        v=KILLED; reason="leak: $(grep -a -m1 -oE "[0-9]+ tests? leaked memory" <<< "$cls")"
     elif (( rc > 128 )); then
         v=KILLED; reason="signal $(( rc - 128 ))"
     else

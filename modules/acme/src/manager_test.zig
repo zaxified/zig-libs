@@ -3110,3 +3110,93 @@ test "wave 2: the account key's PEM is wiped before it is freed, on creation and
     try testing.expectEqual(@as(usize, 2), spy.zero_frees);
     try testing.expectEqual(@as(usize, 0), spy.dirty_frees);
 }
+
+// ── delta mutation run 2026-11-25: on-demand max_cached eviction ─────────────
+
+fn entryNamed(m: *Manager, name: []const u8) ?@TypeOf(m.entries.items[0]) {
+    for (m.entries.items) |e| if (std.mem.eql(u8, e.names[0], name)) return e;
+    return null;
+}
+
+test "mutation 2026-11-25: max_cached never forgets a busy name or a name without a certificate (and does not spin looking for one)" {
+    // Busy entry only: nothing idle to forget; the new name is simply added.
+    {
+        var f: Fixture = undefined;
+        f.init(day0 + day);
+        defer f.deinit();
+        var policy: Policy = .{};
+        var fake: FakeIssuer = .{ .script = &.{.{ .ok = .{ .chain = chainOf(fx.od1_crt), .key = fx.od1_key } }} };
+        var m = f.manager(.{ .storage = undefined, .on_demand = .{
+            .ctx = &policy,
+            .allow = Policy.allow,
+            .rate = .{ .max = 10, .window_s = 60 },
+            .max_cached = 1,
+        } });
+        defer m.deinit();
+        try m.addIssuer(fake.issuer(false));
+        try expectServes(&m, "od.example", chainOf(fx.od1_crt));
+        m.entries.items[0].busy = true; // a renewal in progress, say
+        defer m.entries.items[0].busy = false;
+        const got = try m.certificate(testing.allocator, "od2.example"); // the script is spent: no certificate
+        try testing.expect(got == null);
+        try testing.expectEqual(@as(usize, 2), m.entries.items.len);
+        try testing.expect(entryNamed(&m, "od.example") != null);
+    }
+    // A name without a certificate (its issuance failed) only: also nothing to forget.
+    {
+        var f: Fixture = undefined;
+        f.init(day0 + day);
+        defer f.deinit();
+        var policy: Policy = .{};
+        var fake: FakeIssuer = .{ .script = &.{.{ .fail = .{ .problem = "scripted" } }} };
+        var m = f.manager(.{ .storage = undefined, .on_demand = .{
+            .ctx = &policy,
+            .allow = Policy.allow,
+            .rate = .{ .max = 10, .window_s = 60 },
+            .max_cached = 1,
+        } });
+        defer m.deinit();
+        try m.addIssuer(fake.issuer(false));
+        try testing.expect((try m.certificate(testing.allocator, "x.example")) == null);
+        try testing.expectEqual(@as(usize, 1), m.entries.items.len);
+        try testing.expect((try m.certificate(testing.allocator, "y.example")) == null);
+        try testing.expectEqual(@as(usize, 2), m.entries.items.len);
+    }
+}
+
+test "mutation 2026-11-25: max_cached forgets the one idle name with a certificate, not a busy one or one without a certificate" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{
+        .script = &.{
+            .{ .fail = .{ .problem = "scripted" } }, // x.example: an entry without a certificate, first in the list
+            .{ .ok = .{ .chain = chainOf(fx.od1_crt), .key = fx.od1_key } },
+            .{ .ok = .{ .chain = chainOf(fx.od2_crt), .key = fx.od2_key } },
+        },
+    };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{
+        .ctx = &policy,
+        .allow = Policy.allow,
+        .rate = .{ .max = 10, .window_s = 60 },
+        .max_cached = 3,
+    } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try testing.expect((try m.certificate(testing.allocator, "x.example")) == null);
+    try expectServes(&m, "od.example", chainOf(fx.od1_crt));
+    try expectServes(&m, "od2.example", chainOf(fx.od2_crt));
+    try testing.expectEqual(@as(usize, 3), m.entries.items.len);
+    entryNamed(&m, "od.example").?.busy = true;
+    defer if (entryNamed(&m, "od.example")) |e| {
+        e.busy = false;
+    };
+    // A fourth name: the only idle name holding a certificate is od2.example.
+    try testing.expect((try m.certificate(testing.allocator, "y.example")) == null);
+    try testing.expect(entryNamed(&m, "od2.example") == null);
+    try testing.expect(entryNamed(&m, "x.example") != null);
+    const kept = entryNamed(&m, "od.example") orelse return error.BusyNameForgotten;
+    try testing.expect(!kept.removed);
+    try testing.expect(entryNamed(&m, "y.example") != null);
+}

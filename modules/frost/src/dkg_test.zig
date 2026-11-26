@@ -17,6 +17,7 @@
 //!     named, and every count/identifier check of frost-core.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const frost = @import("root.zig");
 const dkg = frost.dkg;
 
@@ -451,4 +452,131 @@ test "dkg: an allocation failure in any part leaks nothing" {
             key.deinit();
         } else |e| try testing.expectEqual(error.OutOfMemory, e);
     }
+}
+
+// ── delta mutation run 2026-11-25 ───────────────────────────────────────────
+
+test "mutation 2026-11-25: part1 accepts max_signers == min_signers" {
+    const gpa = testing.allocator;
+    const coeffs = [_]Scalar{ testScalar('a', 31), testScalar('a', 32) };
+    const nonce = testScalar('k', 31);
+    var s1: dkg.Round1SecretPackage = undefined;
+    var pkg = try dkg.part1(gpa, &s1, try Identifier.fromU16(1), 2, 2, &coeffs, &nonce);
+    defer pkg.deinit(gpa);
+    defer s1.deinit(gpa);
+    try testing.expectEqual(@as(u16, 2), s1.max_signers);
+    try testing.expectEqual(@as(u16, 2), s1.min_signers);
+}
+
+test "mutation 2026-11-25: verifyProofOfKnowledge refuses a malformed commitment, R, or scalar, and a zero scalar" {
+    const gpa = testing.allocator;
+    var run = try runDkg(gpa, 3, 2, 11);
+    defer run.deinit(gpa);
+    const sender = try Identifier.fromU16(2);
+    const good = run.packages[1];
+    try testing.expect(dkg.verifyProofOfKnowledge(sender, good));
+    const junk: frost.Element = .{ .bytes = @splat(0) };
+
+    var bad_commit = [2]frost.Element{ junk, good.commitment[1] };
+    try testing.expect(!dkg.verifyProofOfKnowledge(sender, .{ .commitment = &bad_commit, .proof_of_knowledge = good.proof_of_knowledge }));
+    var bad_r = good;
+    bad_r.proof_of_knowledge.r = junk;
+    try testing.expect(!dkg.verifyProofOfKnowledge(sender, bad_r));
+    var big_z = good;
+    big_z.proof_of_knowledge.z = @splat(0xff); // >= the group order
+    try testing.expect(!dkg.verifyProofOfKnowledge(sender, big_z));
+    var zero_z = good;
+    zero_z.proof_of_knowledge.z = @splat(0);
+    try testing.expect(!dkg.verifyProofOfKnowledge(sender, zero_z));
+    try testing.expect(!dkg.verifyProofOfKnowledge(sender, .{ .commitment = &.{}, .proof_of_knowledge = good.proof_of_knowledge }));
+}
+
+test "mutation 2026-11-25: part2 and part3 refuse too many packages and over-long commitments" {
+    const gpa = testing.allocator;
+    var run = try runDkg(gpa, 3, 2, 12);
+    defer run.deinit(gpa);
+    const id4 = try Identifier.fromU16(4);
+    const r1 = try round1For(gpa, run.packages, 0);
+    defer gpa.free(r1);
+    const r2 = try round2For(gpa, run.sent, 0);
+    defer gpa.free(r2);
+    var s2: dkg.Round2SecretPackage = undefined;
+    var key: dkg.KeyPackage = undefined;
+
+    // One package too many (a third sender).
+    var extra1 = [3]dkg.Round1Received{ r1[0], r1[1], .{ .sender = id4, .package = r1[0].package } };
+    try testing.expectError(error.IncorrectNumberOfPackages, dkg.part2(gpa, &s2, &run.secrets1[0], &extra1, null));
+    try testing.expectError(error.IncorrectNumberOfPackages, dkg.part3(gpa, &key, &run.secrets2[0], &extra1, &[3]dkg.Round2Received{ r2[0], r2[1], .{ .sender = id4, .signing_share = r2[0].signing_share } }, null));
+    // Consistently too few in both lists.
+    try testing.expectError(error.IncorrectNumberOfPackages, dkg.part3(gpa, &key, &run.secrets2[0], r1[0..1], r2[0..1], null));
+
+    // A commitment with an extra element (the proof only reads element 0).
+    const c = r1[0].package.commitment;
+    var long = [3]frost.Element{ c[0], c[1], c[1] };
+    var longer = [2]dkg.Round1Received{ r1[0], r1[1] };
+    longer[0].package.commitment = &long;
+    try testing.expectError(error.IncorrectNumberOfCommitments, dkg.part2(gpa, &s2, &run.secrets1[0], &longer, null));
+    try testing.expectError(error.IncorrectNumberOfCommitments, dkg.part3(gpa, &key, &run.secrets2[0], &longer, r2, null));
+
+    // part3: a duplicate sender among the round-1 packages (round 2 is fine).
+    var dup1 = [2]dkg.Round1Received{ r1[0], r1[1] };
+    dup1[1].sender = dup1[0].sender;
+    try testing.expectError(error.DuplicatedIdentifier, dkg.part3(gpa, &key, &run.secrets2[0], &dup1, r2, null));
+    // part3: the participant's own identifier among the round-1 senders.
+    var own1 = [2]dkg.Round1Received{ r1[0], r1[1] };
+    own1[0].sender = try Identifier.fromU16(1);
+    try testing.expectError(error.UnknownIdentifier, dkg.part3(gpa, &key, &run.secrets2[0], &own1, r2, null));
+}
+
+fn allZero(p: [*]const volatile u8, n: usize) bool {
+    for (0..n) |i| if (p[i] != 0) return false;
+    return true;
+}
+
+test "mutation 2026-11-25: every dkg secret container is wiped by its deinit (ReleaseFast: the safe builds poison on free)" {
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var run = try runDkg(gpa, 3, 2, 21);
+    defer run.deinit(gpa);
+    var buf: [16384]u8 align(16) = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+
+    // Round1SecretPackage.deinit: the coefficients.
+    const coefs = [_]Scalar{ testScalar('a', 91), testScalar('a', 92) };
+    const nonce = testScalar('k', 91);
+    var s1: dkg.Round1SecretPackage = undefined;
+    var pkg = try dkg.part1(a, &s1, try Identifier.fromU16(1), 3, 2, &coefs, &nonce);
+    const cp: [*]const volatile u8 = @ptrCast(s1.coefficients.ptr);
+    const clen = s1.coefficients.len * @sizeOf(Scalar);
+    try testing.expect(!allZero(cp, clen));
+    pkg.deinit(a);
+    s1.deinit(a);
+    try testing.expect(allZero(cp, clen));
+
+    // freeRound2Packages and Round2SecretPackage.deinit (the kept share).
+    const r1 = try round1For(gpa, run.packages, 0);
+    defer gpa.free(r1);
+    var sec2: dkg.Round2SecretPackage = undefined;
+    const sent = try dkg.part2(a, &sec2, &run.secrets1[0], r1, null);
+    const sp: [*]const volatile u8 = @ptrCast(sent.ptr);
+    const slen = sent.len * @sizeOf(dkg.Round2Package);
+    try testing.expect(!allZero(sp, slen));
+    dkg.freeRound2Packages(a, sent);
+    try testing.expect(allZero(sp, slen));
+    const kp: [*]const volatile u8 = @ptrCast(&sec2.secret_share.bytes);
+    try testing.expect(!allZero(kp, 32));
+    const r2 = try round2For(gpa, run.sent, 0);
+    defer gpa.free(r2);
+    var key: dkg.KeyPackage = undefined;
+    var pubs = try dkg.part3(a, &key, &sec2, r1, r2, null);
+    defer pubs.deinit(a);
+    sec2.deinit(a);
+    try testing.expect(allZero(kp, 32));
+
+    // KeyPackage.deinit: the signing share.
+    const sk: [*]const volatile u8 = @ptrCast(&key.signing_share.bytes);
+    try testing.expect(!allZero(sk, 32));
+    key.deinit();
+    try testing.expect(allZero(sk, 32));
 }

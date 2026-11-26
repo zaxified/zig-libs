@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** killing tests from the 2026-11-25 whole-module mutation run (`ttl_fn`, `getAll`, refresh-after-write).
 - **2026-11-21** — **Additive:** `Options.refresh_after_ns` (Caffeine `refreshAfterWrite`): a positive entry past that age but not expired is served while one caller reloads it on its own thread; `Cache.refresh(key)` reloads a key unconditionally; `Stats.refreshes` (new field). Default off, stored layout and behaviour unchanged when off. `invalidate(key)` now uses `ramcache.Cache.remove` instead of the poison-generation shadow (same observable behaviour).
 
 - **2026-11-16** — New: bulk loading. `Options.bulk_loader` (`BulkLoader`) + `Cache.getAll(keys)` / `freeAll`: hits served from the cache, keys already in flight awaited (coalesced), the remaining distinct keys fetched in ONE bulk loader call, stored under the usual TTL/negative rules (`ttl_fn` included); keys the loader omits become negative entries; without a bulk loader each missing key uses the single loader. Default behaviour unchanged.

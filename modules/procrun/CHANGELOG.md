@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** killing tests from the 2026-11-25 delta mutation run.
 - **2026-11-21** — **Additive:** `Spec.path_policy` (`PathPolicy`: `.parent` default as before, `.child_env` searches the child's `PATH` as Python and Rust do, `.none` makes a bare `argv[0]` relative to `cwd`).
 - **2026-11-21** — **Additive:** `Handle.retain`/`Handle.release`: a watchdog thread holding its own reference may `kill`/`cancel`/`signal*`/`terminate` while `wait` blocks and after it returned (no-ops once reaped); the signal methods now take a lock shared with `wait`. A `Handle` nobody retained behaves as before.
 - **2026-11-21** — **Behaviour change:** a child started by the Linux spawner is signalled through a pidfd (`CLONE_PIDFD`, `pidfd_send_signal`), so a reaped child's recycled pid cannot be hit; one descriptor per live child, closed at the reap; fallback to the old `waitid` gate where the kernel lacks it, for std's spawner and for process-group signals. A signal to a child that was already reaped out-of-band is now `ESRCH` on the pidfd, as before a no-op.

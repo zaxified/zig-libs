@@ -1123,3 +1123,54 @@ test "the local cursor matches testkit's: it cycles, and ranged stays in range" 
     var r: FuzzCursor = .{ .bytes = &[_]u8{0xFF} };
     try std.testing.expectEqual(@as(u32, 3), r.ranged(3, 3));
 }
+
+// ── delta mutation run 2026-11-25 ───────────────────────────────────────────
+
+test "mutation 2026-11-25: a comm_i that differs from identifier's entry in only the hiding or only the binding commitment is InvalidCommitmentList" {
+    const gpa = std.testing.allocator;
+    const group_public_key = elementFromHex(v.group.public_key);
+    const commitment_list = vectorCommitmentList();
+    const msg = hexN(4, v.group.message);
+    const p1_scalar = signingShareFromHex(v.participant_shares.p1).scalar();
+    const verifying_share_1 = try frost.Element.fromPoint(try frost.Secp256k1.basePoint.mul(p1_scalar.toBytes(.big), .big));
+    const h1 = elementFromHex(v.round1_p1.hiding_nonce_commitment);
+    const b1 = elementFromHex(v.round1_p1.binding_nonce_commitment);
+    const h3 = elementFromHex(v.round1_p3.hiding_nonce_commitment);
+    const b3 = elementFromHex(v.round1_p3.binding_nonce_commitment);
+    const half_wrong = [_]frost.NonceCommitmentPair{
+        .{ .hiding = h3, .binding = b1 },
+        .{ .hiding = h1, .binding = b3 },
+    };
+    for (half_wrong) |comm| {
+        try std.testing.expectError(error.InvalidCommitmentList, frost.verifySignatureShare(
+            gpa,
+            identifierFromU16(1),
+            verifying_share_1,
+            comm,
+            signatureShareFromHex(v.round2.p1_sig_share),
+            &commitment_list,
+            group_public_key,
+            &msg,
+        ));
+    }
+}
+
+test "mutation 2026-11-25: vssVerify is false for a malformed commitment element at any position and for a zero identifier" {
+    const gpa = std.testing.allocator;
+    const secret_key = scalarFromHex(v.group.secret_key);
+    const coefficients = [_]frost.Scalar{scalarFromHex(v.group.coefficient_1)};
+    const dealt = try frost.trustedDealerKeygen(gpa, secret_key, &coefficients, 3, 2);
+    defer gpa.free(dealt.shares);
+    defer gpa.free(dealt.vss_commitment);
+    const sh: frost.ParticipantShare = .{ .identifier = identifierFromU16(2), .signing_share = signingShareFromHex(v.participant_shares.p2) };
+    try std.testing.expect(try frost.vssVerify(&sh, dealt.vss_commitment));
+    const junk: frost.Element = .{ .bytes = @splat(0) };
+    const last_bad = [_]frost.Element{ dealt.vss_commitment[0], junk };
+    const first_bad = [_]frost.Element{ junk, dealt.vss_commitment[1] };
+    try std.testing.expect(!(try frost.vssVerify(&sh, &last_bad)));
+    try std.testing.expect(!(try frost.vssVerify(&sh, &first_bad)));
+    // identifier 0 is no evaluation point (a NonZeroScalar): never verifies.
+    var zero_id = sh;
+    zero_id.identifier = .{ .bytes = @splat(0) };
+    try std.testing.expect(!(try frost.vssVerify(&zero_id, dealt.vss_commitment)));
+}

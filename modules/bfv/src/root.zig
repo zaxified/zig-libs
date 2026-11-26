@@ -135,6 +135,7 @@ test {
     _ = kat_vectors;
     _ = @import("kat_test.zig");
     _ = @import("ops_test.zig");
+    _ = @import("mutation_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("bench.zig"); // opt-in via BFV_BENCH; SKIPs otherwise

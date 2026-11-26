@@ -395,3 +395,250 @@ test "refresh_after_ns: while one caller reloads a due entry, every other get is
     try testing.expectEqualStrings("v2", after.value);
     try testing.expectEqual(@as(u64, 2), gl.calls.load(.monotonic));
 }
+
+// ── delta mutation run 2026-11-25 (whole-module) ────────────────────────────
+
+/// A bulk loader for the stats and follower tests: key "n..." is missing, every
+/// other key loads "v"; a gate (optional) parks the call, `calls` counts it.
+const MutBulk = struct {
+    io: std.Io,
+    calls: std.atomic.Value(u64) = .init(0),
+    gate: std.atomic.Value(u32) = .init(1),
+
+    fn open(self: *MutBulk) void {
+        self.gate.store(1, .release);
+        self.io.futexWake(u32, &self.gate.raw, std.math.maxInt(u32));
+    }
+    fn loadFn(ctx: ?*anyopaque, keys: []const []const u8, out: []rt.LoadOutcome) anyerror!void {
+        const self: *MutBulk = @ptrCast(@alignCast(ctx.?));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        while (self.gate.load(.acquire) == 0) {
+            self.io.futexWaitTimeout(u32, &self.gate.raw, 0, .{ .duration = .{
+                .raw = .fromMilliseconds(20),
+                .clock = .awake,
+            } }) catch {};
+        }
+        for (keys, out) |k, *o| o.* = if (k[0] == 'n') .missing else .{ .value = "v" };
+    }
+    fn bulk(self: *MutBulk) rt.BulkLoader {
+        return .{ .ctx = self, .load = loadFn };
+    }
+};
+
+fn singleV(_: ?*anyopaque, _: []const u8) anyerror!rt.LoadOutcome {
+    return .{ .value = "v" };
+}
+
+test "mutation 2026-11-25: getAll counts hits, negative hits, misses and one load per bulk call" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var bl = MutBulk{ .io = io };
+    var clk = TestClock{};
+    var c = rt.Cache.init(testing.allocator, .{
+        .io = io,
+        .loader = .{ .load = singleV },
+        .bulk_loader = bl.bulk(),
+        .clock = clk.clock(),
+        .ttl_ns = 1000,
+        .negative_ttl_ns = 1000,
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+    });
+    defer c.deinit();
+    const keys = [_][]const u8{ "a", "n1" };
+    const r1 = try c.getAll(&keys);
+    c.freeAll(r1);
+    var st = c.getStats();
+    try testing.expectEqual(@as(u64, 2), st.misses);
+    try testing.expectEqual(@as(u64, 1), st.loads);
+    try testing.expectEqual(@as(u64, 0), st.hits);
+    const r2 = try c.getAll(&keys);
+    c.freeAll(r2);
+    st = c.getStats();
+    try testing.expectEqual(@as(u64, 2), st.hits); // the value and the cached "missing"
+    try testing.expectEqual(@as(u64, 1), st.negative_hits);
+    try testing.expectEqual(@as(u64, 2), st.misses);
+    try testing.expectEqual(@as(u64, 1), st.loads);
+    try testing.expectEqual(@as(u64, 1), bl.calls.load(.monotonic));
+}
+
+test "mutation 2026-11-25: refresh() counts a refresh and coalesces onto a load in flight" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var dummy = std.atomic.Value(u32).init(0);
+    var gl = GatedLoader{ .io = io, .value = "v1" };
+    var clk = TestClock{};
+    var c = rt.Cache.init(testing.allocator, .{
+        .io = io,
+        .loader = gl.loader(),
+        .clock = clk.clock(),
+        .ttl_ns = 1000,
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+    });
+    defer c.deinit();
+
+    // An explicit refresh of an idle key is a load and a refresh.
+    gl.open();
+    try c.refresh("k");
+    try testing.expectEqual(@as(u64, 1), c.getStats().refreshes);
+    try testing.expectEqual(@as(u64, 1), c.getStats().loads);
+
+    // A refresh that meets a load in flight joins it instead of loading again.
+    for (0..4) |_| {
+        c.invalidate("k");
+        gl.gate.store(0, .release);
+        var w = GetWorker{ .cache = &c, .key = "k", .want = "v1" };
+        const t = try std.Thread.spawn(.{}, GetWorker.run, .{&w});
+        const Pred = struct {
+            gl: *GatedLoader,
+            n: u64,
+            fn check(self: @This()) bool {
+                return self.gl.calls.load(.monotonic) >= self.n;
+            }
+        };
+        const before = gl.calls.load(.monotonic);
+        waitUntil(io, &dummy, Pred{ .gl = &gl, .n = before + 1 });
+        const Refresher = struct {
+            cache: *rt.Cache,
+            fn run(self: *@This()) void {
+                self.cache.refresh("k") catch {};
+            }
+        };
+        var rf = Refresher{ .cache = &c };
+        const t2 = try std.Thread.spawn(.{}, Refresher.run, .{&rf});
+        std.Io.sleep(io, .fromMilliseconds(30), .awake) catch {};
+        gl.open();
+        t.join();
+        t2.join();
+        try testing.expect(w.ok);
+    }
+}
+
+test "mutation 2026-11-25: getAll followers of another thread's call, and a thread that follows getAll's bulk call, get the value" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var dummy = std.atomic.Value(u32).init(0);
+    var gl = GatedLoader{ .io = io, .value = "v1" };
+    var bl = MutBulk{ .io = io, .gate = .init(0) };
+    var clk = TestClock{};
+    var c = rt.Cache.init(testing.allocator, .{
+        .io = io,
+        .loader = gl.loader(),
+        .bulk_loader = bl.bulk(),
+        .clock = clk.clock(),
+        .ttl_ns = 1000,
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+    });
+    defer c.deinit();
+    const Pred = struct {
+        calls: *std.atomic.Value(u64),
+        fn check(self: @This()) bool {
+            return self.calls.load(.monotonic) >= 1;
+        }
+    };
+
+    // (1) getAll follows a single get that is parked in its loader.
+    var w = GetWorker{ .cache = &c, .key = "k", .want = "v1" };
+    const t = try std.Thread.spawn(.{}, GetWorker.run, .{&w});
+    waitUntil(io, &dummy, Pred{ .calls = &gl.calls });
+    const AllWorker = struct {
+        cache: *rt.Cache,
+        keys: []const []const u8,
+        ok: bool = false,
+        fn run(self: *@This()) void {
+            const res = self.cache.getAll(self.keys) catch return;
+            defer self.cache.freeAll(res);
+            self.ok = res.len == self.keys.len and res[0] == .value and std.mem.eql(u8, res[0].value, "v1");
+        }
+    };
+    const only_k = [_][]const u8{"k"};
+    var aw = AllWorker{ .cache = &c, .keys = &only_k };
+    const t2 = try std.Thread.spawn(.{}, AllWorker.run, .{&aw});
+    std.Io.sleep(io, .fromMilliseconds(30), .awake) catch {};
+    gl.open();
+    t.join();
+    t2.join();
+    try testing.expect(w.ok);
+    try testing.expect(aw.ok);
+
+    // (2) a get follows getAll's bulk call that is parked in the bulk loader.
+    const only_x = [_][]const u8{"x"};
+    var lead = AllWorker{ .cache = &c, .keys = &only_x };
+    lead.ok = false;
+    const t3 = try std.Thread.spawn(.{}, AllWorker.run, .{&lead});
+    waitUntil(io, &dummy, Pred{ .calls = &bl.calls });
+    var fw = GetWorker{ .cache = &c, .key = "x", .want = "v" };
+    const t4 = try std.Thread.spawn(.{}, GetWorker.run, .{&fw});
+    std.Io.sleep(io, .fromMilliseconds(30), .awake) catch {};
+    bl.open();
+    t3.join();
+    t4.join();
+    try testing.expect(fw.ok);
+}
+
+test "mutation 2026-11-25: a refresh-tagged entry shorter than its 8-byte deadline is corrupt; exactly the deadline is an empty value" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var clk = TestClock{};
+    var c = rt.Cache.init(testing.allocator, .{
+        .io = io,
+        .loader = .{ .load = singleV },
+        .clock = clk.clock(),
+        .ttl_ns = 1000,
+        .refresh_after_ns = 10,
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+    });
+    defer c.deinit();
+    const now: i64 = clk.t.load(.monotonic);
+    c.store.put("short", "R\x01\x02\x03", now, 1000, c.generation);
+    try testing.expectError(error.CorruptEntry, c.get("short"));
+    var exact: [9]u8 = undefined;
+    exact[0] = 'R';
+    std.mem.writeInt(i64, exact[1..9], std.math.maxInt(i64), .little); // never due
+    c.store.put("exact", &exact, now, 1000, c.generation);
+    const r = try c.get("exact");
+    defer c.free(r);
+    try testing.expectEqual(@as(usize, 0), r.value.len);
+}
+
+test "mutation 2026-11-25: a value stored with refresh_after_ns still expires at its TTL" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var clk = TestClock{};
+    var calls = std.atomic.Value(u64).init(0);
+    const L = struct {
+        fn load(ctx: ?*anyopaque, _: []const u8) anyerror!rt.LoadOutcome {
+            const n: *std.atomic.Value(u64) = @ptrCast(@alignCast(ctx.?));
+            _ = n.fetchAdd(1, .monotonic);
+            return .{ .value = "v" };
+        }
+    };
+    var c = rt.Cache.init(testing.allocator, .{
+        .io = io,
+        .loader = .{ .ctx = &calls, .load = L.load },
+        .clock = clk.clock(),
+        .ttl_ns = 1000,
+        .refresh_after_ns = 400,
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+    });
+    defer c.deinit();
+    clk.t.store(1, .monotonic);
+    c.free(try c.get("k"));
+    clk.t.store(300, .monotonic); // within the TTL and before the refresh deadline: a plain hit
+    c.free(try c.get("k"));
+    try testing.expectEqual(@as(u64, 1), c.getStats().hits);
+    try testing.expectEqual(@as(u64, 1), calls.load(.monotonic));
+    clk.t.store(5000, .monotonic); // far past the TTL: a miss that loads again
+    c.free(try c.get("k"));
+    try testing.expectEqual(@as(u64, 2), c.getStats().misses);
+    try testing.expectEqual(@as(u64, 2), calls.load(.monotonic));
+}

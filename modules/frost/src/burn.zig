@@ -31,3 +31,22 @@ pub noinline fn burnStack() void {
     const p: [*]align(16) volatile V = &buf;
     for (0..buf.len) |i| p[i] = @splat(0);
 }
+
+/// The burn of `dkg.zig`'s three parts. `stack_burn` (32 KiB) is too shallow
+/// for them: measured with `stackprobe_test.zig` (ReleaseFast, direct-region
+/// engine, 2026-11-25) the dirty stack below `dkg.part1` / `part2` / `part3`
+/// reaches 33 087 / 32 927 / 36 047 B (the public-point multiplications of the
+/// proof-of-knowledge and vss checks, plus the Horner evaluation), and the
+/// shared residue rule found bytes below the 32 KiB burn after `part3`. The
+/// burn has to cover the call's depth, so it is 64 KiB here; the signing paths
+/// (measured 19 KB) keep `stack_burn`.
+pub const dkg_burn = 64 * 1024;
+
+/// `burnStack` with `dkg_burn` bytes; the same body (see there for why
+/// `noinline`, the volatile 16-byte stores and the alignment).
+pub noinline fn burnStackDkg() void {
+    const V = @Vector(2, u64);
+    var buf: [dkg_burn / @sizeOf(V)]V align(16) = undefined;
+    const p: [*]align(16) volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
+}
