@@ -2510,7 +2510,10 @@ dtls	ReleaseFast	ku	1	297	0080f1336180e918	505aa3fdd426f98d	cpu=x86_64 control=3
 # length of the decrypted handshake message, a framing value that the record length already shows on
 # the wire; native lowers that memset without the size dispatch.
 dtls	ReleaseFast	hs12	1	48	f663be99d2675b9d	d87712f4d6e60179	cpu=x86_64
-quic-crypto	ReleaseFast	aes	1	84	a9cfcb477cfbd6ba	4d96b4e7d3af1ed7	cpu=x86_64 control=3 trap=45
+# quic-crypto aes portable trap 45 -> 37 (2026-11-26): Protection now keeps one expanded AEAD context per
+# direction instead of expanding the key per packet, so std's soft AES runs its key schedule fewer times and
+# its undefined-lane padding reports fewer untainted contexts. Tainted in-file (84) and control (3) unchanged.
+quic-crypto	ReleaseFast	aes	1	84	a9cfcb477cfbd6ba	4d96b4e7d3af1ed7	cpu=x86_64 control=3 trap=37
 aeskw	ReleaseFast	wrap	1	694	88dac35c72f0539b	23036d19c2656c6a	cpu=x86_64 control=8 trap=28
 aeadframe	ReleaseFast	aes	1	157	fcb76a730014f644	9e2cdfce46f95d92	cpu=x86_64 control=4 trap=4
 ctap2	ReleaseFast	pin	1	100	1a774f0de6a12bd1	01e08eb2902d2802	cpu=x86_64 control=6 trap=6
