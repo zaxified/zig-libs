@@ -430,6 +430,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("kat_commit_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta.deps is exactly {\"hpke\", \"aesgcm\", \"p256\", \"p384\", \"p521\", \"ed448\", \"ct25519\"}" {

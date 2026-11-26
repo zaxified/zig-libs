@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-03 · mutation 2026-11-21 (172/178, 6 eq) · src 06bdc4f8850f852a
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWE_FUZZ) · ct 2026-11-13 (ctgrind, decrypt side, tainted key per kind: dir CEK 18, AxxxKW/GCMKW KEK 5, ECDH-ES static key 8, PBES2 password 3, RSA-OAEP key 20 in-file, unattributed 0; every context is a designed public verdict, itemised under Constant-time; the encrypt side draws its secrets internally and emits only public ciphertext, so it takes no tainted input) · panic 2026-11-13 (sweep of every pub entry point: an `apu`/`apv`/`iv`/`tag`/`p2s`/`epk` member over 128 bytes overran the header encoder's base64 scratch, now `HeaderTooLarge`/`BufferTooSmall`; the Concat KDF accepts an empty output and panics with a checked message beyond its 32-bit fields; a GCM plaintext past 2^36 - 32 bytes is `BufferTooSmall`)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWE_FUZZ) · ct 2026-11-13 (ctgrind, decrypt side, tainted key per kind: dir CEK 16 (18 before the 2026-11-26 burn of `cbc_hmac`: the same verdicts on fewer stacks), AxxxKW/GCMKW KEK 5, ECDH-ES static key 8, PBES2 password 3, RSA-OAEP key 20 in-file, unattributed 0; every context is a designed public verdict, itemised under Constant-time; the encrypt side draws its secrets internally and emits only public ciphertext, so it takes no tainted input) · panic 2026-11-13 (sweep of every pub entry point: an `apu`/`apv`/`iv`/`tag`/`p2s`/`epk` member over 128 bytes overran the header encoder's base64 scratch, now `HeaderTooLarge`/`BufferTooSmall`; the Concat KDF accepts an empty output and panics with a checked message beyond its 32-bit fields; a GCM plaintext past 2^36 - 32 bytes is `BufferTooSmall`)
 
 **Performance:** not measured
 
@@ -185,9 +185,10 @@ against the returned (declassified) one; the module's own branches on it stay co
 x86-64 (`scripts/test.sh ctgrind-portable`) the counts are `cpu=x86_64` variant rows: std's soft-AES
 key schedule (A1) and its `undefined` batch padding (A2) add contexts, none a jwe branch on a key.
 
-- **content 18** — GCM tag verdict `aesgcm` root.zig x3 (one per key size); CBC-HMAC tag
-  verdict `enc.zig` x6 (`timing_safe.eql` result, accept + reject, 3 encs), checked BEFORE any
-  decryption; PKCS#7 unpad result `aescbc` root.zig x2; the plaintext length
+- **content 16** — GCM tag verdict `aesgcm` root.zig x3 (one per key size); CBC-HMAC tag
+  verdict `enc.zig` x3 (`timing_safe.eql` result, one per enc: accept and reject reach it on one
+  stack since 2026-11-26, when `cbc_hmac`'s body moved into its own burned `noinline` frame; it
+  was x6), checked BEFORE any decryption; PKCS#7 unpad result `aescbc` root.zig x3; the plaintext length
   (`root.zig` `n == plaintext.len` x3, its realloc std Allocator.zig / PageAllocator.zig x4).
   All public: accept/reject, and a length the authenticated sender chose.
 - **kw 5** — `aeskw` root.zig unwrap integrity verdict x2, `aesgcm` :1048 x3 (content tag + GCMKW

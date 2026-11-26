@@ -116,6 +116,7 @@ test {
     _ = @import("edges_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 test "meta.deps is exactly {chachapoly, aesgcm} (the AEADs; NOT wireguard)" {

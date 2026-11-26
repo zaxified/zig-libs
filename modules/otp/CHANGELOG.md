@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack coverage sweep: a `testkit.stackprobe` probe of the public secret entry points no probe called — `hotpVerify` and `hotpResync` (`src/stackprobe2_test.zig`). Clean. Test only.
 - **2026-11-16** — New: `hotpVerify` (HOTP look-ahead window, RFC 4226 §7.4; returns the matched counter, window capped by `max_hotp_window`, `error.WindowTooLarge` beyond, whole window always evaluated, constant-time compares) and `hotpResync` (two consecutive codes, §7.4/7.5). Additive; tests from RFC 4226 Appendix D.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).

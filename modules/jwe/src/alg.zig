@@ -93,14 +93,16 @@ pub fn rsaOaepUnwrap(sk: *const rsa.SecretKey, hash: OaepHash, encrypted_key: []
 /// caller-supplied random 96-bit `iv` and no AAD (§4.7.1 — the header
 /// carries `iv`/`tag` as its own params, produced/consumed by the caller of
 /// this function). 16/24/32-byte KEKs on
-/// `aesgcm.Aes128Gcm`/`Aes192Gcm`/`Aes256Gcm`, as `enc.gcm`.
+/// `aesgcm.Aes128Gcm`/`Aes192Gcm`/`Aes256Gcm`, as `enc.gcm`. The KEK goes
+/// down by pointer (`encryptInto`): a `kek[0..n].*` argument left a by-value
+/// copy of it in this frame, above aesgcm's burn (dead-stack probe, 2026-11-26).
 pub fn gcmkwWrap(kek: []const u8, iv: [12]u8, cek: []const u8, ct_out: []u8, tag_out: *[16]u8) Error![]u8 {
     if (ct_out.len < cek.len) return error.BufferTooSmall;
     const ct = ct_out[0..cek.len];
     switch (kek.len) {
-        16 => aesgcm.Aes128Gcm.encrypt(ct, tag_out, cek, "", iv, kek[0..16].*),
+        16 => aesgcm.Aes128Gcm.encryptInto(ct, tag_out, cek, "", iv, kek[0..16]),
         24 => aesgcm.Aes192Gcm.encryptInto(ct, tag_out, cek, "", iv, kek[0..24]),
-        32 => aesgcm.Aes256Gcm.encrypt(ct, tag_out, cek, "", iv, kek[0..32].*),
+        32 => aesgcm.Aes256Gcm.encryptInto(ct, tag_out, cek, "", iv, kek[0..32]),
         else => return error.UnsupportedKeyLength,
     }
     return ct;
@@ -111,9 +113,9 @@ pub fn gcmkwUnwrap(kek: []const u8, iv: [12]u8, tag: [16]u8, encrypted_key: []co
     if (out.len < encrypted_key.len) return error.BufferTooSmall;
     const pt = out[0..encrypted_key.len];
     switch (kek.len) {
-        16 => aesgcm.Aes128Gcm.decrypt(pt, encrypted_key, tag, "", iv, kek[0..16].*) catch return error.UnwrapFailed,
+        16 => aesgcm.Aes128Gcm.decryptInto(pt, encrypted_key, tag, "", iv, kek[0..16]) catch return error.UnwrapFailed,
         24 => aesgcm.Aes192Gcm.decryptInto(pt, encrypted_key, tag, "", iv, kek[0..24]) catch return error.UnwrapFailed,
-        32 => aesgcm.Aes256Gcm.decrypt(pt, encrypted_key, tag, "", iv, kek[0..32].*) catch return error.UnwrapFailed,
+        32 => aesgcm.Aes256Gcm.decryptInto(pt, encrypted_key, tag, "", iv, kek[0..32]) catch return error.UnwrapFailed,
         else => return error.UnsupportedKeyLength,
     }
     return pt;

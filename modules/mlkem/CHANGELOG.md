@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack coverage sweep: a `testkit.stackprobe` probe of the public secret entry points no probe called — the `io` forms (`encapsInto`, `tryEncapsInto`, `generateInto`, `tryGenerateInto` with and without the pairwise check), `pairwiseConsistencyCheck` and the by-value forms (`src/stackprobe2_test.zig`). Clean. Test only.
 - **2026-11-23** — **BEHAVIOURAL, not breaking:** every secret entry point (keygen, encaps, decaps, `SecretKey.fromBytes`) zeroes the stack its body used (12–28 KiB per set, `src/burn.zig`); the module had no dead-stack hardening. Added: `PublicKey.encapsInto`, `tryEncapsInto`, `encapsDeterministicInto`, `SecretKey.decapsInto`, `SecretKey.fromBytesInto`, which write the secret result to caller memory (the by-value forms keep a copy in their own frame; the new probe `src/stackprobe_test.zig` found it). No measurable cost in `bench-mlkem`. ctgrind counts unchanged, digests re-taken.
 - **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): `Poly.v` loses its explicit `align(32)`, the workaround for Zig 0.17.0 dropping the error of an error union whose payload held a 32-byte vector on aarch64 (ziglang/zig#37110, fixed in 0.17.1; `build.zig` now refuses older compilers). The bad-key `SecretKey.fromBytes` tests stay as its regression guard; the CI arm64 lane runs them.
 - **2026-11-01** — Fix: on aarch64 `SecretKey.fromBytes` accepted every

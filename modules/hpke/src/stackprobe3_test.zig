@@ -279,3 +279,87 @@ test "mutation 2026-11-25: STACKPROBE: agile sealBase / openBase leave nothing o
     var back: [10]u8 = undefined;
     _ = try Pr.run("agile openBase", agOpen, .{ s, &kp, &sealed, &back }, &.{ &kp.dhkem_x25519_hkdf_sha256.secret_key, &dh, &ss, &ctx_key, &ctx_exp }, .{});
 }
+
+// ── coverage sweep 2026-11-26: the deterministic senders and the recipients
+//    of the psk / auth / auth-psk modes (X25519, AES-128-GCM) ─────────────────
+
+const Ctx = schedule.Context(Aes, 32);
+
+fn setupPskSDetW(out: *Setup, pkR: X.PublicKey, eph: *const X.KeyPair) !void {
+    return schedule.setupPskSDeterministic(X, Aes, 32, out, pkR, eph, info, probe_psk, "id");
+}
+fn setupAuthSDetW(out: *Setup, pkR: X.PublicKey, skS: *const X.KeyPair, eph: *const X.KeyPair) !void {
+    return schedule.setupAuthSDeterministic(X, Aes, 32, out, pkR, skS, eph, info);
+}
+fn setupAuthPskSDetW(out: *Setup, pkR: X.PublicKey, skS: *const X.KeyPair, eph: *const X.KeyPair) !void {
+    return schedule.setupAuthPskSDeterministic(X, Aes, 32, out, pkR, skS, eph, info, probe_psk, "id");
+}
+fn setupPskRW(out: *Ctx, enc: X.EncappedKey, skR: *const X.KeyPair) !void {
+    return schedule.setupPskR(X, Aes, 32, out, enc, skR, info, probe_psk, "id");
+}
+fn setupAuthRW(out: *Ctx, enc: X.EncappedKey, skR: *const X.KeyPair, pkS: X.PublicKey) !void {
+    return schedule.setupAuthR(X, Aes, 32, out, enc, skR, pkS, info);
+}
+fn setupAuthPskRW(out: *Ctx, enc: X.EncappedKey, skR: *const X.KeyPair, pkS: X.PublicKey) !void {
+    return schedule.setupAuthPskR(X, Aes, 32, out, enc, skR, pkS, info, probe_psk, "id");
+}
+fn sealPskDetW(pkR: X.PublicKey, eph: *const X.KeyPair, out: *[10 + 16]u8) !void {
+    _ = try schedule.sealPskDeterministic(X, Aes, 32, pkR, eph, info, probe_psk, "id", "aad", "0123456789", out);
+}
+fn sealAuthDetW(pkR: X.PublicKey, skS: *const X.KeyPair, eph: *const X.KeyPair, out: *[10 + 16]u8) !void {
+    _ = try schedule.sealAuthDeterministic(X, Aes, 32, pkR, skS, eph, info, "aad", "0123456789", out);
+}
+fn sealAuthPskDetW(pkR: X.PublicKey, skS: *const X.KeyPair, eph: *const X.KeyPair, out: *[10 + 16]u8) !void {
+    _ = try schedule.sealAuthPskDeterministic(X, Aes, 32, pkR, skS, eph, info, probe_psk, "id", "aad", "0123456789", out);
+}
+fn openPskW(enc: X.EncappedKey, skR: *const X.KeyPair, ct: *const [10 + 16]u8, out: *[10]u8) !void {
+    return schedule.openPsk(X, Aes, 32, enc, skR, info, probe_psk, "id", "aad", ct, out);
+}
+fn openAuthW(enc: X.EncappedKey, skR: *const X.KeyPair, pkS: X.PublicKey, ct: *const [10 + 16]u8, out: *[10]u8) !void {
+    return schedule.openAuth(X, Aes, 32, enc, skR, pkS, info, "aad", ct, out);
+}
+fn openAuthPskW(enc: X.EncappedKey, skR: *const X.KeyPair, pkS: X.PublicKey, ct: *const [10 + 16]u8, out: *[10]u8) !void {
+    return schedule.openAuthPsk(X, Aes, 32, enc, skR, pkS, info, probe_psk, "id", "aad", ct, out);
+}
+
+test "STACKPROBE: the deterministic psk/auth senders and the psk/auth recipients leave nothing on the dead stack" {
+    try sp.skipUnlessOptimized();
+    var ikm: [X.Nsk]u8 = undefined;
+    detFill(&ikm);
+    var eph: X.KeyPair = undefined;
+    X.deriveKeyPair(&eph, &ikm);
+    var r: X.KeyPair = undefined;
+    X.deriveKeyPair(&r, "recipient ikm");
+    var s: X.KeyPair = undefined;
+    X.deriveKeyPair(&s, "sender ikm");
+    var ss: [X.Nsecret]u8 = undefined;
+    try X.decap(&ss, eph.public_key, &r);
+    var ss_auth: [X.Nsecret]u8 = undefined;
+    try X.authDecap(&ss_auth, eph.public_key, &r, s.public_key);
+    const dh_e = dhOf(X, &eph.secret_key, &r.public_key);
+    const dh_s = dhOf(X, &s.secret_key, &r.public_key);
+    const enc: X.EncappedKey = eph.public_key;
+    var st: Setup = undefined;
+    var ctx: Ctx = undefined;
+
+    _ = try Pr.run("setupPskSDeterministic", setupPskSDetW, .{ &st, r.public_key, &eph }, &.{ &eph.secret_key, probe_psk, &dh_e, &ss, &st.context.key, &st.context.exporter_secret }, .{});
+    _ = try Pr.run("setupAuthSDeterministic", setupAuthSDetW, .{ &st, r.public_key, &s, &eph }, &.{ &eph.secret_key, &s.secret_key, &dh_e, &dh_s, &ss_auth, &st.context.key, &st.context.exporter_secret }, .{});
+    _ = try Pr.run("setupAuthPskSDeterministic", setupAuthPskSDetW, .{ &st, r.public_key, &s, &eph }, &.{ &eph.secret_key, &s.secret_key, probe_psk, &dh_e, &dh_s, &ss_auth, &st.context.key, &st.context.exporter_secret }, .{});
+    _ = try Pr.run("setupPskR", setupPskRW, .{ &ctx, enc, &r }, &.{ &r.secret_key, probe_psk, &dh_e, &ss, &ctx.key, &ctx.exporter_secret }, .{});
+    _ = try Pr.run("setupAuthR", setupAuthRW, .{ &ctx, enc, &r, s.public_key }, &.{ &r.secret_key, &dh_e, &dh_s, &ss_auth, &ctx.key, &ctx.exporter_secret }, .{});
+    _ = try Pr.run("setupAuthPskR", setupAuthPskRW, .{ &ctx, enc, &r, s.public_key }, &.{ &r.secret_key, probe_psk, &dh_e, &dh_s, &ss_auth, &ctx.key, &ctx.exporter_secret }, .{});
+
+    var ct_psk: [10 + 16]u8 = undefined;
+    var ct_auth: [10 + 16]u8 = undefined;
+    var ct_ap: [10 + 16]u8 = undefined;
+    _ = try Pr.run("sealPskDeterministic", sealPskDetW, .{ r.public_key, &eph, &ct_psk }, &.{ &eph.secret_key, probe_psk, &dh_e, &ss }, .{});
+    _ = try Pr.run("sealAuthDeterministic", sealAuthDetW, .{ r.public_key, &s, &eph, &ct_auth }, &.{ &eph.secret_key, &s.secret_key, &dh_e, &dh_s, &ss_auth }, .{});
+    _ = try Pr.run("sealAuthPskDeterministic", sealAuthPskDetW, .{ r.public_key, &s, &eph, &ct_ap }, &.{ &eph.secret_key, &s.secret_key, probe_psk, &dh_e, &dh_s, &ss_auth }, .{});
+    var back: [10]u8 = undefined;
+    _ = try Pr.run("openPsk", openPskW, .{ enc, &r, &ct_psk, &back }, &.{ &r.secret_key, probe_psk, &dh_e, &ss }, .{});
+    try testing.expectEqualStrings("0123456789", &back);
+    _ = try Pr.run("openAuth", openAuthW, .{ enc, &r, s.public_key, &ct_auth, &back }, &.{ &r.secret_key, &dh_e, &dh_s, &ss_auth }, .{});
+    try testing.expectEqualStrings("0123456789", &back);
+    _ = try Pr.run("openAuthPsk", openAuthPskW, .{ enc, &r, s.public_key, &ct_ap, &back }, &.{ &r.secret_key, probe_psk, &dh_e, &dh_s, &ss_auth }, .{});
+    try testing.expectEqualStrings("0123456789", &back);
+}

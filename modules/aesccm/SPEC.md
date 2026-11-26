@@ -92,7 +92,5 @@ zeroed, additional data / nonce changes rejected, the boundary errors. `scripts/
 
 ## Backlog / deferred
 
-- **A dead-stack probe** (`testkit.stackprobe`, as `aesgcm` / `chachapoly` have): the nine wipes of key-schedule and
-  counter locals are unobserved by any test (2026-11-25 mutation run).
 - **OSCORE on this module.** `oscore` uses std's `Aes128Ccm8` (13-byte nonce) today; switching it to
   `Aes128Ccm8Nonce13` is a one-line change once a consumer wants a single CCM core.

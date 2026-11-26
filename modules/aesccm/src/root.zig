@@ -212,6 +212,7 @@ pub fn Ccm(comptime Aes: type, comptime tag_len: usize, comptime nonce_len: usiz
 test {
     _ = @import("fuzz_test.zig");
     _ = @import("mutation_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 const testing = std.testing;

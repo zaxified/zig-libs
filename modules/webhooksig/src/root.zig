@@ -2024,6 +2024,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("stackprobe3_test.zig");
     _ = @import("sweep_test.zig");
 }
 

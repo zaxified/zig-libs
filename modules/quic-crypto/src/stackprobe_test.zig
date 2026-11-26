@@ -149,3 +149,24 @@ test "mutation 2026-11-25: STACKPROBE: Keyed seal/open leave no key residue on t
     const n2 = try kdChachaSeal(&pt, &ct);
     _ = try P.run("Keyed(ChaCha20Poly1305).open", kdChachaOpen, .{ ct[0..n2], &back }, &.{&key32}, .{});
 }
+
+fn kdGcmInit(k: *const [16]u8) void {
+    Gcm.Keyed.initInto(&kd_gcm, k, iv);
+}
+fn kdChachaInit(k: *const [32]u8) void {
+    Chacha.Keyed.initInto(&kd_chacha, k, iv);
+}
+
+// Coverage sweep 2026-11-26: `Keyed.initInto` expands the key schedule in place; no
+// copy of the key or of the expanded schedule (AES round keys, GHASH key) may
+// stay in its frames. It carries no burn (it writes only into `out`).
+test "STACKPROBE: Keyed.initInto leaves no key or key-schedule bytes on the dead stack" {
+    try sp.skipUnlessOptimized();
+    fill();
+    Gcm.Keyed.initInto(&kd_gcm, &key16, iv);
+    const gcm_state = std.mem.toBytes(kd_gcm.state);
+    defer kd_gcm.wipe();
+    defer kd_chacha.wipe();
+    _ = try P.run("Keyed(Aes128Gcm).initInto", kdGcmInit, .{&key16}, &.{ &key16, &gcm_state }, .{ .burn = false });
+    _ = try P.run("Keyed(ChaCha20Poly1305).initInto", kdChachaInit, .{&key32}, &.{&key32}, .{ .burn = false });
+}

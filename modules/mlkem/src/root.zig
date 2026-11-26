@@ -50,6 +50,7 @@ test {
     _ = @import("vectors_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }
 
 const testing = std.testing;

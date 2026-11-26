@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack coverage sweep: a `testkit.stackprobe` probe of the public secret entry points no probe called — the batch evaluators and the three servers' `blindEvaluateBatch`, every group (`src/stackprobe2_test.zig`). Clean. Test only.
 - **2026-11-23** — Added: `OprfServer.deriveInto`, `VoprfServer.deriveInto`, `PoprfServer.deriveInto` — `derive` into caller memory, so no copy of `skS` stays in a returning frame (the by-value `derive` now delegates to it). ctgrind counts unchanged, digests re-taken.
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-21** — **Behaviour change:** `expandMessageXmd` (SHA-512) and `h2c.expandMessageXmd` are now `sha2.expandMessageXmd` (new dependency `sha2`; `h2c.expandMessageXmd` is a re-export, its `dst` a runtime parameter, so a comptime DST still compiles). A DST over 255 bytes is reduced per RFC 9380 §5.3.3 (`H("H2C-OVERSIZE-DST-" || DST)`) instead of a `@panic` (top level) or a compile error (`h2c`); an empty DST is still a checked `@panic` at the top level. Outputs for every DST of 1..255 bytes are unchanged (K.1, K.3, J.1.1–J.3.1 and every RFC 9497 suite KAT still pass).

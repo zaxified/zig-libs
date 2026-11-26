@@ -1858,4 +1858,5 @@ test "KAT (noise as oracle): XX mode == raw Noise_XX over the XX prologue, byte-
 test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("stackprobe2_test.zig");
 }

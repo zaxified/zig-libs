@@ -79,7 +79,7 @@ noinline fn encryptUnburned(
     tag_out: []u8,
 ) Error!usize {
     if (enc.isGcm()) return gcm.encrypt(enc, cek, iv, aad, plaintext, ciphertext_out, tag_out);
-    return cbc_hmac.encrypt(enc, cek, iv, aad, plaintext, ciphertext_out, tag_out);
+    return cbc_hmac.encryptBody(enc, cek, iv, aad, plaintext, ciphertext_out, tag_out);
 }
 
 /// Decrypt + verify. Returns the written plaintext length. Burned like
@@ -108,7 +108,7 @@ noinline fn decryptUnburned(
     plaintext_out: []u8,
 ) Error!usize {
     if (enc.isGcm()) return gcm.decrypt(enc, cek, iv, aad, ciphertext, tag, plaintext_out);
-    return cbc_hmac.decrypt(enc, cek, iv, aad, ciphertext, tag, plaintext_out);
+    return cbc_hmac.decryptBody(enc, cek, iv, aad, ciphertext, tag, plaintext_out);
 }
 
 /// `A128GCM`/`A192GCM`/`A256GCM` (RFC 7518 §5.3) — the `aesgcm` module's
@@ -216,7 +216,24 @@ pub const cbc_hmac = struct {
     const hmac = std.crypto.auth.hmac.sha2;
     const block_len = 16;
 
+    /// The CEK's MAC half keys an HMAC whose state (key ^ ipad / opad) and the
+    /// AES-CBC frames sit below this call: it burns them like `enc.encrypt`
+    /// (dead-stack coverage sweep 2026-11-26; it had no burn of its own).
     pub fn encrypt(
+        enc: Enc,
+        cek: []const u8,
+        iv: []const u8,
+        aad: []const u8,
+        plaintext: []const u8,
+        ciphertext_out: []u8,
+        tag_out: []u8,
+    ) Error!usize {
+        const r = encryptBody(enc, cek, iv, aad, plaintext, ciphertext_out, tag_out);
+        burn.stack(burn.content_burn);
+        return r;
+    }
+
+    noinline fn encryptBody(
         enc: Enc,
         cek: []const u8,
         iv: []const u8,
@@ -233,7 +250,22 @@ pub const cbc_hmac = struct {
         };
     }
 
+    /// As `encrypt`: burns its frames (the HMAC state, the CBC frames).
     pub fn decrypt(
+        enc: Enc,
+        cek: []const u8,
+        iv: []const u8,
+        aad: []const u8,
+        ciphertext: []const u8,
+        tag: []const u8,
+        plaintext_out: []u8,
+    ) Error!usize {
+        const r = decryptBody(enc, cek, iv, aad, ciphertext, tag, plaintext_out);
+        burn.stack(burn.content_burn);
+        return r;
+    }
+
+    noinline fn decryptBody(
         enc: Enc,
         cek: []const u8,
         iv: []const u8,

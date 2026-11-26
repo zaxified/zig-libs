@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack coverage sweep: a `testkit.stackprobe` probe of the public secret entry points no probe called — `KeyPair.signPrehashed` (`src/stackprobe3_test.zig`). Clean. Test only.
 - **2026-11-23** — **Changed (unreleased API):** the RFC 6979 nonce made public on 2026-11-21 is now `sign.rfc6979NonceInto(out: *Scalar, privkey: *const [32]u8, hash32: *const [32]u8)`, run under a dead-stack burn (`burn.nonce_burn`, 4 KiB). The by-value `rfc6979Nonce(privkey, hash32) Scalar` it replaces copied the key into the caller's frame and returned the nonce, which reveals the key with one signature, through a result slot with no burn; it is private again. Never in a tag. New probe in `src/stackprobe2_test.zig` (needles reached 1 535 B; a 16-byte burn turns it red). `ecvrf` moved to the new form.
 - **2026-11-23** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written dead-stack probe (`src/stackprobe_test.zig`) also applies the residue rule (`testkit.stackprobe.residueOf`) to its snapshots: a non-zero byte below a measured call's burn now fails it, whatever secret the needle model names or misses. Clean. Test only.
 - **2026-11-21** — `sign.rfc6979Nonce(privkey, hash32)` is now `pub` (RFC 6979 §3.2 nonce over `SHA-256(m)`), for `ecvrf`'s P-256 suites (RFC 9381 §5.4.2.1). Additive; no behaviour change.
