@@ -31,6 +31,7 @@ const Fp12 = bls12_381.Fp12;
 const cs = tlock.ciphersuite;
 const Kem = hqc.Hqc128;
 const Env = envelope.Envelope(Kem);
+const Mu = @import("multi.zig").Multi(Kem);
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const WINDOW = 512 * 1024;
@@ -325,6 +326,13 @@ var beacon_pub: g2.Affine = undefined;
 var round_sig: g1.Affine = undefined;
 const probe_round: u64 = 1000;
 
+// Multi-recipient (version 3): two slots over the same key pair.
+var m_coins: [2][Kem.coins_bytes]u8 = undefined;
+var m_eks: [2]*const Kem.EncapsKey = undefined;
+var cur_mrnd: Mu.Randomness = undefined;
+var cur_menv: [16384]u8 = undefined;
+var cur_menv_len: usize = 0;
+
 var heap_buf: [256 * 1024]u8 = undefined;
 var heap_fba: std.heap.FixedBufferAllocator = undefined;
 var rnd_sink: Env.SealRandomness = undefined;
@@ -360,6 +368,21 @@ noinline fn callSeal() void {
 noinline fn callOpen() void {
     heap_fba.reset();
     const p = apiOpen(heap_fba.allocator(), cur_env[0..cur_env_len], &kp.dk);
+    std.mem.doNotOptimizeAway(p.ptr);
+}
+noinline fn callSealMulti() void {
+    heap_fba.reset();
+    const e = Mu.sealWithRandomness(heap_fba.allocator(), &cur_pt, &m_eks, beacon_pub, probe_round, &cur_mrnd, .{}) catch unreachable;
+    std.mem.doNotOptimizeAway(e.ptr);
+}
+noinline fn callSealMultiIo() void {
+    heap_fba.reset();
+    const e = Mu.seal(heap_fba.allocator(), fakeIo(), &cur_pt, &m_eks, beacon_pub, probe_round, .{}) catch unreachable;
+    std.mem.doNotOptimizeAway(e.ptr);
+}
+noinline fn callOpenMulti() void {
+    heap_fba.reset();
+    const p = Mu.open(heap_fba.allocator(), cur_menv[0..cur_menv_len], &kp.dk, round_sig, .{}) catch unreachable;
     std.mem.doNotOptimizeAway(p.ptr);
 }
 noinline fn callSealStream() void {
@@ -415,6 +438,19 @@ test "STACKPROBE: no time secret, sigma, KEM secret, derived key or plaintext re
         @memcpy(cur_env[0..env.len], env);
         cur_env_len = env.len;
         {
+            // Version 3: the same time secret and sigma, a file key, two coin sets.
+            m_coins[0] = cur_rnd.kem_coins;
+            m_coins[1] = cur_rnd.kem_coins;
+            for (&m_coins[1]) |*b| b.* ^= 0x5a;
+            m_eks = .{ &kp.ek, &kp.ek };
+            cur_mrnd = .{ .s_time = cur_rnd.s_time, .tlock_sigma = cur_rnd.tlock_sigma, .file_key = undefined, .kem_coins = &m_coins };
+            Sha256.hash(&[_]u8{ 't', 'e', '-', 'f', c }, &cur_mrnd.file_key, .{});
+            heap_fba.reset();
+            const menv = Mu.sealWithRandomness(heap_fba.allocator(), &cur_pt, &m_eks, beacon_pub, probe_round, &cur_mrnd, .{}) catch unreachable;
+            @memcpy(cur_menv[0..menv.len], menv);
+            cur_menv_len = menv.len;
+        }
+        {
             var w: std.Io.Writer = .fixed(&cur_wire);
             var r: std.Io.Reader = .fixed(&cur_pt);
             heap_fba.reset();
@@ -432,11 +468,15 @@ test "STACKPROBE: no time secret, sigma, KEM secret, derived key or plaintext re
         nd.addBoth("s_pq", &cur_s_pq);
         nd.addBoth("AEAD key", &keys.key);
         nd.addBoth("stream key", &skey);
+        nd.addBoth("file key", &cur_mrnd.file_key);
+        nd.addBoth("KEM m2", m_coins[1][0..Kem.security_bytes]);
         nd.addImage("plaintext", &cur_pt);
         nd.sort();
         leak_src = cur_s_pq;
         bad += try runProbe("seal", callSeal, &nd);
         bad += try runProbe("open", callOpen, &nd);
+        bad += try runProbe("sealMulti", callSealMulti, &nd);
+        bad += try runProbe("openMulti", callOpenMulti, &nd);
         bad += try runProbe("sealStream", callSealStream, &nd);
         bad += try runProbe("openStream", callOpenStream, &nd);
         bad += try runProbe("deriveKeys", callDeriveKeys, &nd);
@@ -448,6 +488,9 @@ test "STACKPROBE: no time secret, sigma, KEM secret, derived key or plaintext re
         nd.sort();
         leak_src = cur_seed[0..32].*;
         bad += try runProbe("SealRandomness.generate", callGenerate, &nd);
+        // `Multi.seal` draws its own randomness into its frame (above the
+        // burned body) and wipes it on the way out: the drawn bytes are the needles.
+        bad += try runProbe("sealMulti(io)", callSealMultiIo, &nd);
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
@@ -466,6 +509,17 @@ test "STACKPROBE: no time secret, sigma, KEM secret, derived key or plaintext re
 var residue_failures: usize = 0;
 fn residueCheck(label: []const u8) void {
     const r = @import("testkit").stackprobe.residueOf(&snap, 0xC7, 512);
+    // mutation 2026-11-25: the residue rule judges only a snapshot that holds a
+    // burn, and every probed call except `generate` ends in one -- a call whose
+    // burn went missing would otherwise be "not judged" and pass.
+    // The burn must also start right below the entry point (measured 95..718
+    // B): with the entry's own `burn.run` gone, a deeper callee's burn (tlock,
+    // hqc) leaves a long zero run that begins 6 KiB or more further down.
+    if (!std.mem.eql(u8, label, "SealRandomness.generate") and (r.burn_len < 512 or r.burn_top > 1024)) {
+        residue_failures += 1;
+        std.debug.print("\n=== STACKPROBE burn missing ({t}): {s}: zero run {d} B from {d} B below the entry ===\n", .{ builtin.mode, label, r.burn_len, r.burn_top });
+        return;
+    }
     if (r.residue_bytes == 0) return;
     residue_failures += 1;
     std.debug.print("\n=== STACKPROBE residue rule ({t}): {s}: {d} B below the burn (burn {d} B from {d} B, deepest {d} B) ===\n", .{ builtin.mode, label, r.residue_bytes, r.burn_len, r.burn_top, r.residue_deepest });

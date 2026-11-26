@@ -9777,3 +9777,55 @@ test "batch: a record whose last chunk is one byte, flipped, drops the batch" {
     try expectGet(&db, "a", null);
     try testing.expectEqual(@as(usize, 0), db.count());
 }
+
+test "mutation 2026-11-25: scanKeys' heap keeps the largest key at the root for every insertion order" {
+    const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g" };
+    const n = keys.len;
+    var perm_idx: usize = 0;
+    var total: usize = 1;
+    for (1..n + 1) |i| total *= i;
+    while (perm_idx < total) : (perm_idx += 1) {
+        // Decode perm_idx as a permutation of 0..n (factoradic).
+        var pool: [n]usize = undefined;
+        for (&pool, 0..) |*p, i| p.* = i;
+        var left: usize = n;
+        var code = perm_idx;
+        var order: [n]usize = undefined;
+        for (&order) |*o| {
+            const pick = code % left;
+            code /= left;
+            o.* = pool[pick];
+            pool[pick] = pool[left - 1];
+            left -= 1;
+        }
+        var heap: [n][]const u8 = undefined;
+        for (order, 0..) |k, i| {
+            heap[i] = keys[k];
+            Db.Scan.siftUp(&heap, i);
+            for (1..i + 1) |j| try testing.expect(!keyLess(heap[(j - 1) / 2], heap[j]));
+        }
+        try testing.expectEqualStrings("g", heap[0]);
+        // Replace the root by the smallest key, as scanKeys does, and sift down.
+        heap[0] = "0";
+        Db.Scan.siftDown(&heap, 0);
+        for (1..n) |j| try testing.expect(!keyLess(heap[(j - 1) / 2], heap[j]));
+        try testing.expectEqualStrings("f", heap[0]);
+    }
+}
+
+test "mutation 2026-11-25: FsStorage allocate on a handle with no kernel descriptor (EBADF) is false, not AccessDenied" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs = FsStorage.init(testing.io, tmp.dir);
+    const st = fs.storage();
+    const h = try st.open("h.dat", .create_truncate);
+    defer st.close(h);
+    // A file of a simulated Io has no usable descriptor; -1 is the same to fallocate.
+    var f = fs.files[h].?;
+    const real = f;
+    f.handle = -1;
+    fs.files[h] = f;
+    defer fs.files[h] = real;
+    try testing.expect(!try st.allocate(h, 4096));
+}

@@ -4704,3 +4704,159 @@ test "Manager.iterate: a custom store that yields an empty or over-long id never
     _ = try m.iterate(testing.allocator, &cnt, Count.visit);
     try testing.expectEqual(@as(usize, 0), cnt.n);
 }
+
+test "mutation 2026-11-25: randomCsrfKey draws fresh CSPRNG bytes on every call" {
+    const a = try randomCsrfKey(testing.io);
+    const b = try randomCsrfKey(testing.io);
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+    const fill: [32]u8 = @splat(0xaa); // what an unfilled `undefined` reads as in safe builds
+    try testing.expect(!std.mem.eql(u8, &a, &fill));
+}
+
+const TypedProbe = struct {
+    before_null: bool = false,
+    after_null: bool = false,
+    fn run(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+        const p: *TypedProbe = @ptrCast(@alignCast(state.?));
+        p.before_null = sessionOf(ctx) == null;
+        try next.run(ctx);
+        p.after_null = sessionOf(ctx) == null;
+    }
+};
+
+test "mutation 2026-11-25: the typed Session slot is empty outside the sessions middleware (restored on the way out)" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var app = App{ .manager = &m };
+    var probe: TypedProbe = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(.{ .state = &probe, .run = TypedProbe.run });
+    try r.use(m.middleware());
+    try r.get("/", hSession);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+    _ = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out, &rbody);
+    try testing.expect(probe.before_null);
+    try testing.expect(probe.after_null);
+}
+
+/// Store-level walk: counts what `iterate` shows and checks each record and
+/// generation against `get`.
+const StoreWalk = struct {
+    store: Store,
+    n: usize = 0,
+    bad: usize = 0,
+    fn visit(ctx: ?*anyopaque, id: []const u8, loaded: Loaded) bool {
+        const w: *StoreWalk = @ptrCast(@alignCast(ctx.?));
+        w.n += 1;
+        const g = (w.store.get(testing.allocator, id) catch null) orelse {
+            w.bad += 1;
+            return true;
+        };
+        defer testing.allocator.free(g.record);
+        if (g.generation != loaded.generation or !std.mem.eql(u8, g.record, loaded.record)) w.bad += 1;
+        return true;
+    }
+};
+
+test "mutation 2026-11-25: RamcacheStore.iterate shows exactly the framed live records, with their generation and record" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var ids: [5][64]u8 = undefined;
+    try fiveUsers(&m, &ids);
+    // Entries that are not a framed live record: shorter than the generation
+    // prefix, and the bare prefix (a pre-2026-10-24 tombstone, `get` reads it as absent).
+    env.cache.put("junk-short", "abc", env.clk.now_ns, env.store.ttl_ns, 0);
+    env.cache.put("junk-prefix", "12345678", env.clk.now_ns, env.store.ttl_ns, 0);
+    var w: StoreWalk = .{ .store = env.store.store() };
+    try env.store.store().iterate(testing.allocator, &w, StoreWalk.visit);
+    try testing.expectEqual(@as(usize, 5), w.n);
+    try testing.expectEqual(@as(usize, 0), w.bad);
+    // A page size of 0 behaves as 1: the walk still ends and shows everything.
+    env.store.iterate_page = 0;
+    w = .{ .store = env.store.store() };
+    try env.store.store().iterate(testing.allocator, &w, StoreWalk.visit);
+    try testing.expectEqual(@as(usize, 5), w.n);
+    // Past the cache's own ttl nothing is shown.
+    env.clk.now_ns += env.store.ttl_ns + 1;
+    w = .{ .store = env.store.store() };
+    try env.store.store().iterate(testing.allocator, &w, StoreWalk.visit);
+    try testing.expectEqual(@as(usize, 0), w.n);
+}
+
+test "mutation 2026-11-25: RamcacheStore.iterate reports OutOfMemory for a failure at ANY allocation, and leaks nothing" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var ids: [5][64]u8 = undefined;
+    try fiveUsers(&m, &ids);
+    var w: StoreWalk = .{ .store = env.store.store() };
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    try env.store.store().iterate(counting.allocator(), &w, StoreWalk.visit);
+    try testing.expectEqual(@as(usize, 5), w.n);
+    const total = counting.alloc_index;
+    try testing.expect(total >= 10);
+    var i: usize = 0;
+    while (i < total) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        w = .{ .store = env.store.store() };
+        try testing.expectError(error.OutOfMemory, env.store.store().iterate(failing.allocator(), &w, StoreWalk.visit));
+    }
+}
+
+/// Fails exactly ONE allocation (the `target`-th) and serves every other one:
+/// `FailingAllocator` keeps failing from `fail_index` on, which hides a
+/// failure path whose next allocation would fail anyway.
+const OneShotFail = struct {
+    child: Allocator,
+    target: usize,
+    n: usize = 0,
+
+    fn allocator(s: *OneShotFail) Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const s: *OneShotFail = @ptrCast(@alignCast(ctx));
+        defer s.n += 1;
+        if (s.n == s.target) return null;
+        return s.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const s: *OneShotFail = @ptrCast(@alignCast(ctx));
+        return s.child.rawResize(mem, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const s: *OneShotFail = @ptrCast(@alignCast(ctx));
+        return s.child.rawRemap(mem, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const s: *OneShotFail = @ptrCast(@alignCast(ctx));
+        s.child.rawFree(mem, alignment, ra);
+    }
+};
+
+test "mutation 2026-11-25: RamcacheStore.iterate reports OutOfMemory when ONE allocation fails and the rest succeed" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var ids: [5][64]u8 = undefined;
+    try fiveUsers(&m, &ids);
+    var w: StoreWalk = .{ .store = env.store.store() };
+    var counting: OneShotFail = .{ .child = testing.allocator, .target = std.math.maxInt(usize) };
+    try env.store.store().iterate(counting.allocator(), &w, StoreWalk.visit);
+    try testing.expectEqual(@as(usize, 5), w.n);
+    var i: usize = 0;
+    while (i < counting.n) : (i += 1) {
+        var one: OneShotFail = .{ .child = testing.allocator, .target = i };
+        w = .{ .store = env.store.store() };
+        try testing.expectError(error.OutOfMemory, env.store.store().iterate(one.allocator(), &w, StoreWalk.visit));
+    }
+}

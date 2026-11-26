@@ -1193,3 +1193,30 @@ test "CookieManager: partitioned is a Partitioned attribute and needs Secure" {
         .partitioned = true,
     }));
 }
+
+const TypedProbe = struct {
+    before_null: bool = false,
+    after_null: bool = false,
+    fn run(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+        const p: *TypedProbe = @ptrCast(@alignCast(state.?));
+        p.before_null = sessions.sessionOf(ctx) == null;
+        try next.run(ctx);
+        p.after_null = sessions.sessionOf(ctx) == null;
+    }
+};
+
+test "mutation 2026-11-25: CookieManager's typed Session slot is empty outside its middleware (restored on the way out)" {
+    var env: Env = .{};
+    var m = try env.manager(.{ .idle = 60 * std.time.ns_per_s });
+    var probe: TypedProbe = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &m;
+    try r.use(.{ .state = &probe, .run = TypedProbe.run });
+    try r.use(m.middleware());
+    try r.get("/", hSidAgrees);
+    var o1: [8192]u8 = undefined;
+    _ = request(&r, "GET", null, "", &o1);
+    try testing.expect(probe.before_null);
+    try testing.expect(probe.after_null);
+}
