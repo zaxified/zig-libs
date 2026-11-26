@@ -49,6 +49,20 @@ pub const private_op_burn = 160 * 1024;
 /// zeroing, once per key.
 pub const key_burn = 384 * 1024;
 
+/// The encrypted-PEM loaders (`fromPemEncrypted`, `fromPemEncryptedLimited`):
+/// the key-loading body plus the decoded `PemBlock` (its `max_pem_der_len`
+/// buffer) and the by-value `SecretKey` result on the way up. They dirtied
+/// 428.6 KiB in ReleaseFast (2026-11-26 coverage sweep, `stackprobe3_test.zig`:
+/// 15.7 KiB of residue below `key_burn` with password/key needles in it).
+/// 512 KiB leaves ~19 % headroom.
+pub const pem_key_burn = 512 * 1024;
+
+/// The secret-key serializers (`toPkcs1Der`, `toPkcs8Der`, `toPem`): the
+/// limbs of `d`, `dP`, `dQ`, `qInv` pass through `elemFromFf` results and
+/// the DER integer writer. They dirtied 4.5-5.7 KiB with no burn at all
+/// (2026-11-26 coverage sweep: 1269 B of residue). 8 KiB.
+pub const marshal_burn = 8 * 1024;
+
 /// `bcryptPbkdf` and `Blowfish.init` (4 KiB Blowfish state per frame, one
 /// SHA-512 of the passphrase): one-shot slow KDF, generous size, not yet
 /// measured (`stackprobe2_test.zig`, 2026-10-09).

@@ -813,21 +813,35 @@ pub const SecretKey = struct {
     /// The byte lengths of the secret INTEGERs are part of DER and so of the
     /// output's timing, as they are of every encoder's and parser's.
     pub fn toPkcs1Der(sk: *const SecretKey, out: []u8) MarshalError![]u8 {
-        return marshal.privateDer(sk, .pkcs1, out);
+        const r = privateDerUnburned(sk, .pkcs1, out);
+        burn.stack(burn.marshal_burn);
+        return r;
+    }
+
+    noinline fn privateDerUnburned(sk: *const SecretKey, form: PrivateKeyForm, out: []u8) MarshalError![]u8 {
+        return marshal.privateDer(sk, form, out);
+    }
+
+    noinline fn privatePemUnburned(sk: *const SecretKey, form: PrivateKeyForm, out: []u8) MarshalError![]u8 {
+        return marshal.privatePem(sk, form, out);
     }
 
     /// DER PKCS#8 `PrivateKeyInfo` (RFC 5958 v1) — `openssl pkey -outform
     /// DER`, Go `x509.MarshalPKCS8PrivateKey`. As `toPkcs1Der`;
     /// `out.len ≥ max_pkcs8_der_len` always suffices.
     pub fn toPkcs8Der(sk: *const SecretKey, out: []u8) MarshalError![]u8 {
-        return marshal.privateDer(sk, .pkcs8, out);
+        const r = privateDerUnburned(sk, .pkcs8, out);
+        burn.stack(burn.marshal_burn);
+        return r;
     }
 
     /// PEM `PRIVATE KEY` (`.pkcs8`) or `RSA PRIVATE KEY` (`.pkcs1`), the
     /// unencrypted forms `fromPem` reads. As `toPkcs1Der`;
     /// `out.len ≥ max_private_pem_len` always suffices.
     pub fn toPem(sk: *const SecretKey, form: PrivateKeyForm, out: []u8) MarshalError![]u8 {
-        return marshal.privatePem(sk, form, out);
+        const r = privatePemUnburned(sk, form, out);
+        burn.stack(burn.marshal_burn);
+        return r;
     }
 
     /// PEM `ENCRYPTED PRIVATE KEY` (PBES2, see `fromPkcs8Encrypted`) — and,
@@ -835,7 +849,7 @@ pub const SecretKey = struct {
     /// reads (the password is then unused).
     pub fn fromPemEncrypted(out: *SecretKey, text: []const u8, password: []const u8) (PemError || FromEncryptedError)!void {
         const r = fromPemEncryptedUnburned(out, text, password);
-        burn.stack(burn.key_burn);
+        burn.stack(burn.pem_key_burn);
         return r;
     }
 
@@ -857,7 +871,7 @@ pub const SecretKey = struct {
     // secret-api-ok: `limits` holds a public cost cap, not a secret.
     pub fn fromPemEncryptedLimited(out: *SecretKey, text: []const u8, password: []const u8, limits: EncryptedKeyLimits) (PemError || FromEncryptedError)!void {
         const r = fromPemEncryptedLimitedUnburned(out, text, password, limits);
-        burn.stack(burn.key_burn);
+        burn.stack(burn.pem_key_burn);
         return r;
     }
 
@@ -3910,6 +3924,7 @@ test {
     _ = @import("sweep_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("stackprobe3_test.zig");
     _ = @import("wycheproof_test.zig");
 }
 
