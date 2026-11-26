@@ -6,7 +6,7 @@
 
 **Scope:** core — Falcon Round-3 reference as shipped in liboqs 0.16.0 / PQClean (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-25 (1285/1426, 141 eq) · src 390dcca2ff0060d1
+**Audit:** review 2026-09-03 · mutation 2026-11-25 (1285/1426, 141 eq) · src fe793d26d17d6eac
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, FALCON_FUZZ) · ct 2026-09-09 (ctgrind)
 

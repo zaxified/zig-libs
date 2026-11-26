@@ -6,7 +6,7 @@
 
 **Scope:** mvp — facebook/opaque-ke and bytemare/opaque (RFC 9807) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-25 (260/287, 27 eq) · src 0e52d2d8d70eb6ec
+**Audit:** review 2026-09-15 · mutation 2026-11-25 (260/287, 27 eq) · src ebad38ff9220a285
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `opaque-login` at `.scale` 4 = 50,000 runs — a run is a registration plus a login — `opaque-hostile` 200,000, OPAQUE_FUZZ; P256-SHA256 and curve25519-3DH harnesses 2026-11-23, 40,000-run budget, clean) · ct 2026-09-16 (ctgrind)
 

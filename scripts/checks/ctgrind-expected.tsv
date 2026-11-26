@@ -710,7 +710,7 @@ bip340	ReleaseFast	sign	1	<=90	a4a4b885682a02a8	0ce3274dc49157be
 # < n verdict and sampleElem's isZero rejection (both decide only whether a
 # drawn candidate is discarded) and blindCore's break on the unit verdict of
 # m*r (false only for a multiple of p or q). See blindrsa SPEC, Constant-time.
-blindrsa	ReleaseFast	blind	1	<=3	8ef7ed15e1a38e88	4352055809b3f3c7
+blindrsa	ReleaseFast	blind	1	<=3	834de90c9732729b	4352055809b3f3c7
 # blindrsa sign 218 -> 7 (2026-10-02): rsa's CRT path left std.crypto.ff. Left,
 # all on the signature s that is about to be published: blindSign's ff parse of
 # s_b (rejectNonCanonical, 1) and its unblinding `sk.n.mul(s_b, b_inv)` (ff
@@ -727,7 +727,7 @@ blindrsa	ReleaseFast	blind	1	<=3	8ef7ed15e1a38e88	4352055809b3f3c7
 # ff montgomeryMul unblinding over b_inv, 3) replaced by rsa.rsadpCrtBlinded.
 # Left: rsa drawBlindingPair's redraw verdict, rsa's F3 verdict, ff fromBytes
 # in the rsavp1 self-check parse of s, blindSign's timing_safe.eql verdict.
-blindrsa	ReleaseFast	sign	1	4	8ef7ed15e1a38e88	4d5e3740a158032d
+blindrsa	ReleaseFast	sign	1	4	834de90c9732729b	4d5e3740a158032d
 # A1 threshold_ecdsa R2 fix (2026-09-15, fixwt/a): `zkproofs.mulAddBytes`'s
 # carry-propagation tail no longer exits early on `carry != 0` (which compiled
 # to `cmp $0x100`/`jb` over the tainted running sum, zkproofs.zig);
@@ -1551,8 +1551,8 @@ mqtt	ReleaseFast	pwverify	1	0	59f0f38ee60f886c	bcc95d04fa79c847
 # (curve25519.zig `ladder`; 2 ephemeral keygens + 4 DH) + 2 x the AEAD tag-verify
 # outcome (std chacha20.zig `decrypt` via chachapoly); transport 6 = the tag-verify
 # outcome of the 6 decryptions.
-noise	ReleaseFast	hs	1	8	beebacb32c0874e4	95912b58e70d0846
-noise	ReleaseFast	transport	1	6	28460bb4942443c8	b4443cf65f6c3849
+noise	ReleaseFast	hs	1	8	139ff36d96c41b8c	95912b58e70d0846
+noise	ReleaseFast	transport	1	6	aed909e5ba5a6d9d	b4443cf65f6c3849
 # tlsclient (2026-10-10) — kex: Client.initInto on a canned ServerHello with
 # the key-share secrets (entropy[64..240]) tainted; cv: signCertificateVerify
 # with the client key tainted (P-256, P-384, Ed25519). No context is a branch
@@ -1768,8 +1768,8 @@ tlsserver	ReleaseFast	ech	1	456	82a28eda0eb571f6	c257fcbb1b68d8df
 # AEAD tag-verify outcome in open. The harness marks the unmasked header
 # defined before open; without that the AEAD's length handling on it adds ~50
 # artefacts.
-quic-crypto	ReleaseFast	aes	1	4	a9cfcb477cfbd6ba	4d96b4e7d3af1ed7
-quic-crypto	ReleaseFast	chacha	1	4	a9cfcb477cfbd6ba	d1cf9a5cadb2a284
+quic-crypto	ReleaseFast	aes	1	4	3039aa194fe66232	4d96b4e7d3af1ed7
+quic-crypto	ReleaseFast	chacha	1	4	3039aa194fe66232	d1cf9a5cadb2a284
 # megolm (2026-10-10) — msg: ratchet + Ed25519 signing key tainted through
 # encrypt/decrypt (the harness marks the wire message, the decrypted length
 # and its own allocator index defined: all public); skey: SessionKey and
@@ -1837,7 +1837,7 @@ aeskw	ReleaseFast	wrap	1	12	88dac35c72f0539b	23036d19c2656c6a
 # aesccm (2026-11-21) — aead: key + plaintext tainted, AES-128/256 with tags
 # 8/16 (12-byte nonce): seal, open, tampered open. 8 = the tag verdict after
 # the timing-safe compare (root.zig `open`), accept + reject per profile.
-aesccm	ReleaseFast	aead	1	8	127a73c2fdbb70df	d38f305d54b5a2c3
+aesccm	ReleaseFast	aead	1	8	09ccc9334ac3bbe8	d38f305d54b5a2c3
 # wireguard (2026-11-03) — messages and public keys declassified where they leave the
 # function that made them (they go on the wire). Read off the --stacks log:
 # keyb64 1, keyhex 1 = the codec's accept/reject. handshake 4 = three AEAD tag
@@ -2497,7 +2497,7 @@ aesgcm	ReleaseFast	generic	1	226	f53f30679e9e0b14	b60805fea700d105	cpu=x86_64 co
 # `expected` tag comes from std soft `encrypt` of the counter block, whose stack-allocated padding
 # lanes are `undefined`, origin soft.zig:610, so the compare branches on them without any taint)
 # + 8 witness (the printed tag/plaintext), trap +16 more witness prints (nothing declassified).
-aesccm	ReleaseFast	aead	1	192	127a73c2fdbb70df	d38f305d54b5a2c3	cpu=x86_64 control=16 trap=32
+aesccm	ReleaseFast	aead	1	192	09ccc9334ac3bbe8	d38f305d54b5a2c3	cpu=x86_64 control=16 trap=32
 dtls	ReleaseFast	hs	1	302	03d775e0e9abe1d8	61a204df8edf79a0	cpu=x86_64 control=177 trap=179
 dtls	ReleaseFast	app	1	278	03d775e0e9abe1d8	70da17057fd7a044	cpu=x86_64 control=279 trap=279
 # 2026-11-21 (connection ID work): ku +1 in the tainted, the untainted and the no-fvalgrind rows alike (296/299/299 ->
@@ -2513,7 +2513,7 @@ dtls	ReleaseFast	hs12	1	48	c9dbbb898ba6fbb3	d87712f4d6e60179	cpu=x86_64
 # quic-crypto aes portable trap 45 -> 37 (2026-11-26): Protection now keeps one expanded AEAD context per
 # direction instead of expanding the key per packet, so std's soft AES runs its key schedule fewer times and
 # its undefined-lane padding reports fewer untainted contexts. Tainted in-file (84) and control (3) unchanged.
-quic-crypto	ReleaseFast	aes	1	84	a9cfcb477cfbd6ba	4d96b4e7d3af1ed7	cpu=x86_64 control=3 trap=37
+quic-crypto	ReleaseFast	aes	1	84	3039aa194fe66232	4d96b4e7d3af1ed7	cpu=x86_64 control=3 trap=37
 aeskw	ReleaseFast	wrap	1	694	88dac35c72f0539b	23036d19c2656c6a	cpu=x86_64 control=8 trap=28
 aeadframe	ReleaseFast	aes	1	157	fcb76a730014f644	9e2cdfce46f95d92	cpu=x86_64 control=4 trap=4
 ctap2	ReleaseFast	pin	1	100	e20d2cc588863de8	01e08eb2902d2802	cpu=x86_64 control=6 trap=6

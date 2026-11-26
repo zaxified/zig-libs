@@ -6,7 +6,7 @@
 
 **Scope:** core — libsecp256k1 v0.8.0 `musig` module (BIP327) (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-11-25 (110/125, 15 eq) · src ea2c26e92a3e23df
+**Audit:** review 2026-10-08 · mutation 2026-11-25 (110/125, 15 eq) · src e7adee792415922d
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MUSIG2_FUZZ; psig at 1/4, session at 1/20 of it) · ct 2026-09-09 (ctgrind; `detsign` <=192 in-file 2026-11-21, the `sign` classes plus the nonce-derivation verdicts; `sign` <=103 in-file since Zig 0.17.0, 2026-10-18: +2 = k256 `Fe.fromBytes`'s canonicity test inside `cpoint`'s `lift`, no longer folded into the identical check of `XOnlyPublicKey.fromBytes`, over the signer's own public key and public nonce that partial-signature self-verification parses -- public values)
 

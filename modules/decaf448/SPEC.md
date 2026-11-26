@@ -6,7 +6,7 @@
 
 **Scope:** core — RFC 9496 decaf448 as in RustCrypto `ed448-goldilocks` (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after the full scalar field — sub/negate/invert/random/wide reduction — and `hash_to_decaf448`/RFC 9497 `HashToScalar` landed)
 
-**Audit:** review 2026-07-18 · mutation 2026-11-25 (110/122, 12 eq) · src ea0165b995246b1b
+**Audit:** review 2026-07-18 · mutation 2026-11-25 (110/122, 12 eq) · src 38f7039d3eaab531
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DECAF448_FUZZ; decode at 1/2, group at 1/8, hash at 1/4 of it) · ct 2026-08-11 (ctgrind)
 

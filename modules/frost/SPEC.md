@@ -6,7 +6,7 @@
 
 **Scope:** mvp — ZcashFoundation/frost frost-core 3.0.0, secp256k1 suite only (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-11-25 (150/157, 7 eq) · src ba44adc76fcde298
+**Audit:** review 2026-10-08 · mutation 2026-11-25 (150/157, 7 eq) · src 7cf6e292dcd5bc50
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean (`frost-protocol` at its scale, 1,000), FROST_FUZZ) · ct 2026-09-09 (ctgrind)
 

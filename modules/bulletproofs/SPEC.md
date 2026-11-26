@@ -6,7 +6,7 @@
 
 **Scope:** core — dalek-cryptography/bulletproofs, single and aggregated proofs, batch verification (surveyed 2026-09-30, aggregation and batching 2026-10-02)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-25 (417/439, 19 eq) · src d988faa029c58677
+**Audit:** review 2026-09-15 · mutation 2026-11-25 (417/439, 19 eq) · src fde375485d7a1ee6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BULLETPROOFS_FUZZ; rp-decode at 1/4, prove-verify at 1/40 of it) · ct 2026-09-15 (ctgrind)
 

@@ -6,7 +6,7 @@
 
 **Scope:** parity — libsodium `crypto_box_seal` (surveyed 2026-09-30 at release 1.0.22; interop and the benchmark run against the installed 1.0.18)
 
-**Audit:** review 2026-11-13 · mutation 2026-11-13 (126/152, 26 eq) · src c4fea380fcb915c2
+**Audit:** review 2026-11-13 · mutation 2026-11-13 (126/152, 26 eq) · src dd28352de476b497
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, SEALEDBOX_FUZZ) · ct 2026-10-07 (ctgrind) · panic 2026-10-30 (sweep + blind review: sealedLen saturates; delta audit 2/2)
 

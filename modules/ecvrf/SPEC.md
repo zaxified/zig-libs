@@ -6,7 +6,7 @@
 
 **Scope:** core — RFC 9381 (suites 0x01-0x04: 0x03 as in ProtonMail/go-ecvrf) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-16 · mutation 2026-11-25 (110/132, 22 eq) · src ccf90536297ead4b
+**Audit:** review 2026-09-16 · mutation 2026-11-25 (110/132, 22 eq) · src 9c4ad02667cb1d3f
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ECVRF_FUZZ; verify at 1/2, prove-verify at 1/4 of it) · ct 2026-09-16 (ctgrind)
 

@@ -6,7 +6,7 @@
 
 **Scope:** parity — curve25519-dalek 5.0 (secret-scalar group operations), not a full curve25519 library: point and scalar types are `std`'s (surveyed 2026-10-10)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-25 (153/177, 24 eq) · src 85043e8755a5cd3d
+**Audit:** review 2026-09-15 · mutation 2026-11-25 (153/177, 24 eq) · src 9276c69e6d97a216
 
 **Hardening:** fuzz 2026-11-01 (160,000 runs clean, CT25519_FUZZ, 8 jobs × 20,000, every reach label hit) · ct 2026-09-29 (ctgrind) · panic 2026-10-30 (sweep + blind review: nothing to fix (fixed-size inputs, mulMulti already a checked panic); stack minimum in Backlog)
 

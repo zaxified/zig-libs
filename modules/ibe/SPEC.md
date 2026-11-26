@@ -6,7 +6,7 @@
 
 **Scope:** core — Boneh-Franklin FullIdent; Encryption4All/ibe, drand/tlock (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-25 (70/76, 6 eq) · src ac004c17d1ed5978
+**Audit:** review 2026-09-09 · mutation 2026-11-25 (70/76, 6 eq) · src 2d070b44b8653425
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, IBE_FUZZ) · ct 2026-10-02 (ctgrind)
 

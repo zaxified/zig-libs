@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 4.0 RSA and Go `crypto/rsa` + the `crypto/x509` RSA key codecs: PKCS#1 v1.5 and PSS sign/verify (run-time hash, prehashed digests, PSS salt recovery, decoupled MGF1), OAEP, key generation, PKCS#1/PKCS#8/SPKI/PEM read and write including encrypted PKCS#8 (PBES2/PBKDF2/AES-CBC), OpenSSH private keys, moduli up to 8192 bits (surveyed 2026-09-30 and 2026-10-14, gaps closed 2026-10-14); RSAES-PKCS1-v1_5, multi-prime keys, scrypt/PBES1/legacy-PEM encryption and > 8192-bit moduli are out (see "What is deliberately not done")
 
-**Audit:** review 2026-11-13 · mutation 2026-11-25 (234/284, 50 eq) · src dfff5e55ff07b594
+**Audit:** review 2026-11-13 · mutation 2026-11-25 (234/284, 50 eq) · src 041556a06a39435b
 
 **Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-11-17 (ctgrind; private-key PEM rows `pemenc` 0 / `pemdec` 2 added) · panic 2026-10-30 (sweep + blind review: e ≥ 2^32 private keys rejected (were catch unreachable on every private op), nested-SPKI recursion removed, short modulus_len primitives → error, PSS/byteLen/modinverse asserts → errors; delta audit 19/20 + 1 eq)
 
