@@ -660,6 +660,60 @@ test "indexSocketOwners: max_bytes caps the owner records at max_bytes / @sizeOf
     try testing.expectEqual(@as(usize, 0), none.owners.len);
 }
 
+test "mutation 2026-11-25: indexSocketOwners max_bytes budget met by the last descriptor of a process stops the walk there, the higher pid is not visited" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    const a = try highFd(try mkSock(linux.AF.INET, linux.SOCK.STREAM));
+    defer _ = linux.close(a);
+    const b = try highFd(try mkSock(linux.AF.INET, linux.SOCK.DGRAM));
+    defer _ = linux.close(b);
+    const self_pid: u32 = @intCast(linux.getpid());
+
+    // A process with a higher pid, as in the max_owners test above.
+    const frc = linux.fork();
+    if (linux.errno(frc) != .SUCCESS) return error.SkipZigTest;
+    if (frc == 0) {
+        while (true) _ = linux.pause();
+    }
+    const child: linux.pid_t = @intCast(frc);
+    defer {
+        _ = linux.kill(child, .KILL);
+        var st: i32 = 0;
+        _ = linux.waitpid(child, &st, 0);
+    }
+
+    var attempt: usize = 0;
+    while (attempt < 10) : (attempt += 1) {
+        const before = try countProcDirs(io, self_pid);
+        var full = try process.indexSocketOwners(gpa, io, .{});
+        defer full.deinit(gpa);
+        var c_self: usize = 0;
+        for (full.owners) |o| {
+            if (o.pid <= self_pid) c_self += 1;
+        }
+        // The budget in bytes is exactly the records up to and including this process.
+        var capped = try process.indexSocketOwners(gpa, io, .{ .max_bytes = c_self * @sizeOf(process.SocketOwner) });
+        defer capped.deinit(gpa);
+        var full2 = try process.indexSocketOwners(gpa, io, .{});
+        defer full2.deinit(gpa);
+        var c_self2: usize = 0;
+        for (full2.owners) |o| {
+            if (o.pid <= self_pid) c_self2 += 1;
+        }
+        if (full.owners.len != full2.owners.len or c_self != c_self2 or full.truncated or c_self < 2) continue;
+
+        try testing.expect(capped.truncated);
+        try testing.expectEqual(c_self, capped.owners.len);
+        // The walk stopped at this process: the child above it was not visited.
+        try testing.expect(capped.scanned + capped.denied + capped.vanished <= before.le);
+        return;
+    }
+    return error.SkipZigTest;
+}
+
 test "indexSocketOwners: a max_owners cap ends the walk at the process that fills it; /proc entries that are not pids are not scanned (mutation audit)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});

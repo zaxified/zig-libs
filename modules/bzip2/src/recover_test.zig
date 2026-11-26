@@ -127,3 +127,159 @@ test "recover: bit offsets, short regions, the block limit and the empty cases" 
     const exact = try recover.findBlocks(gpa, z, .{ .max_blocks = a.len });
     gpa.free(exact);
 }
+
+/// A most-significant-bit-first bit string, for building inputs and expected streams bit by bit.
+const BitStr = struct {
+    gpa: std.mem.Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+    n: usize = 0,
+
+    fn deinit(self: *BitStr) void {
+        self.bytes.deinit(self.gpa);
+    }
+
+    fn bit(self: *BitStr, b: u1) !void {
+        if (self.n % 8 == 0) try self.bytes.append(self.gpa, 0);
+        if (b == 1) self.bytes.items[self.n / 8] |= @as(u8, 0x80) >> @intCast(self.n % 8);
+        self.n += 1;
+    }
+
+    fn put(self: *BitStr, v: u64, count: u7) !void {
+        var k = count;
+        while (k > 0) {
+            k -= 1;
+            try self.bit(@intCast((v >> @as(u6, @intCast(k))) & 1));
+        }
+    }
+
+    fn zeros(self: *BitStr, count: usize) !void {
+        for (0..count) |_| try self.bit(0);
+    }
+};
+
+const mut_block_magic: u64 = 0x314159265359;
+const mut_end_magic: u64 = 0x177245385090;
+
+/// Input bit `pos` of `input`, zero past the end.
+fn inputBit(input: []const u8, pos: usize) u1 {
+    if (pos / 8 >= input.len) return 0;
+    return @intCast((input[pos / 8] >> @intCast(7 - pos % 8)) & 1);
+}
+
+test "mutation 2026-11-25: writeBlockStream equals a bit-by-bit reference for every length mod 32 and mod 8, offsets, and past the end of the input" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x62_7a_32);
+    var input: [64]u8 = undefined;
+    prng.random().bytes(&input);
+    const firsts = [_]u64{ 0, 3, 8, 13 };
+    const lens = [_]u64{ 32, 33, 34, 63, 64, 65, 96, 97, 128, 129, 130, 131, 136, 160, 200 };
+    for (firsts) |first| for (lens) |n| {
+        var want: BitStr = .{ .gpa = gpa };
+        defer want.deinit();
+        try want.put(0x425A6839, 32); // "BZh9"
+        try want.put(mut_block_magic, 48);
+        for (0..n) |k| try want.bit(inputBit(&input, @intCast(first + k)));
+        try want.put(mut_end_magic, 48);
+        var crc: u64 = 0;
+        for (0..32) |k| crc = (crc << 1) | inputBit(&input, @intCast(first + k));
+        try want.put(crc, 32);
+        var got: std.Io.Writer.Allocating = .init(gpa);
+        defer got.deinit();
+        try recover.writeBlockStream(&input, .{ .first_bit = first, .last_bit = first + n - 1 }, &got.writer);
+        try testing.expectEqualSlices(u8, want.bytes.items, got.written());
+    };
+    // A block that runs past the end of the input reads zeros there (documented), it does not read out of bounds.
+    var want: BitStr = .{ .gpa = gpa };
+    defer want.deinit();
+    try want.put(0x425A6839, 32);
+    try want.put(mut_block_magic, 48);
+    for (0..100) |k| try want.bit(inputBit(&input, 480 + k));
+    try want.put(mut_end_magic, 48);
+    var crc: u64 = 0;
+    for (0..32) |k| crc = (crc << 1) | inputBit(&input, 480 + k);
+    try want.put(crc, 32);
+    var got: std.Io.Writer.Allocating = .init(gpa);
+    defer got.deinit();
+    try recover.writeBlockStream(&input, .{ .first_bit = 480, .last_bit = 579 }, &got.writer);
+    try testing.expectEqualSlices(u8, want.bytes.items, got.written());
+}
+
+test "mutation 2026-11-25: findBlocks at the edges: a magic at bit 0, adjacent magics, a 130/131-bit region, junk before the first magic, the block limit" {
+    const gpa = testing.allocator;
+    // magic at bit 0, then 131 bits, then the end magic: one block, bits 48 ..= 178 (131 bits).
+    {
+        var s: BitStr = .{ .gpa = gpa };
+        defer s.deinit();
+        try s.put(mut_block_magic, 48);
+        try s.zeros(131);
+        try s.put(mut_end_magic, 48);
+        const bl = try recover.findBlocks(gpa, s.bytes.items, .{});
+        defer gpa.free(bl);
+        try testing.expectEqual(@as(usize, 1), bl.len);
+        try testing.expectEqual(@as(u64, 48), bl[0].first_bit);
+        try testing.expectEqual(@as(u64, 178), bl[0].last_bit);
+    }
+    // 130 bits between the magics is too short to be a block.
+    {
+        var s: BitStr = .{ .gpa = gpa };
+        defer s.deinit();
+        try s.put(mut_block_magic, 48);
+        try s.zeros(130);
+        try s.put(mut_end_magic, 48);
+        const bl = try recover.findBlocks(gpa, s.bytes.items, .{});
+        defer gpa.free(bl);
+        try testing.expectEqual(@as(usize, 0), bl.len);
+    }
+    // Two magics back to back: an empty region, no block and no arithmetic underflow.
+    {
+        var s: BitStr = .{ .gpa = gpa };
+        defer s.deinit();
+        try s.put(mut_block_magic, 48);
+        try s.put(mut_end_magic, 48);
+        const bl = try recover.findBlocks(gpa, s.bytes.items, .{});
+        defer gpa.free(bl);
+        try testing.expectEqual(@as(usize, 0), bl.len);
+    }
+    // 200 bits of junk before the first magic are not a block; the block after it is found 200 bits later.
+    {
+        var s: BitStr = .{ .gpa = gpa };
+        defer s.deinit();
+        try s.zeros(200);
+        try s.put(mut_block_magic, 48);
+        try s.zeros(131);
+        try s.put(mut_end_magic, 48);
+        const bl = try recover.findBlocks(gpa, s.bytes.items, .{});
+        defer gpa.free(bl);
+        try testing.expectEqual(@as(usize, 1), bl.len);
+        try testing.expectEqual(@as(u64, 248), bl[0].first_bit);
+        try testing.expectEqual(@as(u64, 378), bl[0].last_bit);
+    }
+    // The block limit is exact: two blocks need max_blocks 2, one fewer is TooManyBlocks, 0 refuses the first.
+    {
+        var s: BitStr = .{ .gpa = gpa };
+        defer s.deinit();
+        try s.put(mut_block_magic, 48);
+        try s.zeros(131);
+        try s.put(mut_block_magic, 48);
+        try s.zeros(131);
+        try s.put(mut_end_magic, 48);
+        const two = try recover.findBlocks(gpa, s.bytes.items, .{ .max_blocks = 2 });
+        defer gpa.free(two);
+        try testing.expectEqual(@as(usize, 2), two.len);
+        try testing.expectError(error.TooManyBlocks, recover.findBlocks(gpa, s.bytes.items, .{ .max_blocks = 1 }));
+        try testing.expectError(error.TooManyBlocks, recover.findBlocks(gpa, s.bytes.items, .{ .max_blocks = 0 }));
+    }
+}
+
+test "mutation 2026-11-25: a level 9 block of more than 100 kB is recovered as a stream that decodes (the recovered header is level 9)" {
+    const gpa = testing.allocator;
+    const text = try textInput(gpa, 250_000, 14);
+    defer gpa.free(text);
+    const z = try bz.compress(gpa, text, .{ .level = 9 });
+    defer gpa.free(z);
+    var bad: usize = 0;
+    const back = try recoverAll(gpa, z, &bad);
+    defer gpa.free(back);
+    try testing.expectEqual(@as(usize, 0), bad);
+    try testing.expectEqualSlices(u8, text, back);
+}
