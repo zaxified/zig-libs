@@ -830,6 +830,7 @@ test {
     _ = @import("oracle_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("audit_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 test "root: the module doc example runs" {
