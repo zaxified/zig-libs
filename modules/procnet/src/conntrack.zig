@@ -244,6 +244,28 @@ test "parseConntrack: reply tuple, mark, use and per-direction counters" {
     try testing.expectEqual(@as(u32, 0), result.flows[3].mark);
 }
 
+test "mutation 2026-11-25: parseConntrack: a malformed or overflowing counter reads as 0, a one-tuple line has no reply side at all" {
+    const text =
+        \\ipv4 2 tcp 6 100 ESTABLISHED src=10.0.0.5 dst=10.0.0.6 sport=1 dport=2 packets=18446744073709551616 bytes=-5 src=10.0.0.6 dst=10.0.0.5 sport=2 dport=1 mark=zz use=4294967296
+        \\ipv4 2 tcp 6 100 ESTABLISHED src=10.0.0.5 dst=10.0.0.6 sport=1 dport=2
+        \\
+    ;
+    var result = try parseConntrack(testing.allocator, text, 50);
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), result.flows.len);
+    const bad = result.flows[0];
+    try testing.expectEqual(@as(u64, 0), bad.orig_packets); // 2^64 does not fit
+    try testing.expectEqual(@as(u64, 0), bad.orig_bytes); // negative
+    try testing.expectEqual(@as(u32, 0), bad.mark); // not a number
+    try testing.expectEqual(@as(u32, 0), bad.use); // 2^32 does not fit
+    try testing.expectEqual(@as(u16, 2), bad.reply_sport); // the line itself is fine
+    const one = result.flows[1];
+    try testing.expect(one.reply_src == null);
+    try testing.expect(one.reply_dst == null);
+    try testing.expectEqual(@as(u16, 0), one.reply_sport);
+    try testing.expectEqual(@as(u16, 0), one.reply_dport);
+}
+
 test "parseConntrack: max caps the sample but total counts every line" {
     var result = try parseConntrack(testing.allocator, fixture, 2);
     defer result.deinit(testing.allocator);

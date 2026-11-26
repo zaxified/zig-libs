@@ -4303,6 +4303,57 @@ test "Snapshot: max_entries counts every entry kind, and a path past max_path_by
     try testing.expectError(error.TooDeep, Snapshot.open(gpa, io, deep, .{ .max_depth = 64 }));
 }
 
+/// Builds `root/<31 dirs of 255 bytes>/<a bytes>/<b bytes>` (and a file named
+/// `file_len` bytes in the deepest one when `file_len != 0`); the deepest
+/// directory's snapshot path is 31*255 + 30 + (a + 1) + (b + 1) = 7937 + a + b.
+fn buildPathChain(io: Io, root: Dir, a: usize, b: usize, file_len: usize) !void {
+    const long: [255]u8 = @splat('d');
+    var cur = try root.createDirPathOpen(io, &long, .{ .open_options = .{ .iterate = true } });
+    for (1..31) |_| {
+        const next = try cur.createDirPathOpen(io, &long, .{ .open_options = .{ .iterate = true } });
+        cur.close(io);
+        cur = next;
+    }
+    const na: [255]u8 = @splat('a');
+    const nb: [255]u8 = @splat('b');
+    const mid = try cur.createDirPathOpen(io, na[0..a], .{ .open_options = .{ .iterate = true } });
+    cur.close(io);
+    const last = try mid.createDirPathOpen(io, nb[0..b], .{ .open_options = .{ .iterate = true } });
+    mid.close(io);
+    defer last.close(io);
+    if (file_len != 0) {
+        const nf: [255]u8 = @splat('f');
+        try last.writeFile(io, .{ .sub_path = nf[0..file_len], .data = "F" });
+    }
+}
+
+test "mutation 2026-11-25: Snapshot refuses a path past max_path_bytes (8192) and holds one of exactly that length, file or directory" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    // (a, b, file_len, expect ok); path = 7937 + a + b for the directory, + 1 + file_len for the file.
+    const Case = struct { a: usize, b: usize, f: usize, ok: bool };
+    const cases = [_]Case{
+        .{ .a = 200, .b = 55, .f = 0, .ok = true }, // directory path 8192
+        .{ .a = 200, .b = 56, .f = 0, .ok = false }, // directory path 8193
+        .{ .a = 200, .b = 54, .f = 0, .ok = true }, // directory path 8191
+        .{ .a = 200, .b = 53, .f = 1, .ok = true }, // file path 8192 (directory 8190)
+        .{ .a = 200, .b = 53, .f = 2, .ok = false }, // file path 8193 under a directory that fits
+    };
+    for (cases) |c| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+        defer root.close(io);
+        try buildPathChain(io, root, c.a, c.b, c.f);
+        if (c.ok) {
+            var s = try Snapshot.open(gpa, io, root, .{ .max_depth = 64 });
+            s.deinit(io);
+        } else {
+            try testing.expectError(error.TooDeep, Snapshot.open(gpa, io, root, .{ .max_depth = 64 }));
+        }
+    }
+}
+
 test "Snapshot: more directories than max_dirs is TooManyFiles, empty ones included (sweep 2026-10-28 F-2)" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

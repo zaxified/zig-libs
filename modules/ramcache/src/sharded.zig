@@ -2231,6 +2231,64 @@ test "getOrLoad: a caller at another generation does not take the in-flight load
     try expectInvariants(&sc);
 }
 
+const KeyedLoadThread = struct {
+    sc: *Sharded,
+    lc: *GenLoadCtx,
+    key: []const u8,
+    cur_gen: u64,
+    out: ?[]u8 = null,
+
+    fn run(t: *KeyedLoadThread) void {
+        t.out = t.sc.getOrLoad(testing.allocator, t.key, 0, t.cur_gen, 0, t.cur_gen, t.lc.loader()) catch null;
+    }
+};
+
+test "mutation 2026-11-25: getOrLoad: a superseded load that finishes first leaves the newer flight registered under the newer caller's key" {
+    var sc = try testSharded(1 << 20, 64, 4);
+    defer sc.deinit();
+    var old: GenLoadCtx = .{ .sc = &sc, .val = "old", .hold = true, .hold_gen = 1 };
+    // The newer load parks until a caller has joined its flight (generation 2).
+    var new: GenLoadCtx = .{ .sc = &sc, .val = "new", .hold = true, .hold_gen = 2 };
+    var third: GenLoadCtx = .{ .sc = &sc, .val = "third" };
+
+    // The old leader's key is a buffer that dies as soon as it has finished.
+    const old_key = try testing.allocator.dupe(u8, "k");
+    var t1: KeyedLoadThread = .{ .sc = &sc, .lc = &old, .key = old_key, .cur_gen = 1 };
+    const th1 = try std.Thread.spawn(.{}, KeyedLoadThread.run, .{&t1});
+    var spins: usize = 0;
+    while (!old.entered.load(.acquire) and spins < 2_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(old.entered.load(.acquire));
+
+    // Generation 2 supersedes the flight and keeps loading.
+    var t2: KeyedLoadThread = .{ .sc = &sc, .lc = &new, .key = "k", .cur_gen = 2 };
+    const th2 = try std.Thread.spawn(.{}, KeyedLoadThread.run, .{&t2});
+    spins = 0;
+    while (!new.entered.load(.acquire) and spins < 2_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(new.entered.load(.acquire));
+
+    // The superseded load finishes while the newer one is still in flight, and its key is freed.
+    old.release.store(true, .release);
+    th1.join();
+    testing.allocator.free(old_key);
+    try testing.expectEqualStrings("old", t1.out.?); // the superseded caller still gets its own load's value
+    testing.allocator.free(t1.out.?);
+
+    // A caller at generation 2 must find the newer flight and wait on it, not start a third load.
+    var t3: KeyedLoadThread = .{ .sc = &sc, .lc = &third, .key = "k", .cur_gen = 2 };
+    const th3 = try std.Thread.spawn(.{}, KeyedLoadThread.run, .{&t3});
+    th3.join(); // returns once the newer loader sees the parked waiter and finishes
+    new.release.store(true, .release);
+    th2.join();
+    defer if (t2.out) |o| testing.allocator.free(o);
+    defer if (t3.out) |o| testing.allocator.free(o);
+    try testing.expectEqual(@as(u32, 0), third.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), new.calls.load(.monotonic));
+    try testing.expectEqualStrings("new", t3.out.?);
+    try testing.expectEqualStrings("new", t2.out.?);
+    for (sc.shards) |*s| try testing.expectEqual(@as(usize, 0), s.inflight.count());
+    try expectInvariants(&sc);
+}
+
 test "idle_ttl_ns through the shards: a read refreshes the deadline, silence expires the entry, and it counts as expired" {
     var sc = try Sharded.init(testing.allocator, .{
         .max_bytes = 1 << 20,

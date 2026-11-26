@@ -3880,6 +3880,237 @@ test "scan: an empty cache is done at once" {
     try testing.expect(c.scan(&cur, 0, 0, 10, ScanCollector.hook, &col)); // the cursor was done: a new call continues at the end
 }
 
+/// Scan `c` in pages of 2 until the cursor has passed 70 % of the table (the walk is not done).
+fn scanPastSeventyPercent(c: *Cache, cur: *Cache.ScanCursor, col: *ScanCollector) !void {
+    var guard: usize = 0;
+    while (@as(usize, cur.slot) * 10 < @as(usize, c.map.capacity()) * 7) : (guard += 1) {
+        try testing.expect(!c.scan(cur, 0, 0, 2, ScanCollector.hook, col));
+        try testing.expect(guard < 10_000);
+    }
+}
+
+test "mutation 2026-11-25: scan: cursor fields are honoured exactly (not started, past the table), pages are exactly max, a finished walk stays finished" {
+    var c = testCache(1 << 20, 64);
+    defer c.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..20) |i| {
+        const k = std.fmt.bufPrint(&buf, "p{d}", .{i}) catch unreachable;
+        c.put(k, k, 0, 0, 0);
+    }
+    // A cursor that says it has not started begins at slot 0 whatever its slot and epoch say.
+    {
+        var col: ScanCollector = .{};
+        defer col.deinit();
+        var cur: Cache.ScanCursor = .{ .slot = 40, .epoch = c.map_epoch, .started = false };
+        while (!c.scan(&cur, 0, 0, 100, ScanCollector.hook, &col)) {}
+        try testing.expectEqual(@as(usize, 20), col.keys.items.len);
+    }
+    // A cursor past the end of the table is a finished walk, not an out-of-bounds iterator.
+    {
+        var col: ScanCollector = .{};
+        defer col.deinit();
+        var cur: Cache.ScanCursor = .{ .slot = 1 << 30, .epoch = c.map_epoch, .started = true };
+        try testing.expect(c.scan(&cur, 0, 0, 100, ScanCollector.hook, &col));
+        try testing.expectEqual(@as(usize, 0), col.keys.items.len);
+    }
+    // Every page that is not the last delivers exactly `max` entries; a finished cursor delivers nothing more.
+    {
+        var col: ScanCollector = .{};
+        defer col.deinit();
+        var cur: Cache.ScanCursor = .{};
+        var guard: usize = 0;
+        while (true) : (guard += 1) {
+            const before = col.keys.items.len;
+            const done = c.scan(&cur, 0, 0, 3, ScanCollector.hook, &col);
+            const got = col.keys.items.len - before;
+            if (done) {
+                try testing.expect(got <= 3);
+                break;
+            }
+            try testing.expectEqual(@as(usize, 3), got);
+            try testing.expect(guard < 100);
+        }
+        try testing.expectEqual(@as(usize, 20), col.keys.items.len);
+        try testing.expect(c.scan(&cur, 0, 0, 3, ScanCollector.hook, &col));
+        try testing.expect(c.scan(&cur, 0, 0, 3, ScanCollector.hook, &col));
+        try testing.expectEqual(@as(usize, 20), col.keys.items.len);
+    }
+}
+
+test "mutation 2026-11-25: scan: the callback runs as a hook (a get inside it does not drop an expired entry), and the flag is restored" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    c.put("ttl", "v", 0, 10, 0); // expired at t=100
+    c.put("a", "a", 0, 0, 0);
+    c.put("b", "b", 0, 0, 0);
+    const Probe = struct {
+        cache: *Cache,
+        calls: usize = 0,
+        fn cb(ctx: ?*anyopaque, key: []const u8, value: []const u8) void {
+            _ = key;
+            _ = value;
+            const p: *@This() = @ptrCast(@alignCast(ctx.?));
+            p.calls += 1;
+            _ = p.cache.get("ttl", 100, 0); // a miss that would drop the entry outside a hook
+        }
+    };
+    var p: Probe = .{ .cache = &c };
+    var cur: Cache.ScanCursor = .{};
+    while (!c.scan(&cur, 100, 0, 10, Probe.cb, &p)) {}
+    try testing.expectEqual(@as(usize, 2), p.calls);
+    try testing.expectEqual(@as(usize, 3), c.stats.entries); // nothing was dropped mid-walk
+    try testing.expect(!c.in_hook);
+    c.put("later", "v", 0, 0, 0); // a stuck flag would panic here
+}
+
+test "mutation 2026-11-25: scan: a grow late in the walk restarts it, and misses no entry that was there throughout" {
+    var c = testCache(1 << 24, 100_000);
+    defer c.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..40) |i| {
+        const k = std.fmt.bufPrint(&buf, "s{d}", .{i}) catch unreachable;
+        c.put(k, k, 0, 0, 0);
+    }
+    var col: ScanCollector = .{};
+    defer col.deinit();
+    var cur: Cache.ScanCursor = .{};
+    // The cursor stands near the end of the old table when the index doubles, so a walk that
+    // ignored the epoch would skip the first 35 % of the new table.
+    const cap0 = c.map.capacity();
+    try scanPastSeventyPercent(&c, &cur, &col);
+    const epoch = c.map_epoch;
+    var i: usize = 0;
+    while (c.map.capacity() == cap0) : (i += 1) {
+        const k = std.fmt.bufPrint(&buf, "g{d}", .{i}) catch unreachable;
+        c.put(k, k, 0, 0, 0);
+        try testing.expect(i < 5000);
+    }
+    try testing.expect(c.map_epoch != epoch);
+    while (!c.scan(&cur, 0, 0, 1000, ScanCollector.hook, &col)) {}
+    for (0..40) |j| {
+        const k = std.fmt.bufPrint(&buf, "s{d}", .{j}) catch unreachable;
+        try testing.expect(col.count(k) >= 1);
+    }
+}
+
+test "mutation 2026-11-25: scan: an in-place rehash (tombstones shed) late in the walk restarts it, and misses no entry that was there throughout" {
+    var c = testCache(1 << 24, 100_000);
+    defer c.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..40) |i| {
+        const k = std.fmt.bufPrint(&buf, "s{d}", .{i}) catch unreachable;
+        c.put(k, k, 0, 0, 0);
+    }
+    for (0..300) |i| {
+        const k = std.fmt.bufPrint(&buf, "f{d}", .{i}) catch unreachable;
+        c.put(k, k, 0, 0, 0);
+    }
+    var col: ScanCollector = .{};
+    defer col.deinit();
+    var cur: Cache.ScanCursor = .{};
+    try scanPastSeventyPercent(&c, &cur, &col);
+    const epoch = c.map_epoch;
+    const cap = c.map.capacity();
+    const rehashes = c.stats.rehashes;
+    // Enough removals that the next insert sheds the tombstones in place: the slots move, the capacity does not.
+    for (0..300) |i| {
+        const k = std.fmt.bufPrint(&buf, "f{d}", .{i}) catch unreachable;
+        try testing.expect(c.remove(k));
+    }
+    c.put("z", "z", 0, 0, 0);
+    try testing.expectEqual(rehashes + 1, c.stats.rehashes);
+    try testing.expectEqual(cap, c.map.capacity());
+    try testing.expect(c.map_epoch != epoch);
+    while (!c.scan(&cur, 0, 0, 1000, ScanCollector.hook, &col)) {}
+    for (0..40) |j| {
+        const k = std.fmt.bufPrint(&buf, "s{d}", .{j}) catch unreachable;
+        try testing.expect(col.count(k) >= 1);
+    }
+}
+
+test "mutation 2026-11-25: reserve: the map growing under it counts as a relocation (map_epoch)" {
+    var c = testCache(1 << 20, 16);
+    defer c.deinit();
+    const e0 = c.map_epoch;
+    const fill = c.reserve("a", 1, 0, 0, 0).?;
+    try testing.expect(c.map_epoch != e0);
+    c.discard(fill);
+}
+
+fn slotOf(c: *const Cache, key: []const u8) ?usize {
+    var it = c.map.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*.key, key)) return it.index - 1;
+    }
+    return null;
+}
+
+test "mutation 2026-11-25: scan: a shed of tombstones moves a key to a slot behind the cursor, and the restarted walk still shows it" {
+    var c = testCache(1 << 24, 100_000);
+    defer c.deinit();
+    var buf: [24]u8 = undefined;
+    for (0..40) |i| {
+        const k = std.fmt.bufPrint(&buf, "f{d}", .{i}) catch unreachable;
+        c.put(k, k, 0, 0, 0);
+    }
+    const cap = c.map.capacity();
+    // Three keys with the same home slot H, in a stretch of the index nothing else uses: they
+    // sit in H, H+1, H+2, in insertion order.
+    const used = try testing.allocator.alloc(bool, cap);
+    defer testing.allocator.free(used);
+    @memset(used, false);
+    {
+        var it = c.map.iterator();
+        while (it.next()) |_| used[it.index - 1] = true;
+    }
+    const home: usize = for (1..cap - 6) |h| {
+        if (!std.mem.containsAtLeast(bool, used[h - 1 .. h + 5], 1, &.{true})) break h;
+    } else return error.SkipZigTest;
+    var names: [3][24]u8 = undefined;
+    var lens: [3]usize = undefined;
+    var found: usize = 0;
+    var n: usize = 0;
+    while (found < 3) : (n += 1) {
+        try testing.expect(n < 200_000);
+        const k = std.fmt.bufPrint(&buf, "x{d}", .{n}) catch unreachable;
+        if (c.keyFor(k).hash & (cap - 1) != home) continue;
+        @memcpy(names[found][0..k.len], k);
+        lens[found] = k.len;
+        found += 1;
+    }
+    for (0..3) |i| c.put(names[i][0..lens[i]], names[i][0..lens[i]], 0, 0, 0);
+    try testing.expectEqual(cap, c.map.capacity());
+    for (0..3) |i| try testing.expectEqual(home + i, slotOf(&c, names[i][0..lens[i]]).?);
+
+    // The walk has just shown the first of them: the cursor stands at H + 1.
+    var col: ScanCollector = .{};
+    defer col.deinit();
+    var cur: Cache.ScanCursor = .{};
+    var guard: usize = 0;
+    while (cur.slot <= home) : (guard += 1) {
+        try testing.expect(!c.scan(&cur, 0, 0, 1, ScanCollector.hook, &col));
+        try testing.expect(guard < 1000);
+    }
+    try testing.expectEqual(home + 1, @as(usize, cur.slot));
+    try testing.expectEqual(@as(usize, 1), col.count(names[0][0..lens[0]]));
+
+    // Remove it and enough fillers for the next insert to shed the tombstones in place:
+    // the second key moves back to H, behind the cursor.
+    const rehashes = c.stats.rehashes;
+    try testing.expect(c.remove(names[0][0..lens[0]]));
+    for (0..35) |i| {
+        const k = std.fmt.bufPrint(&buf, "f{d}", .{i}) catch unreachable;
+        _ = c.remove(k);
+    }
+    c.put("z", "z", 0, 0, 0);
+    try testing.expectEqual(rehashes + 1, c.stats.rehashes);
+    try testing.expectEqual(cap, c.map.capacity());
+    try testing.expectEqual(home, slotOf(&c, names[1][0..lens[1]]).?);
+    while (!c.scan(&cur, 0, 0, 1000, ScanCollector.hook, &col)) {}
+    try testing.expect(col.count(names[1][0..lens[1]]) >= 1);
+    try testing.expect(col.count(names[2][0..lens[2]]) >= 1);
+}
+
 test "drainDirty visits exactly the dirty entries, skipping clean ones" {
     var c = testCache(1 << 20, 16);
     defer c.deinit();

@@ -109,3 +109,81 @@ test "encodeP2PKH: the compressed generator key gives the well-known address; ve
     try t.expectEqual(@as(u8, 0x6f), payload[0]);
     try t.expectEqualSlices(u8, &.{ 0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94, 0x1c, 0x45, 0xd1, 0xb3, 0xa3, 0x23, 0xf1, 0x43, 0x3b, 0xd6 }, payload[1..]);
 }
+
+// ── locateErrors (delta mutation 2026-11-25) ────────────────────────────
+
+test "mutation 2026-11-25: locateErrors: the letter ends 'A' 'Z' 'a' 'z' count as letters in the case check" {
+    const cases = [_][]const u8{ "Ab1qqqqqq", "Zb1qqqqqq", "Xa1qqqqqq", "Xz1qqqqqq", "bA1qqqqqq", "bZ1qqqqqq" };
+    for (cases) |s| {
+        const l = bech32.locateErrors(s, null);
+        try t.expectEqual(bech32.Fault.mixed_case, l.fault);
+        try t.expectEqualSlices(u8, &.{1}, l.positions());
+    }
+}
+
+test "mutation 2026-11-25: locateErrors: a '1' inside the HRP, the HRP bytes 33 and 126, and an 83-byte HRP are valid, not faults" {
+    const data = [_]u5{ 1, 2, 3, 4 };
+    const hrp83: [bech32.max_hrp_len]u8 = @splat('a');
+    const hrps = [_][]const u8{ "x1y", "!", "~", "!~", &hrp83 };
+    for (hrps) |hrp| {
+        // the 83-byte HRP leaves room for the checksum only
+        const n: usize = if (hrp.len == bech32.max_hrp_len) 0 else data.len;
+        const enc = try bech32.encode(hrp, data[0..n], .bech32);
+        const l = bech32.locateErrors(enc.slice(), null);
+        try t.expectEqual(bech32.Fault.none, l.fault);
+        try t.expectEqual(@as(?bech32.Encoding, .bech32), l.encoding);
+    }
+}
+
+test "mutation 2026-11-25: locateErrors: an HRP byte outside [33,126] is reported even when the checksum is wrong too" {
+    const l = bech32.locateErrors("x\x7fy1pzry9x0s0mux", null);
+    try t.expectEqual(bech32.Fault.invalid_character, l.fault);
+    try t.expectEqualSlices(u8, &.{1}, l.positions());
+    // ... and ahead of the separator check: five data characters would otherwise be a bad separator.
+    const short = bech32.locateErrors("x\x7fy1pzry", null);
+    try t.expectEqual(bech32.Fault.invalid_character, short.fault);
+    try t.expectEqualSlices(u8, &.{1}, short.positions());
+}
+
+test "mutation 2026-11-25: locateErrors: `expected` restricts the repair to one checksum constant" {
+    // A bech32m string with one wrong character: repairable as bech32m, not as bech32.
+    const s = "bc1r23alxd5mzfsh79vn6pgufs6c0";
+    const m = bech32.locateErrors(s, .bech32m);
+    try t.expectEqual(bech32.Fault.bad_checksum, m.fault);
+    try t.expectEqual(@as(?bech32.Encoding, .bech32m), m.encoding);
+    const b = bech32.locateErrors(s, .bech32);
+    try t.expectEqual(bech32.Fault.bad_checksum_unlocated, b.fault);
+}
+
+/// The repaired copy of `s` by `l`, decoded: the encoding it checksums as.
+fn repairedEncoding(s: []const u8, l: bech32.Located) !bech32.Encoding {
+    var fixed: [bech32.max_len]u8 = undefined;
+    @memcpy(fixed[0..s.len], s);
+    for (l.positions(), l.fixes()) |p, f| fixed[p] = f;
+    return (try bech32.decode(fixed[0..s.len])).encoding;
+}
+
+test "mutation 2026-11-25: locateErrors with expected = null: the repair with fewer errors wins, bech32 on a tie, positions ascending" {
+    // Three strings built (see the comments) so that the residue is explained under BOTH constants.
+    // Tie: bech32 with two errors (data indexes 0 and 1) is also a bech32m string with two other errors.
+    const tie = "bc1vl3clxd5mzfsh79vn6uzma6q";
+    const lt = bech32.locateErrors(tie, null);
+    try t.expectEqual(bech32.Fault.bad_checksum, lt.fault);
+    try t.expectEqual(@as(?bech32.Encoding, .bech32), lt.encoding);
+    try t.expectEqualSlices(u8, &.{ 3, 4 }, lt.positions());
+    try t.expectEqual(bech32.Encoding.bech32, try repairedEncoding(tie, lt));
+    // One error as bech32 (data index 1), two as bech32m: the single repair wins.
+    const s1 = "bc1rt3clxd5mzfsh79vn6pg0kaytjeq8w4ur23clxd5mzfsh79vn6pg0kaytjeq8w4ur23clxd5mzfsh7sgr994";
+    const l1 = bech32.locateErrors(s1, null);
+    try t.expectEqual(bech32.Fault.bad_checksum, l1.fault);
+    try t.expectEqual(@as(?bech32.Encoding, .bech32), l1.encoding);
+    try t.expectEqualSlices(u8, &.{4}, l1.positions());
+    try t.expectEqual(bech32.Encoding.bech32, try repairedEncoding(s1, l1));
+    // The mirror image: one error as bech32m, two as bech32.
+    const s2 = "bc1rt3clxd5mzfsh79vn6pg0kaytjeq8w4ur23clxd5mzfsh79vn6pg0kaytjeq8w4ur23clxd5mzfsh795nfqh";
+    const l2 = bech32.locateErrors(s2, null);
+    try t.expectEqual(bech32.Fault.bad_checksum, l2.fault);
+    try t.expectEqual(@as(?bech32.Encoding, .bech32m), l2.encoding);
+    try t.expectEqualSlices(u8, &.{4}, l2.positions());
+    try t.expectEqual(bech32.Encoding.bech32m, try repairedEncoding(s2, l2));
+}

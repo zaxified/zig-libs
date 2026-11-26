@@ -3012,6 +3012,31 @@ test "writer refuses a path, link target or pax name the reader would refuse (li
     try testing.expectEqual(@as(usize, max_name_len), e2.path.len);
 }
 
+test "mutation 2026-11-25: writer name limits: hardlinks count, the largest accepted values pass, a regular file's link_target is not checked" {
+    const gpa = testing.allocator;
+    const big = try gpa.alloc(u8, max_name_len + 8);
+    defer gpa.free(big);
+    @memset(big, 'p');
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const gw = Writer.init(&aw.writer);
+    const pw = Writer.initOptions(&aw.writer, .{ .long_names = .pax });
+    // A hardlink target is held to the same limit as a symlink target.
+    try testing.expectError(error.FieldOutOfRange, gw.writeHeader(.{ .path = "h", .kind = .hardlink, .link_target = big[0..max_name_len] }));
+    try testing.expectError(error.FieldOutOfRange, pw.writeHeader(.{ .path = "h", .kind = .hardlink, .link_target = big[0 .. max_name_len + 1] }));
+    try testing.expectEqual(@as(usize, 0), aw.written().len);
+    // The largest accepted link targets (GNU: with its NUL; pax: the value itself), and pax names, are written.
+    try gw.writeHeader(.{ .path = "l", .kind = .symlink, .link_target = big[0 .. max_name_len - 1] });
+    try gw.writeHeader(.{ .path = "h", .kind = .hardlink, .link_target = big[0 .. max_name_len - 1] });
+    try pw.writeHeader(.{ .path = "l", .kind = .symlink, .link_target = big[0..max_name_len] });
+    try pw.writeHeader(.{ .path = "u", .uname = big[0..max_name_len] });
+    try pw.writeHeader(.{ .path = "g", .gname = big[0..max_name_len] });
+    // A regular file carries no link target on the wire, so a long one is not a reason to refuse it.
+    try gw.writeHeader(.{ .path = "f", .link_target = big });
+    try pw.writeHeader(.{ .path = "f", .link_target = big });
+    try testing.expect(aw.written().len > 0);
+}
+
 test "writer refuses a numeric field that does not fit, instead of truncating it" {
     var buf: [4 * block_size]u8 = undefined;
     var dst: std.Io.Writer = .fixed(&buf);
