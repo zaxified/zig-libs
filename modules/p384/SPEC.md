@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-13)
 
-**Audit:** review 2026-10-30 · mutation 2026-11-01 (55/57, 1 eq) · src 65e4298bf8e278e5
+**Audit:** review 2026-10-30 · mutation 2026-11-25 (105/116, 10 eq) · src 855a80647d3fc569
 
 **Hardening:** fuzz 2026-10-13 (200,000 runs clean, P384_FUZZ, 8 jobs × 25,000, every reach label hit) · ct 2026-10-13 (ctgrind mul/keygen/sign/ecdh: secret tainted, 0 in-file; positive control `vartime` flags 11) · panic 2026-10-30 (sweep + blind review: nothing to fix (DER max already covers 48×0xff); pin tests only)
 
@@ -205,6 +205,9 @@ generate/fromSecretKey/sign/ecdh/mul in ReleaseFast: green.
   2^-32 per square; no input can be constructed cheaply) — the card's one open survivor.
 - **Bench:** `P384_BENCH=1 scripts/modtest p384 -Doptimize=ReleaseFast` (`bench.zig`).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Delta mutation 2026-11-25** (`modinv`): 59 mutants, 50 killed, 9 equivalent or unobservable (two need an input near
+  the Bernstein-Yang worst case), 0 open. New unit tests: divsteps59 against a reference, the updateDE range
+  invariant, normalize.
 
 ## Performance
 
