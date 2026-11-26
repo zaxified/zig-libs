@@ -290,3 +290,41 @@ test "pseudonode id allocator: nonzero, distinct, lowest free, exhausts at 255, 
     a.release(255);
     try testing.expectEqual(@as(?u8, 255), a.alloc());
 }
+
+test "mutation 2026-11-25: the fragment and the purge carry their level, IS-type and flag bits" {
+    const r = localDis();
+    var buf: [256]u8 = undefined;
+    const f = try buildFragment(&buf, r, &.{sys(2)}, 0, .{ .is_l2 = true, .is_type = 3, .sequence_number = 77, .remaining_lifetime = 600, .fragment = 3 });
+    const lsp = try isis.Lsp.decode(f.wire);
+    try testing.expectEqual(isis.PduType.l2_lsp, lsp.header.pdu_type);
+    try testing.expectEqual(@as(u2, 3), lsp.flags.is_type);
+    try testing.expect(!lsp.flags.partition_repair);
+    try testing.expectEqual(@as(u4, 0), lsp.flags.attached);
+    try testing.expect(!lsp.flags.overload);
+    try testing.expectEqual(@as(u32, 77), lsp.sequence_number);
+    try testing.expectEqual(@as(u16, 600), lsp.remaining_lifetime);
+    const l1 = try isis.Lsp.decode((try buildFragment(&buf, r, &.{}, 0, .{})).wire);
+    try testing.expectEqual(isis.PduType.l1_lsp, l1.header.pdu_type);
+    try testing.expectEqual(@as(u2, 1), l1.flags.is_type);
+
+    var pbuf: [64]u8 = undefined;
+    const p2 = try isis.Lsp.decode(try buildPurge(&pbuf, r, 2, 9, true));
+    try testing.expectEqual(isis.PduType.l2_lsp, p2.header.pdu_type);
+    try testing.expectEqual(@as(u2, 1), p2.flags.is_type);
+    try testing.expect(!p2.flags.partition_repair and !p2.flags.overload);
+    try testing.expectEqual(@as(u4, 0), p2.flags.attached);
+    const p1 = try isis.Lsp.decode(try buildPurge(&pbuf, r, 2, 9, false));
+    try testing.expectEqual(isis.PduType.l1_lsp, p1.header.pdu_type);
+}
+
+test "mutation 2026-11-25: allocator take/isUsed address bit id & 63 of word id >> 6" {
+    var a: PseudonodeIdAllocator = .empty;
+    try testing.expect(a.take(40));
+    try testing.expect(a.isUsed(40));
+    try testing.expect(!a.isUsed(8)); // 40 & 31 would be bit 8
+    try testing.expect(!a.take(40));
+    try testing.expect(a.take(8));
+    a.release(40);
+    try testing.expect(!a.isUsed(40));
+    try testing.expect(a.isUsed(8));
+}

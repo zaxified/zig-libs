@@ -3186,3 +3186,111 @@ test "singularFound and compareLit are runQuery(...).found and compare, with the
         }
     };
 }
+
+test "mutation 2026-11-25: checkNodes counts past a string end and past an escape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = &[_]JsonCol{.{ .name = "x", .key = "", .type = .int }};
+    // `["a",1,2,3]` holds 5 values; the closing quote must end the string
+    try std.testing.expectError(error.NodeLimit, shape(a, "[\"a\",1,2,3]", .{ .columns = cols, .max_nodes = 4 }));
+    _ = try shape(a, "[\"a\",1,2,3]", .{ .columns = cols, .max_nodes = 5 });
+    // an escape applies to the one byte after the backslash only
+    try std.testing.expectError(error.NodeLimit, shape(a, "[\"\\n\",1,2,3]", .{ .columns = cols, .max_nodes = 4 }));
+    _ = try shape(a, "[\"\\n\",1,2,3]", .{ .columns = cols, .max_nodes = 5 });
+}
+
+test "mutation 2026-11-25: declared nested columns: shared names, the other container kind, oversize cells" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // two nested columns sharing one declared name keep their own cells
+    const f = try shape(a, "[{\"p\":[1],\"q\":[2,3]}]", .{ .columns = &.{
+        .{ .name = "t", .key = "p", .type = .list },
+        .{ .name = "t", .key = "q", .type = .list },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), f.columnAt(0).get(0).list.len());
+    try std.testing.expectEqual(@as(usize, 2), f.columnAt(1).get(0).list.len());
+    try std.testing.expectEqualStrings("t", f.columns[0].name);
+    try std.testing.expectEqualStrings("t", f.columns[1].name);
+    // an object where a list is declared, and an array where a struct is declared, are null
+    const g = try shape(a, "[{\"o\":{\"x\":1},\"l\":[1]}]", .{ .columns = &.{
+        .{ .name = "o", .key = "o", .type = .list },
+        .{ .name = "l", .key = "l", .type = .@"struct" },
+    } });
+    try std.testing.expect(g.columnAt(0).get(0) == .null);
+    try std.testing.expect(g.columnAt(1).get(0) == .null);
+    // a nested value over dataframe's cell cap is a work-limit refusal
+    var doc: std.ArrayList(u8) = .empty;
+    try doc.appendSlice(a, "[{\"big\":[");
+    for (0..(1 << 19)) |i| try doc.print(a, "{s}1234", .{if (i == 0) "" else ","});
+    try doc.appendSlice(a, "]}]");
+    try std.testing.expectError(error.WorkLimit, shape(a, doc.items, .{ .columns = &.{.{ .name = "b", .key = "big", .type = .list }} }));
+}
+
+test "mutation 2026-11-25: singular walks match runQuery at the path-depth cap, with a long key, and over several matches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const long = try a.alloc(u8, 130);
+    @memset(long, 'k');
+    var doc: std.ArrayList(u8) = .empty;
+    try doc.print(a, "{{\"{s}\":{{\"b\":[10,20,30]}},\"a\":", .{long});
+    for (0..70) |_| try doc.appendSlice(a, "{\"a\":");
+    try doc.appendSlice(a, "1");
+    for (0..70) |_| try doc.append(a, '}');
+    try doc.append(a, '}');
+    const parsed = try std.json.parseFromSliceLeaky(J, a, doc.items, .{});
+    const child = struct {
+        fn f(al: std.mem.Allocator, sel: Selector) Seg {
+            const p = al.create([1]Selector) catch unreachable;
+            p[0] = sel;
+            return .{ .child = p };
+        }
+    }.f;
+    var queries: std.ArrayList(Query) = .empty;
+    for ([_]usize{ 1, 62, 63, 64, 65, 66, 69 }) |k| {
+        const segs = try a.alloc(Seg, k);
+        for (segs) |*s| s.* = child(a, .{ .name = "a" });
+        try queries.append(a, .{ .absolute = true, .segs = segs });
+    }
+    try queries.append(a, .{ .absolute = true, .segs = &.{ child(a, .{ .name = long }), child(a, .{ .name = "b" }), child(a, .{ .index = 1 }) } });
+    try queries.append(a, .{ .absolute = true, .segs = &.{ child(a, .{ .name = long }), child(a, .{ .name = "b" }), child(a, .wildcard) } });
+    for (queries.items) |q| for ([_]usize{ 1, 1000 }) |limit| for ([_]usize{ 40, 130, 1 << 20 }) |budget| {
+        var w1: Work = .{ .limit = budget };
+        var c1: Ctx = .{ .a = a, .root = parsed, .limit = limit, .work = &w1 };
+        var w2: Work = .{ .limit = budget };
+        var c2: Ctx = .{ .a = a, .root = parsed, .limit = limit, .work = &w2 };
+        const want: Error!?J = if (runQuery(&c1, parsed, q, 1, 0)) |r| r.found else |e| e;
+        const got = singularFound(&c2, parsed, q, 0);
+        if (want) |wv| {
+            const gv = try got;
+            try std.testing.expectEqual(wv == null, gv == null);
+            if (wv) |x| try std.testing.expect(std.meta.eql(x, gv.?));
+        } else |e| try std.testing.expectError(e, got);
+        try std.testing.expectEqual(w1.used, w2.used);
+        if (q.isSingular()) {
+            var w3: Work = .{ .limit = budget };
+            var c3: Ctx = .{ .a = a, .root = parsed, .limit = limit, .work = &w3 };
+            const gp = singularPtr(&c3, parsed, q, 0);
+            if (want) |wv| {
+                const gv = try gp;
+                try std.testing.expectEqual(wv == null, gv == null);
+                if (wv) |x| try std.testing.expect(std.meta.eql(x, gv.?.*));
+            } else |e| try std.testing.expectError(e, gp);
+            try std.testing.expectEqual(w1.used, w3.used);
+        }
+    };
+}
+
+test "mutation 2026-11-25: decodeNested reports text that is not JSON as BadJson (not as a work limit)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{.{ .name = "\x00jsonshape.0", .type = .text }};
+    var b = try df.FrameBuilder.init(a, &cols, 1);
+    try b.appendRow(&[_]Value{.{ .text = "[1," }});
+    const f = try b.toOwned();
+    const spec: ShapeSpec = .{ .columns = &.{.{ .name = "t", .key = "t", .type = .list }} };
+    try std.testing.expectError(error.BadJson, decodeNested(a, f, spec));
+}

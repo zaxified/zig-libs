@@ -452,3 +452,72 @@ test "parseIdpMetadata: entity attributes and EncryptionMethod algorithms are re
     // The signing certificate list is untouched by the encryption descriptor (use="encryption" is skipped).
     try std.testing.expectEqual(@as(usize, 1), md.signing_certs_der.len);
 }
+
+test "mutation 2026-11-25: IdP metadata EncryptionMethod and EntityAttributes readers: element filters, caps, descriptors without use" {
+    const alloc = std.testing.allocator;
+    const head =
+        "<md:EntityDescriptor xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" " ++
+        "xmlns:mdattr=\"urn:oasis:names:tc:SAML:metadata:attribute\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" entityID=\"https://idp.example.org\">";
+    const sso = "<md:SingleSignOnService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\" Location=\"https://idp.example.org/sso\"/>";
+    const cert = "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>AAAA</ds:X509Certificate></ds:X509Data></ds:KeyInfo>";
+
+    // filters and a descriptor without `use`
+    const doc = head ++
+        "<md:Extensions>" ++
+        "<mdattr:Other><saml:Attribute Name=\"wrong-parent\"><saml:AttributeValue>v</saml:AttributeValue></saml:Attribute></mdattr:Other>" ++
+        "<mdattr:EntityAttributes>" ++
+        "<saml:Other Name=\"wrong-element\"/>" ++
+        "<saml:Attribute><saml:AttributeValue>no-name</saml:AttributeValue></saml:Attribute>" ++
+        "<saml:Attribute Name=\"ok\"><saml:Other>not-a-value</saml:Other><saml:AttributeValue>real</saml:AttributeValue></saml:Attribute>" ++
+        "</mdattr:EntityAttributes></md:Extensions>" ++
+        "<md:IDPSSODescriptor protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\">" ++
+        "<md:KeyDescriptor use=\"encryption\">" ++ cert ++
+        "<md:Other Algorithm=\"not-an-encryption-method\"/><md:EncryptionMethod/>" ++
+        "<md:EncryptionMethod Algorithm=\"alg-a\"/></md:KeyDescriptor>" ++
+        "<md:KeyDescriptor>" ++ cert ++ "<md:EncryptionMethod Algorithm=\"alg-nouse\"/></md:KeyDescriptor>" ++
+        sso ++ "</md:IDPSSODescriptor></md:EntityDescriptor>";
+    var md = try saml.parseIdpMetadata(alloc, doc);
+    defer md.deinit();
+    try std.testing.expectEqual(@as(usize, 1), md.entity_attributes.len);
+    try std.testing.expectEqualStrings("ok", md.entity_attributes[0].name);
+    try std.testing.expectEqual(@as(usize, 1), md.entity_attributes[0].values.len);
+    try std.testing.expectEqualStrings("real", md.entity_attributes[0].values[0]);
+    try std.testing.expectEqual(@as(usize, 2), md.encryption_methods.len);
+    try std.testing.expectEqualStrings("alg-a", md.encryption_methods[0]);
+    try std.testing.expectEqualStrings("alg-nouse", md.encryption_methods[1]);
+    // an A, B, A sequence is deduplicated against every earlier entry, not only the last
+    const dd = head ++ "<md:IDPSSODescriptor protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\"><md:KeyDescriptor>" ++ cert ++
+        "<md:EncryptionMethod Algorithm=\"A\"/><md:EncryptionMethod Algorithm=\"B\"/><md:EncryptionMethod Algorithm=\"A\"/></md:KeyDescriptor>" ++ sso ++
+        "</md:IDPSSODescriptor></md:EntityDescriptor>";
+    var md2 = try saml.parseIdpMetadata(alloc, dd);
+    defer md2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), md2.encryption_methods.len);
+
+    // caps: 70 distinct entries are cut at max_metadata_attributes
+    var enc: std.ArrayList(u8) = .empty;
+    defer enc.deinit(alloc);
+    try enc.appendSlice(alloc, head ++ "<md:IDPSSODescriptor protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\"><md:KeyDescriptor>" ++ cert);
+    for (0..70) |i| try enc.print(alloc, "<md:EncryptionMethod Algorithm=\"alg-{d}\"/>", .{i});
+    try enc.appendSlice(alloc, "</md:KeyDescriptor>" ++ sso ++ "</md:IDPSSODescriptor></md:EntityDescriptor>");
+    var md3 = try saml.parseIdpMetadata(alloc, enc.items);
+    defer md3.deinit();
+    try std.testing.expectEqual(@as(usize, saml.max_metadata_attributes), md3.encryption_methods.len);
+
+    var attrs: std.ArrayList(u8) = .empty;
+    defer attrs.deinit(alloc);
+    try attrs.appendSlice(alloc, head ++ "<md:Extensions><mdattr:EntityAttributes>");
+    for (0..70) |i| try attrs.print(alloc, "<saml:Attribute Name=\"n{d}\"><saml:AttributeValue>v</saml:AttributeValue></saml:Attribute>", .{i});
+    try attrs.appendSlice(alloc, "</mdattr:EntityAttributes></md:Extensions><md:IDPSSODescriptor protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\">" ++ sso ++ "</md:IDPSSODescriptor></md:EntityDescriptor>");
+    var md4 = try saml.parseIdpMetadata(alloc, attrs.items);
+    defer md4.deinit();
+    try std.testing.expectEqual(@as(usize, saml.max_metadata_attributes), md4.entity_attributes.len);
+
+    var vals: std.ArrayList(u8) = .empty;
+    defer vals.deinit(alloc);
+    try vals.appendSlice(alloc, head ++ "<md:Extensions><mdattr:EntityAttributes><saml:Attribute Name=\"many\">");
+    for (0..70) |i| try vals.print(alloc, "<saml:AttributeValue>v{d}</saml:AttributeValue>", .{i});
+    try vals.appendSlice(alloc, "</saml:Attribute></mdattr:EntityAttributes></md:Extensions><md:IDPSSODescriptor protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\">" ++ sso ++ "</md:IDPSSODescriptor></md:EntityDescriptor>");
+    var md5 = try saml.parseIdpMetadata(alloc, vals.items);
+    defer md5.deinit();
+    try std.testing.expectEqual(@as(usize, saml.max_metadata_attributes), md5.entity_attributes[0].values.len);
+}
