@@ -1646,9 +1646,9 @@ tlsclient	ReleaseFast	cv	1	30	aeb841d005c8d4a6	a92e71f50313cf2b
 # in takeHandshakeMessage (Connection.zig, epoch-2 branch) on the AEAD-decrypted record -- the same "processing of
 # decrypted content" class as the existing `ctype != content_type_handshake` site, two contexts (per call site/mode,
 # memcheck's duplicate rule). No branch on a key or secret.
-dtls	ReleaseFast	hs	1	176	0080f1336180e918	61a204df8edf79a0
+dtls	ReleaseFast	hs	1	176	03d775e0e9abe1d8	61a204df8edf79a0
 # 2026-11-03 (re-pin from full CI 41622100028, counts only, not read by --stacks): dtls app 14 -> 13, down by one after chachapoly's short AEAD engine (no dtls source changed). Owner rule: no local ctgrind re-run.
-dtls	ReleaseFast	app	1	13	0080f1336180e918	70da17057fd7a044
+dtls	ReleaseFast	app	1	13	03d775e0e9abe1d8	70da17057fd7a044
 # 2026-11-13 (KeyUpdate / exporter / ALPN; local --stacks run, contexts read one by one): hs 120 -> 123 = +3 messages.zig
 # decodeExtensions on the DECRYPTED EncryptedExtensions (the client now parses it for the ALPN answer), class (b). app 13 -> 23:
 # per record the replay window (replayCheckAndUpdate, now reached through per-epoch pointers, so inlined once per record: 12)
@@ -1657,7 +1657,7 @@ dtls	ReleaseFast	app	1	13	0080f1336180e918	70da17057fd7a044
 # exporter master secret tainted, a KeyUpdate each way (update_requested), the ACKs, records both ways on epoch 4, an
 # RFC 8446 §7.5 export, under AES-128-GCM and ChaCha20-Poly1305: 22 = the same class-(b) record sites as app plus
 # processAck's parsing of the decrypted ACK body (2) and its replay window (2). No branch on a key or secret.
-dtls	ReleaseFast	ku	1	21	0080f1336180e918	505aa3fdd426f98d
+dtls	ReleaseFast	ku	1	21	03d775e0e9abe1d8	505aa3fdd426f98d
 # 2026-11-13 (DTLS 1.2, Connection12; local --stacks run, contexts read by top frame and module chain). hs/app/ku
 # unchanged in count (174/13/21); their source digests move because Connection.zig gained the 1.2 Config fields, the
 # dual-version hello and the NegotiatedDtls12 gates (no tainted path touched). New rows:
@@ -1706,8 +1706,8 @@ dtls	ReleaseFast	ku	1	21	0080f1336180e918	505aa3fdd426f98d
 # (RFC 5077) before the Finished (Connection12 1011, reported for both PSK modes) — class (b), work on decrypted
 # content, no branch on a key; the ticket and stapling code is not driven by the harness. hs/app/ku/app12 counts
 # unchanged (176/13/21/3); digests re-pinned.
-dtls	ReleaseFast	hs12	1	46	f663be99d2675b9d	d87712f4d6e60179
-dtls	ReleaseFast	app12	1	3	f663be99d2675b9d	a30c6f8f370c5fa7
+dtls	ReleaseFast	hs12	1	46	c9dbbb898ba6fbb3	d87712f4d6e60179
+dtls	ReleaseFast	app12	1	3	c9dbbb898ba6fbb3	a30c6f8f370c5fa7
 # tlsserver (2026-10-21) — hs: Server.feed on the plaintext ClientHello
 # records of five recorded sessions (P-256/X25519, P-256/X25519MLKEM768, P-384,
 # Ed25519, a HelloRetryRequest) up to the first flight, every octet of
@@ -2498,18 +2498,18 @@ aesgcm	ReleaseFast	generic	1	226	f53f30679e9e0b14	b60805fea700d105	cpu=x86_64 co
 # lanes are `undefined`, origin soft.zig:610, so the compare branches on them without any taint)
 # + 8 witness (the printed tag/plaintext), trap +16 more witness prints (nothing declassified).
 aesccm	ReleaseFast	aead	1	192	127a73c2fdbb70df	d38f305d54b5a2c3	cpu=x86_64 control=16 trap=32
-dtls	ReleaseFast	hs	1	302	0080f1336180e918	61a204df8edf79a0	cpu=x86_64 control=177 trap=179
-dtls	ReleaseFast	app	1	278	0080f1336180e918	70da17057fd7a044	cpu=x86_64 control=279 trap=279
+dtls	ReleaseFast	hs	1	302	03d775e0e9abe1d8	61a204df8edf79a0	cpu=x86_64 control=177 trap=179
+dtls	ReleaseFast	app	1	278	03d775e0e9abe1d8	70da17057fd7a044	cpu=x86_64 control=279 trap=279
 # 2026-11-21 (connection ID work): ku +1 in the tainted, the untainted and the no-fvalgrind rows alike (296/299/299 ->
 # 297/300/300) — a taint-independent context of the portable build from the new CID-message branches in poll/processAck,
 # not a secret one; hs12 55 -> 47, the same eight once-instead-of-twice sites as the native row (see the dtls note).
-dtls	ReleaseFast	ku	1	297	0080f1336180e918	505aa3fdd426f98d	cpu=x86_64 control=300 trap=300
+dtls	ReleaseFast	ku	1	297	03d775e0e9abe1d8	505aa3fdd426f98d	cpu=x86_64 control=300 trap=300
 # dtls hs12 (+2, own --stacks diff portable vs native, 2026-11-18): +1 B (std X25519 curve25519.zig `ladder`
 # via ct25519 root.zig) and +1 compiler_rt `shortMemset` (compiler_rt.zig) for
 # handshake.zig `feed`'s `@memset(received[...][0..fragment_body.len])`. The branch is on the fragment
 # length of the decrypted handshake message, a framing value that the record length already shows on
 # the wire; native lowers that memset without the size dispatch.
-dtls	ReleaseFast	hs12	1	48	f663be99d2675b9d	d87712f4d6e60179	cpu=x86_64
+dtls	ReleaseFast	hs12	1	48	c9dbbb898ba6fbb3	d87712f4d6e60179	cpu=x86_64
 # quic-crypto aes portable trap 45 -> 37 (2026-11-26): Protection now keeps one expanded AEAD context per
 # direction instead of expanding the key per packet, so std's soft AES runs its key schedule fewer times and
 # its undefined-lane padding reports fewer untainted contexts. Tainted in-file (84) and control (3) unchanged.
