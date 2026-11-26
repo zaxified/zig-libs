@@ -174,6 +174,7 @@ pub fn Protection(comptime Aead: type) type {
             state: if (keyed_context) Aead.Context else [key_length]u8,
 
             /// `out` ← the packet protection for `*key` / `iv`.
+            // secret-api-ok: the key schedule is expanded in place by `Aead.Context.initInto`, which burns (aesgcm); otherwise a plain copy into `out`. Probed: stackprobe_test.zig (Keyed.initInto).
             pub fn initInto(out: *Keyed, key: *const [key_length]u8, iv: [nonce_length]u8) void {
                 out.iv = iv;
                 if (keyed_context) {

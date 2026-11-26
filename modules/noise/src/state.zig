@@ -238,6 +238,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
 
             /// §5.1 `InitializeKey(key)`: sets `k = key`, `n = 0`. The key is
             /// taken by pointer so the call leaves no copy in a dead frame.
+            // secret-api-ok: the key schedule is expanded in place by the AEAD's own `Context.initInto`, which burns (aesgcm); otherwise a plain copy into `self`. Probed: stackprobe2_test.zig.
             pub fn initializeKey(self: *CipherState, key: *const [32]u8) void {
                 self.k = key.*;
                 self.n = 0;

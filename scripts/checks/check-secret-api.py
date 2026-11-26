@@ -594,9 +594,13 @@ def scan_module(module, want_burned=False):
     fn_names = set()
     entries = []
     bodies = {}
+    qbodies = {}  # (innermost container, name) -> bodies
     for f, fi in files.items():
         for name, params, ret, body, pos, is_pub in all_fns(fi):
             bodies.setdefault(name, []).append(body)
+            enc = fi.enclosing(pos)
+            if enc:
+                qbodies.setdefault((enc[0], name), []).append(body)
             if not is_pub:
                 continue
             fn_names.add(name)
@@ -643,7 +647,35 @@ def scan_module(module, want_burned=False):
     for n, bs in bodies.items():
         if dep_call and any(dep_call.search(b) for b in bs):
             burned.add(n)
-    calls = {n: {c for b in bs for c in CALL.findall(b)} - {n} for n, bs in bodies.items()}
+    # A QUALIFIED call `T.name(` to a container `T` of this module resolves to
+    # that container's own `name`, not to every `name` the module has: rsa's
+    # `marshal.privateDer` calls `RevWriter.init(out)`, a plain constructor,
+    # and inherited the burn of `Blowfish.init` by name (2026-11-26: the
+    # private-key serializers shipped with no burn and passed this gate).
+    # A pair is burned when one of its bodies burns or calls a burned name.
+    qburned = {
+        q for q, bs in qbodies.items()
+        if any(BURN.search(b) or (dep_call and dep_call.search(b)) for b in bs)
+    }
+
+    parsed = {}  # body -> {callee: [qualifier or ""]}, parsed once
+
+    def eff_calls(body):
+        pc = parsed.get(body)
+        if pc is None:
+            pc = {}
+            for c in set(CALL.findall(body)):
+                pc[c] = re.findall(r"(?<![\w.])([A-Za-z_]\w*\.)?" + re.escape(c) + r"\s*\(", body)
+            parsed[body] = pc
+        out = set()
+        for c, quals in pc.items():
+            if any(not q or (q[:-1], c) not in qbodies or (q[:-1], c) in qburned for q in quals):
+                out.add(c)
+            elif not quals:
+                out.add(c)  # `@call(.m, f, ...)` or a deeper chain: keep by name
+        return out
+
+    calls = {n: set().union(*(eff_calls(b) for b in bs)) - {n} for n, bs in bodies.items()}
     # A THIN wrapper: every body under this name is short (a line or two of
     # argument shaping around one call). A long body that reaches a burn on one
     # path (opcua's `Channel.call`) is not burned on the others.
@@ -658,6 +690,10 @@ def scan_module(module, want_burned=False):
         for n, cs in calls.items():
             if n in fn_names and n not in burned and thin.get(n) and not cs.isdisjoint(burned):
                 burned.add(n)
+                grew = True
+        for q, bs in qbodies.items():
+            if q not in qburned and any(not (eff_calls(b) - {q[1]}).isdisjoint(burned) for b in bs):
+                qburned.add(q)
                 grew = True
     if want_burned:
         return {e[2] for e in entries if e[2] in burned}
@@ -711,7 +747,7 @@ def scan_module(module, want_burned=False):
             continue
         if touches == ["self"] and not rs and ACCESSOR.match(name):
             continue
-        if not (set(CALL.findall(body)) - {name}).isdisjoint(burned):
+        if not (eff_calls(body) - {name}).isdisjoint(burned):
             continue
         # A QUALIFIED call to the same name on another container is not
         # recursion: voprf's `OprfServer.blindEvaluate` calls

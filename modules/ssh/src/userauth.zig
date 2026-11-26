@@ -1504,6 +1504,7 @@ pub const PreAuthConn = struct {
 
     /// Send an SSH_MSG_USERAUTH_BANNER (§5.4) now, before any request is
     /// read. At most `max_sent_banner_len` bytes (`error.NameTooLong`).
+    // secret-api-ok: the banner is public; the packet is encrypted under `Transport.sendPacket` -> `writePacket`'s record burn.
     pub fn sendBanner(self: *const PreAuthConn, message: []const u8) UserauthError!void {
         return sendBannerPacket(self.t, message);
     }

@@ -73,6 +73,7 @@ pub fn Ccm(comptime Aes: type, comptime tag_len: usize, comptime nonce_len: usiz
 
         ctx: @TypeOf(Aes.initEnc(@as([Aes.key_bits / 8]u8, undefined))),
 
+        // secret-api-ok: std's AEAD shape (key by value, no burn), on purpose: the schedule lands in the returned/owned context, and stackprobe_test.zig finds no round key or plaintext on the dead stack for AES-128/192/256.
         pub fn init(key: [key_length]u8) Self {
             return .{ .ctx = Aes.initEnc(key) };
         }
@@ -119,6 +120,7 @@ pub fn Ccm(comptime Aes: type, comptime tag_len: usize, comptime nonce_len: usiz
         }
 
         /// One-shot `init` + `seal` + `deinit`.
+        // secret-api-ok: std's AEAD shape (key by value, no burn), on purpose: the schedule lands in the returned/owned context, and stackprobe_test.zig finds no round key or plaintext on the dead stack for AES-128/192/256.
         pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) Error!void {
             var s = init(key);
             defer s.deinit();
@@ -126,6 +128,7 @@ pub fn Ccm(comptime Aes: type, comptime tag_len: usize, comptime nonce_len: usiz
         }
 
         /// One-shot `init` + `open` + `deinit`.
+        // secret-api-ok: std's AEAD shape (key by value, no burn), on purpose: the schedule lands in the returned/owned context, and stackprobe_test.zig finds no round key or plaintext on the dead stack for AES-128/192/256.
         pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) OpenError!void {
             var s = init(key);
             defer s.deinit();
