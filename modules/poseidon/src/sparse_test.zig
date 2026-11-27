@@ -10,6 +10,7 @@ const bls = @import("bls12_381_poseidon.zig");
 const neptune = @import("neptune.zig");
 const small_field = @import("small_field.zig");
 const perm = @import("perm.zig");
+const grain_mod = @import("grain.zig");
 
 fn randomState(comptime P: type, rng: std.Random) [P.t]P.Fr {
     var st: [P.t]P.Fr = undefined;
@@ -98,4 +99,9 @@ test "optimised == plain: unusual round shapes over a small field" {
             for (a, b) |x, y| try testing.expect(x.eql(y));
         }
     }
+}
+
+test "mutation 2026-11-25: a consecutive-Cauchy MDS draws no Grain candidates" {
+    const tables = try grain_mod.derive(smallCfg(3, 8, 2));
+    try testing.expectEqual(@as(usize, 0), tables.mds_candidates);
 }

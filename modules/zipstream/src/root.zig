@@ -4088,6 +4088,7 @@ test {
     _ = @import("s2_test.zig");
     _ = @import("raw_test.zig");
     _ = @import("deflate64_test.zig");
+    _ = @import("mutation_test.zig");
     _ = @import("crypto_test.zig");
     _ = @import("crypto.zig");
     _ = @import("sweep_test.zig");

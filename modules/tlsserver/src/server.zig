@@ -9611,3 +9611,75 @@ test "extra_groups: each is negotiated and served alone when Config.groups enabl
         try testing.expectError(error.HandshakeFailure, s0.feed(rec));
     }
 }
+
+// ── delta mutation run 2026-11-25 ───────────────────────────────────────────
+
+fn retryPatched(first: Hello, second: Hello, flip: usize) !?Error {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const r1 = try buildRecord(testing.allocator, first);
+    defer testing.allocator.free(r1);
+    _ = try s.feed(r1);
+    try testing.expectEqual(State.client_hello_retry, s.state);
+    const r2 = try buildRecord(testing.allocator, second);
+    defer testing.allocator.free(r2);
+    if (flip < r2.len) r2[flip] ^= 1;
+    if (s.feed(r2)) |_| return null else |err| return @as(?Error, err);
+}
+
+test "mutation 2026-11-25: the second hello must repeat the random, the session id octets and a final empty extension" {
+    // random: record header 5 + handshake header 4 + legacy_version 2
+    try testing.expectEqual(@as(?Error, error.IllegalParameter), try retryPatched(x25519_share_first, p256_only, 11));
+    try testing.expectEqual(@as(?Error, null), try retryPatched(x25519_share_first, p256_only, std.math.maxInt(usize)));
+    var sid1 = x25519_share_first;
+    sid1.session_id = &(@as([32]u8, @splat(6)));
+    var sid2 = p256_only;
+    sid2.session_id = &(@as([32]u8, @splat(7)));
+    try testing.expectEqual(error.IllegalParameter, (try retry(sid1, "", sid2)).err.?);
+    var empty_ext = p256_only;
+    empty_ext.extra = &.{.{ 0x7f7f, "" }};
+    try testing.expectEqual(error.IllegalParameter, (try retry(x25519_share_first, "", empty_ext)).err.?);
+}
+
+test "mutation 2026-11-25: Config.check sizes the client-auth extensions exactly, ticket requests size the output" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const base: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var auth: ClientAuth = .{ .verifier = .{ .verify = AcceptAny.verify }, .clock = .{ .now_ms = AcceptAny.clock } };
+    var c = base;
+    c.client_auth = &auth;
+    // 32767 schemes pass the count guard but their extension is over 65535 octets
+    const many = try testing.allocator.alloc(u16, 32767);
+    defer testing.allocator.free(many);
+    @memset(many, 0x0403);
+    auth.schemes = many;
+    try testing.expectError(error.ClientAuthAuthorities, c.check());
+    const too_many = try testing.allocator.alloc(u16, 32768);
+    defer testing.allocator.free(too_many);
+    @memset(too_many, 0x0403);
+    auth.schemes = too_many;
+    try testing.expectError(error.ClientAuthSchemes, c.check());
+    // one scheme (8 octets), the authorities header (6) and one name (2 + len): 65535 is the last that fits
+    auth.schemes = &.{0x0403};
+    const dn = try testing.allocator.alloc(u8, 65520);
+    defer testing.allocator.free(dn);
+    @memset(dn, 0x30);
+    auth.authorities = &.{dn[0..65519]};
+    try c.check();
+    auth.authorities = &.{dn[0..65520]};
+    try testing.expectError(error.ClientAuthAuthorities, c.check());
+
+    var small_t = NoTickets.tickets;
+    small_t.count = 1;
+    small_t.max_requested = 1;
+    var big_t = small_t;
+    big_t.max_requested = 200;
+    var small_cfg = base;
+    small_cfg.tickets = &small_t;
+    var big_cfg = base;
+    big_cfg.tickets = &big_t;
+    try testing.expect(minOutputLen(&big_cfg, testKey()) > minOutputLen(&small_cfg, testKey()) + 10000);
+}

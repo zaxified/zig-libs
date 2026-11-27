@@ -2223,3 +2223,67 @@ test "ECDH-ES: wrong recipient key, other curve, no key, off-curve originator po
     const x = xmlenc.EcPublicKey{ .x25519 = @splat(9) };
     try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = x } }, random, .{}));
 }
+
+test "mutation 2026-11-25: RSA-OAEP with SHA-256 and MGF1-SHA-1 names both; ECDH-ES parameters up to 128 octets; the originator point is checked" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5a)));
+    const random = prng.random();
+    const rsa_kp = try makeKey();
+    const rsa_sk = rsa_kp.secret_key;
+    // digest SHA-256 with MGF1-SHA-1 is not the short "rsa-oaep-mgf1p" form
+    const oaep = try xmlenc.encryptData(alloc, "m", .{ .rsa_oaep = .{ .key = rsa_kp.public_key, .digest = .sha256, .mgf = .sha1 } }, random, .{});
+    defer alloc.free(oaep);
+    try std.testing.expect(std.mem.find(u8, oaep, "xmlenc11#mgf1sha1") != null);
+    try std.testing.expect(std.mem.find(u8, oaep, "xmlenc#sha256") != null);
+    var odoc = try xml.parse(alloc, oaep, .{});
+    defer odoc.deinit();
+    alloc.free(try xmlenc.decryptData(alloc, odoc.root, &rsa_sk, .{}));
+    // and digest SHA-1 with MGF1-SHA-256 neither
+    const oaep2 = try xmlenc.encryptData(alloc, "m", .{ .rsa_oaep = .{ .key = rsa_kp.public_key, .digest = .sha1, .mgf = .sha256 } }, random, .{});
+    defer alloc.free(oaep2);
+    try std.testing.expect(std.mem.find(u8, oaep2, "xmlenc11#mgf1sha256") != null);
+    var odoc2 = try xml.parse(alloc, oaep2, .{});
+    defer odoc2.deinit();
+    alloc.free(try xmlenc.decryptData(alloc, odoc2.root, &rsa_sk, .{}));
+
+    // parameters of exactly 128 octets are accepted (and read back), 129 are not
+    const kp = try ecKeyPair(.p256, 0x74);
+    const p128: [128]u8 = @splat('p');
+    const p129: [129]u8 = @splat('p');
+    const Set = struct { id: ?[]const u8 = null, u: []const u8 = "", v: []const u8 = "" };
+    const ok = [_]Set{ .{ .id = &p128 }, .{ .u = &p128 }, .{ .v = &p128 } };
+    for (ok) |p| {
+        const t = try xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = kp.pk, .algorithm_id = p.id, .party_u_info = p.u, .party_v_info = p.v } }, random, .{});
+        defer alloc.free(t);
+        var d = try xml.parse(alloc, t, .{});
+        defer d.deinit();
+        alloc.free(try xmlenc.decryptData(alloc, d.root, &rsa_sk, .{ .ec_private_key = &kp.sk }));
+    }
+    const bad = [_]Set{ .{ .id = &p129 }, .{ .u = &p129 }, .{ .v = &p129 } };
+    for (bad) |p| try std.testing.expectError(error.UnsupportedAlgorithm, xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = kp.pk, .algorithm_id = p.id, .party_u_info = p.u, .party_v_info = p.v } }, random, .{}));
+
+    // the originator point: first octet 0x04 and exactly 1 + 2 * width octets
+    const t = try xmlenc.encryptData(alloc, "x", .{ .ecdh_es = .{ .recipient = kp.pk } }, random, .{});
+    defer alloc.free(t);
+    const open_tag = "<dsig11:PublicKey>";
+    const at = (std.mem.find(u8, t, open_tag) orelse return error.EditNotFound) + open_tag.len;
+    const end = std.mem.findPos(u8, t, at, "</dsig11:PublicKey>") orelse return error.EditNotFound;
+    var raw: [66]u8 = undefined;
+    const n = try std.base64.standard.Decoder.calcSizeForSlice(t[at..end]);
+    try std.base64.standard.Decoder.decode(raw[0..n], t[at..end]);
+    for ([_]u8{ 0, 1 }) |variant| {
+        var pt: [66]u8 = raw;
+        var len = n;
+        if (variant == 0) pt[0] = 0x03 else {
+            pt[len] = 0;
+            len += 1;
+        }
+        var enc: [96]u8 = undefined;
+        const text = std.base64.standard.Encoder.encode(&enc, pt[0..len]);
+        const edited = try std.mem.concat(alloc, u8, &.{ t[0..at], text, t[end..] });
+        defer alloc.free(edited);
+        var d = try xml.parse(alloc, edited, .{});
+        defer d.deinit();
+        try std.testing.expectError(error.MalformedStructure, xmlenc.decryptData(alloc, d.root, &rsa_sk, .{ .ec_private_key = &kp.sk }));
+    }
+}

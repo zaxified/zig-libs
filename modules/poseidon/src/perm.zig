@@ -347,3 +347,25 @@ pub fn Permutation(comptime cfg: Config) type {
         }
     };
 }
+
+test "mutation 2026-11-25: invertHat pivots past a zero entry and refuses a singular matrix" {
+    const small_field = @import("small_field.zig");
+    const F = small_field.SmallField(101);
+    const P = Permutation(.{ .Fr = F, .modulus_be = F.modulus_be, .n = 7, .t = 3, .r_f = 2, .r_p = 1, .mds = .cauchy_consecutive });
+    const small = struct {
+        fn f(v: u8) F {
+            var be: [32]u8 = @splat(0);
+            be[31] = v;
+            return F.fromBytes(be) catch unreachable;
+        }
+    }.f;
+    const id: [2][2]F = .{ .{ small(1), small(0) }, .{ small(0), small(1) } };
+    // a zero on the diagonal: the pivot row is found below and swapped in
+    const m: [2][2]F = .{ .{ small(0), small(2) }, .{ small(3), small(0) } };
+    const inv = try P.invertHat(&m);
+    const prod = P.matMulHat(&m, &inv);
+    for (0..2) |i| for (0..2) |j| try std.testing.expect(prod[i][j].eql(id[i][j]));
+    // no nonzero pivot in the second column
+    const s: [2][2]F = .{ .{ small(0), small(0) }, .{ small(1), small(1) } };
+    try std.testing.expectError(error.NotInvertible, P.invertHat(&s));
+}

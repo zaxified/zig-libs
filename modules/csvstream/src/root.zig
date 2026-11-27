@@ -197,6 +197,7 @@ test {
     _ = sniff;
     _ = @import("fuzz_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 // ── external anchor: maxogden/csv-spectrum corpus ───────────────────────────

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **NO CONSUMER-VISIBLE CHANGE:** killing tests from the 2026-11-25 delta mutation run.
 - **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** `clientauth.leafPublicKey` / `rawPublicKey` delegate to `tls13.certverify.publicKeyFromCert` / `publicKeyFromSpkiDer` (the SubjectPublicKeyInfo-to-key mapping moved there, shared with `dtls`); same keys accepted, same errors.
 - **2026-11-21** — **Added:** `CertifiedKey.rsa_blinding` (default null): an RSA key's per-key `rsa.BlindingCache`, used by every RSA-PSS CertificateVerify signed with that `CertifiedKey` (~5 % of an RSA-2048 signature); not thread-safe, so one `CertifiedKey` per thread when set.
 - **2026-11-21** — **NO CONSUMER-VISIBLE CHANGE:** test vectors `src/ja4_vectors.zig` (JA4 of the 69 recorded TCP client hellos by github.com/exaring/ja4plus, written by `tools/ja4_oracle`); `fingerprint.ja4` agrees with every one.
