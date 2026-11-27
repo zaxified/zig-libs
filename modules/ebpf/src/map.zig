@@ -554,3 +554,88 @@ test "unprivileged: a bogus map fd is an error, not a crash" {
         return error.TestUnexpectedResult;
     } else |e| try testing.expect(e == error.InvalidArgument or e == error.PermissionDenied);
 }
+
+fn mtNotTooSmall(r: anytype) !void {
+    if (r) |_| {} else |e| try testing.expect(e != error.BufferTooSmall);
+}
+
+test "mutation 2026-11-27: errno mapping, key and buffer checks, attr fields" {
+    const cases = [_]struct { e: linux.E, want: Error }{
+        .{ .e = .PERM, .want = error.PermissionDenied },
+        .{ .e = .ACCES, .want = error.PermissionDenied },
+        .{ .e = .INVAL, .want = error.InvalidArgument },
+        .{ .e = .BADF, .want = error.InvalidArgument },
+        .{ .e = .FAULT, .want = error.InvalidArgument },
+        .{ .e = .EXIST, .want = error.KeyExists },
+        .{ .e = .NOENT, .want = error.KeyNotFound },
+        .{ .e = .@"2BIG", .want = error.MapFull },
+        .{ .e = .NOSYS, .want = error.NotSupported },
+        .{ .e = .OPNOTSUPP, .want = error.NotSupported },
+        .{ .e = .NOMEM, .want = error.SystemResources },
+        .{ .e = .NOSPC, .want = error.SystemResources },
+        .{ .e = .MFILE, .want = error.SystemResources },
+        .{ .e = .NFILE, .want = error.SystemResources },
+        .{ .e = .AGAIN, .want = error.Unexpected },
+    };
+    for (cases) |c| try testing.expectEqual(c.want, mapErrno(c.e));
+
+    const m: Map = .{ .fd = 1000, .map_type = 1, .key_size = 4, .value_size = 8, .max_entries = 1, .map_flags = 0 };
+    var key4: [4]u8 = @splat(1);
+    var key8: [8]u8 = @splat(1);
+    var val: [8]u8 = @splat(0);
+    var out4: [4]u8 = undefined;
+    // a longer key is as wrong as a shorter one, for every call that takes one
+    try testing.expectError(error.BufferTooSmall, m.checkKey(&key8));
+    try testing.expectError(error.BufferTooSmall, m.lookupAndDelete(&key8, &val, 0));
+    try testing.expectError(error.BufferTooSmall, m.nextKey(&key8, &out4));
+    // the value buffer: one byte short is refused, the exact size reaches the syscall (a bogus fd)
+    try testing.expectError(error.BufferTooSmall, m.lookupAndDelete(&key4, val[0..7], 0));
+    try mtNotTooSmall(m.lookupAndDelete(&key4, &val, 0));
+    try testing.expectError(error.BufferTooSmall, m.update(&key4, val[0..7], .any, 0));
+    try mtNotTooSmall(m.update(&key4, &val, .any, 0));
+    try testing.expectError(error.BufferTooSmall, m.update(&key8, &val, .any, 0));
+
+    // elem(): every field is what the caller gave
+    const e = m.elem(&key4, &val, 7).map_elem;
+    try testing.expectEqual(@as(i64, 1000), @as(i64, e.map_fd));
+    try testing.expectEqual(@intFromPtr(&key4), e.key);
+    try testing.expectEqual(@intFromPtr(&val), e.result.value);
+    try testing.expectEqual(@as(u64, 7), e.flags);
+    const z = m.elem(null, null, 0).map_elem;
+    try testing.expectEqual(@as(u64, 0), z.key);
+    try testing.expectEqual(@as(u64, 0), z.result.value);
+
+    // an empty key or value buffer is a null pointer in the batch attr
+    const empty = m.buildBatchAttr(null, null, &.{}, &.{}, 0);
+    try testing.expectEqual(@as(u64, 0), empty.keys);
+    try testing.expectEqual(@as(u64, 0), empty.values);
+    const full = m.buildBatchAttr(null, null, &key4, &val, 1);
+    try testing.expectEqual(@intFromPtr(&key4), full.keys);
+    try testing.expectEqual(@intFromPtr(&val), full.values);
+
+    // batch buffers: count elements of key_size / valueBytes, a resume token and a next token of cursorSize
+    var keys: [8]u8 = undefined;
+    var vals: [16]u8 = undefined;
+    var cur: [8]u8 = undefined;
+    var nxt: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, m.lookupBatch(null, &nxt, keys[0..4], &vals, 2, 0));
+    try testing.expectError(error.BufferTooSmall, m.lookupBatch(null, &nxt, &keys, vals[0..8], 2, 0));
+    try mtNotTooSmall(m.lookupBatch(null, &nxt, &keys, &vals, 2, 0));
+    try mtNotTooSmall(m.deleteBatch(&keys, 2)); // delete carries no values
+    try testing.expectError(error.BufferTooSmall, m.lookupBatch(cur[0..7], &nxt, &keys, &vals, 2, 0));
+    try testing.expectError(error.BufferTooSmall, m.lookupBatch(null, nxt[0..7], &keys, &vals, 2, 0));
+    try mtNotTooSmall(m.lookupBatch(&cur, &nxt, &keys, &vals, 2, 0));
+
+    // devmapSet / cpumapSet: a key of the wrong size makes any call that passes validation answer BufferTooSmall
+    const dev4: Map = .{ .fd = -1, .map_type = 14, .key_size = 8, .value_size = 4, .max_entries = 1, .map_flags = 0 };
+    const dev8: Map = .{ .fd = -1, .map_type = 14, .key_size = 8, .value_size = 8, .max_entries = 1, .map_flags = 0 };
+    const dev6: Map = .{ .fd = -1, .map_type = 14, .key_size = 8, .value_size = 6, .max_entries = 1, .map_flags = 0 };
+    try testing.expectError(error.InvalidArgument, devmapSet(dev4, 1, 2, 3)); // 4-byte value: no program
+    try testing.expectError(error.BufferTooSmall, devmapSet(dev4, 1, 2, null));
+    try testing.expectError(error.BufferTooSmall, devmapSet(dev8, 1, 2, 3));
+    try testing.expectError(error.InvalidArgument, devmapSet(dev6, 1, 2, null));
+    try testing.expectError(error.InvalidArgument, cpumapSet(dev4, 1, 2, 3));
+    try testing.expectError(error.BufferTooSmall, cpumapSet(dev4, 1, 2, null));
+    try testing.expectError(error.BufferTooSmall, cpumapSet(dev8, 1, 2, 3));
+    try testing.expectError(error.InvalidArgument, cpumapSet(dev6, 1, 2, null));
+}

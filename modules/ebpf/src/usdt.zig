@@ -307,3 +307,182 @@ test "usdt: a probe pointing into .bss or nowhere is unmapped" {
     std.mem.writeInt(u64, copy[note_off + 20 ..][0..8], 0xdead_0000, native_endian);
     try testing.expectError(error.UnmappedAddress, discoverBytes(gpa, copy));
 }
+
+// ── mutation 2026-11-27: the note walk on a patched fixture ──────────────────
+
+const mt_note1 = 0x3028; // first note; its descriptor (pc, base, semaphore) is at +20
+const mt_note2 = mt_note1 + 80;
+
+fn mtSec(copy: []u8, idx: usize) usize {
+    const shoff: usize = @intCast(std.mem.readInt(u64, copy[0x28..][0..8], native_endian));
+    return shoff + idx * 64;
+}
+
+fn mtPut(copy: []u8, at: usize, v: u32) void {
+    std.mem.writeInt(u32, copy[at..][0..4], v, native_endian);
+}
+
+fn mtPut64(copy: []u8, at: usize, v: u64) void {
+    std.mem.writeInt(u64, copy[at..][0..8], v, native_endian);
+}
+
+fn mtFresh(gpa: std.mem.Allocator) ![]u8 {
+    return gpa.dupe(u8, fx_usdt);
+}
+
+test "mutation 2026-11-27: a note is a probe only by section type, section name, note type and owner" {
+    const gpa = testing.allocator;
+    {
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut(c, mt_note1 + 8, 4); // another note type: skipped
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        try testing.expectEqual(@as(usize, 1), s.probes.len);
+        try testing.expectEqualStrings("other", s.probes[0].name);
+    }
+    {
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        c[mt_note1 + 12 + 6] = 'x'; // owner "stapsdx": skipped
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        try testing.expectEqual(@as(usize, 1), s.probes.len);
+    }
+    {
+        // a note whose name is shorter than "stapsdt\0" is skipped, and its padding still counts:
+        // the next note starts where the 4-byte alignment says
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut(c, mt_note1, 5);
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        try testing.expectEqual(@as(usize, 1), s.probes.len);
+        try testing.expectEqualStrings("other", s.probes[0].name);
+    }
+    {
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        const at = std.mem.find(u8, c[0x30b4..], ".note.stapsdt\x00").? + 0x30b4;
+        c[at + 12] = 'x'; // the section is no longer called .note.stapsdt
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        try testing.expectEqual(@as(usize, 0), s.probes.len);
+    }
+    {
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut(c, mtSec(c, 7) + 4, 1); // sh_type PROGBITS instead of NOTE
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        try testing.expectEqual(@as(usize, 0), s.probes.len);
+    }
+}
+
+test "mutation 2026-11-27: descriptor length, string termination and the section edge" {
+    const gpa = testing.allocator;
+    {
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut(c, mt_note1 + 4, 23); // one byte short of pc, base, semaphore
+        try testing.expectError(error.MalformedNote, discoverBytes(gpa, c));
+    }
+    {
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut(c, mt_note2 + 4, 37); // the last string loses its NUL
+        try testing.expectError(error.MalformedNote, discoverBytes(gpa, c));
+    }
+    {
+        // a descriptor that ends exactly at the end of the section is fine
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut(c, mt_note2 + 4, 40);
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        try testing.expectEqual(@as(usize, 2), s.probes.len);
+    }
+    {
+        // a trailing foreign note with no descriptor that ends exactly at the end of the section is skipped
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut(c, mt_note2 + 8, 1);
+        mtPut(c, mt_note2 + 4, 0);
+        mtPut64(c, mtSec(c, 7) + 32, 100); // sh_size: the note's 12 + 8 bytes end the section
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        try testing.expectEqual(@as(usize, 1), s.probes.len);
+    }
+}
+
+test "mutation 2026-11-27: the prelink adjustment and the address-to-offset mapping" {
+    const gpa = testing.allocator;
+    {
+        // .stapsdt.base is at 0x402000: a note written with base 0x401fff moved by +1, pc and semaphore with it
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut64(c, mt_note1 + 28, 0x401fff);
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        var it = s.find("myprov", "myprobe");
+        const p = it.next().?;
+        try testing.expectEqual(@as(u64, 0x401005), p.address);
+        try testing.expectEqual(@as(u64, 0x1005), p.file_offset);
+        try testing.expectEqual(@as(?u64, 0x3001), p.semaphore_offset);
+    }
+    {
+        // base 0x402001: moved by -1
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut64(c, mt_note2 + 20 + 8, 0x402001);
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        var it = s.find("myprov", "other");
+        const p = it.next().?;
+        try testing.expectEqual(@as(u64, 0x401004), p.address);
+        try testing.expectEqual(@as(u64, 0x1004), p.file_offset);
+    }
+    {
+        // base 0: no adjustment at all
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut64(c, mt_note2 + 20 + 8, 0);
+        var s = try discoverBytes(gpa, c);
+        defer s.deinit();
+        var it = s.find("myprov", "other");
+        try testing.expectEqual(@as(u64, 0x1005), it.next().?.file_offset);
+    }
+    {
+        // the last byte of .text maps, the first byte after it does not
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut64(c, mt_note2 + 20, 0x40100f);
+        var s = try discoverBytes(gpa, c);
+        s.deinit();
+        mtPut64(c, mt_note2 + 20, 0x401010);
+        try testing.expectError(error.UnmappedAddress, discoverBytes(gpa, c));
+    }
+    {
+        // an address that only a non-allocated section (.comment, at 0) would hold is unmapped
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut64(c, mt_note2 + 20, 0x10);
+        mtPut64(c, mt_note2 + 20 + 8, 0);
+        try testing.expectError(error.UnmappedAddress, discoverBytes(gpa, c));
+    }
+    {
+        // a section whose file offset plus the address delta would wrap is no mapping
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut64(c, mtSec(c, 1) + 24, 0xffff_ffff_ffff_fff8); // .text sh_offset
+        mtPut64(c, mt_note2 + 20, 0x40100c);
+        try testing.expectError(error.UnmappedAddress, discoverBytes(gpa, c));
+    }
+    {
+        // a NOBITS section has no file bytes: the semaphore in it is unmapped
+        const c = try mtFresh(gpa);
+        defer gpa.free(c);
+        mtPut(c, mtSec(c, 5) + 4, 8); // .probes -> SHT_NOBITS
+        try testing.expectError(error.UnmappedAddress, discoverBytes(gpa, c));
+    }
+}

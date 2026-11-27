@@ -417,3 +417,97 @@ test "skeleton: the .kconfig map is the externs' fields at the loader's offsets"
     try testing.expect(std.mem.find(u8, src, "@offsetOf(Kconfig, \"CONFIG_ZL_NOT_THERE\") == 32") != null);
     try testing.expect(std.mem.find(u8, src, "@sizeOf(Kconfig) == 40") != null);
 }
+
+fn mtWrite(b: *const Btf, tid: u32, depth: u32, alloc: std.mem.Allocator) !?[]u8 {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    errdefer aw.deinit();
+    if (!try writeType(b, tid, &aw.writer, depth)) {
+        aw.deinit();
+        return null;
+    }
+    return try aw.toOwnedSlice();
+}
+
+test "mutation 2026-11-27: identifiers, int and enum widths, floats, depth and opaque cases" {
+    const gpa = testing.allocator;
+    var ib: [32]u8 = undefined;
+    try testing.expectEqualStrings("DataFoo", sectionIdent(&ib, ".data.foo"));
+    try testing.expectEqualStrings("Rodata1", sectionIdent(&ib, ".rodata1")); // digits are identifier characters
+    try testing.expectEqualStrings("S", sectionIdent(&ib, "."));
+    try testing.expectEqualStrings("S", sectionIdent(&ib, ""));
+
+    var r = try btf.RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_a = try r.str(gpa, "a");
+    const n_x = try r.str(gpa, "x");
+    const n_s = try r.str(gpa, "S");
+    const u32_t = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32}); // 1
+    const bool4 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{(4 << 24) | 32}); // 2: BOOL encoding, 4 bytes
+    const off_t = try r.rec(gpa, 0, btf.K_INT, 0, false, 1, &.{(1 << 16) | 8}); // 3: bit offset 1
+    const e1 = try r.rec(gpa, n_s, btf.K_ENUM, 1, false, 1, &.{ n_a, 1 }); // 4
+    const e2 = try r.rec(gpa, n_s, btf.K_ENUM, 1, false, 2, &.{ n_a, 1 }); // 5
+    const e4s = try r.rec(gpa, n_s, btf.K_ENUM, 1, true, 4, &.{ n_a, 1 }); // 6: signed
+    const e8 = try r.rec(gpa, n_s, btf.K_ENUM, 1, false, 8, &.{ n_a, 1 }); // 7
+    const f4 = try r.rec(gpa, n_a, 16, 0, false, 4, &.{}); // 8
+    const f8 = try r.rec(gpa, n_a, 16, 0, false, 8, &.{}); // 9
+    const off_member = try r.rec(gpa, n_s, btf.K_STRUCT, 1, false, 4, &.{ n_a, u32_t, 4 }); // 10: member at bit 4
+    const anon = try r.rec(gpa, n_s, btf.K_STRUCT, 1, false, 4, &.{ 0, u32_t, 0 }); // 11: unnamed member
+    var arr = u32_t;
+    for (0..14) |_| arr = try r.rec(gpa, 0, btf.K_ARRAY, 0, false, 0, &.{ arr, u32_t, 1 });
+    var st = try r.rec(gpa, n_s, btf.K_STRUCT, 1, false, 4, &.{ n_a, u32_t, 0 });
+    for (0..13) |_| st = try r.rec(gpa, n_s, btf.K_STRUCT, 1, false, 4, &.{ n_x, st, 0 });
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    var b = try btf.parse(gpa, blob, .{});
+    defer b.deinit();
+
+    // the depth limit is 12: a type is written at depth 12 and refused at 13
+    const at12 = (try mtWrite(&b, u32_t, 12, gpa)).?;
+    defer gpa.free(at12);
+    try testing.expectEqualStrings("u32", at12);
+    try testing.expect((try mtWrite(&b, u32_t, 13, gpa)) == null);
+    // a BOOL-encoded integer is a bool at one byte only; a bit offset makes an integer opaque
+    const w2 = (try mtWrite(&b, bool4, 0, gpa)).?;
+    defer gpa.free(w2);
+    try testing.expectEqualStrings("u32", w2);
+    try testing.expect((try mtWrite(&b, off_t, 0, gpa)) == null);
+    // enums: by size, signed by the kind flag
+    for ([_]struct { id: u32, want: []const u8 }{
+        .{ .id = e1, .want = "u8" },  .{ .id = e2, .want = "u16" }, .{ .id = e4s, .want = "i32" },                             .{ .id = e8, .want = "u64" },
+        .{ .id = f4, .want = "f32" }, .{ .id = f8, .want = "f64" }, .{ .id = anon, .want = "extern struct { _anon0: u32, }" },
+    }) |c| {
+        const got = (try mtWrite(&b, c.id, 0, gpa)).?;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
+    // a member that does not start on a byte boundary cannot be mirrored
+    try testing.expect((try mtWrite(&b, off_member, 0, gpa)) == null);
+    // 14 nested arrays: the 14th level is where the limit bites, and the rest is a byte array of its size
+    const deep = (try mtWrite(&b, arr, 0, gpa)).?;
+    defer gpa.free(deep);
+    try testing.expect(std.mem.endsWith(u8, deep, "[1][1][4]u8"));
+    try testing.expect(std.mem.find(u8, deep, "u32") == null);
+    // and 14 nested structs
+    const deep_st = (try mtWrite(&b, st, 0, gpa)).?;
+    defer gpa.free(deep_st);
+    try testing.expect(std.mem.find(u8, deep_st, "a: u32") == null);
+    try testing.expect(std.mem.find(u8, deep_st, "x: [4]u8, }") != null);
+}
+
+test "mutation 2026-11-27: a data section that the variables cover exactly gets no tail padding" {
+    const gpa = testing.allocator;
+    const src = try generated(gpa, fx_rodata);
+    defer gpa.free(src);
+    try testing.expect(std.mem.find(u8, src, "_pad0: [4]u8") != null);
+    try testing.expect(std.mem.find(u8, src, "_pad1") == null); // .rodata is 16 bytes: tag ends at 16
+    const core = try generated(gpa, fx_core);
+    defer gpa.free(core);
+    try testing.expect(std.mem.find(u8, core, "extern struct {\n};") == null);
+    // internal maps with no variable (`.ksyms`, a `.rodata` of string literals) get no struct and no accessors
+    for ([_][]const u8{ @embedFile("testdata/externs.bpf.o"), @embedFile("testdata/subprog.bpf.o") }) |bytes| {
+        const g = try generated(gpa, bytes);
+        defer gpa.free(g);
+        try testing.expect(std.mem.find(u8, g, "extern struct {\n};") == null);
+        try testing.expect(std.mem.find(u8, g, "Ksyms") == null);
+    }
+}

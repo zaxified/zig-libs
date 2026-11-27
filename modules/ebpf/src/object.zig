@@ -6437,3 +6437,214 @@ test "externs: resolved against THIS machine's vmlinux BTF and patched into the 
     o.externs[findExternIdx(&o, "bpf_zl_missing_kfunc").?].weak = false;
     try testing.expectError(error.ExternNotFound, resolveKernelExterns(&o, &kern, .{ .search_modules = false }));
 }
+
+// ── mutation 2026-11-27: map initializer slots, sub-program linking, CO-RE immediates, data accessors ──
+
+const mt_rel_maps = 0xd18; // .rel.maps of mapinmap.bpf.o: three 16-byte entries
+const mt_shoff = 0x11a0; // its section header table
+
+fn mtPatchRel(copy: []u8, k: usize, r_offset: ?u64, sym: ?u32, typ: ?u32) void {
+    const at = mt_rel_maps + k * 16;
+    if (r_offset) |o| std.mem.writeInt(u64, copy[at..][0..8], o, .little);
+    if (sym != null or typ != null) {
+        const old = std.mem.readInt(u64, copy[at + 8 ..][0..8], .little);
+        const s: u64 = sym orelse @intCast(old >> 32);
+        const t: u64 = typ orelse @intCast(old & 0xffff_ffff);
+        std.mem.writeInt(u64, copy[at + 8 ..][0..8], (s << 32) | t, .little);
+    }
+}
+
+test "mutation 2026-11-27: the initializer relocations of .maps, and what refuses them" {
+    const gpa = testing.allocator;
+    const copy = try gpa.dupe(u8, fx_mapinmap);
+    defer gpa.free(copy);
+    {
+        // the untouched object has its two + one slots
+        var o = try open(gpa, copy, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 2), o.findMap("outer").?.init_slots.len);
+    }
+    {
+        // .rel.maps that is no REL section, or relocates another section, is not looked at
+        const c = try gpa.dupe(u8, copy);
+        defer gpa.free(c);
+        std.mem.writeInt(u32, c[mt_shoff + 5 * 64 + 4 ..][0..4], 1, .little); // sh_type PROGBITS
+        var o = try open(gpa, c, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 0), o.findMap("outer").?.init_slots.len);
+    }
+    {
+        const c = try gpa.dupe(u8, copy);
+        defer gpa.free(c);
+        std.mem.writeInt(u32, c[mt_shoff + 5 * 64 + 44 ..][0..4], 3, .little); // sh_info: relocates `xdp`
+        var o = try open(gpa, c, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 0), o.findMap("outer").?.init_slots.len);
+    }
+    const Case = struct { k: usize, off: ?u64, sym: ?u32, typ: ?u32, want: ParseError };
+    for ([_]Case{
+        .{ .k = 0, .off = 0, .sym = null, .typ = null, .want = error.RelocationOutOfRange }, // before every map with values
+        .{ .k = 0, .off = 92, .sym = null, .typ = null, .want = error.RelocationOutOfRange }, // not 8-aligned in the slot array
+        .{ .k = 0, .off = 72, .sym = null, .typ = null, .want = error.RelocationOutOfRange }, // before the `values` member
+        .{ .k = 0, .off = null, .sym = null, .typ = 1, .want = error.UnsupportedRelocation }, // R_BPF_64_64
+        .{ .k = 0, .off = null, .sym = 10, .typ = null, .want = error.UnresolvedRelocation }, // a map of maps points into .maps
+        .{ .k = 2, .off = null, .sym = 12, .typ = null, .want = error.UnresolvedRelocation }, // a prog_array points at a function
+    }) |c| {
+        const p = try gpa.dupe(u8, copy);
+        defer gpa.free(p);
+        mtPatchRel(p, c.k, c.off, c.sym, c.typ);
+        try testing.expectError(c.want, open(gpa, p, .{}));
+    }
+    {
+        // a prog_array slot is the program at the symbol's own offset: `entry` is at 16 of its section
+        const c = try gpa.dupe(u8, copy);
+        defer gpa.free(c);
+        mtPatchRel(c, 2, null, 11, null);
+        var o = try open(gpa, c, .{});
+        defer o.deinit();
+        const j = o.findMap("jumps").?;
+        try testing.expectEqual(@as(usize, 1), j.init_slots.len);
+        try testing.expectEqualStrings("entry", o.programs[j.init_slots[0].target.program].name);
+    }
+}
+
+fn mtSpec(name: []const u8, sec: usize, insns: []Insn) ProgramSpec {
+    return .{
+        .sec_name = name,
+        .name = name,
+        .attach_target = "",
+        .prog_type = .xdp,
+        .expected_attach_type = null,
+        .sleepable = false,
+        .sec_idx = sec,
+        .sec_byte_off = 0,
+        .insns = insns,
+        .relos = &.{},
+        .func_info = &.{},
+        .line_info = &.{},
+        .core_relos = &.{},
+    };
+}
+
+test "mutation 2026-11-27: linking a sub-program carries its records, shifted, and patches the call" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var caller_insns = [_]Insn{ std.mem.zeroes(Insn), std.mem.zeroes(Insn) };
+    var sub_insns = [_]Insn{ std.mem.zeroes(Insn), std.mem.zeroes(Insn), std.mem.zeroes(Insn) };
+    var progs = [_]ProgramSpec{mtSpec("caller", 1, &caller_insns)};
+    progs[0].call_sites = try a.dupe(CallSite, &.{.{ .kind = .call, .insn_idx = 0, .sec_idx = 2, .sec_byte_off = 0 }});
+    progs[0].extern_refs = try a.dupe(ExternRef, &.{.{ .insn_idx = 1, .extern_idx = 0, .call = false }});
+    var sub = mtSpec("sub", 2, &sub_insns);
+    sub.extern_refs = try a.dupe(ExternRef, &.{.{ .insn_idx = 1, .extern_idx = 0, .call = false }});
+    sub.core_relos = try a.dupe(btfext.CoreRelo, &.{.{ .insn_off = 2, .type_id = 1, .access_str_off = 0, .kind = 0 }});
+    sub.line_info = try a.dupe(btfext.LineInfo, &.{.{ .insn_off = 1, .file_name_off = 0, .line_off = 0, .line_col = 0 }});
+    try linkSubprograms(a, &progs, &.{sub});
+    const p = progs[0];
+    try testing.expectEqual(@as(usize, 5), p.insns.len);
+    try testing.expectEqual(BPF_PSEUDO_CALL, p.insns[0].src);
+    try testing.expectEqual(@as(i32, 1), p.insns[0].imm); // callee at 2, call at 0: 2 - 0 - 1
+    try testing.expectEqual(@as(usize, 2), p.extern_refs.len);
+    try testing.expectEqual(@as(u32, 1), p.extern_refs[0].insn_idx);
+    try testing.expectEqual(@as(u32, 3), p.extern_refs[1].insn_idx);
+    try testing.expectEqual(@as(usize, 1), p.core_relos.len);
+    try testing.expectEqual(@as(u32, 4), p.core_relos[0].insn_off);
+    try testing.expectEqual(@as(usize, 1), p.line_info.len);
+    try testing.expectEqual(@as(u32, 3), p.line_info[0].insn_off);
+    try testing.expectEqual(@as(usize, 0), p.call_sites.len);
+}
+
+test "mutation 2026-11-27: a function address is BPF_PSEUDO_FUNC, a callee is placed once, the size limit is inclusive" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var caller_insns = [_]Insn{ std.mem.zeroes(Insn), std.mem.zeroes(Insn) };
+    var sub_insns = [_]Insn{ std.mem.zeroes(Insn), std.mem.zeroes(Insn) };
+    var progs = [_]ProgramSpec{mtSpec("caller", 1, &caller_insns)};
+    progs[0].call_sites = try a.dupe(CallSite, &.{
+        .{ .kind = .func_addr, .insn_idx = 0, .sec_idx = 2, .sec_byte_off = 0 },
+        .{ .kind = .call, .insn_idx = 1, .sec_idx = 2, .sec_byte_off = 0 },
+    });
+    const sub = mtSpec("sub", 2, &sub_insns);
+    try linkSubprograms(a, &progs, &.{sub});
+    try testing.expectEqual(@as(usize, 4), progs[0].insns.len); // the callee once, though called twice
+    try testing.expectEqual(BPF_PSEUDO_FUNC, progs[0].insns[0].src);
+    try testing.expectEqual(@as(i32, 1), progs[0].insns[0].imm); // 2 - 0 - 1
+    try testing.expectEqual(BPF_PSEUDO_CALL, progs[0].insns[1].src);
+    try testing.expectEqual(@as(i32, 0), progs[0].insns[1].imm); // 2 - 1 - 1
+
+    // 1 + (limit - 1) instructions is exactly the limit; one more is too many
+    const big = try testing.allocator.alloc(Insn, max_program_insns);
+    defer testing.allocator.free(big);
+    @memset(big, std.mem.zeroes(Insn));
+    var one = [_]Insn{std.mem.zeroes(Insn)};
+    var p2 = [_]ProgramSpec{mtSpec("caller", 1, &one)};
+    p2[0].call_sites = try a.dupe(CallSite, &.{.{ .kind = .call, .insn_idx = 0, .sec_idx = 2, .sec_byte_off = 0 }});
+    try linkSubprograms(a, &p2, &.{mtSpec("sub", 2, big[0 .. max_program_insns - 1])});
+    try testing.expectEqual(max_program_insns, p2[0].insns.len);
+    var p3 = [_]ProgramSpec{mtSpec("caller", 1, &one)};
+    p3[0].call_sites = try a.dupe(CallSite, &.{.{ .kind = .call, .insn_idx = 0, .sec_idx = 2, .sec_byte_off = 0 }});
+    try testing.expectError(error.ProgramTooLarge, linkSubprograms(a, &p3, &.{mtSpec("sub", 2, big)}));
+}
+
+test "mutation 2026-11-27: an ALU immediate takes any i32, a bigger one is refused, either sign" {
+    var insns = [_]Insn{.{ .code = 0x07, .dst = 0, .src = 0, .off = 0, .imm = 0 }}; // ALU64 | K | ADD
+    try patchCoreInsn(&insns, 0, .enumval_value, @bitCast(@as(i64, std.math.minInt(i32))));
+    try testing.expectEqual(@as(i32, std.math.minInt(i32)), insns[0].imm);
+    try patchCoreInsn(&insns, 0, .enumval_value, @bitCast(@as(i64, std.math.maxInt(i32))));
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), insns[0].imm);
+    try testing.expectError(error.CoreValueTooLarge, patchCoreInsn(&insns, 0, .enumval_value, @bitCast(@as(i64, std.math.minInt(i32)) - 1)));
+    try testing.expectError(error.CoreValueTooLarge, patchCoreInsn(&insns, 0, .enumval_value, @as(u64, std.math.maxInt(i32)) + 1));
+}
+
+test "mutation 2026-11-27: dataVariables of .ksyms and .kconfig, the mapping helpers, and what unpinning leaves" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_externs, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 0), (try o.dataVariables(".ksyms")).len);
+    var n_kconfig: usize = 0;
+    for (o.externs) |e| {
+        if (e.kind == .kconfig) n_kconfig += 1;
+    }
+    try testing.expect(n_kconfig > 0 and n_kconfig < o.externs.len);
+    try testing.expectEqual(n_kconfig, (try o.dataVariables(".kconfig")).len);
+
+    // MappedData over a memfd: a zero-length map still takes a page, a writable one can be written, bounds are checked
+    const rc = linux.memfd_create("ebpf-mt", 0);
+    try testing.expect(linux.errno(rc) == .SUCCESS);
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    try testing.expect(linux.errno(linux.ftruncate(fd, 4096)) == .SUCCESS);
+    var empty = try MappedData.map(fd, 0, 0, false);
+    empty.deinit();
+    var md = try MappedData.map(fd, 64, 64, true);
+    defer md.deinit();
+    md.bytes()[0] = 7;
+    try testing.expectEqual(@as(u8, 7), md.bytes()[0]);
+    try testing.expectError(error.SizeMismatch, md.variable(.{ .name = "v", .offset = 65, .size = 0, .type_id = 0 }));
+    try testing.expectError(error.SizeMismatch, md.variable(.{ .name = "v", .offset = 60, .size = 5, .type_id = 0 }));
+    try testing.expectEqual(@as(usize, 4), (try md.variable(.{ .name = "v", .offset = 60, .size = 4, .type_id = 0 })).len);
+    try testing.expectEqual(@as(usize, 0), (try md.variable(.{ .name = "v", .offset = 64, .size = 0, .type_id = 0 })).len);
+    const W = extern struct { a: [64]u8 };
+    const Big = extern struct { a: [65]u8 };
+    _ = try md.view(W);
+    try testing.expectError(error.SizeMismatch, md.view(Big));
+}
+
+test "mutation 2026-11-27: unpinMaps leaves an internal data map's name alone" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_rodata_const, .{});
+    defer o.deinit();
+    var dir_buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/ebpf-mt-{d}", .{linux.getpid()}, 0);
+    try testing.expect(linux.errno(linux.mkdir(dir, 0o700)) == .SUCCESS);
+    defer _ = linux.rmdir(dir);
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/.rodata", .{dir}, 0);
+    const rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
+    try testing.expect(linux.errno(rc) == .SUCCESS);
+    _ = linux.close(@intCast(rc));
+    defer _ = linux.unlink(path);
+    try o.unpinMaps(dir); // the internal map is skipped: its (here: ordinary) file stays
+    try testing.expect(linux.errno(linux.access(path, 0)) == .SUCCESS);
+}

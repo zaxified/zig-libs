@@ -413,3 +413,32 @@ test "unprivileged: every command answers with an error, never a crash" {
     } else |e| try testing.expect(check(e));
     try testing.expectError(error.NotFound, objUnpin("/nonexistent-bpffs-pin/x"));
 }
+
+test "mutation 2026-11-27: errno mapping, the NUL-terminated path, the query attr" {
+    const cases = [_]struct { e: linux.E, want: Error }{
+        .{ .e = .PERM, .want = error.PermissionDenied },
+        .{ .e = .ACCES, .want = error.PermissionDenied },
+        .{ .e = .NOENT, .want = error.NotFound },
+        .{ .e = .EXIST, .want = error.AlreadyExists },
+        .{ .e = .INVAL, .want = error.InvalidArgument },
+        .{ .e = .BADF, .want = error.InvalidArgument },
+        .{ .e = .FAULT, .want = error.InvalidArgument },
+        .{ .e = .NOSYS, .want = error.NotSupported },
+        .{ .e = .OPNOTSUPP, .want = error.NotSupported },
+        .{ .e = .NOTDIR, .want = error.NotBpffs },
+        .{ .e = .NOMEM, .want = error.SystemResources },
+        .{ .e = .NOSPC, .want = error.SystemResources },
+        .{ .e = .MFILE, .want = error.SystemResources },
+        .{ .e = .NFILE, .want = error.SystemResources },
+        .{ .e = .AGAIN, .want = error.Unexpected },
+    };
+    for (cases) |c| try testing.expectEqual(c.want, mapErrno(c.e));
+
+    var pb: [4096]u8 = @splat(0xaa);
+    const z = try pathZ(&pb, "/sys/fs/bpf/x");
+    try testing.expectEqualStrings("/sys/fs/bpf/x", std.mem.span(z));
+    var ids: [2]u32 = undefined;
+    const q = buildQueryAttr(7, .cgroup_inet_egress, .{}, &ids);
+    try testing.expectEqual(@as(u32, @backingInt(BPF.AttachType.cgroup_inet_egress)), q.attach_type);
+    try testing.expectEqual(@as(u32, 0), q.attach_flags);
+}

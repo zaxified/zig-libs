@@ -1223,3 +1223,55 @@ test "selectSymbols: module suffixes, duplicates and the pattern" {
     defer none.deinit();
     try testing.expectEqual(@as(usize, 0), none.ptrs.len);
 }
+
+test "mutation 2026-11-27: multi-link attrs, mprog relatives and the glob" {
+    const gpa = testing.allocator;
+    // kprobe_multi by address carries the address array; the target count may be exactly the maximum
+    const addrs = [_]u64{ 0x1000, 0x2000 };
+    const ka = try buildKprobeMultiAttr(3, .{ .addrs = &addrs });
+    const karm = std.mem.bytesToValue(KprobeMultiArm, ka.arm[0..@sizeOf(KprobeMultiArm)]);
+    try testing.expectEqual(@intFromPtr(&addrs), karm.addrs);
+    try testing.expectEqual(@as(u64, 0), karm.syms);
+    try testing.expectEqual(@as(u32, 2), karm.cnt);
+    const fake: [*]const u64 = @ptrFromInt(8); // never dereferenced: only the count is looked at
+    _ = try buildKprobeMultiAttr(3, .{ .addrs = fake[0..max_multi_targets] });
+    try testing.expectError(error.InvalidOptions, buildKprobeMultiAttr(3, .{ .addrs = fake[0 .. max_multi_targets + 1] }));
+    _ = try buildUprobeMultiAttr(3, .{ .path = "/x", .offsets = fake[0..max_multi_targets] });
+    try testing.expectError(error.InvalidOptions, buildUprobeMultiAttr(3, .{ .path = "/x", .offsets = fake[0 .. max_multi_targets + 1] }));
+    // uprobe_multi: no ref_ctr_offsets is fine, a cookie array and the pid are carried
+    const offs = [_]u64{ 4, 8 };
+    const cks = [_]u64{ 1, 2 };
+    const ua = try buildUprobeMultiAttr(3, .{ .path = "/x", .offsets = &offs, .cookies = &cks, .pid = 5 });
+    const uarm = std.mem.bytesToValue(UprobeMultiArm, ua.arm[0..@sizeOf(UprobeMultiArm)]);
+    try testing.expectEqual(@intFromPtr(&cks), uarm.cookies);
+    try testing.expectEqual(@as(u64, 0), uarm.ref_ctr_offsets);
+    try testing.expectEqual(@as(u32, 5), uarm.pid);
+    try testing.expectEqual(@as(u32, 2), uarm.cnt);
+    // mprog: relative to a link id is F_ID | F_LINK with the id as the relative value
+    const mp = buildMprog(.{ .placement = .{ .after = .{ .link_id = 7 } } });
+    try testing.expectEqual(F_AFTER | F_ID | F_LINK, mp.flags);
+    try testing.expectEqual(@as(u32, 7), mp.arm.tcx.relative);
+
+    // glob: `*` any run, `?` one byte, the rest literal
+    const yes = [_][2][]const u8{
+        .{ "*", "" },            .{ "*", "abc" },              .{ "a*c", "abc" }, .{ "a*c", "ac" },     .{ "a?c", "abc" },
+        .{ "a*b*c", "aXbYbZc" }, .{ "*a*b", "xaxb" },          .{ "*a", "*ba" },  .{ "a**b", "ab" },    .{ "**", "x" },
+        .{ "?", "a" },           .{ "a*", "a" },               .{ "*b", "abb" },  .{ "a*b*c", "abbc" }, .{ "", "" },
+        .{ "*b*", "abc" },       .{ "a*b*c*d", "aXXbXXcXXd" },
+    };
+    for (yes) |c| try testing.expect(globMatch(c[0], c[1]));
+    const no = [_][2][]const u8{
+        .{ "a?c", "ac" },    .{ "a*c", "abd" }, .{ "?", "" },     .{ "", "a" },      .{ "a", "" },  .{ "a*b*c", "acb" },
+        .{ "abc", "ab" },    .{ "ab", "abc" },  .{ "*b", "abx" }, .{ "a*b", "abc" }, .{ "?*", "" }, .{ "*a*b", "bxa" },
+        .{ "aa*ab", "aab" },
+    };
+    for (no) |c| try testing.expect(!globMatch(c[0], c[1]));
+
+    // selectSymbols: tab-separated module column, blank lines, the same name twice
+    var sl = try selectSymbols(gpa, "foo\tmod\n\nbar [m]\nfoo\n  \nbaz", "*");
+    defer sl.deinit();
+    try testing.expectEqual(@as(usize, 3), sl.ptrs.len);
+    try testing.expectEqualStrings("foo", std.mem.span(sl.ptrs[0]));
+    try testing.expectEqualStrings("bar", std.mem.span(sl.ptrs[1]));
+    try testing.expectEqualStrings("baz", std.mem.span(sl.ptrs[2]));
+}

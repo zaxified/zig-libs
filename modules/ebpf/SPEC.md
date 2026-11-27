@@ -1099,6 +1099,15 @@ and the errno-to-error mapping of the privileged calls), file-size ceilings (64 
 guards, and bitfield-of-array members clang never emits. The privileged lane (the `LIVE:` tests) is where they belong.
 
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **PARTIAL delta mutation 2026-11-27 — the card's mutation entry is NOT updated:** the six new files
+  (`kconfig`, `usdt`, `btfsanitize`, `skeleton`, `map`, `bpfsys`) and the new `bpflink` arms whole, plus listed
+  functions of `btfext.zig` and `object.zig`: 519 mutants, 482 killed (3 by hang), 11 equivalent, 26 unobservable
+  (kernel or mock `bpf()`, hostile ELF symbol tables), 0 open; 27 inline tests. Not yet mutated, so the card stays
+  "src changed since audit" until a follow-up delta covers them: `object.zig`'s `parseMapDef` (map-in-map),
+  `collectStructOps`, `planStructOps`, `buildStructOpsValue`, `collectExterns` and helpers,
+  `uintMemberValue`, the `parseLegacyMaps`/`addInternalMap`/`splitProgramSection`, `collectRelocations`
+  (call sites), `sliceBtfExt`/`relocateProgram`/`fixupDatasecs`, `load()`, `createMap` (map-in-map,
+  struct_ops), `loadOneProgram` and `attachStructOps` changes. Tables: CML `20261125-owed/ebpf-delta-*`.
 
 ## What is deliberately not done
 

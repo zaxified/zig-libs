@@ -2748,3 +2748,326 @@ test "computeRelo: several candidates must agree; a candidate that does not matc
     // TYPE_ID_TARGET with two candidates is ambiguous by construction
     try testing.expectError(error.AmbiguousRelocation, computeRelo(&l.parsed, &bad.parsed, typeRelo(7, l_s, a0)));
 }
+
+// ── mutation 2026-11-27: type-based and enum-value relocations, case by case ──
+
+const MtShape = union(enum) {
+    void_,
+    int,
+    int_off, // an integer with a bit offset: not "plain"
+    ptr: *const MtShape,
+    arr: *const MtShape,
+    fwd: []const u8,
+    enm: struct { name: []const u8, vals: []const []const u8 },
+    st: struct { name: []const u8, members: []const MtMember },
+    fp: struct { params: []const MtShape, ret: *const MtShape },
+};
+const MtMember = struct { name: []const u8, shape: MtShape };
+
+fn mtBuild(b: *TestBlob, d: MtShape) anyerror!u32 {
+    switch (d) {
+        .void_ => return 0,
+        .int => return b.rec(0, btf.K_INT, 0, false, 4, &.{32}),
+        .int_off => return b.rec(0, btf.K_INT, 0, false, 4, &.{(1 << 16) | 32}),
+        .ptr => |p| {
+            const x = try mtBuild(b, p.*);
+            return b.rec(0, btf.K_PTR, 0, false, x, &.{});
+        },
+        .arr => |p| {
+            const x = try mtBuild(b, p.*);
+            const idx = try b.rec(0, btf.K_INT, 0, false, 4, &.{32});
+            return b.rec(0, btf.K_ARRAY, 0, false, 0, &.{ x, idx, 1 });
+        },
+        .fwd => |n| return b.rec(try b.str(n), btf.K_FWD, 0, false, 0, &.{}),
+        .enm => |e| {
+            var extra: [8]u32 = undefined;
+            for (e.vals, 0..) |v, i| {
+                extra[i * 2] = try b.str(v);
+                extra[i * 2 + 1] = @intCast(i);
+            }
+            return b.rec(try b.str(e.name), btf.K_ENUM, @intCast(e.vals.len), false, 4, extra[0 .. e.vals.len * 2]);
+        },
+        .st => |s| {
+            var extra: [12]u32 = undefined;
+            for (s.members, 0..) |m, i| {
+                extra[i * 3] = if (m.name.len == 0) 0 else try b.str(m.name);
+                extra[i * 3 + 1] = try mtBuild(b, m.shape);
+                extra[i * 3 + 2] = @intCast(i * 32);
+            }
+            return b.rec(try b.str(s.name), btf.K_STRUCT, @intCast(s.members.len), false, @intCast(s.members.len * 4), extra[0 .. s.members.len * 3]);
+        },
+        .fp => |f| {
+            var extra: [8]u32 = undefined;
+            for (f.params, 0..) |p, i| {
+                extra[i * 2] = 0;
+                extra[i * 2 + 1] = try mtBuild(b, p);
+            }
+            const ret = try mtBuild(b, f.ret.*);
+            return b.rec(0, btf.K_FUNC_PROTO, @intCast(f.params.len), false, ret, extra[0 .. f.params.len * 2]);
+        },
+    }
+}
+
+/// A relocation of kind `kind` on a typedef `T` of `shape`, against the same on the target side.
+fn mtRelo(local: MtShape, target: MtShape, kind: u32) !ReloResult {
+    var lb = try TestBlob.init();
+    const a0 = try lb.str("0");
+    const l_inner = try mtBuild(&lb, local);
+    const l_root = try lb.rec(try lb.str("T"), btf.K_TYPEDEF, 0, false, l_inner, &.{});
+    try lb.finish();
+    defer lb.deinit();
+    var tb = try TestBlob.init();
+    const t_inner = try mtBuild(&tb, target);
+    _ = try tb.rec(try tb.str("T"), btf.K_TYPEDEF, 0, false, t_inner, &.{});
+    try tb.finish();
+    defer tb.deinit();
+    return computeRelo(&lb.parsed, &tb.parsed, typeRelo(kind, l_root, a0));
+}
+
+const mt_int: MtShape = .int;
+const mt_void: MtShape = .void_;
+const mt_int_off: MtShape = .int_off;
+
+test "mutation 2026-11-27: types are compatible by kind, plain ints, parameter and return types, to a bounded depth" {
+    const ptr_int: MtShape = .{ .ptr = &mt_int };
+    const ptr_ptr_int: MtShape = .{ .ptr = &ptr_int };
+    const arr_int: MtShape = .{ .arr = &mt_int };
+    const arr_arr_int: MtShape = .{ .arr = &arr_int };
+    const id = 7; // TYPE_ID_TARGET: the candidate's own id if it is compatible
+    // pointers and arrays are looked through at the same depth: two levels of each are fine
+    try testing.expect((try mtRelo(ptr_ptr_int, ptr_ptr_int, id)).exists);
+    try testing.expect((try mtRelo(arr_arr_int, arr_arr_int, id)).exists);
+    // a function prototype counts a level per parameter / return type: one level of parameters is fine,
+    // a parameter that is itself a prototype with a parameter is one level too many
+    const fp1: MtShape = .{ .fp = .{ .params = &.{mt_int}, .ret = &mt_int } };
+    try testing.expect((try mtRelo(fp1, fp1, id)).exists);
+    const fp2: MtShape = .{ .fp = .{ .params = &.{fp1}, .ret = &mt_int } };
+    try testing.expectError(error.TypeChainTooDeep, mtRelo(fp2, fp2, id));
+    // parameters, return types and counts must agree
+    const st_t: MtShape = .{ .st = .{ .name = "St", .members = &.{} } };
+    const fp_st: MtShape = .{ .fp = .{ .params = &.{st_t}, .ret = &mt_int } };
+    try testing.expect(!(try mtRelo(fp1, fp_st, id)).exists);
+    const fp_void: MtShape = .{ .fp = .{ .params = &.{mt_int}, .ret = &mt_void } };
+    try testing.expect(!(try mtRelo(fp1, fp_void, id)).exists); // int return against void
+    try testing.expect(!(try mtRelo(fp_void, fp1, id)).exists); // void return against int
+    try testing.expect((try mtRelo(fp_void, fp_void, id)).exists);
+    const fp_st_ret: MtShape = .{ .fp = .{ .params = &.{mt_int}, .ret = &st_t } };
+    try testing.expect(!(try mtRelo(fp1, fp_st_ret, id)).exists);
+    const fp0: MtShape = .{ .fp = .{ .params = &.{}, .ret = &mt_int } };
+    try testing.expect(!(try mtRelo(fp1, fp0, id)).exists);
+    // a parameter of another kind is no match and no error
+    const fp_ptr: MtShape = .{ .fp = .{ .params = &.{ptr_int}, .ret = &mt_int } };
+    try testing.expect(!(try mtRelo(fp1, fp_ptr, id)).exists);
+    // an integer with a bit offset is not a plain integer, on either side
+    const fp_off: MtShape = .{ .fp = .{ .params = &.{mt_int_off}, .ret = &mt_int } };
+    try testing.expect(!(try mtRelo(fp_off, fp1, id)).exists);
+    try testing.expect(!(try mtRelo(fp1, fp_off, id)).exists);
+}
+
+test "mutation 2026-11-27: TYPE_MATCHES: names, enumerators, member counts and anonymity, forward declarations behind pointers" {
+    const m = 12; // TYPE_MATCHES
+    const fwd_x: MtShape = .{ .fwd = "X" };
+    const st_x_a: MtShape = .{ .st = .{ .name = "X", .members = &.{.{ .name = "a", .shape = mt_int }} } };
+    const st_x_b: MtShape = .{ .st = .{ .name = "X", .members = &.{.{ .name = "b", .shape = mt_int }} } };
+    const st_y_a: MtShape = .{ .st = .{ .name = "Y", .members = &.{.{ .name = "a", .shape = mt_int }} } };
+    const ptr_fwd: MtShape = .{ .ptr = &fwd_x };
+    const ptr_x_a: MtShape = .{ .ptr = &st_x_a };
+    const ptr_x_b: MtShape = .{ .ptr = &st_x_b };
+    const ptr_int: MtShape = .{ .ptr = &mt_int };
+    const ptr_void: MtShape = .{ .ptr = &mt_void };
+    // a forward declaration matches a struct of its name behind a pointer, either way round
+    try testing.expect((try mtRelo(ptr_fwd, ptr_x_a, m)).exists);
+    try testing.expect((try mtRelo(ptr_x_a, ptr_fwd, m)).exists);
+    // ... but not when it is not behind one, not against a non-aggregate, and two real structs still compare members
+    try testing.expect(!(try mtRelo(fwd_x, st_x_a, m)).exists);
+    try testing.expect(!(try mtRelo(ptr_int, ptr_fwd, m)).exists);
+    try testing.expect(!(try mtRelo(ptr_fwd, ptr_int, m)).exists);
+    try testing.expect(!(try mtRelo(ptr_x_a, ptr_x_b, m)).exists);
+    // void: a pointer to void matches a pointer to void and nothing else
+    try testing.expect((try mtRelo(ptr_void, ptr_void, m)).exists);
+    try testing.expect(!(try mtRelo(ptr_int, ptr_void, m)).exists);
+    try testing.expect(!(try mtRelo(ptr_void, ptr_int, m)).exists);
+    // named kinds must share the (flavor-stripped) name
+    const holds_x: MtShape = .{ .st = .{ .name = "H", .members = &.{.{ .name = "m", .shape = st_x_a }} } };
+    const holds_y: MtShape = .{ .st = .{ .name = "H", .members = &.{.{ .name = "m", .shape = st_y_a }} } };
+    try testing.expect((try mtRelo(holds_x, holds_x, m)).exists);
+    try testing.expect(!(try mtRelo(holds_x, holds_y, m)).exists);
+    // enumerators: every local one must exist in the target, which may have more
+    const e_a: MtShape = .{ .enm = .{ .name = "E", .vals = &.{"A"} } };
+    const e_b: MtShape = .{ .enm = .{ .name = "E", .vals = &.{"B"} } };
+    const e_ab: MtShape = .{ .enm = .{ .name = "E", .vals = &.{ "A", "B" } } };
+    try testing.expect((try mtRelo(e_a, e_ab, m)).exists);
+    try testing.expect(!(try mtRelo(e_a, e_b, m)).exists);
+    try testing.expect(!(try mtRelo(e_ab, e_a, m)).exists);
+    // members: a missing name is a mismatch even when the counts agree; an anonymous member is skipped, but
+    // a local aggregate with more members than the target's is a mismatch
+    const st_ab: MtShape = .{ .st = .{ .name = "X", .members = &.{ .{ .name = "a", .shape = mt_int }, .{ .name = "b", .shape = mt_int } } } };
+    const st_ac: MtShape = .{ .st = .{ .name = "X", .members = &.{ .{ .name = "a", .shape = mt_int }, .{ .name = "c", .shape = mt_int } } } };
+    try testing.expect(!(try mtRelo(st_ab, st_ac, m)).exists);
+    const st_anon_a: MtShape = .{ .st = .{ .name = "X", .members = &.{ .{ .name = "", .shape = mt_int }, .{ .name = "a", .shape = mt_int } } } };
+    const st_pad_a: MtShape = .{ .st = .{ .name = "X", .members = &.{ .{ .name = "pad", .shape = mt_int }, .{ .name = "a", .shape = mt_int } } } };
+    try testing.expect((try mtRelo(st_anon_a, st_pad_a, m)).exists);
+    try testing.expect(!(try mtRelo(st_anon_a, st_x_a, m)).exists);
+    // plain integers only, as members too
+    const st_off: MtShape = .{ .st = .{ .name = "X", .members = &.{.{ .name = "a", .shape = mt_int_off }} } };
+    try testing.expect(!(try mtRelo(st_off, st_x_a, m)).exists);
+    try testing.expect(!(try mtRelo(st_x_a, st_off, m)).exists);
+    // function prototypes: counts, parameters and return types
+    const fp1: MtShape = .{ .fp = .{ .params = &.{mt_int}, .ret = &mt_int } };
+    const fp0: MtShape = .{ .fp = .{ .params = &.{}, .ret = &mt_int } };
+    const fp_st: MtShape = .{ .fp = .{ .params = &.{st_x_a}, .ret = &mt_int } };
+    const fp_st_ret: MtShape = .{ .fp = .{ .params = &.{mt_int}, .ret = &st_x_a } };
+    try testing.expect((try mtRelo(fp1, fp1, m)).exists);
+    try testing.expect(!(try mtRelo(fp1, fp0, m)).exists);
+    try testing.expect(!(try mtRelo(fp1, fp_st, m)).exists);
+    try testing.expect(!(try mtRelo(fp1, fp_st_ret, m)).exists);
+}
+
+/// `n` nested named structs `N0 { a: <wrap> N1 }`, `N1 { a: <wrap> N2 }`, ... : `wrap` 0 = by value, 1 = by pointer, 2 = by array.
+fn mtChain(b: *TestBlob, n: usize, wrap: u8) !u32 {
+    const na = try b.str("a");
+    var inner: u32 = try b.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        var buf: [8]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "N{d}", .{i});
+        const member_t = switch (wrap) {
+            1 => try b.rec(0, btf.K_PTR, 0, false, inner, &.{}),
+            2 => try b.rec(0, btf.K_ARRAY, 0, false, 0, &.{ inner, try b.rec(0, btf.K_INT, 0, false, 4, &.{32}), 1 }),
+            else => inner,
+        };
+        inner = try b.rec(try b.str(name), btf.K_STRUCT, 1, false, 4, &.{ na, member_t, 0 });
+    }
+    return inner;
+}
+
+test "mutation 2026-11-27: TYPE_MATCHES is bounded in depth, by value, by pointer and by array alike" {
+    for ([_]struct { wrap: u8, n: usize }{ .{ .wrap = 0, .n = 40 }, .{ .wrap = 1, .n = 24 }, .{ .wrap = 2, .n = 24 } }) |c| {
+        var lb = try TestBlob.init();
+        const a0 = try lb.str("0");
+        const l_root = try mtChain(&lb, c.n, c.wrap);
+        try lb.finish();
+        defer lb.deinit();
+        var tb = try TestBlob.init();
+        _ = try mtChain(&tb, c.n, c.wrap);
+        try tb.finish();
+        defer tb.deinit();
+        try testing.expectError(error.TypeChainTooDeep, computeRelo(&lb.parsed, &tb.parsed, typeRelo(12, l_root, a0)));
+    }
+    // and a chain that fits is a match
+    var lb = try TestBlob.init();
+    const a0 = try lb.str("0");
+    const l_root = try mtChain(&lb, 10, 0);
+    try lb.finish();
+    defer lb.deinit();
+    var tb = try TestBlob.init();
+    _ = try mtChain(&tb, 10, 0);
+    try tb.finish();
+    defer tb.deinit();
+    try testing.expect((try computeRelo(&lb.parsed, &tb.parsed, typeRelo(12, l_root, a0))).exists);
+}
+
+test "mutation 2026-11-27: relocation roots, qualifiers, access strings and field ambiguity" {
+    var l = try TestBlob.init();
+    const a0 = try l.str("0");
+    const a1 = try l.str("1");
+    const a00 = try l.str("0:0");
+    const n_s = try l.str("S");
+    const n_x = try l.str("x");
+    const n_tag = try l.str("tag");
+    const l_int = try l.rec(0, btf.K_INT, 0, false, 4, &.{32}); // 1
+    const l_s = try l.rec(n_s, btf.K_STRUCT, 1, false, 4, &.{ n_x, l_int, 0 }); // 2
+    const l_v = try l.rec(0, 9, 0, false, l_s, &.{}); // 3: volatile S
+    const l_r = try l.rec(0, 11, 0, false, l_s, &.{}); // 4: restrict S
+    const l_tt = try l.rec(n_tag, 18, 0, false, l_s, &.{}); // 5: a type tag on S
+    const l_cv = try l.rec(0, 10, 0, false, 0, &.{}); // 6: const void
+    const l_anon = try l.rec(0, btf.K_STRUCT, 1, false, 4, &.{ n_x, l_int, 0 }); // 7
+    try l.finish();
+    defer l.deinit();
+    var t = try TestBlob.init();
+    const tn_s = try t.str("S");
+    const tn_x = try t.str("x");
+    const t_int = try t.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    const t_s = try t.rec(tn_s, btf.K_STRUCT, 1, false, 4, &.{ tn_x, t_int, 0 });
+    try t.finish();
+    defer t.deinit();
+    const lb = &l.parsed;
+    const tb = &t.parsed;
+    // every qualifier is looked through to the named type
+    for ([_]u32{ l_v, l_r, l_tt }) |q| try testing.expectEqual(@as(u64, t_s), (try computeRelo(lb, tb, typeRelo(7, q, a0))).value);
+    // a qualifier of void has nothing to match by
+    try testing.expectError(error.TargetTypeNotFound, computeRelo(lb, tb, typeRelo(7, l_cv, a0)));
+    // a type-based access spec is exactly "0"
+    try testing.expectError(error.BadAccessSpec, computeRelo(lb, tb, typeRelo(7, l_s, a1)));
+    // the local type id must exist, also for TYPE_ID_LOCAL
+    try testing.expectError(error.TypeIdOutOfRange, computeRelo(lb, tb, typeRelo(6, 999, a0)));
+    // a type kind is not a field kind; an anonymous field root cannot be matched by name
+    try testing.expectError(error.UnsupportedReloKind, computeFieldRelo(lb, tb, typeRelo(8, l_s, a0)));
+    // ... also when the target has no such type (nothing for the geometry to refuse the kind)
+    var none = try TestBlob.init();
+    _ = try none.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    try none.finish();
+    defer none.deinit();
+    try testing.expectError(error.UnsupportedReloKind, computeFieldRelo(lb, &none.parsed, typeRelo(8, l_s, a0)));
+    try testing.expectError(error.TargetTypeNotFound, computeFieldRelo(lb, tb, typeRelo(0, l_anon, a00)));
+
+    // two candidates that put x at the same bit offset but give it different sizes: FIELD_BYTE_SIZE is ambiguous
+    var t2 = try TestBlob.init();
+    const n2_s = try t2.str("S");
+    const n2_x = try t2.str("x");
+    const int4 = try t2.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    const i8_ = try t2.rec(0, btf.K_INT, 0, false, 8, &.{64});
+    _ = try t2.rec(n2_s, btf.K_STRUCT, 1, false, 16, &.{ n2_x, int4, 64 });
+    _ = try t2.rec(n2_s, btf.K_STRUCT, 1, false, 16, &.{ n2_x, i8_, 64 });
+    try t2.finish();
+    defer t2.deinit();
+    try testing.expectError(error.AmbiguousRelocation, computeRelo(lb, &t2.parsed, typeRelo(1, l_s, a00)));
+}
+
+test "mutation 2026-11-27: enumerator relocations: access spec, enum64 locals, candidates, ambiguity" {
+    var l = try TestBlob.init();
+    const a0 = try l.str("0");
+    const a10 = try l.str("1:0");
+    const a00 = try l.str("0:0");
+    const a01 = try l.str("0:1");
+    const a02 = try l.str("0:2");
+    const n_e = try l.str("E");
+    const n_a = try l.str("A");
+    const n_b = try l.str("B");
+    const l_e = try l.rec(n_e, btf.K_ENUM, 2, false, 4, &.{ n_a, 1, n_b, 2 }); // 1
+    const l_e64 = try l.rec(n_e, btf.K_ENUM64, 1, false, 8, &.{ n_a, 1, 0 }); // 2
+    const l_anon = try l.rec(0, btf.K_ENUM, 1, false, 4, &.{ n_a, 1 }); // 3
+    try l.finish();
+    defer l.deinit();
+    // a first candidate without A, a second with A = 7
+    var t = try TestBlob.init();
+    const tn_e = try t.str("E");
+    const tn_a = try t.str("A");
+    const tn_b = try t.str("B");
+    _ = try t.rec(tn_e, btf.K_ENUM, 1, false, 4, &.{ tn_b, 3 });
+    _ = try t.rec(tn_e, btf.K_ENUM, 1, false, 4, &.{ tn_a, 7 });
+    try t.finish();
+    defer t.deinit();
+    const lb = &l.parsed;
+    const tb = &t.parsed;
+    try testing.expectError(error.BadAccessSpec, computeRelo(lb, tb, typeRelo(11, l_e, a0)));
+    try testing.expectError(error.BadAccessSpec, computeRelo(lb, tb, typeRelo(11, l_e, a10)));
+    try testing.expectError(error.BadLocalSpec, computeRelo(lb, tb, typeRelo(11, l_e, a02))); // index == count
+    try testing.expectError(error.TargetTypeNotFound, computeRelo(lb, tb, typeRelo(11, l_anon, a00)));
+    // the first candidate lacks A: it is skipped, not the end of the search
+    const r = try computeRelo(lb, tb, typeRelo(11, l_e, a00));
+    try testing.expect(r.exists);
+    try testing.expectEqual(@as(u64, 7), r.value);
+    // a local ENUM64 works too
+    try testing.expectEqual(@as(u64, 7), (try computeRelo(lb, tb, typeRelo(11, l_e64, a00))).value);
+    // two candidates that both have B but with other values are ambiguous
+    var t2 = try TestBlob.init();
+    const t2_e = try t2.str("E");
+    const t2_b = try t2.str("B");
+    _ = try t2.rec(t2_e, btf.K_ENUM, 1, false, 4, &.{ t2_b, 3 });
+    _ = try t2.rec(t2_e, btf.K_ENUM, 1, false, 4, &.{ t2_b, 4 });
+    try t2.finish();
+    defer t2.deinit();
+    try testing.expectError(error.AmbiguousRelocation, computeRelo(lb, &t2.parsed, typeRelo(11, l_e, a01)));
+}

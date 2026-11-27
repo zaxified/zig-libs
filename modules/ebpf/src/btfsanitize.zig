@@ -599,3 +599,176 @@ test "neutralizeExterns: extern VARs, FUNCs and their DATASEC become kinds the k
     // nothing to do without externs
     try testing.expect((try neutralizeExterns(gpa, out)) == null);
 }
+
+test "mutation 2026-11-27: each feature alone triggers a rewrite" {
+    try testing.expect((Features{ .func = false }).needsRewrite());
+    try testing.expect((Features{ .func_global = false }).needsRewrite());
+    try testing.expect((Features{ .datasec = false }).needsRewrite());
+    try testing.expect((Features{ .float = false }).needsRewrite());
+    try testing.expect((Features{ .decl_tag = false }).needsRewrite());
+    try testing.expect((Features{ .type_tag = false }).needsRewrite());
+    try testing.expect((Features{ .enum64 = false }).needsRewrite());
+}
+
+fn mtIntWord(b: *const btf.Btf, id: u32) !struct { size: u32, bits: u8, offset: u8, enc: u8 } {
+    const t = try b.byId(id);
+    try testing.expectEqual(btf.Kind.int, t.kind);
+    const ii = try b.intInfo(t);
+    return .{ .size = t.size_type, .bits = ii.bits, .offset = ii.offset, .enc = ii.encoding };
+}
+
+test "mutation 2026-11-27: the rewritten records, field by field" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_a = try r.str(gpa, "a");
+    const n_b = try r.str(gpa, "b");
+    const n_sec = try r.str(gpa, ".data");
+    const n_f = try r.str(gpa, "f");
+    const int1 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32}); // 1
+    const var1 = try r.rec(gpa, n_a, btf.K_VAR, 0, false, int1, &.{1}); // 2
+    const var2 = try r.rec(gpa, n_b, btf.K_VAR, 0, false, int1, &.{1}); // 3
+    const sec = try r.rec(gpa, n_sec, btf.K_DATASEC, 2, false, 8, &.{ var1, 0, 4, var2, 4, 4 }); // 4
+    const proto = try r.rec(gpa, 0, btf.K_FUNC_PROTO, 2, false, int1, &.{ n_a, int1, n_b, int1 }); // 5
+    const gfn = try r.rec(gpa, n_f, btf.K_FUNC, 1, false, proto, &.{}); // 6: global
+    const efn = try r.rec(gpa, n_f, btf.K_FUNC, 2, false, proto, &.{}); // 7: extern
+    const tag = try r.rec(gpa, n_a, btf.K_DECL_TAG, 0, false, var1, &.{0xffff_ffff}); // 8
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+
+    const out = (try sanitize(gpa, blob, .{ .func = false, .func_global = true, .datasec = false, .decl_tag = false })).?;
+    defer gpa.free(out);
+    var b = try btf.parse(gpa, out, .{});
+    defer b.deinit();
+    const nat = builtin.cpu.arch.endian();
+    // VAR and DECL_TAG: a 1-byte INT of 8 bits
+    for ([_]u32{ var1, var2, tag }) |id| {
+        const w = try mtIntWord(&b, id);
+        try testing.expectEqual(@as(u32, 1), w.size);
+        try testing.expectEqual(@as(u8, 8), w.bits);
+        try testing.expectEqual(@as(u8, 0), w.offset);
+        try testing.expectEqual(@as(u8, 0), w.enc);
+    }
+    // DATASEC: one member per variable, 12 bytes apart, named like it, at bit offset 8 * offset
+    const st = try b.byId(sec);
+    try testing.expectEqual(btf.Kind.@"struct", st.kind);
+    try testing.expectEqual(@as(u16, 2), st.vlen);
+    try testing.expectEqual(@as(u32, 8), st.size_type);
+    const m1 = try b.member(st, 1);
+    try testing.expectEqual(n_b, m1.name_off);
+    try testing.expectEqual(var2, m1.type_id);
+    try testing.expectEqual(@as(u32, 32), m1.bit_offset);
+    // FUNC_PROTO: an enum of the same enumerator count, 4 bytes, every value 0, names kept
+    const pe = try b.byId(proto);
+    try testing.expectEqual(btf.Kind.@"enum", pe.kind);
+    try testing.expectEqual(@as(u16, 2), pe.vlen);
+    try testing.expectEqual(@as(u32, 4), pe.size_type);
+    try testing.expectEqual(n_a, std.mem.readInt(u32, pe.extra[0..4], nat));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, pe.extra[4..8], nat));
+    try testing.expectEqual(n_b, std.mem.readInt(u32, pe.extra[8..12], nat));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, pe.extra[12..16], nat));
+    // FUNC: a typedef of the proto
+    try testing.expectEqual(btf.Kind.typedef, (try b.byId(gfn)).kind);
+    try testing.expectEqual(btf.Kind.typedef, (try b.byId(efn)).kind);
+
+    // with FUNC available but no global linkage: only the global function turns static, an extern one stays
+    const out2 = (try sanitize(gpa, blob, .{ .func_global = false })).?;
+    defer gpa.free(out2);
+    var b2 = try btf.parse(gpa, out2, .{});
+    defer b2.deinit();
+    try testing.expectEqual(@as(?btf.FuncLinkage, .static), (try b2.byId(gfn)).funcLinkage());
+    try testing.expectEqual(@as(?btf.FuncLinkage, .external), (try b2.byId(efn)).funcLinkage());
+}
+
+test "mutation 2026-11-27: a blob whose only missing kind is ENUM64 is rewritten, placeholder included" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_e = try r.str(gpa, "E");
+    const n_a = try r.str(gpa, "a");
+    const e64 = try r.rec(gpa, n_e, btf.K_ENUM64, 1, false, 8, &.{ n_a, 5, 1 }); // 1
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    const out = (try sanitize(gpa, blob, .{ .enum64 = false })).?;
+    defer gpa.free(out);
+    var b = try btf.parse(gpa, out, .{});
+    defer b.deinit();
+    try b.validateReferences(null);
+    try testing.expectEqual(@as(u32, 2), b.typeCount());
+    const u = try b.byId(e64);
+    try testing.expectEqual(btf.Kind.@"union", u.kind);
+    const m0 = try b.member(u, 0);
+    try testing.expectEqual(@as(u32, 2), m0.type_id);
+    try testing.expectEqual(@as(u32, 0), m0.bit_offset); // the high word of the value (1) is gone
+    const ph = try b.byId(2);
+    try testing.expectEqualStrings("enum64_placeholder", b.str(ph.name_off).?);
+    const w = try mtIntWord(&b, 2);
+    try testing.expectEqual(@as(u32, 1), w.size);
+    try testing.expectEqual(@as(u8, 8), w.bits);
+}
+
+test "mutation 2026-11-27: neutralizeExterns rewrites by linkage, in a DATASEC whose first entry is not extern" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_a = try r.str(gpa, "CONFIG_A");
+    const n_g = try r.str(gpa, "glob");
+    const n_f = try r.str(gpa, "gfn");
+    const n_sec = try r.str(gpa, ".kconfig");
+    const int1 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32}); // 1
+    const v_ext = try r.rec(gpa, n_a, btf.K_VAR, 0, false, int1, &.{2}); // 2
+    const v_glob = try r.rec(gpa, n_g, btf.K_VAR, 0, false, int1, &.{1}); // 3
+    const proto = try r.rec(gpa, 0, btf.K_FUNC_PROTO, 0, false, 0, &.{}); // 4
+    const gfn = try r.rec(gpa, n_f, btf.K_FUNC, 1, false, proto, &.{}); // 5: a global function, not an extern
+    const sec = try r.rec(gpa, n_sec, btf.K_DATASEC, 2, false, 8, &.{ v_glob, 0, 4, v_ext, 4, 4 }); // 6
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    const out = (try neutralizeExterns(gpa, blob)).?;
+    defer gpa.free(out);
+    var b = try btf.parse(gpa, out, .{});
+    defer b.deinit();
+    try b.validateReferences(null);
+    try testing.expectEqual(btf.Kind.func, (try b.byId(gfn)).kind); // not an extern: untouched
+    try testing.expectEqual(btf.Kind.@"var", (try b.byId(v_glob)).kind);
+    const w = try mtIntWord(&b, v_ext);
+    try testing.expectEqual(@as(u32, 1), w.size);
+    try testing.expectEqual(@as(u8, 8), w.bits);
+    const st = try b.byId(sec);
+    try testing.expectEqual(btf.Kind.@"struct", st.kind);
+    try testing.expectEqual(@as(u16, 2), st.vlen);
+    const m0 = try b.member(st, 0);
+    try testing.expectEqual(n_g, m0.name_off);
+    try testing.expectEqual(@as(u32, 7), m0.type_id);
+    const ph = try b.byId(7);
+    try testing.expectEqualStrings("extern_placeholder", b.str(ph.name_off).?);
+    const pw = try mtIntWord(&b, 7);
+    try testing.expectEqual(@as(u32, 1), pw.size);
+    try testing.expectEqual(@as(u8, 8), pw.bits);
+}
+
+test "mutation 2026-11-27: the probe blobs say what they probe" {
+    var buf: [160]u8 = undefined;
+    {
+        var b = try btf.parse(testing.allocator, probeBlob(&buf, .func_global), .{});
+        defer b.deinit();
+        try testing.expectEqual(@as(?btf.FuncLinkage, .global), (try b.byId(3)).funcLinkage());
+    }
+    {
+        var b = try btf.parse(testing.allocator, probeBlob(&buf, .func), .{});
+        defer b.deinit();
+        try testing.expectEqual(@as(?btf.FuncLinkage, .static), (try b.byId(3)).funcLinkage());
+    }
+    {
+        // the decl_tag annotates the whole type: component index -1
+        var b = try btf.parse(testing.allocator, probeBlob(&buf, .decl_tag), .{});
+        defer b.deinit();
+        try testing.expectEqual(@as(u32, 0xffff_ffff), std.mem.readInt(u32, b.types[b.types.len - 4 ..][0..4], native_endian));
+    }
+    // without CAP_BPF the kernel refuses the probe and `probeFeatures` says so instead of guessing "unsupported"
+    const blob = probeBlob(&buf, .func);
+    if (btf.loadIntoKernel(blob, null)) |fd| {
+        _ = std.os.linux.close(fd);
+    } else |e| {
+        if (e == error.PermissionDenied) try testing.expectError(error.PermissionDenied, probeFeatures());
+    }
+}

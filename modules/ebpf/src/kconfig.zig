@@ -415,3 +415,74 @@ test "kallsymsAddress: exact names, the first match, and the zero an unprivilege
     try testing.expectEqual(@as(?u64, null), kallsymsAddress(text, "absent"));
     try testing.expectEqual(@as(?u64, null), kallsymsAddress(text, "bpf_prog"));
 }
+
+test "mutation 2026-11-27: CRLF lines, a lone quote, and the version limits" {
+    const gpa = testing.allocator;
+    var c = try parse(gpa, "CONFIG_A=y\r\nCONFIG_B=\"s\"\r\n");
+    defer c.deinit();
+    try testing.expectEqual(@as(u8, 'y'), c.get("CONFIG_A").?.tristate);
+    try testing.expectEqualStrings("s", c.get("CONFIG_B").?.string);
+    try testing.expectError(error.BadLine, parse(gpa, "CONFIG_X=\""));
+    // KERNEL_VERSION packs major and minor in 8 bits each beyond the shift; larger ones cannot be encoded
+    try testing.expect(kernelVersionCode("256.0.0") == null);
+    try testing.expect(kernelVersionCode("6.256.0") == null);
+    try testing.expectEqual(@as(?u32, (255 << 16) + (255 << 8) + 0), kernelVersionCode("255.255"));
+    // a number is its leading digits: a non-numeric patch is 0, a suffix on the minor is ignored
+    try testing.expectEqual(@as(?u32, (6 << 16) + (8 << 8) + 0), kernelVersionCode("6.8.x-foo"));
+    try testing.expectEqual(@as(?u32, (6 << 16) + (8 << 8) + 1), kernelVersionCode("6.8a.1"));
+}
+
+test "mutation 2026-11-27: what the declared type does not list is refused, signed values are stored signed" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_tri = try r.str(gpa, "libbpf_tristate");
+    const n_other = try r.str(gpa, "other_enum");
+    const n_y = try r.str(gpa, "Y");
+    const u32_t = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32});
+    const off_t = try r.rec(gpa, 0, btf.K_INT, 0, false, 1, &.{(1 << 16) | 8}); // bit offset 1
+    const bool4 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{(4 << 24) | 32}); // BOOL, but 4 bytes
+    const chr4 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{(3 << 24) | 32}); // CHAR, but 4 bytes
+    const chr = try r.rec(gpa, 0, btf.K_INT, 0, false, 1, &.{(3 << 24) | 8}); // signed char
+    const i32_t = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{(1 << 24) | 32});
+    const e_other = try r.rec(gpa, n_other, btf.K_ENUM, 1, false, 4, &.{ n_y, 1 });
+    const e_tri8 = try r.rec(gpa, n_tri, btf.K_ENUM, 1, false, 8, &.{ n_y, 1 });
+    const e_tri = try r.rec(gpa, n_tri, btf.K_ENUM, 1, false, 4, &.{ n_y, 1 });
+    const e8 = try r.rec(gpa, n_y, btf.K_ENUM, 1, false, 1, &.{ n_y, 1 });
+    const arr_u32 = try r.rec(gpa, 0, btf.K_ARRAY, 0, false, 0, &.{ u32_t, u32_t, 4 });
+    const arr_e8 = try r.rec(gpa, 0, btf.K_ARRAY, 0, false, 0, &.{ e8, u32_t, 4 });
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    var b = try btf.parse(gpa, blob, .{});
+    defer b.deinit();
+    var out: [16]u8 = @splat(0xaa);
+    const one: Value = .{ .int = .{ .negative = false, .magnitude = 1 } };
+    try testing.expectError(error.UnsupportedType, fill(&b, off_t, one, &out));
+    // a BOOL or CHAR encoding is only a bool / char at one byte: wider, it is an integer that takes no letter
+    try testing.expectError(error.BadValue, fill(&b, bool4, .{ .tristate = 'y' }, &out));
+    try testing.expectError(error.BadValue, fill(&b, chr4, .{ .tristate = 'y' }, &out));
+    // an enum is the tristate only by its name and its 4 bytes
+    try testing.expectError(error.UnsupportedType, fill(&b, e_other, .{ .tristate = 'y' }, &out));
+    try testing.expectError(error.UnsupportedType, fill(&b, e_tri8, .{ .tristate = 'y' }, &out));
+    try fill(&b, e_tri, .{ .tristate = 'y' }, &out);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, out[0..4], builtin.cpu.arch.endian()));
+    // a char array holds 1-byte integers only
+    try testing.expectError(error.UnsupportedType, fill(&b, arr_u32, .{ .string = "ab" }, &out));
+    try testing.expectError(error.UnsupportedType, fill(&b, arr_e8, .{ .string = "ab" }, &out));
+    // a signed char keeps its sign: -5 is 0xfb, 200 does not fit
+    try fill(&b, chr, .{ .int = .{ .negative = true, .magnitude = 5 } }, &out);
+    try testing.expectEqual(@as(u8, 0xfb), out[0]);
+    try testing.expectError(error.OutOfRange, fill(&b, chr, .{ .int = .{ .negative = false, .magnitude = 200 } }, &out));
+    // -0 is 0 for an unsigned integer; a negative signed one is stored two's complement
+    @memset(&out, 0xaa);
+    try fill(&b, u32_t, .{ .int = .{ .negative = true, .magnitude = 0 } }, &out);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, out[0..4], builtin.cpu.arch.endian()));
+    try fill(&b, i32_t, .{ .int = .{ .negative = true, .magnitude = 5 } }, &out);
+    try testing.expectEqual(@as(i32, -5), std.mem.readInt(i32, out[0..4], builtin.cpu.arch.endian()));
+}
+
+test "mutation 2026-11-27: kallsyms skips a line it cannot read and keeps looking" {
+    try testing.expectEqual(@as(?u64, 0xffffffff81002000), kallsymsAddress("garbage\nzz T foo\nffffffff81002000 T foo [mod]\n", "foo"));
+    try testing.expectEqual(@as(?u64, 0xffffffff81003000), kallsymsAddress("ffffffff81000000\nffffffff81003000 T bar\n", "bar"));
+    try testing.expectEqual(@as(?u64, 0xffffffff81004000), kallsymsAddress("ffffffff81000000 T\nffffffff81004000 T baz\n", "baz"));
+}
