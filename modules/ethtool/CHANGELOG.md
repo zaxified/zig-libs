@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **NO CONSUMER-VISIBLE CHANGE:** first whole-module mutation run (737/781, 44 eq); 48 tests in `src/mutation_test.zig`, `client.zig` and `ioctl.zig`. Test only.
 - **2026-11-21** — **NEW: PHY list and tunnel offload info.** `Ethtool.phy` (`Phy`) and `tunnelInfo` (`TunnelInfo`, `buildPhy`, `buildTunnelInfo`).
 - **2026-11-21** — **NEW: timestamping configuration and TSINFO statistics.** `Ethtool.tsConfig` / `setTsConfig` (`TsConfig`, `TsConfigSet`), `tsInfoStats`; `TsInfo` gains the fields `stats`, `provider`, `source` and `phy_index` (`TsStats`, `TsProvider`).
 - **2026-11-21** — **NEW: PLCA and MAC merge.** `Ethtool.plca` / `setPlca` / `plcaStatus` (`PlcaCfg`, `PlcaSet`, `PlcaStatus`) and `mm` / `setMm` (`Mm`, `MmSet`, `MmStats`, `MmVerifyStatus`), with their `build*` encoders.

@@ -1736,3 +1736,344 @@ test "a reply body with no header nest cannot pass the device binding" {
         cl.checkReplyEcho(attrs.items, uapi.RINGS.HEADER, .byIndex(2)),
     );
 }
+
+// ── mutation 2026-11-27 (whole-module run) ─────────────────────────────────
+
+/// A scripted peer: `recvDatagram` hands out the datagrams in order, then fails.
+const ScriptSock = struct {
+    portid: u32,
+    dgrams: []const []const u8,
+    next: usize = 0,
+    recvs: u32 = 0,
+
+    fn recvDatagram(self: *ScriptSock) genl.RecvError![]const u8 {
+        self.recvs += 1;
+        if (self.next >= self.dgrams.len) return error.RecvFailed;
+        defer self.next += 1;
+        return self.dgrams[self.next];
+    }
+};
+
+const ScriptEthtool = struct {
+    sock: ScriptSock,
+    family_id: u16,
+    noted: u32 = 0,
+
+    fn noteErrorMessage(self: *ScriptEthtool, _: codec.Message) void {
+        self.noted += 1;
+    }
+};
+
+fn appendMsg(list: *std.ArrayList(u8), msg_type: u16, seq: u32, pid: u32, payload: []const u8) !void {
+    const h = try codec.appendHeader(testing.allocator, list, msg_type, 0, seq, pid);
+    try codec.appendPadded(testing.allocator, list, payload);
+    codec.finishHeader(list, h);
+}
+
+test "mutation 2026-11-27: walkStep skips foreign pid and seq, and a finished walk never reads again" {
+    const gpa = testing.allocator;
+    const family: u16 = 23;
+    const pid: u32 = 100;
+    const seq: u32 = 5;
+    var d1: std.ArrayList(u8) = .empty;
+    defer d1.deinit(gpa);
+    try appendMsg(&d1, family, seq, 999, &.{ 1, 1, 0, 0 }); // foreign pid, cmd 1
+    try appendMsg(&d1, family, seq + 1, pid, &.{ 2, 1, 0, 0 }); // foreign seq, cmd 2
+    try appendMsg(&d1, codec.NLMSG_NOOP, seq, pid, &.{});
+    try appendMsg(&d1, family, seq, pid, &.{ 5, 1, 0, 0 }); // ours, cmd 5
+    try appendMsg(&d1, codec.NLMSG_DONE, seq, pid, &.{ 0, 0, 0, 0 });
+
+    var cl: ScriptEthtool = .{ .sock = .{ .portid = pid, .dgrams = &[_][]const u8{d1.items} }, .family_id = family };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    var finished = false;
+    var msgs: u32 = 0;
+    const first = (try walkStep(&cl, seq, &it, &finished, &msgs)).?;
+    try testing.expectEqual(@as(u8, 5), first.cmd);
+    try testing.expect((try walkStep(&cl, seq, &it, &finished, &msgs)) == null);
+    try testing.expect(finished);
+    // finished is final: no further read, however often it is asked
+    try testing.expect((try walkStep(&cl, seq, &it, &finished, &msgs)) == null);
+    try testing.expectEqual(@as(u32, 1), cl.sock.recvs);
+}
+
+test "mutation 2026-11-27: walkStep: an ACK ends the walk, an errno is noted and mapped, an overrun is SystemResources" {
+    const gpa = testing.allocator;
+    const family: u16 = 23;
+    const pid: u32 = 100;
+    const seq: u32 = 5;
+    var ack_payload: [20]u8 = @splat(0); // error 0 + the echoed header
+    var ack: std.ArrayList(u8) = .empty;
+    defer ack.deinit(gpa);
+    try appendMsg(&ack, codec.NLMSG_ERROR, seq, pid, &ack_payload);
+    {
+        var cl: ScriptEthtool = .{ .sock = .{ .portid = pid, .dgrams = &[_][]const u8{ack.items} }, .family_id = family };
+        var it: codec.MessageIterator = .{ .buf = &.{} };
+        var finished = false;
+        var msgs: u32 = 0;
+        try testing.expect((try walkStep(&cl, seq, &it, &finished, &msgs)) == null);
+        try testing.expect((try walkStep(&cl, seq, &it, &finished, &msgs)) == null);
+        try testing.expectEqual(@as(u32, 1), cl.sock.recvs);
+        try testing.expectEqual(@as(u32, 0), cl.noted);
+    }
+    // -EPERM
+    std.mem.writeInt(i32, ack_payload[0..4], -@as(i32, @intCast(@backingInt(linux.E.PERM))), builtin.cpu.arch.endian());
+    var err: std.ArrayList(u8) = .empty;
+    defer err.deinit(gpa);
+    try appendMsg(&err, codec.NLMSG_ERROR, seq, pid, &ack_payload);
+    {
+        var cl: ScriptEthtool = .{ .sock = .{ .portid = pid, .dgrams = &[_][]const u8{err.items} }, .family_id = family };
+        var it: codec.MessageIterator = .{ .buf = &.{} };
+        var finished = false;
+        var msgs: u32 = 0;
+        try testing.expectError(error.AccessDenied, walkStep(&cl, seq, &it, &finished, &msgs));
+        try testing.expectEqual(@as(u32, 1), cl.noted);
+    }
+    var over: std.ArrayList(u8) = .empty;
+    defer over.deinit(gpa);
+    try appendMsg(&over, codec.NLMSG_OVERRUN, seq, pid, &.{});
+    {
+        var cl: ScriptEthtool = .{ .sock = .{ .portid = pid, .dgrams = &[_][]const u8{over.items} }, .family_id = family };
+        var it: codec.MessageIterator = .{ .buf = &.{} };
+        var finished = false;
+        var msgs: u32 = 0;
+        try testing.expectError(error.SystemResources, walkStep(&cl, seq, &it, &finished, &msgs));
+    }
+}
+
+/// Counts reads and always answers with the same foreign datagram.
+const CountSock = struct {
+    datagram: []const u8,
+    recvs: u32 = 0,
+
+    fn recvDatagram(self: *CountSock) genl.RecvError![]const u8 {
+        self.recvs += 1;
+        return self.datagram;
+    }
+};
+
+test "mutation 2026-11-27: waitForNotification reads exactly max_walk_messages foreign datagrams before it gives up" {
+    const gpa = testing.allocator;
+    const dgram = try nonTerminatingDatagram(gpa, 100, 5, 23);
+    defer gpa.free(dgram);
+    var sock: CountSock = .{ .datagram = dgram };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    try testing.expectError(error.TooManyMessages, waitForNotificationStep(&sock, 23, &it, gpa));
+    try testing.expectEqual(max_walk_messages, sock.recvs);
+}
+
+test "mutation 2026-11-27: errnoToError maps every errno of its table and only those" {
+    const E = linux.E;
+    const cases = .{
+        .{ E.PERM, error.AccessDenied },
+        .{ E.ACCES, error.AccessDenied },
+        .{ E.NODEV, error.NoSuchDevice },
+        .{ E.NXIO, error.NoSuchDevice },
+        .{ E.NOENT, error.NoSuchDevice },
+        .{ E.OPNOTSUPP, error.NotSupported },
+        .{ E.INVAL, error.InvalidRequest },
+        .{ E.MSGSIZE, error.InvalidRequest },
+        .{ E.BUSY, error.Busy },
+        .{ E.AGAIN, error.Busy },
+        .{ E.NOBUFS, error.SystemResources },
+        .{ E.NOMEM, error.SystemResources },
+        .{ E.XDEV, error.Unexpected },
+    };
+    inline for (cases) |c| {
+        const code: i32 = -@as(i32, @intCast(@backingInt(c[0])));
+        try testing.expect(errnoToError(code) == c[1]);
+    }
+    try testing.expect(errnoToError(0) == error.Unexpected);
+    try testing.expect(errnoToError(5) == error.Unexpected);
+    try testing.expect(errnoToError(std.math.minInt(i32)) == error.Unexpected);
+}
+
+test "mutation 2026-11-27: the error folds keep every kind apart" {
+    try testing.expect(mapResolve(error.GroupNotFound) == error.GroupNotFound);
+    try testing.expect(mapResolve(error.FamilyNotFound) == error.NoSuchDevice);
+    try testing.expect(mapResolve(error.OutOfMemory) == error.OutOfMemory);
+    try testing.expect(mapResolve(error.SendFailed) == error.SendFailed);
+    try testing.expect(mapResolve(error.RecvFailed) == error.RecvFailed);
+    try testing.expect(mapResolve(error.MalformedReply) == error.MalformedReply);
+    try testing.expect(mapResolve(error.TooManyMessages) == error.MalformedReply);
+    try testing.expect(mapResolve(error.AccessDenied) == error.AccessDenied);
+    try testing.expect(mapResolve(error.SystemResources) == error.SystemResources);
+    try testing.expect(mapResolve(error.Unexpected) == error.Unexpected);
+
+    try testing.expect(recvErr(error.OutOfMemory) == error.OutOfMemory);
+    try testing.expect(recvErr(error.MalformedReply) == error.MalformedReply);
+    try testing.expect(recvErr(error.SystemResources) == error.SystemResources);
+    try testing.expect(recvErr(error.RecvFailed) == error.RecvFailed);
+
+    try testing.expect(mapParse(error.OutOfMemory) == error.OutOfMemory);
+    try testing.expect(mapParse(error.Truncated) == error.MalformedReply);
+    try testing.expect(mapParse(error.BadLength) == error.MalformedReply);
+}
+
+fn openLive() !Ethtool {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    return Ethtool.open(testing.allocator) catch return error.SkipZigTest;
+}
+
+test "mutation 2026-11-27: noteErrorMessage keeps the kernel's sentence, truncated to the buffer, and clears a stale one" {
+    const gpa = testing.allocator;
+    var cl = try openLive();
+    defer cl.close();
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+
+    // a message without extended-ACK TLVs leaves no sentence, even after a stale one
+    cl.sock.ext_ack_len = 7;
+    const zeros: [20]u8 = @splat(0);
+    var plain: codec.Message = .{ .type = codec.NLMSG_ERROR, .flags = 0, .seq = 1, .pid = 0, .payload = &zeros };
+    cl.noteErrorMessage(plain);
+    try testing.expect(cl.lastErrorMessage() == null);
+
+    // with the TLVs: the sentence is kept
+    try payload.appendSlice(gpa, &zeros);
+    try codec.appendAttrString(gpa, &payload, codec.NLMSGERR_ATTR.MSG, "no device matches name");
+    plain = .{ .type = codec.NLMSG_ERROR, .flags = codec.NLM_F_ACK_TLVS | codec.NLM_F_CAPPED, .seq = 1, .pid = 0, .payload = payload.items };
+    cl.noteErrorMessage(plain);
+    try testing.expectEqualStrings("no device matches name", cl.lastErrorMessage().?);
+
+    // a sentence longer than the buffer is cut to it, not overrun
+    payload.clearRetainingCapacity();
+    try payload.appendSlice(gpa, &zeros);
+    const long = try gpa.alloc(u8, max_error_message + 40);
+    defer gpa.free(long);
+    @memset(long, 'x');
+    try codec.appendAttrString(gpa, &payload, codec.NLMSGERR_ATTR.MSG, long);
+    plain.payload = payload.items;
+    cl.noteErrorMessage(plain);
+    try testing.expectEqual(max_error_message, cl.lastErrorMessage().?.len);
+}
+
+test "mutation 2026-11-27: exchangeGet refuses a reply that names another device" {
+    var cl = try openLive();
+    defer cl.close();
+    const gpa = cl.allocator();
+    // a control first: the same request, bound to the right device, is answered
+    const seq0 = cl.sock.nextSeq();
+    const msg0 = try link.buildLinkState(gpa, cl.family_id, seq0, header.Target.byName("lo"));
+    var ok = cl.exchangeGet(msg0, seq0, uapi.LINKSTATE.HEADER, header.Target.byName("lo")) catch |e| switch (e) {
+        error.NotSupported, error.AccessDenied, error.NoSuchDevice => return error.SkipZigTest,
+        else => return e,
+    };
+    ok.deinit(gpa);
+    // the reply names `lo`; the caller asked about another device
+    const seq = cl.sock.nextSeq();
+    const msg = try link.buildLinkState(gpa, cl.family_id, seq, header.Target.byName("lo"));
+    var bad = cl.exchangeGet(msg, seq, uapi.LINKSTATE.HEADER, header.Target.byName("nosuch0")) catch |e| switch (e) {
+        error.UnexpectedDevice => return,
+        else => return e,
+    };
+    bad.deinit(gpa);
+    return error.TestUnexpectedResult;
+}
+
+test "mutation 2026-11-27: a request starts without the previous rejection's sentence" {
+    var cl = try openLive();
+    defer cl.close();
+    try testing.expectError(error.NoSuchDevice, cl.linkState(header.Target.byName("nosuch0")));
+    if (cl.lastErrorMessage() == null) return error.SkipZigTest; // this kernel attached no sentence
+    _ = cl.linkState(header.Target.byName("lo")) catch return error.SkipZigTest;
+    try testing.expect(cl.lastErrorMessage() == null);
+}
+
+test "mutation 2026-11-27: the all-device dump returns what was dumped, with its attributes" {
+    var cl = try openLive();
+    defer cl.close();
+    const states = cl.linkStateAll() catch |e| switch (e) {
+        error.NotSupported, error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer testing.allocator.free(states);
+    // `lo` exists in every network namespace and answers LINKSTATE_GET
+    var seen_lo = false;
+    for (states) |st| {
+        if (std.mem.eql(u8, st.device.name(), "lo")) seen_lo = true;
+    }
+    try testing.expect(seen_lo);
+}
+
+test "mutation 2026-11-27: raw: a dump asked by flag, a dump asked by extra_flags, and a single request with its attributes" {
+    const gpa = testing.allocator;
+    var cl = try openLive();
+    defer cl.close();
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(gpa);
+    try header.appendGlobal(gpa, &all, uapi.LINKSTATE.HEADER, 0);
+    const dump_reqs = [_]Ethtool.RawRequest{
+        .{ .cmd = uapi.MSG.LINKSTATE_GET, .attrs = all.items, .dump = true },
+        .{ .cmd = uapi.MSG.LINKSTATE_GET, .attrs = all.items, .extra_flags = codec.NLM_F_DUMP },
+    };
+    for (dump_reqs) |req| {
+        const replies = cl.raw(req) catch |e| switch (e) {
+            error.NotSupported, error.AccessDenied => return error.SkipZigTest,
+            else => return e,
+        };
+        defer Ethtool.freeRawReplies(gpa, replies);
+        try testing.expect(replies.len >= 1);
+        try testing.expectEqual(uapi.REPLY.LINKSTATE_GET, replies[0].cmd);
+    }
+    var one: std.ArrayList(u8) = .empty;
+    defer one.deinit(gpa);
+    try header.append(gpa, &one, uapi.LINKSTATE.HEADER, .{ .target = header.Target.byName("lo") });
+    const replies = cl.raw(.{ .cmd = uapi.MSG.LINKSTATE_GET, .attrs = one.items }) catch |e| switch (e) {
+        error.NotSupported, error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer Ethtool.freeRawReplies(gpa, replies);
+    try testing.expectEqual(@as(usize, 1), replies.len);
+    const d = (try header.parseLeading(replies[0].attrs)).?;
+    try testing.expectEqualStrings("lo", d.name());
+}
+
+test "mutation 2026-11-27: collect keeps the first message of a multi-message reply and leaks no other" {
+    const gpa = testing.allocator;
+    var cl = try openLive();
+    defer cl.close();
+    const seq = cl.sock.nextSeq();
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{ .family_id = cl.family_id, .cmd = uapi.MSG.LINKSTATE_GET, .seq = seq, .extra_flags = codec.NLM_F_DUMP });
+    try header.appendGlobal(gpa, &msg, uapi.LINKSTATE.HEADER, 0);
+    try cl.sendBuilt(try header.finishRequest(gpa, &msg, h));
+    // environment note: with a single ethtool-capable device in the namespace the dump holds one
+    // message and the drain branch is not entered; with two or more (e.g. `gre0`/`gretap0` next
+    // to `lo`) it is, and a lost `found != null` guard leaks the first copy.
+    var reply = (cl.collect(seq) catch |e| switch (e) {
+        error.NotSupported, error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    }) orelse return error.SkipZigTest;
+    defer reply.deinit(gpa);
+    try testing.expectEqual(uapi.REPLY.LINKSTATE_GET, reply.cmd);
+}
+
+test "mutation 2026-11-27: joining a multicast group that does not exist is InvalidRequest" {
+    var cl = try openLive();
+    defer cl.close();
+    var ev = EventSocket.openWith(&cl, &.{}) catch return error.SkipZigTest;
+    defer ev.close();
+    try testing.expectError(error.InvalidRequest, ev.joinGroup(0));
+    try testing.expectError(error.InvalidRequest, ev.joinGroup(0x7fff_ffff));
+}
+
+test "mutation 2026-11-27: an unprivileged SET is answered AccessDenied, and a SOPASS never stays in the receive buffer" {
+    var cl = try openLive();
+    defer cl.close();
+    // the ACK-only path: the request must really be sent, or this would wait for ever
+    cl.setPause(header.Target.byName("lo"), .{ .rx = true }) catch |e| switch (e) {
+        error.AccessDenied => {},
+        else => return error.SkipZigTest, // privileged here, or no such operation
+    };
+    // the secret path: the kernel's error reply echoes the request, SOPASS included, into the
+    // receive buffer, and `setWol` zeroes that buffer before it returns
+    const secret = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34 };
+    cl.setWol(header.Target.byName("lo"), .{ .sopass = secret }) catch |e| switch (e) {
+        error.AccessDenied => {
+            try testing.expect(std.mem.find(u8, cl.sock.buf, &secret) == null);
+            return;
+        },
+        else => return error.SkipZigTest,
+    };
+}

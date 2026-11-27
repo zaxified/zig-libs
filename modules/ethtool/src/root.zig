@@ -926,4 +926,5 @@ test {
     _ = client;
     _ = ioctl;
     _ = @import("goldens.zig");
+    _ = @import("mutation_test.zig");
 }

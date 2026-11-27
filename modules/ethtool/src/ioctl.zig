@@ -605,3 +605,123 @@ test "LIVE drvinfo and driverStats agree with ethtool -i / -S" {
     }
     if (!did_info and !did_stats) return skip("no interface answers SIOCETHTOOL drvinfo/stats");
 }
+
+// ── mutation 2026-11-27 (whole-module run) ─────────────────────────────────
+
+test "mutation 2026-11-27: validateName refuses each forbidden character, the dot names, and 16 bytes" {
+    try validateName("abcdefghijklmno"); // 15 bytes: the longest
+    try testing.expectError(error.InvalidInterfaceName, validateName("abcdefghijklmnop")); // 16
+    try testing.expectError(error.InvalidInterfaceName, validateName(""));
+    try testing.expectError(error.InvalidInterfaceName, validateName("."));
+    try testing.expectError(error.InvalidInterfaceName, validateName(".."));
+    for ([_]u8{ 0, '/', ':', ' ', '\t', '\n', '\r', 0x0b, 0x0c }) |c| {
+        const name = [_]u8{ 'e', 't', c, '0' };
+        try testing.expectError(error.InvalidInterfaceName, validateName(&name));
+    }
+    try validateName("eth0");
+}
+
+test "mutation 2026-11-27: mapErrno keeps every errno of its table apart" {
+    try testing.expect(mapErrno(.NODEV) == error.NoSuchDevice);
+    try testing.expect(mapErrno(.OPNOTSUPP) == error.NotSupported);
+    try testing.expect(mapErrno(.AFNOSUPPORT) == error.NotSupported);
+    try testing.expect(mapErrno(.PERM) == error.PermissionDenied);
+    try testing.expect(mapErrno(.ACCES) == error.PermissionDenied);
+    try testing.expect(mapErrno(.INVAL) == error.InvalidRequest);
+    try testing.expect(mapErrno(.NOMEM) == error.SystemResources);
+    try testing.expect(mapErrno(.NOBUFS) == error.SystemResources);
+    try testing.expect(mapErrno(.MFILE) == error.SystemResources);
+    try testing.expect(mapErrno(.NFILE) == error.SystemResources);
+    try testing.expect(mapErrno(.XDEV) == error.Unexpected);
+}
+
+fn replyImages(strings: *[strings_header]u8, vals: *[stats_header]u8, str_len: u32, val_len: u32) void {
+    const endian = builtin.cpu.arch.endian();
+    strings.* = @splat(0);
+    vals.* = @splat(0);
+    std.mem.writeInt(u32, strings[0..4], ETHTOOL_GSTRINGS, endian);
+    std.mem.writeInt(u32, strings[4..8], ETH_SS_STATS, endian);
+    std.mem.writeInt(u32, strings[8..12], str_len, endian);
+    std.mem.writeInt(u32, vals[0..4], ETHTOOL_GSTATS, endian);
+    std.mem.writeInt(u32, vals[4..8], val_len, endian);
+}
+
+test "mutation 2026-11-27: assembleStats at its edges" {
+    const gpa = testing.allocator;
+    const endian = builtin.cpu.arch.endian();
+    var s: [strings_header]u8 = undefined;
+    var v: [stats_header]u8 = undefined;
+
+    // zero counters: header-only images are complete
+    replyImages(&s, &v, 0, 0);
+    var empty = try assembleStats(gpa, 0, &s, &v);
+    defer empty.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), empty.count());
+
+    // shorter than the header: BadReply, never an out-of-bounds read
+    try testing.expectError(error.BadReply, assembleStats(gpa, 0, s[0 .. strings_header - 1], &v));
+    try testing.expectError(error.BadReply, assembleStats(gpa, 0, &s, v[0 .. stats_header - 1]));
+
+    // each echoed word is checked
+    var bad_s = s;
+    std.mem.writeInt(u32, bad_s[0..4], ETHTOOL_GSTATS, endian);
+    try testing.expectError(error.BadReply, assembleStats(gpa, 0, &bad_s, &v));
+    bad_s = s;
+    std.mem.writeInt(u32, bad_s[4..8], ETH_SS_STATS + 1, endian);
+    try testing.expectError(error.BadReply, assembleStats(gpa, 0, &bad_s, &v));
+    var bad_v = v;
+    std.mem.writeInt(u32, bad_v[0..4], ETHTOOL_GSTRINGS, endian);
+    try testing.expectError(error.BadReply, assembleStats(gpa, 0, &s, &bad_v));
+
+    // the strings count alone disagrees with n
+    replyImages(&s, &v, 2, 1);
+    try testing.expectError(error.StatsChanged, assembleStats(gpa, 1, &s, &v));
+    // and the values count alone
+    replyImages(&s, &v, 1, 2);
+    try testing.expectError(error.StatsChanged, assembleStats(gpa, 1, &s, &v));
+
+    // max_stats counters are the last accepted count, one more is TooManyStats
+    {
+        const n: u32 = max_stats;
+        replyImages(&s, &v, n, n);
+        const strings = try gpa.alloc(u8, strings_header + @as(usize, n) * gstring_len);
+        defer gpa.free(strings);
+        const vals = try gpa.alloc(u8, stats_header + @as(usize, n) * 8);
+        defer gpa.free(vals);
+        @memset(strings, 0);
+        @memset(vals, 0);
+        @memcpy(strings[0..strings_header], &s);
+        @memcpy(vals[0..stats_header], &v);
+        var all = try assembleStats(gpa, n, strings, vals);
+        defer all.deinit(gpa);
+        try testing.expectEqual(@as(usize, n), all.count());
+    }
+    replyImages(&s, &v, max_stats + 1, max_stats + 1);
+    try testing.expectError(error.TooManyStats, assembleStats(gpa, max_stats + 1, &s, &v));
+
+    // the NUL check covers the last name too
+    {
+        replyImages(&s, &v, 2, 2);
+        var strings: [strings_header + 2 * gstring_len]u8 = @splat(0);
+        @memcpy(strings[0..strings_header], &s);
+        @memset(strings[strings_header + gstring_len ..], 'x'); // second name: no NUL
+        var vals: [stats_header + 2 * 8]u8 = @splat(0);
+        @memcpy(vals[0..stats_header], &v);
+        try testing.expectError(error.BadReply, assembleStats(gpa, 2, &strings, &vals));
+    }
+}
+
+test "mutation 2026-11-27: a device with a driver answers GDRVINFO; the loopback has no driver statistics" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // `gretap0` is the Ethernet-type tunnel device a fresh namespace gets when ip_gre is loaded; its
+    // driver implements get_drvinfo. (The loopback does not: the ioctl answers EOPNOTSUPP for it.)
+    if (drvinfo("gretap0")) |d| {
+        try testing.expectEqual(ETHTOOL_GDRVINFO, d.raw.cmd);
+        try testing.expect(d.driver().len > 0);
+    } else |e| switch (e) {
+        error.NoSuchDevice => {},
+        else => return e,
+    }
+    // `lo` implements no ETH_SS_STATS string set: the kernel clears its bit in the GSSET_INFO mask
+    try testing.expectError(error.NotSupported, driverStats(testing.allocator, "lo"));
+}

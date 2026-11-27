@@ -6,7 +6,7 @@
 
 **Scope:** core — ethtool(8) 6.19 (surveyed 2026-09-30); raised from mvp 2026-09-30 with `-i` drvinfo and `-S` driver stats over ioctl
 
-**Audit:** review 2026-09-02 · mutation 2026-11-17 (36/42, 6 eq) · src 511bfa6e9e414f1f
+**Audit:** review 2026-09-02 · mutation 2026-11-27 (737/781, 44 eq) · src 218e6f45c195d084
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ETHTOOL_FUZZ) · ct n/a — netlink ethtool queries (keyword review, 2026-10-07)
 
@@ -451,6 +451,16 @@ test time and skips when no interface answers.
 
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
   run and the delta runs after it.
+- **Mutation run (2026-11-27, whole module — the first one; the 2026-11-17 card covered RSS_GET only):** 781
+  mutants over every production file but root's aliases, the goldens and the uapi constant tables; 737 killed
+  (8 by hang), 12 equivalent, 32 unobservable. Every SET encoder is pinned offline by attribute assertions
+  against the UAPI layout. Unobservable: wipes of the WoL SecureOn password before free (safe builds poison the
+  block first: needs a ReleaseFast scanning allocator); real-device ioctl / driver-stats paths (`assembleStats`,
+  the parsing, is tested on hand-built images); reply-echo and SET-reply handling (needs a privileged SET or a
+  peer echoing another device); call-site stats flags (needs a request-capturing socket stand-in); two kills
+  that bite only on a host with `gretap0` / two ethtool devices in the namespace were counted unobservable so
+  the score holds on any runner. No production defect. 48 tests (`src/mutation_test.zig`, `client.zig`,
+  `ioctl.zig`).
 
 ## Backlog / deferred
 
