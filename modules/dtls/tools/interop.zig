@@ -2113,12 +2113,22 @@ fn awaitPeerLine(reader: *std.Io.Reader, want: []const u8) !void {
 }
 
 /// The handshake loop of `runClientFlow12` for a peer whose output we do not parse.
-fn clientHandshake12(io: std.Io, sock: net.Socket, server_addr: *const net.IpAddress, conn: *Connection12, rnd: Entropy, case: Case12, out: []u8, rx: []u8, rec: *Recorder) !void {
+/// `hvr_peer`: the stdout of an Mbed TLS `ssl_server2`, or null. After its
+/// HelloVerifyRequest that server goes to `reset:`, CLOSES the socket it had
+/// connected to us (`mbedtls_net_accept` hijacks the listening UDP socket and
+/// binds a new one) and only then prints "Waiting for a remote connection"
+/// again. A cookie ClientHello sent before that close is queued on the closing
+/// socket and lost; this client does not retransmit, so it waited out its 10 s
+/// deadline. That was the `dtls12-*-client-mbedtls` Timeout of the parallel
+/// interop lane (3 of 4 full lanes 2026-11-26..27; reproduced locally under
+/// CPU load, 26 of 60). So: wait for the second prompt before answering it.
+fn clientHandshake12(io: std.Io, sock: net.Socket, server_addr: *const net.IpAddress, conn: *Connection12, rnd: Entropy, case: Case12, out: []u8, rx: []u8, rec: *Recorder, hvr_peer: ?*std.Io.Reader) !void {
     const hello = try conn.startHandshake(rnd, 0, out);
     rec.op("start");
     rec.hexArg("out", hello);
     rec.end();
     _ = try sendDatagrams(io, sock, server_addr, hello, case.max_datagram);
+    var reseated = false;
     var steps: usize = 0;
     while (!conn.isConnected()) : (steps += 1) {
         if (steps > 40) return error.TooManyFlights;
@@ -2132,6 +2142,10 @@ fn clientHandshake12(io: std.Io, sock: net.Socket, server_addr: *const net.IpAdd
         rec.hexArg("out", result.out);
         rec.numArg("more", @intFromBool(result.need_more_data));
         rec.end();
+        if (hvr_peer) |peer| if (conn.hvr_count == 1 and !reseated) {
+            try awaitPeerText(peer, "Waiting for a remote connection");
+            reseated = true;
+        };
         if (result.out.len > 0) _ = try sendDatagrams(io, sock, server_addr, result.out, case.max_datagram);
     }
 }
@@ -2173,7 +2187,7 @@ fn runClientFlowOpenssl12(io: std.Io, case: Case12, fx: *const Fixtures, rec: *R
 
     var out: [8192]u8 = undefined;
     var rx: [4096]u8 = undefined;
-    try clientHandshake12(io, sock, &server_addr, &conn, rnd, case, &out, &rx, rec);
+    try clientHandshake12(io, sock, &server_addr, &conn, rnd, case, &out, &rx, rec, null);
     try expectState12(&conn, case);
     try expectBool("HelloVerifyRequest seen", case.expect_hvr, conn.hvr_count > 0);
     recordExpect12(rec, &conn);
@@ -2442,7 +2456,7 @@ fn runClientFlowMbed12(io: std.Io, work: std.Io.Dir, case: Case12, fx: *const Fi
 
     var out: [8192]u8 = undefined;
     var rx: [4096]u8 = undefined;
-    try clientHandshake12(io, sock, &server_addr, &conn, rnd, case, &out, &rx, rec);
+    try clientHandshake12(io, sock, &server_addr, &conn, rnd, case, &out, &rx, rec, &stdout_reader.interface);
     try expectState12(&conn, case);
     try expectBool("HelloVerifyRequest seen", case.expect_hvr, conn.hvr_count > 0);
     recordExpect12(rec, &conn);
@@ -2848,7 +2862,7 @@ fn resumeClient12(io: std.Io, case: Case12, fx: *const Fixtures, server_addr: *c
     var out: [8192]u8 = undefined;
     var rx: [4096]u8 = undefined;
     try waitPeerLine(peer_out, "NEXT");
-    try clientHandshake12(io, sock, server_addr, &conn, rnd, case, &out, &rx, &off);
+    try clientHandshake12(io, sock, server_addr, &conn, rnd, case, &out, &rx, &off, null);
     if (!conn.resumed()) return error.TicketNotResumed;
     try sock.send(io, server_addr, try conn.send(case.app_send, &out));
     var plain: [2048]u8 = undefined;
