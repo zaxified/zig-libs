@@ -678,7 +678,10 @@ else not_needed validate; fi
 # mcp: the official Python SDK is the oracle; its version is in the vectors.
 if needs mcp mcp-http; then
 python3 -m venv "$ORACLE_VENVS/mcp" >/dev/null 2>&1 || true
-"$ORACLE_VENVS/mcp/bin/pip" -q install "mcp==2.3.0" >/dev/null 2>&1 \
+# Every dependency pinned too (constraints file): with only the SDK pinned, a venv
+# built on a cache miss took newer pydantic/starlette and the vectors read as stale
+# (full lane 45923991764, 2026-11-27).
+"$ORACLE_VENVS/mcp/bin/pip" -q install -c modules/mcp-http/tools/sdk_oracle/constraints.txt "mcp==2.3.0" >/dev/null 2>&1 \
     && echo "mcp venv: 2.3.0" || echo "mcp venv: install failed"
 else not_needed mcp mcp-http; fi
 echo "::endgroup::"

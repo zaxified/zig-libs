@@ -23,7 +23,9 @@
 //! THIS IS A PROGRAM, NOT A TEST (CONVENTIONS §9). Recipe:
 //!
 //!   V=~/.local/share/zig-libs/oracle-venvs/mcp
-//!   python3 -m venv $V && $V/bin/pip install mcp==2.3.0
+//!   python3 -m venv $V && $V/bin/pip install -c modules/mcp-http/tools/sdk_oracle/constraints.txt mcp==2.3.0
+//!   (the constraints pin the SDK's own dependencies too: without them a venv built on
+//!   another day answers differently and `--check` reads the transcript as stale)
 //!   zig build interop-mcp-http              # re-take, rewrite the transcript
 //!   zig build interop-mcp-http -- --check   # re-take, compare with the committed one
 //!
