@@ -66,6 +66,23 @@ test "STACKPROBE: no HMAC key or Ed25519 secret residue after any entry point" {
     defer v.deinit();
     _ = try P.run("Verifier.verifyBody", root.Verifier.verifyBody, .{ &v, body, &good }, k, .{});
 
+    // `verifyRequest`, the scheme dispatcher, per scheme (2026-11-27 coverage sweep).
+    const clock: root.Clock = .{ .nowFn = struct {
+        fn f(_: ?*anyopaque) i64 {
+            return @intCast(ts);
+        }
+    }.f };
+    _ = try P.run("Verifier.verifyRequest prefixed", root.Verifier.verifyRequest, .{ &v, .{ .signature = &good }, body, @as(i64, @intCast(ts)) }, k, .{});
+    inline for (.{
+        .{ "standard_webhooks", root.Scheme.standard_webhooks, root.Verifier.Headers{ .signature = &std_sig, .timestamp = ts_text, .id = msg_id } },
+        .{ "stripe", root.Scheme.stripe, root.Verifier.Headers{ .signature = stripe_v } },
+        .{ "slack", root.Scheme.slack, root.Verifier.Headers{ .signature = &slack_sig, .timestamp = ts_text } },
+    }) |c| {
+        var vs = try root.Verifier.init(std.testing.allocator, .{ .secret = secret, .scheme = c[1], .clock = clock });
+        defer vs.deinit();
+        _ = try P.run("Verifier.verifyRequest " ++ c[0], root.Verifier.verifyRequest, .{ &vs, c[2], body, @as(i64, @intCast(ts)) }, k, .{});
+    }
+
     const ed = &[_][]const u8{ &kp.secret_key.bytes, std.mem.asBytes(&kp) };
     _ = try P.run("standard.signEd25519", root.standard.signEd25519, .{ &out, &scratch, &kp, msg_id, ts, body }, ed, .{});
     var decoded: Ed25519.KeyPair = undefined;

@@ -395,6 +395,10 @@ noinline fn callKeyGen() void {
     apiKeyGen(&sk_sink, &cur_km, probe_info);
     std.mem.doNotOptimizeAway(&sk_sink);
 }
+noinline fn callKeyGenShake() void {
+    keys.keyGenWith(cs.Shake256, &sk_sink, &cur_km, probe_info, null) catch unreachable;
+    std.mem.doNotOptimizeAway(&sk_sink);
+}
 noinline fn callSkToPk() void {
     apiSkToPk(&pk_sink, &cur_sk);
     std.mem.doNotOptimizeAway(&pk_sink);
@@ -487,6 +491,19 @@ test "STACKPROBE: no SK, e, 1/(SK+e), message scalar, blinding scalar or key mat
         nd.sort();
         leak_src = cur_sk.scalar.toBytes();
         bad += try runProbe("keyGen", callKeyGen, &nd);
+
+        // `keyGenWith` under the SHAKE-256 suite: another `expand_message`
+        // (XOF), another depth (2026-11-27 coverage sweep).
+        var sk_shake: keys.SecretKey = undefined;
+        try keys.keyGenWith(cs.Shake256, &sk_shake, &cur_km, probe_info, null);
+        nd.reset();
+        nd.addFr("sk shake", sk_shake.scalar);
+        nd.addBoth("key material", &cur_km);
+        nd.addImage("derive input", &derive);
+        nd.sort();
+        leak_src = sk_shake.scalar.toBytes();
+        bad += try runProbe("keyGenWith shake256", callKeyGenShake, &nd);
+        leak_src = cur_sk.scalar.toBytes(); // the positive control of the probes below
 
         nd.reset();
         nd.addFr("sk", cur_sk.scalar);

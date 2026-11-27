@@ -84,6 +84,22 @@ fn decGiW(w: *const [S.Nh]u8) !void {
 fn sigKpW(p: *const [S.Nssk]u8, o: *S.Sig.KeyPair) !void {
     return S.signatureKeyPair(p, o);
 }
+fn signAllocW(kp: *const S.Sig.KeyPair) !S.Sig.Signature {
+    return crypto.SignWithLabelAlloc(S, gpa, kp, "LeafNodeTBS", "probe content (alloc)");
+}
+var kem_r: S.Kem.KeyPair = undefined;
+var kem_e: S.Kem.KeyPair = undefined;
+var enc: S.Kem.EncappedKey = undefined;
+var pt: [48]u8 = undefined;
+var ct: [48 + 16]u8 = undefined;
+var dec: [48]u8 = undefined;
+var ei: ks.ExternalInit(S) = undefined;
+fn decScratchW(kp: *const S.Kem.KeyPair) !void {
+    return crypto.DecryptWithLabelScratch(S, enc, kp, "probe label", "probe ctx", &ct, &dec, &scratch);
+}
+fn extDetW(eph: *const S.Kem.KeyPair) !void {
+    return ks.externalInitSenderDeterministic(S, kem_r.public_key, eph, &ei);
+}
 fn sign448W(kp: *const mls.suite.Ed448.KeyPair) !mls.suite.Ed448.Signature {
     return kp.sign("probe content", null);
 }
@@ -121,4 +137,19 @@ test "STACKPROBE: mls key-schedule, tag, tree-derivation and signing helpers lea
     _ = try P.run("CipherSuite.signatureKeyPair", sigKpW, .{ &priv, &sig_kp }, &.{ &priv, sig_secret }, .{});
     _ = try P.run("Ed448.KeyPair.generateDeterministicInto", mls.suite.Ed448.KeyPair.generateDeterministicInto, .{ &kp448, &seed448 }, &.{&seed448}, .{});
     _ = try P.run("Ed448.KeyPair.sign", sign448W, .{&kp448}, &.{&seed448}, .{});
+
+    // Twins of probed blocks (2026-11-27 coverage sweep).
+    _ = try P.run("SignWithLabelAlloc", signAllocW, .{&sig_kp}, &.{ &priv, sig_secret }, .{});
+    kem_r = S.Kem.KeyPair.generateDeterministic(a);
+    kem_e = S.Kem.KeyPair.generateDeterministic(b);
+    std.crypto.hash.sha2.Sha256.hash("mls probe2 pt", pt[0..32], .{});
+    @memcpy(pt[32..], pt[0..16]);
+    var th: std.Io.Threaded = .init(gpa, .{});
+    defer th.deinit();
+    enc = try crypto.EncryptWithLabel(S, kem_r.public_key, th.io(), "probe label", "probe ctx", &pt, &ct);
+    _ = try P.run("DecryptWithLabelScratch", decScratchW, .{&kem_r}, &.{ &kem_r.secret_key, &pt }, .{});
+    try std.testing.expectEqualSlices(u8, &pt, &dec);
+    try ks.externalInitSenderDeterministic(S, kem_r.public_key, &kem_e, &ei);
+    const init_secret = ei.init_secret;
+    _ = try P.run("externalInitSenderDeterministic", extDetW, .{&kem_e}, &.{ &kem_e.secret_key, &init_secret }, .{});
 }

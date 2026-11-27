@@ -101,4 +101,15 @@ test "STACKPROBE: no seed, MAC secret or share residue after any entry point" {
     try V.answer(0, &vq.shares[0], db, &v0, &t0);
     try V.answer(1, &vq.shares[1], db, &v1, &t1);
     _ = try P.run("Verified.reconstruct", V.reconstruct, .{ &vq.secret, &v0, &v1, &t0, &t1, &rec }, &[_][]const u8{std.mem.asBytes(&vq.secret.m)}, .{});
+
+    // `reconstructFromBytes`, the serialized-answer twin (2026-11-27 coverage sweep).
+    var vb0: [v0.len * @sizeOf(V.Word)]u8 = undefined;
+    var vb1: [v1.len * @sizeOf(V.Word)]u8 = undefined;
+    var tb0: [t0.len * V.tag_word_len]u8 = undefined;
+    var tb1: [t1.len * V.tag_word_len]u8 = undefined;
+    try V.Value.answerToBytes(&v0, &vb0);
+    try V.Value.answerToBytes(&v1, &vb1);
+    try V.tagAnswerToBytes(&t0, &tb0);
+    try V.tagAnswerToBytes(&t1, &tb1);
+    _ = try P.run("Verified.reconstructFromBytes", V.reconstructFromBytes, .{ &vq.secret, @as([]const u8, &vb0), @as([]const u8, &vb1), @as([]const u8, &tb0), @as([]const u8, &tb1), @as([]u8, &rec) }, &[_][]const u8{std.mem.asBytes(&vq.secret.m)}, .{});
 }

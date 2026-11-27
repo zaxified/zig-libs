@@ -133,3 +133,35 @@ test "STACKPROBE: no seed or key residue after any entry point" {
     _ = try P.run("Mpf.Key.toBytes", M.Key.toBytes, .{ &mkey0, &mkey_bytes }, mkb, .{});
     _ = try P.run("Mpf.Key.fromBytes", M.Key.fromBytes, .{ &mdecoded, &mkey_bytes }, &[_][]const u8{ &mkey_bytes, &mdecoded.keys[0].seed }, .{});
 }
+
+// ── IDPF (`idpf.zig`): not probed until the 2026-11-27 coverage sweep ──
+// (`genWithSeeds` looked covered only by its Dpf namesake).
+
+const I = root.Idpf(10, 4);
+const IS = root.IdpfWith(root.prg.Sha256Prg, 10, 4);
+
+var ikeys: [2]I.Key = undefined;
+var iskeys: [2]IS.Key = undefined;
+var ikey_bytes: [I.Key.serialized_len]u8 = undefined;
+var idecoded: I.Key = undefined;
+
+test "STACKPROBE: IDPF gen, evalPrefix and the key codec leave no seed or key residue" {
+    try sp.skipUnlessOptimized();
+    setup();
+    var betas: [10]I.Elem = undefined;
+    for (&betas, 0..) |*b, i| b.* = @intCast(0x0101_0101 *% (i + 1));
+    const seeds = &[_][]const u8{ &s0, &s1 };
+    _ = try P.run("Idpf.genWithSeeds", I.genWithSeeds, .{ &@as(I.Index, 333), &betas, &s0, &s1, &ikeys }, seeds, .{});
+    _ = try P.run("IdpfSha.genWithSeeds", IS.genWithSeeds, .{ &@as(IS.Index, 333), &betas, &s0, &s1, &iskeys }, seeds, .{});
+    ikeys[0].toBytes(&ikey_bytes);
+    const kb = &[_][]const u8{ &ikey_bytes, &ikeys[0].seed };
+    _ = try P.run("Idpf.evalPrefix level 1", I.evalPrefix, .{ 0, &ikeys[0], 1, 0 }, kb, .{});
+    _ = try P.run("Idpf.evalPrefix level 6", I.evalPrefix, .{ 1, &ikeys[1], 6, 333 >> 4 }, &[_][]const u8{&ikeys[1].seed}, .{});
+    _ = try P.run("Idpf.evalPrefix level 10", I.evalPrefix, .{ 0, &ikeys[0], 10, 333 }, kb, .{});
+    _ = try P.run("IdpfSha.evalPrefix", IS.evalPrefix, .{ 0, &iskeys[0], 10, 333 }, &[_][]const u8{&iskeys[0].seed}, .{});
+    _ = try P.run("Idpf.Key.toBytes", I.Key.toBytes, .{ &ikeys[0], &ikey_bytes }, kb, .{});
+    _ = try P.run("Idpf.Key.fromBytes", I.Key.fromBytes, .{ &idecoded, &ikey_bytes }, &[_][]const u8{ &ikey_bytes, &idecoded.seed }, .{});
+    // The shares still reconstruct (the probe ran the real code).
+    const y = I.evalPrefix(0, &ikeys[0], 10, 333) +% I.evalPrefix(1, &ikeys[1], 10, 333);
+    try std.testing.expectEqual(betas[9], y);
+}

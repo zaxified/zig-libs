@@ -511,6 +511,8 @@ const Io = struct {
     key_shares: []root.KeyShare = undefined,
     ks_bytes: []u8 = undefined,
     ks_back: root.KeyShare = undefined,
+    child: root.KeyShare = undefined,
+    tweak: Scalar = undefined,
     p: [128]u8 = undefined,
     q: [128]u8 = undefined,
     tp: [128]u8 = undefined,
@@ -610,6 +612,9 @@ noinline fn callKeyShareToBytes() void {
 }
 noinline fn callKeyShareFromBytes() void {
     root.KeyShare.fromBytesAlloc(arena(), io.ks_bytes, &io.ks_back) catch @panic("KeyShare.fromBytesAlloc");
+}
+noinline fn callDeriveChild() void {
+    root.deriveChild(&io.child, io.share_a, arena(), io.tweak) catch @panic("deriveChild");
 }
 noinline fn callPaillierBlumFromPrimes() void {
     root.paillierBlumFromPrimes(&io.p, &io.q, &io.blum) catch @panic("paillierBlumFromPrimes");
@@ -790,6 +795,10 @@ test "STACKPROBE: no secret on the dead stack after the MtA, proof, keygen and c
             n.addRaw("message seed", &io.share_a.message_seed);
             addPaillierSecret(n, "share", &io.share_a.paillier_secret);
         }
+        fn child(n: *Needles) void {
+            keyShare(n);
+            n.addScalar("child x_i", io.share_a.secret_share.add(io.tweak));
+        }
         fn blum(n: *Needles) void {
             n.addRaw("paillier p", &io.p);
             n.addRaw("paillier q", &io.q);
@@ -860,6 +869,13 @@ test "STACKPROBE: no secret on the dead stack after the MtA, proof, keygen and c
     total += probeCall("reconstructSecret", callReconstruct, F.split);
     total += probeCall("KeyShare.toBytesAlloc", callKeyShareToBytes, F.keyShare);
     total += probeCall("KeyShare.fromBytesAlloc", callKeyShareFromBytes, F.keyShare);
+    // `deriveChild` (2026-11-27 coverage sweep): copies the whole share by value.
+    {
+        var il: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("threshold_ecdsa probe child tweak", &il, .{});
+        io.tweak = Scalar.fromBytes(il, .big) catch unreachable;
+    }
+    total += probeCall("deriveChild", callDeriveChild, F.child);
     total += probeCall("paillierBlumFromPrimes", callPaillierBlumFromPrimes, F.blum);
     total += probeCall("Pimod.provePaillier", callPimodPaillier, F.blum);
     total += probeCall("auxParamsWithTrapdoorFromSafePrimes", callAuxFromSafePrimes, F.auxGen);
