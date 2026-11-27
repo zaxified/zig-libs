@@ -2406,4 +2406,5 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
 test {
     _ = @import("sweep_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("mutation_test.zig");
 }

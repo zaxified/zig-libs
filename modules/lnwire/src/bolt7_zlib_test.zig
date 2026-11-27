@@ -161,3 +161,16 @@ test "query_flags decode: malformed bigsize is InvalidEncodedList; uncompressed 
     var it = try good.iterator();
     try testing.expectEqual(@as(?u64, 1), try it.next());
 }
+
+test "mutation 2026-11-25: max_output is exact (24 bytes fit 24, not 23); timestamps refuse a ragged length" {
+    const a = testing.allocator;
+    const good = try hexAlloc(a, "01789c63600001c12b608a69e73e30edbaec0800203b040e");
+    defer a.free(good);
+    try testing.expectError(error.OutputTooLarge, bolt7.decodeShortIds(a, good, .{ .max_output = 23 }));
+    // timestamps: an empty list is valid, 4 and 9 bytes are not whole pairs
+    const none = try bolt7.decodeTimestampPairs(a, &.{0}, .{});
+    a.free(none);
+    try testing.expectError(error.InvalidEncodedList, bolt7.decodeTimestampPairs(a, &.{}, .{}));
+    try testing.expectError(error.InvalidEncodedList, bolt7.decodeTimestampPairs(a, &.{ 0, 1, 2, 3, 4 }, .{}));
+    try testing.expectError(error.InvalidEncodedList, bolt7.decodeTimestampPairs(a, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, .{}));
+}

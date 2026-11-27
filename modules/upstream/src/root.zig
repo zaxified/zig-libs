@@ -2667,3 +2667,28 @@ test "outlier: too few qualifying members, the ejection cap, and the base time s
     try testing.expectEqual(@as(u64, 30 * s), which.?.eject_until_ns); // 10 s + 20 s x 1
     try testing.expectEqual(@as(u32, 1), which.?.ejections);
 }
+
+test {
+    _ = @import("mutation_test.zig");
+}
+
+test "mutation 2026-11-25: private helpers: ring tie-break, a tiny slow-start window with no floor, the prime check" {
+    // two ring points with the same hash: the lower member index sorts first, strictly
+    const p1: RingPoint = .{ .hash = 5, .idx = 1 };
+    const p2: RingPoint = .{ .hash = 5, .idx = 2 };
+    try testing.expect(RingPoint.lessThan({}, p1, p2));
+    try testing.expect(!RingPoint.lessThan({}, p2, p1));
+    try testing.expect(!RingPoint.lessThan({}, p1, p1));
+    try testing.expect(RingPoint.lessThan({}, .{ .hash = 4, .idx = 9 }, p1));
+    // age 0 is read as 1 ns: of a 2 ns window that is half, even with no floor
+    try testing.expectEqual(@as(u64, 500), scaledWeight(1, .{ .window_ns = 2, .min_weight_percent = 0 }, 0));
+    // ring lookup: the first point at or after the hash, wrapping to 0
+    const ring = [_]RingPoint{ .{ .hash = 10, .idx = 0 }, .{ .hash = 20, .idx = 1 }, .{ .hash = 30, .idx = 2 } };
+    try testing.expectEqual(@as(usize, 0), ringIndex(&ring, 5));
+    try testing.expectEqual(@as(usize, 0), ringIndex(&ring, 10));
+    try testing.expectEqual(@as(usize, 1), ringIndex(&ring, 11));
+    try testing.expectEqual(@as(usize, 2), ringIndex(&ring, 30));
+    try testing.expectEqual(@as(usize, 0), ringIndex(&ring, 31));
+    // composite squares: 9, 25, 49 are not prime (the loop must reach d*d == n)
+    try testing.expect(!isPrime(9) and !isPrime(25) and !isPrime(49) and isPrime(7) and isPrime(11));
+}

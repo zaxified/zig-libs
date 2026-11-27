@@ -404,3 +404,107 @@ test "variable-length fields over 65535 bytes are FieldTooLong, not truncated" {
     try testing.expectError(error.FieldTooLong, v2.serializeTxAbort(a, .{ .channel_id = cid, .data = big }));
     try testing.expectError(error.FieldTooLong, v2.serializeTxAddOutput(a, .{ .channel_id = cid, .serial_id = 0, .sats = 0, .script = big }));
 }
+
+/// The message of `hexs` decoded and serialized again with an empty trailing tlv_stream.
+fn plainWire(comptime dec: anytype, comptime ser: anytype, a: Allocator, hexs: []const u8) ![]u8 {
+    const b = try hex(a, hexs);
+    defer a.free(b);
+    var m = try dec(a, b);
+    var ext = m.extension;
+    ext.deinit(a);
+    m.extension = .{};
+    defer m.deinit(a);
+    return ser(a, m);
+}
+
+test "mutation 2026-11-25: every known TLV rule refuses a wrong length in every message, decode and encode" {
+    const a = testing.allocator;
+    const zeros: [70]u8 = @splat(0);
+    inline for (.{
+        .{ wire.open_channel2, v2.decodeOpenChannel2, v2.serializeOpenChannel2, 2, 1 },
+        .{ wire.accept_channel2, v2.decodeAcceptChannel2, v2.serializeAcceptChannel2, 2, 1 },
+        .{ wire.tx_add_input, v2.decodeTxAddInput, v2.serializeTxAddInput, 0, 31 },
+        .{ wire.tx_signatures, v2.decodeTxSignatures, v2.serializeTxSignatures, 0, 63 },
+        .{ wire.tx_init_rbf, v2.decodeTxInitRbf, v2.serializeTxInitRbf, 0, 7 },
+        .{ wire.tx_init_rbf, v2.decodeTxInitRbf, v2.serializeTxInitRbf, 2, 1 },
+        .{ wire.tx_ack_rbf, v2.decodeTxAckRbf, v2.serializeTxAckRbf, 0, 7 },
+        .{ wire.tx_ack_rbf, v2.decodeTxAckRbf, v2.serializeTxAckRbf, 2, 1 },
+        .{ wire.splice_init, v2.decodeSpliceInit, v2.serializeSpliceInit, 2, 1 },
+        .{ wire.splice_ack, v2.decodeSpliceAck, v2.serializeSpliceAck, 2, 1 },
+        .{ wire.closing_complete, v2.decodeClosingComplete, v2.serializeClosingComplete, 1, 63 },
+        .{ wire.closing_complete, v2.decodeClosingComplete, v2.serializeClosingComplete, 2, 63 },
+        .{ wire.closing_complete, v2.decodeClosingComplete, v2.serializeClosingComplete, 3, 63 },
+        .{ wire.closing_sig, v2.decodeClosingSig, v2.serializeClosingSig, 1, 65 },
+        .{ wire.closing_sig, v2.decodeClosingSig, v2.serializeClosingSig, 2, 63 },
+        .{ wire.closing_sig, v2.decodeClosingSig, v2.serializeClosingSig, 3, 65 },
+        .{ wire.start_batch, v2.decodeStartBatch, v2.serializeStartBatch, 1, 1 },
+    }) |c| {
+        const plain = try plainWire(c[1], c[2], a, c[0]);
+        defer a.free(plain);
+        // decode: the record appended to the plain message
+        const bad = try a.alloc(u8, plain.len + 2 + c[4]);
+        defer a.free(bad);
+        @memcpy(bad[0..plain.len], plain);
+        bad[plain.len] = c[3];
+        bad[plain.len + 1] = c[4];
+        @memset(bad[plain.len + 2 ..], 0);
+        try testing.expectError(error.InvalidTlvLength, c[1](a, bad));
+        // encode: the same record in the struct
+        var m = try c[1](a, plain);
+        var recs = [_]message.tlv.RawRecord{.{ .type = c[3], .value = zeros[0..c[4]] }};
+        m.extension.deinit(a);
+        m.extension = .{ .records = &recs };
+        try testing.expectError(error.InvalidTlvLength, c[2](a, m));
+        m.extension = .{};
+        m.deinit(a);
+    }
+}
+
+fn txSigFrame(a: Allocator, n: u16, tail: usize) ![]u8 {
+    const b = try a.alloc(u8, 2 + 32 + 32 + 2 + tail);
+    @memset(b, 0);
+    std.mem.writeInt(u16, b[0..2], v2.TX_SIGNATURES_TYPE, .big);
+    std.mem.writeInt(u16, b[66..68], n, .big);
+    return b;
+}
+
+test "mutation 2026-11-25: tx_signatures count bound: exactly n*2 bytes decode, a larger count is refused before allocating" {
+    const a = testing.allocator;
+    // n empty witnesses need exactly 2n bytes: the boundary is allowed
+    const exact = try txSigFrame(a, 2, 4);
+    defer a.free(exact);
+    var m = try v2.decodeTxSignatures(a, exact);
+    try testing.expectEqual(@as(usize, 2), m.witnesses.len);
+    m.deinit(a);
+    // 3 witnesses cannot fit in 4 bytes: Truncated without any allocation (a failing allocator
+    // would turn an allocation attempt into OutOfMemory)
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const few = try txSigFrame(a, 3, 4);
+    defer a.free(few);
+    try testing.expectError(error.Truncated, v2.decodeTxSignatures(failing.allocator(), few));
+    const huge = try txSigFrame(a, 0xffff, 0);
+    defer a.free(huge);
+    try testing.expectError(error.Truncated, v2.decodeTxSignatures(failing.allocator(), huge));
+}
+
+test "mutation 2026-11-25: tx_signatures encodes 65535 witnesses, refuses 65536" {
+    const a = testing.allocator;
+    const wits = try a.alloc([]const u8, 65536);
+    defer a.free(wits);
+    for (wits) |*w| w.* = &.{};
+    const ok = try v2.serializeTxSignatures(a, .{ .channel_id = cid, .txid = txid, .witnesses = wits[0..65535] });
+    defer a.free(ok);
+    try testing.expectEqual(@as(usize, 2 + 32 + 32 + 2 + 65535 * 2), ok.len);
+    try testing.expectEqual(@as(u16, 65535), std.mem.readInt(u16, ok[66..68], .big));
+    try testing.expectError(error.FieldTooLong, v2.serializeTxSignatures(a, .{ .channel_id = cid, .txid = txid, .witnesses = wits }));
+}
+
+test "mutation 2026-11-25: splice_ack keeps the sign of a negative contribution on the wire and back" {
+    const a = testing.allocator;
+    const b = try v2.serializeSpliceAck(a, .{ .channel_id = cid, .funding_contribution_satoshis = -5, .funding_pubkey = @as([33]u8, @splat(2)) });
+    defer a.free(b);
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfb }, b[34..42]);
+    var m = try v2.decodeSpliceAck(a, b);
+    defer m.deinit(a);
+    try testing.expectEqual(@as(i64, -5), m.funding_contribution_satoshis);
+}
