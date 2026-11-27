@@ -6,7 +6,7 @@
 
 **Scope:** mvp — libbpf 1.7.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-18 (1096/1233, 137 eq) · src 3b8ecad5e9984279
+**Audit:** review 2026-09-02 · mutation 2026-11-27 (1922/2172, 250 eq) · src b85c8021c5ead778
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, EBPF_FUZZ) · ct n/a — bpf program loader (keyword review, 2026-10-07)
 
@@ -1099,15 +1099,13 @@ and the errno-to-error mapping of the privileged calls), file-size ceilings (64 
 guards, and bitfield-of-array members clang never emits. The privileged lane (the `LIVE:` tests) is where they belong.
 
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
-- **PARTIAL delta mutation 2026-11-27 — the card's mutation entry is NOT updated:** the six new files
-  (`kconfig`, `usdt`, `btfsanitize`, `skeleton`, `map`, `bpfsys`) and the new `bpflink` arms whole, plus listed
-  functions of `btfext.zig` and `object.zig`: 519 mutants, 482 killed (3 by hang), 11 equivalent, 26 unobservable
-  (kernel or mock `bpf()`, hostile ELF symbol tables), 0 open; 27 inline tests. Not yet mutated, so the card stays
-  "src changed since audit" until a follow-up delta covers them: `object.zig`'s `parseMapDef` (map-in-map),
-  `collectStructOps`, `planStructOps`, `buildStructOpsValue`, `collectExterns` and helpers,
-  `uintMemberValue`, the `parseLegacyMaps`/`addInternalMap`/`splitProgramSection`, `collectRelocations`
-  (call sites), `sliceBtfExt`/`relocateProgram`/`fixupDatasecs`, `load()`, `createMap` (map-in-map,
-  struct_ops), `loadOneProgram` and `attachStructOps` changes. Tables: CML `20261125-owed/ebpf-delta-*`.
+- **Delta mutation 2026-11-27 (two waves, everything since the 2026-11-18 card):** the six new files
+  (`kconfig`, `usdt`, `btfsanitize`, `skeleton`, `map`, `bpfsys`), the new `bpflink` arms and the touched
+  functions of `btfext.zig` and `object.zig` (struct_ops, externs, kconfig/ksym resolution, module BTF, map-in-map,
+  pinned maps, relocation and load changes): 939 mutants, 826 killed (4 by hang), 27 equivalent, 86 unobservable
+  (a kernel or mock `bpf()`, CAP_BPF, a readable `/proc/kallsyms`, hostile ELF symbol tables), 0 open. 50 inline
+  tests from hand-built ELF/BTF images. It found one defect, fixed: `Object.close` never closed the kernel
+  modules' BTF fds `load` opens for kfuncs/ksyms.
 
 ## What is deliberately not done
 

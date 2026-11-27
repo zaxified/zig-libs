@@ -6665,3 +6665,1330 @@ test "mutation 2026-11-27: unpinMaps leaves an internal data map's name alone" {
     try o.unpinMaps(dir); // the internal map is skipped: its (here: ordinary) file stays
     try testing.expect(linux.errno(linux.access(path, 0)) == .SUCCESS);
 }
+
+// ── mutation 2026-11-27 (D35): externs, struct_ops, map definitions, call relocations, load() ──
+
+const MtSym = enum { kver, config_a, config_b, ksym_i, kfn, ksym_void };
+const MtRel = struct { off: u64, sym: MtSym, typ: u32 };
+const MtKcfg = enum { normal, bad_type, empty, huge };
+const MtExt = struct {
+    weak_kfn: bool = false,
+    decoy: bool = false,
+    legacy_map: ?[]const u8 = null,
+    kcfg: MtKcfg = .normal,
+    no_kconfig: bool = false,
+    /// the kfunc's prototype takes a function pointer whose prototype takes a parameter
+    deep: bool = false,
+};
+
+/// An object with one XDP program, hand-made BTF `.kconfig` / `.ksyms` DATASECs and the matching
+/// undefined symbols. Symbol order: LINUX_KERNEL_VERSION, CONFIG_A, CONFIG_B, ksym_i, kfn, ksym_void.
+fn mtExtObject(gpa: std.mem.Allocator, code: []const u8, rels: []const MtRel, o: MtExt) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_int = try r.str(gpa, "int");
+    const n_ver = try r.str(gpa, "LINUX_KERNEL_VERSION");
+    const n_a = try r.str(gpa, "CONFIG_A");
+    const n_b = try r.str(gpa, "CONFIG_B");
+    const n_si = try r.str(gpa, "ksym_i");
+    const n_sv = try r.str(gpa, "ksym_void");
+    const n_kf = try r.str(gpa, "kfn");
+    const n_st = try r.str(gpa, "static_v");
+    const n_sf = try r.str(gpa, "sfn");
+    const n_kc = try r.str(gpa, ".kconfig");
+    const n_ks = try r.str(gpa, ".ksyms");
+    const n_ch = try r.str(gpa, "char");
+    const int4 = try r.rec(gpa, n_int, btf_mod.K_INT, 0, false, 4, &.{32});
+    const proto = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, 0, &.{});
+    var kproto = proto;
+    if (o.deep) {
+        const p2 = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 1, false, 0, &.{ 0, int4 });
+        const pp = try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, p2, &.{});
+        kproto = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 1, false, 0, &.{ 0, pp });
+    }
+    const chr = try r.rec(gpa, n_ch, btf_mod.K_INT, 0, false, 1, &.{8});
+    const empty_arr = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ chr, int4, 0 });
+    const huge_arr = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ chr, int4, 0x8000_0000 });
+    const ty_a: u32 = switch (o.kcfg) {
+        .normal => int4,
+        .bad_type => proto,
+        .empty => empty_arr,
+        .huge => huge_arr,
+    };
+    const v_ver = try r.rec(gpa, n_ver, btf_mod.K_VAR, 0, false, if (o.kcfg == .huge) huge_arr else int4, &.{2});
+    const v_a = try r.rec(gpa, n_a, btf_mod.K_VAR, 0, false, ty_a, &.{2});
+    const v_b = try r.rec(gpa, n_b, btf_mod.K_VAR, 0, false, int4, &.{2});
+    const v_si = try r.rec(gpa, n_si, btf_mod.K_VAR, 0, false, int4, &.{2});
+    const v_sv = try r.rec(gpa, n_sv, btf_mod.K_VAR, 0, false, 0, &.{2});
+    const f_kf = try r.rec(gpa, n_kf, btf_mod.K_FUNC, 2, false, kproto, &.{});
+    const v_static = try r.rec(gpa, n_st, btf_mod.K_VAR, 0, false, int4, &.{0});
+    const f_global = try r.rec(gpa, n_sf, btf_mod.K_FUNC, 1, false, proto, &.{});
+    if (!o.no_kconfig) switch (o.kcfg) {
+        .normal, .bad_type => _ = try r.rec(gpa, n_kc, btf_mod.K_DATASEC, 3, false, 12, &.{ v_ver, 0, 4, v_a, 4, 4, v_b, 8, 4 }),
+        .empty => _ = try r.rec(gpa, n_kc, btf_mod.K_DATASEC, 1, false, 0, &.{ v_a, 0, 0 }),
+        .huge => _ = try r.rec(gpa, n_kc, btf_mod.K_DATASEC, 2, false, 0, &.{ v_ver, 0, 0, v_a, 0, 0 }),
+    };
+    _ = try r.rec(gpa, n_ks, btf_mod.K_DATASEC, 5, false, 8, &.{ v_si, 0, 4, v_sv, 0, 0, f_kf, 0, 0, v_static, 0, 4, f_global, 0, 0 });
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const px = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = code });
+    _ = try b.sec(.{ .name = ".BTF", .ty = 1, .data = blob });
+    var relb: [8 * 16]u8 = undefined;
+    for (rels, 0..) |rel, k| {
+        const idx: u64 = @as(u64, @backingInt(rel.sym)) + 1 + @intFromBool(o.decoy);
+        std.mem.writeInt(u64, relb[k * 16 ..][0..8], rel.off, .little);
+        std.mem.writeInt(u64, relb[k * 16 + 8 ..][0..8], (idx << 32) | rel.typ, .little);
+    }
+    _ = try b.sec(.{ .name = ".relxdp", .ty = elfsym.SHT_REL, .data = relb[0 .. rels.len * 16], .link = ObjB.SYMTAB_LINK, .info = px, .entsize = 16 });
+    _ = try b.sec(.{ .name = ".kconfig", .ty = 8, .flags = 3, .size = 12 });
+    const defs: [20]u8 = @splat(0);
+    if (o.legacy_map != null) _ = try b.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs });
+    const maps_sec: u16 = if (o.legacy_map != null) 5 else 0;
+    if (o.decoy) _ = try b.sym(.{ .name = "kfn", .info = OBJ_SYM, .shndx = px });
+    const glob: u8 = 0x10;
+    const weak: u8 = 0x20;
+    _ = try b.sym(.{ .name = "LINUX_KERNEL_VERSION", .info = glob, .shndx = 0 });
+    _ = try b.sym(.{ .name = "CONFIG_A", .info = glob, .shndx = 0 });
+    _ = try b.sym(.{ .name = "CONFIG_B", .info = glob, .shndx = 0 });
+    _ = try b.sym(.{ .name = "ksym_i", .info = glob, .shndx = 0 });
+    _ = try b.sym(.{ .name = "kfn", .info = if (o.weak_kfn) weak else glob, .shndx = 0 });
+    _ = try b.sym(.{ .name = "ksym_void", .info = weak, .shndx = 0 });
+    if (o.legacy_map) |nm| _ = try b.sym(.{ .name = nm, .info = OBJ_SYM, .shndx = maps_sec });
+    return b.build();
+}
+
+/// A kernel BTF with `int ksym_i`, `void kfn(void)` and `int ksym_void`.
+fn mtKernBtf(gpa: std.mem.Allocator, bad: bool, deep: bool) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_int = try r.str(gpa, "int");
+    const n_si = try r.str(gpa, "ksym_i");
+    const n_kf = try r.str(gpa, "kfn");
+    const n_sv = try r.str(gpa, "ksym_void");
+    const int4 = try r.rec(gpa, n_int, btf_mod.K_INT, 0, false, 4, &.{32});
+    const ptr = try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, 0, &.{});
+    _ = try r.rec(gpa, n_si, btf_mod.K_VAR, 0, false, if (bad) ptr else int4, &.{1});
+    var proto = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, 0, &.{});
+    if (deep) {
+        const p2 = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 1, false, 0, &.{ 0, int4 });
+        const pp = try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, p2, &.{});
+        proto = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 1, false, 0, &.{ 0, pp });
+    }
+    _ = try r.rec(gpa, n_kf, btf_mod.K_FUNC, 1, false, proto, &.{});
+    _ = try r.rec(gpa, n_sv, btf_mod.K_VAR, 0, false, int4, &.{1});
+    return r.finish(gpa);
+}
+
+/// Declarations of `.ksyms` variables behind qualifiers: `int` (2 bytes), `const void`, `const const void`,
+/// and with `cyc` a `const` that is its own target.
+fn mtQualObject(gpa: std.mem.Allocator, cyc: bool) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_i = try r.str(gpa, "int");
+    const n_vi = try r.str(gpa, "v_int");
+    const n_vc = try r.str(gpa, "v_cc");
+    const n_vv = try r.str(gpa, "v_cv");
+    const n_cy = try r.str(gpa, "v_cyc");
+    const n_ks = try r.str(gpa, ".ksyms");
+    const int2 = try r.rec(gpa, n_i, btf_mod.K_INT, 0, false, 2, &.{16}); // id 1: its size (2) is the id of the next record
+    const cv = try r.rec(gpa, 0, 10, 0, false, 0, &.{}); // id 2: const void
+    const cc = try r.rec(gpa, 0, 10, 0, false, cv, &.{});
+    const v_i = try r.rec(gpa, n_vi, btf_mod.K_VAR, 0, false, int2, &.{2});
+    const v_c = try r.rec(gpa, n_vc, btf_mod.K_VAR, 0, false, cc, &.{2});
+    const v_v = try r.rec(gpa, n_vv, btf_mod.K_VAR, 0, false, cv, &.{2});
+    var ents: [4 * 3]u32 = .{ v_i, 0, 0, v_c, 0, 0, v_v, 0, 0, 0, 0, 0 };
+    var n: u16 = 3;
+    if (cyc) {
+        const loop = try r.rec(gpa, 0, 10, 0, false, r.count + 1, &.{});
+        const v_y = try r.rec(gpa, n_cy, btf_mod.K_VAR, 0, false, loop, &.{2});
+        ents[9] = v_y;
+        n = 4;
+    }
+    _ = try r.rec(gpa, n_ks, btf_mod.K_DATASEC, n, false, 0, ents[0 .. n * 3]);
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    _ = try b.sec(.{ .name = ".BTF", .ty = 1, .data = blob });
+    return b.build();
+}
+
+test "mutation 2026-11-27: every extern declaration lands in its own fields; weak is a property of the undefined symbol" {
+    const gpa = testing.allocator;
+    const code = cat(.{ I_LD64, I_LD64_HI, I_LD64, I_LD64_HI, I_CALL, I_EXIT });
+    const bytes = try mtExtObject(gpa, &code, &.{
+        .{ .off = 0, .sym = .config_b, .typ = R_BPF_64_64 },
+        .{ .off = 16, .sym = .ksym_i, .typ = R_BPF_64_64 },
+        .{ .off = 32, .sym = .kfn, .typ = R_BPF_64_32 },
+    }, .{ .weak_kfn = true, .decoy = true, .legacy_map = "m1" });
+    defer gpa.free(bytes);
+    var o = try open(gpa, bytes, .{});
+    defer o.deinit();
+    const b = &o.btf.?;
+    // static / global declarations in `.ksyms` are not externs
+    try testing.expectEqual(@as(usize, 6), o.externs.len);
+    const want = [_]struct { n: []const u8, kind: ExternKind, off: u32 = 0, weak: bool = false, typeless: bool = false }{
+        .{ .n = "LINUX_KERNEL_VERSION", .kind = .kconfig, .off = 0 },
+        .{ .n = "CONFIG_A", .kind = .kconfig, .off = 4 },
+        .{ .n = "CONFIG_B", .kind = .kconfig, .off = 8 },
+        .{ .n = "ksym_i", .kind = .ksym_var },
+        .{ .n = "ksym_void", .kind = .ksym_var, .weak = true, .typeless = true },
+        .{ .n = "kfn", .kind = .ksym_func, .weak = true },
+    };
+    for (want, o.externs) |w, e| {
+        try testing.expectEqualStrings(w.n, e.name);
+        try testing.expectEqual(w.kind, e.kind);
+        try testing.expectEqual(w.weak, e.weak);
+        try testing.expectEqual(w.typeless, e.typeless);
+        try testing.expectEqual(w.off, e.value_off);
+        if (e.kind == .kconfig) try testing.expectEqual(@as(u32, 4), e.size);
+    }
+    // the VAR / FUNC record and the type behind it
+    const int4 = b.findByNameKind("int", .int).?;
+    try testing.expectEqual(b.findByNameKind("ksym_i", .@"var").?, o.externs[3].btf_id);
+    try testing.expectEqual(int4, o.externs[3].type_id);
+    try testing.expectEqual(b.findByNameKind("CONFIG_B", .@"var").?, o.externs[2].btf_id);
+    try testing.expectEqual(int4, o.externs[2].type_id);
+    const kf = b.findByNameKind("kfn", .func).?;
+    try testing.expectEqual(kf, o.externs[5].btf_id);
+    try testing.expectEqual((try b.byId(kf)).refType().?, o.externs[5].type_id);
+    // the synthesized .kconfig map, after the object's own
+    try testing.expectEqual(@as(usize, 2), o.maps.len);
+    try testing.expectEqualStrings("m1", o.maps[0].name);
+    const km = o.maps[1];
+    try testing.expectEqualStrings(".kconfig", km.name);
+    try testing.expectEqual(BPF.MapType.array, km.map_type);
+    try testing.expectEqual(@as(u32, 4), km.key_size);
+    try testing.expectEqual(@as(u32, 12), km.value_size);
+    try testing.expectEqual(@as(u32, 1), km.max_entries);
+    try testing.expectEqual(BPF_F_RDONLY_PROG, km.map_flags);
+    try testing.expectEqual(MapOrigin.internal, km.origin);
+    try testing.expect(km.freeze);
+    try testing.expect(km.sec_idx != 0);
+    try testing.expectEqual(o.image.findSection(".kconfig").?, km.sec_idx);
+    try testing.expectEqual(@as(usize, 12), km.initial_data.len);
+    for (km.initial_data) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    // the program: a kconfig read is a map_value into that map, the rest are extern references
+    const p = o.programs[0];
+    try testing.expectEqual(@as(usize, 1), p.relos.len);
+    try testing.expectEqual(ReloKind.map_value, p.relos[0].kind);
+    try testing.expectEqual(@as(usize, 1), p.relos[0].map_idx);
+    try testing.expectEqual(@as(u64, 8), p.relos[0].value_off);
+    try testing.expectEqualStrings("CONFIG_B", p.relos[0].sym_name);
+    try testing.expectEqual(@as(usize, 2), p.extern_refs.len);
+    try testing.expectEqual(@as(u32, 2), p.extern_refs[0].insn_idx);
+    try testing.expectEqual(@as(usize, 3), p.extern_refs[0].extern_idx);
+    try testing.expect(!p.extern_refs[0].call);
+    try testing.expectEqual(@as(u32, 4), p.extern_refs[1].insn_idx);
+    try testing.expectEqual(@as(usize, 5), p.extern_refs[1].extern_idx);
+    try testing.expect(p.extern_refs[1].call);
+}
+
+test "mutation 2026-11-27: an object with only ksyms gets no .kconfig map; a legacy map of that name collides" {
+    const gpa = testing.allocator;
+    {
+        const code = cat(.{ I_LD64, I_LD64_HI, I_EXIT });
+        const bytes = try mtExtObject(gpa, &code, &.{.{ .off = 0, .sym = .ksym_i, .typ = R_BPF_64_64 }}, .{ .no_kconfig = true });
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 3), o.externs.len);
+        try testing.expectEqual(@as(usize, 0), o.maps.len);
+    }
+    {
+        const code = cat(.{ I_MOV0, I_EXIT });
+        const bytes = try mtExtObject(gpa, &code, &.{}, .{ .legacy_map = ".kconfig" });
+        defer gpa.free(bytes);
+        try testing.expectError(error.DuplicateMap, open(gpa, bytes, .{}));
+    }
+}
+
+test "mutation 2026-11-27: extern relocations: what each kind may sit on, and what the kconfig layout refuses" {
+    const gpa = testing.allocator;
+    const Case = struct { code: []const [8]u8, rel: MtRel, kcfg: MtKcfg = .normal, want: anyerror };
+    const cases = [_]Case{
+        .{ .code = &.{ I_MOV0, I_EXIT }, .rel = .{ .off = 0, .sym = .kfn, .typ = R_BPF_64_32 }, .want = error.UnsupportedRelocation }, // a kfunc reloc on a non-call
+        .{ .code = &.{ I_CALL, I_EXIT }, .rel = .{ .off = 0, .sym = .config_a, .typ = R_BPF_64_32 }, .want = error.UnsupportedRelocation }, // a call to a kconfig value
+        .{ .code = &.{ I_MOV0, I_EXIT }, .rel = .{ .off = 0, .sym = .ksym_i, .typ = R_BPF_64_64 }, .want = error.UnsupportedRelocation }, // an address load on a mov
+        .{ .code = &.{ I_MOV0, I_LD64 }, .rel = .{ .off = 8, .sym = .ksym_i, .typ = R_BPF_64_64 }, .want = error.RelocationOutOfRange }, // LD_IMM64 is the last instruction
+        .{ .code = &.{ I_LD64, I_LD64_HI, I_EXIT }, .rel = .{ .off = 0, .sym = .config_a, .typ = R_BPF_64_64 }, .kcfg = .empty, .want = error.UnresolvedRelocation }, // a zero-size value makes no .kconfig map
+        .{ .code = &.{ I_MOV0, I_EXIT }, .rel = .{ .off = 0, .sym = .kver, .typ = R_BPF_64_64 }, .kcfg = .bad_type, .want = error.UnsupportedExternType },
+        .{ .code = &.{ I_MOV0, I_EXIT }, .rel = .{ .off = 0, .sym = .kver, .typ = R_BPF_64_64 }, .kcfg = .huge, .want = error.UnsupportedExternType }, // 2 GiB + 2 GiB overflows u32
+    };
+    for (cases, 0..) |c, ci| {
+        var code: [4][8]u8 = undefined;
+        for (c.code, 0..) |ins, k| code[k] = ins;
+        const bytes = try mtExtObject(gpa, std.mem.sliceAsBytes(code[0..c.code.len]), &.{c.rel}, .{ .kcfg = c.kcfg });
+        defer gpa.free(bytes);
+        testing.expectError(c.want, open(gpa, bytes, .{})) catch |e| {
+            std.debug.print("extern case {d}\n", .{ci});
+            return e;
+        };
+    }
+}
+
+test "mutation 2026-11-27: typeless is `void` behind any number of qualifiers, and nothing else" {
+    const gpa = testing.allocator;
+    {
+        const bytes = try mtQualObject(gpa, false);
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 3), o.externs.len);
+        try testing.expect(!o.externs[0].typeless); // a 2-byte int whose size is the id of a `const void`
+        try testing.expect(o.externs[1].typeless); // const const void
+        try testing.expect(o.externs[2].typeless); // const void
+    }
+    {
+        // a qualifier that is its own target must end the walk, whatever it answers
+        const bytes = try mtQualObject(gpa, true);
+        defer gpa.free(bytes);
+        if (open(gpa, bytes, .{})) |o| {
+            var oo = o;
+            oo.deinit();
+        } else |_| {}
+    }
+}
+
+const MtOps = struct {
+    no_btf: bool = false,
+    decoy_rel: bool = false,
+    legacy_map: ?[]const u8 = null,
+    v2_off: u64 = 32,
+    v2_size: u64 = 16,
+    /// symbol 6: an object symbol at the start of p1
+    obj_alias: bool = false,
+};
+const MtOpsRel = struct { off: u64, sym: u32, typ: u32 };
+
+/// An object with a `.struct_ops` section holding two `struct ops { int a; void (*fp)(void); }` variables
+/// (`v1` at 8, `v2` at `v2_off`), programs p1 + p3 (section 1, offsets 0 and 16) and p2 (section 2), and
+/// relocations given by symbol index: 1 v1, 2 v2, 3 p1, 4 p3, 5 p2.
+fn mtOpsObject(gpa: std.mem.Allocator, rels: []const MtOpsRel, o: MtOps) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_int = try r.str(gpa, "int");
+    const n_ops = try r.str(gpa, "ops");
+    const n_a = try r.str(gpa, "a");
+    const n_fp = try r.str(gpa, "fp");
+    const n_v1 = try r.str(gpa, "v1");
+    const n_v2 = try r.str(gpa, "v2");
+    const n_so = try r.str(gpa, ".struct_ops");
+    const int4 = try r.rec(gpa, n_int, btf_mod.K_INT, 0, false, 4, &.{32});
+    const proto = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, 0, &.{});
+    const fp = try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, proto, &.{});
+    const st = try r.rec(gpa, n_ops, btf_mod.K_STRUCT, 2, false, 16, &.{ n_a, int4, 0, n_fp, fp, 64 });
+    const v1 = try r.rec(gpa, n_v1, btf_mod.K_VAR, 0, false, st, &.{1});
+    const v2 = try r.rec(gpa, n_v2, btf_mod.K_VAR, 0, false, st, &.{1});
+    _ = try r.rec(gpa, n_so, btf_mod.K_DATASEC, 2, false, 48, &.{ v1, 8, 16, v2, 32, 16 });
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const code4 = cat(.{ I_MOV0, I_EXIT, I_MOV0, I_EXIT });
+    const code2 = cat(.{ I_MOV0, I_EXIT });
+    _ = try b.sec(.{ .name = "struct_ops/p1", .ty = 1, .flags = ObjB.EXEC, .data = &code4 });
+    _ = try b.sec(.{ .name = "struct_ops/p2", .ty = 1, .flags = ObjB.EXEC, .data = &code2 });
+    var data: [48]u8 = undefined;
+    for (&data, 0..) |*d, i| d.* = if (i >= 32) 0x22 else if (i >= 8) 0x11 else 0;
+    const so = try b.sec(.{ .name = ".struct_ops", .ty = 1, .flags = 3, .data = &data });
+    if (!o.no_btf) _ = try b.sec(.{ .name = ".BTF", .ty = 1, .data = blob });
+    if (o.decoy_rel) _ = try b.sec(.{ .name = ".decoy", .ty = 1, .data = &data, .info = so });
+    var relb: [8 * 16]u8 = undefined;
+    for (rels, 0..) |rel, k| {
+        std.mem.writeInt(u64, relb[k * 16 ..][0..8], rel.off, .little);
+        std.mem.writeInt(u64, relb[k * 16 + 8 ..][0..8], (@as(u64, rel.sym) << 32) | rel.typ, .little);
+    }
+    _ = try b.sec(.{ .name = ".rel.struct_ops", .ty = elfsym.SHT_REL, .data = relb[0 .. rels.len * 16], .link = ObjB.SYMTAB_LINK, .info = so, .entsize = 16 });
+    const defs: [20]u8 = @splat(0);
+    const mapsec: u16 = if (o.legacy_map != null) try b.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs }) else 0;
+    _ = try b.sym(.{ .name = "v1", .info = OBJ_SYM, .shndx = so, .value = 8, .size = 16 });
+    _ = try b.sym(.{ .name = "v2", .info = OBJ_SYM, .shndx = so, .value = o.v2_off, .size = o.v2_size });
+    _ = try b.sym(.{ .name = "p1", .info = FUNC_SYM, .shndx = 1, .value = 0, .size = 16 });
+    _ = try b.sym(.{ .name = "p3", .info = FUNC_SYM, .shndx = 1, .value = 16, .size = 16 });
+    _ = try b.sym(.{ .name = "p2", .info = FUNC_SYM, .shndx = 2, .value = 0, .size = 16 });
+    if (o.obj_alias) _ = try b.sym(.{ .name = "p1o", .info = OBJ_SYM, .shndx = 1, .value = 0 });
+    if (o.legacy_map) |nm| _ = try b.sym(.{ .name = nm, .info = OBJ_SYM, .shndx = mapsec });
+    return b.build();
+}
+
+test "mutation 2026-11-27: struct_ops variables: their own bytes, the program behind each pointer, other maps kept" {
+    const gpa = testing.allocator;
+    const bytes = try mtOpsObject(gpa, &.{
+        .{ .off = 16, .sym = 4, .typ = R_BPF_64_ABS64 }, // v1.fp -> p3
+        .{ .off = 40, .sym = 5, .typ = R_BPF_64_ABS64 }, // v2.fp -> p2
+        .{ .off = 32, .sym = 3, .typ = R_BPF_64_ABS64 }, // the first byte of v2 -> p1
+    }, .{ .decoy_rel = true, .legacy_map = "m1" });
+    defer gpa.free(bytes);
+    var o = try open(gpa, bytes, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 3), o.programs.len);
+    try testing.expectEqualStrings("p1", o.programs[0].name);
+    try testing.expectEqualStrings("p3", o.programs[1].name);
+    try testing.expectEqualStrings("p2", o.programs[2].name);
+    try testing.expectEqual(@as(usize, 3), o.maps.len);
+    try testing.expectEqualStrings("m1", o.maps[0].name);
+    const st = o.btf.?.findByNameKind("ops", .@"struct").?;
+    const want = [_]struct { name: []const u8, fill: u8 }{ .{ .name = "v1", .fill = 0x11 }, .{ .name = "v2", .fill = 0x22 } };
+    for (want, o.maps[1..]) |w, m| {
+        try testing.expectEqualStrings(w.name, m.name);
+        try testing.expectEqual(BPF.MapType.struct_ops, m.map_type);
+        try testing.expectEqual(MapOrigin.struct_ops, m.origin);
+        try testing.expectEqual(@as(u32, 4), m.key_size);
+        try testing.expectEqual(@as(u32, 16), m.value_size);
+        try testing.expectEqual(@as(u32, 1), m.max_entries);
+        try testing.expectEqual(st, m.btf_value_type_id);
+        try testing.expect(!m.struct_ops_link);
+        try testing.expectEqual(@as(usize, 16), m.initial_data.len);
+        try testing.expectEqual(w.fill, m.initial_data[0]);
+        try testing.expectEqual(w.fill, m.initial_data[15]);
+    }
+    const v1 = o.maps[1].struct_ops_progs;
+    try testing.expectEqual(@as(usize, 1), v1.len);
+    try testing.expectEqual(@as(u32, 8), v1[0].member_off);
+    try testing.expectEqual(@as(usize, 1), v1[0].program);
+    const v2 = o.maps[2].struct_ops_progs;
+    try testing.expectEqual(@as(usize, 2), v2.len);
+    try testing.expectEqual(@as(u32, 8), v2[0].member_off);
+    try testing.expectEqual(@as(usize, 2), v2[0].program);
+    try testing.expectEqual(@as(u32, 0), v2[1].member_off); // `<=`: a relocation on the first byte belongs to this variable
+    try testing.expectEqual(@as(usize, 0), v2[1].program);
+}
+
+test "mutation 2026-11-27: struct_ops relocations and variables: every refusal, and a relocation type that is accepted" {
+    const gpa = testing.allocator;
+    const Case = struct { rels: []const MtOpsRel = &.{}, o: MtOps = .{}, want: ?anyerror };
+    const cases = [_]Case{
+        .{ .rels = &.{.{ .off = 16, .sym = 4, .typ = R_BPF_64_32 }}, .want = error.UnsupportedRelocation },
+        .{ .rels = &.{.{ .off = 16, .sym = 4, .typ = R_BPF_64_64 }}, .want = null }, // R_BPF_64_64 is accepted as well
+        .{ .rels = &.{.{ .off = 0, .sym = 4, .typ = R_BPF_64_ABS64 }}, .want = error.RelocationOutOfRange }, // before the first variable
+        .{ .rels = &.{.{ .off = 26, .sym = 4, .typ = R_BPF_64_ABS64 }}, .want = error.RelocationOutOfRange }, // in the gap between two
+        .{ .rels = &.{.{ .off = 16, .sym = 1, .typ = R_BPF_64_ABS64 }}, .want = error.UnresolvedRelocation }, // an object symbol is no program
+        .{ .rels = &.{.{ .off = 16, .sym = 6, .typ = R_BPF_64_ABS64 }}, .o = .{ .obj_alias = true }, .want = error.UnresolvedRelocation }, // an object symbol at a program's offset is no program
+        .{ .o = .{ .v2_off = 100 }, .want = error.MalformedElf }, // a variable past the section
+        .{ .o = .{ .v2_off = 40 }, .want = error.MalformedElf }, // a variable that ends past it
+        .{ .o = .{ .legacy_map = "v1" }, .want = error.DuplicateMap },
+        .{ .o = .{ .legacy_map = "v2" }, .want = error.DuplicateMap },
+    };
+    for (cases, 0..) |c, ci| {
+        const bytes = try mtOpsObject(gpa, c.rels, c.o);
+        defer gpa.free(bytes);
+        if (c.want) |e| {
+            testing.expectError(e, open(gpa, bytes, .{})) catch |err| {
+                std.debug.print("struct_ops case {d}\n", .{ci});
+                return err;
+            };
+        } else {
+            var o = try open(gpa, bytes, .{});
+            o.deinit();
+        }
+    }
+    // without BTF there are no variables to describe, and a relocation in the section is not an error
+    const bytes = try mtOpsObject(gpa, &.{.{ .off = 16, .sym = 4, .typ = R_BPF_64_ABS64 }}, .{ .no_btf = true });
+    defer gpa.free(bytes);
+    var o = try open(gpa, bytes, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 0), o.maps.len);
+}
+
+/// A BTF with `struct <name> { members }` (id 6) and, as the kernel's, `struct bpf_struct_ops_<name> { data }` (id 7, `data` at byte 8).
+fn mtOpsBtf(gpa: std.mem.Allocator, name: []const u8, members: []const MtM, kflag: bool, wrapper: bool) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_int = try r.str(gpa, "int");
+    const int4 = try r.rec(gpa, n_int, btf_mod.K_INT, 0, false, 4, &.{32});
+    const proto = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, 0, &.{});
+    const fp = try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, proto, &.{});
+    const chr = try r.rec(gpa, 0, btf_mod.K_INT, 0, false, 1, &.{8});
+    const huge = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ int4, int4, 0x4000_0001 });
+    const ids = [_]u32{ 0, int4, 0, fp, chr, huge };
+    var extra: [8 * 3]u32 = undefined;
+    for (members, 0..) |m, k| {
+        extra[k * 3] = if (m.name.len == 0) 0 else try r.str(gpa, m.name);
+        extra[k * 3 + 1] = ids[m.ty];
+        extra[k * 3 + 2] = m.off;
+    }
+    const st = try r.rec(gpa, try r.str(gpa, name), btf_mod.K_STRUCT, @intCast(members.len), kflag, 64, extra[0 .. members.len * 3]);
+    if (wrapper) {
+        var buf: [64]u8 = undefined;
+        const wn = try std.fmt.bufPrint(&buf, "bpf_struct_ops_{s}", .{name});
+        _ = try r.rec(gpa, try r.str(gpa, wn), btf_mod.K_STRUCT, 1, false, 72, &.{ try r.str(gpa, "data"), st, 64 });
+    }
+    return r.finish(gpa);
+}
+const MtM = struct { name: []const u8, ty: u32, off: u32 };
+
+test "mutation 2026-11-27: planning struct_ops against a kernel type: flavors, anonymous members, bit fields, sizes" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Case = struct {
+        lname: []const u8 = "ops",
+        lm: []const MtM,
+        lflag: bool = false,
+        km: []const MtM,
+        kflag: bool = false,
+        want: ?anyerror = null,
+        local_id: u32 = 6,
+    };
+    const ab = [_]MtM{ .{ .name = "a", .ty = 1, .off = 0 }, .{ .name = "b", .ty = 3, .off = 64 } };
+    const cases = [_]Case{
+        .{ .lm = &ab, .km = &ab },
+        .{ .lname = "ops___v2", .lm = &ab, .km = &ab }, // a CO-RE flavor suffix names the same kernel type
+        .{ .lm = &.{ .{ .name = "", .ty = 1, .off = 0 }, .{ .name = "a", .ty = 1, .off = 32 } }, .km = &.{.{ .name = "a", .ty = 1, .off = 0 }} },
+        .{ .lm = &.{.{ .name = "a", .ty = 1, .off = (3 << 24) | 0 }}, .lflag = true, .km = &.{.{ .name = "a", .ty = 1, .off = 0 }}, .want = error.StructOpsMemberMismatch },
+        .{ .lm = &.{.{ .name = "a", .ty = 1, .off = 4 }}, .km = &.{.{ .name = "a", .ty = 1, .off = 0 }}, .want = error.StructOpsMemberMismatch },
+        .{ .lm = &.{.{ .name = "a", .ty = 1, .off = 0 }}, .km = &.{.{ .name = "a", .ty = 1, .off = (3 << 24) | 0 }}, .kflag = true, .want = error.StructOpsMemberMismatch },
+        .{ .lm = &.{.{ .name = "a", .ty = 1, .off = 0 }}, .km = &.{.{ .name = "a", .ty = 1, .off = 4 }}, .want = error.StructOpsMemberMismatch },
+        .{ .lm = &.{.{ .name = "a", .ty = 5, .off = 0 }}, .km = &.{.{ .name = "a", .ty = 5, .off = 0 }}, .want = error.StructOpsMemberMismatch }, // equal sizes beyond u32
+        .{ .lm = &ab, .km = &ab, .local_id = 1, .want = error.StructOpsMemberMismatch }, // `int` is no struct
+    };
+    for (cases, 0..) |c, ci| {
+        const lb = try mtOpsBtf(gpa, c.lname, c.lm, c.lflag, false);
+        defer gpa.free(lb);
+        const kb = try mtOpsBtf(gpa, "ops", c.km, c.kflag, true);
+        defer gpa.free(kb);
+        var local = try btf_mod.parse(gpa, lb, .{});
+        defer local.deinit();
+        var kern = try btf_mod.parse(gpa, kb, .{});
+        defer kern.deinit();
+        if (c.want) |e| {
+            testing.expectError(e, planStructOps(a, &local, c.local_id, &kern)) catch |err| {
+                std.debug.print("plan case {d}\n", .{ci});
+                return err;
+            };
+            continue;
+        }
+        const plan = try planStructOps(a, &local, c.local_id, &kern);
+        try testing.expectEqual(@as(u32, 7), plan.value_type_id);
+        try testing.expectEqual(@as(u32, 6), plan.kern_type_id);
+        try testing.expectEqual(@as(u32, 72), plan.value_size);
+        switch (ci) {
+            0, 1 => {
+                try testing.expectEqual(@as(usize, 2), plan.members.len);
+                try testing.expectEqual(StructOpsMember{ .local_off = 0, .kern_off = 8, .size = 4, .kern_index = 0, .is_func = false }, plan.members[0]);
+                try testing.expectEqual(StructOpsMember{ .local_off = 8, .kern_off = 16, .size = 8, .kern_index = 1, .is_func = true }, plan.members[1]);
+            },
+            else => { // the anonymous member is skipped, not matched against the kernel's names
+                try testing.expectEqual(@as(usize, 1), plan.members.len);
+                try testing.expectEqual(StructOpsMember{ .local_off = 4, .kern_off = 8, .size = 4, .kern_index = 0, .is_func = false }, plan.members[0]);
+            },
+        }
+    }
+}
+
+test "mutation 2026-11-27: the kernel-layout value: bounds on both sides, the copied offsets, an absent program" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const initial = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const mk = struct {
+        fn plan(al: std.mem.Allocator, m: StructOpsMember) !StructOpsPlan {
+            return .{ .value_type_id = 1, .kern_type_id = 2, .value_size = 16, .members = try al.dupe(StructOpsMember, &.{m}) };
+        }
+    }.plan;
+    // a scalar member: initial[4..8] goes to value[8..12], the rest stays zero
+    const v = try buildStructOpsValue(a, try mk(a, .{ .local_off = 4, .kern_off = 8, .size = 4, .kern_index = 0, .is_func = false }), &initial, &.{}, &.{});
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 5, 6, 7, 8, 0, 0, 0, 0 }, v);
+    const bad = [_]StructOpsMember{
+        .{ .local_off = 100, .kern_off = 0, .size = 4, .kern_index = 0, .is_func = false }, // starts past the object's bytes
+        .{ .local_off = 6, .kern_off = 0, .size = 4, .kern_index = 0, .is_func = false }, // ends past them
+        .{ .local_off = 0, .kern_off = 100, .size = 4, .kern_index = 0, .is_func = false }, // starts past the value
+        .{ .local_off = 0, .kern_off = 14, .size = 4, .kern_index = 0, .is_func = false }, // ends past it
+    };
+    for (bad) |m| try testing.expectError(error.StructOpsMemberMismatch, buildStructOpsValue(a, try mk(a, m), &initial, &.{}, &.{}));
+    // a function pointer whose program is not in the list of fds
+    const f: StructOpsMember = .{ .local_off = 0, .kern_off = 8, .size = 8, .kern_index = 0, .is_func = true };
+    try testing.expectError(error.MapNotCreated, buildStructOpsValue(a, try mk(a, f), &initial, &.{.{ .member_off = 0, .program = 5 }}, &.{3}));
+}
+
+test "mutation 2026-11-27: load plans struct_ops maps and tells the programs which member they implement" {
+    const gpa = testing.allocator;
+    const blob = try structOpsKernelBlob(gpa, true, 16, false);
+    defer gpa.free(blob);
+    var kern = try btf_mod.parse(gpa, blob, .{});
+    defer kern.deinit();
+    const kt = kern.findByNameKind("tcp_congestion_ops", .@"struct").?;
+    const Idx = struct { n: []const u8, idx: u16 };
+    const idxs = [_]Idx{ .{ .n = "zl_cong_avoid", .idx = 0 }, .{ .n = "zl_ssthresh", .idx = 1 }, .{ .n = "zl_undo_cwnd", .idx = 2 } };
+    {
+        var o = try open(gpa, fx_struct_ops, .{});
+        defer o.deinit();
+        // load fails at the first privileged step; the planning has been done by then
+        load(&o, .{ .load_btf = false, .core = false, .target_btf = &kern }) catch {};
+        for (o.maps) |m| {
+            const plan = m.struct_ops_plan.?;
+            try testing.expectEqual(kt, plan.kern_type_id);
+            try testing.expectEqual(kern.findByNameKind("bpf_struct_ops_tcp_congestion_ops", .@"struct").?, plan.value_type_id);
+            try testing.expectEqual(@as(usize, 4), plan.members.len);
+        }
+        for (idxs) |x| {
+            const p = o.findProgram(x.n).?;
+            try testing.expectEqual(kt, p.attach_btf_id);
+            const want: ?BPF.AttachType = @fromBackingInt(x.idx);
+            try testing.expectEqual(want, p.expected_attach_type);
+        }
+        // the value is built once every program has an fd: with fake ones, for every struct_ops map among others
+        for (o.programs, 0..) |*p, k| p.fd = @intCast(31 + k);
+        defer for (o.programs) |*p| {
+            p.fd = -1;
+        };
+        const orig = o.maps;
+        const maps2 = try gpa.alloc(MapSpec, orig.len + 1);
+        defer gpa.free(maps2);
+        maps2[0] = .{ .name = "x", .map_type = .array, .origin = .legacy, .sec_idx = 0 };
+        @memcpy(maps2[1..], orig);
+        o.maps = maps2;
+        defer o.maps = orig;
+        try buildStructOpsValues(&o);
+        const cc = o.findMap("zl_cc").?;
+        try testing.expectEqual(@as(usize, 48), cc.struct_ops_value.len);
+        const fdOf = struct {
+            fn f(obj: *Object, name: []const u8) u64 {
+                return @intCast(obj.findProgram(name).?.fd);
+            }
+        }.f;
+        try testing.expectEqual(fdOf(&o, "zl_cong_avoid"), std.mem.readInt(u64, cc.struct_ops_value[8..16], .little));
+        try testing.expectEqual(fdOf(&o, "zl_ssthresh"), std.mem.readInt(u64, cc.struct_ops_value[16..24], .little));
+        try testing.expectEqual(fdOf(&o, "zl_undo_cwnd"), std.mem.readInt(u64, cc.struct_ops_value[24..32], .little));
+        try testing.expectEqualStrings("zl_test", std.mem.sliceTo(cc.struct_ops_value[32..48], 0));
+    }
+    {
+        // a relocation on a member that is not a function pointer implements nothing
+        var o0 = try open(gpa, fx_struct_ops, .{});
+        defer o0.deinit();
+        const so = o0.image.findSection(".struct_ops").?;
+        var ri: usize = 0;
+        for (o0.image.sections, 0..) |s, i| {
+            if (s.sh_type == elfsym.SHT_REL and s.sh_info == so) ri = i;
+        }
+        var at: ?usize = null;
+        var k: u32 = 0;
+        while (k < try o0.image.relocationCount(ri)) : (k += 1) {
+            if ((try o0.image.relocation(ri, k)).r_offset == 32) at = @intCast(o0.image.sections[ri].sh_offset + k * 16);
+        }
+        const copy = try gpa.dupe(u8, fx_struct_ops);
+        defer gpa.free(copy);
+        std.mem.writeInt(u64, copy[at.?..][0..8], 0, .little);
+        var o = try open(gpa, copy, .{});
+        defer o.deinit();
+        load(&o, .{ .load_btf = false, .core = false, .target_btf = &kern }) catch {};
+        const p = o.findProgram("zl_cong_avoid").?;
+        try testing.expectEqual(@as(u32, 0), p.attach_btf_id);
+        try testing.expectEqual(@as(?BPF.AttachType, null), p.expected_attach_type);
+        try testing.expectEqual(kt, o.findProgram("zl_ssthresh").?.attach_btf_id);
+    }
+    {
+        // a struct_ops program that no map uses has no attach target and is not loaded
+        var o = try open(gpa, fx_struct_ops, .{});
+        defer o.deinit();
+        o.maps = &.{};
+        try load(&o, .{ .load_btf = false, .core = false });
+        for (o.programs) |p| try testing.expectEqual(@as(linux.fd_t, -1), p.fd);
+    }
+}
+
+fn mtUint(r: *RawB, gpa: std.mem.Allocator, int4: u32, v: u32) !u32 {
+    const arr = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ int4, int4, v });
+    return r.rec(gpa, 0, btf_mod.K_PTR, 0, false, arr, &.{});
+}
+
+const MtMapCase = enum {
+    key_proto,
+    entries_proto,
+    key_huge,
+    mim_ok,
+    mim_elem_int,
+    prog_elem_struct,
+    prog_ok,
+    array_with_values,
+    nested_values,
+    void_elem,
+    elem_proto,
+};
+
+/// An object whose `.maps` holds one variable `m1`, a map definition shaped by `c`.
+fn mtMapCaseObject(gpa: std.mem.Allocator, c: MtMapCase) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_type = try r.str(gpa, "type");
+    const n_max = try r.str(gpa, "max_entries");
+    const n_ks = try r.str(gpa, "key_size");
+    const n_vs = try r.str(gpa, "value_size");
+    const n_key = try r.str(gpa, "key");
+    const n_values = try r.str(gpa, "values");
+    const int4 = try r.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    const proto = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, 0, &.{});
+    const proto_int = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, int4, &.{});
+    const arr7 = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ int4, int4, 7 });
+    const proto_arr = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, arr7, &.{});
+    const huge = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ int4, int4, 0x4000_0001 });
+    const huge_ptr = try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, huge, &.{});
+    const t2 = try mtUint(&r, gpa, int4, 2);
+    const t3 = try mtUint(&r, gpa, int4, 3);
+    const t4 = try mtUint(&r, gpa, int4, 4);
+    const t8 = try mtUint(&r, gpa, int4, 8);
+    const t12 = try mtUint(&r, gpa, int4, 12);
+    const inner = try r.rec(gpa, 0, btf_mod.K_STRUCT, 4, false, 32, &.{ n_type, t2, 0, n_ks, t4, 64, n_vs, t4, 128, n_max, t8, 192 });
+    // an inner definition that itself has `values`
+    const proto_ptr = try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, proto, &.{});
+    const pp_arr = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ proto_ptr, int4, 0 });
+    const inner2 = try r.rec(gpa, 0, btf_mod.K_STRUCT, 2, false, 16, &.{ n_type, t3, 0, n_values, pp_arr, 64 });
+    const proto_inner = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, inner, &.{});
+
+    const map_type: u32 = switch (c) {
+        .prog_elem_struct, .prog_ok => t3,
+        .array_with_values => t2,
+        else => t12,
+    };
+    const target: u32 = switch (c) {
+        .mim_ok, .prog_elem_struct => inner,
+        .mim_elem_int => int4,
+        .prog_ok, .array_with_values => proto,
+        .nested_values => inner2,
+        else => 0,
+    };
+    const elem: u32 = if (c == .elem_proto) proto_inner else try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, target, &.{});
+    const vals = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ elem, int4, 0 });
+    const st = switch (c) {
+        .key_proto => try r.rec(gpa, 0, btf_mod.K_STRUCT, 1, false, 8, &.{ n_key, proto_int, 0 }),
+        .entries_proto => try r.rec(gpa, 0, btf_mod.K_STRUCT, 1, false, 8, &.{ n_max, proto_arr, 0 }),
+        .key_huge => try r.rec(gpa, 0, btf_mod.K_STRUCT, 1, false, 8, &.{ n_key, huge_ptr, 0 }),
+        else => try r.rec(gpa, 0, btf_mod.K_STRUCT, 3, false, 24, &.{ n_type, map_type, 0, n_max, t4, 64, n_values, vals, 128 }),
+    };
+    const v = try r.rec(gpa, try r.str(gpa, "m1"), btf_mod.K_VAR, 0, false, st, &.{1});
+    _ = try r.rec(gpa, try r.str(gpa, ".maps"), btf_mod.K_DATASEC, 1, false, 8, &.{ v, 0, 8 });
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const zeros: [8]u8 = @splat(0);
+    _ = try b.sec(.{ .name = ".maps", .ty = 1, .flags = 3, .data = &zeros });
+    _ = try b.sec(.{ .name = ".BTF", .ty = 1, .data = blob });
+    return b.build();
+}
+
+test "mutation 2026-11-27: map-in-map and prog_array definitions: the inner map, and every shape that is refused" {
+    const gpa = testing.allocator;
+    {
+        const bytes = try mtMapCaseObject(gpa, .mim_ok);
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        const m = o.maps[0];
+        try testing.expectEqual(BPF.MapType.array_of_maps, m.map_type);
+        try testing.expectEqual(@as(u32, 4), m.max_entries);
+        try testing.expect(m.has_values);
+        try testing.expectEqual(@as(u32, 16), m.values_off);
+        const inner = m.inner.?;
+        try testing.expectEqual(BPF.MapType.array, inner.map_type);
+        try testing.expectEqual(@as(u32, 4), inner.key_size);
+        try testing.expectEqual(@as(u32, 4), inner.value_size);
+        try testing.expectEqual(@as(u32, 8), inner.max_entries);
+        try testing.expectEqual(MapOrigin.btf_defined, inner.origin);
+        try testing.expect(!inner.has_values);
+    }
+    {
+        const bytes = try mtMapCaseObject(gpa, .prog_ok);
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        try testing.expectEqual(BPF.MapType.prog_array, o.maps[0].map_type);
+        try testing.expect(o.maps[0].has_values);
+        try testing.expect(o.maps[0].inner == null);
+    }
+    for ([_]MtMapCase{ .key_proto, .entries_proto, .key_huge, .mim_elem_int, .prog_elem_struct, .array_with_values, .nested_values, .void_elem, .elem_proto }) |c| {
+        const bytes = try mtMapCaseObject(gpa, c);
+        defer gpa.free(bytes);
+        testing.expectError(error.MalformedMapDefinition, open(gpa, bytes, .{})) catch |e| {
+            std.debug.print("map case {s}\n", .{@tagName(c)});
+            return e;
+        };
+    }
+}
+
+// ── relocations that make calls ──
+
+/// An XDP section `xdp` (section 1), a `.text` (section 2) and a `.relxdp` with at most one entry against symbol 1 (`gf`).
+fn mtCallObject(gpa: std.mem.Allocator, xdp: []const u8, text: []const u8, rel: ?MtOpsRel, gf: ObjB.Sym, extra: []const ObjB.Sym) ![]u8 {
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const px = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = xdp });
+    _ = try b.sec(.{ .name = ".text", .ty = 1, .flags = ObjB.EXEC, .data = text });
+    var relb: [16]u8 = undefined;
+    if (rel) |x| {
+        std.mem.writeInt(u64, relb[0..8], x.off, .little);
+        std.mem.writeInt(u64, relb[8..16], (@as(u64, x.sym) << 32) | x.typ, .little);
+        _ = try b.sec(.{ .name = ".relxdp", .ty = elfsym.SHT_REL, .data = &relb, .link = ObjB.SYMTAB_LINK, .info = px, .entsize = 16 });
+    }
+    _ = try b.sym(gf);
+    for (extra) |s| _ = try b.sym(s);
+    return b.build();
+}
+
+fn mtMov(imm: i32) [8]u8 {
+    return ins8(0xb7, 0, 0, imm);
+}
+
+test "mutation 2026-11-27: calls and function addresses: what the relocation may sit on, where it points, and what it refuses" {
+    const gpa = testing.allocator;
+    const text = cat(.{ mtMov(7), I_EXIT, mtMov(9), I_EXIT });
+    const other: ObjB.Sym = .{ .name = "other", .info = FUNC_SYM, .shndx = 2, .value = 0, .size = 16 };
+    const gf: ObjB.Sym = .{ .name = "gf", .info = FUNC_SYM, .shndx = 2, .value = 16, .size = 16 };
+    const call = comptime ins8(0x85, 0x10, 0, -1);
+    // a call to the global function `gf`: appended once, the call patched to reach it
+    {
+        const xdp = cat(.{ call, I_EXIT });
+        const bytes = try mtCallObject(gpa, &xdp, &text, .{ .off = 0, .sym = 1, .typ = R_BPF_64_32 }, gf, &.{other});
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        const p = o.programs[0];
+        try testing.expectEqual(@as(usize, 4), p.insns.len);
+        try testing.expectEqual(BPF_PSEUDO_CALL, p.insns[0].src);
+        try testing.expectEqual(@as(i32, 1), p.insns[0].imm);
+        try testing.expectEqual(@as(i32, 9), p.insns[2].imm);
+    }
+    // the address of `gf` as a callback: the symbol's value, not the instruction's immediate, names the function
+    {
+        const xdp = cat(.{ I_LD64, I_LD64_HI, I_EXIT });
+        const bytes = try mtCallObject(gpa, &xdp, &text, .{ .off = 0, .sym = 1, .typ = R_BPF_64_64 }, gf, &.{other});
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        const p = o.programs[0];
+        try testing.expectEqual(@as(usize, 5), p.insns.len);
+        try testing.expectEqual(BPF_PSEUDO_FUNC, p.insns[0].src);
+        try testing.expectEqual(@as(i32, 2), p.insns[0].imm);
+        try testing.expectEqual(@as(i32, 9), p.insns[3].imm);
+    }
+    // a static call: the section symbol, the offset in the instruction's immediate
+    {
+        const text6 = cat(.{ I_MOV0, I_EXIT, I_MOV0, I_EXIT, mtMov(5), I_EXIT });
+        const xdp = cat(.{ ins8(0x85, 0x10, 0, 3), I_EXIT });
+        const bytes = try mtCallObject(gpa, &xdp, &text6, .{ .off = 0, .sym = 1, .typ = R_BPF_64_32 }, .{ .name = "", .info = SEC_SYM, .shndx = 2, .value = 0 }, &.{
+            .{ .name = "pad", .info = FUNC_SYM, .shndx = 2, .value = 0, .size = 32 },
+            .{ .name = "sub", .info = FUNC_SYM, .shndx = 2, .value = 32, .size = 16 },
+        });
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        const p = o.programs[0];
+        try testing.expectEqual(@as(usize, 4), p.insns.len);
+        try testing.expectEqual(@as(i32, 1), p.insns[0].imm);
+        try testing.expectEqual(@as(i32, 5), p.insns[2].imm);
+    }
+    const Case = struct { insn: [8]u8 = call, sym: ObjB.Sym = gf, want: anyerror };
+    const cases = [_]Case{
+        .{ .insn = ins8(0xb7, 0x10, 0, -1), .want = error.UnsupportedRelocation }, // a call relocation on a mov
+        .{ .insn = ins8(0x85, 0x00, 0, -1), .want = error.UnsupportedRelocation }, // on a helper call
+        .{ .sym = .{ .name = "gf", .info = FUNC_SYM, .shndx = 0x4000, .value = 16, .size = 16 }, .want = error.MalformedElf },
+        .{ .insn = ins8(0x85, 0x10, 0, -100), .sym = .{ .name = "", .info = SEC_SYM, .shndx = 2, .value = 0 }, .want = error.RelocationOutOfRange }, // before the section
+        .{ .insn = ins8(0x85, 0x10, 0, 1), .sym = .{ .name = "gf", .info = OBJ_SYM, .shndx = 2, .value = 0xFFFF_FFFF_FFFF_FFF8 }, .want = error.RelocationOutOfRange }, // byte offset overflows u64
+    };
+    for (cases, 0..) |c, ci| {
+        const xdp = flatIns(2, .{ c.insn, I_EXIT });
+        const bytes = try mtCallObject(gpa, &xdp, &text, .{ .off = 0, .sym = 1, .typ = R_BPF_64_32 }, c.sym, &.{other});
+        defer gpa.free(bytes);
+        testing.expectError(c.want, open(gpa, bytes, .{})) catch |e| {
+            std.debug.print("call case {d}\n", .{ci});
+            return e;
+        };
+    }
+}
+
+test "mutation 2026-11-27: calls between functions of one section have no relocation: sibling targets are linked, the rest left alone" {
+    const gpa = testing.allocator;
+    const mk = struct {
+        fn obj(g: std.mem.Allocator, xdp: []const u8, funcs: []const ObjB.Sym) ![]u8 {
+            var b = ObjB.init(g);
+            defer b.deinit();
+            _ = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = xdp });
+            for (funcs) |f| _ = try b.sym(f);
+            return b.build();
+        }
+    }.obj;
+    // f2 (at 2) calls f1 (at 0): the target is outside f2, inside the section, so f1 is appended to f2
+    {
+        const xdp = cat(.{ mtMov(7), I_EXIT, ins8(0x85, 0x10, 0, -3), I_EXIT });
+        const bytes = try mk(gpa, &xdp, &.{
+            .{ .name = "f1", .info = FUNC_SYM, .shndx = 1, .value = 0, .size = 16 },
+            .{ .name = "f2", .info = FUNC_SYM, .shndx = 1, .value = 16, .size = 16 },
+        });
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 2), o.programs[0].insns.len);
+        const f2 = o.findProgram("f2").?;
+        try testing.expectEqual(@as(usize, 4), f2.insns.len);
+        try testing.expectEqual(@as(i32, 1), f2.insns[0].imm); // f1 sits at 2: 2 - 0 - 1
+        try testing.expectEqual(@as(i32, 7), f2.insns[2].imm);
+    }
+    // a register move whose source register happens to be 1 is no call, whatever its immediate says
+    {
+        const xdp = cat(.{ ins8(0xbf, 0x10, 0, 40), I_EXIT });
+        const bytes = try mk(gpa, &xdp, &.{});
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 2), o.programs[0].insns.len);
+        try testing.expectEqual(@as(i32, 40), o.programs[0].insns[0].imm);
+    }
+    // a call to the function's own first instruction (a hand-written object) stays as written
+    {
+        const xdp = cat(.{ ins8(0x85, 0x10, 0, -1), I_EXIT });
+        const bytes = try mk(gpa, &xdp, &.{});
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 2), o.programs[0].insns.len);
+        try testing.expectEqual(@as(i32, -1), o.programs[0].insns[0].imm);
+    }
+    // a target before the section
+    {
+        const xdp = cat(.{ ins8(0x85, 0x10, 0, -5), I_EXIT });
+        const bytes = try mk(gpa, &xdp, &.{});
+        defer gpa.free(bytes);
+        try testing.expectError(error.RelocationOutOfRange, open(gpa, bytes, .{}));
+    }
+}
+
+/// True where creating a map is refused for lack of privilege (EPERM before any argument is looked at).
+fn mtBpfRefused() bool {
+    var m: MapSpec = .{ .name = "probe", .map_type = .array, .origin = .legacy, .sec_idx = 0, .key_size = 4, .value_size = 4, .max_entries = 1 };
+    if (createMap(&m, 0, 0)) |fd| {
+        _ = linux.close(fd);
+        return false;
+    } else |e| return e == error.PermissionDenied;
+}
+
+fn mtBlob(gpa: std.mem.Allocator, name: []const u8, kind: u5) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_int = try r.str(gpa, "int");
+    const n = try r.str(gpa, name);
+    const int4 = try r.rec(gpa, n_int, btf_mod.K_INT, 0, false, 4, &.{32});
+    const proto = try r.rec(gpa, 0, btf_mod.K_FUNC_PROTO, 0, false, 0, &.{});
+    if (kind == btf_mod.K_VAR) {
+        _ = try r.rec(gpa, n, btf_mod.K_VAR, 0, false, int4, &.{1});
+    } else {
+        _ = try r.rec(gpa, n, btf_mod.K_FUNC, 1, false, proto, &.{});
+    }
+    return r.finish(gpa);
+}
+
+test "mutation 2026-11-27: module BTFs: lookup by name and kind, the fd_array positions, which fds are kept" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_xdp_pass, .{});
+    defer o.deinit();
+    var mb: ModuleBtfs = .{};
+    // 0: func kv, 1: var kv, 2: func kg
+    const spec = [_]struct { name: []const u8, kind: u5 }{
+        .{ .name = "kv", .kind = btf_mod.K_FUNC },
+        .{ .name = "kv", .kind = btf_mod.K_VAR },
+        .{ .name = "kg", .kind = btf_mod.K_FUNC },
+    };
+    var fds: [3]linux.fd_t = undefined;
+    for (spec, 0..) |s, i| {
+        const blob = try mtBlob(gpa, s.name, s.kind);
+        const parsed = try btf_mod.parse(gpa, blob, .{ .own_bytes = true });
+        fds[i] = @intCast(linux.dup(0));
+        try mb.entries.append(gpa, .{ .fd = fds[i], .btf = parsed });
+    }
+    {
+        // after a failed lookup nothing is marked used
+        try testing.expect(mb.find("zz", .func) == null);
+        try testing.expect(mb.find("kv", .datasec) == null);
+        for (mb.entries.items) |e| try testing.expect(!e.used);
+    }
+    const kv = mb.find("kv", .@"var").?; // the var, not the function of the same name
+    try testing.expectEqual(@as(u16, 2), kv.fd_index);
+    try testing.expectEqual(@as(u32, 3), kv.id);
+    try testing.expect(!mb.entries.items[0].used and mb.entries.items[1].used and !mb.entries.items[2].used);
+    const kg = mb.find("kg", .func).?; // the last type of the last entry
+    try testing.expectEqual(@as(u16, 3), kg.fd_index);
+    try testing.expect(mb.entries.items[2].used);
+
+    try mb.commit(&o);
+    try testing.expectEqualSlices(i32, &.{ 0, 0, fds[1], fds[2] }, o.fd_array);
+    try testing.expectEqualSlices(linux.fd_t, &.{ fds[1], fds[2] }, o.module_btf_fds);
+    try testing.expectEqual(fds[0], mb.entries.items[0].fd);
+    try testing.expectEqual(@as(linux.fd_t, -1), mb.entries.items[1].fd);
+    try testing.expectEqual(@as(linux.fd_t, -1), mb.entries.items[2].fd);
+    for (o.module_btf_fds) |f| _ = linux.close(f);
+    o.module_btf_fds = &.{};
+    mb.deinit(&o); // closes the one fd that was not kept, frees every BTF
+    try testing.expect(linux.errno(linux.fcntl(fds[0], linux.F.GETFD, 0)) == .BADF);
+
+    // nothing used: nothing is published
+    var none: ModuleBtfs = .{};
+    const blob = try mtBlob(gpa, "kv", btf_mod.K_VAR);
+    const parsed = try btf_mod.parse(gpa, blob, .{ .own_bytes = true });
+    try none.entries.append(gpa, .{ .fd = -1, .btf = parsed });
+    var o2 = try open(gpa, fx_xdp_pass, .{});
+    defer o2.deinit();
+    try none.commit(&o2);
+    try testing.expectEqual(@as(usize, 0), o2.fd_array.len);
+    try testing.expectEqual(@as(usize, 0), o2.module_btf_fds.len);
+    none.deinit(&o2);
+}
+
+test "mutation 2026-11-27: kernel externs are resolved by name and kind, type-checked, and patched into the instructions" {
+    const gpa = testing.allocator;
+    const kb = try mtKernBtf(gpa, false, false);
+    defer gpa.free(kb);
+    var kern = try btf_mod.parse(gpa, kb, .{});
+    defer kern.deinit();
+    const code = cat(.{ I_LD64, I_LD64_HI, I_CALL, I_EXIT });
+    const bytes = try mtExtObject(gpa, &code, &.{
+        .{ .off = 0, .sym = .ksym_i, .typ = R_BPF_64_64 },
+        .{ .off = 16, .sym = .kfn, .typ = R_BPF_64_32 },
+    }, .{ .no_kconfig = true });
+    defer gpa.free(bytes);
+    var o = try open(gpa, bytes, .{});
+    defer o.deinit();
+    // ksym_i, ksym_void (typeless, weak), kfn
+    try testing.expectEqual(@as(usize, 3), o.externs.len);
+    try resolveKernelExterns(&o, &kern, .{ .search_modules = false });
+    try testing.expect(o.externs[0].resolved);
+    try testing.expectEqual(kern.findByNameKind("ksym_i", .@"var").?, o.externs[0].kernel_btf_id);
+    try testing.expect(o.externs[2].resolved);
+    try testing.expectEqual(kern.findByNameKind("kfn", .func).?, o.externs[2].kernel_btf_id);
+    // typeless means kallsyms, even though the kernel BTF has a variable of that name
+    try testing.expect(!o.externs[1].resolved);
+    // and a strong one that kallsyms lacks is an error
+    o.externs[1].weak = false;
+    try testing.expectError(error.ExternNotFound, resolveKernelExterns(&o, &kern, .{ .search_modules = false }));
+    o.externs[1].weak = true;
+    // a symbol kallsyms does list (when it is readable at all) resolves by address
+    if (elfsym.readFileStreaming(gpa, "/proc/kallsyms", 64 << 20)) |ks| {
+        defer gpa.free(ks);
+        if (kconfig_mod.kallsymsAddress(ks, "init_task")) |addr| {
+            o.externs[1].name = "init_task";
+            try resolveKernelExterns(&o, &kern, .{ .search_modules = false });
+            try testing.expect(o.externs[1].resolved);
+            try testing.expectEqual(addr, o.externs[1].addr);
+        }
+    } else |_| {}
+    // a kernel variable of another kind does not match the declaration
+    const kb8 = try mtKernBtf(gpa, true, false);
+    defer gpa.free(kb8);
+    var kern8 = try btf_mod.parse(gpa, kb8, .{});
+    defer kern8.deinit();
+    try testing.expectError(error.ExternTypeMismatch, resolveKernelExterns(&o, &kern8, .{ .search_modules = false }));
+    // a strong extern the kernel lacks
+    o.externs[2].name = "no_such_kfunc";
+    o.externs[2].weak = false;
+    try testing.expectError(error.ExternNotFound, resolveKernelExterns(&o, &kern, .{ .search_modules = false }));
+}
+
+fn mtSetRefs(p: *ProgramSpec, buf: *[2]ExternRef, refs: []const ExternRef) void {
+    @memcpy(buf[0..refs.len], refs);
+    p.extern_refs = buf[0..refs.len];
+}
+
+test "mutation 2026-11-27: patchExterns writes each reference its own fields and refuses what is not an instruction of the right shape" {
+    var ld = [_]Insn{
+        .{ .code = 0x18, .dst = 0, .src = BPF_PSEUDO_MAP_VALUE, .off = 0, .imm = 99 },
+        .{ .code = 0, .dst = 0, .src = 0, .off = 0, .imm = 99 },
+        .{ .code = 0x85, .dst = 0, .src = 0, .off = 0, .imm = -1 },
+        .{ .code = 0x95, .dst = 0, .src = 0, .off = 0, .imm = 0 },
+    };
+    const base = Extern{ .name = "x", .kind = .ksym_var, .weak = false, .btf_id = 0, .type_id = 0 };
+    var ex = [_]Extern{ base, base, base };
+    ex[0].resolved = true;
+    ex[0].kernel_btf_id = 77;
+    ex[0].fd_index = 3;
+    ex[1].kind = .ksym_func;
+    ex[1].resolved = true;
+    ex[1].kernel_btf_id = 55;
+    ex[1].fd_index = 5;
+    ex[2].typeless = true;
+    ex[2].resolved = true;
+    ex[2].addr = 0x1122_3344_5566_7788;
+    var p = mtSpec("p", 1, &ld);
+    var refbuf: [2]ExternRef = undefined;
+    mtSetRefs(&p, &refbuf, &.{ .{ .insn_idx = 0, .extern_idx = 0, .call = false }, .{ .insn_idx = 2, .extern_idx = 1, .call = true } });
+    try patchExterns(&p, &ex);
+    try testing.expectEqual(BPF_PSEUDO_BTF_ID, ld[0].src);
+    try testing.expectEqual(@as(i32, 77), ld[0].imm);
+    try testing.expectEqual(@as(i32, 3), ld[1].imm);
+    try testing.expectEqual(BPF_PSEUDO_KFUNC_CALL, ld[2].src);
+    try testing.expectEqual(@as(i32, 55), ld[2].imm);
+    try testing.expectEqual(@as(i16, 5), ld[2].off);
+    // typeless and resolved: the address in both halves, the pseudo marker gone
+    ld[0].src = BPF_PSEUDO_MAP_VALUE;
+    mtSetRefs(&p, &refbuf, &.{.{ .insn_idx = 0, .extern_idx = 2, .call = false }});
+    try patchExterns(&p, &ex);
+    try testing.expectEqual(@as(u4, 0), ld[0].src);
+    try testing.expectEqual(@as(i32, 0x55667788), ld[0].imm);
+    try testing.expectEqual(@as(i32, 0x11223344), ld[1].imm);
+    // unresolved: a zero constant, or a call to an id no helper has
+    ex[2].resolved = false;
+    ex[2].addr = 5; // not used while unresolved
+    ld[0].src = BPF_PSEUDO_MAP_VALUE;
+    try patchExterns(&p, &ex);
+    try testing.expectEqual(@as(u4, 0), ld[0].src);
+    try testing.expectEqual(@as(i32, 0), ld[0].imm);
+    try testing.expectEqual(@as(i32, 0), ld[1].imm);
+    ex[1].resolved = false;
+    ld[2].src = BPF_PSEUDO_CALL;
+    mtSetRefs(&p, &refbuf, &.{.{ .insn_idx = 2, .extern_idx = 1, .call = true }});
+    try patchExterns(&p, &ex);
+    try testing.expectEqual(@as(u4, 0), ld[2].src);
+    try testing.expectEqual(poison_call_kfunc_base + 1, ld[2].imm);
+    // refusals
+    mtSetRefs(&p, &refbuf, &.{.{ .insn_idx = 4, .extern_idx = 0, .call = false }});
+    try testing.expectError(error.RelocationOutOfRange, patchExterns(&p, &ex));
+    mtSetRefs(&p, &refbuf, &.{.{ .insn_idx = 0, .extern_idx = 3, .call = false }});
+    try testing.expectError(error.RelocationOutOfRange, patchExterns(&p, &ex));
+    mtSetRefs(&p, &refbuf, &.{.{ .insn_idx = 0, .extern_idx = 1, .call = true }}); // a call on an LD_IMM64
+    try testing.expectError(error.NotAnImmediateLoad, patchExterns(&p, &ex));
+    mtSetRefs(&p, &refbuf, &.{.{ .insn_idx = 2, .extern_idx = 0, .call = false }}); // a load on a call
+    try testing.expectError(error.NotAnImmediateLoad, patchExterns(&p, &ex));
+    ld[3].code = 0x18;
+    mtSetRefs(&p, &refbuf, &.{.{ .insn_idx = 3, .extern_idx = 0, .call = false }}); // an LD_IMM64 with no second half
+    try testing.expectError(error.RelocationOutOfRange, patchExterns(&p, &ex));
+}
+
+test "mutation 2026-11-27: load fills the kconfig seed, resolves the ksyms and patches the instructions before it fails" {
+    const gpa = testing.allocator;
+    const kb = try mtKernBtf(gpa, false, false);
+    defer gpa.free(kb);
+    var kern = try btf_mod.parse(gpa, kb, .{});
+    defer kern.deinit();
+    const opts: LoadOptions = .{
+        .load_btf = false,
+        .core = false,
+        .target_btf = &kern,
+        .kconfig = "CONFIG_A=5\nCONFIG_B=7\n",
+        .kernel_version = 0x010203,
+        .search_modules = false,
+    };
+    {
+        const code = cat(.{ I_LD64, I_LD64_HI, I_LD64, I_LD64_HI, I_CALL, I_EXIT });
+        const bytes = try mtExtObject(gpa, &code, &.{
+            .{ .off = 0, .sym = .config_b, .typ = R_BPF_64_64 },
+            .{ .off = 16, .sym = .ksym_i, .typ = R_BPF_64_64 },
+            .{ .off = 32, .sym = .kfn, .typ = R_BPF_64_32 },
+        }, .{});
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        load(&o, opts) catch {}; // the first map creation is where an unprivileged load stops
+        const d = o.maps[0].initial_data;
+        try testing.expectEqual(@as(u32, 0x010203), std.mem.readInt(u32, d[0..4], .little));
+        try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, d[4..8], .little));
+        try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, d[8..12], .little));
+        try testing.expect(o.externs[3].resolved); // ksym_i
+        try testing.expect(o.externs[5].resolved); // kfn
+    }
+    {
+        // with no maps to create, the program's instructions are patched before its load is attempted
+        const code = cat(.{ I_LD64, I_LD64_HI, I_CALL, I_EXIT });
+        const bytes = try mtExtObject(gpa, &code, &.{
+            .{ .off = 0, .sym = .ksym_i, .typ = R_BPF_64_64 },
+            .{ .off = 16, .sym = .kfn, .typ = R_BPF_64_32 },
+        }, .{ .no_kconfig = true });
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        load(&o, opts) catch {};
+        const p = o.programs[0];
+        try testing.expectEqual(BPF_PSEUDO_BTF_ID, p.insns[0].src);
+        try testing.expectEqual(BPF_PSEUDO_KFUNC_CALL, p.insns[2].src);
+    }
+    {
+        // a map relocation with no map behind it is refused before the program is loaded
+        const code = cat(.{ I_LD64, I_LD64_HI, I_EXIT });
+        const bytes = try mtExtObject(gpa, &code, &.{.{ .off = 0, .sym = .config_b, .typ = R_BPF_64_64 }}, .{});
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        o.maps = &.{};
+        try testing.expectError(error.MapNotCreated, load(&o, opts));
+    }
+}
+
+test "mutation 2026-11-27: creating maps: inner templates, initial slots, and the one errno that can be provoked" {
+    const gpa = testing.allocator;
+    var m: MapSpec = .{ .name = "outer", .map_type = .array_of_maps, .origin = .legacy, .sec_idx = 0, .max_entries = 1, .key_size = 4, .value_size = 4 };
+    try testing.expectError(error.InvalidArgument, createMapWithInner(&m)); // an outer map with no inner definition
+    var inner: MapSpec = .{ .name = "i", .map_type = .array, .origin = .legacy, .sec_idx = 0, .key_size = 4, .value_size = 4 };
+    m.inner = &inner;
+    try testing.expectError(error.ZeroMaxEntries, createMapWithInner(&m));
+    try testing.expectError(error.StructOpsTypeNotFound, createStructOpsMap(&m));
+    if (mtBpfRefused()) {
+        inner.map_type = .sk_storage; // a type that legitimately has no entries: the kernel decides, not this check
+        if (createMapWithInner(&m)) |fd| {
+            _ = linux.close(fd);
+        } else |e| try testing.expect(e == error.InvalidArgument or e == error.PermissionDenied);
+        const plan: StructOpsPlan = .{ .value_type_id = 1, .kern_type_id = 2, .value_size = 8, .members = &.{} };
+        var so: MapSpec = .{ .name = "so", .map_type = .struct_ops, .origin = .struct_ops, .sec_idx = 0, .struct_ops_plan = plan };
+        if (createStructOpsMap(&so)) |fd| {
+            _ = linux.close(fd);
+        } else |e| try testing.expect(e == error.InvalidArgument or e == error.PermissionDenied);
+    }
+
+    // initial slots: a reused map keeps what it has, a missing target is refused, a failing update is an error
+    var o = try open(gpa, fx_xdp_pass, .{});
+    defer o.deinit();
+    const orig = o.maps;
+    const progs = o.programs;
+    var maps2 = [_]MapSpec{
+        .{ .name = "outer", .map_type = .array_of_maps, .origin = .legacy, .sec_idx = 0, .fd = 0, .init_slots = &.{.{ .index = 0, .target = .{ .map = 1 } }} },
+        .{ .name = "t", .map_type = .array, .origin = .legacy, .sec_idx = 0, .fd = -1 },
+    };
+    o.maps = &maps2;
+    defer o.maps = orig;
+    maps2[0].reused = true;
+    try fillInitSlots(&o); // reused: untouched, though the target has no fd
+    maps2[0].reused = false;
+    try testing.expectError(error.MapNotCreated, fillInitSlots(&o));
+    maps2[1].fd = 0;
+    try testing.expectError(error.MapUpdateFailed, fillInitSlots(&o)); // fd 0 is no map: the update fails
+    maps2[0].init_slots = &.{.{ .index = 0, .target = .{ .program = 0 } }};
+    maps2[1].fd = 0;
+    try testing.expect(progs[0].fd == -1);
+    try testing.expectError(error.MapNotCreated, fillInitSlots(&o)); // the program has no fd, whatever the map at that index has
+}
+
+test "mutation 2026-11-27: pinning: where a pin is looked for, and what is refused before any syscall" {
+    if (!mtBpfRefused()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const big = try gpa.alloc(u8, 5000);
+    defer gpa.free(big);
+    @memset(big, 'a');
+    var defs: [20]u8 = @splat(0);
+    std.mem.writeInt(u32, defs[0..4], 2, .little);
+    std.mem.writeInt(u32, defs[4..8], 4, .little);
+    std.mem.writeInt(u32, defs[8..12], 4, .little);
+    std.mem.writeInt(u32, defs[12..16], 1, .little);
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const ms = try b.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs });
+    _ = try b.sym(.{ .name = "m1", .info = OBJ_SYM, .shndx = ms, .value = 0 });
+    var o = try openObj(&b, .{});
+    defer o.deinit();
+    // an explicit pin path too long to name: refused as an invalid argument, whatever `pinning` says
+    o.maps[0].pin_path = big;
+    try testing.expectError(error.InvalidArgument, load(&o, .{ .load_btf = false }));
+    o.maps[0].pin_path = "";
+    // no pinning requested: the pin root is never looked at
+    try testing.expectError(error.PermissionDenied, load(&o, .{ .load_btf = false, .pin_root = big }));
+    // by name: the path is `<root>/<name>`, which is too long here
+    o.maps[0].pinning = 1;
+    try testing.expectError(error.InvalidArgument, load(&o, .{ .load_btf = false, .pin_root = big }));
+    // by name, a short path: looking it up needs bpf()
+    try testing.expectError(error.PermissionDenied, load(&o, .{ .load_btf = false, .pin_root = "/ebpf-mt-no-bpffs" }));
+    o.close();
+    o.maps[0].pinning = 0;
+    o.maps[0].pin_path = "/ebpf-mt-no-bpffs/m1";
+    try testing.expectError(error.PermissionDenied, load(&o, .{ .load_btf = false }));
+    o.close();
+    // a path whose parent is not a directory is none of the answered errnos: a failed pin lookup
+    o.maps[0].pin_path = "/dev/null/m1";
+    if (load(&o, .{ .load_btf = false })) |_| {
+        return error.TestUnexpectedResult;
+    } else |e| try testing.expect(e == error.PinFailed or e == error.PermissionDenied);
+    o.close();
+    // an internal data map is never pinned by name
+    var ro = try open(gpa, fx_rodata_const, .{});
+    defer ro.deinit();
+    for (ro.maps) |*m| m.pinning = 1;
+    try testing.expectError(error.PermissionDenied, load(&ro, .{ .load_btf = false, .pin_root = big }));
+}
+
+test "mutation 2026-11-27: attaching a struct_ops map reports the errno of the registration" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_struct_ops, .{});
+    defer o.deinit();
+    var value: [8]u8 = @splat(0);
+    for (o.maps) |*m| {
+        m.fd = 0; // not a map: the kernel answers EBADF / EINVAL (or EPERM where bpf() is refused outright)
+        m.struct_ops_value = &value;
+    }
+    defer for (o.maps) |*m| {
+        m.fd = -1;
+        m.struct_ops_value = &.{};
+    };
+    if (o.attachStructOps("zl_cc")) |_| {
+        return error.TestUnexpectedResult;
+    } else |e| try testing.expect(e == error.InvalidArgument or e == error.PermissionDenied);
+}
+
+test "mutation 2026-11-27: a DATASEC fixup refuses a section the BTF cannot size" {
+    const gpa = testing.allocator;
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_int = try r.str(gpa, "int");
+    const n_v = try r.str(gpa, "v");
+    const n_s = try r.str(gpa, ".custom");
+    const int4 = try r.rec(gpa, n_int, btf_mod.K_INT, 0, false, 4, &.{32});
+    const v = try r.rec(gpa, n_v, btf_mod.K_VAR, 0, false, int4, &.{1});
+    _ = try r.rec(gpa, n_s, btf_mod.K_DATASEC, 1, false, 4, &.{ v, 0, 4 });
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    _ = try b.sec(.{ .name = ".custom", .ty = 8, .flags = 3, .size = 1 << 32 });
+    _ = try b.sec(.{ .name = ".BTF", .ty = 1, .data = blob });
+    var o = try openObj(&b, .{});
+    defer o.deinit();
+    try testing.expectError(error.MalformedElf, fixupDatasecs(&o));
+}
+
+test "mutation 2026-11-27: the kernel's BTF is read once" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_xdp_pass, .{});
+    defer o.deinit();
+    var owned: ?Btf = null;
+    defer if (owned) |*k| k.deinit();
+    const first = kernelBtf(&o, .{}, &owned) catch return error.SkipZigTest;
+    const second = try kernelBtf(&o, .{}, &owned);
+    try testing.expect(first == second);
+}
+
+test "mutation 2026-11-27: a weak kconfig extern reads as zero when there is no configuration or no version" {
+    const gpa = testing.allocator;
+    const code = cat(.{ I_MOV0, I_EXIT });
+    const bytes = try mtExtObject(gpa, &code, &.{}, .{});
+    defer gpa.free(bytes);
+    var o = try open(gpa, bytes, .{});
+    defer o.deinit();
+    for (o.externs[0..3]) |*e| e.weak = true; // LINUX_KERNEL_VERSION, CONFIG_A, CONFIG_B
+    try fillKconfig(&o, null, null);
+    for (o.maps[0].initial_data) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    // only the version is weak: a configuration without a version is fine
+    o.externs[1].weak = false;
+    o.externs[2].weak = false;
+    var cfg = try kconfig_mod.parse(gpa, "CONFIG_A=5\nCONFIG_B=7\n");
+    defer cfg.deinit();
+    try fillKconfig(&o, &cfg, null);
+    try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, o.maps[0].initial_data[4..8], .little));
+    // only the options are weak: a version without a configuration is fine
+    o.externs[1].weak = true;
+    o.externs[2].weak = true;
+    o.externs[0].weak = false;
+    try fillKconfig(&o, null, 9);
+    try testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, o.maps[0].initial_data[0..4], .little));
+}
+
+test "mutation 2026-11-27: an extern whose prototype is too deep to compare is a type mismatch, not a match" {
+    const gpa = testing.allocator;
+    const kb = try mtKernBtf(gpa, false, true);
+    defer gpa.free(kb);
+    var kern = try btf_mod.parse(gpa, kb, .{});
+    defer kern.deinit();
+    const code = cat(.{ I_CALL, I_EXIT });
+    const bytes = try mtExtObject(gpa, &code, &.{.{ .off = 0, .sym = .kfn, .typ = R_BPF_64_32 }}, .{ .no_kconfig = true, .deep = true });
+    defer gpa.free(bytes);
+    var o = try open(gpa, bytes, .{});
+    defer o.deinit();
+    try testing.expectError(error.ExternTypeMismatch, resolveKernelExterns(&o, &kern, .{ .search_modules = false }));
+}
