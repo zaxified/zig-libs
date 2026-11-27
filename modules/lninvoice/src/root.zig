@@ -103,4 +103,5 @@ test {
     _ = offer;
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("mutation_test.zig");
 }

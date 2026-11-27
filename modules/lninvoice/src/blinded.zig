@@ -53,7 +53,7 @@ pub const HopIterator = struct {
         const b = self.bytes[self.pos..];
         const enclen = std.mem.readInt(u16, b[33..35], .big);
         const hop: Hop = .{ .blinded_node_id = b[0..33].*, .encrypted_recipient_data = b[35..][0..enclen] };
-        self.pos += 35 + enclen;
+        self.pos += 35 + @as(usize, enclen);
         return hop;
     }
 };
@@ -118,7 +118,7 @@ pub const PathIterator = struct {
             if (!validPoint(b[hop_bytes..][0..33])) return error.InvalidPoint;
             const enclen = std.mem.readInt(u16, b[hop_bytes + 33 ..][0..2], .big);
             if (b.len - hop_bytes - 35 < enclen) return error.Truncated;
-            hop_bytes += 35 + enclen;
+            hop_bytes += 35 + @as(usize, enclen);
         }
         const path: Path = .{ .first_node = first, .first_path_key = path_key, .num_hops = num_hops, .hops_raw = b[0..hop_bytes] };
         self.pos += used + hop_bytes;
@@ -200,7 +200,7 @@ pub const PayInfoIterator = struct {
             .htlc_maximum_msat = std.mem.readInt(u64, b[18..26], .big),
             .features = b[28..][0..flen],
         };
-        self.pos += PayInfo.fixed_len + flen;
+        self.pos += PayInfo.fixed_len + @as(usize, flen);
         return info;
     }
 

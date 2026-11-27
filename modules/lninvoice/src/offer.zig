@@ -251,7 +251,7 @@ pub fn encodeOffer(allocator: Allocator, f: OfferFields) BuildError![]u8 {
     if (f.description) |d| try records.append(arena, .{ .type = 10, .value = d });
     if (f.features) |ft| try records.append(arena, .{ .type = 12, .value = ft });
     if (f.absolute_expiry) |e| try records.append(arena, .{ .type = 14, .value = try truncated(arena, e) });
-    if (f.paths) |p| try records.append(arena, .{ .type = 16, .value = p });
+    if (f.paths) |p| if (p.len > 0) try records.append(arena, .{ .type = 16, .value = p });
     if (f.issuer) |i| try records.append(arena, .{ .type = 18, .value = i });
     if (f.quantity_max) |q| try records.append(arena, .{ .type = 20, .value = try truncated(arena, q) });
     if (f.issuer_id) |*id| try records.append(arena, .{ .type = 22, .value = id });

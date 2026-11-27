@@ -6,7 +6,7 @@
 
 **Scope:** core — LDK `lightning-invoice` + `offers` (BOLT#11 and BOLT#12) / lnd `zpay32` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (336/352, 16 eq) · src 89186ea0fb2e4469
+**Audit:** review 2026-09-10 · mutation 2026-11-27 (517/536, 19 eq) · src ec815b7b8b8796fe
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean (`lninvoice-bolt11-sign` at its scale, 10,000), LNINVOICE_FUZZ) · ct n/a — the node key is only forwarded by pointer to `k256` (BOLT#11 ECDSA) and `bip340` (BOLT#12 Schnorr), which carry their own ctgrind rows; invoice fields, signatures and node ids are public (review, 2026-10-10)
 **Performance:** not measured
@@ -293,6 +293,12 @@ are held by these rows.
   invoice fields, signatures and node ids are public.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta
   runs after it.
+- **Delta mutation 2026-11-27 (blinded.zig, offer.zig, the bolt12 accessors):** 184 mutants, 181 killed, 3
+  equivalent (a dead guard, an unreachable disjunct, `paths.len <= 1` under the reader's strictly-increasing TLV
+  rule). It found two defects, fixed: the blinded-path and payinfo iterators summed a u16 length with a constant
+  in u16, so a 65501..65535-byte datum — legal for the writers — panicked the reader in safe builds and wrapped
+  in ReleaseFast; and `encodeOffer` wrote an empty `offer_paths` record its own reader refuses. 9 new tests in
+  `src/mutation_test.zig`, the 65535-byte round trips among them.
 
 ## Secret residue on the dead stack
 
