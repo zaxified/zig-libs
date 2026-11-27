@@ -1287,3 +1287,18 @@ test "parseJwks: deinit wipes the decoded `oct` secret before the arena frees it
     set.deinit();
     try testing.expect(std.mem.indexOf(u8, heap, &secret) == null);
 }
+
+test "parseJwks: deinit of a hand-built set (id 0) leaves its borrowed `oct` key alone (2026-11-27)" {
+    // A hand-built set may borrow its key from memory it does not own (here a
+    // local; in practice possibly a string literal in read-only memory).
+    var key: [32]u8 = @splat(0x5A);
+    const arena = try gpa.create(std.heap.ArenaAllocator);
+    arena.* = .init(gpa);
+    const keys = try arena.allocator().alloc(jwt.Jwk, 1);
+    keys[0] = .{ .key = .{ .hmac = &key }, .kid = "h" };
+    var set: jwt.JwkSet = .{ .keys = keys, .skipped = &.{}, .arena = arena };
+    try testing.expectEqual(@as(u64, 0), set.id);
+    set.deinit();
+    const want: [32]u8 = @splat(0x5A);
+    try testing.expectEqualSlices(u8, &want, &key);
+}

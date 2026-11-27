@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — six tokens golang-jwt v5.3.1 accepts and this module refuses, each on an RFC rule: a `crit` naming an extension the recipient does not process, a `crit` naming a registered parameter, an empty `crit` (RFC 7515 §4.1.11), a signature and a payload segment whose unused base64url bits are set (RFC 7515 §2 with RFC 4648 §3.5: two strings for one token), and duplicate claim names (RFC 7519 §4: reject or take the last; golang-jwt takes the last, this module rejects); out of 81 rows `zig build interop-jwt` judges against golang-jwt, the other 75 agree (test `lead: crit, non-canonical base64url and duplicate claims -- golang-jwt v5.3.1 accepts six tokens this module refuses`, `src/go_oracle_vectors.zig`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-25 (1359/1453, 94 eq) · src 26041d97987192dc
+**Audit:** review 2026-11-12 · mutation 2026-11-27 (1363/1457, 94 eq) · src 4cf12cccbc81d196
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWT_FUZZ) · ct 2026-10-13 (ctgrind: HMAC secrets HS256/384/512 sign + verify accept/reject, ES256/ES384/ES512/EdDSA signing keys, RS256/PS256 rsa secret members tainted; hmac 0 in-file, ec 9 in-file = ES256 8 delegated p256/std signer contexts (9 until 2026-10-13, when p256's `rejectIdentity` went from two jumps to one) (ES384 via p384 and ES512 via p521: 0) + 1 jwt-own `rejectIdentity` on R in the EdDSA signer, rsa 3 in-file = the rsa module's F3 fault-check verdict, one per signature, plus PS256's blinding redraw verdict (rsa, since 2026-10-14); itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-10-28 (independent sweep of every pub entry point: token length cap, `crit` list cap, failed-refresh throttle, total `Claims.claim`, `Provider.init` with no key source is `error.NoKeySource`, a `VerifiedCache` used after deinit is a miss, not a panic)
 
@@ -365,6 +365,9 @@ Not wired into `Provider`/`Guard`/`ResourceServer` — see Backlog.
 - **Delta mutation 2026-11-25:** 17 mutants, 15 killed, 1 equivalent (the cache tag byte only has to differ from the
   any-marker 0), 1 unobservable (the `keyDigest` domain tag matters only with a second use of `mac_key`), 0 open. New
   tests: the cache's issuer / audience any-marker, `identityOf`'s typed slot and its restore.
+- **Delta mutation 2026-11-27 (`parseJwks` burn, `JwkSet.deinit` wipe):** 4 mutants, 4 killed, 0 open. The skipped burn
+  dies in the ReleaseFast STACKPROBE build (burn-presence check of the residue rule); the skipped wipe and the dropped
+  `id != 0` gate die in `audit_test.zig` (fixed-buffer heap read after `deinit`; a hand-built set's borrowed key intact).
 
 ## Performance
 
