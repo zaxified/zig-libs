@@ -258,7 +258,9 @@ fn isAscii(s: []const u8) bool {
 /// `s` in Unicode NFKD (BIP-39 mandates it for the mnemonic and the
 /// passphrase), newly allocated; the caller zeroizes and frees it. ASCII text
 /// is its own NFKD and is copied without touching the normalisation tables.
-fn nfkd(allocator: std.mem.Allocator, s: []const u8) NormalizeError![]u8 {
+/// `noinline`: `mnemonicToEntropyIn` calls it in the frame it burns from, and
+/// the burn reaches only what lies below that frame (rule `burnframe`).
+noinline fn nfkd(allocator: std.mem.Allocator, s: []const u8) NormalizeError![]u8 {
     if (isAscii(s)) return allocator.dupe(u8, s);
     return unitext.normalize(allocator, s, .nfkd, .{}) catch |e| switch (e) {
         error.InvalidUtf8 => error.InvalidUtf8,

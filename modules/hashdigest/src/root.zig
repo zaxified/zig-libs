@@ -393,6 +393,13 @@ pub fn xof(kind: Xof, data: []const u8, out: []u8) void {
 /// BLAKE3 keyed hash (a MAC under a 32-byte key) of `data`, `out.len` bytes of output.
 pub fn blake3Keyed(key: *const [32]u8, data: []const u8, out: []u8) void {
     defer burnStack();
+    blake3KeyedBody(key, data, out);
+}
+
+/// `blake3Keyed`'s body one frame down, so the burn reaches the hasher's
+/// key-derived chaining values (an inlined body would leave them in the
+/// burning frame itself; rule `burnframe`, check-secret-api).
+noinline fn blake3KeyedBody(key: *const [32]u8, data: []const u8, out: []u8) void {
     var k = key.*;
     var h = std.crypto.hash.Blake3.init(.{ .key = k });
     h.update(data);
@@ -405,6 +412,11 @@ pub fn blake3Keyed(key: *const [32]u8, data: []const u8, out: []u8) void {
 /// application-specific `context` string.
 pub fn blake3DeriveKey(context: []const u8, material: []const u8, out: []u8) void {
     defer burnStack();
+    blake3DeriveKeyBody(context, material, out);
+}
+
+/// `blake3DeriveKey`'s body one frame down (see `blake3KeyedBody`).
+noinline fn blake3DeriveKeyBody(context: []const u8, material: []const u8, out: []u8) void {
     var h = std.crypto.hash.Blake3.initKdf(context, .{});
     h.update(material);
     h.final(out);

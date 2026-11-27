@@ -57,6 +57,15 @@ ACCEPTED SHAPES
         // secret-api-ok: <reason>
     with a non-empty reason (same rule as `global-alloc-ok:`).
 
+BURN FRAMES (kind `burnframe`, CONVENTIONS.md §2.1.1 D4, 2026-11-27)
+---------------------------------------------------------------------
+In EVERY function of a module (public or not): one that burns with a
+`defer` in its own body must run its work through `noinline fn`s or
+`@call(.never_inline, ...)` -- an inlined callee leaves its intermediates in
+the burning frame, above the burned region, and whether LLVM inlines depends
+on the consumer's call sites. See `burn_frame_findings`. Exempted per call by
+`// burn-frame-ok: <reason>` on the call's line or directly above it.
+
 MODES
 -----
   check-secret-api.py                    report every finding, exit 1 if any
@@ -466,7 +475,18 @@ class CALL:
         return [a or b for a, b in _CALL.findall(body)]
 
 
+MODULE_FILES = {}
+
+
 def module_files(module):
+    """(src dir, {path: FileInfo}) of a module, parsed once per run (a module is
+    read again as every dependent's dependency)."""
+    if module not in MODULE_FILES:
+        MODULE_FILES[module] = _module_files(module)
+    return MODULE_FILES[module]
+
+
+def _module_files(module):
     src_dir = os.path.join(REPO, "modules", module, "src")
     files = {}
     if not os.path.isdir(src_dir):
@@ -697,7 +717,7 @@ def scan_module(module, want_burned=False):
                 grew = True
     if want_burned:
         return {e[2] for e in entries if e[2] in burned}
-    findings = []
+    findings = burn_frame_findings(module, files, seen)
     for f, fi, name, params, ret, body, pos, public in entries:
         if not public:
             continue
@@ -764,6 +784,164 @@ def scan_module(module, want_burned=False):
     return findings
 
 
+NOINLINE_FN = re.compile(r"\bnoinline\s+fn\s+(\w+)\s*\(")
+DEFER_KW = re.compile(r"(?<![\w.])defer\b")
+FRAME_MARKER = re.compile(r"burn-frame-ok:\s*(\S.*)?$")
+# Calls that put nothing secret in the caller's frame: views over memory the
+# caller already owns, and the wipes themselves.
+FRAME_SAFE_CALLS = WIPE_FNS | {"asBytes", "sliceAsBytes", "asSlice", "bytesAsSlice", "bytesAsValue", "assert"}
+NOINLINE_NAMES = {}  # module -> names declared `noinline fn`
+
+
+def noinline_names(module):
+    if module not in NOINLINE_NAMES:
+        _, files = module_files(module)
+        NOINLINE_NAMES[module] = {n for fi in files.values() for n in NOINLINE_FN.findall(fi.src)}
+    return NOINLINE_NAMES[module]
+
+
+def statement_end(s, i):
+    """End of the statement starting at s[i]: the `;` at depth 0, or the end
+    of a `{...}` block that opens it (`defer { ... }`)."""
+    j = i
+    n = len(s)
+    while j < n and s[j] in " \t\n":
+        j += 1
+    if j < n and s[j] == "{":
+        return match_close(s, j)
+    while j < n:
+        c = s[j]
+        if c in "([{":
+            j = match_close(s, j)
+            continue
+        if c == ";":
+            return j + 1
+        j += 1
+    return n
+
+
+def top_level_defers(body):
+    """Positions of the `defer` keywords directly in the fn body's own block
+    (depth 1), in one pass over the body."""
+    want = [m for m in DEFER_KW.finditer(body)]
+    if not want:
+        return []
+    out, k, d, in_str = [], 0, 0, False
+    for i, c in enumerate(body):
+        while k < len(want) and want[k].start() == i:
+            if d == 1:
+                out.append(want[k])
+            k += 1
+        if k == len(want):
+            break
+        if in_str:
+            if c == '"' or c == "\n":
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            d += 1
+        elif c == "}":
+            d -= 1
+    return out
+
+
+def burn_frame_findings(module, files, deps):
+    """`burnframe`: a function that burns the dead stack with a `defer` in its
+    OWN frame must run its secret-holding work one frame down, through a
+    `noinline fn` (or `@call(.never_inline, ...)`).
+
+    Why (owner decision 2026-11-27): the burn zeroes the stack BELOW the
+    frame it runs in. Whatever an inlined callee leaves in the burning frame
+    itself sits above the burned region and survives. Whether LLVM inlines a
+    plain `fn` there depends on how many call sites the binary has: blindrsa's
+    `blindCore` (not yet `noinline`) was inlined into `blind` in a consumer-
+    shaped build with one call site and left r^-1 17.8 KiB above the burn,
+    while the full test binary, with every call site compiled in, kept it out
+    of line and the stack probe stayed green. A probe cannot cover every
+    consumer's inlining; this rule removes the dependence on it.
+
+    Every call left in such a body (outside the `defer` statements) must be a
+    builtin, a wipe, a view (`asBytes`), a `noinline fn` of the module or of a
+    dependency (by name), or `@call(.never_inline, ...)`. Anything else -- a
+    vtable call that cannot inline, say -- takes `// burn-frame-ok: <reason>`
+    on the call's line or the comment line(s) directly above it."""
+    out = []
+    names = set(noinline_names(module))
+    for d in deps:
+        if os.path.isdir(os.path.join(REPO, "modules", d)):
+            names |= noinline_names(d)
+    for f, fi in files.items():
+        rel = os.path.relpath(f, REPO)
+        for name, _params, _ret, body, pos, _is_pub in all_fns(fi):
+            if not body:
+                continue
+            spans = []
+            burns = False
+            if "defer" not in body:
+                continue
+            for m in top_level_defers(body):
+                e = statement_end(body, m.end())
+                spans.append((m.start(), e))
+                stmt = body[m.end() : e]
+                if BURN.search(stmt):
+                    burns = True
+            if not burns:
+                continue
+            # Blank the defer statements, then look at every call left.
+            rest = list(body)
+            for a, e in spans:
+                for k in range(a, e):
+                    if rest[k] != "\n":
+                        rest[k] = " "
+            rest = "".join(rest)
+            body_line = fi.line_of(pos + fi.src[pos:].find(body))
+            bad = []
+
+            def flag(at, callee):
+                line = body_line + rest.count("\n", 0, at)
+                if frame_marker(fi, line) is None:
+                    bad.append((line, callee))
+
+            for m in TRIVIAL_CALL.finditer(rest):
+                callee = m.group(1)
+                last = callee.rsplit(".", 1)[-1]
+                if last in ("if", "while", "for", "switch", "return", "catch", "orelse", "struct", "union", "enum", "error"):
+                    continue
+                if last in FRAME_SAFE_CALLS or last in names:
+                    continue
+                flag(m.start(), callee)
+            # `@call(.never_inline, f, ...)` passes: TRIVIAL_CALL skips `@call(`
+            # and never sees `f` (no `(` follows it). `.auto`/`.always_inline`
+            # are the same exposure as `f(...)`.
+            for m in re.finditer(r"@call\(\s*\.(?!never_inline\b)\w+\s*,\s*([\w.]+)\s*,", rest):
+                if m.group(1).rsplit(".", 1)[-1] not in names:
+                    flag(m.start(), m.group(1))
+            if not bad:
+                continue
+            qual = ".".join(list(reversed(fi.enclosing(pos))) + [name])
+            out.append((module, rel, bad[0][0], qual, "burnframe", ",".join(sorted({c for _, c in bad}))))
+    return out
+
+
+def frame_marker(fi, line):
+    """`burn-frame-ok:` on raw line `line` or in the comment lines directly above it."""
+    t = fi.raw_lines[line - 1] if line - 1 < len(fi.raw_lines) else ""
+    m = FRAME_MARKER.search(t)
+    if m:
+        return m.group(1) or ""
+    i = line - 2
+    while i >= 0:
+        t = fi.raw_lines[i].strip()
+        if not t.startswith("//"):
+            return None
+        m = FRAME_MARKER.search(t)
+        if m:
+            return m.group(1) or ""
+        i -= 1
+    return None
+
+
 def key(fd):
     module, rel, _line, name, kind, _why = fd
     return f"{module}\t{rel}:{name}\t{kind}"
@@ -787,7 +965,7 @@ HEADER = """\
 # Never add a row by hand to get a new module past the gate: fix the shape,
 # or put `secret-api-ok: <reason>` above the function.
 #
-# module<TAB>file:function<TAB>kind (byval | ret | noburn)
+# module<TAB>file:function<TAB>kind (byval | ret | noburn | burnframe)
 """
 
 

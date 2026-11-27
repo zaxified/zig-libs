@@ -167,10 +167,20 @@ must not survive the call **in any frame** — the library's, std's under it, or
 - A std-shaped by-value surface may stay for compatibility when a safe twin `<name>Into` sits
   beside it; anything else that cannot follow D1–D3 says why in `// secret-api-ok: <reason>`
   directly above the `pub fn`.
+- **D4 — a function that burns in its OWN frame (`defer burn…`) runs its secret work through a
+  `noinline fn` or `@call(.never_inline, …)`** (owner's decision 2026-11-27). The burn zeroes only
+  what lies below the frame it runs in; an inlined callee leaves its intermediates in the burning
+  frame itself, above the burned region. Whether LLVM inlines a plain `fn` there depends on how
+  many call sites the binary has, so a stack probe green in the full test binary can be red in a
+  consumer's build (blindrsa `blindCore`, 2026-11-26: inlined with one call site, r⁻¹ 17.8 KiB
+  above the burn). Outside its `defer` statements such a body calls only builtins, wipes, views
+  (`asBytes`) and `noinline` functions; anything else (an indirect vtable call, a public table
+  lookup) says why in `// burn-frame-ok: <reason>` on or directly above the call's line.
 
 Held by two instruments: `scripts/checks/check-secret-api.py` (static, every gate: finds D1–D3
-violations on the public surface by name and type) and `testkit.stackprobe` (dynamic,
-ReleaseFast: a burn deep enough, no secret input/output left in a frame above it).
+violations on the public surface by name and type, and D4 in every function of the module, kind
+`burnframe`) and `testkit.stackprobe` (dynamic, ReleaseFast: a burn deep enough, no secret
+input/output left in a frame above it).
 
 ### 2.2 Where secret-bearing randomness comes from
 

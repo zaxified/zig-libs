@@ -387,6 +387,7 @@ pub fn blind(
     var salt_buf: [Hash.digest_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &salt_buf);
     const salt = salt_buf[0..salt_len];
+    // burn-frame-ok: an indirect call through `random`'s vtable (never inlined); `salt_buf` is wiped by its own defer.
     random.bytes(salt);
 
     // Steps 5-6 (sample r ∈ [1, n) uniformly, invert it) run inside
@@ -603,6 +604,20 @@ pub fn blindSign(
     // Same reason as `blind`: the secrets that survive are inside `rsa` and
     // `montint`, not in copies this module holds. Runs last. See burnStack.
     defer burnStack(sign_stack_burn);
+    return blindSignBody(sk, pk, random, blinded_msg, out);
+}
+
+/// `blindSign`'s body, one frame down. `noinline` is load-bearing, as for
+/// `blindCore`: the burn runs in `blindSign`'s own frame and zeroes only what
+/// lies below it, so an inlined RSASP1 would leave its intermediates in that
+/// frame, above the burned region (rule `burnframe`, check-secret-api).
+noinline fn blindSignBody(
+    sk: *const rsa.SecretKey,
+    pk: rsa.PublicKey,
+    random: std.Random,
+    blinded_msg: []const u8,
+    out: []u8,
+) BlindSignError![]u8 {
     // `pk` must be sk's public half. A caller-passed value, so a checked
     // verdict rather than an assert (a panic in safe builds, silence in
     // ReleaseFast): sweep BRSA-1. The RSAVP1 self-check below would also catch

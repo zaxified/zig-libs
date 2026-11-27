@@ -460,6 +460,7 @@ fn writeHeader(payload: *[serialized_payload_len]u8, version: u32, depth: u8, pa
 /// (testnet), Base58Check.
 pub fn serializePriv(k: *const ExtendedPrivKey, network: Network, out: []u8) bech32.base58.Error![]const u8 {
     defer burnStack();
+    // burn-frame-ok: a lookup in the public version table; no secret passes through it.
     return serializePrivBody(k, network.privVersion(), out);
 }
 
@@ -468,6 +469,7 @@ pub fn serializePriv(k: *const ExtendedPrivKey, network: Network, out: []u8) bec
 /// `xprv`/`tprv`, i.e. `serializePriv`).
 pub fn serializePrivSlip132(k: *const ExtendedPrivKey, network: Network, script: Slip132Script, out: []u8) bech32.base58.Error![]const u8 {
     defer burnStack();
+    // burn-frame-ok: a lookup in the public version table; no secret passes through it.
     return serializePrivBody(k, slip132Entry(network, script).priv_version, out);
 }
 
@@ -551,6 +553,7 @@ pub fn parseSlip132(s: []const u8, out: *ParsedKey) ParseError!Slip132Entry {
     defer burnStack();
     const version = try parseExtendedBody(s, .slip132, out);
     // The body accepted `version`, so the lookup cannot miss.
+    // burn-frame-ok: a lookup in the public version table; no secret passes through it.
     return slip132Find(version).?.entry;
 }
 
