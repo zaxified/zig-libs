@@ -489,19 +489,19 @@ k256	ReleaseFast	field	1	0	1798731813210e82	4f13cccddea81376
 #                base point, which let LLVM fold `mul`'s per-call table (not
 #                the ECDH binary).
 #   ecdsa 10 -> 11   16/11/5/0 (G7 19a05328, `sign` handles R.x >= n).
-k256	ReleaseFast	mul	1	1	e0969c588c9c93b2	2e85d4bddb851304
-k256	ReleaseFast	comb	1	1	e0969c588c9c93b2	cdfc5773d52775d3
-k256	ReleaseFast	sign	1	11	89a94f2fede67b29	bb06c2ed85209b8d
+k256	ReleaseFast	mul	1	1	21b449730908f1a4	2e85d4bddb851304
+k256	ReleaseFast	comb	1	1	21b449730908f1a4	cdfc5773d52775d3
+k256	ReleaseFast	sign	1	11	388a5b7d8b6f4c44	bb06c2ed85209b8d
 # Zig 0.17.0 (2026-10-18): ecdsa 11 -> 10 (decrease). One of signInner's five own contexts
 # (ecdsa_recover.zig) is gone in the LLVM 22 build; every other context has the same shape (the
 # harness frame now prints as `ctgrind_harness.main`). Normalised --stacks diff vs B0.
-k256	ReleaseFast	ecdsa	1	10	47b9da782decca5d	8ff4812d21149442
+k256	ReleaseFast	ecdsa	1	10	5e68fc2e0dc7a52c	8ff4812d21149442
 # k256 2026-11-21 — the blinded fixed-base paths (`Blinding`, libsecp256k1's context randomisation): scalar/key AND
 # the whole blinding state tainted. combblind = comb's one `rejectIdentityOneBranch` (on the final s·G); the
 # reduction of s + (n − b) is masked integer arithmetic (std's `Scalar.fromBytes64` read 2 more, removed).
-k256	ReleaseFast	combblind	1	1	e0969c588c9c93b2	31b63b5e1ab5d793
-k256	ReleaseFast	signblind	1	11	89a94f2fede67b29	9bb769bcd1b73254
-k256	ReleaseFast	ecdsablind	1	10	47b9da782decca5d	cdc0d7699f169fcf
+k256	ReleaseFast	combblind	1	1	21b449730908f1a4	31b63b5e1ab5d793
+k256	ReleaseFast	signblind	1	11	388a5b7d8b6f4c44	9bb769bcd1b73254
+k256	ReleaseFast	ecdsablind	1	10	5e68fc2e0dc7a52c	cdc0d7699f169fcf
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
@@ -2282,38 +2282,38 @@ aaa-gate	ReleaseFast	basic	2	2	bd21a4110f480c21	3e1202ab86ba6261
 # the `timing_safe.eql` derived-public-key == stored-public-key check, which reveals only that
 # the key is inconsistent). rsa 2: rsa module's blinding pair redraw verdict
 # (~2^-1023) and its Bellcore fault-check verdict `m^e == c`; both are the rsa module's.
-tls13	ReleaseFast	ks256	1	0	4a8e2214d8ea3211	18a96cec5170f807
-tls13	ReleaseFast	ks384	1	0	4a8e2214d8ea3211	db1fe2ab079078cc
-tls13	ReleaseFast	x25519_shared	1	0	e7ce7c117c556460	d94c3e5680258153
-tls13	ReleaseFast	x25519_server	1	0	e7ce7c117c556460	a919bb6546cae368
-tls13	ReleaseFast	p256_shared	1	3	e7ce7c117c556460	5a6d8909c5c9f606
-tls13	ReleaseFast	p256_server	1	6	e7ce7c117c556460	67961397c7d98630
-tls13	ReleaseFast	p384_shared	1	0	e7ce7c117c556460	45045869c00fe557
-tls13	ReleaseFast	p384_server	1	2	e7ce7c117c556460	26b0ae6910184a6a
-tls13	ReleaseFast	p521_shared	1	0	e7ce7c117c556460	9ec5a4f021d54e9f
-tls13	ReleaseFast	p521_server	1	2	e7ce7c117c556460	6e20f5c6c27ede32
-tls13	ReleaseFast	x25519mlkem768_shared	1	0	e7ce7c117c556460	6b26c450a8a3715f
-tls13	ReleaseFast	x25519mlkem768_server	1	0	e7ce7c117c556460	3335c00d4dcdf9e5
-tls13	ReleaseFast	p256mlkem768_shared	1	3	e7ce7c117c556460	0562298b6b4ed1d7
-tls13	ReleaseFast	p256mlkem768_server	1	6	e7ce7c117c556460	6ad88ed04597333d
-tls13	ReleaseFast	p384mlkem1024_shared	1	0	e7ce7c117c556460	bcd570a3852296cd
-tls13	ReleaseFast	p384mlkem1024_server	1	2	e7ce7c117c556460	6d80f51094ad54d8
-tls13	ReleaseFast	mlkem1024_shared	1	0	e7ce7c117c556460	6a1d3611f8476fd8
-tls13	ReleaseFast	mlkem1024_server	1	0	e7ce7c117c556460	19e46831cc1a1cf5
-tls13	ReleaseFast	mlkem512_shared	1	0	e7ce7c117c556460	a9ce49823000523b
-tls13	ReleaseFast	mlkem512_server	1	0	e7ce7c117c556460	9472e04fd5f89f9f
-tls13	ReleaseFast	mlkem768_shared	1	0	e7ce7c117c556460	7792a1c40c30279b
-tls13	ReleaseFast	mlkem768_server	1	0	e7ce7c117c556460	8b8273e3bd568f8c
-tls13	ReleaseFast	ffdhe2048_shared	1	1	d4d0a2c477cfb996	d26f953a2378a42e
-tls13	ReleaseFast	ffdhe2048_server	1	2	d4d0a2c477cfb996	1e89b555c395bc7c
-tls13	ReleaseFast	ffdhe3072_shared	1	1	d4d0a2c477cfb996	10318e7476d44855
-tls13	ReleaseFast	ffdhe3072_server	1	2	d4d0a2c477cfb996	727fe78e6b3b4f10
+tls13	ReleaseFast	ks256	1	0	7d96da694fc1e49c	18a96cec5170f807
+tls13	ReleaseFast	ks384	1	0	7d96da694fc1e49c	db1fe2ab079078cc
+tls13	ReleaseFast	x25519_shared	1	0	744d59b89491d5d8	d94c3e5680258153
+tls13	ReleaseFast	x25519_server	1	0	744d59b89491d5d8	a919bb6546cae368
+tls13	ReleaseFast	p256_shared	1	3	744d59b89491d5d8	5a6d8909c5c9f606
+tls13	ReleaseFast	p256_server	1	6	744d59b89491d5d8	67961397c7d98630
+tls13	ReleaseFast	p384_shared	1	0	744d59b89491d5d8	45045869c00fe557
+tls13	ReleaseFast	p384_server	1	2	744d59b89491d5d8	26b0ae6910184a6a
+tls13	ReleaseFast	p521_shared	1	0	744d59b89491d5d8	9ec5a4f021d54e9f
+tls13	ReleaseFast	p521_server	1	2	744d59b89491d5d8	6e20f5c6c27ede32
+tls13	ReleaseFast	x25519mlkem768_shared	1	0	744d59b89491d5d8	6b26c450a8a3715f
+tls13	ReleaseFast	x25519mlkem768_server	1	0	744d59b89491d5d8	3335c00d4dcdf9e5
+tls13	ReleaseFast	p256mlkem768_shared	1	3	744d59b89491d5d8	0562298b6b4ed1d7
+tls13	ReleaseFast	p256mlkem768_server	1	6	744d59b89491d5d8	6ad88ed04597333d
+tls13	ReleaseFast	p384mlkem1024_shared	1	0	744d59b89491d5d8	bcd570a3852296cd
+tls13	ReleaseFast	p384mlkem1024_server	1	2	744d59b89491d5d8	6d80f51094ad54d8
+tls13	ReleaseFast	mlkem1024_shared	1	0	744d59b89491d5d8	6a1d3611f8476fd8
+tls13	ReleaseFast	mlkem1024_server	1	0	744d59b89491d5d8	19e46831cc1a1cf5
+tls13	ReleaseFast	mlkem512_shared	1	0	744d59b89491d5d8	a9ce49823000523b
+tls13	ReleaseFast	mlkem512_server	1	0	744d59b89491d5d8	9472e04fd5f89f9f
+tls13	ReleaseFast	mlkem768_shared	1	0	744d59b89491d5d8	7792a1c40c30279b
+tls13	ReleaseFast	mlkem768_server	1	0	744d59b89491d5d8	8b8273e3bd568f8c
+tls13	ReleaseFast	ffdhe2048_shared	1	1	85a004276ce47ecb	d26f953a2378a42e
+tls13	ReleaseFast	ffdhe2048_server	1	2	85a004276ce47ecb	1e89b555c395bc7c
+tls13	ReleaseFast	ffdhe3072_shared	1	1	85a004276ce47ecb	10318e7476d44855
+tls13	ReleaseFast	ffdhe3072_server	1	2	85a004276ce47ecb	727fe78e6b3b4f10
 # 2026-11-01 — sign_p256 23 -> 10: p256 `fromStd` declassifies r/s (the published signature), so the toDer / memcpy / trimStart contexts on the signature length are gone. Left (--stacks): 5 Scalar.fromBytes (std pcurves common.zig `fromBytes`, deterministicScalar range loop), 2 finalizePrehashed r/s == 0 verdicts (ecdsa.zig), 1 comb group.zig, 2 p256 sign.zig (scalarInRange verdict on the key).
-tls13	ReleaseFast	sign_p256	1	10	f799d1235dcd75ff	8a465d8b96fa4da8
-tls13	ReleaseFast	sign_p384	1	0	f799d1235dcd75ff	13a390049cce9da1
-tls13	ReleaseFast	sign_p521	1	0	f799d1235dcd75ff	08857000a3012635
-tls13	ReleaseFast	sign_ed25519	1	0	f799d1235dcd75ff	8b5e38c1062658b2
-tls13	ReleaseFast	sign_rsa	1	2	f799d1235dcd75ff	15b034e3d63aca72
+tls13	ReleaseFast	sign_p256	1	10	97a3ff8a44e665ab	8a465d8b96fa4da8
+tls13	ReleaseFast	sign_p384	1	0	97a3ff8a44e665ab	13a390049cce9da1
+tls13	ReleaseFast	sign_p521	1	0	97a3ff8a44e665ab	08857000a3012635
+tls13	ReleaseFast	sign_ed25519	1	0	97a3ff8a44e665ab	8b5e38c1062658b2
+tls13	ReleaseFast	sign_rsa	1	2	97a3ff8a44e665ab	15b034e3d63aca72
 
 # mlkem — added 2026-11-01. d‖z (keygen), m (encaps), dk + ciphertext (decaps)
 # tainted; every in-file count is an exact 0. rho is declassified inside
@@ -2604,10 +2604,10 @@ tlsserver	ReleaseFast	hs	1	22	60af83745b8ab0b4	18b712e147be54c3	cpu=x86_64
 tlsserver	ReleaseFast	ech	1	442	60af83745b8ab0b4	c257fcbb1b68d8df	cpu=x86_64
 wireguard	ReleaseFast	handshake	1	13	e3bba5e674102f92	40f18e84501394fa	cpu=x86_64
 wireguard	ReleaseFast	tunnel	1	14	e3bba5e674102f92	8f458611fc103bea	cpu=x86_64
-tls13	ReleaseFast	x25519_shared	1	1	e7ce7c117c556460	d94c3e5680258153	cpu=x86_64
-tls13	ReleaseFast	x25519_server	1	1	e7ce7c117c556460	a919bb6546cae368	cpu=x86_64
-tls13	ReleaseFast	x25519mlkem768_shared	1	1	e7ce7c117c556460	6b26c450a8a3715f	cpu=x86_64
-tls13	ReleaseFast	x25519mlkem768_server	1	1	e7ce7c117c556460	3335c00d4dcdf9e5	cpu=x86_64
+tls13	ReleaseFast	x25519_shared	1	1	744d59b89491d5d8	d94c3e5680258153	cpu=x86_64
+tls13	ReleaseFast	x25519_server	1	1	744d59b89491d5d8	a919bb6546cae368	cpu=x86_64
+tls13	ReleaseFast	x25519mlkem768_shared	1	1	744d59b89491d5d8	6b26c450a8a3715f	cpu=x86_64
+tls13	ReleaseFast	x25519mlkem768_server	1	1	744d59b89491d5d8	3335c00d4dcdf9e5	cpu=x86_64
 #
 # S -- code shape, same verdicts at one more or fewer site (portable vs native --stacks diff,
 # 2026-11-18): acme keycodec der.zig `expect`/parseEcInner +1..2, scalarInRange -4; webhooksig encodeMac
