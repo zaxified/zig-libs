@@ -6,7 +6,7 @@
 
 **Scope:** core — blst v0.3.17 (surveyed 2026-10-06; raised from mvp 2026-10-06 when all six ciphersuites, batch verification, EIP-2333 and the G1/G2 MSM landed)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-20 (60/64, 4 eq) · src a73ca5ee40f9ca79
+**Audit:** review 2026-09-09 · mutation 2026-11-27 (217/229, 12 eq) · src b1a9d26c5060ad7a
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BLS12_381_FUZZ; codec at 1/10, sign-verify at 1/200 of it) · ct 2026-10-02 (ctgrind)
 
@@ -890,6 +890,12 @@ supranational/blst as a black box and emits `src/blst_vectors.zig`).
   passes it needs a `GT` discrete log. The checks stay as the draft's MUST.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
   mutation run and the delta runs after it.
+- **Delta mutation 2026-11-27 (code since the 2026-11-20 card: MSM, subgroup checks, scalar-mul burns):**
+  165 mutants, 157 killed, 4 equivalent (cost-only MSM window and bucket sizing, the Jacobian/batch-affine
+  threshold, bucket layout slack), 4 unobservable (an extra top window no Fr scalar reaches; a y = 0 point,
+  which neither group has since #E(Fp) and #E'(Fp2) are odd; the two `secureZero`s inside a body that
+  `burn.run` already zeroes). The burn-skip mutants die in the ReleaseFast stack probe. New test in
+  `msm.zig`: the batch-affine rounds with `min_pairs = 0` (the mutant hung).
 
 ## What is deliberately not done
 

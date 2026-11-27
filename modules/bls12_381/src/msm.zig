@@ -749,3 +749,20 @@ test "bench: msm, Jacobian vs batch-affine bucket accumulation (opt-in BLS12_381
         }
     }
 }
+
+test "mutation 2026-11-27: the affine bucket rounds terminate for min_pairs = 0 (at least one pair is needed to batch)" {
+    const n = 24;
+    var points: [n]g1.Affine = undefined;
+    var scalars: [n]Fr = undefined;
+    var prng = std.Random.DefaultPrng.init(0x0c0ffee);
+    for (&points, &scalars) |*p, *s| {
+        var wide: [64]u8 = undefined;
+        prng.random().bytes(&wide);
+        s.* = Fr.reduceWide(&wide);
+        prng.random().bytes(&wide);
+        p.* = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(Fr.reduceWide(&wide)).toAffine();
+    }
+    const got = (try msmWith(g1, testing.allocator, &points, &scalars, .{ .min_n = 0, .min_pairs = 0 })).toAffine();
+    const want = naive(g1, &points, &scalars).toAffine();
+    try testing.expectEqual(g1.toBytesCompressed(want), g1.toBytesCompressed(got));
+}
