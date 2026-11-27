@@ -756,8 +756,9 @@ pub fn isTempOf(name: []const u8, base: []const u8) bool {
 /// of `text` that must give back the model it was written from.
 fn checkReloads(gpa: Allocator, text: []const u8, pkg: *const Package, max_bytes: usize) (StoreError)!void {
     if (text.len > max_bytes or text.len > root.max_input_len) return error.FileTooLarge;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line| if (line.len > root.max_line_len) return error.WouldNotReload;
+    // No line-length loop of its own: the parse below applies `parse`'s rule
+    // (a CR before LF not counted). A separate loop here counted the CR and
+    // refused a text both `serialize` and `parse` accept (2026-11-27).
     var back = root.parse(gpa, text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.WouldNotReload,
@@ -895,4 +896,13 @@ inline fn recStep(s: Step) void {
         crash_hook.steps[crash_hook.n_steps] = s;
         crash_hook.n_steps += 1;
     }
+}
+
+test "classify: every permission-class error is denied, a missing path is absent (2026-11-27)" {
+    try std.testing.expectEqual(Class.denied, classify(error.AccessDenied));
+    try std.testing.expectEqual(Class.denied, classify(error.PermissionDenied));
+    try std.testing.expectEqual(Class.denied, classify(error.ReadOnlyFileSystem));
+    try std.testing.expectEqual(Class.absent, classify(error.FileNotFound));
+    try std.testing.expectEqual(Class.absent, classify(error.NotDir));
+    try std.testing.expectEqual(Class.other, classify(error.SystemResources));
 }

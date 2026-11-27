@@ -157,6 +157,7 @@ test {
     _ = batch;
     _ = @import("store_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("mutation_test.zig");
     // External anchor: the real libuci's model of 465 inputs and of this
     // module's serialization of them (tools/interop.zig), replayed offline.
     _ = @import("libuci_oracle_test.zig");
