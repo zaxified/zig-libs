@@ -18,7 +18,9 @@
 //!     for a malformed, unknown, expired or wrong-audience one; 403
 //!     `error="insufficient_scope", scope="…"` for a valid token without
 //!     `required_scopes` or the scopes `scope_for` names for this operation;
-//!     500 when the verifier itself fails;
+//!     every challenge (the 401s too) carries `scope="…"` when scopes are
+//!     required, as RFC 6750 §3 allows, so a client learns what to ask for
+//!     on its first try; 500 when the verifier itself fails;
 //!   - passes the token's `mcp.AuthInfo` to every handler of the request
 //!     (`call.auth`), through `router.Ctx.setTyped`. A middleware of the
 //!     caller's own that stores an `mcp.AuthInfo` the same way is forwarded too.

@@ -3260,6 +3260,7 @@ test {
     _ = modern;
     _ = sidhex;
     _ = @import("sdk_oracle.zig");
+    _ = @import("mutation_test.zig");
 }
 
 /// A POST with arbitrary extra header lines (each ending `\r\n`).
@@ -4842,6 +4843,434 @@ test "localhost_protection: a loopback peer with a foreign Host is 403, with a l
     }
 }
 
+/// `runWire` with a socket peer address on the connection.
+fn runWireFrom(r: *router.Router, peer: std.Io.net.IpAddress, bytes: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [4096]u8 = undefined;
+    var request_body_buf: [4096]u8 = undefined;
+    var response_body_buf: [8192]u8 = undefined;
+    var chunk_buf: [256]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = r.handler(),
+        .context = r,
+        .server_name = null,
+        .peer = peer,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "mutation 2026-11-27: localhost_protection judges loopback peers only; a public peer is not Host-checked" {
+    // The doc on `Transport.localhost_protection`: a request from a loopback
+    // address must carry a loopback Host; "requests from other addresses ...
+    // are not checked". The wire test above only has loopback peers.
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    const foreign = std.fmt.comptimePrint("POST /mcp HTTP/1.1\r\nHost: public.example\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ json.len, json });
+    const cases = [_]struct { []const u8, u16 }{
+        .{ "192.0.2.7", 200 }, // a public peer: not judged
+        .{ "127.0.0.1", 403 }, // a loopback peer naming a foreign host: rebinding
+        .{ "::1", 403 },
+        .{ "2001:db8::7", 200 },
+    };
+    for (cases) |c| {
+        var buf: [4096]u8 = undefined;
+        const peer = try std.Io.net.IpAddress.parse(c[0], 4242);
+        try testing.expectEqual(@as(?u16, c[1]), statusOf(runWireFrom(&r, peer, foreign, &buf)));
+    }
+}
+
+test "mutation 2026-11-27: a Sessions.create that fails after the tag was indexed leaves no tag behind" {
+    // Every allocation of `create` fails once in turn. The first session's
+    // peer handle is 1 (the sequence counts from 1): after a failed create
+    // no push by that handle may find a session, or `by_tag` holds a pointer
+    // to freed memory.
+    var k: usize = 0;
+    var failed: usize = 0;
+    while (k < 10) : (k += 1) {
+        var fa: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = k });
+        var sessions = Sessions.init(fa.allocator());
+        defer sessions.deinit();
+        if (sessions.create()) |_| {} else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            failed += 1;
+            try testing.expect(!try sessions.pushTag(1, "{}"));
+        }
+    }
+    try testing.expect(failed >= 4); // the id, the session, the tag index, the table
+}
+
+test "mutation 2026-11-27: a push whose buffer growth fails consumes no event id" {
+    // The event id is a resumption cursor (`Last-Event-ID`): an id handed
+    // out for an event that was never stored would leave a hole in the
+    // sequence the client replays from.
+    var fa: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var sessions = Sessions.init(fa.allocator());
+    defer sessions.deinit();
+    const created = try sessions.create();
+    fa.fail_index = fa.alloc_index + 1; // the copy of the data succeeds, the buffer growth fails
+    try testing.expectError(error.OutOfMemory, sessions.push(created.id, "{\"n\":0}"));
+    fa.fail_index = std.math.maxInt(usize);
+    try testing.expect(try sessions.push(created.id, "{\"n\":1}"));
+    const s = sessions.map.get(created.id).?;
+    try testing.expectEqual(@as(usize, 1), s.events.items.len);
+    try testing.expectEqual(@as(u64, 1), s.events.items[0].id);
+    try testing.expectEqualStrings("{\"n\":1}", s.events.items[0].data);
+}
+
+fn sessionGone(p: HeldProbe) bool {
+    return !p.s.exists(p.sid);
+}
+
+test "mutation 2026-11-27: a held GET with a queue allowance of 0 is still held (the allowance is at least one byte)" {
+    var rig: HeldGetRig = undefined;
+    if (!try rig.start(testing.allocator, true)) return error.SkipZigTest;
+    defer rig.stop();
+    const io = rig.live.io();
+    rig.transport.listen_queue_bytes = 0;
+    const created = try rig.sessions.create();
+    var wbuf: [256]u8 = undefined;
+    const stream = try rig.live.connect();
+    defer stream.close(io);
+    try sendAll(io, stream, getWire(&wbuf, created.id, null));
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = true }, heldIs);
+    sleepMs(io, 150);
+    try testing.expect(rig.sessions.heldNow(created.id).?);
+    rig.sessions.close(created.id);
+    var buf: [1024]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, readToEnd(io, stream, &buf), "HTTP/1.1 200"));
+}
+
+test "mutation 2026-11-27: an event that overflows the held GET's queue ends that stream; the client replays on reconnect" {
+    var rig: HeldGetRig = undefined;
+    if (!try rig.start(testing.allocator, true)) return error.SkipZigTest;
+    defer rig.stop();
+    const io = rig.live.io();
+    rig.transport.listen_queue_bytes = 16;
+    const created = try rig.sessions.create();
+    var wbuf: [256]u8 = undefined;
+    const stream = try rig.live.connect();
+    defer stream.close(io);
+    try sendAll(io, stream, getWire(&wbuf, created.id, null));
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = true }, heldIs);
+    // Documented on `Transport.listen_queue_bytes` / the delivery model: the queue overflowing ENDS the stream.
+    var big_buf: [256]u8 = undefined;
+    const big = std.mem.print(&big_buf, "{{\"n\":\"{s}\"}}", .{&@as([200]u8, @splat('x'))}) catch unreachable;
+    try testing.expect(try rig.sessions.push(created.id, big));
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = false }, heldIs);
+    // The event is in the replay buffer for the reconnect.
+    var wbuf2: [256]u8 = undefined;
+    const again = try rig.live.connect();
+    defer again.close(io);
+    try sendAll(io, again, getWire(&wbuf2, created.id, null));
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = true }, heldIs);
+    rig.sessions.close(created.id);
+    var buf: [2048]u8 = undefined;
+    try testing.expect(std.mem.find(u8, readToEnd(io, again, &buf), "id: 1\n") != null);
+}
+
+test "mutation 2026-11-27: a GET on a session already marked closing drains what is queued, ends, and forgets the session" {
+    var rig: HeldGetRig = undefined;
+    if (!try rig.start(testing.allocator, true)) return error.SkipZigTest;
+    defer rig.stop();
+    const io = rig.live.io();
+    const created = try rig.sessions.create();
+    try testing.expect(try rig.sessions.push(created.id, "{\"n\":1}"));
+    rig.sessions.close(created.id);
+    var wbuf: [256]u8 = undefined;
+    const stream = try rig.live.connect();
+    defer stream.close(io);
+    try sendAll(io, stream, getWire(&wbuf, created.id, null));
+    var buf: [2048]u8 = undefined;
+    const got = readToEnd(io, stream, &buf); // returns: the stream is not held open
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.find(u8, got, "data: {\"n\":1}") != null);
+    try waitFor(io, HeldProbe{ .s = &rig.sessions, .sid = created.id, .want = false }, sessionGone);
+}
+
+test "mutation 2026-11-27: the RFC 9728 document is cacheable and its 405 names the allowed method" {
+    const gpa = testing.allocator;
+    var server = try buildAuthServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .auth = &test_mcp_auth };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var b0: [4096]u8 = undefined;
+    const md = runWire(&r, "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", &b0);
+    try testing.expectEqual(@as(?u16, 200), statusOf(md));
+    try testing.expectEqualStrings("application/json", headerValue(md, "content-type").?);
+    try testing.expectEqualStrings("max-age=3600", headerValue(md, "cache-control").?);
+    var b1: [4096]u8 = undefined;
+    const bad = runWire(&r, post("/.well-known/oauth-protected-resource/mcp", "{}"), &b1);
+    try testing.expectEqual(@as(?u16, 405), statusOf(bad));
+    // RFC 9110 section 15.5.6: a 405 MUST carry Allow.
+    try testing.expectEqualStrings("GET", headerValue(bad, "allow").?);
+}
+
+test "mutation 2026-11-27: attachHold: one held stream per session, detachHold clears only its own hold, closing is reported both ways" {
+    var sessions = Sessions.init(testing.allocator);
+    defer sessions.deinit();
+    const created = try sessions.create();
+    try testing.expect(try sessions.push(created.id, "{\"n\":1}"));
+    try testing.expect(try sessions.push(created.id, "{\"n\":2}"));
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var h1: http.Server.Hold = .{};
+    var h2: http.Server.Hold = .{};
+    var replay: std.ArrayList(Sessions.StoredEvent) = .empty;
+    const first = try sessions.attachHold(created.id, &h1, 1, arena, &replay);
+    try testing.expect(first == .ok);
+    try testing.expect(!first.ok.closing);
+    // Only the events AFTER Last-Event-ID 1.
+    try testing.expectEqual(@as(usize, 1), replay.items.len);
+    try testing.expectEqual(@as(u64, 2), replay.items[0].id);
+    const s = sessions.map.get(created.id).?;
+    try testing.expect(s.held == &h1);
+    // A second stream while the first one's peer is still there: conflict, nothing replaced.
+    var replay2: std.ArrayList(Sessions.StoredEvent) = .empty;
+    try testing.expect((try sessions.attachHold(created.id, &h2, 0, arena, &replay2)) == .conflict);
+    try testing.expectEqual(@as(usize, 0), replay2.items.len);
+    try testing.expect(s.held == &h1);
+    // Detaching a hold that is not the held one changes nothing.
+    try testing.expect(!sessions.detachHold(created.id, &h2));
+    try testing.expect(s.held == &h1);
+    try testing.expect(!sessions.detachHold(created.id, &h1));
+    try testing.expect(s.held == null);
+    // A session marked closing is reported by attach and by detach.
+    s.closing = true;
+    var replay3: std.ArrayList(Sessions.StoredEvent) = .empty;
+    const third = try sessions.attachHold(created.id, &h1, 0, arena, &replay3);
+    try testing.expect(third == .ok and third.ok.closing);
+    try testing.expect(sessions.detachHold(created.id, &h1));
+    // An unknown session.
+    try testing.expect((try sessions.attachHold("nope", &h1, 0, arena, &replay3)) == .unknown);
+    try testing.expect(!sessions.detachHold("nope", &h1));
+}
+
+test "mutation 2026-11-27: the listen sink writes whole lines to the session of its peer and starts every call clean" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var listens = Listens.init(gpa);
+    defer listens.deinit();
+    const a = try sessions.create();
+    const b = try sessions.create();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions, .listens = &listens };
+    const sink = transport.pushSink();
+    // No such peer, no writer.
+    try testing.expect(sink.writerFor(sink.ctx, 424242) == null);
+    const w = sink.writerFor(sink.ctx, a.tag).?;
+    // Two lines in one write (CRLF and LF), then a line split over a vectored write.
+    try w.writeAll("{\"a\":1}\r\n{\"b\":2}\n");
+    var parts = [_][]const u8{ "{\"c\":", "3}\n" };
+    try w.writeVecAll(&parts);
+    const sa = sessions.map.get(a.id).?;
+    try testing.expectEqual(@as(usize, 3), sa.events.items.len);
+    try testing.expectEqualStrings("{\"a\":1}", sa.events.items[0].data);
+    try testing.expectEqualStrings("{\"b\":2}", sa.events.items[1].data);
+    try testing.expectEqualStrings("{\"c\":3}", sa.events.items[2].data);
+    // Half a line left by one call is dropped when the next call starts, for any peer.
+    try w.writeAll("{\"stale\":");
+    const w2 = sink.writerFor(sink.ctx, b.tag).?;
+    try w2.writeAll("{\"d\":4}\n");
+    const sb = sessions.map.get(b.id).?;
+    try testing.expectEqual(@as(usize, 1), sb.events.items.len);
+    try testing.expectEqualStrings("{\"d\":4}", sb.events.items[0].data);
+    try testing.expectEqual(@as(usize, 3), sa.events.items.len);
+    // The peer ends between the sink's lookup and a write: the write fails.
+    _ = sessions.destroy(b.id);
+    try testing.expectError(error.WriteFailed, w2.writeAll("{\"e\":5}\n"));
+}
+
+var outer_info_restored: bool = false;
+
+fn restoreProbeMiddleware(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    var info: mcp.AuthInfo = .{ .client_id = "outer" };
+    const prev = try ctx.setTyped(mcp.AuthInfo, &info);
+    defer _ = ctx.setTyped(mcp.AuthInfo, prev) catch {};
+    try next.run(ctx);
+    outer_info_restored = if (ctx.getTyped(mcp.AuthInfo)) |p| @intFromPtr(p) == @intFromPtr(&info) else false;
+}
+
+test "mutation 2026-11-27: the gate puts back the AuthInfo it found when the request is done" {
+    const gpa = testing.allocator;
+    var server = try buildAuthServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .auth = &test_mcp_auth };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(.{ .run = restoreProbeMiddleware });
+    try r.use(transport.middleware());
+    outer_info_restored = false;
+    var b: [4096]u8 = undefined;
+    const got = runWire(&r, postHeaders("Authorization: Bearer good\r\n", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}}"), &b);
+    try testing.expect(std.mem.find(u8, got, "cli-9") != null);
+    try testing.expect(outer_info_restored);
+}
+
+test "mutation 2026-11-27: with Transport.listens set, only subscriptions/listen is held; a tools/call is served as usual" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var listens = Listens.init(gpa);
+    defer listens.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .listens = &listens };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var buf: [8192]u8 = undefined;
+    const got = runWire(&r, postHeaders(modern_call_headers ++ "Accept: application/json, text/event-stream\r\n", modern_call_body), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expectEqualStrings("application/json", headerValue(got, "content-type").?);
+    try testing.expect(std.mem.find(u8, bodyOf(got), "\"resultType\":\"complete\"") != null);
+    try testing.expectEqual(@as(usize, 0), listens.count());
+}
+
+fn countOf(hay: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.find(u8, hay[from..], needle)) |i| : (from += i + needle.len) n += 1;
+    return n;
+}
+
+test "mutation 2026-11-27: with Transport.listens and no connection to hold, a listen is the acknowledgment and ONE graceful close, nothing left registered" {
+    const gpa = testing.allocator;
+    for ([_]bool{false}) |push_on| {
+        var server = try buildServer(gpa);
+        defer server.deinit();
+        server.push = push_on;
+        var listens = Listens.init(gpa);
+        defer listens.deinit();
+        var transport = Transport{ .gpa = gpa, .server = &server, .listens = &listens };
+        var r = router.Router.init(gpa);
+        defer r.deinit();
+        try r.use(transport.middleware());
+        var buf: [8192]u8 = undefined;
+        const got = runWire(&r, listen_wire, &buf);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+        try testing.expectEqualStrings("text/event-stream", headerValue(got, "content-type").?);
+        const ack = std.mem.find(u8, got, "notifications/subscriptions/acknowledged").?;
+        const done = std.mem.find(u8, got, "\"id\":\"listen-1\",\"result\"").?;
+        try testing.expect(ack < done);
+        // The graceful close once, however the listen ended (subscriptions.mdx "Graceful Closure").
+        try testing.expectEqual(@as(usize, 1), countOf(got, "\"id\":\"listen-1\",\"result\""));
+        try testing.expectEqual(@as(usize, 0), listens.count());
+        // The listen's private peer is forgotten: no subscription state survives the request.
+        try testing.expectEqual(@as(usize, 0), server.peers.items.len);
+    }
+}
+
+test "mutation 2026-11-27: the drain-and-close GET of a session marked closing sends what is queued, ends, and forgets the session" {
+    // `Sessions.close`: "its next GET drains what is queued and ends".
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    const created = try sessions.create();
+    try testing.expect(try sessions.push(created.id, "{\"n\":1}"));
+    sessions.close(created.id);
+    var wbuf: [256]u8 = undefined;
+    var buf: [4096]u8 = undefined;
+    const got = runWire(&r, getWithSession(&wbuf, created.id, null), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(std.mem.find(u8, got, "data: {\"n\":1}") != null);
+    try testing.expect(!sessions.exists(created.id));
+}
+
+test "mutation 2026-11-27: with Transport.listens set, closing the connection of a tools/call still cancels it" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{ .name = "slow", .description = "waits for cancellation", .input_schema = "{\"type\":\"object\"}", .handler = slowTool });
+    var listens = Listens.init(gpa);
+    defer listens.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .listens = &listens };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+    slow_started.store(false, .release);
+    slow_saw_cancel.store(false, .release);
+    var wire_buf: [1024]u8 = undefined;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{}," ++ modern_meta ++ "}}";
+    const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: slow\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    const stream = try live.connect();
+    try sendAll(io, stream, wire);
+    try waitFor(io, {}, slowStarted);
+    stream.close(io);
+    var waited: u32 = 0;
+    while (!slow_saw_cancel.load(.acquire) and waited < 4000) : (waited += 2) sleepMs(io, 2);
+    try testing.expect(slow_saw_cancel.load(.acquire));
+}
+
+fn scopeByTarget(_: ?*anyopaque, op: auth.Operation) []const []const u8 {
+    // Only the tool named `whoami` needs the tools scope; the method does not matter.
+    if (op.target) |t| if (std.mem.eql(u8, t, "whoami")) return auth_scopes[1..2];
+    return &.{};
+}
+
+test "mutation 2026-11-27: scope_for is asked about the target; every response path hands the token's AuthInfo to the tool" {
+    const gpa = testing.allocator;
+    var server = try buildAuthServer(gpa);
+    defer server.deinit();
+    var gate = test_mcp_auth;
+    gate.scope_for = scopeByTarget;
+    var transport = Transport{ .gpa = gpa, .server = &server, .auth = &gate };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    const whoami = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}}}";
+    const echo = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"x\":1}}}";
+    var buf: [8192]u8 = undefined;
+    // The target decides: a read-only token is refused whoami and served echo.
+    const refused = runWire(&r, postHeaders("Authorization: Bearer readonly\r\n", whoami), &buf);
+    try testing.expectEqual(@as(?u16, 403), statusOf(refused));
+    var buf2: [8192]u8 = undefined;
+    const served = runWire(&r, postHeaders("Authorization: Bearer readonly\r\n", echo), &buf2);
+    try testing.expectEqual(@as(?u16, 200), statusOf(served));
+
+    // Legacy JSON, legacy SSE, 2026-07-28 JSON and 2026-07-28 SSE: the tool sees the caller.
+    const modern_whoami = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{}," ++ modern_meta ++ "}}";
+    const modern_h = "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: whoami\r\nAuthorization: Bearer good\r\n";
+    const wires = [_][]const u8{
+        postHeaders("Authorization: Bearer good\r\n", whoami),
+        postHeaders("Authorization: Bearer good\r\nAccept: text/event-stream\r\n", whoami),
+        postHeaders(modern_h, modern_whoami),
+        postHeaders(modern_h ++ "Accept: text/event-stream\r\n", modern_whoami),
+    };
+    for (wires) |w| {
+        var b: [8192]u8 = undefined;
+        const got = runWire(&r, w, &b);
+        try testing.expectEqual(@as(?u16, 200), statusOf(got));
+        try testing.expect(std.mem.find(u8, got, "cli-9") != null);
+    }
+}
+
 fn ownAuthMiddleware(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     var info: mcp.AuthInfo = .{ .client_id = "from-my-gate" };
     const prev = try ctx.setTyped(mcp.AuthInfo, &info);
@@ -4944,4 +5373,143 @@ test "fuzz driver: MCP_HTTP_FUZZ (auth)" {
 
 test "fuzz harness: auth, 400 seeds, reaches every outcome" {
     try AuthMark.reach(fuzzAuth, "mcp-http-auth", 400);
+}
+
+test "held listen: a refused subscriptions/listen is a lone application/json error, as without Transport.listens (2026-11-27)" {
+    const gpa = testing.allocator;
+    const wire = postHeaders("Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\n", "{\"jsonrpc\":\"2.0\",\"id\":\"listen-1\",\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":5}}");
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    server.push = true;
+    var listens = Listens.init(gpa);
+    defer listens.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .listens = &listens };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var buf: [8192]u8 = undefined;
+    const got = runWire(&r, wire, &buf);
+    try testing.expectEqualStrings("application/json", headerValue(got, "content-type").?);
+    try testing.expect(std.mem.find(u8, got, "\"id\":\"listen-1\",\"error\"") != null);
+    try testing.expect(std.mem.find(u8, got, "acknowledged") == null);
+}
+
+fn peersEmpty(s: *mcp.Server) bool {
+    return s.listens.items.len == 0 and s.session_subs.items.len == 0;
+}
+
+test "mutation 2026-11-27: a held listen the client closed is forgotten by mcp, not only unregistered" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    server.push = true;
+    var listens = Listens.init(gpa);
+    defer listens.deinit();
+    var spin: SpinLock = .{};
+    var transport = Transport{ .gpa = gpa, .server = &server, .listens = &listens, .lock = spin.iface() };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+
+    const stream = try live.connect();
+    try sendAll(io, stream, listen_wire);
+    try waitFor(io, &listens, oneListen);
+    // While it is held, mcp keeps the listen's state under its private peer.
+    transport.lock.acquire();
+    const held_listens = server.listens.items.len;
+    transport.lock.release();
+    try testing.expectEqual(@as(usize, 1), held_listens);
+    stream.close(io);
+    try waitFor(io, &listens, noListen);
+    // After the client left, `forgetPeer` drops it (it runs just after the
+    // listen is unregistered, under the transport lock): nothing accumulates.
+    var waited: u32 = 0;
+    while (waited <= 5000) : (waited += 2) {
+        transport.lock.acquire();
+        const empty = peersEmpty(&server);
+        transport.lock.release();
+        if (empty) return;
+        sleepMs(io, 2);
+    }
+    return error.ConditionNeverHeld;
+}
+
+var pair_started: [2]std.atomic.Value(bool) = .{ .init(false), .init(false) };
+var pair_saw_cancel: [2]std.atomic.Value(bool) = .{ .init(false), .init(false) };
+var pair_done: [2]std.atomic.Value(bool) = .{ .init(false), .init(false) };
+var pair_release: std.atomic.Value(bool) = .init(false);
+
+fn pairTool(comptime k: usize) fn (?*anyopaque, *mcp.ToolCall) bool {
+    return struct {
+        fn run(_: ?*anyopaque, call: *mcp.ToolCall) bool {
+            pair_started[k].store(true, .release);
+            var spins: u32 = 0;
+            // Both wait for their own cancellation or for the test's release.
+            while (!call.cancelled() and !pair_release.load(.acquire) and spins < 5000) : (spins += 1) {
+                var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = std.os.linux.nanosleep(&ts, null);
+            }
+            pair_saw_cancel[k].store(call.cancelled(), .release);
+            call.write("{\"ok\":true}");
+            pair_done[k].store(true, .release);
+            return false;
+        }
+    }.run;
+}
+
+fn pairStarted(k: usize) bool {
+    return pair_started[k].load(.acquire);
+}
+
+fn pairDone(k: usize) bool {
+    return pair_done[k].load(.acquire);
+}
+
+test "mutation 2026-11-27: closing one of two overlapping tools/call with the same JSON-RPC id cancels only that call" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    try server.addTool(.{ .name = "pair0", .description = "waits for cancellation or release", .input_schema = "{\"type\":\"object\"}", .handler = pairTool(0) });
+    try server.addTool(.{ .name = "pair1", .description = "waits for cancellation or release", .input_schema = "{\"type\":\"object\"}", .handler = pairTool(1) });
+    // No transport lock: the two calls overlap (a lock serialises them).
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var live: Live = undefined;
+    if (!try live.start(&r)) return error.SkipZigTest;
+    defer live.stop();
+    const io = live.io();
+    for (0..2) |k| {
+        pair_started[k].store(false, .release);
+        pair_saw_cancel[k].store(false, .release);
+        pair_done[k].store(false, .release);
+    }
+    pair_release.store(false, .release);
+
+    var streams: [2]std.Io.net.Stream = undefined;
+    inline for (.{ "pair0", "pair1" }, 0..) |name, k| {
+        var wire_buf: [1024]u8 = undefined;
+        // The same id 7 on both connections.
+        const body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"" ++ name ++ "\",\"arguments\":{}," ++ modern_meta ++ "}}";
+        const wire = try std.mem.print(&wire_buf, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: " ++ name ++ "\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+        streams[k] = try live.connect();
+        try sendAll(io, streams[k], wire);
+        try waitFor(io, @as(usize, k), pairStarted);
+    }
+    // Close the connection of the call that registered SECOND: `cancelInflight`
+    // flags the first entry matching (peer, id), so a shared peer handle would
+    // cancel the first call instead of this one.
+    streams[1].close(io);
+    try waitFor(io, @as(usize, 1), pairDone);
+    try testing.expect(pair_saw_cancel[1].load(.acquire));
+    // The other call, same id on another connection, is untouched.
+    pair_release.store(true, .release);
+    try waitFor(io, @as(usize, 0), pairDone);
+    try testing.expect(!pair_saw_cancel[0].load(.acquire));
+    streams[0].close(io);
 }

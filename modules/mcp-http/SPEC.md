@@ -6,7 +6,7 @@
 
 **Scope:** parity — the official MCP SDKs' Streamable HTTP servers (python-sdk v2.3.0 the reference, typescript-sdk 2.4.0, go-sdk v1.8.0): the 2026-07-28 stateless transport and the 2025-11-25/2025-06-18 session shape (held GET stream, `Last-Event-ID` replay, DELETE), JSON or SSE responses, held `subscriptions/listen`, cancellation on disconnect, the DNS-rebinding defense (Origin allowlist, `Host` guard, the Go SDK's default localhost protection), and MCP authorization on the resource-server side (RFC 9728 metadata, RFC 6750 challenges, RFC 8707 audience, required and per-operation scopes, `AuthInfo` to handlers); deliberately not: a pluggable event store / cross-node bus, the legacy HTTP+SSE transport, the RFC 8414 mirror (surveyed 2026-11-25; raised from core)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-20 (169/181, 2 eq) · src d1440d13367f5fef
+**Audit:** review 2026-09-02 · mutation 2026-11-27 (376/408, 22 eq) · src 5d8ccddabb5d47bf
 
 **Hardening:** fuzz 2026-11-25 (MCP_HTTP_FUZZ, ReleaseSafe, clean: `mcp-http-pre-parse` and `mcp-http-top-level-id` 200,000 runs each, `mcp-http-wire` at `.scale` 2 = 100,000 runs — raw HTTP requests against two live sessions: forged session id → 404, foreign Origin → 403, DELETE takes only its own session, damaged requests answered or dropped —, `mcp-http-auth` 200,000 runs — damaged bearer-gated requests, long keys before `method`, repeated and odd `Authorization` fields: a token without the tool scope never runs a tool, every answer one of the gate's statuses) · ct 2026-10-10 (ctgrind: Mcp-Session-Id bytes through the id encoding; 0 in-file after replacing std.fmt `{x}`) · panic 2026-11-25 (independent sweep of every pub entry point, HS-1..HS-5: depth-bounded pre-parse of unauthenticated bodies, scope checks a long key cannot evade (an unreadable body is 400 under `scope_for`), `replay_depth = 0`, header lookups without a null unwrap, indexed session tags)
 **Performance:** ref 0.021–0.061× modelcontextprotocol/python-sdk v2.3.0 (uvicorn; `zig build bench-mcp-http`: stateless JSON `tools/call` and `tools/list` over 20 tools at 1 and 4 keep-alive connections, one Go load generator for every server, bench shield) (measured 2026-11-25)
@@ -275,6 +275,14 @@ Run: `scripts/modtest mcp-http`; the example (`example/main.zig`) is built by
   body, and the annotation-chain depth ceiling.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
   whole-module mutation run and the delta runs after it.
+- **Delta mutation 2026-11-27 (auth.zig whole; HostGuard, held GET/listen, cancellation in root.zig and
+  modern.zig — additive, ~34 % of production lines):** 227 mutants, 207 killed, 20 equivalent or unobservable,
+  0 open. Every authorization and host-guard decision is pinned; two were gaps (a non-Bearer header reached the
+  verifier as the token; the loopback-only Host check applied to public peers). Pinned choices of the module:
+  every challenge carries `scope="…"` when scopes are required (RFC 6750 §3 allows it), and the RFC 9728
+  document is served with `Cache-Control: max-age=3600`. A socket-free `subscriptions/listen` with `listens`
+  set is held without peer detection until `finishAll`, the idle timeout or shutdown (`http.Server.Hold`'s
+  socket-free rule), not a hang. 26 new tests (`src/mutation_test.zig`, inline in `src/root.zig`).
 
 ### Oracle: a real captured session from the official `mcp` Python SDK
 
