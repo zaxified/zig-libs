@@ -71,7 +71,7 @@ pub const ParseError = error{
     BadLength,
 };
 
-pub const CallError = TransportError || status.StatusError || ParseError || Allocator.Error;
+pub const CallError = TransportError || status.StatusError || ParseError || cbor.EncodeError;
 
 /// The success payload of one response: the bytes after the status byte.
 pub const Response = struct {
@@ -91,7 +91,7 @@ pub const Response = struct {
 /// CTAP2 canonical order (§8.1: every key set used here is a small unsigned
 /// or negative integer, for which bytewise order of the encoded key and the
 /// spec's "shortest first, then bytewise" order coincide).
-pub fn encodeRequest(allocator: Allocator, command: u8, params: ?cbor.Value) Allocator.Error![]u8 {
+pub fn encodeRequest(allocator: Allocator, command: u8, params: ?cbor.Value) cbor.EncodeError![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, command);

@@ -31,6 +31,16 @@ const cbor = @import("root.zig");
 const Value = cbor.Value;
 const MapEntry = cbor.MapEntry;
 
+/// `cbor.encode` of a structure this file builds from `.bytes`/`.text` items
+/// only (the `*_structure`s): no `.simple` in it, so `InvalidSimpleValue`
+/// cannot occur and the result keeps `Allocator.Error`.
+fn encodeOwn(a: Allocator, v: Value) Allocator.Error![]u8 {
+    return cbor.encode(a, v, .{}) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidSimpleValue => unreachable,
+    };
+}
+
 // ── registered parameter labels (RFC 9052 §7 / RFC 9053) ───────────────────
 
 /// COSE_Key common parameter labels (RFC 9052 §7, Table 3).
@@ -481,7 +491,7 @@ pub fn parseSign1(value: Value) Sign1Error!Sign1 {
 /// Build the wire bytes for `s` (the bare 4-element array — RFC 9052 does
 /// not require the tag-18 wrapper; callers wanting it can wrap the result
 /// in `Value.Tag{.number = 18, ...}` and re-encode themselves).
-pub fn encodeSign1(a: Allocator, s: Sign1) Allocator.Error![]u8 {
+pub fn encodeSign1(a: Allocator, s: Sign1) cbor.EncodeError![]u8 {
     const payload_v: Value = if (s.payload) |p| .{ .bytes = p } else .null_value;
     const arr = [_]Value{
         .{ .bytes = s.protected },
@@ -509,7 +519,7 @@ pub fn sigStructure(a: Allocator, protected: []const u8, external_aad: []const u
         .{ .bytes = external_aad },
         .{ .bytes = payload },
     };
-    return try cbor.encode(a, .{ .array = &arr }, .{});
+    return encodeOwn(a, .{ .array = &arr });
 }
 
 // ── COSE_Sign, COSE_Mac0, COSE_Encrypt0 (RFC 9052 §4.1, §6.2, §5.2) ─────────
@@ -678,7 +688,7 @@ pub fn parseSignature(value: Value) SignError!Signature {
 }
 
 /// Build the wire bytes of a `COSE_Sign` (the bare array, see `encodeSign1`).
-pub fn encodeSign(a: Allocator, s: SignParts) Allocator.Error![]u8 {
+pub fn encodeSign(a: Allocator, s: SignParts) cbor.EncodeError![]u8 {
     const sig_vals = try a.alloc(Value, s.signatures.len);
     defer a.free(sig_vals);
     const inner = try a.alloc([3]Value, s.signatures.len);
@@ -707,7 +717,7 @@ pub fn signStructure(a: Allocator, body_protected: []const u8, sign_protected: [
         .{ .bytes = external_aad },
         .{ .bytes = payload },
     };
-    return try cbor.encode(a, .{ .array = &arr }, .{});
+    return encodeOwn(a, .{ .array = &arr });
 }
 
 /// Parse a `COSE_Mac0` (RFC 9052 §6.2), bare or tag-17 wrapped.
@@ -726,7 +736,7 @@ pub fn parseMac0(value: Value) Mac0Error!Mac0 {
 }
 
 /// Build the wire bytes of a `COSE_Mac0` (the bare array).
-pub fn encodeMac0(a: Allocator, m: Mac0) Allocator.Error![]u8 {
+pub fn encodeMac0(a: Allocator, m: Mac0) cbor.EncodeError![]u8 {
     const arr = [_]Value{
         .{ .bytes = m.protected },
         .{ .map = m.unprotected },
@@ -745,7 +755,7 @@ pub fn macStructure(a: Allocator, protected: []const u8, external_aad: []const u
         .{ .bytes = external_aad },
         .{ .bytes = payload },
     };
-    return try cbor.encode(a, .{ .array = &arr }, .{});
+    return encodeOwn(a, .{ .array = &arr });
 }
 
 /// Parse a `COSE_Encrypt0` (RFC 9052 §5.2), bare or tag-16 wrapped.
@@ -763,7 +773,7 @@ pub fn parseEncrypt0(value: Value) Encrypt0Error!Encrypt0 {
 }
 
 /// Build the wire bytes of a `COSE_Encrypt0` (the bare array).
-pub fn encodeEncrypt0(a: Allocator, e: Encrypt0) Allocator.Error![]u8 {
+pub fn encodeEncrypt0(a: Allocator, e: Encrypt0) cbor.EncodeError![]u8 {
     const arr = [_]Value{
         .{ .bytes = e.protected },
         .{ .map = e.unprotected },
@@ -781,7 +791,7 @@ pub fn encStructure(a: Allocator, protected: []const u8, external_aad: []const u
         .{ .bytes = structProtected(protected) },
         .{ .bytes = external_aad },
     };
-    return try cbor.encode(a, .{ .array = &arr }, .{});
+    return encodeOwn(a, .{ .array = &arr });
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────

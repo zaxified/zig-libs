@@ -297,7 +297,7 @@ pub fn parseMakeCredentialResponse(allocator: Allocator, body: []const u8) (fram
 
 /// The WebAuthn attestation object (`{"fmt", "attStmt", "authData"}`, canonical CBOR) of a response: what a relying
 /// party's `webauthn.verifyAttestation` / `verifyRegistration` takes.
-pub fn attestationObject(allocator: Allocator, resp: MakeCredentialResponse) Allocator.Error![]u8 {
+pub fn attestationObject(allocator: Allocator, resp: MakeCredentialResponse) cbor.EncodeError![]u8 {
     const entries = [_]MapEntry{
         textKey("fmt", text(resp.fmt)),
         textKey("attStmt", resp.att_stmt),

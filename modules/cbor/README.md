@@ -93,7 +93,7 @@ const Value = cbor.Value; // tagged union: uint/negint/bytes/text/array/map/tag/
 const MapEntry = cbor.MapEntry; // { key: Value, value: Value }
 const DecodeError = cbor.DecodeError; // error{ Truncated, Malformed, DepthLimitExceeded, TrailingGarbage,
                                       //        DuplicateKey, NotDeterministic, OutOfMemory }
-const EncodeError = cbor.EncodeError; // Allocator.Error
+const EncodeError = cbor.EncodeError; // Allocator.Error || error{InvalidSimpleValue} (a .simple in 20..31)
 
 fn decode(a: Allocator, bytes: []const u8, opts: cbor.DecodeOptions) DecodeError!Value;
 // One item from the front + the bytes it took; the rest is the caller's (no TrailingGarbage):
@@ -126,7 +126,7 @@ fn typed.decode(comptime T: type, gpa: Allocator, bytes: []const u8, o: typed.Op
 fn typed.decodeLeaky(comptime T: type, arena: Allocator, bytes: []const u8, o: typed.Options) typed.Error!T;
 fn typed.fromValue(comptime T: type, arena: Allocator, v: Value, o: typed.Options) typed.Error!T;
 fn typed.toValue(arena: Allocator, x: anytype) Allocator.Error!Value;
-fn typed.encode(gpa: Allocator, x: anytype, o: cbor.EncodeOptions) Allocator.Error![]u8;
+fn typed.encode(gpa: Allocator, x: anytype, o: cbor.EncodeOptions) cbor.EncodeError![]u8;
 // integers to 128 bits (bignums beyond 64); typed.Tagged(N, T) and `pub const cbor_tag = N;` carry a tag (error.WrongTag)
 
 // ── COSE ──
@@ -136,7 +136,7 @@ fn cose.encodeEc2Key(a: Allocator, k: cose.Ec2Key) Allocator.Error!Value;
 fn cose.encodeOkpKey(a: Allocator, k: cose.OkpKey) Allocator.Error!Value;
 
 fn cose.parseSign1(value: Value) cose.Sign1Error!cose.Sign1;
-fn cose.encodeSign1(a: Allocator, s: cose.Sign1) Allocator.Error![]u8;
+fn cose.encodeSign1(a: Allocator, s: cose.Sign1) cbor.EncodeError![]u8;
 fn cose.sigStructure(a: Allocator, protected: []const u8, external_aad: []const u8, payload: []const u8) Allocator.Error![]u8;
 // COSE_Sign / COSE_Mac0 / COSE_Encrypt0: parseSign/parseSignature/encodeSign/signStructure,
 // parseMac0/encodeMac0/macStructure, parseEncrypt0/encodeEncrypt0/encStructure (tags tag_sign, tag_mac0, tag_encrypt0)

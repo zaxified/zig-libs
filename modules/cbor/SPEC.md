@@ -6,7 +6,7 @@
 
 **Scope:** core — libcbor 0.14 / fxamacker/cbor 2.9 (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (47/51, 4 eq) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-27 (412/423, 11 eq) · src d73561da5aae93d3
 
 **Hardening:** fuzz 2026-10-04 (900,000 runs clean, reach per oracle) · ct n/a — data codec only (keyword review, 2026-10-07)
 
@@ -231,6 +231,15 @@ Run: `scripts/modtest cbor` (`zig build test-cbor`; add `-Doptimize=ReleaseFast`
   built with `--test-filter "fuzz driver"`.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
   run and the delta runs after it.
+- **Mutation run (2026-11-27, whole module):** 423 mutants over every production file (root, stream, cose,
+  typed, diag): 412 killed (2 by hang), 11 equivalent (each argued in the run's verdict table: a guard made
+  redundant by its only call sites, a cost-only sort of a one-entry map, float-printing branches a double
+  cannot reach). 28 new tests in `src/mutation_test.zig`. Two mutants flip comptime `jsontext` options in
+  `diag.zig`, which the runtime switch cannot reach; they were applied by hand in two extra builds and are
+  killed by `core_test.zig`'s Appendix A diagnostic rows. The run found one defect: a hand-built
+  `.simple` in 20..31 was encoded as `f8 14`..`f8 1f`, which RFC 8949 §3.3 forbids and this module's own
+  decoder refuses; `encode` and `Writer.simple`/`Writer.value` return `error.InvalidSimpleValue` now (the
+  guard is newer than the run and killed by the new test).
 
 ## What is deliberately not done
 

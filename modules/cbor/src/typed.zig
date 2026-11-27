@@ -182,7 +182,7 @@ pub fn toValue(arena: Allocator, x: anytype) Allocator.Error!Value {
 
 /// Encode `x` to `gpa`-owned bytes (`root.encode` options apply:
 /// `.canonical = true` for the deterministic form).
-pub fn encode(gpa: Allocator, x: anytype, options: root.EncodeOptions) Allocator.Error![]u8 {
+pub fn encode(gpa: Allocator, x: anytype, options: root.EncodeOptions) root.EncodeError![]u8 {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const v = try toValue(arena.allocator(), x);

@@ -591,6 +591,9 @@ pub const Writer = struct {
     w: *std.Io.Writer,
 
     pub const Error = std.Io.Writer.Error;
+    /// `simple` and `value`: also `InvalidSimpleValue` for a simple value in
+    /// 20..31, which has no well-formed encoding (RFC 8949 §3.3).
+    pub const ValueError = Error || error{InvalidSimpleValue};
 
     pub fn init(w: *std.Io.Writer) Writer {
         return .{ .w = w };
@@ -667,10 +670,17 @@ pub const Writer = struct {
         try self.w.writeByte(0xf7);
     }
 
-    /// A simple value (0..19 or 32..255; 20..31 are not simple values and
-    /// are a programmer error, as with `Value.simple`).
-    pub fn simple(self: Writer, s: u8) Error!void {
-        if (s < 20) try self.w.writeByte(0xe0 | s) else try self.w.writeAll(&.{ 0xf8, s });
+    /// A simple value (0..19 or 32..255). 20..31 are not simple values
+    /// (RFC 8949 §3.3) and return `error.InvalidSimpleValue` in every build
+    /// mode, writing nothing.
+    pub fn simple(self: Writer, s: u8) ValueError!void {
+        if (s < 20) {
+            try self.w.writeByte(0xe0 | s);
+        } else if (s < 32) {
+            return error.InvalidSimpleValue;
+        } else {
+            try self.w.writeAll(&.{ 0xf8, s });
+        }
     }
 
     /// A float in the shortest width that keeps its value (NaN as `f97e00`).
@@ -700,7 +710,7 @@ pub const Writer = struct {
     /// A whole `Value`, byte for byte what `encode(.., .{})` returns (map
     /// order as given, float widths as given). For the canonical form, which
     /// needs scratch to sort keys, use `encode(.., .{ .canonical = true })`.
-    pub fn value(self: Writer, v: Value) Error!void {
+    pub fn value(self: Writer, v: Value) ValueError!void {
         switch (v) {
             .uint => |u| try self.uint(u),
             .negint => |n| try self.negint(n),

@@ -113,7 +113,10 @@ pub const DecodeError = error{
     OutOfMemory,
 };
 
-pub const EncodeError = Allocator.Error;
+/// `InvalidSimpleValue`: a hand-built `.simple` in 20..31. RFC 8949 §3.3
+/// gives 20..23 to false/true/null/undefined (their own `Value` variants) and
+/// leaves 24..31 reserved; no encoding of them is well-formed (2026-11-27).
+pub const EncodeError = Allocator.Error || error{InvalidSimpleValue};
 
 // ── Value: the decoded-value representation ─────────────────────────────────
 
@@ -144,7 +147,9 @@ pub const Value = union(enum) {
     tag: Tag,
     /// Major type 7, simple value (not bool/null/undefined/float): either
     /// the direct 0–19 form or the 1-byte 32–255 form. 20–31 are reserved
-    /// for bool/null/undefined/float/break and never appear here.
+    /// for bool/null/undefined/float/break and never appear here: `decode`
+    /// never produces them, and `encode`/`Writer` refuse a hand-built one
+    /// with `error.InvalidSimpleValue`.
     simple: u8,
     /// Major type 7 — `false`/`true`.
     bool: bool,
@@ -635,7 +640,11 @@ const Decoder = struct {
         var built: usize = 0;
         defer for (keys[0..built]) |k| a.free(k);
         for (entries, 0..) |e, i| {
-            keys[i] = try encode(a, e.key, .{ .canonical = true });
+            // A decoded key never holds a `.simple` in 20..31 (decodeSimpleOrFloat refuses it).
+            keys[i] = encode(a, e.key, .{ .canonical = true }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidSimpleValue => unreachable,
+            };
             built = i + 1;
         }
         std.mem.sort([]u8, keys, {}, struct {
@@ -884,6 +893,8 @@ fn encodeInto(list: *std.ArrayList(u8), a: Allocator, value: Value, options: Enc
         .simple => |s| {
             if (s < 20) {
                 try list.append(a, 0xe0 | s);
+            } else if (s < 32) {
+                return error.InvalidSimpleValue;
             } else {
                 try list.append(a, 0xf8);
                 try list.append(a, s);
@@ -1002,6 +1013,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("kat_test.zig");
     _ = @import("cose_kat_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 // P-20: `decode` leaked the partially built tree on every error path with a
