@@ -400,3 +400,36 @@ fn fuzzPcap(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     try testing.expect((try back.next()) == null);
     PcapMark.mark(.round_trip);
 }
+
+// ── mutation audit 2026-11-27 (D37) ─────────────────────────────────────────
+
+test "mutation 2026-11-27: writeHeader writes the linktype and snaplen it is given; the file is version 2.4; other majors are refused" {
+    const e = builtin.cpu.arch.endian();
+    var out: [header_len]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try writeHeader(&w, .{ .linktype = 101, .snaplen = 1500 }); // LINKTYPE_RAW
+    var r = try Reader.init(&out);
+    try testing.expectEqual(@as(u32, 101), r.header.linktype);
+    try testing.expectEqual(@as(u32, 1500), r.header.snaplen);
+    try testing.expectEqual(@as(u16, 4), r.header.version_minor); // pcap-savefile(5): 2.4
+    try testing.expect((try r.next()) == null);
+    for ([_]u16{ 0, 1, 3 }) |major| {
+        var bad = out;
+        std.mem.writeInt(u16, bad[4..6], major, e);
+        try testing.expectError(error.UnsupportedVersion, Reader.init(&bad));
+    }
+}
+
+test "mutation 2026-11-27: a record header that ends the file exactly, with no captured bytes, is a record" {
+    var out: [header_len + record_header_len]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try writeHeader(&w, .{});
+    // 1000 s + 1 us after the epoch; 60 bytes on the wire, none captured.
+    try writeRecord(&w, .micro, default_snaplen, 1_000_000_001_000, 60, "");
+    var r = try Reader.init(w.buffered());
+    const rec = (try r.next()).?;
+    try testing.expectEqual(@as(usize, 0), rec.data.len);
+    try testing.expectEqual(@as(u32, 60), rec.orig_len);
+    try testing.expectEqual(@as(u64, 1_000_000_001_000), rec.ts_ns);
+    try testing.expect((try r.next()) == null);
+}

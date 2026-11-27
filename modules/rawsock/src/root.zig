@@ -3138,3 +3138,169 @@ test "parseAuxdataVlan: a record that exactly fills the buffer is still read (sw
     aux.* = .{ .tp_status = TP_STATUS_VLAN_VALID, .tp_len = 39, .tp_snaplen = 39, .tp_mac = 0, .tp_net = 14, .tp_vlan_tci = 7, .tp_vlan_tpid = 0 };
     try testing.expectEqual(@as(?u16, 7), parseAuxdataVlan(control[0..total]));
 }
+
+// ── mutation audit 2026-11-27 (D37): control-message scanners, interface ioctls, filter and timeout guards ──
+
+/// Write a control-message record header at `off` of `buf`.
+fn putCmsg(buf: []u8, off: usize, len: usize, level: i32, typ: i32) void {
+    var hdr: linux.cmsghdr = undefined;
+    hdr.len = len;
+    hdr.level = level;
+    hdr.type = typ;
+    @memcpy(buf[off..][0..@sizeOf(linux.cmsghdr)], std.mem.asBytes(&hdr));
+}
+
+fn putTimespec(buf: []u8, off: usize, sec: i64, nsec: i64) void {
+    const ts: KernelTimespec = .{ .sec = sec, .nsec = nsec };
+    @memcpy(buf[off..][0..@sizeOf(KernelTimespec)], std.mem.asBytes(&ts));
+}
+
+fn putAux(buf: []u8, off: usize, status: u32, tci: u16) void {
+    const aux: TpacketAuxdata = .{ .tp_status = status, .tp_len = 60, .tp_snaplen = 60, .tp_mac = 0, .tp_net = 14, .tp_vlan_tci = tci, .tp_vlan_tpid = 0x8100 };
+    @memcpy(buf[off..][0..@sizeOf(TpacketAuxdata)], std.mem.asBytes(&aux));
+}
+
+fn cmsgScanBody() void {
+    const ts_new = linux.SO.TIMESTAMPNS_NEW;
+    // A header-only record (CMSG_LEN(0) = 16) is skipped, the next record is read.
+    var buf: [128]u8 align(8) = @splat(0);
+    putCmsg(&buf, 0, 16, linux.SOL.SOCKET, 0);
+    putCmsg(&buf, 16, 32, linux.SOL.SOCKET, ts_new);
+    putTimespec(&buf, 32, 5, 7);
+    if (parseTimestampNs(buf[0..48]) != 5_000_000_007) @panic("ts: header-only record not skipped");
+    // A cmsg_len below sizeof(cmsghdr) ends the list (the kernel's CMSG_OK / glibc's __cmsg_nxthdr): the
+    // bytes at offset 8 are not a record, even though they look like one.
+    buf = @splat(0);
+    putCmsg(&buf, 0, 8, 32, 0);
+    putCmsg(&buf, 8, 32, linux.SOL.SOCKET, ts_new);
+    putTimespec(&buf, 24, 5, 7);
+    if (parseTimestampNs(buf[0..40]) != null) @panic("ts: scan went on past a record shorter than its header");
+    // Instant zero is a time; a negative nanosecond field is not; the u64 nanosecond sum is checked.
+    buf = @splat(0);
+    putCmsg(&buf, 0, 32, linux.SOL.SOCKET, ts_new);
+    putTimespec(&buf, 16, 0, 5);
+    if (parseTimestampNs(buf[0..32]) != 5) @panic("ts: instant 0 s + 5 ns");
+    putTimespec(&buf, 16, 5, -1);
+    if (parseTimestampNs(buf[0..32]) != null) @panic("ts: negative nanoseconds accepted");
+    // 18446744073 s * 1e9 = 18446744073000000000; u64 max is ...709551615.
+    putTimespec(&buf, 16, 18446744073, 709551615);
+    if (parseTimestampNs(buf[0..32]) != std.math.maxInt(u64)) @panic("ts: u64 max not representable");
+    putTimespec(&buf, 16, 18446744073, 709551616);
+    if (parseTimestampNs(buf[0..32]) != null) @panic("ts: u64 overflow wrapped");
+    // A record whose length (31) leaves one byte short of the 16-byte timespec is not a timestamp, though
+    // the padding to 32 would hold one.
+    buf = @splat(0);
+    putCmsg(&buf, 0, 31, linux.SOL.SOCKET, ts_new);
+    if (parseTimestampNs(buf[0..32]) != null) @panic("ts: a 15-byte payload read as a timespec");
+    // A record claiming only 8 payload bytes is not a timestamp, even if the bytes after it would fit one.
+    buf = @splat(0);
+    putCmsg(&buf, 0, 24, linux.SOL.SOCKET, ts_new);
+    putTimespec(&buf, 16, 5, 7);
+    if (parseTimestampNs(buf[0..48]) != null) @panic("ts: an 8-byte payload read as a timespec");
+
+    // The same shapes for PACKET_AUXDATA.
+    const aux_len = 16 + @sizeOf(TpacketAuxdata);
+    const sol_packet = linux.SOL.PACKET;
+    const auxdata = linux.PACKET.AUXDATA;
+    // A foreign record first (a timestamp), the AUXDATA record behind it.
+    buf = @splat(0);
+    putCmsg(&buf, 0, 32, linux.SOL.SOCKET, ts_new);
+    putCmsg(&buf, 32, aux_len, sol_packet, auxdata);
+    putAux(&buf, 48, TP_STATUS_VLAN_VALID, 9);
+    if (parseAuxdataVlan(buf[0 .. 32 + aux_len]) != 9) @panic("aux: record behind a foreign one not found");
+    // A header-only record first.
+    buf = @splat(0);
+    putCmsg(&buf, 0, 16, linux.SOL.SOCKET, 0);
+    putCmsg(&buf, 16, aux_len, sol_packet, auxdata);
+    putAux(&buf, 32, TP_STATUS_VLAN_VALID, 9);
+    if (parseAuxdataVlan(buf[0 .. 16 + aux_len]) != 9) @panic("aux: header-only record not skipped");
+    // cmsg_len < sizeof(cmsghdr) ends the list.
+    buf = @splat(0);
+    putCmsg(&buf, 0, 8, 32, 0);
+    putCmsg(&buf, 8, aux_len, sol_packet, auxdata);
+    putAux(&buf, 24, TP_STATUS_VLAN_VALID, 9);
+    if (parseAuxdataVlan(buf[0 .. 8 + aux_len]) != null) @panic("aux: scan went on past a record shorter than its header");
+    // Right type at the wrong level, right level with another type (PACKET_ORIGDEV = 9).
+    buf = @splat(0);
+    putCmsg(&buf, 0, aux_len, linux.SOL.SOCKET, auxdata);
+    putAux(&buf, 16, TP_STATUS_VLAN_VALID, 9);
+    if (parseAuxdataVlan(buf[0..aux_len]) != null) @panic("aux: the type of another level taken");
+    putCmsg(&buf, 0, aux_len, sol_packet, 9);
+    if (parseAuxdataVlan(buf[0..aux_len]) != null) @panic("aux: another packet-level type taken");
+    // A record whose length (35) is one byte short of its payload is not read although the padding would hold it.
+    buf = @splat(0);
+    putCmsg(&buf, 0, aux_len - 1, sol_packet, auxdata);
+    putAux(&buf, 16, TP_STATUS_VLAN_VALID, 9);
+    if (parseAuxdataVlan(buf[0..40]) != null) @panic("aux: a 19-byte payload read as tpacket_auxdata");
+    // A record claiming 8 payload bytes: the VLAN fields behind it (in the next bytes) are not its own.
+    buf = @splat(0);
+    putCmsg(&buf, 0, 24, sol_packet, auxdata);
+    putAux(&buf, 16, TP_STATUS_VLAN_VALID, 9);
+    if (parseAuxdataVlan(buf[0..48]) != null) @panic("aux: a short record read past its length");
+}
+
+test "mutation 2026-11-27: the cmsg scanners step over foreign and empty records, stop at one shorter than its header, check every length" {
+    try @import("sweep_test.zig").expectSurvives(cmsgScanBody);
+}
+
+test "mutation 2026-11-27: cmsgAlign rounds up to the next usize multiple and leaves multiples alone" {
+    const a = @sizeOf(usize);
+    try testing.expectEqual(@as(usize, 0), cmsgAlign(0));
+    try testing.expectEqual(a, cmsgAlign(1));
+    try testing.expectEqual(a, cmsgAlign(a));
+    try testing.expectEqual(2 * a, cmsgAlign(a + 1));
+    try testing.expectEqual(2 * a, cmsgAlign(2 * a));
+    if (a == 8) try testing.expectEqual(@as(usize, 40), cmsgAlign(36)); // CMSG_ALIGN(36) on LP64
+}
+
+test "mutation 2026-11-27: parseReply refuses an ar$pro that is not IPv4 on its own (RFC 826)" {
+    var f = arp.buildRequest(.{ 0x02, 0, 0, 0, 0, 0x01 }, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 });
+    std.mem.writeInt(u16, f[20..22], 2, .big); // ar$op = reply
+    try testing.expect(arp.parseReply(&f) != null);
+    std.mem.writeInt(u16, f[16..18], 0x86dd, .big); // ar$pro = IPv6, hln/pln still 6/4
+    try testing.expect(arp.parseReply(&f) == null);
+}
+
+test "mutation 2026-11-27: hwaddr on lo is NotEthernet; with lo up, ipv4Addr and ipv4Netmask find 127.0.0.1/8" {
+    bringLoopbackUp();
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expectEqual(.SUCCESS, linux.errno(rc));
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const lo = try ifaceByName("lo");
+    // ARPHRD_LOOPBACK, not ARPHRD_ETHER: the family check refuses it, the lookup itself works.
+    try testing.expectError(error.NotEthernet, hwaddr(fd, lo));
+    var req: ifreq = .{};
+    @memcpy(req.name[0..2], "lo");
+    try testing.expectEqual(.SUCCESS, linux.errno(linux.ioctl(fd, linux.SIOCGIFFLAGS, @intFromPtr(&req))));
+    if (std.mem.bytesToValue(u16, req.un[0..2]) & 0x1 == 0) return error.SkipZigTest; // lo down (unprivileged fresh netns): no address
+    // IFF_UP on the loopback means the kernel configured 127.0.0.1/8 on it.
+    try testing.expectEqual([_]u8{ 127, 0, 0, 1 }, try ipv4Addr(fd, lo));
+    try testing.expectEqual([_]u8{ 255, 0, 0, 0 }, try ipv4Netmask(fd, lo));
+}
+
+test "mutation 2026-11-27: attachFilter: empty and over 65535 instructions are InvalidFilter, 65535 and a bad fd reach the syscall" {
+    const one = [_]BpfInsn{bpf.stmt(bpf.ret | bpf.k, 0)};
+    try testing.expectError(error.InvalidFilter, attachFilter(-1, &[_]BpfInsn{}));
+    try testing.expectError(error.FilterFailed, attachFilter(-1, &one)); // EBADF is a failure, not success
+    const big = try testing.allocator.alloc(BpfInsn, 65536);
+    defer testing.allocator.free(big);
+    @memset(big, one[0]);
+    try testing.expectError(error.InvalidFilter, attachFilter(-1, big));
+    try testing.expectError(error.FilterFailed, attachFilter(-1, big[0..65535]));
+}
+
+test "mutation 2026-11-27: setRcvTimeout stores seconds and the millisecond remainder (readback on a UDP socket)" {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expectEqual(.SUCCESS, linux.errno(rc));
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    // 2040 ms = 2 s + 40 ms: 40 ms is a whole number of jiffies at HZ 100, 250, 300 and 1000, so the
+    // kernel hands back exactly what was stored.
+    try setRcvTimeout(fd, 2040);
+    var tv: linux.timeval = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.timeval);
+    try testing.expectEqual(.SUCCESS, linux.errno(linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&tv), &len)));
+    try testing.expectEqual(@as(@TypeOf(tv.sec), 2), tv.sec);
+    try testing.expectEqual(@as(@TypeOf(tv.usec), 40_000), tv.usec);
+}

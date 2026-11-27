@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **FIX:** `pcapng.Reader` reported a complete Section Header Block whose own length is under 28 bytes (the pcapng minimum) as `error.Truncated`; it is `error.BadBlock` now, and `Truncated` stays for input that ends before the block does. Found by the whole-module mutation run (1281/1370, 89 eq), which also added 36 inline tests.
 - **2026-11-27** — **FIX (behaviour change):** `ip6 net ADDR/LEN` refused host bits only in the words the prefix touches; `ip6 net 2001:db8::1/32` compiled. It is now `Syntax` ("non-network bits set"), as libpcap 1.10.6 `pcap_compile` has it (all four words are checked).
 
 - **2026-11-27** — **FIX (behaviour change, previously `Syntax`):** a bare `ip6 net ADDR` (no `/LEN`) is a /128 and compiles like `ip6 host ADDR`, as libpcap 1.10.6 `pcap_compile` does.

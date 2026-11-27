@@ -224,8 +224,12 @@ pub const Reader = struct {
             // The Section Header fixes the byte order; its length field is
             // read in it, so look at the magic first.
             const m = std.mem.readInt(u32, r.buf[start + 8 ..][0..4], .little);
-            if (r.buf.len - start < 28) return error.Truncated;
             r.order = if (m == byte_order_magic) .little else if (m == @byteSwap(byte_order_magic)) .big else return error.BadMagic;
+            // A Section Header is at least 28 bytes (pcapng §4.1). One whose own
+            // length says less is a bad block even when all of it is present;
+            // `Truncated` is only for input that ends before the block does
+            // (2026-11-27: a complete 24-byte SHB read as Truncated).
+            if (std.mem.readInt(u32, r.buf[start + 4 ..][0..4], r.order) < 28) return error.BadBlock;
         }
         const o = r.order;
         const kind_o = std.mem.readInt(u32, r.buf[start..][0..4], o);
@@ -1041,4 +1045,166 @@ test "Reader: packet and simple blocks at their limits, and a stray public inter
     _ = (try r.next()).?;
     r.n_ifaces = 1000;
     try testing.expectError(error.BadInterface, r.next());
+}
+
+// ── mutation audit 2026-11-27 (D37) ─────────────────────────────────────────
+
+test "mutation 2026-11-27: writeHeader carries the linktype it is given; a record over max_snaplen is refused" {
+    var out: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try writeHeader(&w, .{ .linktype = 101 }); // LINKTYPE_RAW
+    try writeRecord(&w, .nano, 5, 3, "abc");
+    var r = try Reader.init(w.buffered());
+    const rec = (try r.next()).?;
+    try testing.expectEqual(@as(u16, 101), rec.linktype);
+    const big = try testing.allocator.alloc(u8, max_snaplen + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    var w2: std.Io.Writer = .fixed(&out);
+    try testing.expectError(error.InvalidRecord, writeRecord(&w2, .nano, 0, max_snaplen + 1, big));
+}
+
+test "mutation 2026-11-27: Reader: blocks shorter than their fixed part are BadBlock, a section of another major is refused" {
+    // Enhanced Packet Block bodies of 0, 4 and 16 bytes (the fixed part is 20).
+    for ([_]usize{ 0, 4, 16 }) |body_len| {
+        var b: Build = .{ .o = .little };
+        b.shb(1);
+        b.idb(1, null, null);
+        b.open(block_epb);
+        for (0..body_len / 4) |_| b.u32_(0);
+        b.close();
+        var r = try Reader.init(b.done());
+        try testing.expectError(error.BadBlock, r.next());
+    }
+    // An EPB that claims 4 captured bytes and holds none.
+    var b: Build = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, null, null);
+    b.open(block_epb);
+    b.u32_(0);
+    b.u32_(0);
+    b.u32_(0);
+    b.u32_(4);
+    b.u32_(4);
+    b.close();
+    var r = try Reader.init(b.done());
+    try testing.expectError(error.BadBlock, r.next());
+    // A Section Header Block of 20 bytes (the minimum is 28) is not skipped over: a well-formed
+    // interface and packet behind it are not reached.
+    b = .{ .o = .little };
+    b.open(block_shb);
+    b.u32_(byte_order_magic);
+    b.u16_(1);
+    b.u16_(0);
+    b.close();
+    b.idb(1, null, null);
+    b.epb(0, 5, "x");
+    r = try Reader.init(b.done());
+    try testing.expectError(error.BadBlock, r.next());
+    // Major 0 is not pcapng 1.x.
+    b = .{ .o = .little };
+    b.shb(0);
+    r = try Reader.init(b.done());
+    try testing.expectError(error.UnsupportedVersion, r.next());
+    // An Interface Description Block of 4 body bytes, a Simple Packet Block of none.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.open(block_idb);
+    b.u32_(0);
+    b.close();
+    r = try Reader.init(b.done());
+    try testing.expectError(error.BadBlock, r.next());
+    b = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, null, null);
+    b.open(block_spb);
+    b.close();
+    r = try Reader.init(b.done());
+    try testing.expectError(error.BadBlock, r.next());
+}
+
+test "mutation 2026-11-27: Reader: orig_len is the original length, the interface id is read where the block puts it" {
+    var b: Build = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, null, null);
+    b.idb(105, null, null);
+    // EPB on interface 1: captured 4 bytes of a 60-byte packet.
+    b.open(block_epb);
+    b.u32_(1);
+    b.u32_(0);
+    b.u32_(5);
+    b.u32_(4);
+    b.u32_(60);
+    b.bytes("abcd");
+    b.close();
+    // Obsolete Packet Block on interface 1 (u16), drops 0 (u16), nothing captured: body exactly 20 bytes.
+    b.open(block_pb);
+    b.u16_(1);
+    b.u16_(0);
+    b.u32_(0);
+    b.u32_(7);
+    b.u32_(0);
+    b.u32_(0);
+    b.close();
+    var r = try Reader.init(b.done());
+    const e = (try r.next()).?;
+    try testing.expectEqual(@as(u32, 60), e.orig_len);
+    try testing.expectEqualStrings("abcd", e.data);
+    try testing.expectEqual(@as(u32, 1), e.interface);
+    try testing.expectEqual(@as(u16, 105), e.linktype);
+    const p = (try r.next()).?;
+    try testing.expectEqual(@as(u32, 1), p.interface);
+    try testing.expectEqual(@as(u16, 105), p.linktype);
+    try testing.expectEqual(@as(usize, 0), p.data.len);
+    try testing.expectEqual(@as(u64, 7_000), p.ts_ns); // the default resolution is 10^-6 s
+    try testing.expect((try r.next()) == null);
+}
+
+test "mutation 2026-11-27: Reader: an 8-byte option that is not if_tsoffset is not an offset; if_tsresol 10 is a tenth of a nanosecond; the largest instant" {
+    // if_name (code 2) of 8 bytes before the end of options.
+    var b: Build = .{ .o = .little };
+    b.shb(1);
+    b.open(block_idb);
+    b.u16_(1);
+    b.u16_(0);
+    b.u32_(1500);
+    b.u16_(2);
+    b.u16_(8);
+    b.bytes(&[_]u8{ 1, 1, 1, 1, 1, 1, 1, 1 });
+    b.u16_(0);
+    b.u16_(0);
+    b.close();
+    b.epb(0, 5, "x");
+    var r = try Reader.init(b.done());
+    try testing.expectEqual(@as(u64, 5_000), (try r.next()).?.ts_ns);
+    // if_tsresol 10: one tick is 10^-10 s, so 100 ticks are 10 ns.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, 10, null);
+    b.epb(0, 100, "x");
+    r = try Reader.init(b.done());
+    try testing.expectEqual(@as(u64, 10), (try r.next()).?.ts_ns);
+    // 2^64 - 1 ns at nanosecond resolution fits 64-bit nanoseconds.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, 9, null);
+    b.epb(0, std.math.maxInt(u64), "x");
+    r = try Reader.init(b.done());
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), (try r.next()).?.ts_ns);
+}
+
+test "a Section Header shorter than 28 bytes is BadBlock when complete, Truncated when the input ends first (2026-11-27)" {
+    // 24 bytes, all present: type, total length 24, byte-order magic, version, trailing length 24.
+    var short: [24]u8 = @splat(0);
+    std.mem.writeInt(u32, short[0..4], block_shb, .little);
+    std.mem.writeInt(u32, short[4..8], 24, .little);
+    std.mem.writeInt(u32, short[8..12], byte_order_magic, .little);
+    std.mem.writeInt(u32, short[20..24], 24, .little);
+    var r: Reader = .{ .buf = &short };
+    try std.testing.expectError(error.BadBlock, r.block());
+    // A 28-byte SHB cut to 24 bytes: the input ends first.
+    var cut = short;
+    std.mem.writeInt(u32, cut[4..8], 28, .little);
+    var r2: Reader = .{ .buf = &cut };
+    try std.testing.expectError(error.Truncated, r2.block());
 }

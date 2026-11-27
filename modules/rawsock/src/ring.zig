@@ -1481,3 +1481,123 @@ fn fuzzSeq2(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     r.deinit();
     try testing.expectError(error.Closed, r.next(0));
 }
+
+// ── mutation audit 2026-11-27 (D37) ─────────────────────────────────────────
+
+test "mutation 2026-11-27: Block.init refuses a first packet without room for its header; a bad next header is reported by the packet that holds it" {
+    const e = builtin.cpu.arch.endian();
+    var buf: [4096]u8 = undefined;
+    // One packet of 60 bytes: blk_len = 48 + 112. The first header must start at or before blk_len - 48.
+    buildBlock(&buf, 1, 60);
+    const blk_len = std.mem.readInt(u32, buf[20..24], e);
+    std.mem.writeInt(u32, buf[16..20], blk_len - packet_header_len, e);
+    _ = try Block.init(&buf);
+    std.mem.writeInt(u32, buf[16..20], blk_len - packet_header_len + 1, e);
+    try testing.expectError(error.BadBlock, Block.init(&buf));
+    // Two packets: the first one's next_offset points past the block, resp. into its own data.
+    buildBlock(&buf, 2, 60);
+    for ([_]u32{ 225, 60 }) |next| { // blk_len - off = 224; this packet's data ends at off + 48 + 60
+        std.mem.writeInt(u32, buf[block_header_len..][0..4], next, e);
+        var b = try Block.init(&buf);
+        try testing.expectError(error.BadBlock, b.nextPacket());
+        try testing.expect((try b.nextPacket()) == null);
+    }
+    // A data offset (tp_mac) beyond the 48-byte header: the data starts there.
+    buildBlock(&buf, 1, 60);
+    std.mem.writeInt(u32, buf[block_header_len + 12 ..][0..4], 40, e); // tp_snaplen
+    std.mem.writeInt(u16, buf[block_header_len + 24 ..][0..2], 64, e); // tp_mac
+    @memset(buf[block_header_len + 48 ..][0..16], 0x11);
+    @memset(buf[block_header_len + 64 ..][0..40], 0xee);
+    var b = try Block.init(&buf);
+    const p = (try b.nextPacket()).?;
+    try testing.expectEqual(@as(usize, 40), p.bytes.len);
+    try testing.expectEqual(@as(u8, 0xee), p.bytes[0]);
+}
+
+test "mutation 2026-11-27: Ring.init and RingV2.init: limits the total check does not cover, and a socket that is not AF_PACKET" {
+    const dummy: root.Socket = .{ .fd = -1 };
+    // More than max_blocks blocks and frames below 128 bytes, with a small total.
+    try testing.expectError(error.BadSize, Ring.init(dummy, .{ .block_size = 4096, .block_nr = max_blocks + 1 }));
+    try testing.expectError(error.BadSize, Ring.init(dummy, .{ .frame_size = 64 }));
+    try testing.expectError(error.BadSize, Ring.init(dummy, .{ .frame_size = 112 }));
+    // One block of max_block_size + a page is within max_total.
+    try testing.expectError(error.BadSize, RingV2.init(dummy, .{ .block_size = max_block_size + 4096, .block_nr = 1 }));
+    // An AF_INET socket is not a packet socket: the kernel refuses PACKET_VERSION (ENOPROTOOPT).
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expectEqual(.SUCCESS, linux.errno(rc));
+    const sock: root.Socket = .{ .fd = @intCast(rc) };
+    defer sock.close();
+    try testing.expectError(error.RingUnsupported, Ring.init(sock, .{}));
+    try testing.expectError(error.RingUnsupported, RingV2.init(sock, .{}));
+}
+
+test "mutation 2026-11-27: deinit of a fromMap ring leaves the caller's memory mapped and empties the ring's view of it" {
+    const e = builtin.cpu.arch.endian();
+    const S = struct {
+        var m3: [2 * 4096]u8 align(std.heap.page_size_min) = undefined;
+        var m2: [2 * 4096]u8 align(std.heap.page_size_min) = undefined;
+    };
+    fakeMap(&S.m3, 4096, 2, 1, 2);
+    var r3 = try Ring.fromMap(&S.m3, 4096, 2);
+    r3.deinit();
+    try testing.expectEqual(@as(usize, 0), r3.map.len);
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, S.m3[0..4], e)); // buildBlock's version word, still there
+    fakeMap2(&S.m2, 4096, 2, 1024, 8);
+    var r2 = try RingV2.fromMap(&S.m2, 4096, 2, 1024);
+    r2.deinit();
+    try testing.expectEqual(@as(usize, 0), r2.map.len);
+    try testing.expectEqual(status_user, std.mem.readInt(u32, S.m2[0..4], e));
+}
+
+test "mutation 2026-11-27: a hand-out ticket is never 0, also after the counter wraps (V3 and V2)" {
+    var map: [4 * 4096]u8 align(std.heap.page_size_min) = undefined;
+    fakeMap(&map, 4096, 4, 2, 4);
+    var r = try Ring.fromMap(&map, 4096, 4);
+    r.next_ticket = std.math.maxInt(u64);
+    const b0 = (try r.next(0)).?;
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), b0.ticket);
+    try r.release(b0);
+    const b1 = (try r.next(0)).?;
+    try testing.expectEqual(@as(u64, 1), b1.ticket);
+    try r.release(b1);
+
+    var map2: [2 * 4096]u8 align(std.heap.page_size_min) = undefined;
+    fakeMap2(&map2, 4096, 2, 1024, 8);
+    var r2 = try RingV2.fromMap(&map2, 4096, 2, 1024);
+    r2.next_ticket = std.math.maxInt(u64);
+    const f0 = (try r2.next(0)).?;
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), f0.ticket);
+    try r2.release(f0);
+    const f1 = (try r2.next(0)).?;
+    try testing.expectEqual(@as(u64, 1), f1.ticket);
+    try r2.release(f1);
+}
+
+test "mutation 2026-11-27: a V2 frame of exactly the header size, with nothing captured, is an empty packet" {
+    const e = builtin.cpu.arch.endian();
+    var f: [frame_header_len]u8 = @splat(0);
+    std.mem.writeInt(u16, f[12..14], frame_header_len, e); // tp_mac = 32, tp_snaplen = 0
+    const p = try (FrameV2{ .bytes = &f }).packet();
+    try testing.expectEqual(@as(usize, 0), p.bytes.len);
+}
+
+test "mutation 2026-11-27: RingV2.fromMap accepts 2^32 - 1 frames and refuses 2^32 + 65536 (fabricated slice, never touched)" {
+    const base: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(std.heap.page_size_min);
+    const big = base[0 .. 1 << 40];
+    // 4_194_368 B blocks of 64 B frames: 65_537 frames per block.
+    const r = try RingV2.fromMap(big, 4_194_368, 65_535, 64);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), r.frame_nr);
+    try testing.expectError(error.BadSize, RingV2.fromMap(big, 4_194_368, 65_536, 64));
+}
+
+fn v2WaitFreeBody() void {
+    var map: [2 * 4096]u8 align(std.heap.page_size_min) = undefined;
+    fakeMap2(&map, 4096, 2, 1024, 0); // no frame is ready
+    var r = RingV2.fromMap(&map, 4096, 2, 1024) catch @panic("fromMap");
+    const got = r.next(-1) catch @panic("next");
+    if (got != null) @panic("a frame from a ring with none ready");
+}
+
+test "mutation 2026-11-27: RingV2.next on a fake mapping never waits, not even for an infinite timeout" {
+    try @import("sweep_test.zig").expectSurvives(v2WaitFreeBody);
+}
