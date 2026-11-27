@@ -2244,3 +2244,424 @@ test "unlinkability: third-party leakage ε is ~0 for the Poisson mix, large for
     try testing.expect(nocover.e2e_min_set < (types.SenderBound{}).min_sender_set); // ...and the sender-set bound sees it too
     try testing.expect(poisson.e2e_min_set >= (types.SenderBound{}).min_sender_set);
 }
+
+// ── mutation 2026-11-27: tests that need the private handlers (whole-module audit) ──
+
+const LOOP_CFG = LoopixConfig{ .mix_loop_interval = 60 };
+
+fn testSim(gpa: Allocator, mix: anytype, log: *netsim.Log, comptime scen: anytype) !Sim {
+    var sim = netsim.Sim.init(gpa, 0, mix.protocol(), log, UNTIL, 10_000);
+    errdefer sim.deinit();
+    try scen(&sim);
+    return sim;
+}
+
+/// Leaves 0xAA below the caller's frame, so an uninitialised local that lands there is visibly stale
+/// (a ReleaseSafe build does not poison `undefined` by itself).
+noinline fn dirtyStack() void {
+    var buf: [16384]u8 = undefined;
+    @memset(&buf, 0xAA);
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+fn allZero(slice: []const NodeId) bool {
+    for (slice) |v| if (v != 0) return false;
+    return true;
+}
+
+test "mutation 2026-11-27: originated headers carry no stale bytes, the right origin record and sender-chosen holds only when configured" {
+    const gpa = testing.allocator;
+    // sender-chosen holds with mean 1: every drawn hold is 0 (a mean of fifo_delay = 5000 would not be)
+    const cfg = LoopixConfig{ .sender_chosen_delays = true, .mean_delay = 1, .fifo_delay = 5000 };
+    var mix = try Loopix.init(gpa, cfg, 1);
+    defer mix.deinit(gpa);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = netsim.Sim.init(gpa, 0, mix.protocol(), &log, UNTIL, 10_000);
+    defer sim.deinit();
+    try scenarioFor(cfg)(&sim);
+    var prng = mixing.Prng.init(1);
+    dirtyStack();
+    const h = try mix.relay.originateCover(&sim, 2, .loop_cover, &prng);
+    try testing.expect(h.has_delays);
+    for (h.delays[0..h.n_hops]) |d| try testing.expectEqual(@as(u32, 0), d);
+    try testing.expect(allZero(h.route[h.n_hops + 1 ..])); // nothing uninitialised goes on the wire
+    try testing.expectEqual(cfg.clientNode(2), h.route[h.n_hops]); // a loop ends at its sender
+    const o = mix.relay.origins.items[mix.relay.origins.items.len - 1];
+    try testing.expectEqual(@as(u8, 2), o.client);
+    try testing.expectEqual(@as(?u8, 2), o.recipient);
+    try testing.expect(!o.from_mix);
+
+    // mix loops: no sender-chosen holds configured => none written, even with a prng at hand
+    var lmix = try Loopix.init(gpa, LOOP_CFG, 1);
+    defer lmix.deinit(gpa);
+    var llog: netsim.Log = .{};
+    defer llog.deinit(gpa);
+    var lsim = netsim.Sim.init(gpa, 0, lmix.protocol(), &llog, UNTIL, 10_000);
+    defer lsim.deinit();
+    try scenarioFor(LOOP_CFG)(&lsim);
+    var routes: [2][8][3]NodeId = undefined;
+    for (0..2) |m| for (0..8) |k| {
+        dirtyStack();
+        const lh = try lmix.relay.originateMixLoop(&lsim, LOOP_CFG.mixNode(0, @intCast(m)), &prng);
+        try testing.expect(!lh.has_delays);
+        try testing.expect(allZero(lh.route[lh.n_hops + 1 ..]));
+        routes[m][k] = lh.route[0..3].*;
+        try testing.expectEqual(@as(NodeId, LOOP_CFG.mixNode(0, @intCast(m))), lh.route[lh.n_hops]); // home
+    };
+    // consecutive loops of one mix take different routes, and two mixes' first loops differ
+    var distinct_seq = false;
+    var distinct_mix = false;
+    for (1..8) |k| {
+        if (!std.mem.eql(NodeId, &routes[0][k], &routes[0][0])) distinct_seq = true;
+    }
+    for (0..8) |k| {
+        if (!std.mem.eql(NodeId, &routes[0][k], &routes[1][k])) distinct_mix = true;
+    }
+    try testing.expect(distinct_seq and distinct_mix);
+    const lo = lmix.relay.origins.items[lmix.relay.origins.items.len - 1];
+    try testing.expect(lo.from_mix);
+}
+
+test "mutation 2026-11-27: a client counts exactly what it cannot decode, cannot place or was not addressed to it" {
+    const gpa = testing.allocator;
+    var mix = try Loopix.init(gpa, P, 1);
+    defer mix.deinit(gpa);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = try testSim(gpa, &mix, &log, providerScenario);
+    defer sim.deinit();
+    const c0 = P.clientNode(0);
+    try mix.relay.sent.put(gpa, 42, .{ .client = 1, .at = 0, .kind = .real, .recipient = c0 });
+
+    // a mailbox answer announcing no packets is no error and no delivery
+    try mix.relay.clientMessage(&sim, c0, &.{ 0xF1, 0 });
+    try testing.expectEqual(@as(u64, 0), mix.relay.malformed);
+    // plain garbage; an answer whose first slot is garbage
+    try mix.relay.clientMessage(&sim, c0, &.{ 0x7F, 1, 2 });
+    try testing.expectEqual(@as(u64, 1), mix.relay.malformed);
+    var resp: [2 + MixHeader.wire_len]u8 = @splat(0x7F);
+    resp[0] = 0xF1;
+    resp[1] = 1;
+    try mix.relay.clientMessage(&sim, c0, &resp);
+    try testing.expectEqual(@as(u64, 2), mix.relay.malformed);
+    // a well-formed header nobody sent
+    var unknown = MixHeader{ .kind = .real, .id = 777, .hop = 3, .n_hops = 3, .route = .{ 0, 3, 6, P.providerOf(0), 0, 0, 0 }, .recipient = c0 };
+    var buf: [MixHeader.wire_len]u8 = undefined;
+    unknown.encode(&buf);
+    try mix.relay.clientMessage(&sim, c0, &buf);
+    try testing.expectEqual(@as(u64, 3), mix.relay.malformed);
+    // a packet still mid-route (hop < n_hops) for the right client is not a delivery
+    unknown.id = 42;
+    unknown.hop = 2;
+    unknown.encode(&buf);
+    try mix.relay.clientMessage(&sim, c0, &buf);
+    try testing.expectEqual(@as(u64, 1), mix.relay.misdelivered);
+    try testing.expectEqual(@as(usize, 0), mix.deliveries().len);
+    try testing.expectEqual(@as(u64, 3), mix.relay.malformed);
+}
+
+test "mutation 2026-11-27: stats() — counts, latencies, overhead and bytes, and zeros (not NaN) when nothing was sent or delivered" {
+    const gpa = testing.allocator;
+    var mix = try Loopix.init(gpa, DEFAULT_CFG, 1);
+    defer mix.deinit(gpa);
+    // only cover so far: no real packet, so no overhead ratio and no per-real byte cost
+    try mix.relay.sent.put(gpa, 1, .{ .client = 0, .at = 0, .kind = .drop_cover, .recipient = 4 });
+    const z = mix.stats();
+    try testing.expectEqual(@as(f64, 0.0), z.overhead);
+    try testing.expectEqual(@as(f64, 0.0), z.mean_latency);
+    try testing.expectEqual(@as(f64, 0.0), z.bytes_per_real);
+    try testing.expectEqual(@as(usize, 1), z.cover_sent);
+
+    try mix.relay.sent.put(gpa, 2, .{ .client = 0, .at = 0, .kind = .real, .recipient = 4 });
+    try mix.relay.sent.put(gpa, 3, .{ .client = 0, .at = 0, .kind = .real, .recipient = 4 });
+    try mix.relay.sent.put(gpa, 4, .{ .client = 0, .at = 0, .kind = .real, .recipient = 4 });
+    try mix.relay.sent.put(gpa, 5, .{ .client = 0, .at = 0, .kind = .loop_cover, .recipient = 3 });
+    try mix.relay.mix_sent.put(gpa, 90, .{ .mix = 0, .at = 0 });
+    try mix.relay.mix_sent.put(gpa, 91, .{ .mix = 1, .at = 0 });
+    try mix.relay.deliveries.append(gpa, .{ .id = 2, .kind = .real, .sender = 0, .recipient = 1, .sent = 0, .delivered = 10 });
+    try mix.relay.deliveries.append(gpa, .{ .id = 3, .kind = .real, .sender = 0, .recipient = 1, .sent = 5, .delivered = 35 });
+    try mix.relay.deliveries.append(gpa, .{ .id = 5, .kind = .loop_cover, .sender = 0, .recipient = 0, .sent = 0, .delivered = 999 });
+    mix.relay.link_bytes = 1000;
+    mix.relay.fetch_bytes = 64;
+    const s = mix.stats();
+    try testing.expectEqual(@as(usize, 3), s.real_sent);
+    try testing.expectEqual(@as(usize, 2), s.cover_sent);
+    try testing.expectEqual(@as(usize, 2), s.real_delivered);
+    try testing.expectEqual(@as(usize, 2), s.mix_cover_sent);
+    try testing.expectApproxEqAbs(@as(f64, 20.0), s.mean_latency, 1e-9); // (10 + 30) / 2
+    try testing.expectEqual(@as(Time, 30), s.max_latency);
+    try testing.expectApproxEqAbs(@as(f64, (2.0 + 2.0) / 3.0), s.overhead, 1e-9); // cover + mix loops per real
+    try testing.expectEqual(@as(u64, 1000), s.link_bytes);
+    try testing.expectEqual(@as(u64, 64), s.fetch_bytes);
+    try testing.expectApproxEqAbs(@as(f64, 500.0), s.bytes_per_real, 1e-9);
+}
+
+test "mutation 2026-11-27: the timers settle watched loops; only loop cover is watched; a fresh Loopix starts with zero counts" {
+    const gpa = testing.allocator;
+    var mix = try Loopix.init(gpa, P, 1);
+    defer mix.deinit(gpa);
+    for (mix.lost) |l| try testing.expectEqual(@as(u32, 0), l);
+    for (mix.mix_lost) |l| try testing.expectEqual(@as(u32, 0), l);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = try testSim(gpa, &mix, &log, providerScenario);
+    defer sim.deinit();
+    const p = mix.protocol();
+    const c0 = P.clientNode(0);
+
+    // a loop that is home: either timer of its client settles it
+    try mix.loops.put(gpa, 7, .{ .client = 0, .deadline = 100 });
+    try mix.relay.delivered.put(gpa, 7, 0);
+    try p.onTimerFn.?(p.ctx, &sim, c0, FETCH_TIMER);
+    try testing.expectEqual(@as(u64, 1), mix.loops_returned);
+    try testing.expectEqual(@as(usize, 0), mix.loops.count());
+    try mix.loops.put(gpa, 8, .{ .client = 0, .deadline = 100 });
+    try mix.relay.delivered.put(gpa, 8, 0);
+    try p.onTimerFn.?(p.ctx, &sim, c0, COVER_TIMER);
+    try testing.expectEqual(@as(u64, 2), mix.loops_returned);
+    try testing.expect(mix.loops.get(8) == null);
+
+    // every cover emission that is watched is a loop
+    for (0..40) |_| try p.onTimerFn.?(p.ctx, &sim, c0, COVER_TIMER);
+    try testing.expect(mix.loops_watched > 0);
+    try testing.expectEqual(@as(usize, @intCast(mix.loops_watched)), mix.loops.count());
+    var it = mix.loops.keyIterator();
+    while (it.next()) |id| try testing.expectEqual(MsgKind.loop_cover, mix.relay.sent.get(id.*).?.kind);
+    var loops: usize = 0;
+    var drops: usize = 0;
+    var sit = mix.relay.sent.valueIterator();
+    while (sit.next()) |s| switch (s.kind) {
+        .loop_cover => loops += 1,
+        .drop_cover => drops += 1,
+        .real => {},
+    };
+    try testing.expect(loops > 0 and drops > 0); // both kinds were emitted; only loops were watched
+}
+
+test "mutation 2026-11-27: an n−1 attacker drops at its mix, within [start, stop), and only there" {
+    const gpa = testing.allocator;
+    var mix = try Loopix.init(gpa, DEFAULT_CFG, 1);
+    defer mix.deinit(gpa);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = try testSim(gpa, &mix, &log, scenario);
+    defer sim.deinit();
+    const p = mix.protocol();
+    const m0 = DEFAULT_CFG.mixNode(0, 0);
+    const m1 = DEFAULT_CFG.mixNode(0, 1);
+    const hdr = MixHeader{ .kind = .real, .id = 1, .hop = 0, .n_hops = 3, .route = .{ m0, 3, 6, 9, 0, 0, 0 } };
+    var buf: [MixHeader.wire_len]u8 = undefined;
+    hdr.encode(&buf);
+    // the sim clock reads 0: the window [0, 1) contains it, [1, 5) and [0, 0) do not
+    mix.attack = .{ .mix = m0, .start = 0, .stop = 1 };
+    try p.onMessageFn(p.ctx, &sim, m0, DEFAULT_CFG.clientNode(0), &buf);
+    try testing.expectEqual(@as(u64, 1), mix.attack_dropped);
+    try testing.expectEqual(@as(usize, 0), mix.relay.queues[m0].items.len);
+    mix.attack = .{ .mix = m0, .start = 1, .stop = 5 };
+    try p.onMessageFn(p.ctx, &sim, m0, DEFAULT_CFG.clientNode(0), &buf);
+    mix.attack = .{ .mix = m0, .start = 0, .stop = 0 };
+    try p.onMessageFn(p.ctx, &sim, m0, DEFAULT_CFG.clientNode(0), &buf);
+    try testing.expectEqual(@as(u64, 1), mix.attack_dropped);
+    try testing.expectEqual(@as(usize, 2), mix.relay.queues[m0].items.len);
+    // another mix is not blocked
+    mix.attack = .{ .mix = m1, .start = 0, .stop = 1 };
+    try p.onMessageFn(p.ctx, &sim, m0, DEFAULT_CFG.clientNode(0), &buf);
+    try testing.expectEqual(@as(u64, 1), mix.attack_dropped);
+    try testing.expectEqual(@as(usize, 3), mix.relay.queues[m0].items.len);
+}
+
+test "mutation 2026-11-27: a mix loop's deadline is its holds + (hops + 1) legs at worst + the slack; timed batches wait a period per hop" {
+    const gpa = testing.allocator;
+    var mix = try Loopix.init(gpa, LOOP_CFG, 1);
+    defer mix.deinit(gpa);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = netsim.Sim.init(gpa, 0, mix.protocol(), &log, UNTIL, 10_000);
+    defer sim.deinit();
+    var h = MixHeader{ .kind = .loop_cover, .id = 5, .hop = 0, .n_hops = 3, .route = @splat(0), .has_delays = true };
+    h.delays = .{ 10, 20, 30, 0, 0, 0, 0 };
+    try mix.watchMixLoop(&sim, 0, h);
+    try testing.expectEqual(@as(Time, 60 + (3 + 1) * max_link_latency + LOOP_CFG.loop_slack), mix.mix_loops.get(5).?.deadline);
+    try testing.expectEqual(@as(u64, 1), mix.mix_loops_watched);
+
+    const timed_cfg = LoopixConfig{ .mix_loop_interval = 60, .mix_strategy = .timed, .batch_period = 40 };
+    var tmix = try Loopix.init(gpa, timed_cfg, 1);
+    defer tmix.deinit(gpa);
+    var tlog: netsim.Log = .{};
+    defer tlog.deinit(gpa);
+    var tsim = netsim.Sim.init(gpa, 0, tmix.protocol(), &tlog, UNTIL, 10_000);
+    defer tsim.deinit();
+    h.has_delays = false;
+    try tmix.watchMixLoop(&tsim, 0, h);
+    try testing.expectEqual(@as(Time, 3 * 40 + (3 + 1) * max_link_latency + timed_cfg.loop_slack), tmix.mix_loops.get(5).?.deadline);
+    try testing.expectEqual(@as(?Time, 3 * 40), tmix.holdBound(h));
+    // a threshold batch waits for traffic: its holds cannot be known, so nothing is watched
+    const thr_cfg = LoopixConfig{ .mix_loop_interval = 60, .mix_strategy = .threshold };
+    var xmix = try Loopix.init(gpa, thr_cfg, 1);
+    defer xmix.deinit(gpa);
+    try testing.expectEqual(@as(?Time, null), xmix.holdBound(h));
+}
+
+test "mutation 2026-11-27: FifoMix holds exactly fifo_delay, serves mailboxes, and is reusable after reset" {
+    const gpa = testing.allocator;
+    const cfg = LoopixConfig{ .clients = 8, .providers = 2, .fifo_delay = 25 };
+    var fresh = try FifoMix.init(gpa, cfg);
+    defer fresh.deinit(gpa);
+    _ = try netsim.replay(gpa, .{ .seed = 3, .scenario = scenarioFor(cfg), .protocol = fresh.protocol(), .until = UNTIL }, &.{}, null);
+    // every hold at every mix is exactly fifo_delay (mean_delay is 40: not the law of this mix)
+    try testing.expect(fresh.transcript().len > 50);
+    for (fresh.transcript()) |t| try testing.expectEqual(@as(Time, 25), t.departure - t.arrival);
+    // clients pull their mailboxes (fetch timers armed at start, re-armed on each pull): packets arrive
+    try testing.expect(fresh.relay.deliveries.items.len > 10);
+    try testing.expect(fresh.relay.fetch_lens.items.len > 10);
+
+    var used = try FifoMix.init(gpa, cfg);
+    defer used.deinit(gpa);
+    _ = try netsim.replay(gpa, .{ .seed = 9, .scenario = scenarioFor(cfg), .protocol = used.protocol(), .until = UNTIL }, &.{}, null);
+    used.relay.malformed = 5;
+    used.relay.next_id = 500;
+    _ = try netsim.replay(gpa, .{ .seed = 3, .scenario = scenarioFor(cfg), .protocol = used.protocol(), .until = UNTIL }, &.{}, null);
+    try testing.expectEqual(fresh.transcript().len, used.transcript().len);
+    for (fresh.transcript(), used.transcript()) |a, b| try testing.expectEqual(a, b);
+    try testing.expectEqual(fresh.relay.malformed, used.relay.malformed);
+    try testing.expectEqual(fresh.relay.deliveries.items.len, used.relay.deliveries.items.len);
+}
+
+fn mutHdr(h: MixHeader) [MixHeader.wire_len]u8 {
+    var b: [MixHeader.wire_len]u8 = undefined;
+    h.encode(&b);
+    return b;
+}
+
+test "mutation 2026-11-27: a mix takes back exactly its own loop, only when it is home, and counts a second return" {
+    const gpa = testing.allocator;
+    var mix = try Loopix.init(gpa, LOOP_CFG, 1);
+    defer mix.deinit(gpa);
+    const m0 = LOOP_CFG.mixNode(0, 0);
+    const m1 = LOOP_CFG.mixNode(0, 1);
+    try mix.relay.mix_sent.put(gpa, 9, .{ .mix = m0, .at = 0 });
+    try mix.relay.mix_sent.put(gpa, 10, .{ .mix = m1, .at = 0 });
+    var h = MixHeader{ .kind = .loop_cover, .id = 9, .hop = 3, .n_hops = 3, .route = .{ LOOP_CFG.mixNode(0, 2), LOOP_CFG.mixNode(1, 0), LOOP_CFG.mixNode(2, 0), m0, 0, 0, 0 } };
+    // still on its way (hop < n_hops), though the route ends at this mix
+    h.hop = 1;
+    var b = mutHdr(h);
+    try testing.expect(!mix.relay.mixLoopReturn(m0, &b));
+    // home, but the route ends at another node
+    h.hop = 3;
+    h.route[3] = m1;
+    b = mutHdr(h);
+    try testing.expect(!mix.relay.mixLoopReturn(m0, &b));
+    // home at this mix, but another mix sent that id
+    h.route[3] = m0;
+    h.id = 10;
+    b = mutHdr(h);
+    try testing.expect(!mix.relay.mixLoopReturn(m0, &b));
+    try testing.expectEqual(@as(u32, 0), mix.relay.mix_returned.count());
+    // its own loop, home: taken back and recorded; a second copy is counted, not recorded twice
+    h.id = 9;
+    b = mutHdr(h);
+    try testing.expect(mix.relay.mixLoopReturn(m0, &b));
+    try testing.expectEqual(@as(u32, 1), mix.relay.mix_returned.count());
+    try testing.expectEqual(@as(u64, 0), mix.relay.misdelivered);
+    try testing.expect(mix.relay.mixLoopReturn(m0, &b));
+    try testing.expectEqual(@as(u64, 1), mix.relay.misdelivered);
+    try testing.expectEqual(@as(u32, 1), mix.relay.mix_returned.count());
+}
+
+test "mutation 2026-11-27: loops are settled per owner, lost only past the deadline, and exactly once" {
+    const gpa = testing.allocator;
+    var mix = try Loopix.init(gpa, P, 1);
+    defer mix.deinit(gpa);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = try testSim(gpa, &mix, &log, providerScenario);
+    defer sim.deinit();
+    sim.now = 50;
+    // two home loops of two clients: client 0's check settles only client 0's, once
+    try mix.loops.put(gpa, 1, .{ .client = 0, .deadline = 100 });
+    try mix.loops.put(gpa, 2, .{ .client = 1, .deadline = 100 });
+    try mix.relay.delivered.put(gpa, 1, 0);
+    try mix.relay.delivered.put(gpa, 2, 0);
+    try mix.checkLoops(&sim, 0);
+    try mix.checkLoops(&sim, 0);
+    try testing.expectEqual(@as(u64, 1), mix.loops_returned);
+    try testing.expectEqual(@as(usize, 1), mix.loops.count());
+    // at its deadline a loop is not yet lost; one tick later it is, once
+    try mix.loops.put(gpa, 3, .{ .client = 0, .deadline = 50 });
+    try mix.checkLoops(&sim, 0);
+    try testing.expectEqual(@as(u32, 0), mix.lost[0]);
+    try testing.expectEqual(@as(usize, 2), mix.loops.count());
+    sim.now = 51;
+    try mix.checkLoops(&sim, 0);
+    try mix.checkLoops(&sim, 0);
+    try testing.expectEqual(@as(u32, 1), mix.lost[0]);
+    try testing.expect(mix.loops.get(3) == null);
+    try testing.expectEqual(@as(usize, 0), mix.alarms.items.len);
+    // the second loss reaches loop_alarm_lost (2): one alarm, not one per later loss
+    try mix.loops.put(gpa, 4, .{ .client = 0, .deadline = 10 });
+    try mix.loops.put(gpa, 5, .{ .client = 0, .deadline = 10 });
+    try mix.checkLoops(&sim, 0);
+    try testing.expectEqual(@as(u32, 3), mix.lost[0]);
+    try testing.expectEqual(@as(usize, 1), mix.alarms.items.len);
+}
+
+test "mutation 2026-11-27: a mix's own loops are settled the same way" {
+    const gpa = testing.allocator;
+    var mix = try Loopix.init(gpa, LOOP_CFG, 1);
+    defer mix.deinit(gpa);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = try testSim(gpa, &mix, &log, scenarioFor(LOOP_CFG));
+    defer sim.deinit();
+    sim.now = 50;
+    try mix.mix_loops.put(gpa, 1, .{ .mix = 0, .deadline = 100 });
+    try mix.mix_loops.put(gpa, 2, .{ .mix = 1, .deadline = 100 });
+    try mix.relay.mix_returned.put(gpa, 1, 0);
+    try mix.relay.mix_returned.put(gpa, 2, 0);
+    try mix.checkMixLoops(&sim, 0);
+    try mix.checkMixLoops(&sim, 0);
+    try testing.expectEqual(@as(u64, 1), mix.mix_loops_returned);
+    try testing.expectEqual(@as(usize, 1), mix.mix_loops.count());
+    try mix.mix_loops.put(gpa, 3, .{ .mix = 0, .deadline = 50 });
+    try mix.checkMixLoops(&sim, 0);
+    try testing.expectEqual(@as(u32, 0), mix.mix_lost[0]);
+    sim.now = 51;
+    try mix.checkMixLoops(&sim, 0);
+    try mix.checkMixLoops(&sim, 0);
+    try testing.expectEqual(@as(u32, 1), mix.mix_lost[0]);
+    try testing.expect(mix.mix_loops.get(3) == null);
+    try mix.mix_loops.put(gpa, 4, .{ .mix = 0, .deadline = 10 });
+    try mix.mix_loops.put(gpa, 5, .{ .mix = 0, .deadline = 10 });
+    try mix.checkMixLoops(&sim, 0);
+    try testing.expectEqual(@as(u32, 3), mix.mix_lost[0]);
+    try testing.expectEqual(@as(usize, 1), mix.mix_alarms.items.len);
+}
+
+test "mutation 2026-11-27: a release timer forwards the packet whose OWN release time is now, not an overdue one" {
+    const gpa = testing.allocator;
+    var mix = try Loopix.init(gpa, DEFAULT_CFG, 1);
+    defer mix.deinit(gpa);
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = try testSim(gpa, &mix, &log, scenario);
+    defer sim.deinit();
+    const m0 = DEFAULT_CFG.mixNode(0, 0);
+    const route: [7]NodeId = .{ m0, DEFAULT_CFG.mixNode(1, 0), DEFAULT_CFG.mixNode(2, 0), DEFAULT_CFG.clientNode(0), 0, 0, 0 };
+    const stale = MixHeader{ .kind = .real, .id = 100, .hop = 0, .n_hops = 3, .route = route };
+    const due = MixHeader{ .kind = .real, .id = 200, .hop = 0, .n_hops = 3, .route = route };
+    try mix.relay.queues[m0].append(gpa, .{ .arrival = 1, .release_at = 3, .hdr = stale });
+    try mix.relay.queues[m0].append(gpa, .{ .arrival = 2, .release_at = 5, .hdr = due });
+    sim.now = 5;
+    try mix.relay.release(&sim, m0);
+    try testing.expectEqual(@as(usize, 1), mix.relay.transcript.items.len);
+    try testing.expectEqual(@as(u64, 200), mix.relay.transcript.items[0].id);
+    try testing.expectEqual(@as(Time, 2), mix.relay.transcript.items[0].arrival);
+    try testing.expectEqual(@as(Time, 5), mix.relay.transcript.items[0].departure);
+    try testing.expectEqual(@as(usize, 1), mix.relay.queues[m0].items.len);
+    try testing.expectEqual(@as(u64, 100), mix.relay.queues[m0].items[0].hdr.id);
+    // nothing is due at a tick no packet was scheduled for
+    sim.now = 6;
+    try mix.relay.release(&sim, m0);
+    try testing.expectEqual(@as(usize, 1), mix.relay.transcript.items.len);
+}

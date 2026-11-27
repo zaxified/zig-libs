@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation run (568/584, 16 eq); 43 tests (`src/mutation_test.zig`, inline in `protocol.zig`). Test only.
 - **2026-11-24** — Added (the four items of the reference simulator, arXiv 2107.12172): `LoopixConfig.topology` (`cascade`, `multi_cascade`, `free_route` beside `stratified`; `scenarioFor(cfg)`, `routing.pickMixLoopRoute`, `isMix`, `isExitMix`); `mix_strategy` (`threshold`, `timed` batch-and-reorder with `DelayModel.batch`, `mixing.shuffle`); `mix_loop_interval` (mix-originated loops, `Loopix.mix_alarms`, `MixAlarm`, `TrafficStats.mix_cover_sent`, `mixing.nextMixLoop`); `measureReceiver` / `ReceiverBound` / `ReceiverResult` / `LoopixConfig.exitRows`, `SenderResult.mean_epsilon` / `max_epsilon` / `unlinkable` / `UnlinkBound`. Source-breaking only where a struct is built positionally: `Transit` gained `to`, `Origin` gained `recipient` and `from_mix` (both defaulted), `DelayModel` gained the `batch` variant (an exhaustive `switch` over it needs a new arm). Behaviour change: `measureEndToEnd` groups a mix's passes by hop as well, and its sender distribution is conditioned on the sender being a client (unchanged for a transcript without mix loops).
 
 - **2026-11-21** — Added: traffic cost in bytes (`TrafficStats.link_bytes`, `fetch_bytes`, `bytes_per_real`; every protocol send is counted) and a 160-node configuration (`LARGE_CFG`, `largeScenario`).

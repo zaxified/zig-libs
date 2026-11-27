@@ -6,7 +6,7 @@
 
 **Scope:** core — as a mixnet simulator/analysis library, against A. Piotrowska's discrete-event mix network simulator (arXiv 2107.12172, the Loopix/Nym evaluation tool) (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (24/24) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-27 (568/584, 16 eq) · src 1fe4c0fa1a12dccc
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, LOOPIX_FUZZ) · ct n/a — mixnet simulation over sphinx (keyword review, 2026-10-07)
 
@@ -317,6 +317,11 @@ is skipped.
   has an in-suite reach check and a pinned corpus count.
 - **Oracles:** none; the guarantees are invariants with positive controls (class C, see *Anchoring*).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Mutation run (2026-11-27, whole module):** 584 mutants, 568 killed (1 by hang), 16 equivalent (redundant
+  guards, identical values, dead code; two hash-input constants). New tests: `Loopix.reset` / `Relay.reset`, a
+  known-answer test for `mix64`, protocol handlers (inline in `protocol.zig`), "no stale bytes on the wire". The
+  adversary-sweep expected values come from an independent re-implementation of the documented algorithm. The
+  existing Poisson anonymity sweep pins the route hash's constants through its margin. No production defect.
 
 ## Backlog / deferred
 
