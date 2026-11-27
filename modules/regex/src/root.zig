@@ -5909,6 +5909,7 @@ test {
     _ = @import("mutation_test.zig");
     _ = @import("mutation_parse_test.zig");
     _ = @import("mutation_engine_test.zig");
+    _ = @import("mutation_delta_test.zig");
 }
 
 test "robustness: random patterns and inputs compile or refuse, and match, without a trap" {
@@ -8363,4 +8364,107 @@ test "bytes mode: Matcher.find/captures by the byte-stepping find DFA give the P
     probe_counts = .initFill(0);
     try testing.expectEqual(Span{ .start = 8, .end = 10 }, um.find("\u{00e9}ab \u{00e9} ab", 0).?);
     try testing.expect(probe_counts.get(.pike_bytes_step) + probe_counts.get(.bt_at) > 0);
+}
+
+// ── delta mutation run 2026-11-27: tests that need the probe hook ──
+
+test "mutation 2026-11-27: the bytes-mode find DFA empties its table at 256 states and goes on answering as the Pike VM" {
+    const gpa = testing.allocator;
+    // `[ab].{9}c` with rare c's and half the other bytes x: a state is the
+    // set of the last ten a/b positions, so far more than 256 of them turn up.
+    var re = try Regex.compileOptions(gpa, "[ab].{9}c", .{ .syntax = .rust, .utf8 = false });
+    defer re.deinit(gpa);
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    m.dfa_eager = true;
+    var pike = try Matcher.init(gpa, &re);
+    defer pike.deinit();
+    pike.pike_only = true;
+    var prng = std.Random.DefaultPrng.init(0xf1a5);
+    const rnd = prng.random();
+    const text = try gpa.alloc(u8, 6000);
+    defer gpa.free(text);
+    for (text) |*c| {
+        const r = rnd.uintLessThan(u8, 40);
+        c.* = if (r == 0) 'c' else if (r < 20) 'x' else "ab"[rnd.uintLessThan(u8, 2)];
+    }
+    probe_counts = .initFill(0);
+    var it = m.iterator(text);
+    var it2 = pike.iterator(text);
+    var n: usize = 0;
+    while (it2.next()) |want| : (n += 1) try testing.expectEqual(@as(?Span, want), it.next());
+    try testing.expectEqual(@as(?Span, null), it.next());
+    try testing.expect(n > 20);
+    try testing.expect(probe_counts.get(.bytes_find_flush) > 0);
+    try testing.expect(probe_counts.get(.bytes_find_step) > 256);
+    // The table is bounded, and one row and one entry list per state, no more.
+    const d = m.bdfa.?;
+    try testing.expect(d.states.items.len <= BytesFindDfa.max_states);
+    try testing.expectEqual(d.states.items.len, d.trans.items.len);
+    var listed: usize = 0;
+    for (d.states.items) |st| listed += st.len;
+    try testing.expectEqual(listed, d.ents.items.len);
+    // And the same text from every tenth start, one match each.
+    var from: usize = 0;
+    while (from < text.len) : (from += 10) try testing.expectEqual(pike.find(text, from), m.find(text, from));
+}
+
+test "mutation 2026-11-27: the bytes-mode DFAs — pike_only builds none, a leftmost-longest Regex leaves find to the VM, Dfa.max_insts is the exact bound" {
+    const gpa = testing.allocator;
+    const opts: Options = .{ .syntax = .rust, .utf8 = false };
+    var re = try Regex.compileOptions(gpa, "ab+c", opts);
+    defer re.deinit(gpa);
+    var pm = try Matcher.init(gpa, &re);
+    defer pm.deinit();
+    pm.pike_only = true;
+    pm.dfa_eager = true;
+    probe_counts = .initFill(0);
+    try testing.expectEqual(@as(?Span, .{ .start = 2, .end = 6 }), pm.find("xxabbc", 0));
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.dfa_made));
+    try testing.expectEqual(@as(usize, 0), probe_counts.get(.bytes_find_step));
+    var dm = try Matcher.init(gpa, &re);
+    defer dm.deinit();
+    dm.dfa_eager = true;
+    probe_counts = .initFill(0);
+    try testing.expectEqual(@as(?Span, .{ .start = 2, .end = 6 }), dm.find("xxabbc", 0));
+    try testing.expect(probe_counts.get(.bytes_find_step) > 0);
+
+    // Leftmost-longest: the DFA is leftmost-first, so the VM answers.
+    var lre = try Regex.compileOptions(gpa, "a|ab", .{ .syntax = .rust, .utf8 = false, .longest = true });
+    defer lre.deinit(gpa);
+    var lm = try Matcher.init(gpa, &lre);
+    defer lm.deinit();
+    lm.dfa_eager = true;
+    try testing.expectEqual(@as(?Span, .{ .start = 1, .end = 3 }), lm.find("xab", 0));
+    var fre = try Regex.compileOptions(gpa, "a|ab", opts);
+    defer fre.deinit(gpa);
+    var fm = try Matcher.init(gpa, &fre);
+    defer fm.deinit();
+    fm.dfa_eager = true;
+    try testing.expectEqual(@as(?Span, .{ .start = 1, .end = 2 }), fm.find("xab", 0));
+
+    // The bound: a program of up to Dfa.max_insts instructions runs the byte
+    // DFAs, one instruction more does not.
+    var saw_edge = false;
+    var n: usize = 118;
+    while (n <= 136) : (n += 1) {
+        var pat: [16]u8 = undefined;
+        const p = try std.fmt.bufPrint(&pat, "a{{{d}}}", .{n});
+        var bre = try Regex.compileOptions(gpa, p, opts);
+        defer bre.deinit(gpa);
+        if (bre.insts.len == Dfa.max_insts) saw_edge = true;
+        const text = try gpa.alloc(u8, n);
+        defer gpa.free(text);
+        @memset(text, 'a');
+        probe_counts = .initFill(0);
+        try testing.expect(bre.isMatch(text));
+        try testing.expectEqual(bre.insts.len <= Dfa.max_insts, probe_counts.get(.dfa_step) > 0);
+        var bm = try Matcher.init(gpa, &bre);
+        defer bm.deinit();
+        bm.dfa_eager = true;
+        probe_counts = .initFill(0);
+        try testing.expectEqual(@as(?Span, .{ .start = 0, .end = n }), bm.find(text, 0));
+        try testing.expectEqual(bre.insts.len <= Dfa.max_insts, probe_counts.get(.bytes_find_step) > 0);
+    }
+    try testing.expect(saw_edge);
 }
