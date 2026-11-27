@@ -16,6 +16,7 @@ const rdata = @import("rdata.zig");
 const wire = @import("wire.zig");
 const canonical = @import("canonical.zig");
 const ds = @import("ds.zig");
+const burn = @import("burn.zig");
 
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
@@ -68,7 +69,18 @@ pub const SignParams = struct {
 
 /// RRSIG RDATA (owned by `gpa`) covering `rrset` (one owner name, type and class; `owner_name` is its text name)
 /// signed with `key`. The RRset's records are canonicalized and sorted exactly as `validate` expects.
+/// The stack the signing dirtied is burned (`burn.sign_burn`).
 pub fn signRrset(
+    gpa: std.mem.Allocator,
+    rrset: []const dns.Record,
+    owner_name: []const u8,
+    key: SigningKey,
+    params: SignParams,
+) SignError![]u8 {
+    return burn.run(burn.sign_burn, SignError![]u8, signRrsetBody, .{ gpa, rrset, owner_name, key, params });
+}
+
+fn signRrsetBody(
     gpa: std.mem.Allocator,
     rrset: []const dns.Record,
     owner_name: []const u8,
