@@ -1219,6 +1219,14 @@ pub const JwkSet = struct {
     arena: *std.heap.ArenaAllocator,
 
     pub fn deinit(self: *JwkSet) void {
+        // A parsed set (`id != 0`) owns its `oct` secrets in the arena: wipe
+        // them before the arena hands the memory back. A hand-built set
+        // (`id == 0`) may borrow its slices, even from read-only memory, so
+        // it is left to its builder.
+        if (self.id != 0) for (self.keys) |jwk| switch (jwk.key) {
+            .hmac => |k| std.crypto.secureZero(u8, @constCast(k)),
+            else => {},
+        };
         const gpa = self.arena.child_allocator;
         self.arena.deinit();
         gpa.destroy(self.arena);
@@ -1300,7 +1308,11 @@ pub const JwkSet = struct {
 /// recorded in `skipped` — a set-wide error is returned only when the
 /// document itself is not a JWKS. Arbitrary bytes never panic.
 pub fn parseJwks(gpa: std.mem.Allocator, json: []const u8) JwksError!JwkSet {
-    return parseJwksSource(gpa, json, .local);
+    // A local set may hold `oct` secrets: the JSON scanner and the base64
+    // decoder that see `k` run one frame down, under a burn (2026-11-27; the
+    // network path refuses `oct` and holds no secret, so it is not burned).
+    // The returned `JwkSet` holds only pointers.
+    return burn.run(burn.jwks_burn, JwksError!JwkSet, parseJwksSource, .{ gpa, json, .local });
 }
 
 /// `parseJwks` with an explicit trust source (see `JwkSource`). The public

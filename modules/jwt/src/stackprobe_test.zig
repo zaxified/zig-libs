@@ -862,7 +862,7 @@ test "STACKPROBE: VerifiedCache.init leaves no copy of its MAC key on the dead s
 // and are asserted by the last test in this file.
 var residue_failures: usize = 0;
 /// Measured calls that are plain copies with no burn by design (burn-presence survey 2026-11-26).
-const no_burn_by_design = [_][]const u8{"parseJwks oct"};
+const no_burn_by_design = [_][]const u8{}; // `parseJwks oct` burns since 2026-11-27
 fn burnsByDesign(label: []const u8) bool {
     for (no_burn_by_design) |e| if (std.mem.endsWith(u8, label, e)) return false;
     return true;

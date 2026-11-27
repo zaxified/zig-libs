@@ -1264,3 +1264,26 @@ test "encodeJson / SigningKey.sign: an RSA key of 2047 bits is below the signing
     try testing.expectError(error.InvalidKey, jwt.encodeJson(gpa, "{}", .{ .rs256 = odd }, .{}));
     try testing.expectError(error.InvalidKey, jwt.encodeJson(gpa, "{}", .{ .ps256 = .{ .key = odd, .random = csprng.random() } }, .{}));
 }
+
+/// The fixed heap of the `oct` wipe test (static: 1 MiB is too big for a test thread's stack).
+var oct_wipe_heap: [1 << 20]u8 = undefined;
+
+test "parseJwks: deinit wipes the decoded `oct` secret before the arena frees it (2026-11-27)" {
+    // The set's arena runs over a fixed buffer, so the freed memory stays
+    // readable: the decoded `k` must not be in it after deinit.
+    const secret: [32]u8 = @splat(0xA5);
+    var k_b64: [43]u8 = undefined;
+    _ = enc.encode(&k_b64, &secret);
+    var json_buf: [128]u8 = undefined;
+    const json = try std.fmt.bufPrint(&json_buf, "{{\"keys\":[{{\"kty\":\"oct\",\"kid\":\"h\",\"k\":\"{s}\"}}]}}", .{k_b64});
+    const heap = &oct_wipe_heap;
+    @memset(heap, 0);
+    var fba: std.heap.FixedBufferAllocator = .init(heap);
+    var set = try jwt.parseJwks(fba.allocator(), json);
+    try testing.expectEqual(@as(usize, 1), set.keys.len);
+    try testing.expectEqualSlices(u8, &secret, set.keys[0].key.hmac);
+    // Positive control: the secret is in the heap while the set lives.
+    try testing.expect(std.mem.indexOf(u8, heap, &secret) != null);
+    set.deinit();
+    try testing.expect(std.mem.indexOf(u8, heap, &secret) == null);
+}

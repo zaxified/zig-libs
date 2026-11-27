@@ -68,3 +68,12 @@ pub const pem_key_burn = 48 * 1024;
 /// stack probe for the same calls (`tlsserver/src/burn.zig`
 /// `mldsa_key_burn`, 2026-10-21).
 pub const mldsa_key_burn = .{ .ml_dsa_44 = 448 * 1024, .ml_dsa_65 = 704 * 1024, .ml_dsa_87 = 1280 * 1024 };
+
+/// `parseJwks` (a local set, which may hold `kty:"oct"` secrets): std.json's
+/// scanner and b64ct's decoder see `k`. The body dirtied 681 KiB in
+/// ReleaseFast (2026-11-27): `Key` is 68 KB (an ML-DSA-87 public key holds its
+/// expanded matrix) and `jwkFromValue`'s frame keeps about ten of them, so
+/// `k` is decoded ~680 KiB down. A 16 KiB burn left 547 B of that frame
+/// region unburned (residue rule). The burn reuses stack the body already
+/// took; shrinking the frame is SPEC Backlog.
+pub const jwks_burn = 768 * 1024;
