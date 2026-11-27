@@ -13782,3 +13782,150 @@ test "export: a repeated entry of the later presence ops is written once" {
         .{ .field = "F", .kind = .string, .cross = &.{ .{ .op = .required_without_all, .other = "A" }, .{ .op = .required_without_all, .other = "A" } } },
     });
 }
+
+// ── tests: pinned by the 2026-11-27 delta mutation run ──────────────────────
+
+test "mutation 2026-11-27: date-time cross rules are instants only under format date_time/date" {
+    // `ne_field` on a `date_time` rule: the same instant in two offsets is equal, so the rule fails.
+    const ne = [_]Rule{
+        .{ .field = "a", .format = .date_time, .cross = &.{.{ .op = .ne_field, .other = "b" }} },
+        .{ .field = "b" },
+    };
+    try expectBoth("{\"a\":\"2026-01-01T01:00:00+01:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &ne, &.{.{ "a", "field_equal" }});
+    try expectBoth("{\"a\":\"2026-01-01T01:00:00+01:00\",\"b\":\"2026-01-01T00:00:01Z\"}", &ne, &.{});
+    // A format that is neither `date_time` nor `date` leaves the strings as text, even when they
+    // are shaped like date-times (`ascii` holds for both).
+    const ascii = [_]Rule{
+        .{ .field = "a", .format = .ascii, .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "b" },
+    };
+    try expectBoth("{\"a\":\"2026-01-01T01:00:00+01:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &ascii, &.{.{ "a", "field_mismatch" }});
+    // A `date` rule counts as one that holds a date or date-time: the instants apply (the value is
+    // no `date`, so its own format error stays, but the cross rule must not add a second one).
+    const date = [_]Rule{
+        .{ .field = "a", .format = .date, .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "b" },
+    };
+    try expectBoth("{\"a\":\"2026-01-01T01:00:00+01:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &date, &.{.{ "a", "format" }});
+    // Offset-less date-times are instants too (as UTC) on either side of `eq_field`; a fraction of
+    // zeros is the same instant.
+    const dt = [_]Rule{
+        .{ .field = "a", .format = .date_time, .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "b" },
+    };
+    try expectBoth("{\"a\":\"2026-01-01T00:00:00Z\",\"b\":\"2026-01-01T00:00:00.0\"}", &dt, &.{});
+    try expectBoth("{\"a\":\"2026-01-01T00:00:00\",\"b\":\"2026-01-01T00:00:00.0Z\"}", &dt, &.{.{ "a", "format" }});
+}
+
+test "mutation 2026-11-27: a leap second needs 23:59 on the local clock too, and local_* keep the other limits" {
+    for ([_]Format{ .local_time, .time }) |f| {
+        const sfx: []const u8 = if (f == .time) "Z" else "";
+        var buf: [32]u8 = undefined;
+        const ok = try std.fmt.bufPrint(&buf, "23:59:60{s}", .{sfx});
+        try testing.expect(validateFormat(f, ok));
+        const bad1 = try std.fmt.bufPrint(&buf, "23:58:60{s}", .{sfx});
+        try testing.expect(!validateFormat(f, bad1));
+        const bad2 = try std.fmt.bufPrint(&buf, "12:59:60{s}", .{sfx});
+        try testing.expect(!validateFormat(f, bad2));
+        const bad3 = try std.fmt.bufPrint(&buf, "12:00:60{s}", .{sfx});
+        try testing.expect(!validateFormat(f, bad3));
+    }
+    try testing.expect(validateFormat(.local_date_time, "2026-12-31T23:59:60"));
+    try testing.expect(!validateFormat(.local_date_time, "2026-12-31T12:00:60"));
+    try testing.expect(!validateFormat(.local_date_time, "2026-12-31T23:58:60"));
+    // With an offset the instant is what counts, also across midnight (RFC 3339 5.7 Appendix D).
+    try testing.expect(validateFormat(.local_time, "00:29:60+00:30"));
+    try testing.expect(validateFormat(.time, "00:29:60+00:30"));
+    try testing.expect(validateFormat(.date_time, "2026-01-01T00:29:60+00:30"));
+}
+
+test "mutation 2026-11-27: the messages of local_time, local_date_time and iso3166_2" {
+    const cases = [_]struct { f: Format, want: []const u8 }{
+        .{ .f = .local_time, .want = "Input should be a valid local time" },
+        .{ .f = .local_date_time, .want = "Input should be a valid local date-time" },
+        .{ .f = .iso3166_2, .want = "Input should be a valid ISO 3166-2 subdivision code" },
+    };
+    for (cases) |c| {
+        const rules = [_]Rule{.{ .field = "t", .kind = .string, .format = c.f }};
+        var rep = try validateJson(testing.allocator, "{\"t\":\"x\"}", &rules);
+        defer rep.deinit();
+        try testing.expectEqual(@as(usize, 1), rep.errors.len);
+        try testing.expectEqualStrings("format", rep.errors[0].code);
+        try testing.expectEqualStrings(c.want, rep.errors[0].message);
+    }
+}
+
+test "mutation 2026-11-27: a userinfo may hold '@' and ':' (Go splits the authority at the last '@')" {
+    // RFC 3986 gives `userinfo` no '@', Go's net/url (the reference) accepts one and splits at the
+    // last: the host is `host`, which has no port to check.
+    try testing.expect(validateFormat(.uri, "http://a@b:c@host/"));
+    try testing.expect(validateFormat(.uri, "http://u:p@host:8080/"));
+    try testing.expect(!validateFormat(.uri, "http://u:p@host:80x/"));
+}
+
+test "mutation 2026-11-27: parseQueryLeaky runs the cross rule of the rule it belongs to" {
+    const Range = struct {
+        lo: u32 = 0,
+        hi: u32 = 0,
+        pub const validate_rules: []const Rule = &.{
+            .{ .field = "lo", .kind = .int },
+            .{ .field = "hi", .kind = .int, .cross = &.{.{ .op = .gte_field, .other = "lo" }} },
+        };
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const ok = (try parseQueryLeaky(Range, arena.allocator(), "lo=3&hi=9", .{})).ok;
+    try testing.expectEqual(@as(u32, 9), ok.hi);
+    const bad = try parseQueryLeaky(Range, arena.allocator(), "lo=9&hi=3", .{});
+    try testing.expect(bad == .invalid);
+    try testing.expectEqual(@as(usize, 1), bad.invalid.errors.len);
+    try testing.expectEqualStrings("hi", bad.invalid.errors[0].path);
+    try testing.expectEqualStrings("greater_than_equal_field", bad.invalid.errors[0].code);
+}
+
+test "mutation 2026-11-27: every middleware answers problem+json, for the limit, parse and typed paths too" {
+    var probe: Probe = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &probe;
+    const shallow: Body = .{ .gpa = testing.allocator, .schema = &thing_schema, .limits = .{ .max_depth = 1 }, .problem = .{} };
+    const g1 = try r.group("/limit");
+    try g1.use(shallow.middleware());
+    try g1.post("/run", hEchoBody);
+    const plain_body: Body = .{ .gpa = testing.allocator, .schema = &thing_schema, .problem = .{} };
+    const g2 = try r.group("/parse");
+    try g2.use(plain_body.middleware());
+    try g2.post("/run", hEchoBody);
+    const typed: TypedThing = .{ .gpa = testing.allocator, .problem = .{} };
+    const g3 = try r.group("/typed");
+    try g3.use(typed.middleware());
+    try g3.post("/run", hTypedThing);
+    const params_mw: PathParams = .{ .gpa = testing.allocator, .schema = &id_schema, .problem = .{} };
+    const g4 = try r.group("/users");
+    try g4.use(params_mw.middleware());
+    try g4.get("/:id", hUserById);
+
+    var buf: [2048]u8 = undefined;
+    const answers = [_][]const u8{
+        runWire(&r, postWire("/limit/run", "{\"a\":{\"b\":1}}"), &buf),
+    };
+    try expectStatus(answers[0], "400");
+    try testing.expect(std.mem.find(u8, answers[0], "Content-Type: application/problem+json\r\n") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(answers[0]), "\"status\":400") != null);
+
+    var buf2: [2048]u8 = undefined;
+    const parse = runWire(&r, postWire("/parse/run", "{\"name\":"), &buf2);
+    try expectStatus(parse, "400");
+    try testing.expect(std.mem.find(u8, parse, "Content-Type: application/problem+json\r\n") != null);
+
+    var buf3: [2048]u8 = undefined;
+    const ty = runWire(&r, postWire("/typed/run", "{\"name\":\"gear\",\"qty\":\"many\"}"), &buf3);
+    try expectStatus(ty, "400");
+    try testing.expect(std.mem.find(u8, ty, "Content-Type: application/problem+json\r\n") != null);
+
+    var buf4: [2048]u8 = undefined;
+    const pp = runWire(&r, getWire("/users/abc"), &buf4);
+    try expectStatus(pp, "400");
+    try testing.expect(std.mem.find(u8, pp, "Content-Type: application/problem+json\r\n") != null);
+    try testing.expect(!probe.invoked);
+}

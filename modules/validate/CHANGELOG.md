@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation run (87/87); 6 tests in `src/root.zig`. Test only.
 - **2026-11-21** — New `Format.iso3166_2` (go-playground `iso3166_2`: an ISO 3166-2 subdivision code, 5,001 entries from go's table, exact case; JSON Schema name `iso3166_2`), anchored by the go oracle; **source-breaking** for an exhaustive `switch` over `Format`.
 - **2026-11-21** — `date_time` and `time` are RFC 3339: **Behaviour change:** the UTC offset is required (an offset-less value was accepted, which RFC 3339, JSON Schema's `date-time`/`time`, ajv and python-jsonschema refuse) and a leap second (`:60`) only where the clock and the offset give 23:59 UTC (it was accepted at any time of day). New `Format.local_time` and `Format.local_date_time` (JSON Schema names `local-time`, `local-date-time`) take the ISO 8601 local forms with the offset optional; **source-breaking** for an exhaustive `switch` over `Format`. The exported schema now says what is enforced.
 - **2026-11-21** — Opt-in RFC 9457 answers from the middleware: the new `problem: ?http.problem.Problem` field of `Body`, `TypedBody`, `Query` and `PathParams` answers a failed validation as 400 `application/problem+json` (the template's `type`/`title`/`detail`/`instance`, status forced to 400, the usual `errors` list as an extension member); null (the default) keeps `application/json` `{"errors":[...]}`.

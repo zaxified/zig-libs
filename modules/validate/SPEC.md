@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — go-playground/validator v10.30.5, the reference, breaks the standard its own tag names in six places the go format oracle found (`tools/format_oracle.py` drives `validate.Var(s, tag)` over 3,289 strings, `tools/go_formats`): `ipv4` accepts the IPv6 text `::ffff:1.2.3.4` and `ipv6` refuses it (RFC 4291 §2.5.5.2), `hostname_rfc1123` accepts a 255-character name (RFC 1035 §2.3.4: 253), `email` accepts a 65-octet local part (RFC 5321 §4.5.3.1.1) and `a@ex~ample.com`, `http_url`/`https_url` accept an empty host `http://:8080/` (RFC 9110 §4.2.1: a recipient MUST reject it) and `datetime` (RFC 3339 layout) accepts the offset `+24:00` (RFC 3339 §5.6); this module refuses every one (test "go format oracle: validateFormat answers as go-playground does, or as a named class decides", classes MAPPED_V4 HOSTNAME_253 EMAIL_LOCAL_64 EMAIL_DOMAIN HTTP_EMPTY_HOST DT_OFFSET_24) (measured 2026-10-24) · feature — the rules export as a JSON Schema 2020-12 document (`writeJsonSchema`, `writeJsonSchemaFor`) that python-jsonschema 4.19.2 and ajv 8.20.0 answer as the module does on 317 rule sets and 2,075 documents (`schema_oracle_test.zig`); go-playground, jprochazk/garde and Keats/validator export no schema (measured 2026-10-24) · feature — the request path is built in: body, typed body, query and path-param middleware for `router` answering one aggregated 400, with the JSON structural caps (depth, array size, members, nodes) enforced by a token scan before any tree exists; go-playground, garde and Keats/validator validate an already decoded struct and leave decoding, its limits and the HTTP answer to the caller (tests "Body middleware: invalid POST → golden 400 JSON, handler NOT invoked", "limits: depth beyond max_depth → too_deep, rejected before schema runs") (measured 2026-10-24)
 
-**Audit:** review 2026-11-07 · mutation 2026-11-19 (2641/2778, 137 eq) · src c8b904415f7c5887
+**Audit:** review 2026-11-07 · mutation 2026-11-27 (2728/2865, 137 eq) · src dfebcc7e8475aa23
 
 **Hardening:** fuzz 2026-10-24 (after `unique`/numeric `one_of`/format fixes: 1,000,000 runs of each of the six harnesses clean, ReleaseSafe, incl. the new `unique` one against a quadratic model; before them 9,000,000 runs of the `compiled` harness clean in 6 jobs, VALIDATE_FUZZ, beside the other four harnesses; 2026-10-11: 200,000-run budget per harness, `cross` added) · ct n/a — input validation (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: float-spelled ints at the type edge refused before std decodes them; enum/unique/path work bounded; export depth-capped)
 
@@ -175,6 +175,9 @@ decoded struct; bad query param → 400).
 - **Cost pin:** `firstDuplicate`'s comparison count is pinned by a test-only counter (`duplicate_comparisons`), which catches a weakened hash that a correct-answer test cannot see.
 - **Constant time:** n/a — input validation, no secret.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Delta mutation 2026-11-27 (~686 changed production lines since the 2026-11-19 card):** 87 mutants, 87
+  killed. Six new tests at the end of `src/root.zig`, three of them pinning the `instantsFor` contract: a value
+  that already fails its own format gets no second cross-field error.
 - **Bench:** `zig build bench-validate` (`tools/bench.zig`, `tools/go_bench`, `tools/rust_fast_bench`), see Performance.
 
 ## Performance
