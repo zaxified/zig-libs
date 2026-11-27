@@ -1730,7 +1730,7 @@ dtls	ReleaseFast	app12	1	3	c9dbbb898ba6fbb3	a30c6f8f370c5fa7
 # records decrypted under PSK-derived keys (inbound next/dispatch, alert
 # classify, installRx). None branches on STEK or resumption-secret octets.
 # 2026-11-01 (re-pin; --stacks diff against 1eb591f0): hs 28 -> 22, no increase. -4: std ecdsa finalizePrehashed / mem contexts of certverify.signEcdsaP256 (p256 `fromStd` now declassifies r/s, the published signature). -3 +1: std edwards25519/ed25519 contexts replaced by one in certverify.zig signEd25519 (Ed25519 signs on ct25519 since e62faa4f; verdicts at the key-consistency eql and the identity check of R). kex.generateNist -> generateNistAt is a rename (same 4 contexts). app: aesgcm frames re-inlined, still 8.
-tlsserver	ReleaseFast	hs	1	22	60af83745b8ab0b4	18b712e147be54c3
+tlsserver	ReleaseFast	hs	1	20	60af83745b8ab0b4	18b712e147be54c3
 # 2026-11-03 (re-pin from full CI 41622100028, counts only, not read by --stacks): tlsserver app 8 -> 7, down by one after chachapoly's short AEAD engine (no tlsserver source changed). Owner rule: no local ctgrind re-run.
 tlsserver	ReleaseFast	app	1	7	60af83745b8ab0b4	ded7de421ed83ff8
 # 2026-10-22 — ticket 74 -> 75 (RFC 7250): the decrypted ticket's format octet now also names a
@@ -2600,7 +2600,7 @@ hpke	ReleaseFast	x25519_authdecap	1	2	988bf797e9128852	05af25d1d0e3943d	cpu=x86_
 hpke	ReleaseFast	xwing_decap	1	1	9792528fc668b453	a1bdb379c24261c4	cpu=x86_64
 tlsclient	ReleaseFast	kex	1	5	e09520cb0a81b4fa	dcbfcf24be022c59	cpu=x86_64 control=1 trap=1
 tlsclient	ReleaseFast	cv	1	33	aeb841d005c8d4a6	a92e71f50313cf2b	cpu=x86_64
-tlsserver	ReleaseFast	hs	1	24	60af83745b8ab0b4	18b712e147be54c3	cpu=x86_64
+tlsserver	ReleaseFast	hs	1	22	60af83745b8ab0b4	18b712e147be54c3	cpu=x86_64
 tlsserver	ReleaseFast	ech	1	442	60af83745b8ab0b4	c257fcbb1b68d8df	cpu=x86_64
 wireguard	ReleaseFast	handshake	1	13	e3bba5e674102f92	40f18e84501394fa	cpu=x86_64
 wireguard	ReleaseFast	tunnel	1	14	e3bba5e674102f92	8f458611fc103bea	cpu=x86_64
