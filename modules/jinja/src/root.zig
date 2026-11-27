@@ -471,6 +471,7 @@ test {
     _ = @import("diag.zig");
     _ = @import("engine_test.zig");
     _ = @import("scope_test.zig");
+    _ = @import("mutation_test.zig");
     _ = @import("conform.zig");
     _ = @import("reference_replay_test.zig");
     _ = @import("bench.zig");

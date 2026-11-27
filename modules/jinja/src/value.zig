@@ -11,6 +11,7 @@
 //! conversion (`from`, `fromJson`), not a second value model.
 
 const std = @import("std");
+const unitext = @import("unitext");
 
 pub const Error = error{
     OutOfMemory,
@@ -405,8 +406,11 @@ fn reprPairs(writer: *std.Io.Writer, pairs: []const Pair, depth: usize) Error!vo
 }
 
 /// Python string repr: single quotes, switching to double quotes when the text
-/// holds a `'` but no `"`. Bytes >= 0x80 pass through — for valid UTF-8 that
-/// matches CPython, which prints printable non-ASCII verbatim.
+/// holds a `'` but no `"`. A valid UTF-8 sequence is printed verbatim when its
+/// code point is printable (`str.isprintable`, `unitext.isPrintableCp`), else
+/// escaped as CPython does: `\xNN` below U+0100, `\uNNNN`, `\UNNNNNNNN`
+/// (U+0085 is `\x85`, U+2028 `\u2028`, U+00A0 `\xa0`; 2026-11-27). Bytes that
+/// are not valid UTF-8 pass through (a Python str cannot hold them).
 fn reprStrTo(writer: *std.Io.Writer, bytes: []const u8) Error!void {
     var has_single = false;
     var has_double = false;
@@ -416,7 +420,37 @@ fn reprStrTo(writer: *std.Io.Writer, bytes: []const u8) Error!void {
     }
     const q: u8 = if (has_single and !has_double) '"' else '\'';
     writer.writeByte(q) catch return error.OutOfMemory;
-    for (bytes) |c| switch (c) {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const c = bytes[i];
+        if (c >= 0x80) {
+            const n = std.unicode.utf8ByteSequenceLength(c) catch 0;
+            const cp: ?u21 = if (n != 0 and i + n <= bytes.len) std.unicode.utf8Decode(bytes[i..][0..n]) catch null else null;
+            if (cp) |v| {
+                if (unitext.isPrintableCp(v)) {
+                    writer.writeAll(bytes[i..][0..n]) catch return error.OutOfMemory;
+                } else if (v < 0x100) {
+                    writer.print("\\x{x:0>2}", .{v}) catch return error.OutOfMemory;
+                } else if (v < 0x10000) {
+                    writer.print("\\u{x:0>4}", .{v}) catch return error.OutOfMemory;
+                } else {
+                    writer.print("\\U{x:0>8}", .{v}) catch return error.OutOfMemory;
+                }
+                i += n;
+            } else {
+                writer.writeByte(c) catch return error.OutOfMemory;
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+        try reprAsciiByte(writer, c, q);
+    }
+    writer.writeByte(q) catch return error.OutOfMemory;
+}
+
+fn reprAsciiByte(writer: *std.Io.Writer, c: u8, q: u8) Error!void {
+    switch (c) {
         '\\' => try w(writer, "\\\\"),
         '\n' => try w(writer, "\\n"),
         '\r' => try w(writer, "\\r"),
@@ -431,8 +465,7 @@ fn reprStrTo(writer: *std.Io.Writer, bytes: []const u8) Error!void {
                 writer.writeByte(c) catch return error.OutOfMemory;
             }
         },
-    };
-    writer.writeByte(q) catch return error.OutOfMemory;
+    }
 }
 
 /// CPython's `repr(float)`: shortest round-trip digits, rendered fixed unless

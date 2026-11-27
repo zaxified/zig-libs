@@ -6,7 +6,7 @@
 
 **Scope:** core — Jinja2 3.1.6 (surveyed 2026-09-30, S3 pass 2026-11-13): faithful core and oracle-checked, now with `format`, `groupby`, `wordwrap`, `filesizeformat`, Unicode case mapping and the `sameas`/`callable` tests; remaining gaps listed in §6 and the builtin table in §6.1 (`urlize`, `pprint`, `random`, `attr`, the `lipsum` global, `{% trans %}`)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-17 (71/74, 3 eq) · src e46005640d451e8e
+**Audit:** review 2026-09-02 · mutation 2026-11-27 (450/480, 30 eq) · src 4b278d4c65a6f7ea
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JINJA_FUZZ) · ct n/a — template engine (keyword review, 2026-10-07)
 
@@ -378,6 +378,14 @@ is not, so the two are not the same file.
   `zig build check-interop` compiles it without running it.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
   the last whole-module mutation run and the delta runs after it.
+- **Delta mutation 2026-11-27 (code since the 2026-11-17 card: delimiters, line statements, urlize,
+  pprint, lorem):** 406 mutants, 379 killed, 24 equivalent, 3 unobservable, 0 open. Expected values in
+  `src/mutation_test.zig` come from Jinja2 3.1.6 / CPython 3.14 `pprint`, never from this module. The
+  run found three divergences from the reference, fixed: a line statement ends at the LAST newline of
+  the blank run after it (Jinja2's `\s*(\n|$)`), `# with a = 1:` does not compile, and `pprint` splits
+  strings at U+0085/U+2028/U+2029; fixing the third showed a fourth, `repr` printing non-printable
+  code points verbatim (now `\x85`, `\u2028`, `\xa0`… as CPython). Two of the run's mutants sat on
+  code the fixes replaced and were dropped; 14 mutants over the fixes are all killed.
 
 **Taking the anchor** (`tools/interop.zig` + `tools/reference.py`, a program, never
 built by `test-jinja`). It renders the corpus with the reference and captures

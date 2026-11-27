@@ -258,17 +258,37 @@ const Lexer = struct {
             }
             if (p >= src.len) break;
             if (src[p] == '\n') {
-                p += 1;
-                self.line += 1;
+                // Jinja2 ends a line statement with `\s*(\n|$)`: the greedy
+                // `\s*` takes every blank line after it, up to the last
+                // newline before content (or to the end of the source).
+                // "# if 1\n\n  B" renders "  B" (2026-11-27, Jinja2 3.1.6).
+                var q = p;
+                var last_nl = p;
+                var nls: usize = 0;
+                while (q < src.len and std.ascii.isWhitespace(src[q])) : (q += 1) {
+                    if (src[q] == '\n') {
+                        last_nl = q;
+                        nls += 1;
+                    }
+                }
+                if (q >= src.len) {
+                    p = src.len;
+                    self.line += nls;
+                } else {
+                    p = last_nl + 1;
+                    self.line += nls;
+                }
                 break;
             }
             try toks.append(self.arena, try self.lexToken(&p, &depth));
         }
         self.pos = p;
         // `# for x in xs:` — a colon after the header of a block tag is
-        // allowed and ignored (Jinja2 skips it in `parse_statements`).
+        // allowed and ignored (Jinja2 skips it in `parse_statements`). Not
+        // after `with`: Jinja2's `parse_with` expects `,` or the block end
+        // there and refuses the colon (2026-11-27, Jinja2 3.1.6).
         if (toks.items.len > 1 and toks.items[toks.items.len - 1].kind == .colon and toks.items[0].kind == .name) {
-            for ([_][]const u8{ "for", "if", "elif", "else", "macro", "call", "block", "filter", "with", "autoescape" }) |kw| {
+            for ([_][]const u8{ "for", "if", "elif", "else", "macro", "call", "block", "filter", "autoescape" }) |kw| {
                 if (std.mem.eql(u8, toks.items[0].text, kw)) {
                     _ = toks.pop();
                     break;

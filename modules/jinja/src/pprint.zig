@@ -192,7 +192,17 @@ const P = struct {
         while (i < s.len) {
             const c = s[i];
             var brk: usize = 0;
-            if (c == '\r' and i + 1 < s.len and s[i + 1] == '\n') brk = 2 else if (c == '\n' or c == '\r' or c == 0x0b or c == 0x0c or (c >= 0x1c and c <= 0x1e)) brk = 1;
+            if (c == '\r' and i + 1 < s.len and s[i + 1] == '\n') {
+                brk = 2;
+            } else if (c == '\n' or c == '\r' or c == 0x0b or c == 0x0c or (c >= 0x1c and c <= 0x1e)) {
+                brk = 1;
+            } else if (c == 0xc2 and i + 1 < s.len and s[i + 1] == 0x85) {
+                // U+0085 NEL; with U+2028/U+2029 below, Python's
+                // `str.splitlines` breaks on them too (2026-11-27).
+                brk = 2;
+            } else if (c == 0xe2 and i + 2 < s.len and s[i + 1] == 0x80 and (s[i + 2] == 0xa8 or s[i + 2] == 0xa9)) {
+                brk = 3;
+            }
             if (brk != 0) {
                 try lines.append(self.arena, s[st .. i + brk]);
                 i += brk;
