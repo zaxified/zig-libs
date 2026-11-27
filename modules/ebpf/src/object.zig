@@ -810,8 +810,9 @@ pub const Object = struct {
         self.* = undefined;
     }
 
-    /// Close every fd this object owns (programs, maps, BTF), leaving the
-    /// parsed specs intact. Idempotent.
+    /// Close every fd this object owns (programs, maps, BTF, the kernel
+    /// modules' BTF that `load` opened for kfuncs/ksyms), leaving the parsed
+    /// specs intact. Idempotent.
     pub fn close(self: *Object) void {
         for (self.programs) |*p| {
             if (p.fd >= 0) _ = linux.close(p.fd);
@@ -823,6 +824,14 @@ pub const Object = struct {
         }
         if (self.btf_fd >= 0) _ = linux.close(self.btf_fd);
         self.btf_fd = -1;
+        // 2026-11-27: these were never closed, one fd leaked per module a
+        // load used. `fd_array` points at the same fds: dropped with them.
+        for (self.module_btf_fds) |*fd| {
+            if (fd.* >= 0) _ = linux.close(fd.*);
+            fd.* = -1;
+        }
+        self.module_btf_fds = &.{};
+        self.fd_array = &.{};
     }
 
     /// Activate a loaded `.struct_ops` map: register it with the kernel (a TCP
@@ -5407,8 +5416,16 @@ test "Object fds: close releases, take transfers, zero is a valid fd" {
     o.programs[0].fd = f1;
     o.maps[0].fd = f2;
     o.btf_fd = f3;
+    var mods = [_]linux.fd_t{ devnull.open(), devnull.open() };
+    var arr = [_]i32{ 0, mods[0], mods[1] };
+    o.module_btf_fds = &mods;
+    o.fd_array = &arr;
     o.close();
     try testing.expect(!devnull.isOpen(f1) and !devnull.isOpen(f2) and !devnull.isOpen(f3));
+    // the kernel modules' BTF fds `load` kept for kfuncs/ksyms (they leaked before 2026-11-27)
+    try testing.expect(!devnull.isOpen(mods[0]) and !devnull.isOpen(mods[1]));
+    try testing.expectEqual(@as(usize, 0), o.module_btf_fds.len);
+    try testing.expectEqual(@as(usize, 0), o.fd_array.len);
     try testing.expectEqual(@as(linux.fd_t, -1), o.programs[0].fd);
     try testing.expectEqual(@as(linux.fd_t, -1), o.maps[0].fd);
     try testing.expectEqual(@as(linux.fd_t, -1), o.btf_fd);
