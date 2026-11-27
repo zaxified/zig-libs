@@ -553,3 +553,10 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "mutation 2026-11-27: writeCalendar keeps a hand-built CalendarTime's offset two-digit (±23:59 at most)" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeCalendar(&w, .{ .year = 2026, .month = 1, .day = 2, .hour = 3, .minute = 4, .second = 5, .milli = 6, .offset_minutes = 32767 });
+    try t.expectEqualStrings("2026-01-02T03:04:05.006+23:59", w.buffered());
+}

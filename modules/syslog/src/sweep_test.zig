@@ -821,3 +821,29 @@ test "TcpEmitter.sendRaw: a frame past the scratch to a peer that stopped readin
     g_big_path = try sockPath(&tmp, &path_buf, "big");
     try testing.expectEqual(@as(u32, 0), try runChild(bigFrameStopReading));
 }
+
+/// Exit 0: a Timeout with a partial frame closes the connection, so the next
+/// send (retries 0) connects afresh and succeeds instead of failing Broken.
+fn reconnectAfterPartialTimeout() u8 {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
+    const io = threaded.io();
+    const body = std.heap.page_allocator.alloc(u8, 400 << 10) catch return 9; // global-alloc-ok: forked sweep child, freed by its exit
+    @memset(body, 'z');
+    const l = StreamListener.bind(g_big_path) catch return 9;
+    var e = transport.ReconnectingEmitter.init(io, .{ .unix = g_big_path }, .{ .send_timeout_ms = 100, .retries = 0, .backoff_ms = 0 });
+    defer e.close();
+    if (e.sendRaw(body)) |_| return 1 else |err| if (err != error.Timeout) return 2;
+    if (e.conn != null) return 3; // a partial frame: the stream is desynchronised, the connection must go
+    // The listener's backlog takes the new connection without an accept.
+    e.sendRaw("after") catch return 4;
+    _ = l;
+    return 0;
+}
+
+test "ReconnectingEmitter: a Timeout mid-frame drops the connection, the next send reconnects (2026-11-27)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    g_big_path = try sockPath(&tmp, &path_buf, "rc");
+    try testing.expectEqual(@as(u32, 0), try runChild(reconnectAfterPartialTimeout));
+}

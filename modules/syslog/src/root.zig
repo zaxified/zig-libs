@@ -156,6 +156,7 @@ test {
     _ = @import("sweep_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("parse_oracle_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 test "meta is well-formed" {

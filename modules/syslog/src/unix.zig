@@ -1122,3 +1122,64 @@ test "journal.makedev: glibc encoding against known values (mutation 2026-11-15)
     };
     for (cases) |c| try t.expectEqual(c[2], journal.makedev(c[0], c[1]));
 }
+
+test "mutation 2026-11-27: monotonicNs is the monotonic clock in nanoseconds" {
+    var a: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &a);
+    const got = monotonicNs().?;
+    var b: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &b);
+    const lo = @as(u64, @intCast(a.sec)) * std.time.ns_per_s + @as(u64, @intCast(a.nsec));
+    const hi = @as(u64, @intCast(b.sec)) * std.time.ns_per_s + @as(u64, @intCast(b.nsec));
+    try t.expect(got >= lo and got <= hi);
+}
+
+fn nowMs() u64 {
+    return monotonicNs().? / std.time.ns_per_ms;
+}
+
+test "mutation 2026-11-27: FullQueueWait: deadline arithmetic, step capped at 50 ms and at the time left, doubling" {
+    // the deadline is now + timeout, in ns
+    const w0 = FullQueueWait.initAt(1000, 7);
+    try t.expectEqual(@as(?u64, 1000 + 7 * std.time.ns_per_ms), w0.deadline_ns);
+    // doubling 1,2,4,...,32,50,50
+    var w = FullQueueWait.initAt(0, 100_000);
+    const want = [_]u32{ 2, 4, 8, 16, 32, 50, 50 };
+    for (want) |x| {
+        try t.expect(w.sleepAt(0));
+        try t.expectEqual(x, w.step_ms);
+    }
+    // past the deadline: false, at the deadline: false
+    try t.expect(!w.sleepAt(100_000 * std.time.ns_per_ms));
+    try t.expect(!w.sleepAt(100_000 * std.time.ns_per_ms + 1));
+    // a step is the doubling step (1 ms), not the time left (100 ms), and not shorter
+    var a = FullQueueWait.initAt(0, 100);
+    var t0 = nowMs();
+    try t.expect(a.sleepAt(0));
+    var dt = nowMs() - t0;
+    try t.expect(dt >= 1 and dt < 60);
+    // a step never sleeps past the deadline: 50 ms step, 10 ms left
+    var b = FullQueueWait.initAt(0, 100);
+    b.step_ms = 50;
+    t0 = nowMs();
+    try t.expect(b.sleepAt(90 * std.time.ns_per_ms));
+    dt = nowMs() - t0;
+    try t.expect(dt >= 9 and dt < 40);
+    // the clock unreadable: no sleep, false
+    var nul = FullQueueWait.initAt(null, 100);
+    try t.expect(!nul.sleepAt(0));
+    var c = FullQueueWait.initAt(0, 100);
+    try t.expect(!c.sleepAt(null));
+}
+
+test "mutation 2026-11-27: writeAllVec: more than 1024 iovecs go out in several writev calls" {
+    const rc = linux.memfd_create("t", 0);
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer closeFd(fd);
+    const one = "x";
+    var iov: [2000]std.posix.iovec_const = undefined;
+    for (&iov) |*v| v.* = .{ .base = one.ptr, .len = 1 };
+    try writeAllVec(fd, &iov);
+    try t.expectEqual(@as(usize, 2000), linux.lseek(fd, 0, linux.SEEK.END));
+}

@@ -950,3 +950,49 @@ test "utf8Boundary: only a lead byte 0xC2..0xF4 moves the cut back; 0xC0, 0xC1 a
     try std.testing.expectEqual(@as(usize, 3), utf8Boundary("a\xf5\x80\x80b", 3));
     try std.testing.expectEqual(@as(usize, 3), utf8Boundary("a\xff\x80\x80b", 3));
 }
+
+test "mutation 2026-11-27: monotonicMs is the monotonic clock in milliseconds" {
+    var a: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &a);
+    const got = monotonicMs().?;
+    var b: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &b);
+    const lo = @as(u64, @intCast(a.sec)) * 1000 + @as(u64, @intCast(a.nsec)) / 1_000_000;
+    const hi = @as(u64, @intCast(b.sec)) * 1000 + @as(u64, @intCast(b.nsec)) / 1_000_000;
+    try t.expect(got >= lo and got <= hi);
+}
+
+test "mutation 2026-11-27: writeFrame: a short write moves on, a zero write is WriteFailed, an over-long count is clamped" {
+    const Step = struct {
+        give: usize,
+        fn write(s: *@This(), chunk: []const u8) TcpEmitter.SendError!usize {
+            _ = chunk;
+            return s.give;
+        }
+    };
+    var s3: Step = .{ .give = 3 };
+    const r = writeFrame(&s3, "0123456789");
+    try t.expectEqual(@as(usize, 10), r.written);
+    try t.expect(r.err == null);
+    var s0: Step = .{ .give = 0 };
+    const z = writeFrame(&s0, "0123456789");
+    try t.expectEqual(@as(usize, 0), z.written);
+    try t.expectEqual(@as(?TcpEmitter.SendError, error.WriteFailed), z.err);
+    // progress, then a refusal: the bytes already out are reported with the error
+    const Seq = struct {
+        gives: [2]usize,
+        i: usize = 0,
+        fn write(s: *@This(), chunk: []const u8) TcpEmitter.SendError!usize {
+            _ = chunk;
+            s.i += 1;
+            return s.gives[s.i - 1];
+        }
+    };
+    var sq: Seq = .{ .gives = .{ 4, 0 } };
+    const q = writeFrame(&sq, "0123456789");
+    try t.expectEqual(@as(usize, 4), q.written);
+    try t.expectEqual(@as(?TcpEmitter.SendError, error.WriteFailed), q.err);
+    var big: Step = .{ .give = 100 };
+    const b = writeFrame(&big, "0123456789");
+    try t.expectEqual(@as(usize, 10), b.written);
+}
