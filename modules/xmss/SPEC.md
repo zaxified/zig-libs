@@ -6,7 +6,7 @@
 
 **Scope:** mvp — xmss-reference (RFC 8391 reference code), go-xmssmt (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation 2026-11-20 (190/202, 12 eq) · src 6a6c265f2624f3aa
+**Audit:** review 2026-09-11 · mutation 2026-11-27 (275/301, 26 eq) · src 51ee5717a44e68d8
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `xmss-sign-verify` at scale 200 = 1,000 runs, each a real signature, XMSS_FUZZ) · ct 2026-10-10 (ctgrind: SK_SEED/SK_PRF through keyGen + 5 signs at h=4; 2 in-file = WOTS chain lengths from H_msg over the PUBLISHED r, an artefact)
 **Performance:** not measured
@@ -281,6 +281,13 @@ scheme's security argument collapses per-index, not per-signature.
   burns and `padPrefix` (comptime). Tests added in `src/kat_test.zig`: the ADRS setters and `setType`'s clearing,
   `ltree` from a dirty address, `keyGen` over a filled `KeyPair`, odd heights h = 3 and 5, an h = 8 sweep, and a jump
   after real signing from a corrupted stack base.
+- **Mutation run (2026-11-27, whole module):** 301 mutants (291 logic in ReleaseSafe, 10 burn/wipe in the
+  ReleaseFast stack probe), 275 killed, 26 equivalent. Every index-advance and exhaustion mutant (a signer
+  reusing or skipping a one-time index) was already killed by the existing suite. Five sign-guard mutants were
+  caught only by a deadlock timeout, a racy 4-thread test or not at all; five deterministic tests replace that.
+  The probe gained chain-value needles for `wotsPkGen`/`wotsSign`. Nine burn/wipe mutants survive singly because
+  the layers cover each other (skipping the WOTS burn together with both `Hasher.final` wipes is red on
+  `DeadStackResidue`): kept as defence in depth, each recorded equivalent with the covering site.
 
 ## Open
 

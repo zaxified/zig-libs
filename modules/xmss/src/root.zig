@@ -617,6 +617,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 // ── the generic suites: round trips at h = 4 (KATs in kat_suites_test.zig) ──
