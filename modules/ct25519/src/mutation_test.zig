@@ -62,3 +62,15 @@ test "mutation 2026-11-25: signEd25519 wipes its seed, hash halves, clamped scal
     const r = root.Edwards25519.scalar.reduce64(r64);
     _ = try P.run("signEd25519", signCall, .{ &kp, &msg }, &.{ &sec, az[0..32], az[32..64], &a, &r64, &r }, .{});
 }
+
+test "mutation 2026-11-25: signEd25519 trusts a consistent key pair (it does not re-derive the public half); signEd25519Checked refuses it" {
+    const a = try Ed.KeyPair.generateDeterministic(@splat(0x41));
+    const b = try Ed.KeyPair.generateDeterministic(@splat(0x42));
+    var wrong = a;
+    wrong.public_key = b.public_key;
+    wrong.secret_key.bytes[32..64].* = b.public_key.toBytes();
+    // The pair agrees with itself, so the comparison signEd25519 makes passes
+    // (as std's sign); only the seed-derived check of the Checked form refuses.
+    _ = try root.signEd25519(&wrong, "m", null);
+    try std.testing.expectError(error.KeyMismatch, root.signEd25519Checked(&wrong.secret_key, "m", null));
+}

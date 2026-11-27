@@ -564,3 +564,9 @@ test "hashToCurveG1: a DST over 255 bytes is accepted (RFC 9380 §5.3.3) and sep
     try testing.expect(G1.Jacobian.fromAffine(a).isOnCurve());
     try testing.expect(!a.x.eql(b.x));
 }
+
+test "mutation 2026-11-25: isSquareFp: zero and one are squares, -1 is not (p = 3 mod 4)" {
+    try testing.expect(isSquareFp(Fp.zero));
+    try testing.expect(isSquareFp(Fp.one));
+    try testing.expect(!isSquareFp(Fp.one.neg()));
+}

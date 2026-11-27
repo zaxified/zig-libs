@@ -689,3 +689,21 @@ test "signBlinded == sign (RFC 6979: deterministic), and the key recovers" {
         try std.testing.expect(q.equivalent(try Secp256k1.combMulBase(privkey, .big)));
     }
 }
+
+test "mutation 2026-11-25: signBlinded takes the blinded path (a corrupted b·G changes the signature)" {
+    const privkey: [32]u8 = @splat(0x21);
+    const seed: [32]u8 = @splat(0x5e);
+    var bl: Blinding = undefined;
+    Blinding.fromSeedInto(&bl, &seed);
+    defer bl.wipe();
+    const h: [32]u8 = @splat(0xa5);
+    const good = try sign(&privkey, h);
+    const same = try signBlinded(&bl, &privkey, h);
+    try testing.expectEqualSlices(u8, &good.r, &same.r);
+    var bad = bl;
+    var base_pt = Secp256k1.basePoint; // a runtime copy: the affine conversion must not run at comptime
+    bad.b_g = base_pt.affineCoordinates(); // b·G is not G
+    if (signBlinded(&bad, &privkey, h)) |sig| {
+        try testing.expect(!std.mem.eql(u8, &good.r, &sig.r));
+    } else |_| {}
+}

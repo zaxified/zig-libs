@@ -337,6 +337,10 @@ pub const Ed25519Signer = struct {
     /// `certverify.signContent` for this key.
     pub fn signContent(self: *const Ed25519Signer, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
         if (out.len < Ed25519.Signature.encoded_length) return error.BufferTooSmall;
+        return burn.run(burn.ed25519_burn, SignError![]u8, signContentBody, .{ self, content, random, out });
+    }
+
+    fn signContentBody(self: *const Ed25519Signer, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
         var noise: ?[Ed25519.noise_length]u8 = drawEd25519Noise(random);
         defer std.crypto.secureZero(u8, std.mem.asBytes(&noise));
         return ed25519Out(self.inner.sign(content, noise), out);
@@ -710,7 +714,7 @@ pub fn signContentWith(
                 else => return error.KeyMismatch,
             };
             if (out.len < Ed25519.Signature.encoded_length) return error.BufferTooSmall;
-            break :blk signEd25519(sk, content, random, out);
+            break :blk burn.run(burn.ed25519_burn, SignError![]u8, signEd25519, .{ sk, content, random, out });
         },
         .ecdsa_secp521r1_sha512 => blk: {
             const sk = switch (secret_key) {

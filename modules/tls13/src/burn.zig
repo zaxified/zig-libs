@@ -51,6 +51,12 @@ pub const ks_burn = 6 * 1024;
 /// for P-256, 2026-10-08) — 1.4 µs of zeroing per handshake.
 pub const ecdsa_burn = 8 * 1024;
 
+/// Ed25519 on `ct25519`, which burns its own signing frames (`sign_burn`):
+/// the frames left to this burn are tls13's own, above ct25519's burn -- the
+/// hedging noise's return slot and by-value argument copies sat 799..1567 B
+/// deep in the probe (2026-11-27); ct25519 burns the deeper frames.
+pub const ed25519_burn = 4 * 1024;
+
 /// ML-DSA (std), per parameter set: `sign` borrows the expanded key but
 /// keeps its vectors on the stack; `verify` decodes the public key with its
 /// matrix A by value. ReleaseFast depths from `stackprobe_test.zig`

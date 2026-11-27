@@ -396,3 +396,114 @@ test "invert: x·x⁻¹ ≡ 1 for random x and edges; invert(0) == 0" {
         }
     }
 }
+
+fn signedVal(comptime S: type, v: S.Signed62) i1200 {
+    var r: i1200 = 0;
+    var i: usize = S.L;
+    while (i > 0) {
+        i -= 1;
+        r = (r << 62) + v[i];
+    }
+    return r;
+}
+
+fn fromSigned(comptime S: type, x: i1200) S.Signed62 {
+    var r: S.Signed62 = undefined;
+    var v = x;
+    for (0..S.L - 1) |i| {
+        r[i] = @intCast(v & ((@as(i1200, 1) << 62) - 1));
+        v >>= 62;
+    }
+    r[S.L - 1] = @intCast(v);
+    return r;
+}
+
+test "mutation 2026-11-25: normalize brings every value of (-2m, m) to [0, m), negated on request (both conditional adds are needed)" {
+    inline for (moduli) |m| {
+        const S = Safegcd(m);
+        const mi: i1200 = m;
+        const cases = [_]i1200{ -2 * mi + 1, -mi - 1, -mi, -mi + 1, -1, 0, 1, mi - 1, -(mi >> 1), -mi - (mi >> 1) };
+        for (cases) |c| {
+            for ([_]i64{ 1, -1 }) |sg| {
+                var r = fromSigned(S, c);
+                S.normalize(&r, sg);
+                const want = @mod(if (sg < 0) -c else c, mi);
+                try std.testing.expectEqual(want, signedVal(S, r));
+            }
+        }
+    }
+}
+
+test "mutation 2026-11-25: updateDE keeps d and e inside the documented (-2m, m) after every batch" {
+    inline for (moduli) |m| {
+        const S = Safegcd(m);
+        const mi: i1200 = m;
+        var prng = std.Random.DefaultPrng.init(0xDE_0062);
+        const rand = prng.random();
+        var round: usize = 0;
+        while (round < 300) : (round += 1) {
+            var xb: u1100 = 0;
+            rand.bytes(std.mem.asBytes(&xb)[0..(S.words * 8)]);
+            xb %= m;
+            if (round == 0) xb = 1;
+            if (round == 1) xb = m - 1;
+            if (round == 2) xb = m >> 1;
+            var d: S.Signed62 = @splat(0);
+            var e: S.Signed62 = @splat(0);
+            e[0] = 1;
+            var f = S.modulus;
+            var g = S.fromWords(fromInt(S, xb));
+            var zeta: i64 = -1;
+            for (0..S.batches) |_| {
+                const step = divsteps59(zeta, @bitCast(f[0]), @bitCast(g[0]));
+                zeta = step.zeta;
+                S.updateDE(&d, &e, step.t);
+                S.updateFG(&f, &g, step.t);
+                const dv = signedVal(S, d);
+                const ev = signedVal(S, e);
+                try std.testing.expect(dv > -2 * mi and dv < mi);
+                try std.testing.expect(ev > -2 * mi and ev < mi);
+            }
+        }
+    }
+}
+
+test "mutation 2026-11-25: updateDE stays inside (-2m, m) from ANY d, e in that range (both negative included) and any matrix of the proven bound" {
+    inline for (moduli) |m| {
+        const S = Safegcd(m);
+        const mi: i1200 = m;
+        var prng = std.Random.DefaultPrng.init(0xDE_0063);
+        const rand = prng.random();
+        for (0..3000) |_| {
+            // A transition matrix of the proven shape |u| + |v| <= 2^62 and |q| + |r| <= 2^62 (the entries of
+            // a real batch are usually far smaller; the contract is for every such matrix).
+            const lim: i64 = 1 << 62;
+            const ua = rand.intRangeAtMost(i64, -lim, lim);
+            const va_max = lim - @as(i64, @intCast(@abs(ua)));
+            const qa = rand.intRangeAtMost(i64, -lim, lim);
+            const ra_max = lim - @as(i64, @intCast(@abs(qa)));
+            const t = Trans{ .u = ua, .v = rand.intRangeAtMost(i64, -va_max, va_max), .q = qa, .r = rand.intRangeAtMost(i64, -ra_max, ra_max) };
+            const lo = -2 * mi + 1;
+            const hi = mi - 1;
+            const span: u1100 = @intCast(hi - lo);
+            var dd: u1100 = 0;
+            var ee: u1100 = 0;
+            rand.bytes(std.mem.asBytes(&dd)[0..(S.words * 8 + 8)]);
+            rand.bytes(std.mem.asBytes(&ee)[0..(S.words * 8 + 8)]);
+            // Both from the negative half half of the time: that is where the (d < 0) + (e < 0) offset matters.
+            var d: i1200 = lo + @as(i1200, @intCast(dd % span));
+            var e: i1200 = lo + @as(i1200, @intCast(ee % span));
+            if (rand.boolean()) {
+                d = -@as(i1200, @intCast(dd % @as(u1100, @intCast(mi))));
+                e = -@as(i1200, @intCast(ee % @as(u1100, @intCast(mi))));
+            }
+            var ds = fromSigned(S, d);
+            var es = fromSigned(S, e);
+            S.updateDE(&ds, &es, t);
+            const dv = signedVal(S, ds);
+            const ev = signedVal(S, es);
+            try std.testing.expect(dv > -2 * mi and dv < mi);
+            try std.testing.expect(ev > -2 * mi and ev < mi);
+        }
+    }
+}

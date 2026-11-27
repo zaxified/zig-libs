@@ -451,3 +451,47 @@ test "mutation 2026-11-25: sign (P-521): noise from `random` changes the signatu
     const zero: EcdsaP521.SecretKey = .{ .bytes = @splat(0) };
     try testing.expectError(error.KeyMismatch, certverify.sign(.ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = &zero }, .server, &th, null, &det1));
 }
+
+// ── 2026-11-25 delta (the Ed25519 signer moved onto `ct25519`, 2026-11-27) ──
+
+test "mutation 2026-11-25: Ed25519Signer.deinit wipes the whole prepared signer" {
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x55));
+    var s = try certverify.Ed25519Signer.init(&kp.secret_key);
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&s), 0));
+    s.deinit();
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&s), 0));
+}
+
+const sp = @import("testkit").stackprobe;
+const NoiseProbe = sp.Probe(.{ .window = 64 * 1024 });
+var noise_out: [certverify.max_signature_len]u8 = undefined;
+var noise_signer: certverify.Ed25519Signer = undefined;
+const noise_th: [48]u8 = @splat(0x6b);
+
+/// The hedging noise is this pattern (non-uniform, so the needle windows see
+/// it); the source has no buffer of its own, unlike a CSPRNG whose state holds
+/// the bytes it just handed out (that copy sits in the probe's frame).
+fn noiseFill(_: *anyopaque, buf: []u8) void {
+    for (buf, 0..) |*b, i| b.* = @truncate(i *% 37 +% 0x29);
+}
+const noise_random = std.Random{ .ptr = undefined, .fillFn = noiseFill };
+
+fn signWithNoise(sk: *const std.crypto.sign.Ed25519.SecretKey) !void {
+    _ = try certverify.sign(.ed25519, .{ .ed25519 = sk }, .server, &noise_th, noise_random, &noise_out);
+}
+
+fn signPreparedWithNoise() !void {
+    _ = try noise_signer.sign(.server, &noise_th, noise_random, &noise_out);
+}
+
+test "mutation 2026-11-25: STACKPROBE: the Ed25519 hedging noise does not stay on the dead stack (per-call key and prepared signer)" {
+    try sp.skipUnlessOptimized();
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x55));
+    var noise: [32]u8 = undefined;
+    noiseFill(undefined, &noise);
+    const needles = &[_][]const u8{&noise};
+    _ = try NoiseProbe.run("ed25519 sign, noise", signWithNoise, .{&kp.secret_key}, needles, .{});
+    noise_signer = try certverify.Ed25519Signer.init(&kp.secret_key);
+    defer noise_signer.deinit();
+    _ = try NoiseProbe.run("ed25519 prepared sign, noise", signPreparedWithNoise, .{}, needles, .{});
+}

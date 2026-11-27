@@ -1927,13 +1927,14 @@ const GenlScripted = struct {
     gpa: std.mem.Allocator = testing.allocator,
     seq: u32 = 0,
     sends: usize = 0,
+    last_len: usize = 0,
 
     fn nextSeq(self: *GenlScripted) u32 {
         self.seq += 1;
         return self.seq;
     }
     fn send(self: *GenlScripted, msg: []const u8) SendError!void {
-        _ = msg;
+        self.last_len = msg.len;
         self.sends += 1;
     }
 
@@ -3237,4 +3238,189 @@ test "Socket: getPolicy of nlctrl on the live kernel, when it has GETPOLICY" {
     const op = p.op(CTRL_CMD_GETFAMILY) orelse return error.TestUnexpectedResult;
     const name = p.find(op.do_policy orelse return error.TestUnexpectedResult, CTRL_ATTR_FAMILY_NAME) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(PolicyKind.nul_string, name.kind);
+}
+
+// ── 2026-11-25 delta mutation audit: GETPOLICY ──────────────────────────────
+
+fn policyAttempt(gpa: std.mem.Allocator, list: *std.ArrayList(u8), seq: u32, interrupted: bool) !void {
+    if (interrupted) {
+        const h = try codec.appendHeader(gpa, list, GENL_ID_CTRL, codec.NLM_F_DUMP_INTR, seq, 7);
+        try appendHeader(gpa, list, CTRL_CMD_GETPOLICY, 2);
+        try codec.appendAttrU16(gpa, list, CTRL_ATTR_FAMILY_ID, 0x21);
+        codec.finishHeader(list, h);
+    } else {
+        try buildPolicyReply(gpa, list, seq, true);
+    }
+    try appendDone(gpa, list, seq, 7);
+}
+
+test "mutation 2026-11-25: parsePolicyRecord: signed 4-byte values, bitfield32 mask and mask land in their fields, a 2-byte signed value is malformed" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    const pol = try codec.nestBegin(gpa, &list, CTRL_ATTR_POLICY);
+    const p0 = try codec.nestBegin(gpa, &list, 0);
+    var e = try policyEntry(gpa, &list, 1, .bitfield32);
+    try codec.appendAttrU32(gpa, &list, NL_POLICY_TYPE_ATTR_BITFIELD32_MASK, 0x5);
+    try codec.appendAttrU64(gpa, &list, NL_POLICY_TYPE_ATTR_MASK, 0x1_0000_0003);
+    try codec.nestEnd(&list, e);
+    e = try policyEntry(gpa, &list, 2, .s32);
+    var four: [4]u8 = undefined;
+    std.mem.writeInt(i32, &four, -9, native_endian);
+    try codec.appendAttr(gpa, &list, NL_POLICY_TYPE_ATTR_MIN_VALUE_S, &four);
+    try codec.appendAttrU32(gpa, &list, NL_POLICY_TYPE_ATTR_MASK, 7);
+    try codec.nestEnd(&list, e);
+    try codec.nestEnd(&list, p0);
+    try codec.nestEnd(&list, pol);
+
+    var ops: std.ArrayList(OpPolicy) = .empty;
+    defer ops.deinit(gpa);
+    var attrs: std.ArrayList(PolicyAttr) = .empty;
+    defer attrs.deinit(gpa);
+    var fid: ?u16 = null;
+    try parsePolicyRecord(gpa, list.items, &fid, &ops, &attrs);
+    try testing.expectEqual(@as(usize, 2), attrs.items.len);
+    try testing.expectEqual(@as(?u32, 5), attrs.items[0].bitfield32_mask);
+    try testing.expectEqual(@as(?u64, 0x1_0000_0003), attrs.items[0].mask);
+    try testing.expectEqual(@as(?i64, -9), attrs.items[1].min_signed);
+    try testing.expectEqual(@as(?u64, 7), attrs.items[1].mask);
+
+    list.clearRetainingCapacity();
+    const pol2 = try codec.nestBegin(gpa, &list, CTRL_ATTR_POLICY);
+    const q0 = try codec.nestBegin(gpa, &list, 0);
+    const e2 = try codec.nestBegin(gpa, &list, 1);
+    try codec.appendAttr(gpa, &list, NL_POLICY_TYPE_ATTR_MIN_VALUE_S, &.{ 1, 2 });
+    try codec.nestEnd(&list, e2);
+    try codec.nestEnd(&list, q0);
+    try codec.nestEnd(&list, pol2);
+    try testing.expectError(error.MalformedReply, parsePolicyRecord(gpa, list.items, &fid, &ops, &attrs));
+}
+
+test "mutation 2026-11-25: parsePolicyRecord: the entry caps are exact for commands and for attributes" {
+    const gpa = testing.allocator;
+    var ops_rec: std.ArrayList(u8) = .empty;
+    defer ops_rec.deinit(gpa);
+    const on = try codec.nestBegin(gpa, &ops_rec, CTRL_ATTR_OP_POLICY);
+    const o = try codec.nestBegin(gpa, &ops_rec, 1);
+    try codec.appendAttrU32(gpa, &ops_rec, CTRL_ATTR_POLICY_DO, 0);
+    try codec.nestEnd(&ops_rec, o);
+    try codec.nestEnd(&ops_rec, on);
+    var attr_rec: std.ArrayList(u8) = .empty;
+    defer attr_rec.deinit(gpa);
+    const pol = try codec.nestBegin(gpa, &attr_rec, CTRL_ATTR_POLICY);
+    const p0 = try codec.nestBegin(gpa, &attr_rec, 0);
+    const e = try policyEntry(gpa, &attr_rec, 1, .u32);
+    try codec.nestEnd(&attr_rec, e);
+    try codec.nestEnd(&attr_rec, p0);
+    try codec.nestEnd(&attr_rec, pol);
+
+    var ops: std.ArrayList(OpPolicy) = .empty;
+    defer ops.deinit(gpa);
+    var attrs: std.ArrayList(PolicyAttr) = .empty;
+    defer attrs.deinit(gpa);
+    var fid: ?u16 = null;
+    try ops.appendNTimes(gpa, .{ .cmd = 0 }, max_policy_entries - 1);
+    try parsePolicyRecord(gpa, ops_rec.items, &fid, &ops, &attrs); // the cap's last slot
+    try testing.expectEqual(max_policy_entries, ops.items.len);
+    try testing.expectError(error.TooManyMessages, parsePolicyRecord(gpa, ops_rec.items, &fid, &ops, &attrs));
+    try attrs.appendNTimes(gpa, .{ .policy = 0, .attr = 0 }, max_policy_entries - 1);
+    try parsePolicyRecord(gpa, attr_rec.items, &fid, &ops, &attrs);
+    try testing.expectEqual(max_policy_entries, attrs.items.len);
+    try testing.expectError(error.TooManyMessages, parsePolicyRecord(gpa, attr_rec.items, &fid, &ops, &attrs));
+}
+
+test "mutation 2026-11-25: getPolicyOver: an interrupted dump restarts, at most max_dump_attempts times; the extended-ACK slot is reset; the request carries the command" {
+    const gpa = testing.allocator;
+    var d1: std.ArrayList(u8) = .empty;
+    defer d1.deinit(gpa);
+    var d2: std.ArrayList(u8) = .empty;
+    defer d2.deinit(gpa);
+    var d3: std.ArrayList(u8) = .empty;
+    defer d3.deinit(gpa);
+    try policyAttempt(gpa, &d1, 1, true);
+    try policyAttempt(gpa, &d2, 2, true);
+    try policyAttempt(gpa, &d3, 3, true);
+    var t: GenlScripted = .{ .script = &.{ d1.items, d2.items, d3.items }, .pid = 7 };
+    try testing.expectError(error.DumpInterrupted, getPolicyOver(&t, "demo", null));
+    try testing.expectEqual(@as(usize, max_dump_attempts), t.sends);
+    try testing.expectEqual(@as(usize, max_dump_attempts), t.recvs);
+
+    var ok: std.ArrayList(u8) = .empty;
+    defer ok.deinit(gpa);
+    try policyAttempt(gpa, &ok, 2, false);
+    t = .{ .script = &.{ d1.items, ok.items }, .pid = 7, .ext_ack_len = 5 };
+    const p = try getPolicyOver(&t, "demo", null);
+    defer p.deinit(gpa);
+    try testing.expectEqual(@as(u16, 0x21), p.family_id);
+    try testing.expectEqual(@as(usize, 2), t.sends);
+    try testing.expectEqual(@as(usize, 0), t.ext_ack_len);
+    try testing.expectEqual(@as(usize, 32), t.last_len); // 16 + 4 + "demo" attribute (12), no CTRL_ATTR_OP
+
+    var ok1: std.ArrayList(u8) = .empty;
+    defer ok1.deinit(gpa);
+    try policyAttempt(gpa, &ok1, 1, false);
+    t = .{ .script = &.{ok1.items}, .pid = 7 };
+    const p2 = try getPolicyOver(&t, "demo", 5);
+    defer p2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 40), t.last_len); // plus CTRL_ATTR_OP = 5 (8)
+}
+
+test "mutation 2026-11-25: getPolicyOver: the datagram budget is exact; overrun, foreign genl families and the extended-ACK reason are handled" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    // A flood of records for another seq: only the datagram budget stops it.
+    try buildPolicyReply(gpa, &out, 99, true);
+    var t: GenlScripted = .{ .filler = out.items, .pid = 7 };
+    try testing.expectError(error.TooManyMessages, getPolicyOver(&t, "demo", null));
+    try testing.expectEqual(@as(usize, max_reply_messages), t.recvs);
+
+    // NLMSG_OVERRUN.
+    var d: std.ArrayList(u8) = .empty;
+    defer d.deinit(gpa);
+    var h = try codec.appendHeader(gpa, &d, codec.NLMSG_OVERRUN, 0, 1, 7);
+    codec.finishHeader(&d, h);
+    t = .{ .script = &.{d.items}, .pid = 7 };
+    try testing.expectError(error.SystemResources, getPolicyOver(&t, "demo", null));
+
+    // A record of another genl family is skipped whatever its payload, and adds nothing.
+    d.clearRetainingCapacity();
+    h = try codec.appendHeader(gpa, &d, GENL_ID_CTRL + 1, 0, 5, 7);
+    try d.appendSlice(gpa, &.{ 0xff, 0xff, 0xff, 0xff });
+    codec.finishHeader(&d, h);
+    try appendDone(gpa, &d, 5, 7);
+    var ops: std.ArrayList(OpPolicy) = .empty;
+    defer ops.deinit(gpa);
+    var attrs: std.ArrayList(PolicyAttr) = .empty;
+    defer attrs.deinit(gpa);
+    var fid: ?u16 = null;
+    t = .{ .script = &.{d.items}, .pid = 7 };
+    try testing.expect(!try collectPolicy(&t, gpa, 5, &fid, &ops, &attrs));
+    try testing.expectEqual(@as(usize, 0), attrs.items.len);
+
+    // The kernel's extended-ACK reason reaches the transport.
+    var e: std.ArrayList(u8) = .empty;
+    defer e.deinit(gpa);
+    const eh = try codec.appendHeader(gpa, &e, codec.NLMSG_ERROR, codec.NLM_F_ACK_TLVS | codec.NLM_F_CAPPED, 1, 7);
+    var code: [4]u8 = undefined;
+    std.mem.writeInt(i32, &code, -@as(i32, @intCast(@backingInt(linux.E.INVAL))), native_endian);
+    try e.appendSlice(gpa, &code);
+    try e.appendSlice(gpa, &@as([codec.header_len]u8, @splat(0)));
+    try codec.appendAttrString(gpa, &e, codec.NLMSGERR_ATTR.MSG, "bad policy request");
+    codec.finishHeader(&e, eh);
+    t = .{ .script = &.{e.items}, .pid = 7 };
+    try testing.expectError(error.Unexpected, getPolicyOver(&t, "demo", null));
+    try testing.expectEqualStrings("bad policy request", t.ext_ack_buf[0..t.ext_ack_len]);
+}
+
+test "mutation 2026-11-25: Socket.getPolicy writes the transport state back (the sequence counter advances)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+    const p = sock.getPolicy("nlctrl", null) catch |err| switch (err) {
+        error.Unexpected, error.AccessDenied => return error.SkipZigTest, // before 5.2, or a sandbox
+        else => return err,
+    };
+    defer p.deinit(testing.allocator);
+    try testing.expect(sock.seq >= 1);
 }

@@ -434,3 +434,44 @@ test "bip340SignBlinded == bip340Sign, and it verifies" {
     const zero: [32]u8 = @splat(0);
     try std.testing.expectError(error.InvalidSecretKey, bip340SignBlinded(&bl, &zero, msg, aux));
 }
+
+test "mutation 2026-11-25: bip340SignBlinded takes the blinded path for both fixed-base multiplies (a b·G off by G moves x(R) as modelled; one that cancels d'·G makes P the identity)" {
+    const sk: [32]u8 = @splat(0x3c);
+    const aux: [32]u8 = @splat(0x07);
+    const seed: [32]u8 = @splat(0x99);
+    var bl: Blinding = undefined;
+    Blinding.fromSeedInto(&bl, &seed);
+    defer bl.wipe();
+    const good = try bip340Sign(&sk, "blinded", aux);
+    try std.testing.expectEqualSlices(u8, &good, &(try bip340SignBlinded(&bl, &sk, "blinded", aux)));
+    // A b·G off by E = G: every blinded product is off by E, so P' = P + E and R' = k'G + E,
+    // k' derived from P' (BIP340). The model below recomputes x(R') from public pieces only.
+    var base_pt = Secp256k1.basePoint; // a runtime copy: the affine conversion must not run at comptime
+    std.mem.doNotOptimizeAway(&base_pt);
+    const n = scalarmod.field_order;
+    const b = n - bl.neg_b;
+    var b_be: [32]u8 = undefined;
+    std.mem.writeInt(u256, &b_be, b, .big);
+    var bad = bl;
+    bad.b_g = (try Secp256k1.combMulBase(b_be, .big)).add(base_pt).affineCoordinates();
+    const Pp = (try Secp256k1.combMulBase(sk, .big)).add(base_pt).affineCoordinates();
+    const dp = try Scalar.fromBytes(sk, .big);
+    const d = if (Pp.y.isOdd()) dp.neg() else dp;
+    const d_bytes = d.toBytes(.big);
+    const px = Pp.x.toBytes(.big);
+    const aux_hash = taggedHash("BIP0340/aux", &.{&aux});
+    var t: [32]u8 = undefined;
+    for (&t, d_bytes, aux_hash) |*ti, di, ai| ti.* = di ^ ai;
+    const k0 = reduceToScalar(taggedHash("BIP0340/nonce", &.{ &t, &px, "blinded" }));
+    const Rp = (try Secp256k1.combMulBase(k0.toBytes(.big), .big)).add(base_pt).affineCoordinates();
+    const sig = try bip340SignBlinded(&bad, &sk, "blinded", aux);
+    try std.testing.expectEqualSlices(u8, &Rp.x.toBytes(.big), sig[0..32]);
+    // d'G blinded with b·G replaced by (b - d')G is the identity: InvalidSecretKey, only if the FIRST multiply is blinded too.
+    const dk = std.mem.readInt(u256, &sk, .big);
+    const x = if (b >= dk) b - dk else b + (n - dk);
+    var x_be: [32]u8 = undefined;
+    std.mem.writeInt(u256, &x_be, x, .big);
+    var cancel = bl;
+    cancel.b_g = (try Secp256k1.combMulBase(x_be, .big)).affineCoordinates();
+    try std.testing.expectError(error.InvalidSecretKey, bip340SignBlinded(&cancel, &sk, "blinded", aux));
+}

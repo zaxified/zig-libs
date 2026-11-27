@@ -1744,3 +1744,54 @@ test "Blinding: the fixed state is b = 1, f = 1; seeds give different states; wi
     a.wipe();
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&a), 0));
 }
+
+fn expectBlindingGolden(seed_byte: u8, want_neg_b: u256, want_f: u256, want_gx: u256, want_gy: u256) !void {
+    var seed: [32]u8 = @splat(seed_byte);
+    var bl: Blinding = undefined;
+    Blinding.fromSeedInto(&bl, &seed);
+    defer bl.wipe();
+    try std.testing.expectEqual(want_neg_b, bl.neg_b);
+    var buf: [32]u8 = undefined;
+    std.mem.writeInt(u256, &buf, want_f, .big);
+    try std.testing.expectEqualSlices(u8, &buf, &bl.f.toBytes(.big));
+    std.mem.writeInt(u256, &buf, want_gx, .big);
+    try std.testing.expectEqualSlices(u8, &buf, &bl.b_g.x.toBytes(.big));
+    std.mem.writeInt(u256, &buf, want_gy, .big);
+    try std.testing.expectEqualSlices(u8, &buf, &bl.b_g.y.toBytes(.big));
+}
+
+test "mutation 2026-11-25: Blinding.fromSeedInto is pinned for two seeds (own derivation, cross-checked with an independent Python implementation; seed 2 has the top bit of b set, seed 1 the top bit of f)" {
+    try expectBlindingGolden(1, 0xae723b92c64709486f9ca87cda9264416d6feefbbe19af07fa0f0376c434b23d, 0x7c546beb8a515655a995c77d9972d453be9f6a0aa4c6b274cdfb33f992f22b2d, 0xc946ac8e841d3464b27ed00dcaf4dbc9c1b9b3cfab8294d73e45a87488b289ad, 0x132315c15820d75c785514021e049608c3a9c6c8500bc84aa425ce5796673f0a);
+    try expectBlindingGolden(2, 0xa498378d5fc177bb46928ab1b162619e967a8844aa5a78c8f3d54d2cc28f8456, 0x6d949ef13b33a66401f12594f6244e6eae06c85435b3345f5f600f7801ea9f8b, 0x31a7051570a2cce0c040169254e1c4e73ab9117489445830ba56626bc973f0eb, 0xb1c82ddb10f3476442be00c587b68f289e55126e5da04a0981293028e0c8a59a);
+}
+
+test "mutation 2026-11-25: Blinding.random draws a fresh state every call" {
+    var a: Blinding = undefined;
+    var b: Blinding = undefined;
+    Blinding.random(&a, std.testing.io);
+    Blinding.random(&b, std.testing.io);
+    defer a.wipe();
+    defer b.wipe();
+    try std.testing.expect(!a.b_g.x.equivalent(b.b_g.x));
+    try std.testing.expect(!a.f.equivalent(b.f));
+}
+
+/// Runtime arguments only: the comb over comptime-known inputs would be evaluated at comptime.
+noinline fn projForTest(k: u256, comptime blinded: bool, bl: *const Blinding) Secp256k1 {
+    return Secp256k1.combProjective(&comb_table, k, blinded, bl);
+}
+
+test "mutation 2026-11-25: the blinded comb accumulator is another representative of the same point (the rescale is applied)" {
+    var seed: [32]u8 = @splat(7);
+    var bl: Blinding = undefined;
+    Blinding.fromSeedInto(&bl, &seed);
+    defer bl.wipe();
+    const ks = [_]u256{ 0x1234_5678_9abc_def0_1357_9bdf_0246_8ace_fedc_ba98_7654_3210_0fed_cba9_8765_4321, 1, std.math.maxInt(u256) >> 1 };
+    for (ks) |k| {
+        const p0 = projForTest(k, false, &bl);
+        const p1 = projForTest(k, true, &bl);
+        try std.testing.expect(p0.equivalent(p1));
+        // Same point, but not the same coordinates: the first loaded entry carried (f², f³, f).
+        try std.testing.expect(!(p0.x.equivalent(p1.x) and p0.y.equivalent(p1.y) and p0.z.equivalent(p1.z)));
+    }
+}
