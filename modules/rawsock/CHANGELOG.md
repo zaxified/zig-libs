@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **FIX (behaviour change):** `ip6 net ADDR/LEN` refused host bits only in the words the prefix touches; `ip6 net 2001:db8::1/32` compiled. It is now `Syntax` ("non-network bits set"), as libpcap 1.10.6 `pcap_compile` has it (all four words are checked).
+
+- **2026-11-27** — **FIX (behaviour change, previously `Syntax`):** a bare `ip6 net ADDR` (no `/LEN`) is a /128 and compiles like `ip6 host ADDR`, as libpcap 1.10.6 `pcap_compile` does.
+
+- **2026-11-27** — **FIX (behaviour change, previously `Syntax`):** an IPv4 dotted-quad part is decimal digits of any length whose value is at most 255 (`host 0001.2.3.4` is 1.2.3.4, `010` is ten, not octal; `1.2.3.0256` stays refused), in `host`, `net`, `net A mask M` and `arp host`, as libpcap 1.10.6 `pcap_compile` does.
+
 - **2026-11-21** — **Behaviour change (previously `UnsupportedExpression`):** `geneve [vni]` compiles as libpcap does (outer IPv4 / IPv6 UDP 6081, Geneve version 0, VNI, then the primitives after it address the inner frame through scratch slots, MAC addresses included); a second `mpls` is the next label of the stack (`mpls 5 and mpls 7`, `mpls and mpls and ip`) and `pppoes and mpls` shifts by one label and takes a label number (before: no shift after it). 61 geneve and 108 mpls/pppoes rows checked against `tcpdump -r`; the kernel accepts the geneve programs.
 
 - **2026-11-21** — **CONSUMER-VISIBLE (additive):** `ring.RingV2`, `ring.OptionsV2`, `ring.FrameV2`: an opt-in `TPACKET_V2` receive ring (one `tpacket2_hdr` frame per packet, the V3 ring's hostile-header checks, ticketed `release`, kernel packet/drop counters). `Ring` (V3) unchanged.

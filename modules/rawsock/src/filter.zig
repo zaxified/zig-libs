@@ -1587,7 +1587,7 @@ const Parser = struct {
         for (text) |c| if (!std.ascii.isHex(c) and c != ':' and c != '.') return error.UnsupportedExpression;
         if (std.mem.findScalar(u8, text, ':') != null) {
             if (fam == .ip4) return error.Syntax;
-            if (is_net and plen == null) return error.Syntax;
+            // libpcap 1.10.6 pcap_compile: a bare `ip6 net ADDR` is a /128, the same as `ip6 host ADDR`.
             const addr6 = netaddr.parseIp6(text) orelse return error.Syntax;
             const pl6 = plen orelse 128;
             if (pl6 > 128) return error.Syntax;
@@ -1604,8 +1604,8 @@ const Parser = struct {
             addr = @splat(0);
             var it = std.mem.splitScalar(u8, text, '.');
             while (it.next()) |part| : (octets += 1) {
-                if (octets == 4 or part.len == 0 or part.len > 3) return error.Syntax;
-                addr[octets] = std.fmt.parseInt(u8, part, 10) catch return error.Syntax;
+                if (octets == 4) return error.Syntax;
+                addr[octets] = ipv4Octet(part) orelse return error.Syntax;
             }
             // Four octets name one host (`net 10.0.0.0` is /32); fewer are a prefix.
             pl = if (octets == 4) 32 else @intCast(8 * octets);
@@ -1886,12 +1886,13 @@ const Parser = struct {
         var i: u32 = 0;
         while (i < 4) : (i += 1) {
             const done = i * 32;
-            if (plen <= done) break;
-            const bits: u8 = @intCast(@min(32, plen - done));
+            const bits: u8 = if (plen <= done) 0 else @intCast(@min(32, plen - done));
             const m = maskOf(bits);
             const word = std.mem.readInt(u32, addr[i * 4 ..][0..4], .big);
-            // Host bits beyond the prefix: libpcap refuses ("non-network bits set").
+            // Host bits beyond the prefix, in any word, also one wholly past it: libpcap 1.10.6
+            // pcap_compile refuses ("non-network bits set"), as `ip6 net 2001:db8::1/32` shows.
             if (word & ~m != 0) return error.Syntax;
+            if (bits == 0) continue;
             const cmp = try p.t(.{ .size = .w, .off = base + i * 4, .mask = if (bits == 32) null else m, .k = word });
             acc = try p.both(.@"and", acc, cmp);
         }
@@ -1915,14 +1916,21 @@ fn maskOf(plen: u8) u32 {
     return if (plen == 0) 0 else ~@as(u32, 0) << @intCast(32 - @as(u32, plen));
 }
 
+/// One dotted-quad part: decimal digits of any length (leading zeros are ignored, not octal) whose
+/// value is at most 255 (libpcap 1.10.6 pcap_compile: `host 0001.2.3.4` is 1.2.3.4, `1.2.3.0256` is refused).
+fn ipv4Octet(part: []const u8) ?u8 {
+    if (part.len == 0) return null;
+    for (part) |c| if (!std.ascii.isDigit(c)) return null;
+    return std.fmt.parseInt(u8, part, 10) catch null;
+}
+
 fn parseIpv4(s: []const u8) ?[4]u8 {
     var out: [4]u8 = undefined;
     var it = std.mem.splitScalar(u8, s, '.');
     var i: usize = 0;
     while (it.next()) |part| : (i += 1) {
-        // An empty part fails parseInt; more than 3 digits is not dotted-quad.
-        if (i == 4 or part.len > 3) return null;
-        out[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+        if (i == 4) return null;
+        out[i] = ipv4Octet(part) orelse return null;
     }
     if (i != 4) return null;
     return out;
@@ -4161,4 +4169,415 @@ test "compileInto: the same program as compile, no allocator; too little scratch
     // Too little scratch / output.
     try testing.expectError(error.OutOfMemory, compileInto(&out, scratch[0..64], "ip and tcp port 80", .{}));
     try testing.expectError(error.OutOfMemory, compileInto(out[0..2], &scratch, "ip and tcp port 80", .{}));
+}
+
+// ── mutation run 2026-11-27 (rawsock part 1, filter.zig whole): tests for the survivors ────────
+// Expected values come from the BPF semantics, RFC 8926 (Geneve), RFC 3032 (MPLS), the pcap-filter
+// grammar and the doc comments above, never from running `compile` and copying its output.
+
+fn m27Ip4(buf: []u8, proto: u8, ttl: u8, frag: u16, src: [4]u8, dst: [4]u8) void {
+    @memset(buf, 0);
+    buf[12] = 0x08;
+    buf[14] = 0x45;
+    std.mem.writeInt(u16, buf[20..22], frag, .big);
+    buf[22] = ttl;
+    buf[23] = proto;
+    @memcpy(buf[26..30], &src);
+    @memcpy(buf[30..34], &dst);
+}
+
+fn m27Accepts(expr: []const u8, opts: Options, frame: []const u8) !bool {
+    const p = try compileOpts(testing.allocator, expr, opts);
+    defer testing.allocator.free(p);
+    try validate(p);
+    return run(p, frame) != 0;
+}
+
+fn m27Same(a: []const u8, b: []const u8) !void {
+    const pa = try compile(testing.allocator, a);
+    defer testing.allocator.free(pa);
+    const pb = try compile(testing.allocator, b);
+    defer testing.allocator.free(pb);
+    try testing.expectEqualSlices(BpfInsn, pb, pa);
+}
+
+test "mutation 2026-11-27: run drops every ancillary load but the metadata words; an unset scratch slot reads 0 for ldx too" {
+    const base = ancillary_base;
+    // `run` has no metadata: a load at SKF_AD_OFF + n drops the frame, whatever the size.
+    for ([_]BpfInsn{ mk(op.ld | op.w | op.abs, base + 8), mk(op.ld | op.h | op.abs, base + 44), mk(op.ld | op.b | op.abs, base + 48) }) |ld| {
+        try testing.expectEqual(@as(u32, 0), run(&.{ ld, mk(op.ret | op.k, 1) }, "abcd"));
+    }
+    // runLive answers four words only; SKF_AD_PROTOCOL (index 0) and the others drop the frame.
+    try testing.expectEqual(@as(u32, 0), runLive(&.{ mk(op.ld | op.w | op.abs, base), mk(op.ret | op.k, 1) }, "abcd", null));
+    try testing.expectEqual(@as(u32, 0), runLiveMeta(&.{ mk(op.ld | op.w | op.abs, base + 12), mk(op.ret | op.k, 1) }, "abcd", .{}));
+    // M[3] was never stored to: ldx reads 0 (the interpreter's documented reading of the unset slot).
+    const prog = [_]BpfInsn{ mk(op.ldx | 0x60, 3), mk(op.misc | op.txa, 0), mk(op.ret | op.a, 0) };
+    try testing.expectEqual(@as(u32, 0), run(&prog, "abcd"));
+}
+
+test "mutation 2026-11-27: usesAncillary looks at loads only; Link.dlt are the savefile numbers" {
+    try testing.expect(!usesAncillary(&.{ mk(op.ld | op.w | op.imm, 0x80000000), mk(op.ret | op.k, 0xfffff000) }));
+    try testing.expect(!usesAncillary(&.{ mk(op.jmp | op.jeq | op.k, 0x80000000), mk(op.ret | op.k, 0) }));
+    try testing.expect(usesAncillary(&.{mk(op.ld | op.w | op.abs, 0xfffff004)}));
+    // tcpdump.org link-layer header types.
+    try testing.expectEqual(@as(u32, 0), Link.bsd_null.dlt());
+    try testing.expectEqual(@as(u32, 1), Link.ethernet.dlt());
+    try testing.expectEqual(@as(u32, 9), Link.ppp.dlt());
+    try testing.expectEqual(@as(u32, 101), Link.raw.dlt());
+    try testing.expectEqual(@as(u32, 108), Link.bsd_loop.dlt());
+    try testing.expectEqual(@as(u32, 113), Link.linux_sll.dlt());
+    try testing.expectEqual(@as(u32, 276), Link.linux_sll2.dlt());
+    try testing.expectEqual(Link.ethernet, Link.fromDlt(1).?);
+    try testing.expectEqual(Link.linux_sll, Link.fromDlt(113).?);
+    try testing.expectEqual(Link.raw, Link.fromDlt(101).?);
+    try testing.expect(Link.fromDlt(2) == null);
+}
+
+const M27Count = struct {
+    frees: usize = 0,
+    fn allocator(c: *M27Count) std.mem.Allocator {
+        return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        _ = ctx;
+        return testing.allocator.rawAlloc(len, al, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const c: *M27Count = @ptrCast(@alignCast(ctx));
+        c.frees += 1;
+        testing.allocator.rawFree(m, al, ra);
+    }
+};
+
+test "mutation 2026-11-27: Scratch.free hands a spilled slice to the next allocator and keeps the buffer's own" {
+    var cnt: M27Count = .{};
+    var buf: [16]u8 = undefined;
+    var s: Scratch = .{ .fba = .init(&buf), .next = cnt.allocator() };
+    const a = s.allocator();
+    const spill = try a.alloc(u8, 32);
+    const own = try a.alloc(u8, 8);
+    try testing.expect(s.fba.ownsSlice(own) and !s.fba.ownsSlice(spill));
+    a.free(own);
+    try testing.expectEqual(@as(usize, 0), cnt.frees);
+    a.free(spill);
+    try testing.expectEqual(@as(usize, 1), cnt.frees);
+}
+
+test "mutation 2026-11-27: compileInto does not depend on what the caller's scratch held, and out may be exactly as long as the program" {
+    // 200 terms: more than 255 instructions between a test and its targets, so `finish` widens.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, "arp");
+    for (0..200) |_| try text.appendSlice(testing.allocator, " or ether[0] & 1 = 1");
+    const want = try compile(testing.allocator, text.items);
+    defer testing.allocator.free(want);
+    const scratch = try testing.allocator.alloc(u8, 1 << 18);
+    defer testing.allocator.free(scratch);
+    var out: [max_insns]BpfInsn = undefined;
+    for ([_]u8{ 0x00, 0x01, 0x55 }) |fill| {
+        @memset(scratch, fill);
+        const got = try compileInto(&out, scratch, text.items, .{});
+        try testing.expectEqualSlices(BpfInsn, want, got);
+    }
+    // Exactly as long as the program: fits; one short: OutOfMemory.
+    const got = try compileInto(out[0..want.len], scratch, text.items, .{});
+    try testing.expectEqualSlices(BpfInsn, want, got);
+    try testing.expectError(error.OutOfMemory, compileInto(out[0 .. want.len - 1], scratch, text.items, .{}));
+}
+
+fn m27Far(arena: std.mem.Allocator, case: u8) ![]BpfInsn {
+    var g: Gen = .{ .a = arena };
+    const t = try g.newLabel();
+    const f = try g.newLabel();
+    try g.ins(op.ld | op.b | op.abs, 0);
+    try g.jump(op.jmp | op.jeq | op.k, 5, t, f);
+    if (case == 0) {
+        try g.place(f);
+        try g.ins(op.ret | op.k, 2);
+    }
+    if (case == 1) {
+        try g.place(t);
+        try g.ins(op.ret | op.k, 1);
+    }
+    for (0..300) |_| try g.ins(op.ld | op.w | op.imm, 7);
+    if (case != 1) {
+        try g.place(t);
+        try g.ins(op.ret | op.k, 1);
+    }
+    if (case != 0) {
+        if (case == 1) {
+            try g.place(f);
+            try g.ins(op.ret | op.k, 2);
+        } else {
+            try g.place(f);
+            try g.ins(op.ret | op.k, 2);
+        }
+    }
+    return g.finish(testing.allocator, &.{});
+}
+
+test "mutation 2026-11-27: finish lays out a conditional jump with a far true target, a far false target and both far" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]u8{ 0, 1, 2 }) |case| {
+        const prog = try m27Far(arena.allocator(), case);
+        defer testing.allocator.free(prog);
+        try validate(prog);
+        // `ld b [0]; jeq #5`: 5 takes the true target (ret 1), anything else the false one (ret 2).
+        try testing.expectEqual(@as(u32, 1), run(prog, &.{5}));
+        try testing.expectEqual(@as(u32, 2), run(prog, &.{6}));
+        if (case == 2) {
+            // The documented shape for two long sides: [cond jt=0 jf=1][ja T][ja F].
+            try testing.expectEqual(@as(u8, 0), prog[1].jt);
+            try testing.expectEqual(@as(u8, 1), prog[1].jf);
+            try testing.expectEqual(@as(u16, op.jmp | op.ja), prog[2].code);
+            try testing.expectEqual(@as(u16, op.jmp | op.ja), prog[3].code);
+        }
+    }
+}
+
+test "mutation 2026-11-27: the gen depth cap counts right children and the end of a left spine" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var p: Parser = .{ .a = a, .lex = .{ .src = "arp" } };
+    const leaf = try p.parseExpr();
+    // and[1] / or[1]: the leaf of n wrappers sits at depth n.
+    for ([_]usize{ 1, 3 }) |kind| {
+        for ([_]usize{ Gen.max_gen_depth, Gen.max_gen_depth + 1 }) |n| {
+            var cur = leaf;
+            for (0..n) |_| {
+                const nd = try a.create(Node);
+                nd.* = if (kind == 1) .{ .@"and" = .{ leaf, cur } } else .{ .@"or" = .{ leaf, cur } };
+                cur = nd;
+            }
+            var g: Gen = .{ .a = a };
+            const t_label = try g.newLabel();
+            const f_label = try g.newLabel();
+            if (n == Gen.max_gen_depth) try g.gen(cur, t_label, f_label, 0) else try testing.expectError(error.FilterTooComplex, g.gen(cur, t_label, f_label, 0));
+        }
+    }
+    // and[0] over a `not`: each level is two edges deep (the spine's end, then the not).
+    for ([_]usize{ Gen.max_gen_depth / 2, Gen.max_gen_depth / 2 + 1 }) |k| {
+        var cur = leaf;
+        for (0..k) |_| {
+            const nt = try a.create(Node);
+            nt.* = .{ .not = cur };
+            const nd = try a.create(Node);
+            nd.* = .{ .@"and" = .{ nt, leaf } };
+            cur = nd;
+        }
+        var g: Gen = .{ .a = a };
+        const t_label = try g.newLabel();
+        const f_label = try g.newLabel();
+        if (k == Gen.max_gen_depth / 2) try g.gen(cur, t_label, f_label, 0) else try testing.expectError(error.FilterTooComplex, g.gen(cur, t_label, f_label, 0));
+    }
+}
+
+test "mutation 2026-11-27: lexer: lone operators, == , glued punctuation, two bracket expressions, bare MAC / IPv6 / net values" {
+    const a = testing.allocator;
+    try testing.expectError(error.Syntax, compile(a, "ip |"));
+    try testing.expectError(error.Syntax, compile(a, "ip &"));
+    try m27Same("ip[8] == 64", "ip[8] = 64");
+    try m27Same("tcp or(udp)", "tcp or (udp)");
+    try m27Same("ip[8]<5", "ip[8] < 5");
+    try m27Same("ip[8]>5", "ip[8] > 5");
+    try m27Same("ip[6] = 1 and tcp[13] = 2", "(ip[6] = 1) and (tcp[13] = 2)");
+    try m27Same("ether host 00:11:22:33:44:55 or aa:bb:cc:dd:ee:ff", "ether host 00:11:22:33:44:55 or ether host aa:bb:cc:dd:ee:ff");
+    try m27Same("ip6 host ::1 or ::2", "ip6 host ::1 or ip6 host ::2");
+    try m27Same("net 10.0.0.0/8 or 11.0.0.0/8", "net 10.0.0.0/8 or net 11.0.0.0/8");
+    try m27Same("port 0X10", "port 16");
+}
+
+test "mutation 2026-11-27: parser refusals: unclosed parenthesis, tcp host, protocol-less shorthand, flag lists, masks, arp net, ip(6) multicast" {
+    const a = testing.allocator;
+    try testing.expectError(error.Syntax, compile(a, "(tcp x"));
+    try testing.expectError(error.Syntax, compile(a, "tcp[tcpflags] & (tcp-syn tcp-ack tcp-fin) != 0"));
+    try testing.expectError(error.Syntax, compile(a, "net 10.1.0.0 mask 255.0.255.0"));
+    // libpcap: the shorthand repeats qualifiers only after host / net / port / portrange.
+    try testing.expect(std.meta.isError(compile(a, "port 80 and ip or 81")));
+    try testing.expect(std.meta.isError(compile(a, "tcp src host 1.2.3.4")));
+    try testing.expectError(error.UnsupportedExpression, compile(a, "arp src net 10.0.0.0/8"));
+    for ([_][]const u8{ "ip multicast", "ip broadcast", "ip protochain 1", "ip6 multicast", "ip6 broadcast", "ip6 protochain 1" }) |e| {
+        try testing.expectError(error.UnsupportedExpression, compile(a, e));
+    }
+}
+
+test "mutation 2026-11-27: a net mask is not kept for the next primitive" {
+    var f: [34]u8 = undefined;
+    // The mask 255.0.255.0 is non-contiguous; `host 10.9.9.9` after it must be an exact host test.
+    m27Ip4(&f, 6, 64, 0, .{ 10, 9, 9, 9 }, .{ 1, 1, 1, 1 });
+    try testing.expect(try m27Accepts("net 10.0.0.0 mask 255.0.255.0 or ip host 10.9.9.9", .{}, &f));
+    m27Ip4(&f, 6, 64, 0, .{ 10, 9, 9, 8 }, .{ 1, 1, 1, 1 });
+    try testing.expect(!(try m27Accepts("net 10.0.0.0 mask 255.0.255.0 or ip host 10.9.9.9", .{}, &f)));
+}
+
+test "mutation 2026-11-27: relational operators at the boundary value" {
+    var f: [34]u8 = undefined;
+    const table = [_]struct { []const u8, [3]bool }{
+        .{ "<", .{ true, false, false } },
+        .{ "<=", .{ true, true, false } },
+        .{ "=", .{ false, true, false } },
+        .{ "==", .{ false, true, false } },
+        .{ "!=", .{ true, false, true } },
+        .{ ">", .{ false, false, true } },
+        .{ ">=", .{ false, true, true } },
+    };
+    for (table) |row| {
+        var buf: [32]u8 = undefined;
+        const e = try std.fmt.bufPrint(&buf, "ip[8] {s} 5", .{row[0]});
+        for ([_]u8{ 4, 5, 6 }, row[1]) |ttl, want| {
+            m27Ip4(&f, 6, ttl, 0, .{ 1, 1, 1, 1 }, .{ 2, 2, 2, 2 });
+            try testing.expectEqual(want, try m27Accepts(e, .{}, &f));
+        }
+    }
+}
+
+test "mutation 2026-11-27: sctp offsets need protocol 132; a port test refuses a fragment whose offset has the top bit set" {
+    var f: [60]u8 = undefined;
+    m27Ip4(&f, 132, 64, 0, .{ 1, 1, 1, 1 }, .{ 2, 2, 2, 2 });
+    std.mem.writeInt(u16, f[34..36], 80, .big);
+    try testing.expect(try m27Accepts("sctp[0:2] = 80", .{}, &f));
+    m27Ip4(&f, 6, 64, 0, .{ 1, 1, 1, 1 }, .{ 2, 2, 2, 2 });
+    std.mem.writeInt(u16, f[34..36], 80, .big);
+    try testing.expect(!(try m27Accepts("sctp[0:2] = 80", .{}, &f)));
+    try testing.expect(try m27Accepts("tcp port 80", .{}, &f));
+    // Fragment offset 0x1000 (units of 8 bytes): not the first fragment, no ports in it.
+    m27Ip4(&f, 6, 64, 0x1000, .{ 1, 1, 1, 1 }, .{ 2, 2, 2, 2 });
+    std.mem.writeInt(u16, f[34..36], 80, .big);
+    try testing.expect(!(try m27Accepts("tcp port 80", .{}, &f)));
+}
+
+test "mutation 2026-11-27: arp host is the whole address, not a /31" {
+    var f: [42]u8 = @splat(0);
+    f[12] = 0x08;
+    f[13] = 0x06;
+    f[28..32].* = .{ 10, 0, 0, 0 };
+    f[38..42].* = .{ 10, 0, 0, 2 };
+    try testing.expect(!(try m27Accepts("arp host 10.0.0.1", .{}, &f)));
+    f[28..32].* = .{ 10, 0, 0, 1 };
+    try testing.expect(try m27Accepts("arp host 10.0.0.1", .{}, &f));
+}
+
+test "mutation 2026-11-27: vlan: all three TPIDs, the VLAN id is the low 12 bits of the TCI" {
+    var f: [20]u8 = @splat(0);
+    for ([_]u16{ 0x8100, 0x88a8, 0x9100 }) |tpid| {
+        std.mem.writeInt(u16, f[12..14], tpid, .big);
+        std.mem.writeInt(u16, f[14..16], 0xa005, .big); // priority 5, DEI 0, id 5
+        try testing.expect(try m27Accepts("vlan", .{}, &f));
+        try testing.expect(try m27Accepts("vlan 5", .{}, &f));
+        try testing.expect(!(try m27Accepts("vlan 6", .{}, &f)));
+    }
+    std.mem.writeInt(u16, f[12..14], 0x0800, .big);
+    try testing.expect(!(try m27Accepts("vlan", .{}, &f)));
+    // The live form: the tag is still in the frame (no metadata), QinQ 0x9100.
+    const prog = try compileOpts(testing.allocator, "vlan", .{ .vlan_ancillary = true });
+    defer testing.allocator.free(prog);
+    std.mem.writeInt(u16, f[12..14], 0x9100, .big);
+    try testing.expect(runLive(prog, &f, null) != 0);
+    std.mem.writeInt(u16, f[12..14], 0x0800, .big);
+    try testing.expectEqual(@as(u32, 0), runLive(prog, &f, null));
+    // Nothing reads the shift after `greater`: no scratch store in the program.
+    const p2 = try compileOpts(testing.allocator, "vlan and greater 100", .{ .vlan_ancillary = true });
+    defer testing.allocator.free(p2);
+    for (p2) |i| try testing.expect(i.code != op.st and i.code != (op.ldx | op.w | op.mem));
+}
+
+test "mutation 2026-11-27: MPLS bottom-of-stack bit alone, PPP protocol numbers for MPLS and unknown EtherTypes" {
+    // RFC 3032: label 20 bits, TC 3, S 1, TTL 8. TC = 1, S = 1: the third byte is 0x03.
+    var f: [40]u8 = @splat(0);
+    f[12] = 0x88;
+    f[13] = 0x47;
+    f[16] = 0x03;
+    f[18] = 0x45;
+    try testing.expect(try m27Accepts("mpls and ip", .{}, &f));
+    f[16] = 0x02; // S = 0
+    try testing.expect(!(try m27Accepts("mpls and ip", .{}, &f)));
+    // PPPoE session: eth(14) + PPPoE(6) + PPP protocol at 20.
+    var g: [30]u8 = @splat(0);
+    g[12] = 0x88;
+    g[13] = 0x64;
+    for ([_]struct { []const u8, u16 }{
+        .{ "pppoes and ether proto 0x8848", 0x0283 },
+        .{ "pppoes and ether proto 0x8847", 0x0281 },
+        .{ "pppoes and ether proto 0x1234", 0x1234 },
+    }) |c| {
+        std.mem.writeInt(u16, g[20..22], c[1], .big);
+        try testing.expect(try m27Accepts(c[0], .{}, &g));
+        std.mem.writeInt(u16, g[20..22], c[1] +% 1, .big);
+        try testing.expect(!(try m27Accepts(c[0], .{}, &g)));
+    }
+    // DLT_PPP: address, control, protocol.
+    const ppp: Options = .{ .link = .ppp };
+    try testing.expect(try m27Accepts("ether proto 0x8847", ppp, &.{ 0xff, 0x03, 0x02, 0x81 }));
+    try testing.expect(try m27Accepts("ether proto 0x8848", ppp, &.{ 0xff, 0x03, 0x02, 0x83 }));
+    try testing.expect(!(try m27Accepts("ether proto 0x8848", ppp, &.{ 0xff, 0x03, 0x02, 0x84 })));
+}
+
+const M27Gv = struct { v6: bool = false, ver_opt: u8 = 0, flags: u8 = 0, rsv: u8 = 0, vni: u24 = 5, frag: u16 = 0 };
+
+fn m27Geneve(buf: *[96]u8, g: M27Gv) []const u8 {
+    @memset(buf, 0);
+    var at: usize = 42;
+    if (g.v6) {
+        buf[12] = 0x86;
+        buf[13] = 0xdd;
+        buf[14] = 0x60;
+        buf[20] = 17;
+        std.mem.writeInt(u16, buf[56..58], 6081, .big);
+        at = 62;
+    } else {
+        buf[12] = 0x08;
+        buf[14] = 0x45;
+        std.mem.writeInt(u16, buf[20..22], g.frag, .big);
+        buf[23] = 17;
+        std.mem.writeInt(u16, buf[36..38], 6081, .big);
+    }
+    buf[at] = g.ver_opt;
+    buf[at + 1] = g.flags;
+    std.mem.writeInt(u16, buf[at + 2 ..][0..2], 0x6558, .big);
+    std.mem.writeInt(u24, buf[at + 4 ..][0..3], g.vni, .big);
+    buf[at + 7] = g.rsv;
+    return buf;
+}
+
+test "mutation 2026-11-27: geneve (RFC 8926): reserved byte ignored, version 0 only, no fragments, the VNI, on IPv4 and IPv6" {
+    var b: [96]u8 = undefined;
+    for ([_]bool{ false, true }) |v6| {
+        try testing.expect(try m27Accepts("geneve", .{}, m27Geneve(&b, .{ .v6 = v6 })));
+        try testing.expect(try m27Accepts("geneve 5", .{}, m27Geneve(&b, .{ .v6 = v6 })));
+        try testing.expect(!(try m27Accepts("geneve 6", .{}, m27Geneve(&b, .{ .v6 = v6 }))));
+        // The reserved byte after the VNI is ignored on receipt.
+        try testing.expect(try m27Accepts("geneve 5", .{}, m27Geneve(&b, .{ .v6 = v6, .rsv = 0x01 })));
+        // Version 1 is not Geneve version 0; the O and C flags (next byte) do not change that.
+        try testing.expect(!(try m27Accepts("geneve", .{}, m27Geneve(&b, .{ .v6 = v6, .ver_opt = 0x40 }))));
+        try testing.expect(try m27Accepts("geneve", .{}, m27Geneve(&b, .{ .v6 = v6, .flags = 0xc0 })));
+    }
+    // IPv4: a datagram with fragment offset 1 is not the first fragment.
+    try testing.expect(!(try m27Accepts("geneve", .{}, m27Geneve(&b, .{ .frag = 0x0001 }))));
+    // An ancillary primitive after geneve stays the kernel's word: outbound is packet type 4.
+    const prog = try compile(testing.allocator, "geneve and outbound");
+    defer testing.allocator.free(prog);
+    try testing.expect(runLiveMeta(prog, m27Geneve(&b, .{}), .{ .pkttype = 4 }) != 0);
+    try testing.expectEqual(@as(u32, 0), runLiveMeta(prog, m27Geneve(&b, .{}), .{ .pkttype = 0 }));
+}
+
+test "mutation 2026-11-27: FIX ip6 net host bits in every word, bare ip6 net is /128, dotted-quad parts of any length (libpcap 1.10.6 pcap_compile)" {
+    const a = testing.allocator;
+    // libpcap 1.10.6 pcap_compile: "non-network bits set" for a word wholly beyond the prefix too.
+    try testing.expectError(error.Syntax, compile(a, "ip6 net 2001:db8::1/32"));
+    try testing.expectError(error.Syntax, compile(a, "ip6 net 2001:db8:0:0:0:0:0:1/64"));
+    a.free(try compile(a, "ip6 net 2001:db8::/32"));
+    // libpcap 1.10.6: `ip6 net 2001:db8::` compiled identically to `ip6 host 2001:db8::`.
+    try m27Same("ip6 net 2001:db8::", "ip6 host 2001:db8::");
+    // libpcap 1.10.6: leading zeros are ignored (not octal), any number of digits; a value over 255 is refused.
+    try m27Same("host 0001.2.3.4", "host 1.2.3.4");
+    try m27Same("host 010.2.3.4", "host 10.2.3.4");
+    try m27Same("host 0010.2.3.4", "host 10.2.3.4");
+    try m27Same("host 08.2.3.4", "host 8.2.3.4");
+    try m27Same("net 0001.2.3.4", "net 1.2.3.4");
+    try testing.expectError(error.Syntax, compile(a, "host 1.2.3.0256"));
+    try testing.expectError(error.Syntax, compile(a, "net 1.2.3.0256"));
+    // A sign is not a digit.
+    try testing.expectError(error.Syntax, compile(a, "arp host +1.2.3.4"));
 }
