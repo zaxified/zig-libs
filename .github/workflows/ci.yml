@@ -329,6 +329,45 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # ⭐ THE PUSH LANE'S CONSISTENCY CHECKS RUN ONCE (2026-11-27, owner OK). Until
+  # then every one of the six `scoped` shards ran `test.sh checks-fast` before
+  # compiling: the same 40-60 s of repo-wide checks six times, on every shard's
+  # critical path (runs 45894307424 / 45847868748: 38-59 s each, plus the gate
+  # tools' build). Here they run once, in parallel with the compile shards, and
+  # `gate` requires this job on a push exactly as it requires `scoped`.
+  scoped-checks:
+    if: "github.event_name != 'workflow_dispatch' && github.event_name != 'schedule'"
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    name: consistency checks
+    steps:
+      # Full history: some checks diff against the base (changelog entries).
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          use-cache: false
+      - name: Point the Zig global cache at a cacheable path
+        id: zg
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global" >> "$GITHUB_ENV"
+          cpu="$(grep -m1 -E 'model name|Model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          [ -n "$cpu" ] || cpu="$(grep -m1 'CPU part' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          echo "cpu=$(printf '%s' "${cpu:-unknown}" | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      # The same entry as `scoped`'s (read-only here: an exact hit never saves).
+      - name: Cache the Zig global cache (0.17 configurer + maker)
+        if: env.ZIGLIBS_DRY_RUN != '1'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/zig-global
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.1-g1
+      - name: Consistency checks
+        env:
+          ZIGLIBS_LANE: consistency checks
+        run: bash scripts/test.sh checks-fast
+
   scoped:
     # ⚠ AND NOT ON A DISPATCH EITHER. A manual run exists to exercise the FULL
     # lanes over a branch; running the scoped one alongside would add a second
@@ -564,7 +603,7 @@ jobs:
           ZIGLIBS_SPLIT: ${{ matrix.split }}
           ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
         run: |
-          bash scripts/test.sh checks-fast
+          # checks-fast runs ONCE, in `scoped-checks` (2026-11-27), not here.
           # A pinned CPU level: GitHub's amd64 pool mixes CPU models, and with
           # `native` every change would have to go green once per model before
           # its stamp holds. +aes+pclmul because no psABI level carries them.
@@ -591,7 +630,6 @@ jobs:
           ZIGLIBS_WAIT_LOCK: 1
         run: |
           pkill -x zig || true
-          bash scripts/test.sh checks-fast
           bash scripts/test.sh build -Dcpu=x86_64_v3+aes+pclmul ${{ matrix.groups }}
       - name: Decide whether the build tree grew
         id: zsave
@@ -1675,13 +1713,14 @@ jobs:
     # `consumer` IS read, and unlike the two shapes it must have run on every
     # ref: it is not part of the either/or, so `skipped` is a failure here just
     # as `failure` is. `since` is read only on a scheduled run.
-    needs: [since, scoped, full, plan, consumer]
+    needs: [since, scoped, scoped-checks, full, plan, consumer]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Exactly one shape must have run, and it must have passed
         env:
           SCOPED: ${{ needs.scoped.result }}
+          SCOPED_CHECKS: ${{ needs.scoped-checks.result }}
           FULL: ${{ needs.full.result }}
           # ⚠ A DISPATCH RUNS THE FULL SHAPE, and the gate must expect that or it
           # would demand `scoped` on a run where `scoped` is correctly idle.
@@ -1736,6 +1775,15 @@ jobs:
           # anything it reports.
           if [ "$idle" != skipped ]; then
             echo "::error::$idle_name is '$idle' — it should not have run on this ref at all"
+            rc=1
+          fi
+          # `scoped-checks` belongs to the scoped shape (2026-11-27): it must
+          # pass where `scoped` ran and be idle where `full` ran.
+          if [ "$ran_name" = scoped ] && [ "$SCOPED_CHECKS" != success ]; then
+            echo "::error::scoped-checks is '$SCOPED_CHECKS', not success — this commit is NOT gated"
+            rc=1
+          elif [ "$ran_name" = full ] && [ "$SCOPED_CHECKS" != skipped ]; then
+            echo "::error::scoped-checks is '$SCOPED_CHECKS' — it should not have run on this ref at all"
             rc=1
           fi
           # `consumer` is outside the either/or: it runs on every ref, so
