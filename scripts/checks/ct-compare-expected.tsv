@@ -18,7 +18,7 @@ modules/blindrsa/src/root.zig	1
 modules/chachapoly/src/root.zig	1
 modules/coap/src/echo.zig	1
 modules/cookies/src/secure.zig	1
-modules/ct25519/src/root.zig	2
+modules/ct25519/src/root.zig	4
 modules/ctap2pin/src/root.zig	3
 modules/dkg/src/core.zig	2
 modules/dkg/src/echo.zig	1
@@ -79,7 +79,6 @@ modules/tenantkex/src/root.zig	2
 modules/tlock/src/age.zig	1
 # tls13 certverify 2026-10-21: the second plain compare is a test's (a hedged ML-DSA signature differs from the deterministic one) -- public.
 # tls13 certverify 2026-11-01: +1 constant-time (Ed25519Signer's once-at-load key check, :274), +1 plain (identity encoding of R, a published signature component, :879).
-modules/tls13/src/certverify.zig	2
 modules/tls13/src/keyschedule.zig	3
 # tlsclient Client 2026-10-30: the 7th plain compare is a test's (da5c973a: the key changed after a KeyUpdate) -- public.
 # tlsclient Client 2026-11-21: +2 constant-time, the ECH accept confirmations (ServerHello random, HelloRetryRequest extension; RFC 9849 §7.2).
