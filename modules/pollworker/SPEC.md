@@ -6,7 +6,7 @@
 
 **Scope:** core — libuv 1.53.0 (event loop + process spawn + work queue): async wake-up, timers, child environment; remaining gaps: no io_uring, no queueing beyond the slot count (surveyed 2026-09-30; raised from mvp)
 
-**Audit:** review 2026-07-19 · mutation 2026-10-05 (22/22) · src ?
+**Audit:** review 2026-07-19 · mutation 2026-11-27 (233/254, 21 eq) · src 43e0a18df35eb2de
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — poll loop worker (keyword review, 2026-10-07)
 
@@ -142,6 +142,12 @@ case, never assumed successful.
   test).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
+- **Mutation run (2026-11-27, whole module):** 254 mutants, 233 killed (13 by hang), 12 equivalent, 9
+  unobservable (ENFILE, ENOSPC, kernel-injected errors, an environment block without its terminating NUL). Four
+  mutants on the re-exec child's path, which the schemata switch cannot reach, were applied by hand and killed.
+  The run closed two test weaknesses: the `Signals` tests turned any `init` failure into a skip, and the
+  fd-inheritance test checked fd 4 only. Some tests lower RLIMIT_NOFILE / RLIMIT_AS (soft limit, restored) and
+  one separates a mutant only on a non-root runner. No production defect.
 
 ## What is deliberately not done
 

@@ -1113,6 +1113,30 @@ fn readEnviron(gpa: std.mem.Allocator) EnvError![]u8 {
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
+// ── mutation 2026-11-27: environment-limit probe (re-executed child) ─────────
+
+// The child half of the environment-limit tests below: the test binary re-executes ITSELF as
+// `pw-probe-<mode>` (as its argv[0], no arguments) under a crafted environment and this first test, instead of the suite, reads
+// its own `/proc/self/environ` through `readEnviron` and exits with the verdict. In a normal run
+// (argv[0] does not start with `pw-probe-`) it does nothing.
+test "environment-limit probe: the child side of the readEnviron limit tests (a no-op in a normal run)" {
+    const orc = linux.open("/proc/self/cmdline", .{ .CLOEXEC = true }, 0);
+    if (@as(isize, @bitCast(orc)) < 0) return;
+    const cfd: i32 = @intCast(orc);
+    defer _ = linux.close(cfd);
+    var cmd: [128]u8 = undefined;
+    const n = linux.read(cfd, &cmd, cmd.len);
+    if (@as(isize, @bitCast(n)) <= 0) return;
+    const prefix = "pw-probe-";
+    if (!std.mem.startsWith(u8, cmd[0..n], prefix)) return;
+    const mode = std.mem.sliceTo(cmd[prefix.len..n], 0);
+    const gpa = std.testing.allocator;
+    const buf = readEnviron(gpa) catch |e| std.process.exit(if (e == error.EnvTooLarge) 11 else 12);
+    if (std.mem.eql(u8, mode, "empty")) std.process.exit(if (buf.len == 1 and buf[0] == 0) 0 else 13);
+    if (std.mem.eql(u8, mode, "exact")) std.process.exit(if (buf.len == env_max_bytes and buf[buf.len - 1] == 0) 0 else 14);
+    std.process.exit(15); // "over": readEnviron should have refused
+}
+
 test "decodeStatus: normal exit (zero and nonzero code) and signal-killed (with/without core dump)" {
     // Normal exit: low 7 bits of the wait(2) status are 0; the code is bits 8..15.
     try std.testing.expectEqual(ProcResult{ .ok = true, .exit_code = 0, .term_signal = null, .spawn_failed = false }, decodeStatus(0 << 8));
@@ -2338,4 +2362,576 @@ test "Signals: SIGKILL, SIGSTOP and an empty list are refused and leave the mask
     try testing.expectError(error.InvalidSignal, Signals.init(&.{ .USR1, .KILL }));
     try testing.expectError(error.InvalidSignal, Signals.init(&.{.STOP}));
     try testing.expectEqualSlices(usize, &before, &blockedNow());
+}
+
+// ── mutation 2026-11-27: tests added by the whole-module audit ───────────────
+
+fn isOpenFd(fd: i32) bool {
+    return @as(isize, @bitCast(linux.fcntl(fd, linux.F.GETFD, 0))) >= 0;
+}
+
+fn isCloexecFd(fd: i32) bool {
+    const r = linux.fcntl(fd, linux.F.GETFD, 0);
+    return @as(isize, @bitCast(r)) >= 0 and (r & linux.FD_CLOEXEC) != 0;
+}
+
+/// Lowers a resource limit for the rest of the scope; `restore` puts it back.
+const Limit = struct {
+    res: linux.rlimit_resource,
+    old: linux.rlimit,
+
+    fn lower(res: linux.rlimit_resource, cur: u64) !Limit {
+        var old: linux.rlimit = undefined;
+        try testing.expectEqual(@as(usize, 0), linux.getrlimit(res, &old));
+        const lim: linux.rlimit = .{ .cur = cur, .max = old.max };
+        try testing.expectEqual(@as(usize, 0), linux.setrlimit(res, &lim));
+        return .{ .res = res, .old = old };
+    }
+
+    fn restore(self: Limit) void {
+        _ = linux.setrlimit(self.res, &self.old);
+    }
+};
+
+/// Virtual size of this process in bytes (`/proc/self/statm`, first field, pages).
+fn vmSizeBytes() !u64 {
+    const orc = linux.open("/proc/self/statm", .{ .CLOEXEC = true }, 0);
+    try testing.expect(@as(isize, @bitCast(orc)) >= 0);
+    const fd: i32 = @intCast(orc);
+    defer _ = linux.close(fd);
+    var buf: [128]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    try testing.expect(@as(isize, @bitCast(n)) > 0);
+    const end = std.mem.findScalar(u8, buf[0..n], ' ') orelse return error.TestUnexpectedResult;
+    return (try std.fmt.parseInt(u64, buf[0..end], 10)) * 4096;
+}
+
+fn monotonicMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
+fn noopTimer(_: ?*anyopaque, _: Timers.Handle) void {}
+
+test "mutation 2026-11-27: Loop.nowMs is CLOCK_MONOTONIC in milliseconds" {
+    const ts: linux.timespec = .{ .sec = 0, .nsec = 1_300_000 };
+    var checked: usize = 0;
+    for (0..2000) |_| {
+        const lo = monotonicMs();
+        const now = try Loop.nowMs();
+        const hi = monotonicMs();
+        try testing.expect(now >= lo and now <= hi);
+        if (lo % 1000 != 0) checked += 1; // a reading with a non-zero millisecond part
+        if (checked >= 5) break;
+        _ = linux.nanosleep(&ts, null);
+    }
+    try testing.expect(checked >= 5);
+}
+
+test "mutation 2026-11-27: Loop.poll: a hard failure (more fds than RLIMIT_NOFILE) is PollFailed" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const lim = try Limit.lower(.NOFILE, 8);
+    defer lim.restore();
+    var fds: [16]Loop.pollfd = undefined;
+    for (&fds) |*f| f.* = .{ .fd = -1, .events = 0, .revents = 0 };
+    try testing.expectError(error.PollFailed, Loop.poll(&fds, 0));
+}
+
+test "mutation 2026-11-27: Poller.wait: a signal during the wait is Interrupted, not PollFailed" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const act: linux.Sigaction = .{ .handler = .{ .handler = ignoreSignal }, .mask = linux.sigemptyset(), .flags = 0 };
+    var old: linux.Sigaction = undefined;
+    _ = linux.sigaction(.USR1, &act, &old);
+    defer _ = linux.sigaction(.USR1, &old, null);
+    var p = try Poller.init();
+    defer p.deinit();
+    const S = struct {
+        var stop = std.atomic.Value(bool).init(false);
+        fn kick(tid: linux.pid_t) void {
+            const ts: linux.timespec = .{ .sec = 0, .nsec = 5_000_000 };
+            while (!stop.load(.acquire)) {
+                _ = linux.tgkill(linux.getpid(), tid, .USR1);
+                _ = linux.nanosleep(&ts, null);
+            }
+        }
+    };
+    S.stop.store(false, .release);
+    const th = try std.Thread.spawn(.{}, S.kick, .{linux.gettid()});
+    defer th.join();
+    defer S.stop.store(true, .release);
+    var out: [1]Poller.Event = undefined;
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        try testing.expect(tries < 1000);
+        _ = p.wait(&out, 10_000) catch |e| {
+            try testing.expectEqual(error.Interrupted, e);
+            break;
+        };
+    }
+}
+
+test "mutation 2026-11-27: decodeStatus follows the wait(2) macros exactly (0x7f test, 0xff00 mask)" {
+    // WIFEXITED is (s & 0x7f) == 0 and WEXITSTATUS is (s >> 8) & 0xff: bit 7 alone is no signal ...
+    try testing.expectEqual(ProcResult{ .ok = true, .exit_code = 0, .term_signal = null, .spawn_failed = false }, decodeStatus(0x80));
+    // ... and nothing above bit 15 belongs to the exit code
+    try testing.expectEqual(ProcResult{ .ok = false, .exit_code = 0x56, .term_signal = null, .spawn_failed = false }, decodeStatus(0x12345600));
+    // a signal keeps its number in the low 7 bits, the core-dump bit 7 stays out of it
+    try testing.expectEqual(ProcResult{ .ok = false, .exit_code = null, .term_signal = 11, .spawn_failed = false }, decodeStatus(11 | 0x80));
+}
+
+test "mutation 2026-11-27: Waker, Poller and Signals descriptors are close-on-exec and deinit closes every one" {
+    var w = try Waker.init();
+    try testing.expect(isCloexecFd(w.read_fd));
+    var rfd = w.read_fd;
+    w.deinit();
+    try testing.expect(!isOpenFd(rfd));
+
+    var wp = try Waker.initPipe();
+    try testing.expect(wp.read_fd != wp.write_fd);
+    try testing.expect(isCloexecFd(wp.read_fd) and isCloexecFd(wp.write_fd));
+    rfd = wp.read_fd;
+    const wfd = wp.write_fd;
+    wp.deinit();
+    try testing.expect(!isOpenFd(rfd) and !isOpenFd(wfd));
+
+    var p = try Poller.init();
+    try testing.expect(isCloexecFd(p.fd));
+    const pfd = p.fd;
+    p.deinit();
+    try testing.expect(!isOpenFd(pfd));
+
+    var sg = try Signals.init(&.{.USR1});
+    try testing.expect(isCloexecFd(sg.fd));
+    const sfd = sg.fd;
+    sg.deinit();
+    try testing.expect(!isOpenFd(sfd));
+    try testing.expect(!isBlocked(blockedNow(), .USR1));
+}
+
+test "mutation 2026-11-27: Waker.clear returns at end of file (the write end was closed)" {
+    var w = try Waker.initPipe();
+    _ = linux.close(w.write_fd);
+    w.write_fd = w.read_fd; // already closed above: deinit must not close it twice
+    w.clear();
+    w.deinit();
+}
+
+test "mutation 2026-11-27: Timers: forged and out-of-range handles are InvalidHandle" {
+    const gpa = testing.allocator;
+    var t: Timers = .{};
+    defer t.deinit(gpa);
+    const h = try t.add(gpa, noopTimer, null);
+    // one past the last slot
+    const past: Timers.Handle = .{ .index = @intCast(t.slots.items.len), .generation = 0 };
+    try testing.expectError(error.InvalidHandle, t.start(past, 0, 10, 0));
+    try testing.expectError(error.InvalidHandle, t.stop(past));
+    // a closed slot, with the generation the NEXT user of the slot will get
+    try t.close(h);
+    const forged: Timers.Handle = .{ .index = h.index, .generation = h.generation + 1 };
+    try testing.expectError(error.InvalidHandle, t.start(forged, 0, 10, 0));
+    try testing.expectError(error.InvalidHandle, t.isActive(forged));
+    try testing.expectError(error.InvalidHandle, t.close(forged));
+}
+
+test "mutation 2026-11-27: Timers: closed slots are reused last-closed first, none is lost" {
+    const gpa = testing.allocator;
+    var t: Timers = .{};
+    defer t.deinit(gpa);
+    const a = try t.add(gpa, noopTimer, null);
+    const b = try t.add(gpa, noopTimer, null);
+    const c = try t.add(gpa, noopTimer, null);
+    try t.close(a);
+    try t.close(b);
+    const r1 = try t.add(gpa, noopTimer, null);
+    const r2 = try t.add(gpa, noopTimer, null);
+    try testing.expectEqual(b.index, r1.index);
+    try testing.expectEqual(a.index, r2.index);
+    try testing.expectEqual(@as(usize, 3), t.slots.items.len); // no fourth slot was needed
+    _ = c;
+}
+
+test "mutation 2026-11-27: Timers: dueIn is 0 for a stopped timer, saturates instead of wrapping; pollTimeout honours a 0 ms caller" {
+    const gpa = testing.allocator;
+    var t: Timers = .{};
+    defer t.deinit(gpa);
+    const h = try t.add(gpa, noopTimer, null);
+    try t.start(h, 0, 100, 0);
+    try testing.expectEqual(@as(u64, 100), t.dueIn(h, 0));
+    // a caller that does not want to block at all is obeyed, whatever the timer says
+    try testing.expectEqual(@as(i32, 0), t.pollTimeout(0, 0));
+    try testing.expectEqual(@as(i32, 100), t.pollTimeout(0, -1));
+    try testing.expectEqual(@as(i32, 30), t.pollTimeout(0, 30));
+    try t.stop(h);
+    try testing.expectEqual(@as(u64, 0), t.dueIn(h, 0)); // inactive
+    // now + timeout saturates at the largest instant
+    const top = std.math.maxInt(u64);
+    try t.start(h, top - 5, 100, 0);
+    try testing.expectEqual(@as(u64, 5), t.dueIn(h, top - 5));
+    try t.start(h, top - 5, 100, 100);
+    try t.again(h, top - 5);
+    try testing.expectEqual(@as(u64, 5), t.dueIn(h, top - 5));
+}
+
+test "mutation 2026-11-27: Poller: remove really unregisters (the fd can be added again), and more than 64 ready fds are reported in batches" {
+    var p = try Poller.init();
+    defer p.deinit();
+    var fds: [2]i32 = undefined;
+    try testing.expect(@as(isize, @bitCast(linux.pipe2(&fds, .{ .CLOEXEC = true }))) >= 0);
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    try p.add(fds[0], Poller.EVENT.IN, 1);
+    try p.remove(fds[0]);
+    try p.add(fds[0], Poller.EVENT.IN, 2);
+    try p.remove(fds[0]);
+
+    // 70 ready eventfds, a caller buffer of 100: one wait never returns more than its 64-slot staging area
+    var efds: [70]i32 = undefined;
+    for (&efds) |*e| {
+        const rc = linux.eventfd(1, linux.EFD.CLOEXEC);
+        try testing.expect(@as(isize, @bitCast(rc)) >= 0);
+        e.* = @intCast(rc);
+    }
+    defer for (efds) |e| {
+        _ = linux.close(e);
+    };
+    for (efds, 0..) |e, i| try p.add(e, Poller.EVENT.IN, i);
+    var out: [100]Poller.Event = undefined;
+    const n = try p.wait(&out, 0);
+    try testing.expectEqual(@as(usize, 64), n);
+    try testing.expectEqual(@as(usize, 64), n);
+}
+
+test "mutation 2026-11-27: Poller.init and Signals.init report fd exhaustion as ProcessFdQuotaExceeded and Signals undo their blocking" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const before = blockedNow();
+    {
+        const lim = try Limit.lower(.NOFILE, 0);
+        defer lim.restore();
+        try testing.expectError(error.ProcessFdQuotaExceeded, Poller.init());
+        try testing.expectError(error.ProcessFdQuotaExceeded, Signals.init(&.{ .USR1, .USR2 }));
+    }
+    try testing.expectEqualSlices(usize, &before, &blockedNow());
+}
+
+test "mutation 2026-11-27: Signals: signal numbers 0 and NSIG are refused; a read on a dead descriptor is SignalsFailed" {
+    const before = blockedNow();
+    try testing.expectError(error.InvalidSignal, Signals.init(&[_]linux.SIG{@fromBackingInt(@intCast(0))}));
+    try testing.expectError(error.InvalidSignal, Signals.init(&[_]linux.SIG{@fromBackingInt(@intCast(linux.NSIG))}));
+    try testing.expectEqualSlices(usize, &before, &blockedNow());
+    const dead: Signals = .{ .fd = -1, .blocked_by_us = linux.sigemptyset() };
+    try testing.expectError(error.SignalsFailed, dead.read());
+}
+
+test "mutation 2026-11-27: Signals.read reports the sender's uid and a child's exit status (SIGCHLD)" {
+    if (!haveFile("/bin/sh")) return error.SkipZigTest;
+    var sg = try Signals.init(&.{ .USR1, .CHLD });
+    defer sg.deinit();
+    _ = linux.tgkill(linux.getpid(), linux.gettid(), .USR1);
+    const info = (try sg.read()).?;
+    try testing.expectEqual(@as(u32, @backingInt(linux.SIG.USR1)), info.signo);
+    // a thread-directed signal comes from this process, i.e. this uid (0 on a root runner: nothing to tell apart there)
+    try testing.expectEqual(@as(u32, @intCast(linux.getuid())), info.uid);
+    // the worker thread inherits the blocked set, so SIGCHLD stays pending for the signalfd
+    const r = try runToCompletion(&.{ "/bin/sh", "-c", "exit 3" });
+    try testing.expectEqual(@as(?u8, 3), r.exit_code);
+    var p = try Poller.init();
+    defer p.deinit();
+    try p.add(sg.fd, Poller.EVENT.IN, 0);
+    var out: [1]Poller.Event = undefined;
+    try testing.expectEqual(@as(usize, 1), try p.wait(&out, 5000));
+    const chld = (try sg.read()).?;
+    try testing.expectEqual(@as(u32, @backingInt(linux.SIG.CHLD)), chld.signo);
+    try testing.expectEqual(@as(i32, 3), chld.status);
+}
+
+test "mutation 2026-11-27: the child gets none of the parent's descriptors from 3 up (fd 3 included)" {
+    if (!haveFile("/bin/sh") or !haveFile("/proc/self/fd")) return error.SkipZigTest;
+    var fds: [2]i32 = undefined;
+    try testing.expect(@as(isize, @bitCast(linux.pipe(&fds))) >= 0); // no CLOEXEC
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    // the lowest free descriptor from 3 up: fd 3 itself whenever it is free
+    const low = linux.fcntl(fds[1], linux.F.DUPFD, 3);
+    try testing.expect(@as(isize, @bitCast(low)) >= 0);
+    defer _ = linux.close(@intCast(low));
+    var cmd_buf: [160]u8 = undefined;
+    const cmd = try std.mem.print(&cmd_buf, "[ -e /proc/self/fd/{d} ] && exit 1; [ -e /proc/self/fd/{d} ] && exit 2; [ -e /proc/self/fd/{d} ] && exit 3; [ -e /proc/self/fd/3 ] && exit 4; exit 0", .{ fds[0], fds[1], low });
+    const r = try runToCompletion(&.{ "/bin/sh", "-c", cmd });
+    try testing.expectEqual(@as(?u8, 0), r.exit_code);
+}
+
+test "mutation 2026-11-27: runChild retries a waitpid interrupted by a signal" {
+    if (!haveFile("/bin/sleep")) return error.SkipZigTest;
+    const act: linux.Sigaction = .{ .handler = .{ .handler = ignoreSignal }, .mask = linux.sigemptyset(), .flags = 0 };
+    var old: linux.Sigaction = undefined;
+    _ = linux.sigaction(.USR1, &act, &old);
+    defer _ = linux.sigaction(.USR1, &old, null);
+
+    const gpa = testing.allocator;
+    var argv = try OwnedArgv.init(gpa, &.{ "/bin/sleep", "0.5" });
+    defer argv.deinit();
+    const S = struct {
+        var tid = std.atomic.Value(i32).init(0);
+        var res: ProcResult = undefined;
+        fn work(a: [:null]?[*:0]const u8) void {
+            tid.store(linux.gettid(), .release);
+            res = runChild(a, &empty_envp);
+        }
+    };
+    S.tid.store(0, .release);
+    const th = try std.Thread.spawn(.{}, S.work, .{argv.ptrs});
+    const ts: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+    var tries: usize = 0;
+    while (S.tid.load(.acquire) == 0) : (tries += 1) {
+        try testing.expect(tries < 1000);
+        _ = linux.nanosleep(&ts, null);
+    }
+    // keep interrupting the worker while its child sleeps; the signal handler is a no-op
+    for (0..20) |_| {
+        _ = linux.tgkill(linux.getpid(), S.tid.load(.acquire), .USR1);
+        _ = linux.nanosleep(&ts, null);
+    }
+    th.join();
+    try testing.expect(!S.res.spawn_failed);
+    try testing.expectEqual(@as(?u8, 0), S.res.exit_code);
+}
+
+test "mutation 2026-11-27: spawnDetached frees its heap block and the slot when the worker thread cannot start" {
+    const Job = struct { res: ProcResult = undefined };
+    var table: JobTable(1, Job) = .{};
+    const H = struct {
+        fn report(_: *Job, _: ProcResult) void {}
+    };
+    // leave room for small allocations but not for a worker thread's 16 MiB stack
+    const lim = try Limit.lower(.AS, try vmSizeBytes() + (8 << 20));
+    defer lim.restore();
+    try testing.expectError(error.ThreadSpawnFailed, table.spawnDetached(testing.allocator, &.{"/bin/true"}, H.report));
+    try testing.expectEqual(@as(usize, 0), table.busy());
+}
+
+test "mutation 2026-11-27: finished workers give their thread stacks back (the thread is detached)" {
+    if (!haveFile("/bin/true")) return error.SkipZigTest;
+    const base = try vmSizeBytes();
+    for (0..12) |_| _ = try runToCompletion(&.{"/bin/true"});
+    // 12 undetached 16 MiB stacks would stay mapped; give the exiting workers a moment to unmap theirs
+    const ts: linux.timespec = .{ .sec = 0, .nsec = 20_000_000 };
+    var tries: usize = 0;
+    while ((try vmSizeBytes()) > base + (48 << 20)) : (tries += 1) {
+        try testing.expect(tries < 200);
+        _ = linux.nanosleep(&ts, null);
+    }
+}
+
+fn collectEnv(gpa: std.mem.Allocator, env: OwnedEnv, out: *std.ArrayList([]const u8)) !void {
+    var i: usize = 0;
+    while (env.ptrs[i]) |p| : (i += 1) try out.append(gpa, std.mem.sliceTo(p, 0));
+}
+
+fn countNamed(entries: []const []const u8, name: []const u8) usize {
+    var n: usize = 0;
+    for (entries) |e| {
+        if (std.mem.eql(u8, envName(e), name)) n += 1;
+    }
+    return n;
+}
+
+test "mutation 2026-11-27: readEnviron returns /proc/self/environ, NUL-terminated" {
+    if (!haveFile("/proc/self/environ")) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const got = try readEnviron(gpa);
+    defer gpa.free(got);
+    // an independent read of the same file
+    const orc = linux.open("/proc/self/environ", .{ .CLOEXEC = true }, 0);
+    try testing.expect(@as(isize, @bitCast(orc)) >= 0);
+    const fd: i32 = @intCast(orc);
+    defer _ = linux.close(fd);
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const rc = linux.read(fd, &chunk, chunk.len);
+        try testing.expect(@as(isize, @bitCast(rc)) >= 0);
+        if (rc == 0) break;
+        try want.appendSlice(gpa, chunk[0..rc]);
+    }
+    if (want.items.len == 0 or want.items[want.items.len - 1] != 0) try want.append(gpa, 0);
+    try testing.expectEqualSlices(u8, want.items, got);
+}
+
+test "mutation 2026-11-27: .overlay keeps each name once — the overlay's last value replaces the parent's variable" {
+    if (!haveFile("/proc/self/environ")) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const parent = try readEnviron(gpa);
+    defer gpa.free(parent);
+    const first = std.mem.sliceTo(parent, 0);
+    const eq = std.mem.findScalar(u8, first, '=') orelse return error.SkipZigTest;
+    if (eq == 0) return error.SkipZigTest;
+    const name = first[0..eq];
+    var entry_buf: [256]u8 = undefined;
+    const entry = try std.mem.print(&entry_buf, "{s}=overlaid", .{name});
+    const items: []const []const u8 = &.{ entry, "PWT_A=one", "PWT_B=kept", "PWT_A=two" };
+    var env = try OwnedEnv.init(gpa, .{ .overlay = items });
+    defer env.deinit();
+    var got: std.ArrayList([]const u8) = .empty;
+    defer got.deinit(gpa);
+    try collectEnv(gpa, env, &got);
+    try testing.expectEqual(@as(usize, 1), countNamed(got.items, name));
+    try testing.expectEqual(@as(usize, 1), countNamed(got.items, "PWT_A"));
+    try testing.expectEqual(@as(usize, 1), countNamed(got.items, "PWT_B"));
+    for (got.items) |e| {
+        if (std.mem.eql(u8, envName(e), name)) try testing.expectEqualStrings(entry, e);
+        if (std.mem.eql(u8, envName(e), "PWT_A")) try testing.expectEqualStrings("PWT_A=two", e);
+    }
+    // every other parent variable is still there, once
+    var parent_others: usize = 0;
+    var it = std.mem.splitScalar(u8, parent, 0);
+    while (it.next()) |e| {
+        if (e.len == 0) continue;
+        const n = envName(e);
+        if (std.mem.eql(u8, n, name) or std.mem.eql(u8, n, "PWT_A") or std.mem.eql(u8, n, "PWT_B")) continue;
+        parent_others += 1;
+    }
+    try testing.expectEqual(parent_others + 3, got.items.len);
+}
+
+test "mutation 2026-11-27: overridden() compares variable names, from the given index on, also for entries without '='" {
+    const items: []const []const u8 = &.{ "A=1", "B=2" };
+    try testing.expect(overridden(items, 0, "A=9"));
+    try testing.expect(!overridden(items, 1, "A=9"));
+    try testing.expect(overridden(items, 1, "B"));
+    try testing.expect(!overridden(items, 0, "C=3"));
+    try testing.expect(overridden(&.{"NOEQ=1"}, 0, "NOEQ"));
+}
+
+test "mutation 2026-11-27: environment limits are inclusive: exactly 4096 entries and exactly 1 MiB are accepted" {
+    const gpa = testing.allocator;
+    // exactly env_max_entries entries
+    const many = try gpa.alloc([]const u8, env_max_entries);
+    defer gpa.free(many);
+    @memset(many, "A=1");
+    var e1 = try OwnedEnv.init(gpa, .{ .list = many });
+    e1.deinit();
+    // exactly env_max_bytes bytes (entry plus its NUL)
+    const big = try gpa.alloc(u8, env_max_bytes - 1);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    big[0] = 'A';
+    big[1] = '=';
+    var e2 = try OwnedEnv.init(gpa, .{ .list = &.{big} });
+    e2.deinit();
+    // more entries than allowed are refused even when an overlay would merge them into one name
+    const dup = try gpa.alloc([]const u8, env_max_entries + 1);
+    defer gpa.free(dup);
+    @memset(dup, "A=1");
+    try testing.expectError(error.EnvTooLarge, OwnedEnv.init(gpa, .{ .overlay = dup }));
+}
+
+test "mutation 2026-11-27: an overlay is bounded by the MERGED environment (entries and bytes), inclusively" {
+    if (!haveFile("/proc/self/environ")) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const parent = try readEnviron(gpa);
+    defer gpa.free(parent);
+    const n0 = splitEnviron(parent, null);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // names "PWN<i>" are not in the parent: the merged count is n0 + items
+    const room = env_max_entries - n0;
+    const fit = try arena.alloc([]const u8, room);
+    for (fit, 0..) |*s, i| s.* = try std.fmt.allocPrint(arena, "PWN{d}=1", .{i});
+    var ok = try OwnedEnv.init(gpa, .{ .overlay = fit });
+    ok.deinit();
+    const over = try arena.alloc([]const u8, room + 1);
+    for (over, 0..) |*s, i| s.* = try std.fmt.allocPrint(arena, "PWN{d}=1", .{i});
+    try testing.expectError(error.EnvTooLarge, OwnedEnv.init(gpa, .{ .overlay = over }));
+    // bytes: the parent's block plus one big entry lands exactly on the limit, one byte more is refused
+    const tail = env_max_bytes - parent.len; // room for the entry and its NUL
+    const exact = try arena.alloc(u8, tail - 1);
+    @memset(exact, 'x');
+    @memcpy(exact[0..6], "PWBIG=");
+    var okb = try OwnedEnv.init(gpa, .{ .overlay = &.{exact} });
+    okb.deinit();
+    const one_more = try arena.alloc(u8, tail);
+    @memset(one_more, 'x');
+    @memcpy(one_more[0..6], "PWBIG=");
+    try testing.expectError(error.EnvTooLarge, OwnedEnv.init(gpa, .{ .overlay = &.{one_more} }));
+}
+
+test "mutation 2026-11-27: readEnviron works when /proc/self/environ opens as descriptor 0 (stdin closed)" {
+    if (!haveFile("/proc/self/environ")) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const want = try readEnviron(gpa);
+    defer gpa.free(want);
+    const saved = linux.fcntl(0, linux.F.DUPFD, 10);
+    if (@as(isize, @bitCast(saved)) < 0) return error.SkipZigTest; // no stdin to put back
+    const keep: i32 = @intCast(saved);
+    _ = linux.close(0);
+    const got = readEnviron(gpa) catch |e| {
+        _ = linux.dup2(keep, 0);
+        _ = linux.close(keep);
+        return e;
+    };
+    _ = linux.dup2(keep, 0);
+    _ = linux.close(keep);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, want, got);
+}
+
+/// Re-executes this test binary as `pw-probe-<mode>` with an environment of exactly `env_total`
+/// bytes (entries plus their NULs; 0 = an empty environment) and returns the child's exit code,
+/// or `null` when it could not be started (e.g. E2BIG).
+fn probeExit(gpa: std.mem.Allocator, mode: [*:0]const u8, env_total: usize) !?u32 {
+    const block = try gpa.alloc(u8, env_total);
+    defer gpa.free(block);
+    var ptrs: std.ArrayList(?[*:0]const u8) = .empty;
+    defer ptrs.deinit(gpa);
+    var at: usize = 0;
+    var left = env_total;
+    while (left > 0) {
+        var take = @min(left, 60_000);
+        if (left - take != 0 and left - take < 4) take -= 4; // keep the last entry at least "F=x" + NUL
+        @memset(block[at .. at + take], 'x');
+        block[at] = 'F';
+        block[at + 1] = '=';
+        block[at + take - 1] = 0;
+        try ptrs.append(gpa, @ptrCast(block.ptr + at));
+        at += take;
+        left -= take;
+    }
+    try ptrs.append(gpa, null);
+    const argv = [_:null]?[*:0]const u8{ mode, null };
+    const forked = linux.fork();
+    const pid: isize = @bitCast(forked);
+    if (pid < 0) return null;
+    if (pid == 0) {
+        // the child's runner prints its progress: keep it off the parent's output
+        const null_fd = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        if (@as(isize, @bitCast(null_fd)) >= 0) {
+            _ = linux.dup2(@intCast(null_fd), 1);
+            _ = linux.dup2(@intCast(null_fd), 2);
+        }
+        _ = linux.execve("/proc/self/exe", &argv, @ptrCast(ptrs.items.ptr));
+        linux.exit_group(127);
+    }
+    var status: i32 = 0;
+    while (true) {
+        const w = linux.waitpid(@intCast(pid), &status, 0);
+        if (@as(isize, @bitCast(w)) >= 0) break;
+        if (linux.errno(w) != .INTR) return null;
+    }
+    const r = decodeStatus(@bitCast(status));
+    if (r.exit_code) |c| return if (c == 127) null else c;
+    return 1000 + @as(u32, r.term_signal orelse 0); // killed by a signal (a safety panic aborts)
+}
+
+test "mutation 2026-11-27: readEnviron on an empty environment returns the lone terminator; on exactly 1 MiB it succeeds, on one byte more it refuses" {
+    if (!haveFile("/proc/self/exe") or !haveFile("/proc/self/cmdline")) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const empty = (try probeExit(gpa, "pw-probe-empty", 0)) orelse return error.SkipZigTest;
+    try testing.expectEqual(@as(u32, 0), empty);
+    const exact = (try probeExit(gpa, "pw-probe-exact", env_max_bytes)) orelse return error.SkipZigTest;
+    try testing.expectEqual(@as(u32, 0), exact);
+    const over = (try probeExit(gpa, "pw-probe-over", env_max_bytes + 1)) orelse return error.SkipZigTest;
+    try testing.expectEqual(@as(u32, 11), over);
 }
