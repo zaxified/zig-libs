@@ -3167,7 +3167,8 @@ fn fromOpensshBinary(bin: []const u8, passphrase: []const u8) FromOpenSSHError!S
 
     var dec_buf: [max_pem_der_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &dec_buf);
-    const sec = try opensshDecryptSection(&dec_buf, ciphername, kdfname, kdfoptions, private_section, passphrase);
+    // The body, not the public wrapper: `fromOpenSSH`'s `key_burn` covers it.
+    const sec = try opensshDecryptSectionUnburned(&dec_buf, ciphername, kdfname, kdfoptions, private_section, passphrase);
     return parsePrivateSection(sec.plain, sec.cipher, sec.encrypted);
 }
 
@@ -3192,9 +3193,23 @@ pub const OpensshSection = struct {
 /// decrypts `section` (aes256-ctr / aes256-cbc, the two ciphers OpenSSH and
 /// Go's x/crypto/ssh read) into `dst` (`dst.len >= section.len`). For an
 /// unencrypted container (`none`/`none`, empty options) `dst` is untouched
-/// and `plain` is `section`. The caller owns wiping `dst` and burning the
-/// stack (bcrypt and AES key schedules live in this frame's callees).
+/// and `plain` is `section`. The caller owns wiping `dst`; the stack is
+/// burned here (`burn.section_burn`: the AES key schedule, the CTR keystream
+/// and the derived key || IV; bcrypt burns its own frames).
 pub fn opensshDecryptSection(
+    dst: []u8,
+    ciphername: []const u8,
+    kdfname: []const u8,
+    kdfoptions: []const u8,
+    section: []const u8,
+    passphrase: []const u8,
+) FromOpenSSHError!OpensshSection {
+    const r = opensshDecryptSectionUnburned(dst, ciphername, kdfname, kdfoptions, section, passphrase);
+    burn.stack(burn.section_burn);
+    return r;
+}
+
+noinline fn opensshDecryptSectionUnburned(
     dst: []u8,
     ciphername: []const u8,
     kdfname: []const u8,
@@ -3925,6 +3940,7 @@ test {
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
     _ = @import("stackprobe3_test.zig");
+    _ = @import("stackprobe4_test.zig");
     _ = @import("wycheproof_test.zig");
 }
 

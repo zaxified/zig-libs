@@ -67,3 +67,10 @@ pub const marshal_burn = 8 * 1024;
 /// SHA-512 of the passphrase): one-shot slow KDF, generous size, not yet
 /// measured (`stackprobe2_test.zig`, 2026-10-09).
 pub const kdf_burn = 32 * 1024;
+
+/// `opensshDecryptSection` (public; the `ssh` module calls it outside
+/// `fromOpenSSH`): the AES-256 key schedule, the CTR keystream and the derived
+/// key || IV sat 655..1167 B deep with no burn (2026-11-27 coverage sweep,
+/// `stackprobe4_test.zig`: 63 needle hits); bcrypt below burns its own frames.
+/// 4 KiB leaves 3.5× headroom.
+pub const section_burn = 4 * 1024;
