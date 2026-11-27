@@ -1023,6 +1023,7 @@ fn roundsAwayWhenBelowHalf(result_neg: bool, mode: RoundingMode) bool {
 test {
     _ = @import("big.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("mutation_test.zig");
     _ = @import("s2_test.zig");
     _ = @import("sweep_test.zig");
 }

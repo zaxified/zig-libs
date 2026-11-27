@@ -4547,3 +4547,16 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "mutation 2026-11-27: decideInterval flags the result inexact even when the low end of the interval is exact" {
+    // man = 10000002, err = 2 at exponent -7: the interval [10000000, 10000004] rounds to 100000 (6 digits)
+    // at both ends; the low end has nothing but zeros below the kept digits, so roundPrec alone would call
+    // it exact. A transcendental result never is.
+    var man = try Managed.initSet(talloc, 10000002);
+    defer man.deinit();
+    var r = (try decideInterval(talloc, &man, 2, -7, false, 6, .half_even)).?;
+    defer r.deinit();
+    try testing.expect(r.inexact);
+    try testing.expect(r.rounded);
+    try expectStr(r.value, "1.00000");
+}
