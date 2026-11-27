@@ -6,7 +6,7 @@
 
 **Scope:** core — libyaml 0.2.5 / libfyaml 1.0 (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (24/26, 2 eq) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-27 (965/1046, 81 eq) · src b1edfa4f51c5cdbf
 
 **Hardening:** fuzz 2026-10-04 (240,000 runs clean (YAML_FUZZ)) · ct n/a — YAML parsing (keyword review, 2026-10-07) · panic 2026-11-25 (independent sweep of every pub entry point, YS-1..YS-8: `%TAG` handles in a hash map (20k directives 28 s → 0.15 s), per-document anchor table reset bounded, tab-only lines and collection keys no longer quadratic, the scanner's simple-key walk over live levels only, a total budget on resolved tag bytes in the `Parser` (`max(1 MiB, 16 × source)`), emit/`typed.toValue` past 4096 levels a checked panic, `valueEql` identity fast path; `src/sweep_test.zig`)
 
@@ -272,6 +272,15 @@ Other test classes:
   suite corpus and against libyaml over mutated documents (`compare.py`, `volume.py`, see Anchoring); the emitter's output
   through PyYAML (`emit_oracle`).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Mutation run (2026-11-27, whole module):** 1046 mutants (conditions of every `if`/`while`/boolean `return`:
+  negate, drop an operand, shift a boundary; `return true/false`; skipped `+=`/`-=` — switch prongs, arithmetic
+  and typed.zig's comptime half are not mutated), 965 killed (42 by hang), 68 equivalent, 13 unobservable. Of the
+  unobservable, 8 sit in `dupEql`, which only runs for two keys of one 64-bit hash bucket: covering it needs a hash
+  seam the module does not have. 41 new tests (`src/mutation_test.zig`, one in `compose.zig` for `Budget`'s
+  in-place shrink). Decisions taken on the run's survivors: a plain scalar's continuation line inside a flow
+  collection must be indented past the parent block node, as every other flow line (`9C9N`; fixed, libyaml is
+  laxer); `_` in a tag handle and a U+FEFF after a flow token are content, as in libyaml (outside YAML 1.2's
+  grammar but not a MUST to refuse).
 
 ## 6. The core schema, and what "1.2 core" excludes
 

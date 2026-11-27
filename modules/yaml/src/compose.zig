@@ -2293,3 +2293,24 @@ test "valueEql: a shared node equals itself in O(1) even in a billion-laughs cha
     // items[n-1] and items[n] are the same shared node: 2^40 tree paths.
     try testing.expect(valueEql(items[n - 1], items[n]));
 }
+
+test "mutation 2026-11-27: Budget gives back what an in-place shrink (resize and remap) returns" {
+    var heap: [256]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&heap);
+    var budget: Budget = .{ .child = fba.allocator(), .limit = 100 };
+    const a = budget.allocator();
+    // resize: a fixed-buffer child shrinks its last allocation in place.
+    const buf = try a.alloc(u8, 100);
+    try std.testing.expectEqual(@as(usize, 100), budget.used);
+    try std.testing.expect(a.resize(buf, 40));
+    try std.testing.expectEqual(@as(usize, 40), budget.used);
+    // The 60 bytes given back are spendable again, to the byte.
+    const more = try a.alloc(u8, 60);
+    try std.testing.expectEqual(@as(usize, 100), budget.used);
+    // remap: the same accounting on the remap path.
+    const shrunk = a.remap(more, 10) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 50), budget.used);
+    try std.testing.expect(!budget.exceeded);
+    a.free(shrunk);
+    a.free(buf[0..40]);
+}

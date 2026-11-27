@@ -165,6 +165,7 @@ test {
     _ = @import("core_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 // ── unit tests ──────────────────────────────────────────────────────────────

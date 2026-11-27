@@ -1511,6 +1511,12 @@ pub const Scanner = struct {
             }
 
             if (self.flow_level == 0 and @as(i64, @intCast(self.column)) < indent) break;
+            // In flow, a continuation line obeys the rule `fetchNextToken`
+            // applies to every flow line (YAML 1.2 §7.4, `9C9N`): indented by
+            // spaces past the enclosing block node. Stop here and let the next
+            // fetch refuse it, as it refuses `[a,\nb]` (2026-11-27; libyaml
+            // accepts both, the suite does not).
+            if (self.flow_level > 0 and leading_blanks and self.only_blanks and self.line_spaces <= self.indent) break;
         }
 
         // A multi-line plain scalar re-enables simple keys (its continuation
