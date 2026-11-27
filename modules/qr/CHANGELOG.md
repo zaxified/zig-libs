@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **NO CONSUMER-VISIBLE CHANGE:** killing tests from the 2026-11-25 delta mutation run.
 - **2026-11-21** — **NEW (source-breaking for an exhaustive `switch` over `Mode`):** Kanji mode. `Mode.kanji` (`Options.mode = .kanji`, never picked automatically): the text is Shift-JIS bytes (even length, each pair 0x8140..0x9FFC or 0xE040..0xEBBF, trail 0x40..0xFC except 0x7F, else `error.ModeMismatch`), packed at 13 bits per character with a character count; capacities match the standard (version 1: 10 characters at L, 4 at H; version 40 at L: 1817), structured-append chunks keep pairs whole. The decoder now reads a Kanji segment and returns its Shift-JIS bytes (before: `error.BadData`); `eci` and `optimize_segments` cannot be combined with it. Default output is unchanged.
 - **2026-11-17** — **Behaviour change:** the mask penalty's rule 4 uses the exact dark share (`k = |dark*20 - total*10| / total`) instead of an integer percent, which overstated the deviation below 50% by up to one point, so the automatically chosen mask can differ for some inputs (ISO/IEC 18004 Table 11, ZXing, nayuki and segno use the exact share). Symbols stay valid and decode the same; the segno goldens did not move. Whole-module mutation (490 mutants, 458 killed, 32 equivalent) with 17 new tests; see SPEC "Audit 2026-11-17".
 

@@ -2701,3 +2701,27 @@ test "Limits: the wiphy and regulatory ceilings can be raised or lowered" {
     ok.deinit(gpa);
     try testing.expectError(error.TooManyEntries, reg_mod.parseLimited(gpa, rules.items, 2));
 }
+
+test "mutation 2026-11-25: an element blob of exactly max_event_ie is whole; ROAM is no successful connect; a MLD address of the wrong length is refused" {
+    const gpa = testing.allocator;
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    const exact = try gpa.alloc(u8, max_event_ie);
+    defer gpa.free(exact);
+    @memset(exact, 0x5c);
+    try codec.appendAttr(gpa, &a, uapi.ATTR.REQ_IE, exact);
+    const e = try parseEvent(uapi.CMD.CONNECT, a.items);
+    try testing.expectEqual(@as(usize, max_event_ie), e.req_ie.bytes().len);
+    try testing.expect(!e.req_ie.truncated);
+
+    var r: std.ArrayList(u8) = .empty;
+    defer r.deinit(gpa);
+    try codec.appendAttrU16(gpa, &r, uapi.ATTR.STATUS_CODE, 0);
+    try testing.expect((try parseEvent(uapi.CMD.CONNECT, r.items)).connectSucceeded());
+    try testing.expect(!(try parseEvent(uapi.CMD.ROAM, r.items)).connectSucceeded());
+
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    try codec.appendAttr(gpa, &bad, uapi.ATTR.MLD_ADDR, &.{ 1, 2, 3 });
+    try testing.expectError(error.BadLength, parseEvent(uapi.CMD.ROAM, bad.items));
+}

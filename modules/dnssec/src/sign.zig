@@ -271,3 +271,49 @@ test "encodeDs: the DS digest matches the DNSKEY it was built from" {
     try testing.expect(try ds.matches(parsed, "example.org", dnskey));
     try testing.expect(!(try ds.matches(parsed, "example.com", dnskey)));
 }
+
+test "mutation 2026-11-25: signRrset refuses an empty RRset itself, takes an explicit original TTL, and the DNSKEY / DS encoders fix their bytes" {
+    const gpa = testing.allocator;
+    const ed = try Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
+    const params: SignParams = .{ .signer_name = "example.org", .key_tag = 7, .inception = 1, .expiration = 2 };
+    try testing.expectError(error.InconsistentRrset, signRrset(gpa, &.{}, "www.example.org", .{ .ed25519 = &ed }, params));
+
+    // An explicit original_ttl is the RRSIG's, whatever the record's own TTL is.
+    const rrset = [_]dns.Record{aRecord("www.example.org", 1)};
+    var p2 = params;
+    p2.original_ttl = 60;
+    const rr = try signRrset(gpa, &rrset, "www.example.org", .{ .ed25519 = &ed }, p2);
+    defer gpa.free(rr);
+    const parsed = try rdata.parseRrsig(gpa, rr);
+    defer gpa.free(parsed.signer_name);
+    try testing.expectEqual(@as(u32, 60), parsed.original_ttl);
+
+    // DNSKEY RDATA: flags big-endian (an asymmetric value), protocol 3, algorithm, key.
+    const dk = try encodeDnskey(gpa, 0x0180, 13, "KEY");
+    defer gpa.free(dk);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x80, 3, 13, 'K', 'E', 'Y' }, dk);
+
+    // DS of garbage DNSKEY RDATA is BadRecord, not another error.
+    try testing.expectError(error.BadRecord, encodeDs(gpa, "example.org", "ab", rdata.Ds.digest_sha256));
+}
+
+test "mutation 2026-11-25: encodeRsaPublicKey trims leading zeros and switches to the long form at 256 exponent bytes" {
+    const gpa = testing.allocator;
+    // Leading zeros are trimmed from both parts.
+    const short = try encodeRsaPublicKey(gpa, &.{ 0, 0, 3 }, &.{ 0, 0, 0xab, 0xcd });
+    defer gpa.free(short);
+    try testing.expectEqualSlices(u8, &.{ 1, 3, 0xab, 0xcd }, short);
+    // 255 bytes: still the one-byte length; 256: the 0 marker and a big-endian u16.
+    var e255: [255]u8 = @splat(0x55);
+    const k255 = try encodeRsaPublicKey(gpa, &e255, &.{ 0xab, 0xcd });
+    defer gpa.free(k255);
+    try testing.expectEqual(@as(usize, 1 + 255 + 2), k255.len);
+    try testing.expectEqual(@as(u8, 255), k255[0]);
+    var e256: [256]u8 = @splat(0x55);
+    const k256 = try encodeRsaPublicKey(gpa, &e256, &.{ 0xab, 0xcd });
+    defer gpa.free(k256);
+    try testing.expectEqual(@as(usize, 3 + 256 + 2), k256.len);
+    try testing.expectEqualSlices(u8, &.{ 0, 0x01, 0x00 }, k256[0..3]);
+    try testing.expectEqualSlices(u8, &e256, k256[3..259]);
+    try testing.expectEqualSlices(u8, &.{ 0xab, 0xcd }, k256[259..]);
+}

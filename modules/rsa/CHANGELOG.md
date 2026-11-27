@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **NO CONSUMER-VISIBLE CHANGE:** killing tests and a `fromOpenSSH` dead-stack probe from the 2026-11-25 delta mutation run.
 - **2026-11-27** — **SECURITY FIX (dead stack, no API change):** `opensshDecryptSection` (public; the `ssh` module calls it outside `fromOpenSSH`) left the AES-256 key schedule, the CTR keystream and the derived key ‖ IV on the dead stack: 63 needle hits 655..1167 B deep, no burn. Its doc made burning the caller's job; it burns itself now (`burn.section_burn`, 4 KiB), and `fromOpenSSH` calls the unburned body under its own `key_burn`. Probe `src/stackprobe4_test.zig` (aes256-ctr and -cbc, fixture built in the test: bcrypt_pbkdf → AES over a known section) red before, green after.
 - **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** killing tests from the 2026-11-25 delta mutation run (factor checks in `fromPrimes`, `generatePrime`, encrypted PKCS#8 parameters).
 - **2026-11-26** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack coverage sweep, wave 3: a `testkit.stackprobe` probe of the public secret entry points no probe called — `rsadp`, `rsadpCrtBlinded`, `rsasp1`, `decryptOaepBlinded` / `decryptOaepHBlinded`, `generate` (appended to `src/stackprobe3_test.zig`). Clean. Test only.

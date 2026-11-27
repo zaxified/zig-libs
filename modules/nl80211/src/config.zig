@@ -583,3 +583,18 @@ test "parsePowerSave: on, off, absent, malformed" {
     try testing.expectEqual(@as(?bool, null), try parsePowerSave(&.{ 8, 0, 3, 0, 1, 0, 0, 0 }));
     try testing.expectError(error.BadLength, parsePowerSave(&.{ 5, 0, 93, 0, 1, 0, 0, 0 }));
 }
+
+test "mutation 2026-11-25: set-wiphy: an empty request is refused, antenna masks come as a pair and are never empty" {
+    const gpa = testing.allocator;
+    const t: Target = .{ .wiphy = 0 };
+    try testing.expectError(error.InvalidRequest, buildSetWiphyParams(gpa, 41, 1, t, .{}));
+    try testing.expectError(error.InvalidRequest, buildSetWiphyParams(gpa, 41, 1, t, .{ .antenna_tx = 3 }));
+    try testing.expectError(error.InvalidRequest, buildSetWiphyParams(gpa, 41, 1, t, .{ .antenna_rx = 3 }));
+    try testing.expectError(error.InvalidRequest, buildSetWiphyParams(gpa, 41, 1, t, .{ .antenna_tx = 0, .antenna_rx = 3 }));
+    try testing.expectError(error.InvalidRequest, buildSetWiphyParams(gpa, 41, 1, t, .{ .antenna_tx = 3, .antenna_rx = 0 }));
+    // Antennas alone are a request.
+    const ok = try buildSetWiphyParams(gpa, 41, 1, t, .{ .antenna_tx = 1, .antenna_rx = 2 });
+    defer gpa.free(ok);
+    try testing.expectEqual(@as(?u32, 1), try attrU32(ok, uapi.ATTR.WIPHY_ANTENNA_TX));
+    try testing.expectEqual(@as(?u32, 2), try attrU32(ok, uapi.ATTR.WIPHY_ANTENNA_RX));
+}

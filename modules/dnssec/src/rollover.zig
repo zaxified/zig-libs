@@ -246,3 +246,80 @@ test "a revoked add_pend key is dropped at once, a revoked unknown key is ignore
     try testing.expectEqual(@as(?State, null), t.stateOf(13, "k"));
     try testing.expectEqual(State.add_pend, t.stateOf(8, "k").?);
 }
+
+test "mutation 2026-11-25: fromDnskey reads the REVOKE bit and keeps self_signed" {
+    const k: rdata.Dnskey = .{ .flags = 0x0181, .protocol = 3, .algorithm = 13, .public_key = "k" };
+    const o = Observed.fromDnskey(k, true);
+    try testing.expect(o.revoked and o.self_signed);
+    const o2 = Observed.fromDnskey(.{ .flags = 0x0101, .protocol = 3, .algorithm = 13, .public_key = "k" }, false);
+    try testing.expect(!o2.revoked and !o2.self_signed);
+}
+
+test "mutation 2026-11-25: restore frees its copy when the append fails" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var t = Tracker.init(fa.allocator(), .{});
+    defer t.deinit();
+    try testing.expectError(error.OutOfMemory, t.restore(13, "key", .valid, 0));
+}
+
+test "mutation 2026-11-25: since is stamped at every transition; a valid key is never aged out; missing keys count as trusted" {
+    var t = Tracker.init(testing.allocator, .{});
+    defer t.deinit();
+    try t.restore(13, "old", .valid, 0);
+    // 100 days in: `old` (valid since day 0, far past the remove hold-down) stays trusted.
+    try t.observe(100 * day, &.{ key("old"), key("new") });
+    try testing.expect(t.isTrusted(13, "old"));
+    try testing.expectEqual(State.add_pend, t.stateOf(13, "new").?);
+    // add_pend -> valid stamps the promotion time.
+    try t.observe(130 * day, &.{ key("old"), key("new") });
+    try testing.expectEqual(State.valid, t.stateOf(13, "new").?);
+    try testing.expectEqual(130 * day, t.find(13, "new").?.since);
+    // valid -> missing stamps; a missing key is trusted and counted.
+    try t.observe(140 * day, &.{key("old")});
+    try testing.expectEqual(State.missing, t.stateOf(13, "new").?);
+    try testing.expectEqual(140 * day, t.find(13, "new").?.since);
+    try testing.expectEqual(@as(usize, 2), t.trustedCount());
+    // missing -> valid stamps.
+    try t.observe(150 * day, &.{ key("old"), key("new") });
+    try testing.expectEqual(State.valid, t.stateOf(13, "new").?);
+    try testing.expectEqual(150 * day, t.find(13, "new").?.since);
+}
+
+test "mutation 2026-11-25: a key is identified by algorithm AND bytes" {
+    var t = Tracker.init(testing.allocator, .{});
+    defer t.deinit();
+    try t.restore(13, "k", .valid, 0);
+    // Same bytes under another algorithm is another key: the algorithm-13 key is absent from the RRset.
+    try t.observe(5 * day, &.{.{ .algorithm = 14, .public_key = "k" }});
+    try testing.expectEqual(State.missing, t.stateOf(13, "k").?);
+    try testing.expectEqual(State.add_pend, t.stateOf(14, "k").?);
+}
+
+test "mutation 2026-11-25: a revoked key's hold-down runs from the first revocation, the state is kept, order survives the drop, a backwards clock never promotes" {
+    var t = Tracker.init(testing.allocator, .{});
+    defer t.deinit();
+    try t.restore(13, "a", .valid, 0);
+    try t.restore(13, "b", .valid, 0);
+    try t.restore(13, "c", .valid, 0);
+    const revoked_a: Observed = .{ .algorithm = 13, .public_key = "a", .revoked = true, .self_signed = true };
+    try t.observe(100 * day, &.{ revoked_a, key("b"), key("c") });
+    // Revoked, stamped now, not dropped at once although it is valid since day 0.
+    try testing.expectEqual(State.revoked, t.stateOf(13, "a").?);
+    try testing.expectEqual(100 * day, t.find(13, "a").?.since);
+    // A second sighting of the revocation does not restart the hold-down.
+    try t.observe(110 * day, &.{ revoked_a, key("b"), key("c") });
+    try testing.expectEqual(100 * day, t.find(13, "a").?.since);
+    try t.observe(129 * day, &.{ revoked_a, key("b"), key("c") });
+    try testing.expect(t.stateOf(13, "a") != null);
+    try t.observe(130 * day, &.{ revoked_a, key("b"), key("c") });
+    try testing.expect(t.stateOf(13, "a") == null);
+    // The drop keeps the order of the others.
+    try testing.expectEqual(@as(usize, 2), t.keys.items.len);
+    try testing.expectEqualStrings("b", t.keys.items[0].public_key);
+    try testing.expectEqualStrings("c", t.keys.items[1].public_key);
+
+    // A clock that went backwards (now < since) counts as no time elapsed, not as 2^32 seconds.
+    try t.observe(200 * day, &.{ key("b"), key("c"), key("n") });
+    try t.observe(50 * day, &.{ key("b"), key("c"), key("n") });
+    try testing.expectEqual(State.add_pend, t.stateOf(13, "n").?);
+}

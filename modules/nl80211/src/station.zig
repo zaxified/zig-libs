@@ -828,3 +828,77 @@ test "parse: multi-link attributes of a station message" {
     try codec.appendAttr(gpa, &bad, uapi.ATTR.MLD_ADDR, &.{ 1, 2, 3 });
     try testing.expectError(error.BadLength, parse(bad.items));
 }
+
+test "mutation 2026-11-25: parseTidStats reads every counter of TID 16 and ignores nests that are not the station's TID_STATS" {
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    // A top-level attribute that is not STA_INFO, holding a perfectly good TID_STATS nest.
+    const decoy = try nestOf(gpa, &msg, uapi.ATTR.IFINDEX);
+    const d_tids = try nestOf(gpa, &msg, uapi.STA_INFO.TID_STATS);
+    const d_one = try nestOf(gpa, &msg, 2);
+    try codec.appendAttrU64(gpa, &msg, uapi.TID_STATS.RX_MSDU, 7);
+    try codec.nestEnd(&msg, d_one);
+    try codec.nestEnd(&msg, d_tids);
+    try codec.nestEnd(&msg, decoy);
+
+    const sta = try nestOf(gpa, &msg, uapi.ATTR.STA_INFO);
+    // Inside STA_INFO, an attribute that is not TID_STATS, holding a good TID nest.
+    const inner = try nestOf(gpa, &msg, uapi.STA_INFO.SIGNAL);
+    const i_one = try nestOf(gpa, &msg, 2);
+    try codec.appendAttrU64(gpa, &msg, uapi.TID_STATS.RX_MSDU, 8);
+    try codec.nestEnd(&msg, i_one);
+    try codec.nestEnd(&msg, inner);
+    const tids = try nestOf(gpa, &msg, uapi.STA_INFO.TID_STATS);
+    const one = try nestOf(gpa, &msg, max_tids); // TID 16, the last one
+    try codec.appendAttrU64(gpa, &msg, uapi.TID_STATS.RX_MSDU, 11);
+    try codec.appendAttrU64(gpa, &msg, uapi.TID_STATS.TX_MSDU, 12);
+    try codec.appendAttrU64(gpa, &msg, uapi.TID_STATS.TX_MSDU_RETRIES, 13);
+    try codec.appendAttrU64(gpa, &msg, uapi.TID_STATS.TX_MSDU_FAILED, 14);
+    const q = try nestOf(gpa, &msg, uapi.TID_STATS.TXQ_STATS);
+    const fields = [_]u16{
+        uapi.TXQ_STATS.BACKLOG_BYTES, uapi.TXQ_STATS.BACKLOG_PACKETS, uapi.TXQ_STATS.FLOWS,      uapi.TXQ_STATS.DROPS,
+        uapi.TXQ_STATS.ECN_MARKS,     uapi.TXQ_STATS.OVERLIMIT,       uapi.TXQ_STATS.OVERMEMORY, uapi.TXQ_STATS.COLLISIONS,
+        uapi.TXQ_STATS.TX_BYTES,      uapi.TXQ_STATS.TX_PACKETS,      uapi.TXQ_STATS.MAX_FLOWS,
+    };
+    for (fields, 0..) |f, i| try codec.appendAttrU32(gpa, &msg, f, @intCast(100 + i));
+    try codec.nestEnd(&msg, q);
+    try codec.nestEnd(&msg, one);
+    try codec.nestEnd(&msg, tids);
+    try codec.nestEnd(&msg, sta);
+
+    var out: [max_tids]TidStats = undefined;
+    const n = try parseTidStats(msg.items, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    const t = out[0];
+    try testing.expectEqual(@as(u8, 16), t.tid);
+    try testing.expectEqual(@as(?u64, 11), t.rx_msdu);
+    try testing.expectEqual(@as(?u64, 12), t.tx_msdu);
+    try testing.expectEqual(@as(?u64, 13), t.tx_msdu_retries);
+    try testing.expectEqual(@as(?u64, 14), t.tx_msdu_failed);
+    const x = t.txq.?;
+    try testing.expectEqual(@as(?u32, 100), x.backlog_bytes);
+    try testing.expectEqual(@as(?u32, 101), x.backlog_packets);
+    try testing.expectEqual(@as(?u32, 102), x.flows);
+    try testing.expectEqual(@as(?u32, 103), x.drops);
+    try testing.expectEqual(@as(?u32, 104), x.ecn_marks);
+    try testing.expectEqual(@as(?u32, 105), x.overlimit);
+    try testing.expectEqual(@as(?u32, 106), x.overmemory);
+    try testing.expectEqual(@as(?u32, 107), x.collisions);
+    try testing.expectEqual(@as(?u32, 108), x.tx_bytes);
+    try testing.expectEqual(@as(?u32, 109), x.tx_packets);
+    try testing.expectEqual(@as(?u32, 110), x.max_flows);
+}
+
+test "mutation 2026-11-25: BSS_PARAM CTS protection" {
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    const sta = try nestOf(gpa, &msg, uapi.ATTR.STA_INFO);
+    const p = try nestOf(gpa, &msg, uapi.STA_INFO.BSS_PARAM);
+    try codec.appendAttr(gpa, &msg, uapi.STA_BSS_PARAM.CTS_PROT, &.{});
+    try codec.nestEnd(&msg, p);
+    try codec.nestEnd(&msg, sta);
+    const b = (try parse(msg.items)).bss_param.?;
+    try testing.expect(b.cts_protection and !b.short_preamble and !b.short_slot_time);
+}

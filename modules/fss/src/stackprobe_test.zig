@@ -165,3 +165,32 @@ test "STACKPROBE: IDPF gen, evalPrefix and the key codec leave no seed or key re
     const y = I.evalPrefix(0, &ikeys[0], 10, 333) +% I.evalPrefix(1, &ikeys[1], 10, 333);
     try std.testing.expectEqual(betas[9], y);
 }
+
+// ── DCF (`dcf.zig`): not probed until the 2026-11-25 delta mutation run ──
+// (its five burn sites were never exercised by a probe).
+
+const C = root.Dcf(10, 4);
+
+var ckeys: [2]C.Key = undefined;
+var ckey_bytes: [C.Key.serialized_len]u8 = undefined;
+var cdecoded: C.Key = undefined;
+var cevals: [C.domain_size]C.Elem = undefined;
+
+test "mutation 2026-11-25: STACKPROBE: DCF gen, eval, evalAll and the key codec leave no seed or key residue" {
+    try sp.skipUnlessOptimized();
+    setup();
+    const seeds = &[_][]const u8{ &s0, &s1 };
+    _ = try P.run("Dcf.genWithSeeds", C.genWithSeeds, .{ &@as(C.Index, 333), &@as(C.Elem, 0x01020304), &s0, &s1, &ckeys }, seeds, .{});
+    ckeys[0].toBytes(&ckey_bytes);
+    const kb = &[_][]const u8{ &ckey_bytes, &ckeys[0].seed };
+    _ = try P.run("Dcf.eval party 0", C.eval, .{ 0, &ckeys[0], 333 }, kb, .{});
+    _ = try P.run("Dcf.eval party 1", C.eval, .{ 1, &ckeys[1], 12 }, &[_][]const u8{&ckeys[1].seed}, .{});
+    _ = try P.run("Dcf.evalAll", C.evalAll, .{ 0, &ckeys[0], &cevals }, kb, .{});
+    _ = try P.run("Dcf.Key.toBytes", C.Key.toBytes, .{ &ckeys[0], &ckey_bytes }, kb, .{});
+    _ = try P.run("Dcf.Key.fromBytes", C.Key.fromBytes, .{ &cdecoded, &ckey_bytes }, &[_][]const u8{ &ckey_bytes, &cdecoded.seed }, .{});
+    // The shares still reconstruct (the probe ran the real code): x < alpha gives beta.
+    const y = C.eval(0, &ckeys[0], 100) +% C.eval(1, &ckeys[1], 100);
+    try std.testing.expectEqual(@as(C.Elem, 0x01020304), y);
+    const z = C.eval(0, &ckeys[0], 400) +% C.eval(1, &ckeys[1], 400);
+    try std.testing.expectEqual(@as(C.Elem, 0), z);
+}

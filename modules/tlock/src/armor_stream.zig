@@ -285,3 +285,86 @@ test "ArmorReader refuses what age.dearmor refuses" {
     try tail.writer.writeAll("x\n");
     try testing.expectError(error.MalformedArmor, readAll(gpa, tail.written()));
 }
+
+// ── mutation 2026-11-25 (delta run over this file) ─────────────────────────
+
+fn armoredOf(gpa: std.mem.Allocator, bin: []const u8) ![]u8 {
+    const arm = try gpa.alloc(u8, age.armoredLen(bin.len));
+    errdefer gpa.free(arm);
+    _ = try age.armor(arm, bin);
+    return arm;
+}
+
+test "mutation 2026-11-25: an empty drain writes nothing, an untouched writer finishes as an empty block" {
+    const gpa = testing.allocator;
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    var small: [7]u8 = undefined;
+    var aw = ArmorWriter.init(&sink.writer, &small);
+    _ = try ArmorWriter.drain(&aw.writer, &.{""}, 1);
+    try testing.expectEqual(@as(usize, 0), sink.written().len);
+    try aw.finish();
+    try testing.expectEqualStrings(age.armor_begin ++ "\n" ++ age.armor_end ++ "\n", sink.written());
+}
+
+test "mutation 2026-11-25: ArmorReader accepts a missing final newline and blanks after END, refuses everything else dearmor refuses" {
+    const gpa = testing.allocator;
+    var bin: [100]u8 = undefined;
+    pattern(&bin);
+    const arm = try armoredOf(gpa, &bin);
+    defer gpa.free(arm);
+    var lines: [6][]const u8 = undefined; // BEGIN, 64, 64, short, END, ""
+    var it = std.mem.splitScalar(u8, arm, '\n');
+    for (&lines) |*l| l.* = it.next().?;
+
+    const long_line = try std.fmt.allocPrint(gpa, "{s}AAAA", .{lines[1]});
+    defer gpa.free(long_line);
+    const padded_64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const cases = [_]struct { name: []const u8, text: []const u8, ok: bool }{
+        .{ .name = "no final newline", .text = try std.fmt.allocPrint(gpa, "{s}\n{s}\n{s}\n{s}\n{s}", .{ lines[0], lines[1], lines[2], lines[3], lines[4] }), .ok = true },
+        .{ .name = "blanks after END", .text = try std.fmt.allocPrint(gpa, "{s}\n{s}\n{s}\n{s}\n{s}  \t\n \n", .{ lines[0], lines[1], lines[2], lines[3], lines[4] }), .ok = true },
+        .{ .name = "garbage before BEGIN", .text = try std.fmt.allocPrint(gpa, "garbage\n{s}\n{s}\n{s}\n{s}\n", .{ lines[1], lines[2], lines[3], lines[4] }), .ok = false },
+        .{ .name = "blank line in the body", .text = try std.fmt.allocPrint(gpa, "{s}\n{s}\n{s}\n\n{s}\n", .{ lines[0], lines[1], lines[2], lines[4] }), .ok = false },
+        .{ .name = "over-long line", .text = try std.fmt.allocPrint(gpa, "{s}\n{s}\n{s}\n{s}\n{s}\n", .{ lines[0], long_line, lines[2], lines[3], lines[4] }), .ok = false },
+        .{ .name = "padded full-width line then more", .text = try std.fmt.allocPrint(gpa, "{s}\n{s}\n{s}\n{s}\n", .{ lines[0], padded_64, lines[1], lines[4] }), .ok = false },
+        .{ .name = "line after the short one", .text = try std.fmt.allocPrint(gpa, "{s}\n{s}\n{s}\n{s}\n{s}\n", .{ lines[0], lines[1], lines[3], lines[2], lines[4] }), .ok = false },
+        .{ .name = "data after END", .text = try std.fmt.allocPrint(gpa, "{s}\n{s}\n{s}\n{s}\n{s}\nAAAA\n", .{ lines[0], lines[1], lines[2], lines[3], lines[4] }), .ok = false },
+        .{ .name = "empty armor", .text = try std.fmt.allocPrint(gpa, "{s}\n{s}\n", .{ lines[0], lines[4] }), .ok = false },
+    };
+    defer for (cases) |c| gpa.free(c.text);
+    for (cases) |c| {
+        errdefer std.debug.print("case: {s}\n", .{c.name});
+        if (c.ok) {
+            const got = try readAll(gpa, c.text);
+            defer gpa.free(got);
+            try testing.expectEqualSlices(u8, &bin, got);
+        } else {
+            try testing.expectError(error.MalformedArmor, readAll(gpa, c.text));
+        }
+    }
+}
+
+test "mutation 2026-11-25: ArmorReader reports a line longer than its input buffer as MalformedArmor, and stays at the end after END" {
+    const gpa = testing.allocator;
+    var junk: [300]u8 = @splat('A');
+    var src: Reader = .fixed(&junk);
+    var lbuf: [72]u8 = undefined;
+    var lim = src.limited(.unlimited, &lbuf);
+    var rb: [8]u8 = undefined;
+    var ar = ArmorReader.init(&lim.interface, &rb);
+    try testing.expectError(error.ReadFailed, ar.reader.takeByte());
+    try testing.expectEqual(@as(?age.ArmorError, error.MalformedArmor), ar.err);
+
+    var bin: [100]u8 = undefined;
+    pattern(&bin);
+    const arm = try armoredOf(gpa, &bin);
+    defer gpa.free(arm);
+    var src2: Reader = .fixed(arm);
+    var buf2: [5]u8 = undefined;
+    var ar2 = ArmorReader.init(&src2, &buf2);
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    _ = try ar2.reader.streamRemaining(&sink.writer);
+    try testing.expectError(error.EndOfStream, ar2.reader.takeByte());
+    try testing.expectEqual(@as(?age.ArmorError, null), ar2.err);
+}

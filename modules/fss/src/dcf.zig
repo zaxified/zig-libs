@@ -365,3 +365,36 @@ test "dcf: key codec round-trips and the decoded key evaluates the same" {
     _ = &s0;
     _ = &s1;
 }
+
+test "mutation 2026-11-25: Dcf.Key.fromBytes keeps only the low bit of a control byte" {
+    const K = Dcf(8, 4);
+    var key: K.Key = undefined;
+    var buf: [K.Key.serialized_len]u8 = @splat(0);
+    // level 1: s_cw(16) || v_cw(4) || t_cw_l || t_cw_r
+    buf[seed_len + seed_len + 4] = 0x02;
+    buf[seed_len + seed_len + 5] = 0x03;
+    K.Key.fromBytes(&key, &buf);
+    try std.testing.expectEqual(@as(u1, 0), key.cw[0].t_cw_l);
+    try std.testing.expectEqual(@as(u1, 1), key.cw[0].t_cw_r);
+}
+
+test "mutation 2026-11-25: Dcf keys are pinned (own output, no external reference): the seed selects, the value expansion and its tweak" {
+    const s0: Seed = @splat(0x31);
+    const s1: Seed = @splat(0x7c);
+    const alpha: u8 = 0x5a;
+    const beta: u32 = 0x0102_0304;
+    const expect_aes = "5886cf99e077452af40a60c71c15b161179566867756eba57a16f56a4e9c48e2";
+    const expect_sha = "12ee28136855ed5cc736a7426960858370e74cc00b8572d38776a36dbc2384ad";
+    inline for (.{ .{ prg_mod.Aes128Mmo, expect_aes }, .{ prg_mod.Sha256Prg, expect_sha } }) |pe| {
+        const D = DcfWith(pe[0], 8, 4);
+        var keys: [2]D.Key = undefined;
+        D.genWithSeeds(&alpha, &beta, &s0, &s1, &keys);
+        var bytes: [D.Key.serialized_len]u8 = undefined;
+        keys[0].toBytes(&bytes);
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&bytes, &h, .{});
+        var hex: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&hex, "{x}", .{&h}) catch unreachable;
+        try std.testing.expectEqualStrings(pe[1], &hex);
+    }
+}

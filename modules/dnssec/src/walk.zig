@@ -658,3 +658,191 @@ test "root_anchors match the IANA root KSK DNSKEY records" {
 
 const ds_mod = @import("ds.zig");
 const KSK2024_B64 = "AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rLGXVaC6rXTsDc449/cidltpkyGwCJNnOAlFNKF2jBosZBU5eeHspaQWOmOElZsjICMQMC3aeHbGiShvZsx4wMYSjH8e7Vrhbu6irwCzVBApESjbUdpWWmEnhathWu1jo+siFUiRAAxm9qyJNg/wOZqqzL/dL/q8PkcRU5oUKEpUge71M3ej2/7CPqpdVwuMoTvoB+ZOT4YeGyxMvHmbrxlFzGOHOijtzN+u1TQNatX2XBuzZNQ1K+s2CXkPIZo7s6JgZyvaBevYtxPvYLw4z9mR7K2vaF18UYH9Z9GNUUeayffKC73PYc=";
+
+// ── mutation 2026-11-25 (delta run over walk.zig) ──────────────────────────
+
+/// `signedSet` with an explicit validity window.
+fn signedSetWindow(a: std.mem.Allocator, owner: []const u8, ty: u16, raws: []const []const u8, signer: TestZone, inc: u32, exp: u32) !Rrset {
+    const recs = try a.alloc(dns.Record, raws.len);
+    for (raws, recs) |raw, *r| r.* = unknownRecord(owner, ty, raw);
+    const sig = try sign.signRrset(a, recs, owner, .{ .ed25519 = &signer.kp }, .{
+        .signer_name = signer.name,
+        .key_tag = signer.tag,
+        .inception = inc,
+        .expiration = exp,
+    });
+    const sigs = try a.alloc([]const u8, 1);
+    sigs[0] = sig;
+    return .{ .records = recs, .rrsigs = sigs };
+}
+
+test "mutation 2026-11-25: a name over 253 bytes is bogus before any fetch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const c = try Chain.init(arena.allocator());
+    // 128 one-byte labels: 255 bytes, every label valid, so only the length cap refuses it.
+    var buf: [255]u8 = undefined;
+    for (0..128) |i| {
+        buf[2 * i] = 'a';
+        if (i < 127) buf[2 * i + 1] = '.';
+    }
+    const fetches_before = c.w.fetches;
+    try testing.expectEqual(root.ValidationResult.bogus, try c.run(&buf, 1));
+    try testing.expectEqual(fetches_before, c.w.fetches);
+}
+
+test "mutation 2026-11-25: unusable DS records are skipped, none usable is bogus, a DS owned by another name is no DS" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Chain.init(a);
+    const good = try dsRdata(a, c.example);
+
+    // A truncated DS beside the good one: skipped, the chain is still secure.
+    try c.w.put("example.org", rdata.rr_type.ds, try oneSet(a, try signedSet(a, "example.org", rdata.rr_type.ds, &.{ "\x00", good }, c.org)));
+    try testing.expectEqual(root.ValidationResult.secure, try c.run("www.example.org", 1));
+
+    // A record whose data is not RDATA bytes (typed) beside the good one: skipped too.
+    {
+        const recs = try a.alloc(dns.Record, 2);
+        recs[0] = unknownRecord("example.org", rdata.rr_type.ds, good);
+        recs[1] = .{ .name = "example.org", .ty = @fromBackingInt(rdata.rr_type.ds), .class = .in, .ttl = 3600, .data = .{ .a = .{ 1, 2, 3, 4 } } };
+        try c.w.put("example.org", rdata.rr_type.ds, try oneSet(a, try signRecords(a, recs, "example.org", c.org)));
+        try testing.expectEqual(root.ValidationResult.secure, try c.run("www.example.org", 1));
+    }
+
+    // Only garbage: no candidate, bogus (not insecure).
+    try c.w.put("example.org", rdata.rr_type.ds, try oneSet(a, try signedSet(a, "example.org", rdata.rr_type.ds, &.{"\x00"}, c.org)));
+    try testing.expectEqual(root.ValidationResult.bogus, try c.run("www.example.org", 1));
+
+    // A properly signed DS RRset that is owned by `org`, not by the queried `example.org`, is not its DS.
+    try c.w.put("example.org", rdata.rr_type.ds, try oneSet(a, try signedSet(a, "org", rdata.rr_type.ds, &.{good}, c.org)));
+    try testing.expectEqual(root.ValidationResult.bogus, try c.run("www.example.org", 1));
+}
+
+test "mutation 2026-11-25: a DNSKEY RRset with a record that is not RDATA bytes is bogus" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Chain.init(a);
+    // The second record's canonical RDATA is empty (an empty TXT list), signed under the root key.
+    const recs = try a.alloc(dns.Record, 2);
+    recs[0] = unknownRecord("", rdata.rr_type.dnskey, c.root_zone.dnskey);
+    recs[1] = .{ .name = "", .ty = @fromBackingInt(rdata.rr_type.dnskey), .class = .in, .ttl = 3600, .data = .{ .txt = &.{} } };
+    try c.w.put("", rdata.rr_type.dnskey, try oneSet(a, try signRecords(a, recs, "", c.root_zone)));
+    try testing.expectEqual(root.ValidationResult.bogus, try c.run("www.example.org", 1));
+}
+
+test "mutation 2026-11-25: a DNSKEY RRset whose own signature is out of its window is bogus even when everything below is valid" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Chain.init(a);
+    try c.w.put("", rdata.rr_type.dnskey, try oneSet(a, try signedSetWindow(a, "", rdata.rr_type.dnskey, &.{c.root_zone.dnskey}, c.root_zone, inception, now - 1)));
+    try testing.expectEqual(root.ValidationResult.bogus, try c.run("www.example.org", 1));
+    try c.w.put("", rdata.rr_type.dnskey, try oneSet(a, try signedSetWindow(a, "", rdata.rr_type.dnskey, &.{c.root_zone.dnskey}, c.root_zone, now + 1, expiration)));
+    try testing.expectEqual(root.ValidationResult.bogus, try c.run("www.example.org", 1));
+}
+
+test "mutation 2026-11-25: empty RRsets in a response are skipped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Chain.init(a);
+    const dk = (try c.w.fetcher().fetch("", rdata.rr_type.dnskey))[0];
+    const with_empty_dk = try a.alloc(Rrset, 2);
+    with_empty_dk[0] = .{ .records = &.{} };
+    with_empty_dk[1] = dk;
+    try c.w.put("", rdata.rr_type.dnskey, with_empty_dk);
+    const nsec_set = (try c.w.fetcher().fetch("www.example.org", rdata.rr_type.ds))[0];
+    const with_empty_nsec = try a.alloc(Rrset, 2);
+    with_empty_nsec[0] = .{ .records = &.{} };
+    with_empty_nsec[1] = nsec_set;
+    try c.w.put("www.example.org", rdata.rr_type.ds, with_empty_nsec);
+    try testing.expectEqual(root.ValidationResult.secure, try c.run("www.example.org", 1));
+}
+
+test "mutation 2026-11-25: only NSEC and NSEC3 RRsets are denial proofs; NSEC3 NODATA at a non-cut continues the walk" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Chain.init(a);
+
+    // The org zone's opt-out NSEC3 (as in the Opt-Out test), but carried in an RRset of type TXT: no proof at all.
+    const salt = "\xaa";
+    const iters: u16 = 2;
+    var nb: [wire.max_canonical_wire_len]u8 = undefined;
+    const org_hash = nsec3.iteratedHash(try wire.encodeCanonicalName("org", &nb), salt, iters);
+    var label_buf: [32]u8 = undefined;
+    const org_label = try base32.encode(&label_buf, &org_hash, .{ .alphabet = .hex, .pad = false });
+    const owner = try std.fmt.allocPrint(a, "{s}.org", .{org_label});
+    const bm = try bitmap(a, &.{ 2, 6, rdata.rr_type.dnskey, rdata.rr_type.rrsig, rdata.rr_type.nsec3param });
+    const n3 = try std.mem.concat(a, u8, &.{ &[_]u8{ 1, 1, 0, iters, salt.len }, salt, &[_]u8{org_hash.len}, &org_hash, bm });
+    try c.w.put("insecure.org", rdata.rr_type.ds, try oneSet(a, try signedSet(a, owner, 16, &.{n3}, c.org)));
+    try testing.expectEqual(root.ValidationResult.bogus, try c.run("www.insecure.org", 1));
+
+    // NSEC3 NODATA: the www.example.org name exists (A only, no NS, no DS), so it is no zone cut.
+    const www_hash = nsec3.iteratedHash(try wire.encodeCanonicalName("www.example.org", &nb), salt, iters);
+    const www_label = try base32.encode(&label_buf, &www_hash, .{ .alphabet = .hex, .pad = false });
+    const www_owner = try std.fmt.allocPrint(a, "{s}.example.org", .{www_label});
+    const www_bm = try bitmap(a, &.{ 1, rdata.rr_type.rrsig });
+    const www_n3 = try std.mem.concat(a, u8, &.{ &[_]u8{ 1, 0, 0, iters, salt.len }, salt, &[_]u8{www_hash.len}, &www_hash, www_bm });
+    try c.w.put("www.example.org", rdata.rr_type.ds, try oneSet(a, try signedSet(a, www_owner, rdata.rr_type.nsec3, &.{www_n3}, c.example)));
+    try testing.expectEqual(root.ValidationResult.secure, try c.run("www.example.org", 1));
+}
+
+test "mutation 2026-11-25: an RRSIG naming another signer or another key tag does not verify, whatever the key" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Chain.init(a);
+    const www = [_]dns.Record{.{ .name = "www.example.org", .ty = .a, .class = .in, .ttl = 300, .data = .{ .a = .{ 192, 0, 2, 1 } } }};
+    const recs = try a.dupe(dns.Record, &www);
+    const Case = struct { signer: []const u8, tag: u16 };
+    for ([_]Case{
+        .{ .signer = "org", .tag = c.example.tag }, // a key of example.org claiming to be the signer of the parent zone
+        .{ .signer = "example.org", .tag = c.example.tag +% 1 }, // the right key, a wrong tag
+    }) |cs| {
+        const sig = try sign.signRrset(a, recs, "www.example.org", .{ .ed25519 = &c.example.kp }, .{
+            .signer_name = cs.signer,
+            .key_tag = cs.tag,
+            .inception = inception,
+            .expiration = expiration,
+        });
+        const sigs = try a.alloc([]const u8, 1);
+        sigs[0] = sig;
+        try c.w.put("www.example.org", 1, try oneSet(a, .{ .records = recs, .rrsigs = sigs }));
+        try testing.expectEqual(root.ValidationResult.bogus, try c.run("www.example.org", 1));
+    }
+}
+
+test "mutation 2026-11-25: an allocation failure anywhere in the walk is OutOfMemory, never a verdict" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const c = try Chain.init(arena.allocator());
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        const r = validateRrset(fa.allocator(), c.w.fetcher(), &.{c.anchor}, "www.example.org", 1, .{ .now = now }) catch |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            continue;
+        };
+        // No failure was induced: this is the ordinary run.
+        try testing.expect(!fa.has_induced_failure);
+        try testing.expectEqual(root.ValidationResult.secure, r);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "mutation 2026-11-25: proveNoDs reports an allocation failure while parsing an NSEC, not an empty proof" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const c = try Chain.init(arena.allocator());
+    const resp = try c.w.fetcher().fetch("www.example.org", rdata.rr_type.ds);
+    // The walker's scratch allocator fails at its first allocation: the next-domain-name copy of the NSEC.
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, proveNoDs(testing.allocator, fa.allocator(), resp, "www.example.org", "example.org", &.{c.example.dnskey}, .{ .now = now }));
+    // And with an allocator that works, the same call proves NODATA.
+    try testing.expectEqual(nsec.DenialResult.no_data, try proveNoDs(testing.allocator, arena.allocator(), resp, "www.example.org", "example.org", &.{c.example.dnskey}, .{ .now = now }));
+}

@@ -3923,3 +3923,47 @@ test "mutation: a forced version refuses text one bit over its capacity" {
     }
     try t.expect(hits >= 1);
 }
+
+test "mutation 2026-11-25: kanji capacity in characters follows the standard's count-field widths (8, 10, 12 bits) wherever the symbol is tight" {
+    const t = std.testing;
+    var m: Matrix = undefined;
+    var big: [4000]u8 = undefined;
+    var i: usize = 0;
+    while (i < big.len) : (i += 2) {
+        big[i] = 0x88;
+        big[i + 1] = 0x9F;
+    }
+    var tight: usize = 0;
+    var v: u6 = 1;
+    while (v <= 40) : (v += 1) {
+        // 4 mode bits + the standard's count field (8 bits up to version 9, 10 up to 26, 12 above).
+        const hdr: usize = 4 + @as(usize, if (v <= 9) 8 else if (v <= 26) 10 else 12);
+        for ([_]Ecc{ .low, .medium, .quartile, .high }) |ecc| {
+            const cap = dataCapacityBits(v, ecc);
+            // Only where one more count bit would cost a whole character; everywhere else it cannot show.
+            if ((cap - hdr) % 13 != 0) continue;
+            tight += 1;
+            const n = (cap - hdr) / 13;
+            try encode(&m, big[0 .. 2 * n], .{ .mode = .kanji, .version = v, .ecc = ecc });
+            try t.expectError(Error.TooLong, encode(&m, big[0 .. 2 * (n + 1)], .{ .mode = .kanji, .version = v, .ecc = ecc }));
+        }
+    }
+    try t.expect(tight >= 5);
+}
+
+test "mutation 2026-11-25: a kanji structured-append chunk is limited by capacity, not by the count field read as bytes" {
+    const t = std.testing;
+    var ms: [4]Matrix = undefined;
+    var text: [300]u8 = undefined;
+    var i: usize = 0;
+    while (i < text.len) : (i += 2) {
+        text[i] = 0x88;
+        text[i + 1] = 0x9F;
+    }
+    // Version 9, ECC L: 1856 data bits; 20 header bits + 4 mode + 8 count leave 140 characters = 280 bytes in one symbol
+    // (the count field allows 255 characters, which is 510 bytes, so it is not what limits the chunk).
+    const one = try encodeSequence(&ms, text[0..280], .{ .mode = .kanji, .version = 9, .ecc = .low });
+    try t.expectEqual(@as(usize, 1), one.len);
+    const two = try encodeSequence(&ms, text[0..282], .{ .mode = .kanji, .version = 9, .ecc = .low });
+    try t.expectEqual(@as(usize, 2), two.len);
+}

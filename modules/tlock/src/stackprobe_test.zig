@@ -402,6 +402,32 @@ noinline fn callAgeDecryptG2() void {
     const p = apiAgeDecryptG2(&pt_sink, cur_file[0..cur_file_len], round_sig_g2);
     std.mem.doNotOptimizeAway(p.ptr);
 }
+// Streaming entry points (`encryptStream` / `decryptStream`, both schemes): probed since the 2026-11-25 delta
+// mutation run (their burn sites had no probe).
+noinline fn callStreamEncrypt() void {
+    var w: std.Io.Writer = .fixed(&file_sink);
+    var r: std.Io.Reader = .fixed(&cur_pt);
+    age.encryptStream(std.testing.allocator, &w, &r, beacon_pub, probe_round, chain_hash, &cur_rnd) catch unreachable;
+    std.mem.doNotOptimizeAway(&file_sink);
+}
+noinline fn callStreamDecrypt() void {
+    var w: std.Io.Writer = .fixed(&pt_sink);
+    var r: std.Io.Reader = .fixed(cur_file[0..cur_file_len]);
+    age.decryptStream(std.testing.allocator, &w, &r, round_sig, .{}) catch unreachable;
+    std.mem.doNotOptimizeAway(&pt_sink);
+}
+noinline fn callStreamEncryptG2() void {
+    var w: std.Io.Writer = .fixed(&file_sink);
+    var r: std.Io.Reader = .fixed(&cur_pt);
+    age.encryptStreamSigG2(std.testing.allocator, &w, &r, beacon_pub_g2, probe_round, chain_hash, &cur_rnd) catch unreachable;
+    std.mem.doNotOptimizeAway(&file_sink);
+}
+noinline fn callStreamDecryptG2() void {
+    var w: std.Io.Writer = .fixed(&pt_sink);
+    var r: std.Io.Reader = .fixed(cur_file[0..cur_file_len]);
+    age.decryptStreamSigG2(std.testing.allocator, &w, &r, round_sig_g2, .{}) catch unreachable;
+    std.mem.doNotOptimizeAway(&pt_sink);
+}
 noinline fn callRandomSigma() void {
     apiRandomSigma(&block_sink, fakeIo());
     std.mem.doNotOptimizeAway(&block_sink);
@@ -543,6 +569,8 @@ test "STACKPROBE: no message, sigma, r, pairing value, file/payload key or plain
         leak_src = cur_pt[0..LEAK].*;
         bad += try runProbe("age.encrypt", callAgeEncrypt, &nd);
         bad += try runProbe("age.decrypt", callAgeDecrypt, &nd);
+        bad += try runProbe("age.encryptStream", callStreamEncrypt, &nd);
+        bad += try runProbe("age.decryptStream", callStreamDecrypt, &nd);
 
         // age, whole file, G2-signature scheme.
         const file_g2 = apiAgeEncryptG2(&cur_file, &cur_pt, beacon_pub_g2, probe_round, &cur_rnd);
@@ -556,6 +584,8 @@ test "STACKPROBE: no message, sigma, r, pairing value, file/payload key or plain
         leak_src = cur_pt[0..LEAK].*;
         bad += try runProbe("age.encryptSigG2", callAgeEncryptG2, &nd);
         bad += try runProbe("age.decryptSigG2", callAgeDecryptG2, &nd);
+        bad += try runProbe("age.encryptStreamSigG2", callStreamEncryptG2, &nd);
+        bad += try runProbe("age.decryptStreamSigG2", callStreamDecryptG2, &nd);
 
         // age, payload layer on its own.
         apiSeal(&cur_sealed, &cur_key, &cur_pt);

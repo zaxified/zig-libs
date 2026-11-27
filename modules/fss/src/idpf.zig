@@ -269,3 +269,15 @@ test "idpf: key codec round-trips" {
     try testing.expectEqualDeep(keys[0], back);
     try testing.expectEqual(@as(usize, 16 + 9 * (18 + 2)), I.Key.serialized_len);
 }
+
+test "mutation 2026-11-25: Idpf.Key.fromBytes keeps only the low bit of a control byte" {
+    const K = Idpf(8, 4);
+    var key: K.Key = undefined;
+    var buf: [K.Key.serialized_len]u8 = @splat(0);
+    // level 1: s_cw(16) || t_cw_l || t_cw_r || ocw(4)
+    buf[seed_len + seed_len] = 0x02;
+    buf[seed_len + seed_len + 1] = 0x03;
+    K.Key.fromBytes(&key, &buf);
+    try std.testing.expectEqual(@as(u1, 0), key.cw[0].t_cw_l);
+    try std.testing.expectEqual(@as(u1, 1), key.cw[0].t_cw_r);
+}
