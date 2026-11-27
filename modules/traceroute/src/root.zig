@@ -6817,3 +6817,875 @@ test "LinuxTransport.recvImpl with a queued socket error waits instead of spinni
     // A spinning wait burns the whole wall time on the CPU; a blocked one almost none.
     try testing.expect(cpu < wall / 2);
 }
+
+// ── mutation audit 2026-11-27: killing tests (expected values from RFC 792 / 4443 / 4884 / 4950 / 5837, the doc comments and SPEC) ──
+
+fn mtNullSend(_: *anyopaque, _: u8, _: []const u8) TransportError!void {}
+fn mtNullSendUdp(_: *anyopaque, _: u8, _: u16, _: []const u8) TransportError!void {}
+fn mtNullSendTcp(_: *anyopaque, _: u8, _: u16, _: u16) TransportError!void {}
+fn mtNullSendTo(_: *anyopaque, _: netaddr.Ip, _: u8, _: []const u8) TransportError!void {}
+fn mtNullSendUdpTo(_: *anyopaque, _: netaddr.Ip, _: u8, _: u16, _: []const u8) TransportError!void {}
+fn mtNullSendTcpTo(_: *anyopaque, _: netaddr.Ip, _: u8, _: u16, _: u16) TransportError!void {}
+fn mtNullRecv(_: *anyopaque, _: []u8, _: u64) TransportError!?Packet {
+    return null;
+}
+fn mtNullRecvTcp(_: *anyopaque, _: u64) TransportError!?TcpEvent {
+    return null;
+}
+fn mtNow(_: *anyopaque) u64 {
+    return 1_000_000;
+}
+var mt_dummy: u8 = 0;
+
+fn mtBase() Transport {
+    return .{ .ctx = &mt_dummy, .sendFn = mtNullSend, .recvFn = mtNullRecv, .nowFn = mtNow };
+}
+
+/// ICMP error message with an RFC 4884 extension structure.
+fn mtExtMsg(family: echo.Family, out: []u8, words: u8, orig_len: usize, objs: []const u8, cks_zero: bool, rsvd: u8) []u8 {
+    @memset(out, 0);
+    out[0] = if (family == .v4) echo.v4.time_exceeded else echo.v6.time_exceeded;
+    if (family == .v4) out[5] = words else out[4] = words;
+    const off = echo.echo_header_len + orig_len;
+    out[off] = 0x20;
+    out[off + 1] = rsvd;
+    @memcpy(out[off + 4 ..][0..objs.len], objs);
+    const ext = out[off .. off + 4 + objs.len];
+    if (!cks_zero) std.mem.writeInt(u16, ext[2..4], echo.checksum(ext), .big);
+    return out[0 .. off + 4 + objs.len];
+}
+
+fn mtObj(out: []u8, class: u8, ctype: u8, body: []const u8) usize {
+    std.mem.writeInt(u16, out[0..2], @intCast(4 + body.len), .big);
+    out[2] = class;
+    out[3] = ctype;
+    @memcpy(out[4..][0..body.len], body);
+    return 4 + body.len;
+}
+
+fn mtMpls(label: u32, tc: u32, bottom: bool, ttl: u32) [4]u8 {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, (label << 12) | (tc << 9) | (@as(u32, @intFromBool(bottom)) << 8) | ttl, .big);
+    return b;
+}
+
+test "mutation 2026-11-27: Options.validate: every limit is inclusive and the run-time product is bounded exactly" {
+    const bad = error.InvalidOptions;
+    try (Options{ .probes_per_hop = max_probes_per_hop }).validate();
+    try testing.expectError(bad, (Options{ .probes_per_hop = max_probes_per_hop + 1 }).validate());
+    try (Options{ .payload_size = max_payload }).validate();
+    try testing.expectError(bad, (Options{ .payload_size = max_payload + 1 }).validate());
+    // flow-stable UDP carries two 16-bit words in the payload: 4 bytes are enough, 3 are not
+    try (Options{ .method = .udp, .flow_stable = true, .payload_size = min_flow_payload }).validate();
+    try testing.expectError(bad, (Options{ .method = .udp, .flow_stable = true, .payload_size = min_flow_payload - 1 }).validate());
+    // the UDP port base means nothing to an ICMP trace, flow-stable or not
+    try (Options{ .udp_port_base = 0 }).validate();
+    try (Options{ .udp_port_base = 65535 }).validate();
+    try (Options{ .flow_stable = true, .udp_port_base = 0 }).validate();
+    // 30 hops x 3 probes x 20 s = max_run_ms exactly
+    try (Options{ .timeout_ms = 20_000 }).validate();
+    try testing.expectError(bad, (Options{ .timeout_ms = 20_001 }).validate());
+    try (Options{ .max_hops = 1, .probes_per_hop = 1, .timeout_ms = max_run_ms }).validate();
+    try testing.expectError(bad, (Options{ .max_hops = 1, .probes_per_hop = 1, .timeout_ms = max_run_ms + 1 }).validate());
+}
+
+test "mutation 2026-11-27: MtrOptions / MtrSetOptions validate: inclusive limits, the UDP port window, the TCP attempt bound" {
+    const bad = error.InvalidOptions;
+    try (MtrOptions{ .first_ttl = 1, .max_hops = 1 }).validate();
+    try (MtrOptions{ .timeout_ms = max_mtr_timeout_ms }).validate();
+    try (MtrOptions{ .gap_ms = 1000 }).validate();
+    try testing.expectError(bad, (MtrOptions{ .gap_ms = 1001 }).validate());
+    try testing.expectError(bad, (MtrOptions{ .timeout_ms = max_mtr_timeout_ms + 1 }).validate());
+    // two rounds' windows of every member must fit above the UDP port base; ICMP ignores the base
+    try (MtrOptions{ .udp_port_base = 65535 }).validate();
+    const cap: u32 = 30;
+    const edge: u16 = @intCast(65536 - 2 * max_set_members * cap);
+    try (MtrOptions{ .method = .udp, .udp_port_base = edge }).validate();
+    try testing.expectError(bad, (MtrOptions{ .method = .udp, .udp_port_base = edge + 1 }).validate());
+    // the TCP attempts a transport keeps open must outlast the timeout: gap * attempts >= timeout
+    const attempts: u32 = LinuxTransport.max_tcp_attempts;
+    try (MtrSetOptions{ .mtr = .{ .method = .tcp, .gap_ms = 4, .timeout_ms = 4 * attempts } }).validate();
+    try testing.expectError(bad, (MtrSetOptions{ .mtr = .{ .method = .tcp, .gap_ms = 4, .timeout_ms = 4 * attempts + 1 } }).validate());
+}
+
+test "mutation 2026-11-27: MtrOptions.wireBase: ICMP windows follow the sequence base, classic UDP stays above its port base" {
+    const o: MtrOptions = .{ .seq_base = 100 };
+    try testing.expectEqual(@as(u16, 100), o.wireBase(0, 30));
+    try testing.expectEqual(@as(u16, 160), o.wireBase(2, 30));
+    const w: MtrOptions = .{ .seq_base = 0xfff0 };
+    try testing.expectEqual(@as(u16, 0xfff0) +% 60, w.wireBase(2, 30)); // wraps
+    // classic UDP: base + (windows * window) modulo the room above the base
+    const u: MtrOptions = .{ .method = .udp, .udp_port_base = 65000 };
+    try testing.expectEqual(@as(u16, 65000), u.wireBase(0, 1));
+    try testing.expectEqual(@as(u16, 65001), u.wireBase(1, 1));
+    try testing.expectEqual(@as(u16, 65000), u.wireBase(536, 1)); // 65536 - 65000 = 536 ports: the window wraps to the base
+    try testing.expectEqual(@as(u16, 65001), u.wireBase(537, 1));
+    // flow-stable UDP: the id is a checksum, never 0 or 0xffff, and it moves with the sequence base
+    const fs: MtrOptions = .{ .method = .udp, .flow_stable = true, .seq_base = 0 };
+    try testing.expectEqual(@as(u16, 1), fs.wireBase(0, 30));
+    try testing.expectEqual(@as(u16, 61), fs.wireBase(2, 30));
+    const fs2: MtrOptions = .{ .method = .udp, .flow_stable = true, .seq_base = 5 };
+    try testing.expectEqual(@as(u16, 66), fs2.wireBase(2, 30));
+    var seq: u32 = 0;
+    while (seq < 0x10000) : (seq += 997) {
+        const o2: MtrOptions = .{ .method = .udp, .flow_stable = true, .seq_base = @intCast(seq) };
+        const b = o2.wireBase(3, 30);
+        try testing.expect(b >= 1 and @as(u32, b) + 29 <= 0xfffe);
+    }
+}
+
+test "mutation 2026-11-27: slotOf: only the sent window maps to a slot" {
+    try testing.expectEqual(@as(?usize, 2), slotOf(3, 1, 3));
+    try testing.expectEqual(@as(?usize, null), slotOf(4, 1, 3));
+    try testing.expectEqual(@as(?usize, 1), slotOf(0, 0xffff, 3));
+    try testing.expectEqual(@as(?usize, null), slotOf(0, 1, 3)); // below the base wraps far past the window
+}
+
+test "mutation 2026-11-27: extensionObjects: a bare header is a structure, a zero checksum means not computed, v6 counts in 8 bytes" {
+    var buf: [512]u8 = undefined;
+    const m0 = mtExtMsg(.v4, &buf, 32, 128, "", false, 0);
+    try testing.expectEqual(@as(usize, 0), extensionObjects(.v4, m0).?.len);
+    try testing.expect(extensionObjects(.v4, m0[0 .. m0.len - 1]) == null);
+    const m1 = mtExtMsg(.v4, &buf, 32, 128, "", true, 0xff);
+    try testing.expect(extensionObjects(.v4, m1) != null);
+    const m2 = mtExtMsg(.v6, &buf, 17, 136, "", false, 0);
+    try testing.expect(extensionObjects(.v6, m2) != null);
+    // a length of 31 words is 124 bytes: below the 128 of RFC 4884 §4.5
+    const m3 = mtExtMsg(.v4, &buf, 31, 124, "", false, 0);
+    try testing.expect(extensionObjects(.v4, m3) == null);
+}
+
+test "mutation 2026-11-27: mplsOf: objects are skipped by their length, entries read 4 bytes at a time, S is bit 8" {
+    var buf: [512]u8 = undefined;
+    var objs: [128]u8 = undefined;
+    var n: usize = 0;
+    n += mtObj(objs[n..], 9, 9, &.{ 1, 2, 3, 4 }); // 8 bytes, not ours
+    n += mtObj(objs[n..], 9, 9, &.{}); // 4 bytes, empty
+    n += mtObj(objs[n..], 2, 1, &mtMpls(5, 1, true, 3)); // class 2 is not MPLS
+    const e1 = mtMpls(0x12345, 5, false, 0xff); // S = 0, TTL has bit 7 set
+    const e2 = mtMpls(0x00abc, 0, true, 1);
+    var body: [11]u8 = undefined;
+    @memcpy(body[0..4], &e1);
+    @memcpy(body[4..8], &e2);
+    @memcpy(body[8..11], "\xaa\xbb\xcc"); // 3 trailing bytes are no entry
+    n += mtObj(objs[n..], 1, 1, &body);
+    const s = mplsOf(.v4, mtExtMsg(.v4, &buf, 32, 128, objs[0..n], false, 0));
+    try testing.expectEqual(@as(u8, 2), s.len);
+    try testing.expectEqual(@as(u20, 0x12345), s.entries[0].label);
+    try testing.expectEqual(@as(u3, 5), s.entries[0].tc);
+    try testing.expect(!s.entries[0].bottom);
+    try testing.expectEqual(@as(u8, 0xff), s.entries[0].ttl);
+    try testing.expectEqual(@as(u20, 0xabc), s.entries[1].label);
+    try testing.expect(s.entries[1].bottom);
+    try testing.expectEqual(@as(u8, 1), s.entries[1].ttl);
+    // an object shorter than its own header ends the walk (len 3 and len 0, each "class 1 type 1")
+    const short3 = [_]u8{ 0, 3, 1, 1, 0, 0, 0, 1 };
+    try testing.expectEqual(@as(u8, 0), mplsOf(.v4, mtExtMsg(.v4, &buf, 32, 128, &short3, false, 0)).len);
+    const short0 = [_]u8{ 0, 0, 1, 1, 0, 0, 0, 1 };
+    try testing.expectEqual(@as(u8, 0), mplsOf(.v4, mtExtMsg(.v4, &buf, 32, 128, &short0, false, 0)).len);
+}
+
+test "mutation 2026-11-27: ifInfoOf: one object per role, names trimmed of padding, AFI of the family, lengths in 4s" {
+    var buf: [512]u8 = undefined;
+    var objs: [128]u8 = undefined;
+    var n: usize = 0;
+    // two next-hop objects (role 3): the set is illegal (RFC 5837 §4.5) and dropped
+    n += mtObj(objs[n..], 2, 0xC8, &.{ 0, 0, 0, 1 });
+    n += mtObj(objs[n..], 2, 0xC8, &.{ 0, 0, 0, 2 });
+    try testing.expectEqual(@as(u8, 0), ifInfoOf(.v4, mtExtMsg(.v4, &buf, 32, 128, objs[0..n], false, 0)).len);
+    // a name that is all padding is empty; one with text keeps exactly the text
+    n = mtObj(&objs, 2, 0x02, &.{ 4, 0, 0, 0 });
+    var s = ifInfoOf(.v4, mtExtMsg(.v4, &buf, 32, 128, objs[0..n], false, 0));
+    try testing.expectEqual(@as(u8, 1), s.len);
+    try testing.expectEqual(@as(u8, 0), s.items[0].name_len);
+    n = mtObj(&objs, 2, 0x02, &.{ 4, 'a', 'b', 0 });
+    s = ifInfoOf(.v4, mtExtMsg(.v4, &buf, 32, 128, objs[0..n], false, 0));
+    try testing.expectEqualStrings("ab", s.items[0].nameSlice());
+    // a name sub-object whose length is not a multiple of 4 ends the walk
+    n = mtObj(&objs, 2, 0x02, &.{ 6, 'a', 'b', 'c', 'd', 0, 0, 0 });
+    try testing.expectEqual(@as(u8, 0), ifInfoOf(.v4, mtExtMsg(.v4, &buf, 32, 128, objs[0..n], false, 0)).len);
+    // IPv6 carries AFI 2: an address object with AFI 1 is damaged
+    var body6: [20]u8 = @splat(0);
+    body6[1] = 1;
+    n = mtObj(&objs, 2, 0x04, &body6);
+    try testing.expectEqual(@as(u8, 0), ifInfoOf(.v6, mtExtMsg(.v6, &buf, 16, 128, objs[0..n], false, 0)).len);
+    body6[1] = 2;
+    n = mtObj(&objs, 2, 0x04, &body6);
+    try testing.expectEqual(@as(u8, 1), ifInfoOf(.v6, mtExtMsg(.v6, &buf, 16, 128, objs[0..n], false, 0)).len);
+}
+
+fn mtUdpErr(out: []u8, ihl_words: u8, sport: u16, dport: u16, dst: [4]u8) []u8 {
+    @memset(out, 0);
+    out[0] = echo.v4.time_exceeded;
+    const q = out[8..];
+    q[0] = 0x40 | ihl_words;
+    q[9] = 17;
+    @memcpy(q[16..20], &dst);
+    const u = q[@as(usize, ihl_words) * 4 ..];
+    std.mem.writeInt(u16, u[0..2], sport, .big);
+    std.mem.writeInt(u16, u[2..4], dport, .big);
+    return out[0 .. 8 + @as(usize, ihl_words) * 4 + 8];
+}
+
+test "mutation 2026-11-27: parseUdpError honours the quoted header's own length (IHL) and refuses an impossible one" {
+    var buf: [128]u8 = undefined;
+    const e5 = parseUdpError(.v4, mtUdpErr(&buf, 5, 0x1111, 33440, .{ 192, 0, 2, 99 })).?;
+    try testing.expectEqual(@as(u16, 0x1111), e5.sport);
+    try testing.expectEqual(@as(u16, 33440), e5.dport);
+    // a quoted header with options (IHL 6): the UDP header starts at byte 24
+    const e6 = parseUdpError(.v4, mtUdpErr(&buf, 6, 0x2222, 33441, .{ 192, 0, 2, 99 })).?;
+    try testing.expectEqual(@as(u16, 0x2222), e6.sport);
+    try testing.expectEqual(@as(u16, 33441), e6.dport);
+    // IHL 4 is no IPv4 header
+    try testing.expect(parseUdpError(.v4, mtUdpErr(&buf, 4, 1, 2, .{ 192, 0, 2, 99 })) == null);
+}
+
+test "mutation 2026-11-27: icmpMessage: IPv4 header length is read from the packet, an 8-byte ICMP message is whole, IPv6 is never stripped" {
+    var pkt: [32]u8 = @splat(0);
+    pkt[0] = 0x46; // IHL 6
+    try echo.writeEchoRequest(.v4, pkt[24..32], 1, 2);
+    try testing.expectEqual(@as(usize, 8), icmpMessage(.v4, &pkt, true).?.len);
+    var p4: [24]u8 = @splat(0);
+    p4[0] = 0x44; // IHL 4: no valid header, although a valid ICMP message sits 16 bytes in
+    try echo.writeEchoRequest(.v4, p4[16..24], 1, 2);
+    try testing.expect(icmpMessage(.v4, &p4, true) == null);
+    // IPv6 sockets never deliver the IP header: the flag changes nothing
+    var m6: [8]u8 = @splat(0);
+    try echo.writeEchoRequest(.v6, &m6, 1, 2);
+    try testing.expectEqual(@as(usize, 8), icmpMessage(.v6, &m6, true).?.len);
+}
+
+test "mutation 2026-11-27: classifyIcmp: an Echo Reply counts from the destination only, MPLS and quoted v6 destination are kept" {
+    var f: FakeTransport = .{ .behaviors = &.{} };
+    defer f.deinit();
+    var req: [echo.echo_header_len + 24]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &req, 0x7472, 5);
+    const reply = try f.buildEchoReply(&req);
+    defer f.gpa.free(reply);
+    const msg = icmpMessage(.v4, reply, false).?;
+    // from someone else: ignored
+    try testing.expect(classifyIcmp(.v4, reply, false, msg, 0x7472, false, test_dest, router_a) == null);
+    // from the destination: a reply; with no source known the address is the destination's
+    const a = classifyIcmp(.v4, reply, false, msg, 0x7472, false, test_dest, test_dest).?;
+    try testing.expect(a.probe.address.?.eql(test_dest));
+    const b = classifyIcmp(.v4, reply, false, msg, 0x7472, false, test_dest, null).?;
+    try testing.expect(b.probe.address.?.eql(test_dest));
+    // a router's Time Exceeded quoting a datagram with an MPLS extension (RFC 4950) keeps its stack
+    var objs: [32]u8 = undefined;
+    const n = mtObj(&objs, 1, 1, &mtMpls(777, 0, true, 9));
+    var big: [256]u8 = undefined;
+    const em = mtExtMsg(.v4, &big, 32, 128, objs[0..n], false, 0);
+    em[8] = 0x45;
+    @memcpy(em[8 + 16 ..][0..4], &[4]u8{ 192, 0, 2, 99 });
+    @memcpy(em[8 + 20 ..][0..8], req[0..8]);
+    std.mem.writeInt(u16, em[2..4], 0, .big);
+    std.mem.writeInt(u16, em[2..4], echo.checksum(em), .big);
+    const m2 = icmpMessage(.v4, em, false).?;
+    const t = classifyIcmp(.v4, em, false, m2, 0x7472, false, test_dest, router_a).?;
+    try testing.expectEqual(@as(u8, 1), t.probe.mpls.len);
+    try testing.expectEqual(@as(u20, 777), t.probe.mpls.entries[0].label);
+    // IPv6: an error quoting another destination is not ours
+    var f6: FakeTransport = .{ .behaviors = &.{}, .family = .v6, .dest = .{ .v6 = @as([16]u8, @splat(0)) } };
+    defer f6.deinit();
+    var req6: [echo.echo_header_len + 24]u8 = @splat(0);
+    try echo.writeEchoRequest(.v6, &req6, 0x7472, 5);
+    const err6 = try f6.buildError(echo.v6.time_exceeded, 0, &req6);
+    defer f6.gpa.free(err6);
+    var other: [16]u8 = @splat(0);
+    other[15] = 7;
+    const m6 = icmpMessage(.v6, err6, false).?;
+    try testing.expect(classifyIcmp(.v6, err6, false, m6, 0x7472, false, .{ .v6 = other }, router_a) == null);
+}
+
+test "mutation 2026-11-27: MtrHop statistics from recorded probes" {
+    var h: MtrHop = .{ .ttl = 1 };
+    h.record(.{}); // a lost probe
+    try testing.expectEqual(@as(u32, 1000), h.lossPermille());
+    h.record(.{ .kind = .time_exceeded, .rtt_ns = 5_000, .address = router_a });
+    h.record(.{ .kind = .time_exceeded, .rtt_ns = 3_000, .address = router_b });
+    h.record(.{ .kind = .time_exceeded, .rtt_ns = 3_000, .address = router_c });
+    try testing.expectEqual(@as(u32, 4), h.sent);
+    try testing.expectEqual(@as(u32, 3), h.received);
+    try testing.expectEqual(@as(u32, 250), h.lossPermille());
+    try testing.expectEqual(@as(?u64, 3_666), h.avgNs());
+    try testing.expectEqual(@as(?u64, 3_000), h.best_ns);
+    try testing.expectEqual(@as(?u64, 5_000), h.worst_ns);
+    try testing.expectEqual(@as(?u64, 3_000), h.last_ns);
+    // consecutive differences: |3000 - 5000| = 2000, |3000 - 3000| = 0
+    try testing.expectEqual(@as(?u64, 1_000), h.jitterNs());
+    try testing.expectEqual(@as(u64, 2_000), h.worst_jitter_ns);
+    // RFC 3550 A.8: J = 0 + (2000 - 0) / 16 = 125, then 125 - (125 - 0) / 16 = 118
+    try testing.expectEqual(@as(u64, 118), h.interarrival_jitter_ns);
+    try testing.expectEqual(@as(?u8, null), h.unreachable_code);
+    try testing.expectEqual(@as(u8, 3), h.address_count);
+    h.record(.{ .kind = .dest_unreachable, .code = 13, .rtt_ns = 4_000, .address = ip4(1, 1, 1, 1) });
+    h.record(.{ .kind = .time_exceeded, .rtt_ns = 4_000, .address = ip4(2, 2, 2, 2) });
+    try testing.expectEqual(@as(?u8, 13), h.unreachable_code);
+    try testing.expectEqual(@as(u8, max_mtr_addresses), h.address_count); // a fifth responder is not kept
+    try testing.expect(h.address.?.eql(ip4(2, 2, 2, 2)));
+    // sums that saturated: no variance, never an underflow; an enormous one clamps
+    const sat: MtrHop = .{ .ttl = 1, .received = 2, .sum_ns = std.math.maxInt(u64), .sumsq_ns2 = 1 };
+    try testing.expectEqual(@as(?u64, 0), sat.stddevNs());
+    const huge: MtrHop = .{ .ttl = 1, .received = 2, .sum_ns = 0, .sumsq_ns2 = std.math.maxInt(u128) };
+    try testing.expectEqual(@as(?u64, std.math.maxInt(u64)), huge.stddevNs());
+    const inf: MtrHop = .{ .ttl = 1, .received = 1, .sum_ln_ns = 1000 };
+    try testing.expectEqual(@as(?u64, std.math.maxInt(u64)), inf.geomeanNs());
+    const one: MtrHop = .{ .ttl = 1, .sent = 1 };
+    try testing.expectEqual(@as(u32, 1000), one.lossPermille());
+    try testing.expectEqual(@as(?u64, null), (MtrHop{ .ttl = 1 }).avgNs());
+}
+
+fn mtQueueTE(f: *FakeTransport, seq: u16, from: netaddr.Ip, arrival: u64) !void {
+    var req: [echo.echo_header_len + 24]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &req, 0x7472, seq);
+    const bytes = try f.buildError(echo.v4.time_exceeded, 0, &req);
+    try f.queue.append(f.gpa, .{ .arrival = arrival, .from = from, .bytes = bytes });
+}
+
+test "mutation 2026-11-27: Mtr: a round is paced by gap_ms and ends at the timeout when dark" {
+    var f: FakeTransport = .{ .behaviors = &.{} };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 3, .gap_ms = 50, .timeout_ms = 400 });
+    defer m.deinit();
+    const t0 = f.clock;
+    try m.round(f.transport());
+    try testing.expectEqual((2 * 50 + 400) * std.time.ns_per_ms, f.clock - t0);
+}
+
+test "mutation 2026-11-27: Mtr: RTTs are send to answer, a complete round ends early, the first answer to a slot wins" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 3 });
+    defer m.deinit();
+    // a competing answer for slot 0 that arrives before the router's own
+    try mtQueueTE(&f, m.opts.seq_base, router_c, f.clock + 500_000);
+    const t0 = f.clock;
+    try m.round(f.transport());
+    try testing.expect(f.clock - t0 < 100 * std.time.ns_per_ms); // everything answered: no wait for timeout_ms
+    try testing.expect(m.hop_buf[0].address.?.eql(router_c));
+    try testing.expectEqual(@as(?u64, 500_000), m.hop_buf[0].last_ns);
+    try testing.expectEqual(@as(?u64, 2 * std.time.ns_per_ms), m.hop_buf[1].last_ns);
+    try testing.expectEqual(@as(?u64, 3 * std.time.ns_per_ms), m.hop_buf[2].last_ns);
+}
+
+test "mutation 2026-11-27: Mtr: each round has its own window of cap ids, a path end is kept through a lost probe" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply, .{ .time_exceeded = router_c }, .{ .time_exceeded = router_c } } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 5, .interval_ms = 100, .max_unknown = 5 });
+    defer m.deinit();
+    try m.round(f.transport());
+    try testing.expectEqual(@as(usize, 5), f.sent.items.len);
+    // the answers beyond the path's end are not part of the last round either
+    try testing.expectEqual(Probe.Kind.timeout, m.last_buf[3].kind);
+    try testing.expectEqual(Probe.Kind.timeout, m.last_buf[4].kind);
+    try testing.expectEqual(@as(?usize, 2), m.end);
+    // round 2: spoofs whose ids lie in the window past this round's three probes are not answers
+    const win2 = m.opts.seq_base +% 5;
+    const at = m.last_start.? + 100 * std.time.ns_per_ms + 5 * std.time.ns_per_ms;
+    try mtQueueTE(&f, win2 +% 3, router_c, at);
+    try mtQueueTE(&f, win2 +% 4, router_c, at);
+    try m.round(f.transport());
+    try testing.expectEqual(@as(usize, 8), f.sent.items.len); // 3 probes (to the path's end), not 5, and not more
+    try testing.expectEqual(win2, f.sent.items[5].seq);
+    try testing.expectEqual(@as(u64, 2), m.rounds);
+    // round 3: the destination's reply is lost: the end stays; a router answers there: the path grew
+    var lost = [_]Behavior{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .drop };
+    f.behaviors = &lost;
+    try m.round(f.transport());
+    try testing.expectEqual(@as(?usize, 2), m.end);
+    lost[2] = .{ .time_exceeded = router_c };
+    try m.round(f.transport());
+    try testing.expectEqual(@as(?usize, null), m.end);
+    // reset forgets everything, including the last round's probes and the destination's reply
+    try testing.expect(!m.reached());
+    m.reset();
+    try testing.expectEqual(Probe.Kind.timeout, m.last_buf[0].kind);
+    try testing.expect(!m.end_reply);
+}
+
+test "mutation 2026-11-27: Mtr: the destination's reply sets the end flag and reset clears it" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .reply } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 4 });
+    defer m.deinit();
+    try m.round(f.transport());
+    try testing.expect(m.end_reply);
+    try testing.expect(m.reached());
+    m.reset();
+    try testing.expect(!m.end_reply);
+    try testing.expect(m.last_buf[0].kind == .timeout and m.last_buf[1].kind == .timeout);
+    try testing.expectEqual(@as(u64, 0), m.rounds);
+}
+
+test "mutation 2026-11-27: Mtr.round and MtrSet.round refuse a transport that lacks what the method needs" {
+    const bad = error.SendFailed;
+    var udp = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 2, .method = .udp });
+    defer udp.deinit();
+    var t = mtBase();
+    try testing.expectError(bad, udp.round(t)); // no sendUdpFn
+    t.sendUdpFn = mtNullSendUdp;
+    try udp.round(t); // classic UDP needs no flow source
+    var fs = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 2, .method = .udp, .flow_stable = true });
+    defer fs.deinit();
+    try testing.expectError(bad, fs.round(t)); // flow-stable UDP needs the flow source of the destination's family
+    t.flow_source = ip4(192, 0, 2, 1);
+    try fs.round(t);
+    var tcp = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 2, .method = .tcp });
+    defer tcp.deinit();
+    var tt = mtBase();
+    tt.sendTcpFn = mtNullSendTcp;
+    try testing.expectError(bad, tcp.round(tt));
+    tt.sendTcpFn = null;
+    tt.recvTcpFn = mtNullRecvTcp;
+    try testing.expectError(bad, tcp.round(tt));
+    tt.sendTcpFn = mtNullSendTcp;
+    try tcp.round(tt);
+
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .method = .udp, .max_hops = 3 } });
+    defer set.deinit();
+    try testing.expectError(bad, set.round(mtBase()));
+    var ts = mtBase();
+    ts.sendUdpToFn = mtNullSendUdpTo;
+    try set.round(ts);
+    set.opts.mtr.max_hops = 10; // the options of a round must match the member buffers
+    try testing.expectError(bad, set.round(ts));
+    var tset = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .method = .tcp, .max_hops = 3, .gap_ms = 20, .timeout_ms = 1000 } });
+    defer tset.deinit();
+    var tc = mtBase();
+    tc.sendTcpToFn = mtNullSendTcpTo;
+    try testing.expectError(bad, tset.round(tc)); // no recvTcpFn
+    tc.recvTcpFn = mtNullRecvTcp;
+    try tset.round(tc);
+    // ids past the member table are no members
+    set.remove(max_set_members);
+    try testing.expect(set.member(max_set_members) == null);
+}
+
+const Lossy = struct {
+    f: *FakeTransport,
+    mask: u64,
+    n: u6 = 0,
+    fail_at: ?u6 = null,
+
+    fn transport(l: *Lossy) Transport {
+        var t = l.f.transport();
+        t.ctx = l;
+        t.sendFn = send;
+        t.recvFn = recv;
+        t.nowFn = now;
+        return t;
+    }
+    fn send(ctx: *anyopaque, ttl: u8, packet: []const u8) TransportError!void {
+        const l: *Lossy = @ptrCast(@alignCast(ctx));
+        const lost = (l.mask >> l.n) & 1 == 1;
+        const fail = l.fail_at != null and l.fail_at.? == l.n;
+        l.n += 1;
+        if (fail) return error.SendFailed;
+        if (lost) return;
+        return FakeTransport.sendImpl(l.f, ttl, packet);
+    }
+    fn recv(ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet {
+        const l: *Lossy = @ptrCast(@alignCast(ctx));
+        return FakeTransport.recvImpl(l.f, buf, timeout_ns);
+    }
+    fn now(ctx: *anyopaque) u64 {
+        const l: *Lossy = @ptrCast(@alignCast(ctx));
+        return l.f.clock;
+    }
+};
+
+test "mutation 2026-11-27: max_silent_hops: a hop answered by either of its probes is not silent, an answer resets the count" {
+    const bh = [_]Behavior{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .{ .time_exceeded = router_c } };
+    // 2 probes a hop; hop 2 answers by its second probe only (the first send, #2, is lost)
+    var f1: FakeTransport = .{ .behaviors = &bh };
+    defer f1.deinit();
+    var l1: Lossy = .{ .f = &f1, .mask = 1 << 2 };
+    var t1 = try traceWith(testing.allocator, l1.transport(), test_dest, .{ .max_hops = 3, .probes_per_hop = 2, .timeout_ms = 10, .max_silent_hops = 1 });
+    defer t1.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), t1.hops.len);
+    // ... and by its first probe only (send #3 lost)
+    var f2: FakeTransport = .{ .behaviors = &bh };
+    defer f2.deinit();
+    var l2: Lossy = .{ .f = &f2, .mask = 1 << 3 };
+    var t2 = try traceWith(testing.allocator, l2.transport(), test_dest, .{ .max_hops = 3, .probes_per_hop = 2, .timeout_ms = 10, .max_silent_hops = 1 });
+    defer t2.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), t2.hops.len);
+    // dark, answered, dark, answered with max_silent_hops = 2: the answer in between resets the run
+    const bh4 = [_]Behavior{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .{ .time_exceeded = router_c }, .{ .time_exceeded = router_a } };
+    var f3: FakeTransport = .{ .behaviors = &bh4 };
+    defer f3.deinit();
+    var l3: Lossy = .{ .f = &f3, .mask = 0b00110011 }; // sends 0,1 (TTL 1) and 4,5 (TTL 3) lost
+    var t3 = try traceWith(testing.allocator, l3.transport(), test_dest, .{ .max_hops = 4, .probes_per_hop = 2, .timeout_ms = 10, .max_silent_hops = 2 });
+    defer t3.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), t3.hops.len);
+}
+
+test "mutation 2026-11-27: one at a time, a late terminal answer ends the trace at the hop being sent" {
+    var f: FakeTransport = .{ .behaviors = &.{ .reply_late, .drop } };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .max_hops = 3, .probes_per_hop = 1 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(usize, 2), tr.hops.len);
+}
+
+const MtCap = struct {
+    clock: u64 = 1_000_000,
+    first_timeout: ?u64 = null,
+    give_len: ?usize = null,
+
+    fn transport(c: *MtCap) Transport {
+        return .{ .ctx = c, .sendFn = send, .recvFn = recv, .nowFn = now };
+    }
+    fn send(_: *anyopaque, _: u8, _: []const u8) TransportError!void {}
+    fn recv(ctx: *anyopaque, _: []u8, timeout_ns: u64) TransportError!?Packet {
+        const c: *MtCap = @ptrCast(@alignCast(ctx));
+        if (c.first_timeout == null) c.first_timeout = timeout_ns;
+        if (c.give_len) |n| {
+            c.give_len = null;
+            return .{ .len = n };
+        }
+        c.clock += timeout_ns;
+        return null;
+    }
+    fn now(ctx: *anyopaque) u64 {
+        const c: *MtCap = @ptrCast(@alignCast(ctx));
+        return c.clock;
+    }
+};
+
+test "mutation 2026-11-27: traceWith waits for the probe's deadline minus now, and a transport reporting an over-long packet fails" {
+    var c: MtCap = .{};
+    var tr = try traceWith(testing.allocator, c.transport(), test_dest, .{ .max_hops = 1, .probes_per_hop = 1, .timeout_ms = 1000 });
+    tr.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u64, 1000 * std.time.ns_per_ms), c.first_timeout);
+    var c2: MtCap = .{ .give_len = 5000 };
+    var t2 = try traceWith(testing.allocator, c2.transport(), test_dest, .{ .max_hops = 1, .probes_per_hop = 1 });
+    defer t2.deinit(testing.allocator);
+    try testing.expectEqual(@as(?TransportError, error.RecvFailed), t2.transport_err);
+}
+
+test "mutation 2026-11-27: traceWith: an answer whose id lies just past the sent window is no answer" {
+    var f: FakeTransport = .{ .behaviors = &.{} };
+    defer f.deinit();
+    var req: [echo.echo_header_len + 24]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &req, 0x7472, 3); // seq_base 1, 2 probes: ids 1 and 2; 3 is outside
+    const bytes = try f.buildEchoReply(&req);
+    try f.queue.append(f.gpa, .{ .arrival = f.clock + 100_000, .from = f.dest, .bytes = bytes });
+    var tr = try runFake(&f, .{ .max_hops = 2, .probes_per_hop = 1, .timeout_ms = 10 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(!tr.reached);
+}
+
+test "mutation 2026-11-27: traceWith refuses TCP unless the transport can both send and receive attempts" {
+    var t = mtBase();
+    t.sendTcpFn = mtNullSendTcp;
+    try testing.expectError(error.InvalidOptions, traceWith(testing.allocator, t, test_dest, .{ .method = .tcp, .max_hops = 1 }));
+    t.sendTcpFn = null;
+    t.recvTcpFn = mtNullRecvTcp;
+    try testing.expectError(error.InvalidOptions, traceWith(testing.allocator, t, test_dest, .{ .method = .tcp, .max_hops = 1 }));
+}
+
+test "mutation 2026-11-27: errQueuePacket rebuilds the RFC 792 / RFC 4443 shape byte for byte" {
+    var out: [2048]u8 = undefined;
+    var probe: [echo.echo_header_len + 24]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &probe, 0x4242, 77);
+    probe[probe.len - 1] = 0x5a; // a last byte the ICMP checksum must cover
+    // v4, ping socket: type, code, the quoted header (ihl 5, total length, TTL 1, ICMP), the probe
+    const p4 = errQueuePacket(.v4, testErrInfo(&probe, .v4, echo.v4.time_exceeded, 0, test_dest, router_a), &out, null).?;
+    try testing.expectEqual(@as(usize, 8 + 20 + probe.len), p4.len);
+    try testing.expectEqual(echo.v4.time_exceeded, out[0]);
+    try testing.expectEqual(@as(u8, 0), out[1]);
+    try testing.expectEqual(@as(u8, 0x45), out[8]);
+    try testing.expectEqual(@as(u16, 20 + probe.len), std.mem.readInt(u16, out[10..12], .big));
+    try testing.expectEqual(@as(u8, 1), out[16]); // the TTL that expired
+    try testing.expectEqual(@as(u8, 1), out[17]); // ICMP
+    try testing.expectEqualSlices(u8, &[4]u8{ 192, 0, 2, 99 }, out[24..28]);
+    try testing.expectEqualSlices(u8, &probe, out[28..p4.len]);
+    try testing.expectEqual(@as(u16, 0), echo.checksum(out[0..p4.len]));
+    // type and code are not swapped
+    const p4b = errQueuePacket(.v4, testErrInfo(&probe, .v4, echo.v4.dest_unreachable, 13, test_dest, router_a), &out, null).?;
+    try testing.expectEqual(echo.v4.dest_unreachable, out[0]);
+    try testing.expectEqual(@as(u8, 13), out[1]);
+    _ = p4b;
+    // exact room: head + one echo header fits, one byte less does not
+    var small: [36]u8 = undefined;
+    try testing.expectEqual(@as(usize, 36), errQueuePacket(.v4, testErrInfo(&probe, .v4, 11, 0, test_dest, router_a), &small, null).?.len);
+    try testing.expect(errQueuePacket(.v4, testErrInfo(&probe, .v4, 11, 0, test_dest, router_a), small[0..35], null) == null);
+    // a quote of exactly 8 bytes (an echo header) is enough for ping, 4 payload bytes for flow-stable UDP
+    try testing.expect(errQueuePacket(.v4, testErrInfo(probe[0..8], .v4, 11, 0, test_dest, router_a), &out, null) != null);
+    try testing.expect(errQueuePacket(.v4, testErrInfo(probe[0..4], .v4, 11, 0, test_dest, router_a), &out, .{ .sport = 1, .flow_stable = true }) != null);
+    try testing.expect(errQueuePacket(.v4, testErrInfo(probe[0..3], .v4, 11, 0, test_dest, router_a), &out, .{ .sport = 1, .flow_stable = true }) == null);
+    // the quote is cut at 1024 bytes
+    var long: [2000]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, long[0..8], 1, 1);
+    const pl = errQueuePacket(.v4, testErrInfo(&long, .v4, 11, 0, test_dest, router_a), &out, null).?;
+    try testing.expectEqual(@as(usize, 28 + 1024), pl.len);
+    // v4, UDP socket with a flow-stable id: UDP header rebuilt in front of the payload
+    var payload: [8]u8 = .{ 0xAA, 0xBB, 0x12, 0x34, 1, 2, 3, 4 };
+    var ei = testErrInfo(&payload, .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
+    ei.src = .{ .v4 = .{ .port = std.mem.nativeToBig(u16, 33434), .addr = std.mem.bytesToValue(u32, &[4]u8{ 192, 0, 2, 99 }) } };
+    const pu = errQueuePacket(.v4, ei, &out, .{ .sport = 0x7777, .flow_stable = true }).?;
+    try testing.expectEqual(@as(usize, 8 + 20 + 8 + payload.len), pu.len);
+    try testing.expectEqual(@as(u8, 17), out[17]); // UDP
+    try testing.expectEqual(@as(u16, 20 + 8 + payload.len), std.mem.readInt(u16, out[10..12], .big));
+    try testing.expectEqual(@as(u16, 0x7777), std.mem.readInt(u16, out[28..30], .big)); // source port
+    try testing.expectEqual(@as(u16, 33434), std.mem.readInt(u16, out[30..32], .big)); // destination port
+    try testing.expectEqual(@as(u16, 8 + payload.len), std.mem.readInt(u16, out[32..34], .big)); // UDP length
+    try testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, out[34..36], .big)); // the id as checksum
+    try testing.expectEqualSlices(u8, &payload, out[36..pu.len]);
+    // v6, ping socket: 0x60, payload length, ICMPv6 next header, hop limit 1; no checksum computed here
+    var probe6: [echo.echo_header_len + 24]u8 = @splat(0);
+    try echo.writeEchoRequest(.v6, &probe6, 0x4242, 9);
+    var d6: [16]u8 = @splat(0);
+    d6[15] = 0x99;
+    var r6 = d6;
+    r6[15] = 1;
+    const p6 = errQueuePacket(.v6, testErrInfo(&probe6, .v6, echo.v6.time_exceeded, 0, .{ .v6 = d6 }, .{ .v6 = r6 }), &out, null).?;
+    try testing.expectEqual(@as(usize, 8 + 40 + probe6.len), p6.len);
+    try testing.expectEqual(@as(u8, 0x60), out[8]);
+    try testing.expectEqual(@as(u16, probe6.len), std.mem.readInt(u16, out[12..14], .big));
+    try testing.expectEqual(@as(u8, 58), out[14]);
+    try testing.expectEqual(@as(u8, 1), out[15]);
+    try testing.expectEqualSlices(u8, &d6, out[32..48]);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, out[2..4], .big));
+}
+
+test "mutation 2026-11-27: LinuxTransport.sockAddr uses network byte order; destOf refuses another family" {
+    const s4 = LinuxTransport.sockAddr(ip4(1, 2, 3, 4), 33434);
+    try testing.expectEqual(std.mem.nativeToBig(u16, 33434), s4.v4.port);
+    var a6: [16]u8 = @splat(0);
+    a6[15] = 1;
+    const s6 = LinuxTransport.sockAddr(.{ .v6 = a6 }, 33434);
+    try testing.expectEqual(std.mem.nativeToBig(u16, 33434), s6.v6.port);
+    var lt4: LinuxTransport = .{ .sock = .{ .fd = -1, .kind = .dgram, .family = .v4, .ident = 0 }, .dest = .{ .v4 = .{ .port = 0, .addr = 0 } } };
+    _ = try lt4.destOf(ip4(1, 2, 3, 4));
+    try testing.expectError(error.SendFailed, lt4.destOf(.{ .v6 = a6 }));
+    var lt6: LinuxTransport = .{ .sock = .{ .fd = -1, .kind = .dgram, .family = .v6, .ident = 0 }, .dest = .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = a6, .scope_id = 0 } } };
+    _ = try lt6.destOf(.{ .v6 = a6 });
+    try testing.expectError(error.SendFailed, lt6.destOf(ip4(1, 2, 3, 4)));
+}
+
+const LossySet = struct {
+    f: *SetFake,
+    mask: u64,
+    n: u8 = 0,
+
+    fn transport(l: *LossySet) Transport {
+        var t = l.f.transport();
+        t.ctx = l;
+        t.sendToFn = sendTo;
+        t.recvFn = recv;
+        t.nowFn = now;
+        return t;
+    }
+    fn sendTo(ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, packet: []const u8) TransportError!void {
+        const l: *LossySet = @ptrCast(@alignCast(ctx));
+        const lost = l.n < 64 and (l.mask >> @as(u6, @intCast(l.n))) & 1 == 1;
+        l.n +|= 1;
+        if (lost) {
+            l.f.log.append(testing.allocator, .{ .dest = dest, .ttl = ttl }) catch return error.SendFailed;
+            return;
+        }
+        return SetFake.sendTo(l.f, dest, ttl, packet);
+    }
+    fn recv(ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet {
+        const l: *LossySet = @ptrCast(@alignCast(ctx));
+        return SetFake.recv(l.f, buf, timeout_ns);
+    }
+    fn now(ctx: *anyopaque) u64 {
+        const l: *LossySet = @ptrCast(@alignCast(ctx));
+        return SetFake.now(l.f);
+    }
+};
+
+test "mutation 2026-11-27: MtrSet: a hop is settled by settle_rounds answers, not by probes sent; both members must have settled" {
+    var f: SetFake = .{ .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply } },
+        .{ .dest = set_dest_2, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply } },
+    } };
+    defer f.deinit();
+    // round 1 sends #0..#7 (TTL by TTL, member by member): #0 is member 1's TTL 1, #3 member 2's TTL 2: both lost
+    var l: LossySet = .{ .f = &f, .mask = (1 << 0) | (1 << 3) };
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 4, .gap_ms = 1 }, .verify_every = 0 });
+    defer set.deinit();
+    _ = try set.add(set_dest_1);
+    _ = try set.add(set_dest_2);
+    for (0..3) |_| try set.round(l.transport());
+    const mark = f.log.items.len;
+    try set.round(l.transport());
+    // member 1's TTL 1 and member 2's TTL 2 have 2 answers in 3 probes: not settled, so nothing is shared yet
+    try testing.expectEqual(@as(usize, 1), f.count(mark, set_dest_2, 1));
+    try testing.expectEqual(@as(usize, 1), f.count(mark, set_dest_2, 2));
+    for (0..2) |_| try set.round(l.transport());
+    const mark2 = f.log.items.len;
+    try set.round(l.transport());
+    try testing.expectEqual(@as(usize, 0), f.count(mark2, set_dest_2, 1));
+    try testing.expectEqual(@as(usize, 0), f.count(mark2, set_dest_2, 2));
+    try testing.expectEqual(@as(usize, 1), f.count(mark2, set_dest_1, 1));
+    // the path ends at TTL 3 (the destination's reply): no TTL past it is probed, for either member
+    for ([_]netaddr.Ip{ set_dest_1, set_dest_2 }) |d| try testing.expectEqual(@as(usize, 0), f.count(mark, d, 4));
+    for ([_]netaddr.Ip{ set_dest_1, set_dest_2 }) |d| try testing.expectEqual(@as(usize, 0), f.count(mark2, d, 4));
+}
+
+test "mutation 2026-11-27: MtrSet: first answer wins, RTT is send to answer, a complete round ends early, TCP goes through the per-destination send" {
+    var f: SetFake = .{ .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply } },
+    } };
+    defer f.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 3, .gap_ms = 1 }, .verify_every = 0 });
+    defer set.deinit();
+    const one = try set.add(set_dest_1);
+    f.inner.dest = set_dest_1;
+    try mtQueueTE(&f.inner, set.opts.mtr.wireBase(0, max_set_members * set.cap), router_c, f.inner.clock + 500_000);
+    const t0 = f.inner.clock;
+    try set.round(f.transport());
+    try testing.expect(f.inner.clock - t0 < 100 * std.time.ns_per_ms); // every probe answered: no wait for timeout_ms
+    const h = set.member(one).?.mtr.hops();
+    try testing.expect(h[0].address.?.eql(router_c)); // the earlier of two answers to one probe
+    try testing.expectEqual(@as(?u64, 500_000), h[0].last_ns);
+    try testing.expectEqual(@as(?u64, 2 * std.time.ns_per_ms), h[1].last_ns);
+
+    var tset = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .method = .tcp, .max_hops = 2, .gap_ms = 20, .timeout_ms = 1000 } });
+    defer tset.deinit();
+    _ = try tset.add(test_dest);
+    var tc = mtBase();
+    tc.sendTcpToFn = mtNullSendTcpTo;
+    tc.recvTcpFn = mtNullRecvTcp;
+    try tset.round(tc); // only sendTcpToFn is set: a probe through sendTcpFn would be a null call
+}
+
+test "mutation 2026-11-27: MtrSet: verification rounds are staggered over members, flow-stable UDP needs a flow source of the family" {
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{}, .verify_every = 7 });
+    defer set.deinit();
+    try testing.expect(set.verifying(0));
+    try testing.expect(set.verifying(1)); // member i is shifted by 7 * i rounds
+    try testing.expect(set.verifying(2));
+    set.rounds = 1;
+    try testing.expect(!set.verifying(0));
+    set.opts.verify_every = 0;
+    try testing.expect(!set.verifying(0));
+
+    var fs = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .method = .udp, .flow_stable = true, .max_hops = 2 } });
+    defer fs.deinit();
+    _ = try fs.add(test_dest);
+    var t = mtBase();
+    t.sendUdpToFn = mtNullSendUdpTo;
+    t.flow_source = .{ .v6 = @as([16]u8, @splat(1)) };
+    try testing.expectError(error.SendFailed, fs.round(t));
+}
+
+test "mutation 2026-11-27: Prober.classify (UDP): a Port Unreachable with no known source is the destination's reply, from anyone else a refusal" {
+    var p: Prober = .{ .t = mtBase(), .dest = test_dest, .family = .v4, .method = .udp, .ident = 0x7474, .payload_size = 24, .payload_fill = 0, .flow_stable = false, .udp_port = 33434, .tcp_port = 80 };
+    var buf: [128]u8 = undefined;
+    const msg = mtUdpErr(&buf, 5, 0x7474, 33434, .{ 192, 0, 2, 99 });
+    buf[0] = echo.v4.dest_unreachable;
+    buf[1] = 3; // port unreachable
+    std.mem.writeInt(u16, buf[2..4], echo.checksum(msg), .big);
+    const none = p.classify(msg, null).?;
+    try testing.expectEqual(Probe.Kind.reply, none.probe.kind);
+    try testing.expect(none.probe.address.?.eql(test_dest));
+    try testing.expectEqual(@as(u16, 33434), none.wire);
+    try testing.expectEqual(Probe.Kind.reply, p.classify(msg, test_dest).?.probe.kind);
+    try testing.expectEqual(Probe.Kind.dest_unreachable, p.classify(msg, router_a).?.probe.kind);
+}
+
+test "mutation 2026-11-27: MtrHop: no probes sent is no loss; geomean clamps at 2^64" {
+    try testing.expectEqual(@as(u32, 0), (MtrHop{ .ttl = 1 }).lossPermille());
+    // find the f64 whose exp is exactly 2^64 (the literal 18446744073709551615.0 is 2^64 as an f64)
+    var x = @log(@as(f64, 18446744073709551616.0));
+    var k: usize = 0;
+    while (k < 200 and @exp(x) != 18446744073709551616.0) : (k += 1) x = std.math.nextAfter(f64, x, 100);
+    if (@exp(x) == 18446744073709551616.0) {
+        const h: MtrHop = .{ .ttl = 1, .received = 1, .sum_ln_ns = x };
+        try testing.expectEqual(@as(?u64, std.math.maxInt(u64)), h.geomeanNs());
+    }
+}
+
+test "mutation 2026-11-27: traceWith: a send that fails inside a hop keeps that hop" {
+    const bh = [_]Behavior{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b } };
+    var f: FakeTransport = .{ .behaviors = &bh };
+    defer f.deinit();
+    var l: Lossy = .{ .f = &f, .mask = 0, .fail_at = 1 }; // the second probe of the first hop
+    var tr = try traceWith(testing.allocator, l.transport(), test_dest, .{ .max_hops = 2, .probes_per_hop = 2, .timeout_ms = 10 });
+    defer tr.deinit(testing.allocator);
+    try testing.expectEqual(@as(?TransportError, error.SendFailed), tr.transport_err);
+    try testing.expectEqual(@as(usize, 1), tr.hops.len);
+    try testing.expectEqual(@as(usize, 2), tr.probes.len);
+    try testing.expectEqual(Probe.Kind.time_exceeded, tr.probes[0].kind);
+}
+
+test "mutation 2026-11-27: LinuxTransport.ident, transport() and withKeptIface" {
+    var lt: LinuxTransport = .{ .sock = .{ .fd = -1, .kind = .raw, .family = .v4, .ident = 0x1234 }, .dest = .{ .v4 = .{ .port = 0, .addr = 0 } } };
+    try testing.expectEqual(@as(u16, 0x1234), lt.ident());
+    try testing.expect(lt.transport().strip_ip_header); // raw IPv4 sockets deliver the IP header
+    lt.udp_fd = 5;
+    lt.udp_port = 777;
+    try testing.expectEqual(@as(u16, 777), lt.ident()); // the UDP method's token is the source port
+    lt.sock.kind = .dgram;
+    try testing.expect(!lt.transport().strip_ip_header);
+    lt.sock.kind = .raw;
+    lt.sock.family = .v6;
+    try testing.expect(!lt.transport().strip_ip_header);
+    try testing.expect(lt.withKeptIface(.{}).iface == null);
+    lt.iface_buf[0..3].* = "eth".*;
+    lt.iface_len = 3;
+    try testing.expectEqualStrings("eth", lt.withKeptIface(.{}).iface.?);
+}
+
+test "mutation 2026-11-27: MtrSet.round: a member does not take a TTL from a member that borrows it itself" {
+    // x and i part at TTL 1 (a vs b); j is silent there, so it agrees with
+    // both, and x, j, i all agree on router c at TTL 2. x-j and j-i share
+    // TTL 1-2, x-i do not: sharing is not transitive. j borrows both from x,
+    // so i cannot take them from j and probes them itself.
+    var f: SetFake = .{ .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_c }, .reply } },
+        .{ .dest = set_dest_2, .behaviors = &.{ .drop, .{ .time_exceeded = router_c }, .reply } },
+        .{ .dest = set_dest_3, .behaviors = &.{ .{ .time_exceeded = router_b }, .{ .time_exceeded = router_c }, .reply } },
+    } };
+    defer f.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 5, .gap_ms = 1 }, .settle_rounds = 3, .verify_every = 0 });
+    defer set.deinit();
+    _ = try set.add(set_dest_1);
+    _ = try set.add(set_dest_2);
+    const three = try set.add(set_dest_3);
+    for (0..3) |_| try set.round(f.transport());
+    const mark = f.log.items.len;
+    try set.round(f.transport());
+    for ([_]u8{ 1, 2 }) |ttl| {
+        try testing.expectEqual(@as(usize, 1), f.count(mark, set_dest_1, ttl));
+        try testing.expectEqual(@as(usize, 0), f.count(mark, set_dest_2, ttl)); // borrowed from x
+        try testing.expectEqual(@as(usize, 1), f.count(mark, set_dest_3, ttl)); // not j's to give
+    }
+    const m3 = set.member(three).?;
+    try testing.expectEqualSlices(bool, &.{ false, false, false }, m3.sharedLastRound());
+    try testing.expect(m3.mtr.lastRound()[0].address.?.eql(router_b));
+}
+
+test "mutation 2026-11-27: MtrSet.round: a member takes a shared TTL from the lowest member that probes it" {
+    // x and y part at TTL 1 (a vs b); i is silent there and agrees with both
+    // on router c at TTL 2: i shares with x and with y, which do not share
+    // with each other. i takes the lowest, x, so TTL 1 shows router a.
+    var f: SetFake = .{ .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_c }, .reply } },
+        .{ .dest = set_dest_2, .behaviors = &.{ .{ .time_exceeded = router_b }, .{ .time_exceeded = router_c }, .reply } },
+        .{ .dest = set_dest_3, .behaviors = &.{ .drop, .{ .time_exceeded = router_c }, .reply } },
+    } };
+    defer f.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 5, .gap_ms = 1 }, .settle_rounds = 3, .verify_every = 0 });
+    defer set.deinit();
+    _ = try set.add(set_dest_1);
+    _ = try set.add(set_dest_2);
+    const three = try set.add(set_dest_3);
+    for (0..3) |_| try set.round(f.transport());
+    const mark = f.log.items.len;
+    try set.round(f.transport());
+    for ([_]u8{ 1, 2 }) |ttl| {
+        try testing.expectEqual(@as(usize, 1), f.count(mark, set_dest_1, ttl));
+        try testing.expectEqual(@as(usize, 0), f.count(mark, set_dest_3, ttl));
+    }
+    try testing.expectEqual(@as(usize, 1), f.count(mark, set_dest_2, 1)); // y keeps its own TTL 1
+    const m3 = set.member(three).?;
+    try testing.expectEqualSlices(bool, &.{ true, true, false }, m3.sharedLastRound());
+    try testing.expect(m3.mtr.lastRound()[0].address.?.eql(router_a)); // x's, not y's
+}

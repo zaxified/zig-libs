@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation run (971/1098, 127 eq); 32 tests inline in `src/root.zig`. Test only.
 - **2026-11-21** — **Behaviour change:** `LinuxTransport` (TCP method): an ICMP error queued on a probe's socket that is neither Time Exceeded nor Destination Unreachable (ICMPv6 Packet Too Big, redirect, parameter problem) no longer ends the attempt as a `*`; the attempt stays open and the handshake can still answer (`syn_ack` / `rst`), as the kernel lowers its path MTU and retransmits.
 - **2026-11-15** — **CONSUMER-VISIBLE (fix):** `Mtr.hops()` / `lastRound()` (and `MtrSet` members) of a path whose destination has not answered now end one probed TTL after the last that answered, as mtr shows its `???` row: a silent destination showed nothing past the last router, as if the path ended there. Before any answer that is TTL 1 alone, once probed. A reached path or a Destination Unreachable end is unchanged. Found on a live target that stopped answering (its trace ended at hop 18).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** private `onesSum` (duplicate-code pass) calls `icmp.checksum.sum`; same results.
