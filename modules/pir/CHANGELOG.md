@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation run (223/240, 17 eq); 10 tests in `src/mutation_test.zig`; the unused `burn.codec_burn` constant removed.
 - **2026-11-21** — New `pir.Cuckoo(domain_bits, h)` (`cuckoo.zig`): collision-free keyword lookup as the reference's cuckoo-hashed DPF-PIR database. `candidates(seed, keyword)` gives the `h` slots, `place(seed, keywords, table, slot_of, max_kicks)` places every keyword offline (`error.TableFull`: re-seed), the client queries all `h` candidates through `Multi(h)`. Additive; `keywordIndex`/`queryKeyword` unchanged.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** follows the fss API change (`DpfWith`/`MpfWith.genWithSeeds` take α and β by `*const`): the three call sites pass pointers to locals.
 

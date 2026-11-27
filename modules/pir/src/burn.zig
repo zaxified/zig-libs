@@ -41,7 +41,3 @@ pub const query_burn = 16 * 1024;
 /// `Verified.reconstruct` / `reconstructFromBytes`: one fixed-trip loop over
 /// the answers with the MAC word (per answer, so tight; not yet measured).
 pub const reconstruct_burn = 4 * 1024;
-
-/// Share codec (`shareToBytes`, `shareFromBytes`): a copy of the `fss` key
-/// codec, which burns itself (per call, tight; not yet measured).
-pub const codec_burn = 2 * 1024;

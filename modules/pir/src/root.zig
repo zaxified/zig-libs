@@ -154,6 +154,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 test "SELF: the README's end-to-end example compiles and retrieves" {

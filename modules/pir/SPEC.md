@@ -6,7 +6,7 @@
 
 **Scope:** core — google/distributed_point_functions PIR (two-server DPF family) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-06 (52/53, 1 eq) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-27 (223/240, 17 eq) · src e086884d139fb4ed
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, PIR_FUZZ) · ct 2026-09-09 (ctgrind)
 
@@ -883,6 +883,12 @@ That is the access-pattern claim in `answer`'s doc comment, made falsifiable.
   secret / share bytes as needles in any frame (ReleaseFast only).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over
   the last whole-module mutation run and the delta runs after it.
+- **Mutation run (2026-11-27, whole module):** 240 mutants (225 logic in ReleaseSafe, 15 burn/wipe in the
+  ReleaseFast stack probe): 223 killed (2 by hang), 10 equivalent (cuckoo victim-choice heuristics, a loop bound,
+  a second domain check, burns cut to n/4 that still cover their body), 7 unobservable (the burns of the two
+  query wrappers, which hold only pointers, the public index and constants; a cuckoo bound at 2^32-1 keywords).
+  The n/64 burn cuts are killed by `DeadStackResidue`. 10 tests in `src/mutation_test.zig`; the unused
+  `burn.codec_burn` was removed (the share codec burns inside `fss`).
 
 ## Where the library stops
 
