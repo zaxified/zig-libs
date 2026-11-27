@@ -734,7 +734,8 @@ fn RateTrip(comptime n: u32) type {
             bucket_ms: u64 = 1_000,
             /// No verdict before the window holds this many calls
             /// (resilience4j `minimumNumberOfCalls`). Default: `n` in count
-            /// mode — a full window.
+            /// mode — a full window; 1 in time mode (a verdict from the first
+            /// call in the window).
             minimum_calls: ?u32 = null,
             /// Trip when failures ≥ this percentage of the window's calls
             /// (1..100; resilience4j default 50).
@@ -2516,4 +2517,5 @@ test "Retry.nextDelayFrom: proportional jitter with an uncapped (maxInt) ceiling
 test {
     _ = @import("model_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("mutation_test.zig");
 }
