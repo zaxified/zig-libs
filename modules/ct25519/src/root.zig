@@ -1947,8 +1947,6 @@ noinline fn signEd25519Unburned(
     msg: []const u8,
     noise: ?[std.crypto.sign.Ed25519.noise_length]u8,
 ) Ed25519SignError!std.crypto.sign.Ed25519.Signature {
-    const Sha512 = std.crypto.hash.sha2.Sha512;
-    const sc = Edwards25519.scalar;
     const pk = key_pair.public_key.toBytes();
     // std's check, without its early-exit compare: both operands are PUBLIC
     // keys, so the verdict is declassified for memcheck (a caller that taints
@@ -1957,22 +1955,148 @@ noinline fn signEd25519Unburned(
     std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&keys_match));
     if (!keys_match) return error.KeyMismatch;
 
-    // RFC 8032 §5.1.5: a = clamp(low half of SHA-512(seed)), prefix = high half.
+    var a: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &a);
+    var prefix: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &prefix);
+    expandSeed(&key_pair.secret_key, &a, &prefix);
+    return signCore(&a, &prefix, &pk, false, msg, if (noise) |*z| z else null);
+}
+
+/// `signEd25519` for a caller that trusts nothing but the seed: the public
+/// key embedded in `secret_key` is RE-DERIVED from the seed in every call
+/// (`[a]B`, sharing one field inversion with `[r]B` on the comb) and compared,
+/// `error.KeyMismatch` when they differ. A public half corrupted in memory (a
+/// fault, a bit flip) is caught before two signatures of one message under two
+/// public keys could leak the scalar. One SHA-512 expansion per call; a key
+/// that signs many times wants `Ed25519Signer`. Burned (`burn.sign_burn`).
+pub fn signEd25519Checked(
+    secret_key: *const std.crypto.sign.Ed25519.SecretKey,
+    msg: []const u8,
+    noise: ?[std.crypto.sign.Ed25519.noise_length]u8,
+) Ed25519SignError!std.crypto.sign.Ed25519.Signature {
+    const sig = signEd25519CheckedUnburned(secret_key, msg, noise);
+    burn.stack(burn.sign_burn);
+    return sig;
+}
+
+noinline fn signEd25519CheckedUnburned(
+    secret_key: *const std.crypto.sign.Ed25519.SecretKey,
+    msg: []const u8,
+    noise: ?[std.crypto.sign.Ed25519.noise_length]u8,
+) Ed25519SignError!std.crypto.sign.Ed25519.Signature {
+    var a: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &a);
+    var prefix: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &prefix);
+    expandSeed(secret_key, &a, &prefix);
+    const pk = secret_key.publicKeyBytes();
+    return signCore(&a, &prefix, &pk, true, msg, if (noise) |*z| z else null);
+}
+
+/// When an `Ed25519Signer` re-derives its public key from the scalar.
+pub const Ed25519PkCheck = enum {
+    /// Once, in `initInto` (the default): a signature is ONE base
+    /// multiplication.
+    once_at_load,
+    /// Also in every signature, as `signEd25519Checked` does: a second base
+    /// multiplication per call (sharing the field inversion), so a public
+    /// half corrupted after load is still caught.
+    every_sign,
+};
+
+/// An Ed25519 key prepared for many signatures: the SHA-512 expansion of the
+/// seed and the check that the embedded public half is `[a]B` are done once,
+/// in `initInto`. Signatures are byte-identical to `signEd25519`'s (and std's)
+/// for the same key, message and `noise`. Holds secrets (the clamped scalar
+/// and the nonce prefix): keep it in place, never copy it by value, and
+/// `deinit` wipes it.
+pub const Ed25519Signer = struct {
+    a: [32]u8,
+    prefix: [32]u8,
+    public_key: [32]u8,
+    pk_check: Ed25519PkCheck,
+
+    pub const InitError = error{KeyMismatch};
+
+    /// Expand `secret_key`'s seed into `out` and check `[a]B` against the
+    /// embedded public half (`error.KeyMismatch`, `out` zeroed). Burned.
+    pub fn initInto(out: *Ed25519Signer, secret_key: *const std.crypto.sign.Ed25519.SecretKey, pk_check: Ed25519PkCheck) InitError!void {
+        const ok = initUnburned(out, secret_key, pk_check);
+        burn.stack(burn.sign_burn);
+        if (!ok) {
+            std.crypto.secureZero(u8, std.mem.asBytes(out));
+            return error.KeyMismatch;
+        }
+    }
+
+    noinline fn initUnburned(out: *Ed25519Signer, secret_key: *const std.crypto.sign.Ed25519.SecretKey, pk_check: Ed25519PkCheck) bool {
+        out.pk_check = pk_check;
+        out.public_key = secret_key.publicKeyBytes();
+        expandSeed(secret_key, &out.a, &out.prefix);
+        var derived = mulBaseEncode(out.a);
+        defer std.crypto.secureZero(u8, &derived);
+        // Both operands are public keys once they agree; the verdict is
+        // declassified for memcheck, as `signEd25519`'s embedded-key check.
+        var ok = std.crypto.timing_safe.eql([32]u8, derived, out.public_key);
+        std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&ok));
+        return ok;
+    }
+
+    /// Wipe the prepared scalar, prefix and public key.
+    pub fn deinit(self: *Ed25519Signer) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+
+    /// RFC 8032 §5.1.6 over the prepared key; `noise = null` is the
+    /// deterministic signature. Burned (`burn.sign_burn`).
+    pub fn sign(self: *const Ed25519Signer, msg: []const u8, noise: ?[std.crypto.sign.Ed25519.noise_length]u8) Ed25519SignError!std.crypto.sign.Ed25519.Signature {
+        const sig = signUnburned(self, msg, noise);
+        burn.stack(burn.sign_burn);
+        return sig;
+    }
+
+    noinline fn signUnburned(self: *const Ed25519Signer, msg: []const u8, noise: ?[std.crypto.sign.Ed25519.noise_length]u8) Ed25519SignError!std.crypto.sign.Ed25519.Signature {
+        return signCore(&self.a, &self.prefix, &self.public_key, self.pk_check == .every_sign, msg, if (noise) |*z| z else null);
+    }
+};
+
+/// RFC 8032 §5.1.5: `a` = clamp(low half of SHA-512(seed)), `prefix` = the
+/// high half. The hash is wiped; `a`/`prefix` are the caller's to wipe.
+fn expandSeed(secret_key: *const std.crypto.sign.Ed25519.SecretKey, a: *[32]u8, prefix: *[32]u8) void {
+    const Sha512 = std.crypto.hash.sha2.Sha512;
     var az: [64]u8 = undefined;
     defer std.crypto.secureZero(u8, &az);
-    var seed = key_pair.secret_key.seed();
+    var seed = secret_key.seed();
     defer std.crypto.secureZero(u8, &seed);
     Sha512.hash(&seed, &az, .{});
-    var a: [32]u8 = az[0..32].*;
-    defer std.crypto.secureZero(u8, &a);
-    sc.clamp(&a);
+    a.* = az[0..32].*;
+    prefix.* = az[32..64].*;
+    Edwards25519.scalar.clamp(a);
+}
+
+/// RFC 8032 §5.1.6 from the expanded key, shared by `signEd25519`,
+/// `signEd25519Checked` and `Ed25519Signer`. `check_public_key`: re-derive
+/// `[a]B` (with `[r]B`, one shared inversion) and compare it with
+/// `public_key`; without it `public_key` is trusted to be `[a]B`. Not burned
+/// itself: every caller runs it inside its own burned body.
+fn signCore(
+    a: *const [32]u8,
+    prefix: *const [32]u8,
+    public_key: *const [32]u8,
+    check_public_key: bool,
+    msg: []const u8,
+    noise: ?*const [std.crypto.sign.Ed25519.noise_length]u8,
+) Ed25519SignError!std.crypto.sign.Ed25519.Signature {
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    const sc = Edwards25519.scalar;
 
     // r = SHA-512([noise] || prefix || M) mod L — std's order, noise first.
     var nh = Sha512.init(.{});
     // Its buffer holds the tail of [noise] || prefix || M.
     defer std.crypto.secureZero(u8, std.mem.asBytes(&nh));
-    if (noise) |*z| nh.update(z);
-    nh.update(az[32..64]);
+    if (noise) |z| nh.update(z);
+    nh.update(prefix);
     nh.update(msg);
     var r64: [64]u8 = undefined;
     defer std.crypto.secureZero(u8, &r64);
@@ -1980,7 +2104,18 @@ noinline fn signEd25519Unburned(
     var r = sc.reduce64(r64);
     defer std.crypto.secureZero(u8, &r);
 
-    const r_bytes = mulBaseEncode(r);
+    var r_bytes: [32]u8 = undefined;
+    if (check_public_key) {
+        const enc = mulBaseEncode2(a.*, r);
+        // A mismatch means a corrupted key; the verdict compares two public
+        // encodings, so it is declassified for memcheck.
+        var pk_ok = std.crypto.timing_safe.eql([32]u8, enc[0], public_key.*);
+        std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&pk_ok));
+        if (!pk_ok) return error.KeyMismatch;
+        r_bytes = enc[1];
+    } else {
+        r_bytes = mulBaseEncode(r);
+    }
     // std's `basePoint.mul` rejects R = O (r = 0 mod L, probability 2^-252);
     // O encodes as y = 1, x = 0. The flag is computed without a branch; the
     // one branch is on that flag, a function of `R` — the public half of the
@@ -1994,12 +2129,12 @@ noinline fn signEd25519Unburned(
 
     var kh = Sha512.init(.{});
     kh.update(&r_bytes);
-    kh.update(&pk);
+    kh.update(public_key);
     kh.update(msg);
     var k64: [64]u8 = undefined;
     kh.final(&k64);
     const k = sc.reduce64(k64);
-    return .{ .r = r_bytes, .s = sc.mulAdd(k, a, r) };
+    return .{ .r = r_bytes, .s = sc.mulAdd(k, a.*, r) };
 }
 
 // ── constant-time multi-scalar multiplication (audit `bulletproofs` B9) ───
@@ -3120,6 +3255,62 @@ test "signEd25519 reproduces RFC 8032 section 7.1 TEST 1 and refuses a key pair 
     other.public_key = (try Ed.KeyPair.generateDeterministic(@splat(7))).public_key;
     try testing.expectError(error.KeyMismatch, other.sign("m", null));
     try testing.expectError(error.KeyMismatch, signEd25519(&other, "m", null));
+}
+
+test "Ed25519Signer (both checks) and signEd25519Checked are byte-identical to std's KeyPair.sign on 2000 keys, messages and noises" {
+    const Ed = std.crypto.sign.Ed25519;
+    var prng = std.Random.DefaultPrng.init(0xED25_9EED);
+    const rnd = prng.random();
+    var n: usize = 0;
+    while (n < 2000) : (n += 1) {
+        var seed: [32]u8 = undefined;
+        rnd.bytes(&seed);
+        const kp = try Ed.KeyPair.generateDeterministic(seed);
+        var msg: [300]u8 = undefined;
+        rnd.bytes(&msg);
+        const m = msg[0..rnd.uintLessThan(usize, msg.len)];
+        var noise: [Ed.noise_length]u8 = undefined;
+        rnd.bytes(&noise);
+        const z: ?[Ed.noise_length]u8 = if (n % 2 == 0) null else noise;
+        const want = (try kp.sign(m, z)).toBytes();
+        var once: Ed25519Signer = undefined;
+        try Ed25519Signer.initInto(&once, &kp.secret_key, .once_at_load);
+        defer once.deinit();
+        var every: Ed25519Signer = undefined;
+        try Ed25519Signer.initInto(&every, &kp.secret_key, .every_sign);
+        defer every.deinit();
+        try testing.expectEqualSlices(u8, &want, &(try once.sign(m, z)).toBytes());
+        try testing.expectEqualSlices(u8, &want, &(try every.sign(m, z)).toBytes());
+        try testing.expectEqualSlices(u8, &want, &(try signEd25519Checked(&kp.secret_key, m, z)).toBytes());
+    }
+}
+
+test "Ed25519Signer and signEd25519Checked refuse a secret key whose embedded public half is not the seed's; every_sign also after load" {
+    const Ed = std.crypto.sign.Ed25519;
+    const kp = try Ed.KeyPair.generateDeterministic(@splat(0x31));
+    const wrong = (try Ed.KeyPair.generateDeterministic(@splat(0x32))).public_key.toBytes();
+    var bad = kp.secret_key;
+    bad.bytes[32..64].* = wrong;
+
+    var s: Ed25519Signer = undefined;
+    try testing.expectError(error.KeyMismatch, Ed25519Signer.initInto(&s, &bad, .once_at_load));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&s), 0)); // zeroed on error
+    try testing.expectError(error.KeyMismatch, Ed25519Signer.initInto(&s, &bad, .every_sign));
+    try testing.expectError(error.KeyMismatch, signEd25519Checked(&bad, "m", null));
+
+    // A public half corrupted AFTER load: `.every_sign` catches it, `.once_at_load` trusts it.
+    var every: Ed25519Signer = undefined;
+    try Ed25519Signer.initInto(&every, &kp.secret_key, .every_sign);
+    every.public_key = wrong;
+    try testing.expectError(error.KeyMismatch, every.sign("m", null));
+    var once: Ed25519Signer = undefined;
+    try Ed25519Signer.initInto(&once, &kp.secret_key, .once_at_load);
+    once.public_key = wrong;
+    _ = try once.sign("m", null);
+
+    // deinit wipes.
+    every.deinit();
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&every), 0));
 }
 
 test "verifyEd25519Strict agrees with std verifyStrict on 12000 valid, mutated and degenerate inputs" {

@@ -287,16 +287,13 @@ pub const SecretKey = union(enum) {
 };
 
 /// When an `Ed25519Signer` verifies that the public key stored in the secret
-/// key really is `[a]B` for the seed.
-pub const Ed25519PkCheck = enum {
-    /// Once, in `init` (the default): signing is ONE base multiplication.
-    once_at_load,
-    /// In every signature, as `sign(.ed25519, ...)` does: a second base
-    /// multiplication per call, so a key whose public half was corrupted in
-    /// memory after load (a fault, a bit flip) is still caught before it can
-    /// leak the scalar through two signatures under two public keys.
-    every_sign,
-};
+/// key really is `[a]B` for the seed: `ct25519`'s enum (`.once_at_load`, the
+/// default: in `init` only, signing is ONE base multiplication; `.every_sign`:
+/// also in every signature, as `sign(.ed25519, ...)` does, a second base
+/// multiplication per call, so a public half corrupted in memory after load is
+/// still caught before it can leak the scalar through two signatures under two
+/// public keys).
+pub const Ed25519PkCheck = ct25519.Ed25519PkCheck;
 
 /// An Ed25519 key prepared for CertificateVerify signing: the SHA-512
 /// expansion and the public-key consistency check (seed -> `[a]B` ==
@@ -304,15 +301,14 @@ pub const Ed25519PkCheck = enum {
 ///
 /// `certverify.sign(.ed25519, ...)` keeps its behaviour -- it re-derives and
 /// compares the public key on EVERY signature (= `.every_sign`); this type
-/// is the opt-in way to sign with one base multiplication. Holds secrets
-/// (the clamped scalar and the nonce prefix): `deinit` wipes it.
+/// is the opt-in way to sign with one base multiplication. The signing is
+/// `ct25519.Ed25519Signer` (burned there); this type adds the RFC 8446 §4.4.3
+/// content and the `random` -> noise draw. Holds secrets (the clamped scalar
+/// and the nonce prefix): `deinit` wipes it.
 pub const Ed25519Signer = struct {
-    a: [32]u8,
-    prefix: [32]u8,
-    public_key: [32]u8,
-    pk_check: Ed25519PkCheck,
+    inner: ct25519.Ed25519Signer,
 
-    pub const InitError = error{KeyMismatch};
+    pub const InitError = ct25519.Ed25519Signer.InitError;
 
     /// `.once_at_load`. `error.KeyMismatch` if the embedded public half is not
     /// the seed's.
@@ -322,25 +318,12 @@ pub const Ed25519Signer = struct {
 
     pub fn initWith(sk: *const Ed25519.SecretKey, pk_check: Ed25519PkCheck) InitError!Ed25519Signer {
         var self: Ed25519Signer = undefined;
-        self.pk_check = pk_check;
-        self.public_key = sk.publicKeyBytes();
-        const ok = burn.run(burn.ed25519_burn, bool, loadChecked, .{ sk, &self });
-        if (!ok) {
-            std.crypto.secureZero(u8, std.mem.asBytes(&self));
-            return error.KeyMismatch;
-        }
+        try ct25519.Ed25519Signer.initInto(&self.inner, sk, pk_check);
         return self;
     }
 
-    fn loadChecked(sk: *const Ed25519.SecretKey, self: *Ed25519Signer) bool {
-        expandSeed(sk, &self.a, &self.prefix);
-        var derived = ct25519.mulBaseEncode(self.a);
-        defer std.crypto.secureZero(u8, &derived);
-        return std.crypto.timing_safe.eql([32]u8, derived, self.public_key);
-    }
-
     pub fn deinit(self: *Ed25519Signer) void {
-        std.crypto.secureZero(u8, std.mem.asBytes(self));
+        self.inner.deinit();
     }
 
     /// `certverify.sign` for this key: RFC 8446 §4.4.3 content from
@@ -354,11 +337,9 @@ pub const Ed25519Signer = struct {
     /// `certverify.signContent` for this key.
     pub fn signContent(self: *const Ed25519Signer, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
         if (out.len < Ed25519.Signature.encoded_length) return error.BufferTooSmall;
-        return burn.run(burn.ed25519_burn, SignError![]u8, signPrepared, .{ self, content, random, out });
-    }
-
-    fn signPrepared(self: *const Ed25519Signer, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
-        return signCore(&self.a, &self.prefix, &self.public_key, self.pk_check == .every_sign, content, random, out);
+        var noise: ?[Ed25519.noise_length]u8 = drawEd25519Noise(random);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&noise));
+        return ed25519Out(self.inner.sign(content, noise), out);
     }
 };
 
@@ -729,7 +710,7 @@ pub fn signContentWith(
                 else => return error.KeyMismatch,
             };
             if (out.len < Ed25519.Signature.encoded_length) return error.BufferTooSmall;
-            break :blk burn.run(burn.ed25519_burn, SignError![]u8, signEd25519, .{ sk, content, random, out });
+            break :blk signEd25519(sk, content, random, out);
         },
         .ecdsa_secp521r1_sha512 => blk: {
             const sk = switch (secret_key) {
@@ -961,85 +942,34 @@ fn verifyEd25519(pk: Ed25519.PublicKey, content: []const u8, signature: []const 
 }
 
 fn signEd25519(sk: *const Ed25519.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
-    // RFC 8032 §5.1.6 over `ct25519.mulBaseEncode2` (fixed-base comb on the
-    // 4x64 field). std's `KeyPair.generateDeterministic` + `sign` would do two
-    // base multiplications with its own ladder (one for the public half, one
-    // for R); this does the same two with the comb, sharing one field
-    // inversion. Byte-identical output to std's signer (pinned by the KATs).
-    var a: [32]u8 = undefined;
-    var prefix: [32]u8 = undefined;
-    defer std.crypto.secureZero(u8, &a);
-    defer std.crypto.secureZero(u8, &prefix);
-    expandSeed(sk, &a, &prefix);
-    const public_key = sk.publicKeyBytes();
-    return signCore(&a, &prefix, &public_key, true, content, random, out);
+    // RFC 8032 §5.1.6 on `ct25519`'s fixed-base comb, the public key
+    // re-derived from the seed and compared in every call (both base
+    // multiplications share one field inversion); burned there.
+    // Byte-identical output to std's signer (pinned by the KATs).
+    var noise: ?[Ed25519.noise_length]u8 = drawEd25519Noise(random);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&noise));
+    return ed25519Out(ct25519.signEd25519Checked(sk, content, noise), out);
 }
 
-/// RFC 8032 §5.1.5: `a` = the clamped low half of SHA-512(seed), `prefix` =
-/// the high half.
-fn expandSeed(sk: *const Ed25519.SecretKey, a: *[32]u8, prefix: *[32]u8) void {
-    const Sha512 = std.crypto.hash.sha2.Sha512;
-    const seed = sk.seed();
-    var h: [Sha512.digest_length]u8 = undefined;
-    Sha512.hash(&seed, &h, .{});
-    defer std.crypto.secureZero(u8, &h);
-    a.* = h[0..32].*;
-    prefix.* = h[32..64].*;
-    std.crypto.ecc.Edwards25519.scalar.clamp(a);
+/// `random` null => the standard deterministic RFC 8032 signature; else 32
+/// bytes of hedging noise (std's `noise` argument). The caller wipes it.
+fn drawEd25519Noise(random: ?std.Random) ?[Ed25519.noise_length]u8 {
+    const rnd = random orelse return null;
+    var z: [Ed25519.noise_length]u8 = undefined;
+    rnd.bytes(&z);
+    return z;
 }
 
-/// RFC 8032 §5.1.6. `check_public_key`: re-derive `[a]B` and compare it with
-/// `public_key` (one extra base multiplication) -- two signatures of one
-/// message under two public keys give away the secret scalar. Without it
-/// `public_key` is trusted to be `[a]B` (`Ed25519Signer` checked it at load).
-fn signCore(a: *const [32]u8, prefix: *const [32]u8, public_key: *const [32]u8, check_public_key: bool, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
-    const Sha512 = std.crypto.hash.sha2.Sha512;
-    const scalar = std.crypto.ecc.Edwards25519.scalar;
-
-    var noise_buf: [Ed25519.noise_length]u8 = undefined;
-    defer std.crypto.secureZero(u8, &noise_buf);
-    var nonce_hash = Sha512.init(.{});
-    if (random) |rnd| { // null => the standard deterministic RFC 8032 signature
-        rnd.bytes(&noise_buf);
-        nonce_hash.update(&noise_buf);
-    }
-    nonce_hash.update(prefix);
-    nonce_hash.update(content);
-    var r64: [64]u8 = undefined;
-    defer std.crypto.secureZero(u8, &r64);
-    nonce_hash.final(&r64);
-    var r = scalar.reduce64(r64);
-    defer std.crypto.secureZero(u8, &r);
-
-    var r_bytes: [32]u8 = undefined;
-    if (check_public_key) {
-        // Compared in every mode (not only under `runtime_safety` like std).
-        // Both base multiplications share one field inversion.
-        const enc = ct25519.mulBaseEncode2(a.*, r);
-        if (!std.crypto.timing_safe.eql([32]u8, enc[0], public_key.*)) return error.KeyMismatch;
-        r_bytes = enc[1];
-    } else {
-        r_bytes = ct25519.mulBaseEncode(r);
-    }
-    // [r]B = O (r = 0 mod L, 2^-252) encodes as y = 1, x = 0.
-    var identity_encoding: [32]u8 = @splat(0);
-    identity_encoding[0] = 1;
-    if (std.mem.eql(u8, &r_bytes, &identity_encoding)) return error.KeyMismatch;
-
-    var k_hash = Sha512.init(.{});
-    k_hash.update(&r_bytes);
-    k_hash.update(public_key);
-    k_hash.update(content);
-    var k64: [64]u8 = undefined;
-    k_hash.final(&k64);
-    const k = scalar.reduce64(k64);
-    var s_bytes = scalar.mulAdd(k, a.*, r);
-    defer std.crypto.secureZero(u8, &s_bytes);
-
-    // Raw 64-byte R || S encoding on the wire (NOT DER); the caller
-    // pre-checked out.len >= encoded_length.
-    @memcpy(out[0..32], &r_bytes);
-    @memcpy(out[32..64], &s_bytes);
+/// The raw 64-byte R || S encoding on the wire (NOT DER); the caller
+/// pre-checked `out.len >= encoded_length`. A key whose public half is not
+/// the seed's, and the 2^-252 `[r]B = O` draw, are `error.KeyMismatch` (as
+/// before `ct25519` carried the signer); the other two errors of the set
+/// cannot come from signing.
+fn ed25519Out(result: ct25519.Ed25519SignError!Ed25519.Signature, out: []u8) SignError![]u8 {
+    const sig = result catch |e| return switch (e) {
+        error.KeyMismatch, error.IdentityElement, error.NonCanonical, error.WeakPublicKey => error.KeyMismatch,
+    };
+    out[0..Ed25519.Signature.encoded_length].* = sig.toBytes();
     return out[0..Ed25519.Signature.encoded_length];
 }
 
@@ -1587,8 +1517,8 @@ test "Ed25519Signer: .once_at_load trusts the stored public key; .every_sign re-
     defer every.deinit();
     // Corrupt the stored public half after load (the fault the per-sign
     // check exists for).
-    once.public_key[5] ^= 1;
-    every.public_key[5] ^= 1;
+    once.inner.public_key[5] ^= 1;
+    every.inner.public_key[5] ^= 1;
     try testing.expectError(error.KeyMismatch, every.signContent("m", null, &out));
     _ = try once.signContent("m", null, &out); // not detected: the documented trade-off
 }

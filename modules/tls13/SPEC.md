@@ -241,14 +241,16 @@ counts pinned in `scripts/checks/ctgrind-expected.tsv`, controls and traps 0):
 - `sign_*` (`certverify.sign`, signing key tainted): P-384 **0**, P-521 **0** (those modules
   declassify the signature; a printed copy of the key is the taint-arrival witness), P-256 10
   (`p256`'s signer: std's `deterministicScalar` rejection loop, `finalizePrehashed` r/s == 0
-  verdicts, the comb and the key-range verdict in `sign.zig`), Ed25519 2 (the signer runs on `ct25519`'s
-  comb: the verdict of the `timing_safe.eql` derived-vs-stored public key check, which says only that the
-  key is inconsistent, and the identity verdict on R = r·B, r ≡ 0 mod L, unreachable in practice),
+  verdicts, the comb and the key-range verdict in `sign.zig`), Ed25519 **0** (since 2026-11-27 the signer
+  is `ct25519`'s `signEd25519Checked` / `Ed25519Signer`, which declassify its two verdicts -- the
+  derived-vs-stored public key check, which says only that the key is inconsistent, and the identity
+  verdict on R = r·B, r ≡ 0 mod L -- as `ct25519.signEd25519` does; they were the row's 2 contexts while
+  this module carried its own copy of the body),
   RSA-PSS 2 (`rsa`'s blinding-pair redraw verdict and its Bellcore fault-check verdict). ML-DSA has
   no row (the signer is std's).
 
-The only contexts in this module's own code are the sampler verdict above and the Ed25519 verdicts of
-`certverify.zig`; neither depends on a secret beyond a verdict. `dtls hs` additionally covers the schedule
+The only contexts in this module's own code are the sampler verdict above (and the FFDHE zero-exponent
+rejection); neither depends on a secret beyond a verdict. `dtls hs` additionally covers the schedule
 inside a handshake.
 
 **Stack requirement.** `kex.stackRequirement(group)`, `certverify.signStackRequirement(scheme)` and
@@ -261,7 +263,7 @@ Dead stack (`CONVENTIONS.md` §2.1.1): secrets in by `*const`, out through out-p
 `expandLabel`, `earlySecret`, `pskBinder`, `verifyPskBinder`, `deriveHandshakeSecret`,
 `deriveMasterSecret`, `computeFinishedVerifyData` and `verifyFinished` run their body under a burn (`burn.ks_burn`), the chaining
 steps need none. `certverify.sign` runs each signer under its own burn (`ecdsa_burn`,
-`ed25519_burn`, `rsa_burn` above `rsa`'s own, `mldsa_sign_burn` / `mldsa_verify_burn` per parameter set);
+Ed25519 inside `ct25519` (`signEd25519Checked`, `Ed25519Signer`: its `sign_burn`), `rsa_burn` above `rsa`'s own, `mldsa_sign_burn` / `mldsa_verify_burn` per parameter set);
 secret keys are borrowed by pointer in every `SecretKey` variant. `kex`'s entry points burn per group
 (`kex_x25519_burn`, `kex_p256_burn`, `kex_p384_burn`, `kex_p521_burn`, `kex_hybrid_burn`,
 `kex_p256_hybrid_burn`, `kex_p384_hybrid_burn`, `kex_mlkem512/768/1024_burn`, `kex_ffdhe_burn`). The

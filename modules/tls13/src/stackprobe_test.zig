@@ -120,7 +120,7 @@ test "STACKPROBE: no key residue after certverify sign/verify, P-521 and ML-DSA"
     try probeMlDsa("mldsa87", mldsa.MLDSA87, .mldsa87);
 }
 
-// ── certverify: Ed25519 (`burn.ed25519_burn`) ────────────────────────────
+// ── certverify: Ed25519 (burned in `ct25519`: `signEd25519Checked`, `Ed25519Signer`) ──
 
 var ed_signer: certverify.Ed25519Signer = undefined;
 
