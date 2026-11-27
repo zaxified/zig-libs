@@ -3912,6 +3912,30 @@ test "server: a handler's CommandFailed closes only its channel (EOF, CLOSE, no 
     try t.expect(std.mem.find(u8, sink.buffered(), "exit-status") == null);
 }
 
+test "mutation 2026-11-27: server: a failing handler's channel is closed by the server itself, without waiting for the client's CLOSE" {
+    const t = std.testing;
+    const Failing = struct {
+        fn run(_: *anyopaque, _: std.mem.Allocator, _: *const RequestInfo, _: []const u8, _: *std.ArrayList(u8), _: *std.ArrayList(u8)) CommandError!u32 {
+            return error.CommandFailed;
+        }
+    };
+    var b: [96]u8 = undefined;
+    var exec_buf: [64]u8 = undefined;
+    var ew: std.Io.Writer = .fixed(&exec_buf);
+    try writeChannelHeader(&ew, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&ew, "exec");
+    try ew.writeByte(0);
+    try messages.writeString(&ew, "id");
+    // No CLOSE from the client: the only CLOSE on the wire is the server's own.
+    const disconnect = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_DISCONNECT), 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var sink_buf: [16 * 1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    const cfg: ServeConfig = .{ .exec = .{ .runInfoFn = Failing.run }, .stdin_mode = .ignore };
+    try serveWith(cfg, &.{ openMsg(&b, 0), ew.buffered(), &disconnect }, &sink);
+    try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_EOF), null, t.allocator));
+    try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE), null, t.allocator));
+}
+
 test "server channels: nothing is answered after our CLOSE; stdin collection is capped at max_input; pty-req refused unless allowed" {
     const t = std.testing;
     var b: [8][64]u8 = undefined;

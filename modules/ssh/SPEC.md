@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSH 10.x (client/server), Go `x/crypto/ssh` as library yardstick (surveyed 2026-09-30; re-assessed 2026-10-06)
 
-**Audit:** review 2026-10-06 · mutation 2026-11-18 (876/1005, 129 eq) · src babe850394a868b0
+**Audit:** review 2026-10-06 · mutation 2026-11-27 (1006/1139, 133 eq) · src d137d687375f424e
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SSH_FUZZ; ssh-pubkey added 2026-10-10) · ct 2026-10-18 (ctgrind; host-key PEM target `pem` added 2026-10-18)
 
@@ -453,6 +453,11 @@ proves interop). `zig build interop-ssh` drives the Go `x/crypto/ssh` oracle (`t
   or `known_hosts` check.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
   mutation run and the delta runs after it.
+- **Delta mutation 2026-11-27 (hostbased in both roles, client password change, the server hooks, source-address
+  rules):** 134 mutants (one wipe mutant in a ReleaseFast `zeroAt` build), 130 killed, 4 equivalent (a buffer
+  size the 1024 spare bytes cover, a service the dispatcher already restricted, an arm the algorithm checks above
+  make unreachable, a reason read only on an earlier return). 13 new tests in `userauth.zig` / `connection.zig`,
+  among them a stack probe for the password-change buffer (positive control: red with the wipe skipped).
 - **No curve25519 KAT:** RFC 8731 publishes no curve25519-sha256 test vectors (its §5 is IANA
   considerations only), so there is no independent known-answer test to wire; the KEX is anchored by the
   live interop lanes.

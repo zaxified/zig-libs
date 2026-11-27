@@ -4750,6 +4750,24 @@ const ua_probe = struct {
         @memcpy(buf[0..secret.len], &secret);
         return secret.len;
     }
+    /// The §8 change: the new password is the secret, written by the caller's
+    /// `PasswordChanger` into `passwordStep`'s own buffer.
+    fn newPassword(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, buf: []u8) ?usize {
+        @memcpy(buf[0..secret.len], &secret);
+        return secret.len;
+    }
+    fn clientChange() UserauthError!void {
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        var fba = std.heap.FixedBufferAllocator.init(&heap);
+        const methods = [_]ClientMethod{.{ .password = "old-password" }};
+        return authenticateWith(&tr, fba.allocator(), "alice", &methods, .{
+            .request_service = false,
+            .password_change = .{ .newFn = newPassword },
+        });
+    }
     fn clientPrompt() UserauthError!void {
         var r: std.Io.Reader = .fixed(framed);
         var sink: std.Io.Writer = .fixed(&sink_buf);
@@ -4780,6 +4798,19 @@ test "STACKPROBE: no prompted-password residue after authenticateWith" {
     ua_probe.framed = try framePackets(&ua_probe.wire, &.{ &fail_pw, &success });
     try ua_probe.clientPrompt(); // positive control: it authenticates
     _ = try ua_probe.P.run("authenticateWith password_prompt", ua_probe.clientPrompt, .{}, &.{&ua_probe.secret}, .{ .burn = false, .residue = false });
+}
+
+test "STACKPROBE: no new-password residue after authenticateWith (the §8 password change)" {
+    try ua_probe.sp.skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha256.hash("ssh probe new password", &ua_probe.secret, .{});
+    var m: [3]Msg = undefined;
+    ua_probe.framed = try framePackets(&ua_probe.wire, &.{
+        m[0].failure("password", false).bytes(),
+        changeReq(&m[1], "expired"),
+        m[2].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+    });
+    try ua_probe.clientChange(); // positive control: it authenticates
+    _ = try ua_probe.P.run("authenticateWith password change", ua_probe.clientChange, .{}, &.{&ua_probe.secret}, .{ .burn = false, .residue = false });
 }
 
 test "serveUserauth: a keyboard-interactive answer is scrubbed from the scratch before the next round is read" {
@@ -5496,4 +5527,509 @@ test "authenticatePassword: without a changer a change request stays Unsupported
         }));
         try t.expectEqual(@as(usize, max_password_changes), np.calls);
     }
+}
+
+// ── delta mutation audit 2026-11-27 (since 2026-11-18): tests for what survived ──
+
+/// A plaintext binary packet (RFC 4253 §6) carrying `payload` of any size.
+/// `transport.writePacket` refuses more than `max_write_payload`; a peer
+/// need not be so polite.
+fn rawPlainPacket(gpa: std.mem.Allocator, payload: []const u8) ![]u8 {
+    var pad: usize = 4;
+    while ((4 + 1 + payload.len + pad) % 8 != 0) pad += 1;
+    const out = try gpa.alloc(u8, 4 + 1 + payload.len + pad);
+    std.mem.writeInt(u32, out[0..4], @intCast(1 + payload.len + pad), .big);
+    out[4] = @intCast(pad);
+    @memcpy(out[5..][0..payload.len], payload);
+    @memset(out[5 + payload.len ..], 0);
+    return out;
+}
+
+/// A `PasswordChanger` that answers `answer`, claims another length, or gives up.
+const ChangeTo = struct {
+    answer: []const u8 = "",
+    claim: ?usize = null, // returned instead of `answer.len`, nothing written
+    give_up: bool = false,
+    calls: usize = 0,
+
+    fn new(ctx: *anyopaque, _: []const u8, _: []const u8, _: []const u8, buf: []u8) ?usize {
+        const self: *ChangeTo = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.give_up) return null;
+        if (self.claim) |c| return c;
+        @memcpy(buf[0..self.answer.len], self.answer);
+        return self.answer.len;
+    }
+};
+
+const PromptOld = struct {
+    calls: usize = 0,
+    fn prompt(ctx: *anyopaque, _: []const u8, buf: []u8) ?usize {
+        const self: *PromptOld = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        @memcpy(buf[0..3], "old");
+        return 3;
+    }
+};
+
+test "mutation 2026-11-27: password change — a prompt of max_banner_len is taken, one byte more is refused" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const Case = struct { prompt: usize, ok: bool };
+    for ([_]Case{ .{ .prompt = max_banner_len, .ok = true }, .{ .prompt = max_banner_len + 1, .ok = false } }) |c| {
+        const prompt = try gpa.alloc(u8, c.prompt);
+        defer gpa.free(prompt);
+        @memset(prompt, 'p');
+        const payload = try gpa.alloc(u8, c.prompt + 16);
+        defer gpa.free(payload);
+        var pw: std.Io.Writer = .fixed(payload);
+        try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_PK_OK));
+        try messages.writeString(&pw, prompt);
+        try messages.writeString(&pw, "");
+        const req_pkt = try rawPlainPacket(gpa, pw.buffered());
+        defer gpa.free(req_pkt);
+        var ok_buf: [64]u8 = undefined;
+        var m: [1]Msg = undefined;
+        const ok_pkt = try framePackets(&ok_buf, &.{m[0].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes()});
+        const wire = try std.mem.concat(gpa, u8, &.{ req_pkt, ok_pkt });
+        defer gpa.free(wire);
+        var r: std.Io.Reader = .fixed(wire);
+        var sink_buf: [2048]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        var ch: ChangeTo = .{ .answer = "new" };
+        const res = authenticatePassword(&tr, gpa, "alice", "pw", .{ .password_change = .{ .ctx = &ch, .newFn = ChangeTo.new } });
+        if (c.ok) {
+            try res;
+            try t.expectEqual(@as(usize, 1), ch.calls);
+        } else {
+            try t.expectError(error.NameTooLong, res);
+            try t.expectEqual(@as(usize, 0), ch.calls);
+        }
+    }
+}
+
+test "mutation 2026-11-27: password change — an answer longer than the buffer is refused; a 1000-byte new password goes out whole" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    // The changer claims more bytes than `max_password_len`.
+    {
+        var m: [1]Msg = undefined;
+        var wire: [1024]u8 = undefined;
+        const framed = try framePackets(&wire, &.{changeReq(&m[0], "expired")});
+        var r: std.Io.Reader = .fixed(framed);
+        var sink_buf: [2048]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        var ch: ChangeTo = .{ .claim = max_password_len + 1 };
+        try t.expectError(error.NameTooLong, authenticatePassword(&tr, gpa, "alice", "pw", .{
+            .password_change = .{ .ctx = &ch, .newFn = ChangeTo.new },
+        }));
+    }
+    // The request buffer holds the new password too, however long.
+    {
+        const long: [1000]u8 = @splat('N');
+        var m: [2]Msg = undefined;
+        var wire: [1024]u8 = undefined;
+        const framed = try framePackets(&wire, &.{
+            changeReq(&m[0], "expired"),
+            m[1].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+        });
+        var r: std.Io.Reader = .fixed(framed);
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        var ch: ChangeTo = .{ .answer = &long };
+        try authenticatePassword(&tr, gpa, "alice", "pw", .{ .password_change = .{ .ctx = &ch, .newFn = ChangeTo.new } });
+        var rr: std.Io.Reader = .fixed(sink.buffered());
+        var cipher: transport.CipherState = .plaintext;
+        var big: [4096]u8 = undefined;
+        _ = try transport.readPacket(&rr, &cipher, &big);
+        const second = try transport.readPacket(&rr, &cipher, &big);
+        var c = Cursor{ .b = second.payload[1..] };
+        _ = try c.string();
+        _ = try c.string();
+        _ = try c.string();
+        try t.expect(try c.boolean());
+        try t.expectEqualStrings("pw", try c.string());
+        try t.expectEqualSlices(u8, &long, try c.string());
+        try t.expect(c.atEnd());
+    }
+}
+
+test "mutation 2026-11-27: password change — a password_prompt method answers a change request; a changer that gives up is final under retryable" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var po: PromptOld = .{};
+    const prompt_method: ClientMethod = .{ .password_prompt = .{ .ctx = &po, .promptFn = PromptOld.prompt } };
+    {
+        var ch: ChangeTo = .{ .answer = "fresh" };
+        var m: [3]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        var wire: [4096]u8 = undefined;
+        const framed = try framePackets(&wire, &.{
+            m[0].failure("password", false).bytes(),
+            changeReq(&m[1], "expired"),
+            m[2].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+        });
+        var r: std.Io.Reader = .fixed(framed);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        try authenticateWith(&tr, gpa, "alice", &.{prompt_method}, .{
+            .request_service = false,
+            .progress = &progress,
+            .password_change = .{ .ctx = &ch, .newFn = ChangeTo.new },
+        });
+        try t.expectEqual(@as(?AuthMethod, .password), progress.succeeded);
+        try t.expectEqual(@as(usize, 1), ch.calls);
+        var store: [8][512]u8 = undefined;
+        var reqs: [4]PwReq = undefined;
+        try t.expectEqual(@as(usize, 2), try passwordRequests(sink.buffered(), &store, &reqs));
+        try t.expect(reqs[1].change);
+        try t.expectEqualStrings("old", reqs[1].old);
+        try t.expectEqualStrings("fresh", reqs[1].new);
+    }
+    // The changer says no: the method is declined, which `retryable` does not retry.
+    {
+        po.calls = 0;
+        var ch: ChangeTo = .{ .give_up = true };
+        var m: [2]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var wire: [4096]u8 = undefined;
+        const framed = try framePackets(&wire, &.{ m[0].failure("password", false).bytes(), changeReq(&m[1], "expired") });
+        var r: std.Io.Reader = .fixed(framed);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        try t.expectError(error.AuthenticationFailed, authenticateWith(&tr, gpa, "alice", &.{.{ .retryable = .{ .method = &prompt_method, .max_tries = 3 } }}, .{
+            .request_service = false,
+            .password_change = .{ .ctx = &ch, .newFn = ChangeTo.new },
+        }));
+        try t.expectEqual(@as(usize, 1), po.calls);
+        try t.expectEqual(@as(usize, 1), ch.calls);
+    }
+}
+
+test "mutation 2026-11-27: authenticateWith hostbased — names of max length go out, one byte more is NameTooLong" {
+    const t = std.testing;
+    const host_key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x48))) };
+    const long: [max_host_len + 1]u8 = @splat('h');
+    const longu: [max_user_len + 1]u8 = @splat('u');
+    const Case = struct { host: usize, user: usize, too_long: bool };
+    for ([_]Case{
+        .{ .host = max_host_len, .user = 4, .too_long = false },
+        .{ .host = max_host_len + 1, .user = 4, .too_long = true },
+        .{ .host = 4, .user = max_user_len, .too_long = false },
+        .{ .host = 4, .user = max_user_len + 1, .too_long = true },
+    }) |c| {
+        var m: [2]Msg = undefined;
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var progress: AuthProgress = .{};
+        const res = clientCanned(&.{
+            m[0].failure("hostbased", false).bytes(),
+            m[1].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+        }, &sink, &.{.{ .hostbased = .{ .key = &host_key, .client_host = long[0..c.host], .client_user = longu[0..c.user] } }}, &progress);
+        if (c.too_long) {
+            try t.expectError(error.NameTooLong, res);
+        } else {
+            try res;
+            try t.expectEqual(@as(?AuthMethod, .hostbased), progress.succeeded);
+        }
+    }
+}
+
+test "mutation 2026-11-27: authenticateWith hostbased — an rsa host key signs with the variant server-sig-algs names; the banner handler hears a banner" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var key: AuthKey = undefined;
+    try AuthKey.fromOpenSSH(&key, @import("hostkey_vectors.zig").rsa_key, null); // pinned to rsa-sha2-256
+    var algs: transport.ServerSigAlgs = .{};
+    for (transport.public_key_algorithms, &algs.accepted) |name, *ok| ok.* = std.mem.eql(u8, name, "rsa-sha2-512");
+    const Hear = struct {
+        calls: usize = 0,
+        fn show(ctx: *anyopaque, message: []const u8, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            std.testing.expectEqualStrings("welcome", message) catch @panic("banner text");
+        }
+    };
+    var hear: Hear = .{};
+    var m: [3]Msg = undefined;
+    var wire: [2048]u8 = undefined;
+    const framed = try framePackets(&wire, &.{
+        m[0].failure("hostbased", false).bytes(),
+        m[1].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER)).str("welcome").str("").bytes(),
+        m[2].begin(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)).bytes(),
+    });
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [8192]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+    tr.session_id = transport.SessionId.from("session");
+    tr.server_sig_algs = algs;
+    try authenticateWith(&tr, gpa, "alice", &.{.{ .hostbased = .{ .key = &key, .client_host = "client.example", .client_user = "alice" } }}, .{
+        .request_service = false,
+        .banner = .{ .ctx = &hear, .showFn = Hear.show },
+    });
+    try t.expectEqual(@as(usize, 1), hear.calls);
+    var rr: std.Io.Reader = .fixed(sink.buffered());
+    var cipher: transport.CipherState = .plaintext;
+    var big: [4096]u8 = undefined;
+    _ = try transport.readPacket(&rr, &cipher, &big);
+    const second = try transport.readPacket(&rr, &cipher, &big);
+    var c = Cursor{ .b = second.payload[1..] };
+    _ = try c.string();
+    _ = try c.string();
+    try t.expectEqualStrings("hostbased", try c.string());
+    try t.expectEqualStrings("rsa-sha2-512", try c.string());
+}
+
+const AddrSeer = struct {
+    pre_sid: [16]u8 = undefined,
+    pre_sid_len: usize = 0,
+    pre_local: ?u16 = null,
+    pre_remote: ?u16 = null,
+    req_local: ?u16 = null,
+    req_remote: ?u16 = null,
+    banner_text: ?[]const u8 = null,
+
+    fn pre(ctx: *anyopaque, conn: *const PreAuthConn) void {
+        const self: *AddrSeer = @ptrCast(@alignCast(ctx));
+        @memcpy(self.pre_sid[0..conn.session_id.len], conn.session_id);
+        self.pre_sid_len = conn.session_id.len;
+        self.pre_local = if (conn.local_address) |a| a.getPort() else null;
+        self.pre_remote = if (conn.remote_address) |a| a.getPort() else null;
+    }
+    fn banner(ctx: *anyopaque, req: *const AuthRequest) ?[]const u8 {
+        const self: *AddrSeer = @ptrCast(@alignCast(ctx));
+        self.req_local = if (req.local_address) |a| a.getPort() else null;
+        self.req_remote = if (req.remote_address) |a| a.getPort() else null;
+        return self.banner_text;
+    }
+};
+
+test "mutation 2026-11-27: serveUserauth — pre_auth sees the session id and both addresses, the banner callback the request's; an empty banner sends nothing" {
+    const t = std.testing;
+    var seer: AddrSeer = .{ .banner_text = "" };
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    var m: [1]Msg = undefined;
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    const res = try serveCanned(&.{m[0].password("alice", "hunter2").bytes()}, &sink, .{
+        .password = accepting.hook(),
+        .pre_auth = .{ .ctx = &seer, .onFn = AddrSeer.pre },
+        .banner_callback = .{ .ctx = &seer, .bannerFn = AddrSeer.banner },
+        .remote_address = std.Io.net.IpAddress.parse("192.0.2.1", 40022) catch unreachable,
+        .local_address = std.Io.net.IpAddress.parse("198.51.100.2", 22) catch unreachable,
+    });
+    try t.expectEqual(AuthMethod.password, res.method);
+    try t.expectEqualStrings("session", seer.pre_sid[0..seer.pre_sid_len]);
+    try t.expectEqual(@as(?u16, 22), seer.pre_local);
+    try t.expectEqual(@as(?u16, 40022), seer.pre_remote);
+    try t.expectEqual(@as(?u16, 22), seer.req_local);
+    try t.expectEqual(@as(?u16, 40022), seer.req_remote);
+    // The callback's "" sent no banner: the one packet out is the SUCCESS.
+    var store: [4][512]u8 = undefined;
+    const replies = try replyPayloads(sink.buffered(), &store);
+    try t.expectEqual(@as(usize, 1), replies.len);
+    try t.expectEqual(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS), replies[0][0]);
+}
+
+test "mutation 2026-11-27: serveUserauth — an abandoned keyboard-interactive dialogue is logged as wrong_answers; a hostbased callback beside a password hook is refused" {
+    const t = std.testing;
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    var hooks: BannerAndLog = .{};
+    var m: [2]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    const res = try serveCanned(&.{
+        m[0].kbd("alice").bytes(),
+        m[1].password("alice", "hunter2").bytes(),
+    }, &sink, .{
+        .password = accepting.hook(),
+        .keyboard_interactive = .{ .prompts = &.{.{ .text = "Code: ", .echo = true }}, .checkFn = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const []const u8) bool {
+                return true;
+            }
+        }.f },
+        .on_auth = .{ .ctx = &hooks, .onFn = BannerAndLog.onAuth },
+    });
+    try t.expectEqual(AuthMethod.password, res.method);
+    try t.expectEqual(@as(usize, 2), hooks.logged);
+    try t.expectEqualStrings("keyboard-interactive", hooks.methodAt(0));
+    try t.expectEqual(AuthOutcome{ .rejected = .wrong_answers }, hooks.log[0].outcome);
+    try t.expectEqual(AuthOutcome.accepted, hooks.log[1].outcome);
+
+    var sink2_buf: [64]u8 = undefined;
+    var sink2: std.Io.Writer = .fixed(&sink2_buf);
+    try t.expectError(error.InvalidAuthConfig, serveCanned(&.{}, &sink2, .{
+        .password = accepting.hook(),
+        .callbacks = .{ .hostbased = .{ .decideFn = struct {
+            fn f(_: *anyopaque, _: *const AuthRequest, _: *const HostbasedRequest) Decision {
+                return .reject;
+            }
+        }.f } },
+    }));
+}
+
+/// A hostbased request for alice, every field as given (a peer need not be well formed).
+fn hbRequestInto(buf: []u8, algorithm: []const u8, blob: []const u8, host: []const u8, client_user: []const u8, sig: []const u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try messages.writeString(&w, "alice");
+    try messages.writeString(&w, connection_service);
+    try messages.writeString(&w, "hostbased");
+    try messages.writeString(&w, algorithm);
+    try messages.writeString(&w, blob);
+    try messages.writeString(&w, host);
+    try messages.writeString(&w, client_user);
+    try messages.writeString(&w, sig);
+    return w.buffered();
+}
+
+/// A hostbased hook that records what it was asked and answers `accept`.
+const HostSeer = struct {
+    accept: bool,
+    calls: usize = 0,
+    user: [32]u8 = undefined,
+    user_len: usize = 0,
+    client_user: [32]u8 = undefined,
+    client_user_len: usize = 0,
+    algorithm: [32]u8 = undefined,
+    algorithm_len: usize = 0,
+    host: [64]u8 = undefined,
+    host_len: usize = 0,
+
+    fn check(ctx: *anyopaque, user: []const u8, hb: *const HostbasedRequest) bool {
+        const self: *HostSeer = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.user_len = @min(user.len, self.user.len);
+        @memcpy(self.user[0..self.user_len], user[0..self.user_len]);
+        self.client_user_len = @min(hb.client_user.len, self.client_user.len);
+        @memcpy(self.client_user[0..self.client_user_len], hb.client_user[0..self.client_user_len]);
+        self.algorithm_len = @min(hb.algorithm.len, self.algorithm.len);
+        @memcpy(self.algorithm[0..self.algorithm_len], hb.algorithm[0..self.algorithm_len]);
+        self.host_len = @min(hb.client_host.len, self.host.len);
+        @memcpy(self.host[0..self.host_len], hb.client_host[0..self.host_len]);
+        return self.accept;
+    }
+};
+
+test "mutation 2026-11-27: serveUserauth hostbased — key blob, signature and name length bounds" {
+    const t = std.testing;
+    const S = struct {
+        var buf: [16384]u8 = undefined;
+        var sink_buf: [16384]u8 = undefined;
+        var blob: [max_key_blob_len + 1]u8 = undefined;
+        var sig: [max_signature_len + 1]u8 = undefined;
+        var name: [max_host_len + 1]u8 = undefined;
+    };
+    @memset(&S.name, 'n');
+    const Case = struct { blob: usize = 51, sig: usize = 4, host: usize = 4, user: usize = 4, too_long: bool };
+    for ([_]Case{
+        .{ .blob = max_key_blob_len, .too_long = false },
+        .{ .blob = max_key_blob_len + 1, .too_long = true },
+        .{ .sig = max_signature_len, .too_long = false },
+        .{ .sig = max_signature_len + 1, .too_long = true },
+        .{ .host = max_host_len, .too_long = false },
+        .{ .host = max_host_len + 1, .too_long = true },
+        .{ .user = max_user_len, .too_long = false },
+        .{ .user = max_user_len + 1, .too_long = true },
+    }) |c| {
+        @memset(&S.blob, 0);
+        var kw: std.Io.Writer = .fixed(&S.blob);
+        try messages.writeString(&kw, "ssh-ed25519");
+        try messages.writeString(&kw, &@as([32]u8, @splat(9)));
+        @memset(&S.sig, 0);
+        const req = try hbRequestInto(&S.buf, "ssh-ed25519", S.blob[0..c.blob], S.name[0..c.host], S.name[0..c.user], S.sig[0..c.sig]);
+        var seer: HostSeer = .{ .accept = false };
+        var sink: std.Io.Writer = .fixed(&S.sink_buf);
+        const res = serveCanned(&.{req}, &sink, .{ .hostbased = .{ .ctx = &seer, .checkFn = HostSeer.check } });
+        // In bounds: the hook refuses, a FAILURE goes out and the canned client has nothing more.
+        if (c.too_long) try t.expectError(error.NameTooLong, res) else try t.expectError(error.EndOfStream, res);
+    }
+}
+
+test "mutation 2026-11-27: serveUserauth hostbased — each malformed request is refused for its own reason; a refused host is not verified" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const host_key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x48))) };
+    const blob = try host_key.publicBlob(gpa);
+    defer gpa.free(blob);
+    var other_sig: [64]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&other_sig);
+    try messages.writeString(&ow, "rsa-sha2-256");
+    try messages.writeString(&ow, "x");
+    var fake_rsa: [16]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&fake_rsa);
+    try messages.writeString(&fw, "ssh-rsa");
+    const Case = struct { blob: []const u8, sig: []const u8, accept: bool, want: AuthFailure };
+    for ([_]Case{
+        // a blob too short to name its type
+        .{ .blob = "", .sig = "", .accept = true, .want = .algorithm_mismatch },
+        // a blob of another type than the algorithm names
+        .{ .blob = fw.buffered(), .sig = "", .accept = true, .want = .algorithm_mismatch },
+        // a signature too short to name its algorithm
+        .{ .blob = blob, .sig = "", .accept = true, .want = .bad_signature },
+        // a signature naming another algorithm than the request
+        .{ .blob = blob, .sig = ow.buffered(), .accept = true, .want = .algorithm_mismatch },
+        // a refused host is refused as such, whatever its signature
+        .{ .blob = blob, .sig = "", .accept = false, .want = .unauthorized_host },
+    }) |c| {
+        var seer: HostSeer = .{ .accept = c.accept };
+        var buf: [1024]u8 = undefined;
+        const req = try hbRequestInto(&buf, "ssh-ed25519", c.blob, "client.example", "alice", c.sig);
+        var why: AuthFailure = .peer_disconnected;
+        var sink_buf: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.AuthenticationFailed, serveCanned(&.{req}, &sink, .{
+            .hostbased = .{ .ctx = &seer, .checkFn = HostSeer.check },
+            .failure = &why,
+            .max_attempts = 1,
+        }));
+        try t.expectEqual(c.want, why);
+    }
+}
+
+test "mutation 2026-11-27: serveUserauth hostbased — the hook is told the login user, the client user, the signature algorithm and the host without its dot (rsa host key)" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var key: AuthKey = undefined;
+    try AuthKey.fromOpenSSH(&key, @import("hostkey_vectors.zig").rsa_key, null); // signs rsa-sha2-256
+    const blob = try key.publicBlob(gpa);
+    defer gpa.free(blob);
+    var to_sign: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&to_sign);
+    try signedBlobHostbased(&w, "session", "alice", connection_service, "rsa-sha2-256", blob, "client.example.", "bob");
+    const sig = try key.sign(gpa, w.buffered());
+    defer gpa.free(sig);
+    var buf: [4096]u8 = undefined;
+    const req = try hbRequestInto(&buf, "rsa-sha2-256", blob, "client.example.", "bob", sig);
+    var seer: HostSeer = .{ .accept = true };
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    const res = try serveCanned(&.{req}, &sink, .{ .hostbased = .{ .ctx = &seer, .checkFn = HostSeer.check } });
+    try t.expectEqual(AuthMethod.hostbased, res.method);
+    try t.expectEqual(@as(usize, 1), seer.calls);
+    try t.expectEqualStrings("alice", seer.user[0..seer.user_len]);
+    try t.expectEqualStrings("bob", seer.client_user[0..seer.client_user_len]);
+    try t.expectEqualStrings("rsa-sha2-256", seer.algorithm[0..seer.algorithm_len]);
+    try t.expectEqualStrings("client.example", seer.host[0..seer.host_len]);
+}
+
+test "mutation 2026-11-27: sourceAddressAllowed — a mapped entry matches an IPv4 peer; ::ffff:0.0.0.0/96 is every IPv4 address" {
+    const t = std.testing;
+    var o: [1]Permissions.Option = undefined;
+    // Go: `net.ParseIP("::ffff:192.0.2.1").Equal(<the IPv4 peer>)` is true.
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("::ffff:192.0.2.1", &o), testAddr("192.0.2.1")));
+    try t.expect(!sourceAddressAllowed(sourceAddressPerms("::ffff:192.0.2.1", &o), testAddr("192.0.2.2")));
+    // Go compares the 96-bit network with an IPv4 peer through To4: a /0 over IPv4.
+    try t.expect(sourceAddressAllowed(sourceAddressPerms("::ffff:0.0.0.0/96", &o), testAddr("203.0.113.9")));
+    try t.expect(!sourceAddressAllowed(sourceAddressPerms("::ffff:0.0.0.0/96", &o), testAddr("2001:db8::1")));
 }
