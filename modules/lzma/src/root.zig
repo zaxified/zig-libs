@@ -54,6 +54,7 @@ test {
     _ = @import("shapes.zig");
     _ = @import("filters.zig");
     _ = @import("filters_test.zig");
+    _ = @import("mutation_filters_test.zig");
     _ = @import("decoder_test.zig");
     _ = @import("encoder_test.zig");
     _ = @import("fuzz_test.zig");

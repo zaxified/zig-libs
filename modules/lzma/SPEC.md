@@ -6,7 +6,7 @@
 
 **Scope:** parity — liblzma 5.8.1 (surveyed 2026-10-20)
 
-**Audit:** review 2026-10-31 · mutation 2026-11-01 (498/568, 52 eq) · src b877b71ab41a6033
+**Audit:** review 2026-10-31 · mutation 2026-11-27 (874/967, 75 eq) · src c74acd48429f09ca
 
 **Hardening:** fuzz 2026-10-20 (200,000 decoder runs + 5,000 round-trip runs clean, LZMA_FUZZ, every reach label hit; arbitrary and mutated streams of all four framings, synthetic .xz with correct header CRCs, chunked and failing readers and sinks, failing allocator; 3,000 seeds in every test run) · ct n/a — compression only, no secret is processed (keyword review, 2026-10-20) · panic 2026-10-31 (sweep + blind review: encoder offset wrap past 4 GiB, StreamWriter double finish, preset clamp, `max_output: ?u64` 256 MiB default; decoder clean; delta audit 19/20 + 1 argued)
 
@@ -199,6 +199,11 @@ None claimed: the data is public. There is no secret in this module.
 - **Constant time:** n/a, no secret is processed.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it.
+- **Delta mutation 2026-11-27 (`filters.zig` and the functions it touched; the LZMA coding core unchanged):**
+  399 mutants, 376 killed (18 by hang), 23 equivalent. Expected values from the xz format spec and hand-worked
+  liblzma converters, cross-checked with xz 5.8.3 on small synthetic inputs. A one-shot failing allocator in the
+  tests reaches worker errors std's `FailingAllocator` hides. The dead `encoder.State.in_total` was removed (two
+  mutants on it dropped). 23 tests in `src/mutation_filters_test.zig`.
 
 ## Performance
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-27** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation run over the filters code (376/399, 23 eq); 23 tests in `src/mutation_filters_test.zig`; the dead `encoder.State.in_total` field removed.
 - **2026-11-21** — **ADDITIVE + BEHAVIOURAL (decoder):** BCJ (x86, PowerPC, IA-64, ARM, ARM Thumb, SPARC, ARM64) and delta filter chains in `.xz` blocks, in both directions: `EncodeOptions.filters` (`Filter`), decoded transparently (a block with a chain of up to three filters used to be `error.UnsupportedFilter`; only a chain that does not end in LZMA2, the RISC-V filter and refused properties still are); multi-block output, `EncodeOptions.block_size` (`xz --block-size`); parallel blocks, `EncodeOptions.threads` and `mtBlockSize` (`xz -T`, bytes equal to `xz -TN`'s, header with both sizes). The output with the new options left at their defaults is unchanged. The CRC-64 moved to the new `crc64` module, which `lzma` now depends on; the encoder's and the index's CRC-64 use it too (same values).
 - **2026-11-20** — New: `Lzma1Props.fromZipHeader` / `toZipHeader` / `zip_header_len`: the 9-byte ZIP method 14 entry header (APPNOTE 5.8.8: SDK version, properties size 5, the 5 properties; written as Python's `zipfile` does, 9.4). `zipstream` uses them.
 - **2026-11-20** — ADDED `LzmaOptions.max_depth` (default 0 = no ceiling, behaviour unchanged): an opt-in cap on `depth`, refused as the existing `error.InvalidOptions`. Test in `lzma_enc.zig`.

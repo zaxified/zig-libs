@@ -200,7 +200,6 @@ const State = struct {
     /// xz: the block header is out.
     block_open: bool,
     finished: bool,
-    in_total: u64,
     lz_out_total: u64,
     /// Filters before LZMA2: their chain, and the encoder-side options the
     /// next block's window and coder are rebuilt from.
@@ -431,7 +430,6 @@ pub const Encoder = struct {
         st.l2.need_dictionary_reset = true;
         st.block_open = false;
         st.finished = false;
-        st.in_total = 0;
         st.lz_out_total = 0;
         st.chain = null;
         st.n_filters = @intCast(opts.filters.len);
@@ -502,7 +500,6 @@ pub const Encoder = struct {
             const piece = rest[0..take];
             rest = rest[take..];
             st.check.update(piece);
-            st.in_total += piece.len;
             st.in_block += piece.len;
             try st.feed(piece, false);
         }
