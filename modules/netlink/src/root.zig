@@ -6513,6 +6513,7 @@ test {
     _ = @import("ext_test.zig");
     _ = fz;
     _ = @import("sweep_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 // ── no-panic sweep wave GV (netlink): tests that need the private engines ───
@@ -7855,4 +7856,637 @@ test "fuzz driver: NETLINK_FUZZ (single-object lookups)" {
 
 test "fuzz harness: single-object lookups, 300 seeds, reaches every outcome" {
     try LookupMark.reach(lookupHarness, "netlink-lookup", 300);
+}
+
+// ── 2026-11-27 whole-module mutation run: tests of the private items ────────
+// The public-API half is mutation_test.zig. Expected values come from the
+// framing rules (nlmsghdr, NLMSG_*, RFC 3549 §2.3) and the documented
+// contracts of the engines, never from the engines' own output.
+
+/// A scripted transport that also records what the engines did to it.
+const MutT = struct {
+    script: []const []const u8 = &.{},
+    pos: usize = 0,
+    pid: u32 = 7,
+    seq: u32 = 42,
+    captures: usize = 0,
+    sends: usize = 0,
+    family: u8 = 0xee,
+
+    fn nextSeq(self: *MutT) u32 {
+        return self.seq;
+    }
+    fn portId(self: *const MutT) u32 {
+        return self.pid;
+    }
+    fn captureExtAck(self: *MutT, _: codec.Message) void {
+        self.captures += 1;
+    }
+    fn send(self: *MutT, _: []const u8) SendError!void {
+        self.sends += 1;
+    }
+    fn sendDumpRequest(self: *MutT, _: u16, _: usize, family: u8) DumpError!u32 {
+        self.sends += 1;
+        self.family = family;
+        return self.seq;
+    }
+    fn recvDatagram(self: *MutT) RecvError![]const u8 {
+        if (self.pos < self.script.len) {
+            defer self.pos += 1;
+            return self.script[self.pos];
+        }
+        return error.RecvFailed;
+    }
+    fn recvDatagramStrict(self: *MutT) StrictRecvError![]const u8 {
+        return self.recvDatagram();
+    }
+};
+
+/// One message (seq 42, pid 7) carrying `payload` padded to 4 bytes.
+fn mutMsg(msg_type: u16, flags: u16, payload: []const u8) ![]u8 {
+    var l: std.ArrayList(u8) = .empty;
+    errdefer l.deinit(testing.allocator);
+    const h = try codec.appendHeader(testing.allocator, &l, msg_type, flags, 42, 7);
+    try codec.appendPadded(testing.allocator, &l, payload);
+    codec.finishHeader(&l, h);
+    return l.toOwnedSlice(testing.allocator);
+}
+
+fn mutLinkPayload(index: i32) [ifinfomsg_len]u8 {
+    var p: [ifinfomsg_len]u8 = @splat(0);
+    std.mem.writeInt(i32, p[4..8], index, native_endian);
+    return p;
+}
+
+test "mutation 2026-11-27: client-side predicates exclude other families and interfaces" {
+    const r: Route = .{ .family = AF.INET, .dst_prefixlen = 0, .protocol = 0, .scope = 0, .rtype = 0, .table = 254, .oif = 5 };
+    try testing.expect(!matchRoute(r, .{ .family = AF.INET6 }));
+    try testing.expect(matchRoute(r, .{ .family = AF.INET, .ifindex = 5 }));
+    try testing.expect(!matchRoute(r, .{ .ifindex = 6 }));
+    const n: Neighbor = .{ .family = AF.INET, .ifindex = 3, .state = 0, .flags = 0, .ntype = 0 };
+    try testing.expect(!matchNeighbor(n, .{ .family = AF.INET6 }));
+    try testing.expect(!matchNeighbor(n, .{ .ifindex = 4 }));
+    try testing.expect(matchNeighbor(n, .{ .family = AF.INET, .ifindex = 3 }));
+    const a: Address = .{ .family = AF.INET, .prefixlen = 8, .scope = 0, .flags = 0, .ifindex = 3 };
+    try testing.expect(!matchAddress(a, .{ .family = AF.INET6 }));
+    try testing.expect(!matchAddress(a, .{ .ifindex = 4 }));
+    try testing.expect(matchAddress(a, .{ .family = AF.INET, .ifindex = 3 }));
+    // A nexthop group (no family of its own) passes any family filter; nothing else with AF_UNSPEC does.
+    const grp: Nexthop = .{ .id = 1, .family = AF.UNSPEC, .group_count = 2 };
+    const plain: Nexthop = .{ .id = 2, .family = AF.INET };
+    const unspec_nogroup: Nexthop = .{ .id = 3, .family = AF.UNSPEC };
+    const inet_with_members: Nexthop = .{ .id = 4, .family = AF.INET, .group_count = 2 };
+    try testing.expect(matchNexthop(grp, .{ .family = AF.INET6 }));
+    try testing.expect(matchNexthop(plain, .{ .family = AF.INET }));
+    try testing.expect(!matchNexthop(plain, .{ .family = AF.INET6 }));
+    try testing.expect(!matchNexthop(unspec_nogroup, .{ .family = AF.INET6 }));
+    try testing.expect(!matchNexthop(inet_with_members, .{ .family = AF.INET6 }));
+    try testing.expect(matchNexthop(plain, .{}));
+}
+
+test "mutation 2026-11-27: Socket.nextSeq counts up and never hands out 0" {
+    var buf: [0]u8 = .{};
+    var s: Socket = .{ .gpa = testing.allocator, .fd = -1, .portid = 0, .seq = 0xfffffffe, .buf = &buf };
+    try testing.expectEqual(@as(u32, 0xffffffff), s.nextSeq());
+    try testing.expectEqual(@as(u32, 1), s.nextSeq()); // wrapped through 0
+    try testing.expectEqual(@as(u32, 2), s.nextSeq());
+}
+
+test "mutation 2026-11-27: captureExtAck keeps the reason and errno, resets stale ones, truncates long ones" {
+    var buf: [0]u8 = .{};
+    var s: Socket = .{ .gpa = testing.allocator, .fd = -1, .portid = 0, .seq = 0, .buf = &buf };
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(testing.allocator);
+    var fixed: [20]u8 = @splat(0);
+    std.mem.writeInt(i32, fixed[0..4], -22, native_endian);
+    std.mem.writeInt(u32, fixed[4..8], codec.header_len, native_endian);
+    try l.appendSlice(testing.allocator, &fixed);
+    try codec.appendAttrString(testing.allocator, &l, codec.NLMSGERR_ATTR.MSG, "Unknown device type");
+    var m: codec.Message = .{ .type = codec.NLMSG_ERROR, .flags = codec.NLM_F_ACK_TLVS | codec.NLM_F_CAPPED, .seq = 1, .pid = 2, .payload = l.items };
+    s.ext_ack_len = 3;
+    s.last_errno = 99;
+    s.captureExtAck(m);
+    try testing.expectEqualStrings("Unknown device type", s.lastErrorMessage());
+    try testing.expectEqual(@as(i32, -22), s.lastErrorCode());
+    // A reply without TLVs: the old reason is gone, the errno is the new one.
+    var bare: [20]u8 = @splat(0);
+    std.mem.writeInt(i32, bare[0..4], -1, native_endian);
+    m.flags = 0;
+    m.payload = &bare;
+    s.captureExtAck(m);
+    try testing.expectEqual(@as(usize, 0), s.lastErrorMessage().len);
+    try testing.expectEqual(@as(i32, -1), s.lastErrorCode());
+    // A reason longer than the buffer is cut at ext_ack_msg_max, not refused.
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(testing.allocator);
+    try long.appendSlice(testing.allocator, &fixed);
+    const text: [300]u8 = @splat('x');
+    try codec.appendAttrString(testing.allocator, &long, codec.NLMSGERR_ATTR.MSG, &text);
+    m.flags = codec.NLM_F_ACK_TLVS | codec.NLM_F_CAPPED;
+    m.payload = long.items;
+    s.captureExtAck(m);
+    try testing.expectEqual(@as(usize, ext_ack_msg_max), s.lastErrorMessage().len);
+    try testing.expectEqualStrings(text[0..ext_ack_msg_max], s.lastErrorMessage());
+}
+
+test "mutation 2026-11-27: setRecvTimeout stores seconds and microseconds separately" {
+    var s = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer s.close();
+    try s.setRecvTimeout(1500);
+    var tv: linux.timeval = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.timeval);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockopt(s.fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&tv), &len)));
+    try testing.expectEqual(@as(@TypeOf(tv.sec), 1), tv.sec);
+    try testing.expectEqual(@as(@TypeOf(tv.usec), 500_000), tv.usec);
+}
+
+test "mutation 2026-11-27: the reply loops forget the previous request's errno and reason" {
+    var s = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer s.close();
+    try s.setRecvTimeout(50);
+    // awaitAckStrict with nothing in flight: nothing arrives, the timeout is WouldBlock.
+    s.last_errno = -5;
+    s.ext_ack_len = 3;
+    try testing.expectError(error.WouldBlock, s.awaitAckStrict(12345));
+    try testing.expectEqual(@as(i32, 0), s.lastErrorCode());
+    try testing.expectEqual(@as(usize, 0), s.lastErrorMessage().len);
+    // getOp: an NLMSG_NOOP without NLM_F_REQUEST is never answered by the kernel.
+    s.last_errno = -5;
+    s.ext_ack_len = 3;
+    const req = try testing.allocator.dupe(u8, &cannedMessage(codec.NLMSG_NOOP, 0, s.nextSeq(), 0));
+    try testing.expectError(error.RecvFailed, s.getOp(Link, parseLink, req, RTM_NEWLINK));
+    try testing.expectEqual(@as(i32, 0), s.lastErrorCode());
+    try testing.expectEqual(@as(usize, 0), s.lastErrorMessage().len);
+}
+
+test "mutation 2026-11-27: the receive buffer grows only past its length, in whole 8 KiB steps" {
+    var fds: [2]i32 = undefined;
+    try nonblockingPair(&fds);
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var sock: Socket = .{ .gpa = testing.allocator, .fd = fds[0], .portid = 0, .seq = 0, .buf = try testing.allocator.alloc(u8, 64) };
+    defer testing.allocator.free(sock.buf);
+    // A datagram of exactly the buffer length fits: no growth.
+    const exact: [64]u8 = @splat(0xab);
+    try testing.expectEqual(@as(usize, 64), linux.write(fds[1], &exact, exact.len));
+    try testing.expectError(error.WouldBlock, sock.recvDatagramLimit(1 << 20));
+    try testing.expectEqual(@as(usize, 64), sock.buf.len);
+    // One above grows to the next multiple of the initial size (8 KiB).
+    const more: [65]u8 = @splat(0xab);
+    try testing.expectEqual(@as(usize, 65), linux.write(fds[1], &more, more.len));
+    try testing.expectError(error.WouldBlock, sock.recvDatagramLimit(1 << 20));
+    try testing.expectEqual(@as(usize, initial_recv_buf_len), sock.buf.len);
+    const big: [9000]u8 = @splat(0xab);
+    try testing.expectEqual(@as(usize, 9000), linux.write(fds[1], &big, big.len));
+    try testing.expectError(error.WouldBlock, sock.recvDatagramLimit(1 << 20));
+    try testing.expectEqual(@as(usize, 2 * initial_recv_buf_len), sock.buf.len);
+}
+
+test "mutation 2026-11-27: awaitAckOver: framing errors, foreign replies, control messages" {
+    const gpa_ = testing.allocator;
+    const trunc = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const s1 = [_][]const u8{&trunc};
+    var t1: MutT = .{ .script = &s1 };
+    try testing.expectError(error.MalformedReply, awaitAckOver(&t1, 42));
+    // A reply for another pid, then for another seq, then ours: both foreign ones are skipped.
+    const f_pid = cannedWith(codec.NLMSG_ERROR, 0, 42, 9, -1);
+    const f_seq = cannedWith(codec.NLMSG_ERROR, 0, 41, 7, -1);
+    const ack = cannedWith(codec.NLMSG_ERROR, 0, 42, 7, 0);
+    const s2 = [_][]const u8{ &f_pid, &f_seq, &ack };
+    var t2: MutT = .{ .script = &s2 };
+    try awaitAckOver(&t2, 42);
+    try testing.expectEqual(@as(usize, 3), t2.pos);
+    try testing.expectEqual(@as(usize, 1), t2.captures);
+    // An NLMSG_ERROR without its errno is malformed, never an ACK.
+    const noerrno = cannedMessage(codec.NLMSG_ERROR, 0, 42, 7);
+    const s3 = [_][]const u8{&noerrno};
+    var t3: MutT = .{ .script = &s3 };
+    try testing.expectError(error.MalformedReply, awaitAckOver(&t3, 42));
+    // NLMSG_OVERRUN is reported as itself; a mapped errno is returned with its extended ACK captured.
+    const ov = cannedMessage(codec.NLMSG_OVERRUN, 0, 42, 7);
+    const s4 = [_][]const u8{&ov};
+    var t4: MutT = .{ .script = &s4 };
+    try testing.expectError(error.Overrun, awaitAckOver(&t4, 42));
+    const exists = cannedWith(codec.NLMSG_ERROR, 0, 42, 7, -@as(i32, @intCast(@backingInt(linux.E.EXIST))));
+    const s5 = [_][]const u8{&exists};
+    var t5: MutT = .{ .script = &s5 };
+    try testing.expectError(error.Exists, awaitAckOver(&t5, 42));
+    try testing.expectEqual(@as(usize, 1), t5.captures);
+    _ = gpa_;
+}
+
+test "mutation 2026-11-27: getOver: framing errors, a null parse, the extended ACK" {
+    const trunc = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const s1 = [_][]const u8{&trunc};
+    var t1: MutT = .{ .script = &s1 };
+    try testing.expectError(error.MalformedReply, getOver(Link, parseLink, &t1, 42, RTM_NEWLINK));
+    // A reply that parses to "nothing usable" (an address record without an address) is malformed.
+    const noaddr = try mutMsg(RTM_NEWADDR, 0, &([_]u8{ 2, 24, 0, 0, 1, 0, 0, 0 }));
+    defer testing.allocator.free(noaddr);
+    const s2 = [_][]const u8{noaddr};
+    var t2: MutT = .{ .script = &s2 };
+    try testing.expectError(error.MalformedReply, getOver(Address, parseAddress, &t2, 42, RTM_NEWADDR));
+    // An NLMSG_ERROR without an errno is malformed; with one, the extended ACK is captured.
+    const noerrno = cannedMessage(codec.NLMSG_ERROR, 0, 42, 7);
+    const s3 = [_][]const u8{&noerrno};
+    var t3: MutT = .{ .script = &s3 };
+    try testing.expectError(error.MalformedReply, getOver(Link, parseLink, &t3, 42, RTM_NEWLINK));
+    const nodev = cannedWith(codec.NLMSG_ERROR, 0, 42, 7, -@as(i32, @intCast(@backingInt(linux.E.NODEV))));
+    const s4 = [_][]const u8{&nodev};
+    var t4: MutT = .{ .script = &s4 };
+    try testing.expectError(error.NoSuchDevice, getOver(Link, parseLink, &t4, 42, RTM_NEWLINK));
+    try testing.expectEqual(@as(usize, 1), t4.captures);
+}
+
+const mut_keep = struct {
+    fn rec(a: std.mem.Allocator, out: *std.ArrayList(Link), payload: []const u8, _: void) DumpError!void {
+        const l = (parseLink(payload) catch return error.MalformedReply) orelse return;
+        try out.append(a, l);
+    }
+};
+
+test "mutation 2026-11-27: collectDumpPass: framing, control messages, foreign record types" {
+    var out: std.ArrayList(Link) = .empty;
+    defer out.deinit(testing.allocator);
+    const trunc = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const s1 = [_][]const u8{&trunc};
+    var t1: MutT = .{ .script = &s1 };
+    try testing.expectError(error.MalformedReply, collectDumpPass(Link, void, mut_keep.rec, testing.allocator, &t1, &out, 42, RTM_NEWLINK, {}, 100));
+    // A DONE carrying a negative errno fails the dump and captures the extended ACK.
+    const failed = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 42, 7, -@as(i32, @intCast(@backingInt(linux.E.NOMEM))));
+    const s2 = [_][]const u8{&failed};
+    var t2: MutT = .{ .script = &s2 };
+    try testing.expectError(error.SystemResources, collectDumpPass(Link, void, mut_keep.rec, testing.allocator, &t2, &out, 42, RTM_NEWLINK, {}, 100));
+    try testing.expectEqual(@as(usize, 1), t2.captures);
+    const ov = cannedMessage(codec.NLMSG_OVERRUN, 0, 42, 7);
+    const s3 = [_][]const u8{&ov};
+    var t3: MutT = .{ .script = &s3 };
+    try testing.expectError(error.SystemResources, collectDumpPass(Link, void, mut_keep.rec, testing.allocator, &t3, &out, 42, RTM_NEWLINK, {}, 100));
+    const noerrno = cannedMessage(codec.NLMSG_ERROR, 0, 42, 7);
+    const s4 = [_][]const u8{&noerrno};
+    var t4: MutT = .{ .script = &s4 };
+    try testing.expectError(error.MalformedReply, collectDumpPass(Link, void, mut_keep.rec, testing.allocator, &t4, &out, 42, RTM_NEWLINK, {}, 100));
+    // A payload message of a type nobody asked for is skipped, not handed to the record function.
+    const lp = mutLinkPayload(5);
+    const other = try mutMsg(RTM_NEWADDR, codec.NLM_F_MULTI, &lp);
+    defer testing.allocator.free(other);
+    const done = cannedMessage(codec.NLMSG_DONE, codec.NLM_F_MULTI, 42, 7);
+    const s5 = [_][]const u8{ other, &done };
+    var t5: MutT = .{ .script = &s5 };
+    try testing.expectEqual(DumpPass.done, try collectDumpPass(Link, void, mut_keep.rec, testing.allocator, &t5, &out, 42, RTM_NEWLINK, {}, 100));
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "mutation 2026-11-27: dumpOver: parse errors fail the dump, the client filter drops, the family goes out, a restart starts over" {
+    const gpa_ = testing.allocator;
+    // A record too short for its parser is a malformed reply, not an empty dump.
+    const short = try mutMsg(RTM_NEWLINK, codec.NLM_F_MULTI, &.{ 1, 2, 3, 4 });
+    defer gpa_.free(short);
+    const done = cannedMessage(codec.NLMSG_DONE, codec.NLM_F_MULTI, 42, 7);
+    const s1 = [_][]const u8{ short, &done };
+    var t1: MutT = .{ .script = &s1 };
+    try testing.expectError(error.MalformedReply, dumpOver(Link, parseLink, matchLink, gpa_, &t1, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{}));
+    // The client-side filter drops what the family/interface filter excludes.
+    const addr = try mutMsg(RTM_NEWADDR, codec.NLM_F_MULTI, &mutAddrPayload(2, 3, .{ 10, 0, 0, 1 }));
+    defer gpa_.free(addr);
+    const s2 = [_][]const u8{ addr, &done };
+    var t2: MutT = .{ .script = &s2 };
+    const none = try dumpOver(Address, parseAddress, matchAddress, gpa_, &t2, RTM_GETADDR, RTM_NEWADDR, ifaddrmsg_len, .{ .family = AF.INET6 });
+    defer gpa_.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+    try testing.expectEqual(AF.INET6, t2.family);
+    var t2b: MutT = .{ .script = &s2 };
+    const one = try dumpOver(Address, parseAddress, matchAddress, gpa_, &t2b, RTM_GETADDR, RTM_NEWADDR, ifaddrmsg_len, .{ .family = AF.INET });
+    defer gpa_.free(one);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqual(AF.INET, t2b.family);
+    var t2c: MutT = .{ .script = &s2 };
+    const all = try dumpOver(Address, parseAddress, matchAddress, gpa_, &t2c, RTM_GETADDR, RTM_NEWADDR, ifaddrmsg_len, .{});
+    defer gpa_.free(all);
+    try testing.expectEqual(AF.UNSPEC, t2c.family);
+    // A restart discards what the interrupted pass had collected.
+    const l1p = mutLinkPayload(1);
+    const l2p = mutLinkPayload(2);
+    const rec1 = try mutMsg(RTM_NEWLINK, codec.NLM_F_MULTI, &l1p);
+    defer gpa_.free(rec1);
+    const rec2 = try mutMsg(RTM_NEWLINK, codec.NLM_F_MULTI, &l2p);
+    defer gpa_.free(rec2);
+    const intr = cannedMessage(codec.NLMSG_DONE, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR, 42, 7);
+    const d1 = try std.mem.concat(gpa_, u8, &.{ rec1, &intr });
+    defer gpa_.free(d1);
+    const d2 = try std.mem.concat(gpa_, u8, &.{ rec2, &done });
+    defer gpa_.free(d2);
+    const s3 = [_][]const u8{ d1, d2 };
+    var t3: MutT = .{ .script = &s3 };
+    const links = try dumpOver(Link, parseLink, matchLink, gpa_, &t3, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{});
+    defer gpa_.free(links);
+    try testing.expectEqual(@as(usize, 1), links.len);
+    try testing.expectEqual(@as(u32, 2), links[0].index);
+    try testing.expectEqual(@as(usize, 2), t3.sends);
+}
+
+fn mutAddrPayload(family: u8, ifindex: u32, addr: [4]u8) [16]u8 {
+    var p: [16]u8 = @splat(0);
+    p[0] = family;
+    p[1] = 8;
+    std.mem.writeInt(u32, p[4..8], ifindex, native_endian);
+    // IFA_LOCAL, len 8
+    std.mem.writeInt(u16, p[8..10], 8, native_endian);
+    std.mem.writeInt(u16, p[10..12], ifa_local, native_endian);
+    p[12..16].* = addr;
+    return p;
+}
+
+test "mutation 2026-11-27: Filter.max_records above the global cap is the global cap" {
+    // 4 Mi + 1 empty-payload records in ONE datagram; the parse and match are trivial,
+    // so the item list stays at one byte per record.
+    const n: usize = max_dump_records + 1;
+    const buf = try testing.allocator.alloc(u8, n * codec.header_len);
+    defer testing.allocator.free(buf);
+    const one_msg = cannedMessage(RTM_NEWLINK, codec.NLM_F_MULTI, 42, 7);
+    for (0..n) |i| @memcpy(buf[i * codec.header_len ..][0..codec.header_len], &one_msg);
+    const triv = struct {
+        fn parse(_: []const u8) codec.Error!?u8 {
+            return 1;
+        }
+        fn match(_: u8, _: Filter) bool {
+            return true;
+        }
+    };
+    const s = [_][]const u8{buf};
+    var t: MutT = .{ .script = &s };
+    try testing.expectError(error.TooManyMessages, dumpOver(u8, triv.parse, triv.match, testing.allocator, &t, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{ .max_records = std.math.maxInt(u32) }));
+}
+
+test "mutation 2026-11-27: dumpCollectOver: a short request is refused, restarts are bounded and start from scratch" {
+    const gpa_ = testing.allocator;
+    var short: [8]u8 = @splat(0);
+    var t0: MutT = .{};
+    try testing.expectError(error.InvalidRequest, dumpCollectOver(FdbEntry, collectFdb, gpa_, &t0, &short, RTM_NEWNEIGH));
+    // Always interrupted: four attempts, then InconsistentDump.
+    var request = cannedMessage(RTM_GETNEIGH, codec.NLM_F_REQUEST | codec.NLM_F_DUMP, 42, 0);
+    const intr = cannedMessage(codec.NLMSG_DONE, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR, 42, 7);
+    const s1 = [_][]const u8{ &intr, &intr, &intr, &intr, &intr, &intr };
+    var t1: MutT = .{ .script = &s1 };
+    try testing.expectError(error.InconsistentDump, dumpCollectOver(FdbEntry, collectFdb, gpa_, &t1, &request, RTM_NEWNEIGH));
+    try testing.expectEqual(@as(usize, max_dump_attempts), t1.sends);
+    // A restart drops the first pass's items.
+    var fdb: [ndmsg_len]u8 = @splat(0);
+    fdb[0] = AF.BRIDGE;
+    const rec = try mutMsg(RTM_NEWNEIGH, codec.NLM_F_MULTI, &fdb);
+    defer gpa_.free(rec);
+    const done = cannedMessage(codec.NLMSG_DONE, codec.NLM_F_MULTI, 42, 7);
+    const d1 = try std.mem.concat(gpa_, u8, &.{ rec, &intr });
+    defer gpa_.free(d1);
+    const d2 = try std.mem.concat(gpa_, u8, &.{ rec, &done });
+    defer gpa_.free(d2);
+    const s2 = [_][]const u8{ d1, d2 };
+    var t2: MutT = .{ .script = &s2 };
+    const got = try dumpCollectOver(FdbEntry, collectFdb, gpa_, &t2, &request, RTM_NEWNEIGH);
+    defer gpa_.free(got);
+    try testing.expectEqual(@as(usize, 1), got.len);
+}
+
+test "mutation 2026-11-27: the AF_BRIDGE collectors turn parse errors into MalformedReply" {
+    const gpa_ = testing.allocator;
+    var fo: std.ArrayList(FdbEntry) = .empty;
+    defer fo.deinit(gpa_);
+    try testing.expectError(error.MalformedReply, collectFdb(gpa_, &fo, &.{ 1, 2, 3 }));
+    var bo: std.ArrayList(BrportInfo) = .empty;
+    defer bo.deinit(gpa_);
+    try testing.expectError(error.MalformedReply, collectBrport(gpa_, &bo, &.{ 1, 2, 3 }));
+    var vo: std.ArrayList(VlanEntry) = .empty;
+    defer vo.deinit(gpa_);
+    try testing.expectError(error.MalformedReply, collectVlans(gpa_, &vo, &.{ 1, 2, 3 }));
+    // A valid FDB record is appended.
+    var fdb: [ndmsg_len]u8 = @splat(0);
+    fdb[0] = AF.BRIDGE;
+    try collectFdb(gpa_, &fo, &fdb);
+    try testing.expectEqual(@as(usize, 1), fo.items.len);
+    var bp: [ifinfomsg_len]u8 = @splat(0);
+    bp[0] = AF.BRIDGE;
+    var pi: std.ArrayList(u8) = .empty;
+    defer pi.deinit(gpa_);
+    try codec.appendPadded(gpa_, &pi, &bp);
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(gpa_);
+    try codec.appendAttrU8(gpa_, &inner, bridge.IFLA_BRPORT.STATE, 3);
+    try codec.appendAttr(gpa_, &pi, bridge.IFLA_PROTINFO, inner.items);
+    try collectBrport(gpa_, &bo, pi.items);
+    try testing.expectEqual(@as(usize, 1), bo.items.len);
+}
+
+// ── 2026-11-27 mutation run: write-op wiring that only a kernel can answer ───
+
+test "mutation 2026-11-27: integration (netns): replace semantics, duplicate rules, neighbours, nexthop families, overrun mappings through the Socket ops" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const rc = linux.fork();
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    if (rc == 0) {
+        var code: u8 = netns_skip;
+        if (enterNetns()) {
+            if (netnsMutationRoundTrip()) |_| {
+                code = 0;
+            } else |err| {
+                code = switch (err) {
+                    error.AccessDenied => netns_skip,
+                    else => netns_fail,
+                };
+            }
+        }
+        linux.exit_group(code);
+    }
+    const pid: i32 = @intCast(rc);
+    var status: u32 = 0;
+    while (true) {
+        const wrc = linux.waitpid(pid, @ptrCast(&status), 0);
+        switch (linux.errno(wrc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    if (status & 0x7f != 0) return error.TestChildKilledBySignal;
+    switch (@as(u8, @truncate(status >> 8))) {
+        0 => {},
+        netns_skip => {
+            if (verboseSkip()) std.debug.print("SKIPPED (netns mutation round-trip): no netns here\n", .{});
+            return error.SkipZigTest;
+        },
+        else => return error.TestNetnsRoundTripFailed,
+    }
+}
+
+fn netnsMutationRoundTrip() !void {
+    netnsStep("Socket.open");
+    var nl = try Socket.open(std.heap.page_allocator); // global-alloc-ok: fork()'d child of a netns integration test
+    defer nl.close();
+    return netnsMutationOn(&nl) catch |err| {
+        netnsReport("mutation wiring", err, &nl);
+        return err;
+    };
+}
+
+fn netnsMutationOn(nl: *Socket) !void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: fork()'d child of a netns integration test
+    netnsStep("linkAdd(dummy)");
+    try nl.linkAdd(.{ .name = "nlm0", .kind = "dummy", .up = true }, .{});
+    const dev = (try findLink(nl, "nlm0")) orelse return error.TestLinkMissing;
+
+    // addressAdd: the default is exclusive (a second add is EEXIST), `.replace` updates in place.
+    var spec: AddressSpec = .{ .ifindex = dev.index, .local = &.{ 10, 77, 0, 1 }, .prefixlen = 24 };
+    netnsStep("addressAdd");
+    try nl.addressAdd(spec, .{});
+    netnsStep("addressAdd(again)");
+    try expectWriteError(error.Exists, nl.addressAdd(spec, .{}));
+    spec.valid_lft = 600;
+    spec.preferred_lft = 300;
+    netnsStep("addressAdd(replace)");
+    try nl.addressAdd(spec, .{ .replace = true });
+    const addrs = try nl.addresses(.{ .ifindex = dev.index, .family = AF.INET });
+    defer gpa.free(addrs);
+    var replaced = false;
+    for (addrs) |a| {
+        if (a.valid_lft == 600 and a.preferred_lft == 300) replaced = true;
+    }
+    if (!replaced) return error.TestReplaceNotApplied;
+
+    // ruleAdd: the same rule twice is EEXIST with the default flags.
+    const rule: RuleSpec = .{ .src = &.{ 10, 78, 0, 0 }, .src_len = 16, .table = 178, .priority = 17800 };
+    netnsStep("ruleAdd");
+    try nl.ruleAdd(rule, .{});
+    netnsStep("ruleAdd(again)");
+    try expectWriteError(error.Exists, nl.ruleAdd(rule, .{}));
+
+    // neighborAdd / neighborDel on an ARP-capable device (a bridge): the add must succeed, the
+    // delete must remove it. (A dummy device is IFF_NOARP and the kernel's strict delete check
+    // answers EINVAL to a mis-typed request, which is why this is not tried on `nlm0`.)
+    var br_ok = true;
+    netnsStep("linkAdd(bridge)");
+    nl.linkAdd(.{ .name = "nlm1", .kind = "bridge", .up = true }, .{}) catch |err| switch (err) {
+        error.NotSupported => br_ok = false,
+        else => return err,
+    };
+    if (br_ok) {
+        const br = (try findLink(nl, "nlm1")) orelse return error.TestLinkMissing;
+        const mac: [6]u8 = .{ 2, 0, 0, 0, 7, 7 };
+        netnsStep("neighborAdd");
+        try nl.neighborAdd(.{ .ifindex = br.index, .dst = &.{ 10, 77, 0, 9 }, .lladdr = &mac }, .{});
+        const ns = try nl.neighbors(.{ .ifindex = br.index, .family = AF.INET });
+        defer gpa.free(ns);
+        var seen = false;
+        for (ns) |n| {
+            if (std.mem.eql(u8, n.dstBytes(), &.{ 10, 77, 0, 9 }) and std.mem.eql(u8, n.lladdrBytes(), &mac)) seen = true;
+        }
+        if (!seen) return error.TestNeighborNotFound;
+        netnsStep("neighborDel");
+        try nl.neighborDel(.{ .ifindex = br.index, .dst = &.{ 10, 77, 0, 9 } });
+        const ns2 = try nl.neighbors(.{ .ifindex = br.index, .family = AF.INET });
+        defer gpa.free(ns2);
+        for (ns2) |n| {
+            if (std.mem.eql(u8, n.dstBytes(), &.{ 10, 77, 0, 9 })) return error.TestNeighborNotDeleted;
+        }
+        // A flush of the AF_BRIDGE table over every state meets the bridge's FDB entries (a bridge
+        // with a port has its own and the port's local entries, all PERMANENT): they carry no
+        // NDA_DST, are skipped, and must not stop the flush.
+        netnsStep("linkAdd(dummy port)");
+        try nl.linkAdd(.{ .name = "nlm2", .kind = "dummy", .up = true }, .{});
+        const port = (try findLink(nl, "nlm2")) orelse return error.TestLinkMissing;
+        netnsStep("portEnslave");
+        try nl.portEnslave(port.index, br.index);
+        netnsStep("neighborFlush(all states)");
+        const fr = try nl.neighborFlush(.{ .family = AF.BRIDGE, .state_mask = ~@as(u16, 0) });
+        if (fr.stopped != null) return error.TestFlushStopped;
+    }
+
+    // nexthop objects: a gateway nexthop is IPv4, a group passes every family filter.
+    // Support is probed with the dump (EOPNOTSUPP is `InvalidRequest` there); once the kernel
+    // has nexthop objects, every add below must succeed.
+    var nh_ok = true;
+    netnsStep("nexthops(probe)");
+    if (nl.nexthops(.{})) |probe| gpa.free(probe) else |err| switch (err) {
+        error.InvalidRequest => nh_ok = false,
+        else => return err,
+    }
+    if (nh_ok) {
+        netnsStep("nexthopAdd");
+        try nl.nexthopAdd(.{ .id = 61, .gateway = &.{ 10, 77, 0, 9 }, .oif = dev.index }, .{});
+        netnsStep("nexthopAdd(group)");
+        try nl.nexthopAdd(.{ .id = 63, .group = &.{.{ .id = 61 }} }, .{});
+        netnsStep("nexthopGet");
+        const got = try nl.nexthopGet(61);
+        if (got.id != 61) return error.TestNexthopWrongId;
+        const v4 = try nl.nexthops(.{ .family = AF.INET });
+        defer gpa.free(v4);
+        const v6 = try nl.nexthops(.{ .family = AF.INET6 });
+        defer gpa.free(v6);
+        const every = try nl.nexthops(.{});
+        defer gpa.free(every);
+        if (!hasNexthop(v4, 61) or !hasNexthop(v4, 63)) return error.TestNexthopFilterV4;
+        if (hasNexthop(v6, 61) or !hasNexthop(v6, 63)) return error.TestNexthopFilterV6;
+        if (!hasNexthop(every, 61) or !hasNexthop(every, 63)) return error.TestNexthopFilterAll;
+    }
+
+    try netnsOverrun(nl);
+}
+
+const overrun_names = [_][]const u8{ "nlo0", "nlo1", "nlo2", "nlo3", "nlo4", "nlo5", "nlo6", "nlo7" };
+
+/// Create and delete a handful of dummy devices: every one of them is a multicast
+/// notification for a monitor socket.
+fn netnsBurst(nl: *Socket) !void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: fork()'d child of a netns integration test
+    netnsStep("burst(linkAdd)");
+    for (overrun_names) |n| try nl.linkAdd(.{ .name = n, .kind = "dummy" }, .{});
+    netnsStep("burst(linkDel)");
+    const ls = try nl.links();
+    defer gpa.free(ls);
+    for (ls) |l| {
+        if (std.mem.startsWith(u8, l.name(), "nlo")) try nl.linkDel(l.index);
+    }
+}
+
+fn netnsDrain(mon: *Socket) void {
+    while (mon.recvDatagramStrict()) |_| {} else |_| {}
+}
+
+/// A monitor socket whose receive queue overflows: the kernel reports ENOBUFS once,
+/// and each receive path maps it to its own vocabulary (`Overrun` strict, `SystemResources`
+/// on the rtnetlink paths).
+fn netnsOverrun(nl: *Socket) !void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: fork()'d child of a netns integration test
+    netnsStep("openMonitor");
+    var mon = try Socket.openMonitor(gpa, try rtnlGroupMask(&.{RTNLGRP.LINK}));
+    defer mon.close();
+    const small: u32 = 2304;
+    _ = linux.setsockopt(mon.fd, linux.SOL.SOCKET, linux.SO.RCVBUF, @ptrCast(&small), @sizeOf(u32));
+    try mon.setRecvTimeout(50);
+
+    netnsStep("overrun(recvDatagramStrict)");
+    try netnsBurst(nl);
+    try testing.expectError(error.Overrun, mon.recvDatagramStrict());
+    netnsDrain(&mon);
+
+    netnsStep("overrun(recvDatagram)");
+    try netnsBurst(nl);
+    try testing.expectError(error.SystemResources, mon.recvDatagram());
+    netnsDrain(&mon);
+
+    netnsStep("overrun(awaitAck)");
+    try netnsBurst(nl);
+    try testing.expectError(error.SystemResources, mon.awaitAck(12345));
+    netnsDrain(&mon);
+
+    netnsStep("overrun(getOp)");
+    try netnsBurst(nl);
+    const req = try gpa.dupe(u8, &cannedMessage(codec.NLMSG_NOOP, 0, mon.nextSeq(), 0));
+    try testing.expectError(error.SystemResources, mon.getOp(Link, parseLink, req, RTM_NEWLINK));
+}
+
+fn hasNexthop(list: []const Nexthop, id: u32) bool {
+    for (list) |n| if (n.id == id) return true;
+    return false;
 }
