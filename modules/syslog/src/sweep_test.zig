@@ -779,3 +779,45 @@ test "TcpEmitter.connectUnix: no socket there, a too long path" {
     try testing.expectError(error.ConnectionRefused, transport.TcpEmitter.connectUnix(testing.io, ".zig-cache/tmp/no-such-syslog-socket", 100));
     try testing.expectError(error.PathTooLong, transport.TcpEmitter.connectUnix(testing.io, &@as([108]u8, @splat('x')), 100));
 }
+
+// ── 2026-11-27: a frame past the scratch to a peer that stopped reading ─────
+
+var g_big_path: []const u8 = "";
+
+/// Exit 0: `sendRaw` of a frame larger than the free socket buffer ends in
+/// `Timeout` (not a hang) and leaves the emitter Broken (bytes went out).
+fn bigFrameStopReading() u8 {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
+    const io = threaded.io();
+    const body = std.heap.page_allocator.alloc(u8, 8 << 20) catch return 9; // global-alloc-ok: forked sweep child, freed by its exit
+    @memset(body, 'z');
+    // Unix stream (the reported repro: ~200 KiB of buffer, 400 KiB frame).
+    {
+        const l = StreamListener.bind(g_big_path) catch return 9;
+        var e = transport.TcpEmitter.connectUnix(io, g_big_path, 1000) catch return 9;
+        const c = l.accept() catch return 9;
+        _ = c;
+        e.send_timeout_ms = 100;
+        if (e.sendRaw(body[0 .. 400 << 10])) |_| return 1 else |err| if (err != error.Timeout) return 2;
+        if (!e.broken) return 3;
+    }
+    // TCP loopback: buffers autotune to a few MiB, so 8 MiB.
+    {
+        var addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+        var server = addr.listen(io, .{}) catch return 9;
+        var e = transport.TcpEmitter.connect(io, server.socket.address) catch return 9;
+        _ = server.accept(io) catch return 9;
+        e.send_timeout_ms = 100;
+        if (e.sendRaw(body)) |_| return 4 else |err| if (err != error.Timeout) return 5;
+        if (!e.broken) return 6;
+    }
+    return 0;
+}
+
+test "TcpEmitter.sendRaw: a frame past the scratch to a peer that stopped reading is Timeout, not a hang (FIX 2026-11-27)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    g_big_path = try sockPath(&tmp, &path_buf, "big");
+    try testing.expectEqual(@as(u32, 0), try runChild(bigFrameStopReading));
+}

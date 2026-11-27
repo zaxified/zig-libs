@@ -88,7 +88,9 @@ fn utf8Boundary(bytes: []const u8, at: usize) usize {
         back += 1;
     }
     if (back == 0) return at;
-    return if (bytes[k] >= 0xC0) k else at;
+    // A lead byte of a well-formed sequence is 0xC2..0xF4 (RFC 3629): 0xC0/0xC1
+    // (overlong) and 0xF5..0xFF never start one, so they keep `at` (2026-11-27).
+    return if (bytes[k] >= 0xC2 and bytes[k] <= 0xF4) k else at;
 }
 
 /// RFC 6587 §3.4.1 octet-counting frame: `MSG-LEN SP SYSLOG-MSG`, where
@@ -348,33 +350,58 @@ pub const TcpEmitter = struct {
         e: *TcpEmitter,
         deadline: std.Io.Timeout,
 
-        /// One bounded write of (a prefix of) `chunk`; returns bytes written.
-        /// The batch is ALWAYS cancelled before returning, so no pending
-        /// operation can still reference `chunk` afterwards; an operation that
-        /// completed despite a timeout still counts (its bytes are on the wire).
+        /// One bounded write of (a prefix of) `chunk`; returns bytes written
+        /// (at least 1).
+        ///
+        /// The write itself is ours, `sendto(MSG_DONTWAIT)`: it copies what
+        /// fits in the socket buffer and never blocks. A `net_write` batch
+        /// operation cannot be used for it: `std.Io.Threaded` polls for
+        /// POLLOUT and then issues a BLOCKING `sendmsg` of the whole chunk
+        /// (the socket is blocking, std treats EAGAIN as a bug), and a chunk
+        /// larger than the free buffer space then blocks in the worker where
+        /// neither the deadline nor `batch.cancel` reaches it (2026-11-27:
+        /// `sendRaw` of 400 KiB to a peer that stopped reading hung forever).
+        /// Only the WAIT for writability goes through the batch, as an EMPTY
+        /// `net_write` (poll for POLLOUT, then a zero-byte `sendmsg` that
+        /// returns at once), which keeps the deadline and `std.Io`
+        /// cancellation. The batch is always cancelled before returning.
         fn write(self: *NetStep, chunk: []const u8) SendError!usize {
             const io = self.e.io;
-            const data = [_][]const u8{chunk};
-            const op: std.Io.Operation = .{ .net_write = .{ .socket_handle = self.e.stream.socket.handle, .data = &data } };
+            const fd = self.e.stream.socket.handle;
+            while (true) {
+                const rc = linux.sendto(fd, chunk.ptr, chunk.len, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, null, 0);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => if (rc != 0 or chunk.len == 0) return rc,
+                    .AGAIN => {},
+                    .INTR => continue,
+                    else => return error.WriteFailed,
+                }
+                try self.waitWritable(io, fd);
+            }
+        }
+
+        fn waitWritable(self: *NetStep, io: std.Io, fd: std.Io.net.Socket.Handle) SendError!void {
+            const empty = [_][]const u8{""};
+            const op: std.Io.Operation = .{ .net_write = .{ .socket_handle = fd, .data = &empty } };
             var storage: [1]std.Io.Operation.Storage = undefined;
             var batch: std.Io.Batch = .init(&storage);
             batch.addAt(0, op);
             const waited = batch.awaitConcurrent(io, self.deadline);
             batch.cancel(io);
             if (batch.next()) |done| {
-                const n = done.result.net_write catch return error.WriteFailed;
-                return n;
+                _ = done.result.net_write catch return error.WriteFailed;
+                return;
             }
             waited catch |err| switch (err) {
                 error.Timeout => return error.Timeout,
                 error.Canceled => return error.Canceled,
                 // The Io cannot run the wait concurrently (not the case for
-                // std.Io.Threaded on Linux, which polls): write untimed
-                // rather than fail every send. Documented gap: this write
-                // has no deadline.
+                // std.Io.Threaded on Linux, which polls): wait untimed
+                // rather than fail every send. Documented gap: no deadline.
                 error.ConcurrencyUnavailable => {
-                    const res = io.operate(op) catch return error.Canceled;
-                    return res.net_write catch error.WriteFailed;
+                    var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
+                    _ = linux.poll(&pfd, 1, -1);
+                    return;
                 },
             };
             return error.WriteFailed;
@@ -913,4 +940,13 @@ test "mapConnectErrno: every named errno maps to its own error (sweep audit GY-S
     try t.expectEqual(error.HostUnreachable, mapConnectErrno(.HOSTUNREACH));
     try t.expectEqual(error.Timeout, mapConnectErrno(.TIMEDOUT));
     try t.expectEqual(error.ConnectFailed, mapConnectErrno(.PERM));
+}
+
+test "utf8Boundary: only a lead byte 0xC2..0xF4 moves the cut back; 0xC0, 0xC1 and 0xF5..0xFF keep it (2026-11-27)" {
+    try std.testing.expectEqual(@as(usize, 1), utf8Boundary("a\xc3\xa9b", 2));
+    try std.testing.expectEqual(@as(usize, 1), utf8Boundary("a\xf4\x8f\xbf\xbfb", 4));
+    try std.testing.expectEqual(@as(usize, 2), utf8Boundary("a\xc0\x80b", 2));
+    try std.testing.expectEqual(@as(usize, 2), utf8Boundary("a\xc1\xbfb", 2));
+    try std.testing.expectEqual(@as(usize, 3), utf8Boundary("a\xf5\x80\x80b", 3));
+    try std.testing.expectEqual(@as(usize, 3), utf8Boundary("a\xff\x80\x80b", 3));
 }
